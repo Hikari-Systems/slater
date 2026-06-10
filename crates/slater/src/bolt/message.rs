@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bolt message set — request decoding and response construction.
 //!
 //! Every Bolt message is a PackStream structure: a one-byte signature (tag) and

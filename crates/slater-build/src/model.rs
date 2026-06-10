@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Typed representation of a parsed dump statement.
 //!
 //! The pest parser turns each raw statement string into one of these; the builder

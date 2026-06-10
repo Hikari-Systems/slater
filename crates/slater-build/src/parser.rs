@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Primitive-Cypher parser and the streaming statement reader.
 //!
 //! [`StatementReader`] splits a dump script into individual statements on

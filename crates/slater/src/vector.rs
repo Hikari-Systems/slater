@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Brute-force vector KNN.
 //!
 //! Slater's whole live estate is below the 50k-vector ANN threshold (PLAN.md

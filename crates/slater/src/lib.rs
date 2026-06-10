@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `slater` — the online, read-only Bolt graph engine, as a library.
 //!
 //! The modules below make up the server: the Bolt/PackStream wire layer, the

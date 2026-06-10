@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Slater on-disk format — the single owner of the byte layout.
 //!
 //! Both binaries (`slater-build`, the offline writer, and `slater`, the online

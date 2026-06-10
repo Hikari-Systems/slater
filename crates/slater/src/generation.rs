@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Opening and validating an immutable graph generation.
 //!
 //! A generation is a content-hashed, append-only directory written by

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Logical planning: choosing how to generate candidate rows for a node pattern.
 //!
 //! The interesting planning decision in a read-only store is *which structure to

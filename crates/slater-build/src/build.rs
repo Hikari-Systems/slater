@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The two-pass offline build: a stream of parsed statements in, an immutable,
 //! generation-numbered on-disk image out.
 //!

@@ -11,7 +11,7 @@ members = ["crates/graph-format", "crates/slater-build", "crates/slater"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "UNLICENSED"
+license = "Apache-2.0"
 
 # Centralised dependency versions; member crates opt in with `.workspace = true`.
 # Listing a dependency here that no member uses yet is harmless — it only takes

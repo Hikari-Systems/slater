@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Volcano-style executor: an AST [`Query`] → result rows, pulled from the
 //! immutable [`Generation`] through the decompressed-block [`BlockCache`].
 //!

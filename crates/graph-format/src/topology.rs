@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! CSR adjacency — forward and reverse — so the reader can traverse either
 //! direction without a scan.
 //!

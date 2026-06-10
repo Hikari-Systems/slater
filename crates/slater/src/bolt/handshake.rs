@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bolt connection handshake and version negotiation.
 //!
 //! A Bolt client opens with a 4-byte magic preamble followed by **four** 4-byte

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Optional at-rest AEAD over individual blocks.
 //!
 //! Encryption is per **block**, not per file: a block is compressed first, then

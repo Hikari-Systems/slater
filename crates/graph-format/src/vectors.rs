@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Full-precision vector store (`vectors.f32.blk`).
 //!
 //! Holds the dense `f32` vectors for every vector index, **grouped by index**:

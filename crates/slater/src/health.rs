@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bolt-native health probe for the container `HEALTHCHECK`.
 //!
 //! The house helper `hs_utils::healthcheck` sends an HTTP `GET /healthcheck` and

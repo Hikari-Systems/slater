@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bounded-resident **headline** test (M9) — Slater's raison d'être.
 //!
 //! The project exists to replace an in-memory graph engine whose RSS scales with

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Access control — argon2id authentication and per-graph read grants.
 //!
 //! The ACL is a plain-JSON file (it lives on a shared/NFS mount alongside the
