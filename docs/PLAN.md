@@ -2,8 +2,7 @@
 
 ## Context
 
-The estate runs several GraphRAG read APIs (`eu-ai-act-data-service`,
-`bioalphaengine-data-service`/MeSH, and other sibling read services) over a single shared **FalkorDB**
+The estate runs several GraphRAG read APIs over a single shared **FalkorDB**
 instance. FalkorDB eagerly
 loads each whole graph into RAM at boot (>700 MB resident for graphs that are not large), which is
 the memory problem we are eliminating. Today those services issue Cypher over **`GRAPH.RO_QUERY --compact`**
@@ -33,7 +32,7 @@ reconciliations made after surveying the neighbours, the confirmed decisions, an
 
 ### hs-utils-rs conventions — reuse, do not reinvent
 - **Dependency form:** `git + tag`, never path/workspace-member. Example
-  (`eu-ai-act-data-service/Cargo.toml`): `hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.10.0", features = ["web"] }`.
+  (`data-service/Cargo.toml`): `hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.10.0", features = ["web"] }`.
   `hs-utils-rs/CLAUDE.md`: *"referenced via git + tag … there is no workspace."* Slater is itself an
   internal cargo workspace; each member still pulls `hs-utils` via git+tag.
 - **Config:** `hs_utils::config::load_layered_value()` → `serde_json::from_value` (newer pattern, used by
@@ -49,7 +48,7 @@ reconciliations made after surveying the neighbours, the confirmed decisions, an
 
 ### The real Cypher surface (widen the floor to this)
 Confirmed call sites: the sibling read services' `src/routes/mod.rs` (e.g.
-`eu-ai-act-data-service/src/routes/mod.rs`), with literals built in `*/src/cypher.rs` and executed via
+`data-service/src/routes/mod.rs`), with literals built in `*/src/cypher.rs` and executed via
 `*/src/falkor.rs` `GRAPH.RO_QUERY --compact`. The read subset **must** cover, beyond the spec floor:
 - **`WITH` pipelines** (projection, `DISTINCT`, `ORDER BY`, post-`WITH` `WHERE`/having, aggregation
   staging) — pervasive.
