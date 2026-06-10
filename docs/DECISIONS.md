@@ -592,8 +592,7 @@ headline. Three coupled decisions made it land cleanly and non-flakily:
 
 ### D35 — Container & ops: workspace multi-stage image, read-only root, Bolt healthcheck
 The `Dockerfile`/`docker-compose.yml`/`README.md` follow the house `*-data-service`
-conventions (e.g. `bioalphaengine-data-service`, `eu-ai-act-data-service`) adapted
-for a **three-crate workspace shipping two binaries**:
+conventions adapted for a **three-crate workspace shipping two binaries**:
 - **Builder stage installs `cmake` + `clang` + `libclang-dev`** for the rustls
   `aws-lc-rs` backend (D5); `git` (already in `rust:1-bookworm`) plus the copied
   `.cargo/config.toml` satisfy the `hs-utils` git+tag fetch via the git CLI.
