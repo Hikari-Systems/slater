@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! ISAM-style sorted range index.
 //!
 //! `(value, id)` pairs are sorted, packed into compressed key-blocks, and a small

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bounded block cache — the decompressed-block LRU.
 //!
 //! Every `.blk` file is a sequence of zstd blocks; the readers fetch a block

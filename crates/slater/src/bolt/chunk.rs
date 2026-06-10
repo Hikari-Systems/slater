@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bolt message chunking.
 //!
 //! After the handshake, every Bolt message travels as one or more **chunks**: a

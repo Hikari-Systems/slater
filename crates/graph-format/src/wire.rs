@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Low-level wire encoding shared by the property store and the indexes.
 //!
 //! Integers use LEB128 unsigned varints (and zig-zag for signed), which keeps

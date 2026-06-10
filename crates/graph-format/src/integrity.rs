@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Copy-completeness / integrity hashing.
 //!
 //! The MANIFEST records a BLAKE3 content hash over the generation's files. The

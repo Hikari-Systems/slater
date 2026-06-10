@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Read-only Cypher parser: source text → typed AST.
 //!
 //! The grammar (`cypher.pest`) is the online query language — separate from

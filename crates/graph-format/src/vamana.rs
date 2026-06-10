@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Disk-native single-layer Vamana graph (DiskANN-style) for the large-vector
 //! ANN path.
 //!

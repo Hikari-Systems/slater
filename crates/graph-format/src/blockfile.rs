@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Generic block-container file used by every `.blk` file in a generation.
 //!
 //! A block file packs many small, length-delimited **records** into fixed-size

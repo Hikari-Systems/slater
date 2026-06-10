@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Shared test fixture: a small, representative generation built directly with
 //! the `graph-format` writers (no dependency on the `slater-build` binary), used
 //! by the planner and executor tests.

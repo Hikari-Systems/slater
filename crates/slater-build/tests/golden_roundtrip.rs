@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Golden round-trip for `slater-build`.
 //!
 //! Builds a tiny but representative dump (multi-label nodes, a string array, an

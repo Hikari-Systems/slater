@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `slater-build` — the offline writer.
 //!
 //! Consumes a primitive-Cypher creation script (the dialect emitted by the dump

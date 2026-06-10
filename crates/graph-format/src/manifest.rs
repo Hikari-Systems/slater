@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The generation MANIFEST — the inventory and self-description of an image.
 //!
 //! Written last by the builder (after every data file is fsynced and hashed) and

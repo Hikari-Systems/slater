@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The `tokio` Bolt listener and per-connection state machine.
 //!
 //! This is the final M4 increment: the piece that ties
@@ -414,18 +415,15 @@ impl ConnCtx {
         user: &str,
         extra: &PsValue,
         query: &str,
-    ) -> std::result::Result<Option<(Vec<String>, Vec<Vec<PsValue>>)>, Failure> {
+    ) -> std::result::Result<Option<introspect::Rows>, Failure> {
         let q = normalize_query(query);
 
         // Graph-agnostic (server-level) statements — answerable without a graph.
         let agnostic = match q.as_str() {
             _ if q.starts_with("call dbms.components") => Some(introspect::dbms_components()),
-            _ if q.starts_with("show databases") || q.starts_with("show default database") => {
-                Some(introspect::show_databases(
-                    &self.readable_databases(user),
-                    &self.bind_addr,
-                ))
-            }
+            _ if q.starts_with("show databases") || q.starts_with("show default database") => Some(
+                introspect::show_databases(&self.readable_databases(user), &self.bind_addr),
+            ),
             _ if q.starts_with("show version") => Some(introspect::show_version()),
             _ if q.starts_with("show procedures") => Some(introspect::show_procedures()),
             _ if q.starts_with("show functions") => {
@@ -440,9 +438,11 @@ impl ConnCtx {
                 "properties",
                 "ownedIndex",
             ])),
-            _ if q.starts_with("show constraint info") => {
-                Some(introspect::empty(&["constraint type", "label", "properties"]))
-            }
+            _ if q.starts_with("show constraint info") => Some(introspect::empty(&[
+                "constraint type",
+                "label",
+                "properties",
+            ])),
             _ if q.starts_with("show triggers") => Some(introspect::empty(&[
                 "trigger name",
                 "statement",
@@ -450,9 +450,11 @@ impl ConnCtx {
                 "phase",
                 "owner",
             ])),
-            _ if q.starts_with("show transactions") => {
-                Some(introspect::empty(&["transactionId", "username", "currentQuery"]))
-            }
+            _ if q.starts_with("show transactions") => Some(introspect::empty(&[
+                "transactionId",
+                "username",
+                "currentQuery",
+            ])),
             _ => None,
         };
         if let Some(rows) = agnostic {
@@ -461,7 +463,7 @@ impl ConnCtx {
 
         // Graph-scoped statements — resolve the graph (honouring an explicit `db`
         // or the default) and read its manifest.
-        let scoped: Option<fn(&graph_format::manifest::Manifest) -> (Vec<String>, Vec<Vec<PsValue>>)> =
+        let scoped: Option<fn(&graph_format::manifest::Manifest) -> introspect::Rows> =
             if q.starts_with("call db.labels") {
                 Some(introspect::db_labels)
             } else if q.starts_with("call db.relationshiptypes") {
@@ -498,12 +500,11 @@ impl ConnCtx {
 fn normalize_query(query: &str) -> String {
     let mut q = query.split_whitespace().collect::<Vec<_>>().join(" ");
     q.make_ascii_lowercase();
-    loop {
-        if let Some(rest) = q.strip_prefix("explain ").or_else(|| q.strip_prefix("profile ")) {
-            q = rest.to_string();
-        } else {
-            break;
-        }
+    while let Some(rest) = q
+        .strip_prefix("explain ")
+        .or_else(|| q.strip_prefix("profile "))
+    {
+        q = rest.to_string();
     }
     q.trim_end_matches(';').trim().to_string()
 }

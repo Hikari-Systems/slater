@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Core identifier newtypes and the property-cell value type.
 //!
 //! Dense internal ids are assigned by the builder: nodes get `0..N`, edges get

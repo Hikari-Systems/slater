@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bolt protocol wire layer.
 //!
 //! Slater speaks Bolt 5.x (with a 4.4 fallback) over TCP, optionally wrapped in

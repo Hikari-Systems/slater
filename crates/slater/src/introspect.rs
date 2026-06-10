@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Read-only introspection / metadata queries — the fixed set of statements a
 //! graph-browser GUI (Neo4j Browser, Memgraph Lab) fires on connect to populate
 //! its schema/sidebar panels.
@@ -145,8 +146,8 @@ pub(crate) fn db_property_keys(m: &Manifest) -> Rows {
 /// Flattened view of every index in the manifest, dialect-independent.
 struct IdxView {
     name: String,
-    kind: &'static str,    // "RANGE" | "VECTOR"
-    entity: &'static str,  // "NODE" | "RELATIONSHIP"
+    kind: &'static str,   // "RANGE" | "VECTOR"
+    entity: &'static str, // "NODE" | "RELATIONSHIP"
     label: String,
     property: String,
     provider: &'static str,
@@ -285,10 +286,7 @@ pub(crate) fn show_storage_info(m: &Manifest) -> Rows {
             vec![s("edge_count"), PsValue::Int(m.edge_count as i64)],
             vec![s("average_degree"), PsValue::Float(avg_degree)],
             vec![s("label_count"), PsValue::Int(m.labels.len() as i64)],
-            vec![
-                s("edge_type_count"),
-                PsValue::Int(m.reltypes.len() as i64),
-            ],
+            vec![s("edge_type_count"), PsValue::Int(m.reltypes.len() as i64)],
         ],
     )
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `slater` — the online, read-only Bolt server (binary entry point).
 //!
 //! Speaks Bolt over (optionally) TLS, authenticates against a JSON ACL, selects

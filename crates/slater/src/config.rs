@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Slater server configuration.
 //!
 // Many fields below are consumed only from milestone 4 (server/cache/query

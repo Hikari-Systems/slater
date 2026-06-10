@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! PackStream v2 — the value serialisation Bolt rides on.
 //!
 //! PackStream is a binary format of self-describing markers. Every value begins

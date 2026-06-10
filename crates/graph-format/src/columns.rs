@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Property store for nodes and edges.
 //!
 //! One record per entity, addressed by its dense id (the blockfile's global

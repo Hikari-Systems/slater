@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Product quantisation (PQ) codebooks + codes for the large-vector ANN path.
 //!
 //! A PQ index splits each `dim`-dimensional vector into `m` contiguous

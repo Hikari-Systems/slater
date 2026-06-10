@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Block compression codec.
 //!
 //! All `.blk` files are split into fixed-size raw blocks, each compressed

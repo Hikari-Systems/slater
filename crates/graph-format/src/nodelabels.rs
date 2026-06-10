@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Per-node label store (`node_labels.blk`).
 //!
 //! `columns` holds only a node's *properties*, not which labels it carries, so
