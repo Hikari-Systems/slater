@@ -1,0 +1,112 @@
+// Primitive-Cypher dump grammar (the dialect emitted by the FalkorDB snapshot
+// dump tool — see docs/PLAN.md "Dump/build format to parse").
+//
+// This grammar covers ONLY the handful of statement shapes a dump script
+// contains; it is deliberately NOT the query language (that lives in `slater`,
+// milestone 4). The streaming reader splits the script on top-level `;` and feeds
+// one statement at a time to the `statement` rule, so a statement never contains a
+// semicolon of its own.
+//
+// The six meaningful forms:
+//   1. node create     CREATE (:L1:L2:__DumpVertex__ {__dump_id__: 0, k: v, embedding: vecf32([...])})
+//   2. edge create     MATCH (a:__DumpVertex__ {__dump_id__: i}), (b:__DumpVertex__ {__dump_id__: j})
+//                      CREATE (a)-[:REL {k: v}]->(b)
+//   3. node range idx  CREATE INDEX FOR (n:Label) ON (n.prop)
+//   4. edge range idx  CREATE INDEX FOR ()-[r:TYPE]->() ON (r.prop)
+//   5. vector idx call CALL db.idx.vector.createNodeIndex('Label','prop', dim, 'cosine')
+//   6. vector idx help createNodeVectorIndex('Label', dim, 'cosine', 'property')
+// plus the ignorable marker/cleanup lines (DROP INDEX …, MATCH … REMOVE …), which
+// parse but carry no data (the marker label/property are simply never persisted).
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+statement = { SOI ~ stmt ~ ";"? ~ EOI }
+
+stmt = {
+    create_index
+  | vector_index_call
+  | vector_index_helper
+  | edge_create
+  | node_create
+  | ignored
+}
+
+// --- node / edge creation ------------------------------------------------------
+
+node_create = { ^"create" ~ node_pattern }
+
+node_pattern = { "(" ~ var? ~ labels? ~ prop_map? ~ ")" }
+
+edge_create = {
+    ^"match" ~ node_pattern ~ "," ~ node_pattern
+  ~ ^"create" ~ rel_create
+}
+
+rel_create = {
+    "(" ~ var ~ ")" ~ "-" ~ "[" ~ rel_detail ~ "]" ~ "->" ~ "(" ~ var ~ ")"
+}
+
+rel_detail = { ":" ~ reltype ~ prop_map? }
+
+labels = { (":" ~ label)+ }
+
+// --- range indexes -------------------------------------------------------------
+
+create_index = {
+    ^"create" ~ ^"index" ~ ^"for"
+  ~ (edge_index_target | node_index_target)
+  ~ ^"on" ~ "(" ~ index_prop ~ ")"
+}
+
+node_index_target = { "(" ~ var? ~ ":" ~ label ~ ")" }
+edge_index_target = { "(" ~ ")" ~ "-" ~ "[" ~ var? ~ ":" ~ reltype ~ "]" ~ "->" ~ "(" ~ ")" }
+index_prop = { var ~ "." ~ key }
+
+// --- vector indexes ------------------------------------------------------------
+
+// Cypher CALL form: positional args (label, prop, dim, metric).
+vector_index_call = { ^"call" ~ proc_create_node_index ~ "(" ~ arg_list ~ ")" ~ yield_clause? }
+proc_create_node_index = @{ "db.idx.vector.createNodeIndex" }
+
+// SDK-style helper line: positional args (label, dim, metric, property).
+vector_index_helper = { ^"createNodeVectorIndex" ~ "(" ~ arg_list ~ ")" }
+
+arg_list = { value ~ ("," ~ value)* }
+yield_clause = _{ ^"yield" ~ ANY* }
+
+// --- ignorable marker / cleanup ------------------------------------------------
+
+ignored = { drop_index | cleanup_remove }
+drop_index = { ^"drop" ~ ANY* }
+cleanup_remove = { ^"match" ~ node_pattern ~ ^"remove" ~ ANY* }
+
+// --- property maps & values ----------------------------------------------------
+
+prop_map = { "{" ~ (prop_entry ~ ("," ~ prop_entry)*)? ~ "}" }
+prop_entry = { key ~ ":" ~ value }
+
+value = { vecf32 | list | string | boolean | null_kw | number }
+
+vecf32 = { ^"vecf32" ~ "(" ~ "[" ~ num_list? ~ "]" ~ ")" }
+num_list = { number ~ ("," ~ number)* }
+
+list = { "[" ~ (value ~ ("," ~ value)*)? ~ "]" }
+
+// Compound-atomic so inner whitespace (multi-paragraph markdown) is preserved and
+// no implicit WHITESPACE is inserted between characters.
+string = ${ ("'" ~ sq_inner ~ "'") | ("\"" ~ dq_inner ~ "\"") }
+sq_inner = @{ sq_char* }
+sq_char = { ("\\" ~ ANY) | (!("'" | "\\") ~ ANY) }
+dq_inner = @{ dq_char* }
+dq_char = { ("\\" ~ ANY) | (!("\"" | "\\") ~ ANY) }
+
+boolean = @{ ^"true" | ^"false" }
+null_kw = @{ ^"null" }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+
+// --- lexical -------------------------------------------------------------------
+
+var = @{ (ASCII_ALPHANUMERIC | "_")+ }
+label = @{ (ASCII_ALPHANUMERIC | "_")+ }
+reltype = @{ (ASCII_ALPHANUMERIC | "_")+ }
+key = @{ ("`" ~ (!"`" ~ ANY)+ ~ "`") | (ASCII_ALPHANUMERIC | "_")+ }

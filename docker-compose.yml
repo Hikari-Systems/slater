@@ -1,0 +1,76 @@
+services:
+
+  # The online, read-only Bolt server (single binary `slater`). The generations
+  # it serves are produced out-of-band by `slater-build` (see the `builder`
+  # service below) and published on the mounted `/data` volume.
+  slater:
+    build:
+      context: .
+    read_only: true
+    tmpfs:
+      # Read-only root filesystem (house style): only these scratch areas are
+      # writable. Slater itself never writes to disk — it is a pure reader.
+      - /tmp
+      - /run
+    volumes:
+      # Per-environment config overlay + secrets (hs convention, same as the
+      # *-data-service repos). `/sandbox/config.json` is deep-merged over the
+      # baked-in config.json at startup; `/sandbox` also holds acl.json, optional
+      # TLS material, and the optional at-rest key file. Mounted read-only.
+      - '../../configs/slater:/sandbox:ro'
+      # The immutable generation images (`<graph>/<generation>/…` + `current`
+      # pointers), on an NFS mount produced by `slater-build`. Read-only — the
+      # generation guard polls `current` but the server never writes.
+      - 'slater-data:/data:ro'
+    ports:
+      # Bolt (optionally Bolt+TLS), not HTTP.
+      - '7687:7687'
+    environment:
+      # hs-utils layered config: `KEY__sub` env overrides (double underscore),
+      # keys matching the camelCase config.json. These illustrate the knobs; the
+      # baked-in config.json supplies the defaults.
+      server__bind: '0.0.0.0'
+      server__port: '7687'
+      dataDir: '/data'
+      aclPath: '/sandbox/acl.json'
+      # Bounded resident memory — the headline guarantee. Resident ≈ these three
+      # budgets + a small fixed overhead, independent of graph size.
+      cache__blockCacheBytes: '268435456'   # 256 MiB — decompressed block LRU
+      cache__vectorCacheBytes: '134217728'  # 128 MiB — resident PQ codes + Vamana block LRU
+      cache__resultCacheBytes: '33554432'   # 32 MiB — query result LRU
+      # Generation guard: poll each graph's `current` pointer and, on a change,
+      # `exit` (default — orchestrator restarts) or `swap` it in place.
+      generationPollMs: '5000'
+      reloadStrategy: 'exit'
+      log__level: 'info'
+      # At-rest encryption (optional). Point keyFile at a mounted secret, or set
+      # keyEnv to the name of an env var holding the hex master key.
+      # encryption__keyFile: '/run/secrets/slater-at-rest-key'
+      # TLS (optional) for `bolt+s`. Point at mounted PEM material under /sandbox.
+      # tls__cert: '/sandbox/tls/server.crt'
+      # tls__key: '/sandbox/tls/server.key'
+    healthcheck:
+      # The probe speaks Bolt (a handshake against the port), not HTTP.
+      test: ['CMD', '/app/slater', 'healthcheck']
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # The offline writer (alternate command, same image). Not started by default
+  # (profile `build`); run a build with, e.g.:
+  #   docker compose run --rm builder \
+  #     --input /dumps/people.cypher --graph people --data-dir /data
+  builder:
+    build:
+      context: .
+    profiles: ['build']
+    entrypoint: ['/app/slater-build']
+    command: ['--help']
+    volumes:
+      # Writable here: the writer publishes new generations atomically.
+      - 'slater-data:/data'
+      - './dumps:/dumps:ro'
+
+volumes:
+  slater-data:

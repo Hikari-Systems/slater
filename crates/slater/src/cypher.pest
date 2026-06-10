@@ -1,0 +1,238 @@
+// Read-only Cypher grammar (the query language Slater serves).
+//
+// This is the ONLINE query grammar, distinct from `slater-build`'s dump dialect
+// (`primitive_cypher.pest`). It covers the widened read subset from docs/PLAN.md:
+// MATCH (incl. OPTIONAL MATCH), WHERE, WITH, RETURN, UNION[ ALL], relationship
+// patterns with type alternation and variable length, map projection, CASE, list
+// predicates, function calls/aggregations, and ORDER BY / SKIP / LIMIT / DISTINCT.
+//
+// Write and procedure clauses are matched as `forbidden_clause` so the translator
+// can reject them with a clear "Slater is read-only" message rather than a generic
+// parse error.
+//
+// Every alphabetic keyword is matched through a `kw_*` rule that asserts a trailing
+// word boundary (`!ident_cont`), so e.g. `or` never matches the `OR` inside
+// `ORDER`, nor `in` the `IN` inside `index`.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+
+// ── Keyword terminals (word-boundary guarded) ───────────────────────────────
+
+kw_union = @{ ^"union" ~ !ident_cont }
+kw_all = @{ ^"all" ~ !ident_cont }
+kw_optional = @{ ^"optional" ~ !ident_cont }
+kw_match = @{ ^"match" ~ !ident_cont }
+kw_where = @{ ^"where" ~ !ident_cont }
+kw_return = @{ ^"return" ~ !ident_cont }
+kw_with = @{ ^"with" ~ !ident_cont }
+kw_distinct = @{ ^"distinct" ~ !ident_cont }
+kw_as = @{ ^"as" ~ !ident_cont }
+kw_order = @{ ^"order" ~ !ident_cont }
+kw_by = @{ ^"by" ~ !ident_cont }
+kw_skip = @{ ^"skip" ~ !ident_cont }
+kw_limit = @{ ^"limit" ~ !ident_cont }
+kw_asc = @{ (^"ascending" | ^"asc") ~ !ident_cont }
+kw_desc = @{ (^"descending" | ^"desc") ~ !ident_cont }
+kw_or = @{ ^"or" ~ !ident_cont }
+kw_and = @{ ^"and" ~ !ident_cont }
+kw_xor = @{ ^"xor" ~ !ident_cont }
+kw_not = @{ ^"not" ~ !ident_cont }
+kw_in = @{ ^"in" ~ !ident_cont }
+kw_is = @{ ^"is" ~ !ident_cont }
+kw_null = @{ ^"null" ~ !ident_cont }
+kw_true = @{ ^"true" ~ !ident_cont }
+kw_false = @{ ^"false" ~ !ident_cont }
+kw_starts = @{ ^"starts" ~ !ident_cont }
+kw_ends = @{ ^"ends" ~ !ident_cont }
+kw_contains = @{ ^"contains" ~ !ident_cont }
+kw_case = @{ ^"case" ~ !ident_cont }
+kw_when = @{ ^"when" ~ !ident_cont }
+kw_then = @{ ^"then" ~ !ident_cont }
+kw_else = @{ ^"else" ~ !ident_cont }
+kw_end = @{ ^"end" ~ !ident_cont }
+kw_call = @{ ^"call" ~ !ident_cont }
+kw_yield = @{ ^"yield" ~ !ident_cont }
+
+// ── Top level ────────────────────────────────────────────────────────────────
+
+query = { SOI ~ single_query ~ (union ~ single_query)* ~ EOI }
+union = { kw_union ~ kw_all? }
+
+single_query = { forbidden_query | reading_clause* ~ return_clause }
+
+// If a query reaches a write/procedure clause we consume the rest verbatim so the
+// parse still succeeds and the translator can reject it with a clear "read-only"
+// message (rather than the user getting an opaque syntax error).
+forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
+// `CALL` is forbidden EXCEPT for the single read-only vector procedure (handled by
+// `vector_call_clause`): the negative lookahead lets that one form fall through to
+// the valid parse while every other procedure call is rejected as read-only.
+forbidden_clause = @{
+    (^"create" | ^"merge" | ^"set" | ^"delete" | ^"remove" | ^"detach"
+      | ^"unwind" | ^"foreach" | ^"load") ~ !ident_cont
+  | ^"call" ~ !ident_cont ~ !(inline_ws+ ~ vector_proc)
+}
+inline_ws = _{ " " | "\t" | "\r" | "\n" }
+
+reading_clause = { match_clause | with_clause | vector_call_clause }
+
+// The one permitted procedure: brute-force vector KNN. Surfaced as a reading
+// clause that binds its YIELD outputs (FalkorDB's `node`, `score`) into scope.
+vector_call_clause = {
+    kw_call ~ vector_proc ~ "(" ~ func_arg ~ ("," ~ func_arg)* ~ ")" ~ yield_clause ~ where_clause?
+}
+vector_proc = @{ ^"db.idx.vector.queryNodes" }
+yield_clause = { kw_yield ~ yield_item ~ ("," ~ yield_item)* }
+yield_item = { identifier ~ (kw_as ~ alias)? }
+
+match_clause = { kw_optional? ~ kw_match ~ pattern ~ ("," ~ pattern)* ~ where_clause? }
+
+with_clause = { kw_with ~ kw_distinct? ~ projection_body ~ where_clause? }
+
+return_clause = { kw_return ~ kw_distinct? ~ projection_body }
+
+projection_body = { projection_items ~ order_by? ~ skip? ~ limit? }
+projection_items = { star_item | (projection_item ~ ("," ~ projection_item)*) }
+star_item = { "*" ~ ("," ~ projection_item)* }
+projection_item = { expr ~ (kw_as ~ alias)? }
+alias = { identifier }
+
+order_by = { kw_order ~ kw_by ~ sort_item ~ ("," ~ sort_item)* }
+sort_item = { expr ~ (kw_asc | kw_desc)? }
+skip = { kw_skip ~ expr }
+limit = { kw_limit ~ expr }
+
+where_clause = { kw_where ~ expr }
+
+// ── Patterns ─────────────────────────────────────────────────────────────────
+
+pattern = { (path_var ~ "=")? ~ node_pattern ~ (rel_pattern ~ node_pattern)* }
+path_var = { identifier }
+
+node_pattern = { "(" ~ var? ~ labels? ~ prop_map? ~ ")" }
+
+rel_pattern = { left_arrow? ~ "-" ~ rel_detail? ~ "-" ~ right_arrow? }
+left_arrow = { "<" }
+right_arrow = { ">" }
+rel_detail = { "[" ~ var? ~ rel_types? ~ var_length? ~ prop_map? ~ "]" }
+rel_types = { ":" ~ type_name ~ ("|" ~ ":"? ~ type_name)* }
+var_length = { "*" ~ range_spec? }
+range_spec = { integer? ~ (".." ~ integer?)? }
+
+labels = { (":" ~ label_name)+ }
+var = { identifier }
+label_name = { identifier }
+type_name = { identifier }
+
+prop_map = { "{" ~ (prop_entry ~ ("," ~ prop_entry)*)? ~ "}" }
+prop_entry = { property_key ~ ":" ~ expr }
+property_key = { identifier }
+
+// ── Expressions (precedence climbing via nested rules) ───────────────────────
+
+expr = { or_expr }
+or_expr = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr = { xor_expr ~ (kw_and ~ xor_expr)* }
+xor_expr = { not_expr ~ (kw_xor ~ not_expr)* }
+not_expr = { not_op* ~ comparison }
+not_op = { kw_not }
+
+comparison = { add_expr ~ comp_rhs* }
+comp_rhs = {
+    string_op ~ add_expr
+  | in_op ~ add_expr
+  | null_test
+  | comp_op ~ add_expr
+}
+comp_op = { "=" | "<>" | "<=" | ">=" | "<" | ">" }
+string_op = { kw_starts ~ kw_with | kw_ends ~ kw_with | kw_contains }
+in_op = { kw_in }
+null_test = { kw_is ~ kw_not? ~ kw_null }
+
+add_expr = { mul_expr ~ (add_op ~ mul_expr)* }
+add_op = { "+" | "-" }
+mul_expr = { unary_expr ~ (mul_op ~ unary_expr)* }
+mul_op = { "*" | "/" | "%" }
+
+unary_expr = { sign* ~ postfix_expr }
+sign = { "+" | "-" }
+
+postfix_expr = { primary ~ postfix_op* }
+postfix_op = { property_access | label_pred | index_access }
+property_access = { "." ~ property_key }
+label_pred = { ":" ~ label_name ~ (":" ~ label_name)* }
+index_access = { "[" ~ expr ~ "]" }
+
+primary = {
+    case_expr
+  | list_comprehension
+  | function_call
+  | map_projection
+  | parens
+  | list_literal
+  | map_literal
+  | literal
+  | parameter
+  | variable
+}
+
+parens = { "(" ~ expr ~ ")" }
+variable = { identifier }
+// A parameter name may be a reserved word (e.g. `$limit`), so it is not
+// reserved-checked the way a bare identifier is.
+parameter = { "$" ~ param_name }
+param_name = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" | ident_start ~ ident_cont* }
+
+// n{.name, .age, alias: expr, .*}
+map_projection = { identifier ~ "{" ~ (map_proj_item ~ ("," ~ map_proj_item)*)? ~ "}" }
+map_proj_item = { proj_all | proj_property | proj_literal }
+proj_all = { ".*" }
+proj_property = { "." ~ property_key }
+proj_literal = { property_key ~ ":" ~ expr }
+
+function_call = { identifier ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" }
+func_arg = { star_arg | expr }
+star_arg = { "*" }
+
+case_expr = { kw_case ~ case_subject? ~ when_clause+ ~ else_clause? ~ kw_end }
+case_subject = { !kw_when ~ expr }
+when_clause = { kw_when ~ expr ~ kw_then ~ expr }
+else_clause = { kw_else ~ expr }
+
+// any/all/none/single(x IN list WHERE pred)
+list_comprehension = { quantifier ~ "(" ~ identifier ~ kw_in ~ expr ~ where_clause? ~ ")" }
+quantifier = @{ (^"any" | ^"all" | ^"none" | ^"single") ~ !ident_cont }
+
+list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+map_literal = { "{" ~ (map_lit_entry ~ ("," ~ map_lit_entry)*)? ~ "}" }
+map_lit_entry = { property_key ~ ":" ~ expr }
+
+// ── Literals ─────────────────────────────────────────────────────────────────
+
+literal = { float | integer | boolean | null | string }
+null = { kw_null }
+boolean = { kw_true | kw_false }
+integer = @{ ("-")? ~ ASCII_DIGIT+ }
+float = @{ ("-")? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+string = ${ "'" ~ sq_inner ~ "'" | "\"" ~ dq_inner ~ "\"" }
+sq_inner = @{ (escape | (!"'" ~ !"\\" ~ ANY))* }
+dq_inner = @{ (escape | (!"\"" ~ !"\\" ~ ANY))* }
+escape = @{ "\\" ~ ANY }
+
+// Identifiers: backtick-quoted or a plain ident that is not a reserved word.
+identifier = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" | (!reserved ~ ident_start ~ ident_cont*) }
+ident_start = _{ ASCII_ALPHA | "_" }
+ident_cont = _{ ASCII_ALPHANUMERIC | "_" }
+
+// Reserved words may not be bare identifiers (so `RETURN return` etc. fail). The
+// trailing !ident_cont guard stops `count` matching the prefix of `countries`.
+reserved = _{
+    (^"match" | ^"optional" | ^"where" | ^"return" | ^"with" | ^"order" | ^"by"
+      | ^"skip" | ^"limit" | ^"distinct" | ^"as" | ^"and" | ^"or" | ^"xor"
+      | ^"not" | ^"in" | ^"is" | ^"null" | ^"true" | ^"false" | ^"case"
+      | ^"when" | ^"then" | ^"else" | ^"end" | ^"contains" | ^"starts"
+      | ^"ends" | ^"union" | ^"ascending" | ^"asc" | ^"descending" | ^"desc"
+      | ^"call" | ^"yield")
+    ~ !ident_cont
+}

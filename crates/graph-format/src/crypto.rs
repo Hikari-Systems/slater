@@ -1,0 +1,204 @@
+//! Optional at-rest AEAD over individual blocks.
+//!
+//! Encryption is per **block**, not per file: a block is compressed first, then
+//! the compressed bytes are sealed with **XChaCha20-Poly1305**. The reader
+//! decrypts a block on a cache miss and then decompresses it, so the block LRU
+//! continues to hold *plaintext-decompressed* blocks and the executor / KNN paths
+//! are entirely unaware that the bytes on disk were encrypted (D28).
+//!
+// DESIGN: pure-Rust `chacha20poly1305` (not the C/aws-lc stack) keeps the whole
+// crypto path musl-clean and self-contained. XChaCha20's 24-byte nonce is wide
+// enough that fresh random nonces never realistically collide, so each block
+// gets an independent random nonce stored beside it in the block directory — the
+// MANIFEST carries only the KDF salt and parameters, never the key.
+//
+// DESIGN: the key-management seam. The MANIFEST holds a per-generation random
+// salt; the *runtime master key* is supplied out of band (an env var or a mounted
+// secret file — `config.encryption{key_env|key_file}`) and is NEVER written into
+// the data directory. The per-generation block key is `BLAKE3::derive_key` over
+// (master key ‖ salt), so two generations built from the same master key still
+// use independent block keys, and losing the salt does not weaken a generation
+// whose master key is held elsewhere.
+
+use anyhow::{bail, Result};
+use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+
+/// AEAD identifier written into the MANIFEST `EncryptionHeader`.
+pub const AEAD_NAME: &str = "xchacha20poly1305";
+/// KDF identifier written into the MANIFEST `EncryptionHeader`.
+pub const KDF_NAME: &str = "blake3-derive-key";
+/// XChaCha20-Poly1305 nonce width (bytes).
+pub const NONCE_LEN: usize = 24;
+/// Derived block-key width (bytes).
+pub const KEY_LEN: usize = 32;
+/// Per-generation KDF salt width (bytes).
+pub const SALT_LEN: usize = 32;
+
+/// BLAKE3 derive-key context. Versioned so a future KDF change is unambiguous.
+const KDF_CONTEXT: &str = "slater generation block key v1";
+
+/// Generate a fresh per-generation random salt.
+pub fn random_salt() -> [u8; SALT_LEN] {
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+/// Derive the 32-byte per-generation block key from the runtime master key and
+/// the generation's salt via `BLAKE3::derive_key`.
+pub fn derive_key(master_key: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+    let mut h = blake3::Hasher::new_derive_key(KDF_CONTEXT);
+    h.update(master_key);
+    h.update(salt);
+    let mut out = [0u8; KEY_LEN];
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+/// Lower-case hex-encode bytes (for the MANIFEST salt field).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Decode a lower/upper-case hex string into bytes. A clear error (not a panic)
+/// on an odd length or a non-hex digit — keys and salts arrive from operators.
+pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        bail!("hex string has an odd number of digits");
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("invalid hex digit {:?}", pair[0] as char))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| anyhow::anyhow!("invalid hex digit {:?}", pair[1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+/// A per-generation block cipher. Cheap to construct from a derived key; holds no
+/// per-block state, so a single instance is shared (behind an `Arc`) across every
+/// reader and the writer for one generation.
+pub struct BlockCipher {
+    aead: XChaCha20Poly1305,
+}
+
+impl BlockCipher {
+    /// Build a cipher from an already-derived 32-byte block key.
+    pub fn from_key(key: &[u8; KEY_LEN]) -> Self {
+        Self {
+            aead: XChaCha20Poly1305::new(Key::from_slice(key)),
+        }
+    }
+
+    /// Derive the per-generation key from a runtime master key + salt and build
+    /// the cipher.
+    pub fn from_master(master_key: &[u8], salt: &[u8]) -> Self {
+        Self::from_key(&derive_key(master_key, salt))
+    }
+
+    /// A fresh random nonce for the next block to be sealed.
+    pub fn random_nonce() -> [u8; NONCE_LEN] {
+        let mut nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce);
+        nonce
+    }
+
+    /// Seal a (compressed) block. The returned ciphertext is `plaintext.len()` +
+    /// the 16-byte Poly1305 tag.
+    pub fn encrypt(&self, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.aead
+            .encrypt(XNonce::from_slice(nonce), plaintext)
+            .map_err(|_| anyhow::anyhow!("AEAD encryption failed"))
+    }
+
+    /// Open a sealed block. Fails with a clear error — never a panic or garbage —
+    /// when the key is wrong or the block has been tampered with (the Poly1305
+    /// tag does not verify).
+    pub fn decrypt(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.aead
+            .decrypt(XNonce::from_slice(nonce), ciphertext)
+            .map_err(|_| {
+                anyhow::anyhow!("AEAD decryption failed: wrong key or corrupt/tampered block")
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_roundtrips_and_rejects_garbage() {
+        let bytes = [0x00u8, 0x0f, 0xa5, 0xff, 0x10];
+        let hex = hex_encode(&bytes);
+        assert_eq!(hex, "000fa5ff10");
+        assert_eq!(hex_decode(&hex).unwrap(), bytes);
+        assert_eq!(hex_decode("  000FA5FF10 ").unwrap(), bytes); // trims + upper-case
+        assert!(hex_decode("abc").is_err()); // odd length
+        assert!(hex_decode("zz").is_err()); // non-hex
+    }
+
+    #[test]
+    fn derive_key_is_deterministic_and_salt_sensitive() {
+        let master = b"super-secret-master-key";
+        let salt_a = [1u8; SALT_LEN];
+        let salt_b = [2u8; SALT_LEN];
+        let k1 = derive_key(master, &salt_a);
+        let k2 = derive_key(master, &salt_a);
+        let k3 = derive_key(master, &salt_b);
+        assert_eq!(k1, k2, "same master + salt derives the same key");
+        assert_ne!(k1, k3, "a different salt derives a different key");
+        // A different master key also diverges.
+        assert_ne!(k1, derive_key(b"other-master-key", &salt_a));
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_roundtrips() {
+        let cipher = BlockCipher::from_master(b"master", &random_salt());
+        let nonce = BlockCipher::random_nonce();
+        let plaintext = b"the quick brown fox compresses well well well".repeat(8);
+        let sealed = cipher.encrypt(&nonce, &plaintext).unwrap();
+        assert_eq!(
+            sealed.len(),
+            plaintext.len() + 16,
+            "ciphertext carries a tag"
+        );
+        assert_ne!(sealed, plaintext);
+        assert_eq!(cipher.decrypt(&nonce, &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn wrong_key_refuses_cleanly() {
+        let salt = random_salt();
+        let nonce = BlockCipher::random_nonce();
+        let sealed = BlockCipher::from_master(b"right", &salt)
+            .encrypt(&nonce, b"payload")
+            .unwrap();
+        let err = BlockCipher::from_master(b"wrong", &salt)
+            .decrypt(&nonce, &sealed)
+            .unwrap_err();
+        assert!(err.to_string().contains("wrong key"));
+    }
+
+    #[test]
+    fn tampered_ciphertext_refuses_cleanly() {
+        let cipher = BlockCipher::from_master(b"master", &random_salt());
+        let nonce = BlockCipher::random_nonce();
+        let mut sealed = cipher.encrypt(&nonce, b"payload bytes here").unwrap();
+        sealed[0] ^= 0xff; // flip a bit
+        assert!(cipher.decrypt(&nonce, &sealed).is_err());
+    }
+}

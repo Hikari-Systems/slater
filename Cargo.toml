@@ -1,0 +1,63 @@
+# Slater — a low-memory, read-only, Bolt-speaking graph engine.
+#
+# Internal cargo workspace of three crates. `hs-utils` is pulled in by the
+# member crates via git+tag (house convention — never a path dependency), even
+# though Slater is itself a workspace.
+[workspace]
+resolver = "2"
+members = ["crates/graph-format", "crates/slater-build", "crates/slater"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "UNLICENSED"
+
+# Centralised dependency versions; member crates opt in with `.workspace = true`.
+# Listing a dependency here that no member uses yet is harmless — it only takes
+# effect when a member declares it.
+[workspace.dependencies]
+# Shared house utilities: config layering, logging init, deserialisers.
+# config/logging/healthcheck are NOT feature-gated, so default-features = false
+# pulls none of the actix/sqlx stack — exactly what a Bolt server wants.
+hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.16.0", default-features = false }
+
+# Workspace-internal.
+graph-format = { path = "crates/graph-format" }
+
+# Core.
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Async + server (slater).
+tokio = { version = "1", features = ["full"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Storage codec (graph-format).
+zstd = "0.13"
+blake3 = "1"
+byteorder = "1"
+
+# Crypto (graph-format encryption / slater ACL).
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+# Parser + CLI (slater-build, slater).
+pest = "2"
+pest_derive = "2"
+clap = { version = "4", features = ["derive"] }
+
+# Parallel query execution (slater).
+rayon = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"

@@ -1,0 +1,23 @@
+[package]
+name = "slater-build"
+description = "Slater offline writer: primitive-Cypher dump script in, immutable on-disk graph image out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slater-build"
+path = "src/main.rs"
+
+[dependencies]
+graph-format.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+clap.workspace = true
+pest.workspace = true
+pest_derive.workspace = true
+tracing.workspace = true

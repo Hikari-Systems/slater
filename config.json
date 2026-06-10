@@ -1,0 +1,35 @@
+{
+  "server": {
+    "bind": "0.0.0.0",
+    "port": 7687
+  },
+  "log": {
+    "level": "info"
+  },
+  "dataDir": "/data",
+  "tls": {
+    "cert": "",
+    "key": ""
+  },
+  "aclPath": "/config/acl.json",
+  "cache": {
+    "blockCacheBytes": 268435456,
+    "vectorCacheBytes": 134217728,
+    "resultCacheBytes": 33554432
+  },
+  "vectorIndexPins": [],
+  "encryption": {
+    "keyEnv": "",
+    "keyFile": ""
+  },
+  "query": {
+    "maxRows": 100000,
+    "timeoutMs": 30000
+  },
+  "vectorQuery": {
+    "beamWidth": 64,
+    "maxHops": 256
+  },
+  "generationPollMs": 5000,
+  "reloadStrategy": "exit"
+}

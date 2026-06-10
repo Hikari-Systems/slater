@@ -1,0 +1,6 @@
+# Force Cargo to fetch git dependencies (hs-utils) using the system `git` CLI
+# rather than the built-in libgit2 transport. In this environment the git CLI's
+# HTTPS path to GitHub works while raw libgit2 transport may not, so this makes
+# `hs-utils` resolve reliably.
+[net]
+git-fetch-with-cli = true
