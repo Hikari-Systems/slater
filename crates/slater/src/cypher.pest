@@ -197,7 +197,11 @@ proj_all = { ".*" }
 proj_property = { "." ~ property_key }
 proj_literal = { property_key ~ ":" ~ expr }
 
-function_call = { identifier ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" }
+function_call = { func_name ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" }
+// A function name may be namespaced with dots (`list.sort`, `vec.cosineSimilarity`).
+// Atomic so the whole dotted path is one token; each segment is still a
+// reserved-word-checked identifier.
+func_name = @{ identifier ~ ("." ~ identifier)* }
 func_arg = { star_arg | expr }
 star_arg = { "*" }
 

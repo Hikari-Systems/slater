@@ -1446,6 +1446,26 @@ mod tests {
     }
 
     #[test]
+    fn lowers_namespaced_function_name() {
+        // The `func_name` grammar rule accepts a dotted namespace; the whole
+        // path is preserved as the function name (`list.sort`, not `list`).
+        let q = ok("RETURN list.sort([3,1,2], false) AS s");
+        match &q.head.ret.body.items[0].expr {
+            Expr::Function { name, args, .. } => {
+                assert_eq!(name, "list.sort");
+                assert!(matches!(args, FuncArgs::Args(a) if a.len() == 2));
+            }
+            other => panic!("expected a Function, got {other:?}"),
+        }
+        // A dotted path without a call is still a property access, not a function.
+        let q = ok("MATCH (n) RETURN n.name AS x");
+        assert!(matches!(
+            &q.head.ret.body.items[0].expr,
+            Expr::Property(_, k) if k == "name"
+        ));
+    }
+
+    #[test]
     fn string_literals_unescape() {
         let q = ok(r#"RETURN 'a\'b\nc' AS s"#);
         assert_eq!(

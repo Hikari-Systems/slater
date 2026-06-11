@@ -2067,8 +2067,150 @@ impl<'g> Engine<'g> {
                 ),
                 _ => Val::Null,
             },
+            // ── List functions (FalkorDB list_funcs.c) ──────────────────────
+            // tail: all but the first element. NULL → NULL.
+            "tail" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::List(xs) => Val::List(xs.into_iter().skip(1).collect()),
+                other => bail!("tail() needs a list, got {}", other.to_display()),
+            },
+            // list.dedup: drop later duplicates, preserving first-seen order.
+            "list.dedup" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::List(mut xs) => {
+                    dedup_vals(&mut xs);
+                    Val::List(xs)
+                }
+                other => bail!("list.dedup() needs a list, got {}", other.to_display()),
+            },
+            // list.sort(list, ascending = true): sorted copy by total order.
+            "list.sort" => list_sort(&args)?,
+            // list.remove(list, idx, count = 1): drop up-to-`count` elements.
+            "list.remove" => list_remove(&args)?,
+            // list.insert(list, idx, val, dups = true): insert one element.
+            "list.insert" => list_insert(&args)?,
+            // list.insertListElements(list, list2, idx, dups = true): splice a list.
+            "list.insertlistelements" => list_insert_elements(&args)?,
+            // Element-wise conversion lists; each element goes through the
+            // matching `*OrNull` scalar (NULL on failure). NULL list → NULL.
+            "tobooleanlist" => self.to_type_list(&a0(0), "toboolean")?,
+            "tofloatlist" => self.to_type_list(&a0(0), "tofloat")?,
+            "tointegerlist" => self.to_type_list(&a0(0), "tointeger")?,
+            "tostringlist" => self.to_type_list(&a0(0), "tostring")?,
+            // ── Entity functions (FalkorDB entity_funcs.c) ──────────────────
+            // hasLabels(node, [labels]): node carries ALL given labels. The
+            // operator form `n:Label` is handled separately by `Expr::HasLabels`.
+            "haslabels" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Node(id) => {
+                    let labels = match a0(1) {
+                        Val::List(xs) => xs,
+                        Val::Null => return Ok(Val::Null),
+                        other => bail!(
+                            "hasLabels() needs a list of label strings, got {}",
+                            other.to_display()
+                        ),
+                    };
+                    let have = self.node_label_ids(id)?;
+                    let mut res = true;
+                    for l in labels {
+                        let name = match l {
+                            Val::Str(s) => s,
+                            other => bail!(
+                                "hasLabels() labels must be strings, got {}",
+                                other.to_display()
+                            ),
+                        };
+                        match self.gen.label_id(&name) {
+                            Some(lid) if have.contains(&lid) => {}
+                            _ => {
+                                res = false;
+                                break;
+                            }
+                        }
+                    }
+                    Val::Bool(res)
+                }
+                other => bail!("hasLabels() needs a node, got {}", other.to_display()),
+            },
+            // indegree/outdegree(node, [types…]): count edges in one direction,
+            // optionally restricted to the given relationship type(s) (passed as
+            // varargs strings or a single array of strings).
+            "indegree" => self.node_degree(&args, true)?,
+            "outdegree" => self.node_degree(&args, false)?,
             other => bail!("unknown function '{other}'"),
         })
+    }
+
+    /// Element-wise list conversion shared by `to{Boolean,Float,Integer,String}List`:
+    /// run each element through the named `*OrNull`-style scalar arm. A NULL list
+    /// yields NULL (FalkorDB `_AR_TOTYPELIST`).
+    fn to_type_list(&self, v: &Val, conv: &str) -> Result<Val> {
+        match v {
+            Val::Null => Ok(Val::Null),
+            Val::List(xs) => {
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs {
+                    out.push(self.call_function(conv, false, vec![x.clone()])?);
+                }
+                Ok(Val::List(out))
+            }
+            other => bail!("{conv}List() needs a list, got {}", other.to_display()),
+        }
+    }
+
+    /// `indegree`/`outdegree`: count a node's edges in one direction, optionally
+    /// filtered to specific relationship types. Mirrors FalkorDB `_AR_NodeDegree`:
+    /// a NULL node yields NULL; type filters may be varargs strings or one array.
+    fn node_degree(&self, args: &[Val], incoming: bool) -> Result<Val> {
+        let dir = if incoming { "indegree" } else { "outdegree" };
+        let id = match args.first() {
+            Some(Val::Node(id)) => *id,
+            Some(Val::Null) | None => return Ok(Val::Null),
+            Some(other) => bail!("{dir}() needs a node, got {}", other.to_display()),
+        };
+        // Collect the (deduplicated) relationship-type filter, if any.
+        let mut names: Vec<String> = Vec::new();
+        if args.len() > 1 {
+            let push = |names: &mut Vec<String>, v: &Val| -> Result<()> {
+                match v {
+                    Val::Str(s) => {
+                        if !names.contains(s) {
+                            names.push(s.clone());
+                        }
+                        Ok(())
+                    }
+                    other => bail!("{dir}() types must be strings, got {}", other.to_display()),
+                }
+            };
+            match &args[1] {
+                Val::List(xs) => {
+                    for x in xs {
+                        push(&mut names, x)?;
+                    }
+                }
+                _ => {
+                    for a in &args[1..] {
+                        push(&mut names, a)?;
+                    }
+                }
+            }
+        }
+        let adjs = if incoming {
+            self.incoming(id)?
+        } else {
+            self.outgoing(id)?
+        };
+        let count = if args.len() > 1 {
+            let type_ids: Vec<u32> = names
+                .iter()
+                .filter_map(|t| self.gen.reltype_id(t))
+                .collect();
+            adjs.iter().filter(|a| type_ids.contains(&a.reltype)).count()
+        } else {
+            adjs.len()
+        };
+        Ok(Val::Int(count as i64))
     }
 
     fn substring(&self, args: &[Val]) -> Result<Val> {
@@ -2609,6 +2751,143 @@ fn dedup_rows(rows: &mut Vec<Vec<Val>>) {
 fn dedup_vals(vals: &mut Vec<Val>) {
     let mut seen: BTreeSet<GroupKey> = BTreeSet::new();
     vals.retain(|v| seen.insert(GroupKey(vec![v.clone()])));
+}
+
+/// Resolve a (possibly negative) list index to a forward offset, mirroring
+/// FalkorDB `list_funcs.c normalize_index`. With `inclusive` the valid range
+/// gains one slot at the end (so `list.insert` can append). Returns `None` when
+/// the index is out of bounds.
+fn normalize_index(idx: i64, len: usize, inclusive: bool) -> Option<usize> {
+    let alen = len as i64 + if inclusive { 1 } else { 0 };
+    if (idx < 0 && idx + alen < 0) || (idx > 0 && idx >= alen) {
+        return None;
+    }
+    Some((if idx < 0 { alen + idx } else { idx }) as usize)
+}
+
+/// Whether `xs` already holds a value equal (by total order) to `v`.
+fn list_contains(xs: &[Val], v: &Val) -> bool {
+    xs.iter().any(|x| x.cmp_total(v) == std::cmp::Ordering::Equal)
+}
+
+/// A mandatory integer argument (FalkorDB `SI_GET_NUMERIC`, so a float truncates).
+fn num_i64(v: Option<&Val>) -> Result<i64> {
+    match v {
+        Some(Val::Int(i)) => Ok(*i),
+        Some(Val::Float(f)) => Ok(*f as i64),
+        _ => bail!("expected an integer index argument"),
+    }
+}
+
+/// `list.sort(list, ascending = true)`: a sorted copy under the total order.
+fn list_sort(args: &[Val]) -> Result<Val> {
+    let mut xs = match args.first() {
+        Some(Val::List(xs)) => xs.clone(),
+        Some(Val::Null) | None => return Ok(Val::Null),
+        Some(other) => bail!("list.sort() needs a list, got {}", other.to_display()),
+    };
+    let ascending = args.get(1).map(truthy).unwrap_or(true);
+    xs.sort_by(|a, b| {
+        let o = a.cmp_total(b);
+        if ascending {
+            o
+        } else {
+            o.reverse()
+        }
+    });
+    Ok(Val::List(xs))
+}
+
+/// `list.remove(list, idx, count = 1)`: drop up to `count` consecutive elements
+/// starting at `idx`. Out-of-bounds index or non-positive count returns the list
+/// unchanged.
+fn list_remove(args: &[Val]) -> Result<Val> {
+    let xs = match args.first() {
+        Some(Val::List(xs)) => xs.clone(),
+        Some(Val::Null) | None => return Ok(Val::Null),
+        Some(other) => bail!("list.remove() needs a list, got {}", other.to_display()),
+    };
+    let index = num_i64(args.get(1))?;
+    let count = match args.get(2) {
+        Some(v) => num_i64(Some(v))?,
+        None => 1,
+    };
+    if count <= 0 {
+        return Ok(Val::List(xs));
+    }
+    let Some(idx) = normalize_index(index, xs.len(), false) else {
+        return Ok(Val::List(xs));
+    };
+    let count = (count as usize).min(xs.len() - idx);
+    let mut out = Vec::with_capacity(xs.len() - count);
+    out.extend_from_slice(&xs[..idx]);
+    out.extend_from_slice(&xs[idx + count..]);
+    Ok(Val::List(out))
+}
+
+/// `list.insert(list, idx, val, dups = true)`: insert one value at `idx`. A NULL
+/// value, an out-of-bounds index, or (when `dups` is false) an already-present
+/// value all return the list unchanged.
+fn list_insert(args: &[Val]) -> Result<Val> {
+    let xs = match args.first() {
+        Some(Val::List(xs)) => xs.clone(),
+        Some(Val::Null) | None => return Ok(Val::Null),
+        Some(other) => bail!("list.insert() needs a list, got {}", other.to_display()),
+    };
+    let val = args.get(2).cloned().unwrap_or(Val::Null);
+    if matches!(val, Val::Null) {
+        return Ok(Val::List(xs));
+    }
+    let index = num_i64(args.get(1))?;
+    let Some(idx) = normalize_index(index, xs.len(), true) else {
+        return Ok(Val::List(xs));
+    };
+    let allow_dups = args.get(3).map(truthy).unwrap_or(true);
+    if !allow_dups && list_contains(&xs, &val) {
+        return Ok(Val::List(xs));
+    }
+    let mut out = Vec::with_capacity(xs.len() + 1);
+    out.extend_from_slice(&xs[..idx]);
+    out.push(val);
+    out.extend_from_slice(&xs[idx..]);
+    Ok(Val::List(out))
+}
+
+/// `list.insertListElements(list, list2, idx, dups = true)`: splice `list2` into
+/// `list` at `idx`. A NULL second list or out-of-bounds index returns the first
+/// list unchanged; with `dups` false, `list2` is deduped and elements already in
+/// `list` are skipped.
+fn list_insert_elements(args: &[Val]) -> Result<Val> {
+    let a = match args.first() {
+        Some(Val::List(xs)) => xs.clone(),
+        Some(Val::Null) | None => return Ok(Val::Null),
+        Some(other) => bail!(
+            "list.insertListElements() needs a list, got {}",
+            other.to_display()
+        ),
+    };
+    let mut b = match args.get(1) {
+        Some(Val::List(xs)) => xs.clone(),
+        Some(Val::Null) | None => return Ok(Val::List(a)),
+        Some(other) => bail!(
+            "list.insertListElements() needs a list as its second argument, got {}",
+            other.to_display()
+        ),
+    };
+    let index = num_i64(args.get(2))?;
+    let Some(idx) = normalize_index(index, a.len(), true) else {
+        return Ok(Val::List(a));
+    };
+    let allow_dups = args.get(3).map(truthy).unwrap_or(true);
+    if !allow_dups {
+        dedup_vals(&mut b);
+        b.retain(|v| !list_contains(&a, v));
+    }
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    out.extend_from_slice(&a[..idx]);
+    out.extend(b);
+    out.extend_from_slice(&a[idx..]);
+    Ok(Val::List(out))
 }
 
 /// Variables a pattern introduces that are not already in `existing`, in order.
@@ -3341,6 +3620,153 @@ mod tests {
         assert!(matches!(row[5], Val::Null));
         assert!(matches!(&row[6], Val::Str(s) if s == "42"));
         assert!(matches!(row[7], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Canonical render of a value for order-sensitive list assertions (the
+    /// `Val` enum derives no `PartialEq`). Mirrors Cypher literal syntax closely
+    /// enough to read the expectations off the FalkorDB test vectors.
+    #[cfg(test)]
+    fn render(v: &Val) -> String {
+        match v {
+            Val::Null => "null".into(),
+            Val::Bool(b) => b.to_string(),
+            Val::Int(i) => i.to_string(),
+            Val::Float(f) => f.to_string(),
+            Val::Str(s) => format!("'{s}'"),
+            Val::List(xs) => {
+                let inner: Vec<String> = xs.iter().map(render).collect();
+                format!("[{}]", inner.join(","))
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    // Phase 2 — list functions tail / list.* and the to*List family.
+    #[test]
+    fn phase2_tail_dedup_sort() {
+        let (root, res) = run(
+            "exec_p2_list_a",
+            "RETURN tail([1,2,3]) AS t, tail([7]) AS t1, tail([]) AS te, \
+             list.dedup([1,2,1,3,3,2]) AS d, list.dedup([3,[1,2],3,[1],[1,2]]) AS dn, \
+             list.sort([3,1,2]) AS s, list.sort([1,3,2], false) AS sd, \
+             list.sort([[4,5,6],[1,2,3]]) AS sl",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "[2,3]");
+        assert_eq!(render(&r[1]), "[]");
+        assert_eq!(render(&r[2]), "[]");
+        assert_eq!(render(&r[3]), "[1,2,3]");
+        assert_eq!(render(&r[4]), "[3,[1,2],[1]]");
+        assert_eq!(render(&r[5]), "[1,2,3]");
+        assert_eq!(render(&r[6]), "[3,2,1]");
+        assert_eq!(render(&r[7]), "[[1,2,3],[4,5,6]]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase2_list_remove() {
+        // Vectors ported from FalkorDB tests/flow/test_list.py test09_remove.
+        let (root, res) = run(
+            "exec_p2_remove",
+            "RETURN list.remove([1,2,3], 1, 2) AS a, list.remove([1,2,3,4], 1, 2) AS b, \
+             list.remove([1,2,3], 2) AS c, list.remove([1,2,3,4], -1, 1) AS d, \
+             list.remove([1,2,3,4], -4, 1) AS e, list.remove([1,2,3,4], -3, 5) AS f, \
+             list.remove([1,2,3,4], -5, 5) AS g, list.remove([1,2,3,4], 4, 5) AS h, \
+             list.remove([1,2,3], 1, 0) AS i, list.remove(null, 2) AS j",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "[1]");
+        assert_eq!(render(&r[1]), "[1,4]");
+        assert_eq!(render(&r[2]), "[1,2]");
+        assert_eq!(render(&r[3]), "[1,2,3]");
+        assert_eq!(render(&r[4]), "[2,3,4]");
+        assert_eq!(render(&r[5]), "[1]");
+        assert_eq!(render(&r[6]), "[1,2,3,4]"); // out-of-bound index → unchanged
+        assert_eq!(render(&r[7]), "[1,2,3,4]");
+        assert_eq!(render(&r[8]), "[1,2,3]"); // count 0 → unchanged
+        assert_eq!(render(&r[9]), "null");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase2_list_insert_and_insert_elements() {
+        // Vectors ported from FalkorDB test_list.py test11_insert / test12.
+        let (root, res) = run(
+            "exec_p2_insert",
+            "RETURN list.insert([1,2,3], 0, 4) AS a, list.insert([1,2,3], 3, 4) AS b, \
+             list.insert([1,2,3], -1, 4) AS c, list.insert([1,2,3], -3, 4) AS d, \
+             list.insert([], 0, 4) AS e, list.insert(null, 2, 3) AS f, \
+             list.insert([1,2,3], 0, 2, false) AS g, \
+             list.insertListElements([1,2,3], [4,5,6], 0) AS h, \
+             list.insertListElements([1,2,3], [4], -1) AS i, \
+             list.insertListElements([1,2,3], [9,3,2,7], 0, false) AS j, \
+             list.insertListElements([1,2,3], null, 1) AS k",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "[4,1,2,3]");
+        assert_eq!(render(&r[1]), "[1,2,3,4]");
+        assert_eq!(render(&r[2]), "[1,2,3,4]");
+        assert_eq!(render(&r[3]), "[1,4,2,3]");
+        assert_eq!(render(&r[4]), "[4]");
+        assert_eq!(render(&r[5]), "null");
+        assert_eq!(render(&r[6]), "[1,2,3]"); // dups=false + 2 already present → unchanged
+        assert_eq!(render(&r[7]), "[4,5,6,1,2,3]");
+        assert_eq!(render(&r[8]), "[1,2,3,4]"); // idx -1 with inclusive bounds → append
+        assert_eq!(render(&r[9]), "[9,7,1,2,3]"); // dups dropped vs list1
+        assert_eq!(render(&r[10]), "[1,2,3]"); // null list2 → unchanged
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase2_to_type_lists() {
+        // Vectors ported from FalkorDB test_list.py test06–09.
+        let (root, res) = run(
+            "exec_p2_tolists",
+            "RETURN toBooleanList(null) AS a, toBooleanList([null, null]) AS b, \
+             toBooleanList(['abc', true, 'false', null, ['a','b']]) AS c, \
+             toFloatList(['abc', 1.5, 7.0578, null, ['a','b']]) AS d, \
+             toIntegerList(['abc', 7, '5', null, ['a','b']]) AS e, \
+             toStringList([1, 2.5, 'x', null]) AS f",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "null");
+        assert_eq!(render(&r[1]), "[null,null]");
+        assert_eq!(render(&r[2]), "[null,true,false,null,null]");
+        assert_eq!(render(&r[3]), "[null,1.5,7.0578,null,null]");
+        assert_eq!(render(&r[4]), "[null,7,5,null,null]");
+        assert_eq!(render(&r[5]), "['1','2.5','x',null]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase2_entity_haslabels_and_degree() {
+        // Fixture: Alice -KNOWS-> Bob, -WORKS_AT-> Acme, -KNOWS-> Carol;
+        //          Bob -KNOWS-> Carol; Carol -WORKS_AT-> Globex.
+        let (root, res) = run(
+            "exec_p2_entity",
+            "MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Carol'}), \
+                   (k:Company {name: 'Acme'}) \
+             RETURN hasLabels(a, ['Person']) AS h1, hasLabels(a, ['Company']) AS h2, \
+                    hasLabels(a, ['Person','Foo']) AS h3, hasLabels(k, ['Company']) AS h4, \
+                    outdegree(a) AS od, outdegree(a, 'KNOWS') AS odk, \
+                    outdegree(a, 'WORKS_AT') AS odw, outdegree(a, ['KNOWS','WORKS_AT']) AS oda, \
+                    indegree(a) AS ai, indegree(c) AS ci, indegree(c, 'KNOWS') AS cik, \
+                    indegree(c, 'WORKS_AT') AS ciw",
+        );
+        let r = &res.rows[0];
+        assert!(matches!(r[0], Val::Bool(true)));
+        assert!(matches!(r[1], Val::Bool(false)));
+        assert!(matches!(r[2], Val::Bool(false)));
+        assert!(matches!(r[3], Val::Bool(true)));
+        assert!(matches!(r[4], Val::Int(3)));
+        assert!(matches!(r[5], Val::Int(2)));
+        assert!(matches!(r[6], Val::Int(1)));
+        assert!(matches!(r[7], Val::Int(3)));
+        assert!(matches!(r[8], Val::Int(0)));
+        assert!(matches!(r[9], Val::Int(2)));
+        assert!(matches!(r[10], Val::Int(2)));
+        assert!(matches!(r[11], Val::Int(0)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
