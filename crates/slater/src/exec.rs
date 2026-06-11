@@ -2379,6 +2379,32 @@ impl<'g> Engine<'g> {
                 ),
                 _ => Val::Null,
             },
+            // Euclidean / cosine *distance* between two vectors (FalkorDB
+            // vector_funcs.c). NULL operand → NULL; a dimension mismatch or a
+            // non-vector operand is an error, matching FalkorDB's "Vector
+            // dimension mismatch" / type-mismatch behaviour. Accept vectors or
+            // numeric lists, like `similarity`.
+            "vec.euclideandistance" | "vec.cosinedistance" => {
+                let (x, y) = (a0(0), a0(1));
+                if matches!(x, Val::Null) || matches!(y, Val::Null) {
+                    Val::Null
+                } else {
+                    let a = as_vector(&x).ok_or_else(|| {
+                        anyhow::anyhow!("{n}() needs vectors, got {}", x.to_display())
+                    })?;
+                    let b = as_vector(&y).ok_or_else(|| {
+                        anyhow::anyhow!("{n}() needs vectors, got {}", y.to_display())
+                    })?;
+                    if a.len() != b.len() {
+                        bail!("Vector dimension mismatch, {} != {}", a.len(), b.len());
+                    }
+                    if n == "vec.euclideandistance" {
+                        Val::Float(vector::euclidean_distance(&a, &b))
+                    } else {
+                        Val::Float(vector::cosine_distance(&a, &b))
+                    }
+                }
+            }
             // ── List functions (FalkorDB list_funcs.c) ──────────────────────
             // tail: all but the first element. NULL → NULL.
             "tail" => match a0(0) {
@@ -4081,6 +4107,57 @@ mod tests {
         assert!((same - 1.0).abs() < 1e-9);
         assert!(orth.abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase8_vector_distance_functions() {
+        // Vectors ported from FalkorDB tests/flow/test_vecsim.py::test01_vector_distance.
+        // euclidean([1,2],[2,3]) = sqrt(2); cosine = 1 - 8/sqrt(65).
+        let (root, res) = run(
+            "exec_p8_dist",
+            "RETURN vec.euclideanDistance(vecf32([1.0, 2.0]), vecf32([2.0, 3.0])) AS e, \
+             vec.cosineDistance(vecf32([1.0, 2.0]), vecf32([2.0, 3.0])) AS c, \
+             vec.euclideanDistance(vecf32([1.0, 1.0]), vecf32([1.0, 1.0])) AS esame, \
+             vec.cosineDistance(vecf32([1.0, 1.0]), vecf32([1.0, 1.0])) AS csame",
+        );
+        assert_float(&res.rows[0][0], 2.0_f64.sqrt());
+        assert_float(&res.rows[0][1], 1.0 - 8.0 / 65.0_f64.sqrt());
+        assert_float(&res.rows[0][2], 0.0);
+        assert_float(&res.rows[0][3], 0.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase8_vector_distance_null_propagates() {
+        // A NULL operand → NULL (either side), for both functions.
+        let (root, res) = run(
+            "exec_p8_null",
+            "RETURN vec.euclideanDistance(null, vecf32([1.0, 1.0])) AS a, \
+             vec.euclideanDistance(vecf32([1.0, 1.0]), null) AS b, \
+             vec.cosineDistance(null, null) AS c",
+        );
+        assert!(matches!(res.rows[0][0], Val::Null));
+        assert!(matches!(res.rows[0][1], Val::Null));
+        assert!(matches!(res.rows[0][2], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase8_vector_distance_errors() {
+        // Dimension mismatch is an error (FalkorDB: "Vector dimension mismatch").
+        let e = run_err(
+            "exec_p8_dim",
+            "RETURN vec.euclideanDistance(vecf32([1.0, 1.0]), vecf32([2.0, 2.0, 3.0])) AS d",
+        );
+        assert!(e.contains("dimension mismatch"), "got: {e}");
+        // A non-vector operand is an error (FalkorDB: "Type mismatch"). Pass a
+        // string directly (vecf32() would reject it first; the distance arm coerces
+        // via as_vector and rejects a non-numeric scalar).
+        let e = run_err(
+            "exec_p8_type",
+            "RETURN vec.cosineDistance([1.0, 1.0], 'foo') AS d",
+        );
+        assert!(e.contains("vectors"), "got: {e}");
     }
 
     #[test]

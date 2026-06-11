@@ -1178,7 +1178,7 @@ async fn handle_request(
                 .clone()
                 .ok_or_else(|| Failure::unauthorized("not authenticated; send LOGON first"))?;
             let sticky = ctx.current_selection(&user);
-            warn!(db = ?extra.get("db"), selected = ?sticky, query = %query, "WIRE-DIAG: RUN");
+            debug!(db = ?extra.get("db"), selected = ?sticky, query = %query, "WIRE-DIAG: RUN");
             // `USE <graph>` / `USE DATABASE <graph>` selects the user's graph in-band
             // (clients that never send the Bolt `db` field, e.g. Memgraph Lab, rely on
             // this). Validate the target and remember it per-user for later db-less
@@ -1197,7 +1197,7 @@ async fn handle_request(
                         format!("cannot USE '{target}' (available: {})", served.join(", ")),
                     ));
                 }
-                warn!(graph = %target, "WIRE-DIAG: USE selected graph");
+                debug!(graph = %target, "WIRE-DIAG: USE selected graph");
                 ctx.set_selection(&user, &target);
                 sess.pending = Some(Pending { rows: vec![], sent: 0 });
                 return Ok(vec![message::success(vec![(

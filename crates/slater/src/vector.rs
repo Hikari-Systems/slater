@@ -55,6 +55,29 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     dot / (na.sqrt() * nb.sqrt())
 }
 
+/// Euclidean (L2) distance between two equal-length vectors:
+/// `sqrt(sum((a[i] - b[i])^2))`. Mirrors FalkorDB `SIVector_EuclideanDistance`
+/// (`vec.euclideanDistance`), which computes in float32; we accumulate in f64 for
+/// consistency with [`cosine_similarity`] (the values round-trip identically at the
+/// 3-decimal precision FalkorDB's own tests assert). The caller guarantees equal
+/// lengths.
+pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f64 {
+    let mut sum = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        let d = *x as f64 - *y as f64;
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+/// Cosine *distance* between two equal-length vectors: `1 - cosine_similarity`,
+/// in `[0, 2]`. Mirrors FalkorDB `vec.cosineDistance`. A zero-norm vector yields a
+/// similarity of `0` (see [`cosine_similarity`]) and hence a distance of `1`, where
+/// FalkorDB would produce `NaN` — a deliberate, more-useful divergence.
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+    1.0 - cosine_similarity(a, b)
+}
+
 /// The distance score for `query` vs `candidate` under `metric` — the value
 /// surfaced as `score` and ordered ascending. Public so the Vamana arm uses the
 /// identical exact re-rank scoring as the brute-force arm (same `score` contract).
