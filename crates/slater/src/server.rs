@@ -321,8 +321,10 @@ struct ConnCtx {
     beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
     bind_addr: String,
-    /// Graph used for a session that sends no `db` field when the user can read
-    /// more than one graph (`config.defaultGraph`); `None` ⇒ ambiguity is an error.
+    /// Graph flagged as the home database in `SHOW DATABASES` (`config.defaultGraph`);
+    /// `None` ⇒ the sole readable graph is home, or none is marked. This is display
+    /// metadata only — it is never used to auto-select a graph for a query, so an
+    /// ambiguous session always errors rather than silently serving this graph.
     default_graph: Option<String>,
 }
 
@@ -338,9 +340,19 @@ impl ConnCtx {
             .filter(|s| !s.is_empty())
         {
             if self.graphs.get(db).is_none() {
+                let mut served: Vec<String> = self
+                    .graphs
+                    .names()
+                    .into_iter()
+                    .filter(|g| acl.can_read(user, g))
+                    .collect();
+                served.sort();
                 return Err(Failure::new(
                     CODE_NOT_FOUND,
-                    format!("graph '{db}' is not served"),
+                    format!(
+                        "graph '{db}' is not served (available: {})",
+                        served.join(", ")
+                    ),
                 ));
             }
             if !acl.can_read(user, db) {
@@ -363,21 +375,21 @@ impl ConnCtx {
                 CODE_FORBIDDEN,
                 format!("user '{user}' has no readable graph"),
             )),
-            // Ambiguous: fall back to the configured default graph if the user can
-            // read it (lets a single-database client work without a `db` field);
-            // otherwise ask the client to name one.
-            _ => self
-                .default_graph
-                .as_ref()
-                .filter(|dg| readable.iter().any(|g| g == *dg))
-                .cloned()
-                .ok_or_else(|| {
-                    Failure::new(
-                        CODE_REQUEST,
-                        "multiple graphs are available; name one in the RUN metadata 'db' field"
-                            .into(),
-                    )
-                }),
+            // Ambiguous: the session named no graph but can read several. We do NOT
+            // silently fall back to a default — that masks a mistyped or unset graph
+            // name by serving an unrelated graph. Require an exact name and tell the
+            // client which graphs are on offer.
+            _ => {
+                readable.sort();
+                Err(Failure::new(
+                    CODE_NOT_FOUND,
+                    format!(
+                        "no graph selected: name an exact graph in the connection's \
+                         database field (one of: {})",
+                        readable.join(", ")
+                    ),
+                ))
+            }
         }
     }
 
@@ -561,6 +573,10 @@ struct Session {
     failed: bool,
     /// A buffered result a `PULL` will drain.
     pending: Option<Pending>,
+    /// The graph resolved and validated at `BEGIN`, held for the life of an explicit
+    /// transaction (Bolt sends the `db` only on `BEGIN`, not on the `RUN`s inside it).
+    /// `None` outside a transaction, where each auto-commit `RUN` resolves its own.
+    tx_graph: Option<String>,
     /// Negotiated Bolt version `(major, minor)`; gates element-id struct fields.
     version: (u8, u8),
 }
@@ -797,6 +813,7 @@ where
         user: None,
         failed: false,
         pending: None,
+        tx_graph: None,
         version: (reply[3], reply[2]),
     };
 
@@ -819,6 +836,7 @@ where
             message::Request::Reset => {
                 sess.failed = false;
                 sess.pending = None;
+                sess.tx_graph = None;
                 framed.write_message(&message::success(vec![])).await?;
                 framed.flush().await?;
                 continue;
@@ -915,15 +933,22 @@ async fn handle_request(
             Ok(vec![message::success(vec![])])
         }
 
-        // Slater only ever runs a read transaction; BEGIN/COMMIT/ROLLBACK are
-        // accepted so transaction-using drivers work, but carry no state.
-        Request::Begin(_) => {
-            if sess.user.is_none() {
-                return Err(Failure::unauthorized("not authenticated; send LOGON first"));
-            }
+        // Slater only ever runs a read transaction; BEGIN/COMMIT/ROLLBACK carry no
+        // execution state, but BEGIN names the target graph (its `db` metadata), so
+        // resolve and validate it here — failing at BEGIN, the first message after
+        // connect, rather than deferring an unknown/ambiguous graph to the first RUN.
+        Request::Begin(meta) => {
+            let user = sess
+                .user
+                .as_deref()
+                .ok_or_else(|| Failure::unauthorized("not authenticated; send LOGON first"))?;
+            sess.tx_graph = Some(ctx.select_graph(&meta, user)?);
             Ok(vec![message::success(vec![])])
         }
-        Request::Commit | Request::Rollback => Ok(vec![message::success(vec![])]),
+        Request::Commit | Request::Rollback => {
+            sess.tx_graph = None;
+            Ok(vec![message::success(vec![])])
+        }
 
         Request::Run {
             query,
@@ -944,7 +969,13 @@ async fn handle_request(
                     PsValue::List(columns.into_iter().map(PsValue::String).collect()),
                 )])]);
             }
-            let graph = ctx.select_graph(&extra, &user)?;
+            // Inside an explicit transaction the graph was resolved at BEGIN and the
+            // RUN carries no `db`; otherwise this is an auto-commit RUN that names its
+            // own graph in `extra`.
+            let graph = match &sess.tx_graph {
+                Some(g) => g.clone(),
+                None => ctx.select_graph(&extra, &user)?,
+            };
             let gen = ctx.graphs.get(&graph).ok_or_else(|| {
                 Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
             })?;
@@ -1357,6 +1388,129 @@ mod tests {
             default_graph: None,
         });
         (root, ctx)
+    }
+
+    /// Recursively copy a (small fixture) directory tree.
+    fn copy_dir(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    /// A ConnCtx serving two graphs (`people` + a copy `places`), with `reporting`
+    /// granted read on both — exercises the ambiguous (multi-graph) selection path.
+    fn build_multi_ctx(tag: &str) -> Arc<ConnCtx> {
+        let (root, _graph, _) = testgen::write_basic(tag);
+        let places = root.join("places");
+        copy_dir(&root.join("people"), &places);
+        // The manifest records its own graph name (and open_all rejects a mismatch);
+        // the data-file content hash excludes MANIFEST.json, so renaming the copied
+        // graph to "places" only requires patching that one field.
+        for entry in std::fs::read_dir(&places).unwrap() {
+            let gen_dir = entry.unwrap().path();
+            let man = gen_dir.join("MANIFEST.json");
+            if man.exists() {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&man).unwrap()).unwrap();
+                v["graph"] = serde_json::json!("places");
+                std::fs::write(&man, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+            }
+        }
+        let acl_path = root.join("acl.json");
+        let json = serde_json::json!({
+            "users": { "reporting": {
+                "passwordArgon2id": hash_password("pw").unwrap(),
+                "grants": { "people": ["read"], "places": ["read"] }
+            }}
+        });
+        std::fs::write(&acl_path, json.to_string()).unwrap();
+        let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
+        let graphs = Arc::new(Graphs::open_all(&root, None).unwrap());
+        Arc::new(ConnCtx {
+            acl,
+            graphs,
+            cache: Arc::new(BlockCache::new(1 << 20)),
+            vector_cache: Arc::new(VectorIndexCache::new(1 << 20)),
+            result_cache: Arc::new(ResultCache::new(1 << 20)),
+            max_rows: 100_000,
+            timeout_ms: 0,
+            beam_width: 64,
+            bind_addr: "127.0.0.1:7687".to_string(),
+            // A default is configured but must NOT be silently served for queries.
+            default_graph: Some("people".to_string()),
+        })
+    }
+
+    #[test]
+    fn unknown_db_name_errors_and_lists_the_served_graphs() {
+        let (_root, ctx) = build_ctx("select_unknown_db");
+        let extra = PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]);
+        let err = ctx.select_graph(&extra, "reporting").unwrap_err();
+        assert_eq!(err.code, CODE_NOT_FOUND);
+        assert!(err.message.contains("'eu-ai-act' is not served"), "{}", err.message);
+        // The real name is offered so a typo is self-correcting.
+        assert!(err.message.contains("people"), "{}", err.message);
+    }
+
+    #[test]
+    fn ambiguous_session_errors_instead_of_silently_serving_the_default() {
+        let ctx = build_multi_ctx("select_ambiguous");
+        // No `db` field, and `reporting` can read two graphs: must error, not fall
+        // back to `default_graph` ("people").
+        let empty = PsValue::Map(vec![]);
+        let err = ctx.select_graph(&empty, "reporting").unwrap_err();
+        assert_eq!(err.code, CODE_NOT_FOUND);
+        assert!(err.message.contains("no graph selected"), "{}", err.message);
+        assert!(err.message.contains("people") && err.message.contains("places"), "{}", err.message);
+        // An empty (not just absent) db string is treated the same.
+        let blank = PsValue::Map(vec![("db".into(), PsValue::str(""))]);
+        assert!(ctx.select_graph(&blank, "reporting").is_err());
+        // Naming an exact, served graph still works.
+        let named = PsValue::Map(vec![("db".into(), PsValue::str("places"))]);
+        assert_eq!(ctx.select_graph(&named, "reporting").ok(), Some("places".to_string()));
+    }
+
+    #[tokio::test]
+    async fn begin_validates_the_graph_and_remembers_it_for_the_transaction() {
+        let ctx = build_multi_ctx("begin_validate");
+        let mut sess = Session {
+            user: Some("reporting".into()),
+            failed: false,
+            pending: None,
+            tx_graph: None,
+            version: (5, 4),
+        };
+        // BEGIN naming an unserved graph fails at BEGIN, before any RUN.
+        let bad = message::Request::Begin(PsValue::Map(vec![(
+            "db".into(),
+            PsValue::str("eu-ai-act"),
+        )]));
+        let err = handle_request(&mut sess, &ctx, bad).await.unwrap_err();
+        assert_eq!(err.code, CODE_NOT_FOUND);
+        assert!(sess.tx_graph.is_none());
+        // BEGIN with no db, for a user who can read >1 graph, is ambiguous → errors.
+        let ambiguous = message::Request::Begin(PsValue::Map(vec![]));
+        assert!(handle_request(&mut sess, &ctx, ambiguous).await.is_err());
+        assert!(sess.tx_graph.is_none());
+        // BEGIN naming a served graph is remembered for the transaction's RUNs.
+        let good = message::Request::Begin(PsValue::Map(vec![(
+            "db".into(),
+            PsValue::str("places"),
+        )]));
+        assert!(handle_request(&mut sess, &ctx, good).await.is_ok());
+        assert_eq!(sess.tx_graph.as_deref(), Some("places"));
+        // COMMIT ends the transaction and clears the held graph.
+        assert!(handle_request(&mut sess, &ctx, message::Request::Commit)
+            .await
+            .is_ok());
+        assert!(sess.tx_graph.is_none());
     }
 
     /// Spawn the connection handler over a fresh loopback listener, returning the

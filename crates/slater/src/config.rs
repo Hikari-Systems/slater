@@ -83,10 +83,10 @@ pub struct AppConfig {
     /// What to do when `current` changes under us: `exit` (default) or `swap`.
     #[serde(default = "default_reload_strategy")]
     pub reload_strategy: String,
-    /// Graph a session targets when the client sends no `db` field and the user can
-    /// read more than one graph. Empty ⇒ no default (an ambiguous session errors,
-    /// asking the client to name a graph). Lets single-database browser clients
-    /// (e.g. Memgraph Lab) work against a chosen graph without a `db` field.
+    /// Graph flagged as the home database in `SHOW DATABASES`. Display metadata only:
+    /// it is never used to auto-select a graph for a query. A session that names no
+    /// graph (and can read more than one) errors and must name an exact graph in its
+    /// `db` field — slater never silently serves a graph the client did not name.
     #[serde(default)]
     pub default_graph: String,
 }
