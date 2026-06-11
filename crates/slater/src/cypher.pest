@@ -176,9 +176,11 @@ index_access = { "[" ~ expr ~ "]" }
 
 primary = {
     case_expr
+  | exists_subquery
   | reduce_expr
   | list_comprehension
   | function_call
+  | pattern_predicate
   | map_projection
   | parens
   | pattern_comp
@@ -232,6 +234,21 @@ reduce_kw = @{ ^"reduce" ~ !ident_cont }
 // `list_literal` in `primary`; it backtracks cleanly when the `ident IN` head is
 // absent.
 list_comp = { "[" ~ identifier ~ kw_in ~ expr ~ ( (where_clause ~ ("|" ~ expr)?) | ("|" ~ expr) ) ~ "]" }
+
+// Pattern predicate: a bare relationship pattern used as a boolean — true iff at
+// least one match exists for the surrounding bindings (FalkorDB `op_semi_apply`).
+// At least one relationship is required, which disambiguates it from `parens`
+// (a bare `(n)` falls through to `parens`/`variable`). Tried before `parens` in
+// `primary`; a non-pattern parenthesised expression backtracks cleanly because
+// `node_pattern` only accepts `( var? labels? prop_map? )`.
+pattern_predicate = { node_pattern ~ (rel_pattern ~ node_pattern)+ }
+
+// Existential subquery `EXISTS { [MATCH] pattern[, …] [WHERE pred] }` — true iff
+// the inner pattern (seeded by the outer row's bindings) has ≥1 match. Only the
+// single-clause read form is supported; a RETURN-bearing or multi-clause inner
+// body is deferred to the CALL{} machinery (Phase 12).
+exists_subquery = { exists_kw ~ "{" ~ kw_match? ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ "}" }
+exists_kw = @{ ^"exists" ~ !ident_cont }
 
 // Pattern comprehension `[(a)-[:R]->(b) WHERE pred | expr]`: a relationship
 // pattern (seeded by already-bound nodes), an optional filter, and a mandatory

@@ -283,6 +283,16 @@ pub mod ast {
             list: Box<Expr>,
             body: Box<Expr>,
         },
+        /// A bare relationship pattern used as a boolean predicate — true iff the
+        /// pattern (seeded by the surrounding bindings) has ≥1 match. The pattern
+        /// has at least one relationship and no path variable.
+        PatternPredicate(Box<Pattern>),
+        /// `EXISTS { [MATCH] patterns [WHERE predicate] }` — true iff the inner
+        /// pattern(s), matched against the outer bindings, yield ≥1 row.
+        Exists {
+            patterns: Vec<Pattern>,
+            predicate: Option<Box<Expr>>,
+        },
     }
 }
 
@@ -915,6 +925,8 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::list_comprehension => lower_list_predicate(inner),
         Rule::list_comp => lower_list_comp(inner),
         Rule::pattern_comp => lower_pattern_comp(inner),
+        Rule::pattern_predicate => lower_pattern_predicate(inner),
+        Rule::exists_subquery => lower_exists(inner),
         other => bail!("internal: unexpected primary {other:?}"),
     }
 }
@@ -1112,6 +1124,50 @@ fn lower_pattern_comp(pair: Pair<Rule>) -> Result<Expr> {
     })
 }
 
+fn lower_pattern_predicate(pair: Pair<Rule>) -> Result<Expr> {
+    // pattern_predicate = { node_pattern ~ (rel_pattern ~ node_pattern)+ }
+    let mut nodes = Vec::new();
+    let mut rels = Vec::new();
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::node_pattern => nodes.push(lower_node_pattern(child)?),
+            Rule::rel_pattern => rels.push(lower_rel_pattern(child)?),
+            other => bail!("internal: unexpected pattern_predicate child {other:?}"),
+        }
+    }
+    let mut nodes = nodes.into_iter();
+    let start = nodes
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("pattern predicate has no node"))?;
+    let chain: Vec<(RelPat, NodePat)> = rels.into_iter().zip(nodes).collect();
+    Ok(Expr::PatternPredicate(Box::new(Pattern {
+        path_var: None,
+        start,
+        rels: chain,
+    })))
+}
+
+fn lower_exists(pair: Pair<Rule>) -> Result<Expr> {
+    // exists_subquery = { exists_kw ~ "{" ~ kw_match? ~ pattern ~ ("," ~ pattern)*
+    //                     ~ where_clause? ~ "}" }
+    let mut patterns = Vec::new();
+    let mut predicate = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::pattern => patterns.push(lower_pattern(child)?),
+            Rule::where_clause => predicate = Some(Box::new(lower_expr(only_child(child)?)?)),
+            other => bail!("internal: unexpected exists child {other:?}"),
+        }
+    }
+    if patterns.is_empty() {
+        bail!("EXISTS subquery has no pattern");
+    }
+    Ok(Expr::Exists {
+        patterns,
+        predicate,
+    })
+}
+
 fn lower_literal(pair: Pair<Rule>) -> Result<Expr> {
     let inner = only_child(pair)?;
     let v = match inner.as_rule() {
@@ -1179,6 +1235,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_yield
             | Rule::kw_unwind
             | Rule::reduce_kw
+            | Rule::exists_kw
     )
 }
 
@@ -1291,6 +1348,15 @@ mod tests {
             Ok(_) => panic!("expected reject for {q:?}"),
             Err(e) => e.to_string(),
         }
+    }
+
+    /// The WHERE expression of the first MATCH clause (for predicate-lowering
+    /// tests).
+    fn match_where(q: &Query) -> &Expr {
+        let Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a MATCH clause");
+        };
+        m.where_.as_ref().expect("MATCH has no WHERE")
     }
 
     /// The accept corpus — representative of the widened read subset (and the
@@ -1671,5 +1737,77 @@ mod tests {
         // Missing accumulator init (a bare `|` with no preceding args) is a
         // genuine syntax error.
         assert!(!err("RETURN reduce(n IN [1,2,3] | n)").is_empty());
+    }
+
+    #[test]
+    fn lowers_pattern_predicate() {
+        // A bare relationship pattern in WHERE lowers to a PatternPredicate whose
+        // pattern has no path var, the anchor node, and one outgoing rel.
+        let q = ok("MATCH (n) WHERE (n)-[:KNOWS]->() RETURN n");
+        match match_where(&q) {
+            Expr::PatternPredicate(p) => {
+                assert!(p.path_var.is_none());
+                assert_eq!(p.start.var.as_deref(), Some("n"));
+                assert_eq!(p.rels.len(), 1);
+                assert_eq!(p.rels[0].0.dir, Direction::Outgoing);
+                assert_eq!(p.rels[0].0.types, vec!["KNOWS".to_string()]);
+            }
+            other => panic!("expected PatternPredicate, got {other:?}"),
+        }
+
+        // The negated form is a Not wrapping the predicate (anti-semi-apply).
+        let q = ok("MATCH (n) WHERE NOT (n)-->() RETURN n");
+        assert!(matches!(
+            match_where(&q),
+            Expr::Not(inner) if matches!(**inner, Expr::PatternPredicate(_))
+        ));
+    }
+
+    #[test]
+    fn bare_parens_is_not_a_pattern_predicate() {
+        // `(n)` with no relationship must backtrack to `parens`/`variable`, not a
+        // pattern predicate (which requires ≥1 relationship).
+        let q = ok("MATCH (n) WHERE (n) RETURN n");
+        assert!(matches!(match_where(&q), Expr::Var(v) if v == "n"));
+        // A parenthesised arithmetic expression is likewise untouched.
+        let q = ok("RETURN (1 + 2) AS v");
+        assert!(matches!(q.head.ret.body.items[0].expr, Expr::Arith(..)));
+    }
+
+    #[test]
+    fn lowers_exists_subquery() {
+        // Pattern-only inner form (no MATCH keyword), no WHERE.
+        let q = ok("MATCH (n) WHERE EXISTS { (n)-[:KNOWS]->() } RETURN n");
+        match match_where(&q) {
+            Expr::Exists {
+                patterns,
+                predicate,
+            } => {
+                assert_eq!(patterns.len(), 1);
+                assert!(predicate.is_none());
+            }
+            other => panic!("expected Exists, got {other:?}"),
+        }
+
+        // Explicit MATCH keyword + inner WHERE.
+        let q = ok("MATCH (n) WHERE EXISTS { MATCH (n)-->(m) WHERE n.age > m.age } RETURN n");
+        match match_where(&q) {
+            Expr::Exists {
+                patterns,
+                predicate,
+            } => {
+                assert_eq!(patterns.len(), 1);
+                assert!(predicate.is_some());
+            }
+            other => panic!("expected Exists, got {other:?}"),
+        }
+
+        // `exists(x)` (parenthesised) remains the scalar property-existence
+        // function — only `exists { … }` is the subquery.
+        let q = ok("MATCH (n) WHERE exists(n.name) RETURN n");
+        assert!(matches!(
+            match_where(&q),
+            Expr::Function { name, .. } if name == "exists"
+        ));
     }
 }

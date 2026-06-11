@@ -1602,6 +1602,28 @@ impl<'g> Engine<'g> {
                 list,
                 body,
             } => self.eval_reduce(acc_var, acc_init, var, list, body, scope, aggs),
+            Expr::PatternPredicate(pattern) => {
+                // True iff the pattern, seeded by the current bindings, has ≥1
+                // match (FalkorDB `op_semi_apply`; the negated form `NOT (…)` is
+                // anti-semi-apply via the surrounding `Expr::Not`). No early-exit:
+                // all matches are collected, then emptiness is tested.
+                let seed = scope.to_binding();
+                let mut bindings = Vec::new();
+                self.match_single_pattern(pattern, &seed, None, &mut bindings)?;
+                Ok(Val::Bool(!bindings.is_empty()))
+            }
+            Expr::Exists {
+                patterns,
+                predicate,
+            } => {
+                // `match_patterns` seeds from the outer bindings, chains the
+                // comma-separated patterns, and applies the inner WHERE once every
+                // pattern is bound — exactly the semi-apply existence test.
+                let seed = scope.to_binding();
+                let mut bindings = Vec::new();
+                self.match_patterns(patterns, 0, seed, predicate.as_deref(), &mut bindings)?;
+                Ok(Val::Bool(!bindings.is_empty()))
+            }
         }
     }
 
@@ -2584,6 +2606,10 @@ fn children(e: &Expr) -> Vec<&Expr> {
             body,
             ..
         } => vec![acc_init.as_ref(), list.as_ref(), body.as_ref()],
+        // The pattern's own inline exprs (prop maps) are not walked, matching
+        // `PatternComprehension`; an EXISTS inner WHERE is.
+        Expr::PatternPredicate(_) => vec![],
+        Expr::Exists { predicate, .. } => predicate.iter().map(|p| p.as_ref()).collect(),
     }
 }
 
@@ -5025,6 +5051,165 @@ mod tests {
         // would-be accumulator binding `sum`, which is unbound -> runtime error.
         assert!(run_err("exec_p5_reduce_e3", "RETURN reduce(sum = 0, n in [1,2,3])")
             .contains("'sum'"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Phase 6 — pattern predicates & EXISTS { } ──────────────────────────────
+    //
+    // Vectors are adapted from FalkorDB/TCK `expressions/pattern/Pattern1.feature`
+    // and `existentialSubqueries/ExistentialSubquery1.feature` onto the shared
+    // read-only fixture (those scenarios use CREATE setup we cannot replay).
+    // Fixture topology:
+    //   Alice -KNOWS-> Bob, Bob -KNOWS-> Carol, Alice -KNOWS-> Carol,
+    //   Alice -WORKS_AT-> Acme, Carol -WORKS_AT-> Globex.
+
+    // Pattern1 [1]/[4]/[6]: any / typed-outgoing / typed-incoming connection.
+    #[test]
+    fn phase6_pattern_predicate_directions() {
+        // Any outgoing edge — everyone with an out-edge (not the two companies).
+        let (root, res) = run(
+            "exec_p6_any_out",
+            "MATCH (n) WHERE (n)-->() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Outgoing KNOWS only (Carol's sole out-edge is WORKS_AT).
+        let (root, res) = run(
+            "exec_p6_knows_out",
+            "MATCH (n) WHERE (n)-[:KNOWS]->() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Incoming KNOWS.
+        let (root, res) = run(
+            "exec_p6_knows_in",
+            "MATCH (n) WHERE (n)<-[:KNOWS]-() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Pattern1 [5]: undirected connection sees the edge from either end.
+    #[test]
+    fn phase6_pattern_predicate_undirected_and_label() {
+        let (root, res) = run(
+            "exec_p6_undirected",
+            "MATCH (n) WHERE (n)-[:WORKS_AT]-() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Acme", "Alice", "Carol", "Globex"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A label predicate on the far node restricts the match.
+        let (root, res) = run(
+            "exec_p6_label",
+            "MATCH (n) WHERE (n)-[:WORKS_AT]->(:Company) RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Pattern1 [19]/[20]/[21]: negation, conjunction, disjunction of predicates.
+    #[test]
+    fn phase6_pattern_predicate_boolean_combinations() {
+        // NOT — anti-semi-apply: the two companies have no out-edge.
+        let (root, res) = run(
+            "exec_p6_not",
+            "MATCH (n) WHERE NOT (n)-->() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Acme", "Globex"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Conjunction — only Alice both KNOWS-out and WORKS_AT-out.
+        let (root, res) = run(
+            "exec_p6_and",
+            "MATCH (n) WHERE (n)-[:KNOWS]->() AND (n)-[:WORKS_AT]->() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Disjunction — WORKS_AT-out (Alice, Carol) OR KNOWS-in (Bob, Carol).
+        let (root, res) = run(
+            "exec_p6_or",
+            "MATCH (n) WHERE (n)-[:WORKS_AT]->() OR (n)<-[:KNOWS]-() RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Pattern1 [14]: two bound endpoints — the predicate pins both sides.
+    #[test]
+    fn phase6_pattern_predicate_two_bound_nodes() {
+        let (root, res) = run(
+            "exec_p6_two_node",
+            "MATCH (n), (m) WHERE (n)-[:KNOWS]->(m) RETURN n.name AS a, m.name AS b",
+        );
+        let mut pairs: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Alice".into(), "Bob".into()),
+                ("Alice".into(), "Carol".into()),
+                ("Bob".into(), "Carol".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ExistentialSubquery1 [1]/[3]: simple EXISTS, with and without a match.
+    #[test]
+    fn phase6_exists_simple() {
+        let (root, res) = run(
+            "exec_p6_exists_knows",
+            "MATCH (n) WHERE EXISTS { (n)-[:KNOWS]->() } RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A non-existent relationship type yields no matches → empty result.
+        let (root, res) = run(
+            "exec_p6_exists_none",
+            "MATCH (n) WHERE EXISTS { (n)-[:NOSUCHREL]->() } RETURN n.name AS name",
+        );
+        assert!(res.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ExistentialSubquery2 [1]: the explicit-MATCH inner form with a label.
+    #[test]
+    fn phase6_exists_with_match_keyword() {
+        let (root, res) = run(
+            "exec_p6_exists_match",
+            "MATCH (n) WHERE EXISTS { MATCH (n)-[:WORKS_AT]->(:Company) } RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ExistentialSubquery1 [2]: inner WHERE correlating outer and inner bindings.
+    #[test]
+    fn phase6_exists_inner_where_correlated() {
+        // Who points at someone older? Only Alice(30)->Bob(25) satisfies n.age >
+        // m.age; Acme/Globex have no age so the comparison is NULL (excluded).
+        let (root, res) = run(
+            "exec_p6_exists_where",
+            "MATCH (n) WHERE EXISTS { (n)-->(m) WHERE n.age > m.age } RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Negated EXISTS — nodes with no outgoing KNOWS edge.
+        let (root, res) = run(
+            "exec_p6_not_exists",
+            "MATCH (n) WHERE NOT EXISTS { (n)-[:KNOWS]->() } RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Acme", "Carol", "Globex"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
