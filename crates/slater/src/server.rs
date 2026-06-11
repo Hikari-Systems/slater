@@ -37,7 +37,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn, Level};
 
 use crate::acl::AclHandle;
 use crate::bolt::chunk;
@@ -1026,48 +1026,133 @@ async fn run_query(
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
     let beam_width = ctx.beam_width;
+    let graph_name = gen.graph().to_string();
+    // Gate all per-query instrumentation on the debug level being active: when it
+    // is off, we take no timestamps and no cache snapshots, and build no
+    // QueryTiming — the hot path is exactly what it was before instrumentation.
+    let instrument = tracing::enabled!(Level::DEBUG);
 
-    let join = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Vec<PsValue>>)> {
-        // Result-cache lookup, then execute-and-cache on a miss.
-        let result = match result_cache.get(&key) {
-            Some(r) => r,
-            None => {
-                let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
-                    .with_vector_cache(vector_cache.as_ref(), beam_width)
-                    .with_params(params)
-                    .with_max_rows(max_rows);
-                if timeout_ms > 0 {
-                    engine =
-                        engine.with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let join =
+        tokio::task::spawn_blocking(move || -> Result<(EncodedRows, Option<QueryTiming>)> {
+            // Per-query instrumentation (only when `instrument`): wall-clock split into
+            // execute vs encode, and the block-cache hit/miss/eviction delta this query
+            // caused (the counters are process-wide, so we snapshot before/after). A
+            // result-cache hit skips execution, which shows up as exec_ms ≈ 0.
+            let t_start = instrument.then(Instant::now);
+            let blk_before = instrument.then(|| cache.metrics());
+
+            // Result-cache lookup, then execute-and-cache on a miss.
+            let (result, result_cache_hit) = match result_cache.get(&key) {
+                Some(r) => (r, true),
+                None => {
+                    let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
+                        .with_vector_cache(vector_cache.as_ref(), beam_width)
+                        .with_params(params)
+                        .with_max_rows(max_rows);
+                    if timeout_ms > 0 {
+                        engine = engine
+                            .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+                    }
+                    let r = Arc::new(engine.run(&ast)?);
+                    let bytes = estimate_result_bytes(&r);
+                    result_cache.insert(key.clone(), r.clone(), bytes);
+                    (r, false)
                 }
-                let r = Arc::new(engine.run(&ast)?);
-                let bytes = estimate_result_bytes(&r);
-                result_cache.insert(key.clone(), r.clone(), bytes);
-                r
+            };
+            let t_after_exec = instrument.then(Instant::now);
+
+            // Encode for this connection's version. A plain engine (no params/limits
+            // needed) resolves Node/Relationship records through the shared block cache.
+            let engine = Engine::new(gen.as_ref(), cache.as_ref());
+            let mut rows = Vec::with_capacity(result.rows.len());
+            for row in &result.rows {
+                let mut encoded = Vec::with_capacity(row.len());
+                for v in row {
+                    encoded.push(encode_val(&engine, version, v)?);
+                }
+                rows.push(encoded);
             }
-        };
-        // Encode for this connection's version. A plain engine (no params/limits
-        // needed) resolves Node/Relationship records through the shared block cache.
-        let engine = Engine::new(gen.as_ref(), cache.as_ref());
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let mut encoded = Vec::with_capacity(row.len());
-            for v in row {
-                encoded.push(encode_val(&engine, version, v)?);
-            }
-            rows.push(encoded);
-        }
-        Ok((result.columns.clone(), rows))
-    })
-    .await;
+
+            let timing = if instrument {
+                let t_end = Instant::now();
+                let blk_after = cache.metrics();
+                let blk_before = blk_before.unwrap();
+                let t_start = t_start.unwrap();
+                let t_after_exec = t_after_exec.unwrap();
+                Some(QueryTiming {
+                    result_cache_hit,
+                    exec_ms: (t_after_exec - t_start).as_secs_f64() * 1e3,
+                    encode_ms: (t_end - t_after_exec).as_secs_f64() * 1e3,
+                    total_ms: (t_end - t_start).as_secs_f64() * 1e3,
+                    rows: rows.len(),
+                    blk_hits: blk_after.hits.saturating_sub(blk_before.hits),
+                    blk_misses: blk_after.misses.saturating_sub(blk_before.misses),
+                    blk_evictions: blk_after.evictions.saturating_sub(blk_before.evictions),
+                })
+            } else {
+                None
+            };
+            Ok(((result.columns.clone(), rows), timing))
+        })
+        .await;
 
     match join {
-        Ok(Ok(out)) => Ok(out),
+        Ok(Ok((out, timing))) => {
+            // Only ever `Some` when the debug level was active (see `instrument`).
+            // A block-cache miss is a cold block read (pread + decompress); many
+            // misses on a small query is the signature of an unindexed scan. A high
+            // total_ms with result_cache=miss and many blk_misses points at exactly
+            // that.
+            if let Some(t) = timing {
+                debug!(
+                    graph = %graph_name,
+                    rows = t.rows,
+                    result_cache = if t.result_cache_hit { "hit" } else { "miss" },
+                    exec_ms = format_args!("{:.1}", t.exec_ms),
+                    encode_ms = format_args!("{:.1}", t.encode_ms),
+                    total_ms = format_args!("{:.1}", t.total_ms),
+                    blk_hits = t.blk_hits,
+                    blk_misses = t.blk_misses,
+                    blk_evicted = t.blk_evictions,
+                    query = %log_query(query),
+                    "query executed"
+                );
+            }
+            Ok(out)
+        }
         Ok(Err(e)) => Err(Failure::from_query_error(&e)),
         Err(e) => Err(Failure::new(
             CODE_EXECUTION,
             format!("query task failed: {e}"),
         )),
+    }
+}
+
+/// Column names plus the PackStream-encoded rows — the shape `run_query`'s
+/// blocking task produces.
+type EncodedRows = (Vec<String>, Vec<Vec<PsValue>>);
+
+/// Per-query timing + cache-delta, captured inside the blocking task and logged
+/// once the result returns (see [`run_query`]).
+struct QueryTiming {
+    result_cache_hit: bool,
+    exec_ms: f64,
+    encode_ms: f64,
+    total_ms: f64,
+    rows: usize,
+    blk_hits: u64,
+    blk_misses: u64,
+    blk_evictions: u64,
+}
+
+/// Collapse a query's whitespace and truncate it for a single-line log field.
+fn log_query(query: &str) -> String {
+    let one_line = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > 160 {
+        let truncated: String = one_line.chars().take(160).collect();
+        format!("{truncated}…")
+    } else {
+        one_line
     }
 }
 

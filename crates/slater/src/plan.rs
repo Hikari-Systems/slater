@@ -19,13 +19,19 @@
 #![allow(dead_code)]
 
 use crate::generation::Generation;
-use crate::parser::ast::{CmpOp, Expr, NodePat};
+use crate::parser::ast::{CmpOp, Expr, FuncArgs, NodePat};
 use graph_format::ids::Value;
 use graph_format::manifest::EntityKind;
 
 /// How the executor should generate candidate nodes for a single node pattern.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeScan {
+    /// Direct seek to specific dense node ids — `id(n) = <int>` (or
+    /// `id(n) IN [<int>, …]`) pinned the anchor. `ids` is already bounds-checked
+    /// (every entry `< node_count`) and deduped, so the executor yields it as-is;
+    /// an empty list means the requested id matches no node. This is the most
+    /// selective strategy (O(1) per id), preferred over every index.
+    IdSeek { ids: Vec<u64> },
     /// Equality lookup through a range (ISAM) index → the matching node ids.
     RangeEq { index: String, key: Value },
     /// Range lookup through a range (ISAM) index, with per-bound inclusivity.
@@ -60,11 +66,134 @@ pub fn choose_node_scan(gen: &Generation, node: &NodePat, where_: Option<&Expr>)
         return choose_from_preds(gen, node, &inline_preds(node));
     };
 
+    // Highest-priority strategy: a direct id() seek. When a top-level `AND`
+    // conjunct pins `id(var)` to concrete ids, the anchor is just those nodes — an
+    // O(1) lookup that beats any index (and turns Memgraph Lab's
+    // `MATCH (n)-[r]->(m) WHERE id(n) = X` neighbourhood-expansion from a full edge
+    // scan into a seek). Soundness: a seek can only *narrow* candidates and the
+    // executor re-checks the full `WHERE` on every binding, so the only hazard is
+    // narrowing away a row a disjunction would have kept — which `id_seek_ids`
+    // prevents by descending `AND` only (never `OR`).
+    if let Some(w) = where_ {
+        if let Some(ids) = id_seek_ids(w, var, gen.node_count()) {
+            return NodeScan::IdSeek { ids };
+        }
+    }
+
     let mut preds = inline_preds(node);
     if let Some(w) = where_ {
         collect_where_preds(w, var, &mut preds);
     }
     choose_from_preds(gen, node, &preds)
+}
+
+/// If the top-level `AND`-conjuncts of `where_` pin `id(var)` to concrete node ids
+/// — `id(var) = <int>` or `id(var) IN [<int>, …]` — return the in-bounds ids
+/// (deduped, sorted). Returns `None` when no such conjunct exists so the caller
+/// falls back to a normal scan.
+///
+/// Only descends `Expr::And` (never `Expr::Or`): an `id(var) = X` buried in a
+/// disjunction does **not** constrain every result to id `X`, so seeking it would
+/// drop valid rows. Every node satisfying the whole `WHERE` must satisfy each
+/// `AND`-conjunct, so the union of the id-conjuncts' id-sets is always a superset
+/// of the true result — a sound candidate set the executor then filters exactly.
+/// A negative or out-of-range id matches no node and is simply dropped (an empty
+/// `Some(vec![])` is a valid "seek that finds nothing", and faster than a scan).
+fn id_seek_ids(expr: &Expr, var: &str, node_count: u64) -> Option<Vec<u64>> {
+    let mut ids: Vec<u64> = Vec::new();
+    let mut found = false;
+    collect_id_eq(expr, var, &mut ids, &mut found);
+    if !found {
+        return None;
+    }
+    ids.retain(|&id| id < node_count);
+    ids.sort_unstable();
+    ids.dedup();
+    Some(ids)
+}
+
+/// Does a top-level `AND`-conjunct of `where_` pin `id(var)` to concrete ids? The
+/// executor uses this to decide whether to **re-root** a pattern onto an
+/// id-seekable end node (so `MATCH (m)-[r]->(n) WHERE id(n) = X` seeks `n` and
+/// walks the edge backwards instead of scanning every `m`). Cheaper than
+/// [`id_seek_ids`] — no bounds resolution, just "is there an id constraint".
+pub(crate) fn is_id_anchored(where_: &Expr, var: &str) -> bool {
+    let mut ids = Vec::new();
+    let mut found = false;
+    collect_id_eq(where_, var, &mut ids, &mut found);
+    found
+}
+
+/// Gather, from the top-level `AND`-conjuncts of `expr`, every concrete node id
+/// that `id(var)` is constrained to. Sets `found` once any `id(var)` equality /
+/// membership conjunct is seen (so a negative-only constraint still yields a
+/// "seek that finds nothing" rather than a fallback scan).
+fn collect_id_eq(expr: &Expr, var: &str, ids: &mut Vec<u64>, found: &mut bool) {
+    match expr {
+        Expr::And(parts) => {
+            for p in parts {
+                collect_id_eq(p, var, ids, found);
+            }
+        }
+        // `id(var) = <int>` / `<int> = id(var)`.
+        Expr::Compare(CmpOp::Eq, l, r) => {
+            if let Some(i) = id_eq_operand(l, r, var) {
+                *found = true;
+                if i >= 0 {
+                    ids.push(i as u64);
+                }
+            }
+        }
+        // `id(var) IN [<int>, …]` — a seek only when every element is a constant
+        // integer (otherwise the full id-set is unknown → fall back to a scan).
+        Expr::In(lhs, rhs) => {
+            if is_id_of(lhs, var) {
+                if let Expr::List(items) = &**rhs {
+                    let consts: Option<Vec<i64>> = items.iter().map(const_int).collect();
+                    if let Some(values) = consts {
+                        *found = true;
+                        ids.extend(values.into_iter().filter(|&i| i >= 0).map(|i| i as u64));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// For an `=` comparison, return the integer if exactly one side is `id(var)` and
+/// the other a constant integer.
+fn id_eq_operand(l: &Expr, r: &Expr, var: &str) -> Option<i64> {
+    if is_id_of(l, var) {
+        return const_int(r);
+    }
+    if is_id_of(r, var) {
+        return const_int(l);
+    }
+    None
+}
+
+/// Evaluate a constant integer expression: an int literal, or a (possibly nested)
+/// numeric negation of one. Needed because `-1` parses as `Neg(Literal(Int(1)))`,
+/// not a negative literal. Overflow (`-i64::MIN`) yields `None` (no seek).
+fn const_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Literal(Value::Int(i)) => Some(*i),
+        Expr::Neg(inner) => const_int(inner).and_then(i64::checked_neg),
+        _ => None,
+    }
+}
+
+/// Is `e` exactly `id(var)` — the built-in `id` function (case-insensitive, not
+/// `DISTINCT`) applied to the single variable `var`?
+fn is_id_of(e: &Expr, var: &str) -> bool {
+    matches!(
+        e,
+        Expr::Function { name, distinct: false, args: FuncArgs::Args(a) }
+            if name.eq_ignore_ascii_case("id")
+                && a.len() == 1
+                && matches!(&a[0], Expr::Var(v) if v == var)
+    )
 }
 
 /// Inline `{prop: literal}` entries are always equality predicates.
@@ -292,6 +421,121 @@ mod tests {
         let (root, graph, _) = crate::testgen::write_basic("plan_all");
         let gen = Generation::open(&root, &graph).unwrap();
         let scan = plan_for(&gen, "MATCH (n) RETURN n");
+        assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── id() seek pushdown ─────────────────────────────────────────────────────
+
+    #[test]
+    fn id_equality_picks_id_seek() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_eq");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) = 1 RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![1] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_equality_flipped_operands_picks_id_seek() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_eq_flip");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE 2 = id(n) RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![2] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_function_is_case_insensitive() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_case");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE ID(n) = 0 RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![0] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_out_of_range_seeks_nothing() {
+        // The fixture has 5 nodes (ids 0..4); 999 matches none → an empty seek
+        // (still an IdSeek, not a scan — the answer is provably empty).
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_oor");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) = 999 RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_negative_seeks_nothing() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_neg");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) = -1 RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_seek_outranks_property_index() {
+        // Both an indexed-name equality and an id() equality are present; the id
+        // seek must win (it is the most selective).
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_vs_idx");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(
+            &gen,
+            "MATCH (n:Person) WHERE id(n) = 1 AND n.name = 'Alice' RETURN n",
+        );
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![1] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_in_list_picks_id_seek() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_in");
+        let gen = Generation::open(&root, &graph).unwrap();
+        // Out-of-range / duplicate ids are dropped; result is sorted + deduped.
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) IN [2, 0, 0, 99] RETURN n");
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![0, 2] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_under_or_does_not_seek() {
+        // CRITICAL guard: `id(n)=0 OR id(n)=2` does not constrain every row to one
+        // id — seeking would drop the other. Must fall back to a (here: full) scan.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_or");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) = 0 OR id(n) = 2 RETURN n");
+        assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_of_other_variable_does_not_seek_anchor() {
+        // The anchor is `n`; the predicate constrains `m`. The anchor must not be
+        // seeked (it would be wrong) — it falls back to a scan.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_otherv");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n)-[r]->(m) WHERE id(m) = 1 RETURN n");
+        assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_in_with_nonliteral_element_does_not_seek() {
+        // A non-literal in the IN list means the id-set is unknown → no seek.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_in_nonlit");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) IN [1, n.age] RETURN n");
+        assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn id_inequality_does_not_seek() {
+        // Only equality / IN seek; `id(n) > 1` is not a point lookup.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_gt");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for(&gen, "MATCH (n) WHERE id(n) > 1 RETURN n");
         assert_eq!(scan, NodeScan::AllNodes);
         let _ = std::fs::remove_dir_all(&root);
     }
