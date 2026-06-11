@@ -47,6 +47,15 @@ pub mod ast {
         Match(MatchClause),
         With(WithClause),
         VectorCall(VectorCallClause),
+        Unwind(UnwindClause),
+    }
+
+    /// `UNWIND <expr> AS <var>` — a read clause that emits one row per element of
+    /// the list `expr` evaluates to, binding the element to `var`.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct UnwindClause {
+        pub expr: Expr,
+        pub var: String,
     }
 
     /// The one permitted procedure call: `CALL db.idx.vector.queryNodes('Label',
@@ -240,6 +249,23 @@ pub mod ast {
             list: Box<Expr>,
             predicate: Option<Box<Expr>>,
         },
+        /// `[var IN list WHERE predicate | projection]`. At least one of
+        /// `predicate`/`projection` is present (grammar-enforced); a missing
+        /// projection yields the bound element.
+        ListComprehension {
+            var: String,
+            list: Box<Expr>,
+            predicate: Option<Box<Expr>>,
+            projection: Option<Box<Expr>>,
+        },
+        /// `[pattern WHERE predicate | projection]` — the pattern is matched
+        /// against the surrounding scope's bindings and `projection` is collected
+        /// per match (projection is mandatory).
+        PatternComprehension {
+            pattern: Box<Pattern>,
+            predicate: Option<Box<Expr>>,
+            projection: Box<Expr>,
+        },
     }
 }
 
@@ -320,6 +346,7 @@ fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
         Rule::match_clause => Ok(Clause::Match(lower_match_clause(inner)?)),
         Rule::with_clause => Ok(Clause::With(lower_with_clause(inner)?)),
         Rule::vector_call_clause => Ok(Clause::VectorCall(lower_vector_call(inner)?)),
+        Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
         other => bail!("internal: unexpected reading clause {other:?}"),
     }
 }
@@ -412,6 +439,21 @@ fn lower_match_clause(pair: Pair<Rule>) -> Result<MatchClause> {
         patterns,
         where_,
     })
+}
+
+fn lower_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
+    // unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias } — kids() drops the
+    // keyword tokens, leaving the list expression then the alias identifier.
+    let mut it = kids(pair);
+    let expr = lower_expr(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("UNWIND without expression"))?,
+    )?;
+    let var = ident_text(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("UNWIND without alias"))?,
+    )?;
+    Ok(UnwindClause { expr, var })
 }
 
 fn lower_with_clause(pair: Pair<Rule>) -> Result<WithClause> {
@@ -822,6 +864,8 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::case_expr => lower_case(inner),
         Rule::map_projection => lower_map_projection(inner),
         Rule::list_comprehension => lower_list_predicate(inner),
+        Rule::list_comp => lower_list_comp(inner),
+        Rule::pattern_comp => lower_pattern_comp(inner),
         other => bail!("internal: unexpected primary {other:?}"),
     }
 }
@@ -930,6 +974,60 @@ fn lower_list_predicate(pair: Pair<Rule>) -> Result<Expr> {
     })
 }
 
+fn lower_list_comp(pair: Pair<Rule>) -> Result<Expr> {
+    // list_comp = { "[" ~ identifier ~ kw_in ~ expr ~ ((where_clause ~ ("|" expr)?) | ("|" expr)) ~ "]" }
+    // After kids() drops kw_in, the children appear in source order: the iteration
+    // identifier, the source-list `expr`, an optional `where_clause`, then an
+    // optional projection `expr`. The first `expr` is always the list; a second
+    // `expr` is the projection.
+    let mut var = None;
+    let mut list = None;
+    let mut predicate = None;
+    let mut projection = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::identifier => var = Some(ident_text(child)?),
+            Rule::where_clause => predicate = Some(Box::new(lower_expr(only_child(child)?)?)),
+            Rule::expr => {
+                let e = Box::new(lower_expr(child)?);
+                if list.is_none() {
+                    list = Some(e);
+                } else {
+                    projection = Some(e);
+                }
+            }
+            other => bail!("internal: unexpected list_comp child {other:?}"),
+        }
+    }
+    Ok(Expr::ListComprehension {
+        var: var.ok_or_else(|| anyhow::anyhow!("missing list-comprehension variable"))?,
+        list: list.ok_or_else(|| anyhow::anyhow!("missing list-comprehension list"))?,
+        predicate,
+        projection,
+    })
+}
+
+fn lower_pattern_comp(pair: Pair<Rule>) -> Result<Expr> {
+    // pattern_comp = { "[" ~ pattern ~ where_clause? ~ "|" ~ expr ~ "]" }
+    let mut pattern = None;
+    let mut predicate = None;
+    let mut projection = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::pattern => pattern = Some(Box::new(lower_pattern(child)?)),
+            Rule::where_clause => predicate = Some(Box::new(lower_expr(only_child(child)?)?)),
+            Rule::expr => projection = Some(Box::new(lower_expr(child)?)),
+            other => bail!("internal: unexpected pattern_comp child {other:?}"),
+        }
+    }
+    Ok(Expr::PatternComprehension {
+        pattern: pattern.ok_or_else(|| anyhow::anyhow!("missing pattern-comprehension pattern"))?,
+        predicate,
+        projection: projection
+            .ok_or_else(|| anyhow::anyhow!("missing pattern-comprehension projection"))?,
+    })
+}
+
 fn lower_literal(pair: Pair<Rule>) -> Result<Expr> {
     let inner = only_child(pair)?;
     let v = match inner.as_rule() {
@@ -995,6 +1093,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_end
             | Rule::kw_call
             | Rule::kw_yield
+            | Rule::kw_unwind
     )
 }
 
@@ -1127,9 +1226,71 @@ mod tests {
             "MATCH (n) RETURN n.embedding[0] AS first",
             "MATCH (n) RETURN collect(DISTINCT n.city) AS cities",
             "RETURN $limit AS l",
+            // §1 list comprehension (filter / map / both) and §1+index.
+            "RETURN [x IN [1, 2, 3] WHERE x > 1] AS r",
+            "RETURN [x IN [1, 2, 3] | x * 2] AS r",
+            "RETURN [x IN [1, 2, 3] WHERE x > 1 | x * 2] AS r",
+            "MATCH (n) RETURN [l IN labels(n) WHERE l <> 'Concept'][0] AS primary",
+            // §2 pattern comprehension.
+            "MATCH (n) RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
+            "MATCH (n) RETURN size([(n)<-[:SOURCED_FROM]-(:Chunk) | 1]) AS deg",
+            // §3 UNWIND (now a read clause, not forbidden).
+            "UNWIND [1, 2, 3] AS x RETURN x",
+            "MATCH (a)-[r*1..2]->(b) WITH r LIMIT 1 UNWIND r AS e RETURN type(e)",
+            // §4 startNode / endNode.
+            "MATCH ()-[r]->() RETURN startNode(r).name AS s, endNode(r).name AS e",
         ];
         for q in corpus {
             ok(q);
+        }
+    }
+
+    #[test]
+    fn comprehension_and_unwind_lower_to_expected_ast() {
+        // List comprehension with both filter and projection.
+        let q = ok("RETURN [x IN [1, 2, 3] WHERE x > 1 | x * 2] AS r");
+        match &q.head.ret.body.items[0].expr {
+            Expr::ListComprehension {
+                var,
+                predicate,
+                projection,
+                ..
+            } => {
+                assert_eq!(var, "x");
+                assert!(predicate.is_some());
+                assert!(projection.is_some());
+            }
+            other => panic!("expected ListComprehension, got {other:?}"),
+        }
+
+        // Pattern comprehension: pattern + mandatory projection, no filter.
+        let q = ok("MATCH (n) RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends");
+        assert!(matches!(
+            &q.head.ret.body.items[0].expr,
+            Expr::PatternComprehension {
+                predicate: None,
+                ..
+            }
+        ));
+
+        // `[a IN b]` (no WHERE/`|`) stays a one-element list literal (membership).
+        let q = ok("RETURN [2 IN [1, 2, 3]] AS r");
+        match &q.head.ret.body.items[0].expr {
+            Expr::List(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], Expr::In(_, _)));
+            }
+            other => panic!("expected a list literal, got {other:?}"),
+        }
+
+        // UNWIND lowers to a reading clause carrying expr + alias.
+        let q = ok("UNWIND [1, 2, 3] AS x RETURN x");
+        match &q.head.reading[0] {
+            Clause::Unwind(uc) => {
+                assert_eq!(uc.var, "x");
+                assert!(matches!(uc.expr, Expr::List(_)));
+            }
+            other => panic!("expected an Unwind clause, got {other:?}"),
         }
     }
 
@@ -1142,7 +1303,6 @@ mod tests {
             ("MATCH (n) DETACH DELETE n", "DETACH"),
             ("MERGE (n:Person {name: 'A'}) RETURN n", "MERGE"),
             ("MATCH (n) REMOVE n:Person RETURN n", "REMOVE"),
-            ("UNWIND [1, 2, 3] AS x RETURN x", "UNWIND"),
             // Every procedure call is rejected EXCEPT the one vector KNN form.
             ("CALL db.labels() YIELD label RETURN label", "CALL"),
             (

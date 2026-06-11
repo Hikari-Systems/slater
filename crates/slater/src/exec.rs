@@ -292,6 +292,42 @@ impl<'a> Scope<'a> {
             Scope::Merge(a, b) => a.get(name).or_else(|| b.get(name)),
         }
     }
+
+    /// Flatten the scope chain into a name→value map. Used to seed the recursive
+    /// matcher (which consumes a `HashMap`) for a pattern comprehension. Shadowing
+    /// follows `get`: a `With` binding and the first arm of a `Merge` win over what
+    /// they layer on top of, so they are inserted last.
+    fn to_binding(&self) -> HashMap<String, Val> {
+        let mut out = HashMap::new();
+        self.collect_into(&mut out);
+        out
+    }
+
+    fn collect_into(&self, out: &mut HashMap<String, Val>) {
+        match self {
+            Scope::Empty => {}
+            Scope::Map(m) => {
+                for (k, v) in m.iter() {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            Scope::Row(cols, row) => {
+                for (c, v) in cols.iter().zip(row.iter()) {
+                    out.insert(c.clone(), v.clone());
+                }
+            }
+            // Parent first, then the layered binding wins on a name clash.
+            Scope::With(parent, n, v) => {
+                parent.collect_into(out);
+                out.insert((*n).to_string(), (*v).clone());
+            }
+            // `get` prefers `a`, so write `b` first and let `a` overwrite.
+            Scope::Merge(a, b) => {
+                b.collect_into(out);
+                a.collect_into(out);
+            }
+        }
+    }
 }
 
 // ── Public result ─────────────────────────────────────────────────────────────
@@ -540,6 +576,7 @@ impl<'g> Engine<'g> {
                     table = self.project(table, &w.body, w.distinct, w.where_.as_ref())?
                 }
                 Clause::VectorCall(vc) => table = self.apply_vector_call(table, vc)?,
+                Clause::Unwind(uc) => table = self.apply_unwind(table, uc)?,
             }
         }
         let table = self.project(table, &sq.ret.body, sq.ret.distinct, None)?;
@@ -582,6 +619,41 @@ impl<'g> Engine<'g> {
                     }
                     out_rows.push(r);
                 }
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    // ── UNWIND ───────────────────────────────────────────────────────────────
+
+    /// Multiply each input row by the elements of the list `uc.expr` evaluates to,
+    /// binding each element to `uc.var`. Matching FalkorDB's `op_unwind` (`_initList`):
+    /// a list expands element-wise, NULL and the empty list emit zero rows, and any
+    /// other scalar is wrapped as a single-element list (one row) — a deliberate
+    /// FalkorDB divergence from Neo4j (which errors on `UNWIND 5`).
+    fn apply_unwind(&self, table: Table, uc: &UnwindClause) -> Result<Table> {
+        let mut out_cols = table.cols.clone();
+        // The alias is a fresh binding appended after the input columns. (A name
+        // clash with an existing column would shadow it on read; the eu-ai-act
+        // service never re-uses an in-scope name here.)
+        out_cols.push(uc.var.clone());
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            self.check_deadline()?;
+            let scope = Scope::Row(&table.cols, row);
+            let items = match self.eval(&uc.expr, &scope, None)? {
+                Val::List(xs) => xs,
+                Val::Null => continue,  // null → zero rows
+                scalar => vec![scalar], // scalar → wrap as [scalar] → one row
+            };
+            for item in items {
+                let mut r = row.clone();
+                r.push(item);
+                out_rows.push(r);
             }
         }
         Ok(Table {
@@ -1418,6 +1490,30 @@ impl<'g> Engine<'g> {
                 list,
                 predicate,
             } => self.eval_list_predicate(*quant, var, list, predicate.as_deref(), scope, aggs),
+            Expr::ListComprehension {
+                var,
+                list,
+                predicate,
+                projection,
+            } => self.eval_list_comprehension(
+                var,
+                list,
+                predicate.as_deref(),
+                projection.as_deref(),
+                scope,
+                aggs,
+            ),
+            Expr::PatternComprehension {
+                pattern,
+                predicate,
+                projection,
+            } => self.eval_pattern_comprehension(
+                pattern,
+                predicate.as_deref(),
+                projection,
+                scope,
+                aggs,
+            ),
         }
     }
 
@@ -1646,6 +1742,69 @@ impl<'g> Engine<'g> {
         })
     }
 
+    /// Evaluate `[var IN list WHERE predicate | projection]`. Mirrors
+    /// [`Self::eval_list_predicate`] element binding: iterate the source list with
+    /// `var` layered onto the scope, keep elements whose predicate is definitely
+    /// true (a NULL predicate excludes, like FalkorDB's three-valued filter), and
+    /// project each survivor (defaulting to the bound element). A NULL source list
+    /// yields NULL.
+    fn eval_list_comprehension(
+        &self,
+        var: &str,
+        list: &Expr,
+        predicate: Option<&Expr>,
+        projection: Option<&Expr>,
+        scope: &Scope,
+        aggs: Option<&AggCursor>,
+    ) -> Result<Val> {
+        let items = match self.eval(list, scope, aggs)? {
+            Val::List(xs) => xs,
+            Val::Null => return Ok(Val::Null),
+            other => bail!(
+                "a list comprehension needs a list, got {}",
+                other.to_display()
+            ),
+        };
+        let mut out = Vec::new();
+        for item in &items {
+            let inner = Scope::With(scope, var, item);
+            if let Some(p) = predicate {
+                if !truthy(&self.eval(p, &inner, aggs)?) {
+                    continue;
+                }
+            }
+            out.push(match projection {
+                Some(e) => self.eval(e, &inner, aggs)?,
+                None => item.clone(),
+            });
+        }
+        Ok(Val::List(out))
+    }
+
+    /// Evaluate `[pattern WHERE predicate | projection]`. The pattern is matched
+    /// against the surrounding scope (its already-bound nodes seed the traversal),
+    /// the optional `WHERE` filters matches, and `projection` is collected per
+    /// match in match order. New pattern variables stay local to each match and do
+    /// not leak to the outer row; an empty match set yields `[]`. This is the
+    /// observable equivalent of FalkorDB's correlated collect sub-plan.
+    fn eval_pattern_comprehension(
+        &self,
+        pattern: &Pattern,
+        predicate: Option<&Expr>,
+        projection: &Expr,
+        scope: &Scope,
+        aggs: Option<&AggCursor>,
+    ) -> Result<Val> {
+        let seed = scope.to_binding();
+        let mut bindings = Vec::new();
+        self.match_single_pattern(pattern, &seed, predicate, &mut bindings)?;
+        let mut out = Vec::with_capacity(bindings.len());
+        for b in bindings {
+            out.push(self.eval(projection, &Scope::Map(&b), aggs)?);
+        }
+        Ok(Val::List(out))
+    }
+
     fn call_function(&self, name: &str, _distinct: bool, args: Vec<Val>) -> Result<Val> {
         let n = name.to_lowercase();
         let a0 = |i: usize| args.get(i).cloned().unwrap_or(Val::Null);
@@ -1772,6 +1931,22 @@ impl<'g> Engine<'g> {
                     .unwrap_or(Val::Null),
                 Val::Null => Val::Null,
                 other => bail!("type() needs a relationship, got {}", other.to_display()),
+            },
+            // startNode/endNode return the stored-direction endpoints carried on
+            // the relationship value (src→dst), so no re-traversal is needed. Match
+            // FalkorDB: NULL argument → NULL; a non-relationship is an error.
+            "startnode" => match a0(0) {
+                Val::Rel { start, .. } => Val::Node(start),
+                Val::Null => Val::Null,
+                other => bail!(
+                    "startNode() needs a relationship, got {}",
+                    other.to_display()
+                ),
+            },
+            "endnode" => match a0(0) {
+                Val::Rel { end, .. } => Val::Node(end),
+                Val::Null => Val::Null,
+                other => bail!("endNode() needs a relationship, got {}", other.to_display()),
             },
             // Build a first-class vector from a list of numbers — the inlined
             // `vecf32([...])` form drivers send (and the query-vector argument of
@@ -1985,6 +2160,32 @@ fn children(e: &Expr) -> Vec<&Expr> {
             list, predicate, ..
         } => {
             let mut v = vec![list.as_ref()];
+            if let Some(p) = predicate {
+                v.push(p);
+            }
+            v
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            let mut v = vec![list.as_ref()];
+            if let Some(p) = predicate {
+                v.push(p);
+            }
+            if let Some(p) = projection {
+                v.push(p);
+            }
+            v
+        }
+        Expr::PatternComprehension {
+            predicate,
+            projection,
+            ..
+        } => {
+            let mut v = vec![projection.as_ref()];
             if let Some(p) = predicate {
                 v.push(p);
             }
@@ -3164,6 +3365,243 @@ mod tests {
             "MATCH (m)-[r*1..2]->(n) WHERE id(n) = 2 RETURN DISTINCT m.name AS name",
         );
         assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── §1 list comprehension ──────────────────────────────────────────────
+
+    /// Display a single-row, single-column list result as a Vec of display strings.
+    fn list0(res: &QueryResult) -> Vec<String> {
+        assert_eq!(res.rows.len(), 1, "expected exactly one row");
+        match &res.rows[0][0] {
+            Val::List(xs) => xs.iter().map(|v| v.to_display()).collect(),
+            other => panic!("expected a list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_comprehension_filter_keeps_non_null() {
+        let (root, res) = run(
+            "exec_listcomp_filter",
+            "RETURN [x IN [1, null, 2] WHERE x IS NOT NULL] AS r",
+        );
+        assert_eq!(list0(&res), vec!["1", "2"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_comprehension_projection_only() {
+        let (root, res) = run("exec_listcomp_map", "RETURN [x IN [1, 2, 3] | x * 2] AS r");
+        assert_eq!(list0(&res), vec!["2", "4", "6"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_comprehension_filter_and_projection() {
+        let (root, res) = run(
+            "exec_listcomp_both",
+            "RETURN [x IN [1, 2, 3] WHERE x > 1 | x * 2] AS r",
+        );
+        assert_eq!(list0(&res), vec!["4", "6"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_comprehension_then_index() {
+        // The primary call site: extract the first non-`Concept` label.
+        let (root, res) = run(
+            "exec_listcomp_index",
+            "RETURN [l IN ['Concept', 'Person'] WHERE l <> 'Concept'][0] AS r",
+        );
+        assert_eq!(res.rows[0][0].to_display(), "Person");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_comprehension_null_source_is_null() {
+        let (root, res) = run(
+            "exec_listcomp_null",
+            "RETURN [x IN null WHERE x > 1 | x] AS r",
+        );
+        assert!(matches!(res.rows[0][0], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_comprehension_nested() {
+        // Inner builds [0,2,4,6] (evens 0..6); outer keeps those whose double is
+        // ≥ 4 and doubles them: 2→4, 4→8, 6→12.
+        let (root, res) = run(
+            "exec_listcomp_nested",
+            "RETURN [e IN [n IN [0,1,2,3,4,5,6] WHERE n % 2 = 0] WHERE e * 2 >= 4 | e * 2] AS r",
+        );
+        assert_eq!(list0(&res), vec!["4", "8", "12"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bare_membership_list_still_parses_as_list_literal() {
+        // `[x IN list]` (no WHERE/`|`) must remain a one-element list literal whose
+        // element is the membership test — NOT a comprehension.
+        let (root, res) = run("exec_membership_literal", "RETURN [2 IN [1, 2, 3]] AS r");
+        match &res.rows[0][0] {
+            Val::List(xs) => {
+                assert_eq!(xs.len(), 1);
+                assert!(matches!(xs[0], Val::Bool(true)));
+            }
+            other => panic!("expected a one-element list, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── §2 pattern comprehension ────────────────────────────────────────────
+
+    #[test]
+    fn pattern_comprehension_degree_via_size() {
+        // size([(n)-[:KNOWS]->(:Person) | 1]) — outgoing KNOWS degree per person.
+        // Alice→{Bob,Carol}=2, Bob→{Carol}=1, Carol→{}=0.
+        let (root, res) = run(
+            "exec_patcomp_size",
+            "MATCH (n:Person) RETURN n.name AS name, size([(n)-[:KNOWS]->(:Person) | 1]) AS deg ORDER BY name",
+        );
+        let got: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Alice".into(), "2".into()),
+                ("Bob".into(), "1".into()),
+                ("Carol".into(), "0".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pattern_comprehension_collects_neighbour_props() {
+        // Alice knows Bob and Carol; the projection collects their names.
+        let (root, res) = run(
+            "exec_patcomp_names",
+            "MATCH (n:Person {name: 'Alice'}) RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
+        );
+        let mut friends = list0(&res);
+        friends.sort();
+        assert_eq!(friends, vec!["Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pattern_comprehension_empty_match_is_empty_list() {
+        // Carol has no outgoing KNOWS edge → an empty list, not null.
+        let (root, res) = run(
+            "exec_patcomp_empty",
+            "MATCH (n:Person {name: 'Carol'}) RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends",
+        );
+        match &res.rows[0][0] {
+            Val::List(xs) => assert!(xs.is_empty()),
+            other => panic!("expected an empty list, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── §3 UNWIND ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn unwind_list_emits_one_row_per_element() {
+        let (root, res) = run("exec_unwind_list", "UNWIND [1, 2, 3] AS x RETURN x");
+        assert_eq!(col0(&res), vec!["1", "2", "3"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwind_empty_and_null_emit_zero_rows() {
+        let (root, res) = run("exec_unwind_empty", "UNWIND [] AS x RETURN x");
+        assert!(res.rows.is_empty());
+        let (root2, res2) = run("exec_unwind_null", "UNWIND null AS x RETURN x");
+        assert!(res2.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn unwind_scalar_wraps_as_single_row() {
+        // FalkorDB divergence from Neo4j: a scalar unwinds to one row.
+        let (root, res) = run("exec_unwind_scalar", "UNWIND 5 AS q RETURN q");
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(5)));
+        let (root2, res2) = run("exec_unwind_scalar_str", "UNWIND 'abc' AS q RETURN q");
+        assert_eq!(res2.rows.len(), 1);
+        assert_eq!(res2.rows[0][0].to_display(), "abc");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn unwind_null_element_is_a_real_row() {
+        let (root, res) = run("exec_unwind_null_elem", "UNWIND [1, null, 2] AS x RETURN x");
+        assert_eq!(res.rows.len(), 3);
+        assert!(matches!(res.rows[1][0], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwind_preserves_upstream_context() {
+        // The original `l` column survives alongside the unwound `x` (TCK scenario:
+        // UNWIND does not prune context).
+        let (root, res) = run(
+            "exec_unwind_ctx",
+            "WITH [1, 2] AS l UNWIND l AS x RETURN l, x ORDER BY x",
+        );
+        assert_eq!(res.rows.len(), 2);
+        // Each row keeps the full list in column 0 and one element in column 1.
+        assert!(matches!(&res.rows[0][0], Val::List(xs) if xs.len() == 2));
+        assert!(matches!(res.rows[0][1], Val::Int(1)));
+        assert!(matches!(res.rows[1][1], Val::Int(2)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unwind_variable_length_relationship_list() {
+        // §3+§4 combined: unwind a collected edge list, then read its endpoints.
+        let (root, res) = run(
+            "exec_unwind_rels",
+            "MATCH (a)-[r*1..2]->(b) WITH r LIMIT 1 UNWIND r AS e RETURN type(e) AS t",
+        );
+        assert!(res
+            .rows
+            .iter()
+            .all(|row| row[0].to_display() == "KNOWS" || row[0].to_display() == "WORKS_AT"));
+        assert!(!res.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── §4 startNode / endNode ──────────────────────────────────────────────
+
+    #[test]
+    fn start_and_end_node_match_walked_endpoints() {
+        // For every KNOWS edge, startNode(e)==a and endNode(e)==b.
+        let (root, res) = run(
+            "exec_startend",
+            "MATCH (a)-[e:KNOWS]->(b) RETURN a.name AS an, startNode(e).name AS sn, b.name AS bn, endNode(e).name AS en",
+        );
+        assert!(!res.rows.is_empty());
+        for r in &res.rows {
+            assert_eq!(r[0].to_display(), r[1].to_display(), "startNode mismatch");
+            assert_eq!(r[2].to_display(), r[3].to_display(), "endNode mismatch");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn start_node_of_null_is_null() {
+        let (root, res) = run(
+            "exec_startnull",
+            "OPTIONAL MATCH (a:Person)-[e:NONEXISTENT]->(b) RETURN startNode(e) AS s LIMIT 1",
+        );
+        assert!(matches!(res.rows[0][0], Val::Null));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

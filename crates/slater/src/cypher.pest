@@ -53,6 +53,7 @@ kw_else = @{ ^"else" ~ !ident_cont }
 kw_end = @{ ^"end" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
+kw_unwind = @{ ^"unwind" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
@@ -70,12 +71,15 @@ forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
 // the valid parse while every other procedure call is rejected as read-only.
 forbidden_clause = @{
     (^"create" | ^"merge" | ^"set" | ^"delete" | ^"remove" | ^"detach"
-      | ^"unwind" | ^"foreach" | ^"load") ~ !ident_cont
+      | ^"foreach" | ^"load") ~ !ident_cont
   | ^"call" ~ !ident_cont ~ !(inline_ws+ ~ vector_proc)
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | unwind_clause }
+
+// UNWIND is a read clause (it multiplies rows over a list); it is NOT forbidden.
+unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias }
 
 // The one permitted procedure: brute-force vector KNN. Surfaced as a reading
 // clause that binds its YIELD outputs (FalkorDB's `node`, `score`) into scope.
@@ -170,6 +174,8 @@ primary = {
   | function_call
   | map_projection
   | parens
+  | pattern_comp
+  | list_comp
   | list_literal
   | map_literal
   | literal
@@ -204,6 +210,19 @@ else_clause = { kw_else ~ expr }
 list_comprehension = { quantifier ~ "(" ~ identifier ~ kw_in ~ expr ~ where_clause? ~ ")" }
 quantifier = @{ (^"any" | ^"all" | ^"none" | ^"single") ~ !ident_cont }
 
+// List comprehension `[x IN list WHERE pred | expr]`. At least one of the WHERE
+// filter / `| expr` projection is required, so a one-element list literal like
+// `[a IN b]` (a membership test) still parses as a `list_literal`. Tried before
+// `list_literal` in `primary`; it backtracks cleanly when the `ident IN` head is
+// absent.
+list_comp = { "[" ~ identifier ~ kw_in ~ expr ~ ( (where_clause ~ ("|" ~ expr)?) | ("|" ~ expr) ) ~ "]" }
+
+// Pattern comprehension `[(a)-[:R]->(b) WHERE pred | expr]`: a relationship
+// pattern (seeded by already-bound nodes), an optional filter, and a mandatory
+// `| expr` projection collected per match. Tried before `list_literal`/`list_comp`
+// in `primary`; its `(` head is unambiguous against both.
+pattern_comp = { "[" ~ pattern ~ where_clause? ~ "|" ~ expr ~ "]" }
+
 list_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 map_literal = { "{" ~ (map_lit_entry ~ ("," ~ map_lit_entry)*)? ~ "}" }
 map_lit_entry = { property_key ~ ":" ~ expr }
@@ -233,6 +252,6 @@ reserved = _{
       | ^"not" | ^"in" | ^"is" | ^"null" | ^"true" | ^"false" | ^"case"
       | ^"when" | ^"then" | ^"else" | ^"end" | ^"contains" | ^"starts"
       | ^"ends" | ^"union" | ^"ascending" | ^"asc" | ^"descending" | ^"desc"
-      | ^"call" | ^"yield")
+      | ^"call" | ^"yield" | ^"unwind")
     ~ !ident_cont
 }

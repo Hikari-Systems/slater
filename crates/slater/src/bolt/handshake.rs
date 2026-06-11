@@ -15,7 +15,14 @@
 pub const PREAMBLE: [u8; 4] = [0x60, 0x60, 0xB0, 0x17];
 
 /// Versions this server speaks, in descending preference. `(major, minor)`.
-pub const SUPPORTED: [(u8, u8); 2] = [(5, 4), (4, 4)];
+///
+/// `(4, 1)` is accepted for the older `neo4rs` Rust driver (frozen at Bolt
+/// 4.0/4.1), which proposes only 4.1/4.0 and would otherwise get `NO_VERSION`.
+/// A 4.1 session reuses the 4.4 fallback paths verbatim: auth is read from HELLO
+/// (not version-gated, see `server::handle_request`), the message loop is
+/// version-agnostic, and the only version-branched encoding is Node/Relationship
+/// `element_id` (Bolt ≥ 5 only) — which read projections never emit.
+pub const SUPPORTED: [(u8, u8); 3] = [(5, 4), (4, 4), (4, 1)];
 
 /// The four zero bytes a server sends when it supports none of the proposals.
 pub const NO_VERSION: [u8; 4] = [0, 0, 0, 0];
@@ -120,6 +127,20 @@ mod tests {
         // Both offered; the server's preference order wins.
         let buf = hello([prop(4, 4, 0), prop(5, 4, 0), prop(0, 0, 0), prop(0, 0, 0)]);
         assert_eq!(handle_client_hello(&buf).unwrap(), [0, 0, 4, 5]);
+    }
+
+    #[test]
+    fn accepts_neo4rs_4_1_proposal() {
+        // The `neo4rs` Rust driver proposes exactly [4.1, 4.0, 0, 0]; we agree on 4.1.
+        let buf = hello([prop(4, 1, 0), prop(4, 0, 0), prop(0, 0, 0), prop(0, 0, 0)]);
+        assert_eq!(handle_client_hello(&buf).unwrap(), [0, 0, 1, 4]);
+    }
+
+    #[test]
+    fn prefers_4_4_over_4_1() {
+        // A client offering both still gets the higher-preference 4.4.
+        let buf = hello([prop(4, 1, 0), prop(4, 4, 0), prop(0, 0, 0), prop(0, 0, 0)]);
+        assert_eq!(handle_client_hello(&buf).unwrap(), [0, 0, 4, 4]);
     }
 
     #[test]
