@@ -332,6 +332,49 @@ pub(crate) fn show_storage_info(m: &Manifest) -> Rows {
     )
 }
 
+/// One cache pool's live stats for `SHOW STORAGE INFO`. The server fills one per
+/// pool (block / vector / result) from its `CacheMetrics` snapshot + residency.
+pub(crate) struct CachePoolStat {
+    pub name: &'static str,
+    pub bytes: usize,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// `SHOW STORAGE INFO` with the per-pool cache metrics appended. Operators read
+/// `<pool>_cache_{bytes,entries,hits,misses,evictions}` to watch residency, hit
+/// rate, and eviction pressure — the evidence for tuning the block/vector/result
+/// budget split (the three pools are isolated by design, so there is no runtime
+/// auto-balancer; these rows are how you balance them by hand).
+pub(crate) fn show_storage_info_with_caches(m: &Manifest, pools: &[CachePoolStat]) -> Rows {
+    let (cols, mut rows) = show_storage_info(m);
+    for p in pools {
+        rows.push(vec![
+            s(format!("{}_cache_bytes", p.name)),
+            PsValue::Int(p.bytes as i64),
+        ]);
+        rows.push(vec![
+            s(format!("{}_cache_entries", p.name)),
+            PsValue::Int(p.entries as i64),
+        ]);
+        rows.push(vec![
+            s(format!("{}_cache_hits", p.name)),
+            PsValue::Int(p.hits as i64),
+        ]);
+        rows.push(vec![
+            s(format!("{}_cache_misses", p.name)),
+            PsValue::Int(p.misses as i64),
+        ]);
+        rows.push(vec![
+            s(format!("{}_cache_evictions", p.name)),
+            PsValue::Int(p.evictions as i64),
+        ]);
+    }
+    (cols, rows)
+}
+
 /// `CALL db.schema.visualization()` — slater does not materialise a schema graph,
 /// so return the well-formed empty shape (Browser shows "no schema" rather than
 /// erroring).

@@ -595,3 +595,180 @@ async fn rss_stays_bounded_under_sustained_knn_load() {
         recall,
     );
 }
+
+// ── Cache idle-TTL reclaim (opt-in; runs ~4½ minutes) ─────────────────────────
+//
+// The headline test above proves residency stays *bounded* under load. This one
+// proves the new idle-TTL feature *reclaims* that residency once the working set
+// goes quiet: with a 3-minute TTL it fills the caches to their budgets (real heap,
+// real evictions), then sits idle and watches the background maintenance sweep
+// free everything after the entries have been untouched for the TTL.
+//
+// Ignored by default because of the real 3-minute wall-clock wait. Run it with:
+//
+//   cargo test --test memory_headline -- --ignored --nocapture \
+//     cache_ttl_reclaims_idle_caches_after_three_minutes
+//
+// The block-cache fill uses 1 MiB blocks so each allocation is above glibc's mmap
+// threshold — freeing them munmaps, so the reclaim shows up in real RSS, not just
+// the caches' own byte accounting (which is the authoritative signal asserted on).
+#[test]
+#[ignore = "runs ~4½ minutes: a real 3-minute idle wait. Run with --ignored --nocapture"]
+fn cache_ttl_reclaims_idle_caches_after_three_minutes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use slater::cache::{BlockCache, BlockKey, FileKind, ResultCache, VectorIndexCache};
+    use slater::exec::{Engine, QueryResult};
+    use slater::generation::Generation as SlaterGen;
+
+    const TTL: Duration = Duration::from_secs(180); // the 3-minute idle TTL under test
+    const BLOCK_BUDGET: usize = 128 * 1024 * 1024; // block-cache budget: 128 MiB
+    const DEMO_BLOCK: usize = 1024 * 1024; // 1 MiB blocks (mmap-backed ⇒ RSS-visible)
+    const DEMO_BLOCKS: u32 = 200; // 200 MiB attempted ⇒ the LRU pages out
+
+    let root = std::env::temp_dir().join(format!("slater_ttl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let raw = build_large_vamana(&root, "docs");
+    let gen = SlaterGen::open(&root, "docs").unwrap();
+    let (ord, pq_bytes) = {
+        let vi = gen.vamana_index("Doc", "embedding").unwrap();
+        (vi.ord, vi.pq.resident_bytes())
+    };
+
+    // Budgets the working set exceeds, so loading saturates them (genuine evictions).
+    let block_cache = Arc::new(BlockCache::new(BLOCK_BUDGET));
+    let vec_cache = Arc::new(VectorIndexCache::new(pq_bytes + 96 * 1024)); // PQ + ~16 blocks
+    let result_cache: Arc<ResultCache<QueryResult>> = Arc::new(ResultCache::new(1024 * 1024));
+    vec_cache.pin(
+        gen.uuid(),
+        ord,
+        gen.vamana_index("Doc", "embedding").unwrap().pq.clone(),
+    );
+
+    // ── LOAD: fill the caches and hit their limits ────────────────────────────
+    // Real KNN queries page the vector pool (store ≫ budget); 1 MiB synthetic
+    // blocks fill the block LRU to its 128 MiB budget (and evict beyond it).
+    let k = 10;
+    for i in 0..40usize {
+        let mut q = raw[(i * 97) % raw.len()].clone();
+        let qi = i % q.len();
+        q[qi] += 0.03;
+        let ast = slater::parser::parse(&knn_query(&q, k)).unwrap();
+        let engine = Engine::new(&gen, &block_cache).with_vector_cache(&vec_cache, 64);
+        let _ = engine.run(&ast).unwrap();
+    }
+    for b in 0..DEMO_BLOCKS {
+        let key = BlockKey::new(gen.uuid(), FileKind::Vectors, b);
+        let _ = block_cache
+            .get_or_try_insert(key, || Ok(vec![0xABu8; DEMO_BLOCK]))
+            .unwrap();
+    }
+
+    let load_block_evict = block_cache.metrics().evictions;
+    let load_vec_evict = vec_cache.metrics().evictions;
+    let rss_after_load = rss_bytes();
+    eprintln!(
+        "LOADED: block cache {} blocks / {:.1} MiB (evictions {load_block_evict}); \
+         vector pool {} blocks (evictions {load_vec_evict}); RSS {:.1} MiB",
+        block_cache.len(),
+        mib(block_cache.bytes() as u64),
+        vec_cache.block_count(),
+        mib(rss_after_load),
+    );
+    assert!(
+        load_block_evict > 0,
+        "the block cache should have hit its 128 MiB budget and evicted"
+    );
+    assert!(!block_cache.is_empty() && block_cache.bytes() <= BLOCK_BUDGET);
+
+    // ── Maintenance sweep — mirrors server::spawn_cache_maintenance exactly ────
+    // Every (TTL/4) clamped to [1s, 30s], evict entries idle past the TTL. Started
+    // now (after load) so the reclaim timing is measured cleanly from the idle point.
+    let sweep_every = (TTL / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sweeper = {
+        let (bc, vc, rc, stop) = (
+            block_cache.clone(),
+            vec_cache.clone(),
+            result_cache.clone(),
+            stop.clone(),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(sweep_every);
+                let now = Instant::now();
+                let freed =
+                    bc.evict_expired(now, TTL) + vc.evict_expired(now, TTL) + rc.evict_expired(now, TTL);
+                if freed > 0 {
+                    eprintln!("   [sweep] reclaimed {freed} idle cache entries");
+                }
+            }
+        })
+    };
+
+    // ── IDLE: touch nothing for > TTL and watch the sweep reclaim ──────────────
+    let idle_start = Instant::now();
+    let mut reclaim_secs: Option<u64> = None;
+    let mut min_rss = rss_after_load;
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let elapsed = idle_start.elapsed().as_secs();
+        let (blen, vblocks, rss) = (block_cache.len(), vec_cache.block_count(), rss_bytes());
+        min_rss = min_rss.min(rss);
+        eprintln!(
+            "  idle {elapsed:>3}s: block cache {blen:>3} blocks / {:>5.1} MiB, \
+             vector pool {vblocks:>2} blocks, RSS {:.1} MiB",
+            mib(block_cache.bytes() as u64),
+            mib(rss),
+        );
+        if reclaim_secs.is_none() && blen == 0 && vblocks == 0 {
+            reclaim_secs = Some(elapsed);
+        }
+        if elapsed >= 250 {
+            break;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = sweeper.join();
+    let pq_survived = vec_cache.resident_pq(gen.uuid(), ord).is_some();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let reclaim_secs = reclaim_secs.expect("caches were never reclaimed after the TTL idle period");
+    let freed_rss = rss_after_load.saturating_sub(min_rss);
+    eprintln!(
+        "RECLAIMED after {reclaim_secs}s idle: block cache {} blocks, vector pool {} blocks; \
+         RSS {:.1} → {:.1} MiB (freed {:.1} MiB); pinned PQ survived: {pq_survived}",
+        block_cache.len(),
+        vec_cache.block_count(),
+        mib(rss_after_load),
+        mib(min_rss),
+        mib(freed_rss),
+    );
+
+    // ── Assertions ────────────────────────────────────────────────────────────
+    // Authoritative signal is the caches' own accounting; RSS is reported, not
+    // asserted (the allocator may retain freed pages — though 1 MiB mmap blocks
+    // munmap on free, so a drop is expected here).
+    assert!(
+        reclaim_secs >= 175,
+        "reclaim happened at {reclaim_secs}s — before the 180s TTL elapsed"
+    );
+    assert!(
+        reclaim_secs <= 240,
+        "reclaim took {reclaim_secs}s — too long for a 180s TTL + 30s sweep cadence"
+    );
+    assert_eq!(block_cache.len(), 0, "block cache must be fully reclaimed when idle past the TTL");
+    assert_eq!(vec_cache.block_count(), 0, "vector blocks must be reclaimed when idle past the TTL");
+    assert!(pq_survived, "pinned PQ codes must be exempt from TTL reclaim");
+    if freed_rss < 32 * 1024 * 1024 {
+        eprintln!(
+            "NOTE: RSS only fell {:.1} MiB — the caches' accounting confirms reclaim; the \
+             allocator likely retained freed pages on this platform.",
+            mib(freed_rss)
+        );
+    }
+}

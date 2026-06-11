@@ -574,6 +574,51 @@ impl ConnCtx {
             return Ok(Some(rows));
         }
 
+        // `SHOW STORAGE INFO` is graph-scoped *and* carries the live per-pool cache
+        // metrics (block / vector / result) so an operator can watch residency, hit
+        // rate, and eviction pressure — the evidence for tuning the budget split.
+        if q.starts_with("show storage info") {
+            let graph = self.select_graph(extra, user, sticky)?;
+            let gen = self.graphs.get(&graph).ok_or_else(|| {
+                Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
+            })?;
+            let (bm, vm, rm) = (
+                self.cache.metrics(),
+                self.vector_cache.metrics(),
+                self.result_cache.metrics(),
+            );
+            let pools = [
+                introspect::CachePoolStat {
+                    name: "block",
+                    bytes: self.cache.bytes(),
+                    entries: self.cache.len(),
+                    hits: bm.hits,
+                    misses: bm.misses,
+                    evictions: bm.evictions,
+                },
+                introspect::CachePoolStat {
+                    name: "vector",
+                    bytes: self.vector_cache.bytes(),
+                    entries: self.vector_cache.block_count(),
+                    hits: vm.hits,
+                    misses: vm.misses,
+                    evictions: vm.evictions,
+                },
+                introspect::CachePoolStat {
+                    name: "result",
+                    bytes: self.result_cache.bytes(),
+                    entries: self.result_cache.len(),
+                    hits: rm.hits,
+                    misses: rm.misses,
+                    evictions: rm.evictions,
+                },
+            ];
+            return Ok(Some(introspect::show_storage_info_with_caches(
+                gen.manifest(),
+                &pools,
+            )));
+        }
+
         // Graph-scoped statements — resolve the graph (honouring an explicit `db`
         // or the default) and read its manifest.
         let scoped: Option<fn(&graph_format::manifest::Manifest) -> introspect::Rows> =
@@ -589,8 +634,6 @@ impl ConnCtx {
                 Some(introspect::db_indexes)
             } else if q.starts_with("show index info") {
                 Some(introspect::show_index_info)
-            } else if q.starts_with("show storage info") {
-                Some(introspect::show_storage_info)
             } else if q.starts_with("call db.schema.visualization") {
                 Some(|_| introspect::schema_visualization())
             } else {
@@ -1898,6 +1941,66 @@ mod tests {
             }
         }
         assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn show_storage_info_includes_per_pool_cache_metrics() {
+        let (root, ctx) = build_ctx("server_storage_info");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // Touch the block cache first so its counters are non-trivial.
+        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+        while c.recv().await.0 != message::tag::SUCCESS {}
+
+        c.send(Client::run("SHOW STORAGE INFO")).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(
+            fields[0].get("fields"),
+            Some(&PsValue::List(vec![
+                PsValue::str("storage info"),
+                PsValue::str("value")
+            ]))
+        );
+
+        c.send(Client::pull_all()).await;
+        let mut kv: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        loop {
+            let (tag, fields) = c.recv().await;
+            if tag == message::tag::RECORD {
+                if let PsValue::List(vals) = &fields[0] {
+                    if let (Some(key), PsValue::Int(v)) = (vals[0].as_str(), &vals[1]) {
+                        kv.insert(key.to_string(), *v);
+                    }
+                }
+            } else {
+                assert_eq!(tag, message::tag::SUCCESS);
+                break;
+            }
+        }
+
+        // The manifest stats are still there…
+        assert!(kv.contains_key("vertex_count"), "manifest rows must remain");
+        // …and every pool now reports its full metric set.
+        for pool in ["block", "vector", "result"] {
+            for metric in ["bytes", "entries", "hits", "misses", "evictions"] {
+                let key = format!("{pool}_cache_{metric}");
+                assert!(kv.contains_key(&key), "SHOW STORAGE INFO missing `{key}`");
+            }
+        }
+        // The MATCH above went through the block cache, so it recorded an access.
+        assert!(
+            kv["block_cache_hits"] + kv["block_cache_misses"] >= 1,
+            "block cache should show at least one access after the MATCH"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
