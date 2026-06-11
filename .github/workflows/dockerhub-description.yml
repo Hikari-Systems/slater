@@ -21,10 +21,10 @@ jobs:
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
       - name: Checkout repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v6
 
       - name: Update Docker Hub overview from DOCKERHUB.md
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
