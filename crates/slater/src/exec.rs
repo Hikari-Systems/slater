@@ -907,7 +907,7 @@ impl<'g> Engine<'g> {
             }
         };
         for c in candidates {
-            if !self.node_ok(c, start)? {
+            if !self.node_ok(c, start, binding)? {
                 continue;
             }
             let mut b = binding.clone();
@@ -979,9 +979,9 @@ impl<'g> Engine<'g> {
         let (rel, next) = &pattern.rels[i];
         match &rel.var_length {
             None => {
-                for hop in self.expand_one_hop(cur, rel)? {
+                for hop in self.expand_one_hop(cur, rel, &binding)? {
                     let nb = hop.neighbour;
-                    if !self.node_ok(nb, next)? {
+                    if !self.node_ok(nb, next, &binding)? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -1006,9 +1006,17 @@ impl<'g> Engine<'g> {
                 let mut paths: Vec<(Vec<Hop>, u64)> = Vec::new();
                 let mut used = HashSet::new();
                 let mut path = Vec::new();
-                self.varlen(cur, rel, (min, max), &mut path, &mut used, &mut paths)?;
+                self.varlen(
+                    cur,
+                    rel,
+                    (min, max),
+                    &mut path,
+                    &mut used,
+                    &mut paths,
+                    &binding,
+                )?;
                 for (hops, endnode) in paths {
-                    if !self.node_ok(endnode, next)? {
+                    if !self.node_ok(endnode, next, &binding)? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -1035,6 +1043,7 @@ impl<'g> Engine<'g> {
     /// Depth-first variable-length expansion with relationship uniqueness (no edge
     /// reused within a path), emitting `(path_edges, end_node)` for every path
     /// whose length is in `[min, max]`.
+    #[allow(clippy::too_many_arguments)] // recursive DFS: scratch buffers + scope
     fn varlen(
         &self,
         node: u64,
@@ -1043,6 +1052,7 @@ impl<'g> Engine<'g> {
         path: &mut Vec<Hop>,
         used: &mut HashSet<u64>,
         out: &mut Vec<(Vec<Hop>, u64)>,
+        binding: &HashMap<String, Val>,
     ) -> Result<()> {
         let (min, max) = bounds;
         if path.len() as u32 >= min {
@@ -1052,7 +1062,7 @@ impl<'g> Engine<'g> {
             return Ok(());
         }
         self.check_deadline()?;
-        for hop in self.expand_one_hop(node, rel)? {
+        for hop in self.expand_one_hop(node, rel, binding)? {
             if used.contains(&hop.edge) {
                 continue;
             }
@@ -1060,7 +1070,7 @@ impl<'g> Engine<'g> {
             let nb = hop.neighbour;
             used.insert(edge);
             path.push(hop);
-            self.varlen(nb, rel, bounds, path, used, out)?;
+            self.varlen(nb, rel, bounds, path, used, out, binding)?;
             path.pop();
             used.remove(&edge);
         }
@@ -1070,7 +1080,12 @@ impl<'g> Engine<'g> {
     /// One traversal step from `node`: edges matching the pattern's direction,
     /// type alternation and relationship property predicates, each resolved to a
     /// [`Hop`] (edge, neighbour, type, and stored src→dst endpoints).
-    fn expand_one_hop(&self, node: u64, rel: &RelPat) -> Result<Vec<Hop>> {
+    fn expand_one_hop(
+        &self,
+        node: u64,
+        rel: &RelPat,
+        binding: &HashMap<String, Val>,
+    ) -> Result<Vec<Hop>> {
         let type_ids: Option<Vec<u32>> = if rel.types.is_empty() {
             None
         } else {
@@ -1100,7 +1115,7 @@ impl<'g> Engine<'g> {
                         continue;
                     }
                 }
-                if !self.rel_ok(a.edge.0, rel)? {
+                if !self.rel_ok(a.edge.0, rel, binding)? {
                     continue;
                 }
                 let (start, end) = if incoming {
@@ -1147,7 +1162,10 @@ impl<'g> Engine<'g> {
     }
 
     /// Whether node `id` satisfies a node pattern's labels and inline properties.
-    fn node_ok(&self, id: u64, pat: &NodePat) -> Result<bool> {
+    /// Inline property values are evaluated against `binding` so a value bound
+    /// earlier (e.g. by a `WITH`, or an earlier node/rel in the pattern) resolves,
+    /// making `(b {id: x})` behave exactly like `(b) WHERE b.id = x`.
+    fn node_ok(&self, id: u64, pat: &NodePat, binding: &HashMap<String, Val>) -> Result<bool> {
         if !pat.labels.is_empty() {
             let have = self.node_label_ids(id)?;
             for l in &pat.labels {
@@ -1158,7 +1176,7 @@ impl<'g> Engine<'g> {
             }
         }
         for (k, e) in &pat.props {
-            let want = self.eval(e, &Scope::Empty, None)?;
+            let want = self.eval(e, &Scope::Map(binding), None)?;
             let got = self.node_prop(id, k)?;
             if got.loose_eq(&want) != Some(true) {
                 return Ok(false);
@@ -1168,9 +1186,10 @@ impl<'g> Engine<'g> {
     }
 
     /// Whether edge `id` satisfies a relationship pattern's inline properties.
-    fn rel_ok(&self, id: u64, rel: &RelPat) -> Result<bool> {
+    /// Values are evaluated against `binding` (see [`node_ok`]).
+    fn rel_ok(&self, id: u64, rel: &RelPat, binding: &HashMap<String, Val>) -> Result<bool> {
         for (k, e) in &rel.props {
-            let want = self.eval(e, &Scope::Empty, None)?;
+            let want = self.eval(e, &Scope::Map(binding), None)?;
             let got = self.edge_prop(id, k)?;
             if got.loose_eq(&want) != Some(true) {
                 return Ok(false);
@@ -2680,6 +2699,75 @@ mod tests {
         assert_eq!(res.rows.len(), 1);
         assert_eq!(res.rows[0][0].to_display(), "Alice");
         assert_eq!(res.rows[0][1].to_display(), "Bob");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Inline property maps whose value is bound earlier (by a `WITH` or an earlier
+    // node/rel) must resolve against the current scope — `(b {id: x})` behaves like
+    // `(b) WHERE b.id = x`. This was the last eu-ai-act-data-service parity gap.
+
+    #[test]
+    fn inline_node_prop_resolves_variable_from_with() {
+        // The exact reported gap: a WITH-bound value feeding a later inline map.
+        let (root, res) = run(
+            "exec_inline_with",
+            "MATCH (n:Person {name:'Bob'}) WITH n.name AS who \
+             MATCH (m:Person {name: who}) RETURN m.age AS age",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(25)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_node_prop_joins_across_matches() {
+        // baseId-style join: carry one node's property into another node's inline map.
+        let (root, res) = run(
+            "exec_inline_join",
+            "MATCH (a:Person {name:'Alice'}) WITH a.city AS c \
+             MATCH (p:Person {city: c}) RETURN p.name AS n",
+        );
+        // Alice and Bob are both in London.
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_rel_prop_resolves_variable() {
+        // Variable value on a relationship inline map.
+        let (root, res) = run(
+            "exec_inline_rel",
+            "WITH 2020 AS yr MATCH (a)-[r:KNOWS {since: yr}]->(b) \
+             RETURN a.name AS a, b.name AS b",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "Alice");
+        assert_eq!(res.rows[0][1].to_display(), "Bob");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_node_prop_resolves_property_access() {
+        // The value is a property access (`a.name`), not just a bare variable.
+        let (root, res) = run(
+            "exec_inline_propaccess",
+            "MATCH (a:Person {name:'Bob'}) \
+             MATCH (m:Person {name: a.name}) RETURN m.name AS n",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "Bob");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inline_node_prop_literal_still_works() {
+        // Regression guard: literal inline maps must keep matching after the change.
+        let (root, res) = run(
+            "exec_inline_literal",
+            "MATCH (n:Person {name:'Bob'}) RETURN n.age AS age",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(25)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
