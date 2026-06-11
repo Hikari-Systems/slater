@@ -657,6 +657,7 @@ impl<'g> Engine<'g> {
                     table = self.project(table, &w.body, w.distinct, w.where_.as_ref())?
                 }
                 Clause::VectorCall(vc) => table = self.apply_vector_call(table, vc)?,
+                Clause::Call(cc) => table = self.apply_call(table, cc)?,
                 Clause::Unwind(uc) => table = self.apply_unwind(table, uc)?,
             }
         }
@@ -741,6 +742,139 @@ impl<'g> Engine<'g> {
             cols: out_cols,
             rows: out_rows,
         })
+    }
+
+    // ── CALL <metadata procedure> (Phase 11) ────────────────────────────────
+
+    /// Run a read-only metadata procedure and bind its outputs into the table.
+    /// The procedures take no arguments and produce rows independent of the input
+    /// bindings, so the result is the input table × the procedure rows, projected
+    /// to the `YIELD`ed columns (or all outputs when `YIELD` is absent) with the
+    /// optional `YIELD … WHERE` applied. Mirrors [`Self::apply_vector_call`]'s
+    /// binding/`WHERE` handling.
+    fn apply_call(&self, table: Table, cc: &CallClause) -> Result<Table> {
+        if !cc.args.is_empty() {
+            bail!("{}() takes no arguments", cc.name);
+        }
+        let (out_names, proc_rows) = self.procedure_rows(&cc.name.to_ascii_lowercase())?;
+
+        // (output index, bound name) pairs: YIELD selects/reorders/aliases; a bare
+        // call binds every output under its own name.
+        let bindings: Vec<(usize, String)> = if cc.yields.is_empty() {
+            out_names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i, n.clone()))
+                .collect()
+        } else {
+            let mut v = Vec::with_capacity(cc.yields.len());
+            for (output, bound) in &cc.yields {
+                let idx = out_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(output))
+                    .ok_or_else(|| anyhow::anyhow!("{}() does not yield '{output}'", cc.name))?;
+                v.push((idx, bound.clone()));
+            }
+            v
+        };
+
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(bindings.iter().map(|(_, b)| b.clone()));
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            self.check_deadline()?;
+            for prow in &proc_rows {
+                let mut r = row.clone();
+                for (idx, _) in &bindings {
+                    r.push(prow[*idx].clone());
+                }
+                if let Some(w) = &cc.where_ {
+                    let scope = Scope::Row(&out_cols, &r);
+                    if three_valued(&self.eval(w, &scope, None)?) != Some(true) {
+                        continue;
+                    }
+                }
+                out_rows.push(r);
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// The fixed output columns and rows for a metadata procedure (lowercased name).
+    fn procedure_rows(&self, name: &str) -> Result<(Vec<String>, Vec<Vec<Val>>)> {
+        match name {
+            // Slater enforces no constraints, so this is always empty — but with the
+            // FalkorDB `db.constraints` output shape so a YIELD over it still binds.
+            "db.constraints" => Ok((
+                ["type", "label", "properties", "entitytype", "status"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                Vec::new(),
+            )),
+            "db.meta.stats" => Ok(self.meta_stats()),
+            "dbms.procedures" => Ok(slater_procedures()),
+            "dbms.functions" => Ok(slater_functions()),
+            other => bail!("unknown procedure '{other}'"),
+        }
+    }
+
+    /// `CALL db.meta.stats()` — schema/stat counts from the manifest plus the
+    /// per-label / per-reltype count maps (ported from FalkorDB `proc_meta_stats.c`).
+    /// All counts come from resident indexes (`nodes_with_label`, `edges_with_reltype`)
+    /// — no graph scan.
+    fn meta_stats(&self) -> (Vec<String>, Vec<Vec<Val>>) {
+        let m = self.gen.manifest();
+        let labels: Vec<(String, Val)> = m
+            .labels
+            .iter()
+            .map(|l| {
+                let cnt = self
+                    .gen
+                    .label_id(l)
+                    .map(|id| self.gen.nodes_with_label(id).len())
+                    .unwrap_or(0);
+                (l.clone(), Val::Int(cnt as i64))
+            })
+            .collect();
+        let reltypes: Vec<(String, Val)> = m
+            .reltypes
+            .iter()
+            .map(|t| {
+                let cnt = self
+                    .gen
+                    .reltype_id(t)
+                    .map(|id| self.gen.edges_with_reltype(id).len())
+                    .unwrap_or(0);
+                (t.clone(), Val::Int(cnt as i64))
+            })
+            .collect();
+        let cols = [
+            "labels",
+            "relTypes",
+            "relCount",
+            "nodeCount",
+            "labelCount",
+            "relTypeCount",
+            "propertyKeyCount",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let row = vec![
+            Val::Map(labels),
+            Val::Map(reltypes),
+            Val::Int(m.edge_count as i64),
+            Val::Int(m.node_count as i64),
+            Val::Int(m.labels.len() as i64),
+            Val::Int(m.reltypes.len() as i64),
+            Val::Int(m.property_keys.len() as i64),
+        ];
+        (cols, vec![row])
     }
 
     // ── CALL db.idx.vector.queryNodes (brute-force KNN) ──────────────────────
@@ -2758,6 +2892,105 @@ impl AggCursor {
         self.cur.set(i + 1);
         self.vals.get(i).cloned().unwrap_or(Val::Null)
     }
+}
+
+/// The procedures slater can answer — `CALL dbms.procedures()` self-report. Every
+/// one is read-only (slater is a read-only engine). Includes both the procedures
+/// dispatched through the query engine (Phase 11) and those answered pre-parse from
+/// the manifest (`db.labels`, `db.indexes`, …) and at the server level
+/// (`dbms.components`): all are callable, so all are reported.
+const SLATER_PROCEDURES: &[&str] = &[
+    "db.constraints",
+    "db.idx.vector.queryNodes",
+    "db.indexes",
+    "db.labels",
+    "db.meta.stats",
+    "db.propertyKeys",
+    "db.relationshipTypes",
+    "dbms.components",
+    "dbms.functions",
+    "dbms.procedures",
+];
+
+/// The scalar + aggregate functions slater implements (lowercased canonical names),
+/// self-reported by `CALL dbms.functions()`. Hand-maintained to mirror the
+/// `call_function` match arms + [`is_aggregate`]; doubles as the roadmap's coverage
+/// gate against FalkorDB's 144-entry `builtin_funcs.gperf`. Add a name here whenever
+/// a new function arm lands.
+const IMPLEMENTED_FUNCTIONS: &[&str] = &[
+    // aggregates
+    "avg", "collect", "count", "max", "min", "percentilecont", "percentiledisc",
+    "stdev", "stdevp", "sum",
+    // numeric / trig
+    "abs", "acos", "asin", "atan", "atan2", "ceil", "cos", "cot", "degrees", "e",
+    "exp", "floor", "haversin", "log", "log10", "pi", "pow", "radians", "round",
+    "sign", "sin", "sqrt", "tan",
+    // string
+    "left", "ltrim", "replace", "reverse", "right", "rtrim", "split", "string.join",
+    "string.matchregex", "string.replaceregex", "substring", "tolower", "toupper",
+    "trim", "lower", "upper",
+    // conversion
+    "toboolean", "tobooleanlist", "tobooleanornull", "tofloat", "tofloatlist",
+    "tofloatornull", "tointeger", "tointegerlist", "tointegerornull", "tostring",
+    "tostringlist", "tostringornull",
+    // list
+    "head", "keys", "last", "list.dedup", "list.insert", "list.insertlistelements",
+    "list.remove", "list.sort", "range", "size", "tail",
+    // predicate / type
+    "coalesce", "exists", "isempty", "type", "typeof",
+    // entity / path
+    "endnode", "haslabels", "id", "indegree", "labels", "length", "nodes",
+    "outdegree", "properties", "relationships", "startnode",
+    // vector
+    "similarity", "vec.cosinedistance", "vec.cosinesimilarity",
+    "vec.euclideandistance", "vecf32",
+    // spatial
+    "distance", "point",
+];
+
+/// `CALL dbms.procedures()` — `[name, mode]` rows, one per [`SLATER_PROCEDURES`].
+fn slater_procedures() -> (Vec<String>, Vec<Vec<Val>>) {
+    let cols = vec!["name".to_string(), "mode".to_string()];
+    let rows = SLATER_PROCEDURES
+        .iter()
+        .map(|n| vec![Val::Str(n.to_string()), Val::Str("READ".to_string())])
+        .collect();
+    (cols, rows)
+}
+
+/// `CALL dbms.functions()` — one row per [`IMPLEMENTED_FUNCTIONS`] with FalkorDB's
+/// 7-column output shape. `name` and `aggregation` are exact; the type-signature
+/// columns (`return_type`, `arguments`) are reported as the permissive `"Any"`
+/// rather than reproducing FalkorDB's per-function `SIType` strings (slater carries
+/// no static type descriptors). `internal`/`reducible`/`variable_len` are `false`.
+fn slater_functions() -> (Vec<String>, Vec<Vec<Val>>) {
+    let cols = [
+        "name",
+        "return_type",
+        "arguments",
+        "internal",
+        "reducible",
+        "aggregation",
+        "variable_len",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let rows = IMPLEMENTED_FUNCTIONS
+        .iter()
+        .map(|n| {
+            vec![
+                Val::Str(n.to_string()),
+                Val::Str("Any".to_string()),
+                Val::List(Vec::new()),
+                Val::Bool(false),
+                Val::Bool(false),
+                Val::Bool(is_aggregate(n)),
+                Val::Bool(false),
+            ]
+        })
+        .collect();
+    (cols, rows)
 }
 
 fn is_aggregate(name: &str) -> bool {
@@ -5930,5 +6163,157 @@ mod tests {
             "MATCH (a:Person {name:'Alice'}) RETURN shortestPath((a)-[:KNOWS*]->(z))",
         );
         assert!(msg.contains("requires bound nodes"), "{msg}");
+    }
+
+    // ── Phase 11: metadata procedures (CALL dispatch) ────────────────────────
+    // Vectors adapted from FalkorDB tests/flow/test_procedures.py (test11/test12)
+    // onto the read-only fixture: Person(3)/Company(2) nodes, KNOWS(3)/WORKS_AT(2)
+    // edges, 5 property keys.
+
+    fn map_get<'a>(v: &'a Val, key: &str) -> &'a Val {
+        match v {
+            Val::Map(m) => m
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, val)| val)
+                .unwrap_or_else(|| panic!("key {key:?} absent in {v:?}")),
+            o => panic!("expected map, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn phase11_meta_stats_bare() {
+        // A bare `CALL db.meta.stats()` (no YIELD/RETURN) returns every output.
+        let (root, res) = run("exec_p11_meta", "CALL db.meta.stats()");
+        assert_eq!(
+            res.columns,
+            vec![
+                "labels",
+                "relTypes",
+                "relCount",
+                "nodeCount",
+                "labelCount",
+                "relTypeCount",
+                "propertyKeyCount"
+            ]
+        );
+        assert_eq!(res.rows.len(), 1);
+        let r = &res.rows[0];
+        assert!(matches!(map_get(&r[0], "Person"), Val::Int(3)));
+        assert!(matches!(map_get(&r[0], "Company"), Val::Int(2)));
+        assert!(matches!(map_get(&r[1], "KNOWS"), Val::Int(3)));
+        assert!(matches!(map_get(&r[1], "WORKS_AT"), Val::Int(2)));
+        assert!(matches!(r[2], Val::Int(5)), "relCount");
+        assert!(matches!(r[3], Val::Int(5)), "nodeCount");
+        assert!(matches!(r[4], Val::Int(2)), "labelCount");
+        assert!(matches!(r[5], Val::Int(2)), "relTypeCount");
+        assert!(matches!(r[6], Val::Int(5)), "propertyKeyCount");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_meta_stats_yield_projection() {
+        // YIELD selects/reorders outputs into a downstream pipeline.
+        let (root, res) = run(
+            "exec_p11_meta_yield",
+            "CALL db.meta.stats() YIELD nodeCount, relCount, propertyKeyCount \
+             RETURN propertyKeyCount AS pk, nodeCount AS n, relCount AS r",
+        );
+        assert_eq!(res.columns, vec!["pk", "n", "r"]);
+        let r = &res.rows[0];
+        assert!(matches!(r[0], Val::Int(5)));
+        assert!(matches!(r[1], Val::Int(5)));
+        assert!(matches!(r[2], Val::Int(5)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_dbms_procedures_yield_order() {
+        // FalkorDB test11 form: YIELD mode, name RETURN mode, name ORDER BY name.
+        let (root, res) = run(
+            "exec_p11_procs",
+            "CALL dbms.procedures() YIELD mode, name RETURN mode, name ORDER BY name",
+        );
+        assert_eq!(res.columns, vec!["mode", "name"]);
+        // Every procedure is READ; names are sorted.
+        let names: Vec<String> = res.rows.iter().map(|r| r[1].to_display()).collect();
+        assert!(res.rows.iter().all(|r| r[0].to_display() == "READ"));
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "ORDER BY name");
+        for want in ["db.constraints", "db.meta.stats", "dbms.functions", "dbms.procedures"] {
+            assert!(names.iter().any(|n| n == want), "missing {want}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_dbms_functions_aggregation_flag() {
+        // FalkorDB test12 form (literals instead of $param): the aggregation flag
+        // distinguishes aggregates from scalars.
+        let (root, res) = run(
+            "exec_p11_funcs",
+            "CALL dbms.functions() YIELD name, aggregation \
+             WHERE name IN ['avg', 'count', 'sin'] \
+             RETURN name, aggregation ORDER BY name",
+        );
+        assert_eq!(res.columns, vec!["name", "aggregation"]);
+        let got: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("avg".to_string(), "true".to_string()),
+                ("count".to_string(), "true".to_string()),
+                ("sin".to_string(), "false".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_dbms_functions_coverage_gate() {
+        // The self-report is the coverage gate: a representative sample of the
+        // functions landed through Phases 1–9 must be present.
+        let (root, res) = run("exec_p11_funcs_cov", "CALL dbms.functions() YIELD name RETURN name");
+        let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+        for want in [
+            "sin", "tail", "point", "distance", "vec.euclideandistance",
+            "tofloatornull", "percentilecont", "string.matchregex",
+        ] {
+            assert!(names.iter().any(|n| n == want), "coverage gate missing {want}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_db_constraints_empty() {
+        // slater enforces no constraints → empty result with the FalkorDB shape.
+        let (root, res) = run(
+            "exec_p11_constraints",
+            "CALL db.constraints() YIELD type, label, properties, entitytype, status \
+             RETURN type, label, properties, entitytype, status",
+        );
+        assert_eq!(
+            res.columns,
+            vec!["type", "label", "properties", "entitytype", "status"]
+        );
+        assert!(res.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase11_call_unknown_yield_errors() {
+        let (root, graph, _) = testgen::write_basic("exec_p11_badyield");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let ast = parser::parse("CALL db.meta.stats() YIELD bogus RETURN bogus").unwrap();
+        let err = engine.run(&ast).unwrap_err().to_string();
+        assert!(err.contains("does not yield 'bogus'"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -60,7 +60,11 @@ kw_unwind = @{ ^"unwind" ~ !ident_cont }
 query = { SOI ~ single_query ~ (union ~ single_query)* ~ EOI }
 union = { kw_union ~ kw_all? }
 
-single_query = { forbidden_query | reading_clause* ~ return_clause }
+// A bare metadata `CALL proc()` (no trailing RETURN) is a complete query — its
+// yielded outputs are the result columns. The middle alternative greedily
+// consumes a `CALL … YIELD … RETURN …` (the call is a `reading_clause`), so the
+// trailing `call_clause` only fires for the RETURN-less browser form.
+single_query = { forbidden_query | reading_clause* ~ return_clause | call_clause }
 
 // If a query reaches a write/procedure clause we consume the rest verbatim so the
 // parse still succeeds and the translator can reject it with a clear "read-only"
@@ -72,11 +76,11 @@ forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
 forbidden_clause = @{
     (^"create" | ^"merge" | ^"set" | ^"delete" | ^"remove" | ^"detach"
       | ^"foreach" | ^"load") ~ !ident_cont
-  | ^"call" ~ !ident_cont ~ !(inline_ws+ ~ vector_proc)
+  | ^"call" ~ !ident_cont ~ !(inline_ws+ ~ (vector_proc | read_proc))
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause | unwind_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | call_clause | unwind_clause }
 
 // UNWIND is a read clause (it multiplies rows over a list); it is NOT forbidden.
 unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias }
@@ -89,6 +93,18 @@ vector_call_clause = {
 vector_proc = @{ ^"db.idx.vector.queryNodes" }
 yield_clause = { kw_yield ~ yield_item ~ ("," ~ yield_item)* }
 yield_item = { identifier ~ (kw_as ~ alias)? }
+
+// Read-only metadata procedures (Phase 11). Unlike the vector procedure these take
+// no index/argument and project schema/stat columns. Whitelisted in
+// `forbidden_clause`'s negative lookahead so every *other* `CALL` stays rejected as
+// read-only. They bind their YIELD outputs (or all outputs, when YIELD is absent)
+// into scope like the vector call does.
+read_proc = @{
+    ^"db.meta.stats" | ^"db.constraints" | ^"dbms.procedures" | ^"dbms.functions"
+}
+call_clause = {
+    kw_call ~ read_proc ~ "(" ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" ~ yield_clause? ~ where_clause?
+}
 
 match_clause = { kw_optional? ~ kw_match ~ pattern ~ ("," ~ pattern)* ~ where_clause? }
 

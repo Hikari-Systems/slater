@@ -47,7 +47,26 @@ pub mod ast {
         Match(MatchClause),
         With(WithClause),
         VectorCall(VectorCallClause),
+        Call(CallClause),
         Unwind(UnwindClause),
+    }
+
+    /// A read-only metadata procedure call (Phase 11): `CALL db.meta.stats()`,
+    /// `CALL dbms.procedures() YIELD name, mode`, etc. The procedure takes no
+    /// arguments; its named outputs are bound by `YIELD` (or all of them, when
+    /// `YIELD` is absent) and an optional `WHERE` filters the yielded rows.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct CallClause {
+        /// The procedure name as written (case preserved); dispatch lowercases it.
+        pub name: String,
+        /// Call arguments (none of these procedures take any — kept for the parse
+        /// shape and a clear "takes no arguments" error at exec).
+        pub args: Vec<Expr>,
+        /// `(procedure output, bound variable)` pairs from `YIELD`; empty means a
+        /// bare call binding every output under its own name.
+        pub yields: Vec<(String, String)>,
+        /// An optional `WHERE` filtering the yielded rows.
+        pub where_: Option<Expr>,
     }
 
     /// `UNWIND <expr> AS <var>` — a read clause that emits one row per element of
@@ -362,6 +381,12 @@ fn lower_single_query(pair: Pair<Rule>) -> Result<SingleQuery> {
             }
             Rule::reading_clause => reading.push(lower_reading_clause(child)?),
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
+            // A bare standalone `CALL proc()` (no trailing RETURN): the call is the
+            // whole query, so synthesise a `RETURN *` over its yielded outputs.
+            Rule::call_clause => {
+                reading.push(Clause::Call(lower_call_clause(child)?));
+                ret = Some(star_return());
+            }
             other => bail!("internal: unexpected single_query child {other:?}"),
         }
     }
@@ -371,15 +396,76 @@ fn lower_single_query(pair: Pair<Rule>) -> Result<SingleQuery> {
     })
 }
 
+/// A synthetic `RETURN *` — used for a bare metadata `CALL proc()` whose result
+/// columns are exactly the procedure's yielded outputs.
+fn star_return() -> ReturnClause {
+    ReturnClause {
+        distinct: false,
+        body: ProjectionBody {
+            star: true,
+            items: Vec::new(),
+            order_by: Vec::new(),
+            skip: None,
+            limit: None,
+        },
+    }
+}
+
 fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
     let inner = only_child(pair)?;
     match inner.as_rule() {
         Rule::match_clause => Ok(Clause::Match(lower_match_clause(inner)?)),
         Rule::with_clause => Ok(Clause::With(lower_with_clause(inner)?)),
         Rule::vector_call_clause => Ok(Clause::VectorCall(lower_vector_call(inner)?)),
+        Rule::call_clause => Ok(Clause::Call(lower_call_clause(inner)?)),
         Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
         other => bail!("internal: unexpected reading clause {other:?}"),
     }
+}
+
+/// Lower a read-only metadata `call_clause` into a [`CallClause`]. Mirrors
+/// [`lower_vector_call`]'s YIELD/WHERE collection but for argument-less procedures
+/// whose outputs are fixed by name.
+fn lower_call_clause(pair: Pair<Rule>) -> Result<CallClause> {
+    let mut name = String::new();
+    let mut args: Vec<Expr> = Vec::new();
+    let mut yields: Vec<(String, String)> = Vec::new();
+    let mut where_ = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::read_proc => name = child.as_str().to_string(),
+            Rule::where_clause => where_ = Some(lower_expr(only_child(child)?)?),
+            Rule::func_arg => {
+                let inner = only_child(child)?;
+                if inner.as_rule() == Rule::star_arg {
+                    bail!("procedure {name} does not take '*' as an argument");
+                }
+                args.push(lower_expr(inner)?);
+            }
+            Rule::yield_clause => {
+                for item in kids(child) {
+                    if item.as_rule() != Rule::yield_item {
+                        continue;
+                    }
+                    let mut it = kids(item);
+                    let output = ident_text(it.next().unwrap())?;
+                    let bound = it
+                        .next()
+                        .map(ident_text)
+                        .transpose()?
+                        .unwrap_or_else(|| output.clone());
+                    yields.push((output, bound));
+                }
+            }
+            other => bail!("internal: unexpected call_clause child {other:?}"),
+        }
+    }
+    Ok(CallClause {
+        name,
+        args,
+        yields,
+        where_,
+    })
 }
 
 fn lower_vector_call(pair: Pair<Rule>) -> Result<VectorCallClause> {
@@ -1550,6 +1636,60 @@ mod tests {
             "CALL db.idx.vector.queryNodes('L', 'p', 5, vecf32([0.1])) YIELD bogus RETURN bogus"
         )
         .is_err());
+    }
+
+    #[test]
+    fn lowers_metadata_call_clause() {
+        // Bare standalone call (no YIELD, no RETURN): a synthetic RETURN * is added.
+        let q = ok("CALL db.meta.stats()");
+        let Clause::Call(cc) = &q.head.reading[0] else {
+            panic!("expected a Call clause, got {:?}", q.head.reading[0]);
+        };
+        assert_eq!(cc.name.to_ascii_lowercase(), "db.meta.stats");
+        assert!(cc.yields.is_empty());
+        assert!(cc.where_.is_none());
+        assert!(q.head.ret.body.star, "bare call synthesises RETURN *");
+
+        // YIELD + WHERE + RETURN form (FalkorDB test11/test12 shape).
+        let q = ok(
+            "CALL dbms.functions() YIELD name AS fn, aggregation WHERE aggregation = true \
+             RETURN fn ORDER BY fn",
+        );
+        let Clause::Call(cc) = &q.head.reading[0] else {
+            panic!("expected a Call clause");
+        };
+        assert_eq!(cc.name.to_ascii_lowercase(), "dbms.functions");
+        assert_eq!(
+            cc.yields,
+            vec![
+                ("name".to_string(), "fn".to_string()),
+                ("aggregation".to_string(), "aggregation".to_string()),
+            ]
+        );
+        assert!(cc.where_.is_some());
+        assert!(!q.head.ret.body.star);
+    }
+
+    #[test]
+    fn metadata_call_whitelist_only() {
+        // The four read-only metadata procs parse; every other CALL stays rejected
+        // as read-only (the whitelist is exactly vector + these four).
+        for q in [
+            "CALL db.meta.stats()",
+            "CALL db.constraints()",
+            "CALL dbms.procedures()",
+            "CALL dbms.functions()",
+        ] {
+            assert!(parse(q).is_ok(), "expected {q:?} to parse");
+        }
+        for q in [
+            "CALL db.labels()",
+            "CALL dbms.security.listUsers()",
+            "CALL algo.pageRank()",
+        ] {
+            let e = err(q);
+            assert!(e.contains("read-only"), "for {q:?} expected read-only, got: {e}");
+        }
     }
 
     #[test]

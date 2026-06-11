@@ -2472,6 +2472,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn meta_stats_procedure_returns_counts_over_bolt() {
+        // Phase 11: a metadata CALL flows through the normal RUN/PULL query path
+        // (it is NOT a pre-parse interception), so its Map output is PackStream-
+        // encoded like any other value.
+        let (root, ctx) = build_ctx("server_metastats");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        c.recv().await;
+        c.send(Client::logon("reporting", "pw")).await;
+        c.recv().await;
+
+        c.send(Client::run(
+            "CALL db.meta.stats() YIELD labels, nodeCount, relCount RETURN labels, nodeCount, relCount",
+        ))
+        .await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(
+            fields[0].get("fields"),
+            Some(&PsValue::List(vec![
+                PsValue::str("labels"),
+                PsValue::str("nodeCount"),
+                PsValue::str("relCount"),
+            ]))
+        );
+
+        c.send(Client::pull_all()).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::RECORD);
+        let PsValue::List(vals) = &fields[0] else {
+            panic!("expected a record list, got {:?}", fields[0]);
+        };
+        // labels is a {label: count} map; nodeCount/relCount are the scalar totals.
+        assert_eq!(vals[0].get("Person"), Some(&PsValue::Int(3)));
+        assert_eq!(vals[0].get("Company"), Some(&PsValue::Int(2)));
+        assert_eq!(vals[1].as_int(), Some(5));
+        assert_eq!(vals[2].as_int(), Some(5));
+
+        let (tag, _) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn identical_query_is_served_from_the_result_cache() {
         let (root, ctx) = build_ctx("server_resultcache");
         let addr = spawn_server(ctx.clone()).await;
