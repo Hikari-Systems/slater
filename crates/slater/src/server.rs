@@ -54,6 +54,10 @@ use crate::parser;
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 const TAG_NODE: u8 = 0x4E;
 const TAG_RELATIONSHIP: u8 = 0x52;
+/// Bolt `Path` (`0x50`) and the `UnboundRelationship` (`0x72`) it carries — a
+/// relationship without endpoint ids, since the path's node list supplies them.
+const TAG_PATH: u8 = 0x50;
+const TAG_UNBOUND_REL: u8 = 0x72;
 
 /// The `server` agent string returned in the `HELLO` reply. Kept with a `Neo4j/`
 /// prefix so the official drivers' feature-gating (which sniffs this string) treats
@@ -1497,6 +1501,9 @@ fn val_bytes(v: &Val) -> usize {
         }
         Val::Node(_) => 24,
         Val::Rel { .. } => 40,
+        Val::Path { nodes, rels } => {
+            16 + nodes.len() * 24 + rels.iter().map(val_bytes).sum::<usize>()
+        }
     }
 }
 
@@ -1559,6 +1566,85 @@ fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
                 fields,
             }
         }
+        // Bolt `Path` (0x50): a list of the distinct nodes (start first), a list of
+        // the distinct relationships as `UnboundRelationship` (0x72) structures, and
+        // an `indices` list weaving them into walk order. Each segment contributes a
+        // pair `[rel_index, node_index]`: `rel_index` is 1-based into the rel list,
+        // signed by traversal direction (+ when the edge's stored src→dst matches the
+        // walk, − when reversed); `node_index` is 0-based into the node list of the
+        // node reached. The walk starts at node 0. Validated against the Neo4j driver
+        // decoder semantics, not FalkorDB's RESP path.
+        Val::Path { nodes, rels } => {
+            // Distinct nodes, preserving first-appearance order (start at index 0).
+            let mut node_ids: Vec<u64> = Vec::new();
+            let mut node_pos: HashMap<u64, usize> = HashMap::new();
+            for &nid in nodes {
+                node_pos.entry(nid).or_insert_with(|| {
+                    node_ids.push(nid);
+                    node_ids.len() - 1
+                });
+            }
+            // Distinct relationships by id (a bidirectional walk may reuse an edge).
+            let mut rel_pos: HashMap<u64, usize> = HashMap::new();
+            let mut rel_order: Vec<&Val> = Vec::new();
+            for r in rels {
+                if let Val::Rel { id, .. } = r {
+                    rel_pos.entry(*id).or_insert_with(|| {
+                        rel_order.push(r);
+                        rel_order.len() - 1
+                    });
+                }
+            }
+            let node_structs = node_ids
+                .iter()
+                .map(|id| encode_val(engine, version, &Val::Node(*id)))
+                .collect::<Result<Vec<_>>>()?;
+            let rel_structs = rel_order
+                .iter()
+                .map(|r| encode_unbound_rel(engine, version, r))
+                .collect::<Result<Vec<_>>>()?;
+            let mut indices = Vec::with_capacity(rels.len() * 2);
+            for (k, r) in rels.iter().enumerate() {
+                if let Val::Rel { id, start, end, .. } = r {
+                    let from = nodes[k];
+                    let to = nodes[k + 1];
+                    let idx = (rel_pos[id] + 1) as i64;
+                    let signed = if *start == from && *end == to { idx } else { -idx };
+                    indices.push(PsValue::Int(signed));
+                    indices.push(PsValue::Int(node_pos[&to] as i64));
+                }
+            }
+            PsValue::Struct {
+                tag: TAG_PATH,
+                fields: vec![
+                    PsValue::List(node_structs),
+                    PsValue::List(rel_structs),
+                    PsValue::List(indices),
+                ],
+            }
+        }
+    })
+}
+
+/// Encode a `Val::Rel` as a Bolt `UnboundRelationship` (0x72): `[id, type, props]`
+/// (plus the element-id field for Bolt ≥ 5). Endpoints are omitted — a path's node
+/// list supplies them.
+fn encode_unbound_rel(engine: &Engine, version: (u8, u8), r: &Val) -> Result<PsValue> {
+    let Val::Rel { id, reltype, .. } = r else {
+        bail!("encode_unbound_rel expects a relationship value");
+    };
+    let (type_name, props) = engine.rel_record(*id, *reltype)?;
+    let mut fields = vec![
+        PsValue::Int(*id as i64),
+        PsValue::String(type_name),
+        PsValue::Map(encode_pairs(engine, version, &props)?),
+    ];
+    if version.0 >= 5 {
+        fields.push(PsValue::String(id.to_string())); // element_id
+    }
+    Ok(PsValue::Struct {
+        tag: TAG_UNBOUND_REL,
+        fields,
     })
 }
 
@@ -2116,6 +2202,83 @@ mod tests {
             other => panic!("expected a Relationship struct, got {other:?}"),
         }
         // Drain the trailing SUCCESS.
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn returns_path_structure() {
+        let (root, ctx) = build_ctx("server_path");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        c.recv().await;
+        c.send(Client::logon("reporting", "pw")).await;
+        c.recv().await;
+
+        c.send(Client::run(
+            "MATCH p = (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN p",
+        ))
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::RECORD);
+        let row = match &fields[0] {
+            PsValue::List(vals) => vals,
+            other => panic!("expected a record list, got {other:?}"),
+        };
+        // Path p: struct 'P' (0x50) with [nodes, rels, indices].
+        let (path_tag, path_fields) = match &row[0] {
+            PsValue::Struct { tag, fields } => (*tag, fields),
+            other => panic!("expected a Path struct, got {other:?}"),
+        };
+        assert_eq!(path_tag, TAG_PATH);
+        assert_eq!(path_fields.len(), 3);
+
+        // Field 0: the two nodes (Alice at index 0, Bob at index 1).
+        let nodes = match &path_fields[0] {
+            PsValue::List(ns) => ns,
+            other => panic!("expected a node list, got {other:?}"),
+        };
+        assert_eq!(nodes.len(), 2);
+        for (n, name) in nodes.iter().zip(["Alice", "Bob"]) {
+            match n {
+                PsValue::Struct { tag, fields } => {
+                    assert_eq!(*tag, TAG_NODE);
+                    assert_eq!(fields[2].get("name"), Some(&PsValue::str(name)));
+                }
+                other => panic!("expected a Node struct, got {other:?}"),
+            }
+        }
+
+        // Field 1: one UnboundRelationship (0x72) — [id, type, props, element_id],
+        // no endpoint ids (the node list supplies them).
+        let rels = match &path_fields[1] {
+            PsValue::List(rs) => rs,
+            other => panic!("expected a rel list, got {other:?}"),
+        };
+        assert_eq!(rels.len(), 1);
+        match &rels[0] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_UNBOUND_REL);
+                assert_eq!(fields.len(), 4); // Bolt 5: id, type, props, element_id
+                assert_eq!(fields[0], PsValue::Int(0), "edge id");
+                assert_eq!(fields[1], PsValue::str("KNOWS"), "type");
+                assert_eq!(fields[2].get("since"), Some(&PsValue::Int(2020)));
+            }
+            other => panic!("expected an UnboundRelationship struct, got {other:?}"),
+        }
+
+        // Field 2: indices weaving the single forward segment — rel 1 (+, forward)
+        // into node index 1 (Bob).
+        assert_eq!(
+            path_fields[2],
+            PsValue::List(vec![PsValue::Int(1), PsValue::Int(1)]),
+            "path indices"
+        );
+
         assert_eq!(c.recv().await.0, message::tag::SUCCESS);
         let _ = std::fs::remove_dir_all(&root);
     }

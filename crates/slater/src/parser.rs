@@ -293,6 +293,10 @@ pub mod ast {
             patterns: Vec<Pattern>,
             predicate: Option<Box<Expr>>,
         },
+        /// `shortestPath((a)-[*]->(b))` — the shortest path between two already-bound
+        /// endpoint nodes over a single variable-length relationship, or NULL when no
+        /// path exists. The inner pattern carries exactly one relationship.
+        ShortestPath(Box<Pattern>),
     }
 }
 
@@ -927,6 +931,7 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::pattern_comp => lower_pattern_comp(inner),
         Rule::pattern_predicate => lower_pattern_predicate(inner),
         Rule::exists_subquery => lower_exists(inner),
+        Rule::shortest_path => lower_shortest_path(inner),
         other => bail!("internal: unexpected primary {other:?}"),
     }
 }
@@ -1166,6 +1171,15 @@ fn lower_exists(pair: Pair<Rule>) -> Result<Expr> {
         patterns,
         predicate,
     })
+}
+
+fn lower_shortest_path(pair: Pair<Rule>) -> Result<Expr> {
+    // shortest_path = { shortest_path_kw ~ "(" ~ pattern ~ ")" }
+    let pat = pair
+        .into_inner()
+        .find(|c| c.as_rule() == Rule::pattern)
+        .ok_or_else(|| anyhow::anyhow!("shortestPath() requires a pattern"))?;
+    Ok(Expr::ShortestPath(Box::new(lower_pattern(pat)?)))
 }
 
 fn lower_literal(pair: Pair<Rule>) -> Result<Expr> {
@@ -1808,6 +1822,43 @@ mod tests {
         assert!(matches!(
             match_where(&q),
             Expr::Function { name, .. } if name == "exists"
+        ));
+    }
+
+    #[test]
+    fn lowers_shortest_path() {
+        // shortestPath wraps a pattern (parsed as a pattern, not function args).
+        let q = ok("MATCH (a), (b) WHERE shortestPath((a)-[:KNOWS*]->(b)) RETURN a");
+        match match_where(&q) {
+            Expr::ShortestPath(pat) => {
+                assert_eq!(pat.start.var.as_deref(), Some("a"));
+                assert_eq!(pat.rels.len(), 1);
+                assert_eq!(pat.rels[0].1.var.as_deref(), Some("b"));
+                assert_eq!(pat.rels[0].0.dir, Direction::Outgoing);
+            }
+            other => panic!("expected ShortestPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binds_path_variable() {
+        // `p = …` records the path variable on the MATCH pattern.
+        let q = ok("MATCH p = (a)-[:KNOWS]->(b) RETURN p");
+        let Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a MATCH clause");
+        };
+        assert_eq!(m.patterns[0].path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn all_shortest_paths_not_supported() {
+        // allShortestPaths is deferred: it is not in the grammar, so its `(…)` body
+        // parses as ordinary function arguments (the inner pattern as a pattern
+        // predicate) and the name is rejected as an unknown function at eval time.
+        let q = ok("MATCH (a), (b) RETURN allShortestPaths((a)-[*]->(b))");
+        assert!(matches!(
+            &q.head.ret.body.items[0].expr,
+            Expr::Function { name, .. } if name == "allShortestPaths"
         ));
     }
 }

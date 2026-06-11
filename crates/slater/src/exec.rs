@@ -101,6 +101,15 @@ pub enum Val {
         end: u64,
         reltype: u32,
     },
+    /// A path: an alternating node/relationship sequence `n0, r0, n1, r1, …, nk`.
+    /// `nodes` holds the `k+1` node ids in walk order (with repeats for a path
+    /// that revisits a node); `rels` holds the `k` relationship values
+    /// (`Val::Rel`, each carrying its *stored* src→dst direction) in walk order.
+    /// Constructor/compute-only — paths are never stored or decoded from disk.
+    Path {
+        nodes: Vec<u64>,
+        rels: Vec<Val>,
+    },
 }
 
 impl Val {
@@ -127,6 +136,7 @@ impl Val {
             Val::Map(_) => 6,
             Val::Node(_) => 7,
             Val::Rel { .. } => 8,
+            Val::Path { .. } => 9,
         }
     }
 
@@ -149,6 +159,22 @@ impl Val {
             (Str(a), Str(b)) => a.cmp(b),
             (Node(a), Node(b)) => a.cmp(b),
             (Rel { id: a, .. }, Rel { id: b, .. }) => a.cmp(b),
+            (
+                Path {
+                    nodes: na,
+                    rels: ra,
+                },
+                Path {
+                    nodes: nb,
+                    rels: rb,
+                },
+            ) => na.cmp(nb).then_with(|| {
+                ra.iter()
+                    .zip(rb)
+                    .map(|(x, y)| x.cmp_total(y))
+                    .find(|o| *o != Ordering::Equal)
+                    .unwrap_or_else(|| ra.len().cmp(&rb.len()))
+            }),
             (List(a), List(b)) => a
                 .iter()
                 .zip(b)
@@ -197,6 +223,22 @@ impl Val {
             (Str(a), Str(b)) => a == b,
             (Node(a), Node(b)) => a == b,
             (Rel { id: a, .. }, Rel { id: b, .. }) => a == b,
+            // Path equality: same node-id sequence and same relationship sequence
+            // (FalkorDB `Path_eq` — endpoints + edges in order).
+            (
+                Path {
+                    nodes: na,
+                    rels: ra,
+                },
+                Path {
+                    nodes: nb,
+                    rels: rb,
+                },
+            ) => {
+                na == nb
+                    && ra.len() == rb.len()
+                    && ra.iter().zip(rb).all(|(x, y)| x.loose_eq(y) == Some(true))
+            }
             (Vector(a), Vector(b)) => a == b,
             (List(a), List(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.loose_eq(y) == Some(true))
@@ -914,7 +956,8 @@ impl<'g> Engine<'g> {
             if let Some(v) = &start.var {
                 b.insert(v.clone(), Val::Node(c));
             }
-            self.expand_chain(pattern, 0, c, b, out)?;
+            let mut path = Vec::new();
+            self.expand_chain(pattern, 0, c, b, c, &mut path, out)?;
         }
         Ok(())
     }
@@ -978,15 +1021,22 @@ impl<'g> Engine<'g> {
         Some(reverse_pattern(pattern))
     }
 
+    #[allow(clippy::too_many_arguments)] // recursive walk: scratch path buffer + start anchor
     fn expand_chain(
         &self,
         pattern: &Pattern,
         i: usize,
         cur: u64,
         binding: HashMap<String, Val>,
+        start: u64,
+        walk: &mut Vec<Hop>,
         out: &mut Vec<HashMap<String, Val>>,
     ) -> Result<()> {
         if i == pattern.rels.len() {
+            let mut binding = binding;
+            if let Some(pv) = &pattern.path_var {
+                binding.insert(pv.clone(), make_path(start, walk));
+            }
             out.push(binding);
             return Ok(());
         }
@@ -1013,7 +1063,9 @@ impl<'g> Engine<'g> {
                     if let Some(v) = &next.var {
                         b.insert(v.clone(), Val::Node(nb));
                     }
-                    self.expand_chain(pattern, i + 1, nb, b, out)?;
+                    walk.push(hop);
+                    self.expand_chain(pattern, i + 1, nb, b, start, walk, out)?;
+                    walk.pop();
                 }
             }
             Some(vl) => {
@@ -1048,7 +1100,10 @@ impl<'g> Engine<'g> {
                     if let Some(v) = &next.var {
                         b.insert(v.clone(), Val::Node(endnode));
                     }
-                    self.expand_chain(pattern, i + 1, endnode, b, out)?;
+                    let n = hops.len();
+                    walk.extend(hops);
+                    self.expand_chain(pattern, i + 1, endnode, b, start, walk, out)?;
+                    walk.truncate(walk.len() - n);
                 }
             }
         }
@@ -1624,7 +1679,112 @@ impl<'g> Engine<'g> {
                 self.match_patterns(patterns, 0, seed, predicate.as_deref(), &mut bindings)?;
                 Ok(Val::Bool(!bindings.is_empty()))
             }
+            Expr::ShortestPath(pattern) => self.eval_shortest_path(pattern, scope),
         }
+    }
+
+    /// Evaluate `shortestPath((a)-[*]->(b))` against the current scope: a BFS over
+    /// the traversal adjacency from the bound source to the bound destination,
+    /// returning the first (hence shortest) connecting [`Val::Path`], or `Val::Null`
+    /// when none exists. Mirrors FalkorDB's validation of the wrapped pattern.
+    fn eval_shortest_path(&self, pattern: &Pattern, scope: &Scope) -> Result<Val> {
+        // The inner pattern must be a single variable-length relationship with no
+        // property filter, between two endpoints already bound to nodes.
+        if pattern.rels.len() != 1 {
+            bail!("shortestPath requires a path containing a single relationship");
+        }
+        let (rel, end) = &pattern.rels[0];
+        if !rel.props.is_empty() {
+            bail!("filters on relationships in shortestPath are not supported");
+        }
+        let (min, max) = match &rel.var_length {
+            Some(vl) => varlen_bounds(vl),
+            None => (1, 1),
+        };
+        if min > 1 {
+            bail!("shortestPath does not support a minimal length different from 0 or 1");
+        }
+        let bound_node = |var: Option<&str>| -> Result<u64> {
+            match var.and_then(|v| scope.get(v)) {
+                Some(Val::Node(id)) => Ok(id),
+                _ => bail!("A shortestPath requires bound nodes"),
+            }
+        };
+        let src = bound_node(pattern.start.var.as_deref())?;
+        let dst = bound_node(end.var.as_deref())?;
+        // FalkorDB orients the returned path from the relationship arrow's tail to
+        // its head. The BFS walks the syntactic start→end (using the pattern's
+        // direction); for an incoming pattern `(b)<-[*]-(a)` the arrow tail is the
+        // end node, so the result is reversed into arrow order. (Undirected keeps
+        // start→end order.)
+        let reverse = matches!(rel.dir, Direction::Incoming);
+
+        // min == 0 admits the empty (single-node) path when src == dst.
+        if min == 0 && src == dst {
+            return Ok(Val::Path {
+                nodes: vec![src],
+                rels: Vec::new(),
+            });
+        }
+        if max == 0 {
+            return Ok(Val::Null);
+        }
+
+        // BFS by node, recording the predecessor edge to reconstruct the path. The
+        // first time `dst` is dequeued (or reached) yields a shortest path; node
+        // uniqueness (visited set) keeps it to simple, shortest paths.
+        let empty = HashMap::new();
+        let mut visited: HashSet<u64> = HashSet::new();
+        visited.insert(src);
+        // (node, predecessor hop into it). The root has no predecessor.
+        let mut pred: HashMap<u64, Hop> = HashMap::new();
+        let mut frontier = vec![src];
+        let mut depth = 0u32;
+        let mut found = false;
+        'bfs: while !frontier.is_empty() && depth < max {
+            self.check_deadline()?;
+            let mut next = Vec::new();
+            for &node in &frontier {
+                for hop in self.expand_one_hop(node, rel, &empty)? {
+                    let nb = hop.neighbour;
+                    if visited.contains(&nb) {
+                        continue;
+                    }
+                    visited.insert(nb);
+                    pred.insert(nb, hop);
+                    if nb == dst {
+                        found = true;
+                        break 'bfs;
+                    }
+                    next.push(nb);
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        if !found {
+            return Ok(Val::Null);
+        }
+        // Walk predecessors back from dst to src, then reverse into walk order.
+        let mut hops_rev: Vec<Hop> = Vec::new();
+        let mut cur = dst;
+        while cur != src {
+            let hop = pred.get(&cur).expect("BFS predecessor recorded");
+            // `cur` is `hop.neighbour`; the node we arrived from is the opposite
+            // stored endpoint.
+            cur = if hop.start == cur { hop.end } else { hop.start };
+            hops_rev.push(hop.clone());
+        }
+        hops_rev.reverse();
+        let path = make_path(src, &hops_rev);
+        if reverse {
+            if let Val::Path { mut nodes, mut rels } = path {
+                nodes.reverse();
+                rels.reverse();
+                return Ok(Val::Path { nodes, rels });
+            }
+        }
+        Ok(path)
     }
 
     fn fold_bool(
@@ -1995,16 +2155,31 @@ impl<'g> Engine<'g> {
                     other.to_display()
                 ),
             },
+            // `length(path)` is the relationship count (FalkorDB `AR_PATH_LENGTH`);
+            // `size`/`length` over a collection/string is the element/char count.
             "size" | "length" => match a0(0) {
                 Val::List(xs) => Val::Int(xs.len() as i64),
                 Val::Vector(xs) => Val::Int(xs.len() as i64),
                 Val::Str(s) => Val::Int(s.chars().count() as i64),
                 Val::Map(m) => Val::Int(m.len() as i64),
+                Val::Path { rels, .. } => Val::Int(rels.len() as i64),
                 Val::Null => Val::Null,
                 other => bail!(
                     "{n}() needs a collection or string, got {}",
                     other.to_display()
                 ),
+            },
+            // nodes(path)/relationships(path): the path's node / relationship
+            // sequence as a list (FalkorDB `AR_NODES`/`AR_RELATIONSHIPS`).
+            "nodes" => match a0(0) {
+                Val::Path { nodes, .. } => Val::List(nodes.into_iter().map(Val::Node).collect()),
+                Val::Null => Val::Null,
+                other => bail!("nodes() needs a path, got {}", other.to_display()),
+            },
+            "relationships" => match a0(0) {
+                Val::Path { rels, .. } => Val::List(rels),
+                Val::Null => Val::Null,
+                other => bail!("relationships() needs a path, got {}", other.to_display()),
             },
             "head" => match a0(0) {
                 Val::List(xs) => xs.into_iter().next().unwrap_or(Val::Null),
@@ -2610,6 +2785,9 @@ fn children(e: &Expr) -> Vec<&Expr> {
         // `PatternComprehension`; an EXISTS inner WHERE is.
         Expr::PatternPredicate(_) => vec![],
         Expr::Exists { predicate, .. } => predicate.iter().map(|p| p.as_ref()).collect(),
+        // The inner pattern's endpoints reference bound vars, not sub-expressions
+        // an aggregate could hide in (mirrors `PatternPredicate`).
+        Expr::ShortestPath(_) => vec![],
     }
 }
 
@@ -3044,6 +3222,7 @@ fn type_name(v: &Val) -> &'static str {
         Val::Map(_) => "Map",
         Val::Node(_) => "Node",
         Val::Rel { .. } => "Edge",
+        Val::Path { .. } => "Path",
     }
 }
 
@@ -3230,6 +3409,22 @@ fn list_insert_elements(args: &[Val]) -> Result<Val> {
     out.extend(b);
     out.extend_from_slice(&a[idx..]);
     Ok(Val::List(out))
+}
+
+/// Materialise a [`Val::Path`] from a start node and the flattened hop sequence
+/// walked to reach the end. Nodes are `start` followed by each hop's neighbour
+/// (in walk order, so an intermediate node revisited by a bidirectional pattern
+/// appears more than once); relationships are each hop carrying its stored
+/// src→dst direction.
+fn make_path(start: u64, hops: &[Hop]) -> Val {
+    let mut nodes = Vec::with_capacity(hops.len() + 1);
+    nodes.push(start);
+    let mut rels = Vec::with_capacity(hops.len());
+    for h in hops {
+        rels.push(h.as_rel());
+        nodes.push(h.neighbour);
+    }
+    Val::Path { nodes, rels }
 }
 
 /// Variables a pattern introduces that are not already in `existing`, in order.
@@ -5211,5 +5406,178 @@ mod tests {
         );
         assert_eq!(col0(&res), vec!["Acme", "Carol", "Globex"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Phase 7 — Val::Path, path functions, shortestPath ────────────────────
+
+    // `MATCH p=(…)-[…]->(…) RETURN p` binds a path; nodes()/length() read it back.
+    // Vectors adapted from FalkorDB tests/flow/test_path.py (read-only fixture).
+    #[test]
+    fn phase7_path_binding_and_functions() {
+        let (root, res) = run(
+            "exec_p7_path_bind",
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS]->(b:Person) \
+             RETURN [n IN nodes(p) | n.name] AS names, length(p) AS l ORDER BY b.name",
+        );
+        assert_eq!(res.columns, vec!["names", "l"]);
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(render(&res.rows[0][0]), "['Alice','Bob']");
+        assert!(matches!(res.rows[0][1], Val::Int(1)));
+        assert_eq!(render(&res.rows[1][0]), "['Alice','Carol']");
+        assert!(matches!(res.rows[1][1], Val::Int(1)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A variable-length path binds every node along the walk (incl. intermediates).
+    #[test]
+    fn phase7_variable_length_path() {
+        let (root, res) = run(
+            "exec_p7_varlen_path",
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS*]->(b:Person) \
+             RETURN [n IN nodes(p) | n.name] AS names ORDER BY length(p), b.name",
+        );
+        let got: Vec<String> = res.rows.iter().map(|r| render(&r[0])).collect();
+        assert_eq!(
+            got,
+            vec![
+                "['Alice','Bob']",
+                "['Alice','Carol']",
+                "['Alice','Bob','Carol']",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // relationships(p) yields the edges in walk order; type()/id() read them.
+    #[test]
+    fn phase7_relationships_function() {
+        let (root, res) = run(
+            "exec_p7_rels_fn",
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS]->(b:Person {name:'Bob'}) \
+             RETURN [r IN relationships(p) | type(r)] AS types, \
+                    [r IN relationships(p) | id(r)] AS ids",
+        );
+        assert_eq!(render(&res.rows[0][0]), "['KNOWS']");
+        assert_eq!(render(&res.rows[0][1]), "[0]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Path equality/inequality filters (test_path.py test_path_comparison). Each of
+    // the 3 KNOWS paths equals only itself, so `p1 = p2` keeps 3 of the 9 pairs.
+    #[test]
+    fn phase7_path_equality() {
+        let (root, res) = run(
+            "exec_p7_path_eq",
+            "MATCH p1=(a:Person)-[:KNOWS]->(b:Person) \
+             MATCH p2=(c:Person)-[:KNOWS]->(d:Person) WHERE p1 = p2 RETURN count(*) AS c",
+        );
+        assert!(matches!(res.rows[0][0], Val::Int(3)));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (root, res) = run(
+            "exec_p7_path_neq",
+            "MATCH p1=(a:Person)-[:KNOWS]->(b:Person) \
+             MATCH p2=(c:Person)-[:KNOWS]->(d:Person) WHERE p1 <> p2 RETURN count(*) AS c",
+        );
+        assert!(matches!(res.rows[0][0], Val::Int(6)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // shortestPath finds the fewest-hop route: Alice→Carol direct (e4), not via Bob.
+    // A reversed pattern `(c)<-[*]-(a)` yields the same path (test_shortest_path.py).
+    #[test]
+    fn phase7_shortest_path() {
+        let (root, res) = run(
+            "exec_p7_sp",
+            "MATCH (a:Person {name:'Alice'}), (c:Person {name:'Carol'}) \
+             RETURN length(shortestPath((a)-[:KNOWS*]->(c))) AS l, \
+                    [n IN nodes(shortestPath((a)-[:KNOWS*]->(c))) | n.name] AS names, \
+                    [n IN nodes(shortestPath((c)<-[:KNOWS*]-(a))) | n.name] AS rev",
+        );
+        assert!(matches!(res.rows[0][0], Val::Int(1)));
+        assert_eq!(render(&res.rows[0][1]), "['Alice','Carol']");
+        assert_eq!(render(&res.rows[0][2]), "['Alice','Carol']");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // `*0..` admits the empty (single-node) path when src == dst; `*` (min 1) does
+    // not, so a node with no cycle back to itself yields NULL (test05_min_hops).
+    #[test]
+    fn phase7_shortest_path_min_zero() {
+        let (root, res) = run(
+            "exec_p7_sp_zero",
+            "MATCH (a:Person {name:'Alice'}) \
+             RETURN length(shortestPath((a)-[:KNOWS*0..]->(a))) AS l, \
+                    [n IN nodes(shortestPath((a)-[:KNOWS*0..]->(a))) | n.name] AS names, \
+                    shortestPath((a)-[:KNOWS*]->(a)) IS NULL AS cyc_null",
+        );
+        assert!(matches!(res.rows[0][0], Val::Int(0)));
+        assert_eq!(render(&res.rows[0][1]), "['Alice']");
+        assert!(matches!(res.rows[0][2], Val::Bool(true)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // No connecting path → NULL (Bob cannot reach Alice over KNOWS).
+    #[test]
+    fn phase7_shortest_path_no_path() {
+        let (root, res) = run(
+            "exec_p7_sp_none",
+            "MATCH (a:Person {name:'Bob'}), (c:Person {name:'Alice'}) \
+             RETURN shortestPath((a)-[:KNOWS*]->(c)) IS NULL AS np",
+        );
+        assert!(matches!(res.rows[0][0], Val::Bool(true)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // shortestPath inside a WHERE filter (test07_shortestPath_in_filter): keep source
+    // nodes that can reach Carol over KNOWS — Alice and Bob (Carol has no cycle).
+    #[test]
+    fn phase7_shortest_path_in_filter() {
+        let (root, res) = run(
+            "exec_p7_sp_filter",
+            "MATCH (a:Person), (c:Person {name:'Carol'}) \
+             WHERE length(shortestPath((a)-[:KNOWS*]->(c))) > 0 RETURN a.name AS n",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The wrapped-pattern restrictions FalkorDB enforces (test01_invalid_shortest_paths).
+    #[test]
+    fn phase7_shortest_path_errors() {
+        let pre = "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Carol'}) RETURN ";
+        let cases = [
+            (
+                "exec_p7_sp_e1",
+                "shortestPath((a)-[:KNOWS*2..]->(b))",
+                "minimal length",
+            ),
+            (
+                "exec_p7_sp_e2",
+                "shortestPath((a)-[:KNOWS]->()-[:KNOWS*]->(b))",
+                "single relationship",
+            ),
+            (
+                "exec_p7_sp_e3",
+                "shortestPath((a)-[:KNOWS* {since:2020}]->(b))",
+                "filters on relationships",
+            ),
+            (
+                "exec_p7_sp_e4",
+                "shortestPath((a)-[:KNOWS*]->())",
+                "requires bound nodes",
+            ),
+        ];
+        for (tag, sp, want) in cases {
+            let msg = run_err(tag, &format!("{pre}{sp}"));
+            assert!(msg.contains(want), "query `{sp}` → `{msg}` (want `{want}`)");
+        }
+
+        // An unbound endpoint variable is likewise rejected.
+        let msg = run_err(
+            "exec_p7_sp_e5",
+            "MATCH (a:Person {name:'Alice'}) RETURN shortestPath((a)-[:KNOWS*]->(z))",
+        );
+        assert!(msg.contains("requires bound nodes"), "{msg}");
     }
 }
