@@ -73,14 +73,33 @@ forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
 // `CALL` is forbidden EXCEPT for the single read-only vector procedure (handled by
 // `vector_call_clause`): the negative lookahead lets that one form fall through to
 // the valid parse while every other procedure call is rejected as read-only.
+// `CALL` is forbidden EXCEPT for the read-only vector/metadata procedures and the
+// `CALL { … }` subquery: the negative lookaheads let those forms fall through to a
+// valid parse while every other procedure call is rejected as read-only. `CALL {`
+// (a subquery) is excluded by `!(inline_ws* ~ "{")` so `call_subquery` handles it.
 forbidden_clause = @{
     (^"create" | ^"merge" | ^"set" | ^"delete" | ^"remove" | ^"detach"
       | ^"foreach" | ^"load") ~ !ident_cont
-  | ^"call" ~ !ident_cont ~ !(inline_ws+ ~ (vector_proc | read_proc))
+  | ^"call" ~ !ident_cont ~ !(inline_ws* ~ "{") ~ !(inline_ws+ ~ (vector_proc | read_proc))
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause | call_clause | unwind_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause }
+
+// `CALL { <subquery> }` (Phase 12): a correlated read-only subquery run once per
+// outer row, multiplying cardinality by its returned rows. The inner body is a
+// full read query (one or more `UNION`-joined parts); each part may import outer
+// variables via a leading `WITH`. A part with no `RETURN` is a unit subquery (it
+// passes the outer rows through unchanged). Writes inside are caught by
+// `subquery_forbidden` and rejected as read-only, exactly like the top level.
+call_subquery = { kw_call ~ "{" ~ subquery ~ "}" }
+subquery = { subquery_part ~ (union ~ subquery_part)* }
+subquery_part = { subquery_forbidden | reading_clause* ~ return_clause | reading_clause+ }
+// Like `forbidden_query` but bounded by the enclosing `}` (it must not swallow the
+// closing brace). A write body containing a nested `}` (e.g. a map literal) stops
+// early here and then fails the outer `"}"` match — still rejected, just with a
+// generic parse error rather than the "read-only" message.
+subquery_forbidden = { reading_clause* ~ forbidden_clause ~ (!"}" ~ ANY)* }
 
 // UNWIND is a read clause (it multiplies rows over a list); it is NOT forbidden.
 unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias }

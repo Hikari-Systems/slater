@@ -48,7 +48,39 @@ pub mod ast {
         With(WithClause),
         VectorCall(VectorCallClause),
         Call(CallClause),
+        CallSubquery(CallSubqueryClause),
         Unwind(UnwindClause),
+    }
+
+    /// Which outer-scope variables a `CALL { … }` subquery branch imports, taken
+    /// from its leading `WITH`. Only "simple" imports are allowed (FalkorDB
+    /// `_ValidateCallInitialWith`): bare variable references, no aliasing, and no
+    /// `WHERE`/`ORDER BY`/`SKIP`/`LIMIT`.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Imports {
+        /// No leading `WITH` — the subquery sees none of the outer variables.
+        None,
+        /// `WITH *` — every outer variable is imported.
+        All,
+        /// `WITH a, b, …` — exactly the named outer variables are imported.
+        Named(Vec<String>),
+    }
+
+    /// A `CALL { <subquery> }` clause (Phase 12). The inner query runs once per
+    /// outer row with its imported variables seeded; a returning subquery
+    /// multiplies the outer cardinality by its result rows, while a unit
+    /// (`RETURN`-less) subquery passes the outer rows through unchanged.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct CallSubqueryClause {
+        /// The inner read query (head plus any `UNION`-joined parts). Leading
+        /// import `WITH`s are kept in place; they re-project the seeded imports.
+        pub inner: Box<Query>,
+        /// What each branch imports, in branch order (head first, then each
+        /// `UNION` part). `imports.len() == 1 + inner.tail.len()`.
+        pub imports: Vec<Imports>,
+        /// Whether the subquery returns rows (multiplies cardinality) or is a unit
+        /// subquery (passes the outer rows through). All branches agree.
+        pub returning: bool,
     }
 
     /// A read-only metadata procedure call (Phase 11): `CALL db.meta.stats()`,
@@ -418,9 +450,125 @@ fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
         Rule::with_clause => Ok(Clause::With(lower_with_clause(inner)?)),
         Rule::vector_call_clause => Ok(Clause::VectorCall(lower_vector_call(inner)?)),
         Rule::call_clause => Ok(Clause::Call(lower_call_clause(inner)?)),
+        Rule::call_subquery => Ok(Clause::CallSubquery(lower_call_subquery(inner)?)),
         Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
         other => bail!("internal: unexpected reading clause {other:?}"),
     }
+}
+
+/// Error text matching FalkorDB's `EMSG_CALLSUBQUERY_INVALID_REFERENCES`.
+const IMPORT_ERR: &str =
+    "WITH imports in CALL {} must consist of only simple references to outside variables";
+
+/// Lower a `CALL { <subquery> }` clause. The inner body is one or more
+/// `UNION`-joined parts; each part lowers to a [`SingleQuery`] plus its
+/// [`Imports`] (the simple variables its leading `WITH` brings in) and whether it
+/// returns. Mirrors FalkorDB `_Validate_call_subquery`: every branch is validated
+/// independently, and the branches must agree on returning vs. unit.
+fn lower_call_subquery(pair: Pair<Rule>) -> Result<CallSubqueryClause> {
+    let subquery = kids(pair)
+        .find(|p| p.as_rule() == Rule::subquery)
+        .ok_or_else(|| anyhow::anyhow!("internal: CALL {{}} has no subquery body"))?;
+
+    let mut parts: Vec<(SingleQuery, bool, Imports)> = Vec::new();
+    let mut union_all: Vec<bool> = Vec::new();
+    for child in subquery.into_inner() {
+        match child.as_rule() {
+            Rule::subquery_part => parts.push(lower_subquery_part(child)?),
+            Rule::union => {
+                let all = child
+                    .as_str()
+                    .split_whitespace()
+                    .any(|w| w.eq_ignore_ascii_case("all"));
+                union_all.push(all);
+            }
+            other => bail!("internal: unexpected subquery child {other:?}"),
+        }
+    }
+    if parts.is_empty() {
+        bail!("internal: CALL {{}} subquery has no parts");
+    }
+
+    // All branches must agree: either every branch returns, or it is a single
+    // unit (non-returning) branch. FalkorDB rejects a mixed/union unit subquery.
+    let returning = parts[0].1;
+    if parts.iter().any(|(_, r, _)| *r != returning) {
+        bail!("all branches of a CALL {{}} subquery must return, or none may");
+    }
+    if !returning && parts.len() > 1 {
+        bail!("a non-returning CALL {{}} subquery cannot use UNION");
+    }
+
+    let mut imports = Vec::with_capacity(parts.len());
+    let mut sqs: Vec<SingleQuery> = Vec::with_capacity(parts.len());
+    for (sq, _, imp) in parts {
+        imports.push(imp);
+        sqs.push(sq);
+    }
+    let head = sqs.remove(0);
+    let tail: Vec<(bool, SingleQuery)> = union_all.into_iter().zip(sqs).collect();
+
+    Ok(CallSubqueryClause {
+        inner: Box::new(Query { head, tail }),
+        imports,
+        returning,
+    })
+}
+
+/// Lower one `subquery_part` into a [`SingleQuery`], whether it returns, and its
+/// imported outer variables. A part with no `RETURN` (a unit subquery) is given a
+/// synthetic `RETURN *` placeholder that exec never projects.
+fn lower_subquery_part(pair: Pair<Rule>) -> Result<(SingleQuery, bool, Imports)> {
+    let mut reading: Vec<Clause> = Vec::new();
+    let mut ret = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::subquery_forbidden => {
+                let kw = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::forbidden_clause)
+                    .map(|p| p.as_str().to_uppercase())
+                    .unwrap_or_else(|| "WRITE".to_string());
+                bail!("Slater is read-only; the '{kw}' clause is not permitted in CALL {{}}");
+            }
+            Rule::reading_clause => reading.push(lower_reading_clause(child)?),
+            Rule::return_clause => ret = Some(lower_return_clause(child)?),
+            other => bail!("internal: unexpected subquery_part child {other:?}"),
+        }
+    }
+    let returning = ret.is_some();
+    let imports = import_spec(reading.first())?;
+    let ret = ret.unwrap_or_else(star_return);
+    Ok((SingleQuery { reading, ret }, returning, imports))
+}
+
+/// Determine what a subquery branch imports from its leading clause, validating
+/// the FalkorDB "simple references" rule when that clause is a `WITH`.
+fn import_spec(first: Option<&Clause>) -> Result<Imports> {
+    let Some(Clause::With(w)) = first else {
+        return Ok(Imports::None);
+    };
+    // A leading import WITH may not carry ORDER BY / SKIP / LIMIT / WHERE.
+    if w.where_.is_some()
+        || !w.body.order_by.is_empty()
+        || w.body.skip.is_some()
+        || w.body.limit.is_some()
+    {
+        bail!("{IMPORT_ERR}");
+    }
+    // `WITH *` imports every outer variable; FalkorDB skips the per-item check for
+    // the star form.
+    if w.body.star {
+        return Ok(Imports::All);
+    }
+    let mut names = Vec::with_capacity(w.body.items.len());
+    for it in &w.body.items {
+        match (&it.expr, &it.alias) {
+            (Expr::Var(n), None) => names.push(n.clone()),
+            _ => bail!("{IMPORT_ERR}"),
+        }
+    }
+    Ok(Imports::Named(names))
 }
 
 /// Lower a read-only metadata `call_clause` into a [`CallClause`]. Mirrors
@@ -2000,5 +2148,85 @@ mod tests {
             &q.head.ret.body.items[0].expr,
             Expr::Function { name, .. } if name == "allShortestPaths"
         ));
+    }
+
+    // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────
+
+    #[test]
+    fn lowers_call_subquery() {
+        // A returning subquery with a simple import WITH: lowers to a CallSubquery
+        // clause whose head imports `p` and returns one column.
+        let q = ok("MATCH (p) CALL { WITH p RETURN p.age AS age } RETURN p, age");
+        let Clause::CallSubquery(cs) = &q.head.reading[1] else {
+            panic!("expected a CallSubquery clause, got {:?}", q.head.reading[1]);
+        };
+        assert!(cs.returning);
+        assert_eq!(cs.imports, vec![Imports::Named(vec!["p".to_string()])]);
+        assert!(cs.inner.tail.is_empty());
+
+        // No leading WITH → no imports; outer variables are invisible inside.
+        let q = ok("UNWIND [1, 2] AS x CALL { UNWIND [3, 4] AS y RETURN y } RETURN x, y");
+        let Clause::CallSubquery(cs) = &q.head.reading[1] else {
+            panic!("expected a CallSubquery clause");
+        };
+        assert_eq!(cs.imports, vec![Imports::None]);
+        assert!(cs.returning);
+    }
+
+    #[test]
+    fn lowers_unit_and_union_subqueries() {
+        // Unit subquery (no inner RETURN): returning is false.
+        let q = ok("WITH 1 AS a CALL { MATCH (p:Person) } RETURN a");
+        let Clause::CallSubquery(cs) = &q.head.reading[1] else {
+            panic!("expected a CallSubquery clause");
+        };
+        assert!(!cs.returning);
+
+        // UNION inside the subquery: two branches, one union-all flag, per-branch
+        // imports.
+        let q = ok(
+            "MATCH (p) CALL { WITH p RETURN p.name AS x UNION WITH p RETURN p.city AS x } RETURN x",
+        );
+        let Clause::CallSubquery(cs) = &q.head.reading[1] else {
+            panic!("expected a CallSubquery clause");
+        };
+        assert!(cs.returning);
+        assert_eq!(cs.inner.tail.len(), 1);
+        assert!(!cs.inner.tail[0].0, "UNION (not ALL) is distinct");
+        assert_eq!(cs.imports.len(), 2);
+    }
+
+    #[test]
+    fn call_subquery_import_validation() {
+        // Only simple variable references may be imported (FalkorDB
+        // _ValidateCallInitialWith). Each of these violates the rule.
+        for q in [
+            "WITH 1 AS a CALL { WITH a + 1 AS b RETURN b } RETURN b",
+            "WITH 1 AS a CALL { WITH a AS b RETURN b } RETURN b",
+            "WITH 1 AS a CALL { WITH a LIMIT 5 RETURN a } RETURN a",
+            "WITH 1 AS a CALL { WITH a ORDER BY a RETURN a } RETURN a",
+            "WITH 1 AS a CALL { WITH a WHERE a > 5 RETURN a } RETURN a",
+            "WITH 1 AS a CALL { WITH a SKIP 5 RETURN a } RETURN a",
+        ] {
+            let e = err(q);
+            assert!(
+                e.contains("simple references to outside variables"),
+                "for {q:?} expected import error, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_subquery_rejects_writes() {
+        // A write clause inside the subquery is rejected as read-only at lowering.
+        let e = err("CALL { MATCH (n) SET n.x = 1 RETURN n } RETURN n");
+        assert!(
+            e.contains("read-only"),
+            "expected read-only rejection, got: {e}"
+        );
+        // A bare CREATE subquery likewise rejects (the `CALL {` carve-out does not
+        // let writes through).
+        let e = err("WITH 1 AS a CALL { CREATE (n:N) RETURN n } RETURN a");
+        assert!(e.contains("read-only"), "got: {e}");
     }
 }

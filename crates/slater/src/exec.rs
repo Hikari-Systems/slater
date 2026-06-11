@@ -649,7 +649,14 @@ impl<'g> Engine<'g> {
     }
 
     fn run_single(&self, sq: &SingleQuery) -> Result<QueryResult> {
-        let mut table = Table::singleton();
+        self.run_single_seeded(sq, Table::singleton())
+    }
+
+    /// Run a single query part starting from `seed` instead of the empty singleton.
+    /// A top-level query seeds the singleton; a `CALL { … }` subquery seeds the
+    /// imported outer variables (one row) so the inner clauses can reference them.
+    fn run_single_seeded(&self, sq: &SingleQuery, seed: Table) -> Result<QueryResult> {
+        let mut table = seed;
         for clause in &sq.reading {
             match clause {
                 Clause::Match(m) => table = self.apply_match(table, m)?,
@@ -658,6 +665,7 @@ impl<'g> Engine<'g> {
                 }
                 Clause::VectorCall(vc) => table = self.apply_vector_call(table, vc)?,
                 Clause::Call(cc) => table = self.apply_call(table, cc)?,
+                Clause::CallSubquery(cs) => table = self.apply_call_subquery(table, cs)?,
                 Clause::Unwind(uc) => table = self.apply_unwind(table, uc)?,
             }
         }
@@ -875,6 +883,133 @@ impl<'g> Engine<'g> {
             Val::Int(m.property_keys.len() as i64),
         ];
         (cols, vec![row])
+    }
+
+    // ── CALL { … } subquery (Phase 12) ───────────────────────────────────────
+
+    /// Run a correlated `CALL { … }` subquery: the inner query is executed once
+    /// per outer row with its imported variables seeded, and the results are
+    /// concatenated back. A returning subquery multiplies the outer cardinality by
+    /// its result rows (each output row is `outer_row ++ inner_row`); a unit
+    /// (`RETURN`-less) subquery passes the outer rows through unchanged (in a
+    /// read-only engine it has no observable effect). Mirrors FalkorDB's
+    /// `op_apply` + `op_argument`.
+    fn apply_call_subquery(&self, table: Table, cs: &CallSubqueryClause) -> Result<Table> {
+        // Unit subquery: run the inner clauses per row to surface any errors, then
+        // emit the outer row unchanged (cardinality preserved).
+        if !cs.returning {
+            for row in &table.rows {
+                self.check_deadline()?;
+                self.run_subquery_for_row(cs, &table.cols, row)?;
+            }
+            return Ok(table);
+        }
+
+        let mut out_cols: Option<Vec<String>> = None;
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            self.check_deadline()?;
+            let inner = self.run_subquery_for_row(cs, &table.cols, row)?;
+            if out_cols.is_none() {
+                out_cols = Some(self.subquery_out_cols(&table.cols, &inner.columns)?);
+            }
+            for irow in inner.rows {
+                let mut r = row.clone();
+                r.extend(irow);
+                out_rows.push(r);
+            }
+        }
+        // With no outer rows the inner never ran; derive the output schema from the
+        // inner RETURN's projection names so the result still has correct columns.
+        let cols = match out_cols {
+            Some(c) => c,
+            None => {
+                let inner_cols: Vec<String> = cs
+                    .inner
+                    .head
+                    .ret
+                    .body
+                    .items
+                    .iter()
+                    .map(|it| it.alias.clone().unwrap_or_else(|| expr_name(&it.expr)))
+                    .collect();
+                self.subquery_out_cols(&table.cols, &inner_cols)?
+            }
+        };
+        Ok(Table {
+            cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Combine the outer columns with the subquery's returned columns, rejecting a
+    /// returned name that is already bound in the outer scope (FalkorDB
+    /// "Variable `x` already declared in outer scope").
+    fn subquery_out_cols(&self, outer: &[String], inner: &[String]) -> Result<Vec<String>> {
+        let mut cols = outer.to_vec();
+        for ic in inner {
+            if outer.iter().any(|c| c == ic) {
+                bail!("Variable `{ic}` already declared in outer scope");
+            }
+            cols.push(ic.clone());
+        }
+        Ok(cols)
+    }
+
+    /// Execute the inner subquery (all `UNION` branches) for one outer row, each
+    /// branch seeded with the variables it imports.
+    fn run_subquery_for_row(
+        &self,
+        cs: &CallSubqueryClause,
+        outer_cols: &[String],
+        outer_row: &[Val],
+    ) -> Result<QueryResult> {
+        let head_seed = self.subquery_seed(&cs.imports[0], outer_cols, outer_row)?;
+        let mut result = self.run_single_seeded(&cs.inner.head, head_seed)?;
+        for (i, (union_all, part)) in cs.inner.tail.iter().enumerate() {
+            let seed = self.subquery_seed(&cs.imports[i + 1], outer_cols, outer_row)?;
+            let next = self.run_single_seeded(part, seed)?;
+            if next.columns.len() != result.columns.len() {
+                bail!("all branches of a CALL {{}} UNION must return the same number of columns");
+            }
+            result.rows.extend(next.rows);
+            if !*union_all {
+                dedup_rows(&mut result.rows);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Build the one-row seed table that imports the requested outer variables into
+    /// a subquery branch. `Imports::None` seeds the empty singleton (the subquery
+    /// sees no outer variables); a named import that is not bound outside errors.
+    fn subquery_seed(
+        &self,
+        imp: &Imports,
+        outer_cols: &[String],
+        outer_row: &[Val],
+    ) -> Result<Table> {
+        match imp {
+            Imports::None => Ok(Table::singleton()),
+            Imports::All => Ok(Table {
+                cols: outer_cols.to_vec(),
+                rows: vec![outer_row.to_vec()],
+            }),
+            Imports::Named(names) => {
+                let mut row = Vec::with_capacity(names.len());
+                for n in names {
+                    let idx = outer_cols
+                        .iter()
+                        .position(|c| c == n)
+                        .ok_or_else(|| anyhow::anyhow!("variable '{n}' is not in scope"))?;
+                    row.push(outer_row[idx].clone());
+                }
+                Ok(Table {
+                    cols: names.clone(),
+                    rows: vec![row],
+                })
+            }
+        }
     }
 
     // ── CALL db.idx.vector.queryNodes (brute-force KNN) ──────────────────────
@@ -6315,5 +6450,212 @@ mod tests {
         let err = engine.run(&ast).unwrap_err().to_string();
         assert!(err.contains("does not yield 'bogus'"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────
+    // Vectors adapted from FalkorDB `tests/flow/test_call_subquery.py` (test02–07,
+    // test14, test17) onto the read-only fixture (Person Alice/Bob/Carol with
+    // name/age/city; their CREATE-based setup is replayed as MATCH over the
+    // fixture).
+
+    #[test]
+    fn phase12_simple_scan_return() {
+        // test02: a plain scan-and-return subquery, with an outer RETURN over it.
+        let (root, res) = run(
+            "exec_p12_scan",
+            "CALL { MATCH (n:Person {name: 'Alice'}) RETURN n } RETURN n.name AS name",
+        );
+        assert_eq!(res.columns, vec!["name"]);
+        assert_eq!(col0(&res), vec!["Alice"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_importing_with_correlated() {
+        // test04: import an outer variable with a leading `WITH` and reference it
+        // inside; the subquery returns one row per outer row.
+        let (root, res) = run(
+            "exec_p12_import",
+            "MATCH (p:Person) CALL { WITH p RETURN p.age AS age } \
+             RETURN p.name AS name, age ORDER BY age ASC",
+        );
+        assert_eq!(res.columns, vec!["name", "age"]);
+        let rows: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Bob".into(), "25".into()),
+                ("Alice".into(), "30".into()),
+                ("Carol".into(), "40".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_cardinality_multiplication() {
+        // test06: a returning subquery multiplies cardinality (2 outer × 3 inner =
+        // 6 rows). The inner does not import `x`, so it is invisible inside.
+        let (root, res) = run(
+            "exec_p12_card",
+            "UNWIND [1, 2] AS x CALL { UNWIND [10, 20, 30] AS y RETURN y } \
+             RETURN x, y ORDER BY x ASC, y ASC",
+        );
+        assert_eq!(res.columns, vec!["x", "y"]);
+        let rows: Vec<(i64, i64)> = res
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Val::Int(a), Val::Int(b)) => (*a, *b),
+                _ => panic!("expected ints"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (1, 10),
+                (1, 20),
+                (1, 30),
+                (2, 10),
+                (2, 20),
+                (2, 30)
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_correlated_filter_drops_rows() {
+        // test03/test05: a returning subquery that yields nothing for an outer row
+        // drops that row entirely (no input passthrough). 'Zztop' matches no node.
+        let (root, res) = run(
+            "exec_p12_drop",
+            "UNWIND ['Alice', 'Zztop'] AS nm \
+             CALL { WITH nm MATCH (p:Person {name: nm}) RETURN p } \
+             RETURN p.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_optional_match_in_subquery() {
+        // test07: OPTIONAL MATCH inside the subquery keeps the row with a null when
+        // nothing matches, so cardinality is preserved per outer row.
+        let (root, res) = run(
+            "exec_p12_optional",
+            "UNWIND [25, 99] AS a \
+             CALL { WITH a OPTIONAL MATCH (p:Person {age: a}) RETURN p } \
+             RETURN a, p.name AS name ORDER BY a ASC",
+        );
+        let rows: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("25".into(), "Bob".into()), ("99".into(), "null".into())]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_aggregation_in_subquery() {
+        // test04/test17: a correlated aggregation. For each threshold `a`, count the
+        // Persons with age >= a (Bob 25, Alice 30, Carol 40).
+        let (root, res) = run(
+            "exec_p12_agg",
+            "UNWIND [25, 30] AS a \
+             CALL { WITH a MATCH (p:Person) WHERE p.age >= a RETURN count(p) AS c } \
+             RETURN a, c ORDER BY a ASC",
+        );
+        let rows: Vec<(i64, i64)> = res
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Val::Int(a), Val::Int(c)) => (*a, *c),
+                _ => panic!("expected ints"),
+            })
+            .collect();
+        assert_eq!(rows, vec![(25, 3), (30, 2)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_nested_call_subquery() {
+        // test14: a CALL {} directly inside another CALL {}.
+        let (root, res) = run(
+            "exec_p12_nested",
+            "CALL { CALL { MATCH (p:Person {name: 'Bob'}) RETURN p } RETURN p } \
+             RETURN p.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_union_in_subquery() {
+        // A UNION inside the subquery, each branch importing `p`. DISTINCT union of
+        // Alice's name and city.
+        let (root, res) = run(
+            "exec_p12_union",
+            "MATCH (p:Person {name: 'Alice'}) \
+             CALL { WITH p RETURN p.name AS x UNION WITH p RETURN p.city AS x } \
+             RETURN x ORDER BY x ASC",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "London"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_unit_subquery_passthrough() {
+        // A unit (RETURN-less) subquery preserves the outer cardinality: one outer
+        // row stays one row even though the inner MATCH finds three Persons.
+        let (root, res) = run(
+            "exec_p12_unit",
+            "WITH 1 AS a CALL { MATCH (p:Person) } RETURN a",
+        );
+        assert_eq!(res.columns, vec!["a"]);
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(1)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase12_non_imported_outer_var_is_invisible() {
+        // test01: without a leading `WITH`, an outer variable is not visible inside.
+        let err = run_err(
+            "exec_p12_invisible",
+            "WITH 1 AS a CALL { RETURN a AS b } RETURN b",
+        );
+        assert!(err.contains("'a' is not in scope"), "{err}");
+    }
+
+    #[test]
+    fn phase12_import_undefined_errors() {
+        // test01: importing a variable that does not exist outside is an error.
+        let err = run_err(
+            "exec_p12_undef",
+            "CALL { WITH a RETURN 1 AS one } RETURN one",
+        );
+        assert!(err.contains("'a' is not in scope"), "{err}");
+    }
+
+    #[test]
+    fn phase12_outer_scope_collision_errors() {
+        // test01: a subquery may not return a name already bound in the outer scope.
+        let err = run_err(
+            "exec_p12_collision",
+            "MATCH (p:Person {name: 'Alice'}) CALL { RETURN 1 AS p } RETURN p",
+        );
+        assert!(
+            err.contains("already declared in outer scope"),
+            "{err}"
+        );
     }
 }
