@@ -1372,10 +1372,39 @@ impl<'g> Engine<'g> {
                 return Ok(Val::Int(indices.len() as i64));
             }
         }
-        let arg = match args {
-            FuncArgs::Args(a) if a.len() == 1 => &a[0],
-            _ => bail!("aggregate {name} expects exactly one argument"),
+        let args_slice = match args {
+            FuncArgs::Args(a) => a.as_slice(),
+            FuncArgs::Star => bail!("aggregate {name} expects an argument"),
         };
+
+        // `percentileCont`/`percentileDisc` are two-arg aggregates: the first arg
+        // is collected per row, the second is a constant percentile in [0, 1]
+        // that FalkorDB reads once on the first invocation. Extract it before the
+        // per-row loop (evaluated against a representative row of the group).
+        let is_percentile = matches!(lname.as_str(), "percentilecont" | "percentiledisc");
+        let percentile = if is_percentile {
+            if args_slice.len() != 2 {
+                bail!("{name}() expects exactly two arguments");
+            }
+            let pscope = match indices.first() {
+                Some(&i) => Scope::Row(&table.cols, &table.rows[i]),
+                None => Scope::Empty,
+            };
+            let p = match self.eval(&args_slice[1], &pscope, None)?.as_num() {
+                Some(p) => p,
+                None => bail!("{name}() percentile must be a number"),
+            };
+            if !(0.0..=1.0).contains(&p) {
+                bail!("Percentile value must be in the range 0 to 1, got {p}");
+            }
+            Some(p)
+        } else {
+            if args_slice.len() != 1 {
+                bail!("aggregate {name} expects exactly one argument");
+            }
+            None
+        };
+        let arg = &args_slice[0];
 
         // Evaluate the argument over the group's rows, dropping nulls.
         let mut vals = Vec::new();
@@ -1403,6 +1432,10 @@ impl<'g> Engine<'g> {
                 .into_iter()
                 .reduce(|a, b| if a.cmp_total(&b).is_ge() { a } else { b })
                 .unwrap_or(Val::Null),
+            "stdev" => std_dev(&vals, true)?,
+            "stdevp" => std_dev(&vals, false)?,
+            "percentilecont" => percentile_cont(&vals, percentile.unwrap())?,
+            "percentiledisc" => percentile_disc(&vals, percentile.unwrap())?,
             other => bail!("unknown aggregate function '{other}'"),
         })
     }
@@ -2319,7 +2352,16 @@ impl AggCursor {
 fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "collect"
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "collect"
+            | "stdev"
+            | "stdevp"
+            | "percentilecont"
+            | "percentiledisc"
     )
 }
 
@@ -2687,6 +2729,76 @@ fn avg(vals: &[Val]) -> Result<Val> {
         }
     }
     Ok(Val::Float(s / vals.len() as f64))
+}
+
+/// Coerce a null-dropped value list to `f64`s, erroring on any non-number.
+fn agg_nums(vals: &[Val], fname: &str) -> Result<Vec<f64>> {
+    let mut xs = Vec::with_capacity(vals.len());
+    for v in vals {
+        match v.as_num() {
+            Some(x) => xs.push(x),
+            None => bail!("{fname}() needs numbers, got {}", v.to_display()),
+        }
+    }
+    Ok(xs)
+}
+
+/// Standard deviation over null-dropped numerics. `sampled` selects the divisor:
+/// `n - 1` for `stDev` (sample), `n` for `stDevP` (population). Mirrors
+/// FalkorDB's `StDevGenericFinalize` — empty input (or a single value in the
+/// sampled case) yields `0.0`.
+fn std_dev(vals: &[Val], sampled: bool) -> Result<Val> {
+    let xs = agg_nums(vals, "stDev")?;
+    let count = xs.len();
+    let divisor = count.saturating_sub(sampled as usize);
+    if count == 0 || divisor == 0 {
+        return Ok(Val::Float(0.0));
+    }
+    let mean = xs.iter().sum::<f64>() / count as f64;
+    // (x - mean)(x + mean) = x² - mean², summed = Σ(x - mean)²; matches FalkorDB.
+    let sum: f64 = xs.iter().map(|&x| (x - mean) * (x + mean)).sum();
+    Ok(Val::Float((sum / divisor as f64).sqrt()))
+}
+
+/// Sort null-dropped numerics ascending; returns `None` (→ NULL result) if empty.
+fn sorted_nums(vals: &[Val], fname: &str) -> Result<Option<Vec<f64>>> {
+    let mut xs = agg_nums(vals, fname)?;
+    if xs.is_empty() {
+        return Ok(None);
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(Some(xs))
+}
+
+/// `percentileCont(value, p)` — linear interpolation between closest ranks.
+/// Mirrors FalkorDB `PercContFinalize`.
+fn percentile_cont(vals: &[Val], p: f64) -> Result<Val> {
+    let Some(xs) = sorted_nums(vals, "percentileCont")? else {
+        return Ok(Val::Null);
+    };
+    let count = xs.len();
+    let float_idx = p * (count - 1) as f64;
+    let int_val = float_idx.floor();
+    let fraction = float_idx - int_val;
+    let index = int_val as usize;
+    if fraction == 0.0 {
+        return Ok(Val::Float(xs[index]));
+    }
+    Ok(Val::Float(xs[index] * (1.0 - fraction) + xs[index + 1] * fraction))
+}
+
+/// `percentileDisc(value, p)` — nearest-rank (no interpolation).
+/// Mirrors FalkorDB `PercDiscFinalize`.
+fn percentile_disc(vals: &[Val], p: f64) -> Result<Val> {
+    let Some(xs) = sorted_nums(vals, "percentileDisc")? else {
+        return Ok(Val::Null);
+    };
+    let idx = if p > 0.0 {
+        (p * xs.len() as f64).ceil() as usize - 1
+    } else {
+        0
+    };
+    Ok(Val::Float(xs[idx]))
 }
 
 /// FalkorDB's value-type name, as returned by `typeOf()` (`SIType_ToString`).
@@ -3767,6 +3879,92 @@ mod tests {
         assert!(matches!(r[9], Val::Int(2)));
         assert!(matches!(r[10], Val::Int(2)));
         assert!(matches!(r[11], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Phase 3: statistical aggregations ────────────────────────────────────
+
+    /// A `Val::Float` close to `want` (FalkorDB returns doubles for these aggs).
+    fn assert_float(v: &Val, want: f64) {
+        match v {
+            Val::Float(x) => assert!(
+                (x - want).abs() < 1e-9,
+                "expected ~{want}, got {x}"
+            ),
+            other => panic!("expected Float({want}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase3_stdev_sample_and_population() {
+        // Vectors ported from FalkorDB tests/flow/test_aggregation.py::test06_StDev.
+        // Edge case: a single value has zero sample deviation.
+        let (root, res) = run("exec_p3_stdev1", "RETURN stDev(5.1) AS s");
+        assert_float(&res.rows[0][0], 0.0);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 1..10: sample variance = 82.5/9, population variance = 82.5/10.
+        let (root, res) = run(
+            "exec_p3_stdev2",
+            "UNWIND [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] AS x \
+             RETURN stDev(x) AS s, stDevP(x) AS sp",
+        );
+        assert_float(&res.rows[0][0], (82.5_f64 / 9.0).sqrt());
+        assert_float(&res.rows[0][1], (82.5_f64 / 10.0).sqrt());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase3_percentile_cont() {
+        // FalkorDB test04_percentileCont: linear interpolation over [2,4,6,8,10].
+        let cases = [(0.0, 2.0), (0.1, 2.8), (0.33, 4.64), (0.5, 6.0), (1.0, 10.0)];
+        for (i, (p, want)) in cases.iter().enumerate() {
+            let (root, res) = run(
+                &format!("exec_p3_pcont_{i}"),
+                &format!("UNWIND [2, 4, 6, 8, 10] AS x RETURN percentileCont(x, {p}) AS r"),
+            );
+            assert_float(&res.rows[0][0], *want);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn phase3_percentile_disc() {
+        // FalkorDB test05_percentileDisc: nearest-rank over [2,4,6,8,10].
+        let cases = [(0.0, 2.0), (0.1, 2.0), (0.33, 4.0), (0.5, 6.0), (1.0, 10.0)];
+        for (i, (p, want)) in cases.iter().enumerate() {
+            let (root, res) = run(
+                &format!("exec_p3_pdisc_{i}"),
+                &format!("UNWIND [2, 4, 6, 8, 10] AS x RETURN percentileDisc(x, {p}) AS r"),
+            );
+            assert_float(&res.rows[0][0], *want);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        // p == 0 takes index 0 of the sorted values, regardless of input order.
+        let (root, res) = run(
+            "exec_p3_pdisc_zero",
+            "UNWIND [0.5, 0, 1] AS x RETURN percentileDisc(x, 0) AS r",
+        );
+        assert_float(&res.rows[0][0], 0.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase3_empty_aggregation_defaults() {
+        // FalkorDB test01_empty_aggregation: with no rows and no grouping key, the
+        // statistical aggregates still emit one row — stDev/stDevP→0, percentiles→null.
+        let (root, res) = run(
+            "exec_p3_empty",
+            "MATCH (n) WHERE n.name = 'noneExisting' \
+             RETURN stDev(n.v) AS a, stDevP(n.v) AS b, \
+                    percentileDisc(n.v, 0.5) AS c, percentileCont(n.v, 0.5) AS d",
+        );
+        assert_eq!(res.rows.len(), 1);
+        let r = &res.rows[0];
+        assert_float(&r[0], 0.0);
+        assert_float(&r[1], 0.0);
+        assert!(matches!(r[2], Val::Null));
+        assert!(matches!(r[3], Val::Null));
         let _ = std::fs::remove_dir_all(&root);
     }
 
