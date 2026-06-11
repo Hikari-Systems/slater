@@ -27,13 +27,19 @@ pub fn probe(host: &str, port: u16) -> bool {
     stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
 
     // Magic preamble followed by four big-endian u32 version proposals, highest
-    // preference first. We offer 5.x then 4.4; any conformant Bolt server replies
-    // with the chosen version, or four zero bytes if it supports none.
+    // preference first. Each proposal is encoded `00 <range> <minor> <major>`,
+    // where `range` is how many consecutive lower minors are ALSO acceptable — so
+    // `00 06 06 05` offers Bolt 5.6 down to 5.0. We MUST offer a range, not a bare
+    // version: this server negotiates Bolt 5.1–5.4, so a plain `5.0` proposal
+    // (`00 00 00 05`) matches nothing and the server replies `00 00 00 00`, making
+    // the probe (and the container HEALTHCHECK) spuriously fail against a perfectly
+    // healthy server. A conformant Bolt server replies with the chosen version, or
+    // four zero bytes if it supports none.
     let mut hs = Vec::with_capacity(20);
     hs.extend_from_slice(&BOLT_MAGIC);
     for v in [
-        0x0000_0005u32,
-        0x0000_0004u32,
+        0x0006_0605u32, // Bolt 5.6 … 5.0
+        0x0003_0404u32, // Bolt 4.4 … 4.1
         0x0000_0000u32,
         0x0000_0000u32,
     ] {
