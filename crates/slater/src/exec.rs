@@ -919,23 +919,33 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
-    /// Decide whether to match `pattern` reversed so an id-seekable **end** node
-    /// leads instead of a full-scan start. Returns the reversed pattern when all of
-    /// these hold, else `None` (match the original):
-    /// - there is a `WHERE`;
-    /// - the pattern has at least one relationship and **no** variable-length hop
-    ///   (a reversed `*` walk could reorder a returned relationship list);
-    /// - it has no path variable (reversal would reverse the path);
-    /// - neither the start nor the end node is already bound by an outer pattern;
-    /// - the **start** is *not* id-anchored (if it were, it already leads optimally);
-    /// - the **end** node *is* id-anchored.
+    /// Decide whether to match `pattern` reversed so a concrete (single-candidate)
+    /// **end** node leads instead of a full-scan start. Returns the reversed pattern
+    /// when it would help, else `None` (match the original). Reversal preserves the
+    /// binding set exactly (same vars, same edges, flipped traversal direction) and
+    /// the full WHERE is re-checked downstream, so it cannot change results.
+    ///
+    /// Common preconditions: the pattern has at least one relationship and **no**
+    /// variable-length hop (a reversed `*` walk could reorder a returned
+    /// relationship list); it has no path variable (reversal would reverse the
+    /// path); and the **start** is a fresh scan (an already-bound start leads with a
+    /// concrete node, so reversal could only lose that).
+    ///
+    /// Two cases re-root:
+    /// - **(1) end already bound** by an outer `MATCH`/`WITH` to a concrete node —
+    ///   lead with that node and walk its reverse adjacency, instead of full-scanning
+    ///   the start label once per bound end row. This is the eu-ai-act §P1
+    ///   reverse-traversal case: `… MATCH (c:Chunk)-[:SOURCED_FROM]->(b)` with `b`
+    ///   bound went from a seek to an O(|Chunk|)-per-row scan without it.
+    /// - **(2) end id-anchored by `WHERE`** (`… WHERE id(end) = X`, the start *not*
+    ///   anchored) — seek the end and walk back, turning a full edge scan into a
+    ///   seek + one-hop (Memgraph Lab neighbourhood expansion).
     fn maybe_reroot(
         &self,
         pattern: &Pattern,
         binding: &HashMap<String, Val>,
         where_: Option<&Expr>,
     ) -> Option<Pattern> {
-        let where_ = where_?;
         if pattern.path_var.is_some() || pattern.rels.is_empty() {
             return None;
         }
@@ -948,10 +958,15 @@ impl<'g> Engine<'g> {
         }
         let end = &pattern.rels.last().unwrap().1;
         let end_var = end.var.as_deref()?;
+        // (1) End node already bound to a concrete node — lead with it.
+        if matches!(binding.get(end_var), Some(Val::Node(_))) {
+            return Some(reverse_pattern(pattern));
+        }
+        // (2) End must otherwise be a fresh scan target id-anchored by WHERE.
         if !unbound(end.var.as_ref()) {
             return None;
         }
-        // Already-optimal start wins; otherwise re-root only onto an id-anchored end.
+        let where_ = where_?;
         let start_anchored = pattern
             .start
             .var
@@ -1901,6 +1916,18 @@ impl<'g> Engine<'g> {
             "floor" => num_fn(&a0(0), |x| x.floor()),
             "round" => num_fn(&a0(0), |x| x.round()),
             "sqrt" => num_fn(&a0(0), |x| x.sqrt()),
+            // Natural log / base-10 log. Like FalkorDB these wrap libm directly, so
+            // a non-positive argument yields the IEEE result (`log(0) = -inf`,
+            // `log(-1) = NaN`) rather than an error — matching its `AR_LOG`/`AR_LOG10`.
+            "log" => num_fn(&a0(0), |x| x.ln()),
+            "log10" => num_fn(&a0(0), |x| x.log10()),
+            "exp" => num_fn(&a0(0), |x| x.exp()),
+            "e" => Val::Float(std::f64::consts::E),
+            "pi" => Val::Float(std::f64::consts::PI),
+            "pow" => match (a0(0).as_num(), a0(1).as_num()) {
+                (Some(b), Some(e)) => Val::Float(b.powf(e)),
+                _ => Val::Null,
+            },
             "sign" => num_fn(&a0(0), |x| x.signum().trunc()),
             "exists" => Val::Bool(!matches!(a0(0), Val::Null)),
             "substring" => self.substring(&args)?,
@@ -3156,6 +3183,62 @@ mod tests {
         };
         assert!((same - 1.0).abs() < 1e-9);
         assert!(orth.abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // log/log10/exp/e/pi/pow — the camelid §1 gap (TF-IDF scoring needs `log`).
+    #[test]
+    fn numeric_log_family_functions() {
+        let (root, res) = run(
+            "exec_logfns",
+            "RETURN log(2.718281828459045) AS ln, log10(1000.0) AS l10, \
+             exp(0.0) AS ex, e() AS e, pi() AS pi, pow(2.0, 10.0) AS p",
+        );
+        let f = |v: &Val| match v {
+            Val::Float(x) => *x,
+            other => panic!("expected float, got {other:?}"),
+        };
+        let r = &res.rows[0];
+        assert!((f(&r[0]) - 1.0).abs() < 1e-12);
+        assert!((f(&r[1]) - 3.0).abs() < 1e-12);
+        assert!((f(&r[2]) - 1.0).abs() < 1e-12);
+        assert!((f(&r[3]) - std::f64::consts::E).abs() < 1e-12);
+        assert!((f(&r[4]) - std::f64::consts::PI).abs() < 1e-12);
+        assert!((f(&r[5]) - 1024.0).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // FalkorDB parity: a non-positive argument to log yields the IEEE result
+    // (-inf / NaN), not an error; NULL propagates as NULL.
+    #[test]
+    fn log_domain_and_null_match_falkordb() {
+        let (root, res) = run(
+            "exec_log_domain",
+            "RETURN log(0.0) AS zero, log(-1.0) AS neg, log(null) AS nul",
+        );
+        let r = &res.rows[0];
+        assert!(matches!(r[0], Val::Float(x) if x == f64::NEG_INFINITY));
+        assert!(matches!(r[1], Val::Float(x) if x.is_nan()));
+        assert!(matches!(r[2], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // eu-ai-act §P1: a relationship whose target node is already bound from a prior
+    // MATCH must lead with that bound node (reverse adjacency), not full-scan the
+    // start label once per bound row. We assert correctness here; the reroot in
+    // `maybe_reroot` removes the O(|start-label|)-per-row blow-up.
+    #[test]
+    fn reverse_traversal_to_bound_node() {
+        // Bob is reached by Alice and Carol via KNOWS. Bind Bob first, then match
+        // the incoming KNOWS with the *source* unbound — the planner should reroot
+        // to lead with Bob and walk reverse adjacency.
+        let (root, res) = run(
+            "exec_bound_end_reroot",
+            "MATCH (b:Person {name:'Bob'}) \
+             MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS nm ORDER BY nm",
+        );
+        let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+        assert_eq!(names, vec!["Alice"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
