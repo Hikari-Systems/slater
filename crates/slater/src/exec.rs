@@ -36,6 +36,7 @@ use crate::cache::{BlockCache, FileKind, VectorIndexCache};
 use crate::generation::Generation;
 use crate::parser::ast::*;
 use crate::plan::{choose_node_scan, is_id_anchored, NodeScan};
+use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{NodeId, Value};
 use graph_format::manifest::AnnMode;
@@ -121,6 +122,19 @@ pub enum Val {
         latitude: f64,
         longitude: f64,
     },
+    /// A temporal value. Like FalkorDB, every temporal is a single `time_t`
+    /// (whole seconds since the Unix epoch, UTC) plus this type tag — see
+    /// [`crate::temporal`] for the full model. Constructor/compute-only (the
+    /// on-disk format cannot store temporals), so they are never decoded from a
+    /// node property.
+    /// `date()` — seconds at UTC midnight of the day.
+    Date(i64),
+    /// `localtime()` — seconds since midnight, `[0, 86400)`.
+    Time(i64),
+    /// `localdatetime()` — seconds since the epoch.
+    DateTime(i64),
+    /// `duration()` — the `time_t` of *epoch + duration*.
+    Duration(i64),
 }
 
 impl Val {
@@ -149,6 +163,10 @@ impl Val {
             Val::Rel { .. } => 8,
             Val::Path { .. } => 9,
             Val::Point { .. } => 10,
+            Val::Date(_) => 11,
+            Val::Time(_) => 12,
+            Val::DateTime(_) => 13,
+            Val::Duration(_) => 14,
         }
     }
 
@@ -199,6 +217,12 @@ impl Val {
                     longitude: lo_b,
                 },
             ) => lo_a.total_cmp(lo_b).then_with(|| la.total_cmp(lb)),
+            // Temporals compare by their underlying `time_t` (FalkorDB compares
+            // `datetimeval`); cross-type falls through to the rank ordering.
+            (Date(a), Date(b))
+            | (Time(a), Time(b))
+            | (DateTime(a), DateTime(b))
+            | (Duration(a), Duration(b)) => a.cmp(b),
             (List(a), List(b)) => a
                 .iter()
                 .zip(b)
@@ -274,6 +298,12 @@ impl Val {
                     longitude: lo_b,
                 },
             ) => la == lb && lo_a == lo_b,
+            // Same-type temporals are equal iff their `time_t` matches; a
+            // temporal vs a different temporal type is unequal (the `_` arm).
+            (Date(a), Date(b))
+            | (Time(a), Time(b))
+            | (DateTime(a), DateTime(b))
+            | (Duration(a), Duration(b)) => a == b,
             (List(a), List(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.loose_eq(y) == Some(true))
             }
@@ -309,6 +339,14 @@ impl Val {
                 latitude,
                 longitude,
             } => format!("point({{latitude: {latitude:.6}, longitude: {longitude:.6}}})"),
+            // Temporals render via their dedicated calendar formatters (Date
+            // `YYYY-MM-DD`, Time `HH:MM:SS`, DateTime `…T…`, Duration `PnYnMnD…`).
+            // All are integer-based — no f64 formatting — so the double-precision
+            // `toString` concern does not arise here.
+            Val::Date(s) => temporal::date_to_string(*s),
+            Val::Time(s) => temporal::time_to_string(*s),
+            Val::DateTime(s) => temporal::datetime_to_string(*s),
+            Val::Duration(s) => temporal::duration_to_string(*s),
             other => format!("{other:?}"),
         }
     }
@@ -2538,6 +2576,22 @@ impl<'g> Engine<'g> {
                 "longitude" => Val::Float(*longitude),
                 _ => Val::Null,
             }),
+            // Temporal component access (FalkorDB `entity_funcs.c` → `*_getComponent`):
+            // an unknown component is an *error* (unlike Point/Map, which yield
+            // NULL). Date/Time/DateTime components are integers; Duration's are
+            // doubles.
+            Val::Date(s) => temporal::date_component(*s, key, false)
+                .map(Val::Int)
+                .ok_or_else(|| anyhow::anyhow!("unknown date component {key}")),
+            Val::Time(s) => temporal::time_component(*s, key)
+                .map(Val::Int)
+                .ok_or_else(|| anyhow::anyhow!("unknown time component {key}")),
+            Val::DateTime(s) => temporal::date_component(*s, key, true)
+                .map(Val::Int)
+                .ok_or_else(|| anyhow::anyhow!("unknown datetime component {key}")),
+            Val::Duration(s) => temporal::duration_component(*s, key)
+                .map(Val::Float)
+                .ok_or_else(|| anyhow::anyhow!("unknown duration component {key}")),
             Val::Null => Ok(Val::Null),
             other => bail!("type {} has no property '{key}'", other.to_display()),
         }
@@ -3171,6 +3225,42 @@ impl<'g> Engine<'g> {
                     b.to_display()
                 ),
             },
+            // ── Temporal constructors (FalkorDB time_funcs.c) ───────────────
+            // Each takes a string (ISO-8601) or a component map; a bad string →
+            // NULL, NULL arg → NULL. A no-arg call would be the wall-clock `now`,
+            // which is out of scope (non-deterministic) → NULL. `timestamp()`
+            // shipped in Phase 1 as an Int and is unchanged.
+            "date" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Str(s) => temporal::date_from_string(&s).map(Val::Date).unwrap_or(Val::Null),
+                Val::Map(m) => build_date(&m)?,
+                other => bail!("date() expects a string or map, got {}", other.to_display()),
+            },
+            "localtime" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Str(s) => temporal::time_from_string(&s).map(Val::Time).unwrap_or(Val::Null),
+                Val::Map(m) => build_time(&m)?,
+                other => bail!("localtime() expects a string or map, got {}", other.to_display()),
+            },
+            "localdatetime" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Str(s) => temporal::datetime_from_string(&s)
+                    .map(Val::DateTime)
+                    .unwrap_or(Val::Null),
+                Val::Map(m) => build_datetime(&m)?,
+                other => bail!(
+                    "localdatetime() expects a string or map, got {}",
+                    other.to_display()
+                ),
+            },
+            "duration" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Str(s) => temporal::duration_from_string(&s)
+                    .map(Val::Duration)
+                    .unwrap_or(Val::Null),
+                Val::Map(m) => build_duration(&m)?,
+                other => bail!("duration() expects a string or map, got {}", other.to_display()),
+            },
             // ── List functions (FalkorDB list_funcs.c) ──────────────────────
             // tail: all but the first element. NULL → NULL.
             "tail" => match a0(0) {
@@ -3571,6 +3661,8 @@ const IMPLEMENTED_FUNCTIONS: &[&str] = &[
     "vec.euclideandistance", "vecf32",
     // spatial
     "distance", "point",
+    // temporal (timestamp shipped in Phase 1)
+    "date", "duration", "localdatetime", "localtime", "timestamp",
 ];
 
 /// `CALL dbms.procedures()` — `[name, mode]` rows, one per [`SLATER_PROCEDURES`].
@@ -3876,9 +3968,270 @@ fn list_index(len: usize, i: i64) -> Option<usize> {
     }
 }
 
+fn is_temporal(v: &Val) -> bool {
+    matches!(
+        v,
+        Val::Date(_) | Val::Time(_) | Val::DateTime(_) | Val::Duration(_)
+    )
+}
+
+/// The underlying `time_t` of any temporal `Val` (0 for non-temporals).
+fn temporal_secs(v: &Val) -> i64 {
+    match v {
+        Val::Date(s) | Val::Time(s) | Val::DateTime(s) | Val::Duration(s) => *s,
+        _ => 0,
+    }
+}
+
+/// Wrap a `time_t` back into the non-duration temporal `Val` of kind `k`.
+fn rewrap_temporal(k: TKind, s: i64) -> Val {
+    match k {
+        TKind::Date => Val::Date(s),
+        TKind::Time => Val::Time(s),
+        TKind::DateTime => Val::DateTime(s),
+    }
+}
+
+fn temporal_kind(v: &Val) -> Option<TKind> {
+    match v {
+        Val::Date(_) => Some(TKind::Date),
+        Val::Time(_) => Some(TKind::Time),
+        Val::DateTime(_) => Some(TKind::DateTime),
+        _ => None,
+    }
+}
+
+/// `+`/`-` where at least one operand is a temporal. Only `temporal ± duration`
+/// and `duration ± duration` are defined (FalkorDB `temporal_arithmetic.c`).
+fn temporal_arith(op: BinOp, a: &Val, b: &Val) -> Result<Val> {
+    match op {
+        BinOp::Add => match (a, b) {
+            (Val::Duration(x), Val::Duration(y)) => {
+                Ok(Val::Duration(temporal::add_durations(*x, *y, false)))
+            }
+            // temporal + duration (either order)
+            (Val::Duration(d), t) | (t, Val::Duration(d)) if temporal_kind(t).is_some() => {
+                let k = temporal_kind(t).unwrap();
+                Ok(rewrap_temporal(
+                    k,
+                    temporal::add_duration(k, temporal_secs(t), *d, false),
+                ))
+            }
+            _ => bail!(
+                "'{}' and '{}' cannot be added",
+                type_name(a),
+                type_name(b)
+            ),
+        },
+        BinOp::Sub => match (a, b) {
+            (Val::Duration(x), Val::Duration(y)) => {
+                Ok(Val::Duration(temporal::add_durations(*x, *y, true)))
+            }
+            // temporal - duration only (duration - temporal is invalid)
+            (t, Val::Duration(d)) if temporal_kind(t).is_some() => {
+                let k = temporal_kind(t).unwrap();
+                Ok(rewrap_temporal(
+                    k,
+                    temporal::add_duration(k, temporal_secs(t), *d, true),
+                ))
+            }
+            _ => bail!(
+                "'{}' and '{}' cannot be subtracted",
+                type_name(a),
+                type_name(b)
+            ),
+        },
+        _ => bail!(
+            "operator not supported between '{}' and '{}'",
+            type_name(a),
+            type_name(b)
+        ),
+    }
+}
+
+// ── Temporal constructor map extraction (FalkorDB time_funcs.c) ──────────────
+
+/// `_get_component`: a case-insensitive integer component in `[min, max]`.
+/// `Ok(None)` = absent; `Err` = wrong type or out of range.
+fn temporal_int(m: &[(String, Val)], key: &str, min: i64, max: i64) -> Result<Option<i64>> {
+    match m.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+        None => Ok(None),
+        Some((_, Val::Int(v))) => {
+            if *v < min || *v > max {
+                bail!("Invalid value for {key} (valid values {min} - {max})");
+            }
+            Ok(Some(*v))
+        }
+        Some(_) => bail!("{key} must be an integer value"),
+    }
+}
+
+/// `_duration_get_component`: a case-insensitive numeric (int or float) component.
+fn temporal_num(m: &[(String, Val)], key: &str) -> Result<Option<f64>> {
+    match m.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+        None => Ok(None),
+        Some((_, v)) => match v.as_num() {
+            Some(n) => Ok(Some(n)),
+            None => bail!("{key} must be a numerical value"),
+        },
+    }
+}
+
+/// `date({...})` (FalkorDB `AR_DATE` map branch): build from y/m/d, ISO week, or
+/// quarter. `year` is mandatory; week and quarter forms are mutually exclusive
+/// with the plain month/day form.
+fn build_date(m: &[(String, Val)]) -> Result<Val> {
+    let year = temporal_int(m, "year", -999_999_999, 999_999_999)?
+        .ok_or_else(|| anyhow::anyhow!("year must be specified"))?;
+    let quarter = temporal_int(m, "quarter", 1, 4)?;
+    let day_of_quarter = temporal_int(m, "dayOfQuarter", 1, 92)?;
+    let month = temporal_int(m, "month", 1, 12)?;
+    let week = temporal_int(m, "week", 1, 53)?;
+    let day = temporal_int(m, "day", 1, 31)?;
+    let day_of_week = temporal_int(m, "dayOfWeek", 1, 7)?;
+
+    let recognized = 1
+        + [quarter, day_of_quarter, month, week, day, day_of_week]
+            .iter()
+            .filter(|c| c.is_some())
+            .count();
+    if m.len() > recognized {
+        bail!("date components map contains an unknown key");
+    }
+
+    let secs = if let Some(week) = week {
+        temporal::date_from_week(year as i32, week, day_of_week.unwrap_or(1))
+    } else if quarter.is_some() || day_of_quarter.is_some() {
+        temporal::date_from_quarter(year as i32, quarter.unwrap_or(1), day_of_quarter.unwrap_or(1))
+    } else {
+        temporal::date_from_components(year as i32, month.unwrap_or(1) as u32, day.unwrap_or(1))
+    };
+    Ok(Val::Date(secs))
+}
+
+/// `localtime({...})` (FalkorDB `AR_LOCALTIME` map branch). `hour` is mandatory;
+/// sub-second fields are validated but dropped (whole-second storage).
+fn build_time(m: &[(String, Val)]) -> Result<Val> {
+    let hour = temporal_int(m, "hour", 0, 23)?;
+    let minute = temporal_int(m, "minute", 0, 59)?;
+    let second = temporal_int(m, "second", 0, 59)?;
+    let milli = temporal_int(m, "millisecond", 0, 999)?;
+    let micro = temporal_int(m, "microsecond", 0, 999_999)?;
+    let nano = temporal_int(m, "nanosecond", 0, 999_999_999)?;
+
+    let recognized = [hour, minute, second, milli, micro, nano]
+        .iter()
+        .filter(|c| c.is_some())
+        .count();
+    let hour = hour.ok_or_else(|| anyhow::anyhow!("hour must be specified"))?;
+    if minute.is_none() && second.is_some() {
+        bail!("second cannot be specified without minute");
+    }
+    if m.len() > recognized {
+        bail!("datetime components map contains an unknown key");
+    }
+    Ok(Val::Time(temporal::time_from_components(
+        hour,
+        minute.unwrap_or(0),
+        second.unwrap_or(0),
+    )))
+}
+
+/// `localdatetime({...})` (FalkorDB `AR_LOCALDATETIME` map branch) — a date
+/// (y/m/d, ISO week, or quarter) plus an optional clock offset.
+fn build_datetime(m: &[(String, Val)]) -> Result<Val> {
+    let year = temporal_int(m, "year", -999_999_999, 999_999_999)?
+        .ok_or_else(|| anyhow::anyhow!("year must be specified"))?;
+    let quarter = temporal_int(m, "quarter", 1, 4)?;
+    let day_of_quarter = temporal_int(m, "dayOfQuarter", 1, 92)?;
+    let month = temporal_int(m, "month", 1, 12)?;
+    let week = temporal_int(m, "week", 1, 53)?;
+    let day = temporal_int(m, "day", 1, 31)?;
+    let day_of_week = temporal_int(m, "dayOfWeek", 1, 7)?;
+    let hour = temporal_int(m, "hour", 0, 23)?;
+    let minute = temporal_int(m, "minute", 0, 59)?;
+    let second = temporal_int(m, "second", 0, 59)?;
+    let milli = temporal_int(m, "millisecond", 0, 999)?;
+    let micro = temporal_int(m, "microsecond", 0, 999_999)?;
+    let nano = temporal_int(m, "nanosecond", 0, 999_999_999)?;
+
+    let recognized = 1
+        + [
+            quarter,
+            day_of_quarter,
+            month,
+            week,
+            day,
+            day_of_week,
+            hour,
+            minute,
+            second,
+            milli,
+            micro,
+            nano,
+        ]
+        .iter()
+        .filter(|c| c.is_some())
+        .count();
+    if m.len() > recognized {
+        bail!("datetime components map contains an unknown key");
+    }
+
+    let hms = (hour.unwrap_or(0), minute.unwrap_or(0), second.unwrap_or(0));
+    let secs = if let Some(week) = week {
+        temporal::datetime_from_week(year as i32, week, day_of_week.unwrap_or(1), hms)
+    } else if quarter.is_some() || day_of_quarter.is_some() {
+        temporal::datetime_from_quarter(
+            year as i32,
+            quarter.unwrap_or(1),
+            day_of_quarter.unwrap_or(1),
+            hms,
+        )
+    } else {
+        temporal::datetime_from_components(year as i32, month.unwrap_or(1) as u32, day.unwrap_or(1), hms)
+    };
+    Ok(Val::DateTime(secs))
+}
+
+/// `duration({...})` (FalkorDB `AR_DURATION` map branch) — any of
+/// years/months/weeks/days/hours/minutes/seconds (numeric, fractional allowed).
+fn build_duration(m: &[(String, Val)]) -> Result<Val> {
+    let years = temporal_num(m, "years")?;
+    let months = temporal_num(m, "months")?;
+    let weeks = temporal_num(m, "weeks")?;
+    let days = temporal_num(m, "days")?;
+    let hours = temporal_num(m, "hours")?;
+    let minutes = temporal_num(m, "minutes")?;
+    let seconds = temporal_num(m, "seconds")?;
+
+    let recognized = [years, months, weeks, days, hours, minutes, seconds]
+        .iter()
+        .filter(|c| c.is_some())
+        .count();
+    if m.len() > recognized {
+        bail!("datetime components map contains an unknown key");
+    }
+    Ok(Val::Duration(temporal::duration_to_timet(
+        years.unwrap_or(0.0),
+        months.unwrap_or(0.0),
+        weeks.unwrap_or(0.0),
+        days.unwrap_or(0.0),
+        hours.unwrap_or(0.0),
+        minutes.unwrap_or(0.0),
+        seconds.unwrap_or(0.0),
+    )))
+}
+
 fn arith(op: BinOp, a: Val, b: Val) -> Result<Val> {
     if matches!(a, Val::Null) || matches!(b, Val::Null) {
         return Ok(Val::Null);
+    }
+    // Temporal arithmetic (FalkorDB `SIValue_Add`/`Subtract` + `temporal_arithmetic.c`):
+    // `temporal ± duration → temporal`, `duration ± duration → duration`; every
+    // other temporal combination is rejected (FalkorDB instead silently coerces
+    // the `time_t` to a number — we error, which is friendlier and untested).
+    if is_temporal(&a) || is_temporal(&b) {
+        return temporal_arith(op, &a, &b);
     }
     // String concatenation and list construction for `+`.
     if let BinOp::Add = op {
@@ -3971,6 +4324,12 @@ fn comparable(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
         (Val::Int(_) | Val::Float(_), Val::Int(_) | Val::Float(_)) => Some(a.cmp_total(b)),
         (Val::Str(x), Val::Str(y)) => Some(x.cmp(y)),
         (Val::Bool(x), Val::Bool(y)) => Some(x.cmp(y)),
+        // Temporals are ordered only against the same temporal type (FalkorDB
+        // `SI_VALUES_ARE_COMPARABLE`); a mixed pair yields `null`.
+        (Val::Date(x), Val::Date(y))
+        | (Val::Time(x), Val::Time(y))
+        | (Val::DateTime(x), Val::DateTime(y))
+        | (Val::Duration(x), Val::Duration(y)) => Some(x.cmp(y)),
         _ => None,
     }
 }
@@ -4233,6 +4592,12 @@ fn type_name(v: &Val) -> &'static str {
         Val::Rel { .. } => "Edge",
         Val::Path { .. } => "Path",
         Val::Point { .. } => "Point",
+        // `localtime`→`Time`, `localdatetime`→`Datetime` (FalkorDB collapses the
+        // Local* enum variants onto these in `SIType_ToString`).
+        Val::Date(_) => "Date",
+        Val::Time(_) => "Time",
+        Val::DateTime(_) => "Datetime",
+        Val::Duration(_) => "Duration",
     }
 }
 
@@ -6907,7 +7272,7 @@ mod tests {
         let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
         for want in [
             "sin", "tail", "point", "distance", "vec.euclideandistance",
-            "tofloatornull", "percentilecont", "string.matchregex",
+            "tofloatornull", "percentilecont", "string.matchregex", "date", "duration",
         ] {
             assert!(names.iter().any(|n| n == want), "coverage gate missing {want}");
         }
@@ -7450,5 +7815,299 @@ mod tests {
             "CALL algo.betweenness({samplingSize: -1}) YIELD node RETURN node",
         );
         assert!(e.contains("samplingSize"), "{e}");
+    }
+
+    // ── Phase 10 — temporal value types (date/localtime/localdatetime/duration) ──
+    // Vectors ported from FalkorDB `tests/flow/test_temporal.py`. The inline `run`
+    // harness has no params, so the `$map`/`$str` inputs become literal map/string
+    // expressions in the query text.
+
+    /// `localtime` from a map and from a string, its `.hour/.minute/.second`
+    /// components, and `toString` (sub-second is dropped → `HH:MM:SS`).
+    #[test]
+    fn phase10_localtime_construction_and_components() {
+        let (root, res) = run(
+            "exec_p10_lt",
+            "WITH localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS d \
+             RETURN toString(d) AS s, d.hour AS h, d.minute AS mi, d.second AS se, typeOf(d) AS t",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'12:31:14'");
+        assert!(matches!(r[1], Val::Int(12)));
+        assert!(matches!(r[2], Val::Int(31)));
+        assert!(matches!(r[3], Val::Int(14)));
+        assert_eq!(render(&r[4]), "'Time'");
+
+        // String forms (compact + colon) and the trailing-fraction drop.
+        let (root2, res2) = run(
+            "exec_p10_lt_str",
+            "RETURN toString(localtime('21')) AS a, toString(localtime('2140')) AS b, \
+                    toString(localtime('214032')) AS c, toString(localtime('21:40:32.143')) AS e",
+        );
+        let r = &res2.rows[0];
+        assert_eq!(render(&r[0]), "'21:00:00'");
+        assert_eq!(render(&r[1]), "'21:40:00'");
+        assert_eq!(render(&r[2]), "'21:40:32'");
+        assert_eq!(render(&r[3]), "'21:40:32'");
+
+        // toString round-trips back to an equal value.
+        let (root3, res3) = run(
+            "exec_p10_lt_rt",
+            "WITH localtime({hour: 12, minute: 31, second: 14}) AS d \
+             RETURN localtime(toString(d)) = d AS b",
+        );
+        assert!(matches!(res3.rows[0][0], Val::Bool(true)));
+        for p in [root, root2, root3] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// `date` from components (y/m/d, ISO week, quarter) and strings, its many
+    /// components, and `toString` (`YYYY-MM-DD`).
+    #[test]
+    fn phase10_date_construction_and_components() {
+        // Component-map and string constructions agree on the rendered date.
+        let (root, res) = run(
+            "exec_p10_date_build",
+            "RETURN toString(date({year:1984})) AS a, \
+                    toString(date({year:1984, month:10})) AS b, \
+                    toString(date({year:1984, week:10})) AS c, \
+                    toString(date({year:1984, month:10, day:11})) AS d, \
+                    toString(date({year:1984, week:10, dayOfWeek:3})) AS e, \
+                    toString(date({year:1984, quarter:3, dayOfQuarter:45})) AS f, \
+                    toString(date({year:1984, quarter:3})) AS g, \
+                    toString(date('2015202')) AS h, toString(date('2015-W30-2')) AS i, \
+                    toString(date('20150721')) AS j",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'1984-01-01'");
+        assert_eq!(render(&r[1]), "'1984-10-01'");
+        assert_eq!(render(&r[2]), "'1984-03-05'");
+        assert_eq!(render(&r[3]), "'1984-10-11'");
+        assert_eq!(render(&r[4]), "'1984-03-07'");
+        assert_eq!(render(&r[5]), "'1984-08-14'");
+        assert_eq!(render(&r[6]), "'1984-07-01'");
+        assert_eq!(render(&r[7]), "'2015-07-21'"); // ordinal day 202
+        assert_eq!(render(&r[8]), "'2015-07-21'"); // ISO week 30, Tue
+        assert_eq!(render(&r[9]), "'2015-07-21'");
+
+        // Components of date(1984-10-21) — incl. FalkorDB's quirky dayOfQuarter (23).
+        let (root2, res2) = run(
+            "exec_p10_date_comp",
+            "WITH date({year: 1984, month:10, day:21}) AS d \
+             RETURN d.year, d.quarter, d.month, d.week, d.day, d.dayOfWeek, \
+                    d.dayOfQuarter, d.ordinalDay, typeOf(d)",
+        );
+        let r = &res2.rows[0];
+        let ints: Vec<i64> = (0..8)
+            .map(|i| match r[i] {
+                Val::Int(v) => v,
+                ref o => panic!("col {i}: expected int, got {o:?}"),
+            })
+            .collect();
+        assert_eq!(ints, vec![1984, 4, 10, 42, 21, 0, 23, 295]);
+        assert_eq!(render(&r[8]), "'Date'");
+        for p in [root, root2] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// `localdatetime` from components/strings, its `toString` (`…T…`), the
+    /// ISO-week construction edge cases, and component access.
+    #[test]
+    fn phase10_localdatetime_construction_and_components() {
+        let (root, res) = run(
+            "exec_p10_ldt",
+            "RETURN toString(localdatetime({year:1984, month:10, day:11, hour:12, minute:31, second:14, nanosecond:645876123})) AS a, \
+                    toString(localdatetime({year:1984, month:10, day:11, hour:12})) AS b, \
+                    toString(localdatetime({year:1984})) AS c, \
+                    toString(localdatetime({year:1918, week:1})) AS d, \
+                    toString(localdatetime({year:1918, week:53})) AS e, \
+                    toString(localdatetime('2025-02-18T12:34:56')) AS f, \
+                    toString(localdatetime('20250218T123456')) AS g",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'1984-10-11T12:31:14'");
+        assert_eq!(render(&r[1]), "'1984-10-11T12:00:00'");
+        assert_eq!(render(&r[2]), "'1984-01-01T00:00:00'");
+        assert_eq!(render(&r[3]), "'1917-12-31T00:00:00'"); // ISO week 1 of 1918
+        assert_eq!(render(&r[4]), "'1918-12-30T00:00:00'"); // lenient week 53
+        assert_eq!(render(&r[5]), "'2025-02-18T12:34:56'");
+        assert_eq!(render(&r[6]), "'2025-02-18T12:34:56'");
+
+        // Components incl. clock parts + round-trip via toString.
+        let (root2, res2) = run(
+            "exec_p10_ldt_comp",
+            "WITH localdatetime({year:1984, month:10, day:21, hour:10, minute:31, second:46}) AS d \
+             RETURN d.year, d.quarter, d.month, d.week, d.day, d.ordinalDay, \
+                    d.hour, d.minute, d.second, \
+                    localdatetime(toString(d)) = d AS rt, typeOf(d) AS t",
+        );
+        let r = &res2.rows[0];
+        let ints: Vec<i64> = (0..9)
+            .map(|i| match r[i] {
+                Val::Int(v) => v,
+                ref o => panic!("col {i}: expected int, got {o:?}"),
+            })
+            .collect();
+        assert_eq!(ints, vec![1984, 4, 10, 42, 21, 295, 10, 31, 46]);
+        assert!(matches!(r[9], Val::Bool(true)), "toString round-trip");
+        assert_eq!(render(&r[10]), "'Datetime'");
+        for p in [root, root2] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// `duration` from a map and ISO-8601 string, its components (weeks fold into
+    /// days), and `toString`.
+    #[test]
+    fn phase10_duration_construction_and_components() {
+        // Components: weeks fold into days (1 week + 4 days → 11 days, 0 weeks).
+        let (root, res) = run(
+            "exec_p10_dur_comp",
+            "WITH duration({years:2, months:3, weeks:1, days:4, hours:5, minutes:22, seconds:7}) AS d \
+             RETURN d.years, d.months, d.weeks, d.days, d.hours, d.minutes, d.seconds, typeOf(d) AS t",
+        );
+        let r = &res.rows[0];
+        // Duration components are doubles (FalkorDB `SI_DoubleVal`) → render as ints.
+        let got: Vec<String> = (0..7).map(|i| render(&r[i])).collect();
+        assert_eq!(got, vec!["2", "3", "0", "11", "5", "22", "7"]);
+        assert_eq!(render(&r[7]), "'Duration'");
+
+        // String form + toString round-trips ('P1M' stays 'P1M').
+        let (root2, res2) = run(
+            "exec_p10_dur_str",
+            "RETURN toString(duration('P1M')) AS a, \
+                    toString(duration('P1Y2M3DT4H5M6S')) AS b, \
+                    toString(duration({years:2, months:3, days:11, hours:5, minutes:22, seconds:7})) AS c",
+        );
+        let r = &res2.rows[0];
+        assert_eq!(render(&r[0]), "'P1M'");
+        assert_eq!(render(&r[1]), "'P1Y2M3DT4H5M6S'");
+        assert_eq!(render(&r[2]), "'P2Y3M11DT5H22M7S'");
+        for p in [root, root2] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// Comparison operators over each temporal type (test_temporal.py *_compare).
+    #[test]
+    fn phase10_temporal_comparison() {
+        let (root, res) = run(
+            "exec_p10_cmp",
+            "WITH date({year:1980, month:12, day:24}) AS d1, date({year:1984, month:10, day:11}) AS d2, \
+                  localtime({hour:10, minute:35}) AS t1, localtime({hour:12, minute:31, second:14}) AS t2, \
+                  duration({years:1, months:11}) AS u1, duration({years:1, months:10}) AS u2 \
+             RETURN d1 < d2, d1 = d2, t1 < t2, t1 >= t2, u1 > u2, u1 = u2, \
+                    d1 = d1, t2 = t2",
+        );
+        let r = &res.rows[0];
+        let b: Vec<bool> = (0..8)
+            .map(|i| match r[i] {
+                Val::Bool(v) => v,
+                ref o => panic!("col {i}: {o:?}"),
+            })
+            .collect();
+        // d1<d2 T, d1=d2 F, t1<t2 T, t1>=t2 F, u1>u2 T, u1=u2 F, d1=d1 T, t2=t2 T
+        assert_eq!(b, vec![true, false, true, false, true, false, true, true]);
+
+        // Cross-type comparison (date vs duration) is `null`, not an error.
+        let (root2, res2) = run(
+            "exec_p10_cmp_x",
+            "WITH date({year:2000, month:1, day:1}) AS d, duration({days:1}) AS u \
+             RETURN d < u AS lt, d = u AS eq",
+        );
+        let r = &res2.rows[0];
+        assert!(matches!(r[0], Val::Null), "date<duration → null");
+        assert!(matches!(r[1], Val::Bool(false)), "date=duration → false");
+        for p in [root, root2] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// Temporal ± duration and duration ± duration (test_temporal.py
+    /// test_duration_add + test_month_end_duration_arithmetic).
+    #[test]
+    fn phase10_temporal_arithmetic() {
+        let (root, res) = run(
+            "exec_p10_arith",
+            "WITH duration({years:1, months:1, weeks:1, days:1, hours:1, minutes:32, seconds:10}) AS a, \
+                  duration({years:2, months:2, weeks:2, days:2, hours:2, minutes:34, seconds:12}) AS b \
+             RETURN toString(a + b) AS sum, toString(b - a) AS diff",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'P3Y3M24DT4H6M22S'"); // 66 min normalises to 4h6m
+        assert_eq!(render(&r[1]), "'P1Y1M8DT1H2M2S'");
+
+        let (root2, res2) = run(
+            "exec_p10_arith2",
+            "RETURN toString(date({year:1984, month:10, day:21}) + duration({years:1, months:1, days:1, hours:1, minutes:1, seconds:1})) AS d, \
+                    toString(duration({years:1, months:1, days:1, hours:1, minutes:1, seconds:1}) + date({year:1984, month:10, day:21})) AS d2, \
+                    toString(localtime({hour:2, minute:34, second:32}) + duration({years:1, months:1, days:1, hours:1, minutes:35, seconds:35})) AS t, \
+                    toString(localtime({hour:10, minute:30, second:10}) - duration({hours:2, minutes:40, seconds:30})) AS t2, \
+                    toString(localdatetime({year:1984, month:10, day:21, hour:5, minute:30, second:10}) + duration({years:1, months:1, days:1, hours:1, minutes:1, seconds:1})) AS dt, \
+                    toString(localdatetime({year:1984, month:10, day:21, hour:5, minute:30, second:10}) - duration({years:1, months:1, days:1, hours:1, minutes:1, seconds:1})) AS dt2",
+        );
+        let r = &res2.rows[0];
+        assert_eq!(render(&r[0]), "'1985-11-22'"); // date + dur (clock parts ignored)
+        assert_eq!(render(&r[1]), "'1985-11-22'"); // commutative
+        assert_eq!(render(&r[2]), "'04:10:07'"); // time + dur (calendar parts ignored)
+        assert_eq!(render(&r[3]), "'07:49:40'"); // time - dur
+        assert_eq!(render(&r[4]), "'1985-11-22T06:31:11'");
+        assert_eq!(render(&r[5]), "'1983-09-20T04:29:09'");
+
+        // Month-end overflow normalises forward (Jan 31 + 1mo → Mar 02).
+        let (root3, res3) = run(
+            "exec_p10_arith_me",
+            "RETURN toString(date('2024-01-31') + duration('P1M')) AS d, \
+                    toString(localdatetime('2024-01-31T00:00:00') + duration('P1M')) AS l",
+        );
+        let r = &res3.rows[0];
+        assert_eq!(render(&r[0]), "'2024-03-02'");
+        assert_eq!(render(&r[1]), "'2024-03-02T00:00:00'");
+        for p in [root, root2, root3] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+
+    /// Unsupported temporal arithmetic errors (duration − temporal is invalid),
+    /// and `null`/unknown-component handling.
+    #[test]
+    fn phase10_temporal_errors_and_null() {
+        for (tag, q) in [
+            (
+                "exec_p10_e1",
+                "RETURN duration({days:1}) - date({year:1984, month:10, day:21})",
+            ),
+            (
+                "exec_p10_e2",
+                "RETURN duration({hours:2}) - localtime({hour:10, minute:30})",
+            ),
+            (
+                "exec_p10_e3",
+                "RETURN duration({days:1}) - localdatetime({year:1984})",
+            ),
+        ] {
+            let e = run_err(tag, q);
+            assert!(e.contains("cannot be subtracted"), "query `{q}` → `{e}`");
+        }
+
+        // Unknown component on a temporal is an error (unlike Point/Map → NULL).
+        let e = run_err(
+            "exec_p10_e_comp",
+            "WITH date({year:2000, month:1, day:1}) AS d RETURN d.bogus",
+        );
+        assert!(e.contains("unknown date component"), "{e}");
+
+        // NULL / bad-string inputs propagate to NULL.
+        let (root, res) = run(
+            "exec_p10_null",
+            "RETURN date(null) AS a, localtime('nonsense') AS b, duration('not-a-duration') AS c",
+        );
+        let r = &res.rows[0];
+        assert!(matches!(r[0], Val::Null));
+        assert!(matches!(r[1], Val::Null));
+        assert!(matches!(r[2], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

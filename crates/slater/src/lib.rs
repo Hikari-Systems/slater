@@ -26,6 +26,7 @@ pub mod introspect;
 pub mod parser;
 pub mod plan;
 pub mod server;
+pub mod temporal;
 pub mod vector;
 
 // Shared in-crate test fixture (built directly with the `graph-format` writers).

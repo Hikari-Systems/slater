@@ -59,6 +59,12 @@ rayon = "1"
 # Regular expressions (slater: `=~` operator + `string.*RegEx` functions).
 regex = "1"
 
+# Calendar arithmetic for the temporal value types (slater: date/localtime/
+# localdatetime/duration). `clock` is disabled — Slater never reads the wall
+# clock (the `.transaction`/now temporals are out of scope), so we only need the
+# proleptic-Gregorian `NaiveDate`/`NaiveDateTime` calendar maths.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 [profile.release]
 strip = true
 lto = true

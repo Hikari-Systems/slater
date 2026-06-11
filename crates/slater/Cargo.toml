@@ -29,3 +29,4 @@ clap.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
 regex.workspace = true
+chrono.workspace = true

@@ -62,6 +62,18 @@ const TAG_UNBOUND_REL: u8 = 0x72;
 /// always WGS-84, so `srid` is fixed at 4326 with `x = longitude`, `y = latitude`
 /// (see `resultset_replybolt.c`).
 const TAG_POINT2D: u8 = 0x58;
+/// Bolt v2 temporal structures (Neo4j PackStream spec). FalkorDB never encodes
+/// temporals over Bolt (its formatter asserts on them), so these follow the
+/// published Neo4j spec — what an official driver decodes. Slater's `localtime`/
+/// `localdatetime` are timezone-free, so they map to the *Local* structs:
+/// - `Date` (`0x44`): `[days::Int]` — days since the Unix epoch.
+/// - `LocalTime` (`0x74`): `[nanoOfDay::Int]`.
+/// - `LocalDateTime` (`0x64`): `[seconds::Int, nanoseconds::Int]`.
+/// - `Duration` (`0x45`): `[months::Int, days::Int, seconds::Int, nanoseconds::Int]`.
+const TAG_DATE: u8 = 0x44;
+const TAG_LOCAL_TIME: u8 = 0x74;
+const TAG_LOCAL_DATETIME: u8 = 0x64;
+const TAG_DURATION: u8 = 0x45;
 
 /// The `server` agent string returned in the `HELLO` reply. Kept with a `Neo4j/`
 /// prefix so the official drivers' feature-gating (which sniffs this string) treats
@@ -1509,6 +1521,7 @@ fn val_bytes(v: &Val) -> usize {
             16 + nodes.len() * 24 + rels.iter().map(val_bytes).sum::<usize>()
         }
         Val::Point { .. } => 32,
+        Val::Date(_) | Val::Time(_) | Val::DateTime(_) | Val::Duration(_) => 24,
     }
 }
 
@@ -1643,6 +1656,33 @@ fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
                 PsValue::Float(*latitude),
             ],
         },
+        // Bolt v2 temporals. Whole-second storage ⇒ `nanoseconds` is always 0.
+        // Not byte-validated against a live driver here (same caveat as Path /
+        // Point2D); follows the published Neo4j PackStream spec.
+        Val::Date(secs) => PsValue::Struct {
+            tag: TAG_DATE,
+            fields: vec![PsValue::Int(secs.div_euclid(86_400))],
+        },
+        Val::Time(secs) => PsValue::Struct {
+            tag: TAG_LOCAL_TIME,
+            fields: vec![PsValue::Int(secs.rem_euclid(86_400) * 1_000_000_000)],
+        },
+        Val::DateTime(secs) => PsValue::Struct {
+            tag: TAG_LOCAL_DATETIME,
+            fields: vec![PsValue::Int(*secs), PsValue::Int(0)],
+        },
+        Val::Duration(secs) => {
+            let d = crate::temporal::duration_components(*secs);
+            PsValue::Struct {
+                tag: TAG_DURATION,
+                fields: vec![
+                    PsValue::Int(d.years * 12 + d.months),
+                    PsValue::Int(d.days),
+                    PsValue::Int(d.hours * 3_600 + d.minutes * 60 + d.seconds),
+                    PsValue::Int(0),
+                ],
+            }
+        }
     })
 }
 
@@ -2336,6 +2376,80 @@ mod tests {
                 assert_eq!(fields[2], PsValue::Float(32.5), "y = latitude");
             }
             other => panic!("expected a Point2D struct, got {other:?}"),
+        }
+
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Bolt v2 temporal structs (Date 0x44, LocalTime 0x74, LocalDateTime 0x64,
+    // Duration 0x45). FalkorDB never wires temporals over Bolt, so this validates
+    // the published Neo4j PackStream encoding an official driver would decode.
+    #[tokio::test]
+    async fn returns_temporal_structures() {
+        let (root, ctx) = build_ctx("server_temporal");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        c.recv().await;
+        c.send(Client::logon("reporting", "pw")).await;
+        c.recv().await;
+
+        c.send(Client::run(
+            "RETURN date('1970-01-02') AS d, localtime({hour:1, minute:0, second:1}) AS t, \
+                    localdatetime('1970-01-01T00:00:05') AS dt, \
+                    duration({months:2, days:3, hours:1, minutes:0, seconds:4}) AS u",
+        ))
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::RECORD);
+        let row = match &fields[0] {
+            PsValue::List(vals) => vals,
+            other => panic!("expected a record list, got {other:?}"),
+        };
+
+        // Date 0x44: [days] — 1970-01-02 is 1 day past the epoch.
+        match &row[0] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_DATE);
+                assert_eq!(fields, &vec![PsValue::Int(1)]);
+            }
+            other => panic!("expected a Date struct, got {other:?}"),
+        }
+        // LocalTime 0x74: [nanoOfDay] — 01:00:01 = 3601 s.
+        match &row[1] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_LOCAL_TIME);
+                assert_eq!(fields, &vec![PsValue::Int(3601 * 1_000_000_000)]);
+            }
+            other => panic!("expected a LocalTime struct, got {other:?}"),
+        }
+        // LocalDateTime 0x64: [seconds, nanoseconds] — epoch + 5 s.
+        match &row[2] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_LOCAL_DATETIME);
+                assert_eq!(fields, &vec![PsValue::Int(5), PsValue::Int(0)]);
+            }
+            other => panic!("expected a LocalDateTime struct, got {other:?}"),
+        }
+        // Duration 0x45: [months, days, seconds, nanoseconds] — 2mo 3d 1h4s.
+        match &row[3] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_DURATION);
+                assert_eq!(
+                    fields,
+                    &vec![
+                        PsValue::Int(2),
+                        PsValue::Int(3),
+                        PsValue::Int(3604),
+                        PsValue::Int(0),
+                    ]
+                );
+            }
+            other => panic!("expected a Duration struct, got {other:?}"),
         }
 
         assert_eq!(c.recv().await.0, message::tag::SUCCESS);
