@@ -108,6 +108,47 @@ pub(crate) fn empty(columns: &[&str]) -> Rows {
     (cols(columns), vec![])
 }
 
+/// `SHOW LICENSE INFO` (Memgraph) — Memgraph Lab probes this on connect to decide
+/// whether Enterprise features (incl. multiple databases / multi-tenancy) are
+/// available. We report a valid Enterprise license so Lab surfaces its database
+/// selector and drives graph selection via `USE <graph>`.
+pub(crate) fn show_license_info() -> Rows {
+    (
+        cols(&["license info", "value"]),
+        vec![
+            vec![s("organization_name"), s("Slater")],
+            vec![s("license_type"), s("enterprise")],
+            vec![s("is_valid"), s("true")],
+            vec![s("valid_until"), s("")],
+            vec![s("memory_limit"), s("0")],
+        ],
+    )
+}
+
+/// `SHOW REPLICATION ROLE` (Memgraph) — a standalone instance is the `main`.
+pub(crate) fn show_replication_role() -> Rows {
+    (cols(&["replication role"]), vec![vec![s("main")]])
+}
+
+/// `SHOW DATABASE` (Memgraph, singular) — the connection's current database. Reports
+/// the sticky `USE <graph>` selection, or `memgraph` when none has been chosen yet.
+pub(crate) fn show_database(current: Option<&str>) -> Rows {
+    (
+        cols(&["Name"]),
+        vec![vec![s(current.unwrap_or("memgraph").to_string())]],
+    )
+}
+
+/// `SHOW DATABASES` in **Memgraph** multi-tenancy format: a single `Name` column
+/// (Neo4j's `SHOW DATABASES` shape, [`show_databases`], differs — many columns, lower
+/// case `name`). Memgraph Lab reads this to populate its database dropdown.
+pub(crate) fn show_databases_memgraph(dbs: &[(String, bool)]) -> Rows {
+    (
+        cols(&["Name"]),
+        dbs.iter().map(|(n, _)| vec![s(n.clone())]).collect(),
+    )
+}
+
 /// `SHOW PROCEDURES` — the only callable procedure slater exposes.
 pub(crate) fn show_procedures() -> Rows {
     (

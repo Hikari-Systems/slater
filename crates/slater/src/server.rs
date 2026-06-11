@@ -26,7 +26,7 @@
 //! - **Bolt failure semantics.** A `FAILURE` puts the connection into a failed state
 //!   where every message except `RESET` is answered `IGNORED`, matching the drivers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -326,13 +326,55 @@ struct ConnCtx {
     /// metadata only — it is never used to auto-select a graph for a query, so an
     /// ambiguous session always errors rather than silently serving this graph.
     default_graph: Option<String>,
+    /// The graph each user last selected with `USE <graph>`, keyed by principal. Kept
+    /// per-user rather than per-connection because pooled drivers (e.g. Memgraph Lab's
+    /// neo4j-javascript driver) spread a logical session's queries across several Bolt
+    /// connections — a per-connection selection would survive only until the pool
+    /// rotated. Consulted when a db-less query needs to resolve its graph.
+    use_selection: RwLock<HashMap<String, String>>,
+    /// Principals observed issuing Memgraph-only statements (`SHOW STORAGE INFO`,
+    /// `CALL mg.*`, …). Memgraph Lab and Neo4j Browser expect different shapes for
+    /// some answers (notably `SHOW DATABASES`); this lets us reply in the right
+    /// dialect. Tracked per-user, not per-connection, because a pooled driver may ask
+    /// `SHOW DATABASES` on a connection that has not yet shown its dialect.
+    memgraph_users: RwLock<HashSet<String>>,
+}
+
+impl ConnCtx {
+    /// The graph `user` last selected via `USE`, if any.
+    fn current_selection(&self, user: &str) -> Option<String> {
+        self.use_selection.read().unwrap().get(user).cloned()
+    }
+
+    /// Record `user`'s `USE <graph>` selection for subsequent db-less queries.
+    fn set_selection(&self, user: &str, graph: &str) {
+        self.use_selection
+            .write()
+            .unwrap()
+            .insert(user.to_string(), graph.to_string());
+    }
+
+    /// Has `user` issued a Memgraph-dialect statement on any connection?
+    fn is_memgraph(&self, user: &str) -> bool {
+        self.memgraph_users.read().unwrap().contains(user)
+    }
+
+    /// Flag `user` as a Memgraph-dialect client (idempotent).
+    fn mark_memgraph(&self, user: &str) {
+        self.memgraph_users.write().unwrap().insert(user.to_string());
+    }
 }
 
 impl ConnCtx {
     /// Resolve the graph a `RUN` targets and check the user may read it. An explicit
     /// `db` in the message metadata wins; otherwise the user's single readable graph
     /// is used, and ambiguity (or none) is an error.
-    fn select_graph(&self, extra: &PsValue, user: &str) -> std::result::Result<String, Failure> {
+    fn select_graph(
+        &self,
+        extra: &PsValue,
+        user: &str,
+        sticky: Option<&str>,
+    ) -> std::result::Result<String, Failure> {
         let acl = self.acl.snapshot();
         if let Some(db) = extra
             .get("db")
@@ -362,6 +404,14 @@ impl ConnCtx {
                 ));
             }
             return Ok(db.to_string());
+        }
+        // No explicit `db`: honour a sticky `USE <graph>` selection if it is still
+        // served and readable, before falling back to the single-graph / ambiguous
+        // resolution.
+        if let Some(g) = sticky {
+            if self.graphs.get(g).is_some() && acl.can_read(user, g) {
+                return Ok(g.to_string());
+            }
         }
         let mut readable: Vec<String> = self
             .graphs
@@ -428,16 +478,30 @@ impl ConnCtx {
         user: &str,
         extra: &PsValue,
         query: &str,
+        sticky: Option<&str>,
+        memgraph: bool,
     ) -> std::result::Result<Option<introspect::Rows>, Failure> {
         let q = normalize_query(query);
 
         // Graph-agnostic (server-level) statements — answerable without a graph.
         let agnostic = match q.as_str() {
             _ if q.starts_with("call dbms.components") => Some(introspect::dbms_components()),
-            _ if q.starts_with("show databases") || q.starts_with("show default database") => Some(
-                introspect::show_databases(&self.readable_databases(user), &self.bind_addr),
-            ),
+            // Memgraph Lab and Neo4j Browser want different `SHOW DATABASES` shapes.
+            _ if q.starts_with("show databases") => Some(if memgraph {
+                introspect::show_databases_memgraph(&self.readable_databases(user))
+            } else {
+                introspect::show_databases(&self.readable_databases(user), &self.bind_addr)
+            }),
+            _ if q.starts_with("show default database") => Some(introspect::show_databases(
+                &self.readable_databases(user),
+                &self.bind_addr,
+            )),
             _ if q.starts_with("show version") => Some(introspect::show_version()),
+            _ if q.starts_with("show license info") => Some(introspect::show_license_info()),
+            _ if q.starts_with("show replication role") => {
+                Some(introspect::show_replication_role())
+            }
+            _ if q == "show database" => Some(introspect::show_database(sticky)),
             _ if q.starts_with("show procedures") => Some(introspect::show_procedures()),
             _ if q.starts_with("show functions") => {
                 Some(introspect::empty(&["name", "category", "description"]))
@@ -497,7 +561,7 @@ impl ConnCtx {
                 None
             };
         if let Some(build) = scoped {
-            let graph = self.select_graph(extra, user)?;
+            let graph = self.select_graph(extra, user, sticky)?;
             let gen = self.graphs.get(&graph).ok_or_else(|| {
                 Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
             })?;
@@ -520,6 +584,53 @@ fn normalize_query(query: &str) -> String {
         q = rest.to_string();
     }
     q.trim_end_matches(';').trim().to_string()
+}
+
+/// Recognise a `USE <graph>` / `USE DATABASE <graph>` statement and extract the graph
+/// name (preserving its original case — graph names are case-sensitive). Returns
+/// `None` for anything that is not a bare `USE`. A backtick- or quote-wrapped name is
+/// unwrapped. Memgraph's database-switch statement; not part of slater's read-only
+/// Cypher grammar, so it is handled out-of-band in the `RUN` path.
+fn parse_use_statement(query: &str) -> Option<String> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    let first = words.next()?;
+    if !first.eq_ignore_ascii_case("use") {
+        return None;
+    }
+    let mut rest: Vec<&str> = words.collect();
+    // Optional `DATABASE` keyword: `USE DATABASE <name>`.
+    if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("database")) {
+        rest.remove(0);
+    }
+    if rest.len() != 1 {
+        return None;
+    }
+    let name = rest[0]
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Does the (already normalised) query belong to Memgraph's SQL dialect — a
+/// statement only a Memgraph client (e.g. Memgraph Lab) issues? Seeing one lets us
+/// answer dialect-sensitive statements (notably `SHOW DATABASES`) in Memgraph's shape
+/// for that user rather than Neo4j's.
+fn is_memgraph_dialect_query(q: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "show storage info",
+        "show index info",
+        "show constraint info",
+        "show replication role",
+        "show replicas",
+        "show streams",
+        "show metrics info",
+        "show triggers",
+        "show version",
+        "call mg.",
+    ];
+    MARKERS.iter().any(|m| q.starts_with(m))
 }
 
 // ── Failure ────────────────────────────────────────────────────────────────
@@ -694,6 +805,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         beam_width: cfg.vector_query.beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
+        use_selection: RwLock::new(HashMap::new()),
+        memgraph_users: RwLock::new(HashSet::new()),
     });
 
     info!(
@@ -934,15 +1047,24 @@ async fn handle_request(
         }
 
         // Slater only ever runs a read transaction; BEGIN/COMMIT/ROLLBACK carry no
-        // execution state, but BEGIN names the target graph (its `db` metadata), so
-        // resolve and validate it here — failing at BEGIN, the first message after
-        // connect, rather than deferring an unknown/ambiguous graph to the first RUN.
+        // execution state. BEGIN *may* name the target graph in its `db` metadata —
+        // when it does, resolve and validate it now so an unknown/ambiguous graph
+        // fails at BEGIN rather than at the first RUN. When it does not (some clients,
+        // e.g. Memgraph Lab, put `db` on the RUN inside the transaction instead),
+        // leave the transaction unbound so that RUN resolves the graph itself.
         Request::Begin(meta) => {
             let user = sess
                 .user
                 .as_deref()
                 .ok_or_else(|| Failure::unauthorized("not authenticated; send LOGON first"))?;
-            sess.tx_graph = Some(ctx.select_graph(&meta, user)?);
+            sess.tx_graph = match meta
+                .get("db")
+                .and_then(PsValue::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(_) => Some(ctx.select_graph(&meta, user, None)?),
+                None => None,
+            };
             Ok(vec![message::success(vec![])])
         }
         Request::Commit | Request::Rollback => {
@@ -959,10 +1081,45 @@ async fn handle_request(
                 .user
                 .clone()
                 .ok_or_else(|| Failure::unauthorized("not authenticated; send LOGON first"))?;
+            let sticky = ctx.current_selection(&user);
+            warn!(db = ?extra.get("db"), selected = ?sticky, query = %query, "WIRE-DIAG: RUN");
+            // `USE <graph>` / `USE DATABASE <graph>` selects the user's graph in-band
+            // (clients that never send the Bolt `db` field, e.g. Memgraph Lab, rely on
+            // this). Validate the target and remember it per-user for later db-less
+            // statements; answer with an empty result like a Memgraph database switch.
+            if let Some(target) = parse_use_statement(&query) {
+                if ctx.graphs.get(&target).is_none() || !ctx.acl.snapshot().can_read(&user, &target) {
+                    let mut served: Vec<String> = ctx
+                        .graphs
+                        .names()
+                        .into_iter()
+                        .filter(|g| ctx.acl.snapshot().can_read(&user, g))
+                        .collect();
+                    served.sort();
+                    return Err(Failure::new(
+                        CODE_NOT_FOUND,
+                        format!("cannot USE '{target}' (available: {})", served.join(", ")),
+                    ));
+                }
+                warn!(graph = %target, "WIRE-DIAG: USE selected graph");
+                ctx.set_selection(&user, &target);
+                sess.pending = Some(Pending { rows: vec![], sent: 0 });
+                return Ok(vec![message::success(vec![(
+                    "fields".into(),
+                    PsValue::List(vec![]),
+                )])]);
+            }
+            // Remember (per-user) when a client reveals itself as Memgraph, so the
+            // dialect-sensitive introspection answers below match what it expects.
+            if is_memgraph_dialect_query(&normalize_query(&query)) {
+                ctx.mark_memgraph(&user);
+            }
             // A browser GUI fires introspection (`CALL db.labels()`, `SHOW …`) on
             // connect; answer those from the manifest before the read-only Cypher
             // grammar (which forbids them) ever sees the query.
-            if let Some((columns, rows)) = ctx.introspect(&user, &extra, &query)? {
+            if let Some((columns, rows)) =
+                ctx.introspect(&user, &extra, &query, sticky.as_deref(), ctx.is_memgraph(&user))?
+            {
                 sess.pending = Some(Pending { rows, sent: 0 });
                 return Ok(vec![message::success(vec![(
                     "fields".into(),
@@ -970,11 +1127,26 @@ async fn handle_request(
                 )])]);
             }
             // Inside an explicit transaction the graph was resolved at BEGIN and the
-            // RUN carries no `db`; otherwise this is an auto-commit RUN that names its
-            // own graph in `extra`.
+            // RUN carries no `db`; otherwise resolve from the RUN's `db`, else the
+            // user's sticky `USE` selection, else their single readable graph.
             let graph = match &sess.tx_graph {
                 Some(g) => g.clone(),
-                None => ctx.select_graph(&extra, &user)?,
+                None => {
+                    let g = ctx.select_graph(&extra, &user, sticky.as_deref())?;
+                    // If this query named the graph explicitly (e.g. Memgraph Lab puts
+                    // the chosen database on its connection-test query but sends none on
+                    // the editor queries that follow), remember it per-user so those
+                    // later db-less queries inherit it across the pool.
+                    if extra
+                        .get("db")
+                        .and_then(PsValue::as_str)
+                        .filter(|s| !s.is_empty())
+                        .is_some()
+                    {
+                        ctx.set_selection(&user, &g);
+                    }
+                    g
+                }
             };
             let gen = ctx.graphs.get(&graph).ok_or_else(|| {
                 Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
@@ -1386,6 +1558,8 @@ mod tests {
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
+            use_selection: RwLock::new(HashMap::new()),
+        memgraph_users: RwLock::new(HashSet::new()),
         });
         (root, ctx)
     }
@@ -1445,6 +1619,8 @@ mod tests {
             bind_addr: "127.0.0.1:7687".to_string(),
             // A default is configured but must NOT be silently served for queries.
             default_graph: Some("people".to_string()),
+            use_selection: RwLock::new(HashMap::new()),
+        memgraph_users: RwLock::new(HashSet::new()),
         })
     }
 
@@ -1452,7 +1628,7 @@ mod tests {
     fn unknown_db_name_errors_and_lists_the_served_graphs() {
         let (_root, ctx) = build_ctx("select_unknown_db");
         let extra = PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]);
-        let err = ctx.select_graph(&extra, "reporting").unwrap_err();
+        let err = ctx.select_graph(&extra, "reporting", None).unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
         assert!(err.message.contains("'eu-ai-act' is not served"), "{}", err.message);
         // The real name is offered so a typo is self-correcting.
@@ -1465,16 +1641,16 @@ mod tests {
         // No `db` field, and `reporting` can read two graphs: must error, not fall
         // back to `default_graph` ("people").
         let empty = PsValue::Map(vec![]);
-        let err = ctx.select_graph(&empty, "reporting").unwrap_err();
+        let err = ctx.select_graph(&empty, "reporting", None).unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
         assert!(err.message.contains("no graph selected"), "{}", err.message);
         assert!(err.message.contains("people") && err.message.contains("places"), "{}", err.message);
         // An empty (not just absent) db string is treated the same.
         let blank = PsValue::Map(vec![("db".into(), PsValue::str(""))]);
-        assert!(ctx.select_graph(&blank, "reporting").is_err());
+        assert!(ctx.select_graph(&blank, "reporting", None).is_err());
         // Naming an exact, served graph still works.
         let named = PsValue::Map(vec![("db".into(), PsValue::str("places"))]);
-        assert_eq!(ctx.select_graph(&named, "reporting").ok(), Some("places".to_string()));
+        assert_eq!(ctx.select_graph(&named, "reporting", None).ok(), Some("places".to_string()));
     }
 
     #[tokio::test]
@@ -1495,9 +1671,11 @@ mod tests {
         let err = handle_request(&mut sess, &ctx, bad).await.unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
         assert!(sess.tx_graph.is_none());
-        // BEGIN with no db, for a user who can read >1 graph, is ambiguous → errors.
-        let ambiguous = message::Request::Begin(PsValue::Map(vec![]));
-        assert!(handle_request(&mut sess, &ctx, ambiguous).await.is_err());
+        // BEGIN with no db does NOT bind the transaction — the graph is deferred to
+        // the RUN (clients like Memgraph Lab put `db` on the RUN, not the BEGIN). The
+        // BEGIN itself succeeds; an unnamed graph only errors if the RUN omits it too.
+        let unbound = message::Request::Begin(PsValue::Map(vec![]));
+        assert!(handle_request(&mut sess, &ctx, unbound).await.is_ok());
         assert!(sess.tx_graph.is_none());
         // BEGIN naming a served graph is remembered for the transaction's RUNs.
         let good = message::Request::Begin(PsValue::Map(vec![(
@@ -1672,6 +1850,68 @@ mod tests {
         }
         assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_use_statement_recognises_the_database_switch_forms() {
+        assert_eq!(parse_use_statement("USE eu_ai_act").as_deref(), Some("eu_ai_act"));
+        assert_eq!(parse_use_statement("use database eu_ai_act;").as_deref(), Some("eu_ai_act"));
+        assert_eq!(parse_use_statement("  USE   `eu_ai_act` ").as_deref(), Some("eu_ai_act"));
+        assert_eq!(parse_use_statement("USE DATABASE \"eu_ai_act\"").as_deref(), Some("eu_ai_act"));
+        // Not a bare USE / malformed → ignored (falls through to the query path).
+        assert_eq!(parse_use_statement("MATCH (n) RETURN n"), None);
+        assert_eq!(parse_use_statement("USE"), None);
+        assert_eq!(parse_use_statement("USE a b"), None);
+        assert_eq!(parse_use_statement("USEFUL eu_ai_act"), None);
+    }
+
+    #[tokio::test]
+    async fn begin_without_db_defers_to_the_run_graph() {
+        // Memgraph Lab's wire shape: an explicit transaction whose BEGIN names no
+        // graph, with `db` riding on the RUN inside it. A multi-graph user must still
+        // succeed — the unbound BEGIN defers, and the RUN resolves the graph.
+        let ctx = build_multi_ctx("begin_defer_run");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // BEGIN with empty metadata (no `db`).
+        c.send(PsValue::Struct {
+            tag: message::tag::BEGIN,
+            fields: vec![PsValue::Map(vec![])],
+        })
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // RUN carrying the graph in its `db` field.
+        c.send(PsValue::Struct {
+            tag: message::tag::RUN,
+            fields: vec![
+                PsValue::str("MATCH (n:Person) RETURN n.name AS name ORDER BY name"),
+                PsValue::Map(vec![]),
+                PsValue::Map(vec![("db".into(), PsValue::str("places"))]),
+            ],
+        })
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        c.send(Client::pull_all()).await;
+        let mut names = Vec::new();
+        loop {
+            let (tag, fields) = c.recv().await;
+            if tag == message::tag::RECORD {
+                if let PsValue::List(vals) = &fields[0] {
+                    names.push(vals[0].as_str().unwrap().to_string());
+                }
+            } else {
+                assert_eq!(tag, message::tag::SUCCESS);
+                break;
+            }
+        }
+        assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
     }
 
     #[tokio::test]
