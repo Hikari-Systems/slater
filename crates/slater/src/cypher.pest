@@ -120,6 +120,11 @@ yield_item = { identifier ~ (kw_as ~ alias)? }
 // into scope like the vector call does.
 read_proc = @{
     ^"db.meta.stats" | ^"db.constraints" | ^"dbms.procedures" | ^"dbms.functions"
+  // algo.* graph-algorithm procedures (Phase 13). Like the metadata procs, these
+  // are arg-bearing reads dispatched through `call_clause`; adding them here also
+  // carves them out of `forbidden_clause`'s read-only rejection.
+  | ^"algo.BFS" | ^"algo.WCC" | ^"algo.pageRank" | ^"algo.HarmonicCentrality"
+  | ^"algo.betweenness" | ^"algo.labelPropagation"
 }
 call_clause = {
     kw_call ~ read_proc ~ "(" ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" ~ yield_clause? ~ where_clause?

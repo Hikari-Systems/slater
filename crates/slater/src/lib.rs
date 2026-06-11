@@ -15,6 +15,7 @@
 //! logging, builds the `tokio` runtime, and hands off to [`server::serve`].
 
 pub mod acl;
+pub mod algo;
 pub mod bolt;
 pub mod cache;
 pub mod config;

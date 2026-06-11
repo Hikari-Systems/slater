@@ -1820,8 +1820,8 @@ mod tests {
 
     #[test]
     fn metadata_call_whitelist_only() {
-        // The four read-only metadata procs parse; every other CALL stays rejected
-        // as read-only (the whitelist is exactly vector + these four).
+        // The read-only metadata + algo procs parse; every other CALL stays rejected
+        // as read-only (the whitelist is exactly vector + metadata + algo.*).
         for q in [
             "CALL db.meta.stats()",
             "CALL db.constraints()",
@@ -1833,11 +1833,45 @@ mod tests {
         for q in [
             "CALL db.labels()",
             "CALL dbms.security.listUsers()",
-            "CALL algo.pageRank()",
+            "CALL algo.stronglyConnectedComponents()", // not a whitelisted algo name
         ] {
             let e = err(q);
             assert!(e.contains("read-only"), "for {q:?} expected read-only, got: {e}");
         }
+    }
+
+    #[test]
+    fn lowers_algo_call_clause() {
+        // algo.* procs parse through `call_clause`, capturing arguments (which may
+        // reference bound variables) and the YIELD list.
+        let q = ok(
+            "MATCH (a:Person) CALL algo.BFS(a, -1, 'KNOWS') YIELD nodes, edges \
+             RETURN nodes, edges",
+        );
+        let Clause::Call(cc) = &q.head.reading[1] else {
+            panic!("expected a Call clause, got {:?}", q.head.reading);
+        };
+        assert_eq!(cc.name.to_ascii_lowercase(), "algo.bfs");
+        assert_eq!(cc.args.len(), 3);
+        assert_eq!(
+            cc.yields,
+            vec![
+                ("nodes".to_string(), "nodes".to_string()),
+                ("edges".to_string(), "edges".to_string()),
+            ]
+        );
+
+        // Config-map argument + standalone (synthetic RETURN *) form.
+        let q = ok("CALL algo.WCC({relationshipTypes: ['KNOWS']})");
+        let Clause::Call(cc) = &q.head.reading[0] else {
+            panic!("expected a Call clause");
+        };
+        assert_eq!(cc.name.to_ascii_lowercase(), "algo.wcc");
+        assert_eq!(cc.args.len(), 1);
+        assert!(q.head.ret.body.star, "bare call synthesises RETURN *");
+
+        // Zero-arg form parses too.
+        assert!(parse("CALL algo.betweenness()").is_ok());
     }
 
     #[test]

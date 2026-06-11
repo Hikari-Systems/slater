@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 
+use crate::algo;
 use crate::cache::{BlockCache, FileKind, VectorIndexCache};
 use crate::generation::Generation;
 use crate::parser::ast::*;
@@ -761,10 +762,17 @@ impl<'g> Engine<'g> {
     /// optional `YIELD … WHERE` applied. Mirrors [`Self::apply_vector_call`]'s
     /// binding/`WHERE` handling.
     fn apply_call(&self, table: Table, cc: &CallClause) -> Result<Table> {
+        let lname = cc.name.to_ascii_lowercase();
+        // algo.* graph-algorithm procedures take arguments (which may reference bound
+        // variables) and compute their rows from the graph, so they follow the
+        // per-row model of `apply_vector_call`, not the input-independent path below.
+        if is_algo_proc(&lname) {
+            return self.apply_algo_call(table, cc, &lname);
+        }
         if !cc.args.is_empty() {
             bail!("{}() takes no arguments", cc.name);
         }
-        let (out_names, proc_rows) = self.procedure_rows(&cc.name.to_ascii_lowercase())?;
+        let (out_names, proc_rows) = self.procedure_rows(&lname)?;
 
         // (output index, bound name) pairs: YIELD selects/reorders/aliases; a bare
         // call binds every output under its own name.
@@ -810,6 +818,389 @@ impl<'g> Engine<'g> {
             cols: out_cols,
             rows: out_rows,
         })
+    }
+
+    // ── algo.* graph-algorithm procedures (Phase 13) ─────────────────────────
+
+    /// Per-row dispatch for an `algo.*` procedure: evaluate the arguments against
+    /// each input row (they may reference bound variables, e.g. `algo.BFS(a, …)`),
+    /// compute the procedure's rows from the graph, then cross-product input rows ×
+    /// proc rows and bind the YIELD outputs. Mirrors [`Self::apply_vector_call`]'s
+    /// per-row binding/`WHERE` handling; the proc rows carry every output in its
+    /// canonical order, so a partial YIELD just selects a subset.
+    fn apply_algo_call(&self, table: Table, cc: &CallClause, lname: &str) -> Result<Table> {
+        let out_names = algo_outputs(lname);
+
+        // (output index, bound name) pairs: YIELD selects/reorders/aliases; a bare
+        // call binds every output under its own name (case-insensitive match).
+        let bindings: Vec<(usize, String)> = if cc.yields.is_empty() {
+            out_names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i, n.to_string()))
+                .collect()
+        } else {
+            let mut v = Vec::with_capacity(cc.yields.len());
+            for (output, bound) in &cc.yields {
+                let idx = out_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(output))
+                    .ok_or_else(|| anyhow::anyhow!("{}() does not yield '{output}'", cc.name))?;
+                v.push((idx, bound.clone()));
+            }
+            v
+        };
+
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(bindings.iter().map(|(_, b)| b.clone()));
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            self.check_deadline()?;
+            let scope = Scope::Row(&table.cols, row);
+            let args: Vec<Val> = cc
+                .args
+                .iter()
+                .map(|e| self.eval(e, &scope, None))
+                .collect::<Result<_>>()?;
+            let proc_rows = self.algo_rows(lname, &args)?;
+            for prow in &proc_rows {
+                let mut r = row.clone();
+                for (idx, _) in &bindings {
+                    r.push(prow[*idx].clone());
+                }
+                if let Some(w) = &cc.where_ {
+                    let row_scope = Scope::Row(&out_cols, &r);
+                    if three_valued(&self.eval(w, &row_scope, None)?) != Some(true) {
+                        continue;
+                    }
+                }
+                out_rows.push(r);
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Compute the rows of an `algo.*` procedure for one set of evaluated arguments.
+    /// Each row carries every output of the procedure in canonical order (see
+    /// [`algo_outputs`]).
+    fn algo_rows(&self, lname: &str, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        match lname {
+            "algo.bfs" => self.algo_bfs(args),
+            "algo.wcc" => self.algo_components(args),
+            "algo.pagerank" => self.algo_pagerank(args),
+            "algo.harmoniccentrality" => self.algo_harmonic(args),
+            "algo.betweenness" => self.algo_betweenness(args),
+            "algo.labelpropagation" => self.algo_labelprop(args),
+            other => bail!("unknown procedure '{other}'"),
+        }
+    }
+
+    /// `algo.BFS(source, maxLevel, relationshipType)` — single-source BFS, yielding
+    /// one row `[nodes, edges]` of the reachable nodes (excluding the source) and the
+    /// tree edge that first reached each. `maxLevel <= 0` is unlimited; a positive
+    /// value caps the BFS depth. A NULL source, an unknown relationship type, or an
+    /// unreachable source all produce **zero** rows (FalkorDB emits nothing).
+    fn algo_bfs(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        if args.len() != 3 {
+            bail!("algo.BFS expects 3 arguments (source, maxLevel, relationshipType)");
+        }
+        let source = match &args[0] {
+            Val::Node(id) => *id,
+            Val::Null => return Ok(Vec::new()),
+            other => bail!("algo.BFS source must be a node, got {}", other.to_display()),
+        };
+        let max_level = match &args[1] {
+            Val::Int(n) => *n,
+            other => bail!(
+                "algo.BFS maxLevel must be an integer, got {}",
+                other.to_display()
+            ),
+        };
+        let reltype: Option<u32> = match &args[2] {
+            Val::Null => None,
+            Val::Str(s) => match self.gen.reltype_id(s) {
+                Some(id) => Some(id),
+                None => return Ok(Vec::new()),
+            },
+            other => bail!(
+                "algo.BFS relationshipType must be a string or null, got {}",
+                other.to_display()
+            ),
+        };
+        let unlimited = max_level <= 0;
+
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(source);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((source, 0i64));
+        let mut nodes: Vec<Val> = Vec::new();
+        let mut edges: Vec<Val> = Vec::new();
+        while let Some((node, lvl)) = queue.pop_front() {
+            if !unlimited && lvl >= max_level {
+                continue;
+            }
+            for a in self.outgoing(node)? {
+                if let Some(rt) = reltype {
+                    if a.reltype != rt {
+                        continue;
+                    }
+                }
+                let nb = a.neighbour.0;
+                if visited.insert(nb) {
+                    nodes.push(Val::Node(nb));
+                    edges.push(Val::Rel {
+                        id: a.edge.0,
+                        start: node,
+                        end: nb,
+                        reltype: a.reltype,
+                    });
+                    queue.push_back((nb, lvl + 1));
+                }
+            }
+        }
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![vec![Val::List(nodes), Val::List(edges)]])
+    }
+
+    /// `algo.WCC([config])` — weakly-connected components; one row `[node,
+    /// componentId]` per selected node. `componentId` is the smallest dense node id
+    /// in the component (a stable canonical representative).
+    fn algo_components(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        let (labels, rels, _) = self.parse_algo_config("WCC", args, &[])?;
+        let view = self.build_view(labels.as_deref(), rels.as_deref())?;
+        let roots = algo::wcc(view.nodes.len(), &view.undirected_edges());
+        let group_id = canonical_group_ids(&view.nodes, &roots);
+        Ok(view
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| vec![Val::Node(id), Val::Int(group_id[i])])
+            .collect())
+    }
+
+    /// `algo.pageRank(label, relationshipType)` — PageRank over the (optionally
+    /// label/reltype filtered) subgraph; one row `[node, score]` per selected node.
+    /// The two arguments are scalar `string|null` (not a config map).
+    fn algo_pagerank(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        if args.len() != 2 {
+            bail!("algo.pageRank expects 2 arguments (label, relationshipType)");
+        }
+        let labels = self.scalar_label_filter("pageRank", &args[0])?;
+        let rels = self.scalar_reltype_filter("pageRank", &args[1])?;
+        let view = self.build_view(labels.as_deref(), rels.as_deref())?;
+        let scores = algo::pagerank(view.nodes.len(), &view.out);
+        Ok(view
+            .nodes
+            .iter()
+            .zip(scores)
+            .map(|(&id, s)| vec![Val::Node(id), Val::Float(s)])
+            .collect())
+    }
+
+    /// `algo.HarmonicCentrality([config])` — harmonic closeness; one row `[node,
+    /// score, reachable]` per selected node.
+    fn algo_harmonic(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        let (labels, rels, _) = self.parse_algo_config("HarmonicCentrality", args, &[])?;
+        let view = self.build_view(labels.as_deref(), rels.as_deref())?;
+        let hc = algo::harmonic(view.nodes.len(), &view.out);
+        Ok(view
+            .nodes
+            .iter()
+            .zip(hc)
+            .map(|(&id, (score, reach))| {
+                vec![Val::Node(id), Val::Float(score), Val::Int(reach as i64)]
+            })
+            .collect())
+    }
+
+    /// `algo.betweenness([config])` — Brandes betweenness; one row `[node, score]`
+    /// per selected node. `samplingSize`/`samplingSeed` are validated but ignored
+    /// (the full exact betweenness is computed; see [`algo::betweenness`]).
+    fn algo_betweenness(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        let (labels, rels, map) =
+            self.parse_algo_config("betweenness", args, &["samplingSize", "samplingSeed"])?;
+        if let Some(v) = map_get_ci(&map, "samplingSize") {
+            if !matches!(v, Val::Int(n) if *n > 0) {
+                bail!("betweenness configuration, 'samplingSize' should be a positive integer");
+            }
+        }
+        if let Some(v) = map_get_ci(&map, "samplingSeed") {
+            if !matches!(v, Val::Int(_)) {
+                bail!("betweenness configuration, 'samplingSeed' should be an integer");
+            }
+        }
+        let view = self.build_view(labels.as_deref(), rels.as_deref())?;
+        let cb = algo::betweenness(view.nodes.len(), &view.out);
+        Ok(view
+            .nodes
+            .iter()
+            .zip(cb)
+            .map(|(&id, s)| vec![Val::Node(id), Val::Float(s)])
+            .collect())
+    }
+
+    /// `algo.labelPropagation([config])` — CDLP community detection; one row `[node,
+    /// communityId]` per selected node. `communityId` is the smallest dense node id
+    /// in the community. `maxIterations` (default 10) caps the propagation rounds.
+    fn algo_labelprop(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
+        let (labels, rels, map) =
+            self.parse_algo_config("labelPropagation", args, &["maxIterations"])?;
+        let mut max_iter = 10usize;
+        if let Some(v) = map_get_ci(&map, "maxIterations") {
+            match v {
+                Val::Int(n) if *n > 0 => max_iter = *n as usize,
+                _ => bail!(
+                    "labelPropagation configuration, 'maxIterations' should be a positive integer"
+                ),
+            }
+        }
+        let view = self.build_view(labels.as_deref(), rels.as_deref())?;
+        let comm = algo::cdlp(view.nodes.len(), &view.undirected_adj(), max_iter);
+        let group_id = canonical_group_ids(&view.nodes, &comm);
+        Ok(view
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| vec![Val::Node(id), Val::Int(group_id[i])])
+            .collect())
+    }
+
+    /// Parse the shared `algo.*` config-map argument (WCC / centrality / community
+    /// procs). `args` holds 0 or 1 evaluated arguments; 0 args or a NULL argument is
+    /// an empty config. `extra` lists the proc-specific keys permitted beyond
+    /// `nodeLabels`/`relationshipTypes`. Returns the resolved label / reltype id
+    /// filters (`None` = "all") plus the raw map for proc-specific keys. Unknown
+    /// labels / reltypes are ignored (mirrors FalkorDB); unknown *keys* error.
+    fn parse_algo_config(
+        &self,
+        proc: &str,
+        args: &[Val],
+        extra: &[&str],
+    ) -> Result<AlgoConfig> {
+        let map: Vec<(String, Val)> = match args {
+            [] | [Val::Null] => Vec::new(),
+            [Val::Map(m)] => m.clone(),
+            [_] => bail!("invalid {proc} configuration"),
+            _ => bail!("{proc} takes at most one configuration argument"),
+        };
+        for (k, _) in &map {
+            let known = k.eq_ignore_ascii_case("nodeLabels")
+                || k.eq_ignore_ascii_case("relationshipTypes")
+                || extra.iter().any(|e| e.eq_ignore_ascii_case(k));
+            if !known {
+                bail!("{proc} configuration contains unknown key '{k}'");
+            }
+        }
+        let labels = match map_get_ci(&map, "nodeLabels") {
+            None => None,
+            Some(v) => Some(self.resolve_name_filter(proc, "nodeLabels", v, true)?),
+        };
+        let rels = match map_get_ci(&map, "relationshipTypes") {
+            None => None,
+            Some(v) => Some(self.resolve_name_filter(proc, "relationshipTypes", v, false)?),
+        };
+        Ok((labels, rels, map))
+    }
+
+    /// Resolve a config `nodeLabels` / `relationshipTypes` value (must be an array of
+    /// strings) to dense label / reltype ids, silently dropping names that don't
+    /// exist in the schema.
+    fn resolve_name_filter(
+        &self,
+        proc: &str,
+        key: &str,
+        v: &Val,
+        is_label: bool,
+    ) -> Result<Vec<u32>> {
+        let items = match v {
+            Val::List(xs) => xs,
+            _ => bail!("{proc} configuration, '{key}' should be an array of strings"),
+        };
+        let mut ids = Vec::new();
+        for it in items {
+            let name = match it {
+                Val::Str(s) => s,
+                _ => bail!("{proc} configuration, '{key}' should be an array of strings"),
+            };
+            let id = if is_label {
+                self.gen.label_id(name)
+            } else {
+                self.gen.reltype_id(name)
+            };
+            if let Some(id) = id {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Resolve a scalar `string|null` label argument (algo.pageRank's first arg) to a
+    /// single-label filter; `null` → `None` (all nodes). An unknown label yields an
+    /// empty selection.
+    fn scalar_label_filter(&self, proc: &str, v: &Val) -> Result<Option<Vec<u32>>> {
+        match v {
+            Val::Null => Ok(None),
+            Val::Str(s) => Ok(Some(self.gen.label_id(s).into_iter().collect())),
+            other => bail!(
+                "algo.{proc} label must be a string or null, got {}",
+                other.to_display()
+            ),
+        }
+    }
+
+    /// Resolve a scalar `string|null` relationship-type argument (algo.pageRank's
+    /// second arg) to a single-reltype filter; `null` → `None` (all edges).
+    fn scalar_reltype_filter(&self, proc: &str, v: &Val) -> Result<Option<Vec<u32>>> {
+        match v {
+            Val::Null => Ok(None),
+            Val::Str(s) => Ok(Some(self.gen.reltype_id(s).into_iter().collect())),
+            other => bail!(
+                "algo.{proc} relationshipType must be a string or null, got {}",
+                other.to_display()
+            ),
+        }
+    }
+
+    /// Materialise the filtered subgraph an `algo.*` procedure runs over: the
+    /// selected dense node ids (ascending) plus directed out-adjacency as 0-based
+    /// indices into that node list. `labels = None` selects every node; otherwise the
+    /// union of nodes carrying any listed label. `rels = None` keeps every edge;
+    /// otherwise only edges of a listed type. An edge is kept only when both
+    /// endpoints are in the selected node set.
+    fn build_view(&self, labels: Option<&[u32]>, rels: Option<&[u32]>) -> Result<GraphView> {
+        let nodes: Vec<u64> = match labels {
+            None => (0..self.gen.node_count()).collect(),
+            Some(lbls) => {
+                let mut set = std::collections::BTreeSet::new();
+                for &l in lbls {
+                    for &nid in self.gen.nodes_with_label(l) {
+                        set.insert(nid);
+                    }
+                }
+                set.into_iter().collect()
+            }
+        };
+        let pos: HashMap<u64, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        let mut out = vec![Vec::new(); nodes.len()];
+        for (i, &id) in nodes.iter().enumerate() {
+            for a in self.outgoing(id)? {
+                if let Some(rs) = rels {
+                    if !rs.contains(&a.reltype) {
+                        continue;
+                    }
+                }
+                if let Some(&j) = pos.get(&a.neighbour.0) {
+                    out[i].push(j);
+                }
+            }
+        }
+        Ok(GraphView { nodes, out })
     }
 
     /// The fixed output columns and rows for a metadata procedure (lowercased name).
@@ -3035,6 +3426,12 @@ impl AggCursor {
 /// the manifest (`db.labels`, `db.indexes`, …) and at the server level
 /// (`dbms.components`): all are callable, so all are reported.
 const SLATER_PROCEDURES: &[&str] = &[
+    "algo.BFS",
+    "algo.HarmonicCentrality",
+    "algo.WCC",
+    "algo.betweenness",
+    "algo.labelPropagation",
+    "algo.pageRank",
     "db.constraints",
     "db.idx.vector.queryNodes",
     "db.indexes",
@@ -3046,6 +3443,99 @@ const SLATER_PROCEDURES: &[&str] = &[
     "dbms.functions",
     "dbms.procedures",
 ];
+
+/// Parsed `algo.*` config: `(label-id filter, reltype-id filter, raw config map)`,
+/// where each filter is `None` for "all". Returned by [`Engine::parse_algo_config`].
+type AlgoConfig = (Option<Vec<u32>>, Option<Vec<u32>>, Vec<(String, Val)>);
+
+/// A filtered subgraph view for `algo.*` procedures (built by
+/// [`Engine::build_view`]): the selected dense node ids in `nodes` (ascending) and
+/// directed out-adjacency `out`, as 0-based indices into `nodes`.
+struct GraphView {
+    nodes: Vec<u64>,
+    out: Vec<Vec<usize>>,
+}
+
+impl GraphView {
+    /// The directed edges as `(from, to)` index pairs — the undirected view used by
+    /// WCC's union-find.
+    fn undirected_edges(&self) -> Vec<(usize, usize)> {
+        let mut e = Vec::new();
+        for (i, adj) in self.out.iter().enumerate() {
+            for &j in adj {
+                e.push((i, j));
+            }
+        }
+        e
+    }
+
+    /// Symmetric adjacency lists (each directed edge contributes both directions) —
+    /// the undirected neighbourhood used by CDLP label propagation.
+    fn undirected_adj(&self) -> Vec<Vec<usize>> {
+        let mut u = vec![Vec::new(); self.nodes.len()];
+        for (i, adj) in self.out.iter().enumerate() {
+            for &j in adj {
+                u[i].push(j);
+                u[j].push(i);
+            }
+        }
+        u
+    }
+}
+
+/// Whether a (lowercased) procedure name is an `algo.*` graph algorithm dispatched
+/// through [`Engine::apply_algo_call`].
+fn is_algo_proc(name: &str) -> bool {
+    matches!(
+        name,
+        "algo.bfs"
+            | "algo.wcc"
+            | "algo.pagerank"
+            | "algo.harmoniccentrality"
+            | "algo.betweenness"
+            | "algo.labelpropagation"
+    )
+}
+
+/// The canonical output column names of an `algo.*` procedure, in the order its
+/// rows carry them.
+fn algo_outputs(lname: &str) -> &'static [&'static str] {
+    match lname {
+        "algo.bfs" => &["nodes", "edges"],
+        "algo.wcc" => &["node", "componentId"],
+        "algo.pagerank" => &["node", "score"],
+        "algo.harmoniccentrality" => &["node", "score", "reachable"],
+        "algo.betweenness" => &["node", "score"],
+        "algo.labelpropagation" => &["node", "communityId"],
+        _ => &[],
+    }
+}
+
+/// Case-insensitive lookup into a `Val::Map`'s key/value pairs.
+fn map_get_ci<'a>(map: &'a [(String, Val)], key: &str) -> Option<&'a Val> {
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+}
+
+/// Map a per-node grouping (each node's `roots[i]` is an arbitrary-but-stable group
+/// representative) to a canonical group id per node: the smallest dense node id in
+/// the group. Used for WCC `componentId` / CDLP `communityId`.
+fn canonical_group_ids(nodes: &[u64], roots: &[usize]) -> Vec<i64> {
+    let mut min_id: HashMap<usize, u64> = HashMap::new();
+    for (i, &r) in roots.iter().enumerate() {
+        let id = nodes[i];
+        min_id
+            .entry(r)
+            .and_modify(|m| {
+                if id < *m {
+                    *m = id;
+                }
+            })
+            .or_insert(id);
+    }
+    roots.iter().map(|r| min_id[r] as i64).collect()
+}
 
 /// The scalar + aggregate functions slater implements (lowercased canonical names),
 /// self-reported by `CALL dbms.functions()`. Hand-maintained to mirror the
@@ -6657,5 +7147,308 @@ mod tests {
             err.contains("already declared in outer scope"),
             "{err}"
         );
+    }
+
+    // ── Phase 13: algo.* graph-algorithm procedures ──────────────────────────
+    //
+    // Tests run over the `write_basic` fixture (dense ids in brackets):
+    //   [0]Alice [1]Bob [2]Carol :Person ; [3]Acme [4]Globex :Company
+    //   Alice-KNOWS->Bob, Bob-KNOWS->Carol, Alice-KNOWS->Carol,
+    //   Alice-WORKS_AT->Acme, Carol-WORKS_AT->Globex
+    // FalkorDB's own algo tests use CREATE setups we can't replay, so the vectors
+    // are adapted to this fixture; assertions follow the FalkorDB tests' style
+    // (orderings, exact-0 for sinks, sum≈1) rather than exact LAGraph float values.
+
+    #[test]
+    fn phase13_bfs_all_reltypes_and_restricted() {
+        // BFS from Alice over all relationship types reaches everyone but Alice.
+        let (root, res) = run(
+            "exec_p13_bfs_all",
+            "MATCH (a:Person {name: 'Alice'}) \
+             CALL algo.BFS(a, -1, NULL) YIELD nodes \
+             UNWIND nodes AS n RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Acme", "Bob", "Carol", "Globex"]);
+
+        // Restricted to KNOWS, only the two reachable Persons appear.
+        let (_, res) = run(
+            "exec_p13_bfs_knows",
+            "MATCH (a:Person {name: 'Alice'}) \
+             CALL algo.BFS(a, -1, 'KNOWS') YIELD nodes \
+             UNWIND nodes AS n RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_bfs_max_depth_and_edges() {
+        // Depth 1 = direct neighbours only; edges parallel the nodes (each is the
+        // tree edge that first reached the node).
+        let (root, res) = run(
+            "exec_p13_bfs_depth",
+            "MATCH (a:Person {name: 'Alice'}) \
+             CALL algo.BFS(a, 1, 'KNOWS') YIELD nodes, edges \
+             RETURN [n IN nodes | n.name] AS ns, [e IN edges | type(e)] AS ts, size(edges) AS k",
+        );
+        assert_eq!(res.rows.len(), 1);
+        // nodes are Bob and Carol (Alice's direct KNOWS neighbours)
+        let Val::List(ns) = &res.rows[0][0] else {
+            panic!("expected list");
+        };
+        let mut names: Vec<String> = ns.iter().map(|v| v.to_display()).collect();
+        names.sort();
+        assert_eq!(names, vec!["Bob", "Carol"]);
+        // every tree edge is a KNOWS edge, one per reached node
+        let Val::List(ts) = &res.rows[0][1] else {
+            panic!("expected list");
+        };
+        assert!(ts.iter().all(|t| t.to_display() == "KNOWS"));
+        assert!(matches!(res.rows[0][2], Val::Int(2)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_bfs_no_results_and_null_source() {
+        // A sink node (Globex) reaches nothing → the CALL produces zero rows.
+        let (root, res) = run(
+            "exec_p13_bfs_sink",
+            "MATCH (g:Company {name: 'Globex'}) \
+             CALL algo.BFS(g, -1, NULL) YIELD nodes RETURN nodes",
+        );
+        assert_eq!(res.rows.len(), 0);
+
+        // A missing relationship type → zero rows.
+        let (_, res) = run(
+            "exec_p13_bfs_missing_rel",
+            "MATCH (a:Person {name: 'Alice'}) \
+             CALL algo.BFS(a, -1, 'NOPE') YIELD nodes RETURN nodes",
+        );
+        assert_eq!(res.rows.len(), 0);
+
+        // A NULL source (OPTIONAL MATCH with no hit) → zero rows, no error.
+        let (_, res) = run(
+            "exec_p13_bfs_null",
+            "OPTIONAL MATCH (n:NoSuchLabel) \
+             CALL algo.BFS(n, -1, NULL) YIELD nodes RETURN nodes",
+        );
+        assert_eq!(res.rows.len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_wcc_components() {
+        // All edges undirected → the whole graph is one component of 5.
+        let (root, res) = run(
+            "exec_p13_wcc_all",
+            "CALL algo.WCC() YIELD node, componentId RETURN node.name AS name, componentId",
+        );
+        assert_eq!(res.rows.len(), 5);
+        let cids: std::collections::HashSet<String> =
+            res.rows.iter().map(|r| r[1].to_display()).collect();
+        assert_eq!(cids.len(), 1, "one component over the full graph");
+
+        // Restricted to KNOWS: the three Persons form one component; the two
+        // Companies (no KNOWS edges) are isolated singletons → 3 components.
+        let (_, res) = run(
+            "exec_p13_wcc_knows",
+            "CALL algo.WCC({relationshipTypes: ['KNOWS']}) YIELD node, componentId \
+             RETURN node.name AS name, componentId",
+        );
+        assert_eq!(res.rows.len(), 5);
+        let mut groups: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for r in &res.rows {
+            groups
+                .entry(r[1].to_display())
+                .or_default()
+                .push(r[0].to_display());
+        }
+        assert_eq!(groups.len(), 3, "Persons + 2 isolated Companies");
+        // the Persons share one component
+        let person_comp: Vec<_> = res
+            .rows
+            .iter()
+            .filter(|r| ["Alice", "Bob", "Carol"].contains(&r[0].to_display().as_str()))
+            .map(|r| r[1].to_display())
+            .collect();
+        assert!(
+            person_comp.windows(2).all(|w| w[0] == w[1]),
+            "Persons in one component"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_wcc_node_label_filter() {
+        // nodeLabels=['Person'] selects only the three Persons, connected via KNOWS.
+        let (root, res) = run(
+            "exec_p13_wcc_person",
+            "CALL algo.WCC({nodeLabels: ['Person']}) YIELD node RETURN node.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_pagerank_scores() {
+        // Over the whole graph: 5 rows, scores positive and summing to ~1
+        // (FalkorDB test_pagerank asserts exactly these structural properties).
+        let (root, res) = run(
+            "exec_p13_pagerank",
+            "CALL algo.pageRank(NULL, NULL) YIELD node, score \
+             RETURN node.name AS name, score",
+        );
+        assert_eq!(res.rows.len(), 5);
+        let mut sum = 0.0;
+        for r in &res.rows {
+            let Val::Float(s) = r[1] else {
+                panic!("score should be a float");
+            };
+            assert!(s > 0.0, "scores are positive");
+            sum += s;
+        }
+        assert!((sum - 1.0).abs() < 1e-4, "scores sum to ~1, got {sum}");
+
+        // Over the Person/KNOWS subgraph (Alice->Bob, Alice->Carol, Bob->Carol),
+        // Carol — the sink all rank flows toward — scores highest of the three.
+        let (_, res) = run(
+            "exec_p13_pagerank_knows",
+            "CALL algo.pageRank('Person', 'KNOWS') YIELD node, score \
+             RETURN node.name AS name, score",
+        );
+        assert_eq!(res.rows.len(), 3);
+        let scores: std::collections::HashMap<String, f64> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let Val::Float(s) = r[1] else {
+                    panic!("score should be a float");
+                };
+                (r[0].to_display(), s)
+            })
+            .collect();
+        assert!(scores["Carol"] > scores["Alice"], "Carol > Alice");
+        assert!(scores["Carol"] > scores["Bob"], "Carol > Bob");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_harmonic_centrality() {
+        // Over the Person/KNOWS subgraph (Alice->Bob, Alice->Carol, Bob->Carol):
+        //   Alice reaches Bob & Carol at d=1 → score 2.0, reachable 2
+        //   Bob reaches Carol at d=1         → score 1.0, reachable 1
+        //   Carol is a sink                  → score 0.0, reachable 0
+        let (root, res) = run(
+            "exec_p13_harmonic",
+            "CALL algo.HarmonicCentrality({nodeLabels: ['Person'], relationshipTypes: ['KNOWS']}) \
+             YIELD node, score, reachable \
+             RETURN node.name AS name, score, reachable ORDER BY score DESC",
+        );
+        assert_eq!(res.rows.len(), 3);
+        assert_eq!(res.rows[0][0].to_display(), "Alice");
+        assert_float(&res.rows[0][1], 2.0);
+        assert!(matches!(res.rows[0][2], Val::Int(2)));
+        assert_eq!(res.rows[1][0].to_display(), "Bob");
+        assert_float(&res.rows[1][1], 1.0);
+        assert!(matches!(res.rows[1][2], Val::Int(1)));
+        assert_eq!(res.rows[2][0].to_display(), "Carol");
+        assert_float(&res.rows[2][1], 0.0);
+        assert!(matches!(res.rows[2][2], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_betweenness() {
+        // Over the whole graph, only Carol lies on a shortest path between other
+        // nodes (Alice->Globex and Bob->Globex both pass through Carol); every other
+        // node has betweenness exactly 0.
+        let (root, res) = run(
+            "exec_p13_betweenness",
+            "CALL algo.betweenness() YIELD node, score RETURN node.name AS name, score",
+        );
+        assert_eq!(res.rows.len(), 5);
+        let scores: std::collections::HashMap<String, f64> = res
+            .rows
+            .iter()
+            .map(|r| {
+                let Val::Float(s) = r[1] else {
+                    panic!("score should be a float");
+                };
+                (r[0].to_display(), s)
+            })
+            .collect();
+        assert!(scores["Carol"] > 0.0, "Carol is on shortest paths");
+        for name in ["Alice", "Bob", "Acme", "Globex"] {
+            assert_eq!(scores[name], 0.0, "{name} is on no shortest path");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_label_propagation() {
+        // Over the KNOWS subgraph the three Persons form one community; the two
+        // Companies (no KNOWS edges) stay in their own singleton communities.
+        let (root, res) = run(
+            "exec_p13_labelprop",
+            "CALL algo.labelPropagation({relationshipTypes: ['KNOWS']}) \
+             YIELD node, communityId RETURN node.name AS name, communityId",
+        );
+        assert_eq!(res.rows.len(), 5);
+        let comm: std::collections::HashMap<String, String> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(comm["Alice"], comm["Bob"]);
+        assert_eq!(comm["Bob"], comm["Carol"]);
+        assert_ne!(comm["Alice"], comm["Acme"]);
+        assert_ne!(comm["Alice"], comm["Globex"]);
+        assert_ne!(comm["Acme"], comm["Globex"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase13_algo_validation_errors() {
+        // Unknown YIELD field.
+        let e = run_err(
+            "exec_p13_err_yield",
+            "CALL algo.WCC() YIELD node, bogus RETURN node",
+        );
+        assert!(e.contains("does not yield 'bogus'"), "{e}");
+
+        // Non-array nodeLabels.
+        let e = run_err(
+            "exec_p13_err_labels",
+            "CALL algo.WCC({nodeLabels: 'Person'}) YIELD node RETURN node",
+        );
+        assert!(e.contains("should be an array of strings"), "{e}");
+
+        // Unknown config key.
+        let e = run_err(
+            "exec_p13_err_key",
+            "CALL algo.WCC({bogus: 1}) YIELD node RETURN node",
+        );
+        assert!(e.contains("unknown key"), "{e}");
+
+        // Non-map config argument.
+        let e = run_err(
+            "exec_p13_err_cfg",
+            "CALL algo.WCC('invalid') YIELD node RETURN node",
+        );
+        assert!(e.contains("invalid WCC configuration"), "{e}");
+
+        // pageRank requires exactly two scalar arguments.
+        let e = run_err(
+            "exec_p13_err_pr_arity",
+            "CALL algo.pageRank('Person') YIELD node RETURN node",
+        );
+        assert!(e.contains("expects 2 arguments"), "{e}");
+
+        // betweenness sampling-size validation.
+        let e = run_err(
+            "exec_p13_err_sampling",
+            "CALL algo.betweenness({samplingSize: -1}) YIELD node RETURN node",
+        );
+        assert!(e.contains("samplingSize"), "{e}");
     }
 }
