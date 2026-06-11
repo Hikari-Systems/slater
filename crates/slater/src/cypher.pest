@@ -163,13 +163,20 @@ unary_expr = { sign* ~ postfix_expr }
 sign = { "+" | "-" }
 
 postfix_expr = { primary ~ postfix_op* }
-postfix_op = { property_access | label_pred | index_access }
+postfix_op = { property_access | label_pred | slice_access | index_access }
 property_access = { "." ~ property_key }
 label_pred = { ":" ~ label_name ~ (":" ~ label_name)* }
+// Slice `list[i..j]` with optional bounds (`[..2]`, `[1..]`, `[..]`). Tried
+// before `index_access` so the `..` separator is matched as a range; a plain
+// subscript `[i]` backtracks cleanly to `index_access`.
+slice_access = { "[" ~ slice_from ~ ".." ~ slice_to ~ "]" }
+slice_from = { expr? }
+slice_to = { expr? }
 index_access = { "[" ~ expr ~ "]" }
 
 primary = {
     case_expr
+  | reduce_expr
   | list_comprehension
   | function_call
   | map_projection
@@ -213,6 +220,11 @@ else_clause = { kw_else ~ expr }
 // any/all/none/single(x IN list WHERE pred)
 list_comprehension = { quantifier ~ "(" ~ identifier ~ kw_in ~ expr ~ where_clause? ~ ")" }
 quantifier = @{ (^"any" | ^"all" | ^"none" | ^"single") ~ !ident_cont }
+
+// reduce(acc = init, x IN list | expr): fold `expr` over `list`, threading `acc`.
+// Tried before `function_call` so `reduce(` is not lowered to a plain call.
+reduce_expr = { reduce_kw ~ "(" ~ identifier ~ "=" ~ expr ~ "," ~ identifier ~ kw_in ~ expr ~ "|" ~ expr ~ ")" }
+reduce_kw = @{ ^"reduce" ~ !ident_cont }
 
 // List comprehension `[x IN list WHERE pred | expr]`. At least one of the WHERE
 // filter / `| expr` projection is required, so a one-element list literal like

@@ -1470,6 +1470,20 @@ impl<'g> Engine<'g> {
                 let i = self.eval(idx, scope, aggs)?;
                 self.index(&b, &i)
             }
+            Expr::Slice { base, from, to } => {
+                let b = self.eval(base, scope, aggs)?;
+                // Absent bounds default to 0 / INT32_MAX, mirroring FalkorDB's
+                // slice AST construction; an explicit NULL bound yields NULL.
+                let f = match from {
+                    Some(e) => self.eval(e, scope, aggs)?,
+                    None => Val::Int(0),
+                };
+                let t = match to {
+                    Some(e) => self.eval(e, scope, aggs)?,
+                    None => Val::Int(i32::MAX as i64),
+                };
+                self.slice(&b, &f, &t)
+            }
             Expr::HasLabels(base, labels) => {
                 let b = self.eval(base, scope, aggs)?;
                 self.has_labels(&b, labels)
@@ -1581,6 +1595,13 @@ impl<'g> Engine<'g> {
                 scope,
                 aggs,
             ),
+            Expr::Reduce {
+                acc_var,
+                acc_init,
+                var,
+                list,
+                body,
+            } => self.eval_reduce(acc_var, acc_init, var, list, body, scope, aggs),
         }
     }
 
@@ -1650,6 +1671,32 @@ impl<'g> Engine<'g> {
                 base.to_display(),
                 idx.to_display()
             ),
+        }
+    }
+
+    /// `base[from..to]` slice. Mirrors FalkorDB `AR_SLICE`: any NULL operand
+    /// yields NULL; a negative bound counts from the end (clamped into range); a
+    /// non-positive width yields an empty result. Extends FalkorDB (arrays only)
+    /// to strings, slicing by Unicode scalar value.
+    fn slice(&self, base: &Val, from: &Val, to: &Val) -> Result<Val> {
+        if matches!(base, Val::Null) || matches!(from, Val::Null) || matches!(to, Val::Null) {
+            return Ok(Val::Null);
+        }
+        let start = num_i64(Some(from))?;
+        let end = num_i64(Some(to))?;
+        match base {
+            Val::List(xs) => Ok(Val::List(slice_range(xs, start, end).to_vec())),
+            Val::Vector(xs) => Ok(Val::List(
+                slice_range(xs, start, end)
+                    .iter()
+                    .map(|f| Val::Float(*f as f64))
+                    .collect(),
+            )),
+            Val::Str(s) => {
+                let chars: Vec<char> = s.chars().collect();
+                Ok(Val::Str(slice_range(&chars, start, end).iter().collect()))
+            }
+            other => bail!("cannot slice {}", other.to_display()),
         }
     }
 
@@ -1846,6 +1893,35 @@ impl<'g> Engine<'g> {
             });
         }
         Ok(Val::List(out))
+    }
+
+    /// Evaluate `reduce(acc = init, var IN list | body)`. Mirrors FalkorDB
+    /// `AR_REDUCE`: a NULL list yields NULL; otherwise fold `body` over the list,
+    /// threading the accumulator (seeded from `init`) and binding `var` to each
+    /// element. Both bindings shadow the surrounding scope only inside `body`.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_reduce(
+        &self,
+        acc_var: &str,
+        acc_init: &Expr,
+        var: &str,
+        list: &Expr,
+        body: &Expr,
+        scope: &Scope,
+        aggs: Option<&AggCursor>,
+    ) -> Result<Val> {
+        let items = match self.eval(list, scope, aggs)? {
+            Val::List(xs) => xs,
+            Val::Null => return Ok(Val::Null),
+            other => bail!("reduce() needs a list, got {}", other.to_display()),
+        };
+        let mut acc = self.eval(acc_init, scope, aggs)?;
+        for item in &items {
+            let acc_scope = Scope::With(scope, acc_var, &acc);
+            let inner = Scope::With(&acc_scope, var, item);
+            acc = self.eval(body, &inner, aggs)?;
+        }
+        Ok(acc)
     }
 
     /// Evaluate `[pattern WHERE predicate | projection]`. The pattern is matched
@@ -2419,6 +2495,16 @@ fn children(e: &Expr) -> Vec<&Expr> {
         Expr::Literal(_) | Expr::Param(_) | Expr::Var(_) => vec![],
         Expr::Property(b, _) => vec![b],
         Expr::Index(b, i) => vec![b, i],
+        Expr::Slice { base, from, to } => {
+            let mut v = vec![base.as_ref()];
+            if let Some(f) = from {
+                v.push(f);
+            }
+            if let Some(t) = to {
+                v.push(t);
+            }
+            v
+        }
         Expr::HasLabels(b, _) => vec![b],
         Expr::Neg(e) | Expr::Not(e) => vec![e],
         Expr::And(xs) | Expr::Or(xs) | Expr::Xor(xs) | Expr::List(xs) => xs.iter().collect(),
@@ -2492,6 +2578,12 @@ fn children(e: &Expr) -> Vec<&Expr> {
             }
             v
         }
+        Expr::Reduce {
+            acc_init,
+            list,
+            body,
+            ..
+        } => vec![acc_init.as_ref(), list.as_ref(), body.as_ref()],
     }
 }
 
@@ -2562,6 +2654,25 @@ fn flip_dir(d: Direction) -> Direction {
 }
 
 /// Resolve a (possibly negative) index against a collection length.
+/// Resolve a `[start..end]` slice into a sub-slice, mirroring FalkorDB `AR_SLICE`:
+/// negative bounds count from the end (a start below 0 clamps to 0, an end above
+/// the length clamps to the length), and a non-positive width yields `&[]`.
+fn slice_range<T>(xs: &[T], start: i64, end: i64) -> &[T] {
+    let len = xs.len() as i64;
+    let mut s = if start < 0 { len - start.abs() } else { start };
+    if s < 0 {
+        s = 0;
+    }
+    let mut e = if end < 0 { len - end.abs() } else { end };
+    if e > len {
+        e = len;
+    }
+    if e <= s {
+        return &[];
+    }
+    &xs[s as usize..e as usize]
+}
+
 fn list_index(len: usize, i: i64) -> Option<usize> {
     let idx = if i < 0 { len as i64 + i } else { i };
     if idx < 0 || idx as usize >= len {
@@ -4779,6 +4890,141 @@ mod tests {
         assert_eq!(render(&r[7]), "null");
         assert_eq!(render(&r[8]), "null");
         assert_eq!(render(&r[9]), "null");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — list slice `[i..j]` (vectors ported from TCK List2.feature and
+    // FalkorDB `AR_SLICE`). Open ends, negative indices, empty/exceeding ranges.
+    #[test]
+    fn phase5_list_slice() {
+        let (root, res) = run(
+            "exec_p5_slice",
+            "WITH [1,2,3,4,5] AS l5, [1,2,3] AS l3 RETURN \
+             l5[1..3] AS a, l3[1..] AS b, l3[..2] AS c, l3[0..1] AS d, \
+             l3[0..0] AS e, l3[-3..-1] AS f, l3[3..1] AS g, l3[-5..5] AS h, \
+             l3[..] AS i",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "[2,3]");
+        assert_eq!(render(&r[1]), "[2,3]");
+        assert_eq!(render(&r[2]), "[1,2]");
+        assert_eq!(render(&r[3]), "[1]");
+        assert_eq!(render(&r[4]), "[]");
+        assert_eq!(render(&r[5]), "[1,2]");
+        assert_eq!(render(&r[6]), "[]");
+        assert_eq!(render(&r[7]), "[1,2,3]");
+        assert_eq!(render(&r[8]), "[1,2,3]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — slice null handling (test_list.py test03 + TCK List2 [9]): a NULL
+    // list or any NULL bound yields NULL.
+    #[test]
+    fn phase5_slice_null() {
+        let (root, res) = run(
+            "exec_p5_slice_null",
+            "WITH null AS n, [1,2,3] AS l RETURN \
+             n[0..5] AS a, l[0..null] AS b, l[null..2] AS c, l[null..] AS d, n[..] AS e",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "null");
+        assert_eq!(render(&r[1]), "null");
+        assert_eq!(render(&r[2]), "null");
+        assert_eq!(render(&r[3]), "null");
+        assert_eq!(render(&r[4]), "null");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — string slicing (Slater extension beyond FalkorDB's array-only
+    // slice; slices by Unicode scalar value).
+    #[test]
+    fn phase5_string_slice() {
+        let (root, res) = run(
+            "exec_p5_str_slice",
+            "WITH 'hello' AS s RETURN s[1..3] AS a, s[..2] AS b, s[2..] AS c, s[-2..] AS d",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'el'");
+        assert_eq!(render(&r[1]), "'he'");
+        assert_eq!(render(&r[2]), "'llo'");
+        assert_eq!(render(&r[3]), "'lo'");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — reduce (vectors ported from FalkorDB test_reduce.py).
+    #[test]
+    fn phase5_reduce() {
+        let (root, res) = run(
+            "exec_p5_reduce",
+            "RETURN \
+             reduce(sum = 0, n in [1,2,3] | sum + n) AS a, \
+             reduce(sum = 0, n in [1,2,3] | sum - n) AS b, \
+             reduce(sum = 0, n in ['1','2','3'] | sum + toInteger(n)) AS c, \
+             reduce(last = 0, n in [1,2,3] | n) AS d, \
+             reduce(msg = 'hello ', c in ['w','o','r','l','d'] | msg + c) AS e, \
+             reduce(arr = [1,2], n in [2,3] | arr + n) AS f, \
+             reduce(sum = 1, n in [] | sum + n) AS g",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "6");
+        assert_eq!(render(&r[1]), "-6");
+        assert_eq!(render(&r[2]), "6");
+        assert_eq!(render(&r[3]), "3");
+        assert_eq!(render(&r[4]), "'hello world'");
+        assert_eq!(render(&r[5]), "[1,2,2,3]");
+        assert_eq!(render(&r[6]), "1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — reduce with carried/outer variables and nesting (test_reduce.py
+    // test_variable_reduction / test_nested_reduction / test_multiple_reductions).
+    #[test]
+    fn phase5_reduce_variables_and_nesting() {
+        let (root, res) = run(
+            "exec_p5_reduce_vars",
+            "WITH 1 AS base, [1,2,3] AS arr, -1 AS bias \
+             RETURN reduce(sum = base, n in arr | sum + n + bias) AS a, \
+             reduce(sum = reduce(x = 1, n in [1] | x + n), \
+                    n in reduce(arr = [1], n in [2] | arr + n) | sum + n) AS b",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "4");
+        assert_eq!(render(&r[1]), "5");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (root, res) = run(
+            "exec_p5_reduce_multi",
+            "UNWIND [[1,2,3],[4,5,6]] AS arr RETURN reduce(sum = 1, n in arr | sum + n) AS s",
+        );
+        assert_eq!(col0(&res), vec!["16", "7"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 5 — reduce null/error handling (test_reduce.py test_null_reduction /
+    // test_type_missmatch_reduction).
+    #[test]
+    fn phase5_reduce_null_and_errors() {
+        let (root, res) = run(
+            "exec_p5_reduce_null",
+            "RETURN reduce(sum = null, n in [1,2,3] | sum + n) AS a, \
+             reduce(sum = 1, n in null | sum + n) AS b, \
+             reduce(sum = 1, n in [1,2,3] | sum + n + null) AS c",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "null");
+        assert_eq!(render(&r[1]), "null");
+        assert_eq!(render(&r[2]), "null");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 'a' * 1 is an invalid operation; '2' is not a list.
+        assert!(run_err("exec_p5_reduce_e1", "RETURN reduce(sum = 'a', n in [1,2,3] | sum * n)")
+            .contains("cannot apply arithmetic"));
+        assert!(run_err("exec_p5_reduce_e2", "RETURN reduce(sum = 1, n in 2 | sum + n)")
+            .contains("needs a list"));
+        // A reduce missing its `| body` is a plain function call over the
+        // would-be accumulator binding `sum`, which is unbound -> runtime error.
+        assert!(run_err("exec_p5_reduce_e3", "RETURN reduce(sum = 0, n in [1,2,3])")
+            .contains("'sum'"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

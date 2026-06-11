@@ -215,6 +215,13 @@ pub mod ast {
         Var(String),
         Property(Box<Expr>, String),
         Index(Box<Expr>, Box<Expr>),
+        /// `base[from..to]` slice. Either bound may be absent (open end), in
+        /// which case it defaults to the start/end of the sequence.
+        Slice {
+            base: Box<Expr>,
+            from: Option<Box<Expr>>,
+            to: Option<Box<Expr>>,
+        },
         /// `expr:Label1:Label2` label predicate (boolean).
         HasLabels(Box<Expr>, Vec<String>),
         Neg(Box<Expr>),
@@ -266,6 +273,15 @@ pub mod ast {
             pattern: Box<Pattern>,
             predicate: Option<Box<Expr>>,
             projection: Box<Expr>,
+        },
+        /// `reduce(acc = init, var IN list | body)` — fold `body` over `list`,
+        /// threading the accumulator from `init`.
+        Reduce {
+            acc_var: String,
+            acc_init: Box<Expr>,
+            var: String,
+            list: Box<Expr>,
+            body: Box<Expr>,
         },
     }
 }
@@ -835,6 +851,32 @@ fn lower_postfix(pair: Pair<Rule>) -> Result<Expr> {
                     .collect::<Result<_>>()?;
                 base = Expr::HasLabels(Box::new(base), labels);
             }
+            Rule::slice_access => {
+                let mut from = None;
+                let mut to = None;
+                for part in inner_op.into_inner() {
+                    match part.as_rule() {
+                        // `slice_from`/`slice_to` wrap an optional `expr`; an
+                        // absent bound leaves the option `None` (open end).
+                        Rule::slice_from => {
+                            if let Some(e) = part.into_inner().next() {
+                                from = Some(Box::new(lower_expr(e)?));
+                            }
+                        }
+                        Rule::slice_to => {
+                            if let Some(e) = part.into_inner().next() {
+                                to = Some(Box::new(lower_expr(e)?));
+                            }
+                        }
+                        other => bail!("internal: unexpected slice part {other:?}"),
+                    }
+                }
+                base = Expr::Slice {
+                    base: Box::new(base),
+                    from,
+                    to,
+                };
+            }
             Rule::index_access => {
                 let idx = lower_expr(only_child(inner_op)?)?;
                 base = Expr::Index(Box::new(base), Box::new(idx));
@@ -869,6 +911,7 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::function_call => lower_function(inner),
         Rule::case_expr => lower_case(inner),
         Rule::map_projection => lower_map_projection(inner),
+        Rule::reduce_expr => lower_reduce(inner),
         Rule::list_comprehension => lower_list_predicate(inner),
         Rule::list_comp => lower_list_comp(inner),
         Rule::pattern_comp => lower_pattern_comp(inner),
@@ -1013,6 +1056,41 @@ fn lower_list_comp(pair: Pair<Rule>) -> Result<Expr> {
     })
 }
 
+fn lower_reduce(pair: Pair<Rule>) -> Result<Expr> {
+    // reduce_expr = { reduce_kw ~ "(" ~ identifier ~ "=" ~ expr ~ "," ~
+    //                 identifier ~ kw_in ~ expr ~ "|" ~ expr ~ ")" }
+    // After kids() drops `reduce_kw`/`kw_in`, the children appear in source order:
+    // acc-var identifier, acc-init expr, loop-var identifier, list expr, body expr.
+    let mut acc_var = None;
+    let mut var = None;
+    let mut exprs: Vec<Expr> = Vec::new();
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::identifier => {
+                let name = ident_text(child)?;
+                if acc_var.is_none() {
+                    acc_var = Some(name);
+                } else {
+                    var = Some(name);
+                }
+            }
+            Rule::expr => exprs.push(lower_expr(child)?),
+            other => bail!("internal: unexpected reduce child {other:?}"),
+        }
+    }
+    if exprs.len() != 3 {
+        bail!("internal: reduce expects 3 sub-expressions, got {}", exprs.len());
+    }
+    let mut it = exprs.into_iter();
+    Ok(Expr::Reduce {
+        acc_var: acc_var.ok_or_else(|| anyhow::anyhow!("missing reduce accumulator"))?,
+        acc_init: Box::new(it.next().unwrap()),
+        var: var.ok_or_else(|| anyhow::anyhow!("missing reduce variable"))?,
+        list: Box::new(it.next().unwrap()),
+        body: Box::new(it.next().unwrap()),
+    })
+}
+
 fn lower_pattern_comp(pair: Pair<Rule>) -> Result<Expr> {
     // pattern_comp = { "[" ~ pattern ~ where_clause? ~ "|" ~ expr ~ "]" }
     let mut pattern = None;
@@ -1100,6 +1178,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_call
             | Rule::kw_yield
             | Rule::kw_unwind
+            | Rule::reduce_kw
     )
 }
 
@@ -1513,5 +1592,84 @@ mod tests {
                 Box::new(Expr::Literal(Value::Str("a.*".to_string()))),
             )
         );
+    }
+
+    #[test]
+    fn lowers_slice_with_open_ends() {
+        // Both bounds present.
+        let q = ok("WITH [1,2,3] AS l RETURN l[1..2]");
+        assert_eq!(
+            q.head.ret.body.items[0].expr,
+            Expr::Slice {
+                base: Box::new(Expr::Var("l".to_string())),
+                from: Some(Box::new(Expr::Literal(Value::Int(1)))),
+                to: Some(Box::new(Expr::Literal(Value::Int(2)))),
+            }
+        );
+
+        // Open start / open end / fully open lower to `None` bounds.
+        let open_start = ok("WITH [1] AS l RETURN l[..2]");
+        assert!(matches!(
+            open_start.head.ret.body.items[0].expr,
+            Expr::Slice { from: None, to: Some(_), .. }
+        ));
+        let open_end = ok("WITH [1] AS l RETURN l[1..]");
+        assert!(matches!(
+            open_end.head.ret.body.items[0].expr,
+            Expr::Slice { from: Some(_), to: None, .. }
+        ));
+        let both = ok("WITH [1] AS l RETURN l[..]");
+        assert!(matches!(
+            both.head.ret.body.items[0].expr,
+            Expr::Slice { from: None, to: None, .. }
+        ));
+    }
+
+    #[test]
+    fn plain_subscript_still_lowers_to_index() {
+        // A non-slice subscript must backtrack to `index_access`.
+        let q = ok("WITH [1,2,3] AS l RETURN l[0]");
+        assert!(matches!(
+            q.head.ret.body.items[0].expr,
+            Expr::Index(..)
+        ));
+    }
+
+    #[test]
+    fn lowers_reduce() {
+        let q = ok("RETURN reduce(s = 0, n IN [1,2,3] | s + n)");
+        assert_eq!(
+            q.head.ret.body.items[0].expr,
+            Expr::Reduce {
+                acc_var: "s".to_string(),
+                acc_init: Box::new(Expr::Literal(Value::Int(0))),
+                var: "n".to_string(),
+                list: Box::new(Expr::List(vec![
+                    Expr::Literal(Value::Int(1)),
+                    Expr::Literal(Value::Int(2)),
+                    Expr::Literal(Value::Int(3)),
+                ])),
+                body: Box::new(Expr::Arith(
+                    BinOp::Add,
+                    Box::new(Expr::Var("s".to_string())),
+                    Box::new(Expr::Var("n".to_string())),
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn reduce_missing_sections_rejected() {
+        // A reduce missing its `| body` parses as a plain function call (matching
+        // FalkorDB, which then rejects it as "Unknown function 'reduce'" at
+        // resolution rather than as a syntax error).
+        let q = ok("RETURN reduce(s = 0, n IN [1,2,3])");
+        assert!(matches!(
+            q.head.ret.body.items[0].expr,
+            Expr::Function { ref name, .. } if name == "reduce"
+        ));
+        // Missing accumulator init (a bare `|` with no preceding args) is a
+        // genuine syntax error.
+        assert!(!err("RETURN reduce(n IN [1,2,3] | n)").is_empty());
     }
 }
