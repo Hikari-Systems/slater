@@ -1885,24 +1885,29 @@ impl<'g> Engine<'g> {
                 Val::Null => Val::Null,
                 other => bail!("last() needs a list, got {}", other.to_display()),
             },
-            "tostring" => match a0(0) {
+            // `tostring`/`toString` and the `*OrNull` variant. FalkorDB's plain
+            // `toString` errors on a non-convertible type while `toStringOrNull`
+            // yields NULL; our renderer never errors, so the two coincide here.
+            "tostring" | "tostringornull" => match a0(0) {
                 Val::Null => Val::Null,
                 v => Val::Str(v.to_display()),
             },
-            "tointeger" => match a0(0) {
+            // `toInteger`/`toFloat`/`toBoolean` already return NULL on a failed
+            // coercion, so the `*OrNull` forms (which never error) are aliases.
+            "tointeger" | "tointegerornull" => match a0(0) {
                 Val::Int(i) => Val::Int(i),
                 Val::Float(f) => Val::Int(f as i64),
                 Val::Str(s) => s.trim().parse::<i64>().map(Val::Int).unwrap_or(Val::Null),
                 Val::Bool(b) => Val::Int(b as i64),
                 _ => Val::Null,
             },
-            "tofloat" => match a0(0) {
+            "tofloat" | "tofloatornull" => match a0(0) {
                 Val::Int(i) => Val::Float(i as f64),
                 Val::Float(f) => Val::Float(f),
                 Val::Str(s) => s.trim().parse::<f64>().map(Val::Float).unwrap_or(Val::Null),
                 _ => Val::Null,
             },
-            "toboolean" => match a0(0) {
+            "toboolean" | "tobooleanornull" => match a0(0) {
                 Val::Bool(b) => Val::Bool(b),
                 Val::Str(s) => match s.trim().to_lowercase().as_str() {
                     "true" => Val::Bool(true),
@@ -1929,6 +1934,37 @@ impl<'g> Engine<'g> {
                 _ => Val::Null,
             },
             "sign" => num_fn(&a0(0), |x| x.signum().trunc()),
+            // Trigonometric family — like FalkorDB these wrap libm directly and
+            // return NULL for a non-numeric (incl. NULL) argument.
+            "sin" => num_fn(&a0(0), |x| x.sin()),
+            "cos" => num_fn(&a0(0), |x| x.cos()),
+            "tan" => num_fn(&a0(0), |x| x.tan()),
+            "cot" => num_fn(&a0(0), |x| x.cos() / x.sin()),
+            "asin" => num_fn(&a0(0), |x| x.asin()),
+            "acos" => num_fn(&a0(0), |x| x.acos()),
+            "atan" => num_fn(&a0(0), |x| x.atan()),
+            "atan2" => match (a0(0).as_num(), a0(1).as_num()) {
+                (Some(y), Some(x)) => Val::Float(y.atan2(x)),
+                _ => Val::Null,
+            },
+            "degrees" => num_fn(&a0(0), |x| x.to_degrees()),
+            "radians" => num_fn(&a0(0), |x| x.to_radians()),
+            // haversin(x) = (1 - cos x) / 2 (FalkorDB AR_HAVERSIN).
+            "haversin" => num_fn(&a0(0), |x| (1.0 - x.cos()) / 2.0),
+            // left/right: the n leftmost/rightmost characters. n must be >= 0;
+            // when the string is shorter than n the whole string is returned.
+            "left" => self.left_right(&args, true)?,
+            "right" => self.left_right(&args, false)?,
+            // typeOf — FalkorDB's value-type name (SIType_ToString).
+            "typeof" => Val::Str(type_name(&a0(0)).to_string()),
+            // isEmpty — empty string / list / map. NULL argument → NULL.
+            "isempty" => match a0(0) {
+                Val::Str(s) => Val::Bool(s.is_empty()),
+                Val::List(xs) => Val::Bool(xs.is_empty()),
+                Val::Map(m) => Val::Bool(m.is_empty()),
+                Val::Null => Val::Null,
+                other => bail!("isEmpty() needs a string, list or map, got {}", other.to_display()),
+            },
             "exists" => Val::Bool(!matches!(a0(0), Val::Null)),
             "substring" => self.substring(&args)?,
             "split" => match (a0(0), a0(1)) {
@@ -2052,6 +2088,35 @@ impl<'g> Engine<'g> {
             _ => bail!("substring() length must be a non-negative integer"),
         };
         Ok(Val::Str(chars[start..end].iter().collect()))
+    }
+
+    /// `left(s, n)` / `right(s, n)`: the n leftmost (or rightmost) characters.
+    /// NULL string → NULL; `n` must be a non-negative integer; an `n` past the
+    /// string length returns the whole string (matching FalkorDB AR_LEFT/AR_RIGHT).
+    fn left_right(&self, args: &[Val], from_left: bool) -> Result<Val> {
+        let s = match args.first() {
+            Some(Val::Str(s)) => s,
+            Some(Val::Null) | None => return Ok(Val::Null),
+            Some(other) => bail!(
+                "{}() needs a string, got {}",
+                if from_left { "left" } else { "right" },
+                other.to_display()
+            ),
+        };
+        let n = match args.get(1) {
+            Some(Val::Int(i)) if *i >= 0 => *i as usize,
+            _ => bail!("length must be a non-negative integer"),
+        };
+        let chars: Vec<char> = s.chars().collect();
+        if n >= chars.len() {
+            return Ok(Val::Str(s.clone()));
+        }
+        let slice = if from_left {
+            &chars[..n]
+        } else {
+            &chars[chars.len() - n..]
+        };
+        Ok(Val::Str(slice.iter().collect()))
     }
 
     fn range_fn(&self, args: &[Val]) -> Result<Val> {
@@ -2480,6 +2545,22 @@ fn avg(vals: &[Val]) -> Result<Val> {
         }
     }
     Ok(Val::Float(s / vals.len() as f64))
+}
+
+/// FalkorDB's value-type name, as returned by `typeOf()` (`SIType_ToString`).
+fn type_name(v: &Val) -> &'static str {
+    match v {
+        Val::Null => "Null",
+        Val::Bool(_) => "Boolean",
+        Val::Int(_) => "Integer",
+        Val::Float(_) => "Float",
+        Val::Str(_) => "String",
+        Val::List(_) => "List",
+        Val::Vector(_) => "Vectorf32",
+        Val::Map(_) => "Map",
+        Val::Node(_) => "Node",
+        Val::Rel { .. } => "Edge",
+    }
 }
 
 fn str_fn(v: &Val, f: impl Fn(&str) -> String) -> Val {
@@ -3183,6 +3264,83 @@ mod tests {
         };
         assert!((same - 1.0).abs() < 1e-9);
         assert!(orth.abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase1_trig_and_angle_functions() {
+        let (root, res) = run(
+            "exec_p1_trig",
+            "RETURN sin(0.0) AS s, cos(0.0) AS c, tan(0.0) AS t, \
+             cot(0.7853981633974483) AS cot, asin(1.0) AS asin, acos(1.0) AS acos, \
+             atan(1.0) AS atan, atan2(1.0, 1.0) AS atan2, \
+             degrees(3.141592653589793) AS deg, radians(180.0) AS rad, \
+             haversin(0.0) AS hav",
+        );
+        let f = |i: usize| match res.rows[0][i] {
+            Val::Float(x) => x,
+            _ => panic!("expected float at col {i}"),
+        };
+        let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        close(f(0), 0.0); // sin 0
+        close(f(1), 1.0); // cos 0
+        close(f(2), 0.0); // tan 0
+        close(f(3), 1.0); // cot(pi/4)
+        close(f(4), std::f64::consts::FRAC_PI_2); // asin 1
+        close(f(5), 0.0); // acos 1
+        close(f(6), std::f64::consts::FRAC_PI_4); // atan 1
+        close(f(7), std::f64::consts::FRAC_PI_4); // atan2(1,1)
+        close(f(8), 180.0); // degrees(pi)
+        close(f(9), std::f64::consts::PI); // radians(180)
+        close(f(10), 0.0); // haversin 0
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase1_left_right_and_isempty_typeof() {
+        let (root, res) = run(
+            "exec_p1_str",
+            "RETURN left('muchacho', 4) AS l, right('muchacho', 4) AS r, \
+             left('hi', 9) AS lover, right('hi', 9) AS rover, \
+             isEmpty('') AS e1, isEmpty('x') AS e2, isEmpty([]) AS e3, \
+             typeOf(1) AS t1, typeOf(1.5) AS t2, typeOf('a') AS t3, \
+             typeOf(true) AS t4, typeOf([1]) AS t5, typeOf(null) AS t6",
+        );
+        let row = &res.rows[0];
+        assert!(matches!(&row[0], Val::Str(s) if s == "much"));
+        assert!(matches!(&row[1], Val::Str(s) if s == "acho"));
+        assert!(matches!(&row[2], Val::Str(s) if s == "hi"));
+        assert!(matches!(&row[3], Val::Str(s) if s == "hi"));
+        assert!(matches!(row[4], Val::Bool(true)));
+        assert!(matches!(row[5], Val::Bool(false)));
+        assert!(matches!(row[6], Val::Bool(true)));
+        assert!(matches!(&row[7], Val::Str(s) if s == "Integer"));
+        assert!(matches!(&row[8], Val::Str(s) if s == "Float"));
+        assert!(matches!(&row[9], Val::Str(s) if s == "String"));
+        assert!(matches!(&row[10], Val::Str(s) if s == "Boolean"));
+        assert!(matches!(&row[11], Val::Str(s) if s == "List"));
+        assert!(matches!(&row[12], Val::Str(s) if s == "Null"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase1_ornull_conversions() {
+        let (root, res) = run(
+            "exec_p1_ornull",
+            "RETURN toIntegerOrNull('7') AS i, toIntegerOrNull('x') AS i2, \
+             toFloatOrNull('1.5') AS f, toFloatOrNull('x') AS f2, \
+             toBooleanOrNull('true') AS b, toBooleanOrNull('x') AS b2, \
+             toStringOrNull(42) AS s, toStringOrNull(null) AS s2",
+        );
+        let row = &res.rows[0];
+        assert!(matches!(row[0], Val::Int(7)));
+        assert!(matches!(row[1], Val::Null));
+        assert!(matches!(row[2], Val::Float(x) if (x - 1.5).abs() < 1e-9));
+        assert!(matches!(row[3], Val::Null));
+        assert!(matches!(row[4], Val::Bool(true)));
+        assert!(matches!(row[5], Val::Null));
+        assert!(matches!(&row[6], Val::Str(s) if s == "42"));
+        assert!(matches!(row[7], Val::Null));
         let _ = std::fs::remove_dir_all(&root);
     }
 
