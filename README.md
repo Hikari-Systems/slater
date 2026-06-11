@@ -28,6 +28,55 @@ happen offline, by building a new generation and atomically swapping the
 `current` pointer; the running server picks the change up via its generation
 guard (see [Generation guard](#generation-guard)).
 
+## Running with Docker
+
+Slater is designed to be run as a **Docker deployment** — that's the expected way
+to use it. Prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) are
+published to **Docker Hub** at
+[**`hikarisystems/slater`**](https://hub.docker.com/r/hikarisystems/slater),
+tagged `:latest` and `:vX.Y.Z` on every release:
+
+```sh
+docker pull hikarisystems/slater:latest
+```
+
+A Docker-command-only usage, configuration, and operations guide lives in
+[`DOCKERHUB.md`](DOCKERHUB.md) (and is mirrored to the Docker Hub overview page) —
+**start there if you're deploying.** In short:
+
+```sh
+# Build a graph generation with the offline writer:
+docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
+  --entrypoint /app/slater-build hikarisystems/slater:latest \
+  --input /dumps/people.cypher --graph people --data-dir /data
+
+# Serve it (read-only) over Bolt on 7687:
+docker run -d --name slater -p 7687:7687 \
+  -v slater-data:/data:ro -v "$PWD/acl.json:/config/acl.json:ro" \
+  hikarisystems/slater:latest
+```
+
+To build the image locally instead (e.g. for development):
+
+```sh
+# Build the image (both binaries).
+docker compose build
+
+# Serve (expects generations under the slater-data volume / your /data mount).
+docker compose up slater
+
+# Build a generation with the offline writer (profile `build`):
+docker compose run --rm builder \
+  --input /dumps/people.cypher --graph people --data-dir /data
+```
+
+The builder stage installs `cmake`, `clang` and `libclang-dev` for the rustls
+`aws-lc-rs` backend; `git` (already in the base image) is required for the
+`hs-utils` git+tag dependency, which `.cargo/config.toml` fetches via the git CLI.
+
+The sections below cover the on-disk format, configuration, ACLs, and a
+local (non-Docker) worked example.
+
 ## How it works
 
 ```
@@ -251,38 +300,6 @@ driver.close()
 
 The KNN `score` is the **cosine distance** (ascending — nearest first), matching
 FalkorDB's `db.idx.vector.queryNodes` contract.
-
-## Running with Docker
-
-Prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) are published to
-**Docker Hub** — the image's home — at
-[**`hikarisystems/slater`**](https://hub.docker.com/r/hikarisystems/slater),
-tagged `:latest` and `:vX.Y.Z` on every release:
-
-```sh
-docker pull hikarisystems/slater:latest
-```
-
-A Docker-command-only usage, configuration, and operations guide lives in
-[`DOCKERHUB.md`](DOCKERHUB.md) (and is mirrored to the Docker Hub overview page).
-
-To build locally instead:
-
-```sh
-# Build the image (both binaries).
-docker compose build
-
-# Serve (expects generations under the slater-data volume / your /data mount).
-docker compose up slater
-
-# Build a generation with the offline writer (profile `build`):
-docker compose run --rm builder \
-  --input /dumps/people.cypher --graph people --data-dir /data
-```
-
-The builder stage installs `cmake`, `clang` and `libclang-dev` for the rustls
-`aws-lc-rs` backend; `git` (already in the base image) is required for the
-`hs-utils` git+tag dependency, which `.cargo/config.toml` fetches via the git CLI.
 
 ## Development
 
