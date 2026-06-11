@@ -110,6 +110,16 @@ pub enum Val {
         nodes: Vec<u64>,
         rels: Vec<Val>,
     },
+    /// A geographic point (FalkorDB `T_POINT`). FalkorDB only constructs WGS-84
+    /// lat/lon points (no Cartesian/x-y form, no SRID parameter); the SRID is
+    /// always 4326, emitted at wire-encode time. Stored as `f64`; FalkorDB keeps
+    /// `f32` internally, but its tests assert coordinates only to 1e-5 and
+    /// distances to a 10% tolerance, so the wider precision is observationally
+    /// equivalent. Constructor/compute-only — points are never decoded from disk.
+    Point {
+        latitude: f64,
+        longitude: f64,
+    },
 }
 
 impl Val {
@@ -137,6 +147,7 @@ impl Val {
             Val::Node(_) => 7,
             Val::Rel { .. } => 8,
             Val::Path { .. } => 9,
+            Val::Point { .. } => 10,
         }
     }
 
@@ -175,6 +186,18 @@ impl Val {
                     .find(|o| *o != Ordering::Equal)
                     .unwrap_or_else(|| ra.len().cmp(&rb.len()))
             }),
+            // FalkorDB orders points by longitude first, then latitude (value.c
+            // T_POINT case): `lon_diff != 0 ? lon_diff : lat_diff`.
+            (
+                Point {
+                    latitude: la,
+                    longitude: lo_a,
+                },
+                Point {
+                    latitude: lb,
+                    longitude: lo_b,
+                },
+            ) => lo_a.total_cmp(lo_b).then_with(|| la.total_cmp(lb)),
             (List(a), List(b)) => a
                 .iter()
                 .zip(b)
@@ -240,6 +263,16 @@ impl Val {
                     && ra.iter().zip(rb).all(|(x, y)| x.loose_eq(y) == Some(true))
             }
             (Vector(a), Vector(b)) => a == b,
+            (
+                Point {
+                    latitude: la,
+                    longitude: lo_a,
+                },
+                Point {
+                    latitude: lb,
+                    longitude: lo_b,
+                },
+            ) => la == lb && lo_a == lo_b,
             (List(a), List(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.loose_eq(y) == Some(true))
             }
@@ -269,6 +302,12 @@ impl Val {
             Val::Int(i) => i.to_string(),
             Val::Float(f) => f.to_string(),
             Val::Str(s) => s.clone(),
+            // FalkorDB `value.c` T_POINT: `point({latitude: %f, longitude: %f})`,
+            // C `%f` ⇒ 6 fractional digits.
+            Val::Point {
+                latitude,
+                longitude,
+            } => format!("point({{latitude: {latitude:.6}, longitude: {longitude:.6}}})"),
             other => format!("{other:?}"),
         }
     }
@@ -1829,6 +1868,16 @@ impl<'g> Engine<'g> {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.clone())
                 .unwrap_or(Val::Null)),
+            // Point coordinate read (FalkorDB `Point_GetCoordinate`): only
+            // `latitude`/`longitude` resolve; any other key yields NULL.
+            Val::Point {
+                latitude,
+                longitude,
+            } => Ok(match key {
+                "latitude" => Val::Float(*latitude),
+                "longitude" => Val::Float(*longitude),
+                _ => Val::Null,
+            }),
             Val::Null => Ok(Val::Null),
             other => bail!("type {} has no property '{key}'", other.to_display()),
         }
@@ -2405,6 +2454,63 @@ impl<'g> Engine<'g> {
                     }
                 }
             }
+            // ── Point / geo functions (FalkorDB point_funcs.c) ──────────────
+            // point({latitude, longitude}): a WGS-84 geographic point. FalkorDB
+            // accepts ONLY the lat/lon map form (no Cartesian x/y, no SRID arg);
+            // the map must have exactly those two numeric keys, latitude in
+            // [-90,90] and longitude in [-180,180]. NULL map → NULL.
+            "point" => match a0(0) {
+                Val::Null => Val::Null,
+                Val::Map(m) => {
+                    if m.len() != 2 {
+                        bail!("A point map should have 2 elements, latitude and longitude");
+                    }
+                    let get = |k: &str| m.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+                    let lat = get("latitude").ok_or_else(|| {
+                        anyhow::anyhow!("Did not find 'latitude' value in point map")
+                    })?;
+                    let lon = get("longitude").ok_or_else(|| {
+                        anyhow::anyhow!("Did not find 'longitude' value in point map")
+                    })?;
+                    let (latitude, longitude) = match (lat.as_num(), lon.as_num()) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => bail!(
+                            "'latitude' and 'longitude' values in point map were not both valid numerics"
+                        ),
+                    };
+                    if !(-90.0..=90.0).contains(&latitude) {
+                        bail!("latitude should be within the -90 to 90 range");
+                    }
+                    if !(-180.0..=180.0).contains(&longitude) {
+                        bail!("longitude should be within the -180 to 180 range");
+                    }
+                    Val::Point {
+                        latitude,
+                        longitude,
+                    }
+                }
+                other => bail!("point() expects a map, got {}", other.to_display()),
+            },
+            // distance(p1, p2): great-circle distance in metres (haversine over the
+            // WGS-84 sphere, FalkorDB `AR_DISTANCE`). NULL operand → NULL.
+            "distance" => match (a0(0), a0(1)) {
+                (Val::Null, _) | (_, Val::Null) => Val::Null,
+                (
+                    Val::Point {
+                        latitude: la,
+                        longitude: lo_a,
+                    },
+                    Val::Point {
+                        latitude: lb,
+                        longitude: lo_b,
+                    },
+                ) => Val::Float(haversine_metres(la, lo_a, lb, lo_b)),
+                (a, b) => bail!(
+                    "distance() needs two points, got {} and {}",
+                    a.to_display(),
+                    b.to_display()
+                ),
+            },
             // ── List functions (FalkorDB list_funcs.c) ──────────────────────
             // tail: all but the first element. NULL → NULL.
             "tail" => match a0(0) {
@@ -3236,6 +3342,25 @@ fn percentile_disc(vals: &[Val], p: f64) -> Result<Val> {
 }
 
 /// FalkorDB's value-type name, as returned by `typeOf()` (`SIType_ToString`).
+/// Great-circle distance in metres between two WGS-84 lat/lon points, via the
+/// haversine formula (FalkorDB `AR_DISTANCE`, `point_funcs.c`). Uses the same
+/// Earth radius (6 378 140 m) FalkorDB does; FalkorDB accumulates in `f32` while
+/// this stays in `f64`, but its `test_point.py` asserts distances only to a 10%
+/// tolerance, so the difference is immaterial.
+fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6_378_140.0;
+    let to_rad = |d: f64| d * std::f64::consts::PI / 180.0;
+    let (phi1, phi2) = (to_rad(lat1), to_rad(lat2));
+    let dphi = phi2 - phi1;
+    let dlambda = to_rad(lon2) - to_rad(lon1);
+    // a = sin²(Δφ/2) + cos φ1 · cos φ2 · sin²(Δλ/2)
+    let a =
+        (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    // c = 2 · atan2(√a, √(1−a)); d = R · c
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    EARTH_RADIUS * c
+}
+
 fn type_name(v: &Val) -> &'static str {
     match v {
         Val::Null => "Null",
@@ -3249,6 +3374,7 @@ fn type_name(v: &Val) -> &'static str {
         Val::Node(_) => "Node",
         Val::Rel { .. } => "Edge",
         Val::Path { .. } => "Path",
+        Val::Point { .. } => "Point",
     }
 }
 
@@ -4158,6 +4284,154 @@ mod tests {
             "RETURN vec.cosineDistance([1.0, 1.0], 'foo') AS d",
         );
         assert!(e.contains("vectors"), "got: {e}");
+    }
+
+    // ── Phase 9 — Val::Point, point()/distance(), coordinate reads ────────────
+
+    // point() construction + coordinate property reads (test_point.py
+    // test_point_coordinates). FalkorDB stores f32; coordinates are asserted to
+    // 1e-5. An unknown coordinate key yields NULL.
+    #[test]
+    fn phase9_point_construction_and_coordinates() {
+        let (root, res) = run(
+            "exec_p9_coords",
+            "WITH point({latitude: 32.070794860, longitude: 34.820751118}) AS p \
+             RETURN p.latitude AS lat, p.longitude AS lon, p.v AS missing, typeOf(p) AS t",
+        );
+        let r = &res.rows[0];
+        match r[0] {
+            Val::Float(x) => assert!((x - 32.070794860).abs() < 1e-5, "lat {x}"),
+            ref o => panic!("expected float latitude, got {o:?}"),
+        }
+        match r[1] {
+            Val::Float(x) => assert!((x - 34.820751118).abs() < 1e-5, "lon {x}"),
+            ref o => panic!("expected float longitude, got {o:?}"),
+        }
+        assert!(matches!(r[2], Val::Null), "unknown key → NULL");
+        assert_eq!(render(&r[3]), "'Point'");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // distance() haversine, in metres (test_point.py test_point_distance). The
+    // FalkorDB suite tolerates 10% error; we assert the same vectors well within it.
+    #[test]
+    fn phase9_point_distance() {
+        let (root, res) = run(
+            "exec_p9_dist",
+            "WITH point({latitude:32.070794860, longitude:34.820751118}) AS a, \
+                  point({latitude:32.070109656, longitude:34.822351298}) AS b, \
+                  point({latitude:30.621734079, longitude:-96.33775507}) AS c \
+             RETURN distance(a, a) AS d0, distance(a, b) AS d160, distance(a, c) AS d_far",
+        );
+        let r = &res.rows[0];
+        let f = |v: &Val| match v {
+            Val::Float(x) => *x,
+            o => panic!("expected float, got {o:?}"),
+        };
+        assert!(f(&r[0]).abs() < 1e-6, "same point → 0, got {}", f(&r[0]));
+        let within = |got: f64, want: f64| {
+            assert!((got - want).abs() <= 0.1 * want, "got {got}, want ~{want}")
+        };
+        within(f(&r[1]), 160.0);
+        within(f(&r[2]), 11_352_120.0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Coordinate range validation + bad-key errors (test_point.py test_point_values).
+    #[test]
+    fn phase9_point_validation_errors() {
+        for (tag, q, needle) in [
+            (
+                "exec_p9_lat_hi",
+                "RETURN point({latitude:90.1, longitude:20}) AS p",
+                "latitude should be within",
+            ),
+            (
+                "exec_p9_lat_lo",
+                "RETURN point({latitude:-90.1, longitude:20}) AS p",
+                "latitude should be within",
+            ),
+            (
+                "exec_p9_lon_hi",
+                "RETURN point({latitude:10, longitude:180.1}) AS p",
+                "longitude should be within",
+            ),
+            (
+                "exec_p9_lon_lo",
+                "RETURN point({latitude:10, longitude:-180.1}) AS p",
+                "longitude should be within",
+            ),
+            (
+                "exec_p9_one_key",
+                "RETURN point({latitude:10}) AS p",
+                "should have 2 elements",
+            ),
+            (
+                "exec_p9_no_lat",
+                "RETURN point({x:1, y:2}) AS p",
+                "Did not find 'latitude'",
+            ),
+        ] {
+            let e = run_err(tag, q);
+            assert!(e.contains(needle), "query `{q}` → `{e}` (want `{needle}`)");
+        }
+    }
+
+    // Ordering + equality. FalkorDB orders points by longitude then latitude
+    // (test_point.py test_nested_point ORDER BY p), and equal points are `=`.
+    #[test]
+    fn phase9_point_ordering_and_equality() {
+        let (root, res) = run(
+            "exec_p9_order",
+            "UNWIND [point({latitude:33, longitude:35}), \
+                     point({latitude:32, longitude:31}), \
+                     point({latitude:32, longitude:32}), \
+                     point({latitude:31, longitude:32}), \
+                     point({latitude:29, longitude:36})] AS p \
+             WITH p ORDER BY p RETURN p.longitude AS lon, p.latitude AS lat",
+        );
+        let lons: Vec<f64> = res
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Val::Float(x) => x,
+                ref o => panic!("{o:?}"),
+            })
+            .collect();
+        assert_eq!(lons, vec![31.0, 32.0, 32.0, 35.0, 36.0]);
+        // The lon-32 tie breaks on latitude ascending (31 before 32).
+        assert!(matches!(res.rows[1][1], Val::Float(x) if (x - 31.0).abs() < 1e-9));
+        assert!(matches!(res.rows[2][1], Val::Float(x) if (x - 32.0).abs() < 1e-9));
+
+        let (root2, eq) = run(
+            "exec_p9_eq",
+            "WITH point({latitude:32, longitude:34}) AS a, \
+                  point({latitude:32, longitude:34}) AS b, \
+                  point({latitude:32, longitude:35}) AS c \
+             RETURN a = b AS same, a = c AS diff",
+        );
+        assert!(matches!(eq.rows[0][0], Val::Bool(true)));
+        assert!(matches!(eq.rows[0][1], Val::Bool(false)));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    // NULL propagation + toString rendering (%f, 6 decimals — test_nested_point).
+    #[test]
+    fn phase9_point_null_and_tostring() {
+        let (root, res) = run(
+            "exec_p9_null_str",
+            "RETURN point(null) AS np, distance(null, point({latitude:1, longitude:2})) AS nd, \
+             toString(point({latitude:32, longitude:34})) AS s",
+        );
+        let r = &res.rows[0];
+        assert!(matches!(r[0], Val::Null));
+        assert!(matches!(r[1], Val::Null));
+        assert_eq!(
+            render(&r[2]),
+            "'point({latitude: 32.000000, longitude: 34.000000})'"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

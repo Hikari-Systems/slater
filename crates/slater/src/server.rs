@@ -58,6 +58,10 @@ const TAG_RELATIONSHIP: u8 = 0x52;
 /// relationship without endpoint ids, since the path's node list supplies them.
 const TAG_PATH: u8 = 0x50;
 const TAG_UNBOUND_REL: u8 = 0x72;
+/// Bolt `Point2D` (`0x58`): `[srid::Int, x::Float, y::Float]`. FalkorDB points are
+/// always WGS-84, so `srid` is fixed at 4326 with `x = longitude`, `y = latitude`
+/// (see `resultset_replybolt.c`).
+const TAG_POINT2D: u8 = 0x58;
 
 /// The `server` agent string returned in the `HELLO` reply. Kept with a `Neo4j/`
 /// prefix so the official drivers' feature-gating (which sniffs this string) treats
@@ -1504,6 +1508,7 @@ fn val_bytes(v: &Val) -> usize {
         Val::Path { nodes, rels } => {
             16 + nodes.len() * 24 + rels.iter().map(val_bytes).sum::<usize>()
         }
+        Val::Point { .. } => 32,
     }
 }
 
@@ -1623,6 +1628,21 @@ fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
                 ],
             }
         }
+        // Bolt `Point2D` (0x58): `[srid, x, y]`. FalkorDB always uses WGS-84, so
+        // srid = 4326, x = longitude, y = latitude (resultset_replybolt.c). Not
+        // yet byte-validated against a live Neo4j driver in this env (none
+        // available); follows the published Point2D spec.
+        Val::Point {
+            latitude,
+            longitude,
+        } => PsValue::Struct {
+            tag: TAG_POINT2D,
+            fields: vec![
+                PsValue::Int(4326),
+                PsValue::Float(*longitude),
+                PsValue::Float(*latitude),
+            ],
+        },
     })
 }
 
@@ -2278,6 +2298,45 @@ mod tests {
             PsValue::List(vec![PsValue::Int(1), PsValue::Int(1)]),
             "path indices"
         );
+
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn returns_point2d_structure() {
+        let (root, ctx) = build_ctx("server_point");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        c.recv().await;
+        c.send(Client::logon("reporting", "pw")).await;
+        c.recv().await;
+
+        c.send(Client::run(
+            "RETURN point({latitude: 32.5, longitude: 34.25}) AS p",
+        ))
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::RECORD);
+        let row = match &fields[0] {
+            PsValue::List(vals) => vals,
+            other => panic!("expected a record list, got {other:?}"),
+        };
+        // Point2D struct (0x58): [srid::Int=4326, x::Float=longitude, y::Float=latitude].
+        match &row[0] {
+            PsValue::Struct { tag, fields } => {
+                assert_eq!(*tag, TAG_POINT2D);
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0], PsValue::Int(4326), "srid");
+                assert_eq!(fields[1], PsValue::Float(34.25), "x = longitude");
+                assert_eq!(fields[2], PsValue::Float(32.5), "y = latitude");
+            }
+            other => panic!("expected a Point2D struct, got {other:?}"),
+        }
 
         assert_eq!(c.recv().await.0, message::tag::SUCCESS);
         let _ = std::fs::remove_dir_all(&root);
