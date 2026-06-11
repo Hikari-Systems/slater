@@ -19,8 +19,9 @@ services:
       # TLS material, and the optional at-rest key file. Mounted read-only.
       - '../../configs/slater:/sandbox:ro'
       # The immutable generation images (`<graph>/<generation>/…` + `current`
-      # pointers), on an NFS mount produced by `slater-build`. Read-only — the
-      # generation guard polls `current` but the server never writes.
+      # pointers) produced by `slater-build`, possibly on remote/network storage
+      # (e.g. NFS). Read-only — the generation guard polls `current` but the
+      # server never writes.
       - 'slater-data:/data:ro'
     ports:
       # Bolt (optionally Bolt+TLS), not HTTP.

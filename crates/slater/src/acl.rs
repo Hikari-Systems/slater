@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Access control — argon2id authentication and per-graph read grants.
 //!
-//! The ACL is a plain-JSON file (it lives on a shared/NFS mount alongside the
+//! The ACL is a plain-JSON file (it lives on shared storage alongside the
 //! data) mapping each user to an **argon2id password hash** and a set of
 //! per-graph grants. Cleartext passwords are never stored; hashes are minted with
 //! the `slater hash-password` subcommand ([`hash_password`]). At `LOGON` the

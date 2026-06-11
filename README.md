@@ -46,10 +46,61 @@ guard (see [Generation guard](#generation-guard)).
 * Every block is zstd-compressed and BLAKE3-checksummed; with `--encrypt` each
   block is additionally sealed with XChaCha20-Poly1305 (AEAD at rest).
 * The server opens a generation by **re-hashing every file** against the manifest,
-  so a half-copied / truncated NFS image is refused rather than served.
+  so a half-copied / truncated image — a torn copy onto the data dir, which may be
+  remote/network storage — is refused rather than served.
 * Reads flow through **three bounded cache pools** — a decompressed-block LRU, a
   vector-index pool (resident PQ codes + a Vamana-block LRU), and a result LRU —
   each with its own byte budget. This is what keeps RSS flat.
+
+### Range indexes (ISAM)
+
+A range index (`range/<name>.isam`, one per indexed `(label, property)`) lets a
+`MATCH (n:Label {prop: v})` or `WHERE n.prop <op> v` resolve to the matching node
+ids **without scanning the label**. It is an
+**[ISAM](https://en.wikipedia.org/wiki/ISAM)** (Indexed Sequential Access Method)
+structure — the classic *static, sorted, block-structured* index, which is exactly
+the right shape for an immutable generation: there are no inserts to rebalance, so
+the simplicity of ISAM buys what a B-tree's mutation machinery would only
+complicate.
+
+* Entries `(value, entity_id)` are sorted by value and packed into the same
+  zstd-compressed 256 KiB blocks as everything else.
+* A small **resident top-level** holds the first key of each block (a sparse
+  index). A lookup binary-searches that in-memory top level to find the *one* block
+  a key can be in, reads + decompresses that block, and scans it — so an equality
+  lookup is **one block read**, and a range scan walks the contiguous run of blocks
+  it spans. (This is why a `meshUi`-indexed lookup is single-digit milliseconds
+  while the same match on an unindexed property scans the whole label.)
+* The planner picks it via `NodeScan::RangeEq` / `RangeRange`; an unindexed
+  predicate falls back to a label sweep or full scan, with the executor re-checking
+  every predicate either way.
+
+### Vector search (Vamana + PQ)
+
+Vector KNN (`db.idx.vector.queryNodes`) has two execution paths, chosen per index
+at build time by the `--ann-threshold` (default 50 000 vectors):
+
+* **Below the threshold — brute force.** The full `f32` vectors live in
+  `vectors.f32.blk`; a query scans the index's group and computes exact cosine
+  distances. Simple and exact; fine when the vector set is small.
+* **At or above the threshold — Vamana + PQ**, the disk-native ANN path that keeps
+  resident memory bounded regardless of how many vectors there are:
+  * **[Vamana](https://arxiv.org/pdf/2401.11324)** is the graph index from the
+    DiskANN line of work: a single proximity graph whose edges are pruned (the
+    `--vamana-r` out-degree and `--vamana-alpha` long-edge factor) so a *greedy
+    beam search* — start at the medoid, repeatedly hop toward the query, keeping a
+    candidate list of width `vectorQuery.beamWidth` — reaches a node's true
+    neighbours in few hops, i.e. **few random block reads per query**. The graph
+    blocks (`vector/<label>.<prop>.vamana`) are paged in through the vector cache,
+    not held wholesale.
+  * **[Product quantisation (PQ)](https://medium.com/aiguys/product-quantization-k-nn-for-big-datasets-12431d764c4e)**
+    compresses each vector into a short code (`--pq-subspaces` × `--pq-bits`): the
+    dimensions are split into subspaces, each independently k-means-clustered, and
+    the vector is stored as the tuple of nearest-centroid ids. These codes
+    (`vector/<label>.<prop>.pq`) are small enough to keep **resident**, so the
+    beam search scores candidates from RAM and only the chosen few full vectors are
+    read from disk. That resident PQ set is what the `cache.vectorCacheBytes` pool
+    pins.
 
 ## Mounts
 
@@ -58,7 +109,7 @@ The container runs with a **read-only root filesystem** and a non-root user
 
 | Path | Purpose | Notes |
 | --- | --- | --- |
-| `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | NFS mount, **read-only**; produced by `slater-build`. |
+| `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | **Read-only**; produced by `slater-build`. May live on remote/network storage (e.g. NFS), so reads are not assumed to be fast local-SSD latencies. |
 | `/sandbox` | Per-environment config overlay + secrets. | `/sandbox/config.json` is deep-merged over the baked-in `config.json`; also holds `acl.json`, TLS PEM material, the at-rest key file. |
 | `/tmp`, `/run` | Scratch (`tmpfs`). | Slater itself never writes to disk. |
 
@@ -94,7 +145,8 @@ overrides (double underscore for nesting; keys match the camelCase config).
 ### Generation guard
 
 Slater polls each graph's `current` pointer every `generationPollMs`
-(**poll, not inotify** — the data dir is an NFS mount). When it changes:
+(**poll, not inotify** — the data dir may be remote/network storage like NFS,
+where filesystem change events are unreliable). When it changes:
 
 * `reloadStrategy=exit` (default): the server logs fatal and exits non-zero so the
   orchestrator restarts it cleanly against the new generation.

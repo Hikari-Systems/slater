@@ -5,8 +5,8 @@
 //! builder writes every file, fsyncs, computes the hash, then writes the MANIFEST
 //! last. On open the reader recomputes the hash over the same inventory and
 //! refuses to serve a generation whose contents do not match its MANIFEST — which
-//! is exactly the failure mode of a half-copied generation rsync'd onto an NFS
-//! mount.
+//! is exactly the failure mode of a generation half-copied onto the data dir
+//! (which may be remote/network storage, e.g. an in-progress rsync onto NFS).
 
 use std::fs::File;
 use std::io::{BufReader, Read};

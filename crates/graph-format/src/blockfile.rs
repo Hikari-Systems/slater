@@ -6,8 +6,9 @@
 //! a small **block directory** (block id → file offset + lengths) as a trailer.
 //! The directory is tiny and is held resident by the reader at open; block bytes
 //! are fetched with positional reads (`pread`) and decompressed on demand — we do
-//! not mmap (mmap over NFS gives close-to-open surprises and unpredictable
-//! eviction; we want explicit, bounded caching instead).
+//! not mmap (over a remote/network filesystem such as NFS, mmap gives
+//! close-to-open surprises and unpredictable eviction; we want explicit, bounded
+//! caching instead).
 //!
 //! On-disk layout:
 //! ```text
@@ -208,7 +209,7 @@ impl BlockFileWriter {
         self.file.write_all(&footer)?;
 
         self.file.flush()?;
-        // fsync so a generation survives an unclean shutdown / NFS flush.
+        // fsync so a generation survives an unclean shutdown / network-FS flush.
         self.file.get_ref().sync_all().context("fsync block file")?;
         Ok(self.dir.len() as u64)
     }

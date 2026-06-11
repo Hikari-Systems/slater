@@ -779,7 +779,8 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// fsync a directory so a rename/creation within it is durable (matters on NFS).
+/// fsync a directory so a rename/creation within it is durable (matters on
+/// remote/network filesystems such as NFS).
 fn fsync_dir(dir: &Path) -> Result<()> {
     let f = fs::File::open(dir).with_context(|| format!("open dir {}", dir.display()))?;
     f.sync_all()

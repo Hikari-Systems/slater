@@ -257,7 +257,8 @@ fn guard_sweep(
 /// swaps in a validated new generation (logging — never crashing — on a corrupt
 /// one). For `Exit` it sends the changed graph's name down `shutdown` and stops, so
 /// `serve` returns an error and the process exits non-zero for the orchestrator to
-/// restart. **Poll, not inotify**: the data dir is an NFS mount (D14/D16).
+/// restart. **Poll, not inotify**: the data dir may be remote/network storage
+/// (e.g. NFS), where filesystem change events are unreliable (D14/D16).
 fn spawn_generation_guard(
     graphs: Arc<Graphs>,
     vector_cache: Arc<VectorIndexCache>,

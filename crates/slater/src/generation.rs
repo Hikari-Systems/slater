@@ -5,8 +5,9 @@
 //! `slater-build` (see `graph_format::manifest` and `docs/DECISIONS.md` D14).
 //! This module is the reader's entry point: it resolves the `current` pointer,
 //! parses the MANIFEST, **re-hashes every inventory file against the manifest and
-//! refuses to serve on any mismatch** (the copy-completeness guard for an NFS
-//! rsync that landed half a generation), opens every reader, and builds the
+//! refuses to serve on any mismatch** (the copy-completeness guard for a
+//! publish that landed half a generation, e.g. an in-progress rsync onto remote
+//! storage), opens every reader, and builds the
 //! inverted label/relationship-type postings the executor needs for selective
 //! scans (D11 — `slater-build` only emits the *forward* per-node label store).
 //
@@ -81,7 +82,8 @@ impl Generation {
     /// Resolve `<data_dir>/<graph>/current`, open that generation, validate it,
     /// and build its in-memory indexes. Fails fast (and the caller should exit
     /// non-zero) on a missing pointer, an unknown format version, or an integrity
-    /// mismatch — the latter being a half-copied generation on an NFS mount.
+    /// mismatch — the latter being a generation half-copied onto the data dir
+    /// (which may be remote/network storage).
     ///
     /// Opens a plaintext generation; an encrypted one is refused (no key). Use
     /// [`Generation::open_with_key`] to supply the at-rest master key.
@@ -231,7 +233,8 @@ impl Generation {
 
     /// Read just the `current` pointer's generation UUID without opening (or
     /// validating) the generation. The generation guard calls this every poll to
-    /// detect a published swap cheaply — the data dir is an NFS mount, so we poll
+    /// detect a published swap cheaply — the data dir may be remote/network
+    /// storage (e.g. NFS), so we poll
     /// this small text file rather than watch it for events (D14/D16).
     pub fn current_uuid(data_dir: impl AsRef<Path>, graph: &str) -> Result<uuid::Uuid> {
         read_current(&data_dir.as_ref().join(graph))

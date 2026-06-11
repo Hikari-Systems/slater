@@ -1,5 +1,5 @@
 {
-  "_comment": "Sample ACL. Passwords are argon2id hashes (mint with `slater hash-password`), never cleartext — this file lives on a shared/NFS mount. The plain-JSON file format is honoured; the secrets within are hashed.",
+  "_comment": "Sample ACL. Passwords are argon2id hashes (mint with `slater hash-password`), never cleartext — this file lives on shared storage. The plain-JSON file format is honoured; the secrets within are hashed.",
   "users": {
     "reporting": {
       "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_WITH_A_REAL_SALT$REPLACE_WITH_A_REAL_HASH",
