@@ -362,6 +362,134 @@ pub fn parse(input: &str) -> Result<Query> {
     lower_query(query)
 }
 
+/// Builtins whose result depends on the wall clock or an entropy source. A query
+/// calling any of these must be excluded from the result cache. Lowercased.
+const NONDETERMINISTIC_FUNCTIONS: &[&str] = &["rand", "randomuuid", "timestamp"];
+
+/// Whether `query` calls a non-deterministic builtin (`rand`/`randomUUID`/
+/// `timestamp`) anywhere — inside `WHERE`/`WITH`/`RETURN`/`ORDER BY` expressions,
+/// pattern property maps, comprehensions, or nested `CALL { … }` subqueries. The
+/// server uses this to skip the result-cache get *and* insert, so each run
+/// re-evaluates the clock/RNG (otherwise a cache hit would replay a stale value).
+///
+/// The `Expr` walk below is deliberately exhaustive (no `_` arm): a new `Expr`
+/// variant will fail to compile here until it is classified, so the detector
+/// can never silently miss a place a function call can hide.
+pub fn is_nondeterministic(query: &Query) -> bool {
+    single_query_nd(&query.head) || query.tail.iter().any(|(_, sq)| single_query_nd(sq))
+}
+
+fn single_query_nd(sq: &SingleQuery) -> bool {
+    sq.reading.iter().any(clause_nd) || projection_body_nd(&sq.ret.body)
+}
+
+fn clause_nd(c: &Clause) -> bool {
+    match c {
+        Clause::Match(m) => {
+            m.patterns.iter().any(pattern_nd) || m.where_.as_ref().is_some_and(expr_nd)
+        }
+        Clause::With(w) => projection_body_nd(&w.body) || w.where_.as_ref().is_some_and(expr_nd),
+        Clause::VectorCall(v) => {
+            expr_nd(&v.k) || expr_nd(&v.query_vec) || v.where_.as_ref().is_some_and(expr_nd)
+        }
+        Clause::Call(c) => c.args.iter().any(expr_nd) || c.where_.as_ref().is_some_and(expr_nd),
+        Clause::CallSubquery(c) => is_nondeterministic(&c.inner),
+        Clause::Unwind(u) => expr_nd(&u.expr),
+    }
+}
+
+fn projection_body_nd(b: &ProjectionBody) -> bool {
+    b.items.iter().any(|it| expr_nd(&it.expr))
+        || b.order_by.iter().any(|(e, _)| expr_nd(e))
+        || b.skip.as_ref().is_some_and(expr_nd)
+        || b.limit.as_ref().is_some_and(expr_nd)
+}
+
+fn pattern_nd(p: &Pattern) -> bool {
+    node_pat_nd(&p.start) || p.rels.iter().any(|(r, n)| rel_pat_nd(r) || node_pat_nd(n))
+}
+
+fn node_pat_nd(n: &NodePat) -> bool {
+    n.props.iter().any(|(_, e)| expr_nd(e))
+}
+
+fn rel_pat_nd(r: &RelPat) -> bool {
+    r.props.iter().any(|(_, e)| expr_nd(e))
+}
+
+fn expr_nd(e: &Expr) -> bool {
+    match e {
+        Expr::Function { name, args, .. } => {
+            NONDETERMINISTIC_FUNCTIONS.contains(&name.to_lowercase().as_str())
+                || match args {
+                    FuncArgs::Star => false,
+                    FuncArgs::Args(a) => a.iter().any(expr_nd),
+                }
+        }
+        Expr::Literal(_) | Expr::Param(_) | Expr::Var(_) => false,
+        Expr::Property(b, _) | Expr::HasLabels(b, _) | Expr::IsNull(b, _) => expr_nd(b),
+        Expr::Neg(b) | Expr::Not(b) => expr_nd(b),
+        Expr::Index(a, b)
+        | Expr::Arith(_, a, b)
+        | Expr::Compare(_, a, b)
+        | Expr::StringOp(_, a, b)
+        | Expr::In(a, b) => expr_nd(a) || expr_nd(b),
+        Expr::Slice { base, from, to } => {
+            expr_nd(base)
+                || from.as_deref().is_some_and(expr_nd)
+                || to.as_deref().is_some_and(expr_nd)
+        }
+        Expr::And(xs) | Expr::Or(xs) | Expr::Xor(xs) | Expr::List(xs) => xs.iter().any(expr_nd),
+        Expr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            subject.as_deref().is_some_and(expr_nd)
+                || whens.iter().any(|(w, t)| expr_nd(w) || expr_nd(t))
+                || els.as_deref().is_some_and(expr_nd)
+        }
+        Expr::Map(kvs) => kvs.iter().any(|(_, v)| expr_nd(v)),
+        Expr::MapProjection { items, .. } => items.iter().any(|it| match it {
+            MapProjItem::Literal(_, e) => expr_nd(e),
+            MapProjItem::AllProps | MapProjItem::Property(_) => false,
+        }),
+        Expr::ListPredicate {
+            list, predicate, ..
+        } => expr_nd(list) || predicate.as_deref().is_some_and(expr_nd),
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            expr_nd(list)
+                || predicate.as_deref().is_some_and(expr_nd)
+                || projection.as_deref().is_some_and(expr_nd)
+        }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            projection,
+        } => {
+            pattern_nd(pattern)
+                || predicate.as_deref().is_some_and(expr_nd)
+                || expr_nd(projection)
+        }
+        Expr::Reduce {
+            acc_init,
+            list,
+            body,
+            ..
+        } => expr_nd(acc_init) || expr_nd(list) || expr_nd(body),
+        Expr::PatternPredicate(p) | Expr::ShortestPath(p) => pattern_nd(p),
+        Expr::Exists {
+            patterns,
+            predicate,
+        } => patterns.iter().any(pattern_nd) || predicate.as_deref().is_some_and(expr_nd),
+    }
+}
+
 // ── Clause lowering ──────────────────────────────────────────────────────────
 
 fn lower_query(pair: Pair<Rule>) -> Result<Query> {
@@ -2262,5 +2390,36 @@ mod tests {
         // let writes through).
         let e = err("WITH 1 AS a CALL { CREATE (n:N) RETURN n } RETURN a");
         assert!(e.contains("read-only"), "got: {e}");
+    }
+
+    // Phase 1b — the non-determinism detector that gates result caching.
+    #[test]
+    fn detects_nondeterministic_functions() {
+        // Calls to rand/randomUUID/timestamp anywhere → non-deterministic.
+        for q in [
+            "RETURN rand()",
+            "RETURN randomUUID()",
+            "RETURN timestamp()",
+            "RETURN TIMESTAMP()",                       // case-insensitive
+            "MATCH (n) WHERE n.age < rand() RETURN n",  // buried in WHERE
+            "MATCH (n) RETURN n ORDER BY rand()",       // in ORDER BY
+            "RETURN [x IN [1,2,3] | timestamp()]",      // in a comprehension
+            "MATCH (n {created: timestamp()}) RETURN n", // in a pattern prop map
+            "CALL { RETURN rand() AS r } RETURN r",     // in a subquery
+        ] {
+            assert!(is_nondeterministic(&ok(q)), "expected non-deterministic: {q:?}");
+        }
+
+        // Deterministic queries — note the string literal `'timestamp()'` is NOT a
+        // call (the AST walk beats a naive substring match).
+        for q in [
+            "RETURN 1",
+            "MATCH (n:Person) RETURN n.name",
+            "RETURN date('2020-01-01')",
+            "RETURN 'timestamp()' AS s",
+            "MATCH (n) WHERE n.timestamp > 5 RETURN n", // property named `timestamp`
+        ] {
+            assert!(!is_nondeterministic(&ok(q)), "expected deterministic: {q:?}");
+        }
     }
 }

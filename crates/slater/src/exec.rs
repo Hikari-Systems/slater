@@ -3261,6 +3261,17 @@ impl<'g> Engine<'g> {
                 Val::Map(m) => build_duration(&m)?,
                 other => bail!("duration() expects a string or map, got {}", other.to_display()),
             },
+            // ── Non-deterministic builtins (wall-clock / RNG) ────────────────
+            // These read the clock or an entropy source, so `parser::is_nondeterministic`
+            // marks any query calling them non-cacheable (server.rs `run_query`
+            // skips the result-cache get + insert) — otherwise a cache hit would
+            // replay a stale value.
+            // `rand()` → uniform double in [0,1) (FalkorDB `AR_RAND`: rand()/RAND_MAX).
+            "rand" => Val::Float(random_f64()),
+            // `randomUUID()` → a fresh RFC-4122 v4 UUID string (FalkorDB `AR_RANDOMUUID`).
+            "randomuuid" => Val::Str(uuid::Uuid::new_v4().to_string()),
+            // `timestamp()` → milliseconds since the Unix epoch (FalkorDB `AR_TIMESTAMP`).
+            "timestamp" => Val::Int(now_millis()),
             // ── List functions (FalkorDB list_funcs.c) ──────────────────────
             // tail: all but the first element. NULL → NULL.
             "tail" => match a0(0) {
@@ -3661,8 +3672,10 @@ const IMPLEMENTED_FUNCTIONS: &[&str] = &[
     "vec.euclideandistance", "vecf32",
     // spatial
     "distance", "point",
-    // temporal (timestamp shipped in Phase 1)
+    // temporal
     "date", "duration", "localdatetime", "localtime", "timestamp",
+    // non-deterministic (clock / RNG)
+    "rand", "randomuuid",
 ];
 
 /// `CALL dbms.procedures()` — `[name, mode]` rows, one per [`SLATER_PROCEDURES`].
@@ -4576,6 +4589,23 @@ fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     // c = 2 · atan2(√a, √(1−a)); d = R · c
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
     EARTH_RADIUS * c
+}
+
+/// A uniform random `f64` in `[0, 1)` for `rand()`. Drawn from the same
+/// CSPRNG that backs `uuid`'s v4 generator (so no extra dependency): 53 high
+/// bits of a fresh UUID divided by `2^53` give a correctly-distributed double.
+fn random_f64() -> f64 {
+    let bits = (uuid::Uuid::new_v4().as_u128() as u64) >> 11; // keep 53 bits
+    (bits as f64) / ((1u64 << 53) as f64)
+}
+
+/// Milliseconds since the Unix epoch for `timestamp()` (FalkorDB's `time_t`-ms).
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn type_name(v: &Val) -> &'static str {
@@ -8109,5 +8139,41 @@ mod tests {
         assert!(matches!(r[1], Val::Null));
         assert!(matches!(r[2], Val::Null));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Phase 1b — non-deterministic builtins (rand / randomUUID / timestamp) ──
+    #[test]
+    fn phase1b_nondeterministic_functions() {
+        let (root, res) = run(
+            "exec_p1b_fns",
+            "RETURN rand() AS r, randomUUID() AS u, timestamp() AS t",
+        );
+        let r = &res.rows[0];
+        match r[0] {
+            Val::Float(x) => assert!((0.0..1.0).contains(&x), "rand() in [0,1): {x}"),
+            ref o => panic!("rand() → {o:?}"),
+        }
+        match &r[1] {
+            // RFC-4122 v4: 36 chars, 4 hyphens, version nibble '4'.
+            Val::Str(s) => {
+                assert_eq!(s.len(), 36, "uuid {s}");
+                assert_eq!(s.matches('-').count(), 4, "uuid {s}");
+                assert_eq!(s.as_bytes()[14], b'4', "v4 version nibble: {s}");
+            }
+            o => panic!("randomUUID() → {o:?}"),
+        }
+        match r[2] {
+            // Milliseconds since the epoch — well past 2020 (1.6e12 ms).
+            Val::Int(t) => assert!(t > 1_600_000_000_000, "timestamp() ms: {t}"),
+            ref o => panic!("timestamp() → {o:?}"),
+        }
+
+        // Two randomUUID() calls in one row are distinct.
+        let (root2, res2) = run("exec_p1b_uuid2", "RETURN randomUUID() AS a, randomUUID() AS b");
+        let r = &res2.rows[0];
+        assert_ne!(render(&r[0]), render(&r[1]), "two UUIDs differ");
+        for p in [root, root2] {
+            let _ = std::fs::remove_dir_all(&p);
+        }
     }
 }

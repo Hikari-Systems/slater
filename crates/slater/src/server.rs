@@ -1339,6 +1339,9 @@ async fn run_query(
     let vector_cache = ctx.vector_cache.clone();
     let result_cache = ctx.result_cache.clone();
     let key = ResultKey::new(gen.uuid(), result_query_key(query, &params));
+    // Queries calling `rand()`/`randomUUID()`/`timestamp()` must re-run every
+    // time, so they bypass the result cache (both lookup and store).
+    let cacheable = !parser::is_nondeterministic(&ast);
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
     let beam_width = ctx.beam_width;
@@ -1357,8 +1360,10 @@ async fn run_query(
             let t_start = instrument.then(Instant::now);
             let blk_before = instrument.then(|| cache.metrics());
 
-            // Result-cache lookup, then execute-and-cache on a miss.
-            let (result, result_cache_hit) = match result_cache.get(&key) {
+            // Result-cache lookup (skipped for non-deterministic queries), then
+            // execute-and-cache on a miss.
+            let cached = if cacheable { result_cache.get(&key) } else { None };
+            let (result, result_cache_hit) = match cached {
                 Some(r) => (r, true),
                 None => {
                     let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
@@ -1370,8 +1375,10 @@ async fn run_query(
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
                     }
                     let r = Arc::new(engine.run(&ast)?);
-                    let bytes = estimate_result_bytes(&r);
-                    result_cache.insert(key.clone(), r.clone(), bytes);
+                    if cacheable {
+                        let bytes = estimate_result_bytes(&r);
+                        result_cache.insert(key.clone(), r.clone(), bytes);
+                    }
                     (r, false)
                 }
             };
@@ -2667,6 +2674,42 @@ mod tests {
         assert_eq!(first, second, "both runs return the same row count");
         assert_eq!(after_second.misses, 1, "second run adds no miss");
         assert!(after_second.hits >= 1, "second run is a cache hit");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn nondeterministic_query_bypasses_the_result_cache() {
+        let (root, ctx) = build_ctx("server_resultcache_nd");
+        let addr = spawn_server(ctx.clone()).await;
+
+        let drive = move |query: &'static str| async move {
+            let mut c = Client::connect(addr).await;
+            c.send(Client::hello()).await;
+            c.recv().await;
+            c.send(Client::logon("reporting", "pw")).await;
+            c.recv().await;
+            c.send(Client::run(query)).await;
+            assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+            c.send(Client::pull_all()).await;
+            loop {
+                let (tag, _) = c.recv().await;
+                if tag != message::tag::RECORD {
+                    break;
+                }
+            }
+        };
+
+        // A query calling timestamp() is never written to (or read from) the cache.
+        let q = "RETURN timestamp() AS t";
+        drive(q).await;
+        drive(q).await;
+        let m = ctx.result_cache.metrics();
+        assert_eq!(ctx.result_cache.len(), 0, "non-deterministic query is not cached");
+        assert_eq!(m.hits, 0, "no cache hit for a non-deterministic query");
+
+        // Sanity: a deterministic query in the same context still caches normally.
+        drive("RETURN 1 AS one").await;
+        assert_eq!(ctx.result_cache.len(), 1, "deterministic query is cached");
         let _ = std::fs::remove_dir_all(&root);
     }
 
