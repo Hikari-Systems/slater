@@ -1500,7 +1500,7 @@ impl<'g> Engine<'g> {
             Expr::StringOp(op, l, r) => {
                 let a = self.eval(l, scope, aggs)?;
                 let b = self.eval(r, scope, aggs)?;
-                Ok(string_op(*op, &a, &b))
+                string_op(*op, &a, &b)
             }
             Expr::In(l, r) => {
                 let a = self.eval(l, scope, aggs)?;
@@ -2012,6 +2012,12 @@ impl<'g> Engine<'g> {
                 (Val::Null, _, _) => Val::Null,
                 _ => bail!("replace() needs three strings"),
             },
+            "string.join" => string_join(&args)?,
+            "string.matchregex" => match_regex(&a0(0), &a0(1))?,
+            "string.replaceregex" => {
+                let repl = if args.len() >= 3 { a0(2) } else { Val::Str(String::new()) };
+                replace_regex(&a0(0), &a0(1), &repl)?
+            }
             "range" => self.range_fn(&args)?,
             "keys" => Val::List(
                 self.all_properties(&a0(0))?
@@ -2664,15 +2670,102 @@ fn comparable(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
     }
 }
 
-fn string_op(op: StrOp, a: &Val, b: &Val) -> Val {
-    match (a, b) {
-        (Val::Str(s), Val::Str(t)) => Val::Bool(match op {
-            StrOp::StartsWith => s.starts_with(t.as_str()),
-            StrOp::EndsWith => s.ends_with(t.as_str()),
-            StrOp::Contains => s.contains(t.as_str()),
-        }),
-        _ => Val::Null,
+fn string_op(op: StrOp, a: &Val, b: &Val) -> Result<Val> {
+    let (s, t) = match (a, b) {
+        (Val::Str(s), Val::Str(t)) => (s, t),
+        // `=~` against a null operand is null (three-valued); so are the others.
+        _ => return Ok(Val::Null),
+    };
+    Ok(Val::Bool(match op {
+        StrOp::StartsWith => s.starts_with(t.as_str()),
+        StrOp::EndsWith => s.ends_with(t.as_str()),
+        StrOp::Contains => s.contains(t.as_str()),
+        // `=~` is a full-match: the whole string must match the pattern, mirroring
+        // FalkorDB's `str_MatchRegex` (anchored at both ends). RE2 has no backrefs.
+        StrOp::Regex => regex_full_match(t)?.is_match(s),
+    }))
+}
+
+// Compile `pattern` anchored as a full-match (`\A(?:…)\z`) so `=~` requires the
+// entire subject to match — openCypher / FalkorDB `=~` semantics.
+fn regex_full_match(pattern: &str) -> Result<regex::Regex> {
+    let anchored = format!(r"\A(?:{pattern})\z");
+    regex::Regex::new(&anchored).map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))
+}
+
+// Compile `pattern` for an unanchored scan (`string.matchRegEx`/`replaceRegEx`),
+// which find every non-overlapping match anywhere in the subject.
+fn regex_scan(pattern: &str) -> Result<regex::Regex> {
+    regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))
+}
+
+// string.join(list, delimiter = '') -> string. Null list -> null; every list
+// element must be a string (mirrors FalkorDB AR_JOIN).
+fn string_join(args: &[Val]) -> Result<Val> {
+    let list = match args.first() {
+        Some(Val::List(xs)) => xs,
+        Some(Val::Null) | None => return Ok(Val::Null),
+        Some(other) => bail!("string.join() needs a list, got {}", other.to_display()),
+    };
+    let delim = match args.get(1) {
+        None => "",
+        Some(Val::Str(d)) => d.as_str(),
+        Some(other) => bail!(
+            "Type mismatch: expected String but was {}",
+            type_name(other)
+        ),
+    };
+    let mut parts = Vec::with_capacity(list.len());
+    for v in list {
+        match v {
+            Val::Str(s) => parts.push(s.as_str()),
+            other => bail!(
+                "Type mismatch: expected String but was {}",
+                type_name(other)
+            ),
+        }
     }
+    Ok(Val::Str(parts.join(delim)))
+}
+
+// string.matchRegEx(str, regex) -> list of [full_match, group1, …] per match.
+// A null operand yields an empty list; non-participating groups become "".
+fn match_regex(s: &Val, pat: &Val) -> Result<Val> {
+    let (s, pat) = match (s, pat) {
+        (Val::Str(s), Val::Str(p)) => (s, p),
+        (Val::Null, _) | (_, Val::Null) => return Ok(Val::List(vec![])),
+        (Val::Str(_), other) | (other, _) => bail!(
+            "Type mismatch: expected String or Null but was {}",
+            type_name(other)
+        ),
+    };
+    let re = regex_scan(pat)?;
+    let mut out = Vec::new();
+    for caps in re.captures_iter(s) {
+        let row = caps
+            .iter()
+            .map(|g| Val::Str(g.map_or("", |m| m.as_str()).to_string()))
+            .collect();
+        out.push(Val::List(row));
+    }
+    Ok(Val::List(out))
+}
+
+// string.replaceRegEx(str, regex, replacement = '') -> string. Any null operand
+// yields null; the replacement is inserted literally (no `$group` expansion).
+fn replace_regex(s: &Val, pat: &Val, repl: &Val) -> Result<Val> {
+    let (s, pat, repl) = match (s, pat, repl) {
+        (Val::Str(s), Val::Str(p), Val::Str(r)) => (s, p, r),
+        (Val::Null, _, _) | (_, Val::Null, _) | (_, _, Val::Null) => return Ok(Val::Null),
+        (Val::Str(_), Val::Str(_), other)
+        | (Val::Str(_), other, _)
+        | (other, _, _) => bail!(
+            "Type mismatch: expected String or Null but was {}",
+            type_name(other)
+        ),
+    };
+    let re = regex_scan(pat)?;
+    Ok(Val::Str(re.replace_all(s, regex::NoExpand(repl)).into_owned()))
 }
 
 fn in_list(needle: &Val, haystack: &Val) -> Val {
@@ -4555,6 +4648,137 @@ mod tests {
             "OPTIONAL MATCH (a:Person)-[e:NONEXISTENT]->(b) RETURN startNode(e) AS s LIMIT 1",
         );
         assert!(matches!(res.rows[0][0], Val::Null));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parse + run `q` expecting an engine error; returns the error text.
+    fn run_err(root_tag: &str, q: &str) -> String {
+        let (root, graph, _) = testgen::write_basic(root_tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let ast = parser::parse(q).unwrap();
+        let err = engine.run(&ast).expect_err("expected query error");
+        let _ = std::fs::remove_dir_all(&root);
+        err.to_string()
+    }
+
+    // Phase 4 — regex `=~` full-match operator (openCypher / FalkorDB
+    // `str_MatchRegex`: the whole subject must match, anchored at both ends).
+    #[test]
+    fn phase4_regex_match_operator() {
+        let (root, res) = run(
+            "exec_p4_regex",
+            "RETURN 'abc' =~ 'a.c' AS m1, 'abc' =~ 'a' AS m2, 'abc' =~ 'ab.*' AS m3, \
+             'Hello World' =~ '.*World' AS m4, 'A' =~ 'a' AS m5, \
+             null =~ 'a' AS m6, 'foo' =~ null AS m7",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "true"); // full match
+        assert_eq!(render(&r[1]), "false"); // 'a' is not the whole 'abc'
+        assert_eq!(render(&r[2]), "true");
+        assert_eq!(render(&r[3]), "true");
+        assert_eq!(render(&r[4]), "false"); // case-sensitive
+        assert_eq!(render(&r[5]), "null"); // null subject -> null
+        assert_eq!(render(&r[6]), "null"); // null pattern -> null
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase4_regex_invalid_pattern_errors() {
+        let msg = run_err("exec_p4_badregex", "RETURN 'aa' =~ '('");
+        assert!(msg.contains("Invalid regex"), "got: {msg}");
+    }
+
+    // Phase 4 — string.join (vectors ported from test_function_calls.py test89).
+    #[test]
+    fn phase4_string_join() {
+        let (root, res) = run(
+            "exec_p4_join",
+            "RETURN string.join(['HELL','OW']) AS a, string.join(['HELL','OW'], ' ') AS b, \
+             string.join(['HELL'], ' ') AS c, string.join(['HELL','OW','NOW'], ' ') AS d, \
+             string.join([]) AS e, string.join([], '|') AS f, string.join(null, '') AS g",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'HELLOW'");
+        assert_eq!(render(&r[1]), "'HELL OW'");
+        assert_eq!(render(&r[2]), "'HELL'");
+        assert_eq!(render(&r[3]), "'HELL OW NOW'");
+        assert_eq!(render(&r[4]), "''");
+        assert_eq!(render(&r[5]), "''");
+        assert_eq!(render(&r[6]), "null");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn phase4_string_join_type_mismatch_errors() {
+        let msg = run_err("exec_p4_join_err", "RETURN string.join(['HELL', 2], ' ')");
+        assert!(
+            msg.contains("Type mismatch") && msg.contains("Integer"),
+            "got: {msg}"
+        );
+    }
+
+    // Phase 4 — string.matchRegEx (vectors ported from test_function_calls.py
+    // test91). Unanchored scan; each match is [full, group1, …]; null -> [].
+    #[test]
+    fn phase4_string_matchregex() {
+        let (root, res) = run(
+            "exec_p4_matchregex",
+            r"RETURN
+                string.matchRegEx('blabla <header h1>txt1</header>', '<header (\w+)>(\w+)</header>') AS a,
+                string.matchRegEx('blabla <header h1>txt1</header> blabla <header h2>txt2</header>', '<header (\w+)>(\w+)</header>') AS b,
+                string.matchRegEx('aba', 'a') AS c,
+                string.matchRegEx('', 'a') AS d,
+                string.matchRegEx('bla', '(bla)(bal)') AS e,
+                string.matchRegEx('bla9', '(bla)[(bal)9]') AS f,
+                string.matchRegEx(null, 'bla') AS g,
+                string.matchRegEx('bla', null) AS h",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "[['<header h1>txt1</header>','h1','txt1']]");
+        assert_eq!(
+            render(&r[1]),
+            "[['<header h1>txt1</header>','h1','txt1'],['<header h2>txt2</header>','h2','txt2']]"
+        );
+        assert_eq!(render(&r[2]), "[['a'],['a']]");
+        assert_eq!(render(&r[3]), "[]");
+        assert_eq!(render(&r[4]), "[]");
+        assert_eq!(render(&r[5]), "[['bla9','bla']]");
+        assert_eq!(render(&r[6]), "[]");
+        assert_eq!(render(&r[7]), "[]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Phase 4 — string.replaceRegEx (vectors ported from test_function_calls.py
+    // test92). Literal replacement (no `$group` expansion); null operand -> null.
+    #[test]
+    fn phase4_string_replaceregex() {
+        let (root, res) = run(
+            "exec_p4_replaceregex",
+            r"RETURN
+                string.replaceRegEx('blabla <header h1>txt1</header>', '<header (\w+)>(\w+)</header>', 'hellow') AS a,
+                string.replaceRegEx('blabla <header h1>txt1</header> blabla <header h2>txt2</header>', '<header (\w+)>(\w+)</header>', 'hellow') AS b,
+                string.replaceRegEx('abc', '[b]') AS c,
+                string.replaceRegEx('abc', '[b]', '55') AS d,
+                string.replaceRegEx('abcb', '[b]', '') AS e,
+                string.replaceRegEx('bbla', '[b]', 'bla') AS f,
+                string.replaceRegEx('', '[b]', 'bla') AS g,
+                string.replaceRegEx(null, 'bla') AS h,
+                string.replaceRegEx('bla', null) AS i,
+                string.replaceRegEx('bla', 'bla', null) AS j",
+        );
+        let r = &res.rows[0];
+        assert_eq!(render(&r[0]), "'blabla hellow'");
+        assert_eq!(render(&r[1]), "'blabla hellow blabla hellow'");
+        assert_eq!(render(&r[2]), "'ac'");
+        assert_eq!(render(&r[3]), "'a55c'");
+        assert_eq!(render(&r[4]), "'ac'");
+        assert_eq!(render(&r[5]), "'blablala'");
+        assert_eq!(render(&r[6]), "''");
+        assert_eq!(render(&r[7]), "null");
+        assert_eq!(render(&r[8]), "null");
+        assert_eq!(render(&r[9]), "null");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

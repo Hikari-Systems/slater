@@ -28,3 +28,4 @@ rayon.workspace = true
 clap.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
+regex.workspace = true

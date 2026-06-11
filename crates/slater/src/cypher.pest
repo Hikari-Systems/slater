@@ -149,7 +149,7 @@ comp_rhs = {
   | null_test
   | comp_op ~ add_expr
 }
-comp_op = { "=" | "<>" | "<=" | ">=" | "<" | ">" }
+comp_op = { "=~" | "=" | "<>" | "<=" | ">=" | "<" | ">" }
 string_op = { kw_starts ~ kw_with | kw_ends ~ kw_with | kw_contains }
 in_op = { kw_in }
 null_test = { kw_is ~ kw_not? ~ kw_null }

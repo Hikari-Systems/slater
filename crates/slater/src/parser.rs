@@ -183,6 +183,7 @@ pub mod ast {
         StartsWith,
         EndsWith,
         Contains,
+        Regex,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,7 +753,12 @@ fn lower_comparison(pair: Pair<Rule>) -> Result<Expr> {
         match op_pair.as_rule() {
             Rule::comp_op => {
                 let right = lower_expr(parts.next().unwrap())?;
-                left = Expr::Compare(cmp_op(op_pair.as_str()), Box::new(left), Box::new(right));
+                // `=~` is the regex full-match operator, not an equality comparison.
+                left = if op_pair.as_str() == "=~" {
+                    Expr::StringOp(StrOp::Regex, Box::new(left), Box::new(right))
+                } else {
+                    Expr::Compare(cmp_op(op_pair.as_str()), Box::new(left), Box::new(right))
+                };
             }
             Rule::string_op => {
                 let right = lower_expr(parts.next().unwrap())?;
@@ -1145,14 +1151,25 @@ fn unescape_string(pair: Pair<Rule>) -> Result<String> {
             out.push(c);
             continue;
         }
+        // Recognised escapes mirror libcypher-parser's `escaped-char` rule; any
+        // other char keeps its backslash (so e.g. a regex `\w` survives intact,
+        // matching FalkorDB rather than collapsing to `w`).
         match chars.next() {
+            Some('a') => out.push('\u{07}'),
+            Some('b') => out.push('\u{08}'),
+            Some('f') => out.push('\u{0C}'),
             Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('v') => out.push('\u{0B}'),
             Some('\\') => out.push('\\'),
             Some('\'') => out.push('\''),
             Some('"') => out.push('"'),
-            Some(other) => out.push(other),
+            Some('?') => out.push('?'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
             None => out.push('\\'),
         }
     }
@@ -1471,6 +1488,30 @@ mod tests {
         assert_eq!(
             q.head.ret.body.items[0].expr,
             Expr::Literal(Value::Str("a'b\nc".to_string()))
+        );
+    }
+
+    #[test]
+    fn unknown_escape_keeps_backslash() {
+        // `\w` is not a recognised escape; the backslash survives so regex
+        // patterns reach the engine intact (FalkorDB / libcypher-parser parity).
+        let q = ok(r"RETURN '\w\d' AS s");
+        assert_eq!(
+            q.head.ret.body.items[0].expr,
+            Expr::Literal(Value::Str(r"\w\d".to_string()))
+        );
+    }
+
+    #[test]
+    fn lowers_regex_match_operator() {
+        let q = ok("RETURN 'abc' =~ 'a.*'");
+        assert_eq!(
+            q.head.ret.body.items[0].expr,
+            Expr::StringOp(
+                StrOp::Regex,
+                Box::new(Expr::Literal(Value::Str("abc".to_string()))),
+                Box::new(Expr::Literal(Value::Str("a.*".to_string()))),
+            )
         );
     }
 }
