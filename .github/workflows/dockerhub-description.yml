@@ -1,0 +1,32 @@
+name: Sync Docker Hub description
+
+# Push DOCKERHUB.md to the Docker Hub repository overview. Runs whenever the file
+# changes on main, and can be triggered manually from the Actions tab (or with
+# `gh workflow run dockerhub-description.yml`). Decoupled from the image build so
+# overview-only edits propagate in seconds without a multi-arch rebuild.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'DOCKERHUB.md'
+      - '.github/workflows/dockerhub-description.yml'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Update Docker Hub overview from DOCKERHUB.md
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: hikarisystems/${{ env.REPO_NAME }}
+          readme-filepath: ./DOCKERHUB.md
