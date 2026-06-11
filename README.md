@@ -254,6 +254,20 @@ FalkorDB's `db.idx.vector.queryNodes` contract.
 
 ## Running with Docker
 
+Prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) are published to
+**Docker Hub** — the image's home — at
+[**`hikarisystems/slater`**](https://hub.docker.com/r/hikarisystems/slater),
+tagged `:latest` and `:vX.Y.Z` on every release:
+
+```sh
+docker pull hikarisystems/slater:latest
+```
+
+A Docker-command-only usage, configuration, and operations guide lives in
+[`DOCKERHUB.md`](DOCKERHUB.md) (and is mirrored to the Docker Hub overview page).
+
+To build locally instead:
+
 ```sh
 # Build the image (both binaries).
 docker compose build

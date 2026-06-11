@@ -1,0 +1,346 @@
+# Slater
+
+**A low-memory, read-only, Bolt-speaking graph + vector engine.**
+
+Slater serves an immutable graph over the **Bolt protocol** (port `7687`), so any
+standard **neo4j driver** (JavaScript, Python, Go, Java, …) or `cypher-shell` can
+query it. Its headline property: **resident memory stays bounded by fixed cache
+budgets, independent of graph size** — it reads decompressed blocks on demand
+from disk (local or network/NFS) rather than holding the whole graph in RAM.
+
+It answers a read-only subset of Cypher (`MATCH … WHERE … RETURN … ORDER BY …
+LIMIT`, label/property index seeks, and disk-native vector KNN via
+`CALL db.idx.vector.queryNodes(...)`). **Writes are rejected** — graphs are built
+offline and published as immutable generations.
+
+📦 **Source, issues & full documentation:**
+[github.com/Hikari-Systems/slater](https://github.com/Hikari-Systems/slater)
+
+---
+
+## What's in the image
+
+The image bundles **two binaries**:
+
+| Binary | Role | How you run it |
+|---|---|---|
+| `slater` | The online **Bolt server** (read-only). | Default entrypoint — just `docker run` the image. |
+| `slater-build` | The offline **writer**: turns a Cypher dump into an immutable generation. | Override the entrypoint: `--entrypoint /app/slater-build`. |
+
+`slater` never writes to disk; `slater-build` produces the generations `slater`
+serves, on a shared `/data` volume.
+
+```
+  dump.cypher ──[ slater-build ]──▶ /data/<graph>/<uuid>/ + `current` ──[ slater ]──▶ neo4j driver
+```
+
+---
+
+## Quick start
+
+### 1. Mint a password hash (for the ACL)
+
+Passwords are stored as argon2id hashes, never cleartext:
+
+```bash
+docker run --rm hikarisystems/slater:latest hash-password 'choose-a-password'
+# → $argon2id$v=19$m=19456,t=2,p=1$....
+```
+
+Create `acl.json` next to you, pasting that hash in:
+
+```json
+{
+  "users": {
+    "reporting": {
+      "passwordArgon2id": "$argon2id$v=19$...your-hash...",
+      "grants": { "people": ["read"] }
+    }
+  }
+}
+```
+
+`grants` maps **graph name → permissions** (`read` is the only permission). A user
+can only see graphs they are granted.
+
+### 2. Build a graph generation
+
+Put a primitive-Cypher creation script (`CREATE (...)`, `CREATE (a)-[...]->(b)`)
+in a local `./dumps` folder, then write it into a named Docker volume:
+
+```bash
+docker volume create slater-data
+
+docker run --rm \
+  -v slater-data:/data \
+  -v "$PWD/dumps:/dumps:ro" \
+  --entrypoint /app/slater-build \
+  hikarisystems/slater:latest \
+  --input /dumps/people.cypher --graph people --data-dir /data
+```
+
+This writes `/data/people/<uuid>/…` and a `current` pointer.
+
+### 3. Run the server
+
+```bash
+docker run -d --name slater \
+  -p 7687:7687 \
+  -v slater-data:/data:ro \
+  -v "$PWD/acl.json:/config/acl.json:ro" \
+  hikarisystems/slater:latest
+```
+
+The server reads `/data` (read-only) and the ACL at `/config/acl.json` (the
+baked-in default path). It listens for Bolt on `7687`.
+
+### 4. Connect and query
+
+Any neo4j driver works; the **database name is the graph name**. Example with
+`cypher-shell` from a container on the same Docker network:
+
+```bash
+docker run --rm -it --network host neo4j:5 \
+  cypher-shell -a bolt://localhost:7687 -u reporting -p 'choose-a-password' -d people \
+  "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+```
+
+From application code use `bolt://<host>:7687` (or `bolt+s://` with TLS), basic
+auth, and set the session `database` to the graph you want.
+
+---
+
+## Configuration
+
+Slater reads a baked-in `/app/config.json` and lets you override **any field two
+ways**, both Docker-friendly:
+
+1. **A config overlay file** — mount your own JSON at `/sandbox/config.json`; it
+   is deep-merged over the defaults at startup.
+2. **Environment variables** — `KEY__sub` form (**double underscore** for
+   nesting), keys matching the camelCase config. Env wins over files.
+
+So these are equivalent ways to set the block-cache budget:
+
+```bash
+-e cache__blockCacheBytes=536870912           # env override
+# …or in /sandbox/config.json: { "cache": { "blockCacheBytes": 536870912 } }
+```
+
+### Key knobs
+
+| Setting | Env var | Default | What it does |
+|---|---|---|---|
+| `dataDir` | `dataDir` | `/data` | Root dir of generations (`<graph>/<uuid>/`). |
+| `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |
+| `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
+| `server.port` | `server__port` | `7687` | Bolt port. |
+| `cache.blockCacheBytes` | `cache__blockCacheBytes` | `268435456` (256 MiB) | Decompressed graph-block LRU. |
+| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | `134217728` (128 MiB) | Resident PQ codes + Vamana block LRU. |
+| `cache.resultCacheBytes` | `cache__resultCacheBytes` | `33554432` (32 MiB) | Query-result LRU. |
+| `cache.cacheTtlMs` | `cache__cacheTtlMs` | `1800000` (30 min) | **Idle TTL**: a cached entry untouched for this long is reclaimed by a background sweep, freeing memory below the budgets. A **negative** value (or `0`) disables the sweep. |
+| `query.maxRows` | `query__maxRows` | `100000` | Max rows per result. |
+| `query.timeoutMs` | `query__timeoutMs` | `30000` | Per-query timeout (`0` = none). |
+| `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | `64` | Vamana beam-search width. |
+| `generationPollMs` | `generationPollMs` | `5000` | How often to poll each graph's `current` pointer. |
+| `reloadStrategy` | `reloadStrategy` | `exit` | On a generation change: `exit` (let the orchestrator restart) or `swap` (hot-swap in place). |
+| `log.level` | `log__level` | `info` | Log level. |
+
+Example — a memory-tight server with a 10-minute idle TTL:
+
+```bash
+docker run -d --name slater -p 7687:7687 \
+  -v slater-data:/data:ro -v "$PWD/acl.json:/config/acl.json:ro" \
+  -e cache__blockCacheBytes=134217728 \
+  -e cache__vectorCacheBytes=67108864 \
+  -e cache__cacheTtlMs=600000 \
+  hikarisystems/slater:latest
+```
+
+---
+
+## Memory & cache behaviour
+
+Resident memory ≈ `blockCacheBytes + vectorCacheBytes + resultCacheBytes` plus a
+small fixed overhead — it does **not** grow with graph size. The three pools are
+isolated on purpose so a vector-heavy query can't evict hot graph blocks (and
+vice versa); tune the split with the budgets above.
+
+The **idle TTL** (`cacheTtlMs`, default 30 min) reclaims pool memory once the
+working set goes quiet, so you can set generous budgets without paying for idle
+RAM. It only affects idle time — under concurrent load the budgets still cap RSS.
+
+You can **watch the pools live** over Bolt — `SHOW STORAGE INFO` appends per-pool
+metrics:
+
+```
+block_cache_bytes / block_cache_entries / block_cache_hits / block_cache_misses / block_cache_evictions
+vector_cache_…    result_cache_…
+```
+
+High `misses`/`evictions` on one pool while another sits idle means it's time to
+rebalance the budgets.
+
+---
+
+## Authentication
+
+- Mint hashes with `docker run --rm hikarisystems/slater hash-password '<pw>'`.
+- Put users + per-graph `grants` in `acl.json`, mount it at `/config/acl.json`
+  (or point `aclPath` elsewhere).
+- The ACL file is **hot-reloaded** — edit it and the server picks up changes
+  without a restart (a malformed file keeps the last good version).
+
+---
+
+## Encryption at rest (optional)
+
+Generations can be sealed per-block with XChaCha20-Poly1305. Build encrypted:
+
+```bash
+docker run --rm \
+  -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
+  -e MASTER_KEY="$(openssl rand -hex 32)" \
+  --entrypoint /app/slater-build \
+  hikarisystems/slater:latest \
+  --input /dumps/people.cypher --graph people --data-dir /data \
+  --encrypt --key-env MASTER_KEY
+```
+
+Serve it by giving the server the same key — either an env var or a mounted file:
+
+```bash
+-e encryption__keyEnv=MASTER_KEY -e MASTER_KEY=<hex>
+# …or:
+-e encryption__keyFile=/run/secrets/slater-key   # mount the hex key there
+```
+
+## TLS (optional, `bolt+s://`)
+
+Mount PEM material and point at it:
+
+```bash
+-v "$PWD/tls:/sandbox/tls:ro" \
+-e tls__cert=/sandbox/tls/server.crt \
+-e tls__key=/sandbox/tls/server.key
+```
+
+---
+
+## Health check
+
+The container `HEALTHCHECK` is built in — it performs a **Bolt handshake** (not
+HTTP) against the configured port. You can also run it manually:
+
+```bash
+docker exec slater /app/slater healthcheck localhost 7687   # exit 0 = healthy
+```
+
+---
+
+## `slater-build` reference
+
+```
+--input <path|->          Creation script, or - for stdin            (required)
+--graph <name>            Logical graph name                          (required)
+--data-dir <dir>          Root data dir to write <graph>/<uuid>/      (required)
+--block-size <bytes>      Block size for prop/label/topology files    (default 262144)
+--vector-block-size <n>   Block size for the vector store             (default 262144)
+--zstd-level <n>          zstd level for all files                    (default 3)
+--vector-spec <path>      JSON sidecar declaring vector indexes       (optional)
+--vamana-threshold <n>    ≥ this many vectors ⇒ disk-native Vamana/PQ (default 50000)
+--vamana-r <n>            Vamana out-degree bound R                    (default 32)
+--vamana-alpha <f>        Vamana robust-prune factor alpha            (default 1.2)
+--pq-subspaces <m>        PQ subspaces (must divide the dimension)     (default 16)
+--pq-bits <n>             PQ bits per subspace (1..=8)                 (default 8)
+--encrypt                 Encrypt every block at rest (needs a key)
+--key-file <path>         Hex master key file        (with --encrypt)
+--key-env <name>          Env var holding the hex key (with --encrypt)
+```
+
+Run `--help` for the authoritative list:
+
+```bash
+docker run --rm --entrypoint /app/slater-build hikarisystems/slater:latest --help
+```
+
+---
+
+## Updating a live graph
+
+Build a **new** generation into the same `/data` volume (same `--graph`, new
+uuid + `current` pointer). The running server polls `current` every
+`generationPollMs` and applies `reloadStrategy`:
+
+- `exit` (default) — the server exits non-zero so your orchestrator restarts it
+  cleanly against the new generation.
+- `swap` — the server validates and hot-swaps the new generation in place,
+  letting in-flight queries finish on the old one.
+
+---
+
+## docker compose example
+
+```yaml
+services:
+  slater:
+    image: hikarisystems/slater:latest
+    read_only: true
+    tmpfs: ["/tmp", "/run"]
+    ports: ["7687:7687"]
+    volumes:
+      - slater-data:/data:ro
+      - ./acl.json:/config/acl.json:ro
+    environment:
+      cache__blockCacheBytes: "268435456"
+      cache__vectorCacheBytes: "134217728"
+      cache__resultCacheBytes: "33554432"
+      cache__cacheTtlMs: "1800000"
+      reloadStrategy: "exit"
+      log__level: "info"
+    healthcheck:
+      test: ["CMD", "/app/slater", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # Run a build on demand:
+  #   docker compose run --rm builder --input /dumps/x.cypher --graph x --data-dir /data
+  builder:
+    image: hikarisystems/slater:latest
+    profiles: ["build"]
+    entrypoint: ["/app/slater-build"]
+    volumes:
+      - slater-data:/data
+      - ./dumps:/dumps:ro
+
+volumes:
+  slater-data:
+```
+
+---
+
+## Tags
+
+- `:latest` — the most recent release.
+- `:vX.Y.Z` — a specific release (e.g. `:v0.1.4`).
+
+Multi-arch: **linux/amd64** and **linux/arm64**.
+```bash
+docker pull hikarisystems/slater:latest
+```
+
+---
+
+## Links
+
+- **GitHub repository:** <https://github.com/Hikari-Systems/slater>
+- **Issues & bug reports:** <https://github.com/Hikari-Systems/slater/issues>
+- **Releases & changelog:** <https://github.com/Hikari-Systems/slater/releases>
+- **Full README & design docs:** <https://github.com/Hikari-Systems/slater#readme>
+- **License:** Apache-2.0
+
+This page is generated from
+[`DOCKERHUB.md`](https://github.com/Hikari-Systems/slater/blob/main/DOCKERHUB.md)
+in the repository and synced on each release.

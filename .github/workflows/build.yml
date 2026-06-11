@@ -92,3 +92,25 @@ jobs:
             -t hikarisystems/${{ env.REPO_NAME }}:${{ github.ref_name }} \
             -t hikarisystems/${{ env.REPO_NAME }}:latest \
             $(printf 'hikarisystems/${{ env.REPO_NAME }}@sha256:%s ' *)
+
+  # Sync the Docker Hub repository overview from DOCKERHUB.md after the image is
+  # published, so the page tracks each release. Uses a token (no short-description
+  # update — that would require the account password).
+  sync-description:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: merge-manifest
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Update Docker Hub overview from DOCKERHUB.md
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: hikarisystems/${{ env.REPO_NAME }}
+          readme-filepath: ./DOCKERHUB.md
