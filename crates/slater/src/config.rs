@@ -50,6 +50,28 @@ mod de {
     pub fn usize<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
         u64(d).map(|v| v as usize)
     }
+
+    struct I64;
+    impl Visitor<'_> for I64 {
+        type Value = i64;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("i64 or numeric string")
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<i64, E> {
+            i64::try_from(v).map_err(|_| E::invalid_value(Unexpected::Unsigned(v), &self))
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<i64, E> {
+            v.parse::<i64>()
+                .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))
+        }
+    }
+
+    pub fn i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+        d.deserialize_any(I64)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +158,21 @@ pub struct CacheConfig {
     /// Byte budget for the result LRU.
     #[serde(default = "default_result_cache", deserialize_with = "de::usize")]
     pub result_cache_bytes: usize,
+    /// Idle TTL in milliseconds: a cached entry not accessed for this long is
+    /// reclaimed by the background maintenance sweep, freeing memory below the
+    /// byte budgets. Defaults to 30 minutes. A **negative** value (or zero)
+    /// disables the sweep — caches then evict purely on budget pressure, as
+    /// before. Pinned PQ codes are never swept.
+    #[serde(default = "default_cache_ttl_ms", deserialize_with = "de::i64")]
+    pub cache_ttl_ms: i64,
+}
+
+impl CacheConfig {
+    /// The idle TTL as a `Duration`, or `None` when disabled (a non-positive
+    /// `cache_ttl_ms`).
+    pub fn cache_ttl(&self) -> Option<std::time::Duration> {
+        (self.cache_ttl_ms > 0).then(|| std::time::Duration::from_millis(self.cache_ttl_ms as u64))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,6 +260,9 @@ fn default_vector_cache() -> usize {
 fn default_result_cache() -> usize {
     32 * 1024 * 1024
 }
+fn default_cache_ttl_ms() -> i64 {
+    30 * 60 * 1000
+}
 fn default_generation_poll_ms() -> u64 {
     5_000
 }
@@ -255,6 +295,7 @@ impl Default for CacheConfig {
             block_cache_bytes: default_block_cache(),
             vector_cache_bytes: default_vector_cache(),
             result_cache_bytes: default_result_cache(),
+            cache_ttl_ms: default_cache_ttl_ms(),
         }
     }
 }
@@ -313,4 +354,41 @@ impl AppConfig {
 pub fn load() -> Result<AppConfig> {
     let root = hs_utils::config::load_layered_value()?;
     serde_json::from_value(root).context("deserialise Slater config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_ttl_defaults_to_30_minutes() {
+        let cfg: CacheConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.cache_ttl_ms, 30 * 60 * 1000);
+        assert_eq!(cfg.cache_ttl(), Some(std::time::Duration::from_secs(30 * 60)));
+    }
+
+    #[test]
+    fn cache_ttl_parses_number_and_numeric_string() {
+        let from_num: CacheConfig =
+            serde_json::from_value(serde_json::json!({ "cacheTtlMs": 1000 })).unwrap();
+        assert_eq!(from_num.cache_ttl(), Some(std::time::Duration::from_secs(1)));
+
+        // The `de::i64` deserializer also accepts a numeric string (config layer parity).
+        let from_str: CacheConfig =
+            serde_json::from_value(serde_json::json!({ "cacheTtlMs": "1000" })).unwrap();
+        assert_eq!(from_str.cache_ttl(), Some(std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn cache_ttl_negative_or_zero_disables() {
+        for v in [0, -1, -1000] {
+            let cfg: CacheConfig =
+                serde_json::from_value(serde_json::json!({ "cacheTtlMs": v })).unwrap();
+            assert_eq!(cfg.cache_ttl(), None, "cacheTtlMs={v} should disable");
+        }
+        // Negative numeric string too.
+        let cfg: CacheConfig =
+            serde_json::from_value(serde_json::json!({ "cacheTtlMs": "-5" })).unwrap();
+        assert_eq!(cfg.cache_ttl(), None);
+    }
 }

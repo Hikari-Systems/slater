@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use graph_format::blockfile::{parse_block, record_from_block, BlockFileReader};
@@ -95,6 +96,10 @@ struct Entry {
     value: Arc<Vec<u8>>,
     bytes: usize,
     tick: u64,
+    /// Wall-clock instant of the most recent access; reset on every touch and
+    /// consulted by the idle-TTL sweep. Assigned together with `tick`, so the
+    /// `order` map (keyed by tick) is also sorted by `last_used`.
+    last_used: Instant,
 }
 
 struct Inner {
@@ -122,8 +127,29 @@ impl Inner {
         self.order.remove(&old_tick);
         let new_tick = self.next_tick();
         self.order.insert(new_tick, *key);
-        self.map.get_mut(key).unwrap().tick = new_tick;
+        let e = self.map.get_mut(key).unwrap();
+        e.tick = new_tick;
+        e.last_used = Instant::now();
         Some(value)
+    }
+
+    /// Evict entries idle for at least `ttl`, walking the LRU order front-to-back
+    /// and stopping at the first still-live entry. Returns the count evicted.
+    /// Unlike budget eviction this has no keep-at-least-one floor — an entirely
+    /// idle cache is fully reclaimed.
+    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
+        let mut evicted = 0;
+        while let Some((&t, &key)) = self.order.iter().next() {
+            if now.saturating_duration_since(self.map[&key].last_used) <= ttl {
+                break;
+            }
+            self.order.remove(&t);
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.bytes;
+            }
+            evicted += 1;
+        }
+        evicted
     }
 
     /// Insert `value` for `key` (or return the existing entry if a concurrent
@@ -142,6 +168,7 @@ impl Inner {
                 value: value.clone(),
                 bytes,
                 tick,
+                last_used: Instant::now(),
             },
         );
         self.bytes += bytes;
@@ -226,6 +253,17 @@ impl BlockCache {
         Ok(rec.to_vec())
     }
 
+    /// Evict every block idle for at least `ttl` as of `now`, freeing its bytes.
+    /// Returns the number evicted; the count is folded into the `evictions`
+    /// counter. Called by the background cache-maintenance task.
+    pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
+        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+        }
+        evicted
+    }
+
     /// Counter snapshot.
     pub fn metrics(&self) -> CacheMetrics {
         CacheMetrics {
@@ -278,6 +316,7 @@ struct ResultEntry<V> {
     value: Arc<V>,
     bytes: usize,
     tick: u64,
+    last_used: Instant,
 }
 
 struct ResultInner<V> {
@@ -303,8 +342,27 @@ impl<V> ResultInner<V> {
         self.order.remove(&old_tick);
         let new_tick = self.next_tick();
         self.order.insert(new_tick, key.clone());
-        self.map.get_mut(key).unwrap().tick = new_tick;
+        let e = self.map.get_mut(key).unwrap();
+        e.tick = new_tick;
+        e.last_used = Instant::now();
         Some(value)
+    }
+
+    /// Evict results idle for at least `ttl`; see `Inner::evict_expired`.
+    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
+        let mut evicted = 0;
+        while let Some((&t, key)) = self.order.iter().next() {
+            let key = key.clone();
+            if now.saturating_duration_since(self.map[&key].last_used) <= ttl {
+                break;
+            }
+            self.order.remove(&t);
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.bytes;
+            }
+            evicted += 1;
+        }
+        evicted
     }
 
     fn insert(&mut self, key: ResultKey, value: Arc<V>, bytes: usize) -> u64 {
@@ -314,7 +372,15 @@ impl<V> ResultInner<V> {
         }
         let tick = self.next_tick();
         self.order.insert(tick, key.clone());
-        self.map.insert(key, ResultEntry { value, bytes, tick });
+        self.map.insert(
+            key,
+            ResultEntry {
+                value,
+                bytes,
+                tick,
+                last_used: Instant::now(),
+            },
+        );
         self.bytes += bytes;
 
         // Evict LRU-first, but keep at least one entry so a single oversized result
@@ -383,6 +449,16 @@ impl<V> ResultCache<V> {
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
+    }
+
+    /// Evict every result idle for at least `ttl` as of `now`. See
+    /// [`BlockCache::evict_expired`].
+    pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
+        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+        }
+        evicted
     }
 
     pub fn metrics(&self) -> CacheMetrics {
@@ -458,8 +534,28 @@ impl VecInner {
         self.order.remove(&old_tick);
         let new_tick = self.next_tick();
         self.order.insert(new_tick, *key);
-        self.blocks.get_mut(key).unwrap().tick = new_tick;
+        let e = self.blocks.get_mut(key).unwrap();
+        e.tick = new_tick;
+        e.last_used = Instant::now();
         Some(value)
+    }
+
+    /// Evict Vamana blocks idle for at least `ttl`; the pinned PQ codes are never
+    /// touched, so the resident navigation set is exempt. See
+    /// `Inner::evict_expired`.
+    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
+        let mut evicted = 0;
+        while let Some((&t, &key)) = self.order.iter().next() {
+            if now.saturating_duration_since(self.blocks[&key].last_used) <= ttl {
+                break;
+            }
+            self.order.remove(&t);
+            if let Some(e) = self.blocks.remove(&key) {
+                self.block_bytes -= e.bytes;
+            }
+            evicted += 1;
+        }
+        evicted
     }
 
     /// Evict LRU blocks until pinned + blocks fit the budget, keeping at least one
@@ -491,6 +587,7 @@ impl VecInner {
                 value: value.clone(),
                 bytes,
                 tick,
+                last_used: Instant::now(),
             },
         );
         self.block_bytes += bytes;
@@ -601,6 +698,17 @@ impl VectorIndexCache {
         let (offsets, data) = parse_block(&raw[..])?;
         let rec = record_from_block(&offsets, data, loc.slot)?;
         Ok(rec.to_vec())
+    }
+
+    /// Evict every Vamana block idle for at least `ttl` as of `now`. Pinned PQ
+    /// codes are exempt — they are the resident navigation set. See
+    /// [`BlockCache::evict_expired`].
+    pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
+        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+        }
+        evicted
     }
 
     pub fn metrics(&self) -> CacheMetrics {
@@ -898,5 +1006,110 @@ mod tests {
         // The pinned PQ is never evicted.
         assert!(cache.resident_pq(g, 0).is_some());
         assert!(cache.bytes() <= budget + 100, "stays bounded near budget");
+    }
+
+    // ── Idle-TTL eviction ──────────────────────────────────────────────────────
+
+    #[test]
+    fn evict_expired_reclaims_idle_blocks() {
+        let cache = BlockCache::new(1 << 20);
+        let g = gen(50);
+        // Capture a reference instant *before* the inserts, so every entry's
+        // `last_used` sits just after `t0` and we can fabricate a future `now`.
+        let t0 = Instant::now();
+        for b in 0..3u32 {
+            cache
+                .get_or_try_insert(BlockKey::new(g, FileKind::Topology, b), || Ok(vec![b as u8; 10]))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 3);
+
+        // As of t0 nothing has aged past the TTL.
+        assert_eq!(cache.evict_expired(t0, Duration::from_secs(60)), 0);
+        assert_eq!(cache.len(), 3);
+
+        // Two minutes later every block is idle past a 60s TTL — all reclaimed
+        // (no keep-one floor, unlike budget eviction).
+        let n = cache.evict_expired(t0 + Duration::from_secs(120), Duration::from_secs(60));
+        assert_eq!(n, 3);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.metrics().evictions, 3);
+    }
+
+    #[test]
+    fn evict_expired_resets_idle_clock_on_touch() {
+        use std::thread::sleep;
+        let cache = BlockCache::new(1 << 20);
+        let g = gen(51);
+        let k = |b| BlockKey::new(g, FileKind::NodeProps, b);
+        cache.get_or_try_insert(k(0), || Ok(vec![0u8; 10])).unwrap();
+        cache.get_or_try_insert(k(1), || Ok(vec![1u8; 10])).unwrap();
+
+        let ttl = Duration::from_millis(100);
+        sleep(Duration::from_millis(60));
+        // Touch block 0 — its idle clock resets while block 1 keeps aging.
+        cache.get_or_try_insert(k(0), || Ok(vec![0u8; 10])).unwrap();
+        sleep(Duration::from_millis(60));
+
+        // Block 1 has been idle ~120ms (> ttl); block 0 ~60ms (< ttl).
+        assert_eq!(
+            cache.evict_expired(Instant::now(), ttl),
+            1,
+            "only the idle block should be reclaimed"
+        );
+        // Block 0 survived (a hit, no reload); block 1 was reclaimed (a fresh miss).
+        let mut reload_0 = false;
+        cache
+            .get_or_try_insert(k(0), || {
+                reload_0 = true;
+                Ok(vec![0u8; 10])
+            })
+            .unwrap();
+        assert!(!reload_0, "recently-touched block 0 should still be resident");
+        let mut reload_1 = false;
+        cache
+            .get_or_try_insert(k(1), || {
+                reload_1 = true;
+                Ok(vec![1u8; 10])
+            })
+            .unwrap();
+        assert!(reload_1, "idle block 1 should have been reclaimed");
+    }
+
+    #[test]
+    fn result_cache_evict_expired_reclaims_idle() {
+        let cache: ResultCache<String> = ResultCache::new(1 << 20);
+        let g = gen(60);
+        let t0 = Instant::now();
+        cache.insert(ResultKey::new(g, "q1"), Arc::new("a".to_string()), 1);
+        cache.insert(ResultKey::new(g, "q2"), Arc::new("b".to_string()), 1);
+
+        assert_eq!(cache.evict_expired(t0, Duration::from_secs(60)), 0);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.evict_expired(t0 + Duration::from_secs(120), Duration::from_secs(60)),
+            2
+        );
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn vector_index_cache_evict_expired_keeps_pinned_pq() {
+        let cache = VectorIndexCache::new(1 << 20);
+        let g = gen(61);
+        cache.pin(g, 0, small_pq(4, 2));
+        let t0 = Instant::now();
+        for b in 0..3u32 {
+            cache
+                .get_or_try_insert(VectorBlockKey::new(g, 0, b), || Ok(vec![b as u8; 10]))
+                .unwrap();
+        }
+        assert_eq!(cache.block_count(), 3);
+
+        let n = cache.evict_expired(t0 + Duration::from_secs(120), Duration::from_secs(60));
+        assert_eq!(n, 3);
+        assert_eq!(cache.block_count(), 0);
+        // The pinned PQ codes are the resident navigation set — never swept.
+        assert!(cache.resident_pq(g, 0).is_some(), "pinned PQ is exempt from TTL");
     }
 }

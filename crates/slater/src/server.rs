@@ -301,6 +301,42 @@ fn spawn_generation_guard(
     });
 }
 
+/// Spawn the background cache-maintenance task: every so often it reclaims cache
+/// entries that have been idle (untouched) for at least `ttl`, freeing memory
+/// below the byte budgets when the working set goes quiet. Pinned PQ codes are
+/// exempt. Only spawned when an idle TTL is configured (`cache.cacheTtlMs > 0`).
+fn spawn_cache_maintenance(
+    cache: Arc<BlockCache>,
+    vector_cache: Arc<VectorIndexCache>,
+    result_cache: Arc<ResultCache<QueryResult>>,
+    ttl: Duration,
+) {
+    // Check ~4x per TTL window so an entry is reclaimed within ~TTL+25% of going
+    // idle, clamped so we neither spin nor let a long TTL drift far past its mark.
+    let sweep_every = (ttl / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sweep_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick — nothing is idle yet at startup.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let (c, v, r) = (cache.clone(), vector_cache.clone(), result_cache.clone());
+            // Each sweep briefly takes the cache mutexes; run off the async reactor.
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                let now = Instant::now();
+                c.evict_expired(now, ttl);
+                v.evict_expired(now, ttl);
+                r.evict_expired(now, ttl);
+            })
+            .await
+            {
+                warn!(error = %e, "cache maintenance sweep task failed");
+            }
+        }
+    });
+}
+
 // ── Shared connection context ─────────────────────────────────────────────────
 
 /// Immutable state shared by every connection task.
@@ -829,6 +865,19 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         cfg.generation_poll_interval(),
         shutdown_tx,
     );
+
+    // The cache-maintenance task: reclaim idle entries past the configured TTL.
+    // Disabled (not spawned) when `cache.cacheTtlMs` is 0 — caches then evict on
+    // budget pressure alone, as before.
+    if let Some(ttl) = cfg.cache.cache_ttl() {
+        info!(ttl_ms = cfg.cache.cache_ttl_ms, "cache idle-TTL eviction enabled");
+        spawn_cache_maintenance(
+            ctx.cache.clone(),
+            ctx.vector_cache.clone(),
+            ctx.result_cache.clone(),
+            ttl,
+        );
+    }
 
     loop {
         tokio::select! {
