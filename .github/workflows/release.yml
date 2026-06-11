@@ -1,0 +1,70 @@
+name: release
+
+# Build the release binaries and publish them as assets on the GitHub release for
+# a pushed `vX.Y.Z` tag. GitHub already attaches the source archives (the
+# "Source code (zip/tar.gz)" links) to every release automatically; this workflow
+# adds the compiled `slater` + `slater-build` binaries (and their checksums)
+# alongside them. Also runnable manually against an existing tag via the Actions
+# tab (workflow_dispatch).
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach binaries to (e.g. v0.1.1)'
+        required: true
+
+# The release step needs write access to create/update the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # The tag this run targets: the pushed ref, or the manual dispatch input.
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
+      # the Dockerfile builder stage); git is already present on the runner.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked --bins
+
+      # Package both binaries into one tarball named for the tag + target triple,
+      # then emit a checksum file so downloaders can verify integrity.
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tarball="slater-${TAG}-${TARGET}.tar.gz"
+          tar -C target/release -czf "dist/${tarball}" slater slater-build
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS.txt )
+          ls -l dist
+
+      - name: Publish binaries to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          # Create the release if it does not exist yet; fill notes from commits.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/slater-*.tar.gz
+            dist/SHA256SUMS.txt
