@@ -102,9 +102,17 @@ jobs:
 
       # `cargo fuzz run` builds just this target before running it, so a build
       # error (a target that no longer matches the API) still fails the leg.
+      #
+      # `--target` is pinned explicitly: cargo-fuzz otherwise defaults it to its
+      # OWN build platform, and the prebuilt binary from install-action is a musl
+      # build — so it would try to compile the fuzz target for
+      # x86_64-unknown-linux-musl, which the minimal nightly toolchain has no std
+      # for ("error[E0463]: can't find crate for `core`"). Pin to the glibc host
+      # target (what we build and ship) so it compiles and actually fuzzes.
       - name: Fuzz ${{ matrix.target }}
         run: |
-          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            --target x86_64-unknown-linux-gnu -- \
             -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
 
       # On a crash, libFuzzer writes a reproducer under fuzz/artifacts — keep it.
