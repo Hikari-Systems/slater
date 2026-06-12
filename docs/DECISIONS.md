@@ -614,3 +614,36 @@ conventions adapted for a **three-crate workspace shipping two binaries**:
   matching the camelCase config keys. The README documents the mounts/env table and
   a worked example: build a graph with `slater-build`, connect with the neo4j JS
   **and** Python drivers, run a `MATCH … RETURN` and a cosine-KNN query.
+
+### D36 — GQL path restrictors are scoped to the variable-length walk (GQL track PR 2)
+GQL's `WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE` prefix a MATCH pattern and control node/edge
+reuse along a path. Slater's `varlen` (`exec.rs`) already owns the natural scope for
+this — it is the one place that threads a per-path `used` edge set — so PR 2 maps the
+restrictors onto that walk rather than inventing a whole-pattern uniqueness pass.
+- **`Pattern.restrictor: Option<PathRestrictor>`; `None` ≡ today's behaviour.** The
+  field is additive, so every existing pattern construction is unaffected. The
+  executor folds `None` onto `Trail` (`walk_mode`), because slater's `*` has *always*
+  been edge-unique — i.e. a bare `*` is already a TRAIL. So absence of a restrictor
+  and an explicit `TRAIL` run the identical code path, and **only `WALK` relaxes**
+  uniqueness; `ACYCLIC`/`SIMPLE` add node-uniqueness.
+- **Mode → uniqueness.** `WALK`: no check (bounded only by `max`/`MAX_VARLEN_HOPS`,
+  the budget and the deadline — a cycle would otherwise expand without limit).
+  `TRAIL`: no repeated edge (`used`). `ACYCLIC`: no repeated node, endpoints included
+  (`visited`, seeded with the walk's start). `SIMPLE`: no repeated node *except* the
+  two endpoints may coincide — a hop back to the start is emitted but not extended, so
+  the start can never become an interior repeat. Node-uniqueness implies
+  edge-uniqueness, so `ACYCLIC`/`SIMPLE` track only `visited` and `TRAIL` only `used`;
+  each mode's per-hop cost stays minimal and the `Trail`/default path is byte-for-byte
+  as before.
+- **Restrictor requires a variable-length relationship (PR 2 scope).** On a fixed hop
+  or node-only pattern there is no `varlen` scope to attach to, so a restrictor there
+  is **rejected** with a clear message rather than silently ignored. Honouring
+  restrictors over fixed-length chains is later work. A pattern with *several* varlen
+  relationships gives each its own independent scope (not one scope spanning the whole
+  path) — also acceptable for PR 2 and revisitable later.
+- **Restrictor over a quantified group is rejected.** `TRAIL ((x)-[:R]->(y)){1,3}`
+  parses but is rejected at lowering: PR 1 desugars a quantified group into the union
+  of separate fixed-length expansions, which cannot share one uniqueness scope, so the
+  restrictor's intent can't be honoured across the repetitions. Reject (clear message)
+  beats silently dropping it. The later fix is a dedicated repeater that threads one
+  `used`/`visited` set instead of desugaring when a restrictor is present.

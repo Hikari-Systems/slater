@@ -186,6 +186,27 @@ pub mod ast {
         /// (`expand_quantified_pattern`), so every consumer of `rels` is unaffected
         /// when `segments` is `None`.
         pub segments: Option<Vec<Segment>>,
+        /// GQL path restrictor (`WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE`), `None` when the
+        /// pattern carries no explicit restrictor. `None` preserves slater's
+        /// historical variable-length semantics (edge-unique = TRAIL), so existing
+        /// queries are untouched; only `Walk` relaxes it and `Acyclic`/`Simple` add
+        /// node-uniqueness. Scoped (PR 2) to variable-length relationships — see
+        /// `expand_chain`/`varlen` in exec.rs.
+        pub restrictor: Option<PathRestrictor>,
+    }
+
+    /// GQL path restrictor controlling node/edge reuse over a variable-length walk.
+    /// On a [`Pattern`] this is `Some` only when the query spells the restrictor out;
+    /// the executor maps the *absence* of one onto today's edge-unique behaviour, so
+    /// `Trail` and a bare `*` are identical and only `Walk` relaxes uniqueness.
+    /// `Acyclic` forbids any repeated node; `Simple` forbids repeats too but lets the
+    /// walk's two endpoints coincide (a single closed cycle).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PathRestrictor {
+        Walk,
+        Trail,
+        Acyclic,
+        Simple,
     }
 
     /// One element of a quantified [`Pattern`], in chain order. A `Hop` is an
@@ -992,6 +1013,7 @@ fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
         start,
         rels: chain,
         segments: None,
+        restrictor: None,
     })
 }
 
@@ -1008,9 +1030,11 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     let mut pending_quant: Option<(Vec<(RelPat, NodePat)>, VarLength)> = None;
     let mut segments: Vec<Segment> = Vec::new();
     let mut has_quant = false;
+    let mut restrictor: Option<PathRestrictor> = None;
 
     for child in pair.into_inner() {
         match child.as_rule() {
+            Rule::path_restrictor => restrictor = Some(lower_path_restrictor(child)?),
             Rule::path_var => path_var = Some(ident_text(child)?),
             Rule::node_pattern => {
                 let node = lower_node_pattern(child)?;
@@ -1056,6 +1080,7 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
             start,
             rels,
             segments: None,
+            restrictor,
         });
     }
 
@@ -1064,11 +1089,35 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     if path_var.is_some() {
         bail!("a path variable over a quantified path pattern is not yet supported");
     }
+    // A restrictor over a quantified group is deferred (DECISIONS D36): the
+    // group desugars into separate fixed-length expansions, which can't share one
+    // uniqueness scope, so honouring TRAIL/ACYCLIC/SIMPLE across the repetitions is
+    // not yet possible. Reject rather than silently ignore the restrictor.
+    if restrictor.is_some() {
+        bail!(
+            "a path restrictor (WALK/TRAIL/ACYCLIC/SIMPLE) over a quantified path \
+             pattern ('((…)){{m,n}}') is not yet supported; apply it to a \
+             variable-length relationship instead"
+        );
+    }
     Ok(Pattern {
         path_var: None,
         start,
         rels: Vec::new(),
         segments: Some(segments),
+        restrictor: None,
+    })
+}
+
+/// Lower a `path_restrictor` keyword into its [`PathRestrictor`] variant.
+fn lower_path_restrictor(pair: Pair<Rule>) -> Result<PathRestrictor> {
+    let kw = only_child(pair)?;
+    Ok(match kw.as_rule() {
+        Rule::kw_walk => PathRestrictor::Walk,
+        Rule::kw_trail => PathRestrictor::Trail,
+        Rule::kw_acyclic => PathRestrictor::Acyclic,
+        Rule::kw_simple => PathRestrictor::Simple,
+        other => bail!("internal: unexpected path_restrictor child {other:?}"),
     })
 }
 
@@ -1703,6 +1752,7 @@ fn lower_pattern_predicate(pair: Pair<Rule>) -> Result<Expr> {
         start,
         rels: chain,
         segments: None,
+        restrictor: None,
     })))
 }
 
@@ -2618,6 +2668,62 @@ mod tests {
         // comprehensions use the plain `pattern` rule, so a quantifier there is a
         // syntax error rather than a silently mis-handled segment.
         assert!(parse("MATCH (a),(b) WHERE shortestPath(((x)-[:R]->(y)){1,2}) RETURN a").is_err());
+    }
+
+    // ── GQL path restrictors (PR 2) ──────────────────────────────────────────
+
+    #[test]
+    fn lowers_path_restrictors() {
+        // Each restrictor keyword parses onto the pattern; the chain is otherwise
+        // an ordinary variable-length pattern (`segments` stays `None`).
+        for (kw, want) in [
+            ("WALK", PathRestrictor::Walk),
+            ("TRAIL", PathRestrictor::Trail),
+            ("ACYCLIC", PathRestrictor::Acyclic),
+            ("SIMPLE", PathRestrictor::Simple),
+        ] {
+            let q = ok(&format!("MATCH {kw} (a)-[:R*1..3]->(b) RETURN b"));
+            let p = first_pattern(&q);
+            assert_eq!(p.restrictor, Some(want), "restrictor for {kw}");
+            assert!(p.segments.is_none(), "restrictor pattern stays ordinary");
+            assert_eq!(p.rels.len(), 1);
+            assert!(p.rels[0].0.var_length.is_some());
+        }
+    }
+
+    #[test]
+    fn absent_restrictor_is_none() {
+        // No restrictor keyword → `None`, which the executor maps onto today's
+        // edge-unique (TRAIL) behaviour, so existing queries are untouched.
+        let q = ok("MATCH (a)-[:R*1..3]->(b) RETURN b");
+        assert_eq!(first_pattern(&q).restrictor, None);
+    }
+
+    #[test]
+    fn restrictor_lowercase_accepted() {
+        // Keywords are case-insensitive like every other keyword terminal.
+        let q = ok("match trail (a)-[:R*]->(b) return b");
+        assert_eq!(first_pattern(&q).restrictor, Some(PathRestrictor::Trail));
+    }
+
+    #[test]
+    fn restrictor_does_not_shadow_node_var() {
+        // A restrictor only sits at the head of a `match_pattern`, never inside
+        // `(…)`, so a node variable spelled `walk` is parsed as a variable, not a
+        // restrictor — and the pattern carries no restrictor.
+        let q = ok("MATCH (walk)-[:R*]->(b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("walk"));
+        assert_eq!(p.restrictor, None);
+    }
+
+    #[test]
+    fn restrictor_over_quantified_rejected() {
+        // A restrictor over a quantified group is deferred (the group desugars into
+        // separate expansions that can't share a uniqueness scope), so it is
+        // rejected with a clear message rather than silently ignored.
+        let e = err("MATCH TRAIL (a) ((x)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
     }
 
     #[test]

@@ -54,6 +54,13 @@ kw_end = @{ ^"end" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
+// GQL path restrictors (PR 2). They appear only at the head of a `match_pattern`
+// (right after MATCH), never inside `(…)`/`[…]`, so they don't shadow a node or
+// relationship variable that happens to be spelled `walk`/`trail`/etc.
+kw_walk = @{ ^"walk" ~ !ident_cont }
+kw_trail = @{ ^"trail" ~ !ident_cont }
+kw_acyclic = @{ ^"acyclic" ~ !ident_cont }
+kw_simple = @{ ^"simple" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
@@ -158,7 +165,13 @@ path_var = { identifier }
 // by `match_clause`; the bare `pattern` rule (shortestPath/EXISTS/pattern
 // comprehensions) stays quantifier-free so those expression contexts never see a
 // segment they can't execute.
-match_pattern = { (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+match_pattern = { path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+
+// GQL path restrictor: `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` prefixed on a MATCH
+// pattern (e.g. `MATCH TRAIL (a)-[:R*]->(b)`). It controls node/edge reuse over a
+// variable-length walk; see `lower_path_restrictor` and `expand_chain` in exec.rs.
+// Scoped (PR 2) to patterns containing a variable-length relationship.
+path_restrictor = { kw_walk | kw_trail | kw_acyclic | kw_simple }
 
 // GQL quantified path pattern: a parenthesised sub-path (≥1 relationship) repeated
 // `{m,n}` / `{m}` / `{m,}` / `{,n}` / `+` / `*` times, e.g. `((x)-[:R]->(y)){1,3}`.

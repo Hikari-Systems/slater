@@ -1179,6 +1179,19 @@ impl<'g> Engine<'g> {
     // ── MATCH ────────────────────────────────────────────────────────────
 
     fn apply_match(&self, table: Table, m: &MatchClause, cap: Option<usize>) -> Result<Table> {
+        // PR 2: a path restrictor is honoured only where `varlen` owns the
+        // uniqueness scope — a variable-length relationship. Reject it on any other
+        // pattern (a node-only or fixed-hop chain) rather than silently ignoring it,
+        // so the user gets a clear message instead of unrestricted results. A
+        // restrictor over a quantified group is already rejected at lowering.
+        for p in &m.patterns {
+            if p.restrictor.is_some() && !p.rels.iter().any(|(r, _)| r.var_length.is_some()) {
+                bail!(
+                    "a path restrictor (WALK/TRAIL/ACYCLIC/SIMPLE) currently requires a \
+                     variable-length relationship, e.g. MATCH TRAIL (a)-[:R*]->(b)"
+                );
+            }
+        }
         // Stage 5: a single non-optional node-only pattern (no relationships, no
         // path variable, fresh-scan anchor) streams candidates straight into rows,
         // skipping the per-row `HashMap` binding the general matcher builds (root
@@ -2540,15 +2553,26 @@ impl<'g> Engine<'g> {
             }
             Some(vl) => {
                 let (min, max) = varlen_bounds(vl);
+                let mode = walk_mode(pattern.restrictor);
                 let mut paths: Vec<(Vec<Hop>, u64)> = Vec::new();
                 let mut used = HashSet::new();
+                // `visited` (node-uniqueness for ACYCLIC/SIMPLE) is seeded with the
+                // walk's start node so a hop back to it is detected — rejected by
+                // ACYCLIC, allowed once as the closing endpoint by SIMPLE.
+                let mut visited = HashSet::new();
+                if matches!(mode, WalkMode::Acyclic | WalkMode::Simple) {
+                    visited.insert(cur);
+                }
                 let mut path = Vec::new();
                 self.varlen(
                     cur,
+                    cur,
                     rel,
                     (min, max),
+                    mode,
                     &mut path,
                     &mut used,
+                    &mut visited,
                     &mut paths,
                     binding,
                 )?;
@@ -2590,17 +2614,35 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
-    /// Depth-first variable-length expansion with relationship uniqueness (no edge
-    /// reused within a path), emitting `(path_edges, end_node)` for every path
-    /// whose length is in `[min, max]`.
+    /// Depth-first variable-length expansion, emitting `(path_edges, end_node)` for
+    /// every path whose length is in `[min, max]`. `mode` (the GQL path restrictor,
+    /// `WalkMode::Trail` by default) governs node/edge reuse within the walk:
+    /// - `Walk` — no restriction (repeated nodes and edges allowed). Bounded only by
+    ///   `max` (`MAX_VARLEN_HOPS` for an open `*`), the intermediate budget and the
+    ///   deadline, since a cycle would otherwise expand without limit.
+    /// - `Trail` — no repeated edge (the historical default for `*`); tracked in
+    ///   `used`.
+    /// - `Acyclic` — no repeated node at all (endpoints included); tracked in
+    ///   `visited`, which the caller seeds with the start node.
+    /// - `Simple` — no repeated node *except* the two endpoints may coincide (a
+    ///   single closed cycle); a hop back to the start node is emitted but not
+    ///   extended, so the start can never become an interior repeat.
+    ///
+    /// Node-uniqueness implies edge-uniqueness, so `Acyclic`/`Simple` need only the
+    /// `visited` set and leave `used` untouched; `Trail` uses only `used`. This keeps
+    /// each mode's per-hop work minimal and the `Trail`/default path byte-for-byte as
+    /// before.
     #[allow(clippy::too_many_arguments)] // recursive DFS: scratch buffers + scope
     fn varlen(
         &self,
+        start: u64,
         node: u64,
         rel: &RelPat,
         bounds: (u32, u32),
+        mode: WalkMode,
         path: &mut Vec<Hop>,
         used: &mut HashSet<u64>,
+        visited: &mut HashSet<u64>,
         out: &mut Vec<(Vec<Hop>, u64)>,
         binding: &HashMap<String, Val>,
     ) -> Result<()> {
@@ -2615,17 +2657,61 @@ impl<'g> Engine<'g> {
             return Ok(());
         }
         self.check_deadline()?;
+        let track_edges = matches!(mode, WalkMode::Trail);
+        let track_nodes = matches!(mode, WalkMode::Acyclic | WalkMode::Simple);
         for hop in self.expand_one_hop(node, rel, binding)? {
-            if used.contains(&hop.edge) {
-                continue;
-            }
             let edge = hop.edge;
             let nb = hop.neighbour;
-            used.insert(edge);
+            // SIMPLE alone permits the one repeat that closes the walk at its start;
+            // it is emitted but never extended (extending would repeat the start as
+            // an interior node).
+            let mut close_only = false;
+            match mode {
+                WalkMode::Walk => {}
+                WalkMode::Trail => {
+                    if used.contains(&edge) {
+                        continue;
+                    }
+                }
+                WalkMode::Acyclic => {
+                    if visited.contains(&nb) {
+                        continue;
+                    }
+                }
+                WalkMode::Simple => {
+                    if visited.contains(&nb) {
+                        if nb != start {
+                            continue;
+                        }
+                        close_only = true;
+                    }
+                }
+            }
+            if track_edges {
+                used.insert(edge);
+            }
+            // `insert` returns false (so `inserted` stays false) when the node is
+            // already present — e.g. the SIMPLE close-the-cycle hop back to `start`,
+            // which the caller pre-seeded — so we never wrongly remove it on unwind.
+            let inserted = track_nodes && visited.insert(nb);
             path.push(hop);
-            self.varlen(nb, rel, bounds, path, used, out, binding)?;
+            if close_only {
+                if path.len() as u32 >= min {
+                    self.charge(path.len() as u64 + 1)?;
+                    out.push((path.clone(), nb));
+                }
+            } else {
+                self.varlen(
+                    start, nb, rel, bounds, mode, path, used, visited, out, binding,
+                )?;
+            }
             path.pop();
-            used.remove(&edge);
+            if track_edges {
+                used.remove(&edge);
+            }
+            if inserted {
+                visited.remove(&nb);
+            }
         }
         Ok(())
     }
@@ -4847,6 +4933,27 @@ fn normalise(v: &[f32]) -> Vec<f32> {
     v.iter().map(|&x| (x as f64 / norm) as f32).collect()
 }
 
+/// Executor-internal view of a GQL path restrictor (`Pattern.restrictor`), with the
+/// *absence* of a restrictor folded onto `Trail` — slater's historical edge-unique
+/// variable-length behaviour — so `None` and explicit `TRAIL` run the identical
+/// code path and existing queries are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    Walk,
+    Trail,
+    Acyclic,
+    Simple,
+}
+
+fn walk_mode(r: Option<PathRestrictor>) -> WalkMode {
+    match r {
+        None | Some(PathRestrictor::Trail) => WalkMode::Trail,
+        Some(PathRestrictor::Walk) => WalkMode::Walk,
+        Some(PathRestrictor::Acyclic) => WalkMode::Acyclic,
+        Some(PathRestrictor::Simple) => WalkMode::Simple,
+    }
+}
+
 fn varlen_bounds(vl: &VarLength) -> (u32, u32) {
     let min = vl.min.unwrap_or(1);
     let max = vl.max.unwrap_or(MAX_VARLEN_HOPS).max(min);
@@ -4894,6 +5001,10 @@ fn reverse_pattern(p: &Pattern) -> Pattern {
         start: new_start,
         rels: new_rels,
         segments: None,
+        // Reversal only fires for restrictor-free, varlen-free patterns
+        // (`maybe_reroot` bails on any `var_length`), so there is no restrictor to
+        // carry; a restrictor pattern always has a variable-length relationship.
+        restrictor: p.restrictor,
     }
 }
 
@@ -4963,6 +5074,9 @@ fn expand_quantified_pattern(p: &Pattern) -> Result<Vec<Pattern>> {
             start: p.start.clone(),
             rels,
             segments: None,
+            // A restrictor over a quantified group is rejected at lowering, so a
+            // segment-bearing pattern never carries one to desugar here.
+            restrictor: None,
         })
         .collect())
 }
@@ -7091,6 +7205,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("lower bound below 1"), "{e}");
+    }
+
+    // ── GQL path restrictors (PR 2) ──────────────────────────────────────────
+    // Run over the cyclic fixture (testgen::write_cycle): a→b→c→a triangle plus a
+    // c→b chord. Over `(s{name:'a'})-[:R*1..4]->(x)` the four modes yield a distinct
+    // number of paths — WALK 6, TRAIL 4, SIMPLE 3, ACYCLIC 2 — which is exactly what
+    // sets them apart (see the fixture doc-comment for the per-length enumeration).
+
+    /// Parse + run `q` against a fresh cycle fixture, returning the result or the
+    /// error string, and always cleaning the fixture up.
+    fn cycle_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph) = testgen::write_cycle(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted end-node names of `(s{name:'a'})-[<restrictor>:R*1..4]->(x)`, one entry
+    /// per matched path (duplicates kept), for the given restrictor prefix.
+    fn cycle_ends(tag: &str, restrictor: &str) -> Vec<String> {
+        let q = format!("MATCH {restrictor} (s {{name:'a'}})-[:R*1..4]->(x) RETURN x.name AS n");
+        let mut v: Vec<String> = cycle_result(tag, &q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| r[0].to_display())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn restrictors_distinguish_modes_on_cycle() {
+        // The headline: each mode produces a different path multiset on the cycle.
+        let walk = cycle_ends("exec_gql_r_walk", "WALK");
+        let trail = cycle_ends("exec_gql_r_trail", "TRAIL");
+        let simple = cycle_ends("exec_gql_r_simple", "SIMPLE");
+        let acyclic = cycle_ends("exec_gql_r_acyclic", "ACYCLIC");
+
+        // WALK reuses edges and nodes freely: every walk of length 1..4.
+        assert_eq!(walk, vec!["a", "b", "b", "b", "c", "c"], "WALK");
+        // TRAIL forbids edge reuse: drops the two length-4 walks that repeat an edge.
+        assert_eq!(trail, vec!["a", "b", "b", "c"], "TRAIL");
+        // SIMPLE forbids interior node repeats but lets the walk close at its start
+        // `a`; the second visit to `b` (via the chord) is excluded.
+        assert_eq!(simple, vec!["a", "b", "c"], "SIMPLE");
+        // ACYCLIC forbids every node repeat, so the closing return to `a` is gone too.
+        assert_eq!(acyclic, vec!["b", "c"], "ACYCLIC");
+
+        // …and the counts are all distinct (6, 4, 3, 2).
+        assert_eq!(
+            (walk.len(), trail.len(), simple.len(), acyclic.len()),
+            (6, 4, 3, 2)
+        );
+    }
+
+    #[test]
+    fn bare_star_equals_trail() {
+        // Parity: a bare `*` (no restrictor) must be byte-for-byte today's behaviour,
+        // which is edge-unique = TRAIL. So absence of a restrictor ≡ explicit TRAIL.
+        let bare = cycle_ends("exec_gql_r_bare", "");
+        let trail = cycle_ends("exec_gql_r_bare_trail", "TRAIL");
+        assert_eq!(bare, trail, "bare * must equal explicit TRAIL");
+        assert_eq!(bare, vec!["a", "b", "b", "c"]);
+    }
+
+    #[test]
+    fn acyclic_excludes_start_that_simple_keeps() {
+        // The one place SIMPLE and ACYCLIC differ on this graph is the cycle-closing
+        // path a→b→c→a: SIMPLE keeps it (endpoints may coincide), ACYCLIC drops it.
+        let simple = cycle_ends("exec_gql_r_se_simple", "SIMPLE");
+        let acyclic = cycle_ends("exec_gql_r_se_acyclic", "ACYCLIC");
+        assert!(
+            simple.contains(&"a".to_string()),
+            "SIMPLE keeps the closed cycle"
+        );
+        assert!(
+            !acyclic.contains(&"a".to_string()),
+            "ACYCLIC drops the closed cycle"
+        );
+    }
+
+    #[test]
+    fn restrictor_requires_variable_length() {
+        // A restrictor is honoured only where `varlen` owns the uniqueness scope.
+        // On a fixed hop or a node-only pattern it is rejected, not silently ignored.
+        for q in [
+            "MATCH TRAIL (s {name:'a'})-[:R]->(x) RETURN x",
+            "MATCH WALK (n) RETURN n",
+        ] {
+            let e = cycle_result("exec_gql_r_novar", q).unwrap_err();
+            assert!(e.contains("variable-length relationship"), "{q}: {e}");
+        }
+    }
+
+    #[test]
+    fn restrictor_over_quantified_group_rejected() {
+        // The grammar accepts `TRAIL ((…)){m,n}` but lowering rejects it: the group
+        // desugars into separate expansions that cannot share one uniqueness scope.
+        let e = cycle_result(
+            "exec_gql_r_quant",
+            "MATCH TRAIL (s {name:'a'}) ((x)-[:R]->(y)){1,2} (z) RETURN z",
+        )
+        .unwrap_err();
+        assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
     }
 
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────

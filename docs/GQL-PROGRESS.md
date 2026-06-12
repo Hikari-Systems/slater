@@ -15,19 +15,18 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 
 ## NEXT ACTION
 
-> **Resume at PR 2 — path restrictors WALK / TRAIL / ACYCLIC / SIMPLE.**
-> Use the "Resume → PR 2" prompt in GQL-PLAN.md §4. Before any new work, run the
-> green-state gate. New branch: `gql-path-restrictors`.
-> Heed PR 2's central design decision (GQL-PLAN.md §2): scope restrictors to
-> variable-length `-[*]-` patterns where `varlen` already owns the `used` edge set;
-> reject restrictor-over-quantified-group for now.
+> **Resume at PR 3 — shortest-path selectors ANY SHORTEST / ALL SHORTEST / SHORTEST k.**
+> Use the "Resume → PR 3" prompt in GQL-PLAN.md §4. Before any new work, run the
+> green-state gate. New branch: `gql-shortest-selectors`.
+> Generalise `eval_shortest_path` (exec.rs ~3127) and drive it from a *selected*
+> MATCH pattern; keep `shortestPath()` delegating to the same single BFS core.
 
 ---
 
 ## PR checklist
 
 - [x] **PR 1 — Quantified path patterns `((…)){m,n}`** — branch `gql-quantified-paths`
-- [ ] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE**
+- [x] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE** — branch `gql-path-restrictors`
 - [ ] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k**
 - [ ] **PR 4 — Label boolean expressions `& | !`** (AST churn)
 - [ ] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs**
@@ -91,6 +90,55 @@ clean; fmt clean.
 - Dual-dialect coverage: GQL↔Cypher parity (`{1,2}`≡`*1..2`, `{2}`≡`*2..2`, multi-hop
   inner ≡ unrolled chain) and dialect *switching* (Cypher `UNION` GQL; Cypher hop +
   GQL group in one pattern).
+
+Committed on branch `gql-quantified-paths` (commit `fa260f1`).
+
+### PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE ✅ (branch `gql-path-restrictors`)
+
+Additive again: the quantifier-free, restrictor-free hot path is byte-for-byte
+unchanged. Full suite green: **372 passed** (362 pre-existing + 10 new); clippy
+clean; fmt clean.
+
+**Approach (so PR 3+ build on it correctly):**
+- Grammar: a `path_restrictor` rule (`kw_walk`/`kw_trail`/`kw_acyclic`/`kw_simple`)
+  prefixed on `match_pattern` only (`MATCH TRAIL (a)-[:R*]->(b)`). It sits at the head
+  of the pattern, never inside `(…)`, so a node variable spelled `walk` is unaffected.
+- AST: `ast::PathRestrictor` (`Walk`|`Trail`|`Acyclic`|`Simple`) + additive
+  `Pattern.restrictor: Option<PathRestrictor>`. `None` = no explicit restrictor; all
+  other Pattern construction sites pass `None` (or carry it through, in
+  `reverse_pattern`).
+- Executor: `expand_chain` reads `pattern.restrictor` at a variable-length hop and
+  threads a `WalkMode` into `varlen`. `walk_mode` folds `None` onto `Trail` because
+  slater's `*` has always been edge-unique — so absence ≡ explicit `TRAIL` and only
+  `WALK` relaxes. `varlen` gained a node `visited` set (seeded with the walk start)
+  for `ACYCLIC`/`SIMPLE`; node-uniqueness implies edge-uniqueness, so those modes skip
+  the `used` edge set entirely and `Trail` keeps only `used` — each mode's per-hop
+  cost stays minimal.
+- Guards: a restrictor is honoured only where `varlen` owns the scope, so `apply_match`
+  rejects a restrictor on any pattern with no variable-length relationship (fixed hop
+  or node-only) with a clear message rather than silently ignoring it.
+
+**Design decisions / limitations (carried forward, see DECISIONS D36):**
+- **Scoped to the variable-length walk.** Restrictors over fixed-length chains are
+  rejected (later work). Multiple varlen relationships in one pattern each get an
+  independent uniqueness scope, not one spanning the whole path.
+- **Restrictor over a quantified group rejected** at lowering (PR 1's desugaring can't
+  share a uniqueness scope across the separate fixed-length expansions).
+- **`SIMPLE` vs `ACYCLIC`.** `ACYCLIC` forbids every repeated node (endpoints
+  included); `SIMPLE` forbids interior repeats but lets the two endpoints coincide (a
+  single closed cycle) — the closing hop is emitted but not extended.
+
+**Tests (all green):**
+- Parser (`parser.rs`): `lowers_path_restrictors`, `absent_restrictor_is_none`,
+  `restrictor_lowercase_accepted`, `restrictor_does_not_shadow_node_var`,
+  `restrictor_over_quantified_rejected`.
+- Exec (`exec.rs`): `restrictors_distinguish_modes_on_cycle` (the headline — WALK 6,
+  TRAIL 4, SIMPLE 3, ACYCLIC 2 paths on a triangle+chord cycle, all distinct),
+  `bare_star_equals_trail` (parity: a bare `*` ≡ explicit `TRAIL`),
+  `acyclic_excludes_start_that_simple_keeps`, `restrictor_requires_variable_length`,
+  `restrictor_over_quantified_group_rejected`.
+- New fixture `testgen::write_cycle`: three `:N` nodes, reltype `R`, a→b→c→a triangle
+  plus a c→b chord — the minimal graph that tells all four modes apart.
 
 **Not yet committed** as of this entry — the branch holds the working tree; commit
 before clearing context.
