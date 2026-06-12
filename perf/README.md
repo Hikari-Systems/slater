@@ -11,6 +11,9 @@ performance gap, measured on the "pole" Manchester crime graph (61,521 nodes /
 - **`bench.py`** — the benchmark. Measures each query uncached (varying Bolt param,
   real execution) and cached (slater result-cache hit), with an optional Neo4j
   parity column.
+- **`cross-engine/`** — the four-engine comparison (slater / Neo4j / Memgraph /
+  FalkorDB), mean of 5 runs with a container restart before each. Produces the
+  "Cross-engine comparison" table in `PERF_PROGRESS.md`. See `cross-engine/README.md`.
 
 ## Quick start
 

@@ -341,6 +341,64 @@ volumes:
 
 ---
 
+## Benchmarking
+
+The source repo ships a small, low-ceremony benchmark under `perf/` — a **smoke
+test, not a rigorous evaluation.** It runs a handful of representative read shapes
+(counts, an indexed lookup, 1–3 hop traversals, a group-by aggregation, an
+unindexed substring scan) on a small sample graph, against **slater, Neo4j 5,
+Memgraph, and FalkorDB** running the identical queries. It answers "do basic
+searches return correctly and run in a sensible time on a sample set?" — single
+client, one node, latency only — and is **not** a throughput benchmark to size a
+deployment from.
+
+The sample crime graph is **tiny** (~62k nodes / ~106k relationships) and fully
+resident in RAM for all four engines, so the per-query times are largely
+in-memory and depend heavily on available memory. The latencies are close enough
+that the **memory footprint, not the milliseconds, is the real story.** Method:
+each engine is restarted before every run, then warmed (full-graph scans +
+per-query warm-ups) before 25 measured queries give a median; figures are the mean
+of 5 such runs.
+
+**Resident memory while serving the run:**
+
+| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| **peak RSS** | **~82 MiB** | ~774 MiB | ~115 MiB | ~140 MiB |
+| steady-state RSS | ~77 MiB | ~772 MiB | ~113 MiB | ~138 MiB |
+
+slater is the smallest footprint (on this toy graph only ~1.4–1.7× under the
+in-memory engines, ~9× under Neo4j), and — unlike the others — it is bounded by
+the cache budgets you set (here 64 + 32 MiB) and **stays flat as the graph grows**
+rather than scaling with the data.
+
+**Latency** (median, milliseconds). The mark sits on **slater**: 🟢 = slater is the
+fastest of the four, ⚪ = slater ties for fastest (within 25%), no mark = another
+engine is faster:
+
+| query shape | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| `count(*)` all nodes | **~0.6 🟢** | ~6.0 | ~3.5 | ~3.6 |
+| label count | **~0.6 🟢** | ~4.3 | ~4.2 | ~2.0 |
+| indexed point lookup | **~0.6 ⚪** | ~4.2 | ~0.5 | ~0.5 |
+| indexed-equality count | ~1.5 | ~3.0 | ~1.0 | ~0.6 |
+| 1-hop traversal | ~2.4 | ~6.9 | ~1.4 | ~0.8 |
+| 2-hop traversal | ~1.5 | ~5.5 | ~1.4 | ~1.0 |
+| group-by aggregation | **~2.8 🟢** | ~9.4 | ~7.2 | ~3.9 |
+| 3-hop traversal | ~1.6 | ~3.9 | ~2.0 | ~1.0 |
+| unindexed substring scan | ~9.0 | ~5.7 | ~7.4 | ~3.4 |
+| `count(DISTINCT …)` | **~2.8 🟢** | ~7.7 | ~6.8 | ~4.5 |
+
+slater wins the count / aggregation / `DISTINCT` shapes outright, ties for fastest
+on the indexed point lookup, beats Neo4j on every row, and **trails Memgraph and
+especially FalkorDB on raw multi-hop traversals and the substring scan** (they hold
+the whole graph in RAM). No engine wins everything; on a dataset this small the
+latencies are close and the memory footprint is the durable difference. See
+[`perf/`](https://github.com/Hikari-Systems/slater/tree/main/perf)
+(`PERF_PROGRESS.md`) in the repository for the harness and methodology.
+
+---
+
 ## Tags
 
 - `:latest` — the most recent release.
