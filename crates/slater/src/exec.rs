@@ -53,6 +53,12 @@ use graph_format::{columns, nodelabels, topology};
 /// upper bounds (`*1..3`) are honoured exactly; only the open-ended case is capped.
 const MAX_VARLEN_HOPS: u32 = 15;
 
+/// A GQL quantified path group `((…)){m,n}` is desugared into the union of its
+/// fixed-length expansions (one ordinary pattern per repetition count). This caps
+/// the total hops a single group may unroll to, so `{1,1000}` over a multi-hop
+/// inner pattern can't generate an enormous pattern set.
+const QUANT_MAX_UNROLL: usize = 32;
+
 /// User-supplied regex patterns (`=~`, `string.matchRegEx`, `string.replaceRegEx`)
 /// are rejected past this many bytes: no legitimate query pattern approaches 1 KiB,
 /// and the cap bounds compile time before the size limits below even apply.
@@ -841,7 +847,7 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let pat = &m.patterns[0];
-        if !pat.rels.is_empty() {
+        if !pat.rels.is_empty() || pat.segments.is_some() {
             return Ok(None); // single-node patterns only
         }
         let node = &pat.start;
@@ -954,7 +960,7 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let pat = &m.patterns[0];
-        if !pat.rels.is_empty() {
+        if !pat.rels.is_empty() || pat.segments.is_some() {
             return Ok(None); // single-node patterns only
         }
         let node = &pat.start;
@@ -1180,6 +1186,12 @@ impl<'g> Engine<'g> {
         if let Some(t) = self.try_stream_match(&table, m, cap)? {
             return Ok(t);
         }
+        // GQL quantified path patterns (`((…)){m,n}`) take a separate path that
+        // desugars each group into the union of its fixed-length expansions. The
+        // common (quantifier-free) case stays on the hot path below untouched.
+        if m.patterns.iter().any(|p| p.segments.is_some()) {
+            return self.apply_match_quantified(table, m, cap);
+        }
         // Variables this clause newly introduces, appended to the scope in order.
         let mut new_vars: Vec<String> = Vec::new();
         for p in &m.patterns {
@@ -1232,6 +1244,96 @@ impl<'g> Engine<'g> {
         })
     }
 
+    /// `MATCH` containing one or more GQL quantified path patterns
+    /// (`((…)){m,n}`). Each source pattern is desugared into the union of its
+    /// fixed-length expansions (`expand_quantified_pattern`); the cartesian product
+    /// of the per-pattern alternatives gives the conjunctive pattern-lists to run.
+    /// Every alternative introduces the same named variables (boundary nodes only —
+    /// group-internal nodes/relationships are anonymised), so the output column set
+    /// is well defined. Each expansion is an ordinary (`segments: None`) pattern, so
+    /// it reuses the full matcher, including edge-uniqueness, `node_ok`, the
+    /// intermediate budget, and the deadline.
+    ///
+    /// Semantics: as with Cypher variable-length, one row is emitted per matching
+    /// path, so two repetition counts that bind the same boundary nodes produce two
+    /// rows (add `DISTINCT` to collapse them) — exactly what `-[*1..2]-` does.
+    fn apply_match_quantified(
+        &self,
+        table: Table,
+        m: &MatchClause,
+        cap: Option<usize>,
+    ) -> Result<Table> {
+        let alts: Vec<Vec<Pattern>> = m
+            .patterns
+            .iter()
+            .map(expand_quantified_pattern)
+            .collect::<Result<_>>()?;
+        let combos = cartesian_patterns(&alts);
+        debug_assert!(
+            !combos.is_empty(),
+            "every quantified group has ≥1 expansion"
+        );
+
+        // New variables are identical across combos by construction; derive from the
+        // first so the column layout matches every expansion.
+        let mut new_vars: Vec<String> = Vec::new();
+        for p in &combos[0] {
+            collect_pattern_vars(p, &table.cols, &mut new_vars);
+        }
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(new_vars.iter().cloned());
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            if cap.is_some_and(|c| out_rows.len() >= c) {
+                break;
+            }
+            self.check_deadline()?;
+            let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
+            for (c, v) in table.cols.iter().zip(row) {
+                seed.insert(c.clone(), v.clone());
+            }
+            // Accumulate all expansions' matches for this seed row before emitting,
+            // so OPTIONAL's "no match" test sees every alternative.
+            let mut matches: Vec<HashMap<String, Val>> = Vec::new();
+            let remaining = cap.map(|c| c.saturating_sub(out_rows.len()));
+            for combo in &combos {
+                if remaining.is_some_and(|r| matches.len() >= r) {
+                    break;
+                }
+                self.match_patterns(
+                    combo,
+                    0,
+                    seed.clone(),
+                    m.where_.as_ref(),
+                    &mut matches,
+                    remaining,
+                )?;
+            }
+
+            if matches.is_empty() && m.optional {
+                let mut r = row.clone();
+                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                out_rows.push(r);
+            } else {
+                for b in matches {
+                    if cap.is_some_and(|c| out_rows.len() >= c) {
+                        break;
+                    }
+                    let mut r = row.clone();
+                    for v in &new_vars {
+                        r.push(b.get(v).cloned().unwrap_or(Val::Null));
+                    }
+                    out_rows.push(r);
+                }
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
     /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
     /// variable, anchor not already bound) directly into output rows, returning
     /// the new table or `None` when the pattern needs the general matcher.
@@ -1254,7 +1356,7 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let p = &m.patterns[0];
-        if !p.rels.is_empty() || p.path_var.is_some() {
+        if !p.rels.is_empty() || p.path_var.is_some() || p.segments.is_some() {
             return Ok(None);
         }
         let start = &p.start;
@@ -4791,7 +4893,126 @@ fn reverse_pattern(p: &Pattern) -> Pattern {
         path_var: None,
         start: new_start,
         rels: new_rels,
+        segments: None,
     }
+}
+
+/// Desugar a pattern that may contain GQL quantified groups into one or more
+/// ordinary (`segments: None`) patterns whose union is equivalent. A pattern with
+/// no groups returns `[clone]`. Each quantified group `((inner)){m,n}` contributes
+/// one alternative per repetition count `k ∈ [m, n]`; the alternatives across all
+/// segments are combined as a cartesian product so a pattern with two groups yields
+/// every (k₁, k₂) length pairing.
+///
+/// Only finite, `m ≥ 1` bounds are supported for now; unbounded (`+`, `*`, `{m,}`)
+/// and zero-length (`{0,n}`) groups are rejected with a clear message rather than
+/// silently mishandled.
+fn expand_quantified_pattern(p: &Pattern) -> Result<Vec<Pattern>> {
+    let Some(segments) = &p.segments else {
+        return Ok(vec![p.clone()]);
+    };
+    // Alternative `rels` chains accumulated left-to-right across segments.
+    let mut chains: Vec<Vec<(RelPat, NodePat)>> = vec![Vec::new()];
+    for seg in segments {
+        let seg_alts: Vec<Vec<(RelPat, NodePat)>> = match seg {
+            Segment::Hop(rel, node) => vec![vec![(rel.clone(), node.clone())]],
+            Segment::Quantified {
+                inner,
+                bounds,
+                exit,
+            } => {
+                let min = bounds.min.unwrap_or(0);
+                let Some(max) = bounds.max else {
+                    bail!(
+                        "an unbounded quantified path pattern ('+', '*' or '{{m,}}') is not yet \
+                         supported; use a finite upper bound such as {{1,5}}"
+                    );
+                };
+                if min < 1 {
+                    bail!(
+                        "a quantified path pattern with a lower bound below 1 ('{{0,n}}', '*') \
+                         is not yet supported; use {{1,n}}"
+                    );
+                }
+                if max < min {
+                    bail!("quantified path pattern upper bound {max} is below lower bound {min}");
+                }
+                if (max as usize).saturating_mul(inner.len()) > QUANT_MAX_UNROLL {
+                    bail!(
+                        "quantified path pattern unrolls to more than {QUANT_MAX_UNROLL} hops; \
+                         tighten the bounds"
+                    );
+                }
+                (min..=max).map(|k| repeat_inner(inner, k, exit)).collect()
+            }
+        };
+        let mut next = Vec::with_capacity(chains.len() * seg_alts.len());
+        for c in &chains {
+            for a in &seg_alts {
+                let mut nc = c.clone();
+                nc.extend(a.iter().cloned());
+                next.push(nc);
+            }
+        }
+        chains = next;
+    }
+    Ok(chains
+        .into_iter()
+        .map(|rels| Pattern {
+            path_var: None,
+            start: p.start.clone(),
+            rels,
+            segments: None,
+        })
+        .collect())
+}
+
+/// `k` (≥1) copies of a quantified group's inner relationship chain, with every
+/// intermediate node and relationship variable anonymised (group-internal bindings
+/// aren't exposed) and the final node replaced by `exit` (the node written after
+/// the group). Node labels/properties on inner nodes are preserved so per-hop
+/// constraints still apply; only the variable name is dropped.
+fn repeat_inner(inner: &[(RelPat, NodePat)], k: u32, exit: &NodePat) -> Vec<(RelPat, NodePat)> {
+    let total = inner.len() * k as usize;
+    let mut out = Vec::with_capacity(total);
+    for _copy in 0..k {
+        for (rel, node) in inner {
+            let mut rel = rel.clone();
+            rel.var = None;
+            let is_last = out.len() + 1 == total;
+            let node = if is_last {
+                exit.clone()
+            } else {
+                NodePat {
+                    var: None,
+                    labels: node.labels.clone(),
+                    props: node.props.clone(),
+                }
+            };
+            out.push((rel, node));
+        }
+    }
+    out
+}
+
+/// Cartesian product of per-pattern alternatives: given each source pattern's list
+/// of desugared expansions, produce every conjunctive pattern-list (one expansion
+/// chosen per source pattern). With no quantified patterns each inner list is a
+/// singleton, so the result is the single original pattern-list.
+fn cartesian_patterns(alts: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
+    let mut combos: Vec<Vec<Pattern>> = vec![Vec::new()];
+    for alt in alts {
+        let mut next = Vec::with_capacity(combos.len() * alt.len().max(1));
+        for c in &combos {
+            for p in alt {
+                let mut nc = c.clone();
+                nc.push(p.clone());
+                next.push(nc);
+            }
+        }
+        combos = next;
+    }
+    combos
 }
 
 fn flip_dir(d: Direction) -> Direction {
@@ -6718,6 +6939,158 @@ mod tests {
         assert_eq!(render(&res.rows[0][0]), "[0,1,2]");
         assert_eq!(render(&res.rows[0][1]), "[0,1]");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── GQL quantified path patterns ─────────────────────────────────────────
+    // Graph (write_basic): KNOWS = Alice→Bob, Bob→Carol, Alice→Carol;
+    // WORKS_AT = Alice→Acme, Carol→Globex.
+
+    /// Run a query against the basic fixture, returning the result or the error
+    /// string (and always cleaning the fixture up).
+    fn run_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph, _) = testgen::write_basic(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted first-column display strings for a query that must succeed.
+    fn gql_col0(tag: &str, q: &str) -> Vec<String> {
+        let mut v: Vec<String> = run_result(tag, q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| r[0].to_display())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn quantified_path_equals_varlength() {
+        // The GQL group `((x)-[:KNOWS]->(y)){1,2}` is the cross-dialect equivalent
+        // of Cypher's `-[:KNOWS*1..2]->`; both must yield the same multiset of end
+        // nodes (Bob, Carol via 1 hop; Carol again via Alice→Bob→Carol).
+        let gql = gql_col0(
+            "exec_gql_q_vs_vl_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){1,2} (b:Person) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_q_vs_vl_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(b:Person) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Bob", "Carol", "Carol"]);
+        assert_eq!(gql, cypher, "GQL quantifier must match Cypher var-length");
+    }
+
+    #[test]
+    fn quantified_exact_equals_fixed_varlength() {
+        // `{2}` is exactly `*2..2`: the only 2-hop KNOWS path from Alice ends at Carol.
+        let gql = gql_col0(
+            "exec_gql_exact_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){2} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_exact_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*2..2]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Carol"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_multi_hop_inner_matches_unrolled() {
+        // A two-relationship inner sub-path repeated once equals the unrolled Cypher
+        // chain `-[:KNOWS]->()-[:WORKS_AT]->()`: Alice→Carol→Globex (Bob has no
+        // WORKS_AT edge).
+        let gql = gql_col0(
+            "exec_gql_multi_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)-[:WORKS_AT]->(z)){1} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_multi_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->()-[:WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Globex"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_dialect_switch_across_union() {
+        // One query, two dialects: a Cypher branch UNIONed with a GQL branch. The
+        // Cypher branch returns Alice's direct KNOWS (Bob, Carol); the GQL `{2}`
+        // branch returns the 2-hop end (Carol); UNION de-dups to {Bob, Carol}.
+        let rows = gql_col0(
+            "exec_gql_union",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name AS b \
+             UNION \
+             MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){2} (b) RETURN b.name AS b",
+        );
+        assert_eq!(rows, vec!["Bob", "Carol"]);
+    }
+
+    #[test]
+    fn quantified_mixed_with_plain_hop() {
+        // A plain Cypher hop and a GQL group in the SAME pattern: Alice -KNOWS-> m
+        // then one more KNOWS to b. Only Alice→Bob→Carol qualifies (Carol has no
+        // outgoing KNOWS), so b = Carol — same as the unrolled 2-hop Cypher chain.
+        let gql = gql_col0(
+            "exec_gql_mixed_g",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(m) ((x)-[:KNOWS]->(y)){1} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_mixed_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->()-[:KNOWS]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Carol"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_count_bypasses_fast_path() {
+        // `count(*)` over a quantified pattern must NOT take the single-node count
+        // fast path (which keys off empty `rels`); the segments guard routes it to
+        // the general matcher, counting all three matching paths.
+        let res = run_result(
+            "exec_gql_count",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){1,2} (b) RETURN count(*) AS c",
+        )
+        .unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(3)),
+            "{:?}",
+            res.rows[0][0]
+        );
+    }
+
+    #[test]
+    fn quantified_unbounded_rejected() {
+        for q in [
+            "MATCH (a) ((x)-[:KNOWS]->(y))+ (b) RETURN b",
+            "MATCH (a) ((x)-[:KNOWS]->(y))* (b) RETURN b",
+            "MATCH (a) ((x)-[:KNOWS]->(y)){1,} (b) RETURN b",
+        ] {
+            let e = run_result("exec_gql_unbounded", q).unwrap_err();
+            assert!(
+                e.contains("unbounded") || e.contains("lower bound"),
+                "{q}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantified_zero_lower_bound_rejected() {
+        let e = run_result(
+            "exec_gql_zero",
+            "MATCH (a) ((x)-[:KNOWS]->(y)){0,2} (b) RETURN b",
+        )
+        .unwrap_err();
+        assert!(e.contains("lower bound below 1"), "{e}");
     }
 
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────

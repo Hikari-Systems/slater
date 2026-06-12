@@ -178,6 +178,32 @@ pub mod ast {
         pub path_var: Option<String>,
         pub start: NodePat,
         pub rels: Vec<(RelPat, NodePat)>,
+        /// `None` for an ordinary pattern (the whole chain lives in `rels`). `Some`
+        /// only when the pattern contains a GQL quantified path group
+        /// (`((…)){m,n}`); then `rels` is empty and the ordered element sequence —
+        /// plain hops interleaved with quantified groups — lives here. The executor
+        /// desugars these into ordinary (`segments: None`) patterns before matching
+        /// (`expand_quantified_pattern`), so every consumer of `rels` is unaffected
+        /// when `segments` is `None`.
+        pub segments: Option<Vec<Segment>>,
+    }
+
+    /// One element of a quantified [`Pattern`], in chain order. A `Hop` is an
+    /// ordinary relationship + its end node; a `Quantified` group is an inner
+    /// relationship sub-chain repeated `bounds` times, terminating at `exit` (the
+    /// node written after the group's closing `)`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Segment {
+        Hop(RelPat, NodePat),
+        Quantified {
+            /// The inner sub-path's relationship chain (excluding its leading node,
+            /// which juxtaposes with the preceding element's node).
+            inner: Vec<(RelPat, NodePat)>,
+            bounds: VarLength,
+            /// The node following the group; the last node of the last repetition
+            /// unifies with it.
+            exit: NodePat,
+        },
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -820,7 +846,7 @@ fn lower_match_clause(pair: Pair<Rule>) -> Result<MatchClause> {
     let mut where_ = None;
     for child in kids(pair) {
         match child.as_rule() {
-            Rule::pattern => patterns.push(lower_pattern(child)?),
+            Rule::match_pattern => patterns.push(lower_match_pattern(child)?),
             Rule::where_clause => where_ = Some(lower_expr(only_child(child)?)?),
             other => bail!("internal: unexpected match child {other:?}"),
         }
@@ -965,7 +991,171 @@ fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
         path_var,
         start,
         rels: chain,
+        segments: None,
     })
+}
+
+/// Lower a `match_pattern` (a `pattern` that may contain GQL quantified groups).
+/// When no quantified group is present this is exactly [`lower_pattern`]'s result
+/// (`segments: None`); when one or more groups appear, the ordered element
+/// sequence is captured in `segments` and `rels` is left empty for the executor to
+/// desugar.
+fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
+    let mut path_var = None;
+    let mut start: Option<NodePat> = None;
+    // Pending relationship awaiting its end node, so we can pair `(connector, node)`.
+    let mut pending_rel: Option<RelPat> = None;
+    let mut pending_quant: Option<(Vec<(RelPat, NodePat)>, VarLength)> = None;
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut has_quant = false;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::path_var => path_var = Some(ident_text(child)?),
+            Rule::node_pattern => {
+                let node = lower_node_pattern(child)?;
+                if start.is_none() {
+                    start = Some(node);
+                } else if let Some((inner, bounds)) = pending_quant.take() {
+                    segments.push(Segment::Quantified {
+                        inner,
+                        bounds,
+                        exit: node,
+                    });
+                } else if let Some(rel) = pending_rel.take() {
+                    segments.push(Segment::Hop(rel, node));
+                } else {
+                    bail!("internal: pattern node without a preceding connector");
+                }
+            }
+            Rule::rel_pattern => pending_rel = Some(lower_rel_pattern(child)?),
+            Rule::quantified_path => {
+                has_quant = true;
+                pending_quant = Some(lower_quantified_path(child)?);
+            }
+            other => bail!("internal: unexpected match_pattern child {other:?}"),
+        }
+    }
+
+    let start = start.ok_or_else(|| anyhow::anyhow!("pattern has no node"))?;
+
+    if !has_quant {
+        // Plain pattern: fold the `Hop` segments back into the ordinary `rels`
+        // chain so the existing `segments: None` machinery handles it verbatim.
+        let rels = segments
+            .into_iter()
+            .map(|s| match s {
+                Segment::Hop(r, n) => Ok((r, n)),
+                Segment::Quantified { .. } => {
+                    bail!("internal: quantified segment without has_quant flag")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Pattern {
+            path_var,
+            start,
+            rels,
+            segments: None,
+        });
+    }
+
+    // Quantified patterns can't yet bind a whole-path variable (the desugaring
+    // discards intermediate nodes, so a reconstructed `Path` would be incomplete).
+    if path_var.is_some() {
+        bail!("a path variable over a quantified path pattern is not yet supported");
+    }
+    Ok(Pattern {
+        path_var: None,
+        start,
+        rels: Vec::new(),
+        segments: Some(segments),
+    })
+}
+
+/// Lower `quantified_path = "(" quantified_inner ")" quantifier_bounds` into the
+/// inner relationship chain plus its repetition bounds. The inner sub-path's
+/// leading node juxtaposes with the preceding element's node, so labels/properties
+/// on it would have to be enforced at every junction — not yet supported, so they
+/// are rejected here rather than silently dropped.
+fn lower_quantified_path(pair: Pair<Rule>) -> Result<(Vec<(RelPat, NodePat)>, VarLength)> {
+    let mut inner: Vec<(RelPat, NodePat)> = Vec::new();
+    let mut bounds: Option<VarLength> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::quantified_inner => {
+                let mut nodes = Vec::new();
+                let mut rels = Vec::new();
+                for d in child.into_inner() {
+                    match d.as_rule() {
+                        Rule::node_pattern => nodes.push(lower_node_pattern(d)?),
+                        Rule::rel_pattern => rels.push(lower_rel_pattern(d)?),
+                        other => bail!("internal: unexpected quantified_inner child {other:?}"),
+                    }
+                }
+                let mut nodes = nodes.into_iter();
+                let first = nodes
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("quantified group has no node"))?;
+                if !first.labels.is_empty() || !first.props.is_empty() {
+                    bail!(
+                        "labels or properties on the first node of a quantified path \
+                         group are not yet supported"
+                    );
+                }
+                for (rel, node) in rels.into_iter().zip(nodes) {
+                    inner.push((rel, node));
+                }
+            }
+            Rule::quantifier_bounds => bounds = Some(lower_quantifier_bounds(child)?),
+            other => bail!("internal: unexpected quantified_path child {other:?}"),
+        }
+    }
+    let bounds = bounds.ok_or_else(|| anyhow::anyhow!("quantified group has no bounds"))?;
+    Ok((inner, bounds))
+}
+
+/// Lower `quantifier_bounds` (`{m}` / `{m,n}` / `{m,}` / `{,n}` / `+` / `*`) into a
+/// [`VarLength`]. `+` is `{1,}`, `*` is `{0,}`; an absent bound is `None` (open).
+fn lower_quantifier_bounds(pair: Pair<Rule>) -> Result<VarLength> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::exact_bound => {
+            let n = parse_u32(only_child(inner)?)?;
+            Ok(VarLength {
+                min: Some(n),
+                max: Some(n),
+            })
+        }
+        Rule::range_bound => {
+            let mut min = None;
+            let mut max = None;
+            for d in inner.into_inner() {
+                match d.as_rule() {
+                    Rule::quant_lo => min = Some(parse_u32(only_child(d)?)?),
+                    Rule::quant_hi => max = Some(parse_u32(only_child(d)?)?),
+                    other => bail!("internal: unexpected range_bound child {other:?}"),
+                }
+            }
+            Ok(VarLength { min, max })
+        }
+        Rule::plus_bound => Ok(VarLength {
+            min: Some(1),
+            max: None,
+        }),
+        Rule::star_bound => Ok(VarLength {
+            min: Some(0),
+            max: None,
+        }),
+        other => bail!("internal: unexpected quantifier_bounds child {other:?}"),
+    }
+}
+
+/// Parse a non-negative `integer` token used as a quantifier bound.
+fn parse_u32(pair: Pair<Rule>) -> Result<u32> {
+    pair.as_str()
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid quantifier bound '{}'", pair.as_str()))
 }
 
 fn lower_node_pattern(pair: Pair<Rule>) -> Result<NodePat> {
@@ -1512,6 +1702,7 @@ fn lower_pattern_predicate(pair: Pair<Rule>) -> Result<Expr> {
         path_var: None,
         start,
         rels: chain,
+        segments: None,
     })))
 }
 
@@ -2311,6 +2502,122 @@ mod tests {
             panic!("expected a MATCH clause");
         };
         assert_eq!(m.patterns[0].path_var.as_deref(), Some("p"));
+    }
+
+    // ── GQL quantified path patterns ─────────────────────────────────────────
+
+    /// Pull the first pattern out of a single-MATCH query.
+    fn first_pattern(q: &Query) -> &Pattern {
+        let Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a MATCH clause");
+        };
+        &m.patterns[0]
+    }
+
+    #[test]
+    fn ordinary_pattern_has_no_segments() {
+        // A quantifier-free pattern lowers exactly as before: the whole chain lives
+        // in `rels` and `segments` stays `None`, so the hot path is untouched.
+        let p = &ok("MATCH (a:Person)-[:KNOWS]->(b) RETURN b").head;
+        let Clause::Match(m) = &p.reading[0] else {
+            panic!("expected MATCH");
+        };
+        assert!(m.patterns[0].segments.is_none());
+        assert_eq!(m.patterns[0].rels.len(), 1);
+    }
+
+    #[test]
+    fn lowers_quantified_range() {
+        let q = ok("MATCH (a:Person) ((x)-[:KNOWS]->(y)){1,3} (b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("a"));
+        assert!(p.rels.is_empty(), "quantified pattern keeps rels empty");
+        let segs = p.segments.as_ref().expect("segments populated");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::Quantified {
+                inner,
+                bounds,
+                exit,
+            } => {
+                assert_eq!(inner.len(), 1);
+                assert_eq!(inner[0].0.types, vec!["KNOWS".to_string()]);
+                assert_eq!(inner[0].0.dir, Direction::Outgoing);
+                assert_eq!(bounds.min, Some(1));
+                assert_eq!(bounds.max, Some(3));
+                assert_eq!(exit.var.as_deref(), Some("b"));
+            }
+            other => panic!("expected Quantified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_quantifier_bound_forms() {
+        let cases = [
+            ("{2}", Some(2u32), Some(2u32)),
+            ("{2,5}", Some(2), Some(5)),
+            ("{2,}", Some(2), None),
+            ("{,5}", None, Some(5)),
+            ("+", Some(1), None),
+            ("*", Some(0), None),
+        ];
+        for (q, min, max) in cases {
+            let src = format!("MATCH (a) ((x)-[:R]->(y)){q} (b) RETURN b");
+            let parsed = ok(&src);
+            let p = first_pattern(&parsed);
+            let segs = p.segments.as_ref().unwrap();
+            match &segs[0] {
+                Segment::Quantified { bounds, .. } => {
+                    assert_eq!(bounds.min, min, "min for {q}");
+                    assert_eq!(bounds.max, max, "max for {q}");
+                }
+                other => panic!("expected Quantified for {q}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_multi_hop_quantified_inner() {
+        let q = ok("MATCH (a) ((x)-[:KNOWS]->(y)-[:WORKS_AT]->(z)){1,2} (b) RETURN b");
+        match &first_pattern(&q).segments.as_ref().unwrap()[0] {
+            Segment::Quantified { inner, .. } => {
+                assert_eq!(inner.len(), 2);
+                assert_eq!(inner[0].0.types, vec!["KNOWS".to_string()]);
+                assert_eq!(inner[1].0.types, vec!["WORKS_AT".to_string()]);
+            }
+            other => panic!("expected Quantified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_hop_then_quantified_mixed() {
+        // A plain Cypher hop followed by a GQL quantified group in one pattern:
+        // the element order is preserved as [Hop, Quantified].
+        let q = ok("MATCH (a:Person)-[:KNOWS]->(m) ((x)-[:KNOWS]->(y)){2} (b) RETURN b");
+        let segs = first_pattern(&q).segments.as_ref().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(segs[0], Segment::Hop(_, _)));
+        assert!(matches!(segs[1], Segment::Quantified { .. }));
+    }
+
+    #[test]
+    fn quantified_rejects_path_variable() {
+        let e = err("MATCH p = (a) ((x)-[:R]->(y)){1,2} (b) RETURN p");
+        assert!(e.contains("path variable"), "{e}");
+    }
+
+    #[test]
+    fn quantified_rejects_inner_start_labels() {
+        let e = err("MATCH (a) ((x:Person)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("first node of a quantified"), "{e}");
+    }
+
+    #[test]
+    fn bare_pattern_rejects_quantifier() {
+        // The quantifier lives only in `match_pattern`; shortestPath/EXISTS/pattern
+        // comprehensions use the plain `pattern` rule, so a quantifier there is a
+        // syntax error rather than a silently mis-handled segment.
+        assert!(parse("MATCH (a),(b) WHERE shortestPath(((x)-[:R]->(y)){1,2}) RETURN a").is_err());
     }
 
     #[test]
