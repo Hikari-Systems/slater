@@ -82,10 +82,22 @@ encryption implies.
      or a plaintext image that does not need the key in the first place. There is no
      legitimate keyed-but-unauthenticated deployment — and therefore no knob an attacker with
      config access could flip to reopen the downgrade. Plaintext deployments configure no key.
-   - **Stamp strip: closed by default.** `requireAclStamp` (default **on**) refuses any
-     generation with no `aclBlake3` stamp. It remains a flag (unlike the MAC) because
-     disabling it is the documented escape from the rebuild-every-graph-on-ACL-change
-     contract (limitation 4) — a genuine operational tradeoff, made explicitly.
+   - **Stamp strip: closed under encryption; defence-in-depth in plaintext.**
+     `requireAclStamp` (default **on**) refuses any generation with no `aclBlake3` stamp. It
+     remains a flag (unlike the MAC) because disabling it is the documented escape from the
+     rebuild-every-graph-on-ACL-change contract (limitation 4) — a genuine operational tradeoff,
+     made explicitly. The strength of the stamp depends on whether the image is authenticated:
+     in an **encrypted + MAC'd** image the MAC covers `aclBlake3`, so a strip invalidates the
+     MAC and is refused unconditionally — the stamp is genuinely *tamper-proof* there, and
+     `requireAclStamp` is in fact redundant for closing the strip (it still earns its keep by
+     refusing legitimately-unstamped images and catching deploy-time skew). In a **plaintext**
+     image the whole manifest is unauthenticated: a data-dir attacker can strip the stamp, or
+     re-stamp it against an `acl.json` they also control, or simply rewrite the data — so
+     `requireAclStamp` there is a tripwire resting on filesystem permissions, **not** a
+     cryptographic guarantee. For a hard guarantee, encrypt. This is also why no in-manifest
+     "must-enforce-the-stamp" flag would help: an unauthenticated flag is equally strippable,
+     and an authenticated one (MAC-covered) is redundant with the MAC that already makes the
+     stamp tamper-proof.
 2. **Plaintext images have no manifest authenticity.** With no master key there is no MAC;
    such images are guarded only by the copy-completeness hash. Use `--encrypt` for authenticity.
 3. **Runtime trust boundary for `acl.json`.** The stamp is now re-verified on every

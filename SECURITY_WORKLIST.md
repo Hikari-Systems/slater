@@ -71,6 +71,11 @@ authenticated principals over Bolt).
   reopen the strip downgrade; plaintext deployments simply configure no key).
   `requireAclStamp` now defaults **on**; it stays a flag because disabling it is the
   documented escape from rebuild-on-every-ACL-change (`THREAT_MODEL.md` limitation 4).
+  *Considered and rejected (2026-06-12):* a manifest indicator that would forbid
+  `requireAclStamp=false`. It buys nothing — an unauthenticated (plaintext) flag is as
+  strippable as the stamp it guards, and an authenticated (MAC-covered) one is redundant
+  with the MAC, which already makes the stamp tamper-proof. The hard guarantee is "encrypt",
+  not a new field (`THREAT_MODEL.md` limitation 1).
 
 - [ ] **No connection-count / per-IP limits.** The listener accepts unbounded concurrent
   connections. *Action:* document fronting with a proxy/limits, or add a `maxConnections`
