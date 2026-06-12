@@ -12,6 +12,13 @@ use anyhow::{bail, Result};
 /// Largest payload carried by one chunk (the 16-bit length ceiling).
 pub const MAX_CHUNK: usize = u16::MAX as usize;
 
+/// Largest reassembled message body we will accept. A Bolt message is a query
+/// string plus a parameter map; legitimate ones are far smaller than this. The
+/// cap exists so a peer cannot stream chunks endlessly (or withhold the
+/// terminating `00 00`) and drive the reassembly buffer to OOM — a pre-auth
+/// denial-of-service, since this runs before `LOGON`.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Frame a complete message body into chunks plus the terminating `00 00`.
 pub fn encode_message(body: &[u8], out: &mut Vec<u8>) {
     for piece in body.chunks(MAX_CHUNK.max(1)) {
@@ -34,6 +41,12 @@ pub fn frame(body: &[u8]) -> Vec<u8> {
 /// terminator). Returns `Ok(None)` if `buf` does not yet hold a full message —
 /// the caller should read more bytes and retry.
 pub fn decode_message(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
+    decode_message_capped(buf, MAX_MESSAGE_BYTES)
+}
+
+/// As [`decode_message`], but with an explicit body cap (so the cap is unit
+/// testable without building a multi-megabyte buffer).
+fn decode_message_capped(buf: &[u8], max_body: usize) -> Result<Option<(Vec<u8>, usize)>> {
     let mut pos = 0;
     let mut body = Vec::new();
     loop {
@@ -48,6 +61,9 @@ pub fn decode_message(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
         }
         if pos + len > buf.len() {
             return Ok(None); // chunk payload not fully arrived yet
+        }
+        if body.len() + len > max_body {
+            bail!("Bolt message exceeds the {max_body}-byte limit; closing connection");
         }
         body.extend_from_slice(&buf[pos..pos + len]);
         pos += len;
@@ -111,6 +127,21 @@ mod tests {
             .is_none());
         // A lone, incomplete header.
         assert!(decode_message(&[0x00]).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_message_is_refused() {
+        // Two 3-byte chunks (body 6) under a 4-byte cap must error rather than
+        // accumulate — the guard that stops a chunk-flood / withheld-terminator OOM.
+        let mut stream = Vec::new();
+        for _ in 0..2 {
+            stream.extend_from_slice(&3u16.to_be_bytes());
+            stream.extend_from_slice(b"abc");
+        }
+        stream.extend_from_slice(&[0, 0]);
+        assert!(decode_message_capped(&stream, 4).is_err());
+        // The same stream is fine under a cap that admits it.
+        assert!(decode_message_capped(&stream, 64).unwrap().is_some());
     }
 
     #[test]

@@ -20,12 +20,15 @@
 //! large id set is materialised, and that is bounded by index/label selectivity;
 //! the per-row state is a handful of bound ids, and block residency is capped by
 //! the cache budget. Result size is bounded by `max_rows`, traversal time by an
-//! optional wall-clock deadline.
+//! optional wall-clock deadline, and intermediate collections (comprehensions,
+//! `UNWIND`, concatenation, aggregate buffers, varlen paths) by an optional
+//! query-wide element budget (`query.maxIntermediate`).
 //
 // The tokio Bolt listener that drives this (decoding RUN/PULL and PackStream-
 // encoding the rows) is the next M4 increment; allow dead_code until it lands.
 #![allow(dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
@@ -49,6 +52,24 @@ use graph_format::{columns, nodelabels, topology};
 /// so a runaway traversal on a densely connected graph cannot blow up. Explicit
 /// upper bounds (`*1..3`) are honoured exactly; only the open-ended case is capped.
 const MAX_VARLEN_HOPS: u32 = 15;
+
+/// User-supplied regex patterns (`=~`, `string.matchRegEx`, `string.replaceRegEx`)
+/// are rejected past this many bytes: no legitimate query pattern approaches 1 KiB,
+/// and the cap bounds compile time before the size limits below even apply.
+const MAX_REGEX_PATTERN_BYTES: usize = 1024;
+
+/// Compiled-NFA size cap (the regex crate default is 10 MiB). Bounds both the
+/// compile cost and the per-match cost of pathological patterns like nested
+/// bounded repetitions (`(a{100}){100}…`).
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Lazy-DFA cache cap per compiled regex (crate default 2 MiB).
+const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
+
+/// Distinct patterns cached per query; past this, patterns still compile (bounded
+/// by the limits above) but are not retained. The cache exists to kill the
+/// per-row recompile of a constant pattern, so one entry is the common case.
+const REGEX_CACHE_MAX: usize = 64;
 
 /// One fully-resolved traversal step: the edge id, the neighbour reached, the
 /// relationship type, and the edge's *stored* direction (`start`→`end`, which is
@@ -489,6 +510,15 @@ pub struct Engine<'g> {
     deadline: Option<Instant>,
     /// Beam-search list size `L` for the Vamana arm (config `vectorQuery.beamWidth`).
     beam_width: usize,
+    /// Query-wide intermediate-element budget (config `query.maxIntermediate`);
+    /// 0 disables. Charged by every operation that materialises a collection
+    /// (comprehensions, UNWIND, list concat, aggregate buffers, varlen paths), so
+    /// a query cannot grow unbounded memory inside the `timeout_ms` window.
+    max_intermediate: u64,
+    budget_used: Cell<u64>,
+    /// Compiled user regexes, keyed by the final compile string. Engines live for
+    /// one query, so this exists to stop `=~` recompiling its pattern per row.
+    regex_cache: RefCell<HashMap<String, regex::Regex>>,
 }
 
 impl<'g> Engine<'g> {
@@ -501,6 +531,9 @@ impl<'g> Engine<'g> {
             max_rows: usize::MAX,
             deadline: None,
             beam_width: 64,
+            max_intermediate: 0,
+            budget_used: Cell::new(0),
+            regex_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -523,6 +556,13 @@ impl<'g> Engine<'g> {
 
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// Cap the total number of intermediate elements a query may materialise
+    /// (config `query.maxIntermediate`); 0 disables the budget.
+    pub fn with_max_intermediate(mut self, max_intermediate: u64) -> Self {
+        self.max_intermediate = max_intermediate;
         self
     }
 
@@ -662,10 +702,30 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
+    /// Charge `n` elements against the query-wide intermediate budget. Called by
+    /// every operation that materialises a collection, so cumulative (not just
+    /// peak) allocation is bounded — geometric growth like `reduce(acc + acc)`
+    /// trips the budget on an early iteration.
+    fn charge(&self, n: u64) -> Result<()> {
+        if self.max_intermediate == 0 {
+            return Ok(());
+        }
+        let used = self.budget_used.get().saturating_add(n);
+        self.budget_used.set(used);
+        if used > self.max_intermediate {
+            bail!(
+                "query exceeded the intermediate result budget of {} elements (query.maxIntermediate)",
+                self.max_intermediate
+            );
+        }
+        Ok(())
+    }
+
     // ── Entry point ───────────────────────────────────────────────────────
 
     /// Execute a (possibly `UNION`ed) query.
     pub fn run(&self, q: &Query) -> Result<QueryResult> {
+        self.budget_used.set(0); // per-run budget; engines may be reused
         let mut result = self.run_single(&q.head)?;
         for (union_all, part) in &q.tail {
             let next = self.run_single(part)?;
@@ -782,6 +842,7 @@ impl<'g> Engine<'g> {
             for item in items {
                 let mut r = row.clone();
                 r.push(item);
+                self.charge(r.len() as u64)?;
                 out_rows.push(r);
             }
         }
@@ -1643,6 +1704,9 @@ impl<'g> Engine<'g> {
                     return Ok(());
                 }
             }
+            // Charging each emitted binding bounds dense-graph materialisation
+            // (plain MATCH and pattern comprehensions alike) by the query budget.
+            self.charge(1)?;
             out.push(binding);
             return Ok(());
         }
@@ -1858,6 +1922,9 @@ impl<'g> Engine<'g> {
     ) -> Result<()> {
         let (min, max) = bounds;
         if path.len() as u32 >= min {
+            // Each emission clones the hop vector, so charge by path length: on a
+            // dense graph the depth cap alone still permits an enormous result set.
+            self.charge(path.len() as u64 + 1)?;
             out.push((path.clone(), node));
         }
         if path.len() as u32 >= max {
@@ -2193,12 +2260,15 @@ impl<'g> Engine<'g> {
         };
         let arg = &args_slice[0];
 
-        // Evaluate the argument over the group's rows, dropping nulls.
+        // Evaluate the argument over the group's rows, dropping nulls. The buffer
+        // is materialised for every aggregate (not just collect), so it charges
+        // the intermediate budget.
         let mut vals = Vec::new();
         for &i in indices {
             let scope = Scope::Row(&table.cols, &table.rows[i]);
             let v = self.eval(arg, &scope, None)?;
             if !matches!(v, Val::Null) {
+                self.charge(1)?;
                 vals.push(v);
             }
         }
@@ -2291,7 +2361,14 @@ impl<'g> Engine<'g> {
             Expr::Arith(op, l, r) => {
                 let a = self.eval(l, scope, aggs)?;
                 let b = self.eval(r, scope, aggs)?;
-                arith(*op, a, b)
+                let v = arith(*op, a, b)?;
+                // List concatenation is the only arithmetic that materialises a
+                // collection; charging every temp defeats geometric growth like
+                // `reduce(acc = [0], x IN range(1, 60) | acc + acc)`.
+                if let Val::List(xs) = &v {
+                    self.charge(xs.len() as u64)?;
+                }
+                Ok(v)
             }
             Expr::Compare(op, l, r) => {
                 let a = self.eval(l, scope, aggs)?;
@@ -2301,7 +2378,7 @@ impl<'g> Engine<'g> {
             Expr::StringOp(op, l, r) => {
                 let a = self.eval(l, scope, aggs)?;
                 let b = self.eval(r, scope, aggs)?;
-                string_op(*op, &a, &b)
+                self.string_op(*op, &a, &b)
             }
             Expr::In(l, r) => {
                 let a = self.eval(l, scope, aggs)?;
@@ -2831,6 +2908,7 @@ impl<'g> Engine<'g> {
                     continue;
                 }
             }
+            self.charge(1)?;
             out.push(match projection {
                 Some(e) => self.eval(e, &inner, aggs)?,
                 None => item.clone(),
@@ -3051,14 +3129,14 @@ impl<'g> Engine<'g> {
                 _ => bail!("replace() needs three strings"),
             },
             "string.join" => string_join(&args)?,
-            "string.matchregex" => match_regex(&a0(0), &a0(1))?,
+            "string.matchregex" => self.match_regex(&a0(0), &a0(1))?,
             "string.replaceregex" => {
                 let repl = if args.len() >= 3 {
                     a0(2)
                 } else {
                     Val::Str(String::new())
                 };
-                replace_regex(&a0(0), &a0(1), &repl)?
+                self.replace_regex(&a0(0), &a0(1), &repl)?
             }
             "range" => self.range_fn(&args)?,
             "keys" => Val::List(
@@ -3496,12 +3574,39 @@ impl<'g> Engine<'g> {
         if step == 0 {
             bail!("range() step must be non-zero");
         }
-        let mut out = Vec::new();
+        // Bound the result *before* allocating. A naive loop over `range(0,
+        // i64::MAX)` allocates until it OOMs, and the unchecked `i += step` it used
+        // to do wraps on overflow into an infinite loop (the per-query deadline is
+        // not consulted inside this tight loop). Compute the element count in i128
+        // (so `end - start` cannot overflow) and refuse anything past the guardrail.
+        // 1M × ~48 B/element ≈ 48 MB — the lone guard when `query.maxIntermediate`
+        // is disabled, so it is sized for the 100–200 MB deployment envelope.
+        const MAX_RANGE_LEN: i128 = 1_000_000;
+        let count: i128 = {
+            let (s, e, st) = (start as i128, end as i128, step as i128);
+            if (st > 0 && s > e) || (st < 0 && s < e) {
+                0
+            } else {
+                (e - s) / st + 1
+            }
+        };
+        if count > MAX_RANGE_LEN {
+            bail!("range() would produce {count} elements, exceeding the limit of {MAX_RANGE_LEN}");
+        }
+        // Also charge the query-wide budget before allocating, so repeated
+        // near-limit ranges cannot stack up to unbounded memory.
+        self.charge(count as u64)?;
+        let mut out = Vec::with_capacity(count as usize);
         let mut i = start;
         // Inclusive of `end`, matching Cypher.
         while (step > 0 && i <= end) || (step < 0 && i >= end) {
             out.push(Val::Int(i));
-            i += step;
+            // Stop cleanly at the i64 boundary instead of wrapping into an infinite
+            // loop (the count guard above already bounds the iteration otherwise).
+            match i.checked_add(step) {
+                Some(n) => i = n,
+                None => break,
+            }
         }
         Ok(Val::List(out))
     }
@@ -4449,33 +4554,99 @@ fn comparable(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
     }
 }
 
-fn string_op(op: StrOp, a: &Val, b: &Val) -> Result<Val> {
-    let (s, t) = match (a, b) {
-        (Val::Str(s), Val::Str(t)) => (s, t),
-        // `=~` against a null operand is null (three-valued); so are the others.
-        _ => return Ok(Val::Null),
-    };
-    Ok(Val::Bool(match op {
-        StrOp::StartsWith => s.starts_with(t.as_str()),
-        StrOp::EndsWith => s.ends_with(t.as_str()),
-        StrOp::Contains => s.contains(t.as_str()),
-        // `=~` is a full-match: the whole string must match the pattern, mirroring
-        // FalkorDB's `str_MatchRegex` (anchored at both ends). RE2 has no backrefs.
-        StrOp::Regex => regex_full_match(t)?.is_match(s),
-    }))
-}
+// ── User-supplied regexes (`=~` / `string.matchRegEx` / `string.replaceRegEx`) ──
+//
+// Patterns are length-capped, built with explicit NFA / lazy-DFA size limits, and
+// cached per query so a constant pattern compiles once rather than once per row.
+// The regex crate is an RE2-style linear-time engine (no backtracking), so with
+// compile cost and automaton size bounded, match time is bounded too.
+impl<'g> Engine<'g> {
+    /// Compile `pattern`, or fetch it from the per-query cache. `anchored` wraps
+    /// it as `\A(?:…)\z` so `=~` requires the entire subject to match —
+    /// openCypher / FalkorDB `=~` semantics; the unanchored form scans for every
+    /// non-overlapping match anywhere in the subject.
+    fn compiled_regex(&self, pattern: &str, anchored: bool) -> Result<regex::Regex> {
+        if pattern.len() > MAX_REGEX_PATTERN_BYTES {
+            bail!(
+                "regex pattern is {} bytes, exceeding the limit of {MAX_REGEX_PATTERN_BYTES}",
+                pattern.len()
+            );
+        }
+        let key = if anchored {
+            format!(r"\A(?:{pattern})\z")
+        } else {
+            pattern.to_string()
+        };
+        if let Some(re) = self.regex_cache.borrow().get(&key) {
+            return Ok(re.clone());
+        }
+        let re = regex::RegexBuilder::new(&key)
+            .size_limit(REGEX_SIZE_LIMIT)
+            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))?;
+        let mut cache = self.regex_cache.borrow_mut();
+        if cache.len() < REGEX_CACHE_MAX {
+            cache.insert(key, re.clone());
+        }
+        Ok(re)
+    }
 
-// Compile `pattern` anchored as a full-match (`\A(?:…)\z`) so `=~` requires the
-// entire subject to match — openCypher / FalkorDB `=~` semantics.
-fn regex_full_match(pattern: &str) -> Result<regex::Regex> {
-    let anchored = format!(r"\A(?:{pattern})\z");
-    regex::Regex::new(&anchored).map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))
-}
+    fn string_op(&self, op: StrOp, a: &Val, b: &Val) -> Result<Val> {
+        let (s, t) = match (a, b) {
+            (Val::Str(s), Val::Str(t)) => (s, t),
+            // `=~` against a null operand is null (three-valued); so are the others.
+            _ => return Ok(Val::Null),
+        };
+        Ok(Val::Bool(match op {
+            StrOp::StartsWith => s.starts_with(t.as_str()),
+            StrOp::EndsWith => s.ends_with(t.as_str()),
+            StrOp::Contains => s.contains(t.as_str()),
+            // `=~` is a full-match: the whole string must match the pattern,
+            // mirroring FalkorDB's `str_MatchRegex` (anchored at both ends).
+            StrOp::Regex => self.compiled_regex(t, true)?.is_match(s),
+        }))
+    }
 
-// Compile `pattern` for an unanchored scan (`string.matchRegEx`/`replaceRegEx`),
-// which find every non-overlapping match anywhere in the subject.
-fn regex_scan(pattern: &str) -> Result<regex::Regex> {
-    regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("Invalid regex: {e}"))
+    // string.matchRegEx(str, regex) -> list of [full_match, group1, …] per match.
+    // A null operand yields an empty list; non-participating groups become "".
+    fn match_regex(&self, s: &Val, pat: &Val) -> Result<Val> {
+        let (s, pat) = match (s, pat) {
+            (Val::Str(s), Val::Str(p)) => (s, p),
+            (Val::Null, _) | (_, Val::Null) => return Ok(Val::List(vec![])),
+            (Val::Str(_), other) | (other, _) => bail!(
+                "Type mismatch: expected String or Null but was {}",
+                type_name(other)
+            ),
+        };
+        let re = self.compiled_regex(pat, false)?;
+        let mut out = Vec::new();
+        for caps in re.captures_iter(s) {
+            let row = caps
+                .iter()
+                .map(|g| Val::Str(g.map_or("", |m| m.as_str()).to_string()))
+                .collect();
+            out.push(Val::List(row));
+        }
+        Ok(Val::List(out))
+    }
+
+    // string.replaceRegEx(str, regex, replacement = '') -> string. Any null operand
+    // yields null; the replacement is inserted literally (no `$group` expansion).
+    fn replace_regex(&self, s: &Val, pat: &Val, repl: &Val) -> Result<Val> {
+        let (s, pat, repl) = match (s, pat, repl) {
+            (Val::Str(s), Val::Str(p), Val::Str(r)) => (s, p, r),
+            (Val::Null, _, _) | (_, Val::Null, _) | (_, _, Val::Null) => return Ok(Val::Null),
+            (Val::Str(_), Val::Str(_), other) | (Val::Str(_), other, _) | (other, _, _) => bail!(
+                "Type mismatch: expected String or Null but was {}",
+                type_name(other)
+            ),
+        };
+        let re = self.compiled_regex(pat, false)?;
+        Ok(Val::Str(
+            re.replace_all(s, regex::NoExpand(repl)).into_owned(),
+        ))
+    }
 }
 
 // string.join(list, delimiter = '') -> string. Null list -> null; every list
@@ -4505,46 +4676,6 @@ fn string_join(args: &[Val]) -> Result<Val> {
         }
     }
     Ok(Val::Str(parts.join(delim)))
-}
-
-// string.matchRegEx(str, regex) -> list of [full_match, group1, …] per match.
-// A null operand yields an empty list; non-participating groups become "".
-fn match_regex(s: &Val, pat: &Val) -> Result<Val> {
-    let (s, pat) = match (s, pat) {
-        (Val::Str(s), Val::Str(p)) => (s, p),
-        (Val::Null, _) | (_, Val::Null) => return Ok(Val::List(vec![])),
-        (Val::Str(_), other) | (other, _) => bail!(
-            "Type mismatch: expected String or Null but was {}",
-            type_name(other)
-        ),
-    };
-    let re = regex_scan(pat)?;
-    let mut out = Vec::new();
-    for caps in re.captures_iter(s) {
-        let row = caps
-            .iter()
-            .map(|g| Val::Str(g.map_or("", |m| m.as_str()).to_string()))
-            .collect();
-        out.push(Val::List(row));
-    }
-    Ok(Val::List(out))
-}
-
-// string.replaceRegEx(str, regex, replacement = '') -> string. Any null operand
-// yields null; the replacement is inserted literally (no `$group` expansion).
-fn replace_regex(s: &Val, pat: &Val, repl: &Val) -> Result<Val> {
-    let (s, pat, repl) = match (s, pat, repl) {
-        (Val::Str(s), Val::Str(p), Val::Str(r)) => (s, p, r),
-        (Val::Null, _, _) | (_, Val::Null, _) | (_, _, Val::Null) => return Ok(Val::Null),
-        (Val::Str(_), Val::Str(_), other) | (Val::Str(_), other, _) | (other, _, _) => bail!(
-            "Type mismatch: expected String or Null but was {}",
-            type_name(other)
-        ),
-    };
-    let re = regex_scan(pat)?;
-    Ok(Val::Str(
-        re.replace_all(s, regex::NoExpand(repl)).into_owned(),
-    ))
 }
 
 fn in_list(needle: &Val, haystack: &Val) -> Val {
@@ -5403,6 +5534,35 @@ mod tests {
     }
 
     #[test]
+    fn range_refuses_unbounded_span() {
+        let (root, graph, _) = testgen::write_basic("exec_range_cap");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+
+        // A full-i64 span would allocate until OOM, and the old unchecked `i += step`
+        // wrapped past i64::MAX into an infinite loop. The element-count guard now
+        // refuses it before allocating — a single cheap query no longer downs the server.
+        let ast = parser::parse("RETURN range(0, 9223372036854775807)").unwrap();
+        let err = engine
+            .run(&ast)
+            .expect_err("an unbounded range must be refused");
+        assert!(
+            format!("{err:#}").contains("range()"),
+            "expected a range() limit error, got: {err:#}"
+        );
+
+        // A bounded range still materialises exactly.
+        let ast = parser::parse("RETURN range(1, 5)").unwrap();
+        let res = engine.run(&ast).unwrap();
+        match &res.rows[0][0] {
+            Val::List(xs) => assert_eq!(xs.len(), 5),
+            other => panic!("expected a list, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn max_rows_limit_is_enforced() {
         let (root, graph, _) = testgen::write_basic("exec_maxrows");
         let gen = Generation::open(&root, &graph).unwrap();
@@ -5413,6 +5573,156 @@ mod tests {
             engine.run(&ast).is_err(),
             "5 rows should exceed the cap of 2"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Regex limits + per-query intermediate budget (Tier-2 hardening) ──────
+
+    /// Open the shared fixture with an intermediate-element budget set.
+    fn budgeted_engine(
+        root_tag: &str,
+        budget: u64,
+    ) -> (std::path::PathBuf, Generation, BlockCache, u64) {
+        let (root, graph, _) = testgen::write_basic(root_tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        (root, gen, cache, budget)
+    }
+
+    /// Run `q` against the fixture with the given budget, returning the result.
+    fn run_budgeted(root_tag: &str, budget: u64, q: &str) -> Result<QueryResult> {
+        let (root, gen, cache, budget) = budgeted_engine(root_tag, budget);
+        let engine = Engine::new(&gen, &cache).with_max_intermediate(budget);
+        let ast = parser::parse(q).unwrap();
+        let res = engine.run(&ast);
+        let _ = std::fs::remove_dir_all(&root);
+        res
+    }
+
+    #[test]
+    fn regex_pattern_length_is_capped() {
+        // A pattern past MAX_REGEX_PATTERN_BYTES is refused before compilation.
+        let long = "a".repeat(2 * MAX_REGEX_PATTERN_BYTES);
+        let err = run_err("exec_regex_len", &format!("RETURN 'a' =~ '{long}'"));
+        assert!(
+            err.contains("regex pattern is"),
+            "expected the pattern-length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn regex_size_limit_is_enforced() {
+        // Well under the length cap in source bytes, but the compiled automaton
+        // (a^100M via nested bounded repetition) blows the NFA size limit.
+        let err = run_err(
+            "exec_regex_size",
+            "RETURN 'a' =~ '((((a{100}){100}){100}){100})'",
+        );
+        assert!(
+            err.contains("Invalid regex"),
+            "expected a size-limit compile error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn regex_cache_compiles_once_per_query() {
+        let (root, graph, _) = testgen::write_basic("exec_regex_cache");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        // `=~` evaluates once per Person row; the pattern must compile once.
+        let ast = parser::parse("MATCH (n:Person) WHERE n.name =~ 'A.*' RETURN n.name").unwrap();
+        let res = engine.run(&ast).unwrap();
+        assert_eq!(col0(&res), vec!["Alice"]);
+        assert_eq!(
+            engine.regex_cache.borrow().len(),
+            1,
+            "one constant pattern should occupy exactly one cache slot"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn intermediate_budget_caps_comprehension() {
+        // range(0, 100000) charges ~100k; the comprehension's output charges
+        // another ~100k, so a 150k budget trips inside the comprehension itself.
+        let err = run_budgeted(
+            "exec_budget_comp",
+            150_000,
+            "RETURN [x IN range(0, 100000) | x]",
+        )
+        .expect_err("the comprehension must exceed the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn intermediate_budget_caps_concat_doubling() {
+        // acc + acc doubles per iteration; charging every temp trips the budget
+        // after ~12 iterations instead of allocating 2^30 elements.
+        let err = run_budgeted(
+            "exec_budget_concat",
+            10_000,
+            "RETURN size(reduce(acc = [0], x IN range(1, 30) | acc + acc))",
+        )
+        .expect_err("geometric list growth must exceed the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn intermediate_budget_caps_unwind() {
+        // range(0, 1000) charges ~1k and fits; the UNWIND'd rows charge ~1k more
+        // and trip a 1.5k budget inside apply_unwind.
+        let err = run_budgeted(
+            "exec_budget_unwind",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN count(x)",
+        )
+        .expect_err("the unwound rows must exceed the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn varlen_charges_intermediate_budget() {
+        // A tiny budget trips while materialising variable-length paths…
+        let err = run_budgeted(
+            "exec_budget_varlen_tiny",
+            2,
+            "MATCH (a)-[*1..3]->(b) RETURN count(*)",
+        )
+        .expect_err("varlen paths must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        // …and a generous budget leaves the same query untouched (no over-charge).
+        let res = run_budgeted(
+            "exec_budget_varlen_ok",
+            1_000_000,
+            "MATCH (a)-[*1..3]->(b) RETURN count(*)",
+        )
+        .expect("a generous budget must not affect the query");
+        assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn budget_resets_between_runs() {
+        let (root, gen, cache, _) = budgeted_engine("exec_budget_reset", 0);
+        let engine = Engine::new(&gen, &cache).with_max_intermediate(1_500);
+        // Each run charges ~1k; without the per-run reset the second would trip.
+        let ast = parser::parse("RETURN size(range(0, 1000))").unwrap();
+        engine.run(&ast).expect("first run fits the budget");
+        engine
+            .run(&ast)
+            .expect("the budget must reset between runs");
         let _ = std::fs::remove_dir_all(&root);
     }
 

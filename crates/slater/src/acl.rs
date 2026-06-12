@@ -143,6 +143,21 @@ pub struct AclHandle {
 struct State {
     acl: Arc<Acl>,
     mtime: Option<SystemTime>,
+    /// BLAKE3 hex digest of the exact `acl.json` bytes this ACL was parsed from —
+    /// the same hash a generation's manifest stamps as `aclBlake3`. Used to refuse
+    /// a hot-reloaded ACL that no longer matches the served generation's stamp.
+    digest: String,
+}
+
+/// Read and parse the ACL at `path`, returning the parsed ACL together with the
+/// BLAKE3 digest of the exact bytes parsed (so the digest binds to the content
+/// actually adopted, with no re-read race).
+fn load_with_digest(path: &Path) -> Result<(Acl, String)> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read ACL {}", path.display()))?;
+    let digest = graph_format::integrity::hash_bytes(text.as_bytes());
+    let acl = Acl::from_json_str(&text).with_context(|| format!("parse ACL {}", path.display()))?;
+    Ok((acl, digest))
 }
 
 impl AclHandle {
@@ -150,13 +165,15 @@ impl AclHandle {
     /// (a server should refuse to start with no usable ACL).
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let acl = Acl::load(&path)?;
+        let (acl, digest) = load_with_digest(&path)?;
         let mtime = file_mtime(&path);
+        warn_if_world_writable(&path);
         Ok(Self {
             path,
             state: RwLock::new(State {
                 acl: Arc::new(acl),
                 mtime,
+                digest,
             }),
         })
     }
@@ -166,16 +183,28 @@ impl AclHandle {
         self.state.read().unwrap().acl.clone()
     }
 
-    /// Re-read the file and swap in the new ACL. On a parse/IO error the last-good
-    /// ACL is kept and the error logged loudly. Returns `true` if a new ACL was
-    /// installed.
+    /// The BLAKE3 digest of the `acl.json` bytes the active ACL was parsed from.
+    pub fn digest(&self) -> String {
+        self.state.read().unwrap().digest.clone()
+    }
+
+    /// Re-read the file and swap in the new ACL unconditionally. On a parse/IO
+    /// error the last-good ACL is kept and the error logged loudly. Returns `true`
+    /// if a new ACL was installed.
+    ///
+    /// Use this only where the caller has *already* established that the on-disk
+    /// `acl.json` matches the served generation's stamp — notably right after a
+    /// generation swap, whose policy check hashes the live ACL against the new
+    /// stamp. For the hot-reload poll path use [`AclHandle::poll_checked`], which
+    /// refuses an ACL that does not match the served stamp.
     pub fn reload(&self) -> bool {
         let mtime = file_mtime(&self.path);
-        match Acl::load(&self.path) {
-            Ok(acl) => {
+        match load_with_digest(&self.path) {
+            Ok((acl, digest)) => {
                 let mut s = self.state.write().unwrap();
                 s.acl = Arc::new(acl);
                 s.mtime = mtime;
+                s.digest = digest;
                 info!(path = %self.path.display(), users = s.acl.users.len(), "reloaded ACL");
                 true
             }
@@ -202,6 +231,91 @@ impl AclHandle {
             self.reload();
         }
         changed
+    }
+
+    /// Hot-reload variant that **enforces the manifest ACL stamp**: a freshly read
+    /// `acl.json` is adopted only when `accept(digest)` returns `true` — i.e. its
+    /// BLAKE3 digest matches the `aclBlake3` of every stamped served generation. A
+    /// digest that does not match is treated as post-generation tampering: the
+    /// last-good ACL is kept and the divergence logged loudly (a malformed file is
+    /// handled the same way). The legitimate path for changing the ACL is to
+    /// rebuild and publish a generation stamped against the new `acl.json`; the
+    /// swap then adopts it via [`AclHandle::reload`].
+    ///
+    /// Returns `true` only if a new ACL was actually installed.
+    pub fn reload_checked(&self, accept: impl Fn(&str) -> bool) -> bool {
+        let mtime = file_mtime(&self.path);
+        match load_with_digest(&self.path) {
+            Ok((acl, digest)) if accept(&digest) => {
+                let mut s = self.state.write().unwrap();
+                s.acl = Arc::new(acl);
+                s.mtime = mtime;
+                s.digest = digest;
+                info!(path = %self.path.display(), users = s.acl.users.len(), "reloaded ACL");
+                true
+            }
+            Ok((_, digest)) => {
+                // Stamp mismatch: refuse the edit and keep the last-good ACL that
+                // matches the served generation. Advance mtime so a steady-state
+                // tamper is logged once, not every poll.
+                warn!(
+                    path = %self.path.display(),
+                    digest = %digest,
+                    "live acl.json does not match the served generation's ACL stamp — refusing the \
+                     hot-reload and keeping the last-good ACL (rebuild the generation against the \
+                     new acl.json to change access control)"
+                );
+                self.state.write().unwrap().mtime = mtime;
+                false
+            }
+            Err(e) => {
+                warn!(path = %self.path.display(), error = %e, "ACL reload failed; keeping last-good ACL");
+                self.state.write().unwrap().mtime = mtime;
+                false
+            }
+        }
+    }
+
+    /// Stamp-enforcing counterpart to [`AclHandle::poll`]: reload (via
+    /// [`AclHandle::reload_checked`]) only when the file's mtime changed. Returns
+    /// `true` if a reload was attempted (whether or not it was accepted).
+    pub fn poll_checked(&self, accept: impl Fn(&str) -> bool) -> bool {
+        let current = file_mtime(&self.path);
+        let changed = {
+            let s = self.state.read().unwrap();
+            current != s.mtime
+        };
+        if changed {
+            self.reload_checked(accept);
+        }
+        changed
+    }
+}
+
+/// Warn (once, at load) if `acl.json` is group- or world-writable. Its runtime
+/// integrity rests on the manifest ACL stamp plus filesystem permissions; a
+/// writable-by-others ACL is a standing tamper risk worth surfacing. Unix-only;
+/// a no-op elsewhere.
+fn warn_if_world_writable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 {
+                warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "acl.json is group- or world-writable; restrict it to the server user \
+                     (chmod 600) — its integrity depends on filesystem permissions between \
+                     generation swaps"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 
@@ -352,6 +466,45 @@ mod tests {
             !snap.verify("alice", "a"),
             "old user gone after a successful reload"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_checked_enforces_the_stamp() {
+        let dir = std::env::temp_dir().join(format!("slater_acl_checked_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acl.json");
+
+        let first = serde_json::json!({
+            "users": { "alice": { "passwordArgon2id": hash_password("a").unwrap(), "grants": { "g": ["read"] } } }
+        });
+        std::fs::write(&path, first.to_string()).unwrap();
+        let handle = AclHandle::load(&path).unwrap();
+        let original = handle.digest();
+        assert!(handle.snapshot().can_read("alice", "g"));
+
+        // A runtime edit that diverges from the stamp (here: every digest rejected)
+        // is refused — the new grant never takes effect and the last-good ACL stays.
+        let tampered = serde_json::json!({
+            "users": { "alice": { "passwordArgon2id": hash_password("a").unwrap(),
+                "grants": { "g": ["read"], "secret": ["read"] } } }
+        });
+        std::fs::write(&path, tampered.to_string()).unwrap();
+        assert!(
+            !handle.reload_checked(|_| false),
+            "tampered ACL must be refused"
+        );
+        assert!(
+            !handle.snapshot().can_read("alice", "secret"),
+            "a refused edit must not grant new access"
+        );
+        assert_eq!(handle.digest(), original, "digest unchanged after refusal");
+
+        // When the digest is accepted (the legitimate rebuild-and-publish path), the
+        // new ACL installs.
+        assert!(handle.reload_checked(|_| true));
+        assert!(handle.snapshot().can_read("alice", "secret"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -88,16 +88,13 @@ pub struct AppConfig {
     /// Path to the JSON ACL file (users → per-graph grants).
     #[serde(default = "default_acl_path")]
     pub acl_path: String,
-    /// Refuse to serve any generation whose manifest lacks a MAC when a master key
-    /// is configured. Closes the MAC-strip downgrade (an attacker who can rewrite
-    /// the manifest deleting `mac` would otherwise silence the check). Off by
-    /// default for compatibility with pre-MAC images.
-    #[serde(default)]
-    pub require_manifest_mac: bool,
     /// Refuse to serve any generation whose manifest lacks an `aclBlake3` stamp.
-    /// Closes the stamp-strip downgrade. Off by default for compatibility with
-    /// images built without `--acl`.
-    #[serde(default)]
+    /// Closes the stamp-strip downgrade. On by default — build images with
+    /// `--acl`; set to `false` only to escape the rebuild-every-graph-on-ACL-change
+    /// contract (`THREAT_MODEL.md` limitation 4), accepting unstamped images.
+    /// (There is no equivalent flag for the manifest MAC: a server configured with
+    /// a master key unconditionally refuses a MAC-less generation.)
+    #[serde(default = "default_true")]
     pub require_acl_stamp: bool,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -225,6 +222,37 @@ impl EncryptionConfig {
         }
         Ok(Some(key))
     }
+
+    /// Refuse a `keyFile` that resolves *inside* `data_dir`. The data directory is
+    /// the one surface this threat model treats as attacker-writable, so a master
+    /// key staged there could be substituted by the same attacker who rewrites the
+    /// generations it authenticates — collapsing the MAC's trust root (see
+    /// `THREAT_MODEL.md`, "Trust boundary"). This is a defence-in-depth tripwire,
+    /// not a complete defence: it does not stop a `keyFile` pointing at some *other*
+    /// attacker-writable path, which only deployment-level isolation can prevent.
+    /// Best-effort: if either path cannot be canonicalised (e.g. the key file does
+    /// not exist) the check is skipped and `load_key` surfaces the real error.
+    pub fn check_key_file_outside_data_dir(&self, data_dir: &str) -> Result<()> {
+        if self.key_file.is_empty() {
+            return Ok(());
+        }
+        let (Ok(key), Ok(data)) = (
+            std::fs::canonicalize(&self.key_file),
+            std::fs::canonicalize(data_dir),
+        ) else {
+            return Ok(());
+        };
+        if key.starts_with(&data) {
+            anyhow::bail!(
+                "encryption keyFile {} resolves inside the data directory {} — the master key \
+                 must live outside the attacker-writable data surface; move it to a path the \
+                 data-publishing principal cannot write",
+                self.key_file,
+                data_dir
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,6 +262,11 @@ pub struct QueryConfig {
     pub max_rows: u64,
     #[serde(default = "default_timeout_ms", deserialize_with = "de::u64")]
     pub timeout_ms: u64,
+    /// Per-query budget on intermediate elements materialised by comprehensions,
+    /// UNWIND, list concatenation, aggregate buffers and variable-length paths;
+    /// 0 disables the budget.
+    #[serde(default = "default_max_intermediate", deserialize_with = "de::u64")]
+    pub max_intermediate: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,6 +280,9 @@ pub struct VectorQueryConfig {
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
 
+fn default_true() -> bool {
+    true
+}
 fn default_data_dir() -> String {
     "/data".into()
 }
@@ -262,14 +298,16 @@ fn default_port() -> u16 {
 fn default_log_level() -> String {
     "info".into()
 }
+// Cache defaults are sized for the typical deployment envelope of 100–200 MB
+// total resident memory (resident ≈ the three cache budgets + fixed overhead).
 fn default_block_cache() -> usize {
-    256 * 1024 * 1024
+    64 * 1024 * 1024
 }
 fn default_vector_cache() -> usize {
-    128 * 1024 * 1024
+    32 * 1024 * 1024
 }
 fn default_result_cache() -> usize {
-    32 * 1024 * 1024
+    16 * 1024 * 1024
 }
 fn default_cache_ttl_ms() -> i64 {
     30 * 60 * 1000
@@ -285,6 +323,12 @@ fn default_max_rows() -> u64 {
 }
 fn default_timeout_ms() -> u64 {
     30_000
+}
+// ~48 bytes per element (size_of::<Val>()), so 1M elements bounds a single
+// query's intermediate materialisation at roughly 48 MB worst case — sized for
+// deployments with 100–200 MB memory limits and a few concurrent queries.
+fn default_max_intermediate() -> u64 {
+    1_000_000
 }
 fn default_beam_width() -> u32 {
     64
@@ -315,6 +359,7 @@ impl Default for QueryConfig {
         Self {
             max_rows: default_max_rows(),
             timeout_ms: default_timeout_ms(),
+            max_intermediate: default_max_intermediate(),
         }
     }
 }
@@ -410,5 +455,48 @@ mod tests {
         let cfg: CacheConfig =
             serde_json::from_value(serde_json::json!({ "cacheTtlMs": "-5" })).unwrap();
         assert_eq!(cfg.cache_ttl(), None);
+    }
+
+    #[test]
+    fn key_file_inside_data_dir_is_refused() {
+        let dir = std::env::temp_dir().join("slater_keyfile_guard_test");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // A key staged inside the (attacker-writable) data dir is refused.
+        let inside = data.join("master.hex");
+        std::fs::write(&inside, "00112233").unwrap();
+        let cfg = EncryptionConfig {
+            key_env: String::new(),
+            key_file: inside.to_str().unwrap().to_string(),
+        };
+        let err = cfg
+            .check_key_file_outside_data_dir(data.to_str().unwrap())
+            .expect_err("keyFile inside the data dir must be refused");
+        assert!(
+            format!("{err:#}").contains("inside the data directory"),
+            "expected the data-dir containment error, got: {err:#}"
+        );
+
+        // The same key one level up (outside the data dir) is accepted.
+        let outside = dir.join("master.hex");
+        std::fs::write(&outside, "00112233").unwrap();
+        let ok = EncryptionConfig {
+            key_env: String::new(),
+            key_file: outside.to_str().unwrap().to_string(),
+        };
+        assert!(ok
+            .check_key_file_outside_data_dir(data.to_str().unwrap())
+            .is_ok());
+
+        // No keyFile (keyEnv or plaintext) ⇒ nothing to check.
+        let none = EncryptionConfig {
+            key_env: "SOME_VAR".into(),
+            key_file: String::new(),
+        };
+        assert!(none
+            .check_key_file_outside_data_dir(data.to_str().unwrap())
+            .is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

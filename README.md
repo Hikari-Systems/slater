@@ -195,14 +195,16 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `server.port` | `server__port` | `7687` | Bolt port. |
 | `dataDir` | `dataDir` | `/data` | Root holding `<graph>/<generation>/`. |
 | `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
-| `cache.blockCacheBytes` | `cache__blockCacheBytes` | 256 MiB | Decompressed block LRU budget. |
-| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 128 MiB | Vector pool (resident PQ + Vamana-block LRU) budget. |
-| `cache.resultCacheBytes` | `cache__resultCacheBytes` | 32 MiB | Result LRU budget. |
+| `requireAclStamp` | `requireAclStamp` | `true` | Refuse a generation with no `aclBlake3` stamp (closes the stamp-strip downgrade); build images with `--acl`. A generation with no manifest MAC is always refused when a master key is configured — that check has no off switch. |
+| `cache.blockCacheBytes` | `cache__blockCacheBytes` | 64 MiB | Decompressed block LRU budget. |
+| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 32 MiB | Vector pool (resident PQ + Vamana-block LRU) budget. |
+| `cache.resultCacheBytes` | `cache__resultCacheBytes` | 16 MiB | Result LRU budget. |
 | `tls.cert` / `tls.key` | `tls__cert` / `tls__key` | _(empty)_ | PEM material; both set ⇒ `bolt+s`. Empty ⇒ plaintext (loopback dev). |
-| `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. |
+| `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataDir` and any attacker-writable path (server refuses to start if it resolves inside `dataDir`); see `THREAT_MODEL.md` "Trust boundary". |
 | `encryption.keyEnv` | `encryption__keyEnv` | _(empty)_ | Env var holding the hex at-rest master key. |
 | `query.maxRows` | `query__maxRows` | 100000 | Per-query row cap. |
 | `query.timeoutMs` | `query__timeoutMs` | 30000 | Per-query wall-clock deadline (0 ⇒ none). |
+| `query.maxIntermediate` | `query__maxIntermediate` | 1000000 | Per-query intermediate-element budget (0 ⇒ none); ~48 B/element, so the default bounds one query at ≈48 MB. |
 | `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | 64 | Vamana beam-search list size. |
 | `generationPollMs` | `generationPollMs` | 5000 | How often to poll each graph's `current`. |
 | `reloadStrategy` | `reloadStrategy` | `exit` | `exit` or `swap` on a generation change. |

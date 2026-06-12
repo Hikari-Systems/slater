@@ -296,6 +296,10 @@ fn build_config(root: &Path, acl_path: &Path) -> slater::config::AppConfig {
         "server": { "bind": "127.0.0.1", "port": 0 },
         "dataDir": root.to_str().unwrap(),
         "aclPath": acl_path.to_str().unwrap(),
+        // The fixture is built unstamped on purpose — this test exercises the
+        // memory headline, not manifest authentication (requireAclStamp defaults
+        // on). No key is configured, so the unconditional MAC check is inert.
+        "requireAclStamp": false,
         "cache": {
             "blockCacheBytes": BLOCK_CACHE_BYTES,
             "vectorCacheBytes": VECTOR_CACHE_BYTES,

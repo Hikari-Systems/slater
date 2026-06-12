@@ -109,8 +109,6 @@ pub struct Graphs {
     /// Live `acl.json` path used to verify per-generation `aclBlake3` stamps at
     /// open/swap time. `None` ⇒ no ACL stamp checking (e.g. unit-test fixtures).
     acl_path: Option<PathBuf>,
-    /// Refuse to serve a keyed image whose manifest carries no MAC (downgrade guard).
-    require_manifest_mac: bool,
     /// Refuse to serve a generation whose manifest carries no ACL stamp.
     require_acl_stamp: bool,
 }
@@ -142,7 +140,6 @@ impl Graphs {
             master_key: master_key.map(<[u8]>::to_vec),
             graphs,
             acl_path: None,
-            require_manifest_mac: false,
             require_acl_stamp: false,
         })
     }
@@ -151,15 +148,11 @@ impl Graphs {
     /// server calls this between `open_all` and `verify_manifest_policy`; the MAC
     /// itself is verified inside `Generation::open_with_key`, while the ACL stamp
     /// and the require-presence downgrade guards are enforced here so the config
-    /// flags stay co-located with the acl path.
-    pub fn set_manifest_policy(
-        &mut self,
-        acl_path: Option<PathBuf>,
-        require_manifest_mac: bool,
-        require_acl_stamp: bool,
-    ) {
+    /// flags stay co-located with the acl path. (MAC presence is not a policy
+    /// knob: a keyed server unconditionally refuses a MAC-less generation — see
+    /// `check_manifest_policy`.)
+    pub fn set_manifest_policy(&mut self, acl_path: Option<PathBuf>, require_acl_stamp: bool) {
         self.acl_path = acl_path;
-        self.require_manifest_mac = require_manifest_mac;
         self.require_acl_stamp = require_acl_stamp;
     }
 
@@ -199,10 +192,38 @@ impl Graphs {
             }
             _ => {}
         }
-        if self.require_manifest_mac && self.master_key.is_some() && m.mac.is_none() {
-            bail!("graph '{name}' manifest has no MAC but requireManifestMac is set");
+        // Not configurable by design: a MAC-less generation on a keyed server is
+        // either a strip attack or a plaintext image that doesn't need the key —
+        // there is no legitimate keyed-but-unauthenticated deployment, so there is
+        // no flag an attacker (or a mistaken operator) could flip to reopen the
+        // strip downgrade. Plaintext deployments simply configure no key.
+        if self.master_key.is_some() && m.mac.is_none() {
+            bail!(
+                "graph '{name}' manifest has no MAC but a master key is configured — \
+                 refusing to serve an unauthenticated generation; rebuild with --encrypt \
+                 (or remove the key for an all-plaintext deployment)"
+            );
         }
         Ok(())
+    }
+
+    /// Is a candidate `acl.json` (identified by its BLAKE3 `digest`) acceptable for
+    /// every served generation? Used to gate ACL hot-reload: a generation that
+    /// carries an `aclBlake3` stamp only accepts an ACL whose digest equals that
+    /// stamp; an unstamped generation imposes no constraint (legacy/plaintext
+    /// images hot-reload as before). With several served graphs the live ACL must
+    /// satisfy them all — the same operational contract as the open/swap check.
+    ///
+    /// This is the runtime enforcement of the `aclBlake3` stamp: between generation
+    /// swaps it refuses a post-build edit to `acl.json`, closing the window where a
+    /// hot-reload would otherwise adopt a tampered ACL unverified.
+    pub fn acl_digest_acceptable(&self, digest: &str) -> bool {
+        self.graphs.values().all(|slot| {
+            match slot.read().unwrap().manifest().acl_blake3.as_deref() {
+                Some(stamp) => stamp == digest,
+                None => true,
+            }
+        })
     }
 
     /// Verify the manifest-authentication policy for every served generation. Called
@@ -328,6 +349,7 @@ fn guard_sweep(
     graphs: &Graphs,
     vector_cache: &VectorIndexCache,
     strategy: ReloadStrategy,
+    acl: Option<&AclHandle>,
 ) -> SweepAction {
     for name in graphs.names() {
         let Some(live) = graphs.get(&name) else {
@@ -347,7 +369,15 @@ fn guard_sweep(
             ReloadStrategy::Exit => return SweepAction::Shutdown(name),
             ReloadStrategy::Swap => match graphs.swap_if_changed(&name, vector_cache) {
                 Ok(Some(new)) => {
-                    info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)")
+                    info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)");
+                    // The swap's policy check already verified the live acl.json
+                    // hashes to the new generation's stamp, so adopt it now: this is
+                    // the legitimate channel for an ACL change (rebuild + publish),
+                    // and it keeps the in-memory ACL in step with the new stamp so a
+                    // later stamp-enforced poll does not reject the matching file.
+                    if let Some(acl) = acl {
+                        acl.reload();
+                    }
                 }
                 Ok(None) => {} // raced back to the live generation
                 Err(e) => {
@@ -372,6 +402,7 @@ fn spawn_generation_guard(
     strategy: ReloadStrategy,
     poll_interval: Duration,
     shutdown: tokio::sync::oneshot::Sender<String>,
+    acl: Option<Arc<AclHandle>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(poll_interval);
@@ -384,10 +415,11 @@ fn spawn_generation_guard(
             ticker.tick().await;
             let graphs = graphs.clone();
             let vector_cache = vector_cache.clone();
+            let acl = acl.clone();
             // The sweep does blocking IO (re-hash + open on a swap), so it runs on
             // the blocking pool, off the async reactor.
             let action = match tokio::task::spawn_blocking(move || {
-                guard_sweep(&graphs, &vector_cache, strategy)
+                guard_sweep(&graphs, &vector_cache, strategy, acl.as_deref())
             })
             .await
             {
@@ -460,6 +492,8 @@ struct ConnCtx {
     result_cache: Arc<ResultCache<QueryResult>>,
     max_rows: usize,
     timeout_ms: u64,
+    /// Per-query intermediate-element budget (`query.maxIntermediate`); 0 disables.
+    max_intermediate: u64,
     /// Beam-search list size for the Vamana arm (`vectorQuery.beamWidth`).
     beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
@@ -916,6 +950,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
                 bail!("connection closed mid-message");
             }
             self.buf.extend_from_slice(&tmp[..n]);
+            // Bound the unparsed buffer too: `decode_message` only caps a *complete*
+            // body, but a peer that streams chunks and never sends the terminating
+            // `00 00` would grow `buf` without bound. Allow a little slack over the
+            // body cap for chunk headers. This guards the pre-auth path (HELLO/LOGON
+            // arrive through here) against memory exhaustion.
+            if self.buf.len() > chunk::MAX_MESSAGE_BYTES + (1 << 20) {
+                bail!(
+                    "Bolt message framing exceeded {} bytes without completing; closing connection",
+                    chunk::MAX_MESSAGE_BYTES
+                );
+            }
         }
     }
 
@@ -952,16 +997,15 @@ pub async fn serve(cfg: AppConfig) -> Result<()> {
 /// the configured budgets, resident-PQ pinning, and the generation guard (D34).
 pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Result<()> {
     let acl = Arc::new(AclHandle::load(&cfg.acl_path).context("load ACL")?);
+    cfg.encryption
+        .check_key_file_outside_data_dir(&cfg.data_dir)
+        .context("validate at-rest encryption key location")?;
     let master_key = cfg
         .encryption
         .load_key()
         .context("load at-rest encryption key")?;
     let mut graphs = Graphs::open_all(Path::new(&cfg.data_dir), master_key.as_deref())?;
-    graphs.set_manifest_policy(
-        Some(PathBuf::from(&cfg.acl_path)),
-        cfg.require_manifest_mac,
-        cfg.require_acl_stamp,
-    );
+    graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
     graphs
         .verify_manifest_policy()
         .context("manifest authentication policy")?;
@@ -1000,6 +1044,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         result_cache,
         max_rows: cfg.query.max_rows as usize,
         timeout_ms: cfg.query.timeout_ms,
+        max_intermediate: cfg.query.max_intermediate,
         beam_width: cfg.vector_query.beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
@@ -1026,6 +1071,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         reload_strategy,
         cfg.generation_poll_interval(),
         shutdown_tx,
+        Some(ctx.acl.clone()),
     );
 
     // The cache-maintenance task: reclaim idle entries past the configured TTL.
@@ -1215,8 +1261,14 @@ fn authenticate(
         .get("credentials")
         .and_then(PsValue::as_str)
         .unwrap_or("");
-    // Pick up any out-of-band ACL edit before authenticating.
-    ctx.acl.poll();
+    // Pick up any out-of-band ACL edit before authenticating — but only adopt one
+    // whose digest still matches the served generation's `aclBlake3` stamp. A
+    // post-generation edit to `acl.json` (e.g. self-granting a read) is refused and
+    // the last-good ACL kept; the legitimate way to change access control is to
+    // rebuild and publish a generation stamped against the new file.
+    let graphs = ctx.graphs.clone();
+    ctx.acl
+        .poll_checked(|digest| graphs.acl_digest_acceptable(digest));
     if ctx.acl.snapshot().verify(principal, credentials) {
         sess.user = Some(principal.to_string());
         Ok(())
@@ -1454,6 +1506,7 @@ async fn run_query(
     let cacheable = !parser::is_nondeterministic(&ast);
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
+    let max_intermediate = ctx.max_intermediate;
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the debug level being active: when it
@@ -1483,7 +1536,8 @@ async fn run_query(
                     let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
                         .with_params(params)
-                        .with_max_rows(max_rows);
+                        .with_max_rows(max_rows)
+                        .with_max_intermediate(max_intermediate);
                     if timeout_ms > 0 {
                         engine = engine
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
@@ -1920,14 +1974,97 @@ mod tests {
         // Stamped with the live digest → serves.
         patch_manifest(&root, "people", "aclBlake3", serde_json::json!(live));
         let mut graphs = Graphs::open_all(&root, None).unwrap();
-        graphs.set_manifest_policy(Some(acl_path.clone()), false, false);
+        graphs.set_manifest_policy(Some(acl_path.clone()), false);
         assert!(graphs.verify_manifest_policy().is_ok());
 
         // Stamped with a stale digest → refuses to serve.
         patch_manifest(&root, "people", "aclBlake3", serde_json::json!("deadbeef"));
         let mut graphs = Graphs::open_all(&root, None).unwrap();
-        graphs.set_manifest_policy(Some(acl_path), false, false);
+        graphs.set_manifest_policy(Some(acl_path), false);
         assert!(graphs.verify_manifest_policy().is_err());
+    }
+
+    #[test]
+    fn acl_digest_acceptable_matches_served_stamp() {
+        let (root, _g, _) = testgen::write_basic("acl_digest_ok");
+        let acl_path = write_acl(&root);
+        let live = graph_format::integrity::hash_file(&acl_path).unwrap();
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!(live));
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path), false);
+
+        assert!(
+            graphs.acl_digest_acceptable(&live),
+            "matching digest accepted"
+        );
+        assert!(
+            !graphs.acl_digest_acceptable("deadbeef"),
+            "a digest other than the stamp is refused"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unstamped_generation_accepts_any_acl_digest() {
+        // A legacy/plaintext image with no aclBlake3 stamp imposes no hot-reload
+        // constraint, so the ACL keeps hot-reloading as before.
+        let (root, _g, _) = testgen::write_basic("acl_digest_unstamped");
+        let acl_path = write_acl(&root);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path), false);
+        assert!(graphs.acl_digest_acceptable("anything"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hot_reload_refuses_tamper_then_adopts_matching_rebuild() {
+        let (root, _g, _) = testgen::write_basic("acl_hotreload_e2e");
+        let acl_path = write_acl(&root);
+        let live = graph_format::integrity::hash_file(&acl_path).unwrap();
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!(live));
+
+        let acl = AclHandle::load(&acl_path).unwrap();
+        assert!(acl.snapshot().can_read("reporting", "people"));
+        assert!(!acl.snapshot().can_read("reporting", "secret"));
+
+        // ── Tamper: edit acl.json at runtime to self-grant a new read. The served
+        // generation still carries the *old* stamp, so the enforced reload refuses it.
+        let tampered = serde_json::json!({
+            "users": { "reporting": { "passwordArgon2id": hash_password("pw").unwrap(),
+                "grants": { "people": ["read"], "secret": ["read"] } } }
+        });
+        std::fs::write(&acl_path, tampered.to_string()).unwrap();
+
+        let graphs = {
+            let mut g = Graphs::open_all(&root, None).unwrap();
+            g.set_manifest_policy(Some(acl_path.clone()), false);
+            Arc::new(g)
+        };
+        let g1 = graphs.clone();
+        assert!(!acl.reload_checked(move |d| g1.acl_digest_acceptable(d)));
+        assert!(
+            !acl.snapshot().can_read("reporting", "secret"),
+            "tampered grant must not take effect"
+        );
+
+        // ── Legitimate change: a generation rebuilt against the new acl.json carries a
+        // matching stamp. Re-open to model the swapped-in generation; the enforced
+        // reload now accepts the same file.
+        let newdigest = graph_format::integrity::hash_file(&acl_path).unwrap();
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!(newdigest));
+        let graphs2 = {
+            let mut g = Graphs::open_all(&root, None).unwrap();
+            g.set_manifest_policy(Some(acl_path), false);
+            Arc::new(g)
+        };
+        let g2 = graphs2.clone();
+        assert!(acl.reload_checked(move |d| g2.acl_digest_acceptable(d)));
+        assert!(
+            acl.snapshot().can_read("reporting", "secret"),
+            "ACL matching the new stamp is adopted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1937,12 +2074,12 @@ mod tests {
 
         // Legacy image with no aclBlake3 serves when not required.
         let mut graphs = Graphs::open_all(&root, None).unwrap();
-        graphs.set_manifest_policy(Some(acl_path.clone()), false, false);
+        graphs.set_manifest_policy(Some(acl_path.clone()), false);
         assert!(graphs.verify_manifest_policy().is_ok());
 
         // requireAclStamp turns the absence into a refusal.
         let mut graphs = Graphs::open_all(&root, None).unwrap();
-        graphs.set_manifest_policy(Some(acl_path), false, true);
+        graphs.set_manifest_policy(Some(acl_path), true);
         assert!(graphs.verify_manifest_policy().is_err());
     }
 
@@ -1984,13 +2121,15 @@ mod tests {
     }
 
     #[test]
-    fn require_manifest_mac_bails_when_key_present_but_mac_absent() {
+    fn keyed_server_refuses_macless_generation_unconditionally() {
         let (root, _g, _) = testgen::write_basic("require_mac");
         let acl_path = write_acl(&root);
-        // The plaintext fixture carries no MAC; opening with a master key present
-        // and requireManifestMac set must refuse (the strip-downgrade guard).
+        // The plaintext fixture carries no MAC; a server configured with a master
+        // key must refuse it (the MAC-strip downgrade guard). This is deliberately
+        // not a policy flag — there is no legitimate keyed-but-unauthenticated
+        // deployment, so there is nothing to configure.
         let mut graphs = Graphs::open_all(&root, Some(b"master")).unwrap();
-        graphs.set_manifest_policy(Some(acl_path), true, false);
+        graphs.set_manifest_policy(Some(acl_path), false);
         assert!(graphs.verify_manifest_policy().is_err());
     }
 
@@ -2016,6 +2155,7 @@ mod tests {
             result_cache,
             max_rows: 100_000,
             timeout_ms: 0,
+            max_intermediate: 1_000_000,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
@@ -2076,6 +2216,7 @@ mod tests {
             result_cache: Arc::new(ResultCache::new(1 << 20)),
             max_rows: 100_000,
             timeout_ms: 0,
+            max_intermediate: 1_000_000,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             // A default is configured but must NOT be silently served for queries.
@@ -3066,14 +3207,14 @@ mod tests {
 
         // No change yet → keep serving.
         assert!(matches!(
-            guard_sweep(&graphs, &vc, ReloadStrategy::Exit),
+            guard_sweep(&graphs, &vc, ReloadStrategy::Exit, None),
             SweepAction::Continue
         ));
 
         // A changed `current` → shutdown signal naming the graph. Exit does not even
         // open the new generation — the orchestrator restart re-opens it cleanly.
         publish_copy_as_new_generation(&root, "people", None);
-        match guard_sweep(&graphs, &vc, ReloadStrategy::Exit) {
+        match guard_sweep(&graphs, &vc, ReloadStrategy::Exit, None) {
             SweepAction::Shutdown(name) => assert_eq!(name, "people"),
             SweepAction::Continue => panic!("expected a shutdown signal on a changed current"),
         }
@@ -3088,7 +3229,7 @@ mod tests {
 
         let new = publish_copy_as_new_generation(&root, "people", None);
         assert!(matches!(
-            guard_sweep(&graphs, &vc, ReloadStrategy::Swap),
+            guard_sweep(&graphs, &vc, ReloadStrategy::Swap, None),
             SweepAction::Continue
         ));
         assert_ne!(new, old);
@@ -3147,6 +3288,7 @@ mod tests {
             ReloadStrategy::Exit,
             Duration::from_millis(20),
             tx,
+            None,
         );
 
         publish_copy_as_new_generation(&root, "people", None);

@@ -12,10 +12,11 @@
     "key": ""
   },
   "aclPath": "/config/acl.json",
+  "requireAclStamp": true,
   "cache": {
-    "blockCacheBytes": 268435456,
-    "vectorCacheBytes": 134217728,
-    "resultCacheBytes": 33554432
+    "blockCacheBytes": 67108864,
+    "vectorCacheBytes": 33554432,
+    "resultCacheBytes": 16777216
   },
   "vectorIndexPins": [],
   "encryption": {
@@ -24,7 +25,8 @@
   },
   "query": {
     "maxRows": 100000,
-    "timeoutMs": 30000
+    "timeoutMs": 30000,
+    "maxIntermediate": 1000000
   },
   "vectorQuery": {
     "beamWidth": 64,

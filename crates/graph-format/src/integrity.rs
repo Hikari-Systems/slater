@@ -31,6 +31,14 @@ pub fn hash_file(path: impl AsRef<Path>) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Hash an in-memory byte slice through BLAKE3 and return the lowercase hex
+/// digest. Identical to [`hash_file`] for the same bytes, so a digest computed
+/// over a file's contents in memory matches the one [`hash_file`] streams from
+/// disk — used to bind an `acl.json` digest to the exact bytes just parsed.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 /// Compute a single content hash over an ordered inventory of `(name, hex_hash)`
 /// pairs. The name is folded in too, so a rename or reordering changes the
 /// digest. The caller supplies the per-file hashes (typically from [`hash_file`]).
