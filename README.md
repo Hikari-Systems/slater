@@ -2,11 +2,6 @@
 
 A low-memory, read-only, Bolt-speaking graph engine.
 
-> **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
-> who insists on going by a single name — "Just… Slater" — and one of my favourite
-> characters in it. See the
-> [character wiki page](https://archer.fandom.com/wiki/Slater).
-
 Slater serves an **immutable, on-disk** graph image over the **Bolt** protocol
 (so any standard neo4j driver can talk to it), keeping **resident memory bounded
 by its cache budgets — independent of graph size**. It replaces an in-memory
@@ -48,6 +43,11 @@ geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
 (`db.idx.vector.queryNodes`). To update a graph you build a new generation and
 atomically swap the `current` pointer; the running server picks the change up via
 its generation guard (see [Generation guard](#generation-guard)).
+
+> **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
+> who insists on going by a single name — "Just… Slater" — and one of my favourite
+> characters in it. See the
+> [character wiki page](https://archer.fandom.com/wiki/Slater).
 
 ## Running with Docker
 
