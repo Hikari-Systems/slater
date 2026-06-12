@@ -38,7 +38,7 @@ use crate::algo;
 use crate::cache::{BlockCache, FileKind, VectorIndexCache};
 use crate::generation::Generation;
 use crate::parser::ast::*;
-use crate::plan::{choose_node_scan, is_id_anchored, NodeScan};
+use crate::plan::{choose_node_scan, index_for, is_id_anchored, NodeScan};
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{NodeId, Value};
@@ -804,6 +804,12 @@ impl<'g> Engine<'g> {
                 rows: vec![row],
             });
         }
+        // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
+        // and `RETURN count(DISTINCT n.p)` are answered from the range index over
+        // (L, p) — one sequential index walk, no per-node property decode.
+        if let Some(res) = self.try_grouped_index_fast_path(sq)? {
+            return Ok(res);
+        }
         self.run_single_seeded(sq, Table::singleton())
     }
 
@@ -915,6 +921,195 @@ impl<'g> Engine<'g> {
             }
         }
         Ok(Some((columns, row)))
+    }
+
+    /// Recognise a single-node aggregation whose grouping/distinct key is an
+    /// *indexed* property, and answer it from the range index instead of decoding
+    /// the property from every node record. Returns the full `QueryResult` or
+    /// `None` when any guard fails (the caller then executes normally).
+    ///
+    /// Guards mirror [`Self::try_count_fast_path`]: exactly one non-OPTIONAL
+    /// `MATCH`, no `WHERE`, one single-node pattern (no rels), exactly one label,
+    /// no inline props; the `RETURN` is non-DISTINCT and not `*`. The grouped /
+    /// aggregated property must be a bare `n.p` with an open range index. Two
+    /// shapes are recognised (anything else falls back):
+    ///   - **group-by**: one `n.p` item + one `count(*)`/`count(n)` + any
+    ///     constants → one row per distinct value of `p`, plus a null group for
+    ///     nodes lacking `p` (`count(*)`/`count(n)` include nulls; `n` is never
+    ///     null, so they agree).
+    ///   - **distinct-count**: one `count(DISTINCT n.p)` + any constants, no
+    ///     grouping item → a single row; the count is the number of distinct keys
+    ///     (the index omits nulls, which `count(DISTINCT …)` also excludes).
+    ///
+    /// `ORDER BY`/`SKIP`/`LIMIT` are applied to the (small) grouped output via
+    /// [`Self::order_skip_limit_no_input`].
+    fn try_grouped_index_fast_path(&self, sq: &SingleQuery) -> Result<Option<QueryResult>> {
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        if m.optional || m.where_.is_some() || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pat = &m.patterns[0];
+        if !pat.rels.is_empty() {
+            return Ok(None); // single-node patterns only
+        }
+        let node = &pat.start;
+        if !node.props.is_empty() {
+            return Ok(None); // an inline prop is an extra equality filter
+        }
+        let [label] = node.labels.as_slice() else {
+            return Ok(None); // exactly one label (null-group denominator is exact)
+        };
+        let var = node.var.as_deref();
+
+        let body = &sq.ret.body;
+        // `sq.ret.distinct` is intentionally NOT a guard: `lower_return_clause`
+        // sets it by scanning the clause text for the word "distinct", so
+        // `RETURN count(DISTINCT n.p)` reports `ret.distinct = true` even though
+        // there is no `RETURN DISTINCT`. For both shapes here the output rows are
+        // unique by grouping key (the null group's key is distinct too), so a
+        // final-row `DISTINCT` dedup is always a no-op — safe to ignore either way.
+        if body.star || body.items.is_empty() {
+            return Ok(None);
+        }
+
+        // Classify each RETURN item: a grouping property `n.p`, the (single)
+        // count aggregate, or a constant. Anything else ⇒ fall back.
+        let mut group_prop: Option<(usize, String)> = None;
+        let mut count_plain: Option<usize> = None;
+        let mut count_distinct: Option<(usize, String)> = None;
+        for (i, it) in body.items.iter().enumerate() {
+            if let Some(p) = node_property(&it.expr, var) {
+                if group_prop.is_some() {
+                    return Ok(None); // more than one grouping key
+                }
+                group_prop = Some((i, p));
+            } else if is_count_of(&it.expr, var) {
+                if count_plain.is_some() || count_distinct.is_some() {
+                    return Ok(None);
+                }
+                count_plain = Some(i);
+            } else if let Some(p) = count_distinct_property(&it.expr, var) {
+                if count_plain.is_some() || count_distinct.is_some() {
+                    return Ok(None);
+                }
+                count_distinct = Some((i, p));
+            } else if !matches!(it.expr, Expr::Param(_) | Expr::Literal(_)) {
+                return Ok(None); // a non-constant, non-{group,count} projection
+            }
+        }
+
+        // Resolve the indexed property, the count column, and (group-by only) the
+        // grouping column. Mixed shapes (e.g. `n.p, count(DISTINCT n.p)`) bail.
+        let (prop, group_i, count_i, is_distinct) = match (group_prop, count_plain, count_distinct)
+        {
+            (Some((gi, p)), Some(ci), None) => (p, Some(gi), ci, false),
+            (None, None, Some((ci, p))) => (p, None, ci, true),
+            _ => return Ok(None),
+        };
+
+        let Some(idx_name) = index_for(self.gen, std::slice::from_ref(label), &prop) else {
+            return Ok(None); // no open range index over (label, prop)
+        };
+        let reader = self
+            .gen
+            .range_index(&idx_name)
+            .expect("index_for only returns open indexes");
+        let groups = reader.distinct_key_counts()?;
+
+        let columns: Vec<String> = body
+            .items
+            .iter()
+            .map(|it| it.alias.clone().unwrap_or_else(|| expr_name(&it.expr)))
+            .collect();
+        let empty: HashMap<String, Val> = HashMap::new();
+
+        let out_rows: Vec<Vec<Val>> = if is_distinct {
+            // Single row: distinct non-null values = number of index keys.
+            let n = groups.len() as i64;
+            let mut r = Vec::with_capacity(body.items.len());
+            for (i, it) in body.items.iter().enumerate() {
+                r.push(if i == count_i {
+                    Val::Int(n)
+                } else {
+                    self.eval(&it.expr, &Scope::Map(&empty), None)?
+                });
+            }
+            vec![r]
+        } else {
+            let group_i = group_i.expect("group-by shape has a grouping item");
+            let Some(lid) = self.gen.label_id(label) else {
+                return Ok(None);
+            };
+            let total = self.gen.nodes_with_label(lid).len() as u64;
+            let indexed: u64 = groups.iter().map(|(_, n)| *n).sum();
+            let null_count = total.saturating_sub(indexed);
+
+            let row_for = |gval: Val, count: i64| -> Result<Vec<Val>> {
+                let mut r = Vec::with_capacity(body.items.len());
+                for (i, it) in body.items.iter().enumerate() {
+                    if i == group_i {
+                        r.push(gval.clone());
+                    } else if i == count_i {
+                        r.push(Val::Int(count));
+                    } else {
+                        r.push(self.eval(&it.expr, &Scope::Map(&empty), None)?);
+                    }
+                }
+                Ok(r)
+            };
+
+            let mut rows = Vec::with_capacity(groups.len() + 1);
+            for (k, n) in groups {
+                rows.push(row_for(Val::from_value(k), n as i64)?);
+            }
+            // Nodes of `label` that lack `prop` form the null group.
+            if null_count > 0 {
+                rows.push(row_for(Val::Null, null_count as i64)?);
+            }
+            rows
+        };
+
+        let rows = self.order_skip_limit_no_input(body, &columns, out_rows)?;
+        Ok(Some(QueryResult { columns, rows }))
+    }
+
+    /// Apply a projection body's `ORDER BY` → `SKIP` → `LIMIT` to already-
+    /// projected `rows` whose columns are `cols`. `ORDER BY` keys reference the
+    /// projected aliases only — the aggregated / fast-path case, where there is no
+    /// 1:1 input table to merge in (cf. the `with_input` branch in [`Self::project`]).
+    fn order_skip_limit_no_input(
+        &self,
+        body: &ProjectionBody,
+        cols: &[String],
+        mut rows: Vec<Vec<Val>>,
+    ) -> Result<Vec<Vec<Val>>> {
+        if !body.order_by.is_empty() {
+            let mut keyed: Vec<(SortKey, Vec<Val>)> = Vec::with_capacity(rows.len());
+            for r in rows {
+                let scope = Scope::Row(cols, &r);
+                let mut keys = Vec::with_capacity(body.order_by.len());
+                for (e, dir) in &body.order_by {
+                    keys.push((self.eval(e, &scope, None)?, *dir));
+                }
+                keyed.push((keys, r));
+            }
+            keyed.sort_by(|a, b| cmp_sort_keys(&a.0, &b.0));
+            rows = keyed.into_iter().map(|(_, r)| r).collect();
+        }
+        if let Some(skip) = &body.skip {
+            let n = self.eval_count(skip)?;
+            rows = rows.into_iter().skip(n).collect();
+        }
+        if let Some(limit) = &body.limit {
+            let n = self.eval_count(limit)?;
+            rows.truncate(n);
+        }
+        Ok(rows)
     }
 
     /// Row cap a final `RETURN` lets us push into the last MATCH (root cause 6 —
@@ -5579,6 +5774,35 @@ fn is_count_of(e: &Expr, var: Option<&str>) -> bool {
     }
 }
 
+/// If `e` is a bare property access `var.p` on the anchor node's variable,
+/// return the property name `p`. Used by the Stage-7 grouped-index fast path.
+fn node_property(e: &Expr, var: Option<&str>) -> Option<String> {
+    match e {
+        Expr::Property(base, p) => match base.as_ref() {
+            Expr::Var(v) if Some(v.as_str()) == var => Some(p.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// If `e` is `count(DISTINCT var.p)` on the anchor node's variable, return the
+/// property name `p` (see `try_grouped_index_fast_path`).
+fn count_distinct_property(e: &Expr, var: Option<&str>) -> Option<String> {
+    let Expr::Function {
+        name,
+        distinct: true,
+        args: FuncArgs::Args(a),
+    } = e
+    else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("count") || a.len() != 1 {
+        return None;
+    }
+    node_property(&a[0], var)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5600,6 +5824,17 @@ mod tests {
     /// assertions.
     fn col0(res: &QueryResult) -> Vec<String> {
         let mut v: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+        v.sort();
+        v
+    }
+
+    /// All rows as display strings, sorted, for order-free whole-result equality.
+    fn rows_disp(res: &QueryResult) -> Vec<Vec<String>> {
+        let mut v: Vec<Vec<String>> = res
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.to_display()).collect())
+            .collect();
         v.sort();
         v
     }
@@ -5742,6 +5977,201 @@ mod tests {
         );
         assert_eq!(col0(&res), vec!["Carol"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grouped_index_distinct_count_fast_path() {
+        // Stage 7: `count(DISTINCT n.p)` over an indexed property is the number of
+        // distinct index keys. age has 3 distinct values; team has one ('Red'),
+        // and the index omits Carol (no team) — DISTINCT also excludes null.
+        let (root, res) = run(
+            "exec_g_distinct_age",
+            "MATCH (n:Person) RETURN count(DISTINCT n.age) AS c",
+        );
+        assert_eq!(res.columns, vec!["c"]);
+        assert!(
+            matches!(res.rows[0][0], Val::Int(3)),
+            "{:?}",
+            res.rows[0][0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // With the cache-busting constant tail, and a single distinct value.
+        let (root, res) = run(
+            "exec_g_distinct_team",
+            "MATCH (n:Person) RETURN count(DISTINCT n.team) AS c, 7 AS k",
+        );
+        assert_eq!(res.columns, vec!["c", "k"]);
+        assert!(
+            matches!(res.rows[0][0], Val::Int(1)),
+            "{:?}",
+            res.rows[0][0]
+        );
+        assert!(matches!(res.rows[0][1], Val::Int(7)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grouped_index_group_by_fast_path() {
+        // Stage 7: group-by an indexed property reads (key, count) from the index.
+        // team: Alice/Bob 'Red' (2) and Carol's missing team becomes a null group
+        // (1). ORDER BY c DESC puts the larger group first.
+        let (root, res) = run(
+            "exec_g_groupby_team",
+            "MATCH (n:Person) RETURN n.team AS t, count(*) AS c ORDER BY c DESC",
+        );
+        assert_eq!(res.columns, vec!["t", "c"]);
+        assert_eq!(res.rows.len(), 2, "{:?}", res.rows);
+        assert_eq!(res.rows[0][0].to_display(), "Red");
+        assert!(matches!(res.rows[0][1], Val::Int(2)));
+        assert!(matches!(res.rows[1][0], Val::Null), "{:?}", res.rows[1][0]);
+        assert!(matches!(res.rows[1][1], Val::Int(1)));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // All-distinct indexed property: one group of 1 per value (no null group,
+        // every Person has an age). `count(n)` behaves like `count(*)` here.
+        let (root, res) = run(
+            "exec_g_groupby_age",
+            "MATCH (n:Person) RETURN n.age AS a, count(n) AS c",
+        );
+        assert_eq!(
+            rows_disp(&res),
+            vec![
+                vec!["25".to_string(), "1".to_string()],
+                vec!["30".to_string(), "1".to_string()],
+                vec!["40".to_string(), "1".to_string()],
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grouped_index_matches_general_path() {
+        // The fast path must return exactly what the general (materialise + group)
+        // path does. A residual WHERE that keeps every row forces the general path;
+        // both group-by team (incl. the null group) and distinct-count must agree.
+        let (root, fast) = run(
+            "exec_g_cmp_fast",
+            "MATCH (n:Person) RETURN n.team AS t, count(*) AS c",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let (root, general) = run(
+            "exec_g_cmp_gen",
+            "MATCH (n:Person) WHERE n.age >= 0 RETURN n.team AS t, count(*) AS c",
+        );
+        assert_eq!(rows_disp(&fast), rows_disp(&general));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (root, fast) = run(
+            "exec_g_cmp_fast_d",
+            "MATCH (n:Person) RETURN count(DISTINCT n.team) AS c",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let (root, general) = run(
+            "exec_g_cmp_gen_d",
+            "MATCH (n:Person) WHERE n.age >= 0 RETURN count(DISTINCT n.team) AS c",
+        );
+        assert_eq!(rows_disp(&fast), rows_disp(&general));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grouped_index_fast_path_guards() {
+        // Shapes the fast path must decline, each still answered correctly by the
+        // general path.
+
+        // (a) Residual WHERE: age >= 30 keeps Alice (Red) and Carol (null).
+        let (root, res) = run(
+            "exec_g_guard_where",
+            "MATCH (n:Person) WHERE n.age >= 30 RETURN n.team AS t, count(*) AS c",
+        );
+        assert_eq!(
+            rows_disp(&res),
+            vec![
+                vec!["Red".to_string(), "1".to_string()],
+                vec!["null".to_string(), "1".to_string()],
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (b) A non-count aggregate (sum) over the grouping property.
+        let (root, res) = run(
+            "exec_g_guard_sum",
+            "MATCH (n:Person) RETURN n.team AS t, sum(n.age) AS s",
+        );
+        // Red = Alice 30 + Bob 25 = 55; null group = Carol 40.
+        assert_eq!(
+            rows_disp(&res),
+            vec![
+                vec!["Red".to_string(), "55".to_string()],
+                vec!["null".to_string(), "40".to_string()],
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (c) Two grouping keys (the second `node.prop` trips the >1-key guard).
+        let (root, res) = run(
+            "exec_g_guard_twokeys",
+            "MATCH (n:Person) RETURN n.team AS t, n.city AS city, count(*) AS c",
+        );
+        // (Red, London) Alice+Bob = 2; (null, Paris) Carol = 1.
+        assert_eq!(res.rows.len(), 2, "{:?}", res.rows);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (d) A non-indexed grouping property (city) — must fall back, still right.
+        let (root, res) = run(
+            "exec_g_guard_noindex",
+            "MATCH (n:Person) RETURN n.city AS city, count(*) AS c ORDER BY c DESC",
+        );
+        assert_eq!(res.rows[0][0].to_display(), "London");
+        assert!(matches!(res.rows[0][1], Val::Int(2)));
+        assert_eq!(res.rows[1][0].to_display(), "Paris");
+        assert!(matches!(res.rows[1][1], Val::Int(1)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grouped_index_fast_path_fires_without_scanning() {
+        // Proof the fast path actually *fires* (rather than just agreeing with the
+        // general path): the index walk charges nothing to the intermediate budget,
+        // so a budget far too small for a per-row scan still succeeds. The control —
+        // the same query forced onto the general path by a residual WHERE — exhausts
+        // that budget scanning the 3 Person rows.
+        //
+        // The `count(DISTINCT n.p)` shape also exercises the parser quirk where the
+        // inner DISTINCT sets `ret.distinct`; the fast path must not be fooled into
+        // declining.
+        let res = run_budgeted(
+            "exec_g_fire_distinct",
+            2,
+            "MATCH (n:Person) RETURN count(DISTINCT n.team) AS c, 7 AS k",
+        )
+        .expect("distinct-count fast path must not scan");
+        assert!(
+            matches!(res.rows[0][0], Val::Int(1)),
+            "{:?}",
+            res.rows[0][0]
+        );
+
+        let res = run_budgeted(
+            "exec_g_fire_group",
+            2,
+            "MATCH (n:Person) RETURN n.team AS t, count(*) AS c",
+        )
+        .expect("group-by fast path must not scan");
+        assert_eq!(res.rows.len(), 2);
+
+        // Control: forced onto the general (scanning) path, the same budget trips.
+        let err = run_budgeted(
+            "exec_g_fire_control",
+            2,
+            "MATCH (n:Person) WHERE n.age >= 0 RETURN count(DISTINCT n.team) AS c",
+        );
+        assert!(
+            err.is_err(),
+            "the general path must exhaust the tiny budget (proving the fast path \
+             above genuinely avoided the scan)"
+        );
     }
 
     #[test]
@@ -8543,7 +8973,7 @@ mod tests {
         assert!(matches!(r[3], Val::Int(5)), "nodeCount");
         assert!(matches!(r[4], Val::Int(2)), "labelCount");
         assert!(matches!(r[5], Val::Int(2)), "relTypeCount");
-        assert!(matches!(r[6], Val::Int(5)), "propertyKeyCount");
+        assert!(matches!(r[6], Val::Int(6)), "propertyKeyCount");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8557,7 +8987,7 @@ mod tests {
         );
         assert_eq!(res.columns, vec!["pk", "n", "r"]);
         let r = &res.rows[0];
-        assert!(matches!(r[0], Val::Int(5)));
+        assert!(matches!(r[0], Val::Int(6))); // propertyKeyCount (name/age/city/since/embedding/team)
         assert!(matches!(r[1], Val::Int(5)));
         assert!(matches!(r[2], Val::Int(5)));
         let _ = std::fs::remove_dir_all(&root);

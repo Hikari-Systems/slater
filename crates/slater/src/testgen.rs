@@ -5,8 +5,8 @@
 //!
 //! The graph (dense node ids in brackets):
 //! ```text
-//! [0] Alice  :Person {name:'Alice', age:30, city:'London'}   (+ embedding → vec store)
-//! [1] Bob    :Person {name:'Bob',   age:25, city:'London'}
+//! [0] Alice  :Person {name:'Alice', age:30, city:'London', team:'Red'}  (+ embedding → vec store)
+//! [1] Bob    :Person {name:'Bob',   age:25, city:'London', team:'Red'}
 //! [2] Carol  :Person {name:'Carol', age:40, city:'Paris'}
 //! [3] Acme   :Company {name:'Acme'}
 //! [4] Globex :Company {name:'Globex'}
@@ -18,8 +18,11 @@
 //! e4 (Alice)-[:KNOWS]->(Carol)
 //! ```
 //! Symbol tables: labels Person(0)/Company(1); reltypes KNOWS(0)/WORKS_AT(1);
-//! property keys name(0)/age(1)/city(2)/since(3)/embedding(4). Range indexes on
-//! (Person,name) and (Person,age); one brute-force vector index on
+//! property keys name(0)/age(1)/city(2)/since(3)/embedding(4)/team(5). Range
+//! indexes on (Person,name), (Person,age) and (Person,team) — the last with a
+//! duplicate value (Alice/Bob='Red') and a node lacking it (Carol), so the
+//! grouped-index fast path's run-length and null-group logic are covered. One
+//! brute-force vector index on
 //! (Person,embedding) holding the three Person embeddings (Alice/Bob/Carol), in
 //! node order, so the KNN path has a real candidate set to rank.
 
@@ -61,12 +64,14 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         (0, Value::Str("Alice".into())),
         (1, Value::Int(30)),
         (2, Value::Str("London".into())),
+        (5, Value::Str("Red".into())),
     ])
     .unwrap();
     np.append(&[
         (0, Value::Str("Bob".into())),
         (1, Value::Int(25)),
         (2, Value::Str("London".into())),
+        (5, Value::Str("Red".into())),
     ])
     .unwrap();
     np.append(&[
@@ -163,6 +168,16 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         LEVEL,
     )
     .unwrap();
+    // (Person, team) — Alice and Bob are both "Red"; Carol has no team. A
+    // duplicate key plus a node lacking the property, so the grouped-index fast
+    // path's run-length count and null-group arithmetic are both exercised.
+    write_isam(
+        dir.join("range").join("node_Person_team.isam"),
+        vec![(Value::Str("Red".into()), 0), (Value::Str("Red".into()), 1)],
+        BLOCK,
+        LEVEL,
+    )
+    .unwrap();
 
     // Inventory + manifest.
     let mut block_sizes = BTreeMap::new();
@@ -185,6 +200,7 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         "vectors.f32.blk",
         "range/node_Person_name.isam",
         "range/node_Person_age.isam",
+        "range/node_Person_team.isam",
     ] {
         add(name, &mut files, &mut block_sizes);
     }
@@ -216,6 +232,7 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
             "city".into(),
             "since".into(),
             "embedding".into(),
+            "team".into(),
         ],
         range_indexes: vec![
             RangeIndexDesc {
@@ -229,6 +246,12 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
                 entity: EntityKind::Node,
                 label_or_type: "Person".into(),
                 property: "age".into(),
+            },
+            RangeIndexDesc {
+                name: "node_Person_team".into(),
+                entity: EntityKind::Node,
+                label_or_type: "Person".into(),
+                property: "team".into(),
             },
         ],
         vector_indexes: vec![VectorIndexDesc {
