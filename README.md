@@ -1,5 +1,8 @@
 # Slater
 
+[![CI](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml/badge.svg)](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Hikari-Systems/slater?sort=semver)](https://github.com/Hikari-Systems/slater/releases/latest)
+
 A low-memory, read-only, Bolt-speaking graph engine.
 
 Slater serves an **immutable, on-disk** graph image over the **Bolt** protocol

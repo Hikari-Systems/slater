@@ -1,0 +1,54 @@
+name: ci
+
+# Fast feedback on every push and pull request: formatting must be clean and the
+# whole workspace must compile. The heavier test suite runs in `release.yml` as
+# the publish gate; this workflow is the per-commit signal behind the README's
+# build badge.
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref supersedes an in-flight run — don't waste runners
+# finishing checks on a commit that's already been replaced.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Formatting: mirror the local pre-commit hook (.githooks/pre-commit) ─────
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+  # ── Build: the whole workspace must compile against the committed lockfile ──
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
+      # the Dockerfile builder stage and release.yml).
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the workspace
+        run: cargo build --workspace --locked
