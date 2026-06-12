@@ -932,9 +932,47 @@ impl Failure {
         Self::new(code, m)
     }
 
-    fn to_message(&self) -> PsValue {
-        message::failure(self.code, &self.message)
+    /// Map the Neo4j status code to an ISO-GQL GQLSTATUS code + description. The
+    /// codes follow GQL's SQLSTATE-style classes: `42000` syntax error or access
+    /// rule violation (a malformed or read-only-rejected statement), `50000` general
+    /// processing exception (everything else). Additive — the legacy `code`/`message`
+    /// still ship verbatim (DECISIONS D41). Description follows GQL house style:
+    /// `error: <condition>. <message>`.
+    fn gqlstatus(&self) -> (&'static str, String) {
+        let (status, condition) = match self.code {
+            // A bad statement or a write/procedure rejected by read-only mode is, in
+            // GQL terms, a syntax-or-access-rule violation (class 42).
+            CODE_SYNTAX | CODE_ACCESS_MODE | CODE_UNAUTHORIZED | CODE_FORBIDDEN => {
+                ("42000", "syntax error or access rule violation")
+            }
+            // Missing graph, bad request, execution failure: general processing.
+            _ => ("50000", "general processing exception"),
+        };
+        (status, format!("error: {condition}. {}", self.message))
     }
+
+    fn to_message(&self) -> PsValue {
+        let (status, description) = self.gqlstatus();
+        message::failure_gqlstatus(self.code, &self.message, status, &description)
+    }
+}
+
+/// The ISO-GQL completion status for a result that has drained `row_count` rows,
+/// as the two additive metadata pairs appended to the final PULL/DISCARD SUCCESS:
+/// `00000` (successful completion) normally, or `02000` (no data) when the result
+/// was empty (DECISIONS D41). Purely additive — `has_more` and any other summary
+/// keys are untouched, so existing drivers ignore these and GQL-aware ones read
+/// the standard status.
+fn gqlstatus_completion(row_count: usize) -> Vec<(String, PsValue)> {
+    let (status, description) = if row_count == 0 {
+        ("02000", "note: no data")
+    } else {
+        ("00000", "note: successful completion")
+    };
+    vec![
+        ("gql_status".into(), PsValue::str(status)),
+        ("status_description".into(), PsValue::str(description)),
+    ]
 }
 
 // ── Per-connection session ────────────────────────────────────────────────────
@@ -1506,22 +1544,26 @@ async fn handle_request(
             }
             pending.sent += take;
             let has_more = pending.sent < pending.rows.len();
-            msgs.push(message::success(vec![(
-                "has_more".into(),
-                PsValue::Bool(has_more),
-            )]));
+            let mut meta = vec![("has_more".into(), PsValue::Bool(has_more))];
+            // The final SUCCESS (no more rows) carries the additive GQLSTATUS
+            // completion status; intermediate ones do not, since the query is not yet
+            // complete.
             if !has_more {
+                meta.extend(gqlstatus_completion(pending.rows.len()));
                 sess.pending = None;
             }
+            msgs.push(message::success(meta));
             Ok(msgs)
         }
 
         Request::Discard(_) => {
+            // The discarded result still completes the statement, so carry the same
+            // additive GQLSTATUS completion status as the final PULL.
+            let row_count = sess.pending.as_ref().map_or(0, |p| p.rows.len());
             sess.pending = None;
-            Ok(vec![message::success(vec![(
-                "has_more".into(),
-                PsValue::Bool(false),
-            )])])
+            let mut meta = vec![("has_more".into(), PsValue::Bool(false))];
+            meta.extend(gqlstatus_completion(row_count));
+            Ok(vec![message::success(meta)])
         }
 
         // Handled before dispatch.
@@ -2647,6 +2689,53 @@ mod tests {
             strip_dialect_prefix("MATCH (n) RETURN n"),
             "MATCH (n) RETURN n"
         );
+    }
+
+    // ── GQL PR 5 — additive GQLSTATUS metadata ────────────────────────────────
+
+    #[test]
+    fn gqlstatus_completion_distinguishes_empty_from_nonempty() {
+        // A non-empty result completes `00000`; an empty one is GQL `02000` (no data).
+        let nonempty = gqlstatus_completion(3);
+        let status = |pairs: &[(String, PsValue)], k: &str| {
+            pairs
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .and_then(|(_, v)| v.as_str().map(str::to_string))
+        };
+        assert_eq!(status(&nonempty, "gql_status").as_deref(), Some("00000"));
+        let empty = gqlstatus_completion(0);
+        assert_eq!(status(&empty, "gql_status").as_deref(), Some("02000"));
+    }
+
+    #[test]
+    fn failure_message_keeps_legacy_keys_and_adds_gqlstatus() {
+        // Syntax / access-mode errors map to GQL class 42; everything else to 50000.
+        assert_eq!(Failure::new(CODE_SYNTAX, "x".into()).gqlstatus().0, "42000");
+        assert_eq!(
+            Failure::new(CODE_ACCESS_MODE, "x".into()).gqlstatus().0,
+            "42000"
+        );
+        assert_eq!(
+            Failure::new(CODE_EXECUTION, "x".into()).gqlstatus().0,
+            "50000"
+        );
+
+        // The wire FAILURE keeps `code`/`message` and gains the GQLSTATUS pair.
+        let PsValue::Struct { tag, fields } = Failure::new(CODE_SYNTAX, "bad".into()).to_message()
+        else {
+            panic!("expected a Struct");
+        };
+        assert_eq!(tag, message::tag::FAILURE);
+        let PsValue::Map(m) = &fields[0] else {
+            panic!("expected a Map");
+        };
+        for key in ["code", "message", "gql_status", "status_description"] {
+            assert!(
+                m.iter().any(|(k, _)| k == key),
+                "missing metadata key {key}"
+            );
+        }
     }
 
     #[tokio::test]

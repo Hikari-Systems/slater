@@ -182,6 +182,32 @@ pub fn failure(code: &str, message: &str) -> PsValue {
     }
 }
 
+/// `FAILURE {code, message, gql_status, status_description}` — the legacy `code` /
+/// `message` pair (which existing Bolt drivers depend on) kept verbatim, plus the
+/// additive ISO-GQL GQLSTATUS fields a GQL-aware client reads (DECISIONS D41). The
+/// `gql_status` is the 5-character GQLSTATUS code and `status_description` its
+/// GQL-house-style text. Nothing is removed or renamed, so older drivers are
+/// unaffected; GQL-aware ones gain the standard status object.
+pub fn failure_gqlstatus(
+    code: &str,
+    message: &str,
+    gql_status: &str,
+    status_description: &str,
+) -> PsValue {
+    PsValue::Struct {
+        tag: tag::FAILURE,
+        fields: vec![PsValue::Map(vec![
+            ("code".into(), PsValue::str(code)),
+            ("message".into(), PsValue::str(message)),
+            ("gql_status".into(), PsValue::str(gql_status)),
+            (
+                "status_description".into(),
+                PsValue::str(status_description),
+            ),
+        ])],
+    }
+}
+
 /// `IGNORED` — sent for messages received while the connection is in FAILED state.
 pub fn ignored() -> PsValue {
     PsValue::Struct {
@@ -214,6 +240,37 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn failure_gqlstatus_keeps_legacy_keys_and_adds_status() {
+        // The GQLSTATUS failure must still carry the legacy `code`/`message` (older
+        // drivers read those) AND the additive `gql_status`/`status_description`.
+        let msg = failure_gqlstatus(
+            "Neo.ClientError.Statement.SyntaxError",
+            "boom",
+            "42000",
+            "error: syntax error or access rule violation. boom",
+        );
+        let PsValue::Struct { tag, fields } = msg else {
+            panic!("expected a Struct");
+        };
+        assert_eq!(tag, tag::FAILURE);
+        let PsValue::Map(m) = &fields[0] else {
+            panic!("expected a Map");
+        };
+        let get = |k: &str| {
+            m.iter()
+                .find(|(kk, _)| kk == k)
+                .and_then(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("code"), Some("Neo.ClientError.Statement.SyntaxError"));
+        assert_eq!(get("message"), Some("boom"));
+        assert_eq!(get("gql_status"), Some("42000"));
+        assert_eq!(
+            get("status_description"),
+            Some("error: syntax error or access rule violation. boom")
+        );
     }
 
     #[test]
