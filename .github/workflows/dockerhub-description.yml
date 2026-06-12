@@ -1,15 +1,14 @@
 name: Sync Docker Hub description
 
-# Push DOCKERHUB.md to the Docker Hub repository overview. Runs whenever the file
-# changes on main, and can be triggered manually from the Actions tab (or with
-# `gh workflow run dockerhub-description.yml`). Decoupled from the image build so
-# overview-only edits propagate in seconds without a multi-arch rebuild.
+# Push DOCKERHUB.md to the Docker Hub repository overview. Runs on every push to
+# main (keeps the overview in lockstep with the repo), and can be triggered
+# manually from the Actions tab (or with `gh workflow run
+# dockerhub-description.yml`). Decoupled from the image build so overview edits
+# propagate in seconds without a multi-arch rebuild; the sync is idempotent, so a
+# push that doesn't touch DOCKERHUB.md just re-pushes the same text.
 on:
   push:
     branches: [main]
-    paths:
-      - 'DOCKERHUB.md'
-      - '.github/workflows/dockerhub-description.yml'
   workflow_dispatch:
 
 jobs:
