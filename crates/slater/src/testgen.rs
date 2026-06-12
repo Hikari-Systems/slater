@@ -278,6 +278,301 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
     (root, graph, uuid)
 }
 
+/// A tiny **cyclic** fixture for the GQL path-restrictor tests (PR 2). Three
+/// `:N` nodes joined by a single relationship type `R`:
+/// ```text
+/// [0] a  [1] b  [2] c          (name = 'a' / 'b' / 'c')
+/// e0 (a)-[:R]->(b)
+/// e1 (b)-[:R]->(c)
+/// e2 (c)-[:R]->(a)             ← closes the a→b→c→a triangle
+/// e3 (c)-[:R]->(b)             ← second route into b (distinct edge)
+/// ```
+/// Adjacency `a→{b}`, `b→{c}`, `c→{a,b}`. This is the minimal graph that tells the
+/// four path modes apart over `MATCH … (s WHERE name='a')-[:R*1..4]->(x)`: the
+/// triangle lets SIMPLE close back at the start `a` (which ACYCLIC forbids), while
+/// the `c→b` chord lets TRAIL revisit `b` via a distinct edge (which SIMPLE/ACYCLIC
+/// forbid as an interior node repeat). Path counts are WALK 6, TRAIL 4, SIMPLE 3,
+/// ACYCLIC 2 — all distinct. No vector/range indexes (restrictors exercise only the
+/// traversal), so the scans fall back to a full node scan.
+pub fn write_cycle(tag: &str) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0004);
+    let graph = "cycle".to_string();
+    let root = std::env::temp_dir().join(format!("slater_cycfix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // node_props.blk — just a name per node so a WHERE can anchor the start.
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    np.append(&[(0, Value::Str("a".into()))]).unwrap();
+    np.append(&[(0, Value::Str("b".into()))]).unwrap();
+    np.append(&[(0, Value::Str("c".into()))]).unwrap();
+    np.finish().unwrap();
+
+    // node_labels.blk — every node is :N (label id 0).
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    nl.append(&[0]).unwrap();
+    nl.append(&[0]).unwrap();
+    nl.append(&[0]).unwrap();
+    nl.finish().unwrap();
+
+    // edge_props.blk — four edges, none carrying properties.
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..4 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    // topology.csr.blk — the triangle plus the c→b chord (reltype R = 0).
+    let edges = vec![
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(1),
+            reltype: 0,
+            edge: EdgeId(0),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(2),
+            reltype: 0,
+            edge: EdgeId(1),
+        },
+        Edge {
+            src: NodeId(2),
+            dst: NodeId(0),
+            reltype: 0,
+            edge: EdgeId(2),
+        },
+        Edge {
+            src: NodeId(2),
+            dst: NodeId(1),
+            reltype: 0,
+            edge: EdgeId(3),
+        },
+    ];
+    write_csr(dir.join("topology.csr.blk"), 3, &edges, BLOCK, LEVEL).unwrap();
+
+    // vectors.f32.blk — empty (no vector index), but the reader always opens it.
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    // Inventory + manifest (no index files to list).
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        encryption: None,
+        node_count: 3,
+        edge_count: 4,
+        labels: vec!["N".into()],
+        reltypes: vec!["R".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
+/// A tiny **diamond** fixture for the GQL shortest-path-selector tests (PR 3). Five
+/// `:N` nodes joined by a single relationship type `R`:
+/// ```text
+/// [0] s  [1] a  [2] b  [3] c  [4] t     (name = 's'/'a'/'b'/'c'/'t')
+/// e0 (s)-[:R]->(a)
+/// e1 (s)-[:R]->(b)
+/// e2 (a)-[:R]->(t)
+/// e3 (b)-[:R]->(t)
+/// e4 (a)-[:R]->(c)
+/// e5 (c)-[:R]->(t)
+/// ```
+/// There are three loopless `s→t` paths: `s→a→t` and `s→b→t` (both length 2), plus
+/// `s→a→c→t` (length 3). This is the minimal graph that tells the selectors apart:
+/// `ALL SHORTEST` returns the two length-2 ties, `SHORTEST 3` returns all three (two
+/// of length 2 then one of length 3), and `ANY SHORTEST` returns a single length-2
+/// path. No vector/range indexes, so the endpoint scans fall back to a full node
+/// scan filtered by `node_ok`.
+pub fn write_diamond(tag: &str) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0005);
+    let graph = "diamond".to_string();
+    let root = std::env::temp_dir().join(format!("slater_diafix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // node_props.blk — a name per node so a WHERE can anchor the endpoints.
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for name in ["s", "a", "b", "c", "t"] {
+        np.append(&[(0, Value::Str(name.into()))]).unwrap();
+    }
+    np.finish().unwrap();
+
+    // node_labels.blk — every node is :N (label id 0).
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..5 {
+        nl.append(&[0]).unwrap();
+    }
+    nl.finish().unwrap();
+
+    // edge_props.blk — six edges, none carrying properties.
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..6 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    // topology.csr.blk — the diamond plus the length-3 detour (reltype R = 0).
+    let edges = vec![
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(1),
+            reltype: 0,
+            edge: EdgeId(0),
+        },
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(2),
+            reltype: 0,
+            edge: EdgeId(1),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(4),
+            reltype: 0,
+            edge: EdgeId(2),
+        },
+        Edge {
+            src: NodeId(2),
+            dst: NodeId(4),
+            reltype: 0,
+            edge: EdgeId(3),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(3),
+            reltype: 0,
+            edge: EdgeId(4),
+        },
+        Edge {
+            src: NodeId(3),
+            dst: NodeId(4),
+            reltype: 0,
+            edge: EdgeId(5),
+        },
+    ];
+    write_csr(dir.join("topology.csr.blk"), 5, &edges, BLOCK, LEVEL).unwrap();
+
+    // vectors.f32.blk — empty (no vector index), but the reader always opens it.
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    // Inventory + manifest (no index files to list).
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        encryption: None,
+        node_count: 5,
+        edge_count: 6,
+        labels: vec!["N".into()],
+        reltypes: vec!["R".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
 /// Parameters for a synthetic Vamana/PQ generation.
 pub struct VamanaFixture {
     pub n: usize,

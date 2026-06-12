@@ -54,6 +54,22 @@ kw_end = @{ ^"end" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
+// GQL spells UNWIND as `FOR alias IN expr` (PR 5). It lowers onto the very same
+// `UnwindClause`, so the executor needs no change — only the surface order differs
+// (alias-then-expr here, expr-then-alias for UNWIND).
+kw_for = @{ ^"for" ~ !ident_cont }
+// GQL path restrictors (PR 2). They appear only at the head of a `match_pattern`
+// (right after MATCH), never inside `(…)`/`[…]`, so they don't shadow a node or
+// relationship variable that happens to be spelled `walk`/`trail`/etc.
+kw_walk = @{ ^"walk" ~ !ident_cont }
+kw_trail = @{ ^"trail" ~ !ident_cont }
+kw_acyclic = @{ ^"acyclic" ~ !ident_cont }
+kw_simple = @{ ^"simple" ~ !ident_cont }
+// GQL shortest-path selectors (PR 3). Like the restrictors they appear only at the
+// head of a `match_pattern`, never inside `(…)`/`[…]`, so a node variable spelled
+// `any`/`shortest` is unaffected. `all` reuses the existing `kw_all` (UNION ALL).
+kw_any = @{ ^"any" ~ !ident_cont }
+kw_shortest = @{ ^"shortest" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
@@ -84,7 +100,7 @@ forbidden_clause = @{
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause | for_clause }
 
 // `CALL { <subquery> }` (Phase 12): a correlated read-only subquery run once per
 // outer row, multiplying cardinality by its returned rows. The inner body is a
@@ -103,6 +119,11 @@ subquery_forbidden = { reading_clause* ~ forbidden_clause ~ (!"}" ~ ANY)* }
 
 // UNWIND is a read clause (it multiplies rows over a list); it is NOT forbidden.
 unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias }
+
+// GQL's `FOR alias IN expr` is UNWIND with the operands swapped. It reuses the
+// existing `kw_in` (already defined for list membership) and lowers to the same
+// `UnwindClause` (parser `lower_for_clause`), so no executor path is duplicated.
+for_clause = { kw_for ~ alias ~ kw_in ~ expr }
 
 // The one permitted procedure: brute-force vector KNN. Surfaced as a reading
 // clause that binds its YIELD outputs (FalkorDB's `node`, `score`) into scope.
@@ -130,7 +151,7 @@ call_clause = {
     kw_call ~ read_proc ~ "(" ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" ~ yield_clause? ~ where_clause?
 }
 
-match_clause = { kw_optional? ~ kw_match ~ pattern ~ ("," ~ pattern)* ~ where_clause? }
+match_clause = { kw_optional? ~ kw_match ~ match_pattern ~ ("," ~ match_pattern)* ~ where_clause? }
 
 with_clause = { kw_with ~ kw_distinct? ~ projection_body ~ where_clause? }
 
@@ -154,20 +175,72 @@ where_clause = { kw_where ~ expr }
 pattern = { (path_var ~ "=")? ~ node_pattern ~ (rel_pattern ~ node_pattern)* }
 path_var = { identifier }
 
+// `match_pattern` is `pattern` plus GQL quantified path patterns. It is used ONLY
+// by `match_clause`; the bare `pattern` rule (shortestPath/EXISTS/pattern
+// comprehensions) stays quantifier-free so those expression contexts never see a
+// segment they can't execute.
+match_pattern = { path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+
+// GQL shortest-path selector: `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k`
+// prefixed on a MATCH pattern (e.g. `MATCH ANY SHORTEST (a)-[:R*]->(b)`). It picks
+// shortest connecting paths between the pattern's two endpoints; see
+// `lower_path_selector` and `apply_match_selected` in exec.rs. Scoped (PR 3) to a
+// single-relationship pattern, like `shortestPath()`. `shortest_k` is tried last so
+// `ANY SHORTEST` / `ALL SHORTEST` (which start with their own keyword) bind first.
+path_selector = { any_shortest | all_shortest | shortest_k }
+any_shortest = { kw_any ~ kw_shortest }
+all_shortest = { kw_all ~ kw_shortest }
+shortest_k = { kw_shortest ~ integer }
+
+// GQL path restrictor: `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` prefixed on a MATCH
+// pattern (e.g. `MATCH TRAIL (a)-[:R*]->(b)`). It controls node/edge reuse over a
+// variable-length walk; see `lower_path_restrictor` and `expand_chain` in exec.rs.
+// Scoped (PR 2) to patterns containing a variable-length relationship.
+path_restrictor = { kw_walk | kw_trail | kw_acyclic | kw_simple }
+
+// GQL quantified path pattern: a parenthesised sub-path (≥1 relationship) repeated
+// `{m,n}` / `{m}` / `{m,}` / `{,n}` / `+` / `*` times, e.g. `((x)-[:R]->(y)){1,3}`.
+// Slater desugars a *bounded* quantifier into the union of its fixed-length
+// expansions at match time (`expand_quantified_pattern` in exec.rs); unbounded
+// forms (`+`, `*`, `{m,}`, `{,n}` open-ended) parse here but are rejected at
+// execution for now. Tried before `rel_pattern` in `match_pattern`; it only fires
+// on a leading `(` so a normal `-[…]-` relationship falls through cleanly.
+quantified_path = { "(" ~ quantified_inner ~ ")" ~ quantifier_bounds }
+quantified_inner = { node_pattern ~ (rel_pattern ~ node_pattern)+ }
+quantifier_bounds = { exact_bound | range_bound | plus_bound | star_bound }
+exact_bound = { "{" ~ integer ~ "}" }
+range_bound = { "{" ~ quant_lo? ~ "," ~ quant_hi? ~ "}" }
+quant_lo = { integer }
+quant_hi = { integer }
+plus_bound = { "+" }
+star_bound = { "*" }
+
 node_pattern = { "(" ~ var? ~ labels? ~ prop_map? ~ ")" }
 
 rel_pattern = { left_arrow? ~ "-" ~ rel_detail? ~ "-" ~ right_arrow? }
 left_arrow = { "<" }
 right_arrow = { ">" }
 rel_detail = { "[" ~ var? ~ rel_types? ~ var_length? ~ prop_map? ~ "]" }
-rel_types = { ":" ~ type_name ~ ("|" ~ ":"? ~ type_name)* }
 var_length = { "*" ~ range_spec? }
 range_spec = { integer? ~ (".." ~ integer?)? }
 
-labels = { (":" ~ label_name)+ }
+// GQL label/type boolean expressions (`!` > `&` > `|`, parens). Both a node's
+// `:label_expr` and a relationship's `:label_expr` share one grammar and one AST
+// node (`LabelExpr`). The classic sugar still parses into the same tree: `:A:B`
+// (the `:` acts as `&`) lowers to AND, and `:T1|T2` / `:T1|:T2` to OR — so every
+// pre-GQL query is unchanged. `labels`/`rel_types` keep distinct rule names purely
+// so the lowering knows which pattern element it is filling in.
+labels = { ":" ~ label_expr }
+rel_types = { ":" ~ label_expr }
+label_expr = { le_or }
+le_or = { le_and ~ ("|" ~ ":"? ~ le_and)* }
+le_and = { le_not ~ (("&" | ":") ~ le_not)* }
+le_not = { le_bang* ~ le_atom }
+le_bang = { "!" }
+le_atom = { le_name | "(" ~ label_expr ~ ")" }
+le_name = { identifier }
 var = { identifier }
 label_name = { identifier }
-type_name = { identifier }
 
 prop_map = { "{" ~ (prop_entry ~ ("," ~ prop_entry)*)? ~ "}" }
 prop_entry = { property_key ~ ":" ~ expr }
@@ -216,6 +289,7 @@ index_access = { "[" ~ expr ~ "]" }
 
 primary = {
     case_expr
+  | cast_expr
   | exists_subquery
   | reduce_expr
   | list_comprehension
@@ -254,6 +328,22 @@ function_call = { func_name ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*
 func_name = @{ identifier ~ ("." ~ identifier)* }
 func_arg = { star_arg | expr }
 star_arg = { "*" }
+
+// GQL `CAST(expr AS TYPE)` — a typed-value conversion. It lowers (parser
+// `lower_cast`) onto slater's existing conversion functions (toInteger/toFloat/
+// toString/toBoolean and the temporal constructors date/localtime/localdatetime/
+// duration), so the executor path is shared, not duplicated. Tried before
+// `function_call` in `primary` so `CAST(` is read as a cast, not a plain call;
+// a `cast(…)` without the `AS TYPE` tail backtracks cleanly to `function_call`.
+cast_expr = { kw_cast ~ "(" ~ expr ~ kw_as ~ cast_type ~ ")" }
+kw_cast = @{ ^"cast" ~ !ident_cont }
+// The GQL type names slater can convert to, longest-prefix first so `integer`
+// wins over `int` etc. (the trailing `!ident_cont` also guards the short forms).
+cast_type = @{
+    (^"integer" | ^"int" | ^"float" | ^"double" | ^"real" | ^"string"
+      | ^"varchar" | ^"boolean" | ^"bool" | ^"localdatetime" | ^"localtime"
+      | ^"date" | ^"duration") ~ !ident_cont
+}
 
 case_expr = { kw_case ~ case_subject? ~ when_clause+ ~ else_clause? ~ kw_end }
 case_subject = { !kw_when ~ expr }
@@ -334,6 +424,6 @@ reserved = _{
       | ^"not" | ^"in" | ^"is" | ^"null" | ^"true" | ^"false" | ^"case"
       | ^"when" | ^"then" | ^"else" | ^"end" | ^"contains" | ^"starts"
       | ^"ends" | ^"union" | ^"ascending" | ^"asc" | ^"descending" | ^"desc"
-      | ^"call" | ^"yield" | ^"unwind")
+      | ^"call" | ^"yield" | ^"unwind" | ^"for")
     ~ !ident_cont
 }

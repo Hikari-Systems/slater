@@ -614,3 +614,168 @@ conventions adapted for a **three-crate workspace shipping two binaries**:
   matching the camelCase config keys. The README documents the mounts/env table and
   a worked example: build a graph with `slater-build`, connect with the neo4j JS
   **and** Python drivers, run a `MATCH … RETURN` and a cosine-KNN query.
+
+### D36 — GQL path restrictors are scoped to the variable-length walk (GQL track PR 2)
+GQL's `WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE` prefix a MATCH pattern and control node/edge
+reuse along a path. Slater's `varlen` (`exec.rs`) already owns the natural scope for
+this — it is the one place that threads a per-path `used` edge set — so PR 2 maps the
+restrictors onto that walk rather than inventing a whole-pattern uniqueness pass.
+- **`Pattern.restrictor: Option<PathRestrictor>`; `None` ≡ today's behaviour.** The
+  field is additive, so every existing pattern construction is unaffected. The
+  executor folds `None` onto `Trail` (`walk_mode`), because slater's `*` has *always*
+  been edge-unique — i.e. a bare `*` is already a TRAIL. So absence of a restrictor
+  and an explicit `TRAIL` run the identical code path, and **only `WALK` relaxes**
+  uniqueness; `ACYCLIC`/`SIMPLE` add node-uniqueness.
+- **Mode → uniqueness.** `WALK`: no check (bounded only by `max`/`MAX_VARLEN_HOPS`,
+  the budget and the deadline — a cycle would otherwise expand without limit).
+  `TRAIL`: no repeated edge (`used`). `ACYCLIC`: no repeated node, endpoints included
+  (`visited`, seeded with the walk's start). `SIMPLE`: no repeated node *except* the
+  two endpoints may coincide — a hop back to the start is emitted but not extended, so
+  the start can never become an interior repeat. Node-uniqueness implies
+  edge-uniqueness, so `ACYCLIC`/`SIMPLE` track only `visited` and `TRAIL` only `used`;
+  each mode's per-hop cost stays minimal and the `Trail`/default path is byte-for-byte
+  as before.
+- **Restrictor requires a variable-length relationship (PR 2 scope).** On a fixed hop
+  or node-only pattern there is no `varlen` scope to attach to, so a restrictor there
+  is **rejected** with a clear message rather than silently ignored. Honouring
+  restrictors over fixed-length chains is later work. A pattern with *several* varlen
+  relationships gives each its own independent scope (not one scope spanning the whole
+  path) — also acceptable for PR 2 and revisitable later.
+- **Restrictor over a quantified group is rejected.** `TRAIL ((x)-[:R]->(y)){1,3}`
+  parses but is rejected at lowering: PR 1 desugars a quantified group into the union
+  of separate fixed-length expansions, which cannot share one uniqueness scope, so the
+  restrictor's intent can't be honoured across the repetitions. Reject (clear message)
+  beats silently dropping it. The later fix is a dedicated repeater that threads one
+  `used`/`visited` set instead of desugaring when a restrictor is present.
+
+### D37 — GQL shortest-path selectors share `shortestPath()`'s BFS core (GQL track PR 3)
+GQL's `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k` prefix a MATCH pattern and pick
+shortest connecting paths between the pattern's two endpoints. Rather than add a second
+traversal, PR 3 generalises the BFS that already backed the `shortestPath()` function
+into one shared core (`select_paths`, `exec.rs`) and routes both callers through it.
+- **`Pattern.selector: Option<PathSelector>` (`AnyShortest`/`AllShortest`/`ShortestK`);
+  `None` ≡ the ordinary matcher.** Additive, like the PR 1/PR 2 pattern fields, so every
+  existing construction is unaffected. A selected pattern is routed out of `apply_match`
+  *before* the streaming/quantified/restrictor paths to its own handler
+  (`apply_match_selected`).
+- **One BFS core for both callers.** `select_paths(src, dst, rel, bounds, selector)`
+  returns the chosen paths as hop-lists in walk order: `AnyShortest` → ≤1 path,
+  `AllShortest` → every path of the single minimum length, `ShortestK(k)` → up to `k`
+  paths in non-decreasing length order. `shortestPath()` is now exactly `AnyShortest`
+  between two *bound* nodes — it validates its wrapped pattern as before, then delegates,
+  so the two can never diverge. Paths are **loopless** (no repeated node), matching
+  `shortestPath()`'s long-standing simple-path search and bounding the walk on a cyclic
+  graph. BFS explores layer-by-layer, so every entry in a layer has the same hop count
+  and paths surface in non-decreasing length order — the property `AllShortest`/`ShortestK`
+  rely on; a path is never extended past `dst`.
+- **Endpoints need not be pre-bound (the real generalisation over `shortestPath()`).**
+  Each endpoint is either a node already bound by the seed/an earlier clause, or a free
+  endpoint **scanned** by the usual planner strategy and filtered by `node_ok` (its
+  labels + inline props). The selector then runs per `(src, dst)` pair. A shared endpoint
+  variable (`(a)-[*]->(a)`) is kept consistent by the same `loose_eq` guard the ordinary
+  matcher uses.
+- **WHERE is applied *after* selection**, per produced path (consistent with how the
+  ordinary matcher applies a clause `WHERE` to a completed binding). So a selector finds
+  the shortest paths first, then filters them by the endpoint/`WHERE` predicates — not a
+  shortest-path-subject-to-`WHERE` search. Acceptable and predictable for the read subset.
+- **Scope (PR 3): a single relationship, like `shortestPath()`.** A multi-relationship
+  selected pattern, a selector combined with a path restrictor, a relationship property
+  filter, and a selector sharing its clause with a comma-joined pattern are all
+  **rejected** with clear messages (future work). A selector over a quantified group is
+  rejected at lowering (same reasoning as D36). `SHORTEST 0` is rejected as meaningless.
+
+### D38 — GQL label boolean expressions reuse one `LabelExpr` AST (GQL track PR 4)
+GQL extends label/type predicates beyond Cypher's `:A:B` (AND) and `:T1|T2` (rel
+alternation) to full booleans `!` > `&` > `|` with parentheses. PR 4 is the one PR
+with AST churn, deliberately sequenced last so the pattern AST (PRs 1–3) had settled.
+- **Sugar lowers into the same tree — no special cases.** The grammar makes both
+  `labels` and `rel_types` a `":" ~ label_expr` precedence climb; `:A:B` parses with
+  the `:` as an AND connector (→ `And`) and `:T1|T2` / `:T1|:T2` as `Or`. So every
+  pre-GQL query produces an ordinary `LabelExpr` and there is no parallel code path for
+  the classic forms. The WHERE postfix predicate `n:A:B` (`label_pred` →
+  `Expr::HasLabels`) is a *different* rule and keeps its AND-only form — out of scope,
+  smaller blast radius.
+- **One `LabelExpr` enum (`Atom`/`And`/`Or`/`Not`) for both node labels and
+  relationship types.** `NodePat.label_expr: Option<LabelExpr>` and
+  `RelPat.type_expr: Option<LabelExpr>` (`None` ≡ no constraint, the additive
+  default that leaves every other construction site untouched, as in D34/D36/D37).
+  Reusing the same enum rather than a parallel `type_expr` type meant a single
+  evaluator and a single grammar. A relationship carries exactly one type, so its
+  expression is evaluated over the singleton present-set `{this edge's type}` — `:A&B`
+  is then correctly always empty, `:!T` excludes one type.
+- **No three-valued logic.** A label is present or absent on a node (a relationship has
+  its one type or not), so `eval` is plain boolean recursion over a present-predicate.
+  An atom naming a label/type the symbol table doesn't know is simply *absent* — so
+  `!Unknown` holds and `Unknown` fails, the sound set-membership answer.
+- **The single-positive-atom fast path is preserved end to end.** This is the common
+  `(:Person)` / `-[:KNOWS]->` case and must not regress:
+  - Planner: `choose_from_preds` reads `node.required_labels()` — the *conjunctive
+    positive atoms* (`A&B`→{A,B}; `A|B`,`!A`→{}). For `:A`/`:A:B` this equals the old
+    `node.labels`, so existing plans (LabelScan / index pick) are byte-for-byte
+    unchanged; a disjunction/negation yields no required label → full scan + `node_ok`
+    re-check (sound, because `node_ok` always re-checks the whole expression).
+  - `node_ok`: a lone positive atom the anchor scan already guaranteed skips the label
+    record decode entirely; only a boolean expression decodes once and evaluates,
+    folding the guaranteed labels into the present-predicate.
+  - `expand_one_hop`: untyped / single `:T` / `:T1|T2` alternation pre-resolve (via
+    `positive_atoms`) to a flat reltype-id set so the per-edge loop stays the pre-GQL
+    `ids.contains` integer test; only `&`/`!` falls to per-edge `eval`.
+  - The single-node count/group fast paths gate on `as_single_atom`, taking the
+    posting/index shortcut only for the lone-atom case and falling back otherwise.
+
+### D39 — GQL `FOR x IN list` lowers onto the existing `UnwindClause` (GQL track PR 5)
+GQL spells `UNWIND list AS x` as `FOR x IN list` — the operands reversed. The grammar
+adds a `for_clause = { kw_for ~ alias ~ kw_in ~ expr }` (reusing the already-defined
+`kw_in`) to `reading_clause`, and `for` joins the reserved set so it can't be a bare
+identifier. The parser's `lower_for_clause` reads alias-then-expr and returns the
+**identical** `UnwindClause` as `lower_unwind_clause` — so past the parser the two
+spellings are the same AST and the executor (`apply_unwind`) is untouched. This is the
+same additive, lower-onto-existing-capability discipline as the rest of the track: no
+new clause type, no new executor path.
+
+### D40 — Optional `GQL` / `CYPHER` dialect prefix is stripped in the server, no-op routing (GQL track PR 5)
+Neo4j selects dialect with a query-string prefix (`CYPHER 5` / `CYPHER 25`), never a
+protocol field; GQL arrives over the same Bolt `RUN`. Slater mirrors this with
+`strip_dialect_prefix` (next to `normalize_query` in `server.rs`): a leading `GQL` /
+`CYPHER` keyword (case-insensitive, at a token boundary), optionally followed by a
+single bare numeric version token (`5`, `25`, `5.0`), is consumed before anything
+inspects the statement, so the USE check, Memgraph detection, introspection and the
+parser all see the bare query.
+- **Stripped in the server layer, not `parser::parse`.** This keeps `parser.rs`
+  language-agnostic — it never learns there is a dialect concept. The prefix is a
+  transport/routing nicety, which is a server concern.
+- **Routing is a deliberate no-op.** One parser serves both Cypher and the GQL subset
+  today (the whole track is a superset grammar), so the dialect selector records nothing
+  and changes no behaviour — it exists for client compatibility and forward room. A
+  following query keyword (`CYPHER MATCH`) and an identifier merely sharing the prefix
+  (`cypher_score`) are left untouched; a bare query is byte-for-byte unaffected.
+
+### D41 — GQLSTATUS surfaced additively in Bolt metadata (GQL track PR 5)
+ISO GQL defines GQLSTATUS status objects; Neo4j surfaces them in Bolt `SUCCESS` /
+`FAILURE` metadata alongside the legacy `code`/`message`. Slater does the same **purely
+additively** — no existing key is removed or renamed, because deployed neo4j drivers
+read `code`/`message`/`has_more`.
+- **FAILURE:** `message::failure_gqlstatus` adds `gql_status` + `status_description` to
+  the existing `code`/`message` map. `Failure::gqlstatus` maps the Neo4j code to a GQL
+  SQLSTATE-style class: `42000` (syntax error or access rule violation) for a malformed
+  or read-only-rejected statement, `50000` (general processing exception) otherwise. The
+  description follows GQL house style (`error: <condition>. <message>`).
+- **SUCCESS:** the *final* PULL / DISCARD SUCCESS (the one completing the statement)
+  carries `gqlstatus_completion`: `00000` (successful completion), or `02000` (no data)
+  on an empty result. Intermediate PULL successes (`has_more = true`) are unchanged,
+  since the statement isn't complete. The low-level decode-error `failure()` path keeps
+  its legacy form (not a query status).
+
+### D42 — GQL `CAST(expr AS TYPE)` lowers onto existing conversion functions (GQL track PR 5)
+A survey of the value-conversion surface found slater's scalar conversions
+(`toInteger`/`toFloat`/`toString`/`toBoolean`, each already NULL-on-failure) and the
+temporal constructors (`date`/`localtime`/`localdatetime`/`duration`, single-argument)
+already cover GQL's typed-value targets — there is no genuine coercion *gap*, only a
+missing surface form. So GQL `CAST` is implemented as a parser lowering, not new
+executor code: a `cast_expr` grammar rule (tried before `function_call`, backtracking
+cleanly for a `cast(…)` without the `AS TYPE` tail) and `lower_cast`, which maps the
+type name to the matching function and emits an ordinary `Expr::Function` — `INTEGER`/
+`INT`→`toInteger`, `FLOAT`/`DOUBLE`/`REAL`→`toFloat`, `STRING`/`VARCHAR`→`toString`,
+`BOOLEAN`/`BOOL`→`toBoolean`, plus `DATE`/`LOCALTIME`/`LOCALDATETIME`/`DURATION`. The
+same additive discipline as D39. Exotic GQL types (zoned temporals, typed lists,
+user-defined types) are deferred — they would need genuine new conversion logic.

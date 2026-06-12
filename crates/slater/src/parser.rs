@@ -178,12 +178,79 @@ pub mod ast {
         pub path_var: Option<String>,
         pub start: NodePat,
         pub rels: Vec<(RelPat, NodePat)>,
+        /// `None` for an ordinary pattern (the whole chain lives in `rels`). `Some`
+        /// only when the pattern contains a GQL quantified path group
+        /// (`((…)){m,n}`); then `rels` is empty and the ordered element sequence —
+        /// plain hops interleaved with quantified groups — lives here. The executor
+        /// desugars these into ordinary (`segments: None`) patterns before matching
+        /// (`expand_quantified_pattern`), so every consumer of `rels` is unaffected
+        /// when `segments` is `None`.
+        pub segments: Option<Vec<Segment>>,
+        /// GQL path restrictor (`WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE`), `None` when the
+        /// pattern carries no explicit restrictor. `None` preserves slater's
+        /// historical variable-length semantics (edge-unique = TRAIL), so existing
+        /// queries are untouched; only `Walk` relaxes it and `Acyclic`/`Simple` add
+        /// node-uniqueness. Scoped (PR 2) to variable-length relationships — see
+        /// `expand_chain`/`varlen` in exec.rs.
+        pub restrictor: Option<PathRestrictor>,
+        /// GQL shortest-path selector (`ANY SHORTEST`/`ALL SHORTEST`/`SHORTEST k`),
+        /// `None` when the pattern carries no selector. When `Some`, the executor
+        /// drives a shortest-path search between the pattern's two endpoints rather
+        /// than the ordinary matcher (`apply_match_selected` in exec.rs). Scoped
+        /// (PR 3) to a single-relationship pattern, like `shortestPath()`.
+        pub selector: Option<PathSelector>,
+    }
+
+    /// GQL shortest-path selector on a [`Pattern`]. Picks shortest connecting paths
+    /// between the pattern's endpoints: `AnyShortest` yields one shortest path per
+    /// endpoint pair; `AllShortest` yields every path of the minimum length;
+    /// `ShortestK(k)` yields up to `k` paths in non-decreasing length order. Paths are
+    /// loopless (no repeated node), mirroring `shortestPath()`'s simple-path search.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PathSelector {
+        AnyShortest,
+        AllShortest,
+        ShortestK(u32),
+    }
+
+    /// GQL path restrictor controlling node/edge reuse over a variable-length walk.
+    /// On a [`Pattern`] this is `Some` only when the query spells the restrictor out;
+    /// the executor maps the *absence* of one onto today's edge-unique behaviour, so
+    /// `Trail` and a bare `*` are identical and only `Walk` relaxes uniqueness.
+    /// `Acyclic` forbids any repeated node; `Simple` forbids repeats too but lets the
+    /// walk's two endpoints coincide (a single closed cycle).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PathRestrictor {
+        Walk,
+        Trail,
+        Acyclic,
+        Simple,
+    }
+
+    /// One element of a quantified [`Pattern`], in chain order. A `Hop` is an
+    /// ordinary relationship + its end node; a `Quantified` group is an inner
+    /// relationship sub-chain repeated `bounds` times, terminating at `exit` (the
+    /// node written after the group's closing `)`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Segment {
+        Hop(RelPat, NodePat),
+        Quantified {
+            /// The inner sub-path's relationship chain (excluding its leading node,
+            /// which juxtaposes with the preceding element's node).
+            inner: Vec<(RelPat, NodePat)>,
+            bounds: VarLength,
+            /// The node following the group; the last node of the last repetition
+            /// unifies with it.
+            exit: NodePat,
+        },
     }
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct NodePat {
         pub var: Option<String>,
-        pub labels: Vec<String>,
+        /// `None` ≡ no label constraint (matches any node). `Some` carries the GQL
+        /// label boolean expression; classic `:A` / `:A:B` lower to `Atom` / `And`.
+        pub label_expr: Option<LabelExpr>,
         pub props: Vec<(String, Expr)>,
     }
 
@@ -191,9 +258,101 @@ pub mod ast {
     pub struct RelPat {
         pub var: Option<String>,
         pub dir: Direction,
-        pub types: Vec<String>,
+        /// `None` ≡ any relationship type. `Some` carries the same `LabelExpr` AST as
+        /// node labels (reused, not a parallel type) — a relationship has exactly one
+        /// type, so the expression is evaluated over that singleton (`:T1|T2` matches
+        /// either, `:A&B` can never hold, `:!T` excludes one type).
+        pub type_expr: Option<LabelExpr>,
         pub var_length: Option<VarLength>,
         pub props: Vec<(String, Expr)>,
+    }
+
+    /// A GQL label / relationship-type boolean expression: `!` (highest) > `&` > `|`,
+    /// with parentheses. Evaluated as plain set membership over a node's label set or
+    /// a relationship's single type — three-valued logic is not needed because a
+    /// label is simply present or absent.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LabelExpr {
+        Atom(String),
+        And(Box<LabelExpr>, Box<LabelExpr>),
+        Or(Box<LabelExpr>, Box<LabelExpr>),
+        Not(Box<LabelExpr>),
+    }
+
+    impl LabelExpr {
+        /// `Some(label)` iff this expression is exactly one positive atom. The planner
+        /// and the single-node fast paths use this to keep the common `(:Person)` case
+        /// on the cheap LabelScan / single-posting path; anything richer falls back to
+        /// a broader scan plus a full `node_ok` re-check.
+        pub fn as_single_atom(&self) -> Option<&String> {
+            match self {
+                LabelExpr::Atom(a) => Some(a),
+                _ => None,
+            }
+        }
+
+        /// If the expression is a single atom or an `OR`-tree of atoms (no `&`/`!`),
+        /// return that flat list of type/label names; otherwise `None`. Relationship
+        /// traversal uses this to keep the pre-GQL "any of these reltypes" id-set hot
+        /// loop for single-type and `:T1|T2` patterns, only evaluating a general
+        /// boolean expression per edge when `&`/`!` actually appear.
+        pub fn positive_atoms(&self) -> Option<Vec<&String>> {
+            fn go<'a>(e: &'a LabelExpr, out: &mut Vec<&'a String>) -> bool {
+                match e {
+                    LabelExpr::Atom(a) => {
+                        out.push(a);
+                        true
+                    }
+                    LabelExpr::Or(l, r) => go(l, out) && go(r, out),
+                    LabelExpr::And(..) | LabelExpr::Not(..) => false,
+                }
+            }
+            let mut out = Vec::new();
+            go(self, &mut out).then_some(out)
+        }
+
+        /// The positively-required atoms — labels that must be present for the whole
+        /// expression to hold (its conjunctive positive atoms). The planner uses these
+        /// to pick a label/index scan; `node_ok` always re-checks the full expression,
+        /// so a returned subset only ever *widens* the candidate set (never unsoundly
+        /// narrows it). `A&B` → {A,B}; `A|B`, `!A`, `A|(B&C)` → {} for the unguaranteed
+        /// parts. For the pre-GQL `:A` / `:A:B` forms this reproduces the old
+        /// `labels: Vec<String>` exactly, so existing plans are unchanged.
+        pub fn required_atoms(&self, out: &mut Vec<String>) {
+            match self {
+                LabelExpr::Atom(a) => out.push(a.clone()),
+                LabelExpr::And(l, r) => {
+                    l.required_atoms(out);
+                    r.required_atoms(out);
+                }
+                LabelExpr::Or(..) | LabelExpr::Not(..) => {}
+            }
+        }
+
+        /// Evaluate the expression given a predicate that reports whether a named atom
+        /// is present (a label on the node, or the relationship's single type). Plain
+        /// boolean recursion — no three-valued logic.
+        pub fn eval(&self, present: &impl Fn(&str) -> bool) -> bool {
+            match self {
+                LabelExpr::Atom(a) => present(a),
+                LabelExpr::And(l, r) => l.eval(present) && r.eval(present),
+                LabelExpr::Or(l, r) => l.eval(present) || r.eval(present),
+                LabelExpr::Not(x) => !x.eval(present),
+            }
+        }
+    }
+
+    impl NodePat {
+        /// The labels the planner may treat as positively required (see
+        /// [`LabelExpr::required_atoms`]). Empty when there is no label constraint or
+        /// it is purely disjunctive/negated.
+        pub fn required_labels(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(e) = &self.label_expr {
+                e.required_atoms(&mut out);
+            }
+            out
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,6 +737,9 @@ fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
         Rule::call_clause => Ok(Clause::Call(lower_call_clause(inner)?)),
         Rule::call_subquery => Ok(Clause::CallSubquery(lower_call_subquery(inner)?)),
         Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
+        // GQL `FOR alias IN expr` lowers onto the very same UnwindClause — see
+        // `lower_for_clause`. The executor never learns the surface spelling.
+        Rule::for_clause => Ok(Clause::Unwind(lower_for_clause(inner)?)),
         other => bail!("internal: unexpected reading clause {other:?}"),
     }
 }
@@ -820,7 +982,7 @@ fn lower_match_clause(pair: Pair<Rule>) -> Result<MatchClause> {
     let mut where_ = None;
     for child in kids(pair) {
         match child.as_rule() {
-            Rule::pattern => patterns.push(lower_pattern(child)?),
+            Rule::match_pattern => patterns.push(lower_match_pattern(child)?),
             Rule::where_clause => where_ = Some(lower_expr(only_child(child)?)?),
             other => bail!("internal: unexpected match child {other:?}"),
         }
@@ -843,6 +1005,24 @@ fn lower_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
     let var = ident_text(
         it.next()
             .ok_or_else(|| anyhow::anyhow!("UNWIND without alias"))?,
+    )?;
+    Ok(UnwindClause { expr, var })
+}
+
+fn lower_for_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
+    // for_clause = { kw_for ~ alias ~ kw_in ~ expr } — GQL's spelling of UNWIND with
+    // the operands reversed. kids() drops the keyword tokens, leaving the alias then
+    // the list expression (the opposite order to `lower_unwind_clause`). It returns
+    // the identical UnwindClause, so `FOR x IN list` and `UNWIND list AS x` are the
+    // same query past the parser.
+    let mut it = kids(pair);
+    let var = ident_text(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("FOR without alias"))?,
+    )?;
+    let expr = lower_expr(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("FOR without expression"))?,
     )?;
     Ok(UnwindClause { expr, var })
 }
@@ -965,29 +1145,264 @@ fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
         path_var,
         start,
         rels: chain,
+        segments: None,
+        restrictor: None,
+        selector: None,
     })
+}
+
+/// Lower a `match_pattern` (a `pattern` that may contain GQL quantified groups).
+/// When no quantified group is present this is exactly [`lower_pattern`]'s result
+/// (`segments: None`); when one or more groups appear, the ordered element
+/// sequence is captured in `segments` and `rels` is left empty for the executor to
+/// desugar.
+fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
+    let mut path_var = None;
+    let mut start: Option<NodePat> = None;
+    // Pending relationship awaiting its end node, so we can pair `(connector, node)`.
+    let mut pending_rel: Option<RelPat> = None;
+    let mut pending_quant: Option<(Vec<(RelPat, NodePat)>, VarLength)> = None;
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut has_quant = false;
+    let mut restrictor: Option<PathRestrictor> = None;
+    let mut selector: Option<PathSelector> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::path_selector => selector = Some(lower_path_selector(child)?),
+            Rule::path_restrictor => restrictor = Some(lower_path_restrictor(child)?),
+            Rule::path_var => path_var = Some(ident_text(child)?),
+            Rule::node_pattern => {
+                let node = lower_node_pattern(child)?;
+                if start.is_none() {
+                    start = Some(node);
+                } else if let Some((inner, bounds)) = pending_quant.take() {
+                    segments.push(Segment::Quantified {
+                        inner,
+                        bounds,
+                        exit: node,
+                    });
+                } else if let Some(rel) = pending_rel.take() {
+                    segments.push(Segment::Hop(rel, node));
+                } else {
+                    bail!("internal: pattern node without a preceding connector");
+                }
+            }
+            Rule::rel_pattern => pending_rel = Some(lower_rel_pattern(child)?),
+            Rule::quantified_path => {
+                has_quant = true;
+                pending_quant = Some(lower_quantified_path(child)?);
+            }
+            other => bail!("internal: unexpected match_pattern child {other:?}"),
+        }
+    }
+
+    let start = start.ok_or_else(|| anyhow::anyhow!("pattern has no node"))?;
+
+    if !has_quant {
+        // Plain pattern: fold the `Hop` segments back into the ordinary `rels`
+        // chain so the existing `segments: None` machinery handles it verbatim.
+        let rels = segments
+            .into_iter()
+            .map(|s| match s {
+                Segment::Hop(r, n) => Ok((r, n)),
+                Segment::Quantified { .. } => {
+                    bail!("internal: quantified segment without has_quant flag")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Pattern {
+            path_var,
+            start,
+            rels,
+            segments: None,
+            restrictor,
+            selector,
+        });
+    }
+
+    // Quantified patterns can't yet bind a whole-path variable (the desugaring
+    // discards intermediate nodes, so a reconstructed `Path` would be incomplete).
+    if path_var.is_some() {
+        bail!("a path variable over a quantified path pattern is not yet supported");
+    }
+    // A restrictor over a quantified group is deferred (DECISIONS D36): the
+    // group desugars into separate fixed-length expansions, which can't share one
+    // uniqueness scope, so honouring TRAIL/ACYCLIC/SIMPLE across the repetitions is
+    // not yet possible. Reject rather than silently ignore the restrictor.
+    if restrictor.is_some() {
+        bail!(
+            "a path restrictor (WALK/TRAIL/ACYCLIC/SIMPLE) over a quantified path \
+             pattern ('((…)){{m,n}}') is not yet supported; apply it to a \
+             variable-length relationship instead"
+        );
+    }
+    // A selector over a quantified group is likewise deferred: shortest-path search
+    // runs over a single variable-length relationship, not a desugared group.
+    if selector.is_some() {
+        bail!(
+            "a path selector (ANY/ALL SHORTEST or SHORTEST k) over a quantified path \
+             pattern ('((…)){{m,n}}') is not yet supported; apply it to a \
+             variable-length relationship instead"
+        );
+    }
+    Ok(Pattern {
+        path_var: None,
+        start,
+        rels: Vec::new(),
+        segments: Some(segments),
+        restrictor: None,
+        selector: None,
+    })
+}
+
+/// Lower a `path_restrictor` keyword into its [`PathRestrictor`] variant.
+fn lower_path_restrictor(pair: Pair<Rule>) -> Result<PathRestrictor> {
+    let kw = only_child(pair)?;
+    Ok(match kw.as_rule() {
+        Rule::kw_walk => PathRestrictor::Walk,
+        Rule::kw_trail => PathRestrictor::Trail,
+        Rule::kw_acyclic => PathRestrictor::Acyclic,
+        Rule::kw_simple => PathRestrictor::Simple,
+        other => bail!("internal: unexpected path_restrictor child {other:?}"),
+    })
+}
+
+/// Lower a `path_selector` (`ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k`) into its
+/// [`PathSelector`] variant.
+fn lower_path_selector(pair: Pair<Rule>) -> Result<PathSelector> {
+    let inner = only_child(pair)?;
+    Ok(match inner.as_rule() {
+        Rule::any_shortest => PathSelector::AnyShortest,
+        Rule::all_shortest => PathSelector::AllShortest,
+        Rule::shortest_k => {
+            // `SHORTEST k`: skip the `kw_shortest` keyword child and read the count.
+            let n = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::integer)
+                .ok_or_else(|| anyhow::anyhow!("internal: SHORTEST k missing its count"))?;
+            let k: u32 = n.as_str().parse().map_err(|_| {
+                anyhow::anyhow!("SHORTEST count '{}' is not a valid integer", n.as_str())
+            })?;
+            if k == 0 {
+                bail!("SHORTEST k requires a positive count (got 0)");
+            }
+            PathSelector::ShortestK(k)
+        }
+        other => bail!("internal: unexpected path_selector child {other:?}"),
+    })
+}
+
+/// Lower `quantified_path = "(" quantified_inner ")" quantifier_bounds` into the
+/// inner relationship chain plus its repetition bounds. The inner sub-path's
+/// leading node juxtaposes with the preceding element's node, so labels/properties
+/// on it would have to be enforced at every junction — not yet supported, so they
+/// are rejected here rather than silently dropped.
+fn lower_quantified_path(pair: Pair<Rule>) -> Result<(Vec<(RelPat, NodePat)>, VarLength)> {
+    let mut inner: Vec<(RelPat, NodePat)> = Vec::new();
+    let mut bounds: Option<VarLength> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::quantified_inner => {
+                let mut nodes = Vec::new();
+                let mut rels = Vec::new();
+                for d in child.into_inner() {
+                    match d.as_rule() {
+                        Rule::node_pattern => nodes.push(lower_node_pattern(d)?),
+                        Rule::rel_pattern => rels.push(lower_rel_pattern(d)?),
+                        other => bail!("internal: unexpected quantified_inner child {other:?}"),
+                    }
+                }
+                let mut nodes = nodes.into_iter();
+                let first = nodes
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("quantified group has no node"))?;
+                if first.label_expr.is_some() || !first.props.is_empty() {
+                    bail!(
+                        "labels or properties on the first node of a quantified path \
+                         group are not yet supported"
+                    );
+                }
+                for (rel, node) in rels.into_iter().zip(nodes) {
+                    inner.push((rel, node));
+                }
+            }
+            Rule::quantifier_bounds => bounds = Some(lower_quantifier_bounds(child)?),
+            other => bail!("internal: unexpected quantified_path child {other:?}"),
+        }
+    }
+    let bounds = bounds.ok_or_else(|| anyhow::anyhow!("quantified group has no bounds"))?;
+    Ok((inner, bounds))
+}
+
+/// Lower `quantifier_bounds` (`{m}` / `{m,n}` / `{m,}` / `{,n}` / `+` / `*`) into a
+/// [`VarLength`]. `+` is `{1,}`, `*` is `{0,}`; an absent bound is `None` (open).
+fn lower_quantifier_bounds(pair: Pair<Rule>) -> Result<VarLength> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::exact_bound => {
+            let n = parse_u32(only_child(inner)?)?;
+            Ok(VarLength {
+                min: Some(n),
+                max: Some(n),
+            })
+        }
+        Rule::range_bound => {
+            let mut min = None;
+            let mut max = None;
+            for d in inner.into_inner() {
+                match d.as_rule() {
+                    Rule::quant_lo => min = Some(parse_u32(only_child(d)?)?),
+                    Rule::quant_hi => max = Some(parse_u32(only_child(d)?)?),
+                    other => bail!("internal: unexpected range_bound child {other:?}"),
+                }
+            }
+            Ok(VarLength { min, max })
+        }
+        Rule::plus_bound => Ok(VarLength {
+            min: Some(1),
+            max: None,
+        }),
+        Rule::star_bound => Ok(VarLength {
+            min: Some(0),
+            max: None,
+        }),
+        other => bail!("internal: unexpected quantifier_bounds child {other:?}"),
+    }
+}
+
+/// Parse a non-negative `integer` token used as a quantifier bound.
+fn parse_u32(pair: Pair<Rule>) -> Result<u32> {
+    pair.as_str()
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("invalid quantifier bound '{}'", pair.as_str()))
 }
 
 fn lower_node_pattern(pair: Pair<Rule>) -> Result<NodePat> {
     let mut var = None;
-    let mut labels = Vec::new();
+    let mut label_expr = None;
     let mut props = Vec::new();
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::var => var = Some(ident_text(only_child(child)?)?),
-            Rule::labels => labels = lower_labels(child)?,
+            Rule::labels => label_expr = Some(lower_labels(child)?),
             Rule::prop_map => props = lower_prop_map(child)?,
             other => bail!("internal: unexpected node child {other:?}"),
         }
     }
-    Ok(NodePat { var, labels, props })
+    Ok(NodePat {
+        var,
+        label_expr,
+        props,
+    })
 }
 
 fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
     let mut left = false;
     let mut right = false;
     let mut var = None;
-    let mut types = Vec::new();
+    let mut type_expr = None;
     let mut var_length = None;
     let mut props = Vec::new();
     for child in pair.into_inner() {
@@ -998,13 +1413,8 @@ fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
                 for d in child.into_inner() {
                     match d.as_rule() {
                         Rule::var => var = Some(ident_text(only_child(d)?)?),
-                        Rule::rel_types => {
-                            for t in d.into_inner() {
-                                if t.as_rule() == Rule::type_name {
-                                    types.push(ident_text(t)?);
-                                }
-                            }
-                        }
+                        // `rel_types` and node `labels` share the `label_expr` grammar.
+                        Rule::rel_types => type_expr = Some(lower_labels(d)?),
                         Rule::var_length => var_length = Some(lower_var_length(d)?),
                         Rule::prop_map => props = lower_prop_map(d)?,
                         other => bail!("internal: unexpected rel_detail child {other:?}"),
@@ -1023,7 +1433,7 @@ fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
     Ok(RelPat {
         var,
         dir,
-        types,
+        type_expr,
         var_length,
         props,
     })
@@ -1066,11 +1476,73 @@ fn lower_var_length(pair: Pair<Rule>) -> Result<VarLength> {
     }
 }
 
-fn lower_labels(pair: Pair<Rule>) -> Result<Vec<String>> {
-    pair.into_inner()
-        .filter(|p| p.as_rule() == Rule::label_name)
-        .map(ident_text)
-        .collect()
+/// Lower a `labels` / `rel_types` pair (`":" ~ label_expr`) into a [`LabelExpr`].
+/// Both node and relationship pattern elements share this grammar and AST.
+fn lower_labels(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let expr = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::label_expr)
+        .ok_or_else(|| anyhow::anyhow!("label expression has no body"))?;
+    lower_label_expr(expr)
+}
+
+// The label-expression grammar mirrors the standard precedence climb: `label_expr`
+// → OR over `le_and` → AND over `le_not` → leading `!`s over `le_atom` (a name or a
+// parenthesised sub-expression). Each lowering peels one layer; absent operators
+// collapse to the single operand, so `:A` lowers to a bare `Atom`.
+
+fn lower_label_expr(pair: Pair<Rule>) -> Result<LabelExpr> {
+    lower_le_or(only_child(pair)?)
+}
+
+fn lower_le_or(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut ands = pair.into_inner().filter(|p| p.as_rule() == Rule::le_and);
+    let first = ands
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty label OR expression"))?;
+    let mut acc = lower_le_and(first)?;
+    for rhs in ands {
+        acc = LabelExpr::Or(Box::new(acc), Box::new(lower_le_and(rhs)?));
+    }
+    Ok(acc)
+}
+
+fn lower_le_and(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut nots = pair.into_inner().filter(|p| p.as_rule() == Rule::le_not);
+    let first = nots
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty label AND expression"))?;
+    let mut acc = lower_le_not(first)?;
+    for rhs in nots {
+        acc = LabelExpr::And(Box::new(acc), Box::new(lower_le_not(rhs)?));
+    }
+    Ok(acc)
+}
+
+fn lower_le_not(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut bangs = 0usize;
+    let mut atom = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::le_bang => bangs += 1,
+            Rule::le_atom => atom = Some(lower_le_atom(child)?),
+            other => bail!("internal: unexpected le_not child {other:?}"),
+        }
+    }
+    let mut expr = atom.ok_or_else(|| anyhow::anyhow!("label NOT without an atom"))?;
+    for _ in 0..bangs {
+        expr = LabelExpr::Not(Box::new(expr));
+    }
+    Ok(expr)
+}
+
+fn lower_le_atom(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let child = only_child(pair)?;
+    match child.as_rule() {
+        Rule::le_name => Ok(LabelExpr::Atom(ident_text(child)?)),
+        Rule::label_expr => lower_label_expr(child),
+        other => bail!("internal: unexpected le_atom child {other:?}"),
+    }
 }
 
 fn lower_prop_map(pair: Pair<Rule>) -> Result<Vec<(String, Expr)>> {
@@ -1283,6 +1755,7 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Map(entries))
         }
         Rule::function_call => lower_function(inner),
+        Rule::cast_expr => lower_cast(inner),
         Rule::case_expr => lower_case(inner),
         Rule::map_projection => lower_map_projection(inner),
         Rule::reduce_expr => lower_reduce(inner),
@@ -1320,6 +1793,40 @@ fn lower_function(pair: Pair<Rule>) -> Result<Expr> {
         } else {
             FuncArgs::Args(args)
         },
+    })
+}
+
+fn lower_cast(pair: Pair<Rule>) -> Result<Expr> {
+    // cast_expr = { kw_cast ~ "(" ~ expr ~ kw_as ~ cast_type ~ ")" }. kids() drops
+    // the keyword tokens, leaving the value expression then the target type name.
+    // GQL's CAST is a typed-value conversion; we lower it onto slater's existing
+    // conversion functions so the executor path is shared (no new coercion code) —
+    // the same additive discipline as FOR → UNWIND (DECISIONS D42).
+    let mut it = kids(pair);
+    let value = lower_expr(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("CAST without value"))?,
+    )?;
+    let ty = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("CAST without target type"))?;
+    let func = match ty.as_str().to_ascii_lowercase().as_str() {
+        "integer" | "int" => "toInteger",
+        "float" | "double" | "real" => "toFloat",
+        "string" | "varchar" => "toString",
+        "boolean" | "bool" => "toBoolean",
+        // The temporal types map to their single-argument constructors, which already
+        // accept a string/map and yield the temporal Val.
+        "date" => "date",
+        "localdatetime" => "localdatetime",
+        "localtime" => "localtime",
+        "duration" => "duration",
+        other => bail!("internal: unexpected CAST type {other:?}"),
+    };
+    Ok(Expr::Function {
+        name: func.to_string(),
+        distinct: false,
+        args: FuncArgs::Args(vec![value]),
     })
 }
 
@@ -1512,6 +2019,9 @@ fn lower_pattern_predicate(pair: Pair<Rule>) -> Result<Expr> {
         path_var: None,
         start,
         rels: chain,
+        segments: None,
+        restrictor: None,
+        selector: None,
     })))
 }
 
@@ -1611,6 +2121,8 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_call
             | Rule::kw_yield
             | Rule::kw_unwind
+            | Rule::kw_for
+            | Rule::kw_cast
             | Rule::reduce_kw
             | Rule::exists_kw
     )
@@ -2032,11 +2544,14 @@ mod tests {
         assert!(m.where_.is_some());
         let p = &m.patterns[0];
         assert_eq!(p.start.var.as_deref(), Some("a"));
-        assert_eq!(p.start.labels, vec!["Person".to_string()]);
+        assert_eq!(
+            p.start.label_expr,
+            Some(LabelExpr::Atom("Person".to_string()))
+        );
         assert_eq!(p.rels.len(), 1);
         let (rel, end) = &p.rels[0];
         assert_eq!(rel.dir, Direction::Outgoing);
-        assert_eq!(rel.types, vec!["KNOWS".to_string()]);
+        assert_eq!(rel.type_expr, Some(LabelExpr::Atom("KNOWS".to_string())));
         assert_eq!(
             rel.var_length,
             Some(VarLength {
@@ -2227,7 +2742,10 @@ mod tests {
                 assert_eq!(p.start.var.as_deref(), Some("n"));
                 assert_eq!(p.rels.len(), 1);
                 assert_eq!(p.rels[0].0.dir, Direction::Outgoing);
-                assert_eq!(p.rels[0].0.types, vec!["KNOWS".to_string()]);
+                assert_eq!(
+                    p.rels[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
             }
             other => panic!("expected PatternPredicate, got {other:?}"),
         }
@@ -2313,6 +2831,255 @@ mod tests {
         assert_eq!(m.patterns[0].path_var.as_deref(), Some("p"));
     }
 
+    // ── GQL quantified path patterns ─────────────────────────────────────────
+
+    /// Pull the first pattern out of a single-MATCH query.
+    fn first_pattern(q: &Query) -> &Pattern {
+        let Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a MATCH clause");
+        };
+        &m.patterns[0]
+    }
+
+    #[test]
+    fn ordinary_pattern_has_no_segments() {
+        // A quantifier-free pattern lowers exactly as before: the whole chain lives
+        // in `rels` and `segments` stays `None`, so the hot path is untouched.
+        let p = &ok("MATCH (a:Person)-[:KNOWS]->(b) RETURN b").head;
+        let Clause::Match(m) = &p.reading[0] else {
+            panic!("expected MATCH");
+        };
+        assert!(m.patterns[0].segments.is_none());
+        assert_eq!(m.patterns[0].rels.len(), 1);
+    }
+
+    #[test]
+    fn lowers_quantified_range() {
+        let q = ok("MATCH (a:Person) ((x)-[:KNOWS]->(y)){1,3} (b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("a"));
+        assert!(p.rels.is_empty(), "quantified pattern keeps rels empty");
+        let segs = p.segments.as_ref().expect("segments populated");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::Quantified {
+                inner,
+                bounds,
+                exit,
+            } => {
+                assert_eq!(inner.len(), 1);
+                assert_eq!(
+                    inner[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
+                assert_eq!(inner[0].0.dir, Direction::Outgoing);
+                assert_eq!(bounds.min, Some(1));
+                assert_eq!(bounds.max, Some(3));
+                assert_eq!(exit.var.as_deref(), Some("b"));
+            }
+            other => panic!("expected Quantified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_quantifier_bound_forms() {
+        let cases = [
+            ("{2}", Some(2u32), Some(2u32)),
+            ("{2,5}", Some(2), Some(5)),
+            ("{2,}", Some(2), None),
+            ("{,5}", None, Some(5)),
+            ("+", Some(1), None),
+            ("*", Some(0), None),
+        ];
+        for (q, min, max) in cases {
+            let src = format!("MATCH (a) ((x)-[:R]->(y)){q} (b) RETURN b");
+            let parsed = ok(&src);
+            let p = first_pattern(&parsed);
+            let segs = p.segments.as_ref().unwrap();
+            match &segs[0] {
+                Segment::Quantified { bounds, .. } => {
+                    assert_eq!(bounds.min, min, "min for {q}");
+                    assert_eq!(bounds.max, max, "max for {q}");
+                }
+                other => panic!("expected Quantified for {q}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lowers_multi_hop_quantified_inner() {
+        let q = ok("MATCH (a) ((x)-[:KNOWS]->(y)-[:WORKS_AT]->(z)){1,2} (b) RETURN b");
+        match &first_pattern(&q).segments.as_ref().unwrap()[0] {
+            Segment::Quantified { inner, .. } => {
+                assert_eq!(inner.len(), 2);
+                assert_eq!(
+                    inner[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
+                assert_eq!(
+                    inner[1].0.type_expr,
+                    Some(LabelExpr::Atom("WORKS_AT".to_string()))
+                );
+            }
+            other => panic!("expected Quantified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_hop_then_quantified_mixed() {
+        // A plain Cypher hop followed by a GQL quantified group in one pattern:
+        // the element order is preserved as [Hop, Quantified].
+        let q = ok("MATCH (a:Person)-[:KNOWS]->(m) ((x)-[:KNOWS]->(y)){2} (b) RETURN b");
+        let segs = first_pattern(&q).segments.as_ref().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(segs[0], Segment::Hop(_, _)));
+        assert!(matches!(segs[1], Segment::Quantified { .. }));
+    }
+
+    #[test]
+    fn quantified_rejects_path_variable() {
+        let e = err("MATCH p = (a) ((x)-[:R]->(y)){1,2} (b) RETURN p");
+        assert!(e.contains("path variable"), "{e}");
+    }
+
+    #[test]
+    fn quantified_rejects_inner_start_labels() {
+        let e = err("MATCH (a) ((x:Person)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("first node of a quantified"), "{e}");
+    }
+
+    #[test]
+    fn bare_pattern_rejects_quantifier() {
+        // The quantifier lives only in `match_pattern`; shortestPath/EXISTS/pattern
+        // comprehensions use the plain `pattern` rule, so a quantifier there is a
+        // syntax error rather than a silently mis-handled segment.
+        assert!(parse("MATCH (a),(b) WHERE shortestPath(((x)-[:R]->(y)){1,2}) RETURN a").is_err());
+    }
+
+    // ── GQL path restrictors (PR 2) ──────────────────────────────────────────
+
+    #[test]
+    fn lowers_path_restrictors() {
+        // Each restrictor keyword parses onto the pattern; the chain is otherwise
+        // an ordinary variable-length pattern (`segments` stays `None`).
+        for (kw, want) in [
+            ("WALK", PathRestrictor::Walk),
+            ("TRAIL", PathRestrictor::Trail),
+            ("ACYCLIC", PathRestrictor::Acyclic),
+            ("SIMPLE", PathRestrictor::Simple),
+        ] {
+            let q = ok(&format!("MATCH {kw} (a)-[:R*1..3]->(b) RETURN b"));
+            let p = first_pattern(&q);
+            assert_eq!(p.restrictor, Some(want), "restrictor for {kw}");
+            assert!(p.segments.is_none(), "restrictor pattern stays ordinary");
+            assert_eq!(p.rels.len(), 1);
+            assert!(p.rels[0].0.var_length.is_some());
+        }
+    }
+
+    #[test]
+    fn absent_restrictor_is_none() {
+        // No restrictor keyword → `None`, which the executor maps onto today's
+        // edge-unique (TRAIL) behaviour, so existing queries are untouched.
+        let q = ok("MATCH (a)-[:R*1..3]->(b) RETURN b");
+        assert_eq!(first_pattern(&q).restrictor, None);
+    }
+
+    #[test]
+    fn restrictor_lowercase_accepted() {
+        // Keywords are case-insensitive like every other keyword terminal.
+        let q = ok("match trail (a)-[:R*]->(b) return b");
+        assert_eq!(first_pattern(&q).restrictor, Some(PathRestrictor::Trail));
+    }
+
+    #[test]
+    fn restrictor_does_not_shadow_node_var() {
+        // A restrictor only sits at the head of a `match_pattern`, never inside
+        // `(…)`, so a node variable spelled `walk` is parsed as a variable, not a
+        // restrictor — and the pattern carries no restrictor.
+        let q = ok("MATCH (walk)-[:R*]->(b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("walk"));
+        assert_eq!(p.restrictor, None);
+    }
+
+    #[test]
+    fn restrictor_over_quantified_rejected() {
+        // A restrictor over a quantified group is deferred (the group desugars into
+        // separate expansions that can't share a uniqueness scope), so it is
+        // rejected with a clear message rather than silently ignored.
+        let e = err("MATCH TRAIL (a) ((x)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
+    }
+
+    // ── GQL shortest-path selectors (PR 3) ───────────────────────────────────
+
+    #[test]
+    fn lowers_path_selectors() {
+        // Each selector form parses onto the pattern; the chain is otherwise an
+        // ordinary variable-length pattern (`segments` stays `None`).
+        for (kw, want) in [
+            ("ANY SHORTEST", PathSelector::AnyShortest),
+            ("ALL SHORTEST", PathSelector::AllShortest),
+            ("SHORTEST 3", PathSelector::ShortestK(3)),
+        ] {
+            let q = ok(&format!("MATCH {kw} (a)-[:R*]->(b) RETURN b"));
+            let p = first_pattern(&q);
+            assert_eq!(p.selector, Some(want), "selector for {kw}");
+            assert!(p.segments.is_none(), "selector pattern stays ordinary");
+            assert_eq!(p.rels.len(), 1);
+        }
+    }
+
+    #[test]
+    fn absent_selector_is_none() {
+        // No selector keyword → `None`: the pattern runs the ordinary matcher.
+        let q = ok("MATCH (a)-[:R*]->(b) RETURN b");
+        assert_eq!(first_pattern(&q).selector, None);
+    }
+
+    #[test]
+    fn selector_lowercase_accepted() {
+        // Keywords are case-insensitive like every other keyword terminal.
+        let q = ok("match any shortest (a)-[:R*]->(b) return b");
+        assert_eq!(first_pattern(&q).selector, Some(PathSelector::AnyShortest));
+    }
+
+    #[test]
+    fn selector_with_path_var_follows_prefix() {
+        // The path-variable assignment follows the selector prefix
+        // (`SELECTOR p = …`), consistent with the restrictor placement (PR 2).
+        let q = ok("MATCH ALL SHORTEST p = (a)-[:R*]->(b) RETURN p");
+        let p = first_pattern(&q);
+        assert_eq!(p.selector, Some(PathSelector::AllShortest));
+        assert_eq!(p.path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn selector_does_not_shadow_node_var() {
+        // A selector only sits at the head of a `match_pattern`, never inside `(…)`,
+        // so a node variable spelled `shortest` parses as a variable, not a selector.
+        let q = ok("MATCH (shortest)-[:R*]->(b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("shortest"));
+        assert_eq!(p.selector, None);
+    }
+
+    #[test]
+    fn selector_zero_k_rejected() {
+        // `SHORTEST 0` is meaningless; rejected at lowering with a clear message.
+        let e = err("MATCH SHORTEST 0 (a)-[:R*]->(b) RETURN b");
+        assert!(e.contains("positive count"), "{e}");
+    }
+
+    #[test]
+    fn selector_over_quantified_rejected() {
+        // A selector over a quantified group is deferred, like the restrictor: the
+        // group desugars into separate expansions, not a single var-length walk.
+        let e = err("MATCH ANY SHORTEST (a) ((x)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("selector") && e.contains("quantified"), "{e}");
+    }
+
     #[test]
     fn all_shortest_paths_not_supported() {
         // allShortestPaths is deferred: it is not in the grammar, so its `(…)` body
@@ -2323,6 +3090,167 @@ mod tests {
             &q.head.ret.body.items[0].expr,
             Expr::Function { name, .. } if name == "allShortestPaths"
         ));
+    }
+
+    // ── GQL label boolean expressions (PR 4) ─────────────────────────────────
+
+    fn atom(s: &str) -> LabelExpr {
+        LabelExpr::Atom(s.to_string())
+    }
+
+    fn node_label_expr(q: &str) -> LabelExpr {
+        first_pattern(&ok(q))
+            .start
+            .label_expr
+            .clone()
+            .expect("node carries a label expression")
+    }
+
+    fn rel_type_expr(q: &str) -> LabelExpr {
+        first_pattern(&ok(q)).rels[0]
+            .0
+            .type_expr
+            .clone()
+            .expect("relationship carries a type expression")
+    }
+
+    #[test]
+    fn lowers_label_and_with_colon_sugar() {
+        // `:A&B` and the classic `:A:B` sugar lower to the SAME And tree — the `:`
+        // separator is just AND. A regression that lowered the colon chain to Or
+        // would change this equality.
+        let want = LabelExpr::And(Box::new(atom("Person")), Box::new(atom("Employee")));
+        assert_eq!(node_label_expr("MATCH (n:Person&Employee) RETURN n"), want);
+        assert_eq!(node_label_expr("MATCH (n:Person:Employee) RETURN n"), want);
+    }
+
+    #[test]
+    fn lowers_label_or_on_node_and_reltype() {
+        // `|` lowers to Or for node labels; the pre-GQL rel-type alternation
+        // `:T1|T2` lowers to the same Or, so the alternation sugar is preserved.
+        assert_eq!(
+            node_label_expr("MATCH (n:Person|Company) RETURN n"),
+            LabelExpr::Or(Box::new(atom("Person")), Box::new(atom("Company"))),
+        );
+        assert_eq!(
+            rel_type_expr("MATCH (a)-[:KNOWS|WORKS_AT]->(b) RETURN b"),
+            LabelExpr::Or(Box::new(atom("KNOWS")), Box::new(atom("WORKS_AT"))),
+        );
+    }
+
+    #[test]
+    fn lowers_label_negation() {
+        assert_eq!(
+            node_label_expr("MATCH (n:!Person) RETURN n"),
+            LabelExpr::Not(Box::new(atom("Person"))),
+        );
+        assert_eq!(
+            rel_type_expr("MATCH (a)-[:!KNOWS]->(b) RETURN b"),
+            LabelExpr::Not(Box::new(atom("KNOWS"))),
+        );
+    }
+
+    #[test]
+    fn label_expr_precedence_not_over_and_over_or() {
+        // `!` binds tighter than `&`, which binds tighter than `|`:
+        //   !A&B   ≡ (!A)&B
+        //   A|B&C  ≡ A|(B&C)
+        assert_eq!(
+            node_label_expr("MATCH (n:!A&B) RETURN n"),
+            LabelExpr::And(
+                Box::new(LabelExpr::Not(Box::new(atom("A")))),
+                Box::new(atom("B")),
+            ),
+        );
+        assert_eq!(
+            node_label_expr("MATCH (n:A|B&C) RETURN n"),
+            LabelExpr::Or(
+                Box::new(atom("A")),
+                Box::new(LabelExpr::And(Box::new(atom("B")), Box::new(atom("C")))),
+            ),
+        );
+    }
+
+    #[test]
+    fn label_parens_override_precedence() {
+        // Parentheses force the OR first, against the default precedence.
+        assert_eq!(
+            node_label_expr("MATCH (n:(A|B)&C) RETURN n"),
+            LabelExpr::And(
+                Box::new(LabelExpr::Or(Box::new(atom("A")), Box::new(atom("B")))),
+                Box::new(atom("C")),
+            ),
+        );
+    }
+
+    #[test]
+    fn absent_label_is_none() {
+        // No label constraint ⇒ `None` (any node), so the hot path is untouched.
+        assert_eq!(
+            first_pattern(&ok("MATCH (n) RETURN n")).start.label_expr,
+            None
+        );
+        assert_eq!(
+            first_pattern(&ok("MATCH (a)-[r]->(b) RETURN b")).rels[0]
+                .0
+                .type_expr,
+            None,
+        );
+    }
+
+    // ── GQL PR 5 — `FOR alias IN expr` lowers onto UnwindClause ───────────────
+
+    #[test]
+    fn for_lowers_to_unwind_clause() {
+        // GQL `FOR x IN [1,2,3]` is exactly `UNWIND [1,2,3] AS x` after the parser:
+        // same UnwindClause, just the surface operand order reversed.
+        let q = ok("FOR x IN [1, 2, 3] RETURN x");
+        match &q.head.reading[0] {
+            Clause::Unwind(uc) => {
+                assert_eq!(uc.var, "x");
+                assert!(matches!(uc.expr, Expr::List(_)));
+            }
+            other => panic!("expected an Unwind clause, got {other:?}"),
+        }
+
+        // Identical AST to the Cypher spelling — the two parse to the same clause.
+        let from_for = ok("FOR x IN [1, 2, 3] RETURN x");
+        let from_unwind = ok("UNWIND [1, 2, 3] AS x RETURN x");
+        assert_eq!(from_for.head.reading, from_unwind.head.reading);
+    }
+
+    #[test]
+    fn cast_lowers_onto_conversion_functions() {
+        // The RETURN projection expression of `q`'s sole RETURN item.
+        fn return_expr(q: &Query) -> &Expr {
+            &q.head.ret.body.items[0].expr
+        }
+
+        // CAST(x AS <type>) lowers to the matching to*/temporal function call; each
+        // spelling (and its alias) maps to the same function name.
+        for (q, func) in [
+            ("RETURN CAST('7' AS INTEGER)", "toInteger"),
+            ("RETURN CAST('7' AS INT)", "toInteger"),
+            ("RETURN CAST(1 AS FLOAT)", "toFloat"),
+            ("RETURN CAST(1 AS DOUBLE)", "toFloat"),
+            ("RETURN CAST(1 AS STRING)", "toString"),
+            ("RETURN CAST('true' AS BOOLEAN)", "toBoolean"),
+            ("RETURN CAST('2024-01-01' AS DATE)", "date"),
+        ] {
+            match return_expr(&ok(q)) {
+                Expr::Function { name, args, .. } => {
+                    assert_eq!(name, func, "for {q:?}");
+                    assert!(matches!(args, FuncArgs::Args(a) if a.len() == 1));
+                }
+                other => panic!("expected a Function for {q:?}, got {other:?}"),
+            }
+        }
+
+        // CAST(x AS INTEGER) is the identical AST to toInteger(x) — pure sugar.
+        assert_eq!(
+            ok("RETURN CAST('7' AS INTEGER)").head.ret.body.items,
+            ok("RETURN toInteger('7')").head.ret.body.items,
+        );
     }
 
     // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────

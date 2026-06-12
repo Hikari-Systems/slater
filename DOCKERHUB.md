@@ -33,6 +33,7 @@ reads fast and memory bounded.
 | **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
 | **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
+| **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Querying with GQL](#querying-with-gql). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
 
@@ -127,6 +128,30 @@ docker run --rm -it --network host neo4j:5 \
 
 From application code use `bolt://<host>:7687` (or `bolt+s://` with TLS), basic
 auth, and set the session `database` to the graph you want.
+
+### Querying with GQL
+
+Alongside read-only Cypher, Slater understands a read-only subset of **ISO GQL**
+(ISO/IEC 39075) over the **same Bolt connection** — no separate endpoint, no driver
+change. A statement may optionally start with a `GQL` or `CYPHER` dialect selector
+(like Neo4j's `CYPHER 5` / `CYPHER 25`); it is stripped and the one engine parses the
+rest, so the prefix changes nothing today. Every GQL form lowers onto an existing
+capability, so GQL and Cypher spellings are equivalent and may be mixed.
+
+| GQL | Cypher equivalent |
+|---|---|
+| `MATCH (a) ((x)-[:R]->(y)){1,3} (b)` | `MATCH (a)-[:R*1..3]->(b)` (quantified path) |
+| `MATCH ACYCLIC (a)-[:R*]->(b)` | path restrictor (`WALK`/`TRAIL`/`ACYCLIC`/`SIMPLE`) over `-[:R*]->` |
+| `MATCH ANY SHORTEST (a)-[:R*]->(b)` | `shortestPath((a)-[:R*]->(b))` (also `ALL SHORTEST`, `SHORTEST k`) |
+| `MATCH (n:Person & !Admin)` | label/type booleans `&` `\|` `!`; `:A:B` stays AND sugar |
+| `FOR x IN [1,2,3] RETURN x` | `UNWIND [1,2,3] AS x RETURN x` |
+| `RETURN CAST('42' AS INTEGER)` | `RETURN toInteger('42')` |
+| `GQL MATCH (n) RETURN n` | optional dialect prefix (no-op routing) |
+
+Responses additionally carry **GQLSTATUS** status objects in the Bolt
+`SUCCESS`/`FAILURE` metadata (`gql_status` + `status_description`), added alongside
+the existing keys so older drivers are unaffected. The full mapping with examples is
+in the [README](https://github.com/Hikari-Systems/slater#supported-gql-subset).
 
 ---
 

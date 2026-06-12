@@ -53,6 +53,12 @@ use graph_format::{columns, nodelabels, topology};
 /// upper bounds (`*1..3`) are honoured exactly; only the open-ended case is capped.
 const MAX_VARLEN_HOPS: u32 = 15;
 
+/// A GQL quantified path group `((…)){m,n}` is desugared into the union of its
+/// fixed-length expansions (one ordinary pattern per repetition count). This caps
+/// the total hops a single group may unroll to, so `{1,1000}` over a multi-hop
+/// inner pattern can't generate an enormous pattern set.
+const QUANT_MAX_UNROLL: usize = 32;
+
 /// User-supplied regex patterns (`=~`, `string.matchRegEx`, `string.replaceRegEx`)
 /// are rejected past this many bytes: no legitimate query pattern approaches 1 KiB,
 /// and the cap bounds compile time before the size limits below even apply.
@@ -83,6 +89,15 @@ struct Hop {
     reltype: u32,
     start: u64,
     end: u64,
+}
+
+/// A relationship-type constraint resolved once before a traversal's per-edge loop
+/// (see [`Engine::expand_one_hop`]). The common positive shapes pre-resolve to a flat
+/// reltype-id set so the hot loop is a plain integer membership test; only a boolean
+/// type expression (`&`/`!`) carries the AST through for per-edge evaluation.
+enum TypeFilter<'a> {
+    AnyOf(Vec<u32>),
+    Expr(&'a LabelExpr),
 }
 
 impl Hop {
@@ -841,7 +856,7 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let pat = &m.patterns[0];
-        if !pat.rels.is_empty() {
+        if !pat.rels.is_empty() || pat.segments.is_some() {
             return Ok(None); // single-node patterns only
         }
         let node = &pat.start;
@@ -875,14 +890,18 @@ impl<'g> Engine<'g> {
 
         // Compute the match count.
         let count: i64 = if node.props.is_empty() {
-            match node.labels.as_slice() {
-                [] => self.gen.node_count() as i64,
-                [l] => self
-                    .gen
-                    .label_id(l)
-                    .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
-                    .unwrap_or(0),
-                _ => return Ok(None), // multi-label intersection — fall back
+            match &node.label_expr {
+                None => self.gen.node_count() as i64,
+                // A lone positive atom is a single label posting; any boolean /
+                // multi-label expression has no single-posting count — fall back.
+                Some(e) => match e.as_single_atom() {
+                    Some(l) => self
+                        .gen
+                        .label_id(l)
+                        .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
+                        .unwrap_or(0),
+                    None => return Ok(None),
+                },
             }
         } else {
             // Inline props: only an exact single indexed-equality is safe (the scan
@@ -899,8 +918,18 @@ impl<'g> Engine<'g> {
                     .iter()
                     .find(|ri| &ri.name == index && ri.entity == EntityKind::Node)
                     .is_some_and(|ri| {
+                        // The RangeEq scan fully determines membership only when no
+                        // label residual remains: either no label constraint, or a
+                        // single positive atom that *is* the index's label. A boolean
+                        // or multi-label expression would need re-checking, so bail.
                         node.props[0].0 == ri.property
-                            && node.labels.iter().all(|l| l == &ri.label_or_type)
+                            && match &node.label_expr {
+                                None => true,
+                                Some(e) => {
+                                    e.as_single_atom().map(String::as_str)
+                                        == Some(ri.label_or_type.as_str())
+                                }
+                            }
                     });
             if !covers {
                 return Ok(None);
@@ -954,15 +983,15 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let pat = &m.patterns[0];
-        if !pat.rels.is_empty() {
+        if !pat.rels.is_empty() || pat.segments.is_some() {
             return Ok(None); // single-node patterns only
         }
         let node = &pat.start;
         if !node.props.is_empty() {
             return Ok(None); // an inline prop is an extra equality filter
         }
-        let [label] = node.labels.as_slice() else {
-            return Ok(None); // exactly one label (null-group denominator is exact)
+        let Some(label) = node.label_expr.as_ref().and_then(|e| e.as_single_atom()) else {
+            return Ok(None); // exactly one positive label (null-group denominator is exact)
         };
         let var = node.var.as_deref();
 
@@ -1173,12 +1202,45 @@ impl<'g> Engine<'g> {
     // ── MATCH ────────────────────────────────────────────────────────────
 
     fn apply_match(&self, table: Table, m: &MatchClause, cap: Option<usize>) -> Result<Table> {
+        // PR 3: a shortest-path selector (`ANY SHORTEST` / `ALL SHORTEST` /
+        // `SHORTEST k`) drives a dedicated search between the pattern's endpoints
+        // rather than the ordinary matcher, so route it out first. A selector must be
+        // the sole pattern in its clause (comma-joined conjunctions alongside a
+        // selector are not yet supported).
+        if m.patterns.iter().any(|p| p.selector.is_some()) {
+            if m.patterns.len() != 1 {
+                bail!(
+                    "a path selector (ANY/ALL SHORTEST or SHORTEST k) must be the only \
+                     pattern in its MATCH clause"
+                );
+            }
+            return self.apply_match_selected(table, m, cap);
+        }
+        // PR 2: a path restrictor is honoured only where `varlen` owns the
+        // uniqueness scope — a variable-length relationship. Reject it on any other
+        // pattern (a node-only or fixed-hop chain) rather than silently ignoring it,
+        // so the user gets a clear message instead of unrestricted results. A
+        // restrictor over a quantified group is already rejected at lowering.
+        for p in &m.patterns {
+            if p.restrictor.is_some() && !p.rels.iter().any(|(r, _)| r.var_length.is_some()) {
+                bail!(
+                    "a path restrictor (WALK/TRAIL/ACYCLIC/SIMPLE) currently requires a \
+                     variable-length relationship, e.g. MATCH TRAIL (a)-[:R*]->(b)"
+                );
+            }
+        }
         // Stage 5: a single non-optional node-only pattern (no relationships, no
         // path variable, fresh-scan anchor) streams candidates straight into rows,
         // skipping the per-row `HashMap` binding the general matcher builds (root
         // cause 4).
         if let Some(t) = self.try_stream_match(&table, m, cap)? {
             return Ok(t);
+        }
+        // GQL quantified path patterns (`((…)){m,n}`) take a separate path that
+        // desugars each group into the union of its fixed-length expansions. The
+        // common (quantifier-free) case stays on the hot path below untouched.
+        if m.patterns.iter().any(|p| p.segments.is_some()) {
+            return self.apply_match_quantified(table, m, cap);
         }
         // Variables this clause newly introduces, appended to the scope in order.
         let mut new_vars: Vec<String> = Vec::new();
@@ -1232,6 +1294,339 @@ impl<'g> Engine<'g> {
         })
     }
 
+    /// `MATCH` containing one or more GQL quantified path patterns
+    /// (`((…)){m,n}`). Each source pattern is desugared into the union of its
+    /// fixed-length expansions (`expand_quantified_pattern`); the cartesian product
+    /// of the per-pattern alternatives gives the conjunctive pattern-lists to run.
+    /// Every alternative introduces the same named variables (boundary nodes only —
+    /// group-internal nodes/relationships are anonymised), so the output column set
+    /// is well defined. Each expansion is an ordinary (`segments: None`) pattern, so
+    /// it reuses the full matcher, including edge-uniqueness, `node_ok`, the
+    /// intermediate budget, and the deadline.
+    ///
+    /// Semantics: as with Cypher variable-length, one row is emitted per matching
+    /// path, so two repetition counts that bind the same boundary nodes produce two
+    /// rows (add `DISTINCT` to collapse them) — exactly what `-[*1..2]-` does.
+    fn apply_match_quantified(
+        &self,
+        table: Table,
+        m: &MatchClause,
+        cap: Option<usize>,
+    ) -> Result<Table> {
+        let alts: Vec<Vec<Pattern>> = m
+            .patterns
+            .iter()
+            .map(expand_quantified_pattern)
+            .collect::<Result<_>>()?;
+        let combos = cartesian_patterns(&alts);
+        debug_assert!(
+            !combos.is_empty(),
+            "every quantified group has ≥1 expansion"
+        );
+
+        // New variables are identical across combos by construction; derive from the
+        // first so the column layout matches every expansion.
+        let mut new_vars: Vec<String> = Vec::new();
+        for p in &combos[0] {
+            collect_pattern_vars(p, &table.cols, &mut new_vars);
+        }
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(new_vars.iter().cloned());
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            if cap.is_some_and(|c| out_rows.len() >= c) {
+                break;
+            }
+            self.check_deadline()?;
+            let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
+            for (c, v) in table.cols.iter().zip(row) {
+                seed.insert(c.clone(), v.clone());
+            }
+            // Accumulate all expansions' matches for this seed row before emitting,
+            // so OPTIONAL's "no match" test sees every alternative.
+            let mut matches: Vec<HashMap<String, Val>> = Vec::new();
+            let remaining = cap.map(|c| c.saturating_sub(out_rows.len()));
+            for combo in &combos {
+                if remaining.is_some_and(|r| matches.len() >= r) {
+                    break;
+                }
+                self.match_patterns(
+                    combo,
+                    0,
+                    seed.clone(),
+                    m.where_.as_ref(),
+                    &mut matches,
+                    remaining,
+                )?;
+            }
+
+            if matches.is_empty() && m.optional {
+                let mut r = row.clone();
+                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                out_rows.push(r);
+            } else {
+                for b in matches {
+                    if cap.is_some_and(|c| out_rows.len() >= c) {
+                        break;
+                    }
+                    let mut r = row.clone();
+                    for v in &new_vars {
+                        r.push(b.get(v).cloned().unwrap_or(Val::Null));
+                    }
+                    out_rows.push(r);
+                }
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// `MATCH` carrying a GQL shortest-path selector (`ANY SHORTEST` / `ALL SHORTEST`
+    /// / `SHORTEST k`). The pattern is a single relationship between two endpoints;
+    /// for every endpoint pair (each side either already bound, or scanned and
+    /// filtered by its node pattern) the selector picks shortest connecting paths via
+    /// the shared BFS core [`select_paths`] — the same core `shortestPath()` uses.
+    /// Each chosen path becomes one output row binding the endpoints, the (list-
+    /// valued) relationship variable and any path variable; the clause `WHERE` is
+    /// applied per row, exactly as the ordinary matcher does.
+    ///
+    /// Scope (PR 3): a selector requires a single-relationship pattern (like
+    /// `shortestPath()`), carries no relationship property filter, and cannot yet be
+    /// combined with a path restrictor — those are rejected with a clear message. A
+    /// selector over a quantified group is already rejected at lowering.
+    fn apply_match_selected(
+        &self,
+        table: Table,
+        m: &MatchClause,
+        cap: Option<usize>,
+    ) -> Result<Table> {
+        let p = &m.patterns[0];
+        let selector = p.selector.expect("routed here only for a selected pattern");
+        if p.restrictor.is_some() {
+            bail!(
+                "combining a path selector with a path restrictor \
+                 (WALK/TRAIL/ACYCLIC/SIMPLE) is not yet supported"
+            );
+        }
+        if p.rels.len() != 1 {
+            bail!(
+                "a path selector (ANY/ALL SHORTEST or SHORTEST k) currently requires a \
+                 single relationship, e.g. MATCH ANY SHORTEST (a)-[:R*]->(b)"
+            );
+        }
+        let (rel, end) = &p.rels[0];
+        if !rel.props.is_empty() {
+            bail!("filters on relationships under a path selector are not supported");
+        }
+        let (min, max) = match &rel.var_length {
+            Some(vl) => varlen_bounds(vl),
+            None => (1, 1),
+        };
+
+        let mut new_vars: Vec<String> = Vec::new();
+        collect_pattern_vars(p, &table.cols, &mut new_vars);
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(new_vars.iter().cloned());
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            if cap.is_some_and(|c| out_rows.len() >= c) {
+                break;
+            }
+            self.check_deadline()?;
+            let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
+            for (c, v) in table.cols.iter().zip(row) {
+                seed.insert(c.clone(), v.clone());
+            }
+
+            // Endpoint candidates: a bound endpoint is its single node; a free one is
+            // scanned and filtered by its node pattern's labels/inline props.
+            let srcs = self.endpoint_candidates(&p.start, &seed, m.where_.as_ref())?;
+            let dsts = self.endpoint_candidates(end, &seed, m.where_.as_ref())?;
+
+            let mut matches: Vec<HashMap<String, Val>> = Vec::new();
+            for &src in &srcs {
+                for &dst in &dsts {
+                    for hops in self.select_paths(src, dst, rel, (min, max), selector)? {
+                        let mut b = seed.clone();
+                        if let Some(v) = &p.start.var {
+                            b.insert(v.clone(), Val::Node(src));
+                        }
+                        // A shared endpoint variable (e.g. `(a)-[*]->(a)`) must agree:
+                        // skip the pair when the end node would contradict a binding
+                        // the start (or seed) already fixed.
+                        if let Some(v) = &end.var {
+                            if let Some(existing) = b.get(v) {
+                                if existing.loose_eq(&Val::Node(dst)) != Some(true) {
+                                    continue;
+                                }
+                            } else {
+                                b.insert(v.clone(), Val::Node(dst));
+                            }
+                        }
+                        if let Some(v) = &rel.var {
+                            let rels = Val::List(hops.iter().map(Hop::as_rel).collect());
+                            b.insert(v.clone(), rels);
+                        }
+                        if let Some(pv) = &p.path_var {
+                            b.insert(pv.clone(), make_path(src, &hops));
+                        }
+                        if let Some(w) = m.where_.as_ref() {
+                            if !truthy(&self.eval(w, &Scope::Map(&b), None)?) {
+                                continue;
+                            }
+                        }
+                        matches.push(b);
+                    }
+                }
+            }
+
+            if matches.is_empty() && m.optional {
+                let mut r = row.clone();
+                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                out_rows.push(r);
+            } else {
+                for b in matches {
+                    if cap.is_some_and(|c| out_rows.len() >= c) {
+                        break;
+                    }
+                    let mut r = row.clone();
+                    for v in &new_vars {
+                        r.push(b.get(v).cloned().unwrap_or(Val::Null));
+                    }
+                    out_rows.push(r);
+                }
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Candidate node ids for one endpoint of a selected pattern. A variable already
+    /// bound to a node (by the seed/an earlier clause) is that single node; bound to
+    /// a non-node it cannot match (empty). A free endpoint is scanned with the usual
+    /// planner strategy and filtered by `node_ok` (its labels + inline props), so an
+    /// endpoint like `(b:Person)` only contributes `:Person` nodes.
+    fn endpoint_candidates(
+        &self,
+        node: &NodePat,
+        binding: &HashMap<String, Val>,
+        where_: Option<&Expr>,
+    ) -> Result<Vec<u64>> {
+        match node.var.as_deref().and_then(|v| binding.get(v)) {
+            Some(Val::Node(id)) => Ok(vec![*id]),
+            Some(_) => Ok(Vec::new()),
+            None => {
+                let scan = choose_node_scan(self.gen, node, where_, &self.plan_params);
+                let guaranteed = self.scan_guaranteed_labels(&scan);
+                let mut out = Vec::new();
+                for c in self.scan_candidates(&scan)? {
+                    if self.node_ok(c, node, binding, &guaranteed)? {
+                        out.push(c);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Shared shortest-path BFS core driving both `shortestPath()` and the GQL path
+    /// selectors. Between two concrete nodes `src`/`dst` it returns the chosen paths
+    /// as hop-lists in walk (start→end) order:
+    /// - `AnyShortest` → at most one shortest path;
+    /// - `AllShortest` → every path of the single minimum length;
+    /// - `ShortestK(k)` → up to `k` paths in non-decreasing length order.
+    ///
+    /// Paths are loopless (no node repeats), matching `shortestPath()`'s long-standing
+    /// simple-path search and bounding the walk on a cyclic graph. Every entry in a
+    /// BFS layer has the same hop count, so paths surface in non-decreasing length
+    /// order — the property `AllShortest`/`ShortestK` rely on. `min`/`max` are the
+    /// relationship's length bounds (a fixed hop is `(1, 1)`); `min == 0` with
+    /// coincident endpoints admits the empty path.
+    fn select_paths(
+        &self,
+        src: u64,
+        dst: u64,
+        rel: &RelPat,
+        bounds: (u32, u32),
+        selector: PathSelector,
+    ) -> Result<Vec<Vec<Hop>>> {
+        let (min, max) = bounds;
+        let empty = HashMap::new();
+        let want = match selector {
+            PathSelector::AnyShortest => 1,
+            PathSelector::ShortestK(k) => k as usize,
+            PathSelector::AllShortest => usize::MAX,
+        };
+        let mut results: Vec<Vec<Hop>> = Vec::new();
+
+        // min == 0 admits the empty (single-node) path when the endpoints coincide.
+        if min == 0 && src == dst {
+            results.push(Vec::new());
+            if results.len() >= want {
+                return Ok(results);
+            }
+        }
+        if max == 0 {
+            return Ok(results);
+        }
+
+        // Each frontier entry carries its own loopless `visited` set so sibling
+        // branches stay simple independently. (node, path so far, visited nodes).
+        let mut frontier: Vec<(u64, Vec<Hop>, HashSet<u64>)> =
+            vec![(src, Vec::new(), HashSet::from([src]))];
+        let mut depth = 0u32;
+        // `AllShortest`: once `dst` is first reached, its layer is the minimum length;
+        // after that layer is fully processed no further shortest path can appear.
+        let mut found_min = false;
+        while !frontier.is_empty() && depth < max {
+            self.check_deadline()?;
+            let mut next = Vec::new();
+            for (node, path, visited) in &frontier {
+                for hop in self.expand_one_hop(*node, rel, &empty)? {
+                    let nb = hop.neighbour;
+                    if visited.contains(&nb) {
+                        continue; // loopless: never revisit a node on this path
+                    }
+                    if nb == dst {
+                        // A connecting path ends here; a loopless path is never
+                        // extended past its destination.
+                        let len = path.len() as u32 + 1;
+                        if len >= min {
+                            let mut hops = path.clone();
+                            hops.push(hop);
+                            self.charge(hops.len() as u64 + 1)?;
+                            results.push(hops);
+                            found_min = true;
+                            if results.len() >= want {
+                                return Ok(results);
+                            }
+                        }
+                        continue;
+                    }
+                    let mut npath = path.clone();
+                    npath.push(hop);
+                    let mut nvisited = visited.clone();
+                    nvisited.insert(nb);
+                    next.push((nb, npath, nvisited));
+                }
+            }
+            // `AllShortest` stops after the first dst-bearing layer; the others stop
+            // only on `want`/exhaustion (handled above and by the loop condition).
+            if found_min && matches!(selector, PathSelector::AllShortest) {
+                return Ok(results);
+            }
+            frontier = next;
+            depth += 1;
+        }
+        Ok(results)
+    }
+
     /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
     /// variable, anchor not already bound) directly into output rows, returning
     /// the new table or `None` when the pattern needs the general matcher.
@@ -1254,7 +1649,7 @@ impl<'g> Engine<'g> {
             return Ok(None);
         }
         let p = &m.patterns[0];
-        if !p.rels.is_empty() || p.path_var.is_some() {
+        if !p.rels.is_empty() || p.path_var.is_some() || p.segments.is_some() {
             return Ok(None);
         }
         let start = &p.start;
@@ -2438,15 +2833,26 @@ impl<'g> Engine<'g> {
             }
             Some(vl) => {
                 let (min, max) = varlen_bounds(vl);
+                let mode = walk_mode(pattern.restrictor);
                 let mut paths: Vec<(Vec<Hop>, u64)> = Vec::new();
                 let mut used = HashSet::new();
+                // `visited` (node-uniqueness for ACYCLIC/SIMPLE) is seeded with the
+                // walk's start node so a hop back to it is detected — rejected by
+                // ACYCLIC, allowed once as the closing endpoint by SIMPLE.
+                let mut visited = HashSet::new();
+                if matches!(mode, WalkMode::Acyclic | WalkMode::Simple) {
+                    visited.insert(cur);
+                }
                 let mut path = Vec::new();
                 self.varlen(
                     cur,
+                    cur,
                     rel,
                     (min, max),
+                    mode,
                     &mut path,
                     &mut used,
+                    &mut visited,
                     &mut paths,
                     binding,
                 )?;
@@ -2488,17 +2894,35 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
-    /// Depth-first variable-length expansion with relationship uniqueness (no edge
-    /// reused within a path), emitting `(path_edges, end_node)` for every path
-    /// whose length is in `[min, max]`.
+    /// Depth-first variable-length expansion, emitting `(path_edges, end_node)` for
+    /// every path whose length is in `[min, max]`. `mode` (the GQL path restrictor,
+    /// `WalkMode::Trail` by default) governs node/edge reuse within the walk:
+    /// - `Walk` — no restriction (repeated nodes and edges allowed). Bounded only by
+    ///   `max` (`MAX_VARLEN_HOPS` for an open `*`), the intermediate budget and the
+    ///   deadline, since a cycle would otherwise expand without limit.
+    /// - `Trail` — no repeated edge (the historical default for `*`); tracked in
+    ///   `used`.
+    /// - `Acyclic` — no repeated node at all (endpoints included); tracked in
+    ///   `visited`, which the caller seeds with the start node.
+    /// - `Simple` — no repeated node *except* the two endpoints may coincide (a
+    ///   single closed cycle); a hop back to the start node is emitted but not
+    ///   extended, so the start can never become an interior repeat.
+    ///
+    /// Node-uniqueness implies edge-uniqueness, so `Acyclic`/`Simple` need only the
+    /// `visited` set and leave `used` untouched; `Trail` uses only `used`. This keeps
+    /// each mode's per-hop work minimal and the `Trail`/default path byte-for-byte as
+    /// before.
     #[allow(clippy::too_many_arguments)] // recursive DFS: scratch buffers + scope
     fn varlen(
         &self,
+        start: u64,
         node: u64,
         rel: &RelPat,
         bounds: (u32, u32),
+        mode: WalkMode,
         path: &mut Vec<Hop>,
         used: &mut HashSet<u64>,
+        visited: &mut HashSet<u64>,
         out: &mut Vec<(Vec<Hop>, u64)>,
         binding: &HashMap<String, Val>,
     ) -> Result<()> {
@@ -2513,17 +2937,61 @@ impl<'g> Engine<'g> {
             return Ok(());
         }
         self.check_deadline()?;
+        let track_edges = matches!(mode, WalkMode::Trail);
+        let track_nodes = matches!(mode, WalkMode::Acyclic | WalkMode::Simple);
         for hop in self.expand_one_hop(node, rel, binding)? {
-            if used.contains(&hop.edge) {
-                continue;
-            }
             let edge = hop.edge;
             let nb = hop.neighbour;
-            used.insert(edge);
+            // SIMPLE alone permits the one repeat that closes the walk at its start;
+            // it is emitted but never extended (extending would repeat the start as
+            // an interior node).
+            let mut close_only = false;
+            match mode {
+                WalkMode::Walk => {}
+                WalkMode::Trail => {
+                    if used.contains(&edge) {
+                        continue;
+                    }
+                }
+                WalkMode::Acyclic => {
+                    if visited.contains(&nb) {
+                        continue;
+                    }
+                }
+                WalkMode::Simple => {
+                    if visited.contains(&nb) {
+                        if nb != start {
+                            continue;
+                        }
+                        close_only = true;
+                    }
+                }
+            }
+            if track_edges {
+                used.insert(edge);
+            }
+            // `insert` returns false (so `inserted` stays false) when the node is
+            // already present — e.g. the SIMPLE close-the-cycle hop back to `start`,
+            // which the caller pre-seeded — so we never wrongly remove it on unwind.
+            let inserted = track_nodes && visited.insert(nb);
             path.push(hop);
-            self.varlen(nb, rel, bounds, path, used, out, binding)?;
+            if close_only {
+                if path.len() as u32 >= min {
+                    self.charge(path.len() as u64 + 1)?;
+                    out.push((path.clone(), nb));
+                }
+            } else {
+                self.varlen(
+                    start, nb, rel, bounds, mode, path, used, visited, out, binding,
+                )?;
+            }
             path.pop();
-            used.remove(&edge);
+            if track_edges {
+                used.remove(&edge);
+            }
+            if inserted {
+                visited.remove(&nb);
+            }
         }
         Ok(())
     }
@@ -2537,16 +3005,21 @@ impl<'g> Engine<'g> {
         rel: &RelPat,
         binding: &HashMap<String, Val>,
     ) -> Result<Vec<Hop>> {
-        let type_ids: Option<Vec<u32>> = if rel.types.is_empty() {
-            None
-        } else {
-            Some(
-                rel.types
-                    .iter()
-                    .filter_map(|t| self.gen.reltype_id(t))
-                    .collect(),
-            )
-        };
+        // Resolve the relationship-type constraint once, before the per-edge loop.
+        // The overwhelmingly common shapes — untyped, a single `:T`, or a `:T1|T2`
+        // alternation — collapse to a flat reltype-id set so the hot loop stays a
+        // plain `ids.contains` integer test, exactly as before GQL. Only a genuine
+        // boolean type expression (`&`/`!`) falls to per-edge evaluation.
+        let type_filter: Option<TypeFilter> =
+            rel.type_expr.as_ref().map(|e| match e.positive_atoms() {
+                Some(names) => TypeFilter::AnyOf(
+                    names
+                        .iter()
+                        .filter_map(|t| self.gen.reltype_id(t))
+                        .collect(),
+                ),
+                None => TypeFilter::Expr(e),
+            });
         // (adjacency list, `incoming`) — for an incoming edge the stored direction
         // is neighbour→node, so start/end are swapped relative to an outgoing one.
         let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
@@ -2561,9 +3034,19 @@ impl<'g> Engine<'g> {
         let mut out = Vec::new();
         for (adjs, incoming) in sources {
             for a in adjs {
-                if let Some(ids) = &type_ids {
-                    if !ids.contains(&a.reltype) {
-                        continue;
+                match &type_filter {
+                    None => {}
+                    Some(TypeFilter::AnyOf(ids)) => {
+                        if !ids.contains(&a.reltype) {
+                            continue;
+                        }
+                    }
+                    Some(TypeFilter::Expr(e)) => {
+                        // A relationship carries exactly one type, so evaluate the
+                        // expression over the singleton present-set {this edge's type}.
+                        if !e.eval(&|name| self.gen.reltype_id(name) == Some(a.reltype)) {
+                            continue;
+                        }
                     }
                 }
                 if !self.rel_ok(a.edge.0, rel, binding)? {
@@ -2649,26 +3132,37 @@ impl<'g> Engine<'g> {
         binding: &HashMap<String, Val>,
         guaranteed: &[u32],
     ) -> Result<bool> {
-        if !pat.labels.is_empty() {
-            // Decode the resident label record at most once, and only if at least
-            // one pattern label is not already guaranteed by the anchor scan (an
-            // unknown label forces the decode, where it then fails to match). The
-            // common traversal case has nothing guaranteed, so short-circuit it
-            // before touching the label symbol table — this path is hot (one call
-            // per candidate per hop) and must match the pre-Stage-2 cost exactly.
-            let need_decode = guaranteed.is_empty()
-                || pat.labels.iter().any(|l| {
-                    self.gen
-                        .label_id(l)
-                        .map_or(true, |lid| !guaranteed.contains(&lid))
-                });
-            if need_decode {
-                let have = self.node_label_ids(id)?;
-                for l in &pat.labels {
-                    match self.gen.label_id(l) {
-                        Some(lid) if guaranteed.contains(&lid) || have.contains(&lid) => {}
-                        _ => return Ok(false),
+        if let Some(expr) = &pat.label_expr {
+            // Fast path, byte-for-byte as cheap as the pre-GQL single-label check: a
+            // lone positive atom `(:Person)` the anchor scan already proved needs no
+            // label record at all. This call is hot (one per candidate per hop), so
+            // the common case must never touch the label record or, when guaranteed,
+            // even the symbol table beyond one lookup.
+            if let Some(atom) = expr.as_single_atom() {
+                match self.gen.label_id(atom) {
+                    Some(lid) if guaranteed.contains(&lid) => {}
+                    Some(lid) => {
+                        if !self.node_label_ids(id)?.contains(&lid) {
+                            return Ok(false);
+                        }
                     }
+                    None => return Ok(false), // unknown label, single atom ⇒ no match
+                }
+            } else {
+                // A boolean label expression (`&`/`|`/`!`, parens): decode the resident
+                // labels once and evaluate as plain set membership. Anchor-proven
+                // labels are folded into the present-predicate so a guaranteed atom
+                // still counts without re-decoding. An atom naming an unknown label is
+                // simply absent — so `!Unknown` holds and `Unknown` fails, the sound
+                // set-logic answer.
+                let have = self.node_label_ids(id)?;
+                let ok = expr.eval(&|name| {
+                    self.gen
+                        .label_id(name)
+                        .is_some_and(|lid| guaranteed.contains(&lid) || have.contains(&lid))
+                });
+                if !ok {
+                    return Ok(false);
                 }
             }
         }
@@ -3150,70 +3644,22 @@ impl<'g> Engine<'g> {
         let src = bound_node(pattern.start.var.as_deref())?;
         let dst = bound_node(end.var.as_deref())?;
         // FalkorDB orients the returned path from the relationship arrow's tail to
-        // its head. The BFS walks the syntactic start→end (using the pattern's
-        // direction); for an incoming pattern `(b)<-[*]-(a)` the arrow tail is the
-        // end node, so the result is reversed into arrow order. (Undirected keeps
-        // start→end order.)
+        // its head. The shared core walks the syntactic start→end (using the
+        // pattern's direction); for an incoming pattern `(b)<-[*]-(a)` the arrow tail
+        // is the end node, so the result is reversed into arrow order. (Undirected
+        // keeps start→end order.)
         let reverse = matches!(rel.dir, Direction::Incoming);
 
-        // min == 0 admits the empty (single-node) path when src == dst.
-        if min == 0 && src == dst {
-            return Ok(Val::Path {
-                nodes: vec![src],
-                rels: Vec::new(),
-            });
-        }
-        if max == 0 {
+        // Delegate to the shared selector core: `shortestPath()` is exactly
+        // `ANY SHORTEST` between two bound nodes — one loopless shortest path, or none.
+        let Some(hops) = self
+            .select_paths(src, dst, rel, (min, max), PathSelector::AnyShortest)?
+            .into_iter()
+            .next()
+        else {
             return Ok(Val::Null);
-        }
-
-        // BFS by node, recording the predecessor edge to reconstruct the path. The
-        // first time `dst` is dequeued (or reached) yields a shortest path; node
-        // uniqueness (visited set) keeps it to simple, shortest paths.
-        let empty = HashMap::new();
-        let mut visited: HashSet<u64> = HashSet::new();
-        visited.insert(src);
-        // (node, predecessor hop into it). The root has no predecessor.
-        let mut pred: HashMap<u64, Hop> = HashMap::new();
-        let mut frontier = vec![src];
-        let mut depth = 0u32;
-        let mut found = false;
-        'bfs: while !frontier.is_empty() && depth < max {
-            self.check_deadline()?;
-            let mut next = Vec::new();
-            for &node in &frontier {
-                for hop in self.expand_one_hop(node, rel, &empty)? {
-                    let nb = hop.neighbour;
-                    if visited.contains(&nb) {
-                        continue;
-                    }
-                    visited.insert(nb);
-                    pred.insert(nb, hop);
-                    if nb == dst {
-                        found = true;
-                        break 'bfs;
-                    }
-                    next.push(nb);
-                }
-            }
-            frontier = next;
-            depth += 1;
-        }
-        if !found {
-            return Ok(Val::Null);
-        }
-        // Walk predecessors back from dst to src, then reverse into walk order.
-        let mut hops_rev: Vec<Hop> = Vec::new();
-        let mut cur = dst;
-        while cur != src {
-            let hop = pred.get(&cur).expect("BFS predecessor recorded");
-            // `cur` is `hop.neighbour`; the node we arrived from is the opposite
-            // stored endpoint.
-            cur = if hop.start == cur { hop.end } else { hop.start };
-            hops_rev.push(hop.clone());
-        }
-        hops_rev.reverse();
-        let path = make_path(src, &hops_rev);
+        };
+        let path = make_path(src, &hops);
         if reverse {
             if let Val::Path {
                 mut nodes,
@@ -4745,6 +5191,27 @@ fn normalise(v: &[f32]) -> Vec<f32> {
     v.iter().map(|&x| (x as f64 / norm) as f32).collect()
 }
 
+/// Executor-internal view of a GQL path restrictor (`Pattern.restrictor`), with the
+/// *absence* of a restrictor folded onto `Trail` — slater's historical edge-unique
+/// variable-length behaviour — so `None` and explicit `TRAIL` run the identical
+/// code path and existing queries are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    Walk,
+    Trail,
+    Acyclic,
+    Simple,
+}
+
+fn walk_mode(r: Option<PathRestrictor>) -> WalkMode {
+    match r {
+        None | Some(PathRestrictor::Trail) => WalkMode::Trail,
+        Some(PathRestrictor::Walk) => WalkMode::Walk,
+        Some(PathRestrictor::Acyclic) => WalkMode::Acyclic,
+        Some(PathRestrictor::Simple) => WalkMode::Simple,
+    }
+}
+
 fn varlen_bounds(vl: &VarLength) -> (u32, u32) {
     let min = vl.min.unwrap_or(1);
     let max = vl.max.unwrap_or(MAX_VARLEN_HOPS).max(min);
@@ -4791,7 +5258,137 @@ fn reverse_pattern(p: &Pattern) -> Pattern {
         path_var: None,
         start: new_start,
         rels: new_rels,
+        segments: None,
+        // Reversal only fires for restrictor-free, varlen-free patterns
+        // (`maybe_reroot` bails on any `var_length`), so there is no restrictor to
+        // carry; a restrictor pattern always has a variable-length relationship.
+        restrictor: p.restrictor,
+        // A selected pattern is routed to `apply_match_selected` and never reaches
+        // `maybe_reroot`, so there is no selector to carry here.
+        selector: None,
     }
+}
+
+/// Desugar a pattern that may contain GQL quantified groups into one or more
+/// ordinary (`segments: None`) patterns whose union is equivalent. A pattern with
+/// no groups returns `[clone]`. Each quantified group `((inner)){m,n}` contributes
+/// one alternative per repetition count `k ∈ [m, n]`; the alternatives across all
+/// segments are combined as a cartesian product so a pattern with two groups yields
+/// every (k₁, k₂) length pairing.
+///
+/// Only finite, `m ≥ 1` bounds are supported for now; unbounded (`+`, `*`, `{m,}`)
+/// and zero-length (`{0,n}`) groups are rejected with a clear message rather than
+/// silently mishandled.
+fn expand_quantified_pattern(p: &Pattern) -> Result<Vec<Pattern>> {
+    let Some(segments) = &p.segments else {
+        return Ok(vec![p.clone()]);
+    };
+    // Alternative `rels` chains accumulated left-to-right across segments.
+    let mut chains: Vec<Vec<(RelPat, NodePat)>> = vec![Vec::new()];
+    for seg in segments {
+        let seg_alts: Vec<Vec<(RelPat, NodePat)>> = match seg {
+            Segment::Hop(rel, node) => vec![vec![(rel.clone(), node.clone())]],
+            Segment::Quantified {
+                inner,
+                bounds,
+                exit,
+            } => {
+                let min = bounds.min.unwrap_or(0);
+                let Some(max) = bounds.max else {
+                    bail!(
+                        "an unbounded quantified path pattern ('+', '*' or '{{m,}}') is not yet \
+                         supported; use a finite upper bound such as {{1,5}}"
+                    );
+                };
+                if min < 1 {
+                    bail!(
+                        "a quantified path pattern with a lower bound below 1 ('{{0,n}}', '*') \
+                         is not yet supported; use {{1,n}}"
+                    );
+                }
+                if max < min {
+                    bail!("quantified path pattern upper bound {max} is below lower bound {min}");
+                }
+                if (max as usize).saturating_mul(inner.len()) > QUANT_MAX_UNROLL {
+                    bail!(
+                        "quantified path pattern unrolls to more than {QUANT_MAX_UNROLL} hops; \
+                         tighten the bounds"
+                    );
+                }
+                (min..=max).map(|k| repeat_inner(inner, k, exit)).collect()
+            }
+        };
+        let mut next = Vec::with_capacity(chains.len() * seg_alts.len());
+        for c in &chains {
+            for a in &seg_alts {
+                let mut nc = c.clone();
+                nc.extend(a.iter().cloned());
+                next.push(nc);
+            }
+        }
+        chains = next;
+    }
+    Ok(chains
+        .into_iter()
+        .map(|rels| Pattern {
+            path_var: None,
+            start: p.start.clone(),
+            rels,
+            segments: None,
+            // A restrictor or selector over a quantified group is rejected at
+            // lowering, so a segment-bearing pattern never carries one to desugar.
+            restrictor: None,
+            selector: None,
+        })
+        .collect())
+}
+
+/// `k` (≥1) copies of a quantified group's inner relationship chain, with every
+/// intermediate node and relationship variable anonymised (group-internal bindings
+/// aren't exposed) and the final node replaced by `exit` (the node written after
+/// the group). Node labels/properties on inner nodes are preserved so per-hop
+/// constraints still apply; only the variable name is dropped.
+fn repeat_inner(inner: &[(RelPat, NodePat)], k: u32, exit: &NodePat) -> Vec<(RelPat, NodePat)> {
+    let total = inner.len() * k as usize;
+    let mut out = Vec::with_capacity(total);
+    for _copy in 0..k {
+        for (rel, node) in inner {
+            let mut rel = rel.clone();
+            rel.var = None;
+            let is_last = out.len() + 1 == total;
+            let node = if is_last {
+                exit.clone()
+            } else {
+                NodePat {
+                    var: None,
+                    label_expr: node.label_expr.clone(),
+                    props: node.props.clone(),
+                }
+            };
+            out.push((rel, node));
+        }
+    }
+    out
+}
+
+/// Cartesian product of per-pattern alternatives: given each source pattern's list
+/// of desugared expansions, produce every conjunctive pattern-list (one expansion
+/// chosen per source pattern). With no quantified patterns each inner list is a
+/// singleton, so the result is the single original pattern-list.
+fn cartesian_patterns(alts: &[Vec<Pattern>]) -> Vec<Vec<Pattern>> {
+    let mut combos: Vec<Vec<Pattern>> = vec![Vec::new()];
+    for alt in alts {
+        let mut next = Vec::with_capacity(combos.len() * alt.len().max(1));
+        for c in &combos {
+            for p in alt {
+                let mut nc = c.clone();
+                nc.push(p.clone());
+                next.push(nc);
+            }
+        }
+        combos = next;
+    }
+    combos
 }
 
 fn flip_dir(d: Direction) -> Direction {
@@ -6718,6 +7315,624 @@ mod tests {
         assert_eq!(render(&res.rows[0][0]), "[0,1,2]");
         assert_eq!(render(&res.rows[0][1]), "[0,1]");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── GQL quantified path patterns ─────────────────────────────────────────
+    // Graph (write_basic): KNOWS = Alice→Bob, Bob→Carol, Alice→Carol;
+    // WORKS_AT = Alice→Acme, Carol→Globex.
+
+    /// Run a query against the basic fixture, returning the result or the error
+    /// string (and always cleaning the fixture up).
+    fn run_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph, _) = testgen::write_basic(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted first-column display strings for a query that must succeed.
+    fn gql_col0(tag: &str, q: &str) -> Vec<String> {
+        let mut v: Vec<String> = run_result(tag, q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| r[0].to_display())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn quantified_path_equals_varlength() {
+        // The GQL group `((x)-[:KNOWS]->(y)){1,2}` is the cross-dialect equivalent
+        // of Cypher's `-[:KNOWS*1..2]->`; both must yield the same multiset of end
+        // nodes (Bob, Carol via 1 hop; Carol again via Alice→Bob→Carol).
+        let gql = gql_col0(
+            "exec_gql_q_vs_vl_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){1,2} (b:Person) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_q_vs_vl_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(b:Person) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Bob", "Carol", "Carol"]);
+        assert_eq!(gql, cypher, "GQL quantifier must match Cypher var-length");
+    }
+
+    #[test]
+    fn quantified_exact_equals_fixed_varlength() {
+        // `{2}` is exactly `*2..2`: the only 2-hop KNOWS path from Alice ends at Carol.
+        let gql = gql_col0(
+            "exec_gql_exact_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){2} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_exact_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*2..2]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Carol"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_multi_hop_inner_matches_unrolled() {
+        // A two-relationship inner sub-path repeated once equals the unrolled Cypher
+        // chain `-[:KNOWS]->()-[:WORKS_AT]->()`: Alice→Carol→Globex (Bob has no
+        // WORKS_AT edge).
+        let gql = gql_col0(
+            "exec_gql_multi_g",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)-[:WORKS_AT]->(z)){1} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_multi_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->()-[:WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Globex"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_dialect_switch_across_union() {
+        // One query, two dialects: a Cypher branch UNIONed with a GQL branch. The
+        // Cypher branch returns Alice's direct KNOWS (Bob, Carol); the GQL `{2}`
+        // branch returns the 2-hop end (Carol); UNION de-dups to {Bob, Carol}.
+        let rows = gql_col0(
+            "exec_gql_union",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name AS b \
+             UNION \
+             MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){2} (b) RETURN b.name AS b",
+        );
+        assert_eq!(rows, vec!["Bob", "Carol"]);
+    }
+
+    #[test]
+    fn quantified_mixed_with_plain_hop() {
+        // A plain Cypher hop and a GQL group in the SAME pattern: Alice -KNOWS-> m
+        // then one more KNOWS to b. Only Alice→Bob→Carol qualifies (Carol has no
+        // outgoing KNOWS), so b = Carol — same as the unrolled 2-hop Cypher chain.
+        let gql = gql_col0(
+            "exec_gql_mixed_g",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(m) ((x)-[:KNOWS]->(y)){1} (b) RETURN b.name AS b",
+        );
+        let cypher = gql_col0(
+            "exec_gql_mixed_c",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->()-[:KNOWS]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(gql, vec!["Carol"]);
+        assert_eq!(gql, cypher);
+    }
+
+    #[test]
+    fn quantified_count_bypasses_fast_path() {
+        // `count(*)` over a quantified pattern must NOT take the single-node count
+        // fast path (which keys off empty `rels`); the segments guard routes it to
+        // the general matcher, counting all three matching paths.
+        let res = run_result(
+            "exec_gql_count",
+            "MATCH (a:Person {name:'Alice'}) ((x)-[:KNOWS]->(y)){1,2} (b) RETURN count(*) AS c",
+        )
+        .unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(3)),
+            "{:?}",
+            res.rows[0][0]
+        );
+    }
+
+    #[test]
+    fn quantified_unbounded_rejected() {
+        for q in [
+            "MATCH (a) ((x)-[:KNOWS]->(y))+ (b) RETURN b",
+            "MATCH (a) ((x)-[:KNOWS]->(y))* (b) RETURN b",
+            "MATCH (a) ((x)-[:KNOWS]->(y)){1,} (b) RETURN b",
+        ] {
+            let e = run_result("exec_gql_unbounded", q).unwrap_err();
+            assert!(
+                e.contains("unbounded") || e.contains("lower bound"),
+                "{q}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantified_zero_lower_bound_rejected() {
+        let e = run_result(
+            "exec_gql_zero",
+            "MATCH (a) ((x)-[:KNOWS]->(y)){0,2} (b) RETURN b",
+        )
+        .unwrap_err();
+        assert!(e.contains("lower bound below 1"), "{e}");
+    }
+
+    // ── GQL path restrictors (PR 2) ──────────────────────────────────────────
+    // Run over the cyclic fixture (testgen::write_cycle): a→b→c→a triangle plus a
+    // c→b chord. Over `(s{name:'a'})-[:R*1..4]->(x)` the four modes yield a distinct
+    // number of paths — WALK 6, TRAIL 4, SIMPLE 3, ACYCLIC 2 — which is exactly what
+    // sets them apart (see the fixture doc-comment for the per-length enumeration).
+
+    /// Parse + run `q` against a fresh cycle fixture, returning the result or the
+    /// error string, and always cleaning the fixture up.
+    fn cycle_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph) = testgen::write_cycle(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted end-node names of `(s{name:'a'})-[<restrictor>:R*1..4]->(x)`, one entry
+    /// per matched path (duplicates kept), for the given restrictor prefix.
+    fn cycle_ends(tag: &str, restrictor: &str) -> Vec<String> {
+        let q = format!("MATCH {restrictor} (s {{name:'a'}})-[:R*1..4]->(x) RETURN x.name AS n");
+        let mut v: Vec<String> = cycle_result(tag, &q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| r[0].to_display())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn restrictors_distinguish_modes_on_cycle() {
+        // The headline: each mode produces a different path multiset on the cycle.
+        let walk = cycle_ends("exec_gql_r_walk", "WALK");
+        let trail = cycle_ends("exec_gql_r_trail", "TRAIL");
+        let simple = cycle_ends("exec_gql_r_simple", "SIMPLE");
+        let acyclic = cycle_ends("exec_gql_r_acyclic", "ACYCLIC");
+
+        // WALK reuses edges and nodes freely: every walk of length 1..4.
+        assert_eq!(walk, vec!["a", "b", "b", "b", "c", "c"], "WALK");
+        // TRAIL forbids edge reuse: drops the two length-4 walks that repeat an edge.
+        assert_eq!(trail, vec!["a", "b", "b", "c"], "TRAIL");
+        // SIMPLE forbids interior node repeats but lets the walk close at its start
+        // `a`; the second visit to `b` (via the chord) is excluded.
+        assert_eq!(simple, vec!["a", "b", "c"], "SIMPLE");
+        // ACYCLIC forbids every node repeat, so the closing return to `a` is gone too.
+        assert_eq!(acyclic, vec!["b", "c"], "ACYCLIC");
+
+        // …and the counts are all distinct (6, 4, 3, 2).
+        assert_eq!(
+            (walk.len(), trail.len(), simple.len(), acyclic.len()),
+            (6, 4, 3, 2)
+        );
+    }
+
+    #[test]
+    fn bare_star_equals_trail() {
+        // Parity: a bare `*` (no restrictor) must be byte-for-byte today's behaviour,
+        // which is edge-unique = TRAIL. So absence of a restrictor ≡ explicit TRAIL.
+        let bare = cycle_ends("exec_gql_r_bare", "");
+        let trail = cycle_ends("exec_gql_r_bare_trail", "TRAIL");
+        assert_eq!(bare, trail, "bare * must equal explicit TRAIL");
+        assert_eq!(bare, vec!["a", "b", "b", "c"]);
+    }
+
+    #[test]
+    fn acyclic_excludes_start_that_simple_keeps() {
+        // The one place SIMPLE and ACYCLIC differ on this graph is the cycle-closing
+        // path a→b→c→a: SIMPLE keeps it (endpoints may coincide), ACYCLIC drops it.
+        let simple = cycle_ends("exec_gql_r_se_simple", "SIMPLE");
+        let acyclic = cycle_ends("exec_gql_r_se_acyclic", "ACYCLIC");
+        assert!(
+            simple.contains(&"a".to_string()),
+            "SIMPLE keeps the closed cycle"
+        );
+        assert!(
+            !acyclic.contains(&"a".to_string()),
+            "ACYCLIC drops the closed cycle"
+        );
+    }
+
+    #[test]
+    fn restrictor_requires_variable_length() {
+        // A restrictor is honoured only where `varlen` owns the uniqueness scope.
+        // On a fixed hop or a node-only pattern it is rejected, not silently ignored.
+        for q in [
+            "MATCH TRAIL (s {name:'a'})-[:R]->(x) RETURN x",
+            "MATCH WALK (n) RETURN n",
+        ] {
+            let e = cycle_result("exec_gql_r_novar", q).unwrap_err();
+            assert!(e.contains("variable-length relationship"), "{q}: {e}");
+        }
+    }
+
+    #[test]
+    fn restrictor_over_quantified_group_rejected() {
+        // The grammar accepts `TRAIL ((…)){m,n}` but lowering rejects it: the group
+        // desugars into separate expansions that cannot share one uniqueness scope.
+        let e = cycle_result(
+            "exec_gql_r_quant",
+            "MATCH TRAIL (s {name:'a'}) ((x)-[:R]->(y)){1,2} (z) RETURN z",
+        )
+        .unwrap_err();
+        assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
+    }
+
+    // ── GQL shortest-path selectors (PR 3) ───────────────────────────────────
+    // ANY/ALL SHORTEST and SHORTEST k share the BFS core `select_paths` with
+    // `shortestPath()`. Parity is checked on the basic fixture; the multi-path
+    // behaviours run over the diamond fixture (testgen::write_diamond), which has two
+    // length-2 `s→t` paths (via `a`, via `b`) plus a length-3 detour `s→a→c→t`.
+
+    /// Parse + run `q` against a fresh diamond fixture, returning the result or the
+    /// error string, and always cleaning the fixture up.
+    fn diamond_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph) = testgen::write_diamond(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted path lengths (`size(r)` per row) for a diamond query that must succeed.
+    fn diamond_lengths(tag: &str, q: &str) -> Vec<i64> {
+        let mut v: Vec<i64> = diamond_result(tag, q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Val::Int(i) => i,
+                ref o => panic!("expected Int length, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn any_shortest_parity_with_shortest_path() {
+        // ANY SHORTEST over a MATCH pattern agrees with the shortestPath() function on
+        // the same endpoints: the single shortest KNOWS path Alice→Carol is the direct
+        // 1-hop edge, and its node sequence is [Alice, Carol].
+        let sel = run_result(
+            "exec_gql_any_parity",
+            "MATCH ANY SHORTEST p = (a:Person {name:'Alice'})-[:KNOWS*]->(c:Person {name:'Carol'}) \
+             RETURN size(relationships(p)) AS l, [n IN nodes(p) | n.name] AS names",
+        )
+        .unwrap();
+        assert_eq!(sel.rows.len(), 1, "one shortest path for the single pair");
+        assert!(
+            matches!(sel.rows[0][0], Val::Int(1)),
+            "{:?}",
+            sel.rows[0][0]
+        );
+        assert_eq!(render(&sel.rows[0][1]), "['Alice','Carol']");
+
+        // The shortestPath() function returns the identical length on the same pair.
+        let func = run_result(
+            "exec_gql_any_parity_fn",
+            "MATCH (a:Person {name:'Alice'}), (c:Person {name:'Carol'}) \
+             RETURN length(shortestPath((a)-[:KNOWS*]->(c))) AS l",
+        )
+        .unwrap();
+        assert!(matches!(func.rows[0][0], Val::Int(1)));
+    }
+
+    #[test]
+    fn any_shortest_picks_one_of_the_ties() {
+        // On the diamond, ANY SHORTEST returns exactly one s→t path, of length 2.
+        let lens = diamond_lengths(
+            "exec_gql_any_one",
+            "MATCH ANY SHORTEST (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2], "a single shortest path");
+    }
+
+    #[test]
+    fn all_shortest_returns_all_ties() {
+        // ALL SHORTEST returns both length-2 paths (via `a`, via `b`) and not the
+        // length-3 detour — every path of the minimum length, no more.
+        let lens = diamond_lengths(
+            "exec_gql_all_ties",
+            "MATCH ALL SHORTEST (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2, 2], "two length-2 ties");
+
+        // The two paths are distinct: their interior node is `a` in one, `b` in the
+        // other.
+        let res = diamond_result(
+            "exec_gql_all_ties_nodes",
+            "MATCH ALL SHORTEST p = (s {name:'s'})-[:R*]->(t {name:'t'}) \
+             RETURN [n IN nodes(p) | n.name] AS names",
+        )
+        .unwrap();
+        let mut names: Vec<String> = res.rows.iter().map(|r| render(&r[0])).collect();
+        names.sort();
+        assert_eq!(names, vec!["['s','a','t']", "['s','b','t']"]);
+    }
+
+    #[test]
+    fn shortest_k_returns_k_in_length_order() {
+        // SHORTEST 2 → the two length-2 ties.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k2",
+                "MATCH SHORTEST 2 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2],
+        );
+        // SHORTEST 3 → the two ties plus the length-3 detour (k can pull in a longer
+        // path once the shortest ones are spent).
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k3",
+                "MATCH SHORTEST 3 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2, 3],
+        );
+        // SHORTEST 4 cannot exceed the three loopless paths that exist.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k4",
+                "MATCH SHORTEST 4 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2, 3],
+        );
+        // SHORTEST 1 ≡ ANY SHORTEST: a single shortest path.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k1",
+                "MATCH SHORTEST 1 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2],
+        );
+    }
+
+    #[test]
+    fn selector_applies_where_after_selection() {
+        // Free endpoints ranging over every node, narrowed by a WHERE on their names:
+        // only the s→t pairing survives, yielding the two shortest paths. This proves
+        // the clause WHERE is applied per produced path, across the endpoint product.
+        let lens = diamond_lengths(
+            "exec_gql_sel_where",
+            "MATCH ALL SHORTEST (x)-[r:R*]->(y) WHERE x.name = 's' AND y.name = 't' \
+             RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2, 2]);
+
+        // A WHERE that excludes every endpoint pair yields no rows.
+        let none = diamond_result(
+            "exec_gql_sel_where_empty",
+            "MATCH ANY SHORTEST (x)-[r:R*]->(y) WHERE x.name = 't' AND y.name = 's' \
+             RETURN size(r) AS l",
+        )
+        .unwrap();
+        assert!(none.rows.is_empty(), "no t→s path exists");
+    }
+
+    #[test]
+    fn selector_optional_emits_null_when_no_path() {
+        // OPTIONAL MATCH with a selector keeps the driving row and null-fills when no
+        // path connects the endpoints (t cannot reach s).
+        let res = diamond_result(
+            "exec_gql_sel_optional",
+            "MATCH (a {name:'t'}) OPTIONAL MATCH ANY SHORTEST (a)-[r:R*]->(z {name:'s'}) \
+             RETURN a.name AS a, r IS NULL AS no_path",
+        )
+        .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "t");
+        assert!(matches!(res.rows[0][1], Val::Bool(true)));
+    }
+
+    #[test]
+    fn selector_rejections() {
+        // A multi-relationship selected pattern is out of scope (PR 3 covers a single
+        // relationship, like shortestPath()).
+        let e = diamond_result(
+            "exec_gql_sel_multi",
+            "MATCH ANY SHORTEST (s {name:'s'})-[:R]->(m)-[:R*]->(t {name:'t'}) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("single relationship"), "{e}");
+
+        // A selector combined with a restrictor is not yet supported.
+        let e = diamond_result(
+            "exec_gql_sel_restr",
+            "MATCH ANY SHORTEST TRAIL (s {name:'s'})-[:R*]->(t {name:'t'}) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("restrictor"), "{e}");
+
+        // A selector over a quantified group is rejected at lowering.
+        let e = diamond_result(
+            "exec_gql_sel_quant",
+            "MATCH ALL SHORTEST (s {name:'s'}) ((x)-[:R]->(y)){1,2} (t) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("selector") && e.contains("quantified"), "{e}");
+
+        // A selector cannot share its clause with a comma-joined pattern.
+        let e = diamond_result(
+            "exec_gql_sel_multipat",
+            "MATCH ANY SHORTEST (s {name:'s'})-[:R*]->(t {name:'t'}), (u) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("only") && e.contains("pattern"), "{e}");
+    }
+
+    // ── GQL label boolean expressions (PR 4) ─────────────────────────────────
+    // The basic fixture has disjoint labels :Person (Alice, Bob, Carol) and
+    // :Company (Acme, Globex), and rel-types KNOWS / WORKS_AT — enough to tell the
+    // boolean forms apart on both nodes and relationships.
+
+    #[test]
+    fn label_boolean_node_cardinalities() {
+        // OR unions the two label sets (all 5), NOT-Person leaves the 2 companies,
+        // and AND is empty (no node carries both labels) — three distinct sets.
+        assert_eq!(
+            gql_col0(
+                "exec_gql_label_or",
+                "MATCH (n:Person|Company) RETURN n.name AS n"
+            ),
+            vec!["Acme", "Alice", "Bob", "Carol", "Globex"],
+        );
+        assert_eq!(
+            gql_col0("exec_gql_label_not", "MATCH (n:!Person) RETURN n.name AS n"),
+            vec!["Acme", "Globex"],
+        );
+        assert!(
+            gql_col0(
+                "exec_gql_label_and",
+                "MATCH (n:Person&Company) RETURN n.name AS n"
+            )
+            .is_empty(),
+            "no node carries both labels",
+        );
+    }
+
+    #[test]
+    fn colon_chain_lowers_to_and_not_or() {
+        // Parity: `:Person:Company` is AND sugar, so it must give the SAME (empty)
+        // result as `:Person&Company` — NOT the 5-row OR result. A regression that
+        // lowered the colon chain to OR would surface here.
+        let colon = gql_col0(
+            "exec_gql_colon_and",
+            "MATCH (n:Person:Company) RETURN n.name AS n",
+        );
+        let amp = gql_col0(
+            "exec_gql_amp_and",
+            "MATCH (n:Person&Company) RETURN n.name AS n",
+        );
+        assert!(colon.is_empty());
+        assert_eq!(colon, amp);
+    }
+
+    #[test]
+    fn label_boolean_reltype_cardinalities() {
+        // Alice's out-edges: KNOWS→Bob, KNOWS→Carol, WORKS_AT→Acme. OR keeps all
+        // three neighbours, NOT-KNOWS keeps just the WORKS_AT target, AND is empty
+        // (an edge carries exactly one type).
+        assert_eq!(
+            gql_col0(
+                "exec_gql_rel_or",
+                "MATCH (a {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b",
+            ),
+            vec!["Acme", "Bob", "Carol"],
+        );
+        assert_eq!(
+            gql_col0(
+                "exec_gql_rel_not",
+                "MATCH (a {name:'Alice'})-[:!KNOWS]->(b) RETURN b.name AS b",
+            ),
+            vec!["Acme"],
+        );
+        assert!(
+            gql_col0(
+                "exec_gql_rel_and",
+                "MATCH (a {name:'Alice'})-[:KNOWS&WORKS_AT]->(b) RETURN b.name AS b",
+            )
+            .is_empty(),
+            "an edge carries exactly one type",
+        );
+    }
+
+    #[test]
+    fn reltype_alternation_parity_with_single_types() {
+        // `:KNOWS|WORKS_AT` (now an Or expression) must equal the union of the two
+        // single-type traversals — the pre-GQL alternation behaviour, unchanged.
+        let alt = gql_col0(
+            "exec_gql_rel_alt",
+            "MATCH (a {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        let knows = gql_col0(
+            "exec_gql_rel_knows",
+            "MATCH (a {name:'Alice'})-[:KNOWS]->(b) RETURN b.name AS b",
+        );
+        let works = gql_col0(
+            "exec_gql_rel_works",
+            "MATCH (a {name:'Alice'})-[:WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        let mut union = [knows, works].concat();
+        union.sort();
+        assert_eq!(alt, union);
+    }
+
+    // ── GQL PR 5 — `FOR` is UNWIND ────────────────────────────────────────────
+
+    #[test]
+    fn for_and_unwind_produce_identical_rows() {
+        // `FOR x IN list` lowers onto the same UnwindClause as `UNWIND list AS x`,
+        // so the two must emit byte-for-byte identical result rows — confirming the
+        // lowering reaches the unchanged executor path.
+        let by_for = gql_col0("exec_gql_for", "FOR x IN [3, 1, 2] RETURN x ORDER BY x");
+        let by_unwind = gql_col0(
+            "exec_gql_unwind",
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x",
+        );
+        assert_eq!(by_for, by_unwind);
+        assert_eq!(by_for, vec!["1", "2", "3"]);
+
+        // FOR over a MATCH-produced list behaves exactly like UNWIND too — one row
+        // per matched `b` (Alice KNOWS both Bob and Carol in the basic fixture).
+        let for_match = gql_col0(
+            "exec_gql_for_match",
+            "MATCH (a {name:'Alice'})-[:KNOWS]->(b) FOR n IN [b.name] RETURN n",
+        );
+        assert_eq!(for_match, vec!["Bob", "Carol"]);
+    }
+
+    #[test]
+    fn cast_executes_as_the_conversion_function() {
+        // CAST lowers onto the to*/temporal functions, so it must compute exactly
+        // what those functions do — confirming the lowering reaches the real path.
+        assert_eq!(
+            gql_col0("exec_gql_cast_int", "RETURN CAST('42' AS INTEGER) AS v"),
+            gql_col0("exec_gql_toint", "RETURN toInteger('42') AS v"),
+        );
+        assert_eq!(
+            gql_col0("exec_gql_cast_int2", "RETURN CAST('42' AS INTEGER) AS v"),
+            vec!["42"],
+        );
+        // Float, string and boolean spellings all round-trip through their function.
+        assert_eq!(
+            gql_col0("exec_gql_cast_float", "RETURN CAST(3 AS FLOAT) AS v"),
+            gql_col0("exec_gql_tofloat", "RETURN toFloat(3) AS v"),
+        );
+        assert_eq!(
+            gql_col0("exec_gql_cast_bool", "RETURN CAST('true' AS BOOLEAN) AS v"),
+            vec!["true"],
+        );
+        // A non-convertible value yields NULL, exactly like toInteger.
+        assert_eq!(
+            gql_col0("exec_gql_cast_null", "RETURN CAST('nope' AS INTEGER) AS v"),
+            gql_col0("exec_gql_toint_null", "RETURN toInteger('nope') AS v"),
+        );
     }
 
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────

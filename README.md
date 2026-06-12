@@ -25,6 +25,7 @@ path.
 | **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
 | **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
+| **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Supported GQL subset](#supported-gql-subset). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
 
@@ -46,6 +47,108 @@ geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
 (`db.idx.vector.queryNodes`). To update a graph you build a new generation and
 atomically swap the `current` pointer; the running server picks the change up via
 its generation guard (see [Generation guard](#generation-guard)).
+
+## Supported GQL subset
+
+Slater also understands a read-only subset of **ISO GQL** (ISO/IEC 39075), the
+standardised graph query language. There is no separate endpoint or protocol: GQL
+arrives over the same Bolt connection and is parsed by the same engine, so the
+standard drivers and tools work unchanged. A statement may optionally carry a
+leading `GQL` or `CYPHER` dialect selector (mirroring the `CYPHER 5` / `CYPHER 25`
+form) — it is stripped and the remainder is parsed either way, as one parser
+serves both languages.
+
+Every GQL form below lowers onto an existing engine capability, so the two
+spellings are equivalent and may be mixed freely (even within one query):
+
+| GQL form | Cypher equivalent | Meaning |
+|---|---|---|
+| `((…)){m,n}` | `…*m..n` | Quantified path — repeat the parenthesised pattern *m* to *n* times. |
+| `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` | (varies; `*` is `TRAIL`) | Path restrictor over a variable-length match: `WALK` allows repeats, `TRAIL` forbids repeated edges (the default for `*`), `ACYCLIC` forbids any repeated node, `SIMPLE` forbids interior repeats but lets the two endpoints coincide. |
+| `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k` | `shortestPath(…)` | Shortest-path selector on a match: any one shortest path, all minimum-length paths, or the first *k* by length. |
+| `:A & B`, `:A \| B`, `:! A`, `:(A \| B) & C` | `:A:B` (AND), `:A\|B` (OR) | Label / relationship-type boolean expressions — `&`, `\|`, `!` and parentheses. The classic `:A:B` (AND) and `:T1\|T2` (alternation) remain valid as sugar. |
+| `FOR x IN list` | `UNWIND list AS x` | Iterate a list, emitting one row per element. |
+| `CAST(expr AS TYPE)` | `toInteger(expr)`, `toFloat(…)`, … | Typed-value conversion (`INTEGER`/`INT`, `FLOAT`/`DOUBLE`/`REAL`, `STRING`/`VARCHAR`, `BOOLEAN`/`BOOL`, `DATE`, `LOCALTIME`, `LOCALDATETIME`, `DURATION`). |
+| `GQL …` / `CYPHER …` prefix | *(none — implicit)* | Optional dialect selector at the very start of a statement; recorded and stripped, with no change of behaviour today. |
+
+GQL responses also carry additive **GQLSTATUS** status objects in the Bolt
+`SUCCESS` / `FAILURE` metadata (`gql_status` + `status_description`) alongside the
+existing keys, so GQL-aware clients see standard status codes while older drivers
+are unaffected.
+
+### Writing GQL vs Cypher
+
+Because both spellings parse to the same plan, you can use whichever reads better —
+and mix them. The pairs below return identical results.
+
+**Quantified paths** — repeat a parenthesised sub-pattern a bounded number of times
+(the quantifier sits on the group, `((…)){m,n}`):
+
+```cypher
+-- GQL
+MATCH (a:Person) ((x)-[:KNOWS]->(y)){1,3} (b:Person) RETURN b
+-- Cypher
+MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN b
+```
+
+**Path restrictors** — control repeated nodes/edges on a variable-length `-[:R*]->`
+match (`WALK` allows repeats, `TRAIL` = no repeated edge — the default for `*` —
+`ACYCLIC` = no repeated node, `SIMPLE` = no repeated *interior* node):
+
+```cypher
+-- GQL: no node may repeat on the variable-length walk
+MATCH ACYCLIC (a)-[:KNOWS*]->(b) RETURN b
+-- Cypher `*` is already edge-unique (= TRAIL); ACYCLIC has no plain-Cypher spelling
+```
+
+**Shortest-path selectors** — pick the shortest path(s) on a match:
+
+```cypher
+-- GQL
+MATCH ANY SHORTEST (a {name:'Alice'})-[:KNOWS*]->(b {name:'Carol'}) RETURN b
+MATCH ALL SHORTEST (a)-[:KNOWS*]->(b) RETURN b      -- every minimum-length path
+MATCH SHORTEST 3 (a)-[:KNOWS*]->(b) RETURN b        -- first 3 by length
+-- Cypher: the shortestPath() function (single shortest; endpoints bound first)
+MATCH (a {name:'Alice'}), (b {name:'Carol'})
+RETURN shortestPath((a)-[:KNOWS*]->(b))
+```
+
+**Label / type boolean expressions** — `&`, `|`, `!` and parentheses:
+
+```cypher
+-- GQL
+MATCH (n:Person & Admin) RETURN n            -- both labels
+MATCH (n:Person & !Admin) RETURN n           -- Person but not Admin
+MATCH (a)-[r:KNOWS | FOLLOWS]->(b) RETURN r   -- either relationship type
+-- Cypher: :Person:Admin is AND sugar; |-alternation is rel-types only; no `!`
+MATCH (n:Person:Admin) RETURN n
+```
+
+**`FOR` instead of `UNWIND`** — iterate a list:
+
+```cypher
+-- GQL
+FOR x IN [1, 2, 3] RETURN x
+-- Cypher
+UNWIND [1, 2, 3] AS x RETURN x
+```
+
+**`CAST` instead of the `to*` functions** — typed-value conversion:
+
+```cypher
+-- GQL
+RETURN CAST('42' AS INTEGER), CAST(3 AS FLOAT), CAST('2024-01-01' AS DATE)
+-- Cypher
+RETURN toInteger('42'), toFloat(3), date('2024-01-01')
+```
+
+**Dialect prefix** — optional; stripped and parsed by the one engine, so it changes
+nothing today but lets a GQL-aware client be explicit:
+
+```cypher
+GQL MATCH (n:Person) RETURN n
+CYPHER MATCH (n:Person) RETURN n
+```
 
 > **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
 > who insists on going by a single name — "Just… Slater" — and one of my favourite
