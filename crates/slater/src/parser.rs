@@ -1755,6 +1755,7 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
             Ok(Expr::Map(entries))
         }
         Rule::function_call => lower_function(inner),
+        Rule::cast_expr => lower_cast(inner),
         Rule::case_expr => lower_case(inner),
         Rule::map_projection => lower_map_projection(inner),
         Rule::reduce_expr => lower_reduce(inner),
@@ -1792,6 +1793,40 @@ fn lower_function(pair: Pair<Rule>) -> Result<Expr> {
         } else {
             FuncArgs::Args(args)
         },
+    })
+}
+
+fn lower_cast(pair: Pair<Rule>) -> Result<Expr> {
+    // cast_expr = { kw_cast ~ "(" ~ expr ~ kw_as ~ cast_type ~ ")" }. kids() drops
+    // the keyword tokens, leaving the value expression then the target type name.
+    // GQL's CAST is a typed-value conversion; we lower it onto slater's existing
+    // conversion functions so the executor path is shared (no new coercion code) —
+    // the same additive discipline as FOR → UNWIND (DECISIONS D42).
+    let mut it = kids(pair);
+    let value = lower_expr(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("CAST without value"))?,
+    )?;
+    let ty = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("CAST without target type"))?;
+    let func = match ty.as_str().to_ascii_lowercase().as_str() {
+        "integer" | "int" => "toInteger",
+        "float" | "double" | "real" => "toFloat",
+        "string" | "varchar" => "toString",
+        "boolean" | "bool" => "toBoolean",
+        // The temporal types map to their single-argument constructors, which already
+        // accept a string/map and yield the temporal Val.
+        "date" => "date",
+        "localdatetime" => "localdatetime",
+        "localtime" => "localtime",
+        "duration" => "duration",
+        other => bail!("internal: unexpected CAST type {other:?}"),
+    };
+    Ok(Expr::Function {
+        name: func.to_string(),
+        distinct: false,
+        args: FuncArgs::Args(vec![value]),
     })
 }
 
@@ -2087,6 +2122,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_yield
             | Rule::kw_unwind
             | Rule::kw_for
+            | Rule::kw_cast
             | Rule::reduce_kw
             | Rule::exists_kw
     )
@@ -3181,6 +3217,40 @@ mod tests {
         let from_for = ok("FOR x IN [1, 2, 3] RETURN x");
         let from_unwind = ok("UNWIND [1, 2, 3] AS x RETURN x");
         assert_eq!(from_for.head.reading, from_unwind.head.reading);
+    }
+
+    #[test]
+    fn cast_lowers_onto_conversion_functions() {
+        // The RETURN projection expression of `q`'s sole RETURN item.
+        fn return_expr(q: &Query) -> &Expr {
+            &q.head.ret.body.items[0].expr
+        }
+
+        // CAST(x AS <type>) lowers to the matching to*/temporal function call; each
+        // spelling (and its alias) maps to the same function name.
+        for (q, func) in [
+            ("RETURN CAST('7' AS INTEGER)", "toInteger"),
+            ("RETURN CAST('7' AS INT)", "toInteger"),
+            ("RETURN CAST(1 AS FLOAT)", "toFloat"),
+            ("RETURN CAST(1 AS DOUBLE)", "toFloat"),
+            ("RETURN CAST(1 AS STRING)", "toString"),
+            ("RETURN CAST('true' AS BOOLEAN)", "toBoolean"),
+            ("RETURN CAST('2024-01-01' AS DATE)", "date"),
+        ] {
+            match return_expr(&ok(q)) {
+                Expr::Function { name, args, .. } => {
+                    assert_eq!(name, func, "for {q:?}");
+                    assert!(matches!(args, FuncArgs::Args(a) if a.len() == 1));
+                }
+                other => panic!("expected a Function for {q:?}, got {other:?}"),
+            }
+        }
+
+        // CAST(x AS INTEGER) is the identical AST to toInteger(x) — pure sugar.
+        assert_eq!(
+            ok("RETURN CAST('7' AS INTEGER)").head.ret.body.items,
+            ok("RETURN toInteger('7')").head.ret.body.items,
+        );
     }
 
     // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────

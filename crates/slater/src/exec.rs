@@ -7907,6 +7907,34 @@ mod tests {
         assert_eq!(for_match, vec!["Bob", "Carol"]);
     }
 
+    #[test]
+    fn cast_executes_as_the_conversion_function() {
+        // CAST lowers onto the to*/temporal functions, so it must compute exactly
+        // what those functions do — confirming the lowering reaches the real path.
+        assert_eq!(
+            gql_col0("exec_gql_cast_int", "RETURN CAST('42' AS INTEGER) AS v"),
+            gql_col0("exec_gql_toint", "RETURN toInteger('42') AS v"),
+        );
+        assert_eq!(
+            gql_col0("exec_gql_cast_int2", "RETURN CAST('42' AS INTEGER) AS v"),
+            vec!["42"],
+        );
+        // Float, string and boolean spellings all round-trip through their function.
+        assert_eq!(
+            gql_col0("exec_gql_cast_float", "RETURN CAST(3 AS FLOAT) AS v"),
+            gql_col0("exec_gql_tofloat", "RETURN toFloat(3) AS v"),
+        );
+        assert_eq!(
+            gql_col0("exec_gql_cast_bool", "RETURN CAST('true' AS BOOLEAN) AS v"),
+            vec!["true"],
+        );
+        // A non-convertible value yields NULL, exactly like toInteger.
+        assert_eq!(
+            gql_col0("exec_gql_cast_null", "RETURN CAST('nope' AS INTEGER) AS v"),
+            gql_col0("exec_gql_toint_null", "RETURN toInteger('nope') AS v"),
+        );
+    }
+
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────
     // Pushing the LIMIT into the match must return the SAME prefix of rows (in
     // match-emit order) that buffering-then-truncating did — early-stop changes

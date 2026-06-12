@@ -289,6 +289,7 @@ index_access = { "[" ~ expr ~ "]" }
 
 primary = {
     case_expr
+  | cast_expr
   | exists_subquery
   | reduce_expr
   | list_comprehension
@@ -327,6 +328,22 @@ function_call = { func_name ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*
 func_name = @{ identifier ~ ("." ~ identifier)* }
 func_arg = { star_arg | expr }
 star_arg = { "*" }
+
+// GQL `CAST(expr AS TYPE)` — a typed-value conversion. It lowers (parser
+// `lower_cast`) onto slater's existing conversion functions (toInteger/toFloat/
+// toString/toBoolean and the temporal constructors date/localtime/localdatetime/
+// duration), so the executor path is shared, not duplicated. Tried before
+// `function_call` in `primary` so `CAST(` is read as a cast, not a plain call;
+// a `cast(…)` without the `AS TYPE` tail backtracks cleanly to `function_call`.
+cast_expr = { kw_cast ~ "(" ~ expr ~ kw_as ~ cast_type ~ ")" }
+kw_cast = @{ ^"cast" ~ !ident_cont }
+// The GQL type names slater can convert to, longest-prefix first so `integer`
+// wins over `int` etc. (the trailing `!ident_cont` also guards the short forms).
+cast_type = @{
+    (^"integer" | ^"int" | ^"float" | ^"double" | ^"real" | ^"string"
+      | ^"varchar" | ^"boolean" | ^"bool" | ^"localdatetime" | ^"localtime"
+      | ^"date" | ^"duration") ~ !ident_cont
+}
 
 case_expr = { kw_case ~ case_subject? ~ when_clause+ ~ else_clause? ~ kw_end }
 case_subject = { !kw_when ~ expr }
