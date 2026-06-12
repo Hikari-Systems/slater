@@ -385,21 +385,21 @@ identical across engines; parameters vary every call so each execution is real
 (slater's result cache is off). slater :7687 (cache-off config), Neo4j :7688,
 Memgraph :7689 (Bolt), FalkorDB :6390 (RESP, `falkordb` client).
 
-**Latency — mean of 5 run-medians (ms).** Mark is on **slater**: 🟢 = slater sole
+**Latency — mean of 5 run-medians.** Mark is on **slater**: 🟢 = slater sole
 fastest, ⚪ = slater ties for fastest (within 25%), blank = another engine faster.
 
 | query | slater | Neo4j 5 | Memgraph | FalkorDB |
 |-------|-------:|--------:|---------:|---------:|
-| count all nodes | **0.56 🟢** | 6.03 | 3.48 | 3.55 |
-| Crime label count | **0.57 🟢** | 4.34 | 4.22 | 1.99 |
-| point lookup (idx nhs_no) | **0.62 ⚪** | 4.22 | 0.50 | 0.50 |
-| idx-eq count (Crime.type) | 1.45 | 3.03 | 0.98 | 0.63 |
-| 1-hop Crime→Location | 2.44 | 6.92 | 1.38 | 0.78 |
-| 2-hop Person→Loc→Area | 1.53 | 5.49 | 1.37 | 1.01 |
-| agg crimes by type | **2.75 🟢** | 9.35 | 7.22 | 3.87 |
-| 3-hop Officer/Crime/Loc | 1.60 | 3.89 | 2.02 | 1.01 |
-| full-scan CONTAINS | 8.96 | 5.72 | 7.37 | 3.36 |
-| count DISTINCT type | **2.76 🟢** | 7.71 | 6.79 | 4.51 |
+| count all nodes | **0.56 ms 🟢** | 6.03 ms | 3.48 ms | 3.55 ms |
+| Crime label count | **0.57 ms 🟢** | 4.34 ms | 4.22 ms | 1.99 ms |
+| point lookup (idx nhs_no) | **0.62 ms ⚪** | 4.22 ms | 0.50 ms | 0.50 ms |
+| idx-eq count (Crime.type) | 1.45 ms | 3.03 ms | 0.98 ms | 0.63 ms |
+| 1-hop Crime→Location | 2.44 ms | 6.92 ms | 1.38 ms | 0.78 ms |
+| 2-hop Person→Loc→Area | 1.53 ms | 5.49 ms | 1.37 ms | 1.01 ms |
+| agg crimes by type | **2.75 ms 🟢** | 9.35 ms | 7.22 ms | 3.87 ms |
+| 3-hop Officer/Crime/Loc | 1.60 ms | 3.89 ms | 2.02 ms | 1.01 ms |
+| full-scan CONTAINS | 8.96 ms | 5.72 ms | 7.37 ms | 3.36 ms |
+| count DISTINCT type | **2.76 ms 🟢** | 7.71 ms | 6.79 ms | 4.51 ms |
 
 For reference, slater vs the field by 25%-parity band: it is **faster than Neo4j
 on every row** (3–11×, CONTAINS a wash); vs **Memgraph** it wins counts/agg/DISTINCT

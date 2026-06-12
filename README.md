@@ -403,22 +403,21 @@ budgets you set (here 64 + 32 MiB) and stays flat as the graph grows**, where th
 others hold the whole graph resident and scale with the data. On a large graph
 that is the difference between a fixed budget and provisioning for the dataset.
 
-**Latency** (median, milliseconds). The mark sits on **slater**: 🟢 = slater is the
-fastest of the four, ⚪ = slater ties for fastest (within 25%), no mark = another
-engine is faster:
+**Latency** (median). The mark sits on **slater**: 🟢 = slater is the fastest of the
+four, ⚪ = slater ties for fastest (within 25%), no mark = another engine is faster:
 
 | query shape | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
-| `count(*)` all nodes | **~0.6 🟢** | ~6.0 | ~3.5 | ~3.6 |
-| label count | **~0.6 🟢** | ~4.3 | ~4.2 | ~2.0 |
-| indexed point lookup | **~0.6 ⚪** | ~4.2 | ~0.5 | ~0.5 |
-| indexed-equality count | ~1.5 | ~3.0 | ~1.0 | ~0.6 |
-| 1-hop traversal | ~2.4 | ~6.9 | ~1.4 | ~0.8 |
-| 2-hop traversal | ~1.5 | ~5.5 | ~1.4 | ~1.0 |
-| group-by aggregation | **~2.8 🟢** | ~9.4 | ~7.2 | ~3.9 |
-| 3-hop traversal | ~1.6 | ~3.9 | ~2.0 | ~1.0 |
-| unindexed substring scan | ~9.0 | ~5.7 | ~7.4 | ~3.4 |
-| `count(DISTINCT …)` | **~2.8 🟢** | ~7.7 | ~6.8 | ~4.5 |
+| `count(*)` all nodes | **~0.6 ms 🟢** | ~6.0 ms | ~3.5 ms | ~3.6 ms |
+| label count | **~0.6 ms 🟢** | ~4.3 ms | ~4.2 ms | ~2.0 ms |
+| indexed point lookup | **~0.6 ms ⚪** | ~4.2 ms | ~0.5 ms | ~0.5 ms |
+| indexed-equality count | ~1.5 ms | ~3.0 ms | ~1.0 ms | ~0.6 ms |
+| 1-hop traversal | ~2.4 ms | ~6.9 ms | ~1.4 ms | ~0.8 ms |
+| 2-hop traversal | ~1.5 ms | ~5.5 ms | ~1.4 ms | ~1.0 ms |
+| group-by aggregation | **~2.8 ms 🟢** | ~9.4 ms | ~7.2 ms | ~3.9 ms |
+| 3-hop traversal | ~1.6 ms | ~3.9 ms | ~2.0 ms | ~1.0 ms |
+| unindexed substring scan | ~9.0 ms | ~5.7 ms | ~7.4 ms | ~3.4 ms |
+| `count(DISTINCT …)` | **~2.8 ms 🟢** | ~7.7 ms | ~6.8 ms | ~4.5 ms |
 
 The shape of it: slater is **faster than every engine here on the count /
 aggregation / `DISTINCT` shapes** (its index-and-metadata fast paths), ties for
