@@ -15,6 +15,21 @@ resident, Slater holds only bounded caches and reads everything else from disk o
 demand, including the disk-native approximate-nearest-neighbour (Vamana/PQ) vector
 path.
 
+## Features
+
+| Feature | What it means for you |
+|---|---|
+| **Bounded, predictable memory** | Resident memory is capped by three cache budgets *you* set — it does **not** grow with graph size. You tune the performance/RAM trade-off instead of provisioning for the whole graph. |
+| **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
+| **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
+| **Tiny, dependency-light install** | A ~5 MB stripped static binary in a ~33 MB multi-arch image (amd64/arm64); pure-Rust TLS, no OpenSSL. Pull and run. |
+| **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
+| **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
+| **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
+| **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
+| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
+| **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
+
 Two binaries make up the workspace:
 
 | Binary | Role |
@@ -22,11 +37,17 @@ Two binaries make up the workspace:
 | `slater` | The online, read-only Bolt server (the container ENTRYPOINT). |
 | `slater-build` | The offline writer: turns a primitive-Cypher dump into an immutable, content-hashed generation directory. |
 
-Slater is **read-only**: no `CREATE`/`MERGE`/`SET`/`DELETE`/`REMOVE`/`DROP`, and
-the only permitted procedure is `db.idx.vector.queryNodes` (cosine KNN). Writes
-happen offline, by building a new generation and atomically swapping the
-`current` pointer; the running server picks the change up via its generation
-guard (see [Generation guard](#generation-guard)).
+Slater splits writing from serving: the offline `slater-build` does all the heavy
+lifting — ingesting your data and compiling it into an immutable generation — so
+the serving process carries **none** of the write-side machinery (transaction
+logs, locks, GC, index rebalancing) on its hot path. That's what keeps reads fast
+and memory light. The serving process is therefore **read-only**, and within that
+envelope answers a broad Cypher surface — pattern matching,
+`WITH`/`UNION`/`CALL {…}` subqueries, 70+ scalar & aggregate functions, temporal &
+geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
+(`db.idx.vector.queryNodes`). To update a graph you build a new generation and
+atomically swap the `current` pointer; the running server picks the change up via
+its generation guard (see [Generation guard](#generation-guard)).
 
 ## Running with Docker
 
@@ -298,8 +319,7 @@ with driver.session(database="people") as session:
 driver.close()
 ```
 
-The KNN `score` is the **cosine distance** (ascending — nearest first), matching
-FalkorDB's `db.idx.vector.queryNodes` contract.
+The KNN `score` is the **cosine distance** (ascending — nearest first).
 
 ## Development
 
@@ -313,6 +333,20 @@ cargo fmt --all -- --check
 
 See `docs/PLAN.md`, `docs/PROGRESS.md` and `docs/DECISIONS.md` for the design,
 the milestone ledger, and the decision log.
+
+## Health check
+
+The `slater` binary doubles as its own liveness probe: `slater healthcheck [host]
+[port]` performs a **Bolt handshake** (not an HTTP request) against the server and
+exits `0` if it negotiates a protocol version, `1` otherwise — defaulting to
+`localhost` and the configured Bolt port. This is what the container
+`HEALTHCHECK` runs, so orchestrators see a truly Bolt-ready server, not just an
+open socket:
+
+```sh
+slater healthcheck localhost 7687    # exit 0 = healthy
+docker exec slater /app/slater healthcheck   # inside the container
+```
 
 ## License
 

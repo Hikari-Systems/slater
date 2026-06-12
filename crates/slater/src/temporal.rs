@@ -248,8 +248,8 @@ fn parse_clock(s: &str) -> Option<(i64, i64, i64)> {
     }
     let v: i64 = int_part.parse().ok()?;
     match int_part.len() {
-        1 | 2 => Some((v, 0, 0)),            // H / HH
-        3 | 4 => Some((v / 100, v % 100, 0)), // HMM / HHMM
+        1 | 2 => Some((v, 0, 0)),                             // H / HH
+        3 | 4 => Some((v / 100, v % 100, 0)),                 // HMM / HHMM
         5 | 6 => Some((v / 10000, (v / 100) % 100, v % 100)), // HMMSS / HHMMSS
         _ => None,
     }

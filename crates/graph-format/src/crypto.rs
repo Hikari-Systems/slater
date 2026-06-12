@@ -40,6 +40,11 @@ pub const SALT_LEN: usize = 32;
 /// BLAKE3 derive-key context. Versioned so a future KDF change is unambiguous.
 const KDF_CONTEXT: &str = "slater generation block key v1";
 
+/// BLAKE3 derive-key context for the manifest-authentication (MAC) subkey.
+/// Distinct from [`KDF_CONTEXT`] so the MAC key and per-block keys are
+/// domain-separated — neither can ever collide with the other.
+const MAC_KDF_CONTEXT: &str = "slater manifest mac v1";
+
 /// Generate a fresh per-generation random salt.
 pub fn random_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
@@ -56,6 +61,26 @@ pub fn derive_key(master_key: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
     let mut out = [0u8; KEY_LEN];
     h.finalize_xof().fill(&mut out);
     out
+}
+
+/// Derive the 32-byte manifest-MAC key from the runtime master key. Unlike the
+/// per-generation block key this is **not** salted: it binds the manifest to the
+/// operator's master key only, and the per-generation salt already lives inside
+/// the (MAC-covered) encryption header. Salt-free keeps the key reproducible at
+/// verify time from the master key alone. Domain-separated from [`derive_key`] by
+/// its KDF context.
+pub fn derive_manifest_mac_key(master_key: &[u8]) -> [u8; KEY_LEN] {
+    let mut h = blake3::Hasher::new_derive_key(MAC_KDF_CONTEXT);
+    h.update(master_key);
+    let mut out = [0u8; KEY_LEN];
+    h.finalize_xof().fill(&mut out);
+    out
+}
+
+/// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
+/// 32-byte subkey from [`derive_manifest_mac_key`].
+pub fn manifest_mac(key: &[u8; KEY_LEN], msg: &[u8]) -> String {
+    hex_encode(blake3::keyed_hash(key, msg).as_bytes())
 }
 
 /// Lower-case hex-encode bytes (for the MANIFEST salt field).
@@ -164,6 +189,44 @@ mod tests {
         assert_ne!(k1, k3, "a different salt derives a different key");
         // A different master key also diverges.
         assert_ne!(k1, derive_key(b"other-master-key", &salt_a));
+    }
+
+    #[test]
+    fn manifest_mac_key_is_deterministic_and_domain_separated() {
+        let master = b"super-secret-master-key";
+        let k1 = derive_manifest_mac_key(master);
+        let k2 = derive_manifest_mac_key(master);
+        assert_eq!(k1, k2, "same master derives the same MAC key");
+        assert_ne!(
+            k1,
+            derive_manifest_mac_key(b"other-master-key"),
+            "a different master diverges"
+        );
+        // Domain separation: the MAC key must not equal a block key derived from
+        // the same master (the block KDF also folds in a salt, but even an
+        // empty-salt block key must differ thanks to the distinct context).
+        assert_ne!(
+            k1,
+            derive_key(master, b""),
+            "MAC key is domain-separated from the block key"
+        );
+    }
+
+    #[test]
+    fn manifest_mac_is_stable_and_message_sensitive() {
+        let key = derive_manifest_mac_key(b"master");
+        let mac = manifest_mac(&key, b"the blueprint bytes");
+        assert_eq!(mac, manifest_mac(&key, b"the blueprint bytes"));
+        assert_ne!(
+            mac,
+            manifest_mac(&key, b"the blueprint bytez"),
+            "one flipped byte changes the MAC"
+        );
+        // A different key over the same message also diverges.
+        assert_ne!(
+            mac,
+            manifest_mac(&derive_manifest_mac_key(b"other"), b"the blueprint bytes")
+        );
     }
 
     #[test]

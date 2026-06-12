@@ -106,6 +106,13 @@ pub struct Graphs {
     data_dir: PathBuf,
     master_key: Option<Vec<u8>>,
     graphs: HashMap<String, RwLock<Arc<Generation>>>,
+    /// Live `acl.json` path used to verify per-generation `aclBlake3` stamps at
+    /// open/swap time. `None` ⇒ no ACL stamp checking (e.g. unit-test fixtures).
+    acl_path: Option<PathBuf>,
+    /// Refuse to serve a keyed image whose manifest carries no MAC (downgrade guard).
+    require_manifest_mac: bool,
+    /// Refuse to serve a generation whose manifest carries no ACL stamp.
+    require_acl_stamp: bool,
 }
 
 impl Graphs {
@@ -134,7 +141,80 @@ impl Graphs {
             data_dir: data_dir.to_path_buf(),
             master_key: master_key.map(<[u8]>::to_vec),
             graphs,
+            acl_path: None,
+            require_manifest_mac: false,
+            require_acl_stamp: false,
         })
+    }
+
+    /// Install the manifest-authentication policy before the graphs go live. The
+    /// server calls this between `open_all` and `verify_manifest_policy`; the MAC
+    /// itself is verified inside `Generation::open_with_key`, while the ACL stamp
+    /// and the require-presence downgrade guards are enforced here so the config
+    /// flags stay co-located with the acl path.
+    pub fn set_manifest_policy(
+        &mut self,
+        acl_path: Option<PathBuf>,
+        require_manifest_mac: bool,
+        require_acl_stamp: bool,
+    ) {
+        self.acl_path = acl_path;
+        self.require_manifest_mac = require_manifest_mac;
+        self.require_acl_stamp = require_acl_stamp;
+    }
+
+    /// Hash the configured live `acl.json` once, or `None` when no `acl_path` is set.
+    fn live_acl_digest(&self) -> Result<Option<String>> {
+        match &self.acl_path {
+            Some(p) => Ok(Some(
+                graph_format::integrity::hash_file(p)
+                    .with_context(|| format!("hash live acl {}", p.display()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Enforce the ACL stamp + require-presence policy for one generation's
+    /// manifest. `live_acl` is the digest of the live `acl.json` (`None` when no
+    /// acl path is configured). Bails — refusing to serve — on a stamp mismatch or
+    /// a violated require-presence flag. (The MAC value itself is verified at open.)
+    fn check_manifest_policy(
+        &self,
+        name: &str,
+        m: &graph_format::manifest::Manifest,
+        live_acl: Option<&str>,
+    ) -> Result<()> {
+        match (&m.acl_blake3, live_acl) {
+            (Some(stamp), Some(live)) if stamp != live => bail!(
+                "graph '{name}' was built against an acl.json with digest {stamp} but the live \
+                 acl hashes to {live} — refusing to serve; rebuild the graph against the current \
+                 acl.json"
+            ),
+            (Some(_), None) => warn!(
+                graph = name,
+                "generation carries an ACL stamp but no aclPath is configured to verify it"
+            ),
+            (None, _) if self.require_acl_stamp => {
+                bail!("graph '{name}' manifest has no ACL stamp but requireAclStamp is set")
+            }
+            _ => {}
+        }
+        if self.require_manifest_mac && self.master_key.is_some() && m.mac.is_none() {
+            bail!("graph '{name}' manifest has no MAC but requireManifestMac is set");
+        }
+        Ok(())
+    }
+
+    /// Verify the manifest-authentication policy for every served generation. Called
+    /// once at boot after `open_all` + `set_manifest_policy`. The live acl is hashed
+    /// a single time and reused across all graphs.
+    pub fn verify_manifest_policy(&self) -> Result<()> {
+        let live = self.live_acl_digest()?;
+        for (name, slot) in &self.graphs {
+            let gen = slot.read().unwrap().clone();
+            self.check_manifest_policy(name, gen.manifest(), live.as_deref())?;
+        }
+        Ok(())
     }
 
     /// A snapshot of the live generation for `name`. A query holds this `Arc` for
@@ -204,6 +284,13 @@ impl Graphs {
                     format!("open swapped-in generation {on_disk} of graph '{name}'")
                 })?,
         );
+
+        // The swapped-in generation may carry a different ACL stamp / MAC presence
+        // than the one it replaces. Re-apply the same policy before publishing it;
+        // a violation returns Err and the caller keeps the old generation serving.
+        let live_acl = self.live_acl_digest()?;
+        self.check_manifest_policy(name, new_gen.manifest(), live_acl.as_deref())
+            .with_context(|| format!("manifest policy for swapped-in generation of '{name}'"))?;
 
         // Pin the new generation's resident PQ *before* publishing it, then swap,
         // then unpin the old — so the pool never under-counts the resident set.
@@ -417,7 +504,10 @@ impl ConnCtx {
 
     /// Flag `user` as a Memgraph-dialect client (idempotent).
     fn mark_memgraph(&self, user: &str) {
-        self.memgraph_users.write().unwrap().insert(user.to_string());
+        self.memgraph_users
+            .write()
+            .unwrap()
+            .insert(user.to_string());
     }
 }
 
@@ -699,7 +789,10 @@ fn parse_use_statement(query: &str) -> Option<String> {
     }
     let mut rest: Vec<&str> = words.collect();
     // Optional `DATABASE` keyword: `USE DATABASE <name>`.
-    if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("database")) {
+    if rest
+        .first()
+        .is_some_and(|w| w.eq_ignore_ascii_case("database"))
+    {
         rest.remove(0);
     }
     if rest.len() != 1 {
@@ -863,10 +956,16 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         .encryption
         .load_key()
         .context("load at-rest encryption key")?;
-    let graphs = Arc::new(Graphs::open_all(
-        Path::new(&cfg.data_dir),
-        master_key.as_deref(),
-    )?);
+    let mut graphs = Graphs::open_all(Path::new(&cfg.data_dir), master_key.as_deref())?;
+    graphs.set_manifest_policy(
+        Some(PathBuf::from(&cfg.acl_path)),
+        cfg.require_manifest_mac,
+        cfg.require_acl_stamp,
+    );
+    graphs
+        .verify_manifest_policy()
+        .context("manifest authentication policy")?;
+    let graphs = Arc::new(graphs);
     if graphs.is_empty() {
         warn!(data_dir = %cfg.data_dir, "no graphs found to serve");
     }
@@ -933,7 +1032,10 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     // Disabled (not spawned) when `cache.cacheTtlMs` is 0 — caches then evict on
     // budget pressure alone, as before.
     if let Some(ttl) = cfg.cache.cache_ttl() {
-        info!(ttl_ms = cfg.cache.cache_ttl_ms, "cache idle-TTL eviction enabled");
+        info!(
+            ttl_ms = cfg.cache.cache_ttl_ms,
+            "cache idle-TTL eviction enabled"
+        );
         spawn_cache_maintenance(
             ctx.cache.clone(),
             ctx.vector_cache.clone(),
@@ -1200,7 +1302,8 @@ async fn handle_request(
             // this). Validate the target and remember it per-user for later db-less
             // statements; answer with an empty result like a Memgraph database switch.
             if let Some(target) = parse_use_statement(&query) {
-                if ctx.graphs.get(&target).is_none() || !ctx.acl.snapshot().can_read(&user, &target) {
+                if ctx.graphs.get(&target).is_none() || !ctx.acl.snapshot().can_read(&user, &target)
+                {
                     let mut served: Vec<String> = ctx
                         .graphs
                         .names()
@@ -1215,7 +1318,10 @@ async fn handle_request(
                 }
                 debug!(graph = %target, "WIRE-DIAG: USE selected graph");
                 ctx.set_selection(&user, &target);
-                sess.pending = Some(Pending { rows: vec![], sent: 0 });
+                sess.pending = Some(Pending {
+                    rows: vec![],
+                    sent: 0,
+                });
                 return Ok(vec![message::success(vec![(
                     "fields".into(),
                     PsValue::List(vec![]),
@@ -1229,9 +1335,13 @@ async fn handle_request(
             // A browser GUI fires introspection (`CALL db.labels()`, `SHOW …`) on
             // connect; answer those from the manifest before the read-only Cypher
             // grammar (which forbids them) ever sees the query.
-            if let Some((columns, rows)) =
-                ctx.introspect(&user, &extra, &query, sticky.as_deref(), ctx.is_memgraph(&user))?
-            {
+            if let Some((columns, rows)) = ctx.introspect(
+                &user,
+                &extra,
+                &query,
+                sticky.as_deref(),
+                ctx.is_memgraph(&user),
+            )? {
                 sess.pending = Some(Pending { rows, sent: 0 });
                 return Ok(vec![message::success(vec![(
                     "fields".into(),
@@ -1362,7 +1472,11 @@ async fn run_query(
 
             // Result-cache lookup (skipped for non-deterministic queries), then
             // execute-and-cache on a miss.
-            let cached = if cacheable { result_cache.get(&key) } else { None };
+            let cached = if cacheable {
+                result_cache.get(&key)
+            } else {
+                None
+            };
             let (result, result_cache_hit) = match cached {
                 Some(r) => (r, true),
                 None => {
@@ -1634,7 +1748,11 @@ fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
                     let from = nodes[k];
                     let to = nodes[k + 1];
                     let idx = (rel_pos[id] + 1) as i64;
-                    let signed = if *start == from && *end == to { idx } else { -idx };
+                    let signed = if *start == from && *end == to {
+                        idx
+                    } else {
+                        -idx
+                    };
                     indices.push(PsValue::Int(signed));
                     indices.push(PsValue::Int(node_pos[&to] as i64));
                 }
@@ -1778,6 +1896,104 @@ mod tests {
         path
     }
 
+    /// Patch one top-level field in every generation manifest of `graph` under
+    /// `root`. Safe for fields outside the data-file inventory (e.g. `aclBlake3`),
+    /// which `content_hash` excludes, so `open_all` still validates afterwards.
+    fn patch_manifest(root: &Path, graph: &str, key: &str, value: serde_json::Value) {
+        for entry in std::fs::read_dir(root.join(graph)).unwrap() {
+            let man = entry.unwrap().path().join("MANIFEST.json");
+            if man.exists() {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&man).unwrap()).unwrap();
+                v[key] = value.clone();
+                std::fs::write(&man, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn acl_stamp_matches_serves_and_mismatch_refuses() {
+        let (root, _g, _) = testgen::write_basic("aclstamp_match");
+        let acl_path = write_acl(&root);
+        let live = graph_format::integrity::hash_file(&acl_path).unwrap();
+
+        // Stamped with the live digest → serves.
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!(live));
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path.clone()), false, false);
+        assert!(graphs.verify_manifest_policy().is_ok());
+
+        // Stamped with a stale digest → refuses to serve.
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!("deadbeef"));
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path), false, false);
+        assert!(graphs.verify_manifest_policy().is_err());
+    }
+
+    #[test]
+    fn unstamped_generation_ignored_unless_required() {
+        let (root, _g, _) = testgen::write_basic("aclstamp_absent");
+        let acl_path = write_acl(&root);
+
+        // Legacy image with no aclBlake3 serves when not required.
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path.clone()), false, false);
+        assert!(graphs.verify_manifest_policy().is_ok());
+
+        // requireAclStamp turns the absence into a refusal.
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path), false, true);
+        assert!(graphs.verify_manifest_policy().is_err());
+    }
+
+    /// Re-seal every generation manifest of `graph` with a MAC under `key`, as an
+    /// encrypted build would. (The fixture data stays plaintext; the MAC path is
+    /// independent of whether blocks are encrypted.)
+    fn reseal_manifest_with_mac(root: &Path, graph: &str, key: &[u8]) {
+        for entry in std::fs::read_dir(root.join(graph)).unwrap() {
+            let man = entry.unwrap().path().join("MANIFEST.json");
+            if man.exists() {
+                let mut m: graph_format::manifest::Manifest =
+                    serde_json::from_str(&std::fs::read_to_string(&man).unwrap()).unwrap();
+                m.seal_mac(key).unwrap();
+                std::fs::write(&man, m.to_json().unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_mac_catches_tamper_through_open() {
+        let (root, _g, _) = testgen::write_basic("mac_e2e");
+        let key: &[u8] = b"operator master key";
+        reseal_manifest_with_mac(&root, "people", key);
+
+        // Sealed manifest opens cleanly with the key (MAC verifies; data plaintext).
+        assert!(Generation::open_with_key(&root, "people", Some(key)).is_ok());
+
+        // Tamper a MAC-covered field the content-hash does NOT cover (nodeCount)
+        // without resealing: the MAC check refuses before anything else. A plaintext
+        // image (no MAC) would happily serve this forged count.
+        patch_manifest(&root, "people", "nodeCount", serde_json::json!(999_999));
+        let err = Generation::open_with_key(&root, "people", Some(key))
+            .err()
+            .expect("tampered manifest must fail to open");
+        assert!(
+            format!("{err:#}").contains("MAC"),
+            "expected a MAC error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn require_manifest_mac_bails_when_key_present_but_mac_absent() {
+        let (root, _g, _) = testgen::write_basic("require_mac");
+        let acl_path = write_acl(&root);
+        // The plaintext fixture carries no MAC; opening with a master key present
+        // and requireManifestMac set must refuse (the strip-downgrade guard).
+        let mut graphs = Graphs::open_all(&root, Some(b"master")).unwrap();
+        graphs.set_manifest_policy(Some(acl_path), true, false);
+        assert!(graphs.verify_manifest_policy().is_err());
+    }
+
     /// Stand up a ConnCtx over the shared fixture graph + a temp ACL.
     fn build_ctx(tag: &str) -> (std::path::PathBuf, Arc<ConnCtx>) {
         let (root, _graph, _) = testgen::write_basic(tag);
@@ -1804,7 +2020,7 @@ mod tests {
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
             use_selection: RwLock::new(HashMap::new()),
-        memgraph_users: RwLock::new(HashSet::new()),
+            memgraph_users: RwLock::new(HashSet::new()),
         });
         (root, ctx)
     }
@@ -1865,7 +2081,7 @@ mod tests {
             // A default is configured but must NOT be silently served for queries.
             default_graph: Some("people".to_string()),
             use_selection: RwLock::new(HashMap::new()),
-        memgraph_users: RwLock::new(HashSet::new()),
+            memgraph_users: RwLock::new(HashSet::new()),
         })
     }
 
@@ -1875,7 +2091,11 @@ mod tests {
         let extra = PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]);
         let err = ctx.select_graph(&extra, "reporting", None).unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
-        assert!(err.message.contains("'eu-ai-act' is not served"), "{}", err.message);
+        assert!(
+            err.message.contains("'eu-ai-act' is not served"),
+            "{}",
+            err.message
+        );
         // The real name is offered so a typo is self-correcting.
         assert!(err.message.contains("people"), "{}", err.message);
     }
@@ -1889,13 +2109,20 @@ mod tests {
         let err = ctx.select_graph(&empty, "reporting", None).unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
         assert!(err.message.contains("no graph selected"), "{}", err.message);
-        assert!(err.message.contains("people") && err.message.contains("places"), "{}", err.message);
+        assert!(
+            err.message.contains("people") && err.message.contains("places"),
+            "{}",
+            err.message
+        );
         // An empty (not just absent) db string is treated the same.
         let blank = PsValue::Map(vec![("db".into(), PsValue::str(""))]);
         assert!(ctx.select_graph(&blank, "reporting", None).is_err());
         // Naming an exact, served graph still works.
         let named = PsValue::Map(vec![("db".into(), PsValue::str("places"))]);
-        assert_eq!(ctx.select_graph(&named, "reporting", None).ok(), Some("places".to_string()));
+        assert_eq!(
+            ctx.select_graph(&named, "reporting", None).ok(),
+            Some("places".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1909,10 +2136,8 @@ mod tests {
             version: (5, 4),
         };
         // BEGIN naming an unserved graph fails at BEGIN, before any RUN.
-        let bad = message::Request::Begin(PsValue::Map(vec![(
-            "db".into(),
-            PsValue::str("eu-ai-act"),
-        )]));
+        let bad =
+            message::Request::Begin(PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]));
         let err = handle_request(&mut sess, &ctx, bad).await.unwrap_err();
         assert_eq!(err.code, CODE_NOT_FOUND);
         assert!(sess.tx_graph.is_none());
@@ -1923,10 +2148,8 @@ mod tests {
         assert!(handle_request(&mut sess, &ctx, unbound).await.is_ok());
         assert!(sess.tx_graph.is_none());
         // BEGIN naming a served graph is remembered for the transaction's RUNs.
-        let good = message::Request::Begin(PsValue::Map(vec![(
-            "db".into(),
-            PsValue::str("places"),
-        )]));
+        let good =
+            message::Request::Begin(PsValue::Map(vec![("db".into(), PsValue::str("places"))]));
         assert!(handle_request(&mut sess, &ctx, good).await.is_ok());
         assert_eq!(sess.tx_graph.as_deref(), Some("places"));
         // COMMIT ends the transaction and clears the held graph.
@@ -2108,7 +2331,8 @@ mod tests {
         assert_eq!(c.recv().await.0, message::tag::SUCCESS);
 
         // Touch the block cache first so its counters are non-trivial.
-        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name")).await;
+        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
         assert_eq!(c.recv().await.0, message::tag::SUCCESS);
         c.send(Client::pull_all()).await;
         while c.recv().await.0 != message::tag::SUCCESS {}
@@ -2159,10 +2383,22 @@ mod tests {
 
     #[test]
     fn parse_use_statement_recognises_the_database_switch_forms() {
-        assert_eq!(parse_use_statement("USE eu_ai_act").as_deref(), Some("eu_ai_act"));
-        assert_eq!(parse_use_statement("use database eu_ai_act;").as_deref(), Some("eu_ai_act"));
-        assert_eq!(parse_use_statement("  USE   `eu_ai_act` ").as_deref(), Some("eu_ai_act"));
-        assert_eq!(parse_use_statement("USE DATABASE \"eu_ai_act\"").as_deref(), Some("eu_ai_act"));
+        assert_eq!(
+            parse_use_statement("USE eu_ai_act").as_deref(),
+            Some("eu_ai_act")
+        );
+        assert_eq!(
+            parse_use_statement("use database eu_ai_act;").as_deref(),
+            Some("eu_ai_act")
+        );
+        assert_eq!(
+            parse_use_statement("  USE   `eu_ai_act` ").as_deref(),
+            Some("eu_ai_act")
+        );
+        assert_eq!(
+            parse_use_statement("USE DATABASE \"eu_ai_act\"").as_deref(),
+            Some("eu_ai_act")
+        );
         // Not a bare USE / malformed → ignored (falls through to the query path).
         assert_eq!(parse_use_statement("MATCH (n) RETURN n"), None);
         assert_eq!(parse_use_statement("USE"), None);
@@ -2704,7 +2940,11 @@ mod tests {
         drive(q).await;
         drive(q).await;
         let m = ctx.result_cache.metrics();
-        assert_eq!(ctx.result_cache.len(), 0, "non-deterministic query is not cached");
+        assert_eq!(
+            ctx.result_cache.len(),
+            0,
+            "non-deterministic query is not cached"
+        );
         assert_eq!(m.hits, 0, "no cache hit for a non-deterministic query");
 
         // Sanity: a deterministic query in the same context still caches normally.

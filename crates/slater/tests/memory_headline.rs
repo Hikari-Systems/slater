@@ -258,6 +258,8 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
                 pq_bits: PQ_BITS,
             },
         }],
+        acl_blake3: None,
+        mac: None,
         files,
     };
     manifest.write_to_dir(&dir).unwrap();
@@ -700,8 +702,9 @@ fn cache_ttl_reclaims_idle_caches_after_three_minutes() {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(sweep_every);
                 let now = Instant::now();
-                let freed =
-                    bc.evict_expired(now, TTL) + vc.evict_expired(now, TTL) + rc.evict_expired(now, TTL);
+                let freed = bc.evict_expired(now, TTL)
+                    + vc.evict_expired(now, TTL)
+                    + rc.evict_expired(now, TTL);
                 if freed > 0 {
                     eprintln!("   [sweep] reclaimed {freed} idle cache entries");
                 }
@@ -761,9 +764,20 @@ fn cache_ttl_reclaims_idle_caches_after_three_minutes() {
         reclaim_secs <= 240,
         "reclaim took {reclaim_secs}s — too long for a 180s TTL + 30s sweep cadence"
     );
-    assert_eq!(block_cache.len(), 0, "block cache must be fully reclaimed when idle past the TTL");
-    assert_eq!(vec_cache.block_count(), 0, "vector blocks must be reclaimed when idle past the TTL");
-    assert!(pq_survived, "pinned PQ codes must be exempt from TTL reclaim");
+    assert_eq!(
+        block_cache.len(),
+        0,
+        "block cache must be fully reclaimed when idle past the TTL"
+    );
+    assert_eq!(
+        vec_cache.block_count(),
+        0,
+        "vector blocks must be reclaimed when idle past the TTL"
+    );
+    assert!(
+        pq_survived,
+        "pinned PQ codes must be exempt from TTL reclaim"
+    );
     if freed_rss < 32 * 1024 * 1024 {
         eprintln!(
             "NOTE: RSS only fell {:.1} MiB — the caches' accounting confirms reclaim; the \

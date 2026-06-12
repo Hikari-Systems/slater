@@ -240,6 +240,8 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
             first_record: 0,
             mode: AnnMode::BruteForce,
         }],
+        acl_blake3: None,
+        mac: None,
         files,
     };
     manifest.write_to_dir(&dir).unwrap();
@@ -422,6 +424,8 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
                 pq_bits: f.pq_bits,
             },
         }],
+        acl_blake3: None,
+        mac: None,
         files,
     };
     manifest.write_to_dir(&dir).unwrap();

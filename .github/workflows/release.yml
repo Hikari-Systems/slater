@@ -26,8 +26,45 @@ permissions:
   contents: write
 
 jobs:
+  # ── Gate: the whole workspace test suite must pass before anything ships ───
+  # Every publishing job below `needs: test`, so a red test run blocks the Docker
+  # push and the binary release for this tag.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
+      # the Dockerfile builder stage).
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      # Mirror the local pre-commit hook (.githooks/pre-commit) so a release can't
+      # ship a formatting regression even if someone committed with --no-verify.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # The whole workspace suite — unit + integration (graph-format crypto/MAC,
+      # the ACL-stamp + manifest-MAC server tests, golden round-trips). `--locked`
+      # builds against the committed Cargo.lock, matching the release binaries.
+      - name: Test suite
+        run: cargo test --workspace --locked
+
   # ── Docker: native per-arch build, pushed to Docker Hub by digest ──────────
   docker-build:
+    needs: test
     runs-on: ${{ matrix.runner }}
     # Slater is a heavy Rust build (rustls/aws-lc-rs, tokio, zstd, argon2); give
     # each native arch plenty of wall-clock on the 2-vCPU runners.
@@ -115,6 +152,7 @@ jobs:
 
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
+    needs: test
     runs-on: ubuntu-latest
     env:
       # The tag this run targets: the pushed ref, or the manual dispatch input.
@@ -125,6 +163,26 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          # Full history + tags so the annotated tag's message is readable below.
+          fetch-depth: 0
+
+      # The annotated tag's message is the human-written release description. We
+      # prepend it to the auto-generated changelog so every release carries a
+      # proper description (see CONTRIBUTING.md). A lightweight tag with no
+      # annotation falls back to the generated notes alone.
+      - name: Derive release notes from the tag annotation
+        id: notes
+        run: |
+          set -euo pipefail
+          body="$(git for-each-ref "refs/tags/${TAG}" --format='%(contents)')"
+          if [ -z "${body//[[:space:]]/}" ]; then
+            echo "::warning::tag ${TAG} has no annotation — falling back to generated notes only. Tag with 'git tag -a ${TAG} -m \"…\"' for a proper description."
+          fi
+          {
+            echo "body<<__RELEASE_NOTES__"
+            echo "$body"
+            echo "__RELEASE_NOTES__"
+          } >> "$GITHUB_OUTPUT"
 
       # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
       # the Dockerfile builder stage); git is already present on the runner.
@@ -155,7 +213,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
-          # Create the release if it does not exist yet; fill notes from commits.
+          # The tag annotation (a proper description) is prepended to the
+          # auto-generated commit changelog.
+          body: ${{ steps.notes.outputs.body }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

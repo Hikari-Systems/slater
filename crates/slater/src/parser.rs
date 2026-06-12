@@ -472,9 +472,7 @@ fn expr_nd(e: &Expr) -> bool {
             predicate,
             projection,
         } => {
-            pattern_nd(pattern)
-                || predicate.as_deref().is_some_and(expr_nd)
-                || expr_nd(projection)
+            pattern_nd(pattern) || predicate.as_deref().is_some_and(expr_nd) || expr_nd(projection)
         }
         Expr::Reduce {
             acc_init,
@@ -1458,7 +1456,10 @@ fn lower_reduce(pair: Pair<Rule>) -> Result<Expr> {
         }
     }
     if exprs.len() != 3 {
-        bail!("internal: reduce expects 3 sub-expressions, got {}", exprs.len());
+        bail!(
+            "internal: reduce expects 3 sub-expressions, got {}",
+            exprs.len()
+        );
     }
     let mut it = exprs.into_iter();
     Ok(Expr::Reduce {
@@ -1964,7 +1965,10 @@ mod tests {
             "CALL algo.stronglyConnectedComponents()", // not a whitelisted algo name
         ] {
             let e = err(q);
-            assert!(e.contains("read-only"), "for {q:?} expected read-only, got: {e}");
+            assert!(
+                e.contains("read-only"),
+                "for {q:?} expected read-only, got: {e}"
+            );
         }
     }
 
@@ -2141,17 +2145,29 @@ mod tests {
         let open_start = ok("WITH [1] AS l RETURN l[..2]");
         assert!(matches!(
             open_start.head.ret.body.items[0].expr,
-            Expr::Slice { from: None, to: Some(_), .. }
+            Expr::Slice {
+                from: None,
+                to: Some(_),
+                ..
+            }
         ));
         let open_end = ok("WITH [1] AS l RETURN l[1..]");
         assert!(matches!(
             open_end.head.ret.body.items[0].expr,
-            Expr::Slice { from: Some(_), to: None, .. }
+            Expr::Slice {
+                from: Some(_),
+                to: None,
+                ..
+            }
         ));
         let both = ok("WITH [1] AS l RETURN l[..]");
         assert!(matches!(
             both.head.ret.body.items[0].expr,
-            Expr::Slice { from: None, to: None, .. }
+            Expr::Slice {
+                from: None,
+                to: None,
+                ..
+            }
         ));
     }
 
@@ -2159,10 +2175,7 @@ mod tests {
     fn plain_subscript_still_lowers_to_index() {
         // A non-slice subscript must backtrack to `index_access`.
         let q = ok("WITH [1,2,3] AS l RETURN l[0]");
-        assert!(matches!(
-            q.head.ret.body.items[0].expr,
-            Expr::Index(..)
-        ));
+        assert!(matches!(q.head.ret.body.items[0].expr, Expr::Index(..)));
     }
 
     #[test]
@@ -2320,7 +2333,10 @@ mod tests {
         // clause whose head imports `p` and returns one column.
         let q = ok("MATCH (p) CALL { WITH p RETURN p.age AS age } RETURN p, age");
         let Clause::CallSubquery(cs) = &q.head.reading[1] else {
-            panic!("expected a CallSubquery clause, got {:?}", q.head.reading[1]);
+            panic!(
+                "expected a CallSubquery clause, got {:?}",
+                q.head.reading[1]
+            );
         };
         assert!(cs.returning);
         assert_eq!(cs.imports, vec![Imports::Named(vec!["p".to_string()])]);
@@ -2400,14 +2416,17 @@ mod tests {
             "RETURN rand()",
             "RETURN randomUUID()",
             "RETURN timestamp()",
-            "RETURN TIMESTAMP()",                       // case-insensitive
-            "MATCH (n) WHERE n.age < rand() RETURN n",  // buried in WHERE
-            "MATCH (n) RETURN n ORDER BY rand()",       // in ORDER BY
-            "RETURN [x IN [1,2,3] | timestamp()]",      // in a comprehension
+            "RETURN TIMESTAMP()",                        // case-insensitive
+            "MATCH (n) WHERE n.age < rand() RETURN n",   // buried in WHERE
+            "MATCH (n) RETURN n ORDER BY rand()",        // in ORDER BY
+            "RETURN [x IN [1,2,3] | timestamp()]",       // in a comprehension
             "MATCH (n {created: timestamp()}) RETURN n", // in a pattern prop map
-            "CALL { RETURN rand() AS r } RETURN r",     // in a subquery
+            "CALL { RETURN rand() AS r } RETURN r",      // in a subquery
         ] {
-            assert!(is_nondeterministic(&ok(q)), "expected non-deterministic: {q:?}");
+            assert!(
+                is_nondeterministic(&ok(q)),
+                "expected non-deterministic: {q:?}"
+            );
         }
 
         // Deterministic queries — note the string literal `'timestamp()'` is NOT a
@@ -2419,7 +2438,10 @@ mod tests {
             "RETURN 'timestamp()' AS s",
             "MATCH (n) WHERE n.timestamp > 5 RETURN n", // property named `timestamp`
         ] {
-            assert!(!is_nondeterministic(&ok(q)), "expected deterministic: {q:?}");
+            assert!(
+                !is_nondeterministic(&ok(q)),
+                "expected deterministic: {q:?}"
+            );
         }
     }
 }

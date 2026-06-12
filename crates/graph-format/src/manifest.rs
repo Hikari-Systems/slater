@@ -134,6 +134,18 @@ pub struct Manifest {
     pub range_indexes: Vec<RangeIndexDesc>,
     #[serde(default)]
     pub vector_indexes: Vec<VectorIndexDesc>,
+    /// BLAKE3 digest (hex) of the live `acl.json` this generation was built
+    /// against (`slater-build --acl`). `None` ⇒ not stamped (older images, or the
+    /// flag was not given). When present, the server re-hashes the configured live
+    /// `acl.json` at open time and refuses to serve this graph if it differs.
+    #[serde(default)]
+    pub acl_blake3: Option<String>,
+    /// Keyed-BLAKE3 MAC (hex) over the canonicalised manifest, under a subkey
+    /// derived from the at-rest master key. `None` ⇒ plaintext image (no master
+    /// key, no MAC). Authenticates every other field — including `content_hash`,
+    /// the file inventory, the encryption header, and `acl_blake3`.
+    #[serde(default)]
+    pub mac: Option<String>,
     /// Inventory of data files (everything except `MANIFEST.json`).
     pub files: Vec<FileEntry>,
 }
@@ -154,6 +166,43 @@ impl Manifest {
                 self.content_hash,
                 computed
             );
+        }
+        Ok(())
+    }
+
+    /// The canonical byte string the MAC is computed over: this manifest with
+    /// `mac` cleared, serialised compactly. Deterministic — serde fixes struct
+    /// field order, `block_sizes` is a `BTreeMap`, and every other collection is
+    /// an order-stable `Vec` written in a fixed order by the builder. Clearing
+    /// `mac` is what lets the same bytes be reproduced at verify time.
+    fn mac_message(&self) -> Result<Vec<u8>> {
+        let mut canon = self.clone();
+        canon.mac = None;
+        serde_json::to_vec(&canon).context("serialise manifest for MAC")
+    }
+
+    /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store
+    /// it in `mac`. Call this **last** at build time — after every other field
+    /// (including `acl_blake3`) is final and immediately before `write_to_dir`.
+    pub fn seal_mac(&mut self, master_key: &[u8]) -> Result<()> {
+        let key = crate::crypto::derive_manifest_mac_key(master_key);
+        let mac = crate::crypto::manifest_mac(&key, &self.mac_message()?);
+        self.mac = Some(mac);
+        Ok(())
+    }
+
+    /// Recompute the MAC and compare it to the stored `mac`. `Ok(())` only on a
+    /// match. Errors if `mac` is absent — callers gate on presence first and only
+    /// call this when a MAC is expected.
+    pub fn verify_mac(&self, master_key: &[u8]) -> Result<()> {
+        let stored = self
+            .mac
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("manifest carries no MAC but one was required"))?;
+        let key = crate::crypto::derive_manifest_mac_key(master_key);
+        let computed = crate::crypto::manifest_mac(&key, &self.mac_message()?);
+        if computed != stored {
+            anyhow::bail!("manifest MAC mismatch — refusing to serve a tampered manifest");
         }
         Ok(())
     }
@@ -224,6 +273,8 @@ mod tests {
                 first_record: 0,
                 mode: AnnMode::BruteForce,
             }],
+            acl_blake3: None,
+            mac: None,
             files,
         }
     }
@@ -243,6 +294,72 @@ mod tests {
         // Tamper with a file hash without updating content_hash.
         m.files[0].blake3 = "cafebabe".into();
         assert!(m.verify_content_hash().is_err());
+    }
+
+    #[test]
+    fn mac_seal_and_verify_roundtrips() {
+        let key = b"operator master key";
+        let mut m = sample();
+        assert!(m.mac.is_none());
+        m.seal_mac(key).unwrap();
+        assert!(m.mac.is_some());
+        m.verify_mac(key).unwrap();
+    }
+
+    #[test]
+    fn mac_detects_tamper_in_every_authenticated_field() {
+        let key = b"operator master key";
+        let base = {
+            let mut m = sample();
+            m.seal_mac(key).unwrap();
+            m
+        };
+
+        // Each closure mutates one authenticated field; the stored MAC must then
+        // fail to verify. This proves the MAC blanket-covers the manifest.
+        let check = |what: &str, tamper: &dyn Fn(&mut Manifest)| {
+            let mut m = base.clone();
+            tamper(&mut m);
+            assert!(
+                m.verify_mac(key).is_err(),
+                "tampering with {what} must break the MAC"
+            );
+        };
+        check("content_hash", &|m| m.content_hash = "00".into());
+        check("file hash", &|m| m.files[0].blake3 = "cafebabe".into());
+        check("graph name", &|m| m.graph = "other".into());
+        check("acl_blake3", &|m| m.acl_blake3 = Some("deadbeef".into()));
+        check("encryption header", &|m| {
+            m.encryption = Some(EncryptionHeader {
+                aead: "x".into(),
+                kdf: "y".into(),
+                salt_hex: "00".into(),
+            })
+        });
+    }
+
+    #[test]
+    fn mac_rejects_wrong_key() {
+        let mut m = sample();
+        m.seal_mac(b"key A").unwrap();
+        assert!(m.verify_mac(b"key B").is_err());
+    }
+
+    #[test]
+    fn mac_message_excludes_the_mac_field() {
+        // The canonical message must be identical whether or not `mac` is set,
+        // otherwise the MAC could never verify against itself.
+        let mut a = sample();
+        let with_none = a.mac_message().unwrap();
+        a.mac = Some("whatever".into());
+        let with_some = a.mac_message().unwrap();
+        assert_eq!(with_none, with_some);
+    }
+
+    #[test]
+    fn verify_mac_errors_when_absent() {
+        let m = sample(); // mac: None
+        assert!(m.verify_mac(b"key").is_err());
     }
 
     #[test]

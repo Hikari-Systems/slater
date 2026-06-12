@@ -55,6 +55,9 @@ pub struct BuildOptions {
     /// At-rest encryption master key (raw bytes). `None` ⇒ plaintext image, the
     /// default, so M2–M5 fixtures and the golden test keep working unchanged.
     pub encryption_key: Option<Vec<u8>>,
+    /// BLAKE3 digest (hex) of the live `acl.json` to stamp into the manifest
+    /// (`--acl`). `None` ⇒ no ACL stamp.
+    pub acl_blake3: Option<String>,
     /// Vector indexes with at least this many vectors are built Vamana/PQ; below
     /// it they stay brute-force full-precision (M5 path).
     pub ann_threshold: u64,
@@ -76,6 +79,7 @@ impl Default for BuildOptions {
             zstd_level: 3,
             vector_index_json: None,
             encryption_key: None,
+            acl_blake3: None,
             ann_threshold: 50_000,
             vamana_r: 32,
             vamana_alpha: 1.2,
@@ -555,7 +559,7 @@ pub fn build(
         .collect();
     let content_hash = content_hash(&inventory);
 
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         magic: String::from_utf8_lossy(graph_format::MAGIC).to_string(),
         format_version: graph_format::FORMAT_VERSION,
         build_uuid: generation,
@@ -573,8 +577,16 @@ pub fn build(
         property_keys: keys.into_names(),
         range_indexes,
         vector_indexes,
+        acl_blake3: opts.acl_blake3.clone(),
+        mac: None,
         files,
     };
+    // Seal the manifest with a keyed MAC iff this is an encrypted image — the MAC
+    // must be computed last, over the otherwise-final manifest, so it authenticates
+    // content_hash, the file inventory, the encryption header, and the ACL stamp.
+    if let Some(key) = &opts.encryption_key {
+        manifest.seal_mac(key)?;
+    }
     manifest.write_to_dir(&tmp_dir)?;
 
     // ---- atomic publish ----------------------------------------------------

@@ -1115,12 +1115,7 @@ impl<'g> Engine<'g> {
     /// `nodeLabels`/`relationshipTypes`. Returns the resolved label / reltype id
     /// filters (`None` = "all") plus the raw map for proc-specific keys. Unknown
     /// labels / reltypes are ignored (mirrors FalkorDB); unknown *keys* error.
-    fn parse_algo_config(
-        &self,
-        proc: &str,
-        args: &[Val],
-        extra: &[&str],
-    ) -> Result<AlgoConfig> {
+    fn parse_algo_config(&self, proc: &str, args: &[Val], extra: &[&str]) -> Result<AlgoConfig> {
         let map: Vec<(String, Val)> = match args {
             [] | [Val::Null] => Vec::new(),
             [Val::Map(m)] => m.clone(),
@@ -2515,7 +2510,11 @@ impl<'g> Engine<'g> {
         hops_rev.reverse();
         let path = make_path(src, &hops_rev);
         if reverse {
-            if let Val::Path { mut nodes, mut rels } = path {
+            if let Val::Path {
+                mut nodes,
+                mut rels,
+            } = path
+            {
                 nodes.reverse();
                 rels.reverse();
                 return Ok(Val::Path { nodes, rels });
@@ -3032,7 +3031,10 @@ impl<'g> Engine<'g> {
                 Val::List(xs) => Val::Bool(xs.is_empty()),
                 Val::Map(m) => Val::Bool(m.is_empty()),
                 Val::Null => Val::Null,
-                other => bail!("isEmpty() needs a string, list or map, got {}", other.to_display()),
+                other => bail!(
+                    "isEmpty() needs a string, list or map, got {}",
+                    other.to_display()
+                ),
             },
             "exists" => Val::Bool(!matches!(a0(0), Val::Null)),
             "substring" => self.substring(&args)?,
@@ -3051,7 +3053,11 @@ impl<'g> Engine<'g> {
             "string.join" => string_join(&args)?,
             "string.matchregex" => match_regex(&a0(0), &a0(1))?,
             "string.replaceregex" => {
-                let repl = if args.len() >= 3 { a0(2) } else { Val::Str(String::new()) };
+                let repl = if args.len() >= 3 {
+                    a0(2)
+                } else {
+                    Val::Str(String::new())
+                };
                 replace_regex(&a0(0), &a0(1), &repl)?
             }
             "range" => self.range_fn(&args)?,
@@ -3232,15 +3238,22 @@ impl<'g> Engine<'g> {
             // shipped in Phase 1 as an Int and is unchanged.
             "date" => match a0(0) {
                 Val::Null => Val::Null,
-                Val::Str(s) => temporal::date_from_string(&s).map(Val::Date).unwrap_or(Val::Null),
+                Val::Str(s) => temporal::date_from_string(&s)
+                    .map(Val::Date)
+                    .unwrap_or(Val::Null),
                 Val::Map(m) => build_date(&m)?,
                 other => bail!("date() expects a string or map, got {}", other.to_display()),
             },
             "localtime" => match a0(0) {
                 Val::Null => Val::Null,
-                Val::Str(s) => temporal::time_from_string(&s).map(Val::Time).unwrap_or(Val::Null),
+                Val::Str(s) => temporal::time_from_string(&s)
+                    .map(Val::Time)
+                    .unwrap_or(Val::Null),
                 Val::Map(m) => build_time(&m)?,
-                other => bail!("localtime() expects a string or map, got {}", other.to_display()),
+                other => bail!(
+                    "localtime() expects a string or map, got {}",
+                    other.to_display()
+                ),
             },
             "localdatetime" => match a0(0) {
                 Val::Null => Val::Null,
@@ -3259,7 +3272,10 @@ impl<'g> Engine<'g> {
                     .map(Val::Duration)
                     .unwrap_or(Val::Null),
                 Val::Map(m) => build_duration(&m)?,
-                other => bail!("duration() expects a string or map, got {}", other.to_display()),
+                other => bail!(
+                    "duration() expects a string or map, got {}",
+                    other.to_display()
+                ),
             },
             // ── Non-deterministic builtins (wall-clock / RNG) ────────────────
             // These read the clock or an entropy source, so `parser::is_nondeterministic`
@@ -3411,7 +3427,9 @@ impl<'g> Engine<'g> {
                 .iter()
                 .filter_map(|t| self.gen.reltype_id(t))
                 .collect();
-            adjs.iter().filter(|a| type_ids.contains(&a.reltype)).count()
+            adjs.iter()
+                .filter(|a| type_ids.contains(&a.reltype))
+                .count()
         } else {
             adjs.len()
         };
@@ -3645,37 +3663,118 @@ fn canonical_group_ids(nodes: &[u64], roots: &[usize]) -> Vec<i64> {
 /// a new function arm lands.
 const IMPLEMENTED_FUNCTIONS: &[&str] = &[
     // aggregates
-    "avg", "collect", "count", "max", "min", "percentilecont", "percentiledisc",
-    "stdev", "stdevp", "sum",
+    "avg",
+    "collect",
+    "count",
+    "max",
+    "min",
+    "percentilecont",
+    "percentiledisc",
+    "stdev",
+    "stdevp",
+    "sum",
     // numeric / trig
-    "abs", "acos", "asin", "atan", "atan2", "ceil", "cos", "cot", "degrees", "e",
-    "exp", "floor", "haversin", "log", "log10", "pi", "pow", "radians", "round",
-    "sign", "sin", "sqrt", "tan",
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "ceil",
+    "cos",
+    "cot",
+    "degrees",
+    "e",
+    "exp",
+    "floor",
+    "haversin",
+    "log",
+    "log10",
+    "pi",
+    "pow",
+    "radians",
+    "round",
+    "sign",
+    "sin",
+    "sqrt",
+    "tan",
     // string
-    "left", "ltrim", "replace", "reverse", "right", "rtrim", "split", "string.join",
-    "string.matchregex", "string.replaceregex", "substring", "tolower", "toupper",
-    "trim", "lower", "upper",
+    "left",
+    "ltrim",
+    "replace",
+    "reverse",
+    "right",
+    "rtrim",
+    "split",
+    "string.join",
+    "string.matchregex",
+    "string.replaceregex",
+    "substring",
+    "tolower",
+    "toupper",
+    "trim",
+    "lower",
+    "upper",
     // conversion
-    "toboolean", "tobooleanlist", "tobooleanornull", "tofloat", "tofloatlist",
-    "tofloatornull", "tointeger", "tointegerlist", "tointegerornull", "tostring",
-    "tostringlist", "tostringornull",
+    "toboolean",
+    "tobooleanlist",
+    "tobooleanornull",
+    "tofloat",
+    "tofloatlist",
+    "tofloatornull",
+    "tointeger",
+    "tointegerlist",
+    "tointegerornull",
+    "tostring",
+    "tostringlist",
+    "tostringornull",
     // list
-    "head", "keys", "last", "list.dedup", "list.insert", "list.insertlistelements",
-    "list.remove", "list.sort", "range", "size", "tail",
+    "head",
+    "keys",
+    "last",
+    "list.dedup",
+    "list.insert",
+    "list.insertlistelements",
+    "list.remove",
+    "list.sort",
+    "range",
+    "size",
+    "tail",
     // predicate / type
-    "coalesce", "exists", "isempty", "type", "typeof",
+    "coalesce",
+    "exists",
+    "isempty",
+    "type",
+    "typeof",
     // entity / path
-    "endnode", "haslabels", "id", "indegree", "labels", "length", "nodes",
-    "outdegree", "properties", "relationships", "startnode",
+    "endnode",
+    "haslabels",
+    "id",
+    "indegree",
+    "labels",
+    "length",
+    "nodes",
+    "outdegree",
+    "properties",
+    "relationships",
+    "startnode",
     // vector
-    "similarity", "vec.cosinedistance", "vec.cosinesimilarity",
-    "vec.euclideandistance", "vecf32",
+    "similarity",
+    "vec.cosinedistance",
+    "vec.cosinesimilarity",
+    "vec.euclideandistance",
+    "vecf32",
     // spatial
-    "distance", "point",
+    "distance",
+    "point",
     // temporal
-    "date", "duration", "localdatetime", "localtime", "timestamp",
+    "date",
+    "duration",
+    "localdatetime",
+    "localtime",
+    "timestamp",
     // non-deterministic (clock / RNG)
-    "rand", "randomuuid",
+    "rand",
+    "randomuuid",
 ];
 
 /// `CALL dbms.procedures()` — `[name, mode]` rows, one per [`SLATER_PROCEDURES`].
@@ -4030,11 +4129,7 @@ fn temporal_arith(op: BinOp, a: &Val, b: &Val) -> Result<Val> {
                     temporal::add_duration(k, temporal_secs(t), *d, false),
                 ))
             }
-            _ => bail!(
-                "'{}' and '{}' cannot be added",
-                type_name(a),
-                type_name(b)
-            ),
+            _ => bail!("'{}' and '{}' cannot be added", type_name(a), type_name(b)),
         },
         BinOp::Sub => match (a, b) {
             (Val::Duration(x), Val::Duration(y)) => {
@@ -4103,11 +4198,10 @@ fn build_date(m: &[(String, Val)]) -> Result<Val> {
     let day = temporal_int(m, "day", 1, 31)?;
     let day_of_week = temporal_int(m, "dayOfWeek", 1, 7)?;
 
-    let recognized = 1
-        + [quarter, day_of_quarter, month, week, day, day_of_week]
-            .iter()
-            .filter(|c| c.is_some())
-            .count();
+    let recognized = 1 + [quarter, day_of_quarter, month, week, day, day_of_week]
+        .iter()
+        .filter(|c| c.is_some())
+        .count();
     if m.len() > recognized {
         bail!("date components map contains an unknown key");
     }
@@ -4115,7 +4209,11 @@ fn build_date(m: &[(String, Val)]) -> Result<Val> {
     let secs = if let Some(week) = week {
         temporal::date_from_week(year as i32, week, day_of_week.unwrap_or(1))
     } else if quarter.is_some() || day_of_quarter.is_some() {
-        temporal::date_from_quarter(year as i32, quarter.unwrap_or(1), day_of_quarter.unwrap_or(1))
+        temporal::date_from_quarter(
+            year as i32,
+            quarter.unwrap_or(1),
+            day_of_quarter.unwrap_or(1),
+        )
     } else {
         temporal::date_from_components(year as i32, month.unwrap_or(1) as u32, day.unwrap_or(1))
     };
@@ -4168,24 +4266,23 @@ fn build_datetime(m: &[(String, Val)]) -> Result<Val> {
     let micro = temporal_int(m, "microsecond", 0, 999_999)?;
     let nano = temporal_int(m, "nanosecond", 0, 999_999_999)?;
 
-    let recognized = 1
-        + [
-            quarter,
-            day_of_quarter,
-            month,
-            week,
-            day,
-            day_of_week,
-            hour,
-            minute,
-            second,
-            milli,
-            micro,
-            nano,
-        ]
-        .iter()
-        .filter(|c| c.is_some())
-        .count();
+    let recognized = 1 + [
+        quarter,
+        day_of_quarter,
+        month,
+        week,
+        day,
+        day_of_week,
+        hour,
+        minute,
+        second,
+        milli,
+        micro,
+        nano,
+    ]
+    .iter()
+    .filter(|c| c.is_some())
+    .count();
     if m.len() > recognized {
         bail!("datetime components map contains an unknown key");
     }
@@ -4201,7 +4298,12 @@ fn build_datetime(m: &[(String, Val)]) -> Result<Val> {
             hms,
         )
     } else {
-        temporal::datetime_from_components(year as i32, month.unwrap_or(1) as u32, day.unwrap_or(1), hms)
+        temporal::datetime_from_components(
+            year as i32,
+            month.unwrap_or(1) as u32,
+            day.unwrap_or(1),
+            hms,
+        )
     };
     Ok(Val::DateTime(secs))
 }
@@ -4434,15 +4536,15 @@ fn replace_regex(s: &Val, pat: &Val, repl: &Val) -> Result<Val> {
     let (s, pat, repl) = match (s, pat, repl) {
         (Val::Str(s), Val::Str(p), Val::Str(r)) => (s, p, r),
         (Val::Null, _, _) | (_, Val::Null, _) | (_, _, Val::Null) => return Ok(Val::Null),
-        (Val::Str(_), Val::Str(_), other)
-        | (Val::Str(_), other, _)
-        | (other, _, _) => bail!(
+        (Val::Str(_), Val::Str(_), other) | (Val::Str(_), other, _) | (other, _, _) => bail!(
             "Type mismatch: expected String or Null but was {}",
             type_name(other)
         ),
     };
     let re = regex_scan(pat)?;
-    Ok(Val::Str(re.replace_all(s, regex::NoExpand(repl)).into_owned()))
+    Ok(Val::Str(
+        re.replace_all(s, regex::NoExpand(repl)).into_owned(),
+    ))
 }
 
 fn in_list(needle: &Val, haystack: &Val) -> Val {
@@ -4554,7 +4656,9 @@ fn percentile_cont(vals: &[Val], p: f64) -> Result<Val> {
     if fraction == 0.0 {
         return Ok(Val::Float(xs[index]));
     }
-    Ok(Val::Float(xs[index] * (1.0 - fraction) + xs[index + 1] * fraction))
+    Ok(Val::Float(
+        xs[index] * (1.0 - fraction) + xs[index + 1] * fraction,
+    ))
 }
 
 /// `percentileDisc(value, p)` — nearest-rank (no interpolation).
@@ -4584,8 +4688,7 @@ fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dphi = phi2 - phi1;
     let dlambda = to_rad(lon2) - to_rad(lon1);
     // a = sin²(Δφ/2) + cos φ1 · cos φ2 · sin²(Δλ/2)
-    let a =
-        (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlambda / 2.0).sin().powi(2);
     // c = 2 · atan2(√a, √(1−a)); d = R · c
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
     EARTH_RADIUS * c
@@ -4693,7 +4796,8 @@ fn normalize_index(idx: i64, len: usize, inclusive: bool) -> Option<usize> {
 
 /// Whether `xs` already holds a value equal (by total order) to `v`.
 fn list_contains(xs: &[Val], v: &Val) -> bool {
-    xs.iter().any(|x| x.cmp_total(v) == std::cmp::Ordering::Equal)
+    xs.iter()
+        .any(|x| x.cmp_total(v) == std::cmp::Ordering::Equal)
 }
 
 /// A mandatory integer argument (FalkorDB `SI_GET_NUMERIC`, so a float truncates).
@@ -5916,10 +6020,7 @@ mod tests {
     /// A `Val::Float` close to `want` (FalkorDB returns doubles for these aggs).
     fn assert_float(v: &Val, want: f64) {
         match v {
-            Val::Float(x) => assert!(
-                (x - want).abs() < 1e-9,
-                "expected ~{want}, got {x}"
-            ),
+            Val::Float(x) => assert!((x - want).abs() < 1e-9, "expected ~{want}, got {x}"),
             other => panic!("expected Float({want}), got {other:?}"),
         }
     }
@@ -5946,7 +6047,13 @@ mod tests {
     #[test]
     fn phase3_percentile_cont() {
         // FalkorDB test04_percentileCont: linear interpolation over [2,4,6,8,10].
-        let cases = [(0.0, 2.0), (0.1, 2.8), (0.33, 4.64), (0.5, 6.0), (1.0, 10.0)];
+        let cases = [
+            (0.0, 2.0),
+            (0.1, 2.8),
+            (0.33, 4.64),
+            (0.5, 6.0),
+            (1.0, 10.0),
+        ];
         for (i, (p, want)) in cases.iter().enumerate() {
             let (root, res) = run(
                 &format!("exec_p3_pcont_{i}"),
@@ -6842,14 +6949,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         // 'a' * 1 is an invalid operation; '2' is not a list.
-        assert!(run_err("exec_p5_reduce_e1", "RETURN reduce(sum = 'a', n in [1,2,3] | sum * n)")
-            .contains("cannot apply arithmetic"));
-        assert!(run_err("exec_p5_reduce_e2", "RETURN reduce(sum = 1, n in 2 | sum + n)")
-            .contains("needs a list"));
+        assert!(run_err(
+            "exec_p5_reduce_e1",
+            "RETURN reduce(sum = 'a', n in [1,2,3] | sum * n)"
+        )
+        .contains("cannot apply arithmetic"));
+        assert!(run_err(
+            "exec_p5_reduce_e2",
+            "RETURN reduce(sum = 1, n in 2 | sum + n)"
+        )
+        .contains("needs a list"));
         // A reduce missing its `| body` is a plain function call over the
         // would-be accumulator binding `sum`, which is unbound -> runtime error.
-        assert!(run_err("exec_p5_reduce_e3", "RETURN reduce(sum = 0, n in [1,2,3])")
-            .contains("'sum'"));
+        assert!(
+            run_err("exec_p5_reduce_e3", "RETURN reduce(sum = 0, n in [1,2,3])").contains("'sum'")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7261,7 +7375,12 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "ORDER BY name");
-        for want in ["db.constraints", "db.meta.stats", "dbms.functions", "dbms.procedures"] {
+        for want in [
+            "db.constraints",
+            "db.meta.stats",
+            "dbms.functions",
+            "dbms.procedures",
+        ] {
             assert!(names.iter().any(|n| n == want), "missing {want}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -7298,13 +7417,27 @@ mod tests {
     fn phase11_dbms_functions_coverage_gate() {
         // The self-report is the coverage gate: a representative sample of the
         // functions landed through Phases 1–9 must be present.
-        let (root, res) = run("exec_p11_funcs_cov", "CALL dbms.functions() YIELD name RETURN name");
+        let (root, res) = run(
+            "exec_p11_funcs_cov",
+            "CALL dbms.functions() YIELD name RETURN name",
+        );
         let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
         for want in [
-            "sin", "tail", "point", "distance", "vec.euclideandistance",
-            "tofloatornull", "percentilecont", "string.matchregex", "date", "duration",
+            "sin",
+            "tail",
+            "point",
+            "distance",
+            "vec.euclideandistance",
+            "tofloatornull",
+            "percentilecont",
+            "string.matchregex",
+            "date",
+            "duration",
         ] {
-            assert!(names.iter().any(|n| n == want), "coverage gate missing {want}");
+            assert!(
+                names.iter().any(|n| n == want),
+                "coverage gate missing {want}"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7401,14 +7534,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![
-                (1, 10),
-                (1, 20),
-                (1, 30),
-                (2, 10),
-                (2, 20),
-                (2, 30)
-            ]
+            vec![(1, 10), (1, 20), (1, 30), (2, 10), (2, 20), (2, 30)]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7538,10 +7664,7 @@ mod tests {
             "exec_p12_collision",
             "MATCH (p:Person {name: 'Alice'}) CALL { RETURN 1 AS p } RETURN p",
         );
-        assert!(
-            err.contains("already declared in outer scope"),
-            "{err}"
-        );
+        assert!(err.contains("already declared in outer scope"), "{err}");
     }
 
     // ── Phase 13: algo.* graph-algorithm procedures ──────────────────────────
@@ -8169,7 +8292,10 @@ mod tests {
         }
 
         // Two randomUUID() calls in one row are distinct.
-        let (root2, res2) = run("exec_p1b_uuid2", "RETURN randomUUID() AS a, randomUUID() AS b");
+        let (root2, res2) = run(
+            "exec_p1b_uuid2",
+            "RETURN randomUUID() AS a, randomUUID() AS b",
+        );
         let r = &res2.rows[0];
         assert_ne!(render(&r[0]), render(&r[1]), "two UUIDs differ");
         for p in [root, root2] {

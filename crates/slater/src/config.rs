@@ -88,6 +88,17 @@ pub struct AppConfig {
     /// Path to the JSON ACL file (users → per-graph grants).
     #[serde(default = "default_acl_path")]
     pub acl_path: String,
+    /// Refuse to serve any generation whose manifest lacks a MAC when a master key
+    /// is configured. Closes the MAC-strip downgrade (an attacker who can rewrite
+    /// the manifest deleting `mac` would otherwise silence the check). Off by
+    /// default for compatibility with pre-MAC images.
+    #[serde(default)]
+    pub require_manifest_mac: bool,
+    /// Refuse to serve any generation whose manifest lacks an `aclBlake3` stamp.
+    /// Closes the stamp-strip downgrade. Off by default for compatibility with
+    /// images built without `--acl`.
+    #[serde(default)]
+    pub require_acl_stamp: bool,
     #[serde(default)]
     pub cache: CacheConfig,
     /// `(label, property)` vector indexes to pin resident for the generation's lifetime.
@@ -364,19 +375,28 @@ mod tests {
     fn cache_ttl_defaults_to_30_minutes() {
         let cfg: CacheConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(cfg.cache_ttl_ms, 30 * 60 * 1000);
-        assert_eq!(cfg.cache_ttl(), Some(std::time::Duration::from_secs(30 * 60)));
+        assert_eq!(
+            cfg.cache_ttl(),
+            Some(std::time::Duration::from_secs(30 * 60))
+        );
     }
 
     #[test]
     fn cache_ttl_parses_number_and_numeric_string() {
         let from_num: CacheConfig =
             serde_json::from_value(serde_json::json!({ "cacheTtlMs": 1000 })).unwrap();
-        assert_eq!(from_num.cache_ttl(), Some(std::time::Duration::from_secs(1)));
+        assert_eq!(
+            from_num.cache_ttl(),
+            Some(std::time::Duration::from_secs(1))
+        );
 
         // The `de::i64` deserializer also accepts a numeric string (config layer parity).
         let from_str: CacheConfig =
             serde_json::from_value(serde_json::json!({ "cacheTtlMs": "1000" })).unwrap();
-        assert_eq!(from_str.cache_ttl(), Some(std::time::Duration::from_secs(1)));
+        assert_eq!(
+            from_str.cache_ttl(),
+            Some(std::time::Duration::from_secs(1))
+        );
     }
 
     #[test]

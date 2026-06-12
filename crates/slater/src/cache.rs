@@ -1019,7 +1019,9 @@ mod tests {
         let t0 = Instant::now();
         for b in 0..3u32 {
             cache
-                .get_or_try_insert(BlockKey::new(g, FileKind::Topology, b), || Ok(vec![b as u8; 10]))
+                .get_or_try_insert(BlockKey::new(g, FileKind::Topology, b), || {
+                    Ok(vec![b as u8; 10])
+                })
                 .unwrap();
         }
         assert_eq!(cache.len(), 3);
@@ -1065,7 +1067,10 @@ mod tests {
                 Ok(vec![0u8; 10])
             })
             .unwrap();
-        assert!(!reload_0, "recently-touched block 0 should still be resident");
+        assert!(
+            !reload_0,
+            "recently-touched block 0 should still be resident"
+        );
         let mut reload_1 = false;
         cache
             .get_or_try_insert(k(1), || {
@@ -1110,6 +1115,9 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(cache.block_count(), 0);
         // The pinned PQ codes are the resident navigation set — never swept.
-        assert!(cache.resident_pq(g, 0).is_some(), "pinned PQ is exempt from TTL");
+        assert!(
+            cache.resident_pq(g, 0).is_some(),
+            "pinned PQ is exempt from TTL"
+        );
     }
 }

@@ -8,13 +8,33 @@ query it. Its headline property: **resident memory stays bounded by fixed cache
 budgets, independent of graph size** — it reads decompressed blocks on demand
 from disk (local or network/NFS) rather than holding the whole graph in RAM.
 
-It answers a read-only subset of Cypher (`MATCH … WHERE … RETURN … ORDER BY …
-LIMIT`, label/property index seeks, and disk-native vector KNN via
-`CALL db.idx.vector.queryNodes(...)`). **Writes are rejected** — graphs are built
-offline and published as immutable generations.
+It answers a broad read-only slice of Cypher — pattern
+matching, `WITH`/`UNION`/`CALL {…}` subqueries, 70+ functions & aggregations,
+temporal & geospatial values, label/property index seeks, and disk-native vector
+KNN (`CALL db.idx.vector.queryNodes(...)`). Graphs are **built offline** by
+`slater-build` and published as immutable generations, so the serving process
+carries none of the write-side machinery (logs, locks, GC) — that's what keeps
+reads fast and memory bounded.
 
 📦 **Source, issues & full documentation:**
 [github.com/Hikari-Systems/slater](https://github.com/Hikari-Systems/slater)
+
+---
+
+## Features
+
+| Feature | What it means for you |
+|---|---|
+| **Bounded, predictable memory** | Resident memory is capped by three cache budgets *you* set — it does **not** grow with graph size. You tune the performance/RAM trade-off instead of provisioning for the whole graph. |
+| **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
+| **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
+| **Tiny, dependency-light install** | A ~5 MB stripped static binary in a ~33 MB multi-arch image (amd64/arm64); pure-Rust TLS, no OpenSSL. Pull and run. |
+| **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
+| **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
+| **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
+| **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
+| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
+| **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
 
 ---
 

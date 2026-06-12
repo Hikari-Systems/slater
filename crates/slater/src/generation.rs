@@ -131,6 +131,22 @@ impl Generation {
             );
         }
 
+        // Manifest authentication: when a master key is configured and the
+        // manifest carries a MAC, verify it before trusting any other field. This
+        // authenticates content_hash, the file inventory, the encryption header,
+        // and the ACL stamp — so an attacker without the key cannot forge a
+        // manifest that opens. A plaintext image carries no MAC and is guarded
+        // only by the copy-completeness hash below (see THREAT_MODEL.md). The
+        // "require a MAC when absent" downgrade policy lives in the server, which
+        // holds the config flags.
+        if let Some(key) = master_key {
+            if manifest.mac.is_some() {
+                manifest.verify_mac(key).with_context(|| {
+                    format!("verify MANIFEST MAC for generation {uuid} of graph {graph}")
+                })?;
+            }
+        }
+
         // Copy-completeness guard: re-hash every inventory file from disk and
         // refuse on the first mismatch, then confirm the manifest's own content
         // hash is self-consistent with that inventory.
@@ -676,6 +692,8 @@ mod tests {
                 first_record: 0,
                 mode: AnnMode::BruteForce,
             }],
+            acl_blake3: None,
+            mac: None,
             files,
         };
         manifest.write_to_dir(&dir).unwrap();

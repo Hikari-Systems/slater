@@ -84,6 +84,12 @@ struct Cli {
     /// `--encrypt`).
     #[arg(long)]
     key_env: Option<String>,
+
+    /// Optional path to the live `acl.json`. When given, its BLAKE3 digest is
+    /// stamped into the MANIFEST (`aclBlake3`); the server then refuses to serve
+    /// this generation if the configured live `acl.json` later differs.
+    #[arg(long)]
+    acl: Option<PathBuf>,
 }
 
 /// Resolve the at-rest master key from the CLI flags. Returns `None` unless
@@ -116,12 +122,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let encryption_key = resolve_master_key(&cli)?;
+    let acl_blake3 = match &cli.acl {
+        Some(p) => Some(
+            graph_format::integrity::hash_file(p)
+                .with_context(|| format!("hash acl file {}", p.display()))?,
+        ),
+        None => None,
+    };
     let opts = BuildOptions {
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
         zstd_level: cli.zstd_level,
         vector_index_json: cli.vector_index_json.clone(),
         encryption_key,
+        acl_blake3,
         ann_threshold: cli.ann_threshold,
         vamana_r: cli.vamana_r,
         vamana_alpha: cli.vamana_alpha,
