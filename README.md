@@ -403,12 +403,13 @@ warm cache) before 25 measured queries give a median; the figures below are the
 **mean of 5 such runs**. Varying query parameters keep every execution real (no
 result-cache hits). Harness: [`perf/`](perf/).
 
-**Resident memory while serving the run:**
+**Resident memory while serving the run** (🟢 = slater has the smallest RSS, ⚪ =
+ties within 25%):
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
-| **peak RSS** | **~82 MiB** | ~774 MiB | ~115 MiB | ~140 MiB |
-| steady-state RSS | ~77 MiB | ~772 MiB | ~113 MiB | ~138 MiB |
+| **peak RSS** | **~82 MiB 🟢** | ~774 MiB | ~115 MiB | ~140 MiB |
+| steady-state RSS | ~77 MiB 🟢 | ~772 MiB | ~113 MiB | ~138 MiB |
 
 slater is the smallest footprint, but on this tiny, fully-resident graph the
 in-memory engines are only ~1.4–1.7× larger (Neo4j ~9×). The point isn't the
@@ -441,6 +442,73 @@ whole graph in RAM, win. It also beats Neo4j on every row. No engine wins
 everything; on a dataset this small the latencies are close and the **memory
 footprint is the durable difference.** `perf/PERF_PROGRESS.md` has the dataset,
 the harness, and the methodology.
+
+### Larger graphs — where bounded memory shows
+
+The pole graph is too small to exercise the headline claim (every engine holds it
+fully resident). [`perf/cross-engine-hs/`](perf/cross-engine-hs/) re-runs the same
+metrics against two larger reference graphs — a **340,839-node / 469,438-edge**
+MeSH graph (pure graph, 5× pole's edges) and a **20,766-node EU-AI-Act** graph
+carrying **54.8 MiB of 1024-dim embeddings**. Same four engines, same method
+(slater on default 64 + 32 + 16 MiB budgets), two single-graph runs.
+
+Peak RSS while serving — slater is the **smallest of the four on both**, and the
+vector graph is where it matters:
+
+| peak RSS | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| MeSH (340k nodes) | **262 MiB 🟢** | 1127 MiB | 350 MiB | 454 MiB |
+| EU-AI-Act (54.8 MiB vectors) | **144 MiB 🟢** | 694 MiB | 219 MiB | 317 MiB |
+
+(Same mark as the latency tables, applied to RSS: 🟢 = slater smallest, ⚪ = ties
+within 25% — slater is sole-smallest on both. Its footprint is not resident graph:
+idle RSS is ~16 MiB and the MeSH peak is transient per-query working memory, not
+held data — see [`perf/cross-engine-hs/README.md`](perf/cross-engine-hs/README.md).)
+
+On EU-AI-Act slater serves the whole graph at **144 MiB — 4.8× below Neo4j** — and
+on the graph shapes it wins outright (count / group-by / `DISTINCT` / scan run
+**10–40× faster** than the others on the big MeSH graph via its metadata + index
+fast paths). The vector queries are the other side of the trade — latency, mean of
+5 runs (🟢 = slater fastest of the four, ⚪ = ties within 25%):
+
+| EU-AI-Act query | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| kNN top-10 Concept | 16.25 ms | 8.01 ms | 1.88 ms | 1.15 ms |
+| kNN top-50 Concept | 16.86 ms | 8.67 ms | 2.01 ms | 1.25 ms |
+| kNN top-10 Chunk | 8.26 ms | 5.54 ms | 1.84 ms | 1.34 ms |
+| kNN-10 + 1-hop expand | 15.97 ms | 5.29 ms | 1.66 ms | 1.16 ms |
+| count all nodes | **0.51 ms 🟢** | 3.45 ms | 1.22 ms | 1.31 ms |
+| Concept label count | **0.51 ms 🟢** | 2.82 ms | 1.47 ms | 0.91 ms |
+| point lookup (idx id) | 0.97 ms | 3.86 ms | 0.43 ms | 0.43 ms |
+
+The kNN gap is **algorithmic, not memory**: slater answers vector search with an
+*exact brute-force* scan (these indexes are below its 50k-vector ANN threshold)
+where the in-memory engines use a resident HNSW — so it's 16 ms vs ~1 ms, but every
+hit is exact. At the default 64 MiB block budget the 54.8 MiB of vectors are
+**resident**, so this is not paging.
+
+**Too big for cache — the bounded-memory dial.** Brute-force reads full-precision
+vectors through the **block** cache (`blockCacheBytes`), so that budget — not
+`vectorCacheBytes` — governs vector residency. Sizing it below a vector group
+(Concept = 41 MiB, Chunk = 18 MiB) makes slater re-fetch + re-decompress that group
+on every scan; the latency cliff lands **exactly at each group's working-set size**,
+and slater keeps serving rather than failing:
+
+| slater `blockCacheBytes` | Concept kNN-10 (41 MiB group) | Chunk kNN-10 (18 MiB group) |
+|---:|--:|--:|
+| 64 MiB (default) | 16.9 ms | 8.6 ms |
+| 48 MiB | 16.4 ms | 8.2 ms |
+| 40 MiB | **43.6 ms** ← Concept evicts | 8.3 ms |
+| 24 MiB | 43.0 ms | 8.2 ms |
+| 16 MiB | 42.8 ms | **22.3 ms** ← Chunk evicts too |
+
+A ~2.7× kNN slowdown buys a smaller resident footprint — a continuous RAM↔latency
+dial the in-memory engines don't have (they hold the whole graph + HNSW resident or
+they don't run). (Caveat: the 54.8 MiB file stays in the host OS page cache, so this
+degradation is re-decompression cost, not physical-disk I/O — a true disk-bound
+measurement needs a graph larger than RAM.) Full tables, methodology, the MeSH
+suite, and the sweep are in
+[`perf/cross-engine-hs/README.md`](perf/cross-engine-hs/README.md).
 
 ## License
 

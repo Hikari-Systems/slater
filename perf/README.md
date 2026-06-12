@@ -14,6 +14,13 @@ performance gap, measured on the "pole" Manchester crime graph (61,521 nodes /
 - **`cross-engine/`** — the four-engine comparison (slater / Neo4j / Memgraph /
   FalkorDB), mean of 5 runs with a container restart before each. Produces the
   "Cross-engine comparison" table in `PERF_PROGRESS.md`. See `cross-engine/README.md`.
+- **`cross-engine-hs/`** — the same four-engine method on two **larger**
+  hs-backend-spot reference graphs: a 340,839-node / 469,438-edge MeSH graph (pure
+  graph) and a 20,766-node EU-AI-Act graph with 54.8 MiB of 1024-dim embeddings
+  (adds a kNN suite). This is where the bounded-memory claim is actually exercised —
+  slater is the smallest RSS of the four on both. Includes a `blockCacheBytes` sweep
+  showing the kNN latency/RSS tradeoff when vectors no longer fit the cache. See
+  `cross-engine-hs/README.md`.
 
 ## Quick start
 

@@ -7,6 +7,10 @@ Cargo.lock.orig
 /testdata/generated
 *.profraw
 
+# Python bytecode from the perf harnesses.
+__pycache__/
+*.pyc
+
 # Local, uncommitted notes: client-compatibility / Cypher-gap findings produced
 # while integrating downstream services. Kept out of git (and survives `git clean`
 # being avoided here) so they aren't wiped on rebuilds.

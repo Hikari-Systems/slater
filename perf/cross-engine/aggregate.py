@@ -51,12 +51,27 @@ for q in ORDER:
         cells.append(s)
     print(f"| {q} | " + " | ".join(cells) + " |")
 
-# memory
+# memory — mark slater the same way as latency (🟢 sole-smallest RSS, ⚪ ties <25%)
 print("\n--- memory (run-5 cycle) ---")
 mt = os.path.join(RES, "memory.txt")
 if os.path.exists(mt):
+    mem = {}
     for line in open(mt):
         parts = dict(p.split("=") for p in line.split()[1:]) if len(line.split())>1 else {}
-        e = line.split()[0]
-        pk = int(parts.get("peak",0)); cur = int(parts.get("current",0))
-        print(f"{LABEL.get(e,e):10s} peak={pk/1048576:7.0f} MiB  current={cur/1048576:7.0f} MiB")
+        mem[line.split()[0]] = (int(parts.get("peak",0)), int(parts.get("current",0)))
+
+    def mem_marker(idx):
+        vals = {e: m[idx] for e, m in mem.items() if m[idx] > 0}
+        if "slater" not in vals: return ""
+        best = min(vals.values())
+        winners = [e for e, v in vals.items() if v <= best * 1.25]
+        if "slater" not in winners: return ""
+        return "🟢" if len(winners) == 1 else "⚪"
+
+    pk_mark, cur_mark = mem_marker(0), mem_marker(1)
+    for e in ENGINES:
+        if e not in mem: continue
+        pk, cur = mem[e]
+        pkm = f" {pk_mark}" if e == "slater" and pk_mark else ""
+        curm = f" {cur_mark}" if e == "slater" and cur_mark else ""
+        print(f"{LABEL.get(e,e):10s} peak={pk/1048576:7.0f} MiB{pkm}  current={cur/1048576:7.0f} MiB{curm}")

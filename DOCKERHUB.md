@@ -360,12 +360,13 @@ each engine is restarted before every run, then warmed (full-graph scans +
 per-query warm-ups) before 25 measured queries give a median; figures are the mean
 of 5 such runs.
 
-**Resident memory while serving the run:**
+**Resident memory while serving the run** (🟢 = slater has the smallest RSS, ⚪ =
+ties within 25%):
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
-| **peak RSS** | **~82 MiB** | ~774 MiB | ~115 MiB | ~140 MiB |
-| steady-state RSS | ~77 MiB | ~772 MiB | ~113 MiB | ~138 MiB |
+| **peak RSS** | **~82 MiB 🟢** | ~774 MiB | ~115 MiB | ~140 MiB |
+| steady-state RSS | ~77 MiB 🟢 | ~772 MiB | ~113 MiB | ~138 MiB |
 
 slater is the smallest footprint (on this toy graph only ~1.4–1.7× under the
 in-memory engines, ~9× under Neo4j), and — unlike the others — it is bounded by
@@ -395,6 +396,48 @@ the whole graph in RAM). No engine wins everything; on a dataset this small the
 latencies are close and the memory footprint is the durable difference. See
 [`perf/`](https://github.com/Hikari-Systems/slater/tree/main/perf)
 (`PERF_PROGRESS.md`) in the repository for the harness and methodology.
+
+### Larger graphs
+
+A second harness
+([`perf/cross-engine-hs/`](https://github.com/Hikari-Systems/slater/tree/main/perf/cross-engine-hs))
+re-runs the same metrics on two bigger reference graphs — a 340,839-node /
+469,438-edge MeSH graph, and a 20,766-node graph carrying 54.8 MiB of 1024-dim
+embeddings. Peak RSS while serving (slater on default budgets):
+
+| peak RSS | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| MeSH (340k nodes) | **262 MiB 🟢** | 1127 MiB | 350 MiB | 454 MiB |
+| vector graph (54.8 MiB vectors) | **144 MiB 🟢** | 694 MiB | 219 MiB | 317 MiB |
+
+(🟢 = slater sole-smallest RSS. On MeSH its idle RSS is ~16 MiB; the 262 MiB peak is transient per-query working memory, not resident data.)
+
+slater is the smallest footprint on both (4.8× under Neo4j on the vector graph),
+and is **10–40× faster than the others on count / group-by / `DISTINCT` / scan** on
+the big MeSH graph. It **trails on kNN** — vector search runs as an exact
+brute-force scan (an algorithmic gap vs the others' HNSW):
+
+| vector query (latency) | slater | Neo4j 5 | Memgraph | FalkorDB |
+|---|--:|--:|--:|--:|
+| kNN top-10 Concept | 16.3 ms | 8.0 ms | 1.9 ms | 1.2 ms |
+| kNN top-50 Concept | 16.9 ms | 8.7 ms | 2.0 ms | 1.3 ms |
+| count all nodes | **0.5 ms** | 3.5 ms | 1.2 ms | 1.3 ms |
+
+Brute-force reads vectors through the **block** cache, so `blockCacheBytes` is the
+dial that trades RSS for kNN latency. At the 64 MiB default the 54.8 MiB of vectors
+are resident (16.9 ms); sizing it below a vector group (Concept 41 MiB, Chunk 18
+MiB) makes slater re-fetch the group per scan, with the cliff exactly at each
+group's size:
+
+| slater `blockCacheBytes` | Concept kNN-10 | Chunk kNN-10 |
+|---:|--:|--:|
+| 64 / 48 MiB | 16.9 / 16.4 ms | 8.6 / 8.2 ms |
+| 40 / 24 MiB | **43.6 / 43.0 ms** | 8.3 / 8.2 ms |
+| 16 MiB | 42.8 ms | **22.3 ms** |
+
+A ~2.7× kNN slowdown for a smaller footprint — a RAM↔latency dial the in-memory
+engines (whole graph + HNSW resident) don't have. Tables and full sweep are in that
+directory's README.
 
 ---
 
