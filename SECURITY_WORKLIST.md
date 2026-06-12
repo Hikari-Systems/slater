@@ -12,7 +12,7 @@ authenticated principals over Bolt).
 
 ## Status at a glance
 
-**5 done · 4 open** (as of 2026-06-12)
+**5 done · 1 in progress · 3 open** (as of 2026-06-12)
 
 | # | Item | Tier | Status |
 |---|---|---|---|
@@ -20,7 +20,7 @@ authenticated principals over Bolt).
 | 2 | Large intermediate lists | Tier 2 | ✅ Done (2026-06-12) |
 | 3 | Variable-length path explosion | Tier 2 | ✅ Done (2026-06-12) |
 | 4 | Generation rollback / freshness | Tier 3 | ⬜ Open |
-| 5 | Parser / PackStream panics on malformed input | Tier 3 | ⬜ Open |
+| 5 | Parser / PackStream panics on malformed input | Tier 3 | 🔄 In progress (fuzz harness landed; 1 OOM fixed) |
 | 6 | Checked arithmetic in value helpers | Tier 3 | ⬜ Open |
 | 7 | `requireManifestMac` / `requireAclStamp` defaults | Deployment | ✅ Done (2026-06-12) |
 | 8 | No connection-count / per-IP limits | Deployment | ⬜ Open |
@@ -63,13 +63,23 @@ authenticated principals over Bolt).
   `current` whose counter is lower than the highest it has served. Cheaper interim: operators
   prune superseded generations.
 
-- [ ] **⬜ OPEN — Parser / PackStream panics on malformed input** — *low* (per-connection DoS).
+- [ ] **🔄 IN PROGRESS — Parser / PackStream panics on malformed input** — *low–medium* (per-connection / pre-auth DoS).
   `unwrap()` / `expect()` on parsed structure in `crates/slater/src/parser.rs` (e.g. ~361,
   ~1057, ~1083) and `crates/slater/src/bolt/packstream.rs`. These run inside per-connection
   / `spawn_blocking` tasks, so a panic drops *that connection*, not the server — but it is
   still a sharp edge.
-  *Fix:* convert the reachable-on-bad-input ones to typed errors; audit with a fuzz target
-  over the query string and the PackStream decoder.
+  *In progress (2026-06-12):* a cargo-fuzz harness now exists (`fuzz/`) with three targets —
+  the Cypher parser (`parser::parse`), the PackStream value decoder (`packstream::from_slice`),
+  and the Bolt chunk-framing decoder (`chunk::decode_message`) — gated on tagged builds by the
+  `fuzz` job in `.github/workflows/release.yml` (fanned out one-per-runner on a Blacksmith
+  matrix, ~5 min each; a crash blocks the release). The harness immediately found a
+  **pre-auth memory-DoS**: `read_list`/`read_map`/`read_struct` called `Vec::with_capacity(n)`
+  on an attacker-controlled u32, so a 5-byte message (`0xD6` + a ~2.5-billion length) requested
+  ~80 GB before reading any body. **Fixed** by bounding the pre-allocation to the bytes
+  remaining (`n.min(self.remaining())`); regression test
+  `forged_length_headers_bail_without_huge_allocation`. Parser and chunk targets fuzz clean.
+  *Remaining:* longer/scheduled fuzzing and an explicit audit of the reachable `unwrap()`/
+  `expect()` sites for panics (the OOM was the first finding, not necessarily the last).
 
 - [ ] **⬜ OPEN — Checked arithmetic in value helpers** — *low*.
   `slice_range` computes `len - start.abs()` (`crates/slater/src/exec.rs` ~4075), which

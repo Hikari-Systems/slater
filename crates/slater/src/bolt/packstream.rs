@@ -303,7 +303,12 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_list(&mut self, n: usize) -> Result<PsValue> {
-        let mut items = Vec::with_capacity(n);
+        // `n` is an attacker-controlled u32; each element is ≥1 byte, so a valid
+        // list of `n` items needs ≥`n` bytes of body. Cap the pre-allocation at
+        // the bytes actually remaining so a bogus huge length (e.g. `0xD6` with a
+        // 2.5-billion count in a 5-byte message) can't drive an out-of-memory
+        // allocation before the loop's first short read bails.
+        let mut items = Vec::with_capacity(n.min(self.remaining()));
         for _ in 0..n {
             items.push(self.read_value()?);
         }
@@ -311,7 +316,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_map(&mut self, n: usize) -> Result<PsValue> {
-        let mut entries = Vec::with_capacity(n);
+        // See `read_list`: bound the pre-allocation by the remaining bytes (each
+        // entry is ≥2 bytes), so a forged length cannot OOM the decoder.
+        let mut entries = Vec::with_capacity(n.min(self.remaining()));
         for _ in 0..n {
             let key = match self.read_value()? {
                 PsValue::String(s) => s,
@@ -325,7 +332,9 @@ impl<'a> Decoder<'a> {
 
     fn read_struct(&mut self, field_count: usize) -> Result<PsValue> {
         let tag = self.u8()?;
-        let mut fields = Vec::with_capacity(field_count);
+        // See `read_list`: bound the pre-allocation by the remaining bytes so a
+        // forged field count cannot OOM the decoder.
+        let mut fields = Vec::with_capacity(field_count.min(self.remaining()));
         for _ in 0..field_count {
             fields.push(self.read_value()?);
         }
@@ -351,6 +360,21 @@ mod tests {
         let bytes = to_vec(&v);
         let back = from_slice(&bytes).unwrap();
         assert_eq!(v, back, "roundtrip mismatch; bytes={bytes:02X?}");
+    }
+
+    #[test]
+    fn forged_length_headers_bail_without_huge_allocation() {
+        // Regression (found by the `packstream_decode` fuzz target): a list/map/
+        // struct header declaring a ~2.5-billion element count in a tiny message
+        // must error on the short body, not pre-allocate gigabytes. With the
+        // capacity bounded by the remaining bytes this returns quickly.
+        // `0xD6` = list, u32 length 0x959595AF (≈2.5e9), then no body.
+        assert!(from_slice(&[0xD6, 0x95, 0x95, 0x95, 0xAF]).is_err());
+        // `0xDA` = map, u32 length; `0xDE`?—use 0xDA marker with huge count.
+        assert!(from_slice(&[0xDA, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+        // `0xB?` tiny-struct is ≤15 fields, but the u32 list path above is the
+        // unbounded one; also check a u16 list length with no body.
+        assert!(from_slice(&[0xD5, 0xFF, 0xFF]).is_err());
     }
 
     #[test]

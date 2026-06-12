@@ -1,0 +1,42 @@
+# cargo-fuzz targets for Slater's untrusted-input surface: the Cypher query
+# parser and the Bolt/PackStream decoders. Kept as its own workspace (the empty
+# `[workspace]` table below) so the instrumented `libfuzzer-sys` dependency never
+# leaks into the main workspace build. Requires a nightly toolchain + cargo-fuzz;
+# see `.github/workflows/ci.yml` (the `fuzz` job) and `cargo fuzz run <target>`.
+[package]
+name = "slater-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.slater]
+path = "../crates/slater"
+
+[workspace]
+
+[[bin]]
+name = "parse_query"
+path = "fuzz_targets/parse_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packstream_decode"
+path = "fuzz_targets/packstream_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_decode"
+path = "fuzz_targets/chunk_decode.rs"
+test = false
+doc = false
+bench = false

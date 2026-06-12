@@ -27,8 +27,8 @@ permissions:
 
 jobs:
   # ── Gate: the whole workspace test suite must pass before anything ships ───
-  # Every publishing job below `needs: test`, so a red test run blocks the Docker
-  # push and the binary release for this tag.
+  # Every publishing job below `needs: [test, fuzz]`, so a red test run or a fuzz
+  # crash blocks the Docker push and the binary release for this tag.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -62,9 +62,64 @@ jobs:
       - name: Test suite
         run: cargo test --workspace --locked
 
+  # ── Gate: fuzz the untrusted-input decoders before shipping a tag ──────────
+  # The Cypher parser and the Bolt/PackStream decoders (targets in `fuzz/`) each
+  # get a time-boxed libFuzzer run. Run only on tagged builds — not on every CI
+  # iteration — so each target can fuzz for several minutes rather than seconds.
+  # The targets fan out one-per-runner across a Blacksmith matrix (as the Docker
+  # build does), so they run in parallel and a crash fails only its own leg while
+  # still blocking the release. cargo-fuzz needs nightly + libFuzzer.
+  fuzz:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_query, packstream_decode, chunk_decode]
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # `cargo fuzz run` builds just this target before running it, so a build
+      # error (a target that no longer matches the API) still fails the leg.
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
+
+      # On a crash, libFuzzer writes a reproducer under fuzz/artifacts — keep it.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # ── Docker: native per-arch build, pushed to Docker Hub by digest ──────────
   docker-build:
-    needs: test
+    needs: [test, fuzz]
     runs-on: ${{ matrix.runner }}
     # Slater is a heavy Rust build (rustls/aws-lc-rs, tokio, zstd, argon2); give
     # each native arch plenty of wall-clock on the 2-vCPU runners.
@@ -152,7 +207,7 @@ jobs:
 
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
-    needs: test
+    needs: [test, fuzz]
     runs-on: ubuntu-latest
     env:
       # The tag this run targets: the pushed ref, or the manual dispatch input.
