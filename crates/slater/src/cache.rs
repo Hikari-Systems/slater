@@ -9,9 +9,11 @@
 //! `(generation, file, block)` under a global byte budget, so resident memory is
 //! bounded regardless of graph size while hot blocks stay warm.
 //!
-//! `graph_format::blockfile` exposes `parse_block` + `record_from_block` precisely
-//! so a cache holder can slice an individual record out of a cached decompressed
-//! block without decompressing again; [`BlockCache::record`] is that path.
+//! `graph_format::blockfile` exposes `record_range_in_block` precisely so a cache
+//! holder can locate an individual record's byte range within a cached decompressed
+//! block without decompressing (or re-parsing the offset table) again;
+//! [`BlockCache::record`] is that path, returning a [`BlockRecord`] that borrows the
+//! cached block by `Arc` rather than copying the record out.
 //!
 //! Eviction order is LRU, tracked with a monotonic tick and a `BTreeMap` ordering
 //! (O(log n) per access) — simple and obviously correct, which matters more here
@@ -27,9 +29,56 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use graph_format::blockfile::{parse_block, record_from_block, BlockFileReader};
+use graph_format::blockfile::{record_range_in_block, BlockFileReader};
 use graph_format::ids::Generation as GenId;
 use graph_format::pq::ResidentPq;
+
+/// A record sliced out of a cached, decompressed block. Holds an `Arc` clone of the
+/// block so the borrowed bytes stay alive, plus the record's byte range within it.
+///
+/// This is the Stage-4 replacement for the old `record() -> Vec<u8>`: every node /
+/// edge / label / property / adjacency read used to `to_vec()`-copy its record off
+/// the cached block (and allocate a fresh offset table to find it). A `BlockRecord`
+/// copies nothing — it `Arc`-clones the block (one atomic increment) and remembers
+/// `start..end`. It `Deref`s to `&[u8]`, so the decoders that take a byte slice are
+/// unchanged at the call sites.
+#[derive(Clone)]
+pub struct BlockRecord {
+    block: Arc<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl BlockRecord {
+    /// The record bytes (borrowing the cached block).
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.block[self.start..self.end]
+    }
+}
+
+impl std::ops::Deref for BlockRecord {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for BlockRecord {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for BlockRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockRecord")
+            .field("len", &(self.end - self.start))
+            .finish()
+    }
+}
 
 /// Identifies which file within a generation a block belongs to. Encoded into a
 /// `u32` for the cache key; range indexes carry their MANIFEST position in the
@@ -244,13 +293,16 @@ impl BlockCache {
         gen: GenId,
         file: FileKind,
         global: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<BlockRecord> {
         let loc = reader.locate(global)?;
         let key = BlockKey::new(gen, file, loc.block.0);
         let raw = self.get_or_try_insert(key, || reader.read_block(loc.block))?;
-        let (offsets, data) = parse_block(&raw[..])?;
-        let rec = record_from_block(&offsets, data, loc.slot)?;
-        Ok(rec.to_vec())
+        let range = record_range_in_block(&raw[..], loc.slot)?;
+        Ok(BlockRecord {
+            block: raw,
+            start: range.start,
+            end: range.end,
+        })
     }
 
     /// Evict every block idle for at least `ttl` as of `now`, freeing its bytes.
@@ -709,13 +761,16 @@ impl VectorIndexCache {
         gen: GenId,
         ord: u32,
         global: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<BlockRecord> {
         let loc = reader.locate(global)?;
         let key = VectorBlockKey::new(gen, ord, loc.block.0);
         let raw = self.get_or_try_insert(key, || reader.read_block(loc.block))?;
-        let (offsets, data) = parse_block(&raw[..])?;
-        let rec = record_from_block(&offsets, data, loc.slot)?;
-        Ok(rec.to_vec())
+        let range = record_range_in_block(&raw[..], loc.slot)?;
+        Ok(BlockRecord {
+            block: raw,
+            start: range.start,
+            end: range.end,
+        })
     }
 
     /// Evict every Vamana block idle for at least `ttl` as of `now`. Pinned PQ
@@ -862,7 +917,7 @@ mod tests {
             let got = cache
                 .record(&reader, g, FileKind::EdgeProps, i as u64)
                 .unwrap();
-            assert_eq!(&got, want);
+            assert_eq!(got.as_slice(), &want[..]);
         }
         // Read everything again — now every block is resident, so the second
         // sweep adds only hits (no new misses beyond the first sweep's blocks).
@@ -871,7 +926,7 @@ mod tests {
             let got = cache
                 .record(&reader, g, FileKind::EdgeProps, i as u64)
                 .unwrap();
-            assert_eq!(&got, want);
+            assert_eq!(got.as_slice(), &want[..]);
         }
         let after_second = cache.metrics();
         assert_eq!(
@@ -880,6 +935,41 @@ mod tests {
         );
         assert!(after_second.hits > after_first.hits);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn block_record_outlives_eviction_of_its_block() {
+        // A BlockRecord Arc-clones the block, so it stays valid even after the
+        // block it came from is evicted by budget pressure mid-scan.
+        let path = std::env::temp_dir().join(format!("slater_rec_evict_{}", std::process::id()));
+        let mut w = BlockFileWriter::create(&path, 64, 3).unwrap();
+        let mut expected = Vec::new();
+        for i in 0..60u32 {
+            let rec = format!("rec-{i}-{}", "k".repeat((i % 25) as usize)).into_bytes();
+            w.append_record(&rec).unwrap();
+            expected.push(rec);
+        }
+        w.finish().unwrap();
+        let reader = BlockFileReader::open(&path).unwrap();
+        assert!(reader.num_blocks() > 2, "need several blocks");
+
+        // Tiny budget keeps ~one block resident, forcing eviction as we scan.
+        let cache = BlockCache::new(128);
+        let g = gen(99);
+        // Hold the very first record while we read every later one (evicting block 0).
+        let first = cache.record(&reader, g, FileKind::NodeProps, 0).unwrap();
+        for i in 1..expected.len() {
+            let _ = cache
+                .record(&reader, g, FileKind::NodeProps, i as u64)
+                .unwrap();
+        }
+        assert!(
+            cache.metrics().evictions > 0,
+            "scan should have evicted blocks"
+        );
+        // The held record is still the correct bytes despite its block being gone.
+        assert_eq!(first.as_slice(), &expected[0][..]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1003,11 +1093,17 @@ mod tests {
         assert!(cache.resident_pq(g, 1).is_none());
 
         for (i, want) in expected.iter().enumerate() {
-            assert_eq!(&cache.record(&reader, g, 0, i as u64).unwrap(), want);
+            assert_eq!(
+                cache.record(&reader, g, 0, i as u64).unwrap().as_slice(),
+                &want[..]
+            );
         }
         let after_first = cache.metrics();
         for (i, want) in expected.iter().enumerate() {
-            assert_eq!(&cache.record(&reader, g, 0, i as u64).unwrap(), want);
+            assert_eq!(
+                cache.record(&reader, g, 0, i as u64).unwrap().as_slice(),
+                &want[..]
+            );
         }
         assert_eq!(
             cache.metrics().misses,

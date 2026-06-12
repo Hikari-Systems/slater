@@ -17,12 +17,13 @@
 | 1 | Parameters → index selection | low | **DONE** | idx-eq **0.8 ms** (from 901 ms); 1-hop ~30–100 ms (from 952 ms) |
 | 2 | Skip redundant per-node label re-check | low | **DONE** | Crime-label-count **0.64 ms** (from 841 ms); also fixed CONTAINS/agg/DISTINCT |
 | 3 | Count fast-paths (metadata / index cardinality) | low | **DONE** | counts **0.6–0.8 ms** (from 14–901 ms) |
-| 4 | Block-cache record read (no per-record copy / less locking) | high | TODO | broad floor drop |
-| 5 | Streaming aggregation + projection pushdown + prop memo | med | TODO | agg/DISTINCT still ~60 ms (8–9× Neo4j) |
-| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 2-hop ~50 ms, 3-hop ~3 s (traversal unchanged this round) |
+| 4 | Block-cache record read (no per-record copy / less locking) | high | **DONE** | broad floor drop: 2-hop **48→1.95 ms** (Neo4j parity), agg/CONTAINS/DISTINCT ~3×, 3-hop ~49 ms |
+| 5 | Streaming aggregation + projection pushdown + prop memo | med | TODO | agg/DISTINCT now ~20 ms (2.5–3× Neo4j) |
+| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 1-hop ~5 ms, 3-hop ~49 ms (still traversal-bound) |
 
 Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk) — **DONE 2026-06-12**, see
-"Validation results" below. Next round: **4 → 5 → 6** (the traversal/aggregation engine).
+"Validation results (Stages 0–3)" below. **Stage 4 DONE 2026-06-12** — see "Validation results
+(Stage 4)". Next: **5 → 6** (streaming aggregation, then the traversal frame).
 **Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–6 (see below).
 
 ### Bonus (this round): result-cache disable switch
@@ -143,6 +144,36 @@ and will re-baseline it.
 >    between runs.
 > 3. **Small param pools < `--meas`.** CONTAINS (14 terms) and idx-eq/1-hop (13 crime types)
 >    repeat within a single run, so even one run partially cache-hits unless the cache is disabled.
+
+## Validation results (Stage 4 — block-cache borrowed record, measured 2026-06-12, cache DISABLED)
+
+Freshly built current-source image (`resultCacheBytes: 0`, so "cached" ≈ "uncached" confirms no
+reuse), same machine/data, Neo4j on :7688 as the parity reference. **No `!rows` mismatch on any
+row** → correctness preserved. Two back-to-back runs agreed within noise; the medians below are
+representative.
+
+| query | Stages 0–3 (cache off) | **Stage 4 (cache off)** | Neo4j | vs Neo4j |
+|-------|----------------------:|------------------------:|------:|---------:|
+| count all nodes | 0.63 ms | **0.56 ms** | 3.3 ms | 5.7× faster |
+| Crime label count | 0.61 ms | **0.58 ms** | 2.2 ms | 3.7× faster |
+| point lookup (idx nhs_no) | 0.69 ms | **0.64 ms** | 1.1 ms | 1.7× faster |
+| idx-eq count (Crime.type) | 1.58 ms | **1.45 ms** | 1.3 ms | ~parity |
+| 1-hop Crime→Location | ~99 ms | **~5 ms** (min 2.7) | 2.2 ms | 1/2.2× |
+| 2-hop Person→Loc→Area | 48 ms | **1.95 ms** | 2.1 ms | **~parity** |
+| agg crimes by type | 61 ms | **19.5 ms** | 7.8 ms | 1/2.5× |
+| 3-hop Officer/Crime/Loc | ~3155 ms* | **~49 ms** | 2.1 ms | 1/24× |
+| full-scan CONTAINS | 58 ms | **16 ms** | 4.5 ms | 1/3.6× |
+| count DISTINCT type | 61 ms | **20.5 ms** | 6.6 ms | 1/3.1× |
+
+**Headline:** removing the per-record `to_vec()` copy **and** the per-record offset-table
+allocation from the cached-record read gave the predicted broad floor drop on every scan/traversal
+row. **2-hop reached Neo4j parity** (48 → 1.95 ms); aggregations and full scans fell ~3× (now
+2.5–3.7× off Neo4j — these are Stage 5's target); 1-/3-hop traversals fell ~20× and are now the
+remaining gap for Stage 6. The pure count/index rows (Stages 1–3) are unchanged, as expected.
+Memory unchanged/better: slater **65 MiB** RSS vs Neo4j **655 MiB**.
+
+\* The 3-hop "before" (3155 ms) was the cross-binary artifact flagged under Stages 0–3; Stage 4 now
+gives a clean current-source 3-hop of ~49 ms, re-baselining it for Stage 6.
 
 ## Validation harness
 
@@ -298,15 +329,32 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 - **Validate:** count queries < 1 ms; results unchanged. Guard: any WHERE/extra pattern disables
   the fast path (add tests for `count(*)` with and without a filter).
 
-### Stage 4 — Block-cache record read (broad constant factor)
-- **Problem:** root cause 3 — per-record `Mutex` + `to_vec()` copy.
-- **Change:** return a shared/borrowed record (`Arc<[u8]>` or a guard that borrows the cached
-  decompressed block) instead of copying; reduce contention with a sharded cache or an `RwLock`
-  read path; optionally a batch API to read a contiguous candidate id range under one lock.
-- **Files:** `crates/slater/src/cache.rs` (`record` ~241, lock sites ~225); call sites in
-  `exec.rs` (`node_props`/`edge_props`/`node_label_ids`/`outgoing`/`incoming` ~571–617).
+### Stage 4 — Block-cache record read (broad constant factor)  **[DONE 2026-06-12]**
+- **Result:** `BlockCache::record` / `VectorIndexCache::record` now return a new **`BlockRecord`**
+  (`cache.rs`) — an `Arc`-clone of the cached decompressed block plus the record's `start..end`
+  byte range — instead of `rec.to_vec()`. `BlockRecord` derefs to `&[u8]`, so every executor call
+  site (`node_props`/`edge_props`/`node_label_ids`/`outgoing`/`incoming`/`vector_group` and the
+  Vamana beam-search reader) is unchanged via deref coercion — no lifetime churn into the executor.
+  A new allocation-free `blockfile::record_range_in_block(raw, slot)` computes the range by reading
+  only `count` + the two bracketing slot offsets, so the hot path also drops the per-access
+  `parse_block` offset-table `Vec<u32>` allocation. Net: **two heap allocs (copy + offsets) removed
+  per record access.** The lock path is unchanged (load already runs outside the lock; sharding/
+  `RwLock` deferred — not needed to hit the targets). Outstanding `BlockRecord`s stay valid after
+  their block is evicted (the `Arc` keeps it alive) — covered by a test. All 324 slater + 49
+  graph-format lib tests green. Tests: `cache::tests::block_record_outlives_eviction_of_its_block`,
+  `blockfile::tests::record_range_in_block_matches_record_from_block` (+ updated record tests).
+  Bench: broad floor drop, 2-hop → Neo4j parity, no row-count regression — see "Validation results
+  (Stage 4)" above.
+- **Problem:** root cause 3 — per-record `Mutex` + `to_vec()` copy (and, found in passing, a
+  per-record `parse_block` offset-table allocation).
+- **Change:** return a shared/borrowed record (`BlockRecord` holding an `Arc<Vec<u8>>` + range)
+  instead of copying. (Sharded/`RwLock` cache and a contiguous-range batch API were considered and
+  left for later — the borrowed-record + offset-alloc removal already met the floor-drop target.)
+- **Files:** `crates/slater/src/cache.rs` (`BlockRecord`, `record` ~283/~330); call sites in
+  `exec.rs` unchanged; `crates/graph-format/src/blockfile.rs` (`record_range_in_block`).
 - **Risk:** lifetime/aliasing churn across the executor — land behind full `cargo test` + bench.
-- **Validate:** uniform drop across all scan/traversal rows; no correctness change.
+  *Realised low:* deref coercion kept every call site byte-for-byte; no executor signature changed.
+- **Validate:** uniform drop across all scan/traversal rows; no correctness change. ✓
 
 ### Stage 5 — Streaming aggregation + projection pushdown + prop memo
 - **Problem:** root causes 4 & 5 — `Vec<HashMap>` per row; per-access full prop decode.

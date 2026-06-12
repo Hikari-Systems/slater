@@ -431,6 +431,36 @@ pub fn record_from_block<'a>(offsets: &[u32], data: &'a [u8], slot: u32) -> Resu
     Ok(&data[offsets[slot] as usize..offsets[slot + 1] as usize])
 }
 
+/// Byte range of the `slot`-th record within the **whole** decompressed block
+/// (header included), reading only `count` and the two bracketing slot offsets —
+/// no offset-table allocation. A cache holder that keeps the `Arc`-owned block can
+/// slice the record straight out by this range, so a scan touching N records pays
+/// neither a per-record `to_vec()` copy nor a per-record `parse_block` allocation.
+/// Bounds-checked against the block length so a corrupt block errors instead of
+/// panicking.
+pub fn record_range_in_block(raw: &[u8], slot: u32) -> Result<std::ops::Range<usize>> {
+    let mut hdr = raw;
+    let count = hdr.read_u32::<LittleEndian>()? as usize;
+    let slot = slot as usize;
+    if slot + 1 > count {
+        bail!("record slot out of range");
+    }
+    let header_len = 4 + (count + 1) * 4;
+    if raw.len() < header_len {
+        bail!("truncated block header");
+    }
+    let off = |i: usize| -> usize {
+        let at = 4 + i * 4;
+        u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]) as usize
+    };
+    let start = header_len + off(slot);
+    let end = header_len + off(slot + 1);
+    if start > end || end > raw.len() {
+        bail!("record range out of bounds");
+    }
+    Ok(start..end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +514,33 @@ mod tests {
             assert_eq!(&r.read_record_global(i as u64).unwrap(), want);
         }
         assert!(r.locate(expected.len() as u64).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_range_in_block_matches_record_from_block() {
+        // The allocation-free range helper must slice the exact same bytes as the
+        // parse_block + record_from_block path, for every slot in a real block.
+        let path = tmp("range");
+        let mut w = BlockFileWriter::create(&path, 1024, 3).unwrap();
+        let mut locs = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..200u32 {
+            let rec = format!("r{i}:{}", "q".repeat((i % 50) as usize)).into_bytes();
+            locs.push(w.append_record(&rec).unwrap());
+            expected.push(rec);
+        }
+        w.finish().unwrap();
+
+        let r = BlockFileReader::open(&path).unwrap();
+        for (loc, want) in locs.iter().zip(&expected) {
+            let raw = r.read_block(loc.block).unwrap();
+            let range = record_range_in_block(&raw, loc.slot).unwrap();
+            assert_eq!(&raw[range], &want[..]);
+        }
+        // Out-of-range slot errors instead of panicking.
+        let raw0 = r.read_block(locs[0].block).unwrap();
+        assert!(record_range_in_block(&raw0, u32::MAX).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
