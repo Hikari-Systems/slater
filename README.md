@@ -239,6 +239,20 @@ Mint a hash (never store cleartext) with:
 slater hash-password 's3cret'        # prints a $argon2id$… string for acl.json
 ```
 
+## Health check
+
+The `slater` binary doubles as its own liveness probe: `slater healthcheck [host]
+[port]` performs a **Bolt handshake** (not an HTTP request) against the server and
+exits `0` if it negotiates a protocol version, `1` otherwise — defaulting to
+`localhost` and the configured Bolt port. This is what the container
+`HEALTHCHECK` runs, so orchestrators see a truly Bolt-ready server, not just an
+open socket:
+
+```sh
+slater healthcheck localhost 7687    # exit 0 = healthy
+docker exec slater /app/slater healthcheck   # inside the container
+```
+
 ## Worked example
 
 Build a small graph, serve it, and query it with the neo4j **JavaScript** and
@@ -427,20 +441,6 @@ whole graph in RAM, win. It also beats Neo4j on every row. No engine wins
 everything; on a dataset this small the latencies are close and the **memory
 footprint is the durable difference.** `perf/PERF_PROGRESS.md` has the dataset,
 the harness, and the methodology.
-
-## Health check
-
-The `slater` binary doubles as its own liveness probe: `slater healthcheck [host]
-[port]` performs a **Bolt handshake** (not an HTTP request) against the server and
-exits `0` if it negotiates a protocol version, `1` otherwise — defaulting to
-`localhost` and the configured Bolt port. This is what the container
-`HEALTHCHECK` runs, so orchestrators see a truly Bolt-ready server, not just an
-open socket:
-
-```sh
-slater healthcheck localhost 7687    # exit 0 = healthy
-docker exec slater /app/slater healthcheck   # inside the container
-```
 
 ## License
 
