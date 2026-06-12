@@ -193,6 +193,24 @@ pub mod ast {
         /// node-uniqueness. Scoped (PR 2) to variable-length relationships — see
         /// `expand_chain`/`varlen` in exec.rs.
         pub restrictor: Option<PathRestrictor>,
+        /// GQL shortest-path selector (`ANY SHORTEST`/`ALL SHORTEST`/`SHORTEST k`),
+        /// `None` when the pattern carries no selector. When `Some`, the executor
+        /// drives a shortest-path search between the pattern's two endpoints rather
+        /// than the ordinary matcher (`apply_match_selected` in exec.rs). Scoped
+        /// (PR 3) to a single-relationship pattern, like `shortestPath()`.
+        pub selector: Option<PathSelector>,
+    }
+
+    /// GQL shortest-path selector on a [`Pattern`]. Picks shortest connecting paths
+    /// between the pattern's endpoints: `AnyShortest` yields one shortest path per
+    /// endpoint pair; `AllShortest` yields every path of the minimum length;
+    /// `ShortestK(k)` yields up to `k` paths in non-decreasing length order. Paths are
+    /// loopless (no repeated node), mirroring `shortestPath()`'s simple-path search.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PathSelector {
+        AnyShortest,
+        AllShortest,
+        ShortestK(u32),
     }
 
     /// GQL path restrictor controlling node/edge reuse over a variable-length walk.
@@ -1014,6 +1032,7 @@ fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
         rels: chain,
         segments: None,
         restrictor: None,
+        selector: None,
     })
 }
 
@@ -1031,9 +1050,11 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut has_quant = false;
     let mut restrictor: Option<PathRestrictor> = None;
+    let mut selector: Option<PathSelector> = None;
 
     for child in pair.into_inner() {
         match child.as_rule() {
+            Rule::path_selector => selector = Some(lower_path_selector(child)?),
             Rule::path_restrictor => restrictor = Some(lower_path_restrictor(child)?),
             Rule::path_var => path_var = Some(ident_text(child)?),
             Rule::node_pattern => {
@@ -1081,6 +1102,7 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
             rels,
             segments: None,
             restrictor,
+            selector,
         });
     }
 
@@ -1100,12 +1122,22 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
              variable-length relationship instead"
         );
     }
+    // A selector over a quantified group is likewise deferred: shortest-path search
+    // runs over a single variable-length relationship, not a desugared group.
+    if selector.is_some() {
+        bail!(
+            "a path selector (ANY/ALL SHORTEST or SHORTEST k) over a quantified path \
+             pattern ('((…)){{m,n}}') is not yet supported; apply it to a \
+             variable-length relationship instead"
+        );
+    }
     Ok(Pattern {
         path_var: None,
         start,
         rels: Vec::new(),
         segments: Some(segments),
         restrictor: None,
+        selector: None,
     })
 }
 
@@ -1118,6 +1150,31 @@ fn lower_path_restrictor(pair: Pair<Rule>) -> Result<PathRestrictor> {
         Rule::kw_acyclic => PathRestrictor::Acyclic,
         Rule::kw_simple => PathRestrictor::Simple,
         other => bail!("internal: unexpected path_restrictor child {other:?}"),
+    })
+}
+
+/// Lower a `path_selector` (`ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k`) into its
+/// [`PathSelector`] variant.
+fn lower_path_selector(pair: Pair<Rule>) -> Result<PathSelector> {
+    let inner = only_child(pair)?;
+    Ok(match inner.as_rule() {
+        Rule::any_shortest => PathSelector::AnyShortest,
+        Rule::all_shortest => PathSelector::AllShortest,
+        Rule::shortest_k => {
+            // `SHORTEST k`: skip the `kw_shortest` keyword child and read the count.
+            let n = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::integer)
+                .ok_or_else(|| anyhow::anyhow!("internal: SHORTEST k missing its count"))?;
+            let k: u32 = n.as_str().parse().map_err(|_| {
+                anyhow::anyhow!("SHORTEST count '{}' is not a valid integer", n.as_str())
+            })?;
+            if k == 0 {
+                bail!("SHORTEST k requires a positive count (got 0)");
+            }
+            PathSelector::ShortestK(k)
+        }
+        other => bail!("internal: unexpected path_selector child {other:?}"),
     })
 }
 
@@ -1753,6 +1810,7 @@ fn lower_pattern_predicate(pair: Pair<Rule>) -> Result<Expr> {
         rels: chain,
         segments: None,
         restrictor: None,
+        selector: None,
     })))
 }
 
@@ -2724,6 +2782,74 @@ mod tests {
         // rejected with a clear message rather than silently ignored.
         let e = err("MATCH TRAIL (a) ((x)-[:R]->(y)){1,2} (b) RETURN b");
         assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
+    }
+
+    // ── GQL shortest-path selectors (PR 3) ───────────────────────────────────
+
+    #[test]
+    fn lowers_path_selectors() {
+        // Each selector form parses onto the pattern; the chain is otherwise an
+        // ordinary variable-length pattern (`segments` stays `None`).
+        for (kw, want) in [
+            ("ANY SHORTEST", PathSelector::AnyShortest),
+            ("ALL SHORTEST", PathSelector::AllShortest),
+            ("SHORTEST 3", PathSelector::ShortestK(3)),
+        ] {
+            let q = ok(&format!("MATCH {kw} (a)-[:R*]->(b) RETURN b"));
+            let p = first_pattern(&q);
+            assert_eq!(p.selector, Some(want), "selector for {kw}");
+            assert!(p.segments.is_none(), "selector pattern stays ordinary");
+            assert_eq!(p.rels.len(), 1);
+        }
+    }
+
+    #[test]
+    fn absent_selector_is_none() {
+        // No selector keyword → `None`: the pattern runs the ordinary matcher.
+        let q = ok("MATCH (a)-[:R*]->(b) RETURN b");
+        assert_eq!(first_pattern(&q).selector, None);
+    }
+
+    #[test]
+    fn selector_lowercase_accepted() {
+        // Keywords are case-insensitive like every other keyword terminal.
+        let q = ok("match any shortest (a)-[:R*]->(b) return b");
+        assert_eq!(first_pattern(&q).selector, Some(PathSelector::AnyShortest));
+    }
+
+    #[test]
+    fn selector_with_path_var_follows_prefix() {
+        // The path-variable assignment follows the selector prefix
+        // (`SELECTOR p = …`), consistent with the restrictor placement (PR 2).
+        let q = ok("MATCH ALL SHORTEST p = (a)-[:R*]->(b) RETURN p");
+        let p = first_pattern(&q);
+        assert_eq!(p.selector, Some(PathSelector::AllShortest));
+        assert_eq!(p.path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn selector_does_not_shadow_node_var() {
+        // A selector only sits at the head of a `match_pattern`, never inside `(…)`,
+        // so a node variable spelled `shortest` parses as a variable, not a selector.
+        let q = ok("MATCH (shortest)-[:R*]->(b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("shortest"));
+        assert_eq!(p.selector, None);
+    }
+
+    #[test]
+    fn selector_zero_k_rejected() {
+        // `SHORTEST 0` is meaningless; rejected at lowering with a clear message.
+        let e = err("MATCH SHORTEST 0 (a)-[:R*]->(b) RETURN b");
+        assert!(e.contains("positive count"), "{e}");
+    }
+
+    #[test]
+    fn selector_over_quantified_rejected() {
+        // A selector over a quantified group is deferred, like the restrictor: the
+        // group desugars into separate expansions, not a single var-length walk.
+        let e = err("MATCH ANY SHORTEST (a) ((x)-[:R]->(y)){1,2} (b) RETURN b");
+        assert!(e.contains("selector") && e.contains("quantified"), "{e}");
     }
 
     #[test]

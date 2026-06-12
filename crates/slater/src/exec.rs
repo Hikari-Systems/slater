@@ -1179,6 +1179,20 @@ impl<'g> Engine<'g> {
     // ── MATCH ────────────────────────────────────────────────────────────
 
     fn apply_match(&self, table: Table, m: &MatchClause, cap: Option<usize>) -> Result<Table> {
+        // PR 3: a shortest-path selector (`ANY SHORTEST` / `ALL SHORTEST` /
+        // `SHORTEST k`) drives a dedicated search between the pattern's endpoints
+        // rather than the ordinary matcher, so route it out first. A selector must be
+        // the sole pattern in its clause (comma-joined conjunctions alongside a
+        // selector are not yet supported).
+        if m.patterns.iter().any(|p| p.selector.is_some()) {
+            if m.patterns.len() != 1 {
+                bail!(
+                    "a path selector (ANY/ALL SHORTEST or SHORTEST k) must be the only \
+                     pattern in its MATCH clause"
+                );
+            }
+            return self.apply_match_selected(table, m, cap);
+        }
         // PR 2: a path restrictor is honoured only where `varlen` owns the
         // uniqueness scope — a variable-length relationship. Reject it on any other
         // pattern (a node-only or fixed-hop chain) rather than silently ignoring it,
@@ -1345,6 +1359,249 @@ impl<'g> Engine<'g> {
             cols: out_cols,
             rows: out_rows,
         })
+    }
+
+    /// `MATCH` carrying a GQL shortest-path selector (`ANY SHORTEST` / `ALL SHORTEST`
+    /// / `SHORTEST k`). The pattern is a single relationship between two endpoints;
+    /// for every endpoint pair (each side either already bound, or scanned and
+    /// filtered by its node pattern) the selector picks shortest connecting paths via
+    /// the shared BFS core [`select_paths`] — the same core `shortestPath()` uses.
+    /// Each chosen path becomes one output row binding the endpoints, the (list-
+    /// valued) relationship variable and any path variable; the clause `WHERE` is
+    /// applied per row, exactly as the ordinary matcher does.
+    ///
+    /// Scope (PR 3): a selector requires a single-relationship pattern (like
+    /// `shortestPath()`), carries no relationship property filter, and cannot yet be
+    /// combined with a path restrictor — those are rejected with a clear message. A
+    /// selector over a quantified group is already rejected at lowering.
+    fn apply_match_selected(
+        &self,
+        table: Table,
+        m: &MatchClause,
+        cap: Option<usize>,
+    ) -> Result<Table> {
+        let p = &m.patterns[0];
+        let selector = p.selector.expect("routed here only for a selected pattern");
+        if p.restrictor.is_some() {
+            bail!(
+                "combining a path selector with a path restrictor \
+                 (WALK/TRAIL/ACYCLIC/SIMPLE) is not yet supported"
+            );
+        }
+        if p.rels.len() != 1 {
+            bail!(
+                "a path selector (ANY/ALL SHORTEST or SHORTEST k) currently requires a \
+                 single relationship, e.g. MATCH ANY SHORTEST (a)-[:R*]->(b)"
+            );
+        }
+        let (rel, end) = &p.rels[0];
+        if !rel.props.is_empty() {
+            bail!("filters on relationships under a path selector are not supported");
+        }
+        let (min, max) = match &rel.var_length {
+            Some(vl) => varlen_bounds(vl),
+            None => (1, 1),
+        };
+
+        let mut new_vars: Vec<String> = Vec::new();
+        collect_pattern_vars(p, &table.cols, &mut new_vars);
+        let mut out_cols = table.cols.clone();
+        out_cols.extend(new_vars.iter().cloned());
+
+        let mut out_rows = Vec::new();
+        for row in &table.rows {
+            if cap.is_some_and(|c| out_rows.len() >= c) {
+                break;
+            }
+            self.check_deadline()?;
+            let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
+            for (c, v) in table.cols.iter().zip(row) {
+                seed.insert(c.clone(), v.clone());
+            }
+
+            // Endpoint candidates: a bound endpoint is its single node; a free one is
+            // scanned and filtered by its node pattern's labels/inline props.
+            let srcs = self.endpoint_candidates(&p.start, &seed, m.where_.as_ref())?;
+            let dsts = self.endpoint_candidates(end, &seed, m.where_.as_ref())?;
+
+            let mut matches: Vec<HashMap<String, Val>> = Vec::new();
+            for &src in &srcs {
+                for &dst in &dsts {
+                    for hops in self.select_paths(src, dst, rel, (min, max), selector)? {
+                        let mut b = seed.clone();
+                        if let Some(v) = &p.start.var {
+                            b.insert(v.clone(), Val::Node(src));
+                        }
+                        // A shared endpoint variable (e.g. `(a)-[*]->(a)`) must agree:
+                        // skip the pair when the end node would contradict a binding
+                        // the start (or seed) already fixed.
+                        if let Some(v) = &end.var {
+                            if let Some(existing) = b.get(v) {
+                                if existing.loose_eq(&Val::Node(dst)) != Some(true) {
+                                    continue;
+                                }
+                            } else {
+                                b.insert(v.clone(), Val::Node(dst));
+                            }
+                        }
+                        if let Some(v) = &rel.var {
+                            let rels = Val::List(hops.iter().map(Hop::as_rel).collect());
+                            b.insert(v.clone(), rels);
+                        }
+                        if let Some(pv) = &p.path_var {
+                            b.insert(pv.clone(), make_path(src, &hops));
+                        }
+                        if let Some(w) = m.where_.as_ref() {
+                            if !truthy(&self.eval(w, &Scope::Map(&b), None)?) {
+                                continue;
+                            }
+                        }
+                        matches.push(b);
+                    }
+                }
+            }
+
+            if matches.is_empty() && m.optional {
+                let mut r = row.clone();
+                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                out_rows.push(r);
+            } else {
+                for b in matches {
+                    if cap.is_some_and(|c| out_rows.len() >= c) {
+                        break;
+                    }
+                    let mut r = row.clone();
+                    for v in &new_vars {
+                        r.push(b.get(v).cloned().unwrap_or(Val::Null));
+                    }
+                    out_rows.push(r);
+                }
+            }
+        }
+        Ok(Table {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Candidate node ids for one endpoint of a selected pattern. A variable already
+    /// bound to a node (by the seed/an earlier clause) is that single node; bound to
+    /// a non-node it cannot match (empty). A free endpoint is scanned with the usual
+    /// planner strategy and filtered by `node_ok` (its labels + inline props), so an
+    /// endpoint like `(b:Person)` only contributes `:Person` nodes.
+    fn endpoint_candidates(
+        &self,
+        node: &NodePat,
+        binding: &HashMap<String, Val>,
+        where_: Option<&Expr>,
+    ) -> Result<Vec<u64>> {
+        match node.var.as_deref().and_then(|v| binding.get(v)) {
+            Some(Val::Node(id)) => Ok(vec![*id]),
+            Some(_) => Ok(Vec::new()),
+            None => {
+                let scan = choose_node_scan(self.gen, node, where_, &self.plan_params);
+                let guaranteed = self.scan_guaranteed_labels(&scan);
+                let mut out = Vec::new();
+                for c in self.scan_candidates(&scan)? {
+                    if self.node_ok(c, node, binding, &guaranteed)? {
+                        out.push(c);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Shared shortest-path BFS core driving both `shortestPath()` and the GQL path
+    /// selectors. Between two concrete nodes `src`/`dst` it returns the chosen paths
+    /// as hop-lists in walk (start→end) order:
+    /// - `AnyShortest` → at most one shortest path;
+    /// - `AllShortest` → every path of the single minimum length;
+    /// - `ShortestK(k)` → up to `k` paths in non-decreasing length order.
+    ///
+    /// Paths are loopless (no node repeats), matching `shortestPath()`'s long-standing
+    /// simple-path search and bounding the walk on a cyclic graph. Every entry in a
+    /// BFS layer has the same hop count, so paths surface in non-decreasing length
+    /// order — the property `AllShortest`/`ShortestK` rely on. `min`/`max` are the
+    /// relationship's length bounds (a fixed hop is `(1, 1)`); `min == 0` with
+    /// coincident endpoints admits the empty path.
+    fn select_paths(
+        &self,
+        src: u64,
+        dst: u64,
+        rel: &RelPat,
+        bounds: (u32, u32),
+        selector: PathSelector,
+    ) -> Result<Vec<Vec<Hop>>> {
+        let (min, max) = bounds;
+        let empty = HashMap::new();
+        let want = match selector {
+            PathSelector::AnyShortest => 1,
+            PathSelector::ShortestK(k) => k as usize,
+            PathSelector::AllShortest => usize::MAX,
+        };
+        let mut results: Vec<Vec<Hop>> = Vec::new();
+
+        // min == 0 admits the empty (single-node) path when the endpoints coincide.
+        if min == 0 && src == dst {
+            results.push(Vec::new());
+            if results.len() >= want {
+                return Ok(results);
+            }
+        }
+        if max == 0 {
+            return Ok(results);
+        }
+
+        // Each frontier entry carries its own loopless `visited` set so sibling
+        // branches stay simple independently. (node, path so far, visited nodes).
+        let mut frontier: Vec<(u64, Vec<Hop>, HashSet<u64>)> =
+            vec![(src, Vec::new(), HashSet::from([src]))];
+        let mut depth = 0u32;
+        // `AllShortest`: once `dst` is first reached, its layer is the minimum length;
+        // after that layer is fully processed no further shortest path can appear.
+        let mut found_min = false;
+        while !frontier.is_empty() && depth < max {
+            self.check_deadline()?;
+            let mut next = Vec::new();
+            for (node, path, visited) in &frontier {
+                for hop in self.expand_one_hop(*node, rel, &empty)? {
+                    let nb = hop.neighbour;
+                    if visited.contains(&nb) {
+                        continue; // loopless: never revisit a node on this path
+                    }
+                    if nb == dst {
+                        // A connecting path ends here; a loopless path is never
+                        // extended past its destination.
+                        let len = path.len() as u32 + 1;
+                        if len >= min {
+                            let mut hops = path.clone();
+                            hops.push(hop);
+                            self.charge(hops.len() as u64 + 1)?;
+                            results.push(hops);
+                            found_min = true;
+                            if results.len() >= want {
+                                return Ok(results);
+                            }
+                        }
+                        continue;
+                    }
+                    let mut npath = path.clone();
+                    npath.push(hop);
+                    let mut nvisited = visited.clone();
+                    nvisited.insert(nb);
+                    next.push((nb, npath, nvisited));
+                }
+            }
+            // `AllShortest` stops after the first dst-bearing layer; the others stop
+            // only on `want`/exhaustion (handled above and by the loop condition).
+            if found_min && matches!(selector, PathSelector::AllShortest) {
+                return Ok(results);
+            }
+            frontier = next;
+            depth += 1;
+        }
+        Ok(results)
     }
 
     /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
@@ -3338,70 +3595,22 @@ impl<'g> Engine<'g> {
         let src = bound_node(pattern.start.var.as_deref())?;
         let dst = bound_node(end.var.as_deref())?;
         // FalkorDB orients the returned path from the relationship arrow's tail to
-        // its head. The BFS walks the syntactic start→end (using the pattern's
-        // direction); for an incoming pattern `(b)<-[*]-(a)` the arrow tail is the
-        // end node, so the result is reversed into arrow order. (Undirected keeps
-        // start→end order.)
+        // its head. The shared core walks the syntactic start→end (using the
+        // pattern's direction); for an incoming pattern `(b)<-[*]-(a)` the arrow tail
+        // is the end node, so the result is reversed into arrow order. (Undirected
+        // keeps start→end order.)
         let reverse = matches!(rel.dir, Direction::Incoming);
 
-        // min == 0 admits the empty (single-node) path when src == dst.
-        if min == 0 && src == dst {
-            return Ok(Val::Path {
-                nodes: vec![src],
-                rels: Vec::new(),
-            });
-        }
-        if max == 0 {
+        // Delegate to the shared selector core: `shortestPath()` is exactly
+        // `ANY SHORTEST` between two bound nodes — one loopless shortest path, or none.
+        let Some(hops) = self
+            .select_paths(src, dst, rel, (min, max), PathSelector::AnyShortest)?
+            .into_iter()
+            .next()
+        else {
             return Ok(Val::Null);
-        }
-
-        // BFS by node, recording the predecessor edge to reconstruct the path. The
-        // first time `dst` is dequeued (or reached) yields a shortest path; node
-        // uniqueness (visited set) keeps it to simple, shortest paths.
-        let empty = HashMap::new();
-        let mut visited: HashSet<u64> = HashSet::new();
-        visited.insert(src);
-        // (node, predecessor hop into it). The root has no predecessor.
-        let mut pred: HashMap<u64, Hop> = HashMap::new();
-        let mut frontier = vec![src];
-        let mut depth = 0u32;
-        let mut found = false;
-        'bfs: while !frontier.is_empty() && depth < max {
-            self.check_deadline()?;
-            let mut next = Vec::new();
-            for &node in &frontier {
-                for hop in self.expand_one_hop(node, rel, &empty)? {
-                    let nb = hop.neighbour;
-                    if visited.contains(&nb) {
-                        continue;
-                    }
-                    visited.insert(nb);
-                    pred.insert(nb, hop);
-                    if nb == dst {
-                        found = true;
-                        break 'bfs;
-                    }
-                    next.push(nb);
-                }
-            }
-            frontier = next;
-            depth += 1;
-        }
-        if !found {
-            return Ok(Val::Null);
-        }
-        // Walk predecessors back from dst to src, then reverse into walk order.
-        let mut hops_rev: Vec<Hop> = Vec::new();
-        let mut cur = dst;
-        while cur != src {
-            let hop = pred.get(&cur).expect("BFS predecessor recorded");
-            // `cur` is `hop.neighbour`; the node we arrived from is the opposite
-            // stored endpoint.
-            cur = if hop.start == cur { hop.end } else { hop.start };
-            hops_rev.push(hop.clone());
-        }
-        hops_rev.reverse();
-        let path = make_path(src, &hops_rev);
+        };
+        let path = make_path(src, &hops);
         if reverse {
             if let Val::Path {
                 mut nodes,
@@ -5005,6 +5214,9 @@ fn reverse_pattern(p: &Pattern) -> Pattern {
         // (`maybe_reroot` bails on any `var_length`), so there is no restrictor to
         // carry; a restrictor pattern always has a variable-length relationship.
         restrictor: p.restrictor,
+        // A selected pattern is routed to `apply_match_selected` and never reaches
+        // `maybe_reroot`, so there is no selector to carry here.
+        selector: None,
     }
 }
 
@@ -5074,9 +5286,10 @@ fn expand_quantified_pattern(p: &Pattern) -> Result<Vec<Pattern>> {
             start: p.start.clone(),
             rels,
             segments: None,
-            // A restrictor over a quantified group is rejected at lowering, so a
-            // segment-bearing pattern never carries one to desugar here.
+            // A restrictor or selector over a quantified group is rejected at
+            // lowering, so a segment-bearing pattern never carries one to desugar.
             restrictor: None,
+            selector: None,
         })
         .collect())
 }
@@ -7315,6 +7528,213 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("restrictor") && e.contains("quantified"), "{e}");
+    }
+
+    // ── GQL shortest-path selectors (PR 3) ───────────────────────────────────
+    // ANY/ALL SHORTEST and SHORTEST k share the BFS core `select_paths` with
+    // `shortestPath()`. Parity is checked on the basic fixture; the multi-path
+    // behaviours run over the diamond fixture (testgen::write_diamond), which has two
+    // length-2 `s→t` paths (via `a`, via `b`) plus a length-3 detour `s→a→c→t`.
+
+    /// Parse + run `q` against a fresh diamond fixture, returning the result or the
+    /// error string, and always cleaning the fixture up.
+    fn diamond_result(tag: &str, q: &str) -> std::result::Result<QueryResult, String> {
+        let (root, graph) = testgen::write_diamond(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let out = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
+
+    /// Sorted path lengths (`size(r)` per row) for a diamond query that must succeed.
+    fn diamond_lengths(tag: &str, q: &str) -> Vec<i64> {
+        let mut v: Vec<i64> = diamond_result(tag, q)
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Val::Int(i) => i,
+                ref o => panic!("expected Int length, got {o:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn any_shortest_parity_with_shortest_path() {
+        // ANY SHORTEST over a MATCH pattern agrees with the shortestPath() function on
+        // the same endpoints: the single shortest KNOWS path Alice→Carol is the direct
+        // 1-hop edge, and its node sequence is [Alice, Carol].
+        let sel = run_result(
+            "exec_gql_any_parity",
+            "MATCH ANY SHORTEST p = (a:Person {name:'Alice'})-[:KNOWS*]->(c:Person {name:'Carol'}) \
+             RETURN size(relationships(p)) AS l, [n IN nodes(p) | n.name] AS names",
+        )
+        .unwrap();
+        assert_eq!(sel.rows.len(), 1, "one shortest path for the single pair");
+        assert!(
+            matches!(sel.rows[0][0], Val::Int(1)),
+            "{:?}",
+            sel.rows[0][0]
+        );
+        assert_eq!(render(&sel.rows[0][1]), "['Alice','Carol']");
+
+        // The shortestPath() function returns the identical length on the same pair.
+        let func = run_result(
+            "exec_gql_any_parity_fn",
+            "MATCH (a:Person {name:'Alice'}), (c:Person {name:'Carol'}) \
+             RETURN length(shortestPath((a)-[:KNOWS*]->(c))) AS l",
+        )
+        .unwrap();
+        assert!(matches!(func.rows[0][0], Val::Int(1)));
+    }
+
+    #[test]
+    fn any_shortest_picks_one_of_the_ties() {
+        // On the diamond, ANY SHORTEST returns exactly one s→t path, of length 2.
+        let lens = diamond_lengths(
+            "exec_gql_any_one",
+            "MATCH ANY SHORTEST (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2], "a single shortest path");
+    }
+
+    #[test]
+    fn all_shortest_returns_all_ties() {
+        // ALL SHORTEST returns both length-2 paths (via `a`, via `b`) and not the
+        // length-3 detour — every path of the minimum length, no more.
+        let lens = diamond_lengths(
+            "exec_gql_all_ties",
+            "MATCH ALL SHORTEST (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2, 2], "two length-2 ties");
+
+        // The two paths are distinct: their interior node is `a` in one, `b` in the
+        // other.
+        let res = diamond_result(
+            "exec_gql_all_ties_nodes",
+            "MATCH ALL SHORTEST p = (s {name:'s'})-[:R*]->(t {name:'t'}) \
+             RETURN [n IN nodes(p) | n.name] AS names",
+        )
+        .unwrap();
+        let mut names: Vec<String> = res.rows.iter().map(|r| render(&r[0])).collect();
+        names.sort();
+        assert_eq!(names, vec!["['s','a','t']", "['s','b','t']"]);
+    }
+
+    #[test]
+    fn shortest_k_returns_k_in_length_order() {
+        // SHORTEST 2 → the two length-2 ties.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k2",
+                "MATCH SHORTEST 2 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2],
+        );
+        // SHORTEST 3 → the two ties plus the length-3 detour (k can pull in a longer
+        // path once the shortest ones are spent).
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k3",
+                "MATCH SHORTEST 3 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2, 3],
+        );
+        // SHORTEST 4 cannot exceed the three loopless paths that exist.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k4",
+                "MATCH SHORTEST 4 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2, 2, 3],
+        );
+        // SHORTEST 1 ≡ ANY SHORTEST: a single shortest path.
+        assert_eq!(
+            diamond_lengths(
+                "exec_gql_k1",
+                "MATCH SHORTEST 1 (s {name:'s'})-[r:R*]->(t {name:'t'}) RETURN size(r) AS l",
+            ),
+            vec![2],
+        );
+    }
+
+    #[test]
+    fn selector_applies_where_after_selection() {
+        // Free endpoints ranging over every node, narrowed by a WHERE on their names:
+        // only the s→t pairing survives, yielding the two shortest paths. This proves
+        // the clause WHERE is applied per produced path, across the endpoint product.
+        let lens = diamond_lengths(
+            "exec_gql_sel_where",
+            "MATCH ALL SHORTEST (x)-[r:R*]->(y) WHERE x.name = 's' AND y.name = 't' \
+             RETURN size(r) AS l",
+        );
+        assert_eq!(lens, vec![2, 2]);
+
+        // A WHERE that excludes every endpoint pair yields no rows.
+        let none = diamond_result(
+            "exec_gql_sel_where_empty",
+            "MATCH ANY SHORTEST (x)-[r:R*]->(y) WHERE x.name = 't' AND y.name = 's' \
+             RETURN size(r) AS l",
+        )
+        .unwrap();
+        assert!(none.rows.is_empty(), "no t→s path exists");
+    }
+
+    #[test]
+    fn selector_optional_emits_null_when_no_path() {
+        // OPTIONAL MATCH with a selector keeps the driving row and null-fills when no
+        // path connects the endpoints (t cannot reach s).
+        let res = diamond_result(
+            "exec_gql_sel_optional",
+            "MATCH (a {name:'t'}) OPTIONAL MATCH ANY SHORTEST (a)-[r:R*]->(z {name:'s'}) \
+             RETURN a.name AS a, r IS NULL AS no_path",
+        )
+        .unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "t");
+        assert!(matches!(res.rows[0][1], Val::Bool(true)));
+    }
+
+    #[test]
+    fn selector_rejections() {
+        // A multi-relationship selected pattern is out of scope (PR 3 covers a single
+        // relationship, like shortestPath()).
+        let e = diamond_result(
+            "exec_gql_sel_multi",
+            "MATCH ANY SHORTEST (s {name:'s'})-[:R]->(m)-[:R*]->(t {name:'t'}) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("single relationship"), "{e}");
+
+        // A selector combined with a restrictor is not yet supported.
+        let e = diamond_result(
+            "exec_gql_sel_restr",
+            "MATCH ANY SHORTEST TRAIL (s {name:'s'})-[:R*]->(t {name:'t'}) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("restrictor"), "{e}");
+
+        // A selector over a quantified group is rejected at lowering.
+        let e = diamond_result(
+            "exec_gql_sel_quant",
+            "MATCH ALL SHORTEST (s {name:'s'}) ((x)-[:R]->(y)){1,2} (t) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("selector") && e.contains("quantified"), "{e}");
+
+        // A selector cannot share its clause with a comma-joined pattern.
+        let e = diamond_result(
+            "exec_gql_sel_multipat",
+            "MATCH ANY SHORTEST (s {name:'s'})-[:R*]->(t {name:'t'}), (u) RETURN t",
+        )
+        .unwrap_err();
+        assert!(e.contains("only") && e.contains("pattern"), "{e}");
     }
 
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────

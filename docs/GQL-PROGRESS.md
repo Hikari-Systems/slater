@@ -15,11 +15,12 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 
 ## NEXT ACTION
 
-> **Resume at PR 3 — shortest-path selectors ANY SHORTEST / ALL SHORTEST / SHORTEST k.**
-> Use the "Resume → PR 3" prompt in GQL-PLAN.md §4. Before any new work, run the
-> green-state gate. New branch: `gql-shortest-selectors`.
-> Generalise `eval_shortest_path` (exec.rs ~3127) and drive it from a *selected*
-> MATCH pattern; keep `shortestPath()` delegating to the same single BFS core.
+> **Resume at PR 4 — label boolean expressions `& | !`.**
+> Use the "Resume → PR 4" prompt in GQL-PLAN.md §4. Before any new work, run the
+> green-state gate. New branch: `gql-label-expressions`.
+> **This PR changes the AST** (`NodePat.labels` → a `label_expr`); grep every
+> `.labels` reader first and expect broad edits. Commit a WIP-green checkpoint once
+> the AST change compiles and all existing tests pass, *before* adding new behaviour.
 
 ---
 
@@ -27,7 +28,7 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 
 - [x] **PR 1 — Quantified path patterns `((…)){m,n}`** — branch `gql-quantified-paths`
 - [x] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE** — branch `gql-path-restrictors`
-- [ ] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k**
+- [x] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k** — branch `gql-shortest-selectors`
 - [ ] **PR 4 — Label boolean expressions `& | !`** (AST churn)
 - [ ] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs**
 
@@ -139,6 +140,63 @@ clean; fmt clean.
   `restrictor_over_quantified_group_rejected`.
 - New fixture `testgen::write_cycle`: three `:N` nodes, reltype `R`, a→b→c→a triangle
   plus a c→b chord — the minimal graph that tells all four modes apart.
+
+Committed on branch `gql-path-restrictors` (commit `237093c`).
+
+### PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k ✅ (branch `gql-shortest-selectors`)
+
+Additive again: the quantifier-free, restrictor-free, selector-free hot path is
+untouched. Full suite green: **386 passed** (372 pre-existing + 14 new); clippy clean;
+fmt clean.
+
+**Approach (so PR 4+ build on it correctly):**
+- Grammar: a `path_selector` rule (`any_shortest`/`all_shortest`/`shortest_k`) prefixed
+  on `match_pattern` *before* the restrictor and the optional path variable
+  (`MATCH ANY SHORTEST (a)-[:R*]->(b)`, `MATCH ALL SHORTEST p = …`, `MATCH SHORTEST 3 …`).
+  `all_shortest` reuses the existing `kw_all`; `kw_any`/`kw_shortest` are new. Like the
+  restrictors it sits only at the pattern head, so a node var spelled `any`/`shortest`
+  is unaffected.
+- AST: `ast::PathSelector` (`AnyShortest`|`AllShortest`|`ShortestK(u32)`) + additive
+  `Pattern.selector: Option<PathSelector>`. All other Pattern construction sites pass
+  `None`. `SHORTEST 0` is rejected at lowering.
+- Executor: **one shared BFS core** `select_paths(src, dst, rel, bounds, selector)`
+  drives both the selector and `shortestPath()`. It returns loopless paths in
+  non-decreasing length order — `AnyShortest` ≤1, `AllShortest` every minimum-length
+  path, `ShortestK(k)` the first `k`. `eval_shortest_path` now validates its wrapped
+  pattern then delegates with `AnyShortest` between two bound nodes (so the function and
+  the selector can never diverge — confirmed by the unchanged `phase7_shortest_path*`
+  tests). `apply_match_selected` resolves each endpoint (bound node, or scanned +
+  `node_ok`-filtered), runs the core per `(src, dst)` pair, binds endpoints / the
+  list-valued rel var / any path var, and applies the clause `WHERE` per produced path.
+- Guards: a selected pattern is routed out of `apply_match` first; the fast paths and
+  the quantified/restrictor branches never see one.
+
+**Design decisions / limitations (carried forward, see DECISIONS D37):**
+- **Single relationship, like `shortestPath()`.** Multi-relationship selected patterns,
+  selector+restrictor combinations, relationship property filters, and a selector
+  sharing its clause with a comma-joined pattern are rejected with clear messages.
+- **Endpoints need not be pre-bound** — the real generalisation over `shortestPath()`
+  (which requires both endpoints bound). Free endpoints are scanned and label/prop
+  filtered.
+- **WHERE is applied after selection** (find shortest, then filter), not a
+  shortest-subject-to-WHERE search.
+- **Loopless paths** (no repeated node), matching `shortestPath()`'s simple-path search.
+
+**Tests (all green):**
+- Parser (`parser.rs`): `lowers_path_selectors`, `absent_selector_is_none`,
+  `selector_lowercase_accepted`, `selector_with_path_var_follows_prefix`,
+  `selector_does_not_shadow_node_var`, `selector_zero_k_rejected`,
+  `selector_over_quantified_rejected`.
+- Exec (`exec.rs`): `any_shortest_parity_with_shortest_path` (parity vs the function:
+  same length + node sequence), `any_shortest_picks_one_of_the_ties`,
+  `all_shortest_returns_all_ties` (both length-2 ties, distinct interior nodes),
+  `shortest_k_returns_k_in_length_order` (`SHORTEST 2`→2, `SHORTEST 3`→2+1 longer,
+  `SHORTEST 4` capped at the 3 existing paths, `SHORTEST 1`≡`ANY SHORTEST`),
+  `selector_applies_where_after_selection`, `selector_optional_emits_null_when_no_path`,
+  `selector_rejections`.
+- New fixture `testgen::write_diamond`: five `:N` nodes, reltype `R`, two length-2
+  `s→t` paths (via `a`, via `b`) plus a length-3 detour `s→a→c→t` — the minimal graph
+  that tells the three selectors apart.
 
 **Not yet committed** as of this entry — the branch holds the working tree; commit
 before clearing context.

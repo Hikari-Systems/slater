@@ -647,3 +647,39 @@ restrictors onto that walk rather than inventing a whole-pattern uniqueness pass
   restrictor's intent can't be honoured across the repetitions. Reject (clear message)
   beats silently dropping it. The later fix is a dedicated repeater that threads one
   `used`/`visited` set instead of desugaring when a restrictor is present.
+
+### D37 — GQL shortest-path selectors share `shortestPath()`'s BFS core (GQL track PR 3)
+GQL's `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k` prefix a MATCH pattern and pick
+shortest connecting paths between the pattern's two endpoints. Rather than add a second
+traversal, PR 3 generalises the BFS that already backed the `shortestPath()` function
+into one shared core (`select_paths`, `exec.rs`) and routes both callers through it.
+- **`Pattern.selector: Option<PathSelector>` (`AnyShortest`/`AllShortest`/`ShortestK`);
+  `None` ≡ the ordinary matcher.** Additive, like the PR 1/PR 2 pattern fields, so every
+  existing construction is unaffected. A selected pattern is routed out of `apply_match`
+  *before* the streaming/quantified/restrictor paths to its own handler
+  (`apply_match_selected`).
+- **One BFS core for both callers.** `select_paths(src, dst, rel, bounds, selector)`
+  returns the chosen paths as hop-lists in walk order: `AnyShortest` → ≤1 path,
+  `AllShortest` → every path of the single minimum length, `ShortestK(k)` → up to `k`
+  paths in non-decreasing length order. `shortestPath()` is now exactly `AnyShortest`
+  between two *bound* nodes — it validates its wrapped pattern as before, then delegates,
+  so the two can never diverge. Paths are **loopless** (no repeated node), matching
+  `shortestPath()`'s long-standing simple-path search and bounding the walk on a cyclic
+  graph. BFS explores layer-by-layer, so every entry in a layer has the same hop count
+  and paths surface in non-decreasing length order — the property `AllShortest`/`ShortestK`
+  rely on; a path is never extended past `dst`.
+- **Endpoints need not be pre-bound (the real generalisation over `shortestPath()`).**
+  Each endpoint is either a node already bound by the seed/an earlier clause, or a free
+  endpoint **scanned** by the usual planner strategy and filtered by `node_ok` (its
+  labels + inline props). The selector then runs per `(src, dst)` pair. A shared endpoint
+  variable (`(a)-[*]->(a)`) is kept consistent by the same `loose_eq` guard the ordinary
+  matcher uses.
+- **WHERE is applied *after* selection**, per produced path (consistent with how the
+  ordinary matcher applies a clause `WHERE` to a completed binding). So a selector finds
+  the shortest paths first, then filters them by the endpoint/`WHERE` predicates — not a
+  shortest-path-subject-to-`WHERE` search. Acceptable and predictable for the read subset.
+- **Scope (PR 3): a single relationship, like `shortestPath()`.** A multi-relationship
+  selected pattern, a selector combined with a path restrictor, a relationship property
+  filter, and a selector sharing its clause with a comma-joined pattern are all
+  **rejected** with clear messages (future work). A selector over a quantified group is
+  rejected at lowering (same reasoning as D36). `SHORTEST 0` is rejected as meaningless.

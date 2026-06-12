@@ -61,6 +61,11 @@ kw_walk = @{ ^"walk" ~ !ident_cont }
 kw_trail = @{ ^"trail" ~ !ident_cont }
 kw_acyclic = @{ ^"acyclic" ~ !ident_cont }
 kw_simple = @{ ^"simple" ~ !ident_cont }
+// GQL shortest-path selectors (PR 3). Like the restrictors they appear only at the
+// head of a `match_pattern`, never inside `(…)`/`[…]`, so a node variable spelled
+// `any`/`shortest` is unaffected. `all` reuses the existing `kw_all` (UNION ALL).
+kw_any = @{ ^"any" ~ !ident_cont }
+kw_shortest = @{ ^"shortest" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
@@ -165,7 +170,18 @@ path_var = { identifier }
 // by `match_clause`; the bare `pattern` rule (shortestPath/EXISTS/pattern
 // comprehensions) stays quantifier-free so those expression contexts never see a
 // segment they can't execute.
-match_pattern = { path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+match_pattern = { path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+
+// GQL shortest-path selector: `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k`
+// prefixed on a MATCH pattern (e.g. `MATCH ANY SHORTEST (a)-[:R*]->(b)`). It picks
+// shortest connecting paths between the pattern's two endpoints; see
+// `lower_path_selector` and `apply_match_selected` in exec.rs. Scoped (PR 3) to a
+// single-relationship pattern, like `shortestPath()`. `shortest_k` is tried last so
+// `ANY SHORTEST` / `ALL SHORTEST` (which start with their own keyword) bind first.
+path_selector = { any_shortest | all_shortest | shortest_k }
+any_shortest = { kw_any ~ kw_shortest }
+all_shortest = { kw_all ~ kw_shortest }
+shortest_k = { kw_shortest ~ integer }
 
 // GQL path restrictor: `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` prefixed on a MATCH
 // pattern (e.g. `MATCH TRAIL (a)-[:R*]->(b)`). It controls node/edge reuse over a
