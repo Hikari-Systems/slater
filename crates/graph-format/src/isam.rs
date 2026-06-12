@@ -387,6 +387,24 @@ impl IsamReader {
         out.dedup();
         Ok(out)
     }
+
+    /// Distinct keys in ascending order, each paired with the number of entries
+    /// (ids) sharing that key. One sequential pass over all blocks — no per-key
+    /// lookups and no node-record reads. Keys are globally sorted with equal keys
+    /// adjacent (see `write_isam`), so a run-length count over the concatenated
+    /// blocks is exact; an open run is carried across the block boundary.
+    pub fn distinct_key_counts(&self) -> Result<Vec<(Value, u64)>> {
+        let mut out: Vec<(Value, u64)> = Vec::new();
+        for b in 0..self.top.len() {
+            for (k, _) in self.read_block(b)? {
+                match out.last_mut() {
+                    Some((prev, n)) if prev.cmp_key(&k) == Ordering::Equal => *n += 1,
+                    _ => out.push((k, 1)),
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +446,41 @@ mod tests {
         }
         // Absent key.
         assert!(r.lookup_eq(&Value::Str("Nope".into())).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn distinct_key_counts_matches_lookup_eq() {
+        let path = tmp("distinct");
+        // Repeated keys whose runs span block boundaries (tiny blocks below).
+        let mut entries = Vec::new();
+        let sources = ["Fowler-2010", "Smith-1999", "Whitehead-2024"];
+        for id in 0..600u64 {
+            entries.push((Value::Str(sources[(id % 3) as usize].to_string()), id));
+        }
+        write_isam(&path, entries.clone(), 64, 3).unwrap();
+        let r = IsamReader::open(&path).unwrap();
+        assert!(r.num_blocks() > 1);
+
+        let got = r.distinct_key_counts().unwrap();
+        // Keys ascending and distinct.
+        assert_eq!(
+            got.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            sources
+                .iter()
+                .map(|s| Value::Str(s.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        // Each count equals the per-key lookup length (the run-length is exact).
+        for (k, n) in &got {
+            assert_eq!(*n, r.lookup_eq(k).unwrap().len() as u64);
+            assert_eq!(*n, linear_eq(&entries, k).len() as u64);
+        }
+        // Counts sum to the total number of entries.
+        assert_eq!(
+            got.iter().map(|(_, n)| n).sum::<u64>(),
+            entries.len() as u64
+        );
         let _ = std::fs::remove_file(&path);
     }
 

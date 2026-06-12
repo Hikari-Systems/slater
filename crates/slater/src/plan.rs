@@ -261,7 +261,7 @@ fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)])
 }
 
 /// Find an *open* range index over `(label ∈ labels, prop)` for a node entity.
-fn index_for(gen: &Generation, labels: &[String], prop: &str) -> Option<String> {
+pub(crate) fn index_for(gen: &Generation, labels: &[String], prop: &str) -> Option<String> {
     for ri in &gen.manifest().range_indexes {
         if ri.entity == EntityKind::Node
             && ri.property == prop

@@ -20,15 +20,18 @@
 | 4 | Block-cache record read (no per-record copy / less locking) | high | **DONE** | broad floor drop: 2-hop **48→1.95 ms** (Neo4j parity), agg/CONTAINS/DISTINCT ~3×, 3-hop ~49 ms |
 | 5 | Streaming aggregation + projection pushdown + prop memo | med | **DONE** | agg **19.5→10.3 ms**, DISTINCT **20.5→11.6 ms**, CONTAINS **16→9.0 ms** (~1.8× each; now 1.3–2× Neo4j) |
 | 6 | Traversal frame **+ LIMIT pushdown** (the real lever) | med | **DONE** | 3-hop **45→1.6 ms** (now *beats* Neo4j), 1-hop **4.8→2.6 ms**, 2-hop 2.0→1.6 ms; no row regressions |
+| 7 | Index-driven group-by / DISTINCT fast path | med | **DONE** | agg **10.8→2.8 ms**, count DISTINCT **11.3→2.6 ms** (both now *beat* Neo4j); CONTAINS unchanged (out of scope) |
 
 Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk) — **DONE 2026-06-12**, see
 "Validation results (Stages 0–3)" below. **Stage 4 DONE 2026-06-12** — see "Validation results
 (Stage 4)". **Stage 5 DONE 2026-06-12** — see "Validation results (Stage 5)". **Stage 6 DONE
-2026-06-12** — see "Validation results (Stage 6)". All six stages are now complete; cold
-execution matches or beats Neo4j on every benchmark row except the three Crime-anchored full
-scans (agg/CONTAINS/DISTINCT, 1.3–2.3× off), which stay compute-bound (no further fast path
-applies without changing the answer).
-**Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–6 (see below).
+2026-06-12** — see "Validation results (Stage 6)". **Stage 7 DONE 2026-06-12** — see "Validation
+results (Stage 7)". Cold execution now matches or beats Neo4j on every benchmark row **except
+`full-scan CONTAINS`** (~9 ms vs Neo4j ~4 ms): a substring match that no index can shortcut, and
+the one remaining compute-bound row. Stage 7 closed the other two former gaps (agg-by-type and
+count-DISTINCT-type) by answering them from the range index instead of decoding a property from
+every Crime node.
+**Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–7 (see below).
 
 ### Bonus (this round): result-cache disable switch
 `config.cache.resultCacheBytes` ≤ 0 now **disables** the result LRU entirely (`get` always
@@ -286,6 +289,84 @@ tests lock its semantics), but the measurable Stage-6 win is entirely the LIMIT 
   `exec::tests::limit_pushdown_{traversal_returns_order_preserving_prefix,with_skip,
   streaming_scan_prefix}`, `exec::tests::limit_does_not_break_aggregation_or_order`.
 
+## Validation results (Stage 7 — index-driven group-by / DISTINCT, measured 2026-06-12, cache DISABLED)
+
+Freshly built current-source image (`resultCacheBytes: 0`), same machine/data, Neo4j on :7688.
+**No `!rows` mismatch on any row** → correctness preserved. The "before" column is a same-session
+re-run of the Stage-6 image (agrees with the Stage-6 table); two back-to-back after-runs agreed
+within noise.
+
+| query | Stage 6 (cache off) | **Stage 7 (cache off)** | Neo4j | vs Neo4j |
+|-------|-------------------:|------------------------:|------:|---------:|
+| count all nodes | 0.63 ms | 0.61 ms | 2.9 ms | ~4.8× faster |
+| Crime label count | 0.61 ms | 0.63 ms | 1.7 ms | ~2.7× faster |
+| point lookup (idx nhs_no) | 0.68 ms | 0.70 ms | 1.1 ms | ~1.5× faster |
+| idx-eq count (Crime.type) | 1.55 ms | 1.5 ms | 1.1 ms | 1/1.3× |
+| 1-hop Crime→Location | 2.6 ms | 2.6 ms | 1.95 ms | 1/1.3× |
+| 2-hop Person→Loc→Area | 1.61 ms | 1.61 ms | 1.9 ms | ~parity |
+| agg crimes by type | 10.8 ms | **2.8 ms** | 7.9 ms | **~2.8× faster** |
+| 3-hop Officer/Crime/Loc | 1.63 ms | 1.6 ms | 2.1 ms | 1.3× faster |
+| full-scan CONTAINS | 9.3 ms | 9.1 ms | 4.1 ms | 1/2.2× (unchanged, out of scope) |
+| count DISTINCT type | 11.3 ms | **2.6 ms** | 6.5 ms | **~2.4× faster** |
+
+**Headline: agg-by-type fell 10.8 → 2.8 ms (~3.9×) and count-DISTINCT-type 11.3 → 2.6 ms (~4.3×);
+both now *beat* Neo4j.** Every other row is unchanged within noise — no regression on the sub-2 ms
+count/index rows or the traversal rows. The only remaining gap is `full-scan CONTAINS` (substring
+match, no index applies — explicitly out of scope). Memory unchanged (~62 MiB RSS).
+
+### What it does (the structure already existed at write time)
+
+`c.type` already has a sorted range index (`node_Crime_type` — the ISAM the idx-eq row uses), built
+at ingest. It was used **only** for equality lookups; Stage 7 adds the read path that answers
+group-by and DISTINCT from it:
+
+- **`IsamReader::distinct_key_counts()`** (`crates/graph-format/src/isam.rs`): one sequential pass
+  over all index blocks, run-length-counting adjacent equal keys (keys are globally sorted with
+  equal keys adjacent — the same invariant `lookup_eq`'s block-walk relies on). Returns
+  `Vec<(Value, count)>`. **No node-record reads.**
+- **`try_grouped_index_fast_path`** (`crates/slater/src/exec.rs`, in `run_single` right after
+  `try_count_fast_path`): recognises `MATCH (n:L) RETURN n.p, count(*)` (group-by) and
+  `RETURN count(DISTINCT n.p)` (distinct-count) over an indexed `p` (reusing `plan::index_for`),
+  and builds the result from `distinct_key_counts()`:
+  - **group-by**: one row per `(key, count)`, plus a **null group** for `L`-nodes lacking `p`
+    (`nodes_with_label(L).len() − Σcount`; the index is per-(label,property) so its ids ⊆ the label
+    posting, making this exact). The pole data has crimes with no `type`, so the agg row correctly
+    emits 14 groups (13 types + null); DISTINCT correctly reports 13 (the index omits nulls, which
+    `count(DISTINCT …)` also excludes).
+  - **distinct-count**: a single row whose value is the number of distinct keys.
+  - `ORDER BY`/`SKIP`/`LIMIT` are applied to the small grouped output via
+    `order_skip_limit_no_input` (the agg query has `ORDER BY n DESC LIMIT 10`).
+
+Guards mirror `try_count_fast_path` (one non-OPTIONAL `MATCH`, no `WHERE`, single-node pattern, one
+label, no inline props, no `*`); any other aggregate, a second grouping key, or a non-indexed
+property falls back to the (correct) general path.
+
+### Gotcha found and fixed mid-stage (the DISTINCT path first declined)
+
+The first after-bench showed agg dropping to 2.8 ms but **DISTINCT unchanged at 11 ms** — the
+distinct shape was silently declining. Cause: `lower_return_clause` sets `ReturnClause.distinct` via
+`has_keyword(pair, "distinct")`, a **raw text scan** of the whole clause — so
+`RETURN count(DISTINCT c.type)` reports `ret.distinct = true` even though there is no
+`RETURN DISTINCT`. The initial `if sq.ret.distinct { return None }` guard therefore rejected exactly
+the distinct-count shape. Fix: drop that guard — for both shapes the output rows are unique by
+grouping key (the null group's key is distinct too), so a final-row `DISTINCT` is always a no-op.
+(The harmless quirk is why the general path never surfaced it: dedup over a single count row does
+nothing.) A correctness test alone could not catch this — the general path returns the same answer —
+so `grouped_index_fast_path_fires_without_scanning` asserts *firing* via the intermediate budget:
+the index walk charges nothing, so a budget too small for a per-row scan succeeds, while the same
+query forced onto the general path (residual `WHERE`) exhausts it.
+
+### Tests (346 slater + 51 graph-format lib tests green)
+
+- **graph-format**: `isam::tests::distinct_key_counts_matches_lookup_eq` — duplicate keys spanning a
+  block boundary; each `(key, count)` equals `lookup_eq(key).len()`, keys ascending/distinct.
+- **slater** (fixture gained a `(Person, team)` index — Alice/Bob = `'Red'`, Carol has no team — to
+  exercise a duplicate key *and* a null group): `exec::tests::grouped_index_{distinct_count_fast_path,
+  group_by_fast_path,matches_general_path,fast_path_guards,fast_path_fires_without_scanning}`.
+  `matches_general_path` compares the fast path against the same query forced onto the general path;
+  `fast_path_guards` covers the fall-backs (residual `WHERE`, non-count aggregate, two grouping keys,
+  non-indexed property).
+
 ## Validation harness
 
 ### Test data locations (on this machine)
@@ -523,6 +604,33 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
   `try_stream_match`, `match_patterns`, `match_single_pattern`, `expand_chain`, `restore_binding`.
 - **Validate:** 3-/1-/2-hop drop to low ms; results unchanged (frame characterization +
   `limit_pushdown_*` tests; 341 slater + 50 graph-format lib tests green). ✓
+
+### Stage 7 — Index-driven group-by / DISTINCT fast path  **[DONE 2026-06-12]**
+- **Result:** agg-by-type **10.8→2.8 ms**, count-DISTINCT-type **11.3→2.6 ms** (both now beat
+  Neo4j); all other rows unchanged, no `!rows` mismatch. See "Validation results (Stage 7)" for the
+  full table, the *what-it-does* breakdown, and the mid-stage `ret.distinct` gotcha.
+- **Problem:** the two remaining index-answerable full scans. `MATCH (c:Crime) RETURN c.type,
+  count(*)` and `count(DISTINCT c.type)` materialised ~28k Crime rows and decoded `c.type` per node,
+  even though `c.type` already has a sorted range index — the answer (distinct keys + per-key counts)
+  is one sequential index walk away, touching no node records.
+- **Change (two parts):**
+  1. **`IsamReader::distinct_key_counts()`** (`crates/graph-format/src/isam.rs`): run-length count of
+     adjacent equal keys over all blocks → `Vec<(Value, u64)>`; no node-record reads.
+  2. **`try_grouped_index_fast_path`** (`crates/slater/src/exec.rs`, in `run_single` after
+     `try_count_fast_path`): recognises the group-by and distinct-count shapes over an indexed
+     property (reuses `plan::index_for`), builds rows from `distinct_key_counts()` — including a null
+     group for label-nodes lacking the property — and applies `ORDER BY/SKIP/LIMIT` via the new
+     `order_skip_limit_no_input`. `ret.distinct` is deliberately **not** a guard (the parser sets it
+     from the inner `count(DISTINCT …)`; final-row dedup over unique grouped rows is a no-op).
+- **Files:** `crates/graph-format/src/isam.rs` (`distinct_key_counts`); `crates/slater/src/exec.rs`
+  (`try_grouped_index_fast_path`, `order_skip_limit_no_input`, `node_property`,
+  `count_distinct_property`); `crates/slater/src/plan.rs` (`index_for` → `pub(crate)`);
+  `crates/slater/src/testgen.rs` (fixture `(Person, team)` index for dup-key + null-group coverage).
+- **Out of scope:** `full-scan CONTAINS` (substring; no index applies — would need a trigram index
+  or a parallel scan). It is now the only benchmark row slower than Neo4j.
+- **Validate:** agg/DISTINCT drop to ~2.6–2.8 ms and beat Neo4j; no regression elsewhere; 346 slater
+  + 51 graph-format lib tests green, incl. `grouped_index_fast_path_fires_without_scanning` (proves
+  the path fires via the intermediate budget, not just correctness). ✓
 
 ## Appendix — regenerate test data if lost
 
