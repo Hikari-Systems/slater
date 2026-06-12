@@ -433,6 +433,53 @@ mod tests {
     }
 
     #[test]
+    fn single_positive_label_atom_still_picks_label_scan() {
+        // PR 4 perf-parity: a lone positive label atom must keep the cheap LabelScan
+        // (and stay a guaranteed label downstream), exactly as the pre-LabelExpr
+        // `:Person` case did.
+        let (root, graph, _) = crate::testgen::write_basic("plan_label_atom");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let person = gen.label_id("Person").unwrap();
+        assert_eq!(
+            plan_for(&gen, "MATCH (n:Person) RETURN n"),
+            NodeScan::LabelScan { label_id: person },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conjunction_label_scans_the_smaller_posting() {
+        // `:A&B` keeps both as required labels (like the old `:A:B`), so the planner
+        // still picks the smaller label posting (2 companies < 3 persons); `node_ok`
+        // then enforces the full conjunction.
+        let (root, graph, _) = crate::testgen::write_basic("plan_label_and");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let company = gen.label_id("Company").unwrap();
+        assert_eq!(
+            plan_for(&gen, "MATCH (n:Person&Company) RETURN n"),
+            NodeScan::LabelScan { label_id: company },
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disjunctive_or_negated_label_expr_falls_back_to_all_nodes() {
+        // A disjunction or negation guarantees no single label, so there is nothing
+        // to label-scan: plan a full scan and let `node_ok` re-check the expression.
+        let (root, graph, _) = crate::testgen::write_basic("plan_label_bool");
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(
+            plan_for(&gen, "MATCH (n:Person|Company) RETURN n"),
+            NodeScan::AllNodes,
+        );
+        assert_eq!(
+            plan_for(&gen, "MATCH (n:!Person) RETURN n"),
+            NodeScan::AllNodes
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn inline_equality_on_indexed_property_picks_range_eq() {
         let (root, graph, _) = crate::testgen::write_basic("plan_inline_eq");
         let gen = Generation::open(&root, &graph).unwrap();

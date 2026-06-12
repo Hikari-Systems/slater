@@ -683,3 +683,42 @@ into one shared core (`select_paths`, `exec.rs`) and routes both callers through
   filter, and a selector sharing its clause with a comma-joined pattern are all
   **rejected** with clear messages (future work). A selector over a quantified group is
   rejected at lowering (same reasoning as D36). `SHORTEST 0` is rejected as meaningless.
+
+### D38 — GQL label boolean expressions reuse one `LabelExpr` AST (GQL track PR 4)
+GQL extends label/type predicates beyond Cypher's `:A:B` (AND) and `:T1|T2` (rel
+alternation) to full booleans `!` > `&` > `|` with parentheses. PR 4 is the one PR
+with AST churn, deliberately sequenced last so the pattern AST (PRs 1–3) had settled.
+- **Sugar lowers into the same tree — no special cases.** The grammar makes both
+  `labels` and `rel_types` a `":" ~ label_expr` precedence climb; `:A:B` parses with
+  the `:` as an AND connector (→ `And`) and `:T1|T2` / `:T1|:T2` as `Or`. So every
+  pre-GQL query produces an ordinary `LabelExpr` and there is no parallel code path for
+  the classic forms. The WHERE postfix predicate `n:A:B` (`label_pred` →
+  `Expr::HasLabels`) is a *different* rule and keeps its AND-only form — out of scope,
+  smaller blast radius.
+- **One `LabelExpr` enum (`Atom`/`And`/`Or`/`Not`) for both node labels and
+  relationship types.** `NodePat.label_expr: Option<LabelExpr>` and
+  `RelPat.type_expr: Option<LabelExpr>` (`None` ≡ no constraint, the additive
+  default that leaves every other construction site untouched, as in D34/D36/D37).
+  Reusing the same enum rather than a parallel `type_expr` type meant a single
+  evaluator and a single grammar. A relationship carries exactly one type, so its
+  expression is evaluated over the singleton present-set `{this edge's type}` — `:A&B`
+  is then correctly always empty, `:!T` excludes one type.
+- **No three-valued logic.** A label is present or absent on a node (a relationship has
+  its one type or not), so `eval` is plain boolean recursion over a present-predicate.
+  An atom naming a label/type the symbol table doesn't know is simply *absent* — so
+  `!Unknown` holds and `Unknown` fails, the sound set-membership answer.
+- **The single-positive-atom fast path is preserved end to end.** This is the common
+  `(:Person)` / `-[:KNOWS]->` case and must not regress:
+  - Planner: `choose_from_preds` reads `node.required_labels()` — the *conjunctive
+    positive atoms* (`A&B`→{A,B}; `A|B`,`!A`→{}). For `:A`/`:A:B` this equals the old
+    `node.labels`, so existing plans (LabelScan / index pick) are byte-for-byte
+    unchanged; a disjunction/negation yields no required label → full scan + `node_ok`
+    re-check (sound, because `node_ok` always re-checks the whole expression).
+  - `node_ok`: a lone positive atom the anchor scan already guaranteed skips the label
+    record decode entirely; only a boolean expression decodes once and evaluates,
+    folding the guaranteed labels into the present-predicate.
+  - `expand_one_hop`: untyped / single `:T` / `:T1|T2` alternation pre-resolve (via
+    `positive_atoms`) to a flat reltype-id set so the per-edge loop stays the pre-GQL
+    `ids.contains` integer test; only `&`/`!` falls to per-edge `eval`.
+  - The single-node count/group fast paths gate on `as_single_atom`, taking the
+    posting/index shortcut only for the lone-atom case and falling back otherwise.

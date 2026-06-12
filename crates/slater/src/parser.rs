@@ -3034,6 +3034,112 @@ mod tests {
         ));
     }
 
+    // ── GQL label boolean expressions (PR 4) ─────────────────────────────────
+
+    fn atom(s: &str) -> LabelExpr {
+        LabelExpr::Atom(s.to_string())
+    }
+
+    fn node_label_expr(q: &str) -> LabelExpr {
+        first_pattern(&ok(q))
+            .start
+            .label_expr
+            .clone()
+            .expect("node carries a label expression")
+    }
+
+    fn rel_type_expr(q: &str) -> LabelExpr {
+        first_pattern(&ok(q)).rels[0]
+            .0
+            .type_expr
+            .clone()
+            .expect("relationship carries a type expression")
+    }
+
+    #[test]
+    fn lowers_label_and_with_colon_sugar() {
+        // `:A&B` and the classic `:A:B` sugar lower to the SAME And tree — the `:`
+        // separator is just AND. A regression that lowered the colon chain to Or
+        // would change this equality.
+        let want = LabelExpr::And(Box::new(atom("Person")), Box::new(atom("Employee")));
+        assert_eq!(node_label_expr("MATCH (n:Person&Employee) RETURN n"), want);
+        assert_eq!(node_label_expr("MATCH (n:Person:Employee) RETURN n"), want);
+    }
+
+    #[test]
+    fn lowers_label_or_on_node_and_reltype() {
+        // `|` lowers to Or for node labels; the pre-GQL rel-type alternation
+        // `:T1|T2` lowers to the same Or, so the alternation sugar is preserved.
+        assert_eq!(
+            node_label_expr("MATCH (n:Person|Company) RETURN n"),
+            LabelExpr::Or(Box::new(atom("Person")), Box::new(atom("Company"))),
+        );
+        assert_eq!(
+            rel_type_expr("MATCH (a)-[:KNOWS|WORKS_AT]->(b) RETURN b"),
+            LabelExpr::Or(Box::new(atom("KNOWS")), Box::new(atom("WORKS_AT"))),
+        );
+    }
+
+    #[test]
+    fn lowers_label_negation() {
+        assert_eq!(
+            node_label_expr("MATCH (n:!Person) RETURN n"),
+            LabelExpr::Not(Box::new(atom("Person"))),
+        );
+        assert_eq!(
+            rel_type_expr("MATCH (a)-[:!KNOWS]->(b) RETURN b"),
+            LabelExpr::Not(Box::new(atom("KNOWS"))),
+        );
+    }
+
+    #[test]
+    fn label_expr_precedence_not_over_and_over_or() {
+        // `!` binds tighter than `&`, which binds tighter than `|`:
+        //   !A&B   ≡ (!A)&B
+        //   A|B&C  ≡ A|(B&C)
+        assert_eq!(
+            node_label_expr("MATCH (n:!A&B) RETURN n"),
+            LabelExpr::And(
+                Box::new(LabelExpr::Not(Box::new(atom("A")))),
+                Box::new(atom("B")),
+            ),
+        );
+        assert_eq!(
+            node_label_expr("MATCH (n:A|B&C) RETURN n"),
+            LabelExpr::Or(
+                Box::new(atom("A")),
+                Box::new(LabelExpr::And(Box::new(atom("B")), Box::new(atom("C")))),
+            ),
+        );
+    }
+
+    #[test]
+    fn label_parens_override_precedence() {
+        // Parentheses force the OR first, against the default precedence.
+        assert_eq!(
+            node_label_expr("MATCH (n:(A|B)&C) RETURN n"),
+            LabelExpr::And(
+                Box::new(LabelExpr::Or(Box::new(atom("A")), Box::new(atom("B")))),
+                Box::new(atom("C")),
+            ),
+        );
+    }
+
+    #[test]
+    fn absent_label_is_none() {
+        // No label constraint ⇒ `None` (any node), so the hot path is untouched.
+        assert_eq!(
+            first_pattern(&ok("MATCH (n) RETURN n")).start.label_expr,
+            None
+        );
+        assert_eq!(
+            first_pattern(&ok("MATCH (a)-[r]->(b) RETURN b")).rels[0]
+                .0
+                .type_expr,
+            None,
+        );
+    }
+
     // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────
 
     #[test]

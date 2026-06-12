@@ -7786,6 +7786,103 @@ mod tests {
         assert!(e.contains("only") && e.contains("pattern"), "{e}");
     }
 
+    // ── GQL label boolean expressions (PR 4) ─────────────────────────────────
+    // The basic fixture has disjoint labels :Person (Alice, Bob, Carol) and
+    // :Company (Acme, Globex), and rel-types KNOWS / WORKS_AT — enough to tell the
+    // boolean forms apart on both nodes and relationships.
+
+    #[test]
+    fn label_boolean_node_cardinalities() {
+        // OR unions the two label sets (all 5), NOT-Person leaves the 2 companies,
+        // and AND is empty (no node carries both labels) — three distinct sets.
+        assert_eq!(
+            gql_col0(
+                "exec_gql_label_or",
+                "MATCH (n:Person|Company) RETURN n.name AS n"
+            ),
+            vec!["Acme", "Alice", "Bob", "Carol", "Globex"],
+        );
+        assert_eq!(
+            gql_col0("exec_gql_label_not", "MATCH (n:!Person) RETURN n.name AS n"),
+            vec!["Acme", "Globex"],
+        );
+        assert!(
+            gql_col0(
+                "exec_gql_label_and",
+                "MATCH (n:Person&Company) RETURN n.name AS n"
+            )
+            .is_empty(),
+            "no node carries both labels",
+        );
+    }
+
+    #[test]
+    fn colon_chain_lowers_to_and_not_or() {
+        // Parity: `:Person:Company` is AND sugar, so it must give the SAME (empty)
+        // result as `:Person&Company` — NOT the 5-row OR result. A regression that
+        // lowered the colon chain to OR would surface here.
+        let colon = gql_col0(
+            "exec_gql_colon_and",
+            "MATCH (n:Person:Company) RETURN n.name AS n",
+        );
+        let amp = gql_col0(
+            "exec_gql_amp_and",
+            "MATCH (n:Person&Company) RETURN n.name AS n",
+        );
+        assert!(colon.is_empty());
+        assert_eq!(colon, amp);
+    }
+
+    #[test]
+    fn label_boolean_reltype_cardinalities() {
+        // Alice's out-edges: KNOWS→Bob, KNOWS→Carol, WORKS_AT→Acme. OR keeps all
+        // three neighbours, NOT-KNOWS keeps just the WORKS_AT target, AND is empty
+        // (an edge carries exactly one type).
+        assert_eq!(
+            gql_col0(
+                "exec_gql_rel_or",
+                "MATCH (a {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b",
+            ),
+            vec!["Acme", "Bob", "Carol"],
+        );
+        assert_eq!(
+            gql_col0(
+                "exec_gql_rel_not",
+                "MATCH (a {name:'Alice'})-[:!KNOWS]->(b) RETURN b.name AS b",
+            ),
+            vec!["Acme"],
+        );
+        assert!(
+            gql_col0(
+                "exec_gql_rel_and",
+                "MATCH (a {name:'Alice'})-[:KNOWS&WORKS_AT]->(b) RETURN b.name AS b",
+            )
+            .is_empty(),
+            "an edge carries exactly one type",
+        );
+    }
+
+    #[test]
+    fn reltype_alternation_parity_with_single_types() {
+        // `:KNOWS|WORKS_AT` (now an Or expression) must equal the union of the two
+        // single-type traversals — the pre-GQL alternation behaviour, unchanged.
+        let alt = gql_col0(
+            "exec_gql_rel_alt",
+            "MATCH (a {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        let knows = gql_col0(
+            "exec_gql_rel_knows",
+            "MATCH (a {name:'Alice'})-[:KNOWS]->(b) RETURN b.name AS b",
+        );
+        let works = gql_col0(
+            "exec_gql_rel_works",
+            "MATCH (a {name:'Alice'})-[:WORKS_AT]->(b) RETURN b.name AS b",
+        );
+        let mut union = [knows, works].concat();
+        union.sort();
+        assert_eq!(alt, union);
+    }
+
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────
     // Pushing the LIMIT into the match must return the SAME prefix of rows (in
     // match-emit order) that buffering-then-truncating did — early-stop changes

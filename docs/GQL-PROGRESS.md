@@ -15,12 +15,11 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 
 ## NEXT ACTION
 
-> **Resume at PR 4 — label boolean expressions `& | !`.**
-> Use the "Resume → PR 4" prompt in GQL-PLAN.md §4. Before any new work, run the
-> green-state gate. New branch: `gql-label-expressions`.
-> **This PR changes the AST** (`NodePat.labels` → a `label_expr`); grep every
-> `.labels` reader first and expect broad edits. Commit a WIP-green checkpoint once
-> the AST change compiles and all existing tests pass, *before* adding new behaviour.
+> **Resume at PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs.**
+> Use the "Resume → PR 5" prompt in GQL-PLAN.md §4. Before any new work, run the
+> green-state gate. New branch: `gql-finish`. PR 5 is several small *independent*
+> items — they can be separate commits. This is the final PR; mark the track
+> COMPLETE when done.
 
 ---
 
@@ -29,7 +28,7 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 - [x] **PR 1 — Quantified path patterns `((…)){m,n}`** — branch `gql-quantified-paths`
 - [x] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE** — branch `gql-path-restrictors`
 - [x] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k** — branch `gql-shortest-selectors`
-- [~] **PR 4 — Label boolean expressions `& | !`** (AST churn) — branch `gql-label-expressions`; WIP-green checkpoint committed (AST swapped to `LabelExpr`, all 386 existing tests green via sugar lowering) before the new `&|!` tests
+- [x] **PR 4 — Label boolean expressions `& | !`** — branch `gql-label-expressions`
 - [ ] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs**
 
 Status keys: `[ ]` todo · `[~]` in progress · `[x]` done-green · `[!]` blocked.
@@ -198,5 +197,72 @@ fmt clean.
   `s→t` paths (via `a`, via `b`) plus a length-3 detour `s→a→c→t` — the minimal graph
   that tells the three selectors apart.
 
-**Not yet committed** as of this entry — the branch holds the working tree; commit
-before clearing context.
+Committed on branch `gql-shortest-selectors` (commit `2a499fe`).
+
+### PR 4 — Label boolean expressions `& | !` ✅ (branch `gql-label-expressions`)
+
+The one PR with AST churn, done last so the pattern AST had settled. The non-label
+hot path stays byte-for-byte unchanged. Full suite green: **399 passed** (386
+pre-existing + 13 new); clippy clean; fmt clean. A WIP-green checkpoint (commit
+`6263fa8`) captured the AST swap with all 386 existing tests passing, before the new
+`&|!` behaviour tests — the documented mid-PR sub-boundary (GQL-PLAN.md §3).
+
+**Approach (so PR 5 builds on it correctly):**
+- Grammar: `labels` and `rel_types` both become `":" ~ label_expr`, a precedence
+  climb `le_or` (`|`) → `le_and` (`&` *or* `:`) → `le_not` (leading `!`s) → `le_atom`
+  (a name or a parenthesised sub-expression). The classic sugar lowers into the SAME
+  tree: `:A:B` → `And` (the `:` is an AND connector), `:T1|T2` / `:T1|:T2` → `Or` — so
+  every pre-GQL query parses unchanged. The WHERE postfix predicate `n:A:B`
+  (`label_pred`, `Expr::HasLabels`) is a separate rule and keeps its AND-only form.
+- AST: one shared `ast::LabelExpr` (`Atom`/`And`/`Or`/`Not`) reused for *both* node
+  labels and relationship types — `NodePat.label_expr: Option<LabelExpr>` and
+  `RelPat.type_expr: Option<LabelExpr>` (`None` ≡ no constraint). Reusing one enum
+  (rather than a parallel type) kept the blast radius to a single evaluator and one
+  grammar. Helpers: `as_single_atom` (the fast-path probe), `positive_atoms` (single
+  atom or `OR`-tree of atoms → flat name list), `required_atoms`/`NodePat::
+  required_labels` (conjunctive positive atoms, for the planner), and `eval` (plain
+  boolean over a present-predicate — no three-valued logic; a label is present or
+  absent).
+- Executor — nodes (`node_ok`): a single positive atom the anchor scan already proved
+  skips the label-record decode entirely (the pre-GQL hot path, preserved exactly);
+  any boolean expression decodes the resident labels once and evaluates, folding the
+  anchor-guaranteed labels into the present-predicate. An atom naming an unknown label
+  is simply absent (so `!Unknown` holds, `Unknown` fails) — sound set logic.
+- Executor — relationships (`expand_one_hop`): the type constraint resolves once,
+  before the per-edge loop, into a `TypeFilter`. Untyped / single `:T` / `:T1|T2`
+  alternation collapse to a flat reltype-id set (`positive_atoms`) so the hot loop
+  stays the pre-GQL `ids.contains` integer test; only a genuine `&`/`!` type
+  expression falls to per-edge `eval` (evaluated over the edge's singleton type, so
+  `:A&B` is correctly always empty).
+- Planner (`choose_from_preds`): reads `node.required_labels()` (the conjunctive
+  positive atoms) wherever it used `node.labels`. For `:A` / `:A:B` this is identical
+  to before, so existing plans are unchanged; a disjunction/negation yields no
+  required label and falls back to a full scan + `node_ok` re-check. The single-node
+  count/group fast paths (`try_count_fast_path`, `try_grouped_index_fast_path`) gate
+  on `as_single_atom`, so only the lone-positive-atom case takes the posting/index
+  shortcut.
+
+**Design decisions / limitations (carried forward, see DECISIONS D38):**
+- **One `LabelExpr` for nodes and rel-types**, evaluated as plain boolean set
+  membership (relationships over their singleton type).
+- **Sugar lowers, never special-cases.** `:A:B` and `:T1|T2` produce ordinary
+  `And`/`Or` trees; there is no separate code path for them.
+- **Single-positive-atom fast path preserved** end to end (LabelScan + guaranteed
+  label + decode-skip); only `&`/`|`/`!`/parens take the general evaluator.
+- **WHERE postfix `n:A:B` predicate unchanged** (AND-only) — out of scope, smaller
+  blast radius.
+
+**Tests (all green):**
+- Parser (`parser.rs`): `lowers_label_and_with_colon_sugar` (`:A&B` ≡ `:A:B`),
+  `lowers_label_or_on_node_and_reltype`, `lowers_label_negation`,
+  `label_expr_precedence_not_over_and_over_or` (`!A&B`≡`(!A)&B`, `A|B&C`≡`A|(B&C)`),
+  `label_parens_override_precedence` (`(A|B)&C`), `absent_label_is_none`.
+- Exec (`exec.rs`, basic fixture): `label_boolean_node_cardinalities` (OR=5, NOT=2,
+  AND=0), `colon_chain_lowers_to_and_not_or` (parity: `:A:B` ≡ `:A&B`, not OR),
+  `label_boolean_reltype_cardinalities` (OR/NOT/AND on KNOWS/WORKS_AT),
+  `reltype_alternation_parity_with_single_types` (`:T1|T2` ≡ union of single types).
+- Planner (`plan.rs`): `single_positive_label_atom_still_picks_label_scan`
+  (perf-parity), `conjunction_label_scans_the_smaller_posting` (`:A&B` → smaller
+  posting), `disjunctive_or_negated_label_expr_falls_back_to_all_nodes`.
+
+Committed on branch `gql-label-expressions`.
