@@ -54,6 +54,10 @@ kw_end = @{ ^"end" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
+// GQL spells UNWIND as `FOR alias IN expr` (PR 5). It lowers onto the very same
+// `UnwindClause`, so the executor needs no change — only the surface order differs
+// (alias-then-expr here, expr-then-alias for UNWIND).
+kw_for = @{ ^"for" ~ !ident_cont }
 // GQL path restrictors (PR 2). They appear only at the head of a `match_pattern`
 // (right after MATCH), never inside `(…)`/`[…]`, so they don't shadow a node or
 // relationship variable that happens to be spelled `walk`/`trail`/etc.
@@ -96,7 +100,7 @@ forbidden_clause = @{
 }
 inline_ws = _{ " " | "\t" | "\r" | "\n" }
 
-reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause }
+reading_clause = { match_clause | with_clause | vector_call_clause | call_subquery | call_clause | unwind_clause | for_clause }
 
 // `CALL { <subquery> }` (Phase 12): a correlated read-only subquery run once per
 // outer row, multiplying cardinality by its returned rows. The inner body is a
@@ -115,6 +119,11 @@ subquery_forbidden = { reading_clause* ~ forbidden_clause ~ (!"}" ~ ANY)* }
 
 // UNWIND is a read clause (it multiplies rows over a list); it is NOT forbidden.
 unwind_clause = { kw_unwind ~ expr ~ kw_as ~ alias }
+
+// GQL's `FOR alias IN expr` is UNWIND with the operands swapped. It reuses the
+// existing `kw_in` (already defined for list membership) and lowers to the same
+// `UnwindClause` (parser `lower_for_clause`), so no executor path is duplicated.
+for_clause = { kw_for ~ alias ~ kw_in ~ expr }
 
 // The one permitted procedure: brute-force vector KNN. Surfaced as a reading
 // clause that binds its YIELD outputs (FalkorDB's `node`, `score`) into scope.
@@ -398,6 +407,6 @@ reserved = _{
       | ^"not" | ^"in" | ^"is" | ^"null" | ^"true" | ^"false" | ^"case"
       | ^"when" | ^"then" | ^"else" | ^"end" | ^"contains" | ^"starts"
       | ^"ends" | ^"union" | ^"ascending" | ^"asc" | ^"descending" | ^"desc"
-      | ^"call" | ^"yield" | ^"unwind")
+      | ^"call" | ^"yield" | ^"unwind" | ^"for")
     ~ !ident_cont
 }

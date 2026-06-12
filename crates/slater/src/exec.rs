@@ -7883,6 +7883,30 @@ mod tests {
         assert_eq!(alt, union);
     }
 
+    // ── GQL PR 5 — `FOR` is UNWIND ────────────────────────────────────────────
+
+    #[test]
+    fn for_and_unwind_produce_identical_rows() {
+        // `FOR x IN list` lowers onto the same UnwindClause as `UNWIND list AS x`,
+        // so the two must emit byte-for-byte identical result rows — confirming the
+        // lowering reaches the unchanged executor path.
+        let by_for = gql_col0("exec_gql_for", "FOR x IN [3, 1, 2] RETURN x ORDER BY x");
+        let by_unwind = gql_col0(
+            "exec_gql_unwind",
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x",
+        );
+        assert_eq!(by_for, by_unwind);
+        assert_eq!(by_for, vec!["1", "2", "3"]);
+
+        // FOR over a MATCH-produced list behaves exactly like UNWIND too — one row
+        // per matched `b` (Alice KNOWS both Bob and Carol in the basic fixture).
+        let for_match = gql_col0(
+            "exec_gql_for_match",
+            "MATCH (a {name:'Alice'})-[:KNOWS]->(b) FOR n IN [b.name] RETURN n",
+        );
+        assert_eq!(for_match, vec!["Bob", "Carol"]);
+    }
+
     // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────
     // Pushing the LIMIT into the match must return the SAME prefix of rows (in
     // match-emit order) that buffering-then-truncating did — early-stop changes

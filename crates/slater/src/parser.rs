@@ -737,6 +737,9 @@ fn lower_reading_clause(pair: Pair<Rule>) -> Result<Clause> {
         Rule::call_clause => Ok(Clause::Call(lower_call_clause(inner)?)),
         Rule::call_subquery => Ok(Clause::CallSubquery(lower_call_subquery(inner)?)),
         Rule::unwind_clause => Ok(Clause::Unwind(lower_unwind_clause(inner)?)),
+        // GQL `FOR alias IN expr` lowers onto the very same UnwindClause — see
+        // `lower_for_clause`. The executor never learns the surface spelling.
+        Rule::for_clause => Ok(Clause::Unwind(lower_for_clause(inner)?)),
         other => bail!("internal: unexpected reading clause {other:?}"),
     }
 }
@@ -1002,6 +1005,24 @@ fn lower_unwind_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
     let var = ident_text(
         it.next()
             .ok_or_else(|| anyhow::anyhow!("UNWIND without alias"))?,
+    )?;
+    Ok(UnwindClause { expr, var })
+}
+
+fn lower_for_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
+    // for_clause = { kw_for ~ alias ~ kw_in ~ expr } — GQL's spelling of UNWIND with
+    // the operands reversed. kids() drops the keyword tokens, leaving the alias then
+    // the list expression (the opposite order to `lower_unwind_clause`). It returns
+    // the identical UnwindClause, so `FOR x IN list` and `UNWIND list AS x` are the
+    // same query past the parser.
+    let mut it = kids(pair);
+    let var = ident_text(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("FOR without alias"))?,
+    )?;
+    let expr = lower_expr(
+        it.next()
+            .ok_or_else(|| anyhow::anyhow!("FOR without expression"))?,
     )?;
     Ok(UnwindClause { expr, var })
 }
@@ -2065,6 +2086,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_call
             | Rule::kw_yield
             | Rule::kw_unwind
+            | Rule::kw_for
             | Rule::reduce_kw
             | Rule::exists_kw
     )
@@ -3138,6 +3160,27 @@ mod tests {
                 .type_expr,
             None,
         );
+    }
+
+    // ── GQL PR 5 — `FOR alias IN expr` lowers onto UnwindClause ───────────────
+
+    #[test]
+    fn for_lowers_to_unwind_clause() {
+        // GQL `FOR x IN [1,2,3]` is exactly `UNWIND [1,2,3] AS x` after the parser:
+        // same UnwindClause, just the surface operand order reversed.
+        let q = ok("FOR x IN [1, 2, 3] RETURN x");
+        match &q.head.reading[0] {
+            Clause::Unwind(uc) => {
+                assert_eq!(uc.var, "x");
+                assert!(matches!(uc.expr, Expr::List(_)));
+            }
+            other => panic!("expected an Unwind clause, got {other:?}"),
+        }
+
+        // Identical AST to the Cypher spelling — the two parse to the same clause.
+        let from_for = ok("FOR x IN [1, 2, 3] RETURN x");
+        let from_unwind = ok("UNWIND [1, 2, 3] AS x RETURN x");
+        assert_eq!(from_for.head.reading, from_unwind.head.reading);
     }
 
     // ── Phase 12 — CALL { … } subquery ───────────────────────────────────────
