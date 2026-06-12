@@ -107,6 +107,60 @@ pub fn write_value(buf: &mut Vec<u8>, v: &Value) {
     }
 }
 
+/// Advance the slice past one encoded value without materialising it. Used by
+/// the single-key property reader (`columns::decode_one`) to skip the values of
+/// keys the caller didn't ask for — a string/list/vector is stepped over rather
+/// than allocated, so reading one property of a many-property record costs no
+/// per-value heap allocation.
+pub fn skip_value(r: &mut &[u8]) -> Result<()> {
+    let Some((&tag, rest)) = r.split_first() else {
+        bail!("value truncated (no tag)");
+    };
+    *r = rest;
+    match tag {
+        TAG_NULL => {}
+        TAG_BOOL => {
+            let Some((_, rest)) = r.split_first() else {
+                bail!("bool truncated");
+            };
+            *r = rest;
+        }
+        TAG_INT => {
+            read_uvarint(r)?;
+        }
+        TAG_FLOAT => skip_bytes(r, 8)?,
+        TAG_STR => {
+            let len = read_uvarint(r)? as usize;
+            skip_bytes(r, len)?;
+        }
+        TAG_LIST => {
+            let n = read_uvarint(r)? as usize;
+            for _ in 0..n {
+                skip_value(r)?;
+            }
+        }
+        TAG_VECTOR => {
+            let n = read_uvarint(r)? as usize;
+            skip_bytes(
+                r,
+                n.checked_mul(4)
+                    .ok_or_else(|| anyhow::anyhow!("vector too long"))?,
+            )?;
+        }
+        other => bail!("unknown value tag {other}"),
+    }
+    Ok(())
+}
+
+#[inline]
+fn skip_bytes(r: &mut &[u8], n: usize) -> Result<()> {
+    if r.len() < n {
+        bail!("value truncated");
+    }
+    *r = &r[n..];
+    Ok(())
+}
+
 /// Decode a property value, advancing the slice.
 pub fn read_value(r: &mut &[u8]) -> Result<Value> {
     let Some((&tag, rest)) = r.split_first() else {

@@ -21,7 +21,7 @@ use anyhow::Result;
 use crate::blockfile::{BlockFileReader, BlockFileWriter, RecordLoc};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
-use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
+use crate::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
 /// Writer for a property `.blk` file. Append entities strictly in dense-id order
 /// (0, 1, 2, …); the append position becomes the entity id.
@@ -154,6 +154,25 @@ pub fn decode_props(rec: &[u8]) -> Result<Vec<(u32, Value)>> {
     Ok(out)
 }
 
+/// Decode a single property `target_key` from a property record, returning its
+/// value or `None` if the key is absent. Values of other keys are *skipped*
+/// (stepped over without allocation) rather than decoded, so reading one
+/// property of a k-property node costs one (matching) value decode plus k−1
+/// cheap skips — not k full `Value` allocations (root cause 5). Keys are unique
+/// within a record, so the scan returns on the first match.
+pub fn decode_one(rec: &[u8], target_key: u32) -> Result<Option<Value>> {
+    let mut r = rec;
+    let count = read_uvarint(&mut r)? as usize;
+    for _ in 0..count {
+        let key_id = read_uvarint(&mut r)? as u32;
+        if key_id == target_key {
+            return Ok(Some(read_value(&mut r)?));
+        }
+        skip_value(&mut r)?;
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +211,35 @@ mod tests {
             assert_eq!(&r.props(i as u64).unwrap(), e);
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decode_one_matches_full_decode_and_skips() {
+        // A record with several keys whose values include kinds that allocate
+        // when fully decoded (string, list, vector) — `decode_one` must step over
+        // those it doesn't want and return exactly what `decode_props` would.
+        let props = vec![
+            (0u32, Value::Str("Manchester".into())),
+            (1, Value::Int(-7)),
+            (2, Value::List(vec![Value::Str("a".into()), Value::Int(9)])),
+            (3, Value::Vector(vec![1.0, -2.5, 3.0])),
+            (4, Value::Bool(true)),
+            (5, Value::Float(0.125)),
+        ];
+        let mut rec = Vec::new();
+        write_uvarint(&mut rec, props.len() as u64);
+        for (k, v) in &props {
+            write_uvarint(&mut rec, *k as u64);
+            write_value(&mut rec, v);
+        }
+        for (k, v) in &props {
+            assert_eq!(decode_one(&rec, *k).unwrap().as_ref(), Some(v));
+        }
+        // Absent key → None.
+        assert_eq!(decode_one(&rec, 99).unwrap(), None);
+        // Empty record → None for any key.
+        let mut empty = Vec::new();
+        write_uvarint(&mut empty, 0);
+        assert_eq!(decode_one(&empty, 0).unwrap(), None);
     }
 }

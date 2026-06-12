@@ -676,24 +676,33 @@ impl<'g> Engine<'g> {
         let Some(key_id) = self.gen.property_key_id(key) else {
             return Ok(Val::Null);
         };
-        for (k, v) in self.node_props(id)? {
-            if k == key_id {
-                return Ok(Val::from_value(v));
-            }
-        }
-        Ok(Val::Null)
+        // Decode only the requested key from the cached record, skipping the
+        // values of the others (root cause 5): a single-property read no longer
+        // allocates a `Vec<(u32, Value)>` nor decodes every other value.
+        let rec = self.cache.record(
+            self.gen.node_props().inner(),
+            self.gen.uuid(),
+            FileKind::NodeProps,
+            id,
+        )?;
+        Ok(columns::decode_one(&rec, key_id)?
+            .map(Val::from_value)
+            .unwrap_or(Val::Null))
     }
 
     fn edge_prop(&self, id: u64, key: &str) -> Result<Val> {
         let Some(key_id) = self.gen.property_key_id(key) else {
             return Ok(Val::Null);
         };
-        for (k, v) in self.edge_props(id)? {
-            if k == key_id {
-                return Ok(Val::from_value(v));
-            }
-        }
-        Ok(Val::Null)
+        let rec = self.cache.record(
+            self.gen.edge_props().inner(),
+            self.gen.uuid(),
+            FileKind::EdgeProps,
+            id,
+        )?;
+        Ok(columns::decode_one(&rec, key_id)?
+            .map(Val::from_value)
+            .unwrap_or(Val::Null))
     }
 
     /// Resolve a node's label names and named properties — the material a Bolt
@@ -935,6 +944,13 @@ impl<'g> Engine<'g> {
     // ── MATCH ────────────────────────────────────────────────────────────
 
     fn apply_match(&self, table: Table, m: &MatchClause) -> Result<Table> {
+        // Stage 5: a single non-optional node-only pattern (no relationships, no
+        // path variable, fresh-scan anchor) streams candidates straight into rows,
+        // skipping the per-row `HashMap` binding the general matcher builds (root
+        // cause 4).
+        if let Some(t) = self.try_stream_match(&table, m)? {
+            return Ok(t);
+        }
         // Variables this clause newly introduces, appended to the scope in order.
         let mut new_vars: Vec<String> = Vec::new();
         for p in &m.patterns {
@@ -971,6 +987,79 @@ impl<'g> Engine<'g> {
             cols: out_cols,
             rows: out_rows,
         })
+    }
+
+    /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
+    /// variable, anchor not already bound) directly into output rows, returning
+    /// the new table or `None` when the pattern needs the general matcher.
+    ///
+    /// The general path materialises a `Vec<HashMap<String, Val>>` — one cloned
+    /// binding map per matched row (root cause 4). For a bare label/index scan the
+    /// only new binding is the anchor node, so we append `Val::Node(id)` to a clone
+    /// of the input row and skip the map entirely. The anchor scan is chosen once
+    /// (parameter/`WHERE`-aware, like the general path), `node_ok` enforces the
+    /// pattern's labels/inline props, and the clause `WHERE` is re-evaluated per
+    /// emitted row against the full row scope — identical semantics to
+    /// `match_patterns`, including row order and the per-row intermediate charge.
+    fn try_stream_match(&self, table: &Table, m: &MatchClause) -> Result<Option<Table>> {
+        if m.optional || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let p = &m.patterns[0];
+        if !p.rels.is_empty() || p.path_var.is_some() {
+            return Ok(None);
+        }
+        let start = &p.start;
+        // An already-bound anchor is a single concrete node, handled by the general
+        // matcher's bound-anchor branch; only a fresh scan streams here.
+        if let Some(v) = &start.var {
+            if table.cols.contains(v) {
+                return Ok(None);
+            }
+        }
+
+        let scan = choose_node_scan(self.gen, start, m.where_.as_ref(), &self.plan_params);
+        let guaranteed = self.scan_guaranteed_labels(&scan);
+        let candidates = self.scan_candidates(&scan)?;
+
+        let mut out_cols = table.cols.clone();
+        if let Some(v) = &start.var {
+            out_cols.push(v.clone());
+        }
+
+        let mut out_rows = Vec::new();
+        for in_row in &table.rows {
+            self.check_deadline()?;
+            // Binding for inline-prop evaluation in `node_ok`, built once per input
+            // row (the anchor's own var is intentionally absent, as in the general
+            // path). Typically one row — the singleton seed — so one map per query.
+            let in_binding: HashMap<String, Val> = table
+                .cols
+                .iter()
+                .cloned()
+                .zip(in_row.iter().cloned())
+                .collect();
+            for &c in &candidates {
+                if !self.node_ok(c, start, &in_binding, &guaranteed)? {
+                    continue;
+                }
+                let mut row = in_row.clone();
+                if start.var.is_some() {
+                    row.push(Val::Node(c));
+                }
+                if let Some(w) = m.where_.as_ref() {
+                    if !truthy(&self.eval(w, &Scope::Row(&out_cols, &row), None)?) {
+                        continue;
+                    }
+                }
+                self.charge(1)?;
+                out_rows.push(row);
+            }
+        }
+        Ok(Some(Table {
+            cols: out_cols,
+            rows: out_rows,
+        }))
     }
 
     // ── UNWIND ───────────────────────────────────────────────────────────────
@@ -5455,6 +5544,50 @@ mod tests {
             "{:?}",
             res.rows[0][0]
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn streaming_scan_where_and_property_projection() {
+        // Stage 5: a single node-only MATCH streams without per-row HashMaps. A
+        // WHERE filter that reads a property (city = 'London') keeps Alice + Bob,
+        // and the projected property comes back correctly.
+        let (root, res) = run(
+            "exec_stream_where",
+            "MATCH (n:Person) WHERE n.city = 'London' RETURN n.name AS name",
+        );
+        assert_eq!(res.columns, vec!["name"]);
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn streaming_scan_group_by_property_aggregation() {
+        // Aggregation over the streamed rows: group the 3 Person nodes by city
+        // (London → 2, Paris → 1). Exercises the streaming match feeding
+        // project_aggregated with a per-row property read.
+        let (root, res) = run(
+            "exec_stream_agg",
+            "MATCH (n:Person) RETURN n.city AS city, count(*) AS c ORDER BY c DESC",
+        );
+        assert_eq!(res.columns, vec!["city", "c"]);
+        assert_eq!(res.rows.len(), 2);
+        assert_eq!(res.rows[0][0].to_display(), "London");
+        assert!(matches!(res.rows[0][1], Val::Int(2)));
+        assert_eq!(res.rows[1][0].to_display(), "Paris");
+        assert!(matches!(res.rows[1][1], Val::Int(1)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn streaming_scan_inline_prop_filter() {
+        // An inline property on the anchor (handled by node_ok in the streaming
+        // path, not a residual WHERE) selects the single matching node.
+        let (root, res) = run(
+            "exec_stream_inline",
+            "MATCH (n:Person {city: 'Paris'}) RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Carol"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

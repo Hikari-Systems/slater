@@ -18,12 +18,13 @@
 | 2 | Skip redundant per-node label re-check | low | **DONE** | Crime-label-count **0.64 ms** (from 841 ms); also fixed CONTAINS/agg/DISTINCT |
 | 3 | Count fast-paths (metadata / index cardinality) | low | **DONE** | counts **0.6–0.8 ms** (from 14–901 ms) |
 | 4 | Block-cache record read (no per-record copy / less locking) | high | **DONE** | broad floor drop: 2-hop **48→1.95 ms** (Neo4j parity), agg/CONTAINS/DISTINCT ~3×, 3-hop ~49 ms |
-| 5 | Streaming aggregation + projection pushdown + prop memo | med | TODO | agg/DISTINCT now ~20 ms (2.5–3× Neo4j) |
-| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 1-hop ~5 ms, 3-hop ~49 ms (still traversal-bound) |
+| 5 | Streaming aggregation + projection pushdown + prop memo | med | **DONE** | agg **19.5→10.3 ms**, DISTINCT **20.5→11.6 ms**, CONTAINS **16→9.0 ms** (~1.8× each; now 1.3–2× Neo4j) |
+| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 1-hop ~4.8 ms, 3-hop ~45 ms (still traversal-bound) |
 
 Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk) — **DONE 2026-06-12**, see
 "Validation results (Stages 0–3)" below. **Stage 4 DONE 2026-06-12** — see "Validation results
-(Stage 4)". Next: **5 → 6** (streaming aggregation, then the traversal frame).
+(Stage 4)". **Stage 5 DONE 2026-06-12** — see "Validation results (Stage 5)". Next: **6** (the
+traversal frame — the remaining gap is the 1-/3-hop traversals).
 **Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–6 (see below).
 
 ### Bonus (this round): result-cache disable switch
@@ -174,6 +175,46 @@ Memory unchanged/better: slater **65 MiB** RSS vs Neo4j **655 MiB**.
 
 \* The 3-hop "before" (3155 ms) was the cross-binary artifact flagged under Stages 0–3; Stage 4 now
 gives a clean current-source 3-hop of ~49 ms, re-baselining it for Stage 6.
+
+## Validation results (Stage 5 — streaming scan + single-key prop decode, measured 2026-06-12, cache DISABLED)
+
+Freshly built current-source image (`resultCacheBytes: 0`), same machine/data, Neo4j on :7688.
+**No `!rows` mismatch on any row** → correctness preserved. Two back-to-back runs agreed within
+noise; medians below are representative (the two runs are shown where they differ).
+
+| query | Stage 4 (cache off) | **Stage 5 (cache off)** | Neo4j | vs Neo4j |
+|-------|-------------------:|------------------------:|------:|---------:|
+| count all nodes | 0.56 ms | 0.61–0.63 ms | 3.0–3.4 ms | ~5× faster |
+| Crime label count | 0.58 ms | 0.60–0.63 ms | 1.7–1.8 ms | ~2.8× faster |
+| point lookup (idx nhs_no) | 0.64 ms | 0.69 ms | 1.1 ms | 1.6× faster |
+| idx-eq count (Crime.type) | 1.45 ms | 1.58 ms | 1.1 ms | 1/1.4× |
+| 1-hop Crime→Location | ~5 ms | **4.8 ms** | 2.0–2.4 ms | 1/2.0–2.4× |
+| 2-hop Person→Loc→Area | 1.95 ms | 2.04–2.08 ms | 2.1–2.7 ms | **~parity** |
+| agg crimes by type | 19.5 ms | **10.3 ms** | 7.7–7.9 ms | 1/1.3× |
+| 3-hop Officer/Crime/Loc | ~49 ms | 45 ms | 2.1 ms | 1/21× |
+| full-scan CONTAINS | 16 ms | **9.0 ms** | 4.3–4.5 ms | 1/2.0× |
+| count DISTINCT type | 20.5 ms | **11.6 ms** | 6.6–6.8 ms | 1/1.7–1.8× |
+
+**Headline:** the three Stage-5 target rows each fell ~**1.8×** (agg 19.5→10.3, DISTINCT
+20.5→11.6, CONTAINS 16→9.0 ms) and are now **1.3–2.0× off Neo4j** (agg nearly at parity). Two
+changes, both on the Crime-anchored full-scan path:
+1. **Streaming single-pattern scan** (`exec.rs` `try_stream_match`): a node-only `MATCH` with no
+   relationships streams candidates straight into output rows, dropping the per-row
+   `HashMap<String, Val>` binding the general matcher allocates+clones (root cause 4). The anchor
+   scan is chosen once, `node_ok` enforces labels/inline props, and the clause `WHERE` is
+   re-evaluated per emitted row — identical semantics (row order, intermediate-budget charge).
+2. **Single-key property decode** (`columns::decode_one` + `wire::skip_value`): `node_prop`/
+   `edge_prop` now decode only the requested key from the cached record, *skipping* the other
+   values (stepping over strings/lists/vectors without allocating) instead of decoding the whole
+   map into a `Vec<(u32, Value)>` and linear-scanning (root cause 5). Each target reads exactly
+   one property per row, so this removes k−1 value allocations per node.
+
+The count/index rows (Stages 1–3) are unchanged within noise. 1-/3-hop traversals are essentially
+unchanged (they don't take the no-rel streaming path) and remain Stage 6's target. Memory
+unchanged/better: slater **62 MiB** RSS vs Neo4j **758 MiB**. Tests:
+`graph-format` `columns::tests::decode_one_matches_full_decode_and_skips`; `slater`
+`exec::tests::streaming_scan_{where_and_property_projection,group_by_property_aggregation,inline_prop_filter}`
+(327 slater + 50 graph-format lib tests green).
 
 ## Validation harness
 
@@ -356,14 +397,38 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
   *Realised low:* deref coercion kept every call site byte-for-byte; no executor signature changed.
 - **Validate:** uniform drop across all scan/traversal rows; no correctness change. ✓
 
-### Stage 5 — Streaming aggregation + projection pushdown + prop memo
+### Stage 5 — Streaming aggregation + projection pushdown + prop memo  **[DONE 2026-06-12]**
+- **Result:** two changes, both validated against the harness (see "Validation results (Stage 5)"):
+  1. **`try_stream_match`** (`exec.rs`, called at the top of `apply_match`): a single
+     non-OPTIONAL node-only `MATCH` (one pattern, no relationships, no path var, fresh-scan anchor)
+     streams scan candidates straight into output rows — appending `Val::Node(id)` to a clone of
+     the input row — instead of building the general matcher's `Vec<HashMap<String, Val>>` (one
+     cloned binding map per row, root cause 4). The anchor scan is chosen once (parameter/`WHERE`-
+     aware), `node_ok` enforces the pattern's labels + inline props (with the anchor's own var
+     intentionally absent, as in the general path), and the clause `WHERE` is re-evaluated per
+     emitted row against the full row scope — identical semantics (row order, the per-row
+     `charge(1)` intermediate-budget tick). Any rel / path var / already-bound anchor / OPTIONAL /
+     multi-pattern falls back to the general path.
+  2. **`columns::decode_one` + `wire::skip_value`** (graph-format): `node_prop`/`edge_prop` decode
+     only the requested key from the cached record and *skip* the other values (step over a
+     string/list/vector without allocating) rather than decoding the whole map into a
+     `Vec<(u32, Value)>` and linear-scanning (root cause 5). One matching value decode + k−1 cheap
+     skips, no per-value heap alloc for the unwanted keys.
+  Net on the three target rows: agg **19.5→10.3 ms**, count DISTINCT **20.5→11.6 ms**, CONTAINS
+  **16→9.0 ms** (~1.8× each; agg nearly at Neo4j parity). No row-count regression; count/index and
+  traversal rows unchanged within noise. The doc's "prop memo" idea (decode a node's whole record
+  once per row, serve all reads from it) was **not** needed: every target reads exactly one
+  property per row, so the skip-based single-key decode strictly beats a memoised full decode
+  (partial < full) and adds no per-row scratch map. A future multi-property RETURN over one node
+  is the only case a memo would help; revisit if such a row shows up.
 - **Problem:** root causes 4 & 5 — `Vec<HashMap>` per row; per-access full prop decode.
-- **Change:** count/aggregate by streaming candidates without building a HashMap per row; project
-  only RETURN-referenced columns; decode a node's prop record once per row and serve all property
-  reads from it.
-- **Files:** `crates/slater/src/exec.rs` (`match_single_pattern`, `project*`, `node_prop` ~639).
-- **Validate:** `agg crimes by type`, `count DISTINCT type`, multi-property RETURNs improve; rows
-  unchanged.
+- **Change:** stream candidates without building a HashMap per row; decode only the property keys a
+  read needs.
+- **Files:** `crates/slater/src/exec.rs` (`apply_match`/`try_stream_match`, `node_prop`/`edge_prop`
+  ~675); `crates/graph-format/src/columns.rs` (`decode_one`), `crates/graph-format/src/wire.rs`
+  (`skip_value`).
+- **Validate:** `agg crimes by type`, `count DISTINCT type`, full-scan CONTAINS improve ~1.8×; rows
+  unchanged. ✓
 
 ### Stage 6 — Traversal frame / streaming
 - **Problem:** root cause 6 — per-hop `binding.clone()` and full path buffering (3-hop 2242 ms).
