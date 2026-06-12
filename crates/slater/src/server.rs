@@ -809,6 +809,49 @@ fn normalize_query(query: &str) -> String {
     q.trim_end_matches(';').trim().to_string()
 }
 
+/// Strip an optional leading `GQL` / `CYPHER` dialect selector from a statement,
+/// returning the remainder to parse. This mirrors Neo4j's `CYPHER 5` / `CYPHER 25`
+/// dialect prefix: the language is chosen by a query-string token, never a protocol
+/// negotiation. Routing is a deliberate no-op today — one parser serves both Cypher
+/// and the GQL subset (DECISIONS D40) — so we record nothing and simply hand the
+/// rest to `parser::parse`, keeping `parser.rs` language-agnostic.
+///
+/// Only a leading `GQL` / `CYPHER` keyword (case-insensitive, at a token boundary),
+/// optionally followed by a single bare numeric version token (`5`, `25`, `5.0`), is
+/// consumed. A following query keyword (`CYPHER MATCH …`) is preserved untouched, and
+/// anything that is not such a prefix is returned unchanged — so a bare query, and an
+/// identifier such as `cypher_score`, are never disturbed. The prefix is recognised
+/// only at the very start of the statement.
+fn strip_dialect_prefix(query: &str) -> &str {
+    let trimmed = query.trim_start();
+    for kw in ["gql", "cypher"] {
+        // The keyword must be followed by whitespace, so a longer identifier sharing
+        // the prefix (e.g. `cypher_x`) is never mistaken for a dialect selector.
+        let Some(after_kw) = trimmed.get(..kw.len()).and_then(|head| {
+            head.eq_ignore_ascii_case(kw)
+                .then(|| &trimmed[kw.len()..])
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        }) else {
+            continue;
+        };
+        // Optionally swallow a single numeric version token (`CYPHER 25`); a query
+        // keyword in that slot (`CYPHER MATCH`) is left in place.
+        let rest = after_kw.trim_start();
+        return match rest.split_once(char::is_whitespace) {
+            Some((first, tail)) if is_version_token(first) => tail.trim_start(),
+            _ => rest,
+        };
+    }
+    query
+}
+
+/// A bare dialect-version token: digits and dots only (`5`, `25`, `5.0`), nothing
+/// like a query keyword. Used by [`strip_dialect_prefix`] to tell `CYPHER 25 MATCH`
+/// (version) from `CYPHER MATCH` (no version).
+fn is_version_token(t: &str) -> bool {
+    !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
 /// Recognise a `USE <graph>` / `USE DATABASE <graph>` statement and extract the graph
 /// name (preserving its original case — graph names are case-sensitive). Returns
 /// `None` for anything that is not a bare `USE`. A backtick- or quote-wrapped name is
@@ -1349,6 +1392,12 @@ async fn handle_request(
                 .ok_or_else(|| Failure::unauthorized("not authenticated; send LOGON first"))?;
             let sticky = ctx.current_selection(&user);
             debug!(db = ?extra.get("db"), selected = ?sticky, query = %query, "WIRE-DIAG: RUN");
+            // Strip an optional leading `GQL` / `CYPHER` dialect selector (Neo4j's
+            // `CYPHER 5` / `CYPHER 25` form) before anything inspects the statement,
+            // so the USE check, Memgraph detection, introspection and the parser all
+            // see the bare query. Routing is a no-op — one parser serves both
+            // languages (DECISIONS D40) — so we simply drop the prefix.
+            let query = strip_dialect_prefix(&query).to_string();
             // `USE <graph>` / `USE DATABASE <graph>` selects the user's graph in-band
             // (clients that never send the Bolt `db` field, e.g. Memgraph Lab, rely on
             // this). Validate the target and remember it per-user for later db-less
@@ -2545,6 +2594,59 @@ mod tests {
         assert_eq!(parse_use_statement("USE"), None);
         assert_eq!(parse_use_statement("USE a b"), None);
         assert_eq!(parse_use_statement("USEFUL eu_ai_act"), None);
+    }
+
+    // ── GQL PR 5 — optional `GQL` / `CYPHER` dialect prefix ───────────────────
+
+    #[test]
+    fn strip_dialect_prefix_removes_the_selector_only() {
+        // The keyword (any case), with or without a numeric version token, is dropped.
+        assert_eq!(
+            strip_dialect_prefix("GQL MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
+        assert_eq!(
+            strip_dialect_prefix("cypher MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
+        assert_eq!(
+            strip_dialect_prefix("CYPHER 25 MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
+        assert_eq!(
+            strip_dialect_prefix("  cypher 5.0\n MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
+
+        // A bare query is returned untouched, and an identifier merely sharing the
+        // prefix (`cypher_score`) is never mistaken for a selector.
+        assert_eq!(
+            strip_dialect_prefix("MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
+        assert_eq!(
+            strip_dialect_prefix("RETURN cypher_score"),
+            "RETURN cypher_score"
+        );
+        // `CYPHER` immediately followed by a query keyword (no version) keeps the
+        // keyword — only the selector is consumed.
+        assert_eq!(strip_dialect_prefix("GQL RETURN 1"), "RETURN 1");
+    }
+
+    #[test]
+    fn dialect_prefix_parses_to_the_same_ast_as_the_bare_query() {
+        // GQL / CYPHER prefixes are pure dialect selectors: after stripping, the
+        // remainder parses to the identical AST as the unprefixed query.
+        let bare = parser::parse("MATCH (n) RETURN n").unwrap();
+        for q in ["GQL MATCH (n) RETURN n", "CYPHER MATCH (n) RETURN n"] {
+            let stripped = strip_dialect_prefix(q);
+            assert_eq!(parser::parse(stripped).unwrap(), bare, "for {q:?}");
+        }
+        // A bare query is byte-for-byte unaffected by the strip.
+        assert_eq!(
+            strip_dialect_prefix("MATCH (n) RETURN n"),
+            "MATCH (n) RETURN n"
+        );
     }
 
     #[tokio::test]
