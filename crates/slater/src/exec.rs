@@ -42,7 +42,7 @@ use crate::plan::{choose_node_scan, is_id_anchored, NodeScan};
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{NodeId, Value};
-use graph_format::manifest::AnnMode;
+use graph_format::manifest::{AnnMode, EntityKind};
 use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
@@ -156,6 +156,32 @@ pub enum Val {
     DateTime(i64),
     /// `duration()` — the `time_t` of *epoch + duration*.
     Duration(i64),
+}
+
+/// Project a runtime [`Val`] back to a planning [`Value`], for the subset that can
+/// key a range index. Returns `None` for runtime-only shapes (nodes, rels, paths,
+/// maps, points, temporals) the on-disk index can never hold — the planner then
+/// drops that `$param` predicate and falls back to a scan. The inverse of
+/// [`Val::from_value`].
+fn val_to_value(v: &Val) -> Option<Value> {
+    Some(match v {
+        Val::Null => Value::Null,
+        Val::Bool(b) => Value::Bool(*b),
+        Val::Int(i) => Value::Int(*i),
+        Val::Float(f) => Value::Float(*f),
+        Val::Str(s) => Value::Str(s.clone()),
+        Val::Vector(xs) => Value::Vector(xs.clone()),
+        Val::List(xs) => Value::List(xs.iter().map(val_to_value).collect::<Option<Vec<_>>>()?),
+        Val::Map(_)
+        | Val::Node(_)
+        | Val::Rel { .. }
+        | Val::Path { .. }
+        | Val::Point { .. }
+        | Val::Date(_)
+        | Val::Time(_)
+        | Val::DateTime(_)
+        | Val::Duration(_) => return None,
+    })
 }
 
 impl Val {
@@ -506,6 +532,11 @@ pub struct Engine<'g> {
     /// brute-force arm and all non-vector queries leave it `None`.
     vec_cache: Option<&'g VectorIndexCache>,
     params: HashMap<String, Val>,
+    /// The subset of `params` that can key an index, projected to `Value` once so
+    /// the planner can resolve `$param` predicates without re-converting per call
+    /// (see `choose_node_scan`). Non-keyable params (nodes, maps, temporals) are
+    /// simply absent — the planner then drops that predicate and falls back.
+    plan_params: HashMap<String, Value>,
     max_rows: usize,
     deadline: Option<Instant>,
     /// Beam-search list size `L` for the Vamana arm (config `vectorQuery.beamWidth`).
@@ -528,6 +559,7 @@ impl<'g> Engine<'g> {
             cache,
             vec_cache: None,
             params: HashMap::new(),
+            plan_params: HashMap::new(),
             max_rows: usize::MAX,
             deadline: None,
             beam_width: 64,
@@ -545,6 +577,10 @@ impl<'g> Engine<'g> {
     }
 
     pub fn with_params(mut self, params: HashMap<String, Val>) -> Self {
+        self.plan_params = params
+            .iter()
+            .filter_map(|(k, v)| val_to_value(v).map(|vv| (k.clone(), vv)))
+            .collect();
         self.params = params;
         self
     }
@@ -748,7 +784,116 @@ impl<'g> Engine<'g> {
     }
 
     fn run_single(&self, sq: &SingleQuery) -> Result<QueryResult> {
+        // Stage 3: a bare `MATCH (n[:L][{p: v}]) RETURN count(*)|count(n)` is answered
+        // from resident metadata / a single index lookup, skipping row materialisation.
+        // Only reachable here (top-level / UNION part), where the seed is the empty
+        // singleton — a `CALL { … }` subquery seeds outer rows via `run_single_seeded`
+        // and never takes this path, so the count is always over the whole match.
+        if let Some((col, count)) = self.try_count_fast_path(sq)? {
+            return Ok(QueryResult {
+                columns: vec![col],
+                rows: vec![vec![Val::Int(count)]],
+            });
+        }
         self.run_single_seeded(sq, Table::singleton())
+    }
+
+    /// Recognise a single-node `count` aggregate that can be answered without
+    /// materialising rows, returning `(output_column, count)` or `None` when any
+    /// guard fails (the caller then executes normally). Guards: exactly one MATCH
+    /// reading clause, non-OPTIONAL, no WHERE, one single-node pattern (no rels);
+    /// the RETURN is exactly one non-DISTINCT `count(*)` or `count(n)` (n the
+    /// pattern's variable) with no grouping/ORDER BY/SKIP/LIMIT/`*`. The count is:
+    /// no inline props → `node_count()` (0 labels) or `nodes_with_label(L).len()`
+    /// (1 label); a single indexed-equality inline prop whose index covers exactly
+    /// the pattern's label+prop → that index's `lookup_eq` length. Anything else
+    /// (multi-label, residual props, non-index props) falls back.
+    fn try_count_fast_path(&self, sq: &SingleQuery) -> Result<Option<(String, i64)>> {
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        if m.optional || m.where_.is_some() || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pat = &m.patterns[0];
+        if !pat.rels.is_empty() {
+            return Ok(None); // single-node patterns only
+        }
+        let node = &pat.start;
+
+        // RETURN must be exactly one non-DISTINCT count, nothing else.
+        if sq.ret.distinct {
+            return Ok(None);
+        }
+        let body = &sq.ret.body;
+        if body.star
+            || body.items.len() != 1
+            || !body.order_by.is_empty()
+            || body.skip.is_some()
+            || body.limit.is_some()
+        {
+            return Ok(None);
+        }
+        let item = &body.items[0];
+        let is_count = match &item.expr {
+            Expr::Function {
+                name,
+                distinct: false,
+                args,
+            } if name.eq_ignore_ascii_case("count") => match args {
+                FuncArgs::Star => true,
+                // count(n) where n is the pattern's variable counts the same matches.
+                FuncArgs::Args(a) if a.len() == 1 => {
+                    matches!(&a[0], Expr::Var(v) if Some(v) == node.var.as_ref())
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_count {
+            return Ok(None);
+        }
+        let col = item.alias.clone().unwrap_or_else(|| expr_name(&item.expr));
+
+        // No inline props: read the count straight from resident metadata.
+        if node.props.is_empty() {
+            let count = match node.labels.as_slice() {
+                [] => self.gen.node_count(),
+                [l] => self
+                    .gen
+                    .label_id(l)
+                    .map(|lid| self.gen.nodes_with_label(lid).len() as u64)
+                    .unwrap_or(0),
+                _ => return Ok(None), // multi-label intersection — fall back
+            };
+            return Ok(Some((col, count as i64)));
+        }
+
+        // Inline props: only an exact single indexed-equality is safe (the scan
+        // result then needs no residual filtering, so its length is the count).
+        let scan = choose_node_scan(self.gen, node, None, &self.plan_params);
+        if let NodeScan::RangeEq { index, .. } = &scan {
+            if node.props.len() == 1 {
+                let covers = self
+                    .gen
+                    .manifest()
+                    .range_indexes
+                    .iter()
+                    .find(|ri| &ri.name == index && ri.entity == EntityKind::Node)
+                    .is_some_and(|ri| {
+                        node.props[0].0 == ri.property
+                            && node.labels.iter().all(|l| l == &ri.label_or_type)
+                    });
+                if covers {
+                    let ids = self.scan_candidates(&scan)?;
+                    return Ok(Some((col, ids.len() as i64)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Run a single query part starting from `seed` instead of the empty singleton.
@@ -1735,17 +1880,23 @@ impl<'g> Engine<'g> {
         let rerooted = self.maybe_reroot(pattern, binding, where_);
         let pattern = rerooted.as_ref().unwrap_or(pattern);
         let start = &pattern.start;
-        let candidates: Vec<u64> = match start.var.as_deref().and_then(|v| binding.get(v)) {
-            Some(Val::Node(id)) => vec![*id],
-            Some(_) => return Ok(()), // bound to a non-node → cannot match
-            None => {
-                // The anchor is the only place the planner picks a scan strategy.
-                let scan = choose_node_scan(self.gen, start, where_);
-                self.scan_candidates(&scan)?
-            }
-        };
+        // `guaranteed` are the anchor labels the chosen scan already proves for every
+        // candidate, so `node_ok` can skip re-decoding a label record for them
+        // (root cause 2). Only the scanned branch yields guarantees; an already-bound
+        // anchor is a single node we still verify in full.
+        let (candidates, guaranteed): (Vec<u64>, Vec<u32>) =
+            match start.var.as_deref().and_then(|v| binding.get(v)) {
+                Some(Val::Node(id)) => (vec![*id], Vec::new()),
+                Some(_) => return Ok(()), // bound to a non-node → cannot match
+                None => {
+                    // The anchor is the only place the planner picks a scan strategy.
+                    let scan = choose_node_scan(self.gen, start, where_, &self.plan_params);
+                    let guaranteed = self.scan_guaranteed_labels(&scan);
+                    (self.scan_candidates(&scan)?, guaranteed)
+                }
+            };
         for c in candidates {
-            if !self.node_ok(c, start, binding)? {
+            if !self.node_ok(c, start, binding, &guaranteed)? {
                 continue;
             }
             let mut b = binding.clone();
@@ -1842,7 +1993,7 @@ impl<'g> Engine<'g> {
             None => {
                 for hop in self.expand_one_hop(cur, rel, &binding)? {
                     let nb = hop.neighbour;
-                    if !self.node_ok(nb, next, &binding)? {
+                    if !self.node_ok(nb, next, &binding, &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -1879,7 +2030,7 @@ impl<'g> Engine<'g> {
                     &binding,
                 )?;
                 for (hops, endnode) in paths {
-                    if !self.node_ok(endnode, next, &binding)? {
+                    if !self.node_ok(endnode, next, &binding, &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -2030,17 +2181,59 @@ impl<'g> Engine<'g> {
         }
     }
 
+    /// The label ids a chosen anchor scan already proves every candidate carries,
+    /// so `node_ok` can skip re-decoding a label record for them (root cause 2). A
+    /// `LabelScan` proves its label; a range-index scan proves the (node) label the
+    /// index is defined on — a node only enters that index if it carries that label.
+    /// Id seeks and full scans prove nothing.
+    fn scan_guaranteed_labels(&self, scan: &NodeScan) -> Vec<u32> {
+        match scan {
+            NodeScan::LabelScan { label_id } => vec![*label_id],
+            NodeScan::RangeEq { index, .. } | NodeScan::RangeRange { index, .. } => self
+                .gen
+                .manifest()
+                .range_indexes
+                .iter()
+                .find(|ri| &ri.name == index && ri.entity == EntityKind::Node)
+                .and_then(|ri| self.gen.label_id(&ri.label_or_type))
+                .into_iter()
+                .collect(),
+            NodeScan::IdSeek { .. } | NodeScan::AllNodes => Vec::new(),
+        }
+    }
+
     /// Whether node `id` satisfies a node pattern's labels and inline properties.
     /// Inline property values are evaluated against `binding` so a value bound
     /// earlier (e.g. by a `WITH`, or an earlier node/rel in the pattern) resolves,
     /// making `(b {id: x})` behave exactly like `(b) WHERE b.id = x`.
-    fn node_ok(&self, id: u64, pat: &NodePat, binding: &HashMap<String, Val>) -> Result<bool> {
+    ///
+    /// `guaranteed` lists label ids the caller's anchor scan already proved for `id`
+    /// (see [`scan_guaranteed_labels`]); those are skipped so the common
+    /// label-scan/index-scan path never decodes a label record. Downstream
+    /// (traversal) callers pass `&[]` — their candidates carry no such proof.
+    fn node_ok(
+        &self,
+        id: u64,
+        pat: &NodePat,
+        binding: &HashMap<String, Val>,
+        guaranteed: &[u32],
+    ) -> Result<bool> {
         if !pat.labels.is_empty() {
-            let have = self.node_label_ids(id)?;
+            // Resolve each pattern label to an id, dropping any already guaranteed.
+            // An unknown label can never match. Only decode the resident label
+            // record if at least one label still needs checking.
+            let mut need: Vec<u32> = Vec::new();
             for l in &pat.labels {
                 match self.gen.label_id(l) {
-                    Some(lid) if have.contains(&lid) => {}
-                    _ => return Ok(false),
+                    None => return Ok(false),
+                    Some(lid) if guaranteed.contains(&lid) => {}
+                    Some(lid) => need.push(lid),
+                }
+            }
+            if !need.is_empty() {
+                let have = self.node_label_ids(id)?;
+                if !need.iter().all(|lid| have.contains(lid)) {
+                    return Ok(false);
                 }
             }
         }
@@ -5144,6 +5337,70 @@ mod tests {
         let (root, res) = run("exec_label", "MATCH (n:Person) RETURN n.name AS name");
         assert_eq!(res.columns, vec!["name"]);
         assert_eq!(col0(&res), vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn label_count_uses_fast_path() {
+        // Stage 3: `MATCH (n:Person) RETURN count(*)` reads the label posting length
+        // (3 Person nodes in the fixture) without materialising rows.
+        let (root, res) = run("exec_count_label", "MATCH (n:Person) RETURN count(*) AS c");
+        assert_eq!(res.columns, vec!["c"]);
+        assert!(
+            matches!(res.rows[0][0], Val::Int(3)),
+            "{:?}",
+            res.rows[0][0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // count(n) over the same pattern is identical.
+        let (root, res) = run(
+            "exec_count_label_n",
+            "MATCH (n:Person) RETURN count(n) AS c",
+        );
+        assert!(matches!(res.rows[0][0], Val::Int(3)));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // An unknown label counts zero (not an error, not a full scan).
+        let (root, res) = run("exec_count_unknown", "MATCH (n:Nope) RETURN count(*) AS c");
+        assert!(matches!(res.rows[0][0], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn count_with_where_still_correct() {
+        // A residual WHERE disables the fast path; the answer must still be right
+        // (2 of the 3 Person nodes have age >= 30 in the fixture: Alice 30, Carol 40;
+        // Bob is 25).
+        let (root, res) = run(
+            "exec_count_where",
+            "MATCH (n:Person) WHERE n.age >= 30 RETURN count(*) AS c",
+        );
+        assert!(
+            matches!(res.rows[0][0], Val::Int(2)),
+            "{:?}",
+            res.rows[0][0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_indexed_equality_count_fast_path() {
+        // Stage 1 + 3: `{name: $n}` selects the name index and the count comes from
+        // its `lookup_eq` length, not a label scan + materialise.
+        let (root, graph, _) = testgen::write_basic("exec_count_param_idx");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let mut params = HashMap::new();
+        params.insert("n".to_string(), Val::Str("Carol".into()));
+        let engine = Engine::new(&gen, &cache).with_params(params);
+        let ast = parser::parse("MATCH (n:Person {name: $n}) RETURN count(*) AS c").unwrap();
+        let res = engine.run(&ast).unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(1)),
+            "{:?}",
+            res.rows[0][0]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

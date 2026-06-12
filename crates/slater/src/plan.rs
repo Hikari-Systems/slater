@@ -11,9 +11,14 @@
 //! Correctness does **not** depend on the planner being clever. The executor always
 //! re-applies every label and property predicate to each candidate it is handed
 //! (see `exec`), so a [`NodeScan`] only ever *narrows the candidate set* — picking
-//! a worse strategy costs time, never correctness. That is what lets the planner
-//! plan on literals alone and ignore parameters: a parameterised predicate simply
-//! falls back to a scan, and the executor filters it.
+//! a worse strategy costs time, never correctness.
+//!
+//! The planner is **parameter-aware**: the RUN message carries the query's `$param`
+//! bindings before planning, so a predicate like `{type: $t}` or `WHERE n.x = $v`
+//! resolves its constant against the param map and selects an index just as a
+//! literal would. A param that is absent or whose runtime type cannot key an index
+//! simply does not contribute a predicate — the anchor falls back to a scan and the
+//! executor filters it, exactly as before (this is what keeps it sound).
 //
 // Consumed by the executor (`exec`); the standalone planner is unit-tested here.
 #![allow(dead_code)]
@@ -22,6 +27,7 @@ use crate::generation::Generation;
 use crate::parser::ast::{CmpOp, Expr, FuncArgs, NodePat};
 use graph_format::ids::Value;
 use graph_format::manifest::EntityKind;
+use std::collections::HashMap;
 
 /// How the executor should generate candidate nodes for a single node pattern.
 #[derive(Debug, Clone, PartialEq)]
@@ -59,11 +65,16 @@ enum Pred {
 /// `var` is the node pattern's variable (predicates in `WHERE` reference it by
 /// name); `where_` is the clause's optional predicate. Preference order:
 /// range-index equality → range-index range → smallest label posting → full scan.
-pub fn choose_node_scan(gen: &Generation, node: &NodePat, where_: Option<&Expr>) -> NodeScan {
+pub fn choose_node_scan(
+    gen: &Generation,
+    node: &NodePat,
+    where_: Option<&Expr>,
+    params: &HashMap<String, Value>,
+) -> NodeScan {
     let Some(var) = node.var.as_deref() else {
         // An anonymous anchor can still be label/range-selective via its own
         // inline props, but it has no name for WHERE predicates to reference.
-        return choose_from_preds(gen, node, &inline_preds(node));
+        return choose_from_preds(gen, node, &inline_preds(node, params));
     };
 
     // Highest-priority strategy: a direct id() seek. When a top-level `AND`
@@ -80,9 +91,9 @@ pub fn choose_node_scan(gen: &Generation, node: &NodePat, where_: Option<&Expr>)
         }
     }
 
-    let mut preds = inline_preds(node);
+    let mut preds = inline_preds(node, params);
     if let Some(w) = where_ {
-        collect_where_preds(w, var, &mut preds);
+        collect_where_preds(w, var, params, &mut preds);
     }
     choose_from_preds(gen, node, &preds)
 }
@@ -196,11 +207,12 @@ fn is_id_of(e: &Expr, var: &str) -> bool {
     )
 }
 
-/// Inline `{prop: literal}` entries are always equality predicates.
-fn inline_preds(node: &NodePat) -> Vec<(String, Pred)> {
+/// Inline `{prop: literal}` / `{prop: $param}` entries are always equality
+/// predicates (params resolved against the RUN bindings).
+fn inline_preds(node: &NodePat, params: &HashMap<String, Value>) -> Vec<(String, Pred)> {
     node.props
         .iter()
-        .filter_map(|(k, e)| literal(e).map(|v| (k.clone(), Pred::Eq(v))))
+        .filter_map(|(k, e)| resolve(e, params).map(|v| (k.clone(), Pred::Eq(v))))
         .collect()
 }
 
@@ -264,15 +276,20 @@ fn index_for(gen: &Generation, labels: &[String], prop: &str) -> Option<String> 
 
 /// Flatten the top-level `AND`s of a `WHERE` and pull out constant predicates of
 /// the form `var.prop <op> literal` (or the mirror image).
-fn collect_where_preds(expr: &Expr, var: &str, out: &mut Vec<(String, Pred)>) {
+fn collect_where_preds(
+    expr: &Expr,
+    var: &str,
+    params: &HashMap<String, Value>,
+    out: &mut Vec<(String, Pred)>,
+) {
     match expr {
         Expr::And(parts) => {
             for p in parts {
-                collect_where_preds(p, var, out);
+                collect_where_preds(p, var, params, out);
             }
         }
         Expr::Compare(op, l, r) => {
-            if let Some((prop, val, flipped)) = compare_operands(l, r, var) {
+            if let Some((prop, val, flipped)) = compare_operands(l, r, var, params) {
                 if let Some(pred) = pred_for(*op, val, flipped) {
                     out.push((prop, pred));
                 }
@@ -282,14 +299,19 @@ fn collect_where_preds(expr: &Expr, var: &str, out: &mut Vec<(String, Pred)>) {
     }
 }
 
-/// Match `var.prop <op> literal` / `literal <op> var.prop`, returning
-/// `(prop, value, flipped)` where `flipped` is true when the property was on the
-/// right (so the comparison direction must be mirrored).
-fn compare_operands(l: &Expr, r: &Expr, var: &str) -> Option<(String, Value, bool)> {
-    if let (Some(prop), Some(v)) = (var_prop(l, var), literal(r)) {
+/// Match `var.prop <op> const` / `const <op> var.prop` (where `const` is a literal
+/// or a resolved `$param`), returning `(prop, value, flipped)` — `flipped` is true
+/// when the property was on the right (so the comparison direction must mirror).
+fn compare_operands(
+    l: &Expr,
+    r: &Expr,
+    var: &str,
+    params: &HashMap<String, Value>,
+) -> Option<(String, Value, bool)> {
+    if let (Some(prop), Some(v)) = (var_prop(l, var), resolve(r, params)) {
         return Some((prop, v, false));
     }
-    if let (Some(v), Some(prop)) = (literal(l), var_prop(r, var)) {
+    if let (Some(v), Some(prop)) = (resolve(l, params), var_prop(r, var)) {
         return Some((prop, v, true));
     }
     None
@@ -329,10 +351,13 @@ fn var_prop(e: &Expr, var: &str) -> Option<String> {
     }
 }
 
-/// If `e` is a literal, clone its value.
-fn literal(e: &Expr) -> Option<Value> {
+/// Resolve `e` to a constant planning value: a literal directly, or a `$param`
+/// looked up in the RUN bindings. Any other expression (or an unbound param) is
+/// `None`, so the predicate is dropped and the anchor falls back to a scan.
+fn resolve(e: &Expr, params: &HashMap<String, Value>) -> Option<Value> {
     match e {
         Expr::Literal(v) => Some(v.clone()),
+        Expr::Param(name) => params.get(name).cloned(),
         _ => None,
     }
 }
@@ -353,7 +378,54 @@ mod tests {
     fn plan_for(gen: &Generation, query: &str) -> NodeScan {
         let q = parser::parse(query).unwrap();
         let (node, where_) = anchor(&q);
-        choose_node_scan(gen, node, where_)
+        choose_node_scan(gen, node, where_, &HashMap::new())
+    }
+
+    fn plan_for_params(gen: &Generation, query: &str, params: &[(&str, Value)]) -> NodeScan {
+        let q = parser::parse(query).unwrap();
+        let (node, where_) = anchor(&q);
+        let params: HashMap<String, Value> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        choose_node_scan(gen, node, where_, &params)
+    }
+
+    #[test]
+    fn param_equality_on_indexed_property_picks_range_eq() {
+        // `{name: $n}` and `WHERE n.name = $n` must select the index, not fall
+        // back to a label scan — the param resolves against the RUN bindings.
+        let (root, graph, _) = crate::testgen::write_basic("plan_param_eq");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let want = NodeScan::RangeEq {
+            index: "node_Person_name".into(),
+            key: Value::Str("Carol".into()),
+        };
+        let inline = plan_for_params(
+            &gen,
+            "MATCH (n:Person {name: $n}) RETURN n",
+            &[("n", Value::Str("Carol".into()))],
+        );
+        assert_eq!(inline, want);
+        let where_ = plan_for_params(
+            &gen,
+            "MATCH (n:Person) WHERE n.name = $n RETURN n",
+            &[("n", Value::Str("Carol".into()))],
+        );
+        assert_eq!(where_, want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unbound_param_falls_back_to_label_scan() {
+        // A param the RUN message never supplied contributes no predicate, so the
+        // anchor degrades to a label scan (still correct — executor re-filters).
+        let (root, graph, _) = crate::testgen::write_basic("plan_param_unbound");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for_params(&gen, "MATCH (n:Person) WHERE n.name = $n RETURN n", &[]);
+        let person = gen.label_id("Person").unwrap();
+        assert_eq!(scan, NodeScan::LabelScan { label_id: person });
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

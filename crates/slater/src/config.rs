@@ -72,6 +72,28 @@ mod de {
     pub fn i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
         d.deserialize_any(I64)
     }
+
+    struct Bool;
+    impl Visitor<'_> for Bool {
+        type Value = bool;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("bool or \"true\"/\"false\" string")
+        }
+        fn visit_bool<E: Error>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<bool, E> {
+            match v {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(E::invalid_value(Unexpected::Str(v), &self)),
+            }
+        }
+    }
+
+    pub fn bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(Bool)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,7 +116,7 @@ pub struct AppConfig {
     /// contract (`THREAT_MODEL.md` limitation 4), accepting unstamped images.
     /// (There is no equivalent flag for the manifest MAC: a server configured with
     /// a master key unconditionally refuses a MAC-less generation.)
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "de::bool")]
     pub require_acl_stamp: bool,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -455,6 +477,31 @@ mod tests {
         let cfg: CacheConfig =
             serde_json::from_value(serde_json::json!({ "cacheTtlMs": "-5" })).unwrap();
         assert_eq!(cfg.cache_ttl(), None);
+    }
+
+    #[test]
+    fn require_acl_stamp_parses_bool_and_string() {
+        // The layered loader stringifies every scalar leaf, so the config must
+        // accept both a raw boolean and the stringified "true"/"false" form.
+        let from_bool: AppConfig =
+            serde_json::from_value(serde_json::json!({ "server": {}, "requireAclStamp": false }))
+                .expect("raw bool requireAclStamp");
+        assert!(!from_bool.require_acl_stamp);
+
+        let from_str: AppConfig =
+            serde_json::from_value(serde_json::json!({ "server": {}, "requireAclStamp": "false" }))
+                .expect("stringified requireAclStamp (layered-loader form)");
+        assert!(!from_str.require_acl_stamp);
+
+        let true_str: AppConfig =
+            serde_json::from_value(serde_json::json!({ "server": {}, "requireAclStamp": "true" }))
+                .expect("stringified true");
+        assert!(true_str.require_acl_stamp);
+
+        // Absent ⇒ defaults to true (protections on by default).
+        let absent: AppConfig =
+            serde_json::from_value(serde_json::json!({ "server": {} })).expect("absent default");
+        assert!(absent.require_acl_stamp);
     }
 
     #[test]
