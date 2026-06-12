@@ -47,6 +47,34 @@ geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
 atomically swap the `current` pointer; the running server picks the change up via
 its generation guard (see [Generation guard](#generation-guard)).
 
+## Supported GQL subset
+
+Slater also understands a read-only subset of **ISO GQL** (ISO/IEC 39075), the
+standardised graph query language. There is no separate endpoint or protocol: GQL
+arrives over the same Bolt connection and is parsed by the same engine, so the
+standard drivers and tools work unchanged. A statement may optionally carry a
+leading `GQL` or `CYPHER` dialect selector (mirroring the `CYPHER 5` / `CYPHER 25`
+form) — it is stripped and the remainder is parsed either way, as one parser
+serves both languages.
+
+Every GQL form below lowers onto an existing engine capability, so the two
+spellings are equivalent and may be mixed freely (even within one query):
+
+| GQL form | Cypher equivalent | Meaning |
+|---|---|---|
+| `((…)){m,n}` | `…*m..n` | Quantified path — repeat the parenthesised pattern *m* to *n* times. |
+| `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` | (varies; `*` is `TRAIL`) | Path restrictor over a variable-length match: `WALK` allows repeats, `TRAIL` forbids repeated edges (the default for `*`), `ACYCLIC` forbids any repeated node, `SIMPLE` forbids interior repeats but lets the two endpoints coincide. |
+| `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k` | `shortestPath(…)` | Shortest-path selector on a match: any one shortest path, all minimum-length paths, or the first *k* by length. |
+| `:A & B`, `:A \| B`, `:! A`, `:(A \| B) & C` | `:A:B` (AND), `:A\|B` (OR) | Label / relationship-type boolean expressions — `&`, `\|`, `!` and parentheses. The classic `:A:B` (AND) and `:T1\|T2` (alternation) remain valid as sugar. |
+| `FOR x IN list` | `UNWIND list AS x` | Iterate a list, emitting one row per element. |
+| `CAST(expr AS TYPE)` | `toInteger(expr)`, `toFloat(…)`, … | Typed-value conversion (`INTEGER`/`INT`, `FLOAT`/`DOUBLE`/`REAL`, `STRING`/`VARCHAR`, `BOOLEAN`/`BOOL`, `DATE`, `LOCALTIME`, `LOCALDATETIME`, `DURATION`). |
+| `GQL …` / `CYPHER …` prefix | *(none — implicit)* | Optional dialect selector at the very start of a statement; recorded and stripped, with no change of behaviour today. |
+
+GQL responses also carry additive **GQLSTATUS** status objects in the Bolt
+`SUCCESS` / `FAILURE` metadata (`gql_status` + `status_description`) alongside the
+existing keys, so GQL-aware clients see standard status codes while older drivers
+are unaffected.
+
 > **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
 > who insists on going by a single name — "Just… Slater" — and one of my favourite
 > characters in it. See the
