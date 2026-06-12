@@ -19,12 +19,15 @@
 | 3 | Count fast-paths (metadata / index cardinality) | low | **DONE** | counts **0.6–0.8 ms** (from 14–901 ms) |
 | 4 | Block-cache record read (no per-record copy / less locking) | high | **DONE** | broad floor drop: 2-hop **48→1.95 ms** (Neo4j parity), agg/CONTAINS/DISTINCT ~3×, 3-hop ~49 ms |
 | 5 | Streaming aggregation + projection pushdown + prop memo | med | **DONE** | agg **19.5→10.3 ms**, DISTINCT **20.5→11.6 ms**, CONTAINS **16→9.0 ms** (~1.8× each; now 1.3–2× Neo4j) |
-| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 1-hop ~4.8 ms, 3-hop ~45 ms (still traversal-bound) |
+| 6 | Traversal frame **+ LIMIT pushdown** (the real lever) | med | **DONE** | 3-hop **45→1.6 ms** (now *beats* Neo4j), 1-hop **4.8→2.6 ms**, 2-hop 2.0→1.6 ms; no row regressions |
 
 Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk) — **DONE 2026-06-12**, see
 "Validation results (Stages 0–3)" below. **Stage 4 DONE 2026-06-12** — see "Validation results
-(Stage 4)". **Stage 5 DONE 2026-06-12** — see "Validation results (Stage 5)". Next: **6** (the
-traversal frame — the remaining gap is the 1-/3-hop traversals).
+(Stage 4)". **Stage 5 DONE 2026-06-12** — see "Validation results (Stage 5)". **Stage 6 DONE
+2026-06-12** — see "Validation results (Stage 6)". All six stages are now complete; cold
+execution matches or beats Neo4j on every benchmark row except the three Crime-anchored full
+scans (agg/CONTAINS/DISTINCT, 1.3–2.3× off), which stay compute-bound (no further fast path
+applies without changing the answer).
 **Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–6 (see below).
 
 ### Bonus (this round): result-cache disable switch
@@ -215,6 +218,73 @@ unchanged/better: slater **62 MiB** RSS vs Neo4j **758 MiB**. Tests:
 `graph-format` `columns::tests::decode_one_matches_full_decode_and_skips`; `slater`
 `exec::tests::streaming_scan_{where_and_property_projection,group_by_property_aggregation,inline_prop_filter}`
 (327 slater + 50 graph-format lib tests green).
+
+## Validation results (Stage 6 — traversal frame + LIMIT pushdown, measured 2026-06-12, cache DISABLED)
+
+Freshly built current-source image (`resultCacheBytes: 0`), same machine/data, Neo4j on :7688.
+**No `!rows` mismatch on any row** → correctness preserved. Two back-to-back runs agreed within
+noise; medians below are representative.
+
+| query | Stage 5 (cache off) | **Stage 6 (cache off)** | Neo4j | vs Neo4j |
+|-------|-------------------:|------------------------:|------:|---------:|
+| count all nodes | 0.61–0.64 ms | 0.59–0.64 ms | 2.8–3.2 ms | ~5× faster |
+| Crime label count | 0.59–0.61 ms | 0.59–0.61 ms | 1.6 ms | ~2.7× faster |
+| point lookup (idx nhs_no) | 0.66 ms | 0.67–0.69 ms | 1.0 ms | ~1.5× faster |
+| idx-eq count (Crime.type) | 1.52–1.56 ms | 1.55–1.57 ms | 1.0–1.1 ms | 1/1.5× |
+| 1-hop Crime→Location | 4.7–5.4 ms | **2.6 ms** (min 2.3) | 1.9–2.1 ms | 1/1.3–1.4× |
+| 2-hop Person→Loc→Area | 2.0–2.1 ms | **1.6 ms** | 1.9–2.3 ms | **1.1–1.4× faster** |
+| agg crimes by type | 10.0–10.3 ms | 10.4 ms | 8.1–8.2 ms | 1/1.3× |
+| 3-hop Officer/Crime/Loc | 44–45 ms | **1.6 ms** (min 1.5) | 2.0–2.2 ms | **1.2–1.3× faster** |
+| full-scan CONTAINS | 9.0–9.2 ms | 9.1–9.2 ms | 3.9–4.1 ms | 1/2.2–2.3× |
+| count DISTINCT type | 11.2–11.5 ms | 11.3–11.5 ms | 6.4–6.5 ms | 1/1.8× |
+
+**Headline: the 3-hop fell 45 → 1.6 ms (~28×) and now *beats* Neo4j; the 1-hop fell 4.8 → 2.6 ms;
+the 2-hop also improved to 1.6 ms (now faster than Neo4j).** Every other row is unchanged within
+noise — no regression on the sub-2 ms count/index rows or the Stage-5 agg/CONTAINS/DISTINCT rows.
+Memory unchanged (~62 MiB RSS vs Neo4j ~750 MiB).
+
+### What actually moved the needle (the doc's hypothesis was wrong)
+
+Root cause 6 named **two** things — "per-hop `binding.clone()`" and "buffer all paths". Measurement
+proved it was the **second**, via `LIMIT` interaction, not the first:
+
+- **The binding-clone frame was a no-op on the benchmark.** I first did exactly what the plan said:
+  replaced the per-hop `HashMap<String, Val>` clone in `expand_chain`/`match_single_pattern` with a
+  mutate-in-place frame (`restore_binding`, push/pop backtracking; `walk` and the var-length `used`
+  set already worked this way). It is correct and removes real allocations, but the bench was
+  **flat** (3-hop 44→46 ms, 1-hop unchanged). The per-branch clone was never the dominant cost.
+- **The real cost was materializing every path before a non-pushed `LIMIT`.** The 3-hop query
+  `MATCH (o:Officer)<-[:INVESTIGATED_BY]-(c:Crime)-[:OCCURRED_AT]->(l:Location) … LIMIT 100`
+  produces **28,762** paths (one per crime); the executor buffered all of them into a
+  `Vec<HashMap>` and only then truncated to 100 in `project`. The 2-hop looked "at parity" only
+  because its pattern yields just **368** paths; the 1-hop (one crime type) yields **2,807**. Neo4j
+  is fast here because it pulls lazily and stops at 100.
+- **Fix — LIMIT pushdown / early-stop.** `projection_row_cap` computes a row cap of `SKIP + LIMIT`
+  when the final projection is a plain 1:1 map (no aggregation, no `DISTINCT`, no `ORDER BY`, has a
+  `LIMIT`). `run_single_seeded` applies it to the **last** reading clause only (earlier clauses may
+  filter/expand downstream). The cap threads through `apply_match` → `match_patterns` →
+  `match_single_pattern` → `expand_chain` (and the no-rel `try_stream_match`), which stop emitting
+  once `out` reaches the cap. It is exact: early-stop returns the **same prefix** in match-emit
+  order that buffer-then-truncate did — proven by `limit_pushdown_*` tests comparing limited vs full
+  results. The per-pattern walk is capped only when it is the last pattern **and** there is no
+  residual `WHERE` (otherwise the terminal `WHERE`/downstream patterns can drop rows, so a tight cap
+  could under-produce — guarded by the `sp_cap = … && where_.is_none()` condition).
+
+The binding frame is kept (it's a correct, allocation-reducing cleanup and the characterization
+tests lock its semantics), but the measurable Stage-6 win is entirely the LIMIT pushdown.
+
+### Tests (341 slater + 50 graph-format lib tests green)
+
+- **Frame characterization** (lock the multi-hop result set byte-for-byte across the rewrite):
+  `exec::tests::frame_{two_hop_chain_exact_rows,three_hop_chain_exact_rows,
+  sibling_branch_binding_isolation,same_end_node_via_two_paths,undirected_traversal,
+  where_references_mid_pattern_var,multipattern_comma_join_shared_var,varlen_zero_length_includes_self,
+  varlen_relationship_uniqueness,path_var_walk_order}`. `sibling_branch_binding_isolation` is the
+  specific frame risk — a node with two out-edges where a broken restore would leak a sibling's mid
+  binding.
+- **LIMIT pushdown** (early-stop = order-preserving prefix; aggregation/ORDER BY not capped):
+  `exec::tests::limit_pushdown_{traversal_returns_order_preserving_prefix,with_skip,
+  streaming_scan_prefix}`, `exec::tests::limit_does_not_break_aggregation_or_order`.
 
 ## Validation harness
 
@@ -430,12 +500,29 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 - **Validate:** `agg crimes by type`, `count DISTINCT type`, full-scan CONTAINS improve ~1.8×; rows
   unchanged. ✓
 
-### Stage 6 — Traversal frame / streaming
-- **Problem:** root cause 6 — per-hop `binding.clone()` and full path buffering (3-hop 2242 ms).
-- **Change:** replace the cloned `HashMap` binding with a compact positional frame or a persistent
-  (structurally-shared) map; stream path filtering instead of collecting all paths into a `Vec`.
-- **Files:** `crates/slater/src/exec.rs` (`expand_chain` ~1821, `varlen` ~1913).
-- **Validate:** 3-hop and 2-hop drop to low ms; results unchanged.
+### Stage 6 — Traversal frame + LIMIT pushdown  **[DONE 2026-06-12]**
+- **Result:** 3-hop **45→1.6 ms** (now beats Neo4j), 1-hop **4.8→2.6 ms**, 2-hop 2.0→1.6 ms; all
+  other rows unchanged within noise, no `!rows` mismatch. See "Validation results (Stage 6)" for the
+  full table and the analysis of why the doc's binding-clone hypothesis was wrong.
+- **Problem:** root cause 6 named per-hop `binding.clone()` **and** full path buffering. Only the
+  second mattered, and only via `LIMIT`: a non-pushed `LIMIT` made the executor materialize every
+  path (3-hop = 28,762 paths for `LIMIT 100`) into a `Vec<HashMap>` before truncating in `project`.
+- **Change (two parts):**
+  1. **Binding frame** (the planned change; correct but measurement-neutral): `expand_chain` and
+     `match_single_pattern` now mutate one `HashMap` in place with push/pop restore
+     (`restore_binding`) instead of cloning the binding per neighbour per hop. One clone per
+     *completed* row remains (pushed into `out`). The `walk` path scratch and var-length `used` set
+     already used this discipline.
+  2. **LIMIT pushdown** (the actual lever): `projection_row_cap` derives a `SKIP + LIMIT` row cap
+     when the final projection is a 1:1 map (no aggregation/`DISTINCT`/`ORDER BY`); `run_single_seeded`
+     applies it to the last reading clause; the cap threads through `apply_match`/`match_patterns`/
+     `match_single_pattern`/`expand_chain`/`try_stream_match`, which stop emitting once `out` is full.
+     Exact (same prefix in emit order); the per-pattern walk is capped only on the last pattern with
+     no residual `WHERE`.
+- **Files:** `crates/slater/src/exec.rs` — `projection_row_cap`, `run_single_seeded`, `apply_match`,
+  `try_stream_match`, `match_patterns`, `match_single_pattern`, `expand_chain`, `restore_binding`.
+- **Validate:** 3-/1-/2-hop drop to low ms; results unchanged (frame characterization +
+  `limit_pushdown_*` tests; 341 slater + 50 graph-format lib tests green). ✓
 
 ## Appendix — regenerate test data if lost
 

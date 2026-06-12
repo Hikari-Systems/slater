@@ -917,14 +917,48 @@ impl<'g> Engine<'g> {
         Ok(Some((columns, row)))
     }
 
+    /// Row cap a final `RETURN` lets us push into the last MATCH (root cause 6 —
+    /// "buffer all paths"). When the projection is a plain 1:1 map — no
+    /// aggregation, no `DISTINCT`, no `ORDER BY` — with a `LIMIT`, only the first
+    /// `SKIP + LIMIT` matched rows (in match-emit order) can ever survive, so the
+    /// match may stop the moment it has produced that many. Returns `None` when any
+    /// of those needs the full set (aggregation/`DISTINCT`/`ORDER BY`, or no
+    /// `LIMIT`). The pushdown is exact: stopping early yields the *same* prefix of
+    /// rows that buffering-then-truncating does, since nothing between the match and
+    /// the limit reorders or drops rows. `LIMIT`/`SKIP` are constant expressions
+    /// (Cypher forbids row variables there), so evaluating them here is safe.
+    fn projection_row_cap(&self, body: &ProjectionBody, distinct: bool) -> Result<Option<usize>> {
+        let Some(limit) = &body.limit else {
+            return Ok(None);
+        };
+        if distinct || !body.order_by.is_empty() {
+            return Ok(None);
+        }
+        if body.items.iter().any(|it| contains_aggregate(&it.expr)) {
+            return Ok(None);
+        }
+        let n = self.eval_count(limit)?;
+        let skip = match &body.skip {
+            Some(s) => self.eval_count(s)?,
+            None => 0,
+        };
+        Ok(Some(n.saturating_add(skip)))
+    }
+
     /// Run a single query part starting from `seed` instead of the empty singleton.
     /// A top-level query seeds the singleton; a `CALL { … }` subquery seeds the
     /// imported outer variables (one row) so the inner clauses can reference them.
     fn run_single_seeded(&self, sq: &SingleQuery, seed: Table) -> Result<QueryResult> {
+        // A pushable `RETURN … LIMIT n` caps only the LAST reading clause feeding
+        // the final 1:1 projection — earlier clauses may be filtered or expanded
+        // downstream, so capping them could under-produce.
+        let cap = self.projection_row_cap(&sq.ret.body, sq.ret.distinct)?;
+        let last = sq.reading.len();
         let mut table = seed;
-        for clause in &sq.reading {
+        for (i, clause) in sq.reading.iter().enumerate() {
+            let clause_cap = if i + 1 == last { cap } else { None };
             match clause {
-                Clause::Match(m) => table = self.apply_match(table, m)?,
+                Clause::Match(m) => table = self.apply_match(table, m, clause_cap)?,
                 Clause::With(w) => {
                     table = self.project(table, &w.body, w.distinct, w.where_.as_ref())?
                 }
@@ -943,12 +977,12 @@ impl<'g> Engine<'g> {
 
     // ── MATCH ────────────────────────────────────────────────────────────
 
-    fn apply_match(&self, table: Table, m: &MatchClause) -> Result<Table> {
+    fn apply_match(&self, table: Table, m: &MatchClause, cap: Option<usize>) -> Result<Table> {
         // Stage 5: a single non-optional node-only pattern (no relationships, no
         // path variable, fresh-scan anchor) streams candidates straight into rows,
         // skipping the per-row `HashMap` binding the general matcher builds (root
         // cause 4).
-        if let Some(t) = self.try_stream_match(&table, m)? {
+        if let Some(t) = self.try_stream_match(&table, m, cap)? {
             return Ok(t);
         }
         // Variables this clause newly introduces, appended to the scope in order.
@@ -961,13 +995,27 @@ impl<'g> Engine<'g> {
 
         let mut out_rows = Vec::new();
         for row in &table.rows {
+            // Stage 6: stop once a pushed `LIMIT` is satisfied — the cumulative cap
+            // across all seed rows. The per-seed match is also capped at the rows
+            // still needed, so a single seed expanding millions of paths halts early.
+            if cap.is_some_and(|c| out_rows.len() >= c) {
+                break;
+            }
             self.check_deadline()?;
             let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
             for (c, v) in table.cols.iter().zip(row) {
                 seed.insert(c.clone(), v.clone());
             }
             let mut matches: Vec<HashMap<String, Val>> = Vec::new();
-            self.match_patterns(&m.patterns, 0, seed, m.where_.as_ref(), &mut matches)?;
+            let remaining = cap.map(|c| c.saturating_sub(out_rows.len()));
+            self.match_patterns(
+                &m.patterns,
+                0,
+                seed,
+                m.where_.as_ref(),
+                &mut matches,
+                remaining,
+            )?;
 
             if matches.is_empty() && m.optional {
                 let mut r = row.clone();
@@ -1001,7 +1049,12 @@ impl<'g> Engine<'g> {
     /// pattern's labels/inline props, and the clause `WHERE` is re-evaluated per
     /// emitted row against the full row scope — identical semantics to
     /// `match_patterns`, including row order and the per-row intermediate charge.
-    fn try_stream_match(&self, table: &Table, m: &MatchClause) -> Result<Option<Table>> {
+    fn try_stream_match(
+        &self,
+        table: &Table,
+        m: &MatchClause,
+        cap: Option<usize>,
+    ) -> Result<Option<Table>> {
         if m.optional || m.patterns.len() != 1 {
             return Ok(None);
         }
@@ -1028,7 +1081,7 @@ impl<'g> Engine<'g> {
         }
 
         let mut out_rows = Vec::new();
-        for in_row in &table.rows {
+        'outer: for in_row in &table.rows {
             self.check_deadline()?;
             // Binding for inline-prop evaluation in `node_ok`, built once per input
             // row (the anchor's own var is intentionally absent, as in the general
@@ -1040,6 +1093,11 @@ impl<'g> Engine<'g> {
                 .zip(in_row.iter().cloned())
                 .collect();
             for &c in &candidates {
+                // Stage 6: honour a pushed `LIMIT` (no ORDER BY/aggregation/DISTINCT)
+                // so a bare `MATCH (n:L) … LIMIT k` scans only k matching nodes.
+                if cap.is_some_and(|cc| out_rows.len() >= cc) {
+                    break 'outer;
+                }
                 if !self.node_ok(c, start, &in_binding, &guaranteed)? {
                     continue;
                 }
@@ -1943,7 +2001,11 @@ impl<'g> Engine<'g> {
         binding: HashMap<String, Val>,
         where_: Option<&Expr>,
         out: &mut Vec<HashMap<String, Val>>,
+        cap: Option<usize>,
     ) -> Result<()> {
+        if cap.is_some_and(|c| out.len() >= c) {
+            return Ok(());
+        }
         if idx == patterns.len() {
             if let Some(w) = where_ {
                 if !truthy(&self.eval(w, &Scope::Map(&binding), None)?) {
@@ -1956,10 +2018,24 @@ impl<'g> Engine<'g> {
             out.push(binding);
             return Ok(());
         }
+        // The pushed cap (Stage 6) bounds this pattern's own expansion only when it
+        // is the LAST pattern AND there is no residual WHERE — then each emitted
+        // binding becomes exactly one output row (1:1), so the expansion needs at
+        // most `cap - out.len()` rows. Otherwise downstream patterns/WHERE may drop
+        // or multiply rows, so the per-pattern walk stays uncapped (only the `out`
+        // accumulation below stops early).
+        let sp_cap = if idx + 1 == patterns.len() && where_.is_none() {
+            cap.map(|c| c.saturating_sub(out.len()))
+        } else {
+            None
+        };
         let mut partial = Vec::new();
-        self.match_single_pattern(&patterns[idx], &binding, where_, &mut partial)?;
+        self.match_single_pattern(&patterns[idx], &binding, where_, &mut partial, sp_cap)?;
         for b in partial {
-            self.match_patterns(patterns, idx + 1, b, where_, out)?;
+            if cap.is_some_and(|c| out.len() >= c) {
+                break;
+            }
+            self.match_patterns(patterns, idx + 1, b, where_, out, cap)?;
         }
         Ok(())
     }
@@ -1970,6 +2046,7 @@ impl<'g> Engine<'g> {
         binding: &HashMap<String, Val>,
         where_: Option<&Expr>,
         out: &mut Vec<HashMap<String, Val>>,
+        cap: Option<usize>,
     ) -> Result<()> {
         // If the start anchor would be a full scan but the pattern's *end* node is
         // id-seekable, match the reversed pattern so the seekable node leads. This
@@ -1996,16 +2073,32 @@ impl<'g> Engine<'g> {
                     (self.scan_candidates(&scan)?, guaranteed)
                 }
             };
+        // One mutable frame for the whole anchor loop. Each candidate binds the
+        // anchor var in place, expands, then restores it — instead of cloning the
+        // inherited scope per candidate, and (in `expand_chain`) per hop per
+        // neighbour. `node_ok` still sees the pre-anchor scope (the anchor's own
+        // var intentionally absent, as before), since `frame` is restored to the
+        // base binding between candidates.
+        let mut frame = binding.clone();
+        let mut walk = Vec::new();
         for c in candidates {
-            if !self.node_ok(c, start, binding, &guaranteed)? {
+            // Stage 6: once a pushed `LIMIT` is met, stop scanning anchors — the
+            // remaining candidates can only add rows the projection would truncate.
+            if cap.is_some_and(|cc| out.len() >= cc) {
+                break;
+            }
+            if !self.node_ok(c, start, &frame, &guaranteed)? {
                 continue;
             }
-            let mut b = binding.clone();
-            if let Some(v) = &start.var {
-                b.insert(v.clone(), Val::Node(c));
+            let prev = start
+                .var
+                .as_ref()
+                .map(|v| (v.clone(), frame.insert(v.clone(), Val::Node(c))));
+            debug_assert!(walk.is_empty());
+            self.expand_chain(pattern, 0, c, &mut frame, c, &mut walk, out, cap)?;
+            if let Some((v, old)) = prev {
+                restore_binding(&mut frame, v, old);
             }
-            let mut path = Vec::new();
-            self.expand_chain(pattern, 0, c, b, c, &mut path, out)?;
         }
         Ok(())
     }
@@ -2075,26 +2168,50 @@ impl<'g> Engine<'g> {
         pattern: &Pattern,
         i: usize,
         cur: u64,
-        binding: HashMap<String, Val>,
+        binding: &mut HashMap<String, Val>,
         start: u64,
         walk: &mut Vec<Hop>,
         out: &mut Vec<HashMap<String, Val>>,
+        cap: Option<usize>,
     ) -> Result<()> {
+        // Mutate-in-place binding frame (root cause 6): rather than `binding.clone()`
+        // per neighbour per hop, each branch inserts its hop's rel/next bindings,
+        // recurses, then restores them on backtrack via `restore_binding`. The only
+        // remaining clone is one per *completed* row (when pushing into `out`),
+        // which is unavoidable and matches the streaming-scan path. `walk` (the path
+        // scratch) and the var-length `used` set already use the same push/pop
+        // discipline, so siblings stay isolated.
+        //
+        // Stage 6: `cap` is the number of rows the final `LIMIT` still needs (only
+        // set when the projection is a 1:1 map with no ORDER BY/aggregation/DISTINCT
+        // and no residual WHERE — see `match_patterns`). Once `out` reaches it we
+        // unwind without expanding further, so a query like the 3-hop that would
+        // otherwise buffer ~28k paths for `LIMIT 100` stops after 100.
+        if cap.is_some_and(|c| out.len() >= c) {
+            return Ok(());
+        }
         if i == pattern.rels.len() {
-            let mut binding = binding;
             if let Some(pv) = &pattern.path_var {
-                binding.insert(pv.clone(), make_path(start, walk));
+                // Bind the path for this completed walk, snapshot the row, then
+                // restore so sibling branches don't inherit a stale path value.
+                let prev = binding.insert(pv.clone(), make_path(start, walk));
+                out.push(binding.clone());
+                restore_binding(binding, pv.clone(), prev);
+            } else {
+                out.push(binding.clone());
             }
-            out.push(binding);
             return Ok(());
         }
         self.check_deadline()?;
         let (rel, next) = &pattern.rels[i];
         match &rel.var_length {
             None => {
-                for hop in self.expand_one_hop(cur, rel, &binding)? {
+                for hop in self.expand_one_hop(cur, rel, binding)? {
+                    if cap.is_some_and(|c| out.len() >= c) {
+                        break;
+                    }
                     let nb = hop.neighbour;
-                    if !self.node_ok(nb, next, &binding, &[])? {
+                    if !self.node_ok(nb, next, binding, &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -2104,16 +2221,24 @@ impl<'g> Engine<'g> {
                             }
                         }
                     }
-                    let mut b = binding.clone();
-                    if let Some(v) = &rel.var {
-                        b.insert(v.clone(), hop.as_rel());
-                    }
-                    if let Some(v) = &next.var {
-                        b.insert(v.clone(), Val::Node(nb));
-                    }
+                    let prev_rel = rel
+                        .var
+                        .as_ref()
+                        .map(|v| (v.clone(), binding.insert(v.clone(), hop.as_rel())));
+                    let prev_next = next
+                        .var
+                        .as_ref()
+                        .map(|v| (v.clone(), binding.insert(v.clone(), Val::Node(nb))));
                     walk.push(hop);
-                    self.expand_chain(pattern, i + 1, nb, b, start, walk, out)?;
+                    self.expand_chain(pattern, i + 1, nb, binding, start, walk, out, cap)?;
                     walk.pop();
+                    // Restore LIFO so an aliasing rel/next var name unwinds correctly.
+                    if let Some((v, prev)) = prev_next {
+                        restore_binding(binding, v, prev);
+                    }
+                    if let Some((v, prev)) = prev_rel {
+                        restore_binding(binding, v, prev);
+                    }
                 }
             }
             Some(vl) => {
@@ -2128,10 +2253,13 @@ impl<'g> Engine<'g> {
                     &mut path,
                     &mut used,
                     &mut paths,
-                    &binding,
+                    binding,
                 )?;
                 for (hops, endnode) in paths {
-                    if !self.node_ok(endnode, next, &binding, &[])? {
+                    if cap.is_some_and(|c| out.len() >= c) {
+                        break;
+                    }
+                    if !self.node_ok(endnode, next, binding, &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -2141,17 +2269,24 @@ impl<'g> Engine<'g> {
                             }
                         }
                     }
-                    let mut b = binding.clone();
-                    if let Some(v) = &rel.var {
-                        b.insert(v.clone(), Val::List(hops.iter().map(Hop::as_rel).collect()));
-                    }
-                    if let Some(v) = &next.var {
-                        b.insert(v.clone(), Val::Node(endnode));
-                    }
+                    let prev_rel = rel.var.as_ref().map(|v| {
+                        let rels = Val::List(hops.iter().map(Hop::as_rel).collect());
+                        (v.clone(), binding.insert(v.clone(), rels))
+                    });
+                    let prev_next = next
+                        .var
+                        .as_ref()
+                        .map(|v| (v.clone(), binding.insert(v.clone(), Val::Node(endnode))));
                     let n = hops.len();
                     walk.extend(hops);
-                    self.expand_chain(pattern, i + 1, endnode, b, start, walk, out)?;
+                    self.expand_chain(pattern, i + 1, endnode, binding, start, walk, out, cap)?;
                     walk.truncate(walk.len() - n);
+                    if let Some((v, prev)) = prev_next {
+                        restore_binding(binding, v, prev);
+                    }
+                    if let Some((v, prev)) = prev_rel {
+                        restore_binding(binding, v, prev);
+                    }
                 }
             }
         }
@@ -2771,7 +2906,7 @@ impl<'g> Engine<'g> {
                 // all matches are collected, then emptiness is tested.
                 let seed = scope.to_binding();
                 let mut bindings = Vec::new();
-                self.match_single_pattern(pattern, &seed, None, &mut bindings)?;
+                self.match_single_pattern(pattern, &seed, None, &mut bindings, None)?;
                 Ok(Val::Bool(!bindings.is_empty()))
             }
             Expr::Exists {
@@ -2783,7 +2918,7 @@ impl<'g> Engine<'g> {
                 // pattern is bound — exactly the semi-apply existence test.
                 let seed = scope.to_binding();
                 let mut bindings = Vec::new();
-                self.match_patterns(patterns, 0, seed, predicate.as_deref(), &mut bindings)?;
+                self.match_patterns(patterns, 0, seed, predicate.as_deref(), &mut bindings, None)?;
                 Ok(Val::Bool(!bindings.is_empty()))
             }
             Expr::ShortestPath(pattern) => self.eval_shortest_path(pattern, scope),
@@ -3260,7 +3395,7 @@ impl<'g> Engine<'g> {
     ) -> Result<Val> {
         let seed = scope.to_binding();
         let mut bindings = Vec::new();
-        self.match_single_pattern(pattern, &seed, predicate, &mut bindings)?;
+        self.match_single_pattern(pattern, &seed, predicate, &mut bindings, None)?;
         let mut out = Vec::with_capacity(bindings.len());
         for b in bindings {
             out.push(self.eval(projection, &Scope::Map(&b), aggs)?);
@@ -4419,6 +4554,24 @@ fn varlen_bounds(vl: &VarLength) -> (u32, u32) {
     let min = vl.min.unwrap_or(1);
     let max = vl.max.unwrap_or(MAX_VARLEN_HOPS).max(min);
     (min, max)
+}
+
+/// Undo a scoped `HashMap::insert` on a traversal binding frame: restore the
+/// value the key held before this branch overwrote it, or remove the key if it
+/// was absent. Paired with each frame insert in [`Engine::expand_chain`] /
+/// [`Engine::match_single_pattern`], this gives the per-branch isolation the old
+/// per-hop `binding.clone()` provided — without cloning the whole map per branch
+/// (root cause 6). Restoring in LIFO order is correct even if two inserts in the
+/// same hop alias the same key (a rel var and node var sharing a name).
+fn restore_binding(binding: &mut HashMap<String, Val>, key: String, prev: Option<Val>) {
+    match prev {
+        Some(v) => {
+            binding.insert(key, v);
+        }
+        None => {
+            binding.remove(&key);
+        }
+    }
 }
 
 /// Reverse a relationship chain so its last node becomes the anchor: walk the
@@ -5952,6 +6105,281 @@ mod tests {
             assert!(matches!(r[1], Val::Null));
         }
         assert_eq!(res.rows[0][0].to_display(), "Acme");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Stage 6 — traversal-frame characterization ───────────────────────────
+    // These lock the exact result set of the multi-hop / variable-length walk so
+    // the mutate-in-place binding frame (replacing the per-hop `binding.clone()`)
+    // is provably result-preserving. They pass on the pre-Stage-6 code and must
+    // still pass byte-for-byte after the rewrite.
+
+    #[test]
+    fn frame_two_hop_chain_exact_rows() {
+        // KNOWS Person→Person edges: Alice→Bob, Bob→Carol, Alice→Carol. The only
+        // length-2 KNOWS chain is Alice→Bob→Carol (Carol has no outgoing KNOWS).
+        let (root, res) = run(
+            "exec_frame_2hop",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             RETURN a.name AS a, b.name AS b, c.name AS c",
+        );
+        let rows: Vec<(String, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display(), r[2].to_display()))
+            .collect();
+        assert_eq!(rows, vec![("Alice".into(), "Bob".into(), "Carol".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_three_hop_chain_exact_rows() {
+        // Headline-shaped 3-hop: KNOWS, KNOWS, WORKS_AT. The only walk is
+        // Alice→Bob→Carol→Globex (Carol WORKS_AT Globex).
+        let (root, res) = run(
+            "exec_frame_3hop",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:WORKS_AT]->(d) \
+             RETURN a.name AS a, b.name AS b, c.name AS c, d.name AS d",
+        );
+        let rows: Vec<(String, String, String, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r[0].to_display(),
+                    r[1].to_display(),
+                    r[2].to_display(),
+                    r[3].to_display(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                "Alice".into(),
+                "Bob".into(),
+                "Carol".into(),
+                "Globex".into()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_sibling_branch_binding_isolation() {
+        // The specific frame risk: Alice has TWO KNOWS siblings (Bob, Carol). Only
+        // the Bob branch extends (Bob→Carol); the Carol branch dead-ends. If a
+        // sibling fails to restore the mid binding `b` on backtrack, the Carol
+        // branch would leak `b = Bob` and fabricate rows. Exactly one row proves
+        // each branch is isolated.
+        let (root, res) = run(
+            "exec_frame_sibling",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN b.name AS b, c.name AS c",
+        );
+        let rows: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(rows, vec![("Bob".into(), "Carol".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_same_end_node_via_two_paths() {
+        // Carol is reachable from Alice by two distinct KNOWS paths — direct
+        // (Alice→Carol) and via Bob (Alice→Bob→Carol). Both must survive as
+        // separate rows; the frame must not collapse or duplicate them.
+        let (root, res) = run(
+            "exec_frame_twopaths",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(c:Person {name:'Carol'}) \
+             RETURN c.name AS c",
+        );
+        assert_eq!(col0(&res), vec!["Carol", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_undirected_traversal() {
+        // Bob's KNOWS edges: incoming from Alice (e0), outgoing to Carol (e1).
+        // Undirected sees both.
+        let (root, res) = run(
+            "exec_frame_undirected",
+            "MATCH (a:Person {name:'Bob'})-[:KNOWS]-(x) RETURN x.name AS x",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_where_references_mid_pattern_var() {
+        // A WHERE on the mid node `b` (evaluated against the full row scope) keeps
+        // only the chain through Bob.
+        let (root, res) = run(
+            "exec_frame_midwhere",
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+             WHERE b.name = 'Bob' RETURN a.name AS a, c.name AS c",
+        );
+        let rows: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(rows, vec![("Alice".into(), "Carol".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_multipattern_comma_join_shared_var() {
+        // Two comma-joined patterns sharing `b`: pattern 1 binds b∈{Bob,Carol};
+        // pattern 2 (b)-[:KNOWS]->(c) only extends from Bob.
+        let (root, res) = run(
+            "exec_frame_comma",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b), (b)-[:KNOWS]->(c) \
+             RETURN b.name AS b, c.name AS c",
+        );
+        let rows: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        assert_eq!(rows, vec![("Bob".into(), "Carol".into())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_varlen_zero_length_includes_self() {
+        // `*0..1`: zero hops binds the anchor itself (Alice); one hop adds its
+        // KNOWS neighbours.
+        let (root, res) = run(
+            "exec_frame_varlen0",
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*0..1]->(b) RETURN b.name AS b",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_varlen_relationship_uniqueness() {
+        // Undirected `*2..2` from Bob must not reuse an edge within a path: the
+        // walks are Bob-e0-Alice-e4-Carol and Bob-e1-Carol-e4-Alice. Reusing e0/e1
+        // would step back to Bob — so a "Bob" in the result would mean uniqueness
+        // is broken.
+        let (root, res) = run(
+            "exec_frame_unique",
+            "MATCH (a:Person {name:'Bob'})-[:KNOWS*2..2]-(x) RETURN x.name AS x",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_path_var_walk_order() {
+        // The path scratch buffer must yield nodes/relationships in walk order
+        // (Alice→Bob→Carol = ids 0,1,2; edges e0,e1 = ids 0,1) after the frame
+        // push/pop rewrite.
+        let (root, res) = run(
+            "exec_frame_pathorder",
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN [n IN nodes(p) | id(n)] AS ns, [r IN relationships(p) | id(r)] AS rs",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(render(&res.rows[0][0]), "[0,1,2]");
+        assert_eq!(render(&res.rows[0][1]), "[0,1]");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Stage 6 — LIMIT pushdown (early-stop) ────────────────────────────────
+    // Pushing the LIMIT into the match must return the SAME prefix of rows (in
+    // match-emit order) that buffering-then-truncating did — early-stop changes
+    // *when* matching halts, never *which* rows come first.
+
+    /// All rows of `q` as `(a, b)` display-string pairs, plus fixture cleanup.
+    fn pairs(tag: &str, q: &str) -> Vec<(String, String)> {
+        let (root, res) = run(tag, q);
+        let v = res
+            .rows
+            .iter()
+            .map(|r| (r[0].to_display(), r[1].to_display()))
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        v
+    }
+
+    #[test]
+    fn limit_pushdown_traversal_returns_order_preserving_prefix() {
+        let full = pairs(
+            "exec_limit_full",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b",
+        );
+        assert!(full.len() >= 3, "{full:?}"); // Alice→Bob, Alice→Carol, Bob→Carol
+        let limited = pairs(
+            "exec_limit_2",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b LIMIT 2",
+        );
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited.as_slice(), &full[..2]);
+    }
+
+    #[test]
+    fn limit_pushdown_with_skip() {
+        // SKIP s LIMIT n caps the match at s+n, then the projection drops s — the
+        // single returned row must equal the unlimited row at index s.
+        let full = pairs(
+            "exec_skiplim_full",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b",
+        );
+        let limited = pairs(
+            "exec_skiplim",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b SKIP 1 LIMIT 1",
+        );
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0], full[1]);
+    }
+
+    #[test]
+    fn limit_pushdown_streaming_scan_prefix() {
+        // The node-only streaming path (try_stream_match) honours the cap too.
+        let (root, full) = run(
+            "exec_limit_stream_full",
+            "MATCH (n:Person) RETURN n.name AS name",
+        );
+        let names_full = col0(&full); // sorted; just need the count
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(names_full.len(), 3);
+        let (root, lim) = run(
+            "exec_limit_stream",
+            "MATCH (n:Person) RETURN n.name AS name LIMIT 2",
+        );
+        assert_eq!(lim.rows.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn limit_does_not_break_aggregation_or_order() {
+        // The cap MUST be `None` when the projection aggregates or orders: the LIMIT
+        // applies after the full group + sort, so all 3 Person rows must be seen.
+        let (root, res) = run(
+            "exec_limit_agg_guard",
+            "MATCH (n:Person) RETURN n.city AS city, count(*) AS c ORDER BY c DESC LIMIT 1",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "London");
+        assert!(
+            matches!(res.rows[0][1], Val::Int(2)),
+            "{:?}",
+            res.rows[0][1]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ORDER BY without aggregation also needs the full set before truncating.
+        let (root, res) = run(
+            "exec_limit_order_guard",
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY n.age DESC LIMIT 1",
+        );
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0].to_display(), "Carol"); // oldest at 40
         let _ = std::fs::remove_dir_all(&root);
     }
 
