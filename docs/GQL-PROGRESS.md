@@ -15,11 +15,13 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 
 ## NEXT ACTION
 
-> **Resume at PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs.**
-> Use the "Resume → PR 5" prompt in GQL-PLAN.md §4. Before any new work, run the
-> green-state gate. New branch: `gql-finish`. PR 5 is several small *independent*
-> items — they can be separate commits. This is the final PR; mark the track
-> COMPLETE when done.
+> **TRACK COMPLETE.** All five PRs are delivered and merged-green. There is no
+> further GQL-track work queued. The ISO GQL read-subset (quantified paths, path
+> restrictors, shortest-path selectors, label/type boolean expressions, FOR,
+> the optional GQL/CYPHER dialect prefix, additive GQLSTATUS metadata and GQL
+> CAST) is implemented additively over the one parser/executor, with the
+> pre-GQL hot path left byte-for-byte unchanged. Final suite: **408 tests
+> passing**; clippy clean; fmt clean. PR 5 lives on branch `gql-finish`.
 
 ---
 
@@ -29,7 +31,9 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 - [x] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE** — branch `gql-path-restrictors`
 - [x] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k** — branch `gql-shortest-selectors`
 - [x] **PR 4 — Label boolean expressions `& | !`** — branch `gql-label-expressions`
-- [ ] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs**
+- [x] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs** — branch `gql-finish`
+
+**🎉 GQL track COMPLETE — all five PRs delivered, green, documented.**
 
 Status keys: `[ ]` todo · `[~]` in progress · `[x]` done-green · `[!]` blocked.
 
@@ -266,3 +270,71 @@ pre-existing + 13 new); clippy clean; fmt clean. A WIP-green checkpoint (commit
   posting), `disjunctive_or_negated_label_expr_falls_back_to_all_nodes`.
 
 Committed on branch `gql-label-expressions`.
+
+### PR 5 — FOR, dialect prefix, GQLSTATUS, CAST, docs ✅ (branch `gql-finish`)
+
+The final PR: several small, independent items, each committed separately and each
+landing the green-state gate before the next. All additive — the pre-GQL hot path is
+untouched. Full suite green: **408 passed** (399 pre-existing + 9 new); clippy clean;
+fmt clean. This PR adds **no pattern-AST changes** (the AST settled in PR 4).
+
+**Item A — `FOR x IN list` → UNWIND (commit `f640efc`):**
+- Grammar: `kw_for`, a `for_clause = { kw_for ~ alias ~ kw_in ~ expr }` (reusing the
+  existing `kw_in`) added to `reading_clause`; `for` joined the reserved set.
+- Parser: `lower_for_clause` reads alias-then-expr and returns the **identical**
+  `UnwindClause` as UNWIND, so the executor (`apply_unwind`) is unchanged (D39).
+- Tests: parser `for_lowers_to_unwind_clause` (FOR ≡ UNWIND AST); exec
+  `for_and_unwind_produce_identical_rows` (gql_col0 parity, incl. FOR over a
+  MATCH-produced list).
+
+**Item B — optional `GQL` / `CYPHER` dialect prefix (commit `407fa53`):**
+- `strip_dialect_prefix` (next to `normalize_query` in `server.rs`) consumes a leading
+  `GQL`/`CYPHER` keyword (case-insensitive, token-bounded) + an optional numeric version
+  token, in the **server layer**, before anything inspects the query — keeping
+  `parser.rs` language-agnostic. Routing is a deliberate no-op (one parser serves both)
+  (D40). A following query keyword (`CYPHER MATCH`) and an identifier sharing the prefix
+  (`cypher_score`) are untouched; a bare query is byte-for-byte unaffected.
+- Tests: `strip_dialect_prefix_removes_the_selector_only`,
+  `dialect_prefix_parses_to_the_same_ast_as_the_bare_query`.
+
+**Item C — additive GQLSTATUS metadata (commit `c933bec`):**
+- `bolt/message.rs` `failure_gqlstatus` adds `gql_status` + `status_description` to the
+  legacy `code`/`message` failure map; `server.rs` `Failure::gqlstatus` maps the Neo4j
+  code to a GQL SQLSTATE class (42000 syntax/access-rule, 50000 general). The final
+  PULL/DISCARD SUCCESS carries `gqlstatus_completion` (00000 success, 02000 no-data on an
+  empty result); intermediate PULL successes are unchanged. Strictly additive — no key
+  removed or renamed, so deployed drivers are undisturbed (D41).
+- Tests: message `failure_gqlstatus_keeps_legacy_keys_and_adds_status`; server
+  `gqlstatus_completion_distinguishes_empty_from_nonempty`,
+  `failure_message_keeps_legacy_keys_and_adds_gqlstatus`.
+
+**Item D — GQL `CAST(expr AS TYPE)` (commit `37ed514`):**
+- Survey found the scalar (`toInteger`/`toFloat`/`toString`/`toBoolean`) and temporal
+  (`date`/`localtime`/`localdatetime`/`duration`) conversions already complete — no
+  genuine coercion gap, only a missing surface form. A `cast_expr` grammar rule (tried
+  before `function_call`, backtracking cleanly without the `AS TYPE` tail) plus
+  `lower_cast` map the type name to the matching function and emit an ordinary
+  `Expr::Function`, reusing the executor unchanged (D42). Exotic GQL types (zoned
+  temporals, typed lists) deferred.
+- Tests: parser `cast_lowers_onto_conversion_functions` (CAST ≡ to* AST, all spellings);
+  exec `cast_executes_as_the_conversion_function` (parity incl. NULL-on-failure).
+
+**Item E — docs (commit `b6834b8`):**
+- README "Supported GQL subset" section + a Cypher↔GQL mapping table (quantified paths,
+  restrictors, selectors, label/type booleans, FOR ≡ UNWIND, CAST, the optional
+  GQL/CYPHER prefix, GQLSTATUS). No vendor names in the copy.
+
+**Decisions recorded:** D39 (FOR→UNWIND), D40 (dialect-prefix strip location + no-op
+routing), D41 (additive GQLSTATUS), D42 (CAST lowering).
+
+Committed on branch `gql-finish`.
+
+---
+
+## Track retrospective
+
+The whole ISO GQL read-subset is delivered as a superset of slater's one parser +
+one executor — **no new sockets, no second language, no protocol change** (GQL-PLAN
+§1). Each PR was additive and left the prior hot path byte-for-byte unchanged; PR 4
+was the single AST-churn PR, sequenced late so the pattern AST had settled, and PR 5
+added no pattern-AST change at all. Test count grew 346 → 408 across the track.

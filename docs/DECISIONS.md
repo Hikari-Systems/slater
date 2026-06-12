@@ -722,3 +722,60 @@ with AST churn, deliberately sequenced last so the pattern AST (PRs 1–3) had s
     `ids.contains` integer test; only `&`/`!` falls to per-edge `eval`.
   - The single-node count/group fast paths gate on `as_single_atom`, taking the
     posting/index shortcut only for the lone-atom case and falling back otherwise.
+
+### D39 — GQL `FOR x IN list` lowers onto the existing `UnwindClause` (GQL track PR 5)
+GQL spells `UNWIND list AS x` as `FOR x IN list` — the operands reversed. The grammar
+adds a `for_clause = { kw_for ~ alias ~ kw_in ~ expr }` (reusing the already-defined
+`kw_in`) to `reading_clause`, and `for` joins the reserved set so it can't be a bare
+identifier. The parser's `lower_for_clause` reads alias-then-expr and returns the
+**identical** `UnwindClause` as `lower_unwind_clause` — so past the parser the two
+spellings are the same AST and the executor (`apply_unwind`) is untouched. This is the
+same additive, lower-onto-existing-capability discipline as the rest of the track: no
+new clause type, no new executor path.
+
+### D40 — Optional `GQL` / `CYPHER` dialect prefix is stripped in the server, no-op routing (GQL track PR 5)
+Neo4j selects dialect with a query-string prefix (`CYPHER 5` / `CYPHER 25`), never a
+protocol field; GQL arrives over the same Bolt `RUN`. Slater mirrors this with
+`strip_dialect_prefix` (next to `normalize_query` in `server.rs`): a leading `GQL` /
+`CYPHER` keyword (case-insensitive, at a token boundary), optionally followed by a
+single bare numeric version token (`5`, `25`, `5.0`), is consumed before anything
+inspects the statement, so the USE check, Memgraph detection, introspection and the
+parser all see the bare query.
+- **Stripped in the server layer, not `parser::parse`.** This keeps `parser.rs`
+  language-agnostic — it never learns there is a dialect concept. The prefix is a
+  transport/routing nicety, which is a server concern.
+- **Routing is a deliberate no-op.** One parser serves both Cypher and the GQL subset
+  today (the whole track is a superset grammar), so the dialect selector records nothing
+  and changes no behaviour — it exists for client compatibility and forward room. A
+  following query keyword (`CYPHER MATCH`) and an identifier merely sharing the prefix
+  (`cypher_score`) are left untouched; a bare query is byte-for-byte unaffected.
+
+### D41 — GQLSTATUS surfaced additively in Bolt metadata (GQL track PR 5)
+ISO GQL defines GQLSTATUS status objects; Neo4j surfaces them in Bolt `SUCCESS` /
+`FAILURE` metadata alongside the legacy `code`/`message`. Slater does the same **purely
+additively** — no existing key is removed or renamed, because deployed neo4j drivers
+read `code`/`message`/`has_more`.
+- **FAILURE:** `message::failure_gqlstatus` adds `gql_status` + `status_description` to
+  the existing `code`/`message` map. `Failure::gqlstatus` maps the Neo4j code to a GQL
+  SQLSTATE-style class: `42000` (syntax error or access rule violation) for a malformed
+  or read-only-rejected statement, `50000` (general processing exception) otherwise. The
+  description follows GQL house style (`error: <condition>. <message>`).
+- **SUCCESS:** the *final* PULL / DISCARD SUCCESS (the one completing the statement)
+  carries `gqlstatus_completion`: `00000` (successful completion), or `02000` (no data)
+  on an empty result. Intermediate PULL successes (`has_more = true`) are unchanged,
+  since the statement isn't complete. The low-level decode-error `failure()` path keeps
+  its legacy form (not a query status).
+
+### D42 — GQL `CAST(expr AS TYPE)` lowers onto existing conversion functions (GQL track PR 5)
+A survey of the value-conversion surface found slater's scalar conversions
+(`toInteger`/`toFloat`/`toString`/`toBoolean`, each already NULL-on-failure) and the
+temporal constructors (`date`/`localtime`/`localdatetime`/`duration`, single-argument)
+already cover GQL's typed-value targets — there is no genuine coercion *gap*, only a
+missing surface form. So GQL `CAST` is implemented as a parser lowering, not new
+executor code: a `cast_expr` grammar rule (tried before `function_call`, backtracking
+cleanly for a `cast(…)` without the `AS TYPE` tail) and `lower_cast`, which maps the
+type name to the matching function and emits an ordinary `Expr::Function` — `INTEGER`/
+`INT`→`toInteger`, `FLOAT`/`DOUBLE`/`REAL`→`toFloat`, `STRING`/`VARCHAR`→`toString`,
+`BOOLEAN`/`BOOL`→`toBoolean`, plus `DATE`/`LOCALTIME`/`LOCALDATETIME`/`DURATION`. The
+same additive discipline as D39. Exotic GQL types (zoned temporals, typed lists,
+user-defined types) are deferred — they would need genuine new conversion logic.
