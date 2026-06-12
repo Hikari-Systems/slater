@@ -212,14 +212,26 @@ rel_pattern = { left_arrow? ~ "-" ~ rel_detail? ~ "-" ~ right_arrow? }
 left_arrow = { "<" }
 right_arrow = { ">" }
 rel_detail = { "[" ~ var? ~ rel_types? ~ var_length? ~ prop_map? ~ "]" }
-rel_types = { ":" ~ type_name ~ ("|" ~ ":"? ~ type_name)* }
 var_length = { "*" ~ range_spec? }
 range_spec = { integer? ~ (".." ~ integer?)? }
 
-labels = { (":" ~ label_name)+ }
+// GQL label/type boolean expressions (`!` > `&` > `|`, parens). Both a node's
+// `:label_expr` and a relationship's `:label_expr` share one grammar and one AST
+// node (`LabelExpr`). The classic sugar still parses into the same tree: `:A:B`
+// (the `:` acts as `&`) lowers to AND, and `:T1|T2` / `:T1|:T2` to OR — so every
+// pre-GQL query is unchanged. `labels`/`rel_types` keep distinct rule names purely
+// so the lowering knows which pattern element it is filling in.
+labels = { ":" ~ label_expr }
+rel_types = { ":" ~ label_expr }
+label_expr = { le_or }
+le_or = { le_and ~ ("|" ~ ":"? ~ le_and)* }
+le_and = { le_not ~ (("&" | ":") ~ le_not)* }
+le_not = { le_bang* ~ le_atom }
+le_bang = { "!" }
+le_atom = { le_name | "(" ~ label_expr ~ ")" }
+le_name = { identifier }
 var = { identifier }
 label_name = { identifier }
-type_name = { identifier }
 
 prop_map = { "{" ~ (prop_entry ~ ("," ~ prop_entry)*)? ~ "}" }
 prop_entry = { property_key ~ ":" ~ expr }

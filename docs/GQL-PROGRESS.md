@@ -29,7 +29,7 @@ cargo build -p slater && cargo test -p slater && cargo clippy -p slater --all-ta
 - [x] **PR 1 — Quantified path patterns `((…)){m,n}`** — branch `gql-quantified-paths`
 - [x] **PR 2 — Path restrictors WALK/TRAIL/ACYCLIC/SIMPLE** — branch `gql-path-restrictors`
 - [x] **PR 3 — Shortest-path selectors ANY/ALL SHORTEST, SHORTEST k** — branch `gql-shortest-selectors`
-- [ ] **PR 4 — Label boolean expressions `& | !`** (AST churn)
+- [~] **PR 4 — Label boolean expressions `& | !`** (AST churn) — branch `gql-label-expressions`; WIP-green checkpoint committed (AST swapped to `LabelExpr`, all 386 existing tests green via sugar lowering) before the new `&|!` tests
 - [ ] **PR 5 — FOR, dialect prefix, GQLSTATUS, value gap-fill, docs**
 
 Status keys: `[ ]` todo · `[~]` in progress · `[x]` done-green · `[!]` blocked.

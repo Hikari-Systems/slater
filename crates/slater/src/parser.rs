@@ -248,7 +248,9 @@ pub mod ast {
     #[derive(Debug, Clone, PartialEq)]
     pub struct NodePat {
         pub var: Option<String>,
-        pub labels: Vec<String>,
+        /// `None` ≡ no label constraint (matches any node). `Some` carries the GQL
+        /// label boolean expression; classic `:A` / `:A:B` lower to `Atom` / `And`.
+        pub label_expr: Option<LabelExpr>,
         pub props: Vec<(String, Expr)>,
     }
 
@@ -256,9 +258,101 @@ pub mod ast {
     pub struct RelPat {
         pub var: Option<String>,
         pub dir: Direction,
-        pub types: Vec<String>,
+        /// `None` ≡ any relationship type. `Some` carries the same `LabelExpr` AST as
+        /// node labels (reused, not a parallel type) — a relationship has exactly one
+        /// type, so the expression is evaluated over that singleton (`:T1|T2` matches
+        /// either, `:A&B` can never hold, `:!T` excludes one type).
+        pub type_expr: Option<LabelExpr>,
         pub var_length: Option<VarLength>,
         pub props: Vec<(String, Expr)>,
+    }
+
+    /// A GQL label / relationship-type boolean expression: `!` (highest) > `&` > `|`,
+    /// with parentheses. Evaluated as plain set membership over a node's label set or
+    /// a relationship's single type — three-valued logic is not needed because a
+    /// label is simply present or absent.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LabelExpr {
+        Atom(String),
+        And(Box<LabelExpr>, Box<LabelExpr>),
+        Or(Box<LabelExpr>, Box<LabelExpr>),
+        Not(Box<LabelExpr>),
+    }
+
+    impl LabelExpr {
+        /// `Some(label)` iff this expression is exactly one positive atom. The planner
+        /// and the single-node fast paths use this to keep the common `(:Person)` case
+        /// on the cheap LabelScan / single-posting path; anything richer falls back to
+        /// a broader scan plus a full `node_ok` re-check.
+        pub fn as_single_atom(&self) -> Option<&String> {
+            match self {
+                LabelExpr::Atom(a) => Some(a),
+                _ => None,
+            }
+        }
+
+        /// If the expression is a single atom or an `OR`-tree of atoms (no `&`/`!`),
+        /// return that flat list of type/label names; otherwise `None`. Relationship
+        /// traversal uses this to keep the pre-GQL "any of these reltypes" id-set hot
+        /// loop for single-type and `:T1|T2` patterns, only evaluating a general
+        /// boolean expression per edge when `&`/`!` actually appear.
+        pub fn positive_atoms(&self) -> Option<Vec<&String>> {
+            fn go<'a>(e: &'a LabelExpr, out: &mut Vec<&'a String>) -> bool {
+                match e {
+                    LabelExpr::Atom(a) => {
+                        out.push(a);
+                        true
+                    }
+                    LabelExpr::Or(l, r) => go(l, out) && go(r, out),
+                    LabelExpr::And(..) | LabelExpr::Not(..) => false,
+                }
+            }
+            let mut out = Vec::new();
+            go(self, &mut out).then_some(out)
+        }
+
+        /// The positively-required atoms — labels that must be present for the whole
+        /// expression to hold (its conjunctive positive atoms). The planner uses these
+        /// to pick a label/index scan; `node_ok` always re-checks the full expression,
+        /// so a returned subset only ever *widens* the candidate set (never unsoundly
+        /// narrows it). `A&B` → {A,B}; `A|B`, `!A`, `A|(B&C)` → {} for the unguaranteed
+        /// parts. For the pre-GQL `:A` / `:A:B` forms this reproduces the old
+        /// `labels: Vec<String>` exactly, so existing plans are unchanged.
+        pub fn required_atoms(&self, out: &mut Vec<String>) {
+            match self {
+                LabelExpr::Atom(a) => out.push(a.clone()),
+                LabelExpr::And(l, r) => {
+                    l.required_atoms(out);
+                    r.required_atoms(out);
+                }
+                LabelExpr::Or(..) | LabelExpr::Not(..) => {}
+            }
+        }
+
+        /// Evaluate the expression given a predicate that reports whether a named atom
+        /// is present (a label on the node, or the relationship's single type). Plain
+        /// boolean recursion — no three-valued logic.
+        pub fn eval(&self, present: &impl Fn(&str) -> bool) -> bool {
+            match self {
+                LabelExpr::Atom(a) => present(a),
+                LabelExpr::And(l, r) => l.eval(present) && r.eval(present),
+                LabelExpr::Or(l, r) => l.eval(present) || r.eval(present),
+                LabelExpr::Not(x) => !x.eval(present),
+            }
+        }
+    }
+
+    impl NodePat {
+        /// The labels the planner may treat as positively required (see
+        /// [`LabelExpr::required_atoms`]). Empty when there is no label constraint or
+        /// it is purely disjunctive/negated.
+        pub fn required_labels(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(e) = &self.label_expr {
+                e.required_atoms(&mut out);
+            }
+            out
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1202,7 +1296,7 @@ fn lower_quantified_path(pair: Pair<Rule>) -> Result<(Vec<(RelPat, NodePat)>, Va
                 let first = nodes
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("quantified group has no node"))?;
-                if !first.labels.is_empty() || !first.props.is_empty() {
+                if first.label_expr.is_some() || !first.props.is_empty() {
                     bail!(
                         "labels or properties on the first node of a quantified path \
                          group are not yet supported"
@@ -1266,24 +1360,28 @@ fn parse_u32(pair: Pair<Rule>) -> Result<u32> {
 
 fn lower_node_pattern(pair: Pair<Rule>) -> Result<NodePat> {
     let mut var = None;
-    let mut labels = Vec::new();
+    let mut label_expr = None;
     let mut props = Vec::new();
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::var => var = Some(ident_text(only_child(child)?)?),
-            Rule::labels => labels = lower_labels(child)?,
+            Rule::labels => label_expr = Some(lower_labels(child)?),
             Rule::prop_map => props = lower_prop_map(child)?,
             other => bail!("internal: unexpected node child {other:?}"),
         }
     }
-    Ok(NodePat { var, labels, props })
+    Ok(NodePat {
+        var,
+        label_expr,
+        props,
+    })
 }
 
 fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
     let mut left = false;
     let mut right = false;
     let mut var = None;
-    let mut types = Vec::new();
+    let mut type_expr = None;
     let mut var_length = None;
     let mut props = Vec::new();
     for child in pair.into_inner() {
@@ -1294,13 +1392,8 @@ fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
                 for d in child.into_inner() {
                     match d.as_rule() {
                         Rule::var => var = Some(ident_text(only_child(d)?)?),
-                        Rule::rel_types => {
-                            for t in d.into_inner() {
-                                if t.as_rule() == Rule::type_name {
-                                    types.push(ident_text(t)?);
-                                }
-                            }
-                        }
+                        // `rel_types` and node `labels` share the `label_expr` grammar.
+                        Rule::rel_types => type_expr = Some(lower_labels(d)?),
                         Rule::var_length => var_length = Some(lower_var_length(d)?),
                         Rule::prop_map => props = lower_prop_map(d)?,
                         other => bail!("internal: unexpected rel_detail child {other:?}"),
@@ -1319,7 +1412,7 @@ fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
     Ok(RelPat {
         var,
         dir,
-        types,
+        type_expr,
         var_length,
         props,
     })
@@ -1362,11 +1455,73 @@ fn lower_var_length(pair: Pair<Rule>) -> Result<VarLength> {
     }
 }
 
-fn lower_labels(pair: Pair<Rule>) -> Result<Vec<String>> {
-    pair.into_inner()
-        .filter(|p| p.as_rule() == Rule::label_name)
-        .map(ident_text)
-        .collect()
+/// Lower a `labels` / `rel_types` pair (`":" ~ label_expr`) into a [`LabelExpr`].
+/// Both node and relationship pattern elements share this grammar and AST.
+fn lower_labels(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let expr = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::label_expr)
+        .ok_or_else(|| anyhow::anyhow!("label expression has no body"))?;
+    lower_label_expr(expr)
+}
+
+// The label-expression grammar mirrors the standard precedence climb: `label_expr`
+// → OR over `le_and` → AND over `le_not` → leading `!`s over `le_atom` (a name or a
+// parenthesised sub-expression). Each lowering peels one layer; absent operators
+// collapse to the single operand, so `:A` lowers to a bare `Atom`.
+
+fn lower_label_expr(pair: Pair<Rule>) -> Result<LabelExpr> {
+    lower_le_or(only_child(pair)?)
+}
+
+fn lower_le_or(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut ands = pair.into_inner().filter(|p| p.as_rule() == Rule::le_and);
+    let first = ands
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty label OR expression"))?;
+    let mut acc = lower_le_and(first)?;
+    for rhs in ands {
+        acc = LabelExpr::Or(Box::new(acc), Box::new(lower_le_and(rhs)?));
+    }
+    Ok(acc)
+}
+
+fn lower_le_and(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut nots = pair.into_inner().filter(|p| p.as_rule() == Rule::le_not);
+    let first = nots
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty label AND expression"))?;
+    let mut acc = lower_le_not(first)?;
+    for rhs in nots {
+        acc = LabelExpr::And(Box::new(acc), Box::new(lower_le_not(rhs)?));
+    }
+    Ok(acc)
+}
+
+fn lower_le_not(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let mut bangs = 0usize;
+    let mut atom = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::le_bang => bangs += 1,
+            Rule::le_atom => atom = Some(lower_le_atom(child)?),
+            other => bail!("internal: unexpected le_not child {other:?}"),
+        }
+    }
+    let mut expr = atom.ok_or_else(|| anyhow::anyhow!("label NOT without an atom"))?;
+    for _ in 0..bangs {
+        expr = LabelExpr::Not(Box::new(expr));
+    }
+    Ok(expr)
+}
+
+fn lower_le_atom(pair: Pair<Rule>) -> Result<LabelExpr> {
+    let child = only_child(pair)?;
+    match child.as_rule() {
+        Rule::le_name => Ok(LabelExpr::Atom(ident_text(child)?)),
+        Rule::label_expr => lower_label_expr(child),
+        other => bail!("internal: unexpected le_atom child {other:?}"),
+    }
 }
 
 fn lower_prop_map(pair: Pair<Rule>) -> Result<Vec<(String, Expr)>> {
@@ -2331,11 +2486,14 @@ mod tests {
         assert!(m.where_.is_some());
         let p = &m.patterns[0];
         assert_eq!(p.start.var.as_deref(), Some("a"));
-        assert_eq!(p.start.labels, vec!["Person".to_string()]);
+        assert_eq!(
+            p.start.label_expr,
+            Some(LabelExpr::Atom("Person".to_string()))
+        );
         assert_eq!(p.rels.len(), 1);
         let (rel, end) = &p.rels[0];
         assert_eq!(rel.dir, Direction::Outgoing);
-        assert_eq!(rel.types, vec!["KNOWS".to_string()]);
+        assert_eq!(rel.type_expr, Some(LabelExpr::Atom("KNOWS".to_string())));
         assert_eq!(
             rel.var_length,
             Some(VarLength {
@@ -2526,7 +2684,10 @@ mod tests {
                 assert_eq!(p.start.var.as_deref(), Some("n"));
                 assert_eq!(p.rels.len(), 1);
                 assert_eq!(p.rels[0].0.dir, Direction::Outgoing);
-                assert_eq!(p.rels[0].0.types, vec!["KNOWS".to_string()]);
+                assert_eq!(
+                    p.rels[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
             }
             other => panic!("expected PatternPredicate, got {other:?}"),
         }
@@ -2649,7 +2810,10 @@ mod tests {
                 exit,
             } => {
                 assert_eq!(inner.len(), 1);
-                assert_eq!(inner[0].0.types, vec!["KNOWS".to_string()]);
+                assert_eq!(
+                    inner[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
                 assert_eq!(inner[0].0.dir, Direction::Outgoing);
                 assert_eq!(bounds.min, Some(1));
                 assert_eq!(bounds.max, Some(3));
@@ -2690,8 +2854,14 @@ mod tests {
         match &first_pattern(&q).segments.as_ref().unwrap()[0] {
             Segment::Quantified { inner, .. } => {
                 assert_eq!(inner.len(), 2);
-                assert_eq!(inner[0].0.types, vec!["KNOWS".to_string()]);
-                assert_eq!(inner[1].0.types, vec!["WORKS_AT".to_string()]);
+                assert_eq!(
+                    inner[0].0.type_expr,
+                    Some(LabelExpr::Atom("KNOWS".to_string()))
+                );
+                assert_eq!(
+                    inner[1].0.type_expr,
+                    Some(LabelExpr::Atom("WORKS_AT".to_string()))
+                );
             }
             other => panic!("expected Quantified, got {other:?}"),
         }

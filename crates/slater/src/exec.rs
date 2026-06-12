@@ -91,6 +91,15 @@ struct Hop {
     end: u64,
 }
 
+/// A relationship-type constraint resolved once before a traversal's per-edge loop
+/// (see [`Engine::expand_one_hop`]). The common positive shapes pre-resolve to a flat
+/// reltype-id set so the hot loop is a plain integer membership test; only a boolean
+/// type expression (`&`/`!`) carries the AST through for per-edge evaluation.
+enum TypeFilter<'a> {
+    AnyOf(Vec<u32>),
+    Expr(&'a LabelExpr),
+}
+
 impl Hop {
     /// The runtime relationship value this hop binds.
     fn as_rel(&self) -> Val {
@@ -881,14 +890,18 @@ impl<'g> Engine<'g> {
 
         // Compute the match count.
         let count: i64 = if node.props.is_empty() {
-            match node.labels.as_slice() {
-                [] => self.gen.node_count() as i64,
-                [l] => self
-                    .gen
-                    .label_id(l)
-                    .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
-                    .unwrap_or(0),
-                _ => return Ok(None), // multi-label intersection — fall back
+            match &node.label_expr {
+                None => self.gen.node_count() as i64,
+                // A lone positive atom is a single label posting; any boolean /
+                // multi-label expression has no single-posting count — fall back.
+                Some(e) => match e.as_single_atom() {
+                    Some(l) => self
+                        .gen
+                        .label_id(l)
+                        .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
+                        .unwrap_or(0),
+                    None => return Ok(None),
+                },
             }
         } else {
             // Inline props: only an exact single indexed-equality is safe (the scan
@@ -905,8 +918,18 @@ impl<'g> Engine<'g> {
                     .iter()
                     .find(|ri| &ri.name == index && ri.entity == EntityKind::Node)
                     .is_some_and(|ri| {
+                        // The RangeEq scan fully determines membership only when no
+                        // label residual remains: either no label constraint, or a
+                        // single positive atom that *is* the index's label. A boolean
+                        // or multi-label expression would need re-checking, so bail.
                         node.props[0].0 == ri.property
-                            && node.labels.iter().all(|l| l == &ri.label_or_type)
+                            && match &node.label_expr {
+                                None => true,
+                                Some(e) => {
+                                    e.as_single_atom().map(String::as_str)
+                                        == Some(ri.label_or_type.as_str())
+                                }
+                            }
                     });
             if !covers {
                 return Ok(None);
@@ -967,8 +990,8 @@ impl<'g> Engine<'g> {
         if !node.props.is_empty() {
             return Ok(None); // an inline prop is an extra equality filter
         }
-        let [label] = node.labels.as_slice() else {
-            return Ok(None); // exactly one label (null-group denominator is exact)
+        let Some(label) = node.label_expr.as_ref().and_then(|e| e.as_single_atom()) else {
+            return Ok(None); // exactly one positive label (null-group denominator is exact)
         };
         let var = node.var.as_deref();
 
@@ -2982,16 +3005,21 @@ impl<'g> Engine<'g> {
         rel: &RelPat,
         binding: &HashMap<String, Val>,
     ) -> Result<Vec<Hop>> {
-        let type_ids: Option<Vec<u32>> = if rel.types.is_empty() {
-            None
-        } else {
-            Some(
-                rel.types
-                    .iter()
-                    .filter_map(|t| self.gen.reltype_id(t))
-                    .collect(),
-            )
-        };
+        // Resolve the relationship-type constraint once, before the per-edge loop.
+        // The overwhelmingly common shapes — untyped, a single `:T`, or a `:T1|T2`
+        // alternation — collapse to a flat reltype-id set so the hot loop stays a
+        // plain `ids.contains` integer test, exactly as before GQL. Only a genuine
+        // boolean type expression (`&`/`!`) falls to per-edge evaluation.
+        let type_filter: Option<TypeFilter> =
+            rel.type_expr.as_ref().map(|e| match e.positive_atoms() {
+                Some(names) => TypeFilter::AnyOf(
+                    names
+                        .iter()
+                        .filter_map(|t| self.gen.reltype_id(t))
+                        .collect(),
+                ),
+                None => TypeFilter::Expr(e),
+            });
         // (adjacency list, `incoming`) — for an incoming edge the stored direction
         // is neighbour→node, so start/end are swapped relative to an outgoing one.
         let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
@@ -3006,9 +3034,19 @@ impl<'g> Engine<'g> {
         let mut out = Vec::new();
         for (adjs, incoming) in sources {
             for a in adjs {
-                if let Some(ids) = &type_ids {
-                    if !ids.contains(&a.reltype) {
-                        continue;
+                match &type_filter {
+                    None => {}
+                    Some(TypeFilter::AnyOf(ids)) => {
+                        if !ids.contains(&a.reltype) {
+                            continue;
+                        }
+                    }
+                    Some(TypeFilter::Expr(e)) => {
+                        // A relationship carries exactly one type, so evaluate the
+                        // expression over the singleton present-set {this edge's type}.
+                        if !e.eval(&|name| self.gen.reltype_id(name) == Some(a.reltype)) {
+                            continue;
+                        }
                     }
                 }
                 if !self.rel_ok(a.edge.0, rel, binding)? {
@@ -3094,26 +3132,37 @@ impl<'g> Engine<'g> {
         binding: &HashMap<String, Val>,
         guaranteed: &[u32],
     ) -> Result<bool> {
-        if !pat.labels.is_empty() {
-            // Decode the resident label record at most once, and only if at least
-            // one pattern label is not already guaranteed by the anchor scan (an
-            // unknown label forces the decode, where it then fails to match). The
-            // common traversal case has nothing guaranteed, so short-circuit it
-            // before touching the label symbol table — this path is hot (one call
-            // per candidate per hop) and must match the pre-Stage-2 cost exactly.
-            let need_decode = guaranteed.is_empty()
-                || pat.labels.iter().any(|l| {
-                    self.gen
-                        .label_id(l)
-                        .map_or(true, |lid| !guaranteed.contains(&lid))
-                });
-            if need_decode {
-                let have = self.node_label_ids(id)?;
-                for l in &pat.labels {
-                    match self.gen.label_id(l) {
-                        Some(lid) if guaranteed.contains(&lid) || have.contains(&lid) => {}
-                        _ => return Ok(false),
+        if let Some(expr) = &pat.label_expr {
+            // Fast path, byte-for-byte as cheap as the pre-GQL single-label check: a
+            // lone positive atom `(:Person)` the anchor scan already proved needs no
+            // label record at all. This call is hot (one per candidate per hop), so
+            // the common case must never touch the label record or, when guaranteed,
+            // even the symbol table beyond one lookup.
+            if let Some(atom) = expr.as_single_atom() {
+                match self.gen.label_id(atom) {
+                    Some(lid) if guaranteed.contains(&lid) => {}
+                    Some(lid) => {
+                        if !self.node_label_ids(id)?.contains(&lid) {
+                            return Ok(false);
+                        }
                     }
+                    None => return Ok(false), // unknown label, single atom ⇒ no match
+                }
+            } else {
+                // A boolean label expression (`&`/`|`/`!`, parens): decode the resident
+                // labels once and evaluate as plain set membership. Anchor-proven
+                // labels are folded into the present-predicate so a guaranteed atom
+                // still counts without re-decoding. An atom naming an unknown label is
+                // simply absent — so `!Unknown` holds and `Unknown` fails, the sound
+                // set-logic answer.
+                let have = self.node_label_ids(id)?;
+                let ok = expr.eval(&|name| {
+                    self.gen
+                        .label_id(name)
+                        .is_some_and(|lid| guaranteed.contains(&lid) || have.contains(&lid))
+                });
+                if !ok {
+                    return Ok(false);
                 }
             }
         }
@@ -5312,7 +5361,7 @@ fn repeat_inner(inner: &[(RelPat, NodePat)], k: u32, exit: &NodePat) -> Vec<(Rel
             } else {
                 NodePat {
                     var: None,
-                    labels: node.labels.clone(),
+                    label_expr: node.label_expr.clone(),
                     props: node.props.clone(),
                 }
             };

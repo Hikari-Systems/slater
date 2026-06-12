@@ -217,10 +217,15 @@ fn inline_preds(node: &NodePat, params: &HashMap<String, Value>) -> Vec<(String,
 }
 
 fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)]) -> NodeScan {
+    // The labels the planner may treat as positively required. For a single positive
+    // atom or a `:A:B` conjunction this is exactly the old `node.labels`, so existing
+    // plans are unchanged; a disjunctive/negated expression yields none, falling back
+    // to a full scan (the executor's `node_ok` then re-checks the whole expression).
+    let req = node.required_labels();
     // Prefer an equality lookup on any indexed property.
     for (prop, pred) in preds {
         if let Pred::Eq(v) = pred {
-            if let Some(index) = index_for(gen, &node.labels, prop) {
+            if let Some(index) = index_for(gen, &req, prop) {
                 return NodeScan::RangeEq {
                     index,
                     key: v.clone(),
@@ -230,7 +235,7 @@ fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)])
     }
     // Else a range lookup, combining lo/hi bounds on a single indexed property.
     for (prop, _) in preds {
-        if let Some(index) = index_for(gen, &node.labels, prop) {
+        if let Some(index) = index_for(gen, &req, prop) {
             let mut lo = None;
             let mut hi = None;
             for (p, pred) in preds {
@@ -248,9 +253,8 @@ fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)])
             }
         }
     }
-    // Else the smallest label posting, if the pattern names any label.
-    let smallest = node
-        .labels
+    // Else the smallest label posting, if the pattern requires any label.
+    let smallest = req
         .iter()
         .filter_map(|l| gen.label_id(l))
         .min_by_key(|&id| gen.nodes_with_label(id).len());
