@@ -13,16 +13,24 @@
 
 | # | Stage | Risk | Status | Result (uncached median) |
 |---|-------|------|--------|--------------------------|
-| 0 | Config bool deser (server boots from current source) | low | TODO | — |
-| 1 | Parameters → index selection | low | TODO | idx-eq target ≤ ~50 ms (from 901 ms) |
-| 2 | Skip redundant per-node label re-check | low | TODO | Crime-label-count target ≈ 14 ms (from 841 ms) |
-| 3 | Count fast-paths (metadata / index cardinality) | low | TODO | counts target < 1 ms |
+| 0 | Config bool deser (server boots from current source) | low | **DONE** | server boots from current source ✓ |
+| 1 | Parameters → index selection | low | **DONE** | idx-eq **0.8 ms** (from 901 ms); 1-hop ~30–100 ms (from 952 ms) |
+| 2 | Skip redundant per-node label re-check | low | **DONE** | Crime-label-count **0.64 ms** (from 841 ms); also fixed CONTAINS/agg/DISTINCT |
+| 3 | Count fast-paths (metadata / index cardinality) | low | **DONE** | counts **0.6–0.8 ms** (from 14–901 ms) |
 | 4 | Block-cache record read (no per-record copy / less locking) | high | TODO | broad floor drop |
-| 5 | Streaming aggregation + projection pushdown + prop memo | med | TODO | — |
-| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 3-hop target low-ms (from 2242 ms) |
+| 5 | Streaming aggregation + projection pushdown + prop memo | med | TODO | agg/DISTINCT still ~60 ms (8–9× Neo4j) |
+| 6 | Traversal frame / streaming (no per-hop binding clone) | med | TODO | 2-hop ~50 ms, 3-hop ~3 s (traversal unchanged this round) |
 
-Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk), then **4 → 5 → 6**.
+Recommended order: **0 → 1 → 2 → 3** (local, high payoff, low risk) — **DONE 2026-06-12**, see
+"Validation results" below. Next round: **4 → 5 → 6** (the traversal/aggregation engine).
 **Stage 0 is a hard prerequisite** for any server-based validation of Stages 1–6 (see below).
+
+### Bonus (this round): result-cache disable switch
+`config.cache.resultCacheBytes` ≤ 0 now **disables** the result LRU entirely (`get` always
+misses, `insert` is a no-op) — see `cache.rs` `ResultCache::{enabled,get,insert}` and
+`config.rs` `de::usize_floor0`. Added so cold-execution can be benchmarked honestly without
+restarting the server, and for deployments that want no result reuse. The old `.max(1)` clamp
+that the Baseline note complained about is now bypassed when the budget is 0.
 
 ## Background
 
@@ -85,9 +93,56 @@ slater uncached (real execution) vs Neo4j; `perf/bench.py` reproduces these.
 | count DISTINCT type | 890 ms | 0.44 ms | 7–11 ms | 1/120 |
 
 **Memory:** slater **129 MB** RSS vs Neo4j **539 MB** at 64 MB page cache (866 MB at 512 MB).
-**Cached note:** slater's result cache cannot be disabled — `cache.rs:422` clamps the budget to
-`.max(1)`, so `resultCacheBytes:0` still caches. The "uncached" column uses varying parameters to
-force misses; do not "fix" the benchmark by trying to disable the cache.
+**Cached note:** slater's result cache *could not* be disabled — `cache.rs:422` clamped the
+budget to `.max(1)`, so `resultCacheBytes:0` still cached. **This round added a real disable
+switch** (`resultCacheBytes` ≤ 0 → pool off); the validation run below uses it, which is why its
+"cached" column ≈ "uncached" (no result reuse). The original "uncached" column used varying
+parameters to force misses.
+
+## Validation results (Stages 0–3, measured 2026-06-12, cache DISABLED)
+
+Same machine/data as the Baseline, served by a **freshly built image of current source**, with
+`resultCacheBytes: 0` so *every* query truly executes (the "cached" column ≈ "uncached" confirms
+the disable). Compare against the frozen Baseline above.
+
+| query | baseline uncached | **now (cache off)** | Neo4j | vs Neo4j | stage |
+|-------|------------------:|--------------------:|------:|---------:|-------|
+| count all nodes | 14 ms | **0.63 ms** | 3.3 ms | **5.3× faster** | 3 |
+| Crime label count | 841 ms | **0.61 ms** | 1.7 ms | **2.8× faster** | 2+3 |
+| point lookup (idx nhs_no) | 13 ms | **0.69 ms** | 1.2 ms | **1.8× faster** | 2 |
+| idx-eq count (Crime.type) | 901 ms | **1.58 ms** | 1.3 ms | ~parity | 1+3 |
+| 1-hop Crime→Location | 952 ms | **~99 ms** (min 19) | 2.0 ms | 1/49× | 1 (anchor); traversal=6 |
+| 2-hop Person→Loc→Area | 45 ms | 48 ms | 2.0 ms | 1/24× | 6 (unchanged) |
+| agg crimes by type | 885 ms | **61 ms** | 7.6 ms | 1/8× | 2 done; 5 left |
+| 3-hop Officer/Crime/Loc | 2242 ms | ~3155 ms | 2.2 ms | 1/1420× | 6 (unchanged*) |
+| full-scan CONTAINS | 879 ms | **58 ms** | 4.5 ms | 1/13× | 2 done; 5 left |
+| count DISTINCT type | 890 ms | **61 ms** | 6.5 ms | 1/9× | 2 done; 5 left |
+
+**Headline:** the four pure count/index rows go from 13–901 ms to **sub-2 ms and now beat or match
+Neo4j**. The label-skip (Stage 2) also cut every Crime-anchored full scan ~15× (CONTAINS, agg,
+DISTINCT 879–890 ms → ~60 ms). Traversal-bound rows (1/2/3-hop) and large aggregations are
+**Stages 5–6** and are deferred to the next round. Memory unchanged/better: slater **~79 MB** RSS
+vs Neo4j **~655 MB**.
+
+\* **3-hop "regression" (2242 → 3155 ms) is not from Stages 0–3.** The traversal hot loop
+(`expand_chain`/`expand_one_hop`/`outgoing`/`incoming`) is byte-for-byte unchanged this round, and
+`node_ok`'s cost was restored to the pre-Stage-2 level (the guaranteed-empty fast path skips the
+symbol-table lookup). The gap is a measurement-context artifact — the frozen Baseline was taken
+from a *different prebuilt binary* (an older `target/release/slater`). Stage 6 rewrites this path
+and will re-baseline it.
+
+> ⚠️ **Benchmarking gotchas discovered this round (read before re-measuring):**
+> 1. **Stale host binary shadowing the port.** A leftover host process
+>    (`target/release/slater`) was bound to `127.0.0.1:7687`; `bench.py` connected to *it* instead
+>    of the Docker container, so the new binary's wins were invisible. Before benching:
+>    `pgrep -af "target/release/slater"` and kill any host listener, or bind the container to a
+>    different host port. Confirm with `ss -ltnp | grep 7687`.
+> 2. **Result-cache warmth across runs.** With the cache *on*, `$k`-tagged queries cache the same
+>    0..24 key set every run, so a *second* run reads as all-hits (~0.4 ms) and looks impossibly
+>    fast. Use the new `resultCacheBytes: 0` for honest cold numbers, or restart the container
+>    between runs.
+> 3. **Small param pools < `--meas`.** CONTAINS (14 terms) and idx-eq/1-hop (13 crime types)
+>    repeat within a single run, so even one run partially cache-hits unless the cache is disabled.
 
 ## Validation harness
 
@@ -171,7 +226,11 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 
 ## Stages (detail)
 
-### Stage 0 — Config bool deserialization (server-boot prerequisite)
+### Stage 0 — Config bool deserialization (server-boot prerequisite)  **[DONE 2026-06-12]**
+- **Result:** added `de::bool` (visitor accepting `true`/`false` and `"true"`/`"false"`) and a
+  `de::usize_floor0` helper; applied `de::bool` to `require_acl_stamp`. A current-source image
+  now boots and serves the pole graph (healthcheck exits 0). Unit test
+  `config::tests::require_acl_stamp_parses_bool_and_string`.
 - **Problem:** `config.rs:97` `require_acl_stamp: bool` can't accept the stringified value the
   layered loader produces → server won't boot (see Stage 0 prerequisite above).
 - **Change:** add a `deser_bool_or_str` (mirror `de::u64`/`deser_u16_or_str` visitor pattern,
@@ -182,7 +241,14 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 - **Validate:** `docker build` then run the server (Serve steps) → `healthcheck` exits 0; add a
   unit test parsing `{"requireAclStamp":"false"}` and `{"requireAclStamp":false}`.
 
-### Stage 1 — Parameters → index selection
+### Stage 1 — Parameters → index selection  **[DONE 2026-06-12]**
+- **Result:** `choose_node_scan` now takes a `&HashMap<String, Value>` of the query's params;
+  `resolve()` (replacing `literal()`) resolves `Expr::Param` against it, so `{type:$t}` /
+  `WHERE n.x=$v` pick `RangeEq`/`RangeRange`. The executor projects its `Val` params to planner
+  `Value`s once (`val_to_value` → `Engine.plan_params` in `with_params`). idx-eq count dropped
+  **901 ms → 0.8 ms**; 1-hop **952 ms → ~30–100 ms** (the index now anchors the scan; the
+  remaining cost is the eager traversal, Stage 6). Planner tests
+  `param_equality_on_indexed_property_picks_range_eq`, `unbound_param_falls_back_to_label_scan`.
 - **Problem:** params bypass index selection (root cause 1) → param equality/range degrades to a
   label scan (901 ms).
 - **Change:** make the planner parameter-aware. The RUN message carries params before planning;
@@ -194,7 +260,14 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 - **Validate:** bench `idx-eq count (Crime.type)` and `1-hop` drop from ~900 ms to tens of ms;
   results unchanged. Add a planner unit test: param equality on an indexed prop picks `RangeEq`.
 
-### Stage 2 — Skip redundant per-node label re-check
+### Stage 2 — Skip redundant per-node label re-check  **[DONE 2026-06-12]**
+- **Result:** `match_single_pattern` computes `scan_guaranteed_labels(scan)` (a `LabelScan`
+  guarantees its label; a `RangeEq`/`RangeRange` guarantees the index's node label) and passes
+  it to `node_ok`, which skips the label-record decode for guaranteed labels. The hot traversal
+  path (nothing guaranteed) short-circuits before touching the label symbol table, so it stays
+  at the pre-Stage-2 cost. Crime-label-count **841 ms → 0.64 ms**; the label-skip also helped
+  every Crime-anchored scan — CONTAINS **879 ms → ~60 ms**, agg **885 ms → ~62 ms**, count
+  DISTINCT **890 ms → ~61 ms**. Downstream-traversal `node_ok` calls pass `&[]` (no guarantee).
 - **Problem:** root cause 2 — `node_ok` re-decodes labels for candidates that already came from
   the label posting (841 ms vs 14 ms).
 - **Change:** when the anchor scan guarantees the label(s) (a `LabelScan{L}`, or a `RangeEq`/
@@ -204,7 +277,17 @@ Compare the `slater uncached` medians against the Baseline table; the `neo4j` co
 - **Files:** `crates/slater/src/exec.rs` (`match_single_pattern` ~1747, `node_ok` ~2037).
 - **Validate:** `Crime label count` ≈ `count all nodes` (~14 ms); results unchanged.
 
-### Stage 3 — Count fast-paths (metadata / index cardinality)
+### Stage 3 — Count fast-paths (metadata / index cardinality)  **[DONE 2026-06-12]**
+- **Result:** `try_count_fast_path` (called at the top of `run_single`, only on the singleton
+  seed — `CALL{}` subqueries bypass it) answers a single-node `count(*)`/`count(n)` from resident
+  metadata: 0 labels → `node_count()`; 1 label → `nodes_with_label(L).len()`; a single
+  indexed-equality inline prop covering exactly the pattern's label+prop → `lookup_eq().len()`.
+  Extra **constant** RETURN items (the benchmark's `, $k AS k`) are allowed (one group). Any
+  WHERE / extra pattern / non-constant projection / multi-label / `DISTINCT` falls back. count-all
+  **14 ms → 0.64 ms**, Crime-label-count **0.64 ms**, idx-eq count **0.8 ms** — all now *beat*
+  Neo4j. Tests: `label_count_uses_fast_path`, `count_with_constant_extra_projection_fast_path`,
+  `count_with_non_constant_extra_projection_falls_back`, `count_with_where_still_correct`,
+  `param_indexed_equality_count_fast_path`.
 - **Problem:** root cause 4 — counts materialize all rows; resident metadata ignored.
 - **Change:** recognize an aggregate-only `RETURN count(*)`/`count(n)` with no residual WHERE and
   a single-node pattern: unfiltered → `gen.node_count()`; one label → `nodes_with_label(L).len()`;

@@ -406,6 +406,11 @@ impl<V> ResultInner<V> {
 /// instantiates it over `exec::QueryResult`.
 pub struct ResultCache<V> {
     inner: Mutex<ResultInner<V>>,
+    /// `false` when the configured `result_cache_bytes` is 0: the pool is disabled,
+    /// so `get` always misses and `insert` is a no-op (every query executes for real).
+    /// Useful for honest cold-execution benchmarking and for deployments that want
+    /// no result reuse. The other two pools (block, vector) have no such switch.
+    enabled: bool,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -421,15 +426,25 @@ impl<V> ResultCache<V> {
                 bytes: 0,
                 budget: budget_bytes.max(1),
             }),
+            enabled: budget_bytes > 0,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
         }
     }
 
+    /// Whether the pool stores anything (`result_cache_bytes > 0`).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Look a result up, recording a hit or miss. On a hit it becomes most-recently
-    /// used.
+    /// used. A disabled pool always misses (and never takes the lock).
     pub fn get(&self, key: &ResultKey) -> Option<Arc<V>> {
+        if !self.enabled {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let hit = self.inner.lock().unwrap().touch_get(key);
         if hit.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -442,8 +457,11 @@ impl<V> ResultCache<V> {
     /// Cache a result under `key`. `value_bytes` is the caller's estimate of the
     /// value's resident footprint; the key's query string length is added on top so
     /// a large inlined-`vecf32` query is charged for the memory its key occupies and
-    /// the pool stays bounded.
+    /// the pool stays bounded. A no-op when the pool is disabled.
     pub fn insert(&self, key: ResultKey, value: Arc<V>, value_bytes: usize) {
+        if !self.enabled {
+            return;
+        }
         let bytes = value_bytes + key.query.len();
         let evicted = self.inner.lock().unwrap().insert(key, value, bytes);
         if evicted > 0 {
@@ -880,6 +898,21 @@ mod tests {
         let m = cache.metrics();
         assert_eq!((m.hits, m.misses, m.evictions), (1, 1, 0));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn result_cache_zero_budget_is_disabled() {
+        // A 0-byte budget disables the pool: insert is a no-op and get always
+        // misses, so every query executes for real (the config disable switch).
+        let cache: ResultCache<String> = ResultCache::new(0);
+        assert!(!cache.enabled());
+        let key = ResultKey::new(gen(1), "MATCH (n) RETURN n");
+        assert!(cache.get(&key).is_none());
+        cache.insert(key.clone(), Arc::new("rows".to_string()), 4);
+        assert!(cache.get(&key).is_none(), "disabled pool must not store");
+        assert_eq!(cache.len(), 0);
+        let m = cache.metrics();
+        assert_eq!((m.hits, m.misses), (0, 2), "two gets, both misses, no hits");
     }
 
     #[test]

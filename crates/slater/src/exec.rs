@@ -789,26 +789,33 @@ impl<'g> Engine<'g> {
         // Only reachable here (top-level / UNION part), where the seed is the empty
         // singleton — a `CALL { … }` subquery seeds outer rows via `run_single_seeded`
         // and never takes this path, so the count is always over the whole match.
-        if let Some((col, count)) = self.try_count_fast_path(sq)? {
+        if let Some((columns, row)) = self.try_count_fast_path(sq)? {
             return Ok(QueryResult {
-                columns: vec![col],
-                rows: vec![vec![Val::Int(count)]],
+                columns,
+                rows: vec![row],
             });
         }
         self.run_single_seeded(sq, Table::singleton())
     }
 
     /// Recognise a single-node `count` aggregate that can be answered without
-    /// materialising rows, returning `(output_column, count)` or `None` when any
-    /// guard fails (the caller then executes normally). Guards: exactly one MATCH
-    /// reading clause, non-OPTIONAL, no WHERE, one single-node pattern (no rels);
-    /// the RETURN is exactly one non-DISTINCT `count(*)` or `count(n)` (n the
-    /// pattern's variable) with no grouping/ORDER BY/SKIP/LIMIT/`*`. The count is:
-    /// no inline props → `node_count()` (0 labels) or `nodes_with_label(L).len()`
-    /// (1 label); a single indexed-equality inline prop whose index covers exactly
-    /// the pattern's label+prop → that index's `lookup_eq` length. Anything else
-    /// (multi-label, residual props, non-index props) falls back.
-    fn try_count_fast_path(&self, sq: &SingleQuery) -> Result<Option<(String, i64)>> {
+    /// materialising rows, returning the single result `(columns, row)` or `None`
+    /// when any guard fails (the caller then executes normally).
+    ///
+    /// Guards: exactly one MATCH reading clause, non-OPTIONAL, no WHERE, one
+    /// single-node pattern (no rels); the RETURN is non-DISTINCT, no
+    /// ORDER BY/SKIP/LIMIT/`*`, and its items are exactly one `count(*)`/`count(n)`
+    /// (n the pattern's variable) plus any number of **constant** items
+    /// (`$param`/literal — the benchmark appends `… , $k AS k` to bust the result
+    /// cache). A constant item is a single grouping key with one group, so the
+    /// count is still over the whole match.
+    ///
+    /// The count itself: no inline props → `node_count()` (0 labels) or
+    /// `nodes_with_label(L).len()` (1 label); a single indexed-equality inline prop
+    /// whose index covers exactly the pattern's label+prop → that index's
+    /// `lookup_eq` length. Anything else (multi-label, residual props, non-index
+    /// props, a non-constant extra projection) falls back.
+    fn try_count_fast_path(&self, sq: &SingleQuery) -> Result<Option<(Vec<String>, Vec<Val>)>> {
         if sq.reading.len() != 1 {
             return Ok(None);
         }
@@ -824,60 +831,53 @@ impl<'g> Engine<'g> {
         }
         let node = &pat.start;
 
-        // RETURN must be exactly one non-DISTINCT count, nothing else.
-        if sq.ret.distinct {
-            return Ok(None);
-        }
         let body = &sq.ret.body;
-        if body.star
-            || body.items.len() != 1
+        if sq.ret.distinct
+            || body.star
+            || body.items.is_empty()
             || !body.order_by.is_empty()
             || body.skip.is_some()
             || body.limit.is_some()
         {
             return Ok(None);
         }
-        let item = &body.items[0];
-        let is_count = match &item.expr {
-            Expr::Function {
-                name,
-                distinct: false,
-                args,
-            } if name.eq_ignore_ascii_case("count") => match args {
-                FuncArgs::Star => true,
-                // count(n) where n is the pattern's variable counts the same matches.
-                FuncArgs::Args(a) if a.len() == 1 => {
-                    matches!(&a[0], Expr::Var(v) if Some(v) == node.var.as_ref())
+        // Exactly one item must be the count; every other item must be a constant
+        // (a single, constant grouping key → one group).
+        let mut count_idx = None;
+        for (i, it) in body.items.iter().enumerate() {
+            if is_count_of(&it.expr, node.var.as_deref()) {
+                if count_idx.is_some() {
+                    return Ok(None); // two counts — not our shape
                 }
-                _ => false,
-            },
-            _ => false,
-        };
-        if !is_count {
-            return Ok(None);
+                count_idx = Some(i);
+            } else if !matches!(it.expr, Expr::Param(_) | Expr::Literal(_)) {
+                return Ok(None); // a non-constant projection ⇒ grouping/other agg
+            }
         }
-        let col = item.alias.clone().unwrap_or_else(|| expr_name(&item.expr));
+        let Some(count_idx) = count_idx else {
+            return Ok(None);
+        };
 
-        // No inline props: read the count straight from resident metadata.
-        if node.props.is_empty() {
-            let count = match node.labels.as_slice() {
-                [] => self.gen.node_count(),
+        // Compute the match count.
+        let count: i64 = if node.props.is_empty() {
+            match node.labels.as_slice() {
+                [] => self.gen.node_count() as i64,
                 [l] => self
                     .gen
                     .label_id(l)
-                    .map(|lid| self.gen.nodes_with_label(lid).len() as u64)
+                    .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
                     .unwrap_or(0),
                 _ => return Ok(None), // multi-label intersection — fall back
+            }
+        } else {
+            // Inline props: only an exact single indexed-equality is safe (the scan
+            // result then needs no residual filtering, so its length is the count).
+            let scan = choose_node_scan(self.gen, node, None, &self.plan_params);
+            let NodeScan::RangeEq { ref index, .. } = scan else {
+                return Ok(None);
             };
-            return Ok(Some((col, count as i64)));
-        }
-
-        // Inline props: only an exact single indexed-equality is safe (the scan
-        // result then needs no residual filtering, so its length is the count).
-        let scan = choose_node_scan(self.gen, node, None, &self.plan_params);
-        if let NodeScan::RangeEq { index, .. } = &scan {
-            if node.props.len() == 1 {
-                let covers = self
+            let covers = node.props.len() == 1
+                && self
                     .gen
                     .manifest()
                     .range_indexes
@@ -887,13 +887,25 @@ impl<'g> Engine<'g> {
                         node.props[0].0 == ri.property
                             && node.labels.iter().all(|l| l == &ri.label_or_type)
                     });
-                if covers {
-                    let ids = self.scan_candidates(&scan)?;
-                    return Ok(Some((col, ids.len() as i64)));
-                }
+            if !covers {
+                return Ok(None);
+            }
+            self.scan_candidates(&scan)?.len() as i64
+        };
+
+        // Build the single output row: the count in its column, constants evaluated.
+        let empty: HashMap<String, Val> = HashMap::new();
+        let mut columns = Vec::with_capacity(body.items.len());
+        let mut row = Vec::with_capacity(body.items.len());
+        for (i, it) in body.items.iter().enumerate() {
+            columns.push(it.alias.clone().unwrap_or_else(|| expr_name(&it.expr)));
+            if i == count_idx {
+                row.push(Val::Int(count));
+            } else {
+                row.push(self.eval(&it.expr, &Scope::Map(&empty), None)?);
             }
         }
-        Ok(None)
+        Ok(Some((columns, row)))
     }
 
     /// Run a single query part starting from `seed` instead of the empty singleton.
@@ -2219,21 +2231,25 @@ impl<'g> Engine<'g> {
         guaranteed: &[u32],
     ) -> Result<bool> {
         if !pat.labels.is_empty() {
-            // Resolve each pattern label to an id, dropping any already guaranteed.
-            // An unknown label can never match. Only decode the resident label
-            // record if at least one label still needs checking.
-            let mut need: Vec<u32> = Vec::new();
-            for l in &pat.labels {
-                match self.gen.label_id(l) {
-                    None => return Ok(false),
-                    Some(lid) if guaranteed.contains(&lid) => {}
-                    Some(lid) => need.push(lid),
-                }
-            }
-            if !need.is_empty() {
+            // Decode the resident label record at most once, and only if at least
+            // one pattern label is not already guaranteed by the anchor scan (an
+            // unknown label forces the decode, where it then fails to match). The
+            // common traversal case has nothing guaranteed, so short-circuit it
+            // before touching the label symbol table — this path is hot (one call
+            // per candidate per hop) and must match the pre-Stage-2 cost exactly.
+            let need_decode = guaranteed.is_empty()
+                || pat.labels.iter().any(|l| {
+                    self.gen
+                        .label_id(l)
+                        .map_or(true, |lid| !guaranteed.contains(&lid))
+                });
+            if need_decode {
                 let have = self.node_label_ids(id)?;
-                if !need.iter().all(|lid| have.contains(lid)) {
-                    return Ok(false);
+                for l in &pat.labels {
+                    match self.gen.label_id(l) {
+                        Some(lid) if guaranteed.contains(&lid) || have.contains(&lid) => {}
+                        _ => return Ok(false),
+                    }
                 }
             }
         }
@@ -5298,6 +5314,29 @@ fn expr_name(e: &Expr) -> String {
     }
 }
 
+/// Is `e` a non-DISTINCT `count(*)`, or `count(var)` where `var` is the anchor
+/// node's variable? Used by the Stage-3 count fast path (see `try_count_fast_path`).
+fn is_count_of(e: &Expr, var: Option<&str>) -> bool {
+    let Expr::Function {
+        name,
+        distinct: false,
+        args,
+    } = e
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("count") {
+        return false;
+    }
+    match args {
+        FuncArgs::Star => true,
+        FuncArgs::Args(a) if a.len() == 1 => {
+            matches!(&a[0], Expr::Var(v) if Some(v.as_str()) == var)
+        }
+        FuncArgs::Args(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5364,6 +5403,41 @@ mod tests {
         // An unknown label counts zero (not an error, not a full scan).
         let (root, res) = run("exec_count_unknown", "MATCH (n:Nope) RETURN count(*) AS c");
         assert!(matches!(res.rows[0][0], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn count_with_constant_extra_projection_fast_path() {
+        // The benchmark appends `… , $k AS k` (a constant grouping key) to bust the
+        // result cache. That is still a single group, so the fast path fires and the
+        // extra column is carried through in order.
+        let (root, res) = run(
+            "exec_count_tag",
+            "MATCH (n:Person) RETURN count(*) AS c, 7 AS k",
+        );
+        assert_eq!(res.columns, vec!["c", "k"]);
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(3)));
+        assert!(matches!(res.rows[0][1], Val::Int(7)));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Order preserved when the tag precedes the count.
+        let (root, res) = run("exec_count_tag2", "MATCH (n) RETURN 9 AS k, count(n) AS c");
+        assert_eq!(res.columns, vec!["k", "c"]);
+        assert!(matches!(res.rows[0][0], Val::Int(9)));
+        assert!(matches!(res.rows[0][1], Val::Int(5)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn count_with_non_constant_extra_projection_falls_back() {
+        // A second item that reads node data is a real grouping key — must NOT take
+        // the fast path; group-by-city over the 3 Person nodes yields 2 rows.
+        let (root, res) = run(
+            "exec_count_group",
+            "MATCH (n:Person) RETURN n.city AS city, count(*) AS c",
+        );
+        assert_eq!(res.rows.len(), 2, "{:?}", res.rows);
         let _ = std::fs::remove_dir_all(&root);
     }
 

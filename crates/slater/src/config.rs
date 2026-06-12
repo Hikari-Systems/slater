@@ -94,6 +94,13 @@ mod de {
     pub fn bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
         d.deserialize_any(Bool)
     }
+
+    /// A byte budget where a non-positive value means "disabled" (floored to 0).
+    /// Accepts a number or numeric string (including a negative one) like the
+    /// other helpers, so `resultCacheBytes: 0` (or any `<= 0`) turns the pool off.
+    pub fn usize_floor0<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+        i64(d).map(|v| usize::try_from(v).unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -185,8 +192,14 @@ pub struct CacheConfig {
     /// Separate byte budget for the large vector-index pool (Vamana blocks + PQ codes).
     #[serde(default = "default_vector_cache", deserialize_with = "de::usize")]
     pub vector_cache_bytes: usize,
-    /// Byte budget for the result LRU.
-    #[serde(default = "default_result_cache", deserialize_with = "de::usize")]
+    /// Byte budget for the result LRU. A value of **0 or less disables the pool**
+    /// entirely: every query then executes for real (no result reuse) — useful for
+    /// honest cold-execution benchmarking, or deployments that never want cached
+    /// results. The block and vector pools have no such switch.
+    #[serde(
+        default = "default_result_cache",
+        deserialize_with = "de::usize_floor0"
+    )]
     pub result_cache_bytes: usize,
     /// Idle TTL in milliseconds: a cached entry not accessed for this long is
     /// reclaimed by the background maintenance sweep, freeing memory below the
