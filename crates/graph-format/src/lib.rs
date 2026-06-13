@@ -22,6 +22,7 @@ pub mod blockfile;
 pub mod codec;
 pub mod columns;
 pub mod crypto;
+pub mod extsort;
 pub mod ids;
 pub mod integrity;
 pub mod isam;

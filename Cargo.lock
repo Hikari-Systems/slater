@@ -1101,6 +1101,7 @@ dependencies = [
  "graph-format",
  "pest",
  "pest_derive",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",

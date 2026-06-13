@@ -125,6 +125,99 @@ pub fn write_csr_with_cipher(
     w.finish()
 }
 
+/// Streaming CSR writer fed edges already grouped by key-node in ascending order.
+/// Replaces the `fwd`/`rev: Vec<Vec<Adj>>` materialisation of [`write_csr`] for the
+/// external builder — only the current node's adjacency (`cur`) is held resident, so
+/// peak memory is `O(max degree)` rather than `O(edges)`.
+///
+/// Drive it in two halves into one file: push every edge keyed by **source** node
+/// (forward adjacency) and call [`CsrStreamWriter::finish_half`]; then push every edge
+/// keyed by **destination** node (reverse adjacency) and call [`CsrStreamWriter::finish`].
+/// Each half emits exactly one record per node `0..node_count` — an empty (count-0)
+/// record for a node with no edges — so the file holds the `2N` records that
+/// [`TopologyReader::open`] requires.
+pub struct CsrStreamWriter {
+    inner: BlockFileWriter,
+    node_count: u64,
+    next_node: u64,
+    cur: Vec<Adj>,
+    halves_done: u8,
+}
+
+impl CsrStreamWriter {
+    pub fn create_with_cipher(
+        path: impl AsRef<Path>,
+        node_count: u64,
+        target_block_bytes: usize,
+        zstd_level: i32,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: BlockFileWriter::create_with_cipher(
+                path,
+                target_block_bytes,
+                zstd_level,
+                cipher,
+            )?,
+            node_count,
+            next_node: 0,
+            cur: Vec::new(),
+            halves_done: 0,
+        })
+    }
+
+    /// Emit the accumulated record for `next_node` and advance.
+    fn emit_one(&mut self) -> Result<()> {
+        let rec = encode_adj(&self.cur);
+        self.inner.append_record(&rec)?;
+        self.cur.clear();
+        self.next_node += 1;
+        Ok(())
+    }
+
+    /// Add `adj` to node `key_node`'s adjacency. `key_node` must be non-decreasing
+    /// across calls within a half and strictly `< node_count`. Skipped nodes get
+    /// empty records so a record's global index stays equal to its node id.
+    pub fn push(&mut self, key_node: u64, adj: Adj) -> Result<()> {
+        if key_node >= self.node_count {
+            bail!("csr key node {key_node} >= node_count {}", self.node_count);
+        }
+        if key_node < self.next_node {
+            bail!(
+                "csr edges not ascending by node (got {key_node}, already at {})",
+                self.next_node
+            );
+        }
+        while self.next_node < key_node {
+            self.emit_one()?;
+        }
+        self.cur.push(adj);
+        Ok(())
+    }
+
+    /// Close the current half, padding empty records through `node_count - 1`, and
+    /// reset for the next half.
+    pub fn finish_half(&mut self) -> Result<()> {
+        while self.next_node < self.node_count {
+            self.emit_one()?;
+        }
+        self.next_node = 0;
+        self.halves_done += 1;
+        Ok(())
+    }
+
+    /// Flush the file; both halves (forward then reverse) must have been closed.
+    pub fn finish(self) -> Result<u64> {
+        if self.halves_done != 2 {
+            bail!(
+                "csr stream needs both halves finished (forward+reverse), got {}",
+                self.halves_done
+            );
+        }
+        self.inner.finish()
+    }
+}
+
 /// Reader over the CSR adjacency.
 pub struct TopologyReader {
     inner: BlockFileReader,
@@ -274,5 +367,106 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stream_writer_matches_write_csr() {
+        // A graph with an isolated sink (node 2: no outgoing) and a node with two
+        // out-edges, so the empty-record padding and multi-edge paths are exercised.
+        let node_count = 5u64;
+        let edges = vec![
+            Edge {
+                src: NodeId(0),
+                dst: NodeId(1),
+                reltype: 0,
+                edge: EdgeId(0),
+            },
+            Edge {
+                src: NodeId(0),
+                dst: NodeId(2),
+                reltype: 1,
+                edge: EdgeId(1),
+            },
+            Edge {
+                src: NodeId(1),
+                dst: NodeId(2),
+                reltype: 0,
+                edge: EdgeId(2),
+            },
+            Edge {
+                src: NodeId(3),
+                dst: NodeId(0),
+                reltype: 1,
+                edge: EdgeId(3),
+            },
+            Edge {
+                src: NodeId(4),
+                dst: NodeId(4),
+                reltype: 2,
+                edge: EdgeId(4),
+            }, // self-loop
+        ];
+
+        let ref_path = tmp("csr_ref");
+        write_csr(&ref_path, node_count, &edges, 256, 3).unwrap();
+
+        // Streaming: forward edges sorted by (src, edge); reverse by (dst, edge).
+        let mut fwd = edges.clone();
+        fwd.sort_by_key(|e| (e.src.0, e.edge.0));
+        let mut rev = edges.clone();
+        rev.sort_by_key(|e| (e.dst.0, e.edge.0));
+
+        let s_path = tmp("csr_stream");
+        let mut w = CsrStreamWriter::create_with_cipher(&s_path, node_count, 256, 3, None).unwrap();
+        for e in &fwd {
+            w.push(
+                e.src.0,
+                Adj {
+                    reltype: e.reltype,
+                    neighbour: e.dst,
+                    edge: e.edge,
+                },
+            )
+            .unwrap();
+        }
+        w.finish_half().unwrap();
+        for e in &rev {
+            w.push(
+                e.dst.0,
+                Adj {
+                    reltype: e.reltype,
+                    neighbour: e.src,
+                    edge: e.edge,
+                },
+            )
+            .unwrap();
+        }
+        w.finish_half().unwrap();
+        w.finish().unwrap();
+
+        let r1 = TopologyReader::open(&ref_path).unwrap();
+        let r2 = TopologyReader::open(&s_path).unwrap();
+        assert_eq!(r1.node_count(), r2.node_count());
+        let key = |a: &Adj| (a.reltype, a.neighbour.0, a.edge.0);
+        for n in 0..node_count {
+            let (mut o1, mut o2) = (
+                r1.outgoing(NodeId(n)).unwrap(),
+                r2.outgoing(NodeId(n)).unwrap(),
+            );
+            o1.sort_by_key(key);
+            o2.sort_by_key(key);
+            assert_eq!(o1, o2, "outgoing mismatch at node {n}");
+            let (mut i1, mut i2) = (
+                r1.incoming(NodeId(n)).unwrap(),
+                r2.incoming(NodeId(n)).unwrap(),
+            );
+            i1.sort_by_key(key);
+            i2.sort_by_key(key);
+            assert_eq!(i1, i2, "incoming mismatch at node {n}");
+        }
+        // The isolated sink still has an (empty) outgoing record.
+        assert!(r2.outgoing(NodeId(2)).unwrap().is_empty());
+        let _ = std::fs::remove_file(&ref_path);
+        let _ = std::fs::remove_file(&s_path);
     }
 }

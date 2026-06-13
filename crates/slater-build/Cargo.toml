@@ -21,3 +21,4 @@ clap.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
 tracing.workspace = true
+rayon.workspace = true

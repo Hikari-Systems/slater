@@ -21,27 +21,26 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
 use graph_format::columns::PropsWriter;
-use graph_format::crypto::{self, BlockCipher};
+use graph_format::crypto::BlockCipher;
 use graph_format::ids::Value;
 use graph_format::ids::{EdgeId, Generation, NodeId};
-use graph_format::integrity::{content_hash, hash_file};
 use graph_format::isam::write_isam_with_cipher;
-use graph_format::manifest::{
-    AnnMode, EncryptionHeader, EntityKind, Manifest, Metric, RangeIndexDesc, VectorIndexDesc,
-};
+use graph_format::manifest::{AnnMode, EntityKind, Metric, RangeIndexDesc, VectorIndexDesc};
 use graph_format::nodelabels::NodeLabelsWriter;
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
 use graph_format::topology::{write_csr_with_cipher, Edge};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
 
+use crate::common::{self, PublishInputs};
 use crate::model::{Entity, Statement, VectorIndexStmt};
 use crate::parser::{parse_statement, StatementReader};
+
+pub use crate::common::BuildOutcome;
 
 /// Tunables for one build (all have sensible defaults in the CLI).
 pub struct BuildOptions {
@@ -69,6 +68,22 @@ pub struct BuildOptions {
     pub pq_subspaces: u32,
     /// PQ bits per subspace.
     pub pq_bits: u32,
+
+    // ---- external (bounded-memory) build knobs ----
+    /// Working-memory budget (bytes) for spill/sort/cluster in the external path.
+    pub max_memory_bytes: usize,
+    /// Scratch directory for spill files; `None` ⇒ a `.scratch-<gen>` under the
+    /// graph dir. Removed on a successful build unless `keep_temp`.
+    pub temp_dir: Option<PathBuf>,
+    /// Node-id reordering for on-disk locality (external path only).
+    pub cluster: crate::cluster::ClusterMode,
+    /// LDG refinement passes (external path only).
+    pub cluster_passes: u32,
+    /// Keep scratch (buckets/spill) after a successful build, for debugging.
+    pub keep_temp: bool,
+    /// Resume an interrupted external build from its surviving scratch, instead of
+    /// starting fresh.
+    pub resume: bool,
 }
 
 impl Default for BuildOptions {
@@ -85,17 +100,14 @@ impl Default for BuildOptions {
             vamana_alpha: 1.2,
             pq_subspaces: 16,
             pq_bits: 8,
+            max_memory_bytes: 4 * 1024 * 1024 * 1024,
+            temp_dir: None,
+            cluster: crate::cluster::ClusterMode::Ldg,
+            cluster_passes: 3,
+            keep_temp: false,
+            resume: false,
         }
     }
-}
-
-/// What a successful build produced.
-pub struct BuildOutcome {
-    pub generation: Generation,
-    pub content_hash: String,
-    pub dir: PathBuf,
-    pub node_count: u64,
-    pub edge_count: u64,
 }
 
 const DUMP_VERTEX: &str = "__DumpVertex__";
@@ -103,13 +115,13 @@ const DUMP_ID: &str = "__dump_id__";
 
 /// First-seen interner: name → dense id, preserving insertion order.
 #[derive(Default)]
-struct Interner {
+pub(crate) struct Interner {
     map: HashMap<String, u32>,
     names: Vec<String>,
 }
 
 impl Interner {
-    fn intern(&mut self, name: &str) -> u32 {
+    pub(crate) fn intern(&mut self, name: &str) -> u32 {
         if let Some(id) = self.map.get(name) {
             return *id;
         }
@@ -119,12 +131,27 @@ impl Interner {
         id
     }
 
-    fn get(&self, name: &str) -> Option<u32> {
+    pub(crate) fn get(&self, name: &str) -> Option<u32> {
         self.map.get(name).copied()
     }
 
-    fn into_names(self) -> Vec<String> {
+    pub(crate) fn into_names(self) -> Vec<String> {
         self.names
+    }
+
+    /// Borrow the name table (e.g. to checkpoint it without consuming the interner).
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Reconstruct an interner from its persisted name table (for resume).
+    pub(crate) fn from_names(names: Vec<String>) -> Self {
+        let map = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        Self { map, names }
     }
 }
 
@@ -133,12 +160,12 @@ impl Interner {
 const PQ_ITERS: usize = 25;
 
 /// An index's gathered vectors, awaiting a brute-force-vs-Vamana routing decision.
-struct PendingIndex {
-    label: String,
-    property: String,
-    dim: u32,
-    metric: Metric,
-    entries: Vec<(u64, Vec<f32>)>,
+pub(crate) struct PendingIndex {
+    pub(crate) label: String,
+    pub(crate) property: String,
+    pub(crate) dim: u32,
+    pub(crate) metric: Metric,
+    pub(crate) entries: Vec<(u64, Vec<f32>)>,
 }
 
 /// A fully-resolved node held in memory during the build.
@@ -303,22 +330,7 @@ pub fn build(
     // Derive the per-generation block cipher (and the MANIFEST header that records
     // the KDF salt — never the key) when encryption is requested. Every block
     // writer below threads this cipher; `None` writes the plaintext format.
-    let (cipher, encryption_header): (Option<Arc<BlockCipher>>, Option<EncryptionHeader>) =
-        match &opts.encryption_key {
-            Some(key) => {
-                let salt = crypto::random_salt();
-                let header = EncryptionHeader {
-                    aead: crypto::AEAD_NAME.to_string(),
-                    kdf: crypto::KDF_NAME.to_string(),
-                    salt_hex: crypto::hex_encode(&salt),
-                };
-                (
-                    Some(Arc::new(BlockCipher::from_master(key, &salt))),
-                    Some(header),
-                )
-            }
-            None => (None, None),
-        };
+    let (cipher, encryption_header) = common::derive_cipher(&opts.encryption_key);
 
     let mut block_sizes: std::collections::BTreeMap<String, u32> = Default::default();
 
@@ -418,49 +430,8 @@ pub fn build(
         });
     }
 
-    fs::create_dir_all(tmp_dir.join("vector"))
-        .with_context(|| format!("create {}", tmp_dir.join("vector").display()))?;
-
-    let mut vector_indexes: Vec<VectorIndexDesc> = Vec::new();
-    // Extra inventory files produced by the Vamana path (rel paths under tmp_dir).
-    let mut vector_files: Vec<String> = Vec::new();
-    {
-        let mut w = VectorStoreWriter::create_with_cipher(
-            tmp_dir.join("vectors.f32.blk"),
-            opts.vector_block_size,
-            opts.zstd_level,
-            cipher.clone(),
-        )?;
-        for pi in &pending {
-            let count = pi.entries.len() as u64;
-            if count >= opts.ann_threshold && vamana_eligible(pi, opts) {
-                // Disk-native Vamana/PQ path.
-                let (desc, files) = build_vamana_index(&tmp_dir, pi, opts, cipher.clone())?;
-                for (name, block) in &files {
-                    vector_files.push(name.clone());
-                    block_sizes.insert(name.clone(), *block);
-                }
-                vector_indexes.push(desc);
-            } else {
-                // Brute-force: append the group to vectors.f32.blk (M5 path).
-                let first_record = w.len();
-                for (nid, xs) in &pi.entries {
-                    w.append(*nid, xs)?;
-                }
-                vector_indexes.push(VectorIndexDesc {
-                    label: pi.label.clone(),
-                    property: pi.property.clone(),
-                    dim: pi.dim,
-                    metric: pi.metric,
-                    count,
-                    first_record,
-                    mode: AnnMode::BruteForce,
-                });
-            }
-        }
-        w.finish()?;
-        block_sizes.insert("vectors.f32.blk".into(), opts.vector_block_size as u32);
-    }
+    let (vector_indexes, vector_files) =
+        write_vector_indexes(&tmp_dir, &pending, opts, cipher.clone(), &mut block_sizes)?;
 
     // range/<name>.isam
     let mut range_indexes: Vec<RangeIndexDesc> = Vec::new();
@@ -526,50 +497,15 @@ pub fn build(
         });
     }
 
-    // ---- inventory + content hash ------------------------------------------
-    let mut file_names: Vec<String> = vec![
-        "node_props.blk".into(),
-        "node_labels.blk".into(),
-        "edge_props.blk".into(),
-        "topology.csr.blk".into(),
-        "vectors.f32.blk".into(),
-    ];
-    for ri in &range_indexes {
-        file_names.push(format!("range/{}.isam", ri.name));
-    }
-    file_names.extend(vector_files);
-    file_names.sort();
-
-    let mut files = Vec::new();
-    for name in &file_names {
-        let path = tmp_dir.join(name);
-        let bytes = fs::metadata(&path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        let blake3 = hash_file(&path)?;
-        files.push(graph_format::manifest::FileEntry {
-            name: name.clone(),
-            bytes,
-            blake3,
-        });
-    }
-    let inventory: Vec<(String, String)> = files
-        .iter()
-        .map(|f| (f.name.clone(), f.blake3.clone()))
-        .collect();
-    let content_hash = content_hash(&inventory);
-
-    let mut manifest = Manifest {
-        magic: String::from_utf8_lossy(graph_format::MAGIC).to_string(),
-        format_version: graph_format::FORMAT_VERSION,
-        build_uuid: generation,
-        graph: graph.to_string(),
-        created_unix: now_unix(),
-        content_hash: content_hash.clone(),
-        block_sizes,
-        codec: "zstd".into(),
+    // ---- inventory, MANIFEST, atomic publish (shared with build_external) --
+    common::write_manifest_and_publish(PublishInputs {
+        tmp_dir: &tmp_dir,
+        graph_dir: &graph_dir,
+        final_dir: &final_dir,
+        generation,
+        graph,
         zstd_level: opts.zstd_level,
-        encryption: encryption_header,
+        block_sizes,
         node_count,
         edge_count,
         labels: labels.into_names(),
@@ -577,45 +513,66 @@ pub fn build(
         property_keys: keys.into_names(),
         range_indexes,
         vector_indexes,
+        encryption_header,
+        encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
-        mac: None,
-        files,
-    };
-    // Seal the manifest with a keyed MAC iff this is an encrypted image — the MAC
-    // must be computed last, over the otherwise-final manifest, so it authenticates
-    // content_hash, the file inventory, the encryption header, and the ACL stamp.
-    if let Some(key) = &opts.encryption_key {
-        manifest.seal_mac(key)?;
-    }
-    manifest.write_to_dir(&tmp_dir)?;
-
-    // ---- atomic publish ----------------------------------------------------
-    fsync_dir(&tmp_dir)?;
-    if final_dir.exists() {
-        // A UUID collision is astronomically unlikely; refuse rather than clobber.
-        bail!(
-            "generation directory already exists: {}",
-            final_dir.display()
-        );
-    }
-    fs::rename(&tmp_dir, &final_dir).with_context(|| format!("publish {}", final_dir.display()))?;
-    fsync_dir(&graph_dir)?;
-
-    // Swap the `current` pointer atomically (write temp, rename over).
-    let current = graph_dir.join("current");
-    let current_tmp = graph_dir.join(".current.tmp");
-    fs::write(&current_tmp, format!("{}\n", generation.0))
-        .with_context(|| format!("write {}", current_tmp.display()))?;
-    fs::rename(&current_tmp, &current).with_context(|| format!("swap {}", current.display()))?;
-    fsync_dir(&graph_dir)?;
-
-    Ok(BuildOutcome {
-        generation,
-        content_hash,
-        dir: final_dir,
-        node_count,
-        edge_count,
+        extra_files: vector_files,
     })
+}
+
+/// Route each gathered [`PendingIndex`] by cardinality and write the vector store
+/// (`vectors.f32.blk`) plus any Vamana/PQ files. Shared by the in-memory and
+/// external builds — both gather the `(node_id, vector)` sets differently but emit
+/// the index identically. Returns the manifest descriptors and the extra
+/// (Vamana/PQ) inventory file names.
+pub(crate) fn write_vector_indexes(
+    tmp_dir: &Path,
+    pending: &[PendingIndex],
+    opts: &BuildOptions,
+    cipher: Option<Arc<BlockCipher>>,
+    block_sizes: &mut std::collections::BTreeMap<String, u32>,
+) -> Result<(Vec<VectorIndexDesc>, Vec<String>)> {
+    fs::create_dir_all(tmp_dir.join("vector"))
+        .with_context(|| format!("create {}", tmp_dir.join("vector").display()))?;
+    let mut vector_indexes: Vec<VectorIndexDesc> = Vec::new();
+    // Extra inventory files produced by the Vamana path (rel paths under tmp_dir).
+    let mut vector_files: Vec<String> = Vec::new();
+    let mut w = VectorStoreWriter::create_with_cipher(
+        tmp_dir.join("vectors.f32.blk"),
+        opts.vector_block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    for pi in pending {
+        let count = pi.entries.len() as u64;
+        if count >= opts.ann_threshold && vamana_eligible(pi, opts) {
+            // Disk-native Vamana/PQ path.
+            let (desc, files) = build_vamana_index(tmp_dir, pi, opts, cipher.clone())?;
+            for (name, block) in &files {
+                vector_files.push(name.clone());
+                block_sizes.insert(name.clone(), *block);
+            }
+            vector_indexes.push(desc);
+        } else {
+            // Brute-force: append the group to vectors.f32.blk (M5 path).
+            let first_record = w.len();
+            for (nid, xs) in &pi.entries {
+                w.append(*nid, xs)?;
+            }
+            vector_indexes.push(VectorIndexDesc {
+                label: pi.label.clone(),
+                property: pi.property.clone(),
+                dim: pi.dim,
+                metric: pi.metric,
+                count,
+                first_record,
+                mode: AnnMode::BruteForce,
+            });
+        }
+    }
+    w.finish()?;
+    block_sizes.insert("vectors.f32.blk".into(), opts.vector_block_size as u32);
+    Ok((vector_indexes, vector_files))
 }
 
 /// Whether an above-threshold index can use the Vamana/PQ path. v1 supports the
@@ -744,7 +701,7 @@ fn build_vamana_index(
     ))
 }
 
-fn parse_metric(s: &str) -> Result<Metric> {
+pub(crate) fn parse_metric(s: &str) -> Result<Metric> {
     match s.to_ascii_lowercase().as_str() {
         "cosine" => Ok(Metric::Cosine),
         "euclidean" | "l2" => Ok(Metric::L2),
@@ -768,7 +725,7 @@ fn default_metric() -> String {
     "cosine".to_string()
 }
 
-fn load_vector_sidecar(path: &Path) -> Result<Vec<VectorIndexStmt>> {
+pub(crate) fn load_vector_sidecar(path: &Path) -> Result<Vec<VectorIndexStmt>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("read vector-index sidecar {}", path.display()))?;
     let specs: Vec<VectorIndexSpec> = serde_json::from_str(&text)
@@ -782,22 +739,6 @@ fn load_vector_sidecar(path: &Path) -> Result<Vec<VectorIndexStmt>> {
             metric: s.metric,
         })
         .collect())
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// fsync a directory so a rename/creation within it is durable (matters on
-/// remote/network filesystems such as NFS).
-fn fsync_dir(dir: &Path) -> Result<()> {
-    let f = fs::File::open(dir).with_context(|| format!("open dir {}", dir.display()))?;
-    f.sync_all()
-        .with_context(|| format!("fsync dir {}", dir.display()))?;
-    Ok(())
 }
 
 fn truncate(s: &str, n: usize) -> String {

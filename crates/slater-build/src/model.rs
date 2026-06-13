@@ -8,10 +8,11 @@
 //! time it reaches the builder.
 
 use graph_format::ids::Value;
+use serde::{Deserialize, Serialize};
 
 /// Which entity a range index attaches to (mirrors `graph_format`'s `EntityKind`
 /// but kept local so the parser layer does not depend on the manifest types).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Entity {
     Node,
     Edge,
@@ -49,14 +50,14 @@ pub struct EdgeStmt {
     pub props: Vec<(String, Value)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RangeIndexStmt {
     pub entity: Entity,
     pub label_or_type: String,
     pub property: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorIndexStmt {
     pub label: String,
     pub property: String,

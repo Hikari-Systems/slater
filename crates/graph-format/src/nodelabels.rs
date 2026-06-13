@@ -24,6 +24,19 @@ use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::wire::{read_uvarint, write_uvarint};
 
+/// Encode one node's label record (`uvarint(count) ‖ count × uvarint(label_id)`)
+/// to bytes. The single source of the record layout — both [`NodeLabelsWriter`]
+/// and the external builder (which pre-encodes labels in pass 1 and byte-copies
+/// the record into the store at emit) go through this so the two can never drift.
+pub fn encode_labels_record(label_ids: &[u32]) -> Vec<u8> {
+    let mut rec = Vec::new();
+    write_uvarint(&mut rec, label_ids.len() as u64);
+    for l in label_ids {
+        write_uvarint(&mut rec, *l as u64);
+    }
+    rec
+}
+
 /// Writer for `node_labels.blk`. Append nodes strictly in dense-id order.
 pub struct NodeLabelsWriter {
     inner: BlockFileWriter,
@@ -59,12 +72,14 @@ impl NodeLabelsWriter {
 
     /// Append one node's label-id list; returns its dense node id.
     pub fn append(&mut self, label_ids: &[u32]) -> Result<u64> {
-        let mut rec = Vec::new();
-        write_uvarint(&mut rec, label_ids.len() as u64);
-        for l in label_ids {
-            write_uvarint(&mut rec, *l as u64);
-        }
-        self.inner.append_record(&rec)?;
+        self.append_raw(&encode_labels_record(label_ids))
+    }
+
+    /// Append a record already encoded by [`encode_labels_record`], byte-for-byte,
+    /// returning its dense node id. The external builder's emit path uses this to
+    /// copy a pass-1-encoded label record straight into the store with no re-encode.
+    pub fn append_raw(&mut self, rec: &[u8]) -> Result<u64> {
+        self.inner.append_record(rec)?;
         let id = self.next;
         self.next += 1;
         Ok(id)

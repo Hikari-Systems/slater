@@ -23,6 +23,21 @@ use crate::crypto::BlockCipher;
 use crate::ids::Value;
 use crate::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
+/// Encode one entity's property record
+/// (`uvarint(count) ‖ count × ( uvarint(key_id) ‖ value )`) to bytes. The single
+/// source of the record layout — both [`PropsWriter`] and the external builder
+/// (which pre-encodes property records in pass 1 and byte-copies them into the
+/// store at emit) go through this, so the two encodings can never drift.
+pub fn encode_props_record(props: &[(u32, Value)]) -> Vec<u8> {
+    let mut rec = Vec::new();
+    write_uvarint(&mut rec, props.len() as u64);
+    for (key_id, value) in props {
+        write_uvarint(&mut rec, *key_id as u64);
+        write_value(&mut rec, value);
+    }
+    rec
+}
+
 /// Writer for a property `.blk` file. Append entities strictly in dense-id order
 /// (0, 1, 2, …); the append position becomes the entity id.
 pub struct PropsWriter {
@@ -61,13 +76,14 @@ impl PropsWriter {
     /// Append one entity's property map. Keys are property-key symbol ids.
     /// Returns the entity's dense id.
     pub fn append(&mut self, props: &[(u32, Value)]) -> Result<u64> {
-        let mut rec = Vec::new();
-        write_uvarint(&mut rec, props.len() as u64);
-        for (key_id, value) in props {
-            write_uvarint(&mut rec, *key_id as u64);
-            write_value(&mut rec, value);
-        }
-        self.inner.append_record(&rec)?;
+        self.append_raw(&encode_props_record(props))
+    }
+
+    /// Append a record already encoded by [`encode_props_record`], byte-for-byte,
+    /// returning its dense id. The external builder's emit path uses this to copy
+    /// a pass-1-encoded property record straight into the store with no re-encode.
+    pub fn append_raw(&mut self, rec: &[u8]) -> Result<u64> {
+        self.inner.append_record(rec)?;
         let id = self.next_id;
         self.next_id += 1;
         Ok(id)

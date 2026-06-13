@@ -54,6 +54,10 @@ pub fn write_isam(
 /// identical to [`write_isam`]). Each compressed block is sealed under its own
 /// random nonce, which is stored in the resident top-level beside the block's
 /// location — the key never touches the file (D28).
+///
+/// Convenience wrapper that sorts in memory and delegates to
+/// [`write_isam_sorted`]; the external builder, which cannot hold all entries,
+/// feeds an already-sorted stream to `write_isam_sorted` directly.
 pub fn write_isam_with_cipher(
     path: impl AsRef<Path>,
     mut entries: Vec<(Value, u64)>,
@@ -62,7 +66,74 @@ pub fn write_isam_with_cipher(
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<u64> {
     entries.sort_by(|a, b| a.0.cmp_key(&b.0).then(a.1.cmp(&b.1)));
+    write_isam_sorted(
+        path,
+        entries.into_iter().map(Ok),
+        target_block_bytes,
+        zstd_level,
+        cipher,
+    )
+}
 
+/// One block's resident top-level entry (first key → block location + nonce).
+struct Top {
+    first_key: Value,
+    offset: u64,
+    comp_len: u32,
+    raw_len: u32,
+    nonce: Option<[u8; NONCE_LEN]>,
+}
+
+/// Compress, optionally seal, and write one key-block; record its top-level entry.
+fn flush_isam_block(
+    file: &mut BufWriter<File>,
+    offset: &mut u64,
+    tops: &mut Vec<Top>,
+    first_key: Value,
+    count: u64,
+    body: &[u8],
+    zstd_level: i32,
+    cipher: &Option<Arc<BlockCipher>>,
+) -> Result<()> {
+    let mut raw = Vec::with_capacity(body.len() + 8);
+    write_uvarint(&mut raw, count);
+    raw.extend_from_slice(body);
+    let comp = codec::compress(&raw, zstd_level)?;
+    let (stored, nonce) = match cipher {
+        Some(c) => {
+            let nonce = BlockCipher::random_nonce();
+            (c.encrypt(&nonce, &comp)?, Some(nonce))
+        }
+        None => (comp, None),
+    };
+    file.write_all(&stored)?;
+    tops.push(Top {
+        first_key,
+        offset: *offset,
+        comp_len: stored.len() as u32,
+        raw_len: raw.len() as u32,
+        nonce,
+    });
+    *offset += stored.len() as u64;
+    Ok(())
+}
+
+/// Build an ISAM index from an **already-sorted** stream of `(value, id)` pairs
+/// (ascending by [`Value::cmp_key`] then id — the same order [`write_isam`]
+/// produces internally). Byte-for-byte identical to `write_isam` on the same
+/// entries, but holds only the current key-block resident, so the external
+/// builder can stream entries straight from an [`crate::extsort::ExtSorter`]
+/// without materialising them all.
+pub fn write_isam_sorted<I>(
+    path: impl AsRef<Path>,
+    entries: I,
+    target_block_bytes: usize,
+    zstd_level: i32,
+    cipher: Option<Arc<BlockCipher>>,
+) -> Result<u64>
+where
+    I: IntoIterator<Item = Result<(Value, u64)>>,
+{
     let f = File::create(path.as_ref())
         .with_context(|| format!("create isam {}", path.as_ref().display()))?;
     let mut file = BufWriter::new(f);
@@ -74,50 +145,47 @@ pub fn write_isam_with_cipher(
     file.write_all(magic)?;
     let mut offset = magic.len() as u64;
 
-    struct Top {
-        first_key: Value,
-        offset: u64,
-        comp_len: u32,
-        raw_len: u32,
-        nonce: Option<[u8; NONCE_LEN]>,
-    }
     let mut tops: Vec<Top> = Vec::new();
+    let mut first_key: Option<Value> = None;
+    let mut count = 0u64;
+    let mut body: Vec<u8> = Vec::new();
 
-    let mut i = 0;
-    while i < entries.len() {
-        // Accumulate one block.
-        let first_key = entries[i].0.clone();
-        let mut raw = Vec::new();
-        // reserve count slot; we patch it after, so build entries first.
-        let mut count = 0u64;
-        let mut body = Vec::new();
-        while i < entries.len() && body.len() < target_block_bytes {
-            let (k, id) = &entries[i];
-            write_value(&mut body, k);
-            write_uvarint(&mut body, *id);
-            count += 1;
-            i += 1;
+    for e in entries {
+        let (k, id) = e?;
+        if first_key.is_none() {
+            first_key = Some(k.clone());
         }
-        write_uvarint(&mut raw, count);
-        raw.extend_from_slice(&body);
-
-        let comp = codec::compress(&raw, zstd_level)?;
-        let (stored, nonce) = match &cipher {
-            Some(c) => {
-                let nonce = BlockCipher::random_nonce();
-                (c.encrypt(&nonce, &comp)?, Some(nonce))
-            }
-            None => (comp, None),
-        };
-        file.write_all(&stored)?;
-        tops.push(Top {
-            first_key,
-            offset,
-            comp_len: stored.len() as u32,
-            raw_len: raw.len() as u32,
-            nonce,
-        });
-        offset += stored.len() as u64;
+        write_value(&mut body, &k);
+        write_uvarint(&mut body, id);
+        count += 1;
+        // Close the block once it reaches target — the entry that crosses the
+        // threshold is the block's last, matching `write_isam`'s boundary exactly.
+        if body.len() >= target_block_bytes {
+            flush_isam_block(
+                &mut file,
+                &mut offset,
+                &mut tops,
+                first_key.take().unwrap(),
+                count,
+                &body,
+                zstd_level,
+                &cipher,
+            )?;
+            count = 0;
+            body.clear();
+        }
+    }
+    if count > 0 {
+        flush_isam_block(
+            &mut file,
+            &mut offset,
+            &mut tops,
+            first_key.take().unwrap(),
+            count,
+            &body,
+            zstd_level,
+            &cipher,
+        )?;
     }
 
     // Top level.
@@ -482,6 +550,38 @@ mod tests {
             entries.len() as u64
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_isam_sorted_is_byte_identical_to_write_isam() {
+        // Feeding a pre-sorted stream to write_isam_sorted must reproduce exactly
+        // the bytes write_isam emits after its in-RAM sort (deterministic zstd,
+        // plaintext). This is the contract the external builder relies on.
+        let mut entries = Vec::new();
+        let sources = ["Fowler-2010", "Whitehead-2024", "Smith-1999", "Adams-2001"];
+        for id in 0..500u64 {
+            entries.push((Value::Str(sources[(id % 4) as usize].to_string()), id));
+        }
+        // Mix in some ints to exercise cross-type ordering at the boundary.
+        for id in 500..600u64 {
+            entries.push((Value::Int((id as i64) % 7), id));
+        }
+
+        let p1 = tmp("sorted_ref");
+        write_isam(&p1, entries.clone(), 96, 3).unwrap();
+
+        let mut sorted = entries.clone();
+        sorted.sort_by(|a, b| a.0.cmp_key(&b.0).then(a.1.cmp(&b.1)));
+        let p2 = tmp("sorted_stream");
+        write_isam_sorted(&p2, sorted.into_iter().map(Ok), 96, 3, None).unwrap();
+
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            std::fs::read(&p2).unwrap(),
+            "write_isam_sorted output differs from write_isam"
+        );
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]
