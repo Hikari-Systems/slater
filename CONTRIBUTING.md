@@ -1,4 +1,4 @@
-# Contributing
+# Contributing (for Claude purposes only)
 
 ## Formatting (local pre-commit gate)
 
