@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Stand up the 4-engine -hs stack for ONE hs-backend-spot reference graph and load
-# all four. Dedicated -hs container names + port block (7700/7701/7702/6401) so the
+# Stand up the 5-engine -hs stack for ONE hs-backend-spot reference graph and load
+# all five. Dedicated -hs container names + port block (7700/7701/7702/6401) so the
 # pole stack on 7687-7689/6390 is never touched.
 #
 # Usage: setup_hs.sh <graph> <cypher_src> [extra_index "Label:prop"]
@@ -60,10 +60,11 @@ for i in $(seq 1 60); do
   [ "$ok" = 1 ] && break
 done
 
-echo "### load neo4j / memgraph / falkordb from $WCY"
+echo "### load neo4j / memgraph / falkordb / ladybug from $WCY"
 $PY "$HERE/load_cypher.py" neo4j    "$WCY" --uri bolt://localhost:7701 --pass polepole12
 $PY "$HERE/load_cypher.py" memgraph "$WCY" --uri bolt://localhost:7702
 $PY "$HERE/load_cypher.py" falkordb "$WCY" --port 6401 --graph "$GRAPH"
+$PY "$HERE/load_ladybug.py" "$WCY" --graph "$GRAPH"
 
 echo "### persist in-memory engines so they recover across the restart-bench loop"
 # Memgraph is in-memory; snapshot so a restart recovers the data.
@@ -72,7 +73,7 @@ $PY -c "from neo4j import GraphDatabase as G; s=G.driver('bolt://localhost:7702'
 docker exec falkordb-hs redis-cli SAVE >/dev/null 2>&1 && echo "  falkordb SAVE ok" || echo "  falkordb SAVE FAILED"
 
 echo "### verify node counts per engine"
-for e in slater neo4j memgraph falkordb; do
+for e in slater neo4j memgraph falkordb ladybug; do
   printf '  %-9s %s\n' "$e" "$($PY "$HERE/count_hs.py" "$e" "$GRAPH")"
 done
 echo "### setup done for $GRAPH"

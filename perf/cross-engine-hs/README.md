@@ -26,9 +26,10 @@ graph can't:
   of vectors fit and stay resident; the interesting behaviour is what happens when
   you size that budget *below* a vector group.
 
-Engines are the same four as pole: **slater / Neo4j 5 / Memgraph / FalkorDB**.
+Engines are the same four as pole plus **LadybugDB**:
+**slater / Neo4j 5 / Memgraph / FalkorDB / LadybugDB**.
 Because Neo4j and Memgraph community editions serve one database at a time, the
-two graphs are **two separate runs**, each a single graph across all four engines.
+two graphs are **two separate runs**, each a single graph across all five engines.
 
 ## Method
 
@@ -36,10 +37,12 @@ Identical to the pole harness (`perf/cross-engine/`): per query, 15 warm-ups the
 25 measured calls with a **fresh parameter every call** (so the result cache always
 misses — real execution cost), median of the 25; each engine is **restarted before
 every run** and re-warmed, and the reported figure is the **mean of 5 such runs**.
-Peak/steady RSS is read from the container cgroup after the final run. Row counts
-are cross-checked across engines (slater matches the Neo4j/Memgraph reference on
-every query). slater is served on its **default cache budgets — block 64 + vector
-32 + result 16 MiB** — the config under which "bounded memory" is the whole point.
+Peak/steady RSS is read from the container cgroup after the final run for service
+engines. LadybugDB is embedded in the benchmark Python process, so the run-5
+wrapper records that process' high-water/current RSS. Row counts are cross-checked
+across engines (slater matches the Neo4j/Memgraph reference on every query). slater
+is served on its **default cache budgets — block 64 + vector 32 + result 16 MiB** —
+the config under which "bounded memory" is the whole point.
 
 The vector indexes use each engine's native procedure — slater/FalkorDB
 `db.idx.vector.queryNodes`, Neo4j `db.index.vector.queryNodes`, Memgraph
@@ -51,7 +54,7 @@ single `:MeshTerm(type)` range index is added uniformly on every engine so `type
 of pole's `Crime.type`.
 
 ```bash
-python3 -m venv /tmp/pole_venv && /tmp/pole_venv/bin/pip install neo4j falkordb
+python3 -m venv /tmp/pole_venv && /tmp/pole_venv/bin/pip install neo4j falkordb ladybug
 SNAP=../../../hs-backend-spot/slater-snapshot/cypher
 # MeSH
 ./setup_hs.sh   mesh      $SNAP/bioalphaengine-companies.cypher MeshTerm:type
@@ -64,11 +67,18 @@ SNAP=../../../hs-backend-spot/slater-snapshot/cypher
 ```
 
 `setup_hs.sh` builds the slater generation (`slater-build`, stamping the ACL) and
-loads the other three from the same primitive-Cypher dump via `load_cypher.py`
-(a quote-aware parser → UNWIND batches; FalkorDB needs `vecf32()` on load and
-`efRuntime:256` on the vector index for full top-k recall).
+loads Neo4j/Memgraph/FalkorDB from the same primitive-Cypher dump via
+`load_cypher.py` (a quote-aware parser → UNWIND batches; FalkorDB needs `vecf32()`
+on load and `efRuntime:256` on the vector index for full top-k recall). LadybugDB
+is loaded by `load_ladybug.py`: it disables the default hash index, creates ART
+indexes on generated `__dump_id__` primary keys, maps multi-label dumped nodes onto
+a primary node table, and stores secondary labels for query rewrites.
 
 ## Results
+
+The result tables below are the existing four-engine baseline. After rerunning
+`setup_hs.sh` / `run_bench_hs.sh`, `aggregate_hs.py` now emits a fifth
+**LadybugDB** latency column and RSS row.
 
 ### MeSH — 340,839 nodes / 469,438 edges (pure graph)
 
@@ -176,6 +186,9 @@ section above — which is exactly why the block budget doesn't move it.)
 
 - `load_cypher.py` — primitive-Cypher → Neo4j/Memgraph/FalkorDB (quote-aware parser,
   UNWIND batches, per-engine vector DDL).
+- `load_ladybug.py` — primitive-Cypher → embedded LadybugDB (ART primary-key indexes,
+  multi-label table mapping + metadata for rewrites).
+- `bench_with_rss.py` — wrapper used for embedded LadybugDB run-5 RSS capture.
 - `bench_mesh.py` / `bench_vec.py` — the two query suites (`engines.py` = shared
   connection layer; dedicated `-hs` ports 7700/7701/7702/6401).
 - `setup_hs.sh` / `run_bench_hs.sh` / `count_hs.py` / `aggregate_hs.py` — orchestration.
