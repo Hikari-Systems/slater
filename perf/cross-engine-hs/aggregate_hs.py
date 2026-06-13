@@ -8,8 +8,14 @@ Usage: aggregate_hs.py <results_dir>
 import json, glob, statistics as st, os, sys
 
 RES = sys.argv[1] if len(sys.argv) > 1 else "/tmp/bench-hs/results"
-ENGINES = ["slater", "neo4j", "memgraph", "falkordb"]
-LABEL = {"slater": "slater", "neo4j": "Neo4j 5", "memgraph": "Memgraph", "falkordb": "FalkorDB"}
+ENGINES = ["slater", "neo4j", "memgraph", "falkordb", "ladybug"]
+LABEL = {
+    "slater": "slater",
+    "neo4j": "Neo4j 5",
+    "memgraph": "Memgraph",
+    "falkordb": "FalkorDB",
+    "ladybug": "LadybugDB",
+}
 
 # discover query order from the first available run file
 ORDER = []
