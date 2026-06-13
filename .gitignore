@@ -15,3 +15,5 @@ __pycache__/
 # while integrating downstream services. Kept out of git (and survives `git clean`
 # being avoided here) so they aren't wiped on rebuilds.
 /client-gaps/
+
+perf/datasets

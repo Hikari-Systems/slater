@@ -199,6 +199,56 @@ fn val_to_value(v: &Val) -> Option<Value> {
     })
 }
 
+/// Project the index-keyable scalars of a per-row binding into a planning map, so
+/// the planner can turn `MATCH (n:L {p: w})` / `WHERE n.p = w` — where `w` was
+/// bound at runtime by `UNWIND`/`WITH`/a prior `MATCH` — into a per-row index seek
+/// instead of a label scan. Non-keyable values (nodes, maps, temporals) are
+/// dropped by [`val_to_value`], so the predicate falls back to a scan exactly as an
+/// unbound variable would. The map is tiny (a handful of in-scope columns).
+fn bound_scalars(binding: &HashMap<String, Val>) -> HashMap<String, Value> {
+    binding
+        .iter()
+        .filter_map(|(k, v)| val_to_value(v).map(|val| (k.clone(), val)))
+        .collect()
+}
+
+/// Does the anchor `start` key its index off a column already in `cols` — an
+/// inline prop `{p: w}` or a `WHERE start.p <op> w` whose value is a bound column?
+/// If so the chosen scan depends on the row and must be re-planned per row; if not,
+/// it can be planned once and reused (the streamed-MATCH fast path). Sound either
+/// way — a false positive only costs the per-row planning; `node_ok` re-filters.
+fn anchor_correlated(start: &NodePat, where_: Option<&Expr>, cols: &[String]) -> bool {
+    let is_col = |name: &str| cols.iter().any(|c| c == name);
+    // Inline `{prop: w}` where `w` is an in-scope column.
+    for (_, e) in &start.props {
+        if let Expr::Var(name) = e {
+            if is_col(name) {
+                return true;
+            }
+        }
+    }
+    // `WHERE start.prop <op> w` (or mirrored) where `w` is an in-scope column.
+    if let (Some(var), Some(w)) = (start.var.as_deref(), where_) {
+        return where_anchor_uses_col(w, var, cols);
+    }
+    false
+}
+
+/// Recurse the top-level `AND`s of a `WHERE`, looking for a comparison between
+/// `var.prop` and a bound column `Expr::Var(c)` (c ∈ `cols`) — the shape that
+/// resolves to a per-row index seek.
+fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
+    let is_anchor_prop = |e: &Expr| matches!(e, Expr::Property(base, _) if matches!(&**base, Expr::Var(v) if v == var));
+    let is_col = |e: &Expr| matches!(e, Expr::Var(c) if cols.iter().any(|x| x == c));
+    match expr {
+        Expr::And(parts) => parts.iter().any(|p| where_anchor_uses_col(p, var, cols)),
+        Expr::Compare(_, l, r) => {
+            (is_anchor_prop(l) && is_col(r)) || (is_col(l) && is_anchor_prop(r))
+        }
+        _ => false,
+    }
+}
+
 impl Val {
     fn from_value(v: Value) -> Val {
         match v {
@@ -792,8 +842,10 @@ impl<'g> Engine<'g> {
             if next.columns.len() != result.columns.len() {
                 bail!("all parts of a UNION must return the same number of columns");
             }
+            self.charge(next.rows.len() as u64)?; // UNION cross-branch buildup
             result.rows.extend(next.rows);
             if !union_all {
+                self.charge(result.rows.len() as u64)?; // DISTINCT `seen` set
                 dedup_rows(&mut result.rows);
             }
         }
@@ -906,7 +958,7 @@ impl<'g> Engine<'g> {
         } else {
             // Inline props: only an exact single indexed-equality is safe (the scan
             // result then needs no residual filtering, so its length is the count).
-            let scan = choose_node_scan(self.gen, node, None, &self.plan_params);
+            let scan = choose_node_scan(self.gen, node, None, &self.plan_params, &HashMap::new());
             let NodeScan::RangeEq { ref index, .. } = scan else {
                 return Ok(None);
             };
@@ -1118,6 +1170,9 @@ impl<'g> Engine<'g> {
         mut rows: Vec<Vec<Val>>,
     ) -> Result<Vec<Vec<Val>>> {
         if !body.order_by.is_empty() {
+            // The `keyed` buffer clones every row plus its sort keys, so charge the
+            // row count before building it (a large ORDER BY is otherwise uncharged).
+            self.charge(rows.len() as u64)?;
             let mut keyed: Vec<(SortKey, Vec<Val>)> = Vec::with_capacity(rows.len());
             for r in rows {
                 let scope = Scope::Row(cols, &r);
@@ -1522,7 +1577,8 @@ impl<'g> Engine<'g> {
             Some(Val::Node(id)) => Ok(vec![*id]),
             Some(_) => Ok(Vec::new()),
             None => {
-                let scan = choose_node_scan(self.gen, node, where_, &self.plan_params);
+                let bound = bound_scalars(binding);
+                let scan = choose_node_scan(self.gen, node, where_, &self.plan_params, &bound);
                 let guaranteed = self.scan_guaranteed_labels(&scan);
                 let mut out = Vec::new();
                 for c in self.scan_candidates(&scan)? {
@@ -1621,6 +1677,12 @@ impl<'g> Engine<'g> {
             if found_min && matches!(selector, PathSelector::AllShortest) {
                 return Ok(results);
             }
+            // Charge the next layer's live branches: each carries a cloned path +
+            // cloned `visited` set, so an exponentially widening frontier (the
+            // hub-dense small-world case that previously OOM-killed the container)
+            // trips the standard `maxIntermediate` budget mid-expansion instead of
+            // exhausting RSS. Only emitted results were charged before this point.
+            self.charge(next.len() as u64)?;
             frontier = next;
             depth += 1;
         }
@@ -1661,9 +1723,25 @@ impl<'g> Engine<'g> {
             }
         }
 
-        let scan = choose_node_scan(self.gen, start, m.where_.as_ref(), &self.plan_params);
-        let guaranteed = self.scan_guaranteed_labels(&scan);
-        let candidates = self.scan_candidates(&scan)?;
+        // A *correlated* anchor keys its index off a column already in `table`
+        // (e.g. `UNWIND $ids AS w MATCH (n:L {p: w})`, or `WHERE n.p = w`): the seek
+        // depends on the row, so the scan must move inside the loop. When the anchor
+        // is uncorrelated we plan once and reuse it for every row — today's fast path.
+        let correlated = anchor_correlated(start, m.where_.as_ref(), &table.cols);
+        let hoisted = if correlated {
+            None
+        } else {
+            let scan = choose_node_scan(
+                self.gen,
+                start,
+                m.where_.as_ref(),
+                &self.plan_params,
+                &HashMap::new(),
+            );
+            let guaranteed = self.scan_guaranteed_labels(&scan);
+            let candidates = self.scan_candidates(&scan)?;
+            Some((guaranteed, candidates))
+        };
 
         let mut out_cols = table.cols.clone();
         if let Some(v) = &start.var {
@@ -1682,13 +1760,32 @@ impl<'g> Engine<'g> {
                 .cloned()
                 .zip(in_row.iter().cloned())
                 .collect();
-            for &c in &candidates {
+            // The hoisted plan, or a per-row index seek keyed by this row's scalars.
+            let per_row;
+            let (guaranteed, candidates): (&[u32], &[u64]) = match &hoisted {
+                Some((g, c)) => (g, c),
+                None => {
+                    let bound = bound_scalars(&in_binding);
+                    let scan = choose_node_scan(
+                        self.gen,
+                        start,
+                        m.where_.as_ref(),
+                        &self.plan_params,
+                        &bound,
+                    );
+                    let guaranteed = self.scan_guaranteed_labels(&scan);
+                    let candidates = self.scan_candidates(&scan)?;
+                    per_row = (guaranteed, candidates);
+                    (&per_row.0, &per_row.1)
+                }
+            };
+            for &c in candidates {
                 // Stage 6: honour a pushed `LIMIT` (no ORDER BY/aggregation/DISTINCT)
                 // so a bare `MATCH (n:L) … LIMIT k` scans only k matching nodes.
                 if cap.is_some_and(|cc| out_rows.len() >= cc) {
                     break 'outer;
                 }
-                if !self.node_ok(c, start, &in_binding, &guaranteed)? {
+                if !self.node_ok(c, start, &in_binding, guaranteed)? {
                     continue;
                 }
                 let mut row = in_row.clone();
@@ -2292,6 +2389,8 @@ impl<'g> Engine<'g> {
             if out_cols.is_none() {
                 out_cols = Some(self.subquery_out_cols(&table.cols, &inner.columns)?);
             }
+            // Charge the cross-row buildup: one output row per (outer × inner) pair.
+            self.charge(inner.rows.len() as u64)?;
             for irow in inner.rows {
                 let mut r = row.clone();
                 r.extend(irow);
@@ -2351,8 +2450,10 @@ impl<'g> Engine<'g> {
             if next.columns.len() != result.columns.len() {
                 bail!("all branches of a CALL {{}} UNION must return the same number of columns");
             }
+            self.charge(next.rows.len() as u64)?; // CALL{} UNION cross-branch buildup
             result.rows.extend(next.rows);
             if !*union_all {
+                self.charge(result.rows.len() as u64)?; // DISTINCT `seen` set
                 dedup_rows(&mut result.rows);
             }
         }
@@ -2658,7 +2759,10 @@ impl<'g> Engine<'g> {
                 Some(_) => return Ok(()), // bound to a non-node → cannot match
                 None => {
                     // The anchor is the only place the planner picks a scan strategy.
-                    let scan = choose_node_scan(self.gen, start, where_, &self.plan_params);
+                    // Scalars already bound for this row let an anchor keyed by a
+                    // bound variable (`{p: w}` / `WHERE n.p = w`) seek the index.
+                    let bound = bound_scalars(binding);
+                    let scan = choose_node_scan(self.gen, start, where_, &self.plan_params, &bound);
                     let guaranteed = self.scan_guaranteed_labels(&scan);
                     (self.scan_candidates(&scan)?, guaranteed)
                 }
@@ -2781,6 +2885,14 @@ impl<'g> Engine<'g> {
             return Ok(());
         }
         if i == pattern.rels.len() {
+            // Charge each completed binding. `match_single_pattern` buffers the whole
+            // single-pattern result set here (its `partial` vector) *before* the
+            // cross-pattern join re-charges it at the `match_patterns` terminal, so a
+            // dense expansion (e.g. every `:LINK` edge over a 1M-node graph) must trip
+            // the budget here — otherwise `partial` balloons RSS to an OOM before the
+            // charged terminal is ever reached. The double count over the two buffers
+            // mirrors their genuine combined peak (conservative on purpose).
+            self.charge(1)?;
             if let Some(pv) = &pattern.path_var {
                 // Bind the path for this completed walk, snapshot the row, then
                 // restore so sibling branches don't inherit a stale path value.
@@ -3219,6 +3331,7 @@ impl<'g> Engine<'g> {
         };
 
         if distinct {
+            self.charge(out_rows.len() as u64)?; // DISTINCT `seen` set
             dedup_rows(&mut out_rows);
         }
 
@@ -3237,6 +3350,9 @@ impl<'g> Engine<'g> {
         // aliases and (for a non-aggregated projection) the input row vars; the
         // alias wins on a clash.
         if !body.order_by.is_empty() {
+            // The `keyed` buffer clones every row plus its sort keys, so charge the
+            // row count before building it (a large ORDER BY is otherwise uncharged).
+            self.charge(out_rows.len() as u64)?;
             let with_input = !aggregating && out_rows.len() == table.rows.len();
             let mut keyed: Vec<(SortKey, Vec<Val>)> = Vec::with_capacity(out_rows.len());
             for (i, r) in out_rows.into_iter().enumerate() {
@@ -3298,7 +3414,14 @@ impl<'g> Engine<'g> {
                     key.push(self.eval(e, &scope, None)?);
                 }
             }
-            groups.entry(GroupKey(key)).or_default().push(ri);
+            // Charge each newly-created group: the `groups` map grows with the
+            // distinct-key cardinality, which is otherwise uncharged (the per-row
+            // index list is bounded by the already-charged input rows).
+            let key = GroupKey(key);
+            if !groups.contains_key(&key) {
+                self.charge(1)?;
+            }
+            groups.entry(key).or_default().push(ri);
         }
         // An aggregation with no rows and no grouping keys still yields one row
         // (e.g. `RETURN count(*)` over an empty match → 0).
@@ -3395,6 +3518,7 @@ impl<'g> Engine<'g> {
             }
         }
         if *distinct {
+            self.charge(vals.len() as u64)?; // DISTINCT-aggregate `seen` set
             dedup_vals(&mut vals);
         }
 
@@ -8248,6 +8372,145 @@ mod tests {
         )
         .expect("a generous budget must not affect the query");
         assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn correlated_unwind_seek_returns_right_rows() {
+        // `UNWIND … AS w MATCH (n:Person {name:w})` keys the anchor off the per-row
+        // scalar `w`. The planner now resolves it to a `node_Person_name` index seek
+        // (see plan.rs `bound_scalar_*` tests); this proves the seek path is sound
+        // end-to-end — the right rows, no more, no fewer.
+        let (root, res) = run(
+            "exec_correlated_unwind",
+            "UNWIND ['Alice', 'Bob', 'Nobody'] AS w \
+             MATCH (n:Person {name: w}) RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Alice", "Bob"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn correlated_where_seek_returns_right_rows() {
+        // The `WHERE n.name = w` spelling resolves to the same per-row seek.
+        let (root, res) = run(
+            "exec_correlated_where",
+            "UNWIND ['Carol', 'Bob'] AS w \
+             MATCH (n:Person) WHERE n.name = w RETURN n.name AS name",
+        );
+        assert_eq!(col0(&res), vec!["Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn distinct_charges_intermediate_budget() {
+        // The `seen` set behind `RETURN DISTINCT` is charged: a budget that admits
+        // the 3-row match (3) but not the DISTINCT pass (+3) trips; 1M is untouched.
+        let err = run_budgeted(
+            "exec_budget_distinct_tiny",
+            5,
+            "MATCH (n:Person) RETURN DISTINCT n.city",
+        )
+        .expect_err("DISTINCT must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let res = run_budgeted(
+            "exec_budget_distinct_ok",
+            1_000_000,
+            "MATCH (n:Person) RETURN DISTINCT n.city",
+        )
+        .expect("a generous budget must not affect the query");
+        assert_eq!(res.rows.len(), 2); // London, Paris
+    }
+
+    #[test]
+    fn order_by_charges_intermediate_budget() {
+        // The `keyed` sort buffer clones every row; charged before it is built.
+        let err = run_budgeted(
+            "exec_budget_order_tiny",
+            5,
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        )
+        .expect_err("ORDER BY must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let res = run_budgeted(
+            "exec_budget_order_ok",
+            1_000_000,
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        )
+        .expect("a generous budget must not affect the query");
+        assert_eq!(res.rows.len(), 3);
+    }
+
+    #[test]
+    fn group_by_charges_intermediate_budget() {
+        // Each distinct group costs one element; a budget that admits the match (3)
+        // and the first group but not the second (Paris) trips.
+        let err = run_budgeted(
+            "exec_budget_group_tiny",
+            4,
+            "MATCH (n:Person) RETURN n.city, count(*)",
+        )
+        .expect_err("GROUP BY must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let res = run_budgeted(
+            "exec_budget_group_ok",
+            1_000_000,
+            "MATCH (n:Person) RETURN n.city, count(*)",
+        )
+        .expect("a generous budget must not affect the query");
+        assert_eq!(res.rows.len(), 2); // {London: 2}, {Paris: 1}
+    }
+
+    #[test]
+    fn shortest_path_frontier_charges_intermediate_budget() {
+        // The BFS frontier behind `shortestPath()` is charged per expansion layer, so
+        // a hub-dense graph trips the budget mid-search instead of ballooning RSS. The
+        // destination (a Company) is unreachable over `:KNOWS`, so no *result* is ever
+        // charged — only the frontier — yet a tiny budget still trips.
+        let q = "MATCH (a:Person {name:'Alice'}), (z:Company {name:'Acme'}) \
+                 RETURN shortestPath((a)-[:KNOWS*]->(z)) IS NULL AS np";
+        let err = run_budgeted("exec_budget_sp_tiny", 3, q)
+            .expect_err("the shortestPath frontier must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let res = run_budgeted("exec_budget_sp_ok", 1_000_000, q)
+            .expect("a generous budget must not affect the query");
+        assert_eq!(col0(&res), vec!["true"]); // no KNOWS path Person→Company
+    }
+
+    #[test]
+    fn rel_match_buffer_charges_intermediate_budget() {
+        // `match_single_pattern` buffers a relationship pattern's whole result set
+        // before the cross-pattern terminal charges it; without charging the buffer a
+        // dense expansion (every `:LINK` edge over a 1M-node graph) OOMs the process.
+        // The fixture's 3 KNOWS edges trip a budget of 2 and pass at 1M.
+        let err = run_budgeted(
+            "exec_budget_relmatch_tiny",
+            2,
+            "MATCH (a)-[:KNOWS]->(b) RETURN count(*)",
+        )
+        .expect_err("the relationship-match buffer must charge the budget");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let res = run_budgeted(
+            "exec_budget_relmatch_ok",
+            1_000_000,
+            "MATCH (a)-[:KNOWS]->(b) RETURN count(*)",
+        )
+        .expect("a generous budget must not affect the query");
+        assert_eq!(res.rows[0][0].to_display(), "3");
     }
 
     #[test]

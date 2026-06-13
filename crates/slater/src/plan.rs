@@ -70,11 +70,12 @@ pub fn choose_node_scan(
     node: &NodePat,
     where_: Option<&Expr>,
     params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
 ) -> NodeScan {
     let Some(var) = node.var.as_deref() else {
         // An anonymous anchor can still be label/range-selective via its own
         // inline props, but it has no name for WHERE predicates to reference.
-        return choose_from_preds(gen, node, &inline_preds(node, params));
+        return choose_from_preds(gen, node, &inline_preds(node, params, bound));
     };
 
     // Highest-priority strategy: a direct id() seek. When a top-level `AND`
@@ -91,9 +92,9 @@ pub fn choose_node_scan(
         }
     }
 
-    let mut preds = inline_preds(node, params);
+    let mut preds = inline_preds(node, params, bound);
     if let Some(w) = where_ {
-        collect_where_preds(w, var, params, &mut preds);
+        collect_where_preds(w, var, params, bound, &mut preds);
     }
     choose_from_preds(gen, node, &preds)
 }
@@ -209,10 +210,14 @@ fn is_id_of(e: &Expr, var: &str) -> bool {
 
 /// Inline `{prop: literal}` / `{prop: $param}` entries are always equality
 /// predicates (params resolved against the RUN bindings).
-fn inline_preds(node: &NodePat, params: &HashMap<String, Value>) -> Vec<(String, Pred)> {
+fn inline_preds(
+    node: &NodePat,
+    params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
+) -> Vec<(String, Pred)> {
     node.props
         .iter()
-        .filter_map(|(k, e)| resolve(e, params).map(|v| (k.clone(), Pred::Eq(v))))
+        .filter_map(|(k, e)| resolve(e, params, bound).map(|v| (k.clone(), Pred::Eq(v))))
         .collect()
 }
 
@@ -284,16 +289,17 @@ fn collect_where_preds(
     expr: &Expr,
     var: &str,
     params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
     out: &mut Vec<(String, Pred)>,
 ) {
     match expr {
         Expr::And(parts) => {
             for p in parts {
-                collect_where_preds(p, var, params, out);
+                collect_where_preds(p, var, params, bound, out);
             }
         }
         Expr::Compare(op, l, r) => {
-            if let Some((prop, val, flipped)) = compare_operands(l, r, var, params) {
+            if let Some((prop, val, flipped)) = compare_operands(l, r, var, params, bound) {
                 if let Some(pred) = pred_for(*op, val, flipped) {
                     out.push((prop, pred));
                 }
@@ -311,11 +317,12 @@ fn compare_operands(
     r: &Expr,
     var: &str,
     params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
 ) -> Option<(String, Value, bool)> {
-    if let (Some(prop), Some(v)) = (var_prop(l, var), resolve(r, params)) {
+    if let (Some(prop), Some(v)) = (var_prop(l, var), resolve(r, params, bound)) {
         return Some((prop, v, false));
     }
-    if let (Some(v), Some(prop)) = (resolve(l, params), var_prop(r, var)) {
+    if let (Some(v), Some(prop)) = (resolve(l, params, bound), var_prop(r, var)) {
         return Some((prop, v, true));
     }
     None
@@ -355,13 +362,20 @@ fn var_prop(e: &Expr, var: &str) -> Option<String> {
     }
 }
 
-/// Resolve `e` to a constant planning value: a literal directly, or a `$param`
-/// looked up in the RUN bindings. Any other expression (or an unbound param) is
-/// `None`, so the predicate is dropped and the anchor falls back to a scan.
-fn resolve(e: &Expr, params: &HashMap<String, Value>) -> Option<Value> {
+/// Resolve `e` to a constant planning value: a literal directly, a `$param`
+/// looked up in the RUN bindings, or a plain variable looked up in `bound` — the
+/// scalars already bound for the current row by `UNWIND`/`WITH`/a prior `MATCH`.
+/// Any other expression (or an unbound param/var) is `None`, so the predicate is
+/// dropped and the anchor falls back to a scan.
+fn resolve(
+    e: &Expr,
+    params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
+) -> Option<Value> {
     match e {
         Expr::Literal(v) => Some(v.clone()),
         Expr::Param(name) => params.get(name).cloned(),
+        Expr::Var(name) => bound.get(name).cloned(),
         _ => None,
     }
 }
@@ -382,7 +396,7 @@ mod tests {
     fn plan_for(gen: &Generation, query: &str) -> NodeScan {
         let q = parser::parse(query).unwrap();
         let (node, where_) = anchor(&q);
-        choose_node_scan(gen, node, where_, &HashMap::new())
+        choose_node_scan(gen, node, where_, &HashMap::new(), &HashMap::new())
     }
 
     fn plan_for_params(gen: &Generation, query: &str, params: &[(&str, Value)]) -> NodeScan {
@@ -392,7 +406,17 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
-        choose_node_scan(gen, node, where_, &params)
+        choose_node_scan(gen, node, where_, &params, &HashMap::new())
+    }
+
+    fn plan_for_bound(gen: &Generation, query: &str, bound: &[(&str, Value)]) -> NodeScan {
+        let q = parser::parse(query).unwrap();
+        let (node, where_) = anchor(&q);
+        let bound: HashMap<String, Value> = bound
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        choose_node_scan(gen, node, where_, &HashMap::new(), &bound)
     }
 
     #[test]
@@ -417,6 +441,45 @@ mod tests {
             &[("n", Value::Str("Carol".into()))],
         );
         assert_eq!(where_, want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bound_scalar_on_indexed_property_picks_range_eq() {
+        // A value bound at runtime (e.g. by `UNWIND $names AS w`) is invisible as a
+        // param, but once threaded through `bound` it resolves to a per-row index
+        // seek — both as an inline prop and as a `WHERE` equality.
+        let (root, graph, _) = crate::testgen::write_basic("plan_bound_eq");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let want = NodeScan::RangeEq {
+            index: "node_Person_name".into(),
+            key: Value::Str("Carol".into()),
+        };
+        let inline = plan_for_bound(
+            &gen,
+            "MATCH (n:Person {name: w}) RETURN n",
+            &[("w", Value::Str("Carol".into()))],
+        );
+        assert_eq!(inline, want);
+        let where_ = plan_for_bound(
+            &gen,
+            "MATCH (n:Person) WHERE n.name = w RETURN n",
+            &[("w", Value::Str("Carol".into()))],
+        );
+        assert_eq!(where_, want);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unbound_var_falls_back_to_label_scan() {
+        // A variable that is not in `bound` (non-keyable Node/Map/temporal values
+        // are filtered to absent before planning) contributes no predicate, so the
+        // anchor degrades to a label scan — still correct, executor re-filters.
+        let (root, graph, _) = crate::testgen::write_basic("plan_bound_unbound");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for_bound(&gen, "MATCH (n:Person) WHERE n.name = w RETURN n", &[]);
+        let person = gen.label_id("Person").unwrap();
+        assert_eq!(scan, NodeScan::LabelScan { label_id: person });
         let _ = std::fs::remove_dir_all(&root);
     }
 
