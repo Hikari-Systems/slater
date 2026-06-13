@@ -1,5 +1,17 @@
 # Contributing (for Claude purposes only)
 
+## General
+
+This file is intended to tell claude what rules it needs to follow when authoring. 
+
+As much as any human interest is appreciated, I'd really prefer not to accept contributions on this 
+repository. My purpose in sharing it at all is simply transparency and openness about how i work, and 
+since doing pull request reviews is my least favourite (but necessary) part of the job I won't be 
+doing any on a project that is primarily aimed at my enjoyment and acting as an entry on my CV. 
+
+If you like it and want to change it, please feel free to fork and modify (please rename it if you plan to 
+share it yourself), but mostly please don't submit pull requests. Thanks in advance for your understanding.
+
 ## Formatting (local pre-commit gate)
 
 Formatting is enforced prettier/eslint-style: a pre-commit hook runs `rustfmt
