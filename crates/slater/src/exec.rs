@@ -1598,12 +1598,22 @@ impl<'g> Engine<'g> {
     /// - `AllShortest` → every path of the single minimum length;
     /// - `ShortestK(k)` → up to `k` paths in non-decreasing length order.
     ///
-    /// Paths are loopless (no node repeats), matching `shortestPath()`'s long-standing
-    /// simple-path search and bounding the walk on a cyclic graph. Every entry in a
-    /// BFS layer has the same hop count, so paths surface in non-decreasing length
-    /// order — the property `AllShortest`/`ShortestK` rely on. `min`/`max` are the
-    /// relationship's length bounds (a fixed hop is `(1, 1)`); `min == 0` with
-    /// coincident endpoints admits the empty path.
+    /// `AnyShortest` (the `shortestPath()` case) needs just one path, so it runs a
+    /// single global-`visited` BFS with a back-pointer map ([`Self::any_shortest_path`]):
+    /// each node is enqueued at most once (frontier ≤ |V|, work `O(V+E)`), BFS first
+    /// reaches every node along a shortest path, and the reconstructed walk is
+    /// automatically simple.
+    ///
+    /// `AllShortest`/`ShortestK` can have exponentially many shortest paths, so they
+    /// keep the loopless simple-path search below: each frontier entry carries its own
+    /// cloned `visited` set, so a node reachable by many prefixes is re-enqueued once
+    /// per prefix. On a hub-dense small-world graph that frontier explodes, so the
+    /// per-layer `maxIntermediate` charge is its backstop (it rejects the blow-up
+    /// instead of OOMing). Paths are loopless (no node repeats), bounding the walk on a
+    /// cyclic graph; every entry in a BFS layer has the same hop count, so paths
+    /// surface in non-decreasing length order — the property those selectors rely on.
+    /// `min`/`max` are the relationship's length bounds (a fixed hop is `(1, 1)`);
+    /// `min == 0` with coincident endpoints admits the empty path.
     fn select_paths(
         &self,
         src: u64,
@@ -1614,6 +1624,9 @@ impl<'g> Engine<'g> {
     ) -> Result<Vec<Vec<Hop>>> {
         let (min, max) = bounds;
         let empty = HashMap::new();
+        if matches!(selector, PathSelector::AnyShortest) {
+            return self.any_shortest_path(src, dst, rel, bounds);
+        }
         let want = match selector {
             PathSelector::AnyShortest => 1,
             PathSelector::ShortestK(k) => k as usize,
@@ -1665,6 +1678,16 @@ impl<'g> Engine<'g> {
                         }
                         continue;
                     }
+                    // Charge this live branch *before* cloning its path + visited set.
+                    // Each branch carries a cloned `Vec<Hop>` + cloned `HashSet<u64>`, so
+                    // on a hub-dense small-world graph a single layer's frontier can
+                    // explode to millions of entries. Charging the whole layer only
+                    // *after* it is materialised lets that one layer exhaust RSS before
+                    // the budget ever trips (it OOM-killed the capped container); charging
+                    // per branch trips the standard `maxIntermediate` budget mid-layer,
+                    // before the clones accumulate. Only emitted results are charged
+                    // elsewhere (above).
+                    self.charge(1)?;
                     let mut npath = path.clone();
                     npath.push(hop);
                     let mut nvisited = visited.clone();
@@ -1677,16 +1700,87 @@ impl<'g> Engine<'g> {
             if found_min && matches!(selector, PathSelector::AllShortest) {
                 return Ok(results);
             }
-            // Charge the next layer's live branches: each carries a cloned path +
-            // cloned `visited` set, so an exponentially widening frontier (the
-            // hub-dense small-world case that previously OOM-killed the container)
-            // trips the standard `maxIntermediate` budget mid-expansion instead of
-            // exhausting RSS. Only emitted results were charged before this point.
-            self.charge(next.len() as u64)?;
             frontier = next;
             depth += 1;
         }
         Ok(results)
+    }
+
+    /// `ANY SHORTEST` / `shortestPath()`: one shortest path between `src` and `dst`,
+    /// found by a single-source BFS with one *global* `visited` set plus a back-pointer
+    /// map (`node -> (predecessor, discovering hop)`). BFS first reaches every node
+    /// along a shortest path, and the reconstructed walk — following back-pointers from
+    /// `dst` to `src` — is automatically simple, so the returned length equals the
+    /// loopless simple-path search's. Because each node is enqueued at most once, the
+    /// frontier is ≤ |V| and total work is `O(V+E)`: the hub-dense small-world case
+    /// that blows up the cloned-`visited` search (kept for `AllShortest`/`ShortestK`)
+    /// returns here in milliseconds, so no `maxIntermediate` frontier charge is needed.
+    ///
+    /// `max` caps the BFS depth; `min` filters whether the discovered `dst` is
+    /// admissible. `min == 0` with coincident endpoints admits the empty path. (For
+    /// `shortestPath()` `min ∈ {0, 1}`, so the discovered shortest distance always
+    /// meets it whenever a path exists.)
+    fn any_shortest_path(
+        &self,
+        src: u64,
+        dst: u64,
+        rel: &RelPat,
+        bounds: (u32, u32),
+    ) -> Result<Vec<Vec<Hop>>> {
+        let (min, max) = bounds;
+        let empty = HashMap::new();
+
+        // min == 0 admits the empty (single-node) path when the endpoints coincide.
+        if min == 0 && src == dst {
+            return Ok(vec![Vec::new()]);
+        }
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Back-pointer per discovered node: who reached it, and over which hop. The
+        // hop's own `start`/`end` are the edge's stored endpoints (not the traversal
+        // direction), so the predecessor is recorded explicitly.
+        let mut parent: HashMap<u64, (u64, Hop)> = HashMap::new();
+        let mut visited: HashSet<u64> = HashSet::from([src]);
+        let mut frontier: Vec<u64> = vec![src];
+        let mut depth = 0u32;
+        while !frontier.is_empty() && depth < max {
+            self.check_deadline()?;
+            let mut next = Vec::new();
+            for &node in &frontier {
+                for hop in self.expand_one_hop(node, rel, &empty)? {
+                    let nb = hop.neighbour;
+                    if !visited.insert(nb) {
+                        continue; // already discovered on a ≤-length shortest path
+                    }
+                    let reached_dst = nb == dst;
+                    parent.insert(nb, (node, hop));
+                    if reached_dst {
+                        // First discovery sits at `dst`'s shortest distance from `src`
+                        // (= depth + 1); admissible only if it meets `min`.
+                        if depth + 1 >= min {
+                            // Walk back-pointers dst→src, then reverse into walk order.
+                            let mut hops = Vec::new();
+                            let mut cur = dst;
+                            while cur != src {
+                                let (prev, hop) =
+                                    parent.remove(&cur).expect("back-pointer chain to src");
+                                hops.push(hop);
+                                cur = prev;
+                            }
+                            hops.reverse();
+                            return Ok(vec![hops]);
+                        }
+                        return Ok(Vec::new());
+                    }
+                    next.push(nb);
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        Ok(Vec::new())
     }
 
     /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
@@ -8470,22 +8564,45 @@ mod tests {
     }
 
     #[test]
-    fn shortest_path_frontier_charges_intermediate_budget() {
-        // The BFS frontier behind `shortestPath()` is charged per expansion layer, so
-        // a hub-dense graph trips the budget mid-search instead of ballooning RSS. The
-        // destination (a Company) is unreachable over `:KNOWS`, so no *result* is ever
-        // charged — only the frontier — yet a tiny budget still trips.
+    fn all_shortest_frontier_charges_intermediate_budget() {
+        // `ALL SHORTEST`/`SHORTEST k` keep the cloned-per-branch simple-path search
+        // (the number of shortest paths can be exponential), whose BFS frontier is
+        // charged per expansion layer so a hub-dense graph trips the budget mid-search
+        // instead of ballooning RSS. The destination (a Company) is unreachable over
+        // `:KNOWS`, so no *result* is ever charged — only the frontier — yet a tiny
+        // budget still trips.
         let q = "MATCH (a:Person {name:'Alice'}), (z:Company {name:'Acme'}) \
-                 RETURN shortestPath((a)-[:KNOWS*]->(z)) IS NULL AS np";
-        let err = run_budgeted("exec_budget_sp_tiny", 3, q)
-            .expect_err("the shortestPath frontier must charge the budget");
+                 MATCH ALL SHORTEST (a)-[:KNOWS*]->(z) RETURN count(*) AS c";
+        let err = run_budgeted("exec_budget_allsp_tiny", 3, q)
+            .expect_err("the ALL SHORTEST frontier must charge the budget");
         assert!(
             format!("{err:#}").contains("intermediate result budget"),
             "expected the budget error, got: {err:#}"
         );
-        let res = run_budgeted("exec_budget_sp_ok", 1_000_000, q)
+        let res = run_budgeted("exec_budget_allsp_ok", 1_000_000, q)
             .expect("a generous budget must not affect the query");
+        assert_eq!(col0(&res), vec!["0"]); // no KNOWS path Person→Company
+    }
+
+    #[test]
+    fn shortest_path_any_succeeds_under_tiny_budget() {
+        // `shortestPath()`/`ANY SHORTEST` now runs a single global-`visited` BFS that
+        // enqueues each node at most once and charges no frontier, so it succeeds in
+        // `O(V+E)` under a budget the old cloned-per-branch search would trip on (3 is
+        // below where the frontier charge fired for `all_shortest_frontier_*`). The
+        // unreachable-Company probe returns NULL cheaply; a reachable pair returns its
+        // length.
+        let unreachable = "MATCH (a:Person {name:'Alice'}), (z:Company {name:'Acme'}) \
+                           RETURN shortestPath((a)-[:KNOWS*]->(z)) IS NULL AS np";
+        let res = run_budgeted("exec_budget_anysp_unreach", 3, unreachable)
+            .expect("the global-visited BFS must not charge the frontier");
         assert_eq!(col0(&res), vec!["true"]); // no KNOWS path Person→Company
+
+        let reachable = "MATCH (a:Person {name:'Alice'}), (z:Person {name:'Carol'}) \
+                         RETURN length(shortestPath((a)-[:KNOWS*]->(z))) AS l";
+        let res = run_budgeted("exec_budget_anysp_reach", 3, reachable)
+            .expect("the global-visited BFS must not charge the frontier");
+        assert_eq!(col0(&res), vec!["1"]); // Alice-[:KNOWS]->Carol directly (e4)
     }
 
     #[test]
