@@ -1169,6 +1169,9 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
 
     for child in pair.into_inner() {
         match child.as_rule() {
+            // `MATCH p = shortestPath((a)-[:R*]->(b))` — desugar the openCypher
+            // function form to the GQL selector machinery (see `lower_shortest_call`).
+            Rule::shortest_call => return lower_shortest_call(child),
             Rule::path_selector => selector = Some(lower_path_selector(child)?),
             Rule::path_restrictor => restrictor = Some(lower_path_restrictor(child)?),
             Rule::path_var => path_var = Some(ident_text(child)?),
@@ -1265,6 +1268,43 @@ fn lower_path_restrictor(pair: Pair<Rule>) -> Result<PathRestrictor> {
         Rule::kw_acyclic => PathRestrictor::Acyclic,
         Rule::kw_simple => PathRestrictor::Simple,
         other => bail!("internal: unexpected path_restrictor child {other:?}"),
+    })
+}
+
+/// Lower `MATCH [p =] shortestPath(pattern)` / `allShortestPaths(pattern)` — the
+/// openCypher function spelling — onto the same AST as the GQL `ANY SHORTEST` /
+/// `ALL SHORTEST` selector: take the inner single-relationship pattern, attach the
+/// selector and (optional) bound path variable, and let the executor's existing
+/// shortest-path machinery (`apply_match_selected`) run it. `shortestPath` yields one
+/// shortest path (AnyShortest); `allShortestPaths` yields every shortest path.
+fn lower_shortest_call(pair: Pair<Rule>) -> Result<Pattern> {
+    let mut path_var = None;
+    let mut selector = None;
+    let mut inner: Option<Pattern> = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::path_var => path_var = Some(ident_text(child)?),
+            Rule::shortest_kind => selector = Some(lower_shortest_kind(child)?),
+            Rule::pattern => inner = Some(lower_pattern(child)?),
+            other => bail!("internal: unexpected shortest_call child {other:?}"),
+        }
+    }
+    let mut pat = inner.ok_or_else(|| anyhow::anyhow!("shortestPath() requires a pattern"))?;
+    if pat.path_var.is_some() {
+        bail!("the path variable goes before shortestPath(...), not inside its pattern");
+    }
+    pat.path_var = path_var;
+    pat.selector = selector;
+    Ok(pat)
+}
+
+/// Map the `shortestPath` / `allShortestPaths` function keyword to its selector.
+fn lower_shortest_kind(pair: Pair<Rule>) -> Result<PathSelector> {
+    let inner = only_child(pair)?;
+    Ok(match inner.as_rule() {
+        Rule::kw_shortestpath => PathSelector::AnyShortest,
+        Rule::kw_allshortestpaths => PathSelector::AllShortest,
+        other => bail!("internal: unexpected shortest_kind child {other:?}"),
     })
 }
 
@@ -3090,6 +3130,44 @@ mod tests {
             &q.head.ret.body.items[0].expr,
             Expr::Function { name, .. } if name == "allShortestPaths"
         ));
+    }
+
+    #[test]
+    fn shortest_path_fn_in_match_desugars_to_any_shortest() {
+        // openCypher `MATCH p = shortestPath((a)-[:R*]->(b))` (Neo4j/Memgraph spelling)
+        // desugars onto the GQL `ANY SHORTEST` selector + bound path variable.
+        let q = ok("MATCH p = shortestPath((a)-[:R*]->(b)) RETURN length(p)");
+        let p = first_pattern(&q);
+        assert_eq!(p.selector, Some(PathSelector::AnyShortest));
+        assert_eq!(p.path_var.as_deref(), Some("p"));
+        assert_eq!(p.start.var.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn all_shortest_paths_fn_in_match_desugars_to_all_shortest() {
+        let q = ok("MATCH p = allShortestPaths((a)-[:R*]->(b)) RETURN p");
+        let p = first_pattern(&q);
+        assert_eq!(p.selector, Some(PathSelector::AllShortest));
+        assert_eq!(p.path_var.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn shortest_path_fn_path_var_optional_and_case_insensitive() {
+        // The bound path variable is optional, and the keyword is case-insensitive.
+        let q = ok("match shortestpath((a)-[:r*]->(b)) return a");
+        let p = first_pattern(&q);
+        assert_eq!(p.selector, Some(PathSelector::AnyShortest));
+        assert_eq!(p.path_var, None);
+    }
+
+    #[test]
+    fn shortest_path_fn_does_not_shadow_node_var() {
+        // `shortestPath` only triggers in MATCH-call position; as a node variable
+        // inside `(…)` it stays an ordinary variable.
+        let q = ok("MATCH (shortestPath)-[:R]->(b) RETURN b");
+        let p = first_pattern(&q);
+        assert_eq!(p.start.var.as_deref(), Some("shortestPath"));
+        assert_eq!(p.selector, None);
     }
 
     // ── GQL label boolean expressions (PR 4) ─────────────────────────────────

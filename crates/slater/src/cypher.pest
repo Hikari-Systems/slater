@@ -70,6 +70,12 @@ kw_simple = @{ ^"simple" ~ !ident_cont }
 // `any`/`shortest` is unaffected. `all` reuses the existing `kw_all` (UNION ALL).
 kw_any = @{ ^"any" ~ !ident_cont }
 kw_shortest = @{ ^"shortest" ~ !ident_cont }
+// openCypher shortest-path *functions* used in MATCH position
+// (`MATCH p = shortestPath((a)-[:R*]->(b))`). They desugar to the GQL `ANY SHORTEST`
+// / `ALL SHORTEST` selectors above (see `lower_shortest_call`). Only valid at the
+// head of a `match_pattern`, so a node variable spelled `shortestpath` is unaffected.
+kw_shortestpath = @{ ^"shortestpath" ~ !ident_cont }
+kw_allshortestpaths = @{ ^"allshortestpaths" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
@@ -178,8 +184,16 @@ path_var = { identifier }
 // `match_pattern` is `pattern` plus GQL quantified path patterns. It is used ONLY
 // by `match_clause`; the bare `pattern` rule (shortestPath/EXISTS/pattern
 // comprehensions) stays quantifier-free so those expression contexts never see a
-// segment they can't execute.
-match_pattern = { path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)* }
+// segment they can't execute. The leading `shortest_call` alternative accepts the
+// openCypher `MATCH p = shortestPath((a)-[:R*]->(b))` spelling (Neo4j/Memgraph
+// compatibility), desugaring to the `ANY SHORTEST` / `ALL SHORTEST` selector.
+match_pattern = { shortest_call | (path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)*) }
+
+// openCypher `shortestPath(...)` / `allShortestPaths(...)` in MATCH position, with an
+// optional bound path variable. The inner `pattern` is a single (var-length)
+// relationship between two endpoints, matching the GQL selector's scope.
+shortest_call = { (path_var ~ "=")? ~ shortest_kind ~ "(" ~ pattern ~ ")" }
+shortest_kind = { kw_shortestpath | kw_allshortestpaths }
 
 // GQL shortest-path selector: `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k`
 // prefixed on a MATCH pattern (e.g. `MATCH ANY SHORTEST (a)-[:R*]->(b)`). It picks
