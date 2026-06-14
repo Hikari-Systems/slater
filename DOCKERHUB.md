@@ -391,7 +391,7 @@ default cache budgets:
 the engine's own footprint). slater's RSS tracks the **query working set**, not the
 graph — idle is ~16–70 MiB at every scale. The in-memory engines grow ~linearly with the
 data and, on the 766M-edge graph (working set ≫ the 15 GiB host), **Memgraph and
-FalkorDB can't load it at all** — only the disk-backed engines (slater, Neo4j) serve it.
+FalkorDB can't load it at all** — only the disk-backed engines serve it.
 
 **…at comparable-to-faster speed, in both regimes** (latency, ms, median):
 

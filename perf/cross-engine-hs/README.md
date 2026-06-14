@@ -224,12 +224,17 @@ nodes / 766M `:LINK` edges (~55× the 1M edge count), range index on `wikidata_i
 the working set is far larger than the **15 GiB** host RAM, so traversals are genuinely
 **disk-bound**, and **only the disk-backed engines can hold the graph at all**:
 
-- **slater** and **Neo4j 5** load it (both page the store from disk).
+- **slater**, **Neo4j 5**, and **LadybugDB** (embedded, Kùzu-derived) load it — all page
+  the store from disk.
 - **FalkorDB** and **Memgraph** keep the whole graph resident in RAM (≈64–128 GiB at
   this scale) → **cannot-load** on a 15 GiB box.
 - **ArcadeDB**'s importer runs for ~days at 766M edges → **skipped**.
-- **LadybugDB** load is on hold (its edge `COPY` needs a large dedicated buffer pool,
-  run in isolation) — to be added.
+
+LadybugDB *loads*, but only barely: its Kùzu `COPY` of the 766M edges is **not**
+bounded-memory — a 4 GiB buffer pool fails (`buffer pool is full`), a 10 GiB pool is
+**OOM-killed**, and only a tuned **~8 GiB** pool completes (peak **13 GiB** RSS, ~4.2 min),
+right at the edge of the 15 GiB host. (slater's external builder builds the same graph
+under a **4 GiB** cap — see *Bulk build / load*.)
 
 Because the on-disk store dwarfs RAM, the cgroup `memory.peak` is dominated by
 reclaimable OS **page cache** and badly misrepresents an engine's own footprint. So the
@@ -238,29 +243,39 @@ caches + query working memory), sampled live during each sweep. Each engine is b
 **in isolation** (one big container at a time on the 15 GiB box).
 
 Latency, ms. slater = mean of 5 restart-cycle runs (very stable); Neo4j = its one clean
-complete pass (see the instability note). Mark is **vs the field that can load** (slater
-vs Neo4j): 🟢 sole-fastest, ⚪ tie (within 25%).
+complete pass (see the instability note); LadybugDB = embedded, 512 MiB read pool. Mark
+is **vs the field that loads it**: 🟢 sole-fastest, ⚪ tie (within 25%).
 
-| query | slater | Neo4j 5 | FalkorDB | Memgraph |
-|---|--:|--:|:--:|:--:|
-| count all nodes | **0.58 🟢** | ~4000 | cannot-load | cannot-load |
-| point lookup (idx wikidata_id) | **1.30 🟢** | 9.72 | cannot-load | cannot-load |
-| degree (1-hop count) | **1.33 🟢** | 14.4 | cannot-load | cannot-load |
-| 1-hop neighbours | **4.25 🟢** | 12.3 | cannot-load | cannot-load |
-| 2-hop | 18.16 ⚪ | 17.4 | cannot-load | cannot-load |
-| 3-hop | **26.66 🟢** | 74.9 | cannot-load | cannot-load |
-| var-length *1..2 distinct | **9.09 🟢** | 116 † | cannot-load | cannot-load |
-| shortestPath ≤6 | **52.6 🟢** (fanout 8) · 82.6 (fanout 1) | 131.9 | cannot-load | cannot-load |
+| query | slater | Neo4j 5 | LadybugDB | FalkorDB | Memgraph |
+|---|--:|--:|--:|:--:|:--:|
+| count all nodes | **0.58 🟢** | ~4000 | 34.2 | cannot-load | cannot-load |
+| point lookup (idx wikidata_id) | **1.30 🟢** | 9.72 | ~2337 ‡ | cannot-load | cannot-load |
+| degree (1-hop count) | **1.33 🟢** | 14.4 | 21.4 | cannot-load | cannot-load |
+| 1-hop neighbours | **4.25 🟢** | 12.3 | 22.9 | cannot-load | cannot-load |
+| 2-hop | 18.16 ⚪ | 17.4 | over-budget § | cannot-load | cannot-load |
+| 3-hop | **26.66 🟢** | 74.9 | over-budget § | cannot-load | cannot-load |
+| var-length *1..2 distinct | **9.09 🟢** | 116 † | n.m. § | cannot-load | cannot-load |
+| shortestPath ≤6 | **52.6 🟢** (fanout 8) · 82.6 (fanout 1) | 131.9 | n.m. § | cannot-load | cannot-load |
 
 † Neo4j's `var-length *1..2 distinct` completes at 116 ms only on the first warm pass;
 on every repeat it **OOMs its 2 GiB heap** (`MemoryPoolOutOfMemoryError` after ~46 s),
 and the restart-cycle eventually crashed the container outright. slater answers the same
 query in 9 ms within its 1M-element `maxIntermediate` budget — bounded by design.
+‡ LadybugDB builds **no secondary index** on `wikidata_id`, so the point lookup is a full
+columnar scan of 91.6M nodes (~2.3 s); the cheaper degree/1-hop shapes reuse the
+now-cached `wikidata_id` column. § Hub-anchored expansion is **unbounded** at this scale —
+the 2-/3-hop shapes ran the embedded process past **~7 GiB** working memory (well over the
+512 MiB read pool) before being stopped; var-length and shortestPath were therefore not
+completed (`n.m.`).
 
 | anon RSS | slater | Neo4j 5 |
 |---|--:|--:|
 | idle | 71 MiB | — |
 | shortestPath sweep | 700 MiB (fanout 1) · 925 MiB (fanout 8) | **2911 MiB** |
+
+(Embedded **LadybugDB** has no server cgroup; its `ru_maxrss` on the count/point/degree/
+1-hop shapes is **652 MiB** with the 512 MiB read pool — but that is only on the shapes
+that stay bounded; its hub expansion blows past ~7 GiB, §.)
 
 This is the thesis at full strength: serving a **766M-edge** graph, slater's resident
 footprint stays **sub-GiB** (idle 71 MiB) and tracks the *query working set*, not the
@@ -300,12 +315,16 @@ graph larger than RAM (the in-memory builder was OOM-killed on this one).
 
 | engine | on-disk | builder / loader | build cost |
 |---|--:|---|---|
-| slater | **14 GB** | `slater-build --external on` (spill-to-disk) | ~29 min, peak **3.5 GiB** RSS under a 4 GiB cap |
+| slater | **14 GB** | `slater-build --external on` (spill-to-disk) | ~29 min, peak **3.5 GiB** RSS under a **4 GiB** cap |
 | Neo4j 5 | 41.8 GB | `neo4j-admin database import` (offline → volume) | not re-timed (focus is RAM) |
+| LadybugDB | 21 GB | Kùzu `COPY FROM` CSV (embedded) | ~4.2 min, peak **13 GiB** RSS (needs a tuned ~8 GiB pool) |
 
 slater's external builder spills to disk and stays under a 4 GiB `--max-memory` cap to
-build the 91.6M/766M generation in ~29 min, and the resulting generation is **3× smaller
-on disk than Neo4j's store** (14 vs 41.8 GB).
+build the 91.6M/766M generation in ~29 min, and the resulting generation is the
+**smallest on disk** (14 GB vs LadybugDB 21 GB, Neo4j 41.8 GB). The contrast is the
+whole point: slater **builds** the larger-than-RAM graph within a fixed 4 GiB budget,
+whereas LadybugDB's bulk `COPY` only fits in a narrow ~8 GiB window and peaks at 13 GiB —
+bounded-memory by construction vs. by luck.
 
 ### EU-AI-Act — 20,766 nodes / 44,790 edges, 54.8 MiB of vectors
 
@@ -381,6 +400,9 @@ section above — which is exactly why the block budget doesn't move it.)
 - `load_ladybug.py` — loader for embedded LadybugDB (single primary table per node,
   `__labels` string, type inference + coercion, Kùzu `COPY` for rels); runs inside
   `Dockerfile.ladybug`.
+- `load_ladybug_csv.py` — header-less-CSV `COPY` loader for LadybugDB at full-Wikidata
+  scale (too large to parse the Cypher dump in memory; `LADYBUG_LOAD_BUFFER_POOL` sizes
+  the bulk pool).
 - `bulk_export.py` — emit `nodes.csv` + `edges.csv` (RFC4180-quoted) from a
   single-label/single-rel-type dump, for the native bulk importers (Wikidata-1M).
 - `bench_mesh.py` / `bench_vec.py` / `bench_wiki.py` — the three query suites
