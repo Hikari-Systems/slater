@@ -59,6 +59,36 @@ SCENARIOS = {
         targets="memory",
         watch=["rss_bytes", "cgroup_mem_limit_bytes", "cache_block_evictions"],
     ),
+    "wiki_cache_churn": Scenario(
+        "wiki_cache_churn",
+        "Disk-bound read mix on the Wikidata graph (Entity/LINK, range idx on "
+        "wikidata_id): range-index point lookups, 1-hop expansions and index "
+        "range scans whose keys spread across a store far larger than the block "
+        "cache → eviction churn and cold block reads while RSS stays cache-bound.",
+        weights={"wiki_point": 5, "wiki_1hop": 3, "wiki_range": 2},
+        targets="memory",
+        watch=["rss_bytes", "cache_block_evictions", "cache_block_misses",
+               "latency_p99_ms"],
+    ),
+    "wiki_point": Scenario(
+        "wiki_point",
+        "Pure range-index point lookups by wikidata_id over a store-spread pool — "
+        "the lightest disk-bound shape; measures index-seek throughput and the "
+        "cache hit/miss balance under concurrency.",
+        weights={"wiki_point": 1},
+        targets="overall",
+        watch=["latency_p99_ms", "cache_block_hits", "cache_block_misses",
+               "rss_bytes"],
+    ),
+    "wiki_budget": Scenario(
+        "wiki_budget",
+        "2-hop expansions on the Wikidata graph that fan out past "
+        "query.maxIntermediate on higher-degree nodes → fail_budget climbs as a "
+        "clean guard instead of unbounded RAM growth.",
+        weights={"wiki_2hop": 4, "wiki_range": 2},
+        targets="query-budget",
+        watch=["fail_budget_total", "rss_bytes", "latency_p99_ms"],
+    ),
     "intermediate_breach": Scenario(
         "intermediate_breach",
         "Large UNWIND/collect materialisations that charge the per-query "

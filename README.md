@@ -542,6 +542,27 @@ RAM↔latency dial, Wikidata 1M & 91.6M, and the full-Wikidata bulk-load + paral
 figures — are in [`perf/cross-engine-hs/README.md`](perf/cross-engine-hs/README.md); the
 pole harness and method are in [`perf/PERF_PROGRESS.md`](perf/PERF_PROGRESS.md).
 
+### Concurrency & brown-out (load testing)
+
+The benchmarks above are single-client. The complementary axis — **behaviour under
+many concurrent clients** — has its own harness, [`perf/loadtest/`](perf/loadtest/):
+a Locust driver over Bolt plus a coordinator that ramps load, reads
+`CALL slater.diagnostics()` under load, finds the capacity knee, and names the
+limiter. Full method and a representative run are in
+[`docs/LOAD-TESTING.md`](docs/LOAD-TESTING.md). Headlines from a 256 MiB-cache run on
+the Wikidata-1M graph (one 16-core box):
+
+- **Holds to 1000 concurrent clients with zero failures.** Throughput peaks ~3k rps;
+  the latency knee (p99 40 → 520 ms) is queueing under core contention, not a hard cap.
+- **The block cache stays bounded and effective** — 100% hit rate, 0 evictions, 50 MB
+  resident for a working set that fits the cache.
+- **Two memory caveats the load test surfaced.** (1) Under sustained concurrency the
+  *process* RSS rises to a retained allocator high-water (~2.7 GB anon, default glibc;
+  **not a leak** — flat over 90k further queries) well above the cache budget;
+  `MALLOC_ARENA_MAX`/jemalloc + a concurrency cap are the levers. (2) `maxIntermediate`
+  is a **per-query** bound, so `N_concurrent × budget` can still OOM — a **server-wide
+  intermediate budget** is the proper fix. Both are tracked in the load-testing doc.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the

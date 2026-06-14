@@ -1,0 +1,4 @@
+# Load-test runtime artifacts (not source).
+.venv/
+out/
+__pycache__/
