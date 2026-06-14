@@ -220,7 +220,10 @@ fast path — 56–365× the service engines) and competitive on the hop travers
 
 The scale-up of the Wikidata-1M graph to the **complete** generation: 91.6M `:Entity`
 nodes / 766M `:LINK` edges (~55× the 1M edge count), range index on `wikidata_id`,
-**14 GB** on disk. This is the regime the whole bounded-memory thesis was built for —
+**14 GB** on disk. (Source: the `wikidata_csr.duckdb` CSR dataset —
+[download](https://huggingface.co/datasets/ladybugdb/wikidata-20260401/tree/main); see
+[`perf/datasets/`](../datasets/) for the DuckDB→dump conversion.) This is the regime the
+whole bounded-memory thesis was built for —
 the working set is far larger than the **15 GiB** host RAM, so traversals are genuinely
 **disk-bound**, and **only the disk-backed engines can hold the graph at all**:
 
