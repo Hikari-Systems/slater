@@ -236,6 +236,11 @@ bounded-memory — a 4 GiB buffer pool fails (`buffer pool is full`), a 10 GiB p
 right at the edge of the 15 GiB host. (slater's external builder builds the same graph
 under a **4 GiB** cap — see *Bulk build / load*.)
 
+> **Note (load cap):** we first capped LadybugDB's load at the **same 4 GiB** slater
+> builds under, but its `COPY` was **OOM-killed ~38 s in** (barely past the node load),
+> so the cap was **raised to 8 GiB** for it to complete. The load figures below are at
+> that raised 8 GiB cap.
+
 Because the on-disk store dwarfs RAM, the cgroup `memory.peak` is dominated by
 reclaimable OS **page cache** and badly misrepresents an engine's own footprint. So the
 resident figure here is the **anonymous** high-water (`memory.stat` `anon` — heap +
