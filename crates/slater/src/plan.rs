@@ -262,7 +262,7 @@ fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)])
     let smallest = req
         .iter()
         .filter_map(|l| gen.label_id(l))
-        .min_by_key(|&id| gen.nodes_with_label(id).len());
+        .min_by_key(|&id| gen.label_node_count(id));
     match smallest {
         Some(label_id) => NodeScan::LabelScan { label_id },
         None => NodeScan::AllNodes,

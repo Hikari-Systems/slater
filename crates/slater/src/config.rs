@@ -302,6 +302,15 @@ pub struct QueryConfig {
     /// 0 disables the budget.
     #[serde(default = "default_max_intermediate", deserialize_with = "de::u64")]
     pub max_intermediate: u64,
+    /// Optional cap on how many nodes a single `shortestPath()` global-visited BFS
+    /// may discover; 0 = unlimited (default). Dedicated to that one O(V) operation so
+    /// tiny-memory deployments can bound it without shrinking the general
+    /// `maxIntermediate` budget every other query shares.
+    #[serde(
+        default = "default_max_shortest_path_explore",
+        deserialize_with = "de::u64"
+    )]
+    pub max_shortest_path_explore: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -365,6 +374,9 @@ fn default_timeout_ms() -> u64 {
 fn default_max_intermediate() -> u64 {
     1_000_000
 }
+fn default_max_shortest_path_explore() -> u64 {
+    0 // unlimited — preserves the AnyShortest "always succeeds in O(V+E)" guarantee
+}
 fn default_beam_width() -> u32 {
     64
 }
@@ -395,6 +407,7 @@ impl Default for QueryConfig {
             max_rows: default_max_rows(),
             timeout_ms: default_timeout_ms(),
             max_intermediate: default_max_intermediate(),
+            max_shortest_path_explore: default_max_shortest_path_explore(),
         }
     }
 }

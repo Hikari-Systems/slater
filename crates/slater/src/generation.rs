@@ -62,10 +62,14 @@ pub struct Generation {
     reltype_ids: HashMap<String, u32>,
     property_key_ids: HashMap<String, u32>,
 
-    /// Inverted postings built at open (D11): label id → dense node ids carrying it.
-    label_postings: HashMap<u32, Vec<u64>>,
-    /// Inverted postings: relationship-type id → dense edge ids of that type.
-    reltype_postings: HashMap<u32, Vec<u64>>,
+    /// Per-label node counts, computed at open by a single scan (D11). We keep
+    /// only the *counts* resident — not the full id postings — so the open-time
+    /// footprint stays O(#labels) rather than O(#nodes). Label *scans* re-derive
+    /// their ids on demand via [`Generation::collect_nodes_with_label`].
+    label_counts: HashMap<u32, u64>,
+    /// Per-relationship-type edge counts (same bounded-memory rationale). No caller
+    /// ever enumerates the edge ids of a type, so only the counts are retained.
+    reltype_counts: HashMap<u32, u64>,
 }
 
 /// One opened Vamana/PQ index. The medoid + R/alpha/PQ params live in the MANIFEST
@@ -212,8 +216,8 @@ impl Generation {
         let reltype_ids = invert_symbols(&manifest.reltypes);
         let property_key_ids = invert_symbols(&manifest.property_keys);
 
-        let label_postings = build_label_postings(&node_labels)?;
-        let reltype_postings = build_reltype_postings(&topology)?;
+        let label_counts = build_label_counts(&node_labels)?;
+        let reltype_counts = build_reltype_counts(&topology)?;
 
         info!(
             graph,
@@ -242,8 +246,8 @@ impl Generation {
             label_ids,
             reltype_ids,
             property_key_ids,
-            label_postings,
-            reltype_postings,
+            label_counts,
+            reltype_counts,
         })
     }
 
@@ -335,20 +339,31 @@ impl Generation {
         self.vamana_indexes.values()
     }
 
-    // ── Inverted postings (selective scans) ────────────────────────────────
+    // ── Inverted counts + on-demand label scan ─────────────────────────────
 
-    /// Dense node ids carrying `label_id`, ascending. Empty slice if none.
-    pub fn nodes_with_label(&self, label_id: u32) -> &[u64] {
-        self.label_postings
-            .get(&label_id)
-            .map_or(&[][..], Vec::as_slice)
+    /// Number of nodes carrying `label_id` (precomputed at open; O(1)).
+    pub fn label_node_count(&self, label_id: u32) -> u64 {
+        self.label_counts.get(&label_id).copied().unwrap_or(0)
     }
 
-    /// Dense edge ids of relationship type `reltype_id`, ascending. Empty if none.
-    pub fn edges_with_reltype(&self, reltype_id: u32) -> &[u64] {
-        self.reltype_postings
-            .get(&reltype_id)
-            .map_or(&[][..], Vec::as_slice)
+    /// Number of edges of relationship type `reltype_id` (precomputed at open; O(1)).
+    pub fn reltype_edge_count(&self, reltype_id: u32) -> u64 {
+        self.reltype_counts.get(&reltype_id).copied().unwrap_or(0)
+    }
+
+    /// Dense node ids carrying `label_id`, ascending — re-derived on demand by a
+    /// single pass over the node-label column. We deliberately do **not** keep a
+    /// resident id posting (it would be O(#nodes) per label); the open-time
+    /// footprint stays bounded and label scans pay the scan only when they run.
+    pub fn collect_nodes_with_label(&self, label_id: u32) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        self.node_labels.inner().for_each_record(|node_id, rec| {
+            if graph_format::nodelabels::decode_labels(rec)?.contains(&label_id) {
+                ids.push(node_id);
+            }
+            Ok(())
+        })?;
+        Ok(ids)
     }
 }
 
@@ -440,43 +455,40 @@ fn invert_symbols(symbols: &[String]) -> HashMap<String, u32> {
 /// per-node loop does O(records-per-block) redundant zstd work per block — which
 /// dominates open time on a large store (e.g. a 340k-node graph). Node ids arrive
 /// ascending, so the postings stay sorted without an extra pass.
-fn build_label_postings(node_labels: &NodeLabelsReader) -> Result<HashMap<u32, Vec<u64>>> {
-    let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
-    node_labels.inner().for_each_record(|node_id, rec| {
+fn build_label_counts(node_labels: &NodeLabelsReader) -> Result<HashMap<u32, u64>> {
+    let mut counts: HashMap<u32, u64> = HashMap::new();
+    node_labels.inner().for_each_record(|_node_id, rec| {
         for label_id in graph_format::nodelabels::decode_labels(rec)? {
-            postings.entry(label_id).or_default().push(node_id);
+            *counts.entry(label_id).or_default() += 1;
         }
         Ok(())
     })?;
-    Ok(postings)
+    Ok(counts)
 }
 
-/// Build the inverted relationship-type postings (`reltype_id → ascending edge
-/// ids`) from the forward CSR. Each edge appears exactly once in the outgoing
-/// adjacency, so a single pass over the outgoing records covers every edge once.
+/// Count edges per relationship type from the forward CSR. Each edge appears
+/// exactly once in the outgoing adjacency, so a single pass over the outgoing
+/// records covers every edge once. We keep only the counts — never the edge-id
+/// lists — because no query path enumerates the edges of a type; the lists would
+/// be O(#edges) resident (≈6 GB on full Wikidata) for no benefit.
 ///
 /// The CSR block file stores outgoing records (global ids `0..node_count`)
 /// followed by incoming records (`node_count..2*node_count`); we scan it
-/// block-by-block (decompressing each block once — see [`build_label_postings`])
-/// and skip the incoming half so each edge is counted exactly once.
-fn build_reltype_postings(topology: &TopologyReader) -> Result<HashMap<u32, Vec<u64>>> {
-    let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+/// block-by-block (decompressing each block once) and skip the incoming half so
+/// each edge is counted exactly once.
+fn build_reltype_counts(topology: &TopologyReader) -> Result<HashMap<u32, u64>> {
+    let mut counts: HashMap<u32, u64> = HashMap::new();
     let node_count = topology.node_count();
     topology.inner().for_each_record(|global, rec| {
         if global >= node_count {
             return Ok(()); // incoming half — already counted via the outgoing record
         }
         for adj in graph_format::topology::decode_adj(rec)? {
-            postings.entry(adj.reltype).or_default().push(adj.edge.0);
+            *counts.entry(adj.reltype).or_default() += 1;
         }
         Ok(())
     })?;
-    // Edge ids arrive in node-then-adjacency order; sort each posting so callers
-    // can binary-search and merge cheaply.
-    for ids in postings.values_mut() {
-        ids.sort_unstable();
-    }
-    Ok(postings)
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -761,19 +773,22 @@ mod tests {
     }
 
     #[test]
-    fn inverted_postings_are_built() {
-        let (root, graph, _) = write_fixture("inverted_postings_are_built");
+    fn label_counts_and_on_demand_scan() {
+        let (root, graph, _) = write_fixture("label_counts_and_on_demand_scan");
         let gen = Generation::open(&root, &graph).unwrap();
 
         let person = gen.label_id("Person").unwrap();
         let company = gen.label_id("Company").unwrap();
-        assert_eq!(gen.nodes_with_label(person), &[0, 1]);
-        assert_eq!(gen.nodes_with_label(company), &[2]);
+        // Counts are resident; id lists are re-derived on demand (no resident posting).
+        assert_eq!(gen.label_node_count(person), 2);
+        assert_eq!(gen.label_node_count(company), 1);
+        assert_eq!(gen.collect_nodes_with_label(person).unwrap(), &[0, 1]);
+        assert_eq!(gen.collect_nodes_with_label(company).unwrap(), &[2]);
 
         let knows = gen.reltype_id("KNOWS").unwrap();
         let works_at = gen.reltype_id("WORKS_AT").unwrap();
-        assert_eq!(gen.edges_with_reltype(knows), &[0]);
-        assert_eq!(gen.edges_with_reltype(works_at), &[1]);
+        assert_eq!(gen.reltype_edge_count(knows), 1);
+        assert_eq!(gen.reltype_edge_count(works_at), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

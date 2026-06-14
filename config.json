@@ -26,7 +26,8 @@
   "query": {
     "maxRows": 100000,
     "timeoutMs": 30000,
-    "maxIntermediate": 1000000
+    "maxIntermediate": 1000000,
+    "maxShortestPathExplore": 0
   },
   "vectorQuery": {
     "beamWidth": 64,

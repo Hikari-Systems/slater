@@ -612,6 +612,14 @@ pub struct Engine<'g> {
     /// a query cannot grow unbounded memory inside the `timeout_ms` window.
     max_intermediate: u64,
     budget_used: Cell<u64>,
+    /// Optional cap on how many nodes a single `shortestPath()` global-visited BFS
+    /// may discover (config `query.maxShortestPathExplore`); 0 = unlimited. Distinct
+    /// from `max_intermediate` on purpose: the BFS holds an O(V) working set with a
+    /// small (compacted) constant, so its natural ceiling is the node count; this is
+    /// a *dedicated* safety valve for tiny-memory deployments that does not loosen
+    /// every other query's intermediate budget. Unlimited by default preserves the
+    /// "AnyShortest always succeeds in O(V+E)" guarantee.
+    max_shortest_path_explore: u64,
     /// Compiled user regexes, keyed by the final compile string. Engines live for
     /// one query, so this exists to stop `=~` recompiling its pattern per row.
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
@@ -630,6 +638,7 @@ impl<'g> Engine<'g> {
             beam_width: 64,
             max_intermediate: 0,
             budget_used: Cell::new(0),
+            max_shortest_path_explore: 0,
             regex_cache: RefCell::new(HashMap::new()),
         }
     }
@@ -664,6 +673,14 @@ impl<'g> Engine<'g> {
     /// (config `query.maxIntermediate`); 0 disables the budget.
     pub fn with_max_intermediate(mut self, max_intermediate: u64) -> Self {
         self.max_intermediate = max_intermediate;
+        self
+    }
+
+    /// Cap the number of nodes a `shortestPath()` global-visited BFS may discover
+    /// (config `query.maxShortestPathExplore`); 0 = unlimited (the default, which
+    /// preserves the always-succeeds guarantee).
+    pub fn with_max_shortest_path_explore(mut self, cap: u64) -> Self {
+        self.max_shortest_path_explore = cap;
         self
     }
 
@@ -893,7 +910,7 @@ impl<'g> Engine<'g> {
     /// count is still over the whole match.
     ///
     /// The count itself: no inline props → `node_count()` (0 labels) or
-    /// `nodes_with_label(L).len()` (1 label); a single indexed-equality inline prop
+    /// `label_node_count(L)` (1 label); a single indexed-equality inline prop
     /// whose index covers exactly the pattern's label+prop → that index's
     /// `lookup_eq` length. Anything else (multi-label, residual props, non-index
     /// props, a non-constant extra projection) falls back.
@@ -950,7 +967,7 @@ impl<'g> Engine<'g> {
                     Some(l) => self
                         .gen
                         .label_id(l)
-                        .map(|lid| self.gen.nodes_with_label(lid).len() as i64)
+                        .map(|lid| self.gen.label_node_count(lid) as i64)
                         .unwrap_or(0),
                     None => return Ok(None),
                 },
@@ -1126,7 +1143,7 @@ impl<'g> Engine<'g> {
             let Some(lid) = self.gen.label_id(label) else {
                 return Ok(None);
             };
-            let total = self.gen.nodes_with_label(lid).len() as u64;
+            let total = self.gen.label_node_count(lid);
             let indexed: u64 = groups.iter().map(|(_, n)| *n).sum();
             let null_count = total.saturating_sub(indexed);
 
@@ -1708,13 +1725,22 @@ impl<'g> Engine<'g> {
 
     /// `ANY SHORTEST` / `shortestPath()`: one shortest path between `src` and `dst`,
     /// found by a single-source BFS with one *global* `visited` set plus a back-pointer
-    /// map (`node -> (predecessor, discovering hop)`). BFS first reaches every node
-    /// along a shortest path, and the reconstructed walk — following back-pointers from
-    /// `dst` to `src` — is automatically simple, so the returned length equals the
-    /// loopless simple-path search's. Because each node is enqueued at most once, the
-    /// frontier is ≤ |V| and total work is `O(V+E)`: the hub-dense small-world case
-    /// that blows up the cloned-`visited` search (kept for `AllShortest`/`ShortestK`)
-    /// returns here in milliseconds, so no `maxIntermediate` frontier charge is needed.
+    /// map (`node -> predecessor`). BFS first reaches every node along a shortest path,
+    /// and the reconstructed walk — following back-pointers from `dst` to `src` — is
+    /// automatically simple, so the returned length equals the loopless simple-path
+    /// search's. Because each node is enqueued at most once, the frontier is ≤ |V| and
+    /// total work is `O(V+E)`: the hub-dense small-world case that blows up the
+    /// cloned-`visited` search (kept for `AllShortest`/`ShortestK`) returns here in
+    /// milliseconds, so no `maxIntermediate` frontier charge is needed.
+    ///
+    /// The working set is kept O(V) with a *small* constant so it stays bounded even
+    /// when the BFS explores a large fraction of a giant component (full Wikidata is
+    /// the motivating case): `visited` is a dense bitset (≈ node_count/8 bytes, ~11 MB
+    /// at 91.6 M nodes) rather than a `HashSet`, and `parent` stores only the
+    /// predecessor node id — the discovering `Hop` is re-derived from the CSR during
+    /// the back-walk (≤ `max` cheap adjacency lookups). An optional, *dedicated*
+    /// `maxShortestPathExplore` cap (0 = unlimited) bounds the discovery count for
+    /// tiny-memory deployments without touching the shared `maxIntermediate` budget.
     ///
     /// `max` caps the BFS depth; `min` filters whether the discovered `dst` is
     /// admissible. `min == 0` with coincident endpoints admits the empty path. (For
@@ -1738,12 +1764,22 @@ impl<'g> Engine<'g> {
             return Ok(Vec::new());
         }
 
-        // Back-pointer per discovered node: who reached it, and over which hop. The
-        // hop's own `start`/`end` are the edge's stored endpoints (not the traversal
-        // direction), so the predecessor is recorded explicitly.
-        let mut parent: HashMap<u64, (u64, Hop)> = HashMap::new();
-        let mut visited: HashSet<u64> = HashSet::from([src]);
+        // Dense bitset `visited` (node ids are 0..node_count) — one bit per node, vs a
+        // HashSet's ~16+ bytes/entry. `parent` keeps only predecessor ids; the hop is
+        // re-derived from the CSR at reconstruction time.
+        let node_count = self.gen.node_count();
+        let mut visited = vec![0u64; ((node_count + 63) / 64) as usize];
+        let mut mark = |id: u64| -> bool {
+            let (w, b) = ((id >> 6) as usize, 1u64 << (id & 63));
+            let was = visited[w] & b != 0;
+            visited[w] |= b;
+            !was // true on first discovery
+        };
+        mark(src);
+        let mut parent: HashMap<u64, u64> = HashMap::new();
         let mut frontier: Vec<u64> = vec![src];
+        let mut discovered: u64 = 1;
+        let cap = self.max_shortest_path_explore;
         let mut depth = 0u32;
         while !frontier.is_empty() && depth < max {
             self.check_deadline()?;
@@ -1751,26 +1787,22 @@ impl<'g> Engine<'g> {
             for &node in &frontier {
                 for hop in self.expand_one_hop(node, rel, &empty)? {
                     let nb = hop.neighbour;
-                    if !visited.insert(nb) {
+                    if !mark(nb) {
                         continue; // already discovered on a ≤-length shortest path
                     }
-                    let reached_dst = nb == dst;
-                    parent.insert(nb, (node, hop));
-                    if reached_dst {
+                    discovered += 1;
+                    if cap != 0 && discovered > cap {
+                        bail!(
+                            "shortestPath exceeded the exploration cap of {cap} nodes \
+                             (query.maxShortestPathExplore)"
+                        );
+                    }
+                    parent.insert(nb, node);
+                    if nb == dst {
                         // First discovery sits at `dst`'s shortest distance from `src`
                         // (= depth + 1); admissible only if it meets `min`.
                         if depth + 1 >= min {
-                            // Walk back-pointers dst→src, then reverse into walk order.
-                            let mut hops = Vec::new();
-                            let mut cur = dst;
-                            while cur != src {
-                                let (prev, hop) =
-                                    parent.remove(&cur).expect("back-pointer chain to src");
-                                hops.push(hop);
-                                cur = prev;
-                            }
-                            hops.reverse();
-                            return Ok(vec![hops]);
+                            return Ok(vec![self.reconstruct_shortest(src, dst, rel, &parent)?]);
                         }
                         return Ok(Vec::new());
                     }
@@ -1781,6 +1813,35 @@ impl<'g> Engine<'g> {
             depth += 1;
         }
         Ok(Vec::new())
+    }
+
+    /// Rebuild the hop sequence src→dst from a predecessor map, re-deriving each
+    /// discovering [`Hop`] from the CSR (the BFS stored only predecessor ids to keep
+    /// its working set small). For each step `prev -> cur` we take the first edge of
+    /// the pattern's type from `prev` that lands on `cur`; any such edge is a valid
+    /// shortest-path edge (parallel multi-edges are interchangeable for `AnyShortest`).
+    fn reconstruct_shortest(
+        &self,
+        src: u64,
+        dst: u64,
+        rel: &RelPat,
+        parent: &HashMap<u64, u64>,
+    ) -> Result<Vec<Hop>> {
+        let empty = HashMap::new();
+        let mut hops = Vec::new();
+        let mut cur = dst;
+        while cur != src {
+            let prev = *parent.get(&cur).expect("back-pointer chain to src");
+            let hop = self
+                .expand_one_hop(prev, rel, &empty)?
+                .into_iter()
+                .find(|h| h.neighbour == cur)
+                .expect("discovering edge re-derivable from the CSR");
+            hops.push(hop);
+            cur = prev;
+        }
+        hops.reverse();
+        Ok(hops)
     }
 
     /// Stream a single node-only `MATCH` (one pattern, no relationships, no path
@@ -2358,7 +2419,7 @@ impl<'g> Engine<'g> {
             Some(lbls) => {
                 let mut set = std::collections::BTreeSet::new();
                 for &l in lbls {
-                    for &nid in self.gen.nodes_with_label(l) {
+                    for nid in self.gen.collect_nodes_with_label(l)? {
                         set.insert(nid);
                     }
                 }
@@ -2403,8 +2464,8 @@ impl<'g> Engine<'g> {
 
     /// `CALL db.meta.stats()` — schema/stat counts from the manifest plus the
     /// per-label / per-reltype count maps (ported from FalkorDB `proc_meta_stats.c`).
-    /// All counts come from resident indexes (`nodes_with_label`, `edges_with_reltype`)
-    /// — no graph scan.
+    /// All counts come from the resident per-label / per-reltype count maps
+    /// (`label_node_count`, `reltype_edge_count`) — no graph scan.
     fn meta_stats(&self) -> (Vec<String>, Vec<Vec<Val>>) {
         let m = self.gen.manifest();
         let labels: Vec<(String, Val)> = m
@@ -2414,7 +2475,7 @@ impl<'g> Engine<'g> {
                 let cnt = self
                     .gen
                     .label_id(l)
-                    .map(|id| self.gen.nodes_with_label(id).len())
+                    .map(|id| self.gen.label_node_count(id) as usize)
                     .unwrap_or(0);
                 (l.clone(), Val::Int(cnt as i64))
             })
@@ -2426,7 +2487,7 @@ impl<'g> Engine<'g> {
                 let cnt = self
                     .gen
                     .reltype_id(t)
-                    .map(|id| self.gen.edges_with_reltype(id).len())
+                    .map(|id| self.gen.reltype_edge_count(id) as usize)
                     .unwrap_or(0);
                 (t.clone(), Val::Int(cnt as i64))
             })
@@ -3296,7 +3357,7 @@ impl<'g> Engine<'g> {
                     hi.as_ref().map(|(v, _)| v),
                     hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
                 ),
-            NodeScan::LabelScan { label_id } => Ok(self.gen.nodes_with_label(*label_id).to_vec()),
+            NodeScan::LabelScan { label_id } => self.gen.collect_nodes_with_label(*label_id),
             NodeScan::AllNodes => Ok((0..self.gen.node_count()).collect()),
         }
     }
@@ -8603,6 +8664,32 @@ mod tests {
         let res = run_budgeted("exec_budget_anysp_reach", 3, reachable)
             .expect("the global-visited BFS must not charge the frontier");
         assert_eq!(col0(&res), vec!["1"]); // Alice-[:KNOWS]->Carol directly (e4)
+    }
+
+    #[test]
+    fn shortest_path_explore_cap_bounds_the_bfs() {
+        // The dedicated `maxShortestPathExplore` cap bounds the global-visited BFS
+        // independently of `maxIntermediate`: the reachable pair the unlimited BFS
+        // finds above fails *cleanly* (no panic, no OOM) once the discovery count
+        // exceeds the cap, while the default (0 = unlimited) still succeeds and the
+        // re-derived path keeps its correct length.
+        let q = "MATCH (a:Person {name:'Alice'}), (z:Person {name:'Carol'}) \
+                 RETURN length(shortestPath((a)-[:KNOWS*]->(z))) AS l";
+        let (root, gen, cache, _) = budgeted_engine("exec_sp_explore_cap", 1_000_000);
+        let err = Engine::new(&gen, &cache)
+            .with_max_shortest_path_explore(1)
+            .run(&parser::parse(q).unwrap())
+            .expect_err("the explore cap must bound the BFS");
+        assert!(
+            format!("{err:#}").contains("maxShortestPathExplore"),
+            "expected the explore-cap error, got: {err:#}"
+        );
+        let res = Engine::new(&gen, &cache)
+            .with_max_shortest_path_explore(0)
+            .run(&parser::parse(q).unwrap())
+            .expect("the default unlimited cap must succeed");
+        assert_eq!(col0(&res), vec!["1"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -494,6 +494,9 @@ struct ConnCtx {
     timeout_ms: u64,
     /// Per-query intermediate-element budget (`query.maxIntermediate`); 0 disables.
     max_intermediate: u64,
+    /// Per-query `shortestPath()` BFS discovery cap (`query.maxShortestPathExplore`);
+    /// 0 = unlimited.
+    max_shortest_path_explore: u64,
     /// Beam-search list size for the Vamana arm (`vectorQuery.beamWidth`).
     beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
@@ -1126,6 +1129,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_rows: cfg.query.max_rows as usize,
         timeout_ms: cfg.query.timeout_ms,
         max_intermediate: cfg.query.max_intermediate,
+        max_shortest_path_explore: cfg.query.max_shortest_path_explore,
         beam_width: cfg.vector_query.beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
@@ -1598,6 +1602,7 @@ async fn run_query(
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
     let max_intermediate = ctx.max_intermediate;
+    let max_shortest_path_explore = ctx.max_shortest_path_explore;
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the debug level being active: when it
@@ -1628,7 +1633,8 @@ async fn run_query(
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
                         .with_params(params)
                         .with_max_rows(max_rows)
-                        .with_max_intermediate(max_intermediate);
+                        .with_max_intermediate(max_intermediate)
+                        .with_max_shortest_path_explore(max_shortest_path_explore);
                     if timeout_ms > 0 {
                         engine = engine
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
@@ -2247,6 +2253,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            max_shortest_path_explore: 0,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
@@ -2308,6 +2315,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            max_shortest_path_explore: 0,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             // A default is configured but must NOT be silently served for queries.
