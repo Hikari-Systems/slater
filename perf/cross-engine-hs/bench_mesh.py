@@ -57,16 +57,27 @@ def pools():
 
 P = pools()
 # Prime page caches after the cold restart (warm even the disk-backed engine).
+# Best-effort: slater's query.maxIntermediate budget rejects the unanchored all-rel
+# count (>1M intermediates), which must not abort the run before the suite.
 for _ in range(5):
-    run("MATCH (n) RETURN count(n)", {})
-    run("MATCH ()-[r]->() RETURN count(r)", {})
+    for warm in ("MATCH (n) RETURN count(n)", "MATCH ()-[r]->() RETURN count(r)"):
+        try:
+            run(warm, {})
+        except Exception:
+            pass
 out = {}
 for name, q, pf in SUITE:
-    for i in range(WARMUP):
-        run(q, pf(i, P))
-    ts = []
-    for i in range(MEAS):
-        a = time.perf_counter(); run(q, pf(WARMUP + i, P)); ts.append((time.perf_counter() - a) * 1000)
-    out[name] = round(st.median(ts), 3)
+    try:
+        for i in range(WARMUP):
+            run(q, pf(i, P))
+        ts = []
+        for i in range(MEAS):
+            a = time.perf_counter(); run(q, pf(WARMUP + i, P)); ts.append((time.perf_counter() - a) * 1000)
+        out[name] = round(st.median(ts), 3)
+    except Exception as e:
+        # e.g. slater rejecting a query that exceeds its query.maxIntermediate budget
+        # (bounded-memory protection) — record None rather than killing the suite.
+        out[name] = None
+        print(f"  {ENGINE} query {name!r} failed: {str(e)[:140]}", file=sys.stderr)
 close()
 print(json.dumps(out))

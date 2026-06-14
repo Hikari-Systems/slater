@@ -22,6 +22,9 @@ Usage:
     load_cypher.py neo4j   <dump.cypher> --uri bolt://localhost:7691 --pass <pw>
     load_cypher.py memgraph <dump.cypher> --uri bolt://localhost:7692
     load_cypher.py falkordb <dump.cypher> --port 6401 --graph <name>
+
+ArcadeDB is loaded by the dedicated load_arcadedb.py (its composite-type model is
+incompatible with the __DumpVertex__ label add/strip trick used here).
 """
 import sys, re, time, argparse
 from collections import defaultdict
@@ -65,8 +68,8 @@ class _P:
 
     def value(self):
         self.ws(); c = self.s[self.i]
-        if c == '"':
-            return self.string()
+        if c == '"' or c == "'":   # MeSH dump quotes with ", wikidata-1m with '
+            return self.string(c)
         if c == "[":
             return self.list()
         if c == "{":
@@ -86,14 +89,14 @@ class _P:
         if tok == "null":  return None
         return float(tok) if ("." in tok or "e" in tok or "E" in tok) else int(tok)
 
-    def string(self):
-        assert self.s[self.i] == '"'; self.i += 1; out = []
+    def string(self, quote='"'):
+        assert self.s[self.i] == quote; self.i += 1; out = []
         while True:
             c = self.s[self.i]; self.i += 1
             if c == "\\":
                 e = self.s[self.i]; self.i += 1
                 out.append({"n": "\n", "t": "\t", "r": "\r"}.get(e, e))
-            elif c == '"':
+            elif c == quote:
                 return "".join(out)
             else:
                 out.append(c)
@@ -194,7 +197,6 @@ def load(target, nodes, rels, range_idx, vec_idx, args):
                     f'{{"dimension":{dim},"metric":"{metric_mg}","capacity":{cap}}}')
 
     t0 = time.time()
-    run(join_idx)
     # nodes grouped by label-set
     by_labels = defaultdict(list)
     for did, labels, props in nodes:
@@ -210,6 +212,10 @@ def load(target, nodes, rels, range_idx, vec_idx, args):
         for ch in chunks(rws, BATCH):
             run(q, {"rows": ch})
         print(f"  nodes :{':'.join(labels)} -> {len(rws)}", flush=True)
+    # join index on the temp label, built once nodes exist (ArcadeDB requires the
+    # type to exist before indexing it; the other engines are order-agnostic). It
+    # accelerates the by-__dump_id__ rel lookups below.
+    run(join_idx)
     # rels grouped by type
     by_type = defaultdict(list)
     has_props = defaultdict(bool)

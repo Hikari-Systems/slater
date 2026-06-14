@@ -1,0 +1,13 @@
+# Thin image for the embedded LadybugDB engine (Kùzu-derived graph DB).
+#
+# The PyPI name is `real_ladybug` (plain `ladybug` is the unrelated building-energy
+# package). The published 0.15.3 wheel is manylinux — no compiler needed. We run the
+# loader AND the bench INSIDE this image against a mounted .lbug volume so nothing is
+# installed on the host and RSS is read from the container cgroup like the other engines.
+#
+# Build:  docker build -t slater-ladybug:local -f Dockerfile.ladybug .
+FROM python:3.12-slim
+RUN pip install --no-cache-dir real_ladybug==0.15.3 neo4j
+WORKDIR /app
+# The cross-engine-hs/ dir (engines.py, load_ladybug.py, load_cypher.py, bench_*.py,
+# count_hs.py) is bind-mounted at /app at run time; nothing is COPYed in.

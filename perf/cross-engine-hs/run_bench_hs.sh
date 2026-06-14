@@ -9,9 +9,25 @@ GRAPH="$1"; BENCH="$2"; EXPECT="$3"
 PY=/tmp/pole_venv/bin/python
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RES="/tmp/bench-hs/results-${GRAPH}"
-mkdir -p "$RES"; rm -f "$RES"/*
-ENGINES="slater neo4j memgraph falkordb"
-declare -A CONT=( [slater]=slater-hs [neo4j]=neo4j-hs [memgraph]=memgraph-hs [falkordb]=falkordb-hs )
+mkdir -p "$RES"
+# Clear only the result files for the engines being run this invocation, so the
+# one-at-a-time full-Wikidata sweep (each engine benched in isolation) doesn't wipe
+# the others' results. memory.txt is appended; the aggregator keeps the last line/engine.
+# Engine set is overridable via env so a run can target a subset (e.g. the full
+# Wikidata sweep, where only the disk-backed engines slater/neo4j/ladybug can load).
+ENGINES="${ENGINES:-slater neo4j memgraph falkordb arcadedb ladybug}"
+# ladybug is embedded (no container/port): run inside the slater-ladybug image.
+declare -A CONT=( [slater]=slater-hs [neo4j]=neo4j-hs [memgraph]=memgraph-hs \
+                  [falkordb]=falkordb-hs [arcadedb]=arcadedb-hs )
+LBVOL=/tmp/bench-hs/ladybug
+# Run the embedded-ladybug container as the host user so files it writes (notably
+# memory.txt) are host-owned — otherwise the later cgroup `tee -a` can't append.
+LB_MOUNTS="--user $(id -u):$(id -g) -v $HERE:/app -v $LBVOL:/data/ladybug"
+# Propagate the graph name into the embedded-ladybug container (its bench resolves
+# /data/ladybug/<graph>.lbug from WIKI_GRAPH; without this it defaults to wikidata1m).
+LB_ENV="-e WIKI_GRAPH=${WIKI_GRAPH:-wikidata1m}"
+for e in $ENGINES; do rm -f "$RES/${e}".run*.json "$RES/${e}".run*.err; done
+touch "$RES/memory.txt"  # host-owned up front, so every appender can write it
 
 wait_ready () {  # $1 engine
   for i in $(seq 1 90); do
@@ -24,9 +40,22 @@ wait_ready () {  # $1 engine
 
 for run in 1 2 3 4 5; do
   for e in $ENGINES; do
-    docker restart "${CONT[$e]}" >/dev/null 2>&1
-    wait_ready "$e" || continue
-    $PY "$HERE/$BENCH" "$e" > "$RES/${e}.run${run}.json" 2>"$RES/${e}.run${run}.err"
+    if [ "$e" = "ladybug" ]; then
+      # Embedded: each `docker run` is a fresh process — no restart needed. On the
+      # final run, capture the bench process' peak RSS into the shared memory.txt.
+      if [ "$run" = "5" ]; then
+        docker run --rm $LB_MOUNTS $LB_ENV -v "$RES":/results -w /app slater-ladybug:local \
+          python /app/bench_with_rss.py "/app/$BENCH" ladybug /results/memory.txt \
+          > "$RES/${e}.run${run}.json" 2>"$RES/${e}.run${run}.err"
+      else
+        docker run --rm $LB_MOUNTS $LB_ENV -w /app slater-ladybug:local \
+          python "/app/$BENCH" ladybug > "$RES/${e}.run${run}.json" 2>"$RES/${e}.run${run}.err"
+      fi
+    else
+      docker restart "${CONT[$e]}" >/dev/null 2>&1
+      wait_ready "$e" || continue
+      $PY "$HERE/$BENCH" "$e" > "$RES/${e}.run${run}.json" 2>"$RES/${e}.run${run}.err"
+    fi
     echo "run $run $e -> $(head -c 90 "$RES/${e}.run${run}.json" 2>/dev/null)"
   done
 done
@@ -34,6 +63,7 @@ done
 echo "=== memory (run-5 cycle) ==="
 cg=/sys/fs/cgroup
 for e in $ENGINES; do
+  [ "$e" = "ladybug" ] && continue  # ladybug RSS already written by bench_with_rss.py
   id=$(docker inspect -f '{{.Id}}' "${CONT[$e]}")
   peak=""; cur=""
   for base in "$cg/docker/$id" "$cg/system.slice/docker-$id.scope"; do
