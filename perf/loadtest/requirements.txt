@@ -1,0 +1,6 @@
+# Load-test suite dependencies. Standard, widely-used tools only:
+#   - locust: the de-facto Python load-testing framework (custom Bolt client).
+#   - neo4j:  the official driver — same one perf/bench.py already uses, so the
+#             query patterns and connection style are shared.
+locust>=2.20
+neo4j>=5.0

@@ -52,6 +52,21 @@ pub(crate) fn dbms_components() -> Rows {
     )
 }
 
+/// `CALL slater.diagnostics()` / `SHOW SERVER DIAGNOSTICS` — the gated load-test
+/// health snapshot, rendered as a two-column `metric`/`value` table (the same
+/// shape `SHOW STORAGE INFO` uses). The caller (`server`) builds the ordered
+/// `(name, value)` rows from the live [`crate::diag::Diagnostics`] snapshot; this
+/// just frames them for the wire. `value` is a mixed Int/Float column so a driver
+/// returns each metric as its native type.
+pub(crate) fn server_diagnostics(rows: &[(String, PsValue)]) -> Rows {
+    (
+        cols(&["metric", "value"]),
+        rows.iter()
+            .map(|(k, v)| vec![s(k.clone()), v.clone()])
+            .collect(),
+    )
+}
+
 /// `SHOW VERSION` (Memgraph) — single-column version string.
 pub(crate) fn show_version() -> Rows {
     (

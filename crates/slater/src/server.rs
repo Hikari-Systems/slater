@@ -562,6 +562,18 @@ struct ConnCtx {
     per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// Per-source concurrent-connection cap; 0 = unlimited.
     max_per_ip: usize,
+
+    // ── Load-test diagnostics (see `config::AppConfig::load_test_diagnostics`) ─
+    /// Gated diagnostics registry. Inert (no atomics touched) when disabled, so
+    /// the hot path is unchanged; answers `CALL slater.diagnostics()` when on.
+    diag: Arc<crate::diag::Diagnostics>,
+    /// The same global connection semaphore the accept loop holds, kept here so
+    /// the diagnostics snapshot can report live occupancy and headroom.
+    conn_limit: Arc<Semaphore>,
+    /// Configured global / pre-auth connection caps (0 = unlimited), echoed by the
+    /// diagnostics snapshot next to live occupancy.
+    max_connections: usize,
+    max_pre_auth_connections: usize,
 }
 
 impl ConnCtx {
@@ -700,6 +712,62 @@ impl ConnCtx {
     /// fires on connect (which the strict read-only Cypher grammar would reject),
     /// answering them from the in-memory manifest. Returns `Ok(None)` for anything
     /// that is not such a statement, so the caller falls through to the query path.
+    /// Assemble the live (non-counter) state the diagnostics snapshot needs:
+    /// connection-semaphore occupancy, configured caps, and the three cache pools.
+    /// Read on demand from `CALL slater.diagnostics()` only, never on the hot path.
+    fn live_gauges(&self) -> crate::diag::LiveGauges {
+        use crate::diag::{CachePoolSnapshot, LiveGauges};
+        // In-use = configured permits − currently available. `semaphore_permits`
+        // maps the "0 = unlimited" config to the sentinel the semaphore was built
+        // with, so the subtraction matches the live permit count either way.
+        let in_use = |configured: usize, sem: &Semaphore| -> u64 {
+            (semaphore_permits(configured) as u64).saturating_sub(sem.available_permits() as u64)
+        };
+        let (bm, vm, rm) = (
+            self.cache.metrics(),
+            self.vector_cache.metrics(),
+            self.result_cache.metrics(),
+        );
+        LiveGauges {
+            conn_in_use: in_use(self.max_connections, &self.conn_limit),
+            conn_limit: self.max_connections as u64,
+            pre_auth_in_use: in_use(self.max_pre_auth_connections, &self.pre_auth_limit),
+            pre_auth_limit: self.max_pre_auth_connections as u64,
+            max_per_ip: self.max_per_ip as u64,
+            max_rows: self.max_rows as u64,
+            timeout_ms: self.timeout_ms,
+            max_intermediate: self.max_intermediate,
+            max_shortest_path_explore: self.max_shortest_path_explore,
+            // The effective fanout = the pool's thread count (1 when sequential).
+            max_fanout: self
+                .fanout_pool
+                .as_ref()
+                .map_or(1, |p| p.current_num_threads()) as u64,
+            max_message_bytes: self.max_message_bytes as u64,
+            block_cache: CachePoolSnapshot {
+                bytes: self.cache.bytes() as u64,
+                entries: self.cache.len() as u64,
+                hits: bm.hits,
+                misses: bm.misses,
+                evictions: bm.evictions,
+            },
+            vector_cache: CachePoolSnapshot {
+                bytes: self.vector_cache.bytes() as u64,
+                entries: self.vector_cache.block_count() as u64,
+                hits: vm.hits,
+                misses: vm.misses,
+                evictions: vm.evictions,
+            },
+            result_cache: CachePoolSnapshot {
+                bytes: self.result_cache.bytes() as u64,
+                entries: self.result_cache.len() as u64,
+                hits: rm.hits,
+                misses: rm.misses,
+                evictions: rm.evictions,
+            },
+        }
+    }
+
     fn introspect(
         &self,
         user: &str,
@@ -763,6 +831,26 @@ impl ConnCtx {
         };
         if let Some(rows) = agnostic {
             return Ok(Some(rows));
+        }
+
+        // `CALL slater.diagnostics()` / `SHOW SERVER DIAGNOSTICS` — the gated
+        // load-test health snapshot: process RSS/CPU, the cgroup memory & CPU
+        // limits, connection-cap headroom, per-reason query-failure tallies, and
+        // latency percentiles. Server-level (no graph needed). Errors unless
+        // `loadTestDiagnostics` is on, so the surface stays dark by default and the
+        // hot path keeps no extra state.
+        if q.starts_with("call slater.diagnostics") || q.starts_with("show server diagnostics") {
+            if !self.diag.enabled {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    "load-test diagnostics are disabled; set loadTestDiagnostics=true to \
+                     enable CALL slater.diagnostics()"
+                        .to_string(),
+                ));
+            }
+            let live = self.live_gauges();
+            let rows = self.diag.snapshot(&live);
+            return Ok(Some(introspect::server_diagnostics(&rows)));
         }
 
         // `SHOW STORAGE INFO` is graph-scoped *and* carries the live per-pool cache
@@ -1172,6 +1260,17 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     let reload_strategy = cfg.reload_strategy()?;
     let tls = build_tls_acceptor(&cfg.tls)?;
 
+    // Global concurrent-connection cap. A permit is acquired *before* `accept()`,
+    // so at capacity we stop draining the kernel accept queue — back-pressure lands
+    // in the listen backlog and then the OS refuses new SYNs, rather than the heap
+    // filling with sockets we cannot service. This is what makes the bounded-RSS
+    // guarantee hold under adversarial connection load (each connection's buffers
+    // live outside the cache budget). Built before `ctx` so a clone can live in it
+    // for the diagnostics snapshot to read live occupancy.
+    let conn_limit = Arc::new(Semaphore::new(semaphore_permits(
+        cfg.server.max_connections,
+    )));
+
     let ctx = Arc::new(ConnCtx {
         acl,
         graphs,
@@ -1197,7 +1296,18 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         ))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: cfg.server.max_connections_per_ip,
+        diag: Arc::new(crate::diag::Diagnostics::new(cfg.load_test_diagnostics)),
+        conn_limit: conn_limit.clone(),
+        max_connections: cfg.server.max_connections,
+        max_pre_auth_connections: cfg.server.max_pre_auth_connections,
     });
+    if cfg.load_test_diagnostics {
+        warn!(
+            "load-test diagnostics ENABLED (loadTestDiagnostics=true): extra counters \
+             are maintained and `CALL slater.diagnostics()` is answerable — do not enable \
+             on a production replica"
+        );
+    }
 
     info!(
         bind = %cfg.server.bind,
@@ -1211,16 +1321,6 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_connections_per_ip = cfg.server.max_connections_per_ip,
         "slater Bolt listener ready"
     );
-
-    // Global concurrent-connection cap. A permit is acquired *before* `accept()`,
-    // so at capacity we stop draining the kernel accept queue — back-pressure lands
-    // in the listen backlog and then the OS refuses new SYNs, rather than the heap
-    // filling with sockets we cannot service. This is what makes the bounded-RSS
-    // guarantee hold under adversarial connection load (each connection's buffers
-    // live outside the cache budget).
-    let conn_limit = Arc::new(Semaphore::new(semaphore_permits(
-        cfg.server.max_connections,
-    )));
 
     // The in-flight generation guard: poll each graph's `current` and, on a change,
     // either swap the validated new generation in place or signal a clean exit.
@@ -1284,12 +1384,14 @@ async fn accept_loop(
                         Some(g) => Some(g),
                         None => {
                             warn!(%peer, "per-source connection cap reached; rejecting connection");
+                            ctx.diag.record_rejected_per_ip();
                             continue; // drops `permit` and `sock`, freeing the slot
                         }
                     }
                 } else {
                     None
                 };
+                ctx.diag.record_accepted();
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
@@ -1435,6 +1537,7 @@ where
         Ok(p) => Some(p),
         Err(_) => {
             debug!("pre-auth connection budget reached; rejecting connection");
+            ctx.diag.record_rejected_pre_auth();
             return Ok(());
         }
     };
@@ -1453,7 +1556,10 @@ where
     match login_deadline {
         Some(dl) => timeout_at(dl, framed.stream.read_exact(&mut hello))
             .await
-            .map_err(|_| anyhow!("handshake not completed within the login deadline"))?
+            .map_err(|_| {
+                ctx.diag.record_login_timeout();
+                anyhow!("handshake not completed within the login deadline")
+            })?
             .context("read handshake")?,
         None => framed
             .stream
@@ -1492,6 +1598,7 @@ where
                     Ok(p) => pre_auth_permit = Some(p),
                     Err(_) => {
                         debug!("pre-auth budget full on re-auth; closing connection");
+                        ctx.diag.record_rejected_pre_auth();
                         break;
                     }
                 }
@@ -1506,6 +1613,7 @@ where
                     Ok(r) => r,
                     Err(_) => {
                         debug!("authenticated connection idle past the timeout; closing");
+                        ctx.diag.record_idle_timeout();
                         return Ok(());
                     }
                 },
@@ -1516,15 +1624,25 @@ where
                     Ok(r) => r,
                     Err(_) => {
                         debug!("login deadline exceeded before authentication; closing");
+                        ctx.diag.record_login_timeout();
                         return Ok(());
                     }
                 },
                 None => framed.read_message().await,
             }
         };
-        let body = match read? {
-            Some(b) => b,
-            None => break, // clean EOF
+        let body = match read {
+            Ok(Some(b)) => b,
+            Ok(None) => break, // clean EOF
+            Err(e) => {
+                // Classify a reassembly-cap breach for diagnostics before the error
+                // propagates and closes the connection. `sess.user.is_none()` selects
+                // the pre-auth vs authenticated counter (the caps differ by auth state).
+                if e.to_string().contains("exceed") {
+                    ctx.diag.record_msg_too_large(sess.user.is_none());
+                }
+                return Err(e);
+            }
         };
 
         let req = match message::decode_request(&body) {
@@ -1585,6 +1703,7 @@ fn authenticate(
 ) -> std::result::Result<(), Failure> {
     let scheme = meta.get("scheme").and_then(PsValue::as_str).unwrap_or("");
     if scheme != "basic" {
+        ctx.diag.record_auth_failure();
         return Err(Failure::unauthorized(
             "only the 'basic' authentication scheme is supported",
         ));
@@ -1609,6 +1728,7 @@ fn authenticate(
         sess.user = Some(principal.to_string());
         Ok(())
     } else {
+        ctx.diag.record_auth_failure();
         Err(Failure::unauthorized("invalid principal or credentials"))
     }
 }
@@ -1857,11 +1977,14 @@ async fn run_query(
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
-    // Gate all per-query instrumentation on the debug level being active: when it
-    // is off, we take no timestamps and no cache snapshots, and build no
-    // QueryTiming — the hot path is exactly what it was before instrumentation.
-    let instrument = tracing::enabled!(Level::DEBUG);
+    // Gate all per-query instrumentation on the debug level being active OR
+    // load-test diagnostics being enabled: when both are off, we take no
+    // timestamps and no cache snapshots, and build no QueryTiming — the hot path
+    // is exactly what it was before instrumentation. Diagnostics needs the same
+    // `total_ms` for its latency histogram, so it shares this gate.
+    let instrument = tracing::enabled!(Level::DEBUG) || ctx.diag.enabled;
 
+    ctx.diag.on_query_start();
     let join =
         tokio::task::spawn_blocking(move || -> Result<(EncodedRows, Option<QueryTiming>)> {
             // Per-query instrumentation (only when `instrument`): wall-clock split into
@@ -1944,6 +2067,9 @@ async fn run_query(
             // misses on a small query is the signature of an unindexed scan. A high
             // total_ms with result_cache=miss and many blk_misses points at exactly
             // that.
+            // Feed the diagnostics latency histogram (no-op when disabled). When
+            // diagnostics are on, `instrument` is true so `timing` is always Some.
+            let total_ms = timing.as_ref().map(|t| t.total_ms);
             if let Some(t) = timing {
                 debug!(
                     graph = %graph_name,
@@ -1959,13 +2085,20 @@ async fn run_query(
                     "query executed"
                 );
             }
+            ctx.diag.on_query_ok(total_ms.unwrap_or(0.0));
             Ok(out)
         }
-        Ok(Err(e)) => Err(Failure::from_query_error(&e)),
-        Err(e) => Err(Failure::new(
-            CODE_EXECUTION,
-            format!("query task failed: {e}"),
-        )),
+        Ok(Err(e)) => {
+            ctx.diag.on_query_err(&e);
+            Err(Failure::from_query_error(&e))
+        }
+        Err(e) => {
+            ctx.diag.on_query_task_failed();
+            Err(Failure::new(
+                CODE_EXECUTION,
+                format!("query task failed: {e}"),
+            ))
+        }
     }
 }
 
@@ -2495,6 +2628,7 @@ mod tests {
         idle_timeout_ms: u64,
         max_pre_auth_connections: usize,
         max_per_ip: usize,
+        load_test_diagnostics: bool,
     }
 
     impl Default for TestLimits {
@@ -2505,7 +2639,8 @@ mod tests {
                 login_timeout_ms: 0, // off by default so unrelated tests never time out
                 idle_timeout_ms: 0,
                 max_pre_auth_connections: 4_096,
-                max_per_ip: 0, // unlimited by default
+                max_per_ip: 0,                // unlimited by default
+                load_test_diagnostics: false, // diagnostics off by default, as in prod
             }
         }
     }
@@ -2552,6 +2687,10 @@ mod tests {
             ))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: limits.max_per_ip,
+            diag: Arc::new(crate::diag::Diagnostics::new(limits.load_test_diagnostics)),
+            conn_limit: Arc::new(Semaphore::new(semaphore_permits(16_384))),
+            max_connections: 16_384,
+            max_pre_auth_connections: limits.max_pre_auth_connections,
         });
         (root, ctx)
     }
@@ -2623,6 +2762,10 @@ mod tests {
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: 0,
+            diag: Arc::new(crate::diag::Diagnostics::new(false)),
+            conn_limit: Arc::new(Semaphore::new(semaphore_permits(16_384))),
+            max_connections: 16_384,
+            max_pre_auth_connections: 4_096,
         })
     }
 
@@ -2919,6 +3062,118 @@ mod tests {
             kv["block_cache_hits"] + kv["block_cache_misses"] >= 1,
             "block cache should show at least one access after the MATCH"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostics_disabled_by_default_errors() {
+        // With `loadTestDiagnostics` off (the default), the statement must fail
+        // rather than leak a surface — and no diagnostics state is maintained.
+        let (root, ctx) = build_ctx("server_diag_off");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        c.send(Client::run("CALL slater.diagnostics()")).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::FAILURE, "disabled diagnostics must fail");
+        // The message should point the operator at the flag.
+        let msg = fields[0]
+            .get("message")
+            .and_then(PsValue::as_str)
+            .unwrap_or_default();
+        assert!(
+            msg.contains("loadTestDiagnostics"),
+            "failure should name the flag, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnostics_enabled_returns_health_metrics() {
+        // Stand up a server with diagnostics enabled, drive one query so the
+        // query counters are non-trivial, then read the snapshot.
+        let (root, ctx) = build_ctx_limited(
+            "server_diag_on",
+            TestLimits {
+                load_test_diagnostics: true,
+                ..Default::default()
+            },
+        );
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // A successful query so `queries_ok_total` and a latency sample are recorded.
+        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+        while c.recv().await.0 != message::tag::SUCCESS {}
+
+        c.send(Client::run("CALL slater.diagnostics()")).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(
+            tag,
+            message::tag::SUCCESS,
+            "enabled diagnostics must succeed"
+        );
+        assert_eq!(
+            fields[0].get("fields"),
+            Some(&PsValue::List(vec![
+                PsValue::str("metric"),
+                PsValue::str("value")
+            ]))
+        );
+
+        c.send(Client::pull_all()).await;
+        let mut metrics: std::collections::HashMap<String, PsValue> =
+            std::collections::HashMap::new();
+        loop {
+            let (tag, fields) = c.recv().await;
+            if tag == message::tag::RECORD {
+                if let PsValue::List(vals) = &fields[0] {
+                    if let Some(key) = vals[0].as_str() {
+                        metrics.insert(key.to_string(), vals[1].clone());
+                    }
+                }
+            } else {
+                assert_eq!(tag, message::tag::SUCCESS);
+                break;
+            }
+        }
+
+        // Headline rows are present: process RSS, the cgroup limit (may be -1 when
+        // unconstrained), and the echoed connection cap.
+        assert!(
+            metrics.contains_key("rss_bytes"),
+            "snapshot missing rss_bytes"
+        );
+        assert!(
+            metrics.contains_key("cgroup_mem_limit_bytes"),
+            "snapshot missing cgroup_mem_limit_bytes"
+        );
+        assert_eq!(
+            metrics.get("conn_limit"),
+            Some(&PsValue::Int(16_384)),
+            "echoed connection cap should match the configured maxConnections"
+        );
+        // The MATCH was counted as a completed query.
+        match metrics.get("queries_ok_total") {
+            Some(PsValue::Int(n)) => assert!(*n >= 1, "expected >=1 ok query, got {n}"),
+            other => panic!("queries_ok_total missing or not an int: {other:?}"),
+        }
+        // A latency percentile was recorded (>= 0; -1 would mean no samples).
+        match metrics.get("latency_p50_ms") {
+            Some(PsValue::Float(v)) => assert!(*v >= 0.0, "expected a latency sample, got {v}"),
+            other => panic!("latency_p50_ms missing or not a float: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

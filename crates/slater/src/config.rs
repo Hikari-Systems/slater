@@ -136,6 +136,14 @@ pub struct AppConfig {
     pub query: QueryConfig,
     #[serde(default)]
     pub vector_query: VectorQueryConfig,
+    /// Enable load-test diagnostics: maintain extra per-connection / per-query
+    /// counters and a latency histogram, and answer `CALL slater.diagnostics()`
+    /// with live RSS/CPU/cgroup, connection-cap headroom, and failure tallies.
+    /// OFF by default — when off, every record path is a single inert branch and
+    /// the introspection statement errors, so the normal hot path is unchanged.
+    /// Never enable on a production replica (it widens the observable surface).
+    #[serde(default = "default_false", deserialize_with = "de::bool")]
+    pub load_test_diagnostics: bool,
     /// How often to poll each graph's `current` pointer for a generation change.
     #[serde(default = "default_generation_poll_ms", deserialize_with = "de::u64")]
     pub generation_poll_ms: u64,
@@ -381,6 +389,9 @@ pub struct VectorQueryConfig {
 fn default_true() -> bool {
     true
 }
+fn default_false() -> bool {
+    false
+}
 fn default_data_dir() -> String {
     "/data".into()
 }
@@ -608,6 +619,28 @@ mod tests {
         let absent: AppConfig =
             serde_json::from_value(serde_json::json!({ "server": {} })).expect("absent default");
         assert!(absent.require_acl_stamp);
+    }
+
+    #[test]
+    fn load_test_diagnostics_defaults_off_and_parses_bool_and_string() {
+        // Absent ⇒ off, so the diagnostics surface and counters stay dormant
+        // unless explicitly enabled.
+        let absent: AppConfig =
+            serde_json::from_value(serde_json::json!({ "server": {} })).expect("absent default");
+        assert!(!absent.load_test_diagnostics);
+
+        // Raw bool and the stringified layered-loader form both enable it.
+        let from_bool: AppConfig = serde_json::from_value(
+            serde_json::json!({ "server": {}, "loadTestDiagnostics": true }),
+        )
+        .expect("raw bool loadTestDiagnostics");
+        assert!(from_bool.load_test_diagnostics);
+
+        let from_str: AppConfig = serde_json::from_value(
+            serde_json::json!({ "server": {}, "loadTestDiagnostics": "true" }),
+        )
+        .expect("stringified loadTestDiagnostics (layered-loader form)");
+        assert!(from_str.load_test_diagnostics);
     }
 
     #[test]

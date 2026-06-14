@@ -42,5 +42,6 @@
     "maxHops": 256
   },
   "generationPollMs": 5000,
-  "reloadStrategy": "exit"
+  "reloadStrategy": "exit",
+  "loadTestDiagnostics": false
 }

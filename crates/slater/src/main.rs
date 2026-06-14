@@ -21,7 +21,12 @@ fn main() -> anyhow::Result<()> {
     // hash for the ACL and exits; the health probe speaks Bolt (not HTTP, unlike
     // `hs_utils::healthcheck`), so we use a Bolt handshake probe.
     acl::hash_password_subcommand();
-    health::check_subcommand(config::load().map(|c| c.server.port).unwrap_or(7687));
+    let default_port = config::load().map(|c| c.server.port).unwrap_or(7687);
+    health::check_subcommand(default_port);
+    // `diagnostics` opens a Bolt session, runs `CALL slater.diagnostics()`, prints
+    // the snapshot as JSON, and exits — an operator/CI convenience over the same
+    // statement the load-test coordinator reads.
+    health::diagnostics_subcommand(default_port);
 
     let cfg = config::load()?;
     hs_utils::logging::init(&cfg.log.level);
