@@ -249,6 +249,31 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
     }
 }
 
+/// Assemble the walk-order node path `src → … → meet → … → dst` from a bidirectional
+/// search's two neighbour maps: `fpar` is `node -> (predecessor toward src, depth)` and
+/// `bpar` is `node -> (successor toward dst, depth)`.
+fn bidir_node_path(
+    src: u64,
+    dst: u64,
+    meet: u64,
+    fpar: &HashMap<u64, (u64, u32)>,
+    bpar: &HashMap<u64, (u64, u32)>,
+) -> Vec<u64> {
+    let mut nodes = vec![meet];
+    let mut cur = meet;
+    while cur != src {
+        cur = fpar.get(&cur).expect("forward chain to src").0;
+        nodes.push(cur);
+    }
+    nodes.reverse(); // [src, …, meet]
+    let mut cur = meet;
+    while cur != dst {
+        cur = bpar.get(&cur).expect("backward chain to dst").0;
+        nodes.push(cur);
+    }
+    nodes // [src, …, meet, …, dst]
+}
+
 impl Val {
     fn from_value(v: Value) -> Val {
         match v {
@@ -1724,28 +1749,27 @@ impl<'g> Engine<'g> {
     }
 
     /// `ANY SHORTEST` / `shortestPath()`: one shortest path between `src` and `dst`,
-    /// found by a single-source BFS with one *global* `visited` set plus a back-pointer
-    /// map (`node -> predecessor`). BFS first reaches every node along a shortest path,
-    /// and the reconstructed walk — following back-pointers from `dst` to `src` — is
-    /// automatically simple, so the returned length equals the loopless simple-path
-    /// search's. Because each node is enqueued at most once, the frontier is ≤ |V| and
-    /// total work is `O(V+E)`: the hub-dense small-world case that blows up the
-    /// cloned-`visited` search (kept for `AllShortest`/`ShortestK`) returns here in
-    /// milliseconds, so no `maxIntermediate` frontier charge is needed.
+    /// via **bidirectional** BFS — a forward search from `src` along the pattern
+    /// direction and a backward search from `dst` along the *reverse* direction,
+    /// expanding the smaller frontier each step until the two search spheres meet.
     ///
-    /// The working set is kept O(V) with a *small* constant so it stays bounded even
-    /// when the BFS explores a large fraction of a giant component (full Wikidata is
-    /// the motivating case): `visited` is a dense bitset (≈ node_count/8 bytes, ~11 MB
-    /// at 91.6 M nodes) rather than a `HashSet`, and `parent` stores only the
-    /// predecessor node id — the discovering `Hop` is re-derived from the CSR during
-    /// the back-walk (≤ `max` cheap adjacency lookups). An optional, *dedicated*
-    /// `maxShortestPathExplore` cap (0 = unlimited) bounds the discovery count for
-    /// tiny-memory deployments without touching the shared `maxIntermediate` budget.
+    /// Why bidirectional: on a small-world / scale-free graph the k-hop ball grows
+    /// roughly exponentially in k, so a one-sided BFS to depth `max` can touch a large
+    /// fraction of a giant component (≈766 M edge reads on full Wikidata → minutes,
+    /// I/O-bound). Meeting in the middle replaces one depth-`max` ball with two
+    /// depth-`max/2` balls — exponentially less work *and* memory. Each side keeps a
+    /// dense bitset `visited` (≈ node_count/8 bytes) plus a `node -> (neighbour, depth)`
+    /// map; the discovering `Hop`s are re-derived from the CSR during reconstruction,
+    /// so the resident structures stay small. The deadline is checked *within* a level
+    /// (every few thousand expansions) so a runaway search aborts at `timeoutMs` rather
+    /// than overrunning between levels. The optional, dedicated `maxShortestPathExplore`
+    /// cap (0 = unlimited) bounds the total nodes either search may hold, independent of
+    /// the shared `maxIntermediate` budget — preserving the always-succeeds guarantee
+    /// by default.
     ///
-    /// `max` caps the BFS depth; `min` filters whether the discovered `dst` is
-    /// admissible. `min == 0` with coincident endpoints admits the empty path. (For
-    /// `shortestPath()` `min ∈ {0, 1}`, so the discovered shortest distance always
-    /// meets it whenever a path exists.)
+    /// `max` caps the *total* path length; `min` filters the result. `min == 0` with
+    /// coincident endpoints admits the empty path. (For `shortestPath()` `min ∈ {0,1}`,
+    /// so the discovered shortest distance always meets it whenever a path exists.)
     fn any_shortest_path(
         &self,
         src: u64,
@@ -1764,83 +1788,133 @@ impl<'g> Engine<'g> {
             return Ok(Vec::new());
         }
 
-        // Dense bitset `visited` (node ids are 0..node_count) — one bit per node, vs a
-        // HashSet's ~16+ bytes/entry. `parent` keeps only predecessor ids; the hop is
-        // re-derived from the CSR at reconstruction time.
         let node_count = self.gen.node_count();
-        let mut visited = vec![0u64; ((node_count + 63) / 64) as usize];
-        let mut mark = |id: u64| -> bool {
-            let (w, b) = ((id >> 6) as usize, 1u64 << (id & 63));
-            let was = visited[w] & b != 0;
-            visited[w] |= b;
-            !was // true on first discovery
-        };
-        mark(src);
-        let mut parent: HashMap<u64, u64> = HashMap::new();
-        let mut frontier: Vec<u64> = vec![src];
-        let mut discovered: u64 = 1;
+        let words = ((node_count + 63) / 64) as usize;
+        let (mut fvis, mut bvis) = (vec![0u64; words], vec![0u64; words]);
+        let bit = |v: &[u64], id: u64| (v[(id >> 6) as usize] >> (id & 63)) & 1 != 0;
+        let set = |v: &mut [u64], id: u64| v[(id >> 6) as usize] |= 1u64 << (id & 63);
+        set(&mut fvis, src);
+        set(&mut bvis, dst);
+
         let cap = self.max_shortest_path_explore;
-        let mut depth = 0u32;
-        while !frontier.is_empty() && depth < max {
-            self.check_deadline()?;
+        let mut discovered: u64 = 2; // the two endpoints are already held resident
+        if cap != 0 && discovered > cap {
+            bail!("shortestPath exceeded the node cap of {cap} (query.maxShortestPathExplore)");
+        }
+
+        // `node -> (neighbour toward the seed, depth from the seed)`.
+        let mut fpar: HashMap<u64, (u64, u32)> = HashMap::new();
+        let mut bpar: HashMap<u64, (u64, u32)> = HashMap::new();
+        let (mut ffront, mut bfront) = (vec![src], vec![dst]);
+        let (mut fdepth, mut bdepth) = (0u32, 0u32);
+        let fdir = rel.dir;
+        let bdir = match rel.dir {
+            Direction::Outgoing => Direction::Incoming,
+            Direction::Incoming => Direction::Outgoing,
+            Direction::Undirected => Direction::Undirected,
+        };
+        let mut best: Option<(u32, u64)> = None; // (total length, meeting node)
+        let mut since_check = 0u64;
+
+        loop {
+            let combined = fdepth + bdepth;
+            let bound = best.map(|(b, _)| b.min(max)).unwrap_or(max);
+            // No future meeting can be shorter than `combined + 1`, so once the two
+            // radii sum to the best-so-far (or `max`) we are done.
+            if combined >= bound || ffront.is_empty() || bfront.is_empty() {
+                break;
+            }
+
+            // Expand whichever frontier is smaller (the bidirectional speed-up).
+            let forward = ffront.len() <= bfront.len();
+            let (front, dir, depth) = if forward {
+                (&ffront, fdir, fdepth + 1)
+            } else {
+                (&bfront, bdir, bdepth + 1)
+            };
             let mut next = Vec::new();
-            for &node in &frontier {
-                for hop in self.expand_one_hop(node, rel, &empty)? {
+            for &node in front {
+                for hop in self.expand_with_dir(node, rel, dir, &empty)? {
                     let nb = hop.neighbour;
-                    if !mark(nb) {
-                        continue; // already discovered on a ≤-length shortest path
+                    let (mine, theirs) = if forward {
+                        (&mut fvis, &bvis)
+                    } else {
+                        (&mut bvis, &fvis)
+                    };
+                    if bit(mine, nb) {
+                        continue; // already on a ≤-length shortest path this side
                     }
+                    set(mine, nb);
                     discovered += 1;
                     if cap != 0 && discovered > cap {
                         bail!(
-                            "shortestPath exceeded the exploration cap of {cap} nodes \
+                            "shortestPath exceeded the node cap of {cap} \
                              (query.maxShortestPathExplore)"
                         );
                     }
-                    parent.insert(nb, node);
-                    if nb == dst {
-                        // First discovery sits at `dst`'s shortest distance from `src`
-                        // (= depth + 1); admissible only if it meets `min`.
-                        if depth + 1 >= min {
-                            return Ok(vec![self.reconstruct_shortest(src, dst, rel, &parent)?]);
+                    if forward {
+                        fpar.insert(nb, (node, depth));
+                    } else {
+                        bpar.insert(nb, (node, depth));
+                    }
+                    if bit(theirs, nb) {
+                        // The other search already reached `nb`: its depth there is the
+                        // seed (0) or the recorded value.
+                        let other = if forward { &bpar } else { &fpar };
+                        let other_seed = if forward { dst } else { src };
+                        let od = if nb == other_seed {
+                            0
+                        } else {
+                            other.get(&nb).map(|&(_, d)| d).unwrap_or(0)
+                        };
+                        let total = depth + od;
+                        if total >= min && best.map(|(b, _)| total < b).unwrap_or(true) {
+                            best = Some((total, nb));
                         }
-                        return Ok(Vec::new());
                     }
                     next.push(nb);
+                    since_check += 1;
+                    if since_check >= 4096 {
+                        self.check_deadline()?;
+                        since_check = 0;
+                    }
                 }
             }
-            frontier = next;
-            depth += 1;
+            if forward {
+                ffront = next;
+                fdepth = depth;
+            } else {
+                bfront = next;
+                bdepth = depth;
+            }
         }
-        Ok(Vec::new())
+
+        match best {
+            Some((total, meet)) if total >= min && total <= max => {
+                let nodes = bidir_node_path(src, dst, meet, &fpar, &bpar);
+                Ok(vec![self.reconstruct_from_node_path(&nodes, rel)?])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
-    /// Rebuild the hop sequence src→dst from a predecessor map, re-deriving each
-    /// discovering [`Hop`] from the CSR (the BFS stored only predecessor ids to keep
-    /// its working set small). For each step `prev -> cur` we take the first edge of
-    /// the pattern's type from `prev` that lands on `cur`; any such edge is a valid
+    /// Rebuild the hop sequence for a node path (consecutive ids in walk order),
+    /// re-deriving each [`Hop`] from the CSR — the bidirectional search stored only
+    /// neighbour ids to keep its working set small. For each step `u -> v` we take the
+    /// first pattern-typed edge from `u` that lands on `v`; any such edge is a valid
     /// shortest-path edge (parallel multi-edges are interchangeable for `AnyShortest`).
-    fn reconstruct_shortest(
-        &self,
-        src: u64,
-        dst: u64,
-        rel: &RelPat,
-        parent: &HashMap<u64, u64>,
-    ) -> Result<Vec<Hop>> {
+    fn reconstruct_from_node_path(&self, nodes: &[u64], rel: &RelPat) -> Result<Vec<Hop>> {
         let empty = HashMap::new();
-        let mut hops = Vec::new();
-        let mut cur = dst;
-        while cur != src {
-            let prev = *parent.get(&cur).expect("back-pointer chain to src");
+        let mut hops = Vec::with_capacity(nodes.len().saturating_sub(1));
+        for w in nodes.windows(2) {
+            let (u, v) = (w[0], w[1]);
             let hop = self
-                .expand_one_hop(prev, rel, &empty)?
+                .expand_with_dir(u, rel, rel.dir, &empty)?
                 .into_iter()
-                .find(|h| h.neighbour == cur)
-                .expect("discovering edge re-derivable from the CSR");
+                .find(|h| h.neighbour == v)
+                .expect("path edge re-derivable from the CSR");
             hops.push(hop);
-            cur = prev;
         }
-        hops.reverse();
         Ok(hops)
     }
 
@@ -3272,6 +3346,21 @@ impl<'g> Engine<'g> {
         rel: &RelPat,
         binding: &HashMap<String, Val>,
     ) -> Result<Vec<Hop>> {
+        self.expand_with_dir(node, rel, rel.dir, binding)
+    }
+
+    /// As [`Self::expand_one_hop`] but with an explicit traversal `dir`, overriding
+    /// `rel.dir`. The bidirectional `shortestPath()` search uses this to walk the
+    /// *reverse* of the pattern direction outward from `dst` (so an `(a)-[:T]->(b)`
+    /// search expands `dst` over incoming `:T` edges). Type alternation and the
+    /// relationship property predicate are still taken from `rel`.
+    fn expand_with_dir(
+        &self,
+        node: u64,
+        rel: &RelPat,
+        dir: Direction,
+        binding: &HashMap<String, Val>,
+    ) -> Result<Vec<Hop>> {
         // Resolve the relationship-type constraint once, before the per-edge loop.
         // The overwhelmingly common shapes — untyped, a single `:T`, or a `:T1|T2`
         // alternation — collapse to a flat reltype-id set so the hot loop stays a
@@ -3290,7 +3379,7 @@ impl<'g> Engine<'g> {
         // (adjacency list, `incoming`) — for an incoming edge the stored direction
         // is neighbour→node, so start/end are swapped relative to an outgoing one.
         let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
-        match rel.dir {
+        match dir {
             Direction::Outgoing => sources.push((self.outgoing(node)?, false)),
             Direction::Incoming => sources.push((self.incoming(node)?, true)),
             Direction::Undirected => {
@@ -8690,6 +8779,17 @@ mod tests {
             .expect("the default unlimited cap must succeed");
         assert_eq!(col0(&res), vec!["1"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shortest_path_meets_in_the_middle() {
+        // A length-2 shortest path exercises the bidirectional search's meet-in-middle
+        // and reconstruction *across* the meeting node — the endpoints share no direct
+        // edge; the path is Acme -WORKS_AT- Alice -KNOWS- Bob (undirected, mixed type).
+        let q = "MATCH (a:Company {name:'Acme'}), (b:Person {name:'Bob'}) \
+                 RETURN length(shortestPath((a)-[*..6]-(b))) AS l";
+        let res = run_budgeted("exec_sp_midmeet", 1_000_000, q).expect("a length-2 path exists");
+        assert_eq!(col0(&res), vec!["2"]);
     }
 
     #[test]
