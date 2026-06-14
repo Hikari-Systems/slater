@@ -1288,8 +1288,8 @@ fn build_inner(
     })?;
 
     let mut rev_sorter = ExtSorter::<EdgeRev>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-    let mut final_edge_id = 0u64;
-    for r in fwd_sorter.sorted()? {
+    for (final_edge_id, r) in fwd_sorter.sorted()?.enumerate() {
+        let final_edge_id = final_edge_id as u64;
         let ef = r?;
         csr.push(
             ef.final_src,
@@ -1318,7 +1318,6 @@ fn build_inner(
             final_src: ef.final_src,
             reltype: ef.reltype,
         })?;
-        final_edge_id += 1;
     }
     csr.finish_half()?; // forward records 0..N
     for r in rev_sorter.sorted()? {

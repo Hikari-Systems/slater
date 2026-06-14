@@ -374,7 +374,9 @@ mod tests {
             // would drop it first). Run files exist while it lives…
             let mut it = s.sorted().unwrap();
             assert!(count_runs(&dir) > 0, "expected spilled run files to exist");
-            while let Some(r) = it.next() {
+            // Iterate by reference so `it` stays alive to the end of the block (the
+            // run files exist only while it does); a by-value `for` would drop it early.
+            for r in it.by_ref() {
                 r.unwrap();
             }
         }

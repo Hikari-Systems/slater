@@ -185,11 +185,11 @@ where
 
     // 3) Place any node with no edges (never seen in the adjacency) for balance.
     let mut rr = 0usize;
-    for v in 0..n {
-        if part_of[v] == UNASSIGNED {
+    for slot in part_of.iter_mut() {
+        if *slot == UNASSIGNED {
             let pp = rr;
             rr = (rr + 1) % p;
-            part_of[v] = pp as u32;
+            *slot = pp as u32;
             load[pp] += 1;
         }
     }

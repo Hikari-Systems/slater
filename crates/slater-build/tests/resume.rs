@@ -172,7 +172,7 @@ fn resume_mid_pass1() {
         "scratch must be cleaned up"
     );
 
-    let m = Manifest::read_from_dir(&graph_dir.join(current.trim())).unwrap();
+    let m = Manifest::read_from_dir(graph_dir.join(current.trim())).unwrap();
     m.verify_content_hash().unwrap();
     assert_eq!(m.node_count, 3);
     assert_eq!(m.edge_count, 2);

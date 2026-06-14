@@ -279,7 +279,7 @@ fn neighbours_par(
     let mut take = |global: u64| -> Result<()> {
         let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
         for a in topology::decode_adj(&rec)? {
-            if type_ids.is_none_or(|ids| ids.contains(&a.reltype)) {
+            if type_ids.map_or(true, |ids| ids.contains(&a.reltype)) {
                 out.push(a.neighbour.0);
             }
         }
@@ -730,7 +730,7 @@ fn par_gather<I: Sync, T: Send>(
 ) -> Result<Vec<T>> {
     match pool {
         Some(p) if items.len() >= min_batch => p.install(|| items.par_iter().map(&f).collect()),
-        _ => items.iter().map(|x| f(x)).collect(),
+        _ => items.iter().map(&f).collect(),
     }
 }
 
@@ -2259,7 +2259,7 @@ impl<'g> Engine<'g> {
         }
 
         let node_count = self.gen.node_count();
-        let words = ((node_count + 63) / 64) as usize;
+        let words = node_count.div_ceil(64) as usize;
         let (mut fvis, mut bvis) = (vec![0u64; words], vec![0u64; words]);
         let bit = |v: &[u64], id: u64| (v[(id >> 6) as usize] >> (id & 63)) & 1 != 0;
         let set = |v: &mut [u64], id: u64| v[(id >> 6) as usize] |= 1u64 << (id & 63);
@@ -4489,8 +4489,8 @@ impl<'g> Engine<'g> {
             .collect();
         let has_group_item = !group_slots.is_empty();
         let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
-        for ri in 0..table.rows.len() {
-            let key = GroupKey(group_slots.iter().map(|&s| cells[ri][s].clone()).collect());
+        for (ri, row) in cells.iter().enumerate() {
+            let key = GroupKey(group_slots.iter().map(|&s| row[s].clone()).collect());
             if !groups.contains_key(&key) {
                 self.charge(1)?; // charge each newly-created group (mirrors sequential)
             }

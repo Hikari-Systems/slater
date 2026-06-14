@@ -85,6 +85,7 @@ struct Top {
 }
 
 /// Compress, optionally seal, and write one key-block; record its top-level entry.
+#[allow(clippy::too_many_arguments)] // a cohesive write step; bundling into a struct would not aid clarity
 fn flush_isam_block(
     file: &mut BufWriter<File>,
     offset: &mut u64,
