@@ -20,7 +20,7 @@ license = "Apache-2.0"
 # Shared house utilities: config layering, logging init, deserialisers.
 # config/logging/healthcheck are NOT feature-gated, so default-features = false
 # pulls none of the actix/sqlx stack — exactly what a Bolt server wants.
-hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.16.0", default-features = false }
+hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.17.0", default-features = false }
 
 # Workspace-internal.
 graph-format = { path = "crates/graph-format" }
