@@ -24,6 +24,13 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   fanout-capped pool + one order-preserving helper, reused by all per-query operators (the
   shortestPath fast-path gather now calls it). `build_shortest_path_pool` → `build_fanout_pool`
   (thread name `slater-q-{i}`), `ConnCtx.fanout_pool`, `Engine.fanout_pool`/`with_fanout_pool`.
+- (Task 8) — **parallel brute-force kNN**. `read_vector(gen, cache, global)` Sync reader +
+  `KNN_PAR_MIN = 256`; `vector_group` now `par_gather`s the candidate reads. `vector::brute_force_knn_par`
+  scores `par_chunks` (one per worker) → per-chunk top-k → single-threaded merge with the same
+  `(score asc, node id asc)` comparator, so the result is identical to sequential element-for-element.
+  Wired into `apply_vector_call`'s `AnnMode::BruteForce` arm. Tests: `vector::knn_par_matches_sequential`
+  (rayon branch, all metrics, k incl. > group), `knn_par_falls_back_below_threshold_and_without_pool`,
+  `knn_par_propagates_dimension_mismatch`, `exec::vector_knn_with_pool_is_correct` (pool wiring).
 
 ## The reusable pattern
 

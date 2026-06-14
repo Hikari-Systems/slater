@@ -285,6 +285,22 @@ fn neighbours_par(
     Ok(out)
 }
 
+/// Read one vector-index record `global` from `vectors.f32.blk` **through the block
+/// cache** (D18), decoding its dense node id + full-precision vector. The Sync reader
+/// behind the parallel brute-force kNN gather — it takes only `&Generation`/`&BlockCache`
+/// (both `Send + Sync`) so it can run off-thread; mirrors [`Engine::vector_group`]'s
+/// per-record body.
+fn read_vector(gen: &Generation, cache: &BlockCache, global: u64) -> Result<VectorEntry> {
+    let rec = cache.record(gen.vectors().inner(), gen.uuid(), FileKind::Vectors, global)?;
+    vectors::decode_vector(&rec)
+}
+
+/// Minimum vector-group / candidate count below which brute-force kNN reads and
+/// scoring run sequentially — the rayon fan-out overhead isn't worth it for a small
+/// group (and the live estate is entirely below the ANN threshold, so most groups are
+/// small). Above it, both the candidate reads and the distance/top-k scan parallelize.
+const KNN_PAR_MIN: usize = 256;
+
 /// Map `f` over `items` on the shared fanout pool (or sequentially when the pool is
 /// absent or `items` is smaller than `min_batch`), preserving input order. `f` must
 /// read only Sync state (&Generation/&BlockCache) — never the !Sync Engine.
@@ -829,17 +845,15 @@ impl<'g> Engine<'g> {
     /// `vectors.f32.blk` **through the block cache** (D18) — the brute-force KNN
     /// candidate set. Each record decodes to its dense node id + full-precision
     /// vector; the group is contiguous (D10), so this touches only that index's
-    /// blocks and they stay warm for repeat queries.
+    /// blocks and they stay warm for repeat queries. When a fanout pool is
+    /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
+    /// (cache lookup + zstd decode) gather in parallel, preserving record order.
     fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
-        let reader = self.gen.vectors().inner();
-        let mut out = Vec::with_capacity(count as usize);
-        for global in first_record..first_record + count {
-            let rec = self
-                .cache
-                .record(reader, self.gen.uuid(), FileKind::Vectors, global)?;
-            out.push(vectors::decode_vector(&rec)?);
-        }
-        Ok(out)
+        let ids: Vec<u64> = (first_record..first_record + count).collect();
+        let (gen, cache) = (self.gen, self.cache);
+        par_gather(self.fanout_pool.as_deref(), &ids, KNN_PAR_MIN, |&g| {
+            read_vector(gen, cache, g)
+        })
     }
 
     /// A node's value for property `key`, or `Null` if absent. (An embedding
@@ -2898,9 +2912,14 @@ impl<'g> Engine<'g> {
             // brute force scans every candidate exactly; Vamana navigates by PQ in
             // resident memory and re-ranks the beam exactly (D32).
             let neighbours = match &mode {
-                AnnMode::BruteForce => {
-                    vector::brute_force_knn(entries.as_ref().unwrap(), &query, k, metric)?
-                }
+                AnnMode::BruteForce => vector::brute_force_knn_par(
+                    self.fanout_pool.as_deref(),
+                    entries.as_ref().unwrap(),
+                    &query,
+                    k,
+                    metric,
+                    KNN_PAR_MIN,
+                )?,
                 AnnMode::Vamana { medoid, .. } => {
                     self.vamana_knn(&vc.label, &vc.property, *medoid, metric, &query, k)?
                 }
@@ -9006,6 +9025,45 @@ mod tests {
         }
         // First hit is the exact match: distance ~0.
         assert!(matches!(res.rows[0][0], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vector_knn_with_pool_is_correct() {
+        // A pool-configured engine returns the identical (id, score) kNN rows as the
+        // sequential engine. The fixture group is tiny (below KNN_PAR_MIN), so this
+        // pins the pool wiring + sequential-fallback path end to end; the `vector`
+        // unit test exercises the rayon chunked read/score branch directly.
+        let (root, graph, _) = testgen::write_basic("exec_knn_pool");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let q = "CALL db.idx.vector.queryNodes('Person', 'embedding', 3, vecf32([0.1, 0.2, 0.3])) \
+                 YIELD node, score RETURN id(node) AS id, score";
+        let res = Engine::new(&gen, &cache)
+            .with_fanout_pool(Some(pool))
+            .run(&parser::parse(q).unwrap())
+            .expect("pool-configured kNN runs");
+        let want = reference_knn(&[0.1, 0.2, 0.3], 3);
+        assert_eq!(res.rows.len(), want.len());
+        for (got, (wid, wscore)) in res.rows.iter().zip(&want) {
+            let Val::Int(id) = got[0] else {
+                panic!("id should be an integer, got {:?}", got[0]);
+            };
+            let Val::Float(score) = got[1] else {
+                panic!("score should be a float, got {:?}", got[1]);
+            };
+            assert_eq!(id as u64, *wid);
+            assert!(
+                (score - wscore).abs() < 1e-6,
+                "score {score} vs reference {wscore}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 use graph_format::manifest::Metric;
 use graph_format::vectors::VectorEntry;
@@ -141,6 +142,50 @@ pub fn brute_force_knn(
     Ok(scored)
 }
 
+/// Parallel brute-force kNN over a vector index group — identical contract and result
+/// to [`brute_force_knn`].
+///
+/// When `pool` is present, `k > 0`, and `entries.len() >= min_par`, the group is split
+/// into one chunk per worker thread; each chunk is scored exactly and reduced to its own
+/// top-`k`, then the per-chunk lists are merged with the same `(score ascending, node id
+/// ascending)` comparator and truncated. Because the merge re-sorts globally and node ids
+/// are unique, the output matches the sequential scan element-for-element regardless of
+/// chunk boundaries. Falls back to [`brute_force_knn`] below the threshold or with no pool.
+pub fn brute_force_knn_par(
+    pool: Option<&rayon::ThreadPool>,
+    entries: &[VectorEntry],
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    min_par: usize,
+) -> Result<Vec<Neighbour>> {
+    let pool = match pool {
+        Some(p) if k > 0 && entries.len() >= min_par => p,
+        _ => return brute_force_knn(entries, query, k, metric),
+    };
+    // One chunk per worker keeps the per-chunk top-k bounded (≤ k each) and the merge
+    // small. `brute_force_knn` over a chunk scores it exactly and reduces to its top-k.
+    let chunk = entries
+        .len()
+        .div_ceil(pool.current_num_threads().max(1))
+        .max(1);
+    let partials: Vec<Vec<Neighbour>> = pool.install(|| {
+        entries
+            .par_chunks(chunk)
+            .map(|c| brute_force_knn(c, query, k, metric))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    // Merge the per-chunk top-k lists with the global comparator, then keep the best k.
+    let mut merged: Vec<Neighbour> = partials.into_iter().flatten().collect();
+    merged.sort_by(|a, b| {
+        a.score
+            .total_cmp(&b.score)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    merged.truncate(k);
+    Ok(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +270,80 @@ mod tests {
         let err = brute_force_knn(&entries, &[1.0, 0.0], 1, Metric::Cosine)
             .err()
             .unwrap();
+        assert!(err.to_string().contains("dimension"), "got: {err}");
+    }
+
+    /// A deterministic spread of vectors, large enough to cross several rayon chunks.
+    fn spread(n: u64) -> Vec<VectorEntry> {
+        (0..n)
+            .map(|i| {
+                let a = (i % 17) as f32 * 0.13 - 1.0;
+                let b = (i % 31) as f32 * 0.07 + 0.5;
+                let c = ((i * 7) % 23) as f32 * 0.05;
+                entry(i, &[a, b, c])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn knn_par_matches_sequential() {
+        // The chunked parallel scan must return the exact same ordered (id, score)
+        // list as the sequential scan across metrics and a range of k (including
+        // k > group size). `min_par = 1` forces the rayon branch even for the pool.
+        let entries = spread(1000);
+        let query = [0.3f32, -0.2, 0.8];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            for k in [1usize, 5, 50, 999, 1000, 2000] {
+                let seq = brute_force_knn(&entries, &query, k, metric).unwrap();
+                let par = brute_force_knn_par(Some(&pool), &entries, &query, k, metric, 1).unwrap();
+                assert_eq!(seq, par, "metric {metric:?}, k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn knn_par_falls_back_below_threshold_and_without_pool() {
+        let entries = spread(50);
+        let query = [0.1f32, 0.2, 0.3];
+        let seq = brute_force_knn(&entries, &query, 5, Metric::Cosine).unwrap();
+        // No pool → sequential.
+        assert_eq!(
+            brute_force_knn_par(None, &entries, &query, 5, Metric::Cosine, 1).unwrap(),
+            seq
+        );
+        // Pool present but group below `min_par` → sequential fallback, still correct.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(
+            brute_force_knn_par(Some(&pool), &entries, &query, 5, Metric::Cosine, 256).unwrap(),
+            seq
+        );
+    }
+
+    #[test]
+    fn knn_par_propagates_dimension_mismatch() {
+        let mut entries = spread(300);
+        entries[200] = entry(200, &[1.0, 0.0]); // a 2-dim entry in a 3-dim group
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let err = brute_force_knn_par(
+            Some(&pool),
+            &entries,
+            &[0.1, 0.2, 0.3],
+            5,
+            Metric::Cosine,
+            1,
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("dimension"), "got: {err}");
     }
 }
