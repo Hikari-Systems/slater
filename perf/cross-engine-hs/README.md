@@ -270,7 +270,7 @@ completed (`n.m.`).
 
 | anon RSS | slater | Neo4j 5 |
 |---|--:|--:|
-| idle | 71 MiB | — |
+| idle | **71 MiB** | 1344 MiB |
 | shortestPath sweep | 700 MiB (fanout 1) · 925 MiB (fanout 8) | **2911 MiB** |
 
 (Embedded **LadybugDB** has no server cgroup; its `ru_maxrss` on the count/point/degree/
@@ -280,8 +280,9 @@ that stay bounded; its hub expansion blows past ~7 GiB, §.)
 This is the thesis at full strength: serving a **766M-edge** graph, slater's resident
 footprint stays **sub-GiB** (idle 71 MiB) and tracks the *query working set*, not the
 graph — while Neo4j sits at a committed **~2.9 GiB** (its 2 GiB heap + off-heap buffers,
-the same ~2.87 GiB on the fast-query sweep) regardless of query, and the two in-memory
-engines can't load the graph at all. slater is **sole-fastest on count / point / degree
+the same ~2.87 GiB on the fast-query sweep) regardless of query, and even **idle** holds
+**1.3 GiB** of committed JVM heap (~19× slater's 71 MiB). The two in-memory engines can't
+load the graph at all. slater is **sole-fastest on count / point / degree
 / 1-hop / 3-hop / var-length** — it answers `count` from generation metadata (0.58 ms vs
 Neo4j's ~4 s disk scan, ≈7000×) and the point/degree/hop shapes at 3–11× Neo4j — ties on
 the cold 2-hop, and is faster on shortestPath. Notes:
