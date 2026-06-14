@@ -32,6 +32,29 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   (rayon branch, all metrics, k incl. > group), `knn_par_falls_back_below_threshold_and_without_pool`,
   `knn_par_propagates_dimension_mismatch`, `exec::vector_knn_with_pool_is_correct` (pool wiring).
 
+- (Task 9) — **parallel multi-hop / fixed-length chain expansion**. `expand_chain_par` →
+  `par_walk` (gated by `chain_parallelizable`: pool present + non-quantified chain of ≥1
+  fixed-length, property-free rels — **and** `cap.is_none()`) walks the chain from each anchor in
+  **bounded breadth batches**: each batch's adjacency reads `par_gather` via the new Sync reader
+  `hops_par` (mirrors `expand_with_dir` minus `rel_ok`); the merge (`node_ok`/next-var
+  guard/`charge()`/path binding) is single-threaded in input order. Batches expand depth-first on
+  in-order prefixes, so rows, order and the charge sequence are byte-for-byte identical to the
+  sequential `expand_chain`. **Two memory bounds** (the budget only charges at completion, so an
+  uncharged frontier must be bounded structurally): `EXPAND_BATCH=512` flushes the next-hop
+  frontier depth-first (bounds live *branch* count); `EXPAND_READ_CHUNK=64` reads adjacency in
+  node-chunks freed per chunk (bounds the live *read* buffer — a 512-node frontier of hubs
+  otherwise buffers ~14M edges in one `neigh`, where the sequential walk holds only one node's →
+  was a 14 GiB OOM before this). A dense chain now fails cleanly at `maxIntermediate` like
+  sequential. **`cap.is_none()` gate**: a pushed `LIMIT` routes to the sequential early-exit DFS
+  (breadth would over-read a high-degree frontier). Var-length / property-bearing rels stay
+  sequential too. `resolve_type_filter` factored out of `expand_with_dir`. Wired into
+  `match_single_pattern`'s anchor loop. **Perf** (full Wikidata 91.6M/766M, hub pool, maxFanout
+  1→8): 2-hop count 127.9→60.3 ms (**2.1×**), 3-hop count 923→503 ms (**1.8×**), counts
+  byte-identical, 3-hop trips the 1M budget cleanly under both (no OOM); anon RSS 1.6→5.2 GiB
+  (bounded; opt-in). Harness `perf/cross-engine-hs/bench_multihop.py` (uncapped count-based
+  multi-hop over high-degree hubs — the existing `LIMIT 100` 2-hop/3-hop suite stays sequential
+  by the `cap` gate). Test: `exec::multi_hop_with_pool_matches_sequential`.
+
 ## The reusable pattern
 
 > **gather** a set of independent sub-operations — each doing only `&Generation` + `&BlockCache`

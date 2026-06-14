@@ -113,6 +113,17 @@ impl Hop {
     }
 }
 
+/// One in-flight branch of the parallel chain walk ([`Engine::expand_chain_par`]):
+/// the node reached so far, the bindings accumulated along the way (cloned per
+/// branch — the sequential walk's mutate-in-place frame can't be shared across a
+/// live breadth of branches), and the path hops (tracked only when the pattern
+/// binds a path variable, else left empty to avoid the clone).
+struct ChainBranch {
+    cur: u64,
+    binding: HashMap<String, Val>,
+    walk: Vec<Hop>,
+}
+
 // ── Runtime value ─────────────────────────────────────────────────────────────
 
 /// A value flowing through the executor. Extends the stored [`Value`] with the
@@ -284,6 +295,104 @@ fn neighbours_par(
     }
     Ok(out)
 }
+
+/// Resolve a relationship pattern's type constraint once, before a per-edge loop.
+/// The common positive shapes (untyped, `:T`, `:T1|T2`) collapse to a flat
+/// reltype-id set for a plain integer membership test; only a genuine boolean type
+/// expression (`&`/`!`) keeps the AST for per-edge evaluation. Used by both
+/// [`Engine::expand_with_dir`] and the parallel [`hops_par`] reader; touches only
+/// the (Sync) symbol table, so it is safe to call before fanning out.
+fn resolve_type_filter<'a>(gen: &Generation, rel: &'a RelPat) -> Option<TypeFilter<'a>> {
+    rel.type_expr.as_ref().map(|e| match e.positive_atoms() {
+        Some(names) => TypeFilter::AnyOf(names.iter().filter_map(|t| gen.reltype_id(t)).collect()),
+        None => TypeFilter::Expr(e),
+    })
+}
+
+/// Thread-safe single-node hop expansion behind the parallel multi-hop walk
+/// (Task 9): read+decode `node`'s adjacency in direction `dir` through the (Sync)
+/// block cache, yielding one [`Hop`] per edge whose type passes `tf` (`None` = any
+/// type). Mirrors [`Engine::expand_with_dir`] **minus** the relationship-property
+/// predicate (`rel_ok`): the parallel path is gated to property-free rels (see
+/// [`Engine::chain_parallelizable`]), so no `!Sync` per-edge evaluation is needed.
+/// Outgoing edges precede incoming for an undirected hop, and `start`/`end` carry
+/// the stored src→dst direction — both exactly as the sequential reader, so the hop
+/// order (and thus the emitted-row order) is identical.
+fn hops_par(
+    gen: &Generation,
+    cache: &BlockCache,
+    node: u64,
+    dir: Direction,
+    tf: Option<&TypeFilter>,
+) -> Result<Vec<Hop>> {
+    let topo = gen.topology();
+    let read = |global: u64| -> Result<Vec<topology::Adj>> {
+        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+        topology::decode_adj(&rec)
+    };
+    let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
+    match dir {
+        Direction::Outgoing => sources.push((read(topo.outgoing_global(NodeId(node)))?, false)),
+        Direction::Incoming => sources.push((read(topo.incoming_global(NodeId(node)))?, true)),
+        Direction::Undirected => {
+            sources.push((read(topo.outgoing_global(NodeId(node)))?, false));
+            sources.push((read(topo.incoming_global(NodeId(node)))?, true));
+        }
+    }
+    let mut out = Vec::new();
+    for (adjs, incoming) in sources {
+        for a in adjs {
+            match tf {
+                None => {}
+                Some(TypeFilter::AnyOf(ids)) => {
+                    if !ids.contains(&a.reltype) {
+                        continue;
+                    }
+                }
+                Some(TypeFilter::Expr(e)) => {
+                    if !e.eval(&|name| gen.reltype_id(name) == Some(a.reltype)) {
+                        continue;
+                    }
+                }
+            }
+            let (start, end) = if incoming {
+                (a.neighbour.0, node)
+            } else {
+                (node, a.neighbour.0)
+            };
+            out.push(Hop {
+                edge: a.edge.0,
+                neighbour: a.neighbour.0,
+                reltype: a.reltype,
+                start,
+                end,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Minimum frontier size below which a parallel multi-hop level's adjacency reads
+/// run sequentially — the rayon fan-out overhead isn't worth it for a narrow
+/// frontier (the same threshold the shortestPath frontier uses). Above it, the
+/// per-node reads gather on the shared fanout pool.
+const EXPAND_PAR_MIN: usize = 64;
+
+/// Branch-flush size for the parallel chain walk ([`Engine::par_walk`]): the
+/// next-hop frontier is recursed depth-first once it reaches `EXPAND_BATCH`
+/// branches, so live branch memory stays `O(EXPAND_BATCH × chain length)` instead
+/// of the chain's exponential fan-out. (Bounds *branch* count; the read buffer is
+/// bounded separately by [`EXPAND_READ_CHUNK`].)
+const EXPAND_BATCH: usize = 512;
+
+/// Node-chunk size for the parallel chain walk's adjacency reads: a chunk's edges
+/// gather into one buffer that is freed before the next chunk reads, bounding live
+/// read memory to `O(EXPAND_READ_CHUNK × degree)` — one chunk's worth. Decoupled
+/// from [`EXPAND_BATCH`] because a *branch* is tiny but a high-degree node's
+/// *adjacency* is not: reading a whole 512-branch frontier of hubs at once buffers
+/// tens of millions of edges, where the sequential walk holds only one node's. Set
+/// to [`EXPAND_PAR_MIN`] so each chunk is exactly at the pool's fan-out threshold.
+const EXPAND_READ_CHUNK: usize = EXPAND_PAR_MIN;
 
 /// Read one vector-index record `global` from `vectors.f32.blk` **through the block
 /// cache** (D18), decoding its dense node id + full-precision vector. The Sync reader
@@ -3128,6 +3237,16 @@ impl<'g> Engine<'g> {
         // neighbour. `node_ok` still sees the pre-anchor scope (the anchor's own
         // var intentionally absent, as before), since `frame` is restored to the
         // base binding between candidates.
+        // The chain shape (rels, props, var-length) is the same for every anchor, so
+        // decide once whether each anchor's expansion uses the parallel breadth-first
+        // walk (Task 9) or the sequential depth-first one. A pushed `LIMIT` (`cap`)
+        // disables it: the breadth-first walk would eagerly read a whole hop level
+        // before the cap could stop it, over-reading a high-degree frontier the
+        // depth-first early-exit would have skipped — so capped chains stay sequential
+        // (the plan's early-exit rule). Uncapped chains (counts, aggregates, DISTINCT,
+        // un-LIMITed returns) genuinely need the whole neighbourhood, so the parallel
+        // reads are pure overlap with no wasted work.
+        let parallel = cap.is_none() && self.chain_parallelizable(pattern);
         let mut frame = binding.clone();
         let mut walk = Vec::new();
         for c in candidates {
@@ -3143,8 +3262,12 @@ impl<'g> Engine<'g> {
                 .var
                 .as_ref()
                 .map(|v| (v.clone(), frame.insert(v.clone(), Val::Node(c))));
-            debug_assert!(walk.is_empty());
-            self.expand_chain(pattern, 0, c, &mut frame, c, &mut walk, out, cap)?;
+            if parallel {
+                self.expand_chain_par(pattern, c, &frame, out, cap)?;
+            } else {
+                debug_assert!(walk.is_empty());
+                self.expand_chain(pattern, 0, c, &mut frame, c, &mut walk, out, cap)?;
+            }
             if let Some((v, old)) = prev {
                 restore_binding(&mut frame, v, old);
             }
@@ -3209,6 +3332,159 @@ impl<'g> Engine<'g> {
             return None;
         }
         Some(reverse_pattern(pattern))
+    }
+
+    /// Whether `pattern`'s chain qualifies for the parallel breadth-first expansion
+    /// ([`Self::expand_chain_par`], Task 9): a fanout pool is configured and the
+    /// pattern is a plain (non-quantified) chain of at least one **fixed-length,
+    /// property-free** relationship. Property-bearing rels need `rel_ok` (which calls
+    /// the `!Sync` evaluator) and variable-length rels recurse through `varlen`
+    /// (which charges the budget mid-recursion); both stay on the sequential
+    /// [`Self::expand_chain`] path. Node-side labels/props are unrestricted — they are
+    /// re-checked single-threaded in the merge.
+    fn chain_parallelizable(&self, pattern: &Pattern) -> bool {
+        self.fanout_pool.is_some()
+            && pattern.segments.is_none()
+            && !pattern.rels.is_empty()
+            && pattern
+                .rels
+                .iter()
+                .all(|(r, _)| r.var_length.is_none() && r.props.is_empty())
+    }
+
+    /// Parallel counterpart to [`Self::expand_chain`] for a fixed-length,
+    /// property-free chain (gated by [`Self::chain_parallelizable`]). Walks the chain
+    /// from anchor `cur` in **bounded breadth batches** ([`Self::par_walk`]): each
+    /// batch's adjacency reads gather on the shared fanout pool ([`hops_par`]), then
+    /// the merge runs **single-threaded in input order** — `node_ok` + next-var
+    /// binding checks, the intermediate budget `charge()`, and the path binding. Only
+    /// the adjacency I/O overlaps.
+    ///
+    /// Batches are expanded depth-first (an in-order prefix of the frontier, fully
+    /// expanded before the next), so the emitted rows, their order, and the charge
+    /// sequence are byte-for-byte identical to the sequential depth-first walk — while
+    /// live memory stays bounded by `EXPAND_BATCH × chain length` instead of the whole
+    /// exponential frontier. That bound is what keeps a dense chain failing *cleanly*
+    /// at `maxIntermediate` (charged at completion, exactly as `expand_chain`) rather
+    /// than ballooning RSS before the first charge.
+    fn expand_chain_par(
+        &self,
+        pattern: &Pattern,
+        cur: u64,
+        base: &HashMap<String, Val>,
+        out: &mut Vec<HashMap<String, Val>>,
+        cap: Option<usize>,
+    ) -> Result<()> {
+        // Only entered for uncapped chains (see `match_single_pattern`): a pushed
+        // `LIMIT` would over-read the breadth batches, so it routes to the sequential
+        // early-exit path instead.
+        debug_assert!(
+            cap.is_none(),
+            "expand_chain_par must not be used with a pushed cap"
+        );
+        let init = vec![ChainBranch {
+            cur,
+            binding: base.clone(),
+            walk: Vec::new(),
+        }];
+        self.par_walk(pattern, 0, cur, init, out)
+    }
+
+    /// Expand hop `i` of the chain for the in-order branch `frontier`, recursing into
+    /// hop `i+1`. See [`Self::expand_chain_par`] for the invariants. `start` is the
+    /// anchor node (constant down the recursion, for `make_path`). Reads the frontier
+    /// in [`EXPAND_READ_CHUNK`]-node chunks (parallel adjacency reads, freed per
+    /// chunk), builds the next-level branches in order, and recurses depth-first as
+    /// soon as a batch of [`EXPAND_BATCH`] accumulates — bounding both the read buffer
+    /// and the live frontier while preserving depth-first leaf order.
+    fn par_walk(
+        &self,
+        pattern: &Pattern,
+        i: usize,
+        start: u64,
+        frontier: Vec<ChainBranch>,
+        out: &mut Vec<HashMap<String, Val>>,
+    ) -> Result<()> {
+        if i == pattern.rels.len() {
+            // Completion: charge + emit each branch in order (mirrors `expand_chain`'s
+            // terminal — one intermediate per emitted row, path bound if requested).
+            for b in frontier {
+                self.charge(1)?;
+                let mut binding = b.binding;
+                if let Some(pv) = &pattern.path_var {
+                    binding.insert(pv.clone(), make_path(start, &b.walk));
+                }
+                out.push(binding);
+            }
+            return Ok(());
+        }
+        let (gen, cache) = (self.gen, self.cache);
+        let (rel, next) = &pattern.rels[i];
+        let tf = resolve_type_filter(gen, rel);
+        let dir = rel.dir;
+        let track_walk = pattern.path_var.is_some();
+        let mut pending: Vec<ChainBranch> = Vec::new();
+        // Read in small node-chunks, not the whole frontier at once: a chunk's
+        // adjacency buffer (`neigh`) is freed before the next is read, so live read
+        // memory stays `O(EXPAND_READ_CHUNK × degree)` — one chunk's worth — instead
+        // of the whole frontier's edges. Without this, a frontier of high-degree hubs
+        // materialises tens of millions of edges in a single buffer (the sequential
+        // walk only ever holds one node's adjacency). The chunk is ≥ [`EXPAND_PAR_MIN`]
+        // so each read still fans out across the pool.
+        for chunk in frontier.chunks(EXPAND_READ_CHUNK) {
+            self.check_deadline()?;
+            // Gather: each chunk node's type-filtered adjacency, in parallel.
+            let nodes: Vec<u64> = chunk.iter().map(|b| b.cur).collect();
+            let neigh = par_gather(self.fanout_pool.as_deref(), &nodes, EXPAND_PAR_MIN, |&n| {
+                hops_par(gen, cache, n, dir, tf.as_ref())
+            })?;
+            // Merge in input order — the sequential `expand_chain` per-neighbour body:
+            // `node_ok`, the next-var equality guard, rel/next binding.
+            for (b, hops) in chunk.iter().zip(neigh) {
+                for hop in hops {
+                    let nb = hop.neighbour;
+                    if !self.node_ok(nb, next, &b.binding, &[])? {
+                        continue;
+                    }
+                    if let Some(v) = &next.var {
+                        if let Some(existing) = b.binding.get(v) {
+                            if existing.loose_eq(&Val::Node(nb)) != Some(true) {
+                                continue;
+                            }
+                        }
+                    }
+                    let mut binding = b.binding.clone();
+                    if let Some(v) = &rel.var {
+                        binding.insert(v.clone(), hop.as_rel());
+                    }
+                    if let Some(v) = &next.var {
+                        binding.insert(v.clone(), Val::Node(nb));
+                    }
+                    let walk = if track_walk {
+                        let mut w = b.walk.clone();
+                        w.push(hop);
+                        w
+                    } else {
+                        Vec::new()
+                    };
+                    pending.push(ChainBranch {
+                        cur: nb,
+                        binding,
+                        walk,
+                    });
+                    // Flush a full batch into the next hop immediately (depth-first on
+                    // an in-order prefix) so the live frontier never exceeds one batch.
+                    if pending.len() >= EXPAND_BATCH {
+                        let batch = std::mem::take(&mut pending);
+                        self.par_walk(pattern, i + 1, start, batch, out)?;
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            self.par_walk(pattern, i + 1, start, pending, out)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)] // recursive walk: scratch path buffer + start anchor
@@ -3492,16 +3768,7 @@ impl<'g> Engine<'g> {
         // alternation — collapse to a flat reltype-id set so the hot loop stays a
         // plain `ids.contains` integer test, exactly as before GQL. Only a genuine
         // boolean type expression (`&`/`!`) falls to per-edge evaluation.
-        let type_filter: Option<TypeFilter> =
-            rel.type_expr.as_ref().map(|e| match e.positive_atoms() {
-                Some(names) => TypeFilter::AnyOf(
-                    names
-                        .iter()
-                        .filter_map(|t| self.gen.reltype_id(t))
-                        .collect(),
-                ),
-                None => TypeFilter::Expr(e),
-            });
+        let type_filter = resolve_type_filter(self.gen, rel);
         // (adjacency list, `incoming`) — for an incoming edge the stored direction
         // is neighbour→node, so start/end are swapped relative to an outgoing one.
         let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
@@ -8937,6 +9204,84 @@ mod tests {
             .run(&parser::parse(q).unwrap())
             .expect("pool-configured shortestPath runs");
         assert_eq!(col0(&res), vec!["2"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_hop_with_pool_matches_sequential() {
+        // The parallel breadth-first chain expansion (`expand_chain_par`) must return
+        // exactly the rows — and in the same order — as the sequential depth-first
+        // walk, across fixed multi-hop chains, a path variable, a pushed LIMIT, and a
+        // tight intermediate budget. The fixture frontier is below `EXPAND_PAR_MIN`, so
+        // `par_gather` reads sequentially here; this pins `expand_chain_par`'s merge
+        // (node_ok / next-var / charge / cap / path binding) against the DFS path,
+        // while the full-Wikidata benchmark exercises the wide-frontier rayon branch.
+        let (root, gen, cache, _) = budgeted_engine("exec_multihop_pool", 1_000_000);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        // Var-length is gated OUT of the parallel path, so a `*1..2` query is the
+        // sequential walk under both engines — still asserted identical to lock the gate.
+        let queries = [
+            // 2-hop, ordered, with both rel and node vars bound.
+            "MATCH (a:Person)-[r1:KNOWS]->(b)-[r2:KNOWS]->(c) \
+             RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c",
+            // 3-hop mixed types ending in WORKS_AT.
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:WORKS_AT]->(d) \
+             RETURN a.name AS a, d.name AS d ORDER BY a, d",
+            // Undirected one-hop from a pinned anchor (outgoing-then-incoming order).
+            "MATCH (a:Person {name:'Bob'})-[:KNOWS]-(x) RETURN x.name AS x ORDER BY x",
+            // Path variable: the bound path must reconstruct identically.
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN length(p) AS len, nodes(p) AS ns",
+            // Type alternation + an anchor with no LIMIT/ORDER (pushed-cap off).
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b ORDER BY b",
+            // Pushed LIMIT on a 2-hop — gated to the sequential early-exit path under
+            // both engines (a capped chain must not breadth-first over-read).
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS c LIMIT 1",
+            // Variable-length — gated to the sequential path under both engines.
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS*1..2]->(b) RETURN b.name AS b ORDER BY b",
+        ];
+        for q in queries {
+            let ast = parser::parse(q).unwrap();
+            let seq = Engine::new(&gen, &cache)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("sequential `{q}` failed: {e:#}"));
+            let par = Engine::new(&gen, &cache)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("pooled `{q}` failed: {e:#}"));
+            // Whole-result equality preserving row order — the parallel walk must be
+            // byte-for-byte identical, not merely the same set.
+            let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+                r.rows
+                    .iter()
+                    .map(|row| row.iter().map(|c| c.to_display()).collect())
+                    .collect()
+            };
+            assert_eq!(seq.columns, par.columns, "columns differ for `{q}`");
+            assert_eq!(disp(&seq), disp(&par), "rows differ for `{q}`");
+        }
+        // A tight intermediate budget must trip at the same point under both engines:
+        // the 2-hop chain emits 1 row (Alice→Bob→Carol), so a budget of 1 fits and 0
+        // (with the count terminal) is irrelevant — use a chain that overflows a small
+        // budget identically. Alice→Bob→Carol is the lone 2-hop KNOWS path; a budget
+        // that the cross-pattern terminal also charges trips both engines alike.
+        let q = "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN a.name, c.name";
+        let ast = parser::parse(q).unwrap();
+        let seq = Engine::new(&gen, &cache).with_max_intermediate(1).run(&ast);
+        let par = Engine::new(&gen, &cache)
+            .with_max_intermediate(1)
+            .with_fanout_pool(Some(pool.clone()))
+            .run(&ast);
+        match (&seq, &par) {
+            (Ok(s), Ok(p)) => assert_eq!(s.rows.len(), p.rows.len(), "budget row count differs"),
+            (Err(_), Err(_)) => {} // both trip the budget — consistent
+            _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
