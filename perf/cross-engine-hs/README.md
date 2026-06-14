@@ -321,12 +321,12 @@ graph larger than RAM (the in-memory builder was OOM-killed on this one).
 
 | engine | on-disk | builder / loader | build cost |
 |---|--:|---|---|
-| slater | **14 GB** | `slater-build --external on` (spill-to-disk) | ~29 min, peak **3.5 GiB** RSS under a **4 GiB** cap |
+| slater | **14 GB** | `slater-build --external on` (spill-to-disk) | ~27 min, peak **3.4 GiB** RSS under a **4 GiB** cap |
 | Neo4j 5 | 41.8 GB | `neo4j-admin database import` (offline → volume) | not re-timed (focus is RAM) |
 | LadybugDB | 21 GB | Kùzu `COPY FROM` CSV (embedded) | ~4.2 min, peak **13 GiB** RSS (needs a tuned ~8 GiB pool) |
 
 slater's external builder spills to disk and stays under a 4 GiB `--max-memory` cap to
-build the 91.6M/766M generation in ~29 min, and the resulting generation is the
+build the 91.6M/766M generation in ~27 min (peak 3.4 GiB RSS), and the resulting generation is the
 **smallest on disk** (14 GB vs LadybugDB 21 GB, Neo4j 41.8 GB). The contrast is the
 whole point: slater **builds** the larger-than-RAM graph within a fixed 4 GiB budget,
 whereas LadybugDB's bulk `COPY` only fits in a narrow ~8 GiB window and peaks at 13 GiB —
