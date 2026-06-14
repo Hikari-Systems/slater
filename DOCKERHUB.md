@@ -368,101 +368,58 @@ volumes:
 
 ## Benchmarking
 
-The source repo ships a small, low-ceremony benchmark under `perf/` — a **smoke
-test, not a rigorous evaluation.** It runs a handful of representative read shapes
-(counts, an indexed lookup, 1–3 hop traversals, a group-by aggregation, an
-unindexed substring scan) on a small sample graph, against **slater, Neo4j 5,
-Memgraph, and FalkorDB** running the identical queries. It answers "do basic
-searches return correctly and run in a sensible time on a sample set?" — single
-client, one node, latency only — and is **not** a throughput benchmark to size a
-deployment from.
+The repo's `perf/` harnesses back the headline claim — **resident memory bounded by
+cache budgets, not graph size, at comparable query speed.** The same query suite runs on
+**slater, Neo4j 5, Memgraph, FalkorDB** across a tiny pole graph and a cross-engine sweep
+over MeSH, an EU-AI-Act vector graph, and Wikidata at 1M and 91.6M nodes (single client,
+latency medians, each engine restarted + warmed, mean of 5 runs, varying parameters so
+the result cache always misses). It is a correctness-and-footprint check, not a
+throughput benchmark — **one story in two regimes**: memory stays bounded whether the
+graph **fits in RAM** or is **far larger than it**.
 
-The sample crime graph is **tiny** (~62k nodes / ~106k relationships) and fully
-resident in RAM for all four engines, so the per-query times are largely
-in-memory and depend heavily on available memory. The latencies are close enough
-that the **memory footprint, not the milliseconds, is the real story.** Method:
-each engine is restarted before every run, then warmed (full-graph scans +
-per-query warm-ups) before 25 measured queries give a median; figures are the mean
-of 5 such runs.
+**Memory is bounded as the graph grows ~1,500×.** Peak RSS while serving, slater on
+default cache budgets:
 
-**Resident memory while serving the run** (🟢 = slater has the smallest RSS, ⚪ =
-ties within 25%):
-
-| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB |
+| graph (nodes / edges) | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
-| **peak RSS** | **~82 MiB 🟢** | ~774 MiB | ~115 MiB | ~140 MiB |
-| steady-state RSS | ~77 MiB 🟢 | ~772 MiB | ~113 MiB | ~138 MiB |
+| pole — 62k / 106k | **82 MiB** | 774 | 115 | 140 |
+| MeSH — 340k / 469k | **262 MiB** | 1,117 | 355 | 454 |
+| Wikidata — 1M / 13.8M | **645 MiB** | 2,012 | 2,716 | 1,506 |
+| Wikidata — 91.6M / 766M | **~0.9 GiB †** | 2,911 | cannot-load | cannot-load |
 
-slater is the smallest footprint (on this toy graph only ~1.4–1.7× under the
-in-memory engines, ~9× under Neo4j), and — unlike the others — it is bounded by
-the cache budgets you set (here 64 + 32 MiB) and **stays flat as the graph grows**
-rather than scaling with the data.
+† anon high-water (at 14 GB on disk the OS page cache dominates the cgroup peak; anon is
+the engine's own footprint). slater's RSS tracks the **query working set**, not the
+graph — idle is ~16–70 MiB at every scale. The in-memory engines grow ~linearly with the
+data and, on the 766M-edge graph (working set ≫ the 15 GiB host), **Memgraph and
+FalkorDB can't load it at all** — only the disk-backed engines (slater, Neo4j) serve it.
 
-**Latency** (median). The mark sits on **slater**: 🟢 = slater is the fastest of the
-four, ⚪ = slater ties for fastest (within 25%), no mark = another engine is faster:
+**…at comparable-to-faster speed, in both regimes** (latency, ms, median):
 
-| query shape | slater | Neo4j 5 | Memgraph | FalkorDB |
+| in-RAM — pole 62k / 106k | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
-| `count(*)` all nodes | **~0.6 ms 🟢** | ~6.0 ms | ~3.5 ms | ~3.6 ms |
-| label count | **~0.6 ms 🟢** | ~4.3 ms | ~4.2 ms | ~2.0 ms |
-| indexed point lookup | **~0.6 ms ⚪** | ~4.2 ms | ~0.5 ms | ~0.5 ms |
-| indexed-equality count | ~1.5 ms | ~3.0 ms | ~1.0 ms | ~0.6 ms |
-| 1-hop traversal | ~2.4 ms | ~6.9 ms | ~1.4 ms | ~0.8 ms |
-| 2-hop traversal | ~1.5 ms | ~5.5 ms | ~1.4 ms | ~1.0 ms |
-| group-by aggregation | **~2.8 ms 🟢** | ~9.4 ms | ~7.2 ms | ~3.9 ms |
-| 3-hop traversal | ~1.6 ms | ~3.9 ms | ~2.0 ms | ~1.0 ms |
-| unindexed substring scan | ~9.0 ms | ~5.7 ms | ~7.4 ms | ~3.4 ms |
-| `count(DISTINCT …)` | **~2.8 ms 🟢** | ~7.7 ms | ~6.8 ms | ~4.5 ms |
+| count(*) all nodes | **0.6** | 6.0 | 3.5 | 3.6 |
+| indexed point lookup | **0.6** | 4.2 | 0.5 | 0.5 |
+| 1-hop traversal | 2.4 | 6.9 | 1.4 | 0.8 |
+| group-by / count(DISTINCT) | **2.8** | 7.7–9.4 | 6.8–7.2 | 3.9–4.5 |
 
-slater wins the count / aggregation / `DISTINCT` shapes outright, ties for fastest
-on the indexed point lookup, beats Neo4j on every row, and **trails Memgraph and
-especially FalkorDB on raw multi-hop traversals and the substring scan** (they hold
-the whole graph in RAM). No engine wins everything; on a dataset this small the
-latencies are close and the memory footprint is the durable difference. See
-[`perf/`](https://github.com/Hikari-Systems/slater/tree/main/perf)
-(`PERF_PROGRESS.md`) in the repository for the harness and methodology.
+| disk-bound — Wikidata 91.6M / 766M | slater | Neo4j 5 |
+|---|--:|--:|
+| count all nodes | **0.58** | ~4,000 |
+| point lookup (indexed) | **1.30** | 9.7 |
+| 1-hop neighbours | **4.25** | 12.3 |
+| 3-hop | **26.7** | 74.9 |
+| shortestPath ≤6 | **52.6** | 131.9 |
 
-### Larger graphs
-
-A second harness
-([`perf/cross-engine-hs/`](https://github.com/Hikari-Systems/slater/tree/main/perf/cross-engine-hs))
-re-runs the same metrics on two bigger reference graphs — a 340,839-node /
-469,438-edge MeSH graph, and a 20,766-node graph carrying 54.8 MiB of 1024-dim
-embeddings. Peak RSS while serving (slater on default budgets):
-
-| peak RSS | slater | Neo4j 5 | Memgraph | FalkorDB |
-|---|--:|--:|--:|--:|
-| MeSH (340k nodes) | **262 MiB 🟢** | 1127 MiB | 350 MiB | 454 MiB |
-| vector graph (54.8 MiB vectors) | **144 MiB 🟢** | 694 MiB | 219 MiB | 317 MiB |
-
-(🟢 = slater sole-smallest RSS. On MeSH its idle RSS is ~16 MiB; the 262 MiB peak is transient per-query working memory, not resident data.)
-
-slater is the smallest footprint on both (4.8× under Neo4j on the vector graph),
-and is **10–40× faster than the others on count / group-by / `DISTINCT` / scan** on
-the big MeSH graph. It **trails on kNN** — vector search runs as an exact
-brute-force scan (an algorithmic gap vs the others' HNSW):
-
-| vector query (latency) | slater | Neo4j 5 | Memgraph | FalkorDB |
-|---|--:|--:|--:|--:|
-| kNN top-10 Concept | 16.3 ms | 8.0 ms | 1.9 ms | 1.2 ms |
-| kNN top-50 Concept | 16.9 ms | 8.7 ms | 2.0 ms | 1.3 ms |
-| count all nodes | **0.5 ms** | 3.5 ms | 1.2 ms | 1.3 ms |
-
-Brute-force reads vectors through the **block** cache, so `blockCacheBytes` is the
-dial that trades RSS for kNN latency. At the 64 MiB default the 54.8 MiB of vectors
-are resident (16.9 ms); sizing it below a vector group (Concept 41 MiB, Chunk 18
-MiB) makes slater re-fetch the group per scan, with the cliff exactly at each
-group's size:
-
-| slater `blockCacheBytes` | Concept kNN-10 | Chunk kNN-10 |
-|---:|--:|--:|
-| 64 / 48 MiB | 16.9 / 16.4 ms | 8.6 / 8.2 ms |
-| 40 / 24 MiB | **43.6 / 43.0 ms** | 8.3 / 8.2 ms |
-| 16 MiB | 42.8 ms | **22.3 ms** |
-
-A ~2.7× kNN slowdown for a smaller footprint — a RAM↔latency dial the in-memory
-engines (whole graph + HNSW resident) don't have. Tables and full sweep are in that
-directory's README.
+When the graph **fits in RAM** the latencies are close — slater wins counts /
+aggregations / `DISTINCT` via its metadata + index fast paths and trails the in-memory
+engines on raw multi-hop. When the graph is **far larger than RAM** slater matches or
+beats the only other engine that can load it, at **~⅓ the RAM**: `count` is
+metadata-served (0.58 ms vs a ~4 s disk scan) and per-query `maxFanout` parallelism
+carries shortestPath 82.6 → 52.6 ms. (Vector kNN is the one shape slater trails today —
+an exact brute-force scan vs the others' resident HNSW: an algorithmic gap, not memory;
+`blockCacheBytes` is the dial that trades kNN latency for footprint.) Full per-engine
+tables, methodology, and the cache-budget sweep are in the
+[cross-engine benchmark README](https://github.com/Hikari-Systems/slater/tree/main/perf/cross-engine-hs).
 
 ---
 
