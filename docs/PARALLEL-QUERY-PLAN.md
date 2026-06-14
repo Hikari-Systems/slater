@@ -55,6 +55,25 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   multi-hop over high-degree hubs — the existing `LIMIT 100` 2-hop/3-hop suite stays sequential
   by the `cap` gate). Test: `exec::multi_hop_with_pool_matches_sequential`.
 
+- (Task 10) — **parallel anchor scan + `node_ok` filter**. New Sync free fns
+  `node_label_ids_par` / `node_prop_par` (the `&self` bodies, now delegating to them) +
+  `node_ok_par`, the thread-safe twin of `node_ok`: it checks an anchor's `label_expr`
+  and inline props over `&Generation`/`&BlockCache` only. The inline-prop **values**
+  (`wants`) don't depend on the candidate, so `match_single_pattern` evaluates them once
+  single-threaded (they may touch the `!Sync` evaluator) and the workers do only Sync
+  label/column reads + `loose_eq` — accept/reject is byte-for-byte identical, including
+  the `guaranteed`-label skip. The candidate loop `par_gather`s the filter when
+  `cap.is_none()` (a pushed `LIMIT` would over-read the whole candidate set before the
+  cap stops the scan — the early-exit rule, mirrors Task 9), a fanout pool is configured,
+  `candidates.len() >= SCAN_PAR_MIN` (64), and `anchor_filter_reads` confirms `node_ok`
+  actually reads a record (skips trivial guaranteed-single-atom / unknown-label / no-prop
+  anchors). Survivors expand in input order; capped/small/bound-anchor scans keep the
+  inline per-candidate filter with its early break. New wide fixture
+  `testgen::write_wide(tag, n)` (n nodes, half `:Person` / half `:Company`, `name` + a
+  `:Person`-only `team`, no edges/indexes). Test:
+  `exec::anchor_filter_with_pool_matches_sequential` (label-scan+inline-prop, boolean/
+  negated label exprs, empty result, aggregate, tight budget — pool vs sequential).
+
 ## The reusable pattern
 
 > **gather** a set of independent sub-operations — each doing only `&Generation` + `&BlockCache`

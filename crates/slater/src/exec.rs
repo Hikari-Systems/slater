@@ -410,6 +410,91 @@ fn read_vector(gen: &Generation, cache: &BlockCache, global: u64) -> Result<Vect
 /// small). Above it, both the candidate reads and the distance/top-k scan parallelize.
 const KNN_PAR_MIN: usize = 256;
 
+/// Thread-safe read+decode of node `id`'s resident label-id set through the (Sync)
+/// block cache. The free-fn body behind [`Engine::node_label_ids`] so the parallel
+/// anchor filter ([`node_ok_par`], Task 10) can read labels off-thread.
+fn node_label_ids_par(gen: &Generation, cache: &BlockCache, id: u64) -> Result<Vec<u32>> {
+    let rec = cache.record(
+        gen.node_labels().inner(),
+        gen.uuid(),
+        FileKind::NodeLabels,
+        id,
+    )?;
+    nodelabels::decode_labels(&rec)
+}
+
+/// Thread-safe read of node `id`'s value for property `key` (or `Null` if absent),
+/// decoding only the requested key from the cached record. The free-fn body behind
+/// [`Engine::node_prop`]; used by the parallel anchor filter ([`node_ok_par`]).
+fn node_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+    let Some(key_id) = gen.property_key_id(key) else {
+        return Ok(Val::Null);
+    };
+    let rec = cache.record(
+        gen.node_props().inner(),
+        gen.uuid(),
+        FileKind::NodeProps,
+        id,
+    )?;
+    Ok(columns::decode_one(&rec, key_id)?
+        .map(Val::from_value)
+        .unwrap_or(Val::Null))
+}
+
+/// Thread-safe counterpart to [`Engine::node_ok`] for the parallel anchor filter
+/// (Task 10): whether node `id` satisfies the anchor's `label_expr` and inline
+/// properties, touching only the Sync `gen`/`cache`. Inline property **values**
+/// (`wants`) are pre-evaluated once single-threaded by the caller against the row
+/// binding — they don't depend on `id`, and their evaluation may route through the
+/// !Sync executor (`eval`/`regex_cache`), which workers must not — so only the
+/// per-candidate column/label reads and the `loose_eq` comparison run here.
+/// `guaranteed` lists label ids the anchor scan already proved (see
+/// [`Engine::scan_guaranteed_labels`]); they skip the label-record decode exactly as
+/// the sequential path does, so the accept/reject decision is byte-for-byte identical.
+fn node_ok_par(
+    gen: &Generation,
+    cache: &BlockCache,
+    id: u64,
+    label_expr: Option<&LabelExpr>,
+    wants: &[(&str, Val)],
+    guaranteed: &[u32],
+) -> Result<bool> {
+    if let Some(expr) = label_expr {
+        if let Some(atom) = expr.as_single_atom() {
+            match gen.label_id(atom) {
+                Some(lid) if guaranteed.contains(&lid) => {}
+                Some(lid) => {
+                    if !node_label_ids_par(gen, cache, id)?.contains(&lid) {
+                        return Ok(false);
+                    }
+                }
+                None => return Ok(false),
+            }
+        } else {
+            let have = node_label_ids_par(gen, cache, id)?;
+            let ok = expr.eval(&|name| {
+                gen.label_id(name)
+                    .is_some_and(|lid| guaranteed.contains(&lid) || have.contains(&lid))
+            });
+            if !ok {
+                return Ok(false);
+            }
+        }
+    }
+    for (k, want) in wants {
+        let got = node_prop_par(gen, cache, id, k)?;
+        if got.loose_eq(want) != Some(true) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Minimum scanned-candidate count below which the anchor `node_ok` filter (Task 10)
+/// runs sequentially — the rayon fan-out overhead isn't worth it for a narrow scan.
+/// Above it, the per-candidate label/property reads gather on the shared fanout pool.
+const SCAN_PAR_MIN: usize = 64;
+
 /// Map `f` over `items` on the shared fanout pool (or sequentially when the pool is
 /// absent or `items` is smaller than `min_batch`), preserving input order. `f` must
 /// read only Sync state (&Generation/&BlockCache) — never the !Sync Engine.
@@ -923,13 +1008,7 @@ impl<'g> Engine<'g> {
     }
 
     fn node_label_ids(&self, id: u64) -> Result<Vec<u32>> {
-        let rec = self.cache.record(
-            self.gen.node_labels().inner(),
-            self.gen.uuid(),
-            FileKind::NodeLabels,
-            id,
-        )?;
-        nodelabels::decode_labels(&rec)
+        node_label_ids_par(self.gen, self.cache, id)
     }
 
     fn outgoing(&self, id: u64) -> Result<Vec<topology::Adj>> {
@@ -969,21 +1048,10 @@ impl<'g> Engine<'g> {
     /// routed out to the vector store reads as `Null` here — vector *values* are
     /// served by the M5 KNN/`similarity()` path, not by a column read.)
     fn node_prop(&self, id: u64, key: &str) -> Result<Val> {
-        let Some(key_id) = self.gen.property_key_id(key) else {
-            return Ok(Val::Null);
-        };
         // Decode only the requested key from the cached record, skipping the
         // values of the others (root cause 5): a single-property read no longer
         // allocates a `Vec<(u32, Value)>` nor decodes every other value.
-        let rec = self.cache.record(
-            self.gen.node_props().inner(),
-            self.gen.uuid(),
-            FileKind::NodeProps,
-            id,
-        )?;
-        Ok(columns::decode_one(&rec, key_id)?
-            .map(Val::from_value)
-            .unwrap_or(Val::Null))
+        node_prop_par(self.gen, self.cache, id, key)
     }
 
     fn edge_prop(&self, id: u64, key: &str) -> Result<Val> {
@@ -3247,6 +3315,41 @@ impl<'g> Engine<'g> {
         // un-LIMITed returns) genuinely need the whole neighbourhood, so the parallel
         // reads are pure overlap with no wasted work.
         let parallel = cap.is_none() && self.chain_parallelizable(pattern);
+        // Task 10: when the anchor is a scan wide enough to be worth it and `node_ok`
+        // actually reads a per-candidate label/property record, evaluate that filter
+        // across the shared fanout pool up front, then expand only the survivors in
+        // input order. The inline-prop *values* (`wants`) don't depend on the
+        // candidate, so they are evaluated once here (single-threaded — they may route
+        // through the !Sync evaluator) and the workers do only Sync label/column reads
+        // + `loose_eq`. Gated to uncapped scans: a pushed `LIMIT` would over-read the
+        // whole candidate set before the cap could stop the scan (the plan's early-exit
+        // rule), so capped scans keep the inline per-candidate filter with its break.
+        let prefilter = cap.is_none()
+            && self.fanout_pool.is_some()
+            && candidates.len() >= SCAN_PAR_MIN
+            && self.anchor_filter_reads(start, &guaranteed);
+        let candidates: Vec<u64> = if prefilter {
+            let wants: Vec<(&str, Val)> = start
+                .props
+                .iter()
+                .map(|(k, e)| Ok((k.as_str(), self.eval(e, &Scope::Map(binding), None)?)))
+                .collect::<Result<_>>()?;
+            let (gen, cache) = (self.gen, self.cache);
+            let label_expr = start.label_expr.as_ref();
+            let pass = par_gather(
+                self.fanout_pool.as_deref(),
+                &candidates,
+                SCAN_PAR_MIN,
+                |&c| node_ok_par(gen, cache, c, label_expr, &wants, &guaranteed),
+            )?;
+            candidates
+                .into_iter()
+                .zip(pass)
+                .filter_map(|(c, ok)| ok.then_some(c))
+                .collect()
+        } else {
+            candidates
+        };
         let mut frame = binding.clone();
         let mut walk = Vec::new();
         for c in candidates {
@@ -3255,7 +3358,9 @@ impl<'g> Engine<'g> {
             if cap.is_some_and(|cc| out.len() >= cc) {
                 break;
             }
-            if !self.node_ok(c, start, &frame, &guaranteed)? {
+            // Already filtered in parallel above when `prefilter`; otherwise check the
+            // anchor's labels/inline props inline (with the loop's early-exit break).
+            if !prefilter && !self.node_ok(c, start, &frame, &guaranteed)? {
                 continue;
             }
             let prev = start
@@ -3862,6 +3967,28 @@ impl<'g> Engine<'g> {
                 .into_iter()
                 .collect(),
             NodeScan::IdSeek { .. } | NodeScan::AllNodes => Vec::new(),
+        }
+    }
+
+    /// Whether [`Self::node_ok`] would read a per-candidate label or property record
+    /// for the anchor `start` — i.e. whether a parallel filter over many scanned
+    /// candidates (Task 10) is worth the fan-out. Returns false when the filter is
+    /// constant or already proven by the scan: no labels and no inline props, a single
+    /// label atom the scan already guaranteed, or an unknown single label (which
+    /// rejects every candidate with no record read at all).
+    fn anchor_filter_reads(&self, start: &NodePat, guaranteed: &[u32]) -> bool {
+        if !start.props.is_empty() {
+            return true;
+        }
+        match &start.label_expr {
+            None => false,
+            Some(expr) => match expr.as_single_atom() {
+                Some(atom) => match self.gen.label_id(atom) {
+                    Some(lid) => !guaranteed.contains(&lid),
+                    None => false,
+                },
+                None => true,
+            },
         }
     }
 
@@ -9280,6 +9407,74 @@ mod tests {
         match (&seq, &par) {
             (Ok(s), Ok(p)) => assert_eq!(s.rows.len(), p.rows.len(), "budget row count differs"),
             (Err(_), Err(_)) => {} // both trip the budget — consistent
+            _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn anchor_filter_with_pool_matches_sequential() {
+        // The parallel anchor `node_ok` prefilter (Task 10) must keep exactly the
+        // candidates — in the same order — that the sequential inline filter keeps,
+        // across the shapes that make `node_ok` actually read a record: a label scan
+        // with an inline property, a boolean label expression (full scan), an inline
+        // property bound from a parameter, and a tight intermediate budget. The wide
+        // fixture has 200 nodes (100 :Person / 100 :Company) so the candidate set
+        // clears `SCAN_PAR_MIN` and the pooled engine truly fans the filter out.
+        let (root, graph) = testgen::write_wide("exec_anchor_filter", 200);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        let queries = [
+            // Label scan (Person guaranteed) + inline prop → node_ok reads `team`.
+            "MATCH (n:Person {team:'Red'}) RETURN n.name AS name ORDER BY name",
+            // Boolean label expr → full scan + per-candidate label decode.
+            "MATCH (n:Person|Company) RETURN n.name AS name ORDER BY name",
+            // Negated label → full scan, keeps only the :Company half.
+            "MATCH (n:!Person) RETURN n.name AS name ORDER BY name",
+            // Inline prop with no matching value → every candidate rejected.
+            "MATCH (n:Person {team:'Green'}) RETURN n.name AS name ORDER BY name",
+            // Aggregate over the filtered set (uncapped, the prefilter's home turf).
+            "MATCH (n:Person {team:'Blue'}) RETURN count(*) AS c",
+        ];
+        for q in queries {
+            let ast = parser::parse(q).unwrap();
+            let seq = Engine::new(&gen, &cache)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("sequential `{q}` failed: {e:#}"));
+            let par = Engine::new(&gen, &cache)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("pooled `{q}` failed: {e:#}"));
+            let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+                r.rows
+                    .iter()
+                    .map(|row| row.iter().map(|c| c.to_display()).collect())
+                    .collect()
+            };
+            assert_eq!(seq.columns, par.columns, "columns differ for `{q}`");
+            assert_eq!(disp(&seq), disp(&par), "rows differ for `{q}`");
+        }
+        // A tight intermediate budget must trip (or fit) at the same point under both
+        // engines — the prefilter doesn't charge, so the single-threaded merge/terminal
+        // still governs the budget identically.
+        let q = "MATCH (n:Person|Company) RETURN n.name";
+        let ast = parser::parse(q).unwrap();
+        let seq = Engine::new(&gen, &cache)
+            .with_max_intermediate(10)
+            .run(&ast);
+        let par = Engine::new(&gen, &cache)
+            .with_max_intermediate(10)
+            .with_fanout_pool(Some(pool.clone()))
+            .run(&ast);
+        match (&seq, &par) {
+            (Ok(s), Ok(p)) => assert_eq!(s.rows.len(), p.rows.len(), "budget row count differs"),
+            (Err(_), Err(_)) => {}
             _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
