@@ -47,6 +47,7 @@ use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
 use graph_format::{columns, nodelabels, topology};
+use rayon::prelude::*;
 
 /// Unbounded variable-length expansion (`*` / `*n..`) is capped at this many hops,
 /// so a runaway traversal on a densely connected graph cannot blow up. Explicit
@@ -247,6 +248,41 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Thread-safe single-node neighbour read for the parallel `shortestPath()` BFS:
+/// read+decode `node`'s adjacency in direction `dir` through the (Sync) block cache,
+/// keeping neighbours whose reltype passes `type_ids` (`None` = any type). Run
+/// off-thread by the rayon frontier expansion — it touches only the Sync `gen` +
+/// `cache`, never the executor's interior-mutable state, so it carries no rel-property
+/// predicate (the caller restricts the parallel path to property-free patterns).
+fn neighbours_par(
+    gen: &Generation,
+    cache: &BlockCache,
+    node: u64,
+    dir: Direction,
+    type_ids: Option<&[u32]>,
+) -> Result<Vec<u64>> {
+    let topo = gen.topology();
+    let mut out = Vec::new();
+    let mut take = |global: u64| -> Result<()> {
+        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+        for a in topology::decode_adj(&rec)? {
+            if type_ids.is_none_or(|ids| ids.contains(&a.reltype)) {
+                out.push(a.neighbour.0);
+            }
+        }
+        Ok(())
+    };
+    match dir {
+        Direction::Outgoing => take(topo.outgoing_global(NodeId(node)))?,
+        Direction::Incoming => take(topo.incoming_global(NodeId(node)))?,
+        Direction::Undirected => {
+            take(topo.outgoing_global(NodeId(node)))?;
+            take(topo.incoming_global(NodeId(node)))?;
+        }
+    }
+    Ok(out)
 }
 
 /// Assemble the walk-order node path `src → … → meet → … → dst` from a bidirectional
@@ -645,6 +681,11 @@ pub struct Engine<'g> {
     /// every other query's intermediate budget. Unlimited by default preserves the
     /// "AnyShortest always succeeds in O(V+E)" guarantee.
     max_shortest_path_explore: u64,
+    /// Optional shared worker pool for parallel `shortestPath()` frontier expansion
+    /// (`query.maxShortestPathFanout` > 1). `None` ⇒ sequential. Only the I/O-bound
+    /// adjacency reads run on it; all `visited`/`parent` mutation stays on the calling
+    /// thread, so the executor's interior-mutable caches are never touched off-thread.
+    sp_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     /// Compiled user regexes, keyed by the final compile string. Engines live for
     /// one query, so this exists to stop `=~` recompiling its pattern per row.
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
@@ -664,6 +705,7 @@ impl<'g> Engine<'g> {
             max_intermediate: 0,
             budget_used: Cell::new(0),
             max_shortest_path_explore: 0,
+            sp_pool: None,
             regex_cache: RefCell::new(HashMap::new()),
         }
     }
@@ -706,6 +748,16 @@ impl<'g> Engine<'g> {
     /// preserves the always-succeeds guarantee).
     pub fn with_max_shortest_path_explore(mut self, cap: u64) -> Self {
         self.max_shortest_path_explore = cap;
+        self
+    }
+
+    /// Supply the shared worker pool for parallel `shortestPath()` frontier expansion
+    /// (`query.maxShortestPathFanout` > 1). `None` keeps the search sequential.
+    pub fn with_shortest_path_pool(
+        mut self,
+        pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    ) -> Self {
+        self.sp_pool = pool;
         self
     }
 
@@ -1813,10 +1865,25 @@ impl<'g> Engine<'g> {
             Direction::Incoming => Direction::Outgoing,
             Direction::Undirected => Direction::Undirected,
         };
+        // Parallel frontier expansion is sound only for a property-free pattern whose
+        // type constraint is a flat reltype-id set (or absent): the off-thread worker
+        // reads adjacency but must not evaluate a rel predicate (that would touch the
+        // executor's interior-mutable state). Anything richer expands sequentially.
+        let type_ids: Option<Vec<u32>> = rel.type_expr.as_ref().and_then(|e| {
+            e.positive_atoms().map(|names| {
+                names
+                    .iter()
+                    .filter_map(|t| self.gen.reltype_id(t))
+                    .collect()
+            })
+        });
+        let fast = rel.props.is_empty() && (rel.type_expr.is_none() || type_ids.is_some());
         let mut best: Option<(u32, u64)> = None; // (total length, meeting node)
         let mut since_check = 0u64;
+        const SP_PAR_MIN_FRONTIER: usize = 64; // below this, the pool overhead isn't worth it
 
         loop {
+            self.check_deadline()?;
             let combined = fdepth + bdepth;
             let bound = best.map(|(b, _)| b.min(max)).unwrap_or(max);
             // No future meeting can be shorter than `combined + 1`, so once the two
@@ -1832,10 +1899,50 @@ impl<'g> Engine<'g> {
             } else {
                 (&bfront, bdir, bdepth + 1)
             };
+
+            // Gather the level's neighbours per frontier node. The I/O-bound adjacency
+            // reads (CSR block fetch + zstd decompress, released from the cache mutex)
+            // overlap across the pool; all `visited`/`parent`/meeting mutation happens
+            // single-threaded in the merge below.
+            let expansions: Vec<(u64, Vec<u64>)> = if fast {
+                let tids = type_ids.as_deref();
+                match &self.sp_pool {
+                    Some(pool) if front.len() >= SP_PAR_MIN_FRONTIER => {
+                        let (gen, cache) = (self.gen, self.cache);
+                        pool.install(|| {
+                            front
+                                .par_iter()
+                                .map(|&node| {
+                                    neighbours_par(gen, cache, node, dir, tids)
+                                        .map(|nbs| (node, nbs))
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })?
+                    }
+                    _ => {
+                        let mut v = Vec::with_capacity(front.len());
+                        for &node in front {
+                            v.push((node, neighbours_par(self.gen, self.cache, node, dir, tids)?));
+                        }
+                        v
+                    }
+                }
+            } else {
+                let mut v = Vec::with_capacity(front.len());
+                for &node in front {
+                    let nbs = self
+                        .expand_with_dir(node, rel, dir, &empty)?
+                        .into_iter()
+                        .map(|h| h.neighbour)
+                        .collect();
+                    v.push((node, nbs));
+                }
+                v
+            };
+
             let mut next = Vec::new();
-            for &node in front {
-                for hop in self.expand_with_dir(node, rel, dir, &empty)? {
-                    let nb = hop.neighbour;
+            for (node, nbs) in expansions {
+                for nb in nbs {
                     let (mine, theirs) = if forward {
                         (&mut fvis, &bvis)
                     } else {
@@ -8790,6 +8897,28 @@ mod tests {
                  RETURN length(shortestPath((a)-[*..6]-(b))) AS l";
         let res = run_budgeted("exec_sp_midmeet", 1_000_000, q).expect("a length-2 path exists");
         assert_eq!(col0(&res), vec!["2"]);
+    }
+
+    #[test]
+    fn shortest_path_with_pool_is_correct() {
+        // A pool-configured engine must return identical results to the sequential one
+        // (the parallel frontier gather shares the same neighbour logic; the full-graph
+        // benchmark exercises the large-frontier rayon branch).
+        let (root, gen, cache, _) = budgeted_engine("exec_sp_pool", 1_000_000);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let q = "MATCH (a:Company {name:'Acme'}), (b:Person {name:'Bob'}) \
+                 RETURN length(shortestPath((a)-[*..6]-(b))) AS l";
+        let res = Engine::new(&gen, &cache)
+            .with_shortest_path_pool(Some(pool))
+            .run(&parser::parse(q).unwrap())
+            .expect("pool-configured shortestPath runs");
+        assert_eq!(col0(&res), vec!["2"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

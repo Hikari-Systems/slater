@@ -476,6 +476,22 @@ fn spawn_cache_maintenance(
     });
 }
 
+/// Build the shared worker pool for parallel `shortestPath()` frontier expansion,
+/// or `None` when `fanout <= 1` (sequential). Sized to `min(fanout, cores)`; created
+/// once and shared so per-query expansion never churns OS threads.
+fn build_shortest_path_pool(fanout: usize) -> Option<Arc<rayon::ThreadPool>> {
+    if fanout <= 1 {
+        return None;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(fanout.min(cores))
+        .thread_name(|i| format!("slater-sp-{i}"))
+        .build()
+        .map(Arc::new)
+        .ok()
+}
+
 // ── Shared connection context ─────────────────────────────────────────────────
 
 /// Immutable state shared by every connection task.
@@ -497,6 +513,11 @@ struct ConnCtx {
     /// Per-query `shortestPath()` BFS discovery cap (`query.maxShortestPathExplore`);
     /// 0 = unlimited.
     max_shortest_path_explore: u64,
+    /// Shared worker pool for parallel `shortestPath()` frontier expansion, sized to
+    /// `query.maxShortestPathFanout`. `None` when the fanout is ≤ 1 (sequential).
+    /// Built once per process and shared across connections (per-query pool creation
+    /// would churn OS threads).
+    shortest_path_pool: Option<Arc<rayon::ThreadPool>>,
     /// Beam-search list size for the Vamana arm (`vectorQuery.beamWidth`).
     beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
@@ -1130,6 +1151,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         timeout_ms: cfg.query.timeout_ms,
         max_intermediate: cfg.query.max_intermediate,
         max_shortest_path_explore: cfg.query.max_shortest_path_explore,
+        shortest_path_pool: build_shortest_path_pool(cfg.query.max_shortest_path_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
@@ -1603,6 +1625,7 @@ async fn run_query(
     let timeout_ms = ctx.timeout_ms;
     let max_intermediate = ctx.max_intermediate;
     let max_shortest_path_explore = ctx.max_shortest_path_explore;
+    let shortest_path_pool = ctx.shortest_path_pool.clone();
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the debug level being active: when it
@@ -1634,7 +1657,8 @@ async fn run_query(
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)
-                        .with_max_shortest_path_explore(max_shortest_path_explore);
+                        .with_max_shortest_path_explore(max_shortest_path_explore)
+                        .with_shortest_path_pool(shortest_path_pool.clone());
                     if timeout_ms > 0 {
                         engine = engine
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
@@ -2254,6 +2278,7 @@ mod tests {
             timeout_ms: 0,
             max_intermediate: 1_000_000,
             max_shortest_path_explore: 0,
+            shortest_path_pool: None,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
@@ -2316,6 +2341,7 @@ mod tests {
             timeout_ms: 0,
             max_intermediate: 1_000_000,
             max_shortest_path_explore: 0,
+            shortest_path_pool: None,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
             // A default is configured but must NOT be silently served for queries.
