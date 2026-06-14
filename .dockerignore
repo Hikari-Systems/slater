@@ -1,0 +1,9 @@
+# Build artifacts (compiled inside the builder stage) — never part of the context.
+target/
+# VCS + tooling.
+.git/
+.github/
+# Benchmark harness + scratch (not used by the image build).
+perf/
+docs/
+*.md

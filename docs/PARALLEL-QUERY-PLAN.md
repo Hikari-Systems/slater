@@ -15,6 +15,15 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   - The gather/merge split inside `any_shortest_path` (gather adjacency in the pool, mutate
     `visited`/`parent`/meeting single-threaded).
 - Rollback tag: **`pre-parallel-shortestpath`** (= `db24696`) if parallelism must be reverted.
+- **`7430c7b` KEEP decision (made with Task 7):** full-Wikidata (91.6M/766M) `shortestPath<=6`
+  retest on one build, default-off vs fanout=8 — **176.5 ms → 67.9 ms median (2.6× faster)**,
+  anon RSS 991 → 1068 MiB (+8%, all thread stacks + per-worker adjacency buffers; not from a
+  changed working set). Clear win at modest, bounded memory cost; defaults off. **Kept** — the
+  rollback tag stays available but unused.
+- `ec24b1b` (Task 7) — **`par_gather` + `maxShortestPathFanout` → `maxFanout`**: one shared
+  fanout-capped pool + one order-preserving helper, reused by all per-query operators (the
+  shortestPath fast-path gather now calls it). `build_shortest_path_pool` → `build_fanout_pool`
+  (thread name `slater-q-{i}`), `ConnCtx.fanout_pool`, `Engine.fanout_pool`/`with_fanout_pool`.
 
 ## The reusable pattern
 
@@ -204,10 +213,16 @@ State when this plan was written:
   ~1.44 GiB; shortestPath sequential ~316 ms median / ~0.36 GiB.
 - Neo4j (`neo4j-hs`, volume `neo4j_wikifull`, 91.6M/766M, range idx online) fast-query sweep
   ran (`results-wikidata/neo4j.run*.json`); count ~4.7 s (disk-bound scan).
-- **Pending:** Neo4j shortestPath measurement; slater parallel-shortestPath perf retest
-  (build image with `DOCKER_BUILDKIT=0`, serve with `maxShortestPathFanout`/`maxFanout`=8,
-  spot-check vs 316 ms); write the "Full Wikidata" section into
-  `perf/cross-engine-hs/README.md`; push. **LadybugDB is on hold** (edge COPY needs a big
+- **Pending:** Neo4j shortestPath measurement; write the "Full Wikidata" section into
+  `perf/cross-engine-hs/README.md`; push. **DONE: slater parallel-shortestPath perf retest** —
+  rebuilt the image (`DOCKER_BUILDKIT=0`; added a `.dockerignore` so the legacy builder stops
+  choking on root-owned `target/` files), served `/tmp/wdbuild/data` with
+  `/tmp/bench-hs/config.fanout{1,8}.json`, sampled anon via `sample_anon.sh`:
+  `shortestPath<=6` **176.5 ms (fanout=1) → 67.9 ms (fanout=8)**, anon 991 → 1068 MiB. (The
+  176 ms baseline beats the earlier 316 ms note — warmer page cache / different sampled pairs;
+  the apples-to-apples same-build fanout=1↔8 comparison is the basis for the KEEP call above.)
+  Retest harness: `/tmp/bench-hs/sp_retest.sh`; results in
+  `/tmp/bench-hs/results-wikidata/slater.sp.fanout{1,8}.json`. **LadybugDB is on hold** (edge COPY needs a big
   buffer pool, run alone — `LADYBUG_LOAD_BUFFER_POOL`). FalkorDB/Memgraph = cannot-load.
 - Harness honours `ENGINES`, `WIKI_GRAPH`, `BENCH_SKIP`; `sample_anon.sh` captures anon
   high-water (cgroup `memory.peak` is dominated by reclaimable page cache at this scale —
