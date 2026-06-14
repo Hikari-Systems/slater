@@ -1072,7 +1072,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
     /// Read the next complete (de-chunked) message body, or `None` at a clean EOF.
     async fn read_message(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
-            if let Some((body, consumed)) = chunk::decode_message_capped(&self.buf, self.max_body)? {
+            if let Some((body, consumed)) = chunk::decode_message_capped(&self.buf, self.max_body)?
+            {
                 self.buf.drain(..consumed);
                 return Ok(Some(body));
             }
@@ -1217,7 +1218,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     // filling with sockets we cannot service. This is what makes the bounded-RSS
     // guarantee hold under adversarial connection load (each connection's buffers
     // live outside the cache budget).
-    let conn_limit = Arc::new(Semaphore::new(semaphore_permits(cfg.server.max_connections)));
+    let conn_limit = Arc::new(Semaphore::new(semaphore_permits(
+        cfg.server.max_connections,
+    )));
 
     // The in-flight generation guard: poll each graph's `current` and, on a change,
     // either swap the validated new generation in place or signal a clean exit.
@@ -3815,7 +3818,11 @@ mod tests {
         let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
         assert_eq!(per_ip_key(a), per_ip_key(b), "same /64 ⇒ same key");
         let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
-        assert_ne!(per_ip_key(a), per_ip_key(c), "different /64 ⇒ different key");
+        assert_ne!(
+            per_ip_key(a),
+            per_ip_key(c),
+            "different /64 ⇒ different key"
+        );
     }
 
     #[test]
@@ -3862,7 +3869,11 @@ mod tests {
         let (mut client, server) = duplex(1 << 16);
         client.write_all(&wire).await.unwrap();
         let mut framed = Framed::new(server, 4096);
-        let got = framed.read_message().await.unwrap().expect("a full message");
+        let got = framed
+            .read_message()
+            .await
+            .unwrap()
+            .expect("a full message");
         assert_eq!(got, body);
     }
 
@@ -3905,13 +3916,18 @@ mod tests {
             let huge = "x".repeat(4000);
             c.send(PsValue::Struct {
                 tag: message::tag::HELLO,
-                fields: vec![PsValue::Map(vec![("user_agent".into(), PsValue::str(&huge))])],
+                fields: vec![PsValue::Map(vec![(
+                    "user_agent".into(),
+                    PsValue::str(&huge),
+                )])],
             })
             .await;
             let mut buf = [0u8; 4];
             match tokio::time::timeout(Duration::from_secs(2), c.stream.read(&mut buf)).await {
                 Ok(Ok(0)) | Ok(Err(_)) => {}
-                Ok(Ok(n)) => panic!("server accepted a {n}-byte reply to an oversized pre-auth msg"),
+                Ok(Ok(n)) => {
+                    panic!("server accepted a {n}-byte reply to an oversized pre-auth msg")
+                }
                 Err(_) => panic!("server did not reject the oversized pre-auth message"),
             }
         }
@@ -3967,7 +3983,7 @@ mod tests {
         let _ = b.write_all(&hs).await;
         let mut reply = [0u8; 4];
         match tokio::time::timeout(Duration::from_secs(2), b.read_exact(&mut reply)).await {
-            Ok(Err(_)) => {}                  // EOF / reset: rejected as expected
+            Ok(Err(_)) => {} // EOF / reset: rejected as expected
             Ok(Ok(_)) => panic!("second anonymous connection should have been rejected"),
             Err(_) => panic!("server neither served nor rejected the excess anon connection"),
         }
