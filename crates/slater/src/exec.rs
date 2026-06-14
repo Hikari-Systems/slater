@@ -490,6 +490,224 @@ fn node_ok_par(
     Ok(true)
 }
 
+/// Thread-safe edge-property read — the free-fn body of [`Engine::edge_prop`],
+/// touching only the Sync `gen`/`cache`. Used by [`property_val`] (and thus the
+/// parallel aggregation precompute, Task 12) and by `Engine::edge_prop`, so the two
+/// stay byte-for-byte identical.
+fn edge_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+    let Some(key_id) = gen.property_key_id(key) else {
+        return Ok(Val::Null);
+    };
+    let rec = cache.record(
+        gen.edge_props().inner(),
+        gen.uuid(),
+        FileKind::EdgeProps,
+        id,
+    )?;
+    Ok(columns::decode_one(&rec, key_id)?
+        .map(Val::from_value)
+        .unwrap_or(Val::Null))
+}
+
+/// Thread-safe property access — the free-fn body of [`Engine::property`], reading
+/// only the Sync `gen`/`cache`. Node/Rel reads route through the block cache; the
+/// Map/Point/temporal/Null arms are pure value logic. `Engine::property` delegates
+/// here, and the parallel aggregation precompute ([`eval_simple`], Task 12) calls it
+/// directly, so the two paths produce identical `Val`s for the same input.
+fn property_val(gen: &Generation, cache: &BlockCache, base: &Val, key: &str) -> Result<Val> {
+    match base {
+        Val::Node(id) => node_prop_par(gen, cache, *id, key),
+        Val::Rel { id, .. } => edge_prop_par(gen, cache, *id, key),
+        Val::Map(m) => Ok(m
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Val::Null)),
+        Val::Point {
+            latitude,
+            longitude,
+        } => Ok(match key {
+            "latitude" => Val::Float(*latitude),
+            "longitude" => Val::Float(*longitude),
+            _ => Val::Null,
+        }),
+        Val::Date(s) => temporal::date_component(*s, key, false)
+            .map(Val::Int)
+            .ok_or_else(|| anyhow::anyhow!("unknown date component {key}")),
+        Val::Time(s) => temporal::time_component(*s, key)
+            .map(Val::Int)
+            .ok_or_else(|| anyhow::anyhow!("unknown time component {key}")),
+        Val::DateTime(s) => temporal::date_component(*s, key, true)
+            .map(Val::Int)
+            .ok_or_else(|| anyhow::anyhow!("unknown datetime component {key}")),
+        Val::Duration(s) => temporal::duration_component(*s, key)
+            .map(Val::Float)
+            .ok_or_else(|| anyhow::anyhow!("unknown duration component {key}")),
+        Val::Null => Ok(Val::Null),
+        other => bail!("type {} has no property '{key}'", other.to_display()),
+    }
+}
+
+/// Whether `expr` can be evaluated over a single row using only the Sync
+/// `gen`/`cache`/`params` — no `!Sync` executor state (no regex `=~`, no budget
+/// `charge`, no nested matching). Exactly the forms [`eval_simple`] handles: a
+/// bound variable, a literal, a parameter, or a one-level property read `var.key`.
+/// The parallel aggregation precompute (Task 12) is gated on every group key and
+/// aggregate argument being simple-readable.
+fn simple_readable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Param(_) | Expr::Var(_) => true,
+        Expr::Property(base, _) => matches!(&**base, Expr::Var(_)),
+        _ => false,
+    }
+}
+
+/// Evaluate a [`simple_readable`] expression over one row (`cols`/`row`) using only
+/// the Sync `gen`/`cache`/`params` — the worker-thread counterpart to the restricted
+/// slice of [`Engine::eval`] that the parallel aggregation precompute needs. It
+/// shares [`property_val`] with `Engine::eval`, and its variable / literal /
+/// parameter arms mirror `Engine::eval` exactly, so it returns a byte-for-byte
+/// identical [`Val`] for the same expression and row. A non-simple form is a caller
+/// bug (the call site is gated by [`simple_readable`]) and bails rather than panics.
+fn eval_simple(
+    gen: &Generation,
+    cache: &BlockCache,
+    params: &HashMap<String, Val>,
+    cols: &[String],
+    row: &[Val],
+    expr: &Expr,
+) -> Result<Val> {
+    match expr {
+        Expr::Literal(v) => Ok(Val::from_value(v.clone())),
+        Expr::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("parameter ${name} was not supplied")),
+        Expr::Var(name) => cols
+            .iter()
+            .position(|c| c == name)
+            .map(|i| row[i].clone())
+            .ok_or_else(|| anyhow::anyhow!("variable '{name}' is not in scope")),
+        Expr::Property(base, key) => {
+            let b = eval_simple(gen, cache, params, cols, row, base)?;
+            property_val(gen, cache, &b, key)
+        }
+        _ => bail!("eval_simple called on a non-simple expression"),
+    }
+}
+
+/// One projected output item in the parallel aggregation plan ([`Engine::project_aggregated_par`]).
+/// `slot` indexes the per-row precomputed value buffer (`cells[row][slot]`).
+enum AggItem {
+    /// A non-aggregate (grouping-key) item; its value is `cells[row][slot]`.
+    Group { slot: usize },
+    /// `count(*)` — the group's row count, no per-row read.
+    CountStar,
+    /// A single-argument aggregate (`count`/`sum`/`avg`/`min`/`max`/`collect`/
+    /// `stdev`/`stdevp`, optionally `DISTINCT`); its argument is `cells[row][slot]`.
+    Agg {
+        name: String,
+        distinct: bool,
+        slot: usize,
+    },
+}
+
+/// Plan a [`project_aggregated`](Engine::project_aggregated) over the parallel
+/// precompute path, or return `None` to fall back to the sequential body. Eligible
+/// iff every output item is either a [`simple_readable`] grouping expression or a
+/// **bare** aggregate call (not an aggregate nested in a larger expression) over a
+/// simple-readable argument — `count(*)` or a single-argument aggregate. Two-argument
+/// `percentile*` is excluded. Returns the list of per-row slot expressions (group
+/// keys and aggregate arguments, in first-seen order) and the per-item plan.
+fn plan_par_aggregation(items: &[(Expr, String)]) -> Option<(Vec<&Expr>, Vec<AggItem>)> {
+    let mut slots: Vec<&Expr> = Vec::new();
+    let mut plan: Vec<AggItem> = Vec::with_capacity(items.len());
+    for (e, _) in items {
+        if contains_aggregate(e) {
+            // Only a bare aggregate function call (e.g. `count(n.x)`), never an
+            // aggregate inside an expression (`count(n.x) + 1`): the bare form lets
+            // the merge use the computed value directly, mirroring `eval` returning
+            // the cursor value for an aggregate-function node.
+            let Expr::Function {
+                name,
+                distinct,
+                args,
+            } = e
+            else {
+                return None;
+            };
+            if !is_aggregate(name) {
+                return None;
+            }
+            let lname = name.to_lowercase();
+            match args {
+                FuncArgs::Star => {
+                    if lname != "count" {
+                        return None;
+                    }
+                    plan.push(AggItem::CountStar);
+                }
+                FuncArgs::Args(a) => {
+                    // Single-argument aggregates only (excludes `percentile*`, which
+                    // take a second constant argument handled by `compute_aggregate`).
+                    if a.len() != 1
+                        || matches!(lname.as_str(), "percentilecont" | "percentiledisc")
+                        || !simple_readable(&a[0])
+                    {
+                        return None;
+                    }
+                    let slot = slots.len();
+                    slots.push(&a[0]);
+                    plan.push(AggItem::Agg {
+                        name: lname,
+                        distinct: *distinct,
+                        slot,
+                    });
+                }
+            }
+        } else {
+            if !simple_readable(e) {
+                return None;
+            }
+            let slot = slots.len();
+            slots.push(e);
+            plan.push(AggItem::Group { slot });
+        }
+    }
+    Some((slots, plan))
+}
+
+/// Reduce a group's collected (null-dropped, optionally deduped) values to the
+/// aggregate result. Shared by the sequential [`Engine::compute_aggregate`] and the
+/// parallel-precompute path (Task 12) so both produce identical results. The
+/// two-argument `percentile*` aggregates are handled by the caller (they carry a
+/// constant percentile), so they never reach here.
+fn reduce_agg(lname: &str, vals: Vec<Val>) -> Result<Val> {
+    Ok(match lname {
+        "count" => Val::Int(vals.len() as i64),
+        "collect" => Val::List(vals),
+        "sum" => sum(&vals)?,
+        "avg" => avg(&vals)?,
+        "min" => vals
+            .into_iter()
+            .reduce(|a, b| if a.cmp_total(&b).is_le() { a } else { b })
+            .unwrap_or(Val::Null),
+        "max" => vals
+            .into_iter()
+            .reduce(|a, b| if a.cmp_total(&b).is_ge() { a } else { b })
+            .unwrap_or(Val::Null),
+        "stdev" => std_dev(&vals, true)?,
+        "stdevp" => std_dev(&vals, false)?,
+        other => bail!("unknown aggregate function '{other}'"),
+    })
+}
+
+/// Minimum input-row count below which [`project_aggregated`](Engine::project_aggregated)
+/// runs the sequential per-row eval — the rayon fan-out overhead isn't worth it for a
+/// small table. Above it (with a fanout pool and an eligible shape), the group-key and
+/// aggregate-argument reads gather on the shared fanout pool.
+const AGG_PAR_MIN: usize = 64;
+
 /// Minimum scanned-candidate count below which the anchor `node_ok` filter (Task 10)
 /// runs sequentially — the rayon fan-out overhead isn't worth it for a narrow scan.
 /// Above it, the per-candidate label/property reads gather on the shared fanout pool.
@@ -1061,18 +1279,7 @@ impl<'g> Engine<'g> {
     }
 
     fn edge_prop(&self, id: u64, key: &str) -> Result<Val> {
-        let Some(key_id) = self.gen.property_key_id(key) else {
-            return Ok(Val::Null);
-        };
-        let rec = self.cache.record(
-            self.gen.edge_props().inner(),
-            self.gen.uuid(),
-            FileKind::EdgeProps,
-            id,
-        )?;
-        Ok(columns::decode_one(&rec, key_id)?
-            .map(Val::from_value)
-            .unwrap_or(Val::Null))
+        edge_prop_par(self.gen, self.cache, id, key)
     }
 
     /// Resolve a node's label names and named properties — the material a Bolt
@@ -4177,6 +4384,19 @@ impl<'g> Engine<'g> {
     }
 
     fn project_aggregated(&self, table: &Table, items: &[(Expr, String)]) -> Result<Vec<Vec<Val>>> {
+        // Parallel fast path (Task 12): when every group key and aggregate argument
+        // is `simple_readable` (Sync-evaluable: a var, literal, param, or `var.key`),
+        // a fanout pool is configured, and the table is large enough, precompute the
+        // per-row reads on the pool and reduce single-threaded. The grouping order,
+        // budget charges and results are byte-for-byte identical to the sequential
+        // body below — only the property reads move off-thread.
+        if self.fanout_pool.is_some() && table.rows.len() >= AGG_PAR_MIN {
+            if let Some((slots, plan)) = plan_par_aggregation(items) {
+                if !slots.is_empty() {
+                    return self.project_aggregated_par(table, items.len(), &slots, &plan);
+                }
+            }
+        }
         // Grouping key = the values of the non-aggregating items, per row.
         let group_item: Vec<bool> = items.iter().map(|(e, _)| contains_aggregate(e)).collect();
         let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
@@ -4221,6 +4441,98 @@ impl<'g> Engine<'g> {
                     r.push(self.eval(e, &rep_scope, Some(&cursor))?);
                 } else {
                     r.push(self.eval(e, &rep_scope, None)?);
+                }
+            }
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    /// Parallel counterpart to [`project_aggregated`](Self::project_aggregated) for the
+    /// `simple_readable` shape (see [`plan_par_aggregation`]). The per-row group-key and
+    /// aggregate-argument reads gather on the shared fanout pool (each touching only the
+    /// Sync `gen`/`cache`); grouping, budget charges and the final reduction stay
+    /// single-threaded in input order, so the output and the charge sequence are
+    /// byte-for-byte identical to the sequential body.
+    fn project_aggregated_par(
+        &self,
+        table: &Table,
+        item_count: usize,
+        slots: &[&Expr],
+        plan: &[AggItem],
+    ) -> Result<Vec<Vec<Val>>> {
+        // Precompute, on the pool, the value of every slot expression for every row.
+        // Capture only Sync state (never `&self`, which is `!Sync`).
+        let gen = self.gen;
+        let cache = self.cache;
+        let params = &self.params;
+        let cols = &table.cols;
+        let cells: Vec<Vec<Val>> = par_gather(
+            self.fanout_pool.as_deref(),
+            &table.rows,
+            AGG_PAR_MIN,
+            |row| {
+                slots
+                    .iter()
+                    .map(|e| eval_simple(gen, cache, params, cols, row, e))
+                    .collect::<Result<Vec<_>>>()
+            },
+        )?;
+
+        // Grouping: the key is the non-aggregate (Group) slots, in item order.
+        let group_slots: Vec<usize> = plan
+            .iter()
+            .filter_map(|p| match p {
+                AggItem::Group { slot } => Some(*slot),
+                _ => None,
+            })
+            .collect();
+        let has_group_item = !group_slots.is_empty();
+        let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
+        for ri in 0..table.rows.len() {
+            let key = GroupKey(group_slots.iter().map(|&s| cells[ri][s].clone()).collect());
+            if !groups.contains_key(&key) {
+                self.charge(1)?; // charge each newly-created group (mirrors sequential)
+            }
+            groups.entry(key).or_default().push(ri);
+        }
+        // An aggregation with no rows and no grouping keys still yields one row.
+        if groups.is_empty() && !has_group_item {
+            groups.insert(GroupKey(Vec::new()), Vec::new());
+        }
+
+        let mut out = Vec::with_capacity(groups.len());
+        for (_, indices) in groups {
+            let mut r = Vec::with_capacity(item_count);
+            for p in plan {
+                match p {
+                    // Grouping-key item: take the representative row's value (the
+                    // first index — a Group item only exists when every group is
+                    // non-empty, so `indices[0]` is always present).
+                    AggItem::Group { slot } => r.push(cells[indices[0]][*slot].clone()),
+                    AggItem::CountStar => r.push(Val::Int(indices.len() as i64)),
+                    AggItem::Agg {
+                        name,
+                        distinct,
+                        slot,
+                    } => {
+                        // Mirror `compute_aggregate`: drop nulls, charging each kept
+                        // value in index order; for DISTINCT charge the dedup set, then
+                        // reduce with the shared `reduce_agg`.
+                        let mut vals = Vec::new();
+                        for &i in &indices {
+                            let v = cells[i][*slot].clone();
+                            if !matches!(v, Val::Null) {
+                                self.charge(1)?;
+                                vals.push(v);
+                            }
+                        }
+                        if *distinct {
+                            self.charge(vals.len() as u64)?;
+                            dedup_vals(&mut vals);
+                        }
+                        r.push(reduce_agg(name, vals)?);
+                    }
                 }
             }
             out.push(r);
@@ -4296,25 +4608,13 @@ impl<'g> Engine<'g> {
             dedup_vals(&mut vals);
         }
 
-        Ok(match lname.as_str() {
-            "count" => Val::Int(vals.len() as i64),
-            "collect" => Val::List(vals),
-            "sum" => sum(&vals)?,
-            "avg" => avg(&vals)?,
-            "min" => vals
-                .into_iter()
-                .reduce(|a, b| if a.cmp_total(&b).is_le() { a } else { b })
-                .unwrap_or(Val::Null),
-            "max" => vals
-                .into_iter()
-                .reduce(|a, b| if a.cmp_total(&b).is_ge() { a } else { b })
-                .unwrap_or(Val::Null),
-            "stdev" => std_dev(&vals, true)?,
-            "stdevp" => std_dev(&vals, false)?,
-            "percentilecont" => percentile_cont(&vals, percentile.unwrap())?,
-            "percentiledisc" => percentile_disc(&vals, percentile.unwrap())?,
-            other => bail!("unknown aggregate function '{other}'"),
-        })
+        // `percentile*` carry the constant percentile; every other aggregate's
+        // value→result reduction is shared with the parallel path via `reduce_agg`.
+        match lname.as_str() {
+            "percentilecont" => percentile_cont(&vals, percentile.unwrap()),
+            "percentiledisc" => percentile_disc(&vals, percentile.unwrap()),
+            other => reduce_agg(other, vals),
+        }
     }
 
     /// Evaluate a constant `SKIP`/`LIMIT` expression to a non-negative count.
@@ -4605,44 +4905,13 @@ impl<'g> Engine<'g> {
         Ok(Val::Bool(acc))
     }
 
+    // Point coordinate read (FalkorDB `Point_GetCoordinate`): only
+    // `latitude`/`longitude` resolve; any other key yields NULL. Temporal component
+    // access (FalkorDB `entity_funcs.c` → `*_getComponent`): an unknown component is
+    // an *error* (unlike Point/Map, which yield NULL). The body lives in the Sync
+    // free fn [`property_val`] so the parallel aggregation precompute can share it.
     fn property(&self, base: &Val, key: &str) -> Result<Val> {
-        match base {
-            Val::Node(id) => self.node_prop(*id, key),
-            Val::Rel { id, .. } => self.edge_prop(*id, key),
-            Val::Map(m) => Ok(m
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-                .unwrap_or(Val::Null)),
-            // Point coordinate read (FalkorDB `Point_GetCoordinate`): only
-            // `latitude`/`longitude` resolve; any other key yields NULL.
-            Val::Point {
-                latitude,
-                longitude,
-            } => Ok(match key {
-                "latitude" => Val::Float(*latitude),
-                "longitude" => Val::Float(*longitude),
-                _ => Val::Null,
-            }),
-            // Temporal component access (FalkorDB `entity_funcs.c` → `*_getComponent`):
-            // an unknown component is an *error* (unlike Point/Map, which yield
-            // NULL). Date/Time/DateTime components are integers; Duration's are
-            // doubles.
-            Val::Date(s) => temporal::date_component(*s, key, false)
-                .map(Val::Int)
-                .ok_or_else(|| anyhow::anyhow!("unknown date component {key}")),
-            Val::Time(s) => temporal::time_component(*s, key)
-                .map(Val::Int)
-                .ok_or_else(|| anyhow::anyhow!("unknown time component {key}")),
-            Val::DateTime(s) => temporal::date_component(*s, key, true)
-                .map(Val::Int)
-                .ok_or_else(|| anyhow::anyhow!("unknown datetime component {key}")),
-            Val::Duration(s) => temporal::duration_component(*s, key)
-                .map(Val::Float)
-                .ok_or_else(|| anyhow::anyhow!("unknown duration component {key}")),
-            Val::Null => Ok(Val::Null),
-            other => bail!("type {} has no property '{key}'", other.to_display()),
-        }
+        property_val(self.gen, self.cache, base, key)
     }
 
     fn index(&self, base: &Val, idx: &Val) -> Result<Val> {
@@ -9418,6 +9687,94 @@ mod tests {
             (Ok(s), Ok(p)) => assert_eq!(s.rows.len(), p.rows.len(), "budget row count differs"),
             (Err(_), Err(_)) => {} // both trip the budget — consistent
             _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn aggregation_with_pool_matches_sequential() {
+        // The parallel group-by / count(DISTINCT) precompute (Task 12) must produce the
+        // same grouped output — same row order, same values — as the sequential per-row
+        // eval. The wide fixture has 200 nodes (≥ AGG_PAR_MIN) with `team` ∈ {Red, Blue,
+        // null} and unique `name`, so the pooled engine truly fans the property reads out
+        // while the grouping/reduction stays single-threaded.
+        let (root, graph) = testgen::write_wide("exec_aggregation", 200);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+            r.rows
+                .iter()
+                .map(|row| row.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        let queries = [
+            // Group-by a property + count(*) — the canonical shape.
+            "MATCH (n) RETURN n.team AS t, count(*) AS c ORDER BY t",
+            // count(DISTINCT n.p) — single row, no grouping item; nulls excluded.
+            "MATCH (n) RETURN count(DISTINCT n.team) AS c",
+            // Multiple aggregates over a group, incl. order-sensitive collect().
+            "MATCH (n) RETURN n.team AS t, count(*) AS c, collect(n.name) AS names ORDER BY t",
+            // min/max over a group (uses the cmp_total reduce path).
+            "MATCH (n) RETURN n.team AS t, min(n.name) AS lo, max(n.name) AS hi ORDER BY t",
+            // No grouping item, single-arg aggregate over the whole table.
+            "MATCH (n) RETURN count(n.team) AS c",
+            // A constant grouping item alongside the aggregate.
+            "MATCH (n) RETURN n.team AS t, count(*) AS c, 1 AS one ORDER BY t",
+        ];
+        for q in queries {
+            let ast = parser::parse(q).unwrap();
+            let seq = Engine::new(&gen, &cache)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("sequential `{q}` failed: {e:#}"));
+            let par = Engine::new(&gen, &cache)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("pooled `{q}` failed: {e:#}"));
+            assert_eq!(seq.columns, par.columns, "columns differ for `{q}`");
+            assert_eq!(disp(&seq), disp(&par), "rows differ for `{q}`");
+        }
+
+        // A `$param` grouping key exercises the Param arm of `eval_simple`.
+        {
+            let q = "MATCH (n) RETURN n.team AS t, count(*) AS c, $k AS k ORDER BY t";
+            let ast = parser::parse(q).unwrap();
+            let params = HashMap::from([("k".to_string(), Val::Int(7))]);
+            let seq = Engine::new(&gen, &cache)
+                .with_params(params.clone())
+                .run(&ast)
+                .unwrap();
+            let par = Engine::new(&gen, &cache)
+                .with_params(params)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast)
+                .unwrap();
+            assert_eq!(disp(&seq), disp(&par), "param rows differ for `{q}`");
+        }
+
+        // A tight intermediate budget must trip (or fit) at the same point under both
+        // engines — the parallel path charges each new group and each aggregated value
+        // in the same order as the sequential merge.
+        let q = "MATCH (n) RETURN n.team AS t, count(*) AS c";
+        let ast = parser::parse(q).unwrap();
+        for budget in [1u64, 2, 3] {
+            let seq = Engine::new(&gen, &cache)
+                .with_max_intermediate(budget)
+                .run(&ast);
+            let par = Engine::new(&gen, &cache)
+                .with_max_intermediate(budget)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast);
+            match (&seq, &par) {
+                (Ok(s), Ok(p)) => assert_eq!(disp(s), disp(p), "budget={budget} rows differ"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("budget={budget} behaviour differs: seq={seq:?}, par={par:?}"),
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }

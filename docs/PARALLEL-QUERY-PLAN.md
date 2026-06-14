@@ -88,6 +88,33 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   proc shape + rel/label filters on the edge-bearing `write_basic` fixture pinning the
   merge; `write_wide(200)` clearing the threshold to exercise the rayon read branch).
 
+- (Task 12) — **parallel group-by / `count(DISTINCT)` reduction**. The aggregation
+  projection (`project_aggregated`) now `par_gather`s the per-row group-key and
+  aggregate-argument reads over the shared fanout pool (`AGG_PAR_MIN = 64`) when the
+  shape is **`simple_readable`** — every grouping item and aggregate argument is a
+  bound var, literal, param, or one-level `var.key` property read (the Sync-evaluable
+  subset). The new Sync free fn `eval_simple(gen, cache, params, cols, row, expr)`
+  evaluates those over `&Generation`/`&BlockCache`/`&params` only; it shares the
+  property-access body with `Engine::eval` via the extracted free fns `property_val`
+  (the `Engine::property` body) and `edge_prop_par` (the `Engine::edge_prop` body),
+  so a precomputed cell is **byte-for-byte identical** to the sequential per-row
+  `eval`. `plan_par_aggregation` classifies each output item into an `AggItem`
+  (`Group{slot}` / `CountStar` / `Agg{name,distinct,slot}`); only **bare** aggregate
+  calls (not aggregates nested in an expression) over simple args qualify, and
+  two-arg `percentile*` bails to the sequential path. `project_aggregated_par` then
+  builds the `BTreeMap<GroupKey, Vec<usize>>` and reduces **single-threaded in input
+  order** — charging each new group and each non-null aggregated value (and the
+  DISTINCT dedup set) in the *same order* as the sequential body, so the
+  `maxIntermediate` budget trips/fits identically. The final value→result reduction
+  is the shared free fn `reduce_agg` (factored out of `compute_aggregate`,
+  non-percentile arm). Anything else (regex, aggregate-in-expression, nested
+  property, no pool, table < `AGG_PAR_MIN`, or no per-row read slots) falls back to
+  the unchanged sequential `project_aggregated`. Test:
+  `exec::aggregation_with_pool_matches_sequential` (group-by + count(\*),
+  count(DISTINCT), multi-aggregate incl. order-sensitive `collect`, min/max,
+  no-group single-arg aggregate, constant + `$param` grouping items, tight budgets —
+  pool vs sequential, on `write_wide(200)`).
+
 ## The reusable pattern
 
 > **gather** a set of independent sub-operations — each doing only `&Generation` + `&BlockCache`
