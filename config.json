@@ -34,6 +34,7 @@
     "maxRows": 100000,
     "timeoutMs": 30000,
     "maxIntermediate": 1000000,
+    "maxIntermediateGlobal": 8000000,
     "maxShortestPathExplore": 0,
     "maxFanout": 1
   },

@@ -318,6 +318,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `query.maxRows` | `query__maxRows` | 100000 | Per-query row cap. |
 | `query.timeoutMs` | `query__timeoutMs` | 30000 | Per-query wall-clock deadline (0 ⇒ none). |
 | `query.maxIntermediate` | `query__maxIntermediate` | 1000000 | Per-query intermediate-element budget (0 ⇒ none); ~48 B/element, so the default bounds one query at ≈48 MB. |
+| `query.maxIntermediateGlobal` | `query__maxIntermediateGlobal` | 8000000 | Server-wide ceiling on the sum of all in-flight queries' intermediate elements (0 ⇒ none). Bounds the aggregate so `N` concurrent heavy queries can't multiply the per-query budget into an OOM; ~48 B/element ⇒ ≈384 MB. |
 | `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | 64 | Vamana beam-search list size. |
 | `generationPollMs` | `generationPollMs` | 5000 | How often to poll each graph's `current`. |
 | `reloadStrategy` | `reloadStrategy` | `exit` | `exit` or `swap` on a generation change. |
@@ -560,8 +561,9 @@ the Wikidata-1M graph (one 16-core box):
   *process* RSS rises to a retained allocator high-water (~2.7 GB anon, default glibc;
   **not a leak** — flat over 90k further queries) well above the cache budget;
   `MALLOC_ARENA_MAX`/jemalloc + a concurrency cap are the levers. (2) `maxIntermediate`
-  is a **per-query** bound, so `N_concurrent × budget` can still OOM — a **server-wide
-  intermediate budget** is the proper fix. Both are tracked in the load-testing doc.
+  is a **per-query** bound, so `N_concurrent × budget` could still OOM — now closed by
+  the server-wide **`query.maxIntermediateGlobal`** ceiling (default on). Both are
+  tracked in the load-testing doc.
 
 ## License
 

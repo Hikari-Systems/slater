@@ -120,6 +120,7 @@ pub struct Diagnostics {
     /// signed counter guards against a transient negative read under races.
     queries_in_flight: AtomicI64,
     fail_budget: AtomicU64,
+    fail_global_budget: AtomicU64,
     fail_deadline: AtomicU64,
     fail_shortest_path: AtomicU64,
     fail_parse: AtomicU64,
@@ -214,7 +215,9 @@ impl Diagnostics {
         }
         self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         let m = err.to_string();
-        let counter = if m.contains("intermediate result budget") {
+        let counter = if m.contains("server-wide intermediate budget") {
+            &self.fail_global_budget
+        } else if m.contains("intermediate result budget") {
             &self.fail_budget
         } else if m.contains("exceeded its time limit") {
             &self.fail_deadline
@@ -308,6 +311,7 @@ impl Diagnostics {
             self.queries_in_flight.load(Ordering::Relaxed).max(0)
         );
         int!("fail_budget_total", load(&self.fail_budget));
+        int!("fail_global_budget_total", load(&self.fail_global_budget));
         int!("fail_deadline_total", load(&self.fail_deadline));
         int!("fail_shortest_path_total", load(&self.fail_shortest_path));
         int!("fail_parse_total", load(&self.fail_parse));
@@ -323,6 +327,18 @@ impl Diagnostics {
         int!("cfg_max_rows", live.max_rows as i64);
         int!("cfg_timeout_ms", live.timeout_ms as i64);
         int!("cfg_max_intermediate", live.max_intermediate as i64);
+        int!(
+            "cfg_max_intermediate_global",
+            live.max_intermediate_global as i64
+        );
+        int!(
+            "intermediate_global_in_use",
+            live.intermediate_global_in_use as i64
+        );
+        int!(
+            "intermediate_global_peak",
+            live.intermediate_global_peak as i64
+        );
         int!(
             "cfg_max_shortest_path_explore",
             live.max_shortest_path_explore as i64
@@ -369,6 +385,11 @@ pub struct LiveGauges {
     pub max_rows: u64,
     pub timeout_ms: u64,
     pub max_intermediate: u64,
+    /// Server-wide intermediate budget: the ceiling and its live/peak occupancy
+    /// (`query.maxIntermediateGlobal`). 0 limit ⇒ the guard is disabled.
+    pub max_intermediate_global: u64,
+    pub intermediate_global_in_use: u64,
+    pub intermediate_global_peak: u64,
     pub max_shortest_path_explore: u64,
     pub max_fanout: u64,
     pub max_message_bytes: u64,
@@ -480,6 +501,9 @@ mod tests {
             max_rows: 100,
             timeout_ms: 30_000,
             max_intermediate: 1_000_000,
+            max_intermediate_global: 8_000_000,
+            intermediate_global_in_use: 0,
+            intermediate_global_peak: 0,
             max_shortest_path_explore: 0,
             max_fanout: 1,
             max_message_bytes: 64,

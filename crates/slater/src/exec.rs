@@ -30,6 +30,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -1097,6 +1098,71 @@ impl Table {
     }
 }
 
+// ── Server-wide intermediate budget ─────────────────────────────────────────
+
+/// Process-wide ceiling on the **sum** of all in-flight queries' intermediate
+/// element charges.
+///
+/// The per-query [`Engine::with_max_intermediate`] budget bounds *one* query; it
+/// cannot bound the aggregate, so `N` concurrent memory-heavy queries each
+/// charging up to their per-query cap multiply into `N × maxIntermediate` —
+/// enough to OOM a bounded-memory deployment even though every individual query
+/// is within its limit. This guard closes that gap: every `Engine` charges its
+/// intermediate elements against this shared counter as well as its own, and a
+/// charge that would push the global total past [`limit`](Self::limit) fails the
+/// query with a clean, retryable error instead of growing the heap.
+///
+/// Held as `Arc<GlobalIntermediateBudget>` and shared by every per-query engine.
+/// A `limit` of 0 disables the guard (the counter is never touched).
+pub struct GlobalIntermediateBudget {
+    in_use: AtomicU64,
+    peak: AtomicU64,
+    limit: u64,
+}
+
+impl GlobalIntermediateBudget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            in_use: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            limit,
+        }
+    }
+    /// The configured ceiling (`query.maxIntermediateGlobal`); 0 = disabled.
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+    /// Live sum of all in-flight queries' charged intermediate elements.
+    pub fn in_use(&self) -> u64 {
+        self.in_use.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// High-water mark of [`in_use`](Self::in_use) since start.
+    pub fn peak(&self) -> u64 {
+        self.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Charge `n` elements; returns `false` if the new global total exceeds the
+    /// limit (the caller then rejects the query). The `n` stays added either way —
+    /// the query refunds its whole charge on completion via [`release`](Self::release),
+    /// so a rejected query's transient charge is reclaimed when it unwinds.
+    fn try_charge(&self, n: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.limit == 0 {
+            return true;
+        }
+        let now = self.in_use.fetch_add(n, Relaxed) + n;
+        self.peak.fetch_max(now, Relaxed);
+        now <= self.limit
+    }
+    /// Refund `n` elements when a query finishes (success or failure).
+    fn release(&self, n: u64) {
+        if self.limit == 0 || n == 0 {
+            return;
+        }
+        self.in_use
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // ── Engine ─────────────────────────────────────────────────────────────────
 
 /// Per-query execution context over one generation and its block cache.
@@ -1122,6 +1188,12 @@ pub struct Engine<'g> {
     /// a query cannot grow unbounded memory inside the `timeout_ms` window.
     max_intermediate: u64,
     budget_used: Cell<u64>,
+    /// Server-wide intermediate budget shared across every concurrent query
+    /// (`query.maxIntermediateGlobal`); `None` ⇒ no global guard. Charged in
+    /// lock-step with `budget_used`; `global_charged` is this query's running
+    /// contribution to it, refunded in full when the query ends (see `run`/`Drop`).
+    global_budget: Option<&'g GlobalIntermediateBudget>,
+    global_charged: Cell<u64>,
     /// Optional cap on how many nodes a single `shortestPath()` global-visited BFS
     /// may discover (config `query.maxShortestPathExplore`); 0 = unlimited. Distinct
     /// from `max_intermediate` on purpose: the BFS holds an O(V) working set with a
@@ -1141,6 +1213,15 @@ pub struct Engine<'g> {
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
 }
 
+impl Drop for Engine<'_> {
+    /// Backstop for the global-budget refund if `run` is bypassed or unwound by a
+    /// panic mid-query; after a normal `run` the charge is already 0, so this is a
+    /// no-op on the hot path.
+    fn drop(&mut self) {
+        self.release_global();
+    }
+}
+
 impl<'g> Engine<'g> {
     pub fn new(gen: &'g Generation, cache: &'g BlockCache) -> Self {
         Self {
@@ -1154,6 +1235,8 @@ impl<'g> Engine<'g> {
             beam_width: 64,
             max_intermediate: 0,
             budget_used: Cell::new(0),
+            global_budget: None,
+            global_charged: Cell::new(0),
             max_shortest_path_explore: 0,
             fanout_pool: None,
             regex_cache: RefCell::new(HashMap::new()),
@@ -1190,6 +1273,14 @@ impl<'g> Engine<'g> {
     /// (config `query.maxIntermediate`); 0 disables the budget.
     pub fn with_max_intermediate(mut self, max_intermediate: u64) -> Self {
         self.max_intermediate = max_intermediate;
+        self
+    }
+
+    /// Share the process-wide intermediate budget so this query's charges also
+    /// count against the server-wide ceiling (`query.maxIntermediateGlobal`).
+    /// Without it the query is bounded only by its per-query `maxIntermediate`.
+    pub fn with_global_budget(mut self, budget: &'g GlobalIntermediateBudget) -> Self {
+        self.global_budget = Some(budget);
         self
     }
 
@@ -1329,25 +1420,57 @@ impl<'g> Engine<'g> {
     /// peak) allocation is bounded — geometric growth like `reduce(acc + acc)`
     /// trips the budget on an early iteration.
     fn charge(&self, n: u64) -> Result<()> {
-        if self.max_intermediate == 0 {
-            return Ok(());
+        // Per-query budget (config `query.maxIntermediate`; 0 disables).
+        if self.max_intermediate != 0 {
+            let used = self.budget_used.get().saturating_add(n);
+            self.budget_used.set(used);
+            if used > self.max_intermediate {
+                bail!(
+                    "query exceeded the intermediate result budget of {} elements (query.maxIntermediate)",
+                    self.max_intermediate
+                );
+            }
         }
-        let used = self.budget_used.get().saturating_add(n);
-        self.budget_used.set(used);
-        if used > self.max_intermediate {
-            bail!(
-                "query exceeded the intermediate result budget of {} elements (query.maxIntermediate)",
-                self.max_intermediate
-            );
+        // Server-wide budget (config `query.maxIntermediateGlobal`; 0 disables) —
+        // the aggregate guard a per-query cap cannot provide. Charged even when the
+        // per-query budget is off, and refunded in full when the query ends.
+        if let Some(g) = self.global_budget {
+            if g.limit() != 0 {
+                self.global_charged
+                    .set(self.global_charged.get().saturating_add(n));
+                if !g.try_charge(n) {
+                    bail!(
+                        "server-wide intermediate budget of {} elements exhausted \
+                         (query.maxIntermediateGlobal) — too many concurrent memory-heavy queries",
+                        g.limit()
+                    );
+                }
+            }
         }
         Ok(())
     }
 
+    /// Refund this query's whole global-budget charge. Idempotent: a second call
+    /// (e.g. `Drop` after `run` already released) refunds nothing.
+    fn release_global(&self) {
+        if let Some(g) = self.global_budget {
+            g.release(self.global_charged.replace(0));
+        }
+    }
+
     // ── Entry point ───────────────────────────────────────────────────────
 
-    /// Execute a (possibly `UNION`ed) query.
+    /// Execute a (possibly `UNION`ed) query. Always refunds this query's
+    /// server-wide budget charge before returning, on success or failure.
     pub fn run(&self, q: &Query) -> Result<QueryResult> {
+        let r = self.run_inner(q);
+        self.release_global();
+        r
+    }
+
+    fn run_inner(&self, q: &Query) -> Result<QueryResult> {
         self.budget_used.set(0); // per-run budget; engines may be reused
+        self.global_charged.set(0);
         let mut result = self.run_single(&q.head)?;
         for (union_all, part) in &q.tail {
             let next = self.run_single(part)?;
@@ -9392,6 +9515,115 @@ mod tests {
             format!("{err:#}").contains("intermediate result budget"),
             "expected the budget error, got: {err:#}"
         );
+    }
+
+    #[test]
+    fn global_budget_bounds_concurrent_aggregate() {
+        // The mechanism the per-query cap cannot provide: two "in-flight" queries
+        // charging against one shared budget. Each is individually fine, but their
+        // sum trips the ceiling — and the charge is held until each query refunds.
+        let b = GlobalIntermediateBudget::new(1_000);
+        assert!(b.try_charge(600), "query A within the ceiling");
+        assert!(!b.try_charge(600), "query A+B exceed the ceiling");
+        assert_eq!(b.in_use(), 1_200, "both charges live until refunded");
+        b.release(600);
+        assert_eq!(b.in_use(), 600);
+        b.release(600);
+        assert_eq!(b.in_use(), 0, "all refunded");
+        assert_eq!(b.peak(), 1_200, "peak records the high-water");
+    }
+
+    #[test]
+    fn global_budget_zero_disables() {
+        let b = GlobalIntermediateBudget::new(0);
+        assert!(b.try_charge(10_000_000), "a 0 limit never rejects");
+        assert_eq!(b.in_use(), 0, "a disabled guard never accumulates");
+    }
+
+    #[test]
+    fn global_budget_trips_with_per_query_off() {
+        // Per-query budget disabled (0), but the server-wide guard still bounds the
+        // query — and the distinct error names the global knob.
+        let (root, graph, _) = testgen::write_basic("exec_global_solo");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(1_500);
+        let engine = Engine::new(&gen, &cache)
+            .with_max_intermediate(0)
+            .with_global_budget(&budget);
+        let ast = parser::parse("UNWIND range(0, 1000) AS x RETURN count(x)").unwrap();
+        let err = engine
+            .run(&ast)
+            .expect_err("the global budget must trip with the per-query budget off");
+        assert!(
+            format!("{err:#}").contains("server-wide intermediate budget"),
+            "expected the global-budget error, got: {err:#}"
+        );
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "a failed query refunds its whole charge"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_budget_refunds_after_successful_run() {
+        let (root, graph, _) = testgen::write_basic("exec_global_refund");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(10_000);
+        let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+        let ast = parser::parse("UNWIND range(0, 100) AS x RETURN count(x)").unwrap();
+        engine.run(&ast).expect("well within the budget");
+        assert_eq!(budget.in_use(), 0, "a finished query holds no charge");
+        assert!(budget.peak() > 0, "it did draw on the budget mid-run");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_budget_rises_during_run_and_falls_after() {
+        // Observe the live gauge from a second thread *while* a query executes: the
+        // global charge must climb above zero during the run and return to zero
+        // when it completes (the shared in-flight accounting, end to end).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (root, graph, _) = testgen::write_basic("exec_global_inflight");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        // Generous ceiling so the query never trips the guard; it still charges
+        // ~900k elements and holds them for the whole run, so the reader can see it
+        // climb. (range() itself caps at 1M elements, so stay under that here.)
+        let budget = GlobalIntermediateBudget::new(100_000_000);
+        let done = AtomicBool::new(false);
+        let mut max_live = 0u64;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+                let ast = parser::parse("UNWIND range(0, 900000) AS x RETURN count(x)").unwrap();
+                engine.run(&ast).expect("within the budget");
+                done.store(true, Ordering::Release);
+            });
+            // Sample the live gauge until the query thread signals completion,
+            // yielding each iteration so the worker is not starved (the sampler
+            // must not monopolise a constrained scheduler). The deadline is a
+            // safety net so a stuck query fails the test rather than hanging it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                max_live = max_live.max(budget.in_use());
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+        assert!(
+            max_live > 0,
+            "the global charge must be observable above zero while the query runs"
+        );
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "the charge must fall back to zero once the query completes"
+        );
+        assert!(budget.peak() >= max_live, "peak tracks the live high-water");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

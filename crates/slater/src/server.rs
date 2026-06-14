@@ -49,7 +49,7 @@ use crate::bolt::message;
 use crate::bolt::packstream::PsValue;
 use crate::cache::{BlockCache, ResultCache, ResultKey, VectorIndexCache};
 use crate::config::{AppConfig, ReloadStrategy, TlsConfig};
-use crate::exec::{Engine, QueryResult, Val};
+use crate::exec::{Engine, GlobalIntermediateBudget, QueryResult, Val};
 use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
@@ -514,6 +514,10 @@ struct ConnCtx {
     timeout_ms: u64,
     /// Per-query intermediate-element budget (`query.maxIntermediate`); 0 disables.
     max_intermediate: u64,
+    /// Server-wide ceiling on the sum of all in-flight queries' intermediate
+    /// charges (`query.maxIntermediateGlobal`); shared by every per-query engine so
+    /// concurrency cannot multiply the per-query budget into an OOM. 0 disables.
+    intermediate_budget: Arc<GlobalIntermediateBudget>,
     /// Per-query `shortestPath()` BFS discovery cap (`query.maxShortestPathExplore`);
     /// 0 = unlimited.
     max_shortest_path_explore: u64,
@@ -737,6 +741,9 @@ impl ConnCtx {
             max_rows: self.max_rows as u64,
             timeout_ms: self.timeout_ms,
             max_intermediate: self.max_intermediate,
+            max_intermediate_global: self.intermediate_budget.limit(),
+            intermediate_global_in_use: self.intermediate_budget.in_use(),
+            intermediate_global_peak: self.intermediate_budget.peak(),
             max_shortest_path_explore: self.max_shortest_path_explore,
             // The effective fanout = the pool's thread count (1 when sequential).
             max_fanout: self
@@ -1280,6 +1287,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_rows: cfg.query.max_rows as usize,
         timeout_ms: cfg.query.timeout_ms,
         max_intermediate: cfg.query.max_intermediate,
+        intermediate_budget: Arc::new(GlobalIntermediateBudget::new(
+            cfg.query.max_intermediate_global,
+        )),
         max_shortest_path_explore: cfg.query.max_shortest_path_explore,
         fanout_pool: build_fanout_pool(cfg.query.max_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
@@ -1973,6 +1983,7 @@ async fn run_query(
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
     let max_intermediate = ctx.max_intermediate;
+    let intermediate_budget = ctx.intermediate_budget.clone();
     let max_shortest_path_explore = ctx.max_shortest_path_explore;
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
@@ -2009,6 +2020,7 @@ async fn run_query(
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)
+                        .with_global_budget(intermediate_budget.as_ref())
                         .with_max_shortest_path_explore(max_shortest_path_explore)
                         .with_fanout_pool(fanout_pool.clone());
                     if timeout_ms > 0 {
@@ -2671,6 +2683,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
             fanout_pool: None,
             beam_width: 64,
@@ -2747,6 +2760,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
             fanout_pool: None,
             beam_width: 64,

@@ -356,6 +356,15 @@ pub struct QueryConfig {
     /// 0 disables the budget.
     #[serde(default = "default_max_intermediate", deserialize_with = "de::u64")]
     pub max_intermediate: u64,
+    /// Server-wide ceiling on the *sum* of all in-flight queries' intermediate
+    /// elements. `max_intermediate` bounds one query; this bounds the aggregate so
+    /// `N` concurrent heavy queries cannot multiply into an OOM. A charge that would
+    /// cross it fails that query with a clean, retryable error. 0 disables the guard.
+    #[serde(
+        default = "default_max_intermediate_global",
+        deserialize_with = "de::u64"
+    )]
+    pub max_intermediate_global: u64,
     /// Optional cap on how many nodes a single `shortestPath()` global-visited BFS
     /// may discover; 0 = unlimited (default). Dedicated to that one O(V) operation so
     /// tiny-memory deployments can bound it without shrinking the general
@@ -461,6 +470,15 @@ fn default_timeout_ms() -> u64 {
 fn default_max_intermediate() -> u64 {
     1_000_000
 }
+// Server-wide companion to `max_intermediate`. At ~48 bytes per element the 8M
+// default bounds the aggregate live intermediate memory of *all* concurrent
+// queries at roughly 384 MB — generous enough for normal concurrency (a point
+// lookup charges ~0; only memory-heavy expand/aggregate queries draw it down) yet
+// enough to stop `N × maxIntermediate` from OOMing under a flood of heavy queries.
+// 0 disables the guard.
+fn default_max_intermediate_global() -> u64 {
+    8_000_000
+}
 fn default_max_shortest_path_explore() -> u64 {
     0 // unlimited — preserves the AnyShortest "always succeeds in O(V+E)" guarantee
 }
@@ -497,6 +515,7 @@ impl Default for QueryConfig {
             max_rows: default_max_rows(),
             timeout_ms: default_timeout_ms(),
             max_intermediate: default_max_intermediate(),
+            max_intermediate_global: default_max_intermediate_global(),
             max_shortest_path_explore: default_max_shortest_path_explore(),
             max_fanout: default_max_fanout(),
         }

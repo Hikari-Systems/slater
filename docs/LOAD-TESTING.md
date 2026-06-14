@@ -108,8 +108,18 @@ which OOM'd the 4 GB container even after the per-query cap was tightened 10×
 (the per-step snapshot misses the transient peak, which is why steady RSS read 33 MB
 while the process still died).
 
-**Recommended fix — a server-wide budget guard.** A single global ceiling that all
-in-flight queries charge against, in addition to the per-query cap. Two shapes:
+**Fix — a server-wide budget guard (implemented).** As of this change there is a
+single global ceiling, **`query.maxIntermediateGlobal`** (default 8,000,000
+elements ≈ 384 MB at ~48 B/element; 0 disables), that all in-flight queries charge
+against in addition to the per-query cap. Each `Engine` charges its intermediate
+elements against a shared `GlobalIntermediateBudget`; a charge that would cross the
+ceiling fails *that* query with a clean, retryable error
+(`fail_global_budget_total` in diagnostics, plus the `intermediate_global_in_use` /
+`intermediate_global_peak` gauges) instead of growing the heap. A point lookup
+charges ~0, so light load is unaffected; only memory-heavy expand/aggregate queries
+draw the budget down. This is option 1 below; option 2 remains possible future work.
+
+The two shapes considered:
 
 1. **Global intermediate accounting** (the real bound) — a process-wide atomic of
    live intermediate elements/bytes; each query charges/refunds against both its
