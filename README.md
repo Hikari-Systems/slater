@@ -476,8 +476,8 @@ default cache budgets:
 | graph (nodes / edges) | slater | Neo4j 5 | Memgraph | FalkorDB |
 |---|--:|--:|--:|--:|
 | pole — 62k / 106k | **82 MiB** | 774 | 115 | 140 |
-| MeSH — 340k / 469k | **262 MiB** | 1,117 | 355 | 454 |
-| Wikidata — 1M / 13.8M | **645 MiB** | 2,012 | 2,716 | 1,506 |
+| MeSH — 340k / 469k | **258 MiB** | 1,117 | 355 | 454 |
+| Wikidata — 1M / 13.8M | **~150 MiB** | 2,012 | 2,716 | 1,506 |
 | Wikidata — 91.6M / 766M | **~0.9 GiB †** | 2,911 | cannot-load | cannot-load |
 
 † anon high-water (at 14 GB on disk the OS page cache dominates the cgroup peak; anon is
