@@ -561,9 +561,11 @@ the Wikidata-1M graph (one 16-core box):
   *process* RSS rises to a retained allocator high-water (~2.7 GB anon, default glibc;
   **not a leak** — flat over 90k further queries) well above the cache budget;
   `MALLOC_ARENA_MAX`/jemalloc + a concurrency cap are the levers. (2) `maxIntermediate`
-  is a **per-query** bound, so `N_concurrent × budget` could still OOM — now closed by
-  the server-wide **`query.maxIntermediateGlobal`** ceiling (default on). Both are
-  tracked in the load-testing doc.
+  is a **per-query** bound, so `N_concurrent × budget` can OOM; the server-wide
+  **`query.maxIntermediateGlobal`** ceiling (default on) bounds the aggregate *charged*
+  intermediate, but the load test also found graph expansion **under-charges** its
+  working set, so expansion-heavy floods still need that fix. All tracked in the
+  load-testing doc.
 
 ## License
 

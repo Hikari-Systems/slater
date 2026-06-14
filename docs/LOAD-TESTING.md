@@ -108,29 +108,51 @@ which OOM'd the 4 GB container even after the per-query cap was tightened 10×
 (the per-step snapshot misses the transient peak, which is why steady RSS read 33 MB
 while the process still died).
 
-**Fix — a server-wide budget guard (implemented).** As of this change there is a
-single global ceiling, **`query.maxIntermediateGlobal`** (default 8,000,000
-elements ≈ 384 MB at ~48 B/element; 0 disables), that all in-flight queries charge
-against in addition to the per-query cap. Each `Engine` charges its intermediate
-elements against a shared `GlobalIntermediateBudget`; a charge that would cross the
-ceiling fails *that* query with a clean, retryable error
-(`fail_global_budget_total` in diagnostics, plus the `intermediate_global_in_use` /
-`intermediate_global_peak` gauges) instead of growing the heap. A point lookup
-charges ~0, so light load is unaffected; only memory-heavy expand/aggregate queries
-draw the budget down. This is option 1 below; option 2 remains possible future work.
+**Partial fix — a server-wide budget guard (implemented).** There is now a single
+global ceiling, **`query.maxIntermediateGlobal`** (default 8,000,000 elements
+≈ 384 MB at ~48 B/element; 0 disables), that all in-flight queries charge against in
+addition to the per-query cap. Each `Engine` charges its intermediate elements
+against a shared `GlobalIntermediateBudget`; a charge that would cross the ceiling
+fails *that* query with a clean, retryable error (`fail_global_budget_total` in
+diagnostics, plus the `intermediate_global_in_use` / `intermediate_global_peak`
+gauges) instead of growing the heap. A point lookup charges ~0, so light load is
+unaffected — re-running `wiki_cache_churn` on the guard build is byte-for-byte the
+same (0 rejects, global peak ~211k ≪ the 8M ceiling).
 
-The two shapes considered:
+**…but it does *not* close the `wiki_budget` OOM, which exposed a deeper bug
+(finding 2b).** Re-running `wiki_budget` on the guard build still OOM'd — even with
+the global ceiling tightened to 1M. The diagnostics are the tell: at the moment of
+death the global charge sat right at its limit (`intermediate_global_peak`
+≈ 1,026,943, `fail_global_budget` climbing) while **RSS had spiked to 3.8 GB** — so
+~1M *charged* elements coincided with ~3.8 GB of real memory (~3.8 KB per "element").
+The guard's accounting is correct (the unit tests pin the counter at the limit and
+verify the refund), but the **charge model under-counts graph-expansion working
+memory**, so neither budget can see the allocation that actually OOMs.
 
-1. **Global intermediate accounting** (the real bound) — a process-wide atomic of
-   live intermediate elements/bytes; each query charges/refunds against both its
-   per-query cap *and* a global ceiling (configurable, in the spirit of the cache
-   budgets). A query that would push the global total over the ceiling blocks
-   (back-pressure) or fails with a clean "server busy" instead of OOMing. The
-   per-query in-flight count already exists — this lifts it into a shared atomic
-   with a wait/reject path and a `diagnostics` counter.
-2. **Heavy-query admission control** (simpler, coarser) — a global semaphore
-   limiting how many budget-charging (expand/aggregate) queries run concurrently,
-   capping `N_concurrent` regardless of per-query size.
+### 2b. Graph expansion under-charges its working set
+
+`expand_with_dir` reads a node's **entire adjacency list** (`outgoing()`/`incoming()`
+→ `Vec<Adj>`) and builds a `Vec<Hop>` from it, and `expand_chain` only `charge(1)`s
+per *completed* path. So expanding a hub node allocates a large adjacency vector (and,
+for `count(DISTINCT)`, a `HashMap`-per-row result far heavier than a 48 B `Val`)
+**before any charge fires** — the element budget counts emitted rows, not the bytes
+the expansion materialises. A flood of concurrent hub 2-hops therefore OOMs despite
+both budgets. The accounting fix is to **charge the adjacency length when a node is
+expanded** (and/or account row bytes), so a hub read trips the budget immediately
+instead of after emitting a million rows. Until then, the server-wide budget bounds
+*collect/unwind/aggregate*-style intermediate growth (where charging is proportional)
+but not expansion-dominated queries.
+
+Two shapes were considered for the aggregate guard; option 1 is what shipped:
+
+1. **Global intermediate accounting** (shipped) — a process-wide atomic of live
+   intermediate elements that each query charges/refunds against alongside its
+   per-query cap; a charge over the ceiling fails the query cleanly. Bounds
+   proportionally-charged growth; needs finding 2b to also bound expansion.
+2. **Heavy-query admission control** (future) — a global semaphore limiting how many
+   budget-charging (expand/aggregate) queries run concurrently, capping
+   `N_concurrent` regardless of per-query size. Independent of the charge model, so
+   it would also bound the expansion case.
 
 ### 3. Engine / planner observations surfaced by the disk-bound shapes
 

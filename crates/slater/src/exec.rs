@@ -9426,6 +9426,63 @@ mod tests {
         res
     }
 
+    /// Run `q` with the per-query budget OFF and a server-wide budget set. Asserts
+    /// the universal invariant — every query refunds its whole global charge, so
+    /// the live counter returns to zero — and returns `(result, peak_charge)`.
+    fn run_global(root_tag: &str, global: u64, q: &str) -> (Result<QueryResult>, u64) {
+        let (root, graph, _) = testgen::write_basic(root_tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(global);
+        let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+        let ast = parser::parse(q).unwrap();
+        let res = engine.run(&ast);
+        let peak = budget.peak();
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "every query must refund its whole global charge"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        (res, peak)
+    }
+
+    /// Run `q` with BOTH the per-query and the server-wide budget set, so a test
+    /// can assert which guard trips first. Also asserts the global refund invariant.
+    fn run_both(root_tag: &str, per_query: u64, global: u64, q: &str) -> Result<QueryResult> {
+        let (root, graph, _) = testgen::write_basic(root_tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(global);
+        let engine = Engine::new(&gen, &cache)
+            .with_max_intermediate(per_query)
+            .with_global_budget(&budget);
+        let ast = parser::parse(q).unwrap();
+        let res = engine.run(&ast);
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "query must refund its whole global charge"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        res
+    }
+
+    /// True if `res` is the per-query budget error.
+    fn is_per_query_budget_err(res: &Result<QueryResult>) -> bool {
+        res.as_ref().err().is_some_and(|e| {
+            format!("{e:#}").contains("intermediate result budget")
+                && !format!("{e:#}").contains("server-wide")
+        })
+    }
+
+    /// True if `res` is the server-wide budget error.
+    fn is_global_budget_err(res: &Result<QueryResult>) -> bool {
+        res.as_ref()
+            .err()
+            .is_some_and(|e| format!("{e:#}").contains("server-wide intermediate budget"))
+    }
+
     #[test]
     fn regex_pattern_length_is_capped() {
         // A pattern past MAX_REGEX_PATTERN_BYTES is refused before compilation.
@@ -9624,6 +9681,291 @@ mod tests {
         );
         assert!(budget.peak() >= max_live, "peak tracks the live high-water");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Per-query budget across every materialising operation ────────────────
+
+    #[test]
+    fn intermediate_budget_caps_collect() {
+        // collect() buffers all inputs; charging the buffer trips a tight budget.
+        let err = run_budgeted(
+            "exec_budget_collect",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN collect(x)",
+        )
+        .expect_err("the collect buffer must exceed the budget");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    #[test]
+    fn intermediate_budget_caps_count_distinct() {
+        // count(DISTINCT x) holds a `seen` set; charging it trips the budget.
+        let err = run_budgeted(
+            "exec_budget_distinct",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN count(DISTINCT x)",
+        )
+        .expect_err("the DISTINCT seen-set must exceed the budget");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    #[test]
+    fn intermediate_budget_caps_order_by() {
+        // ORDER BY clones every row plus its sort key into a buffer (charged).
+        let err = run_budgeted(
+            "exec_budget_order",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN x ORDER BY x",
+        )
+        .expect_err("the ORDER BY buffer must exceed the budget");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    #[test]
+    fn intermediate_budget_caps_group_by() {
+        // A distinct grouping key per row creates ~N groups; charging each group
+        // (plus the unwound rows) trips the budget.
+        let err = run_budgeted(
+            "exec_budget_group",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN x AS g, count(*) AS n",
+        )
+        .expect_err("the group table must exceed the budget");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    #[test]
+    fn intermediate_budget_caps_union() {
+        // A UNION accumulates both branches (and a DISTINCT seen-set); a tight
+        // budget trips while building it.
+        let err = run_budgeted(
+            "exec_budget_union",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN x \
+             UNION UNWIND range(0, 1000) AS y RETURN y",
+        )
+        .expect_err("the UNION buildup must exceed the budget");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    #[test]
+    fn intermediate_budget_zero_disables_the_cap() {
+        // A 0 budget means unlimited: a large materialisation completes.
+        let res = run_budgeted(
+            "exec_budget_zero",
+            0,
+            "UNWIND range(0, 200000) AS x RETURN count(x)",
+        )
+        .expect("a 0 budget must not cap anything");
+        assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn intermediate_budget_allows_within_limit() {
+        // Comfortably under the cap → the query succeeds.
+        let res = run_budgeted(
+            "exec_budget_within",
+            100_000,
+            "UNWIND range(0, 1000) AS x RETURN count(x)",
+        )
+        .expect("a query within the budget must succeed");
+        assert_eq!(res.rows.len(), 1);
+    }
+
+    #[test]
+    fn intermediate_budget_threshold_passes_then_trips() {
+        // The same materialisation passes under a generous cap and trips under a
+        // tight one — the budget actually gates on the charged element count.
+        run_budgeted(
+            "exec_budget_thresh_ok",
+            50_000,
+            "RETURN [x IN range(0, 1000) | x]",
+        )
+        .expect("generous budget passes");
+        let err = run_budgeted(
+            "exec_budget_thresh_no",
+            1_500,
+            "RETURN [x IN range(0, 1000) | x]",
+        )
+        .expect_err("tight budget trips");
+        assert!(format!("{err:#}").contains("intermediate result budget"));
+    }
+
+    // ── Server-wide budget across the same operations ────────────────────────
+
+    #[test]
+    fn global_budget_trips_on_comprehension() {
+        let (res, _) = run_global("exec_g_comp", 1_500, "RETURN [x IN range(0, 1000) | x]");
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_trips_on_collect() {
+        let (res, _) = run_global(
+            "exec_g_collect",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN collect(x)",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_trips_on_count_distinct() {
+        let (res, _) = run_global(
+            "exec_g_distinct",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN count(DISTINCT x)",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_trips_on_order_by() {
+        let (res, _) = run_global(
+            "exec_g_order",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN x ORDER BY x",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_trips_on_union() {
+        let (res, _) = run_global(
+            "exec_g_union",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN x UNION UNWIND range(0, 1000) AS y RETURN y",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_allows_small_query() {
+        let (res, peak) = run_global("exec_g_small", 100_000, "RETURN [x IN range(0, 50) | x]");
+        assert!(res.is_ok(), "a small query must not trip: {res:?}");
+        assert!(peak > 0, "it still drew on the budget");
+    }
+
+    #[test]
+    fn global_budget_zero_completes_large() {
+        // Per-query off and global 0 → no cap; a large materialisation completes
+        // and the (disabled) counter never accumulates.
+        let (res, peak) = run_global(
+            "exec_g_zero",
+            0,
+            "UNWIND range(0, 200000) AS x RETURN count(x)",
+        );
+        assert!(res.is_ok(), "0 disables the guard: {res:?}");
+        assert_eq!(peak, 0, "a disabled guard never accumulates");
+    }
+
+    #[test]
+    fn global_budget_refunds_after_a_trip() {
+        // run_global already asserts in_use == 0; make the failure path explicit.
+        let (res, _) = run_global(
+            "exec_g_refund_fail",
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN collect(x)",
+        );
+        assert!(is_global_budget_err(&res), "expected a trip: {res:?}");
+    }
+
+    // ── Interaction of the two budgets ───────────────────────────────────────
+
+    #[test]
+    fn per_query_budget_trips_first_when_tighter() {
+        // Tighter per-query cap (1500) beneath a roomy global (10M) → the per-query
+        // guard fires, named by its own error.
+        let res = run_both(
+            "exec_both_pq",
+            1_500,
+            10_000_000,
+            "UNWIND range(0, 1000) AS x RETURN collect(x)",
+        );
+        assert!(is_per_query_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn global_budget_trips_first_when_tighter() {
+        // Tighter global (1500) beneath a roomy per-query cap (10M) → the
+        // server-wide guard fires, named by its own error.
+        let res = run_both(
+            "exec_both_g",
+            10_000_000,
+            1_500,
+            "UNWIND range(0, 1000) AS x RETURN collect(x)",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn both_budgets_off_completes_large() {
+        let res = run_both(
+            "exec_both_off",
+            0,
+            0,
+            "UNWIND range(0, 200000) AS x RETURN count(x)",
+        );
+        assert!(res.is_ok(), "both budgets off → no cap: {res:?}");
+    }
+
+    // ── Engine reuse: the charge resets and refunds per run ───────────────────
+
+    #[test]
+    fn global_charge_resets_between_runs_on_a_reused_engine() {
+        let (root, graph, _) = testgen::write_basic("exec_g_reuse");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(100_000);
+        let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+        let ast = parser::parse("UNWIND range(0, 500) AS x RETURN count(x)").unwrap();
+        for _ in 0..5 {
+            engine.run(&ast).expect("within the budget");
+            assert_eq!(budget.in_use(), 0, "each run fully refunds before the next");
+        }
+        // A reused engine that has succeeded many times still trips correctly when a
+        // single run exceeds the budget (no stale carry-over inflating the charge).
+        let big = parser::parse("UNWIND range(0, 200000) AS x RETURN collect(x)").unwrap();
+        assert!(
+            engine.run(&big).is_err(),
+            "the oversized run must still trip"
+        );
+        assert_eq!(budget.in_use(), 0, "the tripped run also refunds");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── GlobalIntermediateBudget mechanics ───────────────────────────────────
+
+    #[test]
+    fn global_budget_starts_at_zero() {
+        let b = GlobalIntermediateBudget::new(1_000);
+        assert_eq!(b.in_use(), 0);
+        assert_eq!(b.peak(), 0);
+        assert_eq!(b.limit(), 1_000);
+    }
+
+    #[test]
+    fn global_budget_charge_to_exact_limit_then_trips() {
+        let b = GlobalIntermediateBudget::new(1_000);
+        assert!(
+            b.try_charge(1_000),
+            "charging exactly to the limit is allowed"
+        );
+        assert_eq!(b.in_use(), 1_000);
+        assert!(!b.try_charge(1), "one element past the limit trips");
+        b.release(1_001);
+        assert_eq!(b.in_use(), 0);
+    }
+
+    #[test]
+    fn global_budget_release_cycles_return_to_zero() {
+        let b = GlobalIntermediateBudget::new(10_000);
+        for _ in 0..1_000 {
+            assert!(b.try_charge(7));
+            b.release(7);
+        }
+        assert_eq!(b.in_use(), 0, "balanced charge/release nets to zero");
+        assert!(b.peak() >= 7, "peak captured the per-cycle high-water");
     }
 
     #[test]

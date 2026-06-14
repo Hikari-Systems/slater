@@ -546,6 +546,26 @@ mod tests {
     }
 
     #[test]
+    fn server_wide_budget_error_is_classified_separately() {
+        // The server-wide guard's message contains "intermediate ... budget" too,
+        // so the classifier must key on "server-wide" first and not fold it into
+        // the per-query `fail_budget` counter.
+        let d = Diagnostics::new(true);
+        d.on_query_start();
+        d.on_query_err(&anyhow::anyhow!(
+            "server-wide intermediate budget of 8000000 elements exhausted \
+             (query.maxIntermediateGlobal) — too many concurrent memory-heavy queries"
+        ));
+        assert_eq!(d.fail_global_budget.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            d.fail_budget.load(Ordering::Relaxed),
+            0,
+            "the server-wide error must not count as a per-query budget failure"
+        );
+        assert_eq!(d.queries_in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn histogram_percentiles_track_distribution() {
         let h = LatencyHistogram::default();
         for _ in 0..99 {
