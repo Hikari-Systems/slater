@@ -28,7 +28,7 @@
     "timeoutMs": 30000,
     "maxIntermediate": 1000000,
     "maxShortestPathExplore": 0,
-    "maxShortestPathFanout": 1
+    "maxFanout": 1
   },
   "vectorQuery": {
     "beamWidth": 64,

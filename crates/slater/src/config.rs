@@ -311,16 +311,14 @@ pub struct QueryConfig {
         deserialize_with = "de::u64"
     )]
     pub max_shortest_path_explore: u64,
-    /// Max worker threads for parallel `shortestPath()` BFS frontier expansion.
-    /// 1 (default) keeps it sequential — the safe choice for a throughput-oriented
+    /// Max worker threads for per-query parallelism (shortestPath BFS frontier
+    /// expansion, multi-hop expansion, brute-force kNN, anchor scans, …).
+    /// 1 (default) keeps queries sequential — the safe choice for a throughput-oriented
     /// read server (per-query parallelism steals cores from concurrent queries).
-    /// Raise it to overlap the I/O-bound CSR block reads of a large frontier across
+    /// Raise it to overlap the I/O-bound CSR block reads of a large batch across
     /// cores; the effective fanout is `min(this, available cores)`.
-    #[serde(
-        default = "default_max_shortest_path_fanout",
-        deserialize_with = "de::usize"
-    )]
-    pub max_shortest_path_fanout: usize,
+    #[serde(default = "default_max_fanout", deserialize_with = "de::usize")]
+    pub max_fanout: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -387,7 +385,7 @@ fn default_max_intermediate() -> u64 {
 fn default_max_shortest_path_explore() -> u64 {
     0 // unlimited — preserves the AnyShortest "always succeeds in O(V+E)" guarantee
 }
-fn default_max_shortest_path_fanout() -> usize {
+fn default_max_fanout() -> usize {
     1 // sequential by default — opt in to per-query parallelism explicitly
 }
 fn default_beam_width() -> u32 {
@@ -421,7 +419,7 @@ impl Default for QueryConfig {
             timeout_ms: default_timeout_ms(),
             max_intermediate: default_max_intermediate(),
             max_shortest_path_explore: default_max_shortest_path_explore(),
-            max_shortest_path_fanout: default_max_shortest_path_fanout(),
+            max_fanout: default_max_fanout(),
         }
     }
 }
