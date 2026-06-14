@@ -495,6 +495,12 @@ fn node_ok_par(
 /// Above it, the per-candidate label/property reads gather on the shared fanout pool.
 const SCAN_PAR_MIN: usize = 64;
 
+/// Minimum selected-node count below which `algo.*` subgraph construction
+/// ([`Engine::build_view`], Task 11) reads node adjacency sequentially — the rayon
+/// fan-out overhead isn't worth it for a tiny view. Above it, the per-node
+/// out-adjacency reads gather on the shared fanout pool.
+const BUILD_VIEW_PAR_MIN: usize = 64;
+
 /// Map `f` over `items` on the shared fanout pool (or sequentially when the pool is
 /// absent or `items` is smaller than `min_batch`), preserving input order. `f` must
 /// read only Sync state (&Generation/&BlockCache) — never the !Sync Engine.
@@ -2799,19 +2805,23 @@ impl<'g> Engine<'g> {
             }
         };
         let pos: HashMap<u64, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-        let mut out = vec![Vec::new(); nodes.len()];
-        for (i, &id) in nodes.iter().enumerate() {
-            for a in self.outgoing(id)? {
-                if let Some(rs) = rels {
-                    if !rs.contains(&a.reltype) {
-                        continue;
-                    }
-                }
-                if let Some(&j) = pos.get(&a.neighbour.0) {
-                    out[i].push(j);
-                }
-            }
-        }
+        // Each selected node's out-adjacency read is independent and touches only the
+        // Sync cache, so gather the reads on the shared fanout pool (Task 11).
+        // `neighbours_par` keeps the stored edge order and applies the same rel-type
+        // filter, so mapping each neighbour through `pos` (single-threaded, `pos` is
+        // shared read-only) yields the same 0-based index the sequential build did —
+        // byte-for-byte identical node list + `out`.
+        let (gen, cache) = (self.gen, self.cache);
+        let adj: Vec<Vec<u64>> = par_gather(
+            self.fanout_pool.as_deref(),
+            &nodes,
+            BUILD_VIEW_PAR_MIN,
+            |&id| neighbours_par(gen, cache, id, Direction::Outgoing, rels),
+        )?;
+        let out: Vec<Vec<usize>> = adj
+            .iter()
+            .map(|nbs| nbs.iter().filter_map(|nb| pos.get(nb).copied()).collect())
+            .collect();
         Ok(GraphView { nodes, out })
     }
 
@@ -9478,6 +9488,87 @@ mod tests {
             _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_view_with_pool_matches_sequential() {
+        // The parallel `algo.*` subgraph build (`build_view`, Task 11) must produce the
+        // same view — hence identical algorithm output — as the sequential build. The
+        // per-node adjacency reads gather on the pool while the pos-mapping/select merge
+        // stays single-threaded, so node list + 0-based `out` are byte-for-byte identical.
+        // Two fixtures: the small edge-bearing `write_basic` graph pins the merge with
+        // real adjacency (below `BUILD_VIEW_PAR_MIN`, so `par_gather` reads sequentially),
+        // and the 200-node `write_wide` graph clears the threshold so the pooled engine
+        // truly fans the reads out (no edges → exercises the parallel read + empty merge).
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+            r.rows
+                .iter()
+                .map(|row| row.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        let assert_par_eq = |gen: &Generation, cache: &BlockCache, q: &str| {
+            let ast = parser::parse(q).unwrap();
+            let seq = Engine::new(gen, cache)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("sequential `{q}` failed: {e:#}"));
+            let par = Engine::new(gen, cache)
+                .with_fanout_pool(Some(pool.clone()))
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("pooled `{q}` failed: {e:#}"));
+            assert_eq!(seq.columns, par.columns, "columns differ for `{q}`");
+            assert_eq!(disp(&seq), disp(&par), "rows differ for `{q}`");
+        };
+
+        // Edge-bearing fixture: every algo proc shape, incl. rel-type and label filters.
+        let (root, graph, _) = testgen::write_basic("exec_build_view_pool");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let queries = [
+            "CALL algo.WCC() YIELD node, componentId \
+             RETURN node.name AS name, componentId ORDER BY name",
+            "CALL algo.WCC({relationshipTypes: ['KNOWS']}) YIELD node, componentId \
+             RETURN node.name AS name, componentId ORDER BY name",
+            "CALL algo.WCC({nodeLabels: ['Person']}) YIELD node, componentId \
+             RETURN node.name AS name, componentId ORDER BY name",
+            "CALL algo.pageRank(NULL, NULL) YIELD node, score \
+             RETURN node.name AS name, score ORDER BY name",
+            "CALL algo.pageRank('Person', 'KNOWS') YIELD node, score \
+             RETURN node.name AS name, score ORDER BY name",
+            "CALL algo.betweenness() YIELD node, score RETURN node.name AS name, score ORDER BY name",
+            "CALL algo.HarmonicCentrality({nodeLabels: ['Person'], relationshipTypes: ['KNOWS']}) \
+             YIELD node, score, reachable RETURN node.name AS name, score, reachable ORDER BY name",
+            "CALL algo.labelPropagation({relationshipTypes: ['KNOWS']}) YIELD node, communityId \
+             RETURN node.name AS name, communityId ORDER BY name",
+        ];
+        for q in queries {
+            assert_par_eq(&gen, &cache, q);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Wide fixture (200 nodes ≥ BUILD_VIEW_PAR_MIN): the pooled build fans the
+        // adjacency reads across rayon; pool and sequential must still match exactly.
+        let (wroot, wgraph) = testgen::write_wide("exec_build_view_pool_wide", 200);
+        let wgen = Generation::open(&wroot, &wgraph).unwrap();
+        let wcache = BlockCache::new(1 << 20);
+        assert_par_eq(
+            &wgen,
+            &wcache,
+            "CALL algo.pageRank(NULL, NULL) YIELD node, score \
+             RETURN node.name AS name, score ORDER BY name",
+        );
+        assert_par_eq(
+            &wgen,
+            &wcache,
+            "CALL algo.WCC({nodeLabels: ['Person']}) YIELD node, componentId \
+             RETURN node.name AS name, componentId ORDER BY name",
+        );
+        let _ = std::fs::remove_dir_all(&wroot);
     }
 
     #[test]

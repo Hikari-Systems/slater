@@ -74,6 +74,20 @@ Each task below is **self-contained for a fresh `/clear`ed session**. Do them in
   `exec::anchor_filter_with_pool_matches_sequential` (label-scan+inline-prop, boolean/
   negated label exprs, empty result, aggregate, tight budget — pool vs sequential).
 
+- (Task 11) — **parallel `algo.*` subgraph build (`build_view`)**. Each selected node's
+  out-adjacency read is independent and Sync, so `build_view` now `par_gather`s the reads
+  over the shared fanout pool (`BUILD_VIEW_PAR_MIN = 64`) via the existing `neighbours_par`
+  (`Direction::Outgoing`, rel-type filter = the view's `rels`). `neighbours_par` preserves
+  the stored edge order and applies the same rel filter, so mapping each neighbour through
+  the `pos` index single-threaded (cheap; `pos` is shared read-only) yields the node list +
+  0-based `out` byte-for-byte identical to the sequential build — and thus identical WCC /
+  pageRank / betweenness / harmonic / CDLP output. No budget on this path (the algos run
+  single-threaded on the built view). The `labels = Some` node-set build stays sequential
+  (label-posting collection, a different shape; the adjacency reads are the dominant cost
+  and the clear win). Test: `exec::build_view_with_pool_matches_sequential` (every algo
+  proc shape + rel/label filters on the edge-bearing `write_basic` fixture pinning the
+  merge; `write_wide(200)` clearing the threshold to exercise the rayon read branch).
+
 ## The reusable pattern
 
 > **gather** a set of independent sub-operations — each doing only `&Generation` + `&BlockCache`
