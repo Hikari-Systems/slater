@@ -299,6 +299,13 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | --- | --- | --- | --- |
 | `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
 | `server.port` | `server__port` | `7687` | Bolt port. |
+| `server.maxConnections` | `server__maxConnections` | 16384 | Global concurrent-connection cap (0 ⇒ unlimited). A permit is taken **before `accept()`**, so at capacity back-pressure lands in the kernel listen backlog instead of the heap — this is what keeps resident memory bounded under adversarial connection load. |
+| `server.maxPreAuthConnections` | `server__maxPreAuthConnections` | 4096 | Cap on connections not yet past `LOGON` (0 ⇒ unlimited). Smaller than `maxConnections` so an anonymous flood cannot starve authenticated readers. |
+| `server.maxConnectionsPerIp` | `server__maxConnectionsPerIp` | 1024 | Per-source concurrent-connection cap (0 ⇒ unlimited); keyed on the /32 for IPv4 and the /64 for IPv6. |
+| `server.maxPreAuthBytes` | `server__maxPreAuthBytes` | 65536 | Largest Bolt message accepted **before `LOGON`** (only `HELLO`/`LOGON` arrive then — a few hundred bytes). Ratchets up to `maxMessageBytes` on successful auth, back down on `LOGOFF`. |
+| `server.maxMessageBytes` | `server__maxMessageBytes` | 67108864 | Largest Bolt message accepted from an **authenticated** reader (64 MiB). |
+| `server.loginTimeoutMs` | `server__loginTimeoutMs` | 10000 | Deadline for an unauthenticated peer to finish handshake → `LOGON` (0 ⇒ none); closes the slow-loris a byte cap alone leaves open. |
+| `server.idleTimeoutMs` | `server__idleTimeoutMs` | 0 | Idle read timeout for an **authenticated** connection (0 ⇒ none, the default — pooled drivers legitimately hold idle connections). |
 | `dataDir` | `dataDir` | `/data` | Root holding `<graph>/<generation>/`. |
 | `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
 | `requireAclStamp` | `requireAclStamp` | `true` | Refuse a generation with no `aclBlake3` stamp (closes the stamp-strip downgrade); build images with `--acl`. A generation with no manifest MAC is always refused when a master key is configured — that check has no off switch. |
@@ -318,7 +325,26 @@ overrides (double underscore for nesting; keys match the camelCase config).
 **Resident memory** is approximately
 `blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead,
 **independent of graph size** — that is the headline guarantee, exercised by the
-`rss_stays_bounded_under_sustained_knn_load` integration test.
+`rss_stays_bounded_under_sustained_knn_load` integration test. Per-connection
+buffers live *outside* the cache budgets, so the guarantee holds under adversarial
+load only because `server.maxConnections` bounds how many can exist at once.
+
+### Network posture
+
+Slater is a read replica handle; the **primary** connection-security control is the
+network, not the binary. Bind it to a private interface, restrict source ranges at
+the network layer (security groups / NetworkPolicy), and — if it faces anything but
+trusted clients — front it with a connection-limiting L4 proxy (HAProxy `maxconn` +
+a per-source `stick-table`, or nftables `connlimit` + `hashlimit`). That sits before
+the file descriptor is ever handed to the process, so it is the most robust limit.
+
+The in-binary limits above (`maxConnections`, `maxPreAuthConnections`,
+`maxConnectionsPerIp`, the differential byte caps, and `loginTimeoutMs`) are
+**defence-in-depth**: they default on and generous so they are invisible to a
+legitimate client population, but they make the bounded-RSS guarantee hold even when
+the proxy is forgotten. See **[`docs/HARDENING.md`](docs/HARDENING.md)** for the full
+defensive posture, and `THREAT_MODEL.md` / `SECURITY_WORKLIST.md` for the canonical
+detail.
 
 ### Generation guard
 

@@ -27,8 +27,9 @@
 //!   where every message except `RESET` is answered `IGNORED`, matching the drivers.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,6 +37,8 @@ use graph_format::ids::Generation as GenId;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Level};
 
@@ -541,6 +544,24 @@ struct ConnCtx {
     /// dialect. Tracked per-user, not per-connection, because a pooled driver may ask
     /// `SHOW DATABASES` on a connection that has not yet shown its dialect.
     memgraph_users: RwLock<HashSet<String>>,
+
+    // ── Connection-security limits (see `config::ServerConfig`) ──────────────
+    /// Reassembly-body cap for an authenticated reader.
+    max_message_bytes: usize,
+    /// Reassembly-body cap before `LOGON` (tight; ratchets up on auth).
+    max_pre_auth_bytes: usize,
+    /// Handshake→`LOGON` deadline (ms); 0 = none.
+    login_timeout_ms: u64,
+    /// Idle read timeout (ms) for an authenticated connection; 0 = none.
+    idle_timeout_ms: u64,
+    /// Budget for connections that have not yet completed `LOGON`. A connection holds
+    /// one permit from its first byte until authentication succeeds, then releases it,
+    /// so a flood of anonymous sockets cannot starve authenticated readers.
+    pre_auth_limit: Arc<Semaphore>,
+    /// Live per-source connection counts (key: /32 for IPv4, /64 for IPv6).
+    per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    /// Per-source concurrent-connection cap; 0 = unlimited.
+    max_per_ip: usize,
 }
 
 impl ConnCtx {
@@ -1031,20 +1052,27 @@ struct Session {
 struct Framed<S> {
     stream: S,
     buf: Vec<u8>,
+    /// Largest reassembled message body this connection will currently accept. The
+    /// framer is deliberately auth-blind — it owns a budget number, not the reason
+    /// it changed. `handle_connection` starts it at the tight pre-auth cap and
+    /// bumps it to the generous post-auth cap once `LOGON` succeeds (ratcheting it
+    /// back down on `LOGOFF`).
+    max_body: usize,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
-    fn new(stream: S) -> Self {
+    fn new(stream: S, max_body: usize) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(8192),
+            max_body,
         }
     }
 
     /// Read the next complete (de-chunked) message body, or `None` at a clean EOF.
     async fn read_message(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
-            if let Some((body, consumed)) = chunk::decode_message(&self.buf)? {
+            if let Some((body, consumed)) = chunk::decode_message_capped(&self.buf, self.max_body)? {
                 self.buf.drain(..consumed);
                 return Ok(Some(body));
             }
@@ -1057,15 +1085,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
                 bail!("connection closed mid-message");
             }
             self.buf.extend_from_slice(&tmp[..n]);
-            // Bound the unparsed buffer too: `decode_message` only caps a *complete*
-            // body, but a peer that streams chunks and never sends the terminating
-            // `00 00` would grow `buf` without bound. Allow a little slack over the
-            // body cap for chunk headers. This guards the pre-auth path (HELLO/LOGON
-            // arrive through here) against memory exhaustion.
-            if self.buf.len() > chunk::MAX_MESSAGE_BYTES + (1 << 20) {
+            // Bound the unparsed buffer too: `decode_message_capped` only caps a
+            // *complete* body, but a peer that streams chunks and never sends the
+            // terminating `00 00` would grow `buf` without bound. Allow a little
+            // slack over the body cap for chunk headers. With the pre-auth cap in
+            // force this keeps an unauthenticated peer's footprint tiny.
+            if self.buf.len() > self.max_body + (1 << 20) {
                 bail!(
                     "Bolt message framing exceeded {} bytes without completing; closing connection",
-                    chunk::MAX_MESSAGE_BYTES
+                    self.max_body
                 );
             }
         }
@@ -1159,6 +1187,15 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
         use_selection: RwLock::new(HashMap::new()),
         memgraph_users: RwLock::new(HashSet::new()),
+        max_message_bytes: cfg.server.max_message_bytes,
+        max_pre_auth_bytes: cfg.server.max_pre_auth_bytes,
+        login_timeout_ms: cfg.server.login_timeout_ms,
+        idle_timeout_ms: cfg.server.idle_timeout_ms,
+        pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
+            cfg.server.max_pre_auth_connections,
+        ))),
+        per_ip: Arc::new(Mutex::new(HashMap::new())),
+        max_per_ip: cfg.server.max_connections_per_ip,
     });
 
     info!(
@@ -1168,12 +1205,23 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         graphs = ctx.graphs.len(),
         poll_ms = cfg.generation_poll_ms,
         reload_strategy = %cfg.reload_strategy,
+        max_connections = cfg.server.max_connections,
+        max_pre_auth_connections = cfg.server.max_pre_auth_connections,
+        max_connections_per_ip = cfg.server.max_connections_per_ip,
         "slater Bolt listener ready"
     );
 
+    // Global concurrent-connection cap. A permit is acquired *before* `accept()`,
+    // so at capacity we stop draining the kernel accept queue — back-pressure lands
+    // in the listen backlog and then the OS refuses new SYNs, rather than the heap
+    // filling with sockets we cannot service. This is what makes the bounded-RSS
+    // guarantee hold under adversarial connection load (each connection's buffers
+    // live outside the cache budget).
+    let conn_limit = Arc::new(Semaphore::new(semaphore_permits(cfg.server.max_connections)));
+
     // The in-flight generation guard: poll each graph's `current` and, on a change,
     // either swap the validated new generation in place or signal a clean exit.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<String>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<String>();
     spawn_generation_guard(
         ctx.graphs.clone(),
         ctx.vector_cache.clone(),
@@ -1199,14 +1247,51 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         );
     }
 
+    accept_loop(listener, ctx, tls, conn_limit, shutdown_rx).await
+}
+
+/// The connection accept loop: reserve a global slot, accept, apply the per-source
+/// cap, and spawn a handler holding both. Factored out of [`serve_with_listener`]
+/// so the limit wiring can be driven directly in tests over a loopback listener.
+async fn accept_loop(
+    listener: TcpListener,
+    ctx: Arc<ConnCtx>,
+    tls: Option<TlsAcceptor>,
+    conn_limit: Arc<Semaphore>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<String>,
+) -> Result<()> {
     loop {
+        // Reserve a global slot before pulling the next connection off the queue.
+        // Held for the connection's lifetime (moved into the task below); dropped
+        // here if accept fails, the per-source cap rejects, or shutdown fires.
+        let permit = conn_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection semaphore is never closed");
         tokio::select! {
             accepted = listener.accept() => {
                 let (sock, peer) = accepted.context("accept")?;
                 sock.set_nodelay(true).ok();
+                // Per-source cap: a single address (IPv4 /32, IPv6 /64) may not
+                // monopolise the global pool. Checked here so a rejected source costs
+                // only an accepted-then-closed FD, never a spawned task.
+                let per_ip_guard = if ctx.max_per_ip > 0 {
+                    match try_acquire_per_ip(&ctx.per_ip, per_ip_key(peer.ip()), ctx.max_per_ip) {
+                        Some(g) => Some(g),
+                        None => {
+                            warn!(%peer, "per-source connection cap reached; rejecting connection");
+                            continue; // drops `permit` and `sock`, freeing the slot
+                        }
+                    }
+                } else {
+                    None
+                };
                 let ctx = ctx.clone();
                 let tls = tls.clone();
                 tokio::spawn(async move {
+                    let _permit = permit; // global slot, released on connection end
+                    let _per_ip_guard = per_ip_guard; // per-source count, released on end
                     if let Err(e) = serve_conn(sock, tls, ctx).await {
                         warn!(%peer, error = %e, "connection ended with error");
                     }
@@ -1221,6 +1306,71 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             }
         }
     }
+}
+
+/// Permit count for a configurable limit, mapping 0 ("unlimited") to the largest
+/// value a tokio [`Semaphore`] accepts so the acquire path stays uniform.
+fn semaphore_permits(limit: usize) -> usize {
+    if limit == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        limit
+    }
+}
+
+/// The per-source counting key: the full address for IPv4 (/32), the /64 prefix
+/// for IPv6. An attacker controls an entire /64, so keying on the full v6 address
+/// would let them sidestep the cap by varying the low bits.
+fn per_ip_key(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            let mut masked = [0u8; 16];
+            masked[..8].copy_from_slice(&o[..8]); // keep the /64 prefix, zero the rest
+            IpAddr::V6(std::net::Ipv6Addr::from(masked))
+        }
+    }
+}
+
+/// Decrements a source's live connection count when the connection ends.
+struct PerIpGuard {
+    map: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    key: IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        if let Some(count) = map.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.key); // keep the map bounded by *active* sources
+            }
+        }
+    }
+}
+
+/// Reserve one connection slot for `key`, or `None` if the source is already at
+/// `max`. The returned guard releases the slot on drop.
+fn try_acquire_per_ip(
+    map: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    key: IpAddr,
+    max: usize,
+) -> Option<PerIpGuard> {
+    // Only called when `max > 0`, so a fresh (count 0) entry is always admitted and
+    // never left behind on the rejection path.
+    let mut guard = map.lock().unwrap();
+    let count = guard.entry(key).or_insert(0);
+    if *count >= max {
+        return None;
+    }
+    *count += 1;
+    drop(guard);
+    Some(PerIpGuard {
+        map: map.clone(),
+        key,
+    })
 }
 
 /// (Optionally) wrap the socket in TLS, then run the Bolt connection.
@@ -1275,16 +1425,39 @@ async fn handle_connection<S>(stream: S, ctx: Arc<ConnCtx>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut framed = Framed::new(stream);
+    // Hold a pre-auth budget slot from the first byte until LOGON succeeds. If the
+    // antechamber is full, reject immediately — queuing anonymous sockets would just
+    // hold file descriptors, the very exhaustion this defends against.
+    let mut pre_auth_permit = match ctx.pre_auth_limit.clone().try_acquire_owned() {
+        Ok(p) => Some(p),
+        Err(_) => {
+            debug!("pre-auth connection budget reached; rejecting connection");
+            return Ok(());
+        }
+    };
+
+    // The whole pre-auth phase (handshake → HELLO → LOGON) must finish within the
+    // login deadline — the slow-loris guard a byte cap alone leaves open.
+    let login_deadline = (ctx.login_timeout_ms > 0)
+        .then(|| TokioInstant::now() + Duration::from_millis(ctx.login_timeout_ms));
+
+    // Start under the tight pre-auth body cap; it ratchets up once LOGON succeeds.
+    let mut framed = Framed::new(stream, ctx.max_pre_auth_bytes);
 
     // Handshake: 20 bytes (preamble + four proposals), reply with the agreed
     // 4-byte version, or four zero bytes if we share none (the client disconnects).
     let mut hello = [0u8; 20];
-    framed
-        .stream
-        .read_exact(&mut hello)
-        .await
-        .context("read handshake")?;
+    match login_deadline {
+        Some(dl) => timeout_at(dl, framed.stream.read_exact(&mut hello))
+            .await
+            .map_err(|_| anyhow!("handshake not completed within the login deadline"))?
+            .context("read handshake")?,
+        None => framed
+            .stream
+            .read_exact(&mut hello)
+            .await
+            .context("read handshake")?,
+    };
     let reply = handshake::handle_client_hello(&hello)?;
     framed.stream.write_all(&reply).await?;
     framed.flush().await?;
@@ -1299,7 +1472,58 @@ where
         version: (reply[3], reply[2]),
     };
 
-    while let Some(body) = framed.read_message().await? {
+    loop {
+        // Sync the per-connection budgets to the current auth state before each read.
+        // The framer is auth-blind, so its cap is set here; the pre-auth permit is
+        // released on the transition to authenticated and reclaimed on LOGOFF.
+        if sess.user.is_some() {
+            framed.max_body = ctx.max_message_bytes;
+            pre_auth_permit = None; // free the antechamber slot for the next anon peer
+        } else {
+            framed.max_body = ctx.max_pre_auth_bytes;
+            if pre_auth_permit.is_none() {
+                // Returned to unauthenticated (LOGOFF / re-auth): reclaim a slot or
+                // close. A logged-off connection must not keep the generous budget,
+                // nor sit anonymous outside the antechamber cap.
+                match ctx.pre_auth_limit.clone().try_acquire_owned() {
+                    Ok(p) => pre_auth_permit = Some(p),
+                    Err(_) => {
+                        debug!("pre-auth budget full on re-auth; closing connection");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Read the next message under the auth-appropriate deadline.
+        let read = if sess.user.is_some() {
+            match ctx.idle_timeout_ms {
+                0 => framed.read_message().await,
+                ms => match timeout(Duration::from_millis(ms), framed.read_message()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        debug!("authenticated connection idle past the timeout; closing");
+                        return Ok(());
+                    }
+                },
+            }
+        } else {
+            match login_deadline {
+                Some(dl) => match timeout_at(dl, framed.read_message()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        debug!("login deadline exceeded before authentication; closing");
+                        return Ok(());
+                    }
+                },
+                None => framed.read_message().await,
+            }
+        };
+        let body = match read? {
+            Some(b) => b,
+            None => break, // clean EOF
+        };
+
         let req = match message::decode_request(&body) {
             Ok(r) => r,
             Err(e) => {
@@ -2257,7 +2481,37 @@ mod tests {
     }
 
     /// Stand up a ConnCtx over the shared fixture graph + a temp ACL.
+    /// Per-connection security limits for the test ConnCtx builders. Defaults are
+    /// generous/on so existing tests are unaffected; the connection-security tests
+    /// pass tight values to exercise a specific gate.
+    #[derive(Clone)]
+    struct TestLimits {
+        max_message_bytes: usize,
+        max_pre_auth_bytes: usize,
+        login_timeout_ms: u64,
+        idle_timeout_ms: u64,
+        max_pre_auth_connections: usize,
+        max_per_ip: usize,
+    }
+
+    impl Default for TestLimits {
+        fn default() -> Self {
+            Self {
+                max_message_bytes: 64 * 1024 * 1024,
+                max_pre_auth_bytes: 64 * 1024,
+                login_timeout_ms: 0, // off by default so unrelated tests never time out
+                idle_timeout_ms: 0,
+                max_pre_auth_connections: 4_096,
+                max_per_ip: 0, // unlimited by default
+            }
+        }
+    }
+
     fn build_ctx(tag: &str) -> (std::path::PathBuf, Arc<ConnCtx>) {
+        build_ctx_limited(tag, TestLimits::default())
+    }
+
+    fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<ConnCtx>) {
         let (root, _graph, _) = testgen::write_basic(tag);
         let acl_path = write_acl(&root);
         let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
@@ -2286,6 +2540,15 @@ mod tests {
             default_graph: None,
             use_selection: RwLock::new(HashMap::new()),
             memgraph_users: RwLock::new(HashSet::new()),
+            max_message_bytes: limits.max_message_bytes,
+            max_pre_auth_bytes: limits.max_pre_auth_bytes,
+            login_timeout_ms: limits.login_timeout_ms,
+            idle_timeout_ms: limits.idle_timeout_ms,
+            pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
+                limits.max_pre_auth_connections,
+            ))),
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
+            max_per_ip: limits.max_per_ip,
         });
         (root, ctx)
     }
@@ -2350,6 +2613,13 @@ mod tests {
             default_graph: Some("people".to_string()),
             use_selection: RwLock::new(HashMap::new()),
             memgraph_users: RwLock::new(HashSet::new()),
+            max_message_bytes: 64 * 1024 * 1024,
+            max_pre_auth_bytes: 64 * 1024,
+            login_timeout_ms: 0,
+            idle_timeout_ms: 0,
+            pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
+            max_per_ip: 0,
         })
     }
 
@@ -3525,5 +3795,241 @@ mod tests {
             .expect("the shutdown sender should not be dropped");
         assert_eq!(reason, "people");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Connection-security limits ────────────────────────────────────────────
+
+    #[test]
+    fn semaphore_permits_maps_zero_to_unlimited() {
+        assert_eq!(semaphore_permits(0), Semaphore::MAX_PERMITS);
+        assert_eq!(semaphore_permits(5), 5);
+    }
+
+    #[test]
+    fn per_ip_key_keeps_ipv4_and_masks_ipv6_to_64() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let v4: IpAddr = Ipv4Addr::new(203, 0, 113, 5).into();
+        assert_eq!(per_ip_key(v4), v4, "IPv4 keys on the full /32");
+
+        let a: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(per_ip_key(a), per_ip_key(b), "same /64 ⇒ same key");
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(per_ip_key(a), per_ip_key(c), "different /64 ⇒ different key");
+    }
+
+    #[test]
+    fn try_acquire_per_ip_caps_and_releases() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let map: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        let key: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let g1 = try_acquire_per_ip(&map, key, 2).expect("first slot");
+        let g2 = try_acquire_per_ip(&map, key, 2).expect("second slot");
+        assert!(
+            try_acquire_per_ip(&map, key, 2).is_none(),
+            "third is over the cap"
+        );
+        drop(g1);
+        let g3 = try_acquire_per_ip(&map, key, 2).expect("a freed slot is reusable");
+        drop(g2);
+        drop(g3);
+        assert!(
+            map.lock().unwrap().is_empty(),
+            "the map drains to empty once all sources disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn framed_enforces_the_body_cap_and_a_larger_cap_admits_the_same_message() {
+        use tokio::io::duplex;
+        // A single ~1000-byte chunked message (len header + body + 00 00 terminator).
+        let body = vec![0xABu8; 1000];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(&[0, 0]);
+
+        // Under a 256-byte cap the framer refuses it before allocating the body.
+        let (mut client, server) = duplex(1 << 16);
+        client.write_all(&wire).await.unwrap();
+        let mut framed = Framed::new(server, 256);
+        assert!(
+            framed.read_message().await.is_err(),
+            "a 1000-byte message must be refused under a 256-byte cap"
+        );
+
+        // The identical bytes are accepted once the cap is raised (the post-auth case).
+        let (mut client, server) = duplex(1 << 16);
+        client.write_all(&wire).await.unwrap();
+        let mut framed = Framed::new(server, 4096);
+        let got = framed.read_message().await.unwrap().expect("a full message");
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn login_deadline_closes_an_idle_unauthenticated_connection() {
+        let (_root, ctx) = build_ctx_limited(
+            "login_deadline",
+            TestLimits {
+                login_timeout_ms: 200,
+                ..Default::default()
+            },
+        );
+        let addr = spawn_server(ctx).await;
+        // Connect but never send the handshake: the server must close us out.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {} // clean EOF or reset — both mean "closed"
+            Ok(Ok(n)) => panic!("server sent {n} bytes to an unauthenticated idle peer"),
+            Err(_) => panic!("server did not close the idle pre-auth connection in time"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_auth_cap_is_tight_then_relaxes_after_login() {
+        let (_root, ctx) = build_ctx_limited(
+            "diff_cap",
+            TestLimits {
+                max_pre_auth_bytes: 512,
+                max_message_bytes: 1 << 20,
+                ..Default::default()
+            },
+        );
+        let addr = spawn_server(ctx).await;
+
+        // Pre-auth: a HELLO whose user-agent body blows past 512 bytes is refused —
+        // the connection closes before the message is decoded.
+        {
+            let mut c = Client::connect(addr).await;
+            let huge = "x".repeat(4000);
+            c.send(PsValue::Struct {
+                tag: message::tag::HELLO,
+                fields: vec![PsValue::Map(vec![("user_agent".into(), PsValue::str(&huge))])],
+            })
+            .await;
+            let mut buf = [0u8; 4];
+            match tokio::time::timeout(Duration::from_secs(2), c.stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(n)) => panic!("server accepted a {n}-byte reply to an oversized pre-auth msg"),
+                Err(_) => panic!("server did not reject the oversized pre-auth message"),
+            }
+        }
+
+        // Post-auth: the same connection, once authenticated, accepts a RUN whose
+        // parameter map far exceeds the pre-auth cap (proving the ratchet).
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        let pad = "x".repeat(4000); // > 512-byte pre-auth cap, < 1 MiB post-auth cap
+        c.send(PsValue::Struct {
+            tag: message::tag::RUN,
+            fields: vec![
+                PsValue::str("RETURN 1 AS one"),
+                PsValue::Map(vec![("pad".into(), PsValue::str(&pad))]),
+                PsValue::Map(vec![("db".into(), PsValue::str("people"))]),
+            ],
+        })
+        .await;
+        assert_eq!(
+            c.recv().await.0,
+            message::tag::SUCCESS,
+            "a large post-auth message must be read, not rejected by the pre-auth cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_auth_budget_rejects_excess_anonymous_connections() {
+        let (_root, ctx) = build_ctx_limited(
+            "pre_auth_budget",
+            TestLimits {
+                max_pre_auth_connections: 1,
+                ..Default::default()
+            },
+        );
+        let addr = spawn_server(ctx).await;
+
+        // A holds the only antechamber slot (handshake done, not yet authenticated).
+        let _a = Client::connect(addr).await;
+
+        // B is accepted at TCP level but the handler rejects it for lack of a slot,
+        // so its handshake never completes.
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&handshake::PREAMBLE);
+        hs.extend_from_slice(&[0, 0, 4, 5]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        let _ = b.write_all(&hs).await;
+        let mut reply = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(2), b.read_exact(&mut reply)).await {
+            Ok(Err(_)) => {}                  // EOF / reset: rejected as expected
+            Ok(Ok(_)) => panic!("second anonymous connection should have been rejected"),
+            Err(_) => panic!("server neither served nor rejected the excess anon connection"),
+        }
+    }
+
+    #[tokio::test]
+    async fn global_connection_cap_blocks_until_a_slot_frees() {
+        let (_root, ctx) = build_ctx_limited("global_cap", TestLimits::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn_limit = Arc::new(Semaphore::new(1)); // exactly one slot
+        let (_tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(accept_loop(listener, ctx, None, conn_limit, rx));
+
+        // First client takes the only slot.
+        let a = Client::connect(addr).await;
+        // Second cannot be serviced while at capacity (the permit is taken before
+        // accept, so the server never reads B's handshake).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), Client::connect(addr))
+                .await
+                .is_err(),
+            "a second connection must not be serviced while at capacity"
+        );
+        // Freeing the first frees the slot.
+        drop(a);
+        tokio::time::timeout(Duration::from_secs(2), Client::connect(addr))
+            .await
+            .expect("a slot must free once the first connection closes");
+    }
+
+    #[tokio::test]
+    async fn per_ip_cap_rejects_excess_from_one_source() {
+        let (_root, ctx) = build_ctx_limited(
+            "per_ip_cap",
+            TestLimits {
+                max_per_ip: 1,
+                ..Default::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn_limit = Arc::new(Semaphore::new(1024)); // generous; isolate the per-IP gate
+        let (_tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(accept_loop(listener, ctx, None, conn_limit, rx));
+
+        // First connection from 127.0.0.1 is fine.
+        let _a = Client::connect(addr).await;
+        // A second from the same source is accepted then dropped by the per-IP cap.
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        let mut hs = Vec::new();
+        hs.extend_from_slice(&handshake::PREAMBLE);
+        hs.extend_from_slice(&[0, 0, 4, 5]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        hs.extend_from_slice(&[0, 0, 0, 0]);
+        let _ = b.write_all(&hs).await;
+        let mut reply = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(2), b.read_exact(&mut reply)).await {
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("second connection from the same source should be rejected"),
+            Err(_) => panic!("server neither served nor rejected the per-IP excess"),
+        }
     }
 }

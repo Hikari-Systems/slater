@@ -44,9 +44,11 @@ pub fn decode_message(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     decode_message_capped(buf, MAX_MESSAGE_BYTES)
 }
 
-/// As [`decode_message`], but with an explicit body cap (so the cap is unit
-/// testable without building a multi-megabyte buffer).
-fn decode_message_capped(buf: &[u8], max_body: usize) -> Result<Option<(Vec<u8>, usize)>> {
+/// As [`decode_message`], but with an explicit body cap. The server passes a
+/// per-connection cap here (small before `LOGON`, generous after) so the
+/// pre-auth reassembly budget can be far tighter than the authenticated one; the
+/// explicit cap also keeps the limit unit-testable without a multi-megabyte buffer.
+pub fn decode_message_capped(buf: &[u8], max_body: usize) -> Result<Option<(Vec<u8>, usize)>> {
     let mut pos = 0;
     let mut body = Vec::new();
     loop {

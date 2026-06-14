@@ -78,6 +78,12 @@ authenticated principals over Bolt).
   ~80 GB before reading any body. **Fixed** by bounding the pre-allocation to the bytes
   remaining (`n.min(self.remaining())`); regression test
   `forged_length_headers_bail_without_huge_allocation`. Parser and chunk targets fuzz clean.
+  *Update (connection hardening):* the pre-auth reassembly budget is now **differential** —
+  the framer carries a per-connection `max_body` that starts at the tight `server.maxPreAuthBytes`
+  (default 64 KiB) and only ratchets up to `server.maxMessageBytes` after a verified `LOGON`, so
+  the pre-auth decode surface an anonymous peer can reach is far smaller than the authenticated one.
+  Note the reachable parser panics are **post-auth** (RUN comes after LOGON) and isolated by
+  `spawn_blocking`, so they drop one connection, never the server.
   *Remaining:* longer/scheduled fuzzing and an explicit audit of the reachable `unwrap()`/
   `expect()` sites for panics (the OOM was the first finding, not necessarily the last).
 
@@ -104,9 +110,20 @@ authenticated principals over Bolt).
   with the MAC, which already makes the stamp tamper-proof. The hard guarantee is "encrypt",
   not a new field (`THREAT_MODEL.md` limitation 1).
 
-- [ ] **⬜ OPEN — No connection-count / per-IP limits.** The listener accepts unbounded concurrent
-  connections. *Action:* document fronting with a proxy/limits, or add a `maxConnections`
-  config.
+- [x] **✅ DONE — No connection-count / per-IP limits.** The listener used to accept unbounded
+  concurrent connections — an unauthenticated peer could exhaust file descriptors, and because
+  per-connection buffers live outside the cache budgets, the bounded-RSS guarantee held only for a
+  well-behaved client population.
+  *Fixed (connection hardening):* layered, on-by-default (generous) limits in the binary, plus
+  network-posture guidance. A global semaphore acquired **before `accept()`** (`server.maxConnections`,
+  default 16384) caps concurrency with kernel-backlog back-pressure; a smaller pre-auth budget
+  (`server.maxPreAuthConnections`, 4096) keeps an anonymous flood from starving authenticated
+  readers; a per-source cap (`server.maxConnectionsPerIp`, 1024; /32 for IPv4, /64 for IPv6) stops
+  one source monopolising the pool; and `server.loginTimeoutMs` (10 s) reaps un-authenticated
+  slow-loris connections. The primary control remains network ACLs + an L4 proxy — documented in
+  `README.md` / `docs/HARDENING.md` "Network posture". Tests: `global_connection_cap_blocks_until_a_slot_frees`,
+  `pre_auth_budget_rejects_excess_anonymous_connections`, `per_ip_cap_rejects_excess_from_one_source`,
+  `login_deadline_closes_an_idle_unauthenticated_connection`.
 
 - [x] **✅ DONE — Config / key-location trust boundary.** The MAC's trust root is the master key, and the
   config only *names* where that key is read from (`encryption.keyFile`/`keyEnv`). An attacker

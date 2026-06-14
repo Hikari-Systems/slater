@@ -1,7 +1,14 @@
 {
   "server": {
     "bind": "0.0.0.0",
-    "port": 7687
+    "port": 7687,
+    "maxConnections": 16384,
+    "maxPreAuthConnections": 4096,
+    "maxConnectionsPerIp": 1024,
+    "maxPreAuthBytes": 65536,
+    "maxMessageBytes": 67108864,
+    "loginTimeoutMs": 10000,
+    "idleTimeoutMs": 0
   },
   "log": {
     "level": "info"

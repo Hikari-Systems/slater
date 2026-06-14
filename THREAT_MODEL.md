@@ -134,9 +134,26 @@ accepted risk so future changes stay aware of it.
 
 **Defended:**
 - **Pre-auth Bolt framing flood.** The message framer caps both a single reassembled message
-  (`chunk::MAX_MESSAGE_BYTES`, 64 MiB) and the unparsed accumulation buffer, so a peer that
-  streams chunks endlessly — or withholds the terminating `00 00` — is disconnected instead of
-  driving the process to OOM. This runs before `LOGON`, so it is the most important cap.
+  and the unparsed accumulation buffer, so a peer that streams chunks endlessly — or withholds
+  the terminating `00 00` — is disconnected instead of driving the process to OOM. The cap is
+  **differential**: before `LOGON` only `HELLO`/`LOGON` can arrive (a few hundred bytes), so the
+  pre-auth budget is tight (`server.maxPreAuthBytes`, default 64 KiB); it ratchets up to the
+  generous authenticated cap (`server.maxMessageBytes`, default 64 MiB) on a verified `LOGON`
+  and back down on `LOGOFF`. This runs before authentication, so it is the most important cap.
+- **Pre-auth slow-loris.** An unauthenticated peer must complete handshake → `LOGON` within
+  `server.loginTimeoutMs` (default 10 s) or the connection is closed, so an anonymous peer cannot
+  hold a socket open indefinitely. (`server.idleTimeoutMs` adds an optional post-auth idle
+  timeout; off by default, since pooled drivers legitimately hold idle connections.)
+- **Connection-count exhaustion.** The listener acquires a global permit *before* `accept()`
+  (`server.maxConnections`), so at capacity back-pressure flows into the kernel listen backlog
+  rather than the heap — the process never accepts a descriptor it cannot service. A separate,
+  smaller budget caps connections that have not yet authenticated (`server.maxPreAuthConnections`),
+  so an anonymous flood cannot starve authenticated readers, and a per-source cap
+  (`server.maxConnectionsPerIp`, keyed on the /32 for IPv4 and /64 for IPv6) stops one source
+  monopolising the pool. Because per-connection buffers live outside the cache budgets, this is
+  also what makes the **bounded-RSS guarantee hold under adversarial connection load**, not just
+  well-behaved clients. These are defence-in-depth behind the primary control (network ACLs + an
+  L4 proxy); see `docs/HARDENING.md` "Network posture".
 - **`range()` blow-up.** `range()` refuses a span whose element count exceeds a guardrail
   (1M ≈ 48 MB) and uses checked arithmetic, closing a single-query OOM / infinite-loop (the
   result-row cap does not catch it, since a giant list is one row). This is the lone guard
@@ -159,10 +176,11 @@ accepted risk so future changes stay aware of it.
 
 **Accepted / not yet defended:** the budget counts *elements*, not bytes (1M long strings is
 far more memory than 1M ints — operators can lower the knob); the budget is per query, so N
-concurrent queries can each claim it in full — there is no cross-query global memory
-accounting and no connection-count limit (see `SECURITY_WORKLIST.md`). Operators relying on
-availability under hostile authenticated load should front the listener with appropriate
-resource limits.
+concurrent queries can each claim it in full — there is no cross-query global memory accounting.
+The connection caps bound *count*, not aggregate work: `maxConnections` authenticated readers can
+still each run a query up to the per-query budgets concurrently. Operators relying on availability
+under hostile *authenticated* load should size the per-query budgets and `maxConnections` together,
+and front the listener with network-level resource limits (see `docs/HARDENING.md`).
 
 ## Trust boundary (what the at-rest protections assume)
 

@@ -157,6 +157,52 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_port", deserialize_with = "deser_u16_or_str")]
     pub port: u16,
+
+    // ── Connection-security limits ───────────────────────────────────────────
+    // All default ON but generous: invisible to a legitimate client population,
+    // a backstop against adversarial load (see `THREAT_MODEL.md` Availability and
+    // `docs/HARDENING.md`). The primary control for a read replica is still the
+    // network posture (private bind + an L4 proxy); these are defence-in-depth so
+    // the bounded-RSS guarantee holds even if the proxy is forgotten.
+    /// Largest reassembled Bolt message body accepted from an **authenticated**
+    /// reader (a fat parameter map, an `IN`-list, a KNN query vector, a batch).
+    #[serde(default = "default_max_message_bytes", deserialize_with = "de::usize")]
+    pub max_message_bytes: usize,
+    /// Largest reassembled Bolt message body accepted **before `LOGON`**. Only
+    /// `HELLO`/`LOGON` arrive pre-auth (a user-agent string + credentials — a few
+    /// hundred bytes), so this is tight; it ratchets up to `maxMessageBytes` the
+    /// instant authentication succeeds, and back down on `LOGOFF`.
+    #[serde(default = "default_max_pre_auth_bytes", deserialize_with = "de::usize")]
+    pub max_pre_auth_bytes: usize,
+    /// Deadline (ms) for an unauthenticated peer to complete handshake → `LOGON`.
+    /// Closes the slow-loris a byte cap alone leaves open. 0 = no deadline.
+    #[serde(default = "default_login_timeout_ms", deserialize_with = "de::u64")]
+    pub login_timeout_ms: u64,
+    /// Idle read timeout (ms) for an **authenticated** connection between messages.
+    /// 0 (default) = no timeout — pooled drivers legitimately hold idle connections.
+    #[serde(default = "default_idle_timeout_ms", deserialize_with = "de::u64")]
+    pub idle_timeout_ms: u64,
+    /// Global cap on concurrent connections. A permit is acquired *before* `accept()`,
+    /// so at capacity back-pressure flows into the kernel listen backlog rather than
+    /// the heap. Makes the bounded-RSS guarantee hold under adversarial connection load.
+    #[serde(default = "default_max_connections", deserialize_with = "de::usize")]
+    pub max_connections: usize,
+    /// Cap on connections that have **not** yet completed `LOGON`. Must be smaller than
+    /// `maxConnections` so authenticated readers always have reachable global headroom;
+    /// a flood of anonymous sockets then cannot starve them. 0 = unlimited.
+    #[serde(
+        default = "default_max_pre_auth_connections",
+        deserialize_with = "de::usize"
+    )]
+    pub max_pre_auth_connections: usize,
+    /// Cap on concurrent connections from one source: the full address for IPv4 (/32),
+    /// the /64 prefix for IPv6 (an attacker owns a whole /64). Contains one
+    /// compromised/misbehaving client on a private network. 0 = unlimited.
+    #[serde(
+        default = "default_max_connections_per_ip",
+        deserialize_with = "de::usize"
+    )]
+    pub max_connections_per_ip: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -346,6 +392,28 @@ fn default_bind() -> String {
 }
 fn default_port() -> u16 {
     7687
+}
+// Connection-security defaults: on, but generous (see `ServerConfig`).
+fn default_max_message_bytes() -> usize {
+    64 * 1024 * 1024 // matches the historical chunk::MAX_MESSAGE_BYTES
+}
+fn default_max_pre_auth_bytes() -> usize {
+    64 * 1024 // HELLO/LOGON are a few hundred bytes; 64 KiB is ample headroom
+}
+fn default_login_timeout_ms() -> u64 {
+    10_000
+}
+fn default_idle_timeout_ms() -> u64 {
+    0 // off — pooled drivers legitimately hold idle authenticated connections
+}
+fn default_max_connections() -> usize {
+    16_384
+}
+fn default_max_pre_auth_connections() -> usize {
+    4_096
+}
+fn default_max_connections_per_ip() -> usize {
+    1_024
 }
 fn default_log_level() -> String {
     "info".into()
@@ -583,5 +651,54 @@ mod tests {
             .is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_security_limits_default_on_and_generous() {
+        let cfg: ServerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.max_message_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.max_pre_auth_bytes, 64 * 1024);
+        assert_eq!(cfg.login_timeout_ms, 10_000);
+        assert_eq!(cfg.idle_timeout_ms, 0);
+        assert_eq!(cfg.max_connections, 16_384);
+        assert_eq!(cfg.max_pre_auth_connections, 4_096);
+        assert_eq!(cfg.max_connections_per_ip, 1_024);
+        // The pre-auth budget must leave global headroom for authenticated readers.
+        assert!(cfg.max_pre_auth_connections < cfg.max_connections);
+    }
+
+    #[test]
+    fn server_security_limits_parse_number_and_numeric_string() {
+        // The layered loader stringifies every scalar, so each limit must accept
+        // both a raw number and its numeric-string form.
+        let from_num: ServerConfig = serde_json::from_value(serde_json::json!({
+            "maxMessageBytes": 1024,
+            "maxPreAuthBytes": 256,
+            "loginTimeoutMs": 2000,
+            "idleTimeoutMs": 60000,
+            "maxConnections": 8,
+            "maxPreAuthConnections": 4,
+            "maxConnectionsPerIp": 2,
+        }))
+        .unwrap();
+        let from_str: ServerConfig = serde_json::from_value(serde_json::json!({
+            "maxMessageBytes": "1024",
+            "maxPreAuthBytes": "256",
+            "loginTimeoutMs": "2000",
+            "idleTimeoutMs": "60000",
+            "maxConnections": "8",
+            "maxPreAuthConnections": "4",
+            "maxConnectionsPerIp": "2",
+        }))
+        .unwrap();
+        for cfg in [&from_num, &from_str] {
+            assert_eq!(cfg.max_message_bytes, 1024);
+            assert_eq!(cfg.max_pre_auth_bytes, 256);
+            assert_eq!(cfg.login_timeout_ms, 2000);
+            assert_eq!(cfg.idle_timeout_ms, 60000);
+            assert_eq!(cfg.max_connections, 8);
+            assert_eq!(cfg.max_pre_auth_connections, 4);
+            assert_eq!(cfg.max_connections_per_ip, 2);
+        }
     }
 }
