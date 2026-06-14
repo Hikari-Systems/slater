@@ -230,11 +230,13 @@ the working set is far larger than the **15 GiB** host RAM, so traversals are ge
   this scale) → **cannot-load** on a 15 GiB box.
 - **ArcadeDB**'s importer runs for ~days at 766M edges → **skipped**.
 
-LadybugDB *loads*, but only barely: its Kùzu `COPY` of the 766M edges is **not**
-bounded-memory — a 4 GiB buffer pool fails (`buffer pool is full`), a 10 GiB pool is
-**OOM-killed**, and only a tuned **~8 GiB** pool completes (peak **13 GiB** RSS, ~4.2 min),
-right at the edge of the 15 GiB host. (slater's external builder builds the same graph
-under a **4 GiB** cap — see *Bulk build / load*.)
+LadybugDB *loads*, but only with ~3× the memory — its Kùzu `COPY` of the 766M edges is
+**not** bounded-memory. Under the **same 4 GiB cap slater builds within**, its COPY is
+**OOM-killed 38 s in** (RSS pinned at the 4 GiB cap, barely past the node load). It needs
+a tuned **~8 GiB** pool to finish (peak **13 GiB** RSS, ~4.2 min); a 4 GiB *pool* fails
+outright (`buffer pool is full`) and a 10 GiB pool is OOM-killed. slater, by contrast,
+builds the **same** graph under that 4 GiB cap (peak 3.5 GiB) — bounded-memory by
+construction, not by tuning. (See *Bulk build / load*.)
 
 Because the on-disk store dwarfs RAM, the cgroup `memory.peak` is dominated by
 reclaimable OS **page cache** and badly misrepresents an engine's own footprint. So the
@@ -324,8 +326,9 @@ slater's external builder spills to disk and stays under a 4 GiB `--max-memory` 
 build the 91.6M/766M generation in ~29 min, and the resulting generation is the
 **smallest on disk** (14 GB vs LadybugDB 21 GB, Neo4j 41.8 GB). The contrast is the
 whole point: slater **builds** the larger-than-RAM graph within a fixed 4 GiB budget,
-whereas LadybugDB's bulk `COPY` only fits in a narrow ~8 GiB window and peaks at 13 GiB —
-bounded-memory by construction vs. by luck.
+whereas LadybugDB's bulk `COPY` is **OOM-killed at that same 4 GiB cap** (38 s in) and
+only fits in a narrow ~8 GiB window, peaking at 13 GiB — bounded-memory by construction
+vs. by luck.
 
 ### EU-AI-Act — 20,766 nodes / 44,790 edges, 54.8 MiB of vectors
 
