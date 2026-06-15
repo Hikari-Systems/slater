@@ -560,21 +560,22 @@ algorithmic gap at the smallest footprint; `blockCacheBytes` is the dial that tr
 latency for less RAM.)
 
 **Per-query parallelism (`maxFanout`).** Raising `query.maxFanout` overlaps a query's
-I/O-bound CSR block reads across cores. It helps **only the shapes with real parallelizable
-work** — large hub-anchored uncapped expansions and the shortestPath BFS frontier on the
-766M graph; the capped, random-anchor, in-cache suite shapes are fanout-insensitive (which
-is why the standard tables above don't move). slater on the 766M graph, sequential vs 8-way:
+**cold, I/O-bound** CSR block reads across cores — so it helps disk-bound shapes with a
+large cold working set, and is flat on warm/in-cache shapes (which is why the standard
+tables above don't move). Fresh v0.8.0, measured **cold** (OS page cache dropped + slater
+restarted before *every* call), shortestPath ≤6 between disconnected entities on the 766M
+graph:
 
-| slater @ Wikidata-91.6M | fanout=1 | fanout=8 | speedup |
+| slater @ Wikidata-91.6M, cold | fanout=1 | fanout=8 | speedup |
 |---|--:|--:|--:|
-| shortestPath ≤6 | 82.6 ms | 52.6 ms | 1.6× |
-| 2-hop count(*) (hub-anchored) | 127.9 ms | 60.3 ms | 2.1× |
-| 3-hop count(*) (hub-anchored) | 923.3 ms | 503.3 ms | 1.8× |
+| shortestPath ≤6 (median of 6 pairs) | 918 ms | 608 ms | 1.5× |
+| largest search in the set | 6,269 ms | 2,350 ms | **2.7×** |
 
-(Parallelism trades memory for latency — the fanout=8 3-hop count's working set rises to
-~5.2 GiB across 8 worker frontiers — but stays bounded by `maxIntermediate`, well under the
-in-memory engines' resident graph. `maxFanout=1` is the default, the safe choice for a
-throughput-oriented read server.)
+(The speedup scales with the cold working-set size — small searches are flat, large ones
+approach the core count. The classic uncapped hub 2-/3-hop *count* targets exceed slater's
+`query.maxIntermediate` guard at these hub sizes — refused by design — so they aren't shown.
+Parallelism trades memory for latency but stays bounded; `maxFanout=1` is the default, the
+safe choice for a throughput-oriented read server.)
 
 Full per-engine tables — pole, MeSH, the EU-AI-Act vector suite + the `blockCacheBytes`
 RAM↔latency dial, and Wikidata 1M & 91.6M — are in
