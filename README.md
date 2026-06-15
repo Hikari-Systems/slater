@@ -17,7 +17,7 @@ path.
 |:--|:--|:--|:--|
 | [Features](#features) | [GQL subset](#supported-gql-subset) | [Running with Docker](#running-with-docker) | [How it works](#how-it-works) |
 | [Mounts](#mounts) | [Configuration](#environment--configuration) | [ACL](#acl) | [Health check](#health-check) |
-| [Worked example](#worked-example) | [Development](#development) | [Benchmarking](#benchmarking) | [License](#license) |
+| [Worked example](#worked-example) | [Development](#development) | [Performance](#performance) | [License](#license) |
 
 ## Features
 
@@ -489,7 +489,7 @@ cargo fmt --all -- --check
 See `docs/PLAN.md`, `docs/PROGRESS.md` and `docs/DECISIONS.md` for the design,
 the milestone ledger, and the decision log.
 
-## Benchmarking
+## Performance
 
 `perf/` ships the harnesses behind the headline claim — **resident memory bounded by
 cache budgets, not graph size, at comparable query speed.** The same single-client suite

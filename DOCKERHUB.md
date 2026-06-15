@@ -366,7 +366,7 @@ volumes:
 
 ---
 
-## Benchmarking
+## Performance
 
 `perf/` ships the harnesses behind the headline claim — **resident memory bounded by
 cache budgets, not graph size, at comparable query speed.** The same single-client suite
