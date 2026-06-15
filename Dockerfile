@@ -61,6 +61,18 @@ COPY --from=builder /app/target/release/slater-build ./slater-build
 COPY config.json ./config.json
 COPY acl.json ./acl.json
 
+# Bound the glibc allocator's retained high-water under concurrency (load-test
+# finding 1): without this, the default per-CPU arenas keep freed expansion/encode
+# scratch resident, so a burst of concurrent hub 2-hops drives process RSS to many
+# times the cache budget and can OOM a tightly-capped container even though the
+# logical working set is small. `MALLOC_ARENA_MAX=2` caps arena count and the trim
+# threshold returns freed chunks to the OS promptly. With the intermediate-budget
+# guards charging expansion (so heavy queries fail cleanly), this keeps RSS bounded
+# under the `wiki_budget` brown-out suite at 1000 concurrent clients. Override at
+# run time if a workload genuinely benefits from more arenas.
+ENV MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072
+
 RUN useradd -r -u 1000 appuser
 USER appuser
 

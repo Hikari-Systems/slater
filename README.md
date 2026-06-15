@@ -557,15 +557,18 @@ the Wikidata-1M graph (one 16-core box):
   the latency knee (p99 40 → 520 ms) is queueing under core contention, not a hard cap.
 - **The block cache stays bounded and effective** — 100% hit rate, 0 evictions, 50 MB
   resident for a working set that fits the cache.
-- **Two memory caveats the load test surfaced.** (1) Under sustained concurrency the
-  *process* RSS rises to a retained allocator high-water (~2.7 GB anon, default glibc;
-  **not a leak** — flat over 90k further queries) well above the cache budget;
-  `MALLOC_ARENA_MAX`/jemalloc + a concurrency cap are the levers. (2) `maxIntermediate`
-  is a **per-query** bound, so `N_concurrent × budget` can OOM; the server-wide
-  **`query.maxIntermediateGlobal`** ceiling (default on) bounds the aggregate *charged*
-  intermediate, but the load test also found graph expansion **under-charges** its
-  working set, so expansion-heavy floods still need that fix. All tracked in the
-  load-testing doc.
+- **Two memory issues the load test surfaced, both now closed.** (1) Under sustained
+  concurrency the *process* RSS rose to a retained allocator high-water (~2.7 GB anon,
+  default glibc; **not a leak**) well above the cache budget. The runtime image now sets
+  `MALLOC_ARENA_MAX=2` (+ a trim threshold), which holds RSS to ~0.5–0.6 GB under the
+  same load. (2) `maxIntermediate` is a **per-query** bound, so `N_concurrent × budget`
+  can OOM; the server-wide **`query.maxIntermediateGlobal`** ceiling (default on) bounds
+  the aggregate, and graph expansion now **charges its adjacency** as it reads (it
+  previously counted only emitted rows, under-charging hub reads — finding 2b), so an
+  expansion-heavy flood fails cleanly instead of OOMing. With both fixes the
+  `wiki_budget` 2-hop brown-out suite **holds to 1000 concurrent clients without OOM**
+  (RSS ~0.6 GB, the guard shedding ~60% of hub queries as retryable budget errors). All
+  tracked in the load-testing doc.
 
 ## License
 

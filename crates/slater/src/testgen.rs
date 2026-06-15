@@ -684,6 +684,144 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
     (root, graph)
 }
 
+/// A **hub** (star) fixture for the expansion-charge tests (root cause 2b): one
+/// centre node `[0]` with `n` outgoing `:LINK` edges to leaves `[1..=n]`, and each
+/// leaf carrying a single `:LINK` edge back to the centre. So expanding the centre
+/// reads an `n`-edge adjacency in one step — exactly the hub read that must trip the
+/// intermediate budget immediately, before the `Vec<Hop>` it materialises (and the
+/// completed rows downstream) balloon RSS. The two-way wiring lets a fixed 2-hop
+/// `(:Hub)-[:LINK]->(x)-[:LINK]->(y)` traverse (each leaf hops back to the centre),
+/// so both a 1-hop and a 2-hop expansion can be exercised; with `n ≥ EXPAND_PAR_MIN`
+/// the hop-1 frontier (`n` leaves) also clears the parallel fan-out threshold, so the
+/// pooled `expand_chain_par` path is covered too.
+/// ```text
+/// [0] centre  :Hub  {name:'hub'}
+/// [i] leaf i  :Leaf {name:'leaf{i:05}'}   for i in 1..=n
+/// centre -[:LINK]-> leaf i   (n edges)
+/// leaf i -[:LINK]-> centre   (n edges)
+/// ```
+/// Labels Hub(0)/Leaf(1); reltype LINK(0); property key name(0). No indexes — the
+/// `:Hub` anchor is a label scan that yields the single centre node.
+pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0007);
+    let graph = "hub".to_string();
+    let root = std::env::temp_dir().join(format!("slater_hubfix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // node_props.blk — a name on every node (centre then leaves, in id order).
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    np.append(&[(0, Value::Str("hub".into()))]).unwrap();
+    for i in 1..=n {
+        np.append(&[(0, Value::Str(format!("leaf{i:05}")))])
+            .unwrap();
+    }
+    np.finish().unwrap();
+
+    // node_labels.blk — centre is :Hub(0), every leaf is :Leaf(1).
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    nl.append(&[0]).unwrap();
+    for _ in 1..=n {
+        nl.append(&[1]).unwrap();
+    }
+    nl.finish().unwrap();
+
+    // edge_props.blk — 2n edges, none carrying properties.
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..(2 * n) {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    // topology.csr.blk — centre→leaf then leaf→centre (reltype LINK = 0). Edge ids
+    // are unique across both directions; write_csr buckets them by endpoint itself.
+    let mut edges = Vec::with_capacity(2 * n as usize);
+    for i in 1..=n {
+        edges.push(Edge {
+            src: NodeId(0),
+            dst: NodeId(i),
+            reltype: 0,
+            edge: EdgeId(i - 1),
+        });
+    }
+    for i in 1..=n {
+        edges.push(Edge {
+            src: NodeId(i),
+            dst: NodeId(0),
+            reltype: 0,
+            edge: EdgeId(n - 1 + i),
+        });
+    }
+    write_csr(dir.join("topology.csr.blk"), n + 1, &edges, BLOCK, LEVEL).unwrap();
+
+    // vectors.f32.blk — empty (no vector index), but the reader always opens it.
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    // Inventory + manifest (no index files to list).
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        encryption: None,
+        node_count: n + 1,
+        edge_count: 2 * n,
+        labels: vec!["Hub".into(), "Leaf".into()],
+        reltypes: vec!["LINK".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
 /// Parameters for a synthetic Vamana/PQ generation.
 pub struct VamanaFixture {
     pub n: usize,

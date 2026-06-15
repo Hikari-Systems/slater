@@ -3883,6 +3883,13 @@ impl<'g> Engine<'g> {
             let neigh = par_gather(self.fanout_pool.as_deref(), &nodes, EXPAND_PAR_MIN, |&n| {
                 hops_par(gen, cache, n, dir, tf.as_ref())
             })?;
+            // Charge the gathered hops against the intermediate budget (root cause 2b),
+            // mirroring the sequential `expand_one_hop`. `hops_par` runs on the rayon
+            // pool where `self.charge` (a non-`Sync` `Cell`) cannot be touched, so the
+            // charge stays here on the calling thread once the buffer is materialised —
+            // before the merge below clones it into per-branch bindings.
+            let produced: u64 = neigh.iter().map(|h| h.len() as u64).sum();
+            self.charge(produced)?;
             // Merge in input order — the sequential `expand_chain` per-neighbour body:
             // `node_ok`, the next-var equality guard, rel/next binding.
             for (b, hops) in chunk.iter().zip(neigh) {
@@ -4187,13 +4194,30 @@ impl<'g> Engine<'g> {
     /// One traversal step from `node`: edges matching the pattern's direction,
     /// type alternation and relationship property predicates, each resolved to a
     /// [`Hop`] (edge, neighbour, type, and stored src→dst endpoints).
+    ///
+    /// Charges the produced hops against the intermediate budget (root cause 2b):
+    /// expanding a hub reads its whole adjacency and builds one `Hop` per matching
+    /// edge — a `Vec<Hop>` that, summed over a depth-first chain walk, is the bulk
+    /// of an expansion-heavy query's transient allocation. Without this charge the
+    /// terminal `charge(1)` per *completed* row only trips once millions of heavy
+    /// binding rows have already materialised (the 2b OOM); charging per produced
+    /// hop trips a hub expansion immediately, before those rows accumulate. The
+    /// charge is cumulative (never refunded within the query), so a fan-out that
+    /// re-expands the same hub at every branch is bounded by total work, not peak.
+    ///
+    /// Kept on the budgeted traversal wrapper rather than [`Self::expand_with_dir`]
+    /// itself: the latter is also the reader for `shortestPath()` reconstruction and
+    /// its sequential fallback, which are bounded by the dedicated
+    /// `maxShortestPathExplore` cap and must stay independent of `maxIntermediate`.
     fn expand_one_hop(
         &self,
         node: u64,
         rel: &RelPat,
         binding: &HashMap<String, Val>,
     ) -> Result<Vec<Hop>> {
-        self.expand_with_dir(node, rel, rel.dir, binding)
+        let hops = self.expand_with_dir(node, rel, rel.dir, binding)?;
+        self.charge(hops.len() as u64)?;
+        Ok(hops)
     }
 
     /// As [`Self::expand_one_hop`] but with an explicit traversal `dir`, overriding
@@ -9907,6 +9931,215 @@ mod tests {
             "UNWIND range(0, 200000) AS x RETURN count(x)",
         );
         assert!(res.is_ok(), "both budgets off → no cap: {res:?}");
+    }
+
+    // ── Expansion charge: a hub read must trip the budget (root cause 2b) ─────
+
+    /// Few-thousand-edge hub; comfortably clears `EXPAND_PAR_MIN` (64) so the pooled
+    /// reader fans out, and small enough to build in well under a millisecond.
+    const HUB_N: u64 = 3_000;
+    /// Far below `HUB_N`, so a single hub expansion (which charges ~`HUB_N`) trips it.
+    const HUB_TIGHT: u64 = 100;
+    /// Far above the whole star's cumulative charge (~a few × `HUB_N`), so a full
+    /// expansion completes — the guard must bound hubs without over-charging.
+    const HUB_GENEROUS: u64 = 10_000_000;
+
+    /// Run `q` against an `n`-leaf hub fixture (see [`testgen::write_hub`]) with the
+    /// given per-query and server-wide budgets (0 disables either), optionally behind
+    /// a fanout pool so the parallel `expand_chain_par` path is exercised. Asserts the
+    /// universal refund invariant and returns `(result, global_peak)`.
+    fn run_hub(
+        tag: &str,
+        n: u64,
+        per_query: u64,
+        global: u64,
+        with_pool: bool,
+        q: &str,
+    ) -> (Result<QueryResult>, u64) {
+        let (root, graph) = testgen::write_hub(tag, n);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let budget = GlobalIntermediateBudget::new(global);
+        let mut engine = Engine::new(&gen, &cache)
+            .with_max_intermediate(per_query)
+            .with_global_budget(&budget);
+        if with_pool {
+            engine = engine.with_fanout_pool(Some(std::sync::Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(3)
+                    .build()
+                    .unwrap(),
+            )));
+        }
+        let res = engine.run(&parser::parse(q).unwrap());
+        let peak = budget.peak();
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "every query must refund its whole global charge"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        (res, peak)
+    }
+
+    #[test]
+    fn hub_one_hop_trips_per_query_budget() {
+        // Reading the centre's `HUB_N`-edge adjacency in one hop already charges
+        // `HUB_N`, well past the tight cap — no need to complete any row.
+        let (res, _) = run_hub(
+            "exec_hub_1hop_pq",
+            HUB_N,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
+        );
+        assert!(
+            is_per_query_budget_err(&res),
+            "a hub's one-hop expansion must trip the per-query budget: {res:?}"
+        );
+    }
+
+    #[test]
+    fn hub_one_hop_trips_global_budget() {
+        let (res, _) = run_hub(
+            "exec_hub_1hop_g",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
+        );
+        assert!(
+            is_global_budget_err(&res),
+            "a hub's one-hop expansion must trip the server-wide budget: {res:?}"
+        );
+    }
+
+    #[test]
+    fn hub_two_hop_trips_per_query_budget() {
+        let (res, _) = run_hub(
+            "exec_hub_2hop_pq",
+            HUB_N,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y)",
+        );
+        assert!(is_per_query_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn hub_two_hop_trips_global_budget() {
+        let (res, _) = run_hub(
+            "exec_hub_2hop_g",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y)",
+        );
+        assert!(is_global_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn hub_expansion_charges_before_any_row_completes() {
+        // The crux of 2b: the charge is on the adjacency read, not on completed rows.
+        // `:Hub` matches only the centre, never a leaf, so every expanded neighbour is
+        // rejected by `node_ok` and ZERO rows complete — the pre-fix terminal
+        // `charge(1)` would never fire and a tight budget would (wrongly) pass. Reading
+        // the centre's `HUB_N`-edge adjacency must trip it regardless. Both guards.
+        let (pq, _) = run_hub(
+            "exec_hub_filtered_pq",
+            HUB_N,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x:Hub) RETURN count(x)",
+        );
+        assert!(
+            is_per_query_budget_err(&pq),
+            "a filtered hub read (no row completes) must still trip the per-query budget: {pq:?}"
+        );
+        let (g, _) = run_hub(
+            "exec_hub_filtered_g",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x:Hub) RETURN count(x)",
+        );
+        assert!(
+            is_global_budget_err(&g),
+            "a filtered hub read must still trip the server-wide budget: {g:?}"
+        );
+    }
+
+    #[test]
+    fn hub_small_expansion_succeeds_under_a_generous_budget() {
+        // The guard must bound hubs without over-charging: a generous budget lets the
+        // whole star expand and return the right count, and it really drew on the
+        // budget (≥ one charge per edge read).
+        let (res, peak) = run_hub(
+            "exec_hub_small_ok",
+            HUB_N,
+            HUB_GENEROUS,
+            HUB_GENEROUS,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x) AS n",
+        );
+        let res = res.expect("a generous budget must let the hub expand");
+        assert_eq!(col0(&res), vec![HUB_N.to_string()]);
+        assert!(
+            peak >= HUB_N,
+            "the expansion must charge at least once per edge read: peak={peak}"
+        );
+    }
+
+    #[test]
+    fn hub_expansion_charge_on_parallel_path() {
+        // The fanout pool routes a fixed multi-hop chain through `expand_chain_par`,
+        // whose adjacency reads gather on rayon — where `self.charge`'s `Cell` cannot
+        // be touched. The charge is applied on the calling thread once the buffer
+        // lands, so the same hub expansion still trips a tight budget (per-query and
+        // global) and, under a generous budget, returns exactly the sequential result.
+        // The hop-1 frontier (`HUB_N` leaves) clears `EXPAND_PAR_MIN`, so the pooled
+        // reader truly fans out rather than degrading to a sequential read.
+        let q = "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y) AS n";
+        let (tight, _) = run_hub("exec_hub_par_pq", HUB_N, HUB_TIGHT, 0, true, q);
+        assert!(
+            is_per_query_budget_err(&tight),
+            "the pooled hub expansion must trip the per-query budget: {tight:?}"
+        );
+        let (tight_g, _) = run_hub("exec_hub_par_g", HUB_N, 0, HUB_TIGHT, true, q);
+        assert!(
+            is_global_budget_err(&tight_g),
+            "the pooled hub expansion must trip the server-wide budget: {tight_g:?}"
+        );
+        let (par, _) = run_hub(
+            "exec_hub_par_ok",
+            HUB_N,
+            HUB_GENEROUS,
+            HUB_GENEROUS,
+            true,
+            q,
+        );
+        let (seq, _) = run_hub(
+            "exec_hub_seq_ok",
+            HUB_N,
+            HUB_GENEROUS,
+            HUB_GENEROUS,
+            false,
+            q,
+        );
+        let par = par.expect("pooled generous run");
+        let seq = seq.expect("sequential generous run");
+        assert_eq!(
+            col0(&par),
+            col0(&seq),
+            "pooled and sequential expansions must agree"
+        );
+        assert_eq!(col0(&par), vec![HUB_N.to_string()]);
     }
 
     // ── Engine reuse: the charge resets and refunds per run ───────────────────

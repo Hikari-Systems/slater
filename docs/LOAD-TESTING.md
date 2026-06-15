@@ -53,6 +53,12 @@ enable) and inert on the hot path when off. Never enable it on a production repl
 |   500 | 2317 | 11 ms | 150 ms |  0%   | 2590 MB | OK      |
 |  1000 | 1837 | 14 ms | 520 ms |  0%   | 2744 MB | ⚠ knee  |
 
+> The RSS column above is the **pre-allocator-fix** build (finding 1). With
+> `MALLOC_ARENA_MAX=2` now baked into the runtime image, the same churn mix holds RSS
+> flat at **~0.5 GB** across 100→1000 users (0 failures, 0 global-budget rejects —
+> the light read mix charges ~0, so the budget guard is inert here). Latency and the
+> zero-failure / concurrency story are unchanged.
+
 - **Zero failures**; the service held to 1000 concurrent clients on one box.
 - Throughput peaks ~3k rps and **falls** as concurrency rises — core contention,
   not a hard cap. The p99 knee is at ~1000 users (queueing, p99 40 → 520 ms).
@@ -62,20 +68,32 @@ enable) and inert on the hot path when off. Never enable it on a production repl
   test needs a store ≫ cache — see "The 91.6M graph" below for why that regime is
   hard to drive on a memory-constrained host.)
 
-### `wiki_budget` — 2-hop expansions vs the per-query intermediate guard
+### `wiki_budget` — 2-hop expansions vs the intermediate guards
 
-2-hop `count(DISTINCT)` fans out past `query.maxIntermediate`, so the guard fires
+2-hop `count(DISTINCT)` fans out on higher-degree nodes, so the budget guard fires
 (client-side `Statement.ExecutionFailed`, counted as "failures" by Locust — this is
-the guard *working*, not a crash). Comparing two values of the per-query cap at the
-1000-user step:
+the guard *working*, not a crash). This shape originally **OOM'd the 4 GB container at
+1000 concurrent** even with the server-wide guard, because of two compounding defects
+(findings 1 + 2b below). With both fixed — the runtime image's `MALLOC_ARENA_MAX=2`
+and adjacency-charging graph expansion — the same suite now holds:
 
-| `wiki_budget` @ 1000 users | `maxIntermediate` = 1,000,000 | `maxIntermediate` = 100,000 |
-|---|--:|--:|
-| steady-state RSS (snapshot) | 2496 MB | **33 MB** |
-| outcome | **OOM (exit 137)** | **still OOM (exit 137)** |
+| `wiki_budget` (guard build, `maxIntermediateGlobal` = 1,000,000) | 100 | 500 | 1000 |
+|---|--:|--:|--:|
+| RSS (live, `docker stats`) | 353 MB | 571 MB | 555 MB |
+| fail% (budget guard shedding hub queries) | 60% | 59% | 59% |
+| outcome | OK | OK | **no OOM** |
 
-Tightening the per-query cap 10× slashed *steady-state* RSS but **still OOM'd at
-1000 concurrent** — see the aggregate-budget finding below.
+Diagnostics at the end of the ramp: `fail_global_budget_total` ≈ 31k (the guard
+rejecting expansion-heavy queries cleanly), `intermediate_global_peak` ≈ 5.1M (graph
+expansion is now *visible* to the budget — before finding 2b it pinned at ~1.03M
+counting only emitted rows), `fail_budget_total` ≈ 5, idle `rss_bytes` ≈ 524 MB. The
+guard sheds ~60% of the deliberately-abusive hub 2-hops as retryable errors while the
+container stays well under its 4 GB cap.
+
+For contrast, the pre-fix build: tightening the *per-query* cap 10× (to 100,000)
+slashed steady-state RSS to 33 MB but **still OOM'd at 1000 concurrent**, because the
+transient peak (not steady state) was retained by the allocator and the expansion
+working set was never charged — the two findings below.
 
 ## Findings
 
@@ -90,14 +108,19 @@ count, and partially releases when concurrency drops.
 
 The cause is allocator retention: many small, short-lived per-request allocations
 (result encoding, expansion scratch) under the default glibc allocator, which keeps
-freed memory in its arenas rather than returning it to the OS (no `MALLOC_ARENA_MAX`,
-no `malloc_trim`, no jemalloc). The "resident ≈ cache budgets + small overhead"
-guarantee holds for the **cache**; under high concurrency the resident set is
-dominated by this allocator high-water, ~10× the 256 MiB budget.
+freed memory in its per-CPU arenas rather than returning it to the OS. The
+"resident ≈ cache budgets + small overhead" guarantee holds for the **cache**; under
+high concurrency the resident set was dominated by this allocator high-water, ~10× the
+256 MiB budget.
 
-**Mitigations to evaluate:** `MALLOC_ARENA_MAX=2` (or a jemalloc/mimalloc global
-allocator), a periodic `malloc_trim`, and/or a global concurrency cap on executing
-queries. Worth a dedicated A/B with the harness.
+**Fixed — `MALLOC_ARENA_MAX=2` (+ `MALLOC_TRIM_THRESHOLD_=131072`) baked into the
+runtime image.** Capping the arena count and trimming freed chunks back to the OS holds
+RSS to **~0.5–0.6 GB** under the same `wiki_budget` ramp that previously climbed past
+3.8 GB and OOM'd — a measured A/B on the guard build: identical run, RSS 555 MB and no
+OOM with the env set vs. exit-137 without it. This is the single highest-leverage knob
+for resident memory under concurrency; a jemalloc/mimalloc global allocator and/or a
+heavy-query concurrency cap remain open options if a workload needs more headroom.
+Override the env at run time if a workload genuinely benefits from more arenas.
 
 ### 2. The per-query budget does not bound *aggregate* concurrent memory
 
@@ -119,40 +142,54 @@ gauges) instead of growing the heap. A point lookup charges ~0, so light load is
 unaffected — re-running `wiki_cache_churn` on the guard build is byte-for-byte the
 same (0 rejects, global peak ~211k ≪ the 8M ceiling).
 
-**…but it does *not* close the `wiki_budget` OOM, which exposed a deeper bug
-(finding 2b).** Re-running `wiki_budget` on the guard build still OOM'd — even with
-the global ceiling tightened to 1M. The diagnostics are the tell: at the moment of
-death the global charge sat right at its limit (`intermediate_global_peak`
-≈ 1,026,943, `fail_global_budget` climbing) while **RSS had spiked to 3.8 GB** — so
-~1M *charged* elements coincided with ~3.8 GB of real memory (~3.8 KB per "element").
-The guard's accounting is correct (the unit tests pin the counter at the limit and
-verify the refund), but the **charge model under-counts graph-expansion working
-memory**, so neither budget can see the allocation that actually OOMs.
+Initially this guard alone did *not* close the `wiki_budget` OOM, which exposed a
+deeper bug (finding 2b): on the first guard build `wiki_budget` still OOM'd even with
+the ceiling tightened to 1M. The diagnostics were the tell — at the moment of death
+the global charge sat right at its limit (`intermediate_global_peak` ≈ 1,026,943) while
+**RSS had spiked to 3.8 GB**, so ~1M *charged* elements coincided with ~3.8 GB of real
+memory (~3.8 KB per "element"). The guard's accounting was correct (the unit tests pin
+the counter at the limit and verify the refund), but the **charge model under-counted
+graph-expansion working memory** (finding 2b), and the allocator retained the transient
+peak (finding 1). With both of those fixed, the guard now does bound the aggregate:
+`intermediate_global_peak` rises to ~5.1M (expansion is finally visible — the few-MB
+overshoot above the 1M ceiling is concurrent in-flight charges racing the reject) and
+`wiki_budget` holds at 1000 concurrent without OOM (see the results table above).
 
-### 2b. Graph expansion under-charges its working set
+### 2b. Graph expansion under-charged its working set — *fixed*
 
 `expand_with_dir` reads a node's **entire adjacency list** (`outgoing()`/`incoming()`
-→ `Vec<Adj>`) and builds a `Vec<Hop>` from it, and `expand_chain` only `charge(1)`s
-per *completed* path. So expanding a hub node allocates a large adjacency vector (and,
+→ `Vec<Adj>`) and builds a `Vec<Hop>` from it, and `expand_chain` only `charge(1)`'d
+per *completed* path. So expanding a hub node allocated a large adjacency vector (and,
 for `count(DISTINCT)`, a `HashMap`-per-row result far heavier than a 48 B `Val`)
-**before any charge fires** — the element budget counts emitted rows, not the bytes
-the expansion materialises. A flood of concurrent hub 2-hops therefore OOMs despite
-both budgets. The accounting fix is to **charge the adjacency length when a node is
-expanded** (and/or account row bytes), so a hub read trips the budget immediately
-instead of after emitting a million rows. Until then, the server-wide budget bounds
-*collect/unwind/aggregate*-style intermediate growth (where charging is proportional)
-but not expansion-dominated queries.
+**before any charge fired** — the element budget counted emitted rows, not the bytes
+the expansion materialised. A node whose neighbours were all filtered out (a `node_ok`
+mismatch) completed zero rows and so charged **nothing**, even after reading a million
+edges. A flood of concurrent hub 2-hops therefore OOM'd despite both budgets.
+
+**Fix (shipped):** the budgeted traversal wrapper `expand_one_hop` now charges the
+produced hop count for every expansion, so reading a hub's adjacency trips the budget
+*immediately*, before the `Vec<Hop>` and the downstream rows accumulate. The parallel
+path (`expand_chain_par` → `par_walk`) charges the gathered neighbour buffer on the
+calling thread once it lands — the rayon workers read adjacency but never touch the
+non-`Sync` per-query `Cell`. The charge is deliberately left off `shortestPath()`
+reconstruction (which shares `expand_with_dir` but is bounded by the dedicated
+`maxShortestPathExplore` cap, not `maxIntermediate`). Unit tests over a hub fixture
+(`testgen::write_hub`) prove a 1-hop and a 2-hop trip both the per-query and the
+server-wide budget — including the filtered case where **zero rows complete** — on both
+the sequential and the pooled paths, while a generous budget still expands the whole
+star. In the load test, `wiki_budget`'s `intermediate_global_peak` goes from ~1.03M
+(emitted rows only) to ~5.1M (adjacency visible) and the OOM is gone.
 
 Two shapes were considered for the aggregate guard; option 1 is what shipped:
 
 1. **Global intermediate accounting** (shipped) — a process-wide atomic of live
    intermediate elements that each query charges/refunds against alongside its
-   per-query cap; a charge over the ceiling fails the query cleanly. Bounds
-   proportionally-charged growth; needs finding 2b to also bound expansion.
+   per-query cap; a charge over the ceiling fails the query cleanly. With finding 2b's
+   adjacency charging it now bounds expansion as well as proportionally-charged growth.
 2. **Heavy-query admission control** (future) — a global semaphore limiting how many
    budget-charging (expand/aggregate) queries run concurrently, capping
-   `N_concurrent` regardless of per-query size. Independent of the charge model, so
-   it would also bound the expansion case.
+   `N_concurrent` regardless of per-query size. Independent of the charge model; a
+   further lever if a workload needs hard concurrency bounds beyond the budget.
 
 ### 3. Engine / planner observations surfaced by the disk-bound shapes
 
