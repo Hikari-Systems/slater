@@ -86,6 +86,22 @@ def coerce(value, ktype):
     return value  # array types: left as-is
 
 
+def csv_cell(value, ktype):
+    """Encode a coerced value for a Kùzu COPY CSV cell. Used only for embedding-bearing
+    node tables: COPYing a FLOAT[dim] column is ~65x faster than UNWIND…CREATE
+    (~0.14 ms/row vs ~9 ms/row), which is otherwise prohibitive at 15k embeddings.
+    None -> empty field (NULL). Array columns -> Kùzu '[a,b,c]' list syntax — element
+    strings are emitted raw (csv.writer quotes the whole field), which round-trips only
+    when no element contains a comma/quote/bracket; the loader asserts that holds."""
+    if value is None:
+        return ""
+    if ktype.endswith("]"):  # array: FLOAT[n] / DOUBLE[n] / INT64[] / STRING[] / STRING[n]
+        return "[" + ",".join("" if e is None else str(e) for e in value) + "]"
+    if ktype == "BOOL":
+        return "true" if value else "false"
+    return value if isinstance(value, str) else str(value)
+
+
 def node_create_props(props):
     parts = ["__dump_id__: r.id"]
     parts.extend(f"{qid(p)}: r.props.{qid(p)}" for p in props)
@@ -93,10 +109,16 @@ def node_create_props(props):
     return "{ " + ", ".join(parts) + " }"
 
 
-def rel_create_props(props):
+def rel_create_props(props, col_types):
+    """Set rel props with an explicit CAST to each column's declared type. Without it,
+    Kùzu infers the `$rows` parameter struct's field types from the Python batch values,
+    so a batch whose INT64/DOUBLE field is entirely NULL gets inferred as STRING and the
+    binder rejects it against the INT64 column ("expected INT64 … implicit cast not
+    supported"). CAST pins the type — a NULL casts cleanly to any type."""
     if not props:
         return ""
-    return " { " + ", ".join(f"{qid(p)}: r.props.{qid(p)}" for p in props) + " }"
+    parts = [f"{qid(p)}: CAST(r.props.{qid(p)} AS {col_types[p]})" for p in props]
+    return " { " + ", ".join(parts) + " }"
 
 
 def load(dump, graph, out_dir):
@@ -133,6 +155,11 @@ def load(dump, graph, out_dir):
     for did, labels, props in nodes:
         by_primary[node_primary[did]].append((did, labels, props))
 
+    # Tables holding an embedding load via COPY, not UNWIND (the FLOAT[dim] column makes
+    # per-row CREATE ~65x slower — 15k embeddings would take minutes and pin a core).
+    embed_tables = {label_to_primary.get(lab, lab) for lab, _prop, _dim, _m in vec_idx}
+    node_tmp = tempfile.mkdtemp(prefix="ladybug-nodes-")
+
     for table, rws in sorted(by_primary.items()):
         prop_values = defaultdict(list)
         for _did, _labels, props in rws:
@@ -146,18 +173,32 @@ def load(dump, graph, out_dir):
         conn.execute(ddl).get_all()
 
         props = sorted(prop_values)
-        query = f"UNWIND $rows AS r CREATE (n:{qid(table)} {node_create_props(props)})"
-        batch_rows = [
-            {
-                "id": did,
-                "labels": "|" + "|".join(labels) + "|",
-                "props": {p: coerce(props_map.get(p), col_types[p]) for p in props},
-            }
-            for did, labels, props_map in rws
-        ]
-        for ch in chunks(batch_rows, BATCH):
-            conn.execute(query, {"rows": ch}).get_all()
+        if table in embed_tables:
+            # COPY path: CSV columns in table-definition order (__dump_id__, sorted props,
+            # __labels). csv.writer quotes any field with a comma (incl. the '[…]' arrays).
+            path = os.path.join(node_tmp, f"{table}.csv")
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                for did, labels, props_map in rws:
+                    row = [did]
+                    row.extend(csv_cell(coerce(props_map.get(p), col_types[p]), col_types[p]) for p in props)
+                    row.append("|" + "|".join(labels) + "|")
+                    w.writerow(row)
+            conn.execute(f"COPY {qid(table)} FROM '{path}' (HEADER=false)").get_all()
+        else:
+            query = f"UNWIND $rows AS r CREATE (n:{qid(table)} {node_create_props(props)})"
+            batch_rows = [
+                {
+                    "id": did,
+                    "labels": "|" + "|".join(labels) + "|",
+                    "props": {p: coerce(props_map.get(p), col_types[p]) for p in props},
+                }
+                for did, labels, props_map in rws
+            ]
+            for ch in chunks(batch_rows, BATCH):
+                conn.execute(query, {"rows": ch}).get_all()
         print(f"  ladybug nodes :{table} -> {len(rws)}", flush=True)
+    shutil.rmtree(node_tmp, ignore_errors=True)
 
     rel_pairs = defaultdict(set)
     rel_props = defaultdict(lambda: defaultdict(list))
@@ -201,7 +242,7 @@ def load(dump, graph, out_dir):
             query = (
                 f"UNWIND $rows AS r MATCH (a:{qid(src)} {{__dump_id__: r.a}}), "
                 f"(b:{qid(dst)} {{__dump_id__: r.b}}) "
-                f"CREATE (a)-[e:{qid(typ)}{rel_create_props(props)}]->(b)"
+                f"CREATE (a)-[e:{qid(typ)}{rel_create_props(props, rel_col_types.get(typ, {}))}]->(b)"
             )
             batch_rows = [
                 {"a": a, "b": b,
@@ -212,6 +253,27 @@ def load(dump, graph, out_dir):
                 conn.execute(query, {"rows": ch}).get_all()
         print(f"  ladybug rels :{typ} {src}->{dst} -> {len(rws)}", flush=True)
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Build native HNSW vector indexes (LadybugDB = Kùzu vector extension) so kNN is
+    # served from a resident index like the other engines, not a brute-force scan. The
+    # `vector` extension is baked into the image (Dockerfile.ladybug INSTALLs it); here
+    # we only LOAD it. Each (label, prop) maps to its primary table; in the benched
+    # graphs that table IS the label (the embedding column is FLOAT[dim], no NULLs), so
+    # the bench targets QUERY_VECTOR_INDEX('<Label>', '<Label>_embedding', ...). If a
+    # future graph splits an embedded label across primary tables we warn — a single
+    # native index can't cover the split the way slater/Neo4j's per-label index does.
+    if vec_idx:
+        conn.execute("LOAD vector;").get_all()
+        for label, prop, dim, metric in vec_idx:
+            table = label_to_primary.get(label, label)
+            if table != label:
+                print(f"  WARN ladybug vector index: label {label} -> primary table "
+                      f"{table}; bench QUERY_VECTOR_INDEX must target '{table}'", flush=True)
+            idx = f"{label}_embedding"
+            conn.execute(
+                f"CALL CREATE_VECTOR_INDEX('{table}', '{idx}', '{prop}', metric := '{metric}');"
+            ).get_all()
+            print(f"  ladybug vector index {idx} on :{table}({prop}) dim={dim} {metric}", flush=True)
 
     conn.close()
     db.close()

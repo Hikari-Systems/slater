@@ -75,6 +75,13 @@ def connect(engine, graph):
         bp = int(os.environ.get("LADYBUG_BUFFER_POOL", str(512 * 1024 * 1024)))
         db = lb.Database(path, read_only=True, buffer_pool_size=bp)
         conn = lb.Connection(db)
+        # The query side needs the `vector` extension loaded too (QUERY_VECTOR_INDEX is
+        # provided by it). It's baked into the image, so LOAD is offline; harmless on
+        # non-vector graphs. Best-effort so a stripped image still serves graph queries.
+        try:
+            conn.execute("LOAD vector;")
+        except Exception:
+            pass
         rewrite = _ladybug_rewriter(graph)
         def run(q, params=None):
             res = conn.execute(rewrite(q), params or {})

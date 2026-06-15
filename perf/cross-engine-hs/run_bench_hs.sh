@@ -22,7 +22,10 @@ declare -A CONT=( [slater]=slater-hs [neo4j]=neo4j-hs [memgraph]=memgraph-hs \
 LBVOL=/tmp/bench-hs/ladybug
 # Run the embedded-ladybug container as the host user so files it writes (notably
 # memory.txt) are host-owned — otherwise the later cgroup `tee -a` can't append.
-LB_MOUNTS="--user $(id -u):$(id -g) -v $HERE:/app -v $LBVOL:/data/ladybug"
+# Mount /tmp/bench-hs so the shared kNN query-vector pool (vec_pool.json) is visible:
+# the embedded container has no host network to reach Neo4j, but an earlier engine
+# (slater/neo4j) has already built the pool on the host, so ladybug reads the same one.
+LB_MOUNTS="--user $(id -u):$(id -g) -v $HERE:/app -v $LBVOL:/data/ladybug -v /tmp/bench-hs:/tmp/bench-hs"
 # Propagate the graph name into the embedded-ladybug container (its bench resolves
 # /data/ladybug/<graph>.lbug from WIKI_GRAPH; without this it defaults to wikidata1m).
 LB_ENV="-e WIKI_GRAPH=${WIKI_GRAPH:-wikidata1m}"

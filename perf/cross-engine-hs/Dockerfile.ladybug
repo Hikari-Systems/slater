@@ -8,6 +8,16 @@
 # Build:  docker build -t slater-ladybug:local -f Dockerfile.ladybug .
 FROM python:3.12-slim
 RUN pip install --no-cache-dir real_ladybug==0.15.3 neo4j
+# Bake the `vector` extension into the image. `INSTALL vector` downloads the extension
+# (libvector.lbug_extension) into $HOME/.lbdb and is NOT bundled in the wheel. The bench
+# runs containers as `--user <host-uid>` (whose default HOME is `/`, unwritable) with no
+# guaranteed network, so we pre-install once at build under a world-readable HOME and set
+# ENV HOME to it; runtime only needs `LOAD vector;` (offline). Both the loader
+# (CREATE_VECTOR_INDEX) and the bench (QUERY_VECTOR_INDEX) depend on this.
+ENV HOME=/opt/lbhome
+RUN mkdir -p /opt/lbhome && \
+    python -c "import real_ladybug as lb, tempfile, os; d=tempfile.mkdtemp(); db=lb.Database(os.path.join(d,'x')); c=lb.Connection(db); c.execute('INSTALL vector;'); c.close(); db.close()" && \
+    chmod -R a+rX /opt/lbhome
 WORKDIR /app
 # The cross-engine-hs/ dir (engines.py, load_ladybug.py, load_cypher.py, bench_*.py,
 # count_hs.py) is bind-mounted at /app at run time; nothing is COPYed in.
