@@ -54,7 +54,13 @@ Identical to the pole harness (`perf/cross-engine/`): per query, 15 warm-ups the
 25 measured calls with a **fresh parameter every call** (so the result cache always
 misses — real execution cost), median of the 25; each engine is **restarted before
 every run** and re-warmed, and the reported figure is the **mean of 5 such runs**.
-Peak/steady RSS is read from the container cgroup after the final run. Row counts
+Peak/steady RSS is read from the container cgroup after the final run.
+
+The figures below are **slater v0.8.0** (the published `hikarisystems/slater:v0.8.0`
+image), each engine **measured in isolation** — every other engine container stopped,
+started one at a time — so a row is that engine's own footprint with no cross-engine
+memory/cache pressure. (`setup_hs.sh` takes a `SLATER_IMG` env override to benchmark a
+specific release.) Row counts
 are cross-checked across engines (slater matches the Neo4j/Memgraph reference on
 every query). slater is served on its **default cache budgets — block 64 + vector
 32 + result 16 MiB** — the config under which "bounded memory" is the whole point.
@@ -161,28 +167,28 @@ Latency, mean of 5 runs. Mark on slater: 🟢 sole fastest, ⚪ ties (within 25%
 
 | query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| count all nodes | **0.58 ms 🟢** | 7.36 | 3.47 | 3.42 | 15.42 | 1.88 |
-| Crime label count | **0.58 ms 🟢** | 5.69 | 4.31 | 1.94 | 7.99 | 1.22 |
-| point lookup (idx nhs_no) | 0.63 | 4.94 | 0.47 | 0.47 | 0.75 | 0.48 |
-| idx-eq count (Crime.type) | **0.58 ms ⚪** | 3.68 | 0.95 | 0.62 | 3.25 | 1.47 |
-| 1-hop Crime→Location | 1.36 | 7.00 | 1.31 | 0.77 | 4.10 | 3.17 |
-| 2-hop Person→Loc→Area | 2.43 | 5.62 | 1.23 | 0.97 | 16.98 | 3.99 |
-| agg crimes by type | 2.59 ⚪ | 9.41 | 7.10 | 3.72 | 39.84 | 3.14 |
-| 3-hop Officer/Crime/Loc | 2.55 | 4.78 | 1.96 | 0.97 | 3.04 | 6.07 |
-| full-scan CONTAINS | **0.60 ms 🟢** | 6.04 | 7.17 | 3.26 | 32.30 | 1.93 |
-| count DISTINCT type | 2.50 ⚪ | 7.71 | 6.74 | 4.43 | 39.09 | 2.93 |
+| count all nodes | **0.56 ms 🟢** | 6.38 | 3.39 | 3.44 | 15.39 | 2.53 |
+| Crime label count | **0.58 ms 🟢** | 5.09 | 4.01 | 1.96 | 7.73 | 1.37 |
+| point lookup (idx nhs_no) | 0.63 | 4.49 | 0.47 | 0.49 | 0.75 | 0.50 |
+| idx-eq count (Crime.type) | **0.59 ms ⚪** | 3.33 | 0.89 | 0.59 | 3.37 | 1.54 |
+| 1-hop Crime→Location | 1.35 | 6.62 | 1.26 | 0.76 | 4.11 | 3.00 |
+| 2-hop Person→Loc→Area | 2.44 | 5.52 | 1.21 | 0.99 | 16.31 | 4.09 |
+| agg crimes by type | 2.67 ⚪ | 9.10 | 7.14 | 3.68 | 39.33 | 3.11 |
+| 3-hop Officer/Crime/Loc | 2.55 | 3.79 | 2.01 | 0.98 | 2.83 | 6.04 |
+| full-scan CONTAINS | **0.61 ms 🟢** | 5.70 | 7.22 | 3.23 | 31.84 | 1.90 |
+| count DISTINCT type | 2.54 ⚪ | 7.74 | 6.71 | 4.36 | 38.32 | 2.95 |
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| **peak RSS** | **75 MiB 🟢** | 737 | 114 | 140 | 1548 | 197 |
-| steady RSS | **71 MiB 🟢** | 726 | 96 | 138 | 1494 | 197 |
+| **peak RSS** | **50 MiB 🟢** | 746 | 114 | 140 | 1556 | 198 |
+| steady RSS | **39 MiB 🟢** | 743 | 113 | 138 | 1499 | 198 |
 
 On this toy graph the memory thesis can't bite (the whole graph is ~23 MiB, resident for
-everyone) — slater is smallest at 75 MiB but only ~1.4–2× below Memgraph/FalkorDB, the
+everyone) — slater is smallest at 50 MiB but only ~2.5–4× below Memgraph/FalkorDB, the
 point the larger graphs below make. The added engines behave as elsewhere: **LadybugDB**
-is competitive (1–6 ms) at 197 MiB, and its missing secondary index doesn't bite at this
-scale (the `nhs_no` lookup scans just 369 Person nodes → 0.48 ms); **ArcadeDB** carries
-the heaviest footprint (1548 MiB) and its polymorphic super-type scan makes the
+is competitive (1–6 ms) at 198 MiB, and its missing secondary index doesn't bite at this
+scale (the `nhs_no` lookup scans just 369 Person nodes → 0.50 ms); **ArcadeDB** carries
+the heaviest footprint (1556 MiB) and its polymorphic super-type scan makes the
 aggregations slow (group-by / `count(DISTINCT)` ~40 ms), consistent with its MeSH profile.
 (LadybugDB/ArcadeDB RSS caveats per the *Method* consistency note: ArcadeDB is a cgroup
 figure, LadybugDB an embedded `ru_maxrss`.)
@@ -193,27 +199,27 @@ Latency, mean of 5 runs. Mark on slater: 🟢 sole fastest, ⚪ ties (within 25%
 
 | query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| count all nodes | **0.58 ms 🟢** | 13.92 | 22.69 | 16.20 | 77.84 | 1.45 |
-| Disease label count | **0.59 ms 🟢** | 4.28 | 19.86 | 1.04 | 4.28 | 3.87 |
-| point lookup (idx meshUi) | 1.97 | 4.18 | 0.48 | 0.49 | 0.73 | 8.40 |
-| idx-eq count (MeshTerm.type) | **0.59 ms 🟢** | 5.28 | 4.58 | 2.03 | 370.18 | 2.36 |
-| 1-hop type→BROADER_THAN | **1.37 ms ⚪** | 6.33 | 1.29 | 3.21 | 123.77 | 4.77 |
-| 2-hop BROADER_THAN chain | 33.09 | 5.81 | 8.42 | 16.28 | 4.71 | 6.20 |
-| group-by type | 20.88 | 51.30 | 61.65 | 29.53 | 399.57 | 5.24 |
-| 3-hop Drug/action/Drug | 7.76 | 3.69 | 6.26 | 1.02 | 9.73 | 10.82 |
-| full-scan CONTAINS | **0.61 ms 🟢** | 5.19 | 23.14 | 1.63 | 15.65 | 4.30 |
-| count DISTINCT type | 20.47 | 46.18 | 60.62 | 37.34 | 390.35 | 4.92 |
+| count all nodes | **0.57 ms 🟢** | 14.96 | 23.77 | 16.39 | 81.98 | 2.16 |
+| Disease label count | **0.58 ms 🟢** | 4.20 | 20.72 | 1.06 | 4.42 | 4.29 |
+| point lookup (idx meshUi) | 1.95 | 3.85 | 0.48 | 0.48 | 0.65 | 8.80 |
+| idx-eq count (MeshTerm.type) | **0.60 ms 🟢** | 4.87 | 5.03 | 2.02 | 381.34 | 2.54 |
+| 1-hop type→BROADER_THAN | **1.32 ms ⚪** | 5.82 | 1.21 | 4.10 | 389.57 | 4.91 |
+| 2-hop BROADER_THAN chain | 33.11 | 5.63 | 8.49 | 16.67 | 443.57 | 6.44 |
+| group-by type | 20.09 | 51.45 | 64.15 | 30.56 | 410.95 | 5.49 |
+| 3-hop Drug/action/Drug | 7.86 | 3.37 | 5.47 | 1.01 | 9.70 | 11.23 |
+| full-scan CONTAINS | **0.59 ms 🟢** | 5.39 | 24.09 | 1.69 | 16.27 | 4.11 |
+| count DISTINCT type | 20.17 | 47.78 | 62.64 | 39.31 | 411.07 | 5.28 |
 
 (ms; mark is slater vs the field. LadybugDB now wins group-by/DISTINCT outright, so
 slater no longer earns the 🟢 there.)
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| **peak RSS** | 258 MiB | 1117 MiB | 355 MiB | 454 MiB | 1631 MiB | **125 MiB 🟢** |
-| steady RSS | 216 MiB | 1083 MiB | 326 MiB | 453 MiB | 1612 MiB | **125 MiB 🟢** |
+| **peak RSS** | 197 MiB | 1083 MiB | 358 MiB | 455 MiB | 1631 MiB | **121 MiB 🟢** |
+| steady RSS | 191 MiB | 1082 MiB | 356 MiB | 453 MiB | 1622 MiB | **121 MiB 🟢** |
 
 slater's footprint is **not** resident graph: idle RSS is ~16 MiB, individual queries
-peak at 36–75 MiB; the 258 MiB **peak is transient per-query working memory** across
+peak at 36–75 MiB; the 197 MiB **peak is transient per-query working memory** across
 the suite (wide scans filling the 64 MiB block cache + traversal intermediates) that
 the glibc allocator holds as a high-water mark. slater is **fastest on the count /
 idx-eq / scan shapes** (its metadata + index fast paths — 10–40× the service engines
@@ -224,9 +230,9 @@ deliberate bounded-memory guard — so that priming step is best-effort and skip
 
 The two new engines behave very differently:
 - **LadybugDB** (embedded, Kùzu-derived, columnar) is the **smallest RSS by far —
-  125 MiB** — and its columnar aggregation makes group-by and `count(DISTINCT)` the
+  121 MiB** — and its columnar aggregation makes group-by and `count(DISTINCT)` the
   fastest of any engine (~5 ms). But it builds **no secondary range index** (only the
-  primary key), so its property point-lookup is a scan (8.4 ms). Its single-label
+  primary key), so its property point-lookup is a scan (8.8 ms). Its single-label
   model means every node lives in one `MeshTerm` table with the sub-label kept in a
   `__labels` string and rewritten at query time.
 - **ArcadeDB** (JVM multi-model server) carries the **heaviest footprint (1631 MiB)**.
@@ -240,39 +246,42 @@ Latency, mean of 5 runs. Mark on slater: 🟢 sole fastest, ⚪ ties (within 25%
 
 | query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| count all nodes | **0.58 ms 🟢** | 30.70 | 43.76 | 44.08 | 201.28 | 2.02 |
-| point lookup (idx wikidata_id) | 1.33 | 4.24 | 0.47 | 0.47 | 1.09 | 7.54 |
-| degree (1-hop count) | 1.31 | 6.89 | 0.79 | 0.49 | 1.09 | 3.25 |
-| 1-hop neighbours | 1.53 | 10.60 | 1.58 | 0.48 | 0.97 | 3.25 |
-| 2-hop | 1.62 | 9.97 | 2.03 | 0.52 | 2.71 | 7.63 |
-| 3-hop | 1.73 | 6.29 | 2.10 | 0.68 | 4.05 | 68.25 |
-| var-length *1..2 distinct | 1.68 | 167.59 | 547.65 | 0.60 | 1.17 | 20.56 |
-| shortestPath ≤6 | 2.24 | 4.23 | 2464.96 | 20.98 | 1.29 | 18.54 |
+| count all nodes | **0.56 ms 🟢** | 35.65 | 43.76 † | 44.08 † | 201.28 † | 2.34 |
+| point lookup (idx wikidata_id) | 1.88 | 5.77 | 0.47 † | 0.47 † | 1.09 † | 7.59 |
+| degree (1-hop count) | 1.95 | 11.16 | 0.79 † | 0.49 † | 1.09 † | 3.09 |
+| 1-hop neighbours | 2.06 | 16.45 | 1.58 † | 0.48 † | 0.97 † | 3.26 |
+| 2-hop | 2.17 | 27.44 | 2.03 † | 0.52 † | 2.71 † | 12.24 |
+| 3-hop | 2.41 | 14.29 | 2.10 † | 0.68 † | 4.05 † | 131.38 |
+| var-length *1..2 distinct | 2.22 | 191.15 | 547.65 † | 0.60 † | 1.17 † | 56.82 |
+| shortestPath ≤6 | 2.21 | 6.00 | 2464.96 † | 20.98 † | 1.29 † | 79.32 |
+
+(† Memgraph / FalkorDB / ArcadeDB are the **established** cross-engine figures — at this
+scale reloading 13.8M edges into each via the native bulk path is the expensive step, so
+they were not re-run in this isolated v0.8.0 pass. slater / Neo4j / LadybugDB are fresh.)
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| **peak RSS** | **~150 MiB 🟢** | 2012 MiB | 2716 MiB | 1506 MiB | 2247 MiB | 604 MiB |
-| steady RSS | **~145 MiB 🟢** | 1988 MiB | 1918 MiB | 1218 MiB | 2222 MiB | 604 MiB |
+| **peak RSS** | **~150 MiB 🟢** | ~2330 MiB | 2716 MiB † | 1506 MiB † | 2247 MiB † | ~774 MiB |
+| steady RSS | **~145 MiB 🟢** | ~2300 MiB | 1918 MiB † | 1218 MiB † | 2222 MiB † | ~774 MiB |
 
 This is where the bounded-memory thesis lands hardest: at 1M nodes / 13.8M edges,
 **slater (~150 MiB) is the smallest of every engine — below even embedded LadybugDB
-(604 MiB)**, while the resident in-memory servers hold **1.5–2.7 GiB** (Memgraph 2716,
-ArcadeDB 2247, Neo4j 2012, FalkorDB 1506). slater's footprint tracks the *query working
+(~774 MiB)**, while the resident in-memory servers hold **1.5–2.7 GiB** (Neo4j ~2330; the established in-mem trio Memgraph 2716, ArcadeDB 2247, FalkorDB 1506). slater's footprint tracks the *query working
 set*, not the graph — its `query.maxIntermediate` budget bounds the heaviest expansions,
 so the peak stays ~150 MiB even on the var-length / shortestPath shapes. slater is
 **sole-fastest on `count`** (its metadata fast path — 56–365× the service engines) and
-competitive on the hop traversals (1.3–1.7 ms). Standouts per engine:
+competitive on the hop traversals (~2 ms). Standouts per engine:
 
 - **shortestPath ≤6** between random (mostly disconnected) entities: slater's
   `ANY SHORTEST` global-visited BFS runs it in **2.2 ms** and ArcadeDB in 1.3 ms,
-  while **Memgraph's `*BFS` expansion takes 2465 ms** (it explores to the depth bound)
-  and FalkorDB/LadybugDB are ~20 ms. (Per-engine syntax — see `bench_wiki.shortest_path`.)
-- **var-length `*1..2` distinct**: FalkorDB 0.6 ms / ArcadeDB 1.2 ms / slater 1.6 ms,
-  vs Neo4j 168 ms and Memgraph 548 ms.
+  while **Memgraph's `*BFS` expansion takes 2465 ms** (it explores to the depth bound),
+  FalkorDB is ~21 ms and LadybugDB ~79 ms. (Per-engine syntax — see `bench_wiki.shortest_path`.)
+- **var-length `*1..2` distinct**: FalkorDB 0.6 ms / ArcadeDB 1.2 ms / slater 2.2 ms,
+  vs Neo4j 191 ms and Memgraph 548 ms.
 - **FalkorDB** is the traversal-latency champion (sub-millisecond 1–3 hop) at a 1.5 GiB
   resident cost; **slater** is within ~3× on those hops at <½ the RAM.
-- **LadybugDB** is the next-smallest RSS (604 MiB) but has no secondary range index, so
-  its point lookup scans (7.5 ms) and its 3-hop (68 ms) feels the capped 512 MiB buffer pool.
+- **LadybugDB** (~774 MiB) has no secondary range index, so its point lookup scans (7.6 ms)
+  and its 3-hop (131 ms) feels the capped 512 MiB buffer pool.
 - slater's `query.maxIntermediate` (1M) occasionally rejects a var-length expansion
   off a high-degree hub; `bench_wiki` records the median of the calls that succeed.
 
@@ -427,36 +436,37 @@ verified to produce the identical generation — 91,600,404 nodes / 766,504,024 
 
 ### EU-AI-Act — 20,766 nodes / 44,790 edges, 54.8 MiB of vectors
 
-Five engines re-run together in one session (ArcadeDB has no kNN procedure → no vector
-column). LadybugDB serves kNN from its native Kùzu HNSW index.
+Six engines, each measured in isolation. **ArcadeDB has no kNN procedure**, so it runs
+only the non-vector subset (kNN rows = `—`). LadybugDB serves kNN from its native Kùzu
+HNSW index.
 
-| query | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
-|---|--:|--:|--:|--:|--:|
-| kNN top-10 Concept | 17.31 ms | 9.16 ms | 1.99 ms | 1.27 ms | 3.06 ms |
-| kNN top-50 Concept | 17.67 ms | 10.25 ms | 2.28 ms | 1.41 ms | 2.92 ms |
-| kNN top-10 Chunk | 8.82 ms | 6.44 ms | 2.07 ms | 1.51 ms | 3.27 ms |
-| kNN-10 + 1-hop expand | 16.98 ms | 5.90 ms | 1.88 ms | 1.28 ms | 9.33 ms |
-| count all nodes | **0.57 ms 🟢** | 3.81 ms | 1.37 ms | 1.40 ms | 1.81 ms |
-| Concept label count | **0.57 ms 🟢** | 3.60 ms | 1.61 ms | 1.00 ms | 1.36 ms |
-| point lookup (idx id) | 1.08 ms | 4.57 ms | 0.48 ms | 0.47 ms | 1.05 ms |
+| query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|--:|
+| kNN top-10 Concept | 22.97 ms | 8.55 ms | 1.85 ms | 1.23 ms | — | 2.80 ms |
+| kNN top-50 Concept | 24.50 ms | 9.47 ms | 2.11 ms | 1.39 ms | — | 2.81 ms |
+| kNN top-10 Chunk | 10.37 ms | 5.71 ms | 1.93 ms | 1.48 ms | — | 3.18 ms |
+| kNN-10 + 1-hop expand | 28.00 ms | 6.29 ms | 1.82 ms | 1.27 ms | — | 9.23 ms |
+| count all nodes | **0.57 ms 🟢** | 2.85 ms | 1.32 ms | 1.42 ms | 10.15 ms | 1.76 ms |
+| Concept label count | **0.57 ms 🟢** | 2.93 ms | 1.55 ms | 1.01 ms | 0.83 ms | 1.28 ms |
+| point lookup (idx id) | 1.07 ms | 4.16 ms | 0.46 ms | 0.48 ms | 0.81 ms | 1.04 ms |
 
-| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
-|---|--:|--:|--:|--:|--:|
-| **peak RSS** | **142 MiB 🟢** | 698 MiB | 217 MiB | 317 MiB | 287 MiB |
-| steady RSS | 138 MiB 🟢 | 682 MiB | 196 MiB | 285 MiB | 287 MiB |
+| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|--:|
+| **peak RSS** | **119 MiB 🟢** | 729 MiB | 229 MiB | 312 MiB | 1948 MiB | 286 MiB |
+| steady RSS | 88 MiB 🟢 | 725 MiB | 226 MiB | 283 MiB | 1944 MiB | 286 MiB |
 
-(slater sole-smallest — the next engine, Memgraph at 217 MiB, is >25% larger. LadybugDB's
-287 MiB is its embedded process `ru_maxrss`, not a server cgroup — see the consistency
+(slater sole-smallest — the next engine, Memgraph at 229 MiB, is ~2× larger. LadybugDB's
+286 MiB is its embedded process `ru_maxrss`, not a server cgroup — see the consistency
 note in *Method*; it includes the Python driver + query-vector pool, so it isn't strictly
 comparable to the server cgroup figures.)
 
-slater serves the whole graph at **142 MiB — the smallest of the five, ~4.9× below
+slater serves the whole graph at **119 MiB — the smallest of the six, ~6× below
 Neo4j.** At the default 64 MiB block budget its 54.8 MiB of vectors *are* resident
 (they fit), so the kNN gap is **not** paging — it is purely **algorithmic**: slater does
 an exact brute-force O(N) scan (these indexes are below its 50k-vector ANN threshold)
-where the others answer from a resident HNSW, so slater is ~17 ms where FalkorDB is 1.3
-ms. **LadybugDB lands at ~3 ms** — it answers from its native disk-based HNSW (between
-Neo4j's ~9 ms and Memgraph's ~2 ms), i.e. **~5.6× faster than slater's brute-force** on
+where the others answer from a resident HNSW, so slater is ~23 ms where FalkorDB is 1.2
+ms. **LadybugDB lands at ~2.8 ms** — it answers from its native disk-based HNSW (between
+Neo4j's ~8.5 ms and Memgraph's ~1.9 ms), i.e. **~8× faster than slater's brute-force** on
 the Concept set, confirming the gap is algorithm, not memory: an ANN index beats an exact
 scan here, at the cost slater pays deliberately to stay bounded and exact. (LadybugDB's
 hybrid kNN→1-hop is 9.3 ms — the graph expansion, not the kNN, dominates that row.) The
