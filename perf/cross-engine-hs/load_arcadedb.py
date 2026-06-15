@@ -73,9 +73,18 @@ def load(dump, http, bolt, db, user, password):
     from collections import Counter
     counts = Counter(l for _did, labels, _p in nodes for l in labels)
     common = reduce(lambda a, b: a & b, (set(labels) for _did, labels, _p in nodes))
-    if not common:
-        raise SystemExit("no label common to every node — ArcadeDB inheritance load needs one")
-    super_t = max(common, key=lambda l: counts[l])
+    if common:
+        super_t = max(common, key=lambda l: counts[l])
+    else:
+        # No business label spans every node (e.g. the pole graph: Person / Crime /
+        # Location / … share nothing once __DumpVertex__ is stripped). Use a synthetic
+        # super-type that every node EXTENDS — it carries __dump_id__ + indexed props
+        # and backs the relationship join, exactly as a real common label would. Its
+        # name must not collide with any actual label.
+        super_t = "__DumpNode__"
+        while super_t in counts:
+            super_t += "_"
+        print(f"  no label common to every node — synthetic super-type {super_t}", flush=True)
     print(f"  super-type: {super_t}", flush=True)
 
     def concrete(labels):

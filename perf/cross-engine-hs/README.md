@@ -39,8 +39,11 @@ plugin) and **LadybugDB** (a Kùzu-derived *embedded* graph DB, the `real_ladybu
 wheel; no server/port — it runs in-process inside a thin `slater-ladybug` image
 against a `.lbug` data volume). Because Neo4j and Memgraph community editions serve
 one database at a time, the two graphs are **two separate runs**, each a single
-graph across all engines. ArcadeDB and LadybugDB have no openCypher kNN procedure,
-so on the EU-AI-Act run they execute only the **non-vector** subset of the suite.
+graph across all engines. **ArcadeDB** has no kNN procedure, so on the EU-AI-Act run it
+executes only the **non-vector** subset. **LadybugDB does** serve kNN — its Kùzu base
+ships a native disk-based HNSW index (`CALL CREATE_VECTOR_INDEX` / `QUERY_VECTOR_INDEX`),
+which `bench_vec.py` drives per-engine exactly as it does the other natives; it is no
+openCypher `db.idx.vector.queryNodes`, but it is a real ANN index and is benched in full.
 
 > Thanks to **Arun Sharma ([adsharma](https://github.com/adsharma))** for guidance
 > on adding **LadybugDB** to this benchmark.
@@ -71,13 +74,28 @@ budgets. LadybugDB is single-label-per-node, so `load_ladybug.py` maps every nod
 to one primary table, stores all labels in a `__labels` string, and `engines.py`
 rewrites secondary-label patterns to the primary table + a `__labels CONTAINS`
 filter; it also has no secondary range indexes (only the primary key), so its
-property lookups are scans.
+property lookups are scans. Its embedding-bearing node tables load via Kùzu `COPY`
+(per-row `UNWIND…CREATE` of a `FLOAT[1024]` column is ~9 ms/row — minutes for 15k
+vectors; `COPY` is ~65× faster), and its native HNSW vector index is built at load
+(`CALL CREATE_VECTOR_INDEX`), so it serves kNN from a resident ANN index.
 
-The vector indexes use each engine's native procedure — slater/FalkorDB
+**Cross-engine consistency.** All engines run identical query *text* under one method
+(15 warm-ups → 25 measured, fresh parameter each call, median of 25, mean of 5
+restart-cycle runs, row counts cross-checked vs Neo4j). Two deliberate asymmetries to
+keep in mind when reading the tables: (1) **per-engine syntax** where a shape has no
+portable form — `shortestPath` (`bench_wiki.shortest_path`) and kNN (`bench_vec.knn`:
+slater/FalkorDB `db.idx.vector.queryNodes`, Neo4j `db.index.vector.queryNodes`, Memgraph
+`vector_search.search`, LadybugDB `QUERY_VECTOR_INDEX`); (2) **RSS source** — server
+engines report the container cgroup, embedded LadybugDB reports the bench process'
+`ru_maxrss` high-water (includes the Python driver + the query-vector pool), so its
+memory figures are an upper bound, not strictly comparable to the server cgroups.
+
+The vector indexes use each engine's native procedure (slater/FalkorDB
 `db.idx.vector.queryNodes`, Neo4j `db.index.vector.queryNodes`, Memgraph
-`vector_search.search` — and a shared pool of real embeddings as query vectors
-(slater keeps embeddings in its vector store, not as a readable property, so the
-pool is sampled once from Neo4j and reused identically across engines). For MeSH a
+`vector_search.search`, LadybugDB/Kùzu `QUERY_VECTOR_INDEX`) over a shared pool of real
+embeddings as query vectors (slater keeps embeddings in its vector store, not as a
+readable property, so the pool is sampled once from Neo4j and reused identically across
+engines — the embedded LadybugDB container mounts the same pool file). For MeSH a
 single `:MeshTerm(type)` range index is added uniformly on every engine so `type`
 (Drug/Organism/Disease/PharmacologicalAction) is the low-cardinality indexed analog
 of pole's `Crime.type`.
@@ -128,6 +146,46 @@ loader builds the engine's range index on `wikidata_id` and persists (Neo4j volu
 FalkorDB `SAVE`, Memgraph snapshot) so the data survives the bench's restart cycle.
 
 ## Results
+
+### Pole — 61,521 nodes / 105,840 edges (the baseline graph, all six engines)
+
+The original four-engine pole benchmark (`perf/cross-engine/`) covers slater / Neo4j /
+Memgraph / FalkorDB. Running the same 10 pole shapes through this six-engine harness
+(`bench_pole.py`, `setup_hs.sh pole … Crime:type`) adds **ArcadeDB** and **LadybugDB**.
+Two loader fixes were needed for pole's heterogeneous schema (no single label spans
+every node): `load_arcadedb.py` falls back to a synthetic `__DumpNode__` super-type when
+no business label is common (the same reason ArcadeDB is absent from the EU-AI-Act
+table), and `load_ladybug.py`'s per-row rel `CAST` now tolerates prop-less rel types.
+
+Latency, mean of 5 runs. Mark on slater: 🟢 sole fastest, ⚪ ties (within 25%).
+
+| query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|--:|
+| count all nodes | **0.58 ms 🟢** | 7.36 | 3.47 | 3.42 | 15.42 | 1.88 |
+| Crime label count | **0.58 ms 🟢** | 5.69 | 4.31 | 1.94 | 7.99 | 1.22 |
+| point lookup (idx nhs_no) | 0.63 | 4.94 | 0.47 | 0.47 | 0.75 | 0.48 |
+| idx-eq count (Crime.type) | **0.58 ms ⚪** | 3.68 | 0.95 | 0.62 | 3.25 | 1.47 |
+| 1-hop Crime→Location | 1.36 | 7.00 | 1.31 | 0.77 | 4.10 | 3.17 |
+| 2-hop Person→Loc→Area | 2.43 | 5.62 | 1.23 | 0.97 | 16.98 | 3.99 |
+| agg crimes by type | 2.59 ⚪ | 9.41 | 7.10 | 3.72 | 39.84 | 3.14 |
+| 3-hop Officer/Crime/Loc | 2.55 | 4.78 | 1.96 | 0.97 | 3.04 | 6.07 |
+| full-scan CONTAINS | **0.60 ms 🟢** | 6.04 | 7.17 | 3.26 | 32.30 | 1.93 |
+| count DISTINCT type | 2.50 ⚪ | 7.71 | 6.74 | 4.43 | 39.09 | 2.93 |
+
+| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|--:|
+| **peak RSS** | **75 MiB 🟢** | 737 | 114 | 140 | 1548 | 197 |
+| steady RSS | **71 MiB 🟢** | 726 | 96 | 138 | 1494 | 197 |
+
+On this toy graph the memory thesis can't bite (the whole graph is ~23 MiB, resident for
+everyone) — slater is smallest at 75 MiB but only ~1.4–2× below Memgraph/FalkorDB, the
+point the larger graphs below make. The added engines behave as elsewhere: **LadybugDB**
+is competitive (1–6 ms) at 197 MiB, and its missing secondary index doesn't bite at this
+scale (the `nhs_no` lookup scans just 369 Person nodes → 0.48 ms); **ArcadeDB** carries
+the heaviest footprint (1548 MiB) and its polymorphic super-type scan makes the
+aggregations slow (group-by / `count(DISTINCT)` ~40 ms), consistent with its MeSH profile.
+(LadybugDB/ArcadeDB RSS caveats per the *Method* consistency note: ArcadeDB is a cgroup
+figure, LadybugDB an embedded `ru_maxrss`.)
 
 ### MeSH — 340,839 nodes / 469,438 edges (pure graph)
 
@@ -273,10 +331,12 @@ and the restart-cycle eventually crashed the container outright. slater answers 
 query in 9 ms within its 1M-element `maxIntermediate` budget — bounded by design.
 ‡ LadybugDB builds **no secondary index** on `wikidata_id`, so the point lookup is a full
 columnar scan of 91.6M nodes (~2.3 s); the cheaper degree/1-hop shapes reuse the
-now-cached `wikidata_id` column. § Hub-anchored expansion is **unbounded** at this scale —
-the 2-/3-hop shapes ran the embedded process past **~7 GiB** working memory (well over the
-512 MiB read pool) before being stopped; var-length and shortestPath were therefore not
-completed (`n.m.`).
+now-cached `wikidata_id` column. § At the **512 MiB read pool** the multi-hop /
+var-length / shortestPath shapes exhaust the buffer pool on higher-degree anchors —
+Kùzu's buffer manager rejects the allocation (`buffer pool is full`) rather than ballooning
+unboundedly. **They are pool-bound, not impossible: raise the read pool and they complete**
+— see the larger-pool table below. The point lookup is the exception (structural — a
+secondary-index-less scan that a bigger pool does *not* fix).
 
 | anon RSS | slater | Neo4j 5 |
 |---|--:|--:|
@@ -284,8 +344,30 @@ completed (`n.m.`).
 | shortestPath sweep | 700 MiB (fanout 1) · 925 MiB (fanout 8) | **2911 MiB** |
 
 (Embedded **LadybugDB** has no server cgroup; its `ru_maxrss` on the count/point/degree/
-1-hop shapes is **652 MiB** with the 512 MiB read pool — but that is only on the shapes
-that stay bounded; its hub expansion blows past ~7 GiB, §.)
+1-hop shapes is **652 MiB** with the 512 MiB read pool. The heavier shapes need a larger
+read pool, below.)
+
+**LadybugDB at a larger read pool** (separate experiment — NOT comparable to the 512 MiB
+column above; the graph was rebuilt from `perf/datasets/wikidata_csr.duckdb` and each
+shape run in a `--memory=13g` container with a per-call timeout). This isolates whether
+the `§` shapes are a fundamental limit or just the deliberately-small default pool:
+
+| shape | 512 MiB pool | ≥2 GiB read pool |
+|---|---|--:|
+| 2-hop | over-budget § | **33 ms** (5/5 calls) |
+| 3-hop | over-budget § | **508 ms** (5/5) |
+| var-length *1..2 distinct | `buffer pool full` 3/5 § | **220–250 ms** (5/5 at 2/4/8 GiB) |
+| shortestPath ≤6 | n.m. § | **~2.0 s** (4/4 @ 4 GiB) |
+| point lookup (idx wikidata_id) | ~2.3 s ‡ | ~2.1 s (unchanged) |
+
+So the `§` shapes are **pool-bound, not unbounded** — at the default 512 MiB read pool
+LadybugDB's buffer manager rejects the allocation, but a **≥2 GiB** pool clears it and they
+complete (var-length goes 3/5 → 5/5). The point lookup stays ~2 s regardless — that one is
+structural (no secondary index on `wikidata_id`, so a full columnar scan), and more pool
+doesn't fix it. (Caveat: these anchors are sampled from one `wikidata_id` region, so they
+skew lower-degree/closer than a worst-case hub pair — the *direction* is robust, the exact
+ms are typical-anchor, not adversarial. Contrast slater, whose `query.maxIntermediate`
+bounds the same shapes within a fixed budget at **~9–53 ms** without a pool to size.)
 
 This is the thesis at full strength: serving a **766M-edge** graph, slater's resident
 footprint stays **sub-GiB** (idle 71 MiB) and tracks the *query working set*, not the
@@ -345,30 +427,41 @@ verified to produce the identical generation — 91,600,404 nodes / 766,504,024 
 
 ### EU-AI-Act — 20,766 nodes / 44,790 edges, 54.8 MiB of vectors
 
-| query | slater | Neo4j 5 | Memgraph | FalkorDB |
-|---|--:|--:|--:|--:|
-| kNN top-10 Concept | 17.77 ms | 8.01 ms | 1.88 ms | 1.15 ms |
-| kNN top-50 Concept | 18.49 ms | 8.67 ms | 2.01 ms | 1.25 ms |
-| kNN top-10 Chunk | 9.11 ms | 5.54 ms | 1.84 ms | 1.34 ms |
-| kNN-10 + 1-hop expand | 17.35 ms | 5.29 ms | 1.66 ms | 1.16 ms |
-| count all nodes | **0.59 ms 🟢** | 3.45 ms | 1.22 ms | 1.31 ms |
-| Concept label count | **0.59 ms 🟢** | 2.82 ms | 1.47 ms | 0.91 ms |
-| point lookup (idx id) | 1.13 ms | 3.86 ms | 0.43 ms | 0.43 ms |
+Five engines re-run together in one session (ArcadeDB has no kNN procedure → no vector
+column). LadybugDB serves kNN from its native Kùzu HNSW index.
 
-| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB |
-|---|--:|--:|--:|--:|
-| **peak RSS** | **144 MiB 🟢** | 694 MiB | 219 MiB | 317 MiB |
-| steady RSS | 143 MiB 🟢 | 687 MiB | 195 MiB | 289 MiB |
+| query | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|
+| kNN top-10 Concept | 17.31 ms | 9.16 ms | 1.99 ms | 1.27 ms | 3.06 ms |
+| kNN top-50 Concept | 17.67 ms | 10.25 ms | 2.28 ms | 1.41 ms | 2.92 ms |
+| kNN top-10 Chunk | 8.82 ms | 6.44 ms | 2.07 ms | 1.51 ms | 3.27 ms |
+| kNN-10 + 1-hop expand | 16.98 ms | 5.90 ms | 1.88 ms | 1.28 ms | 9.33 ms |
+| count all nodes | **0.57 ms 🟢** | 3.81 ms | 1.37 ms | 1.40 ms | 1.81 ms |
+| Concept label count | **0.57 ms 🟢** | 3.60 ms | 1.61 ms | 1.00 ms | 1.36 ms |
+| point lookup (idx id) | 1.08 ms | 4.57 ms | 0.48 ms | 0.47 ms | 1.05 ms |
 
-(slater sole-smallest here — the next engine, Memgraph at 219 MiB, is >25% larger.)
+| resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|
+| **peak RSS** | **142 MiB 🟢** | 698 MiB | 217 MiB | 317 MiB | 287 MiB |
+| steady RSS | 138 MiB 🟢 | 682 MiB | 196 MiB | 285 MiB | 287 MiB |
 
-slater serves the whole graph at **144 MiB — the smallest of the four, 4.8× below
+(slater sole-smallest — the next engine, Memgraph at 217 MiB, is >25% larger. LadybugDB's
+287 MiB is its embedded process `ru_maxrss`, not a server cgroup — see the consistency
+note in *Method*; it includes the Python driver + query-vector pool, so it isn't strictly
+comparable to the server cgroup figures.)
+
+slater serves the whole graph at **142 MiB — the smallest of the five, ~4.9× below
 Neo4j.** At the default 64 MiB block budget its 54.8 MiB of vectors *are* resident
-(they fit), so the kNN gap is **not** paging — it is purely **algorithmic**: slater
-does an exact brute-force O(N) scan (these indexes are below its 50k-vector ANN
-threshold) where the others answer from a resident HNSW, so slater is ~18 ms where
-FalkorDB is 1 ms. The bounded-memory dial shows up only when you size the budget
-below the vector set — see the sweep next.
+(they fit), so the kNN gap is **not** paging — it is purely **algorithmic**: slater does
+an exact brute-force O(N) scan (these indexes are below its 50k-vector ANN threshold)
+where the others answer from a resident HNSW, so slater is ~17 ms where FalkorDB is 1.3
+ms. **LadybugDB lands at ~3 ms** — it answers from its native disk-based HNSW (between
+Neo4j's ~9 ms and Memgraph's ~2 ms), i.e. **~5.6× faster than slater's brute-force** on
+the Concept set, confirming the gap is algorithm, not memory: an ANN index beats an exact
+scan here, at the cost slater pays deliberately to stay bounded and exact. (LadybugDB's
+hybrid kNN→1-hop is 9.3 ms — the graph expansion, not the kNN, dominates that row.) The
+bounded-memory dial shows up only when you size the budget below the vector set — see the
+sweep next.
 
 ### Cache-budget sweep (slater only) — and the right knob
 
@@ -413,17 +506,21 @@ section above — which is exactly why the block budget doesn't move it.)
 - `load_cypher.py` — primitive-Cypher → Neo4j/Memgraph/FalkorDB (quote-aware parser,
   UNWIND batches, per-engine vector DDL).
 - `load_arcadedb.py` — schema-first inheritance loader for ArcadeDB (super-type +
-  `EXTENDS` sub-types, `__dump_id__` join; DDL over HTTP/SQL, data over Bolt).
+  `EXTENDS` sub-types, `__dump_id__` join; DDL over HTTP/SQL, data over Bolt). Falls back
+  to a synthetic `__DumpNode__` super-type when no single label spans every node (pole).
 - `load_ladybug.py` — loader for embedded LadybugDB (single primary table per node,
-  `__labels` string, type inference + coercion, Kùzu `COPY` for rels); runs inside
-  `Dockerfile.ladybug`.
+  `__labels` string, type inference + coercion, Kùzu `COPY` for rels and for
+  embedding-bearing node tables, type-aware `CAST` on per-row rel props, and a native
+  HNSW `CREATE_VECTOR_INDEX` per declared vector index); runs inside `Dockerfile.ladybug`
+  (which bakes in the Kùzu `vector` extension so the query side only needs `LOAD`).
 - `load_ladybug_csv.py` — header-less-CSV `COPY` loader for LadybugDB at full-Wikidata
   scale (too large to parse the Cypher dump in memory; `LADYBUG_LOAD_BUFFER_POOL` sizes
   the bulk pool).
 - `bulk_export.py` — emit `nodes.csv` + `edges.csv` (RFC4180-quoted) from a
   single-label/single-rel-type dump, for the native bulk importers (Wikidata-1M).
-- `bench_mesh.py` / `bench_vec.py` / `bench_wiki.py` — the three query suites
+- `bench_mesh.py` / `bench_vec.py` / `bench_wiki.py` / `bench_pole.py` — the query suites
   (`engines.py` = shared connection layer; dedicated `-hs` ports 7700/7701/7702/6401,
-  ArcadeDB 7703; LadybugDB is embedded, no port).
+  ArcadeDB 7703; LadybugDB is embedded, no port). `bench_pole.py` runs the 10 pole shapes
+  across all six engines (the original `perf/cross-engine/` run is servers-only).
 - `bench_with_rss.py` — runs a bench in-process and records peak RSS (LadybugDB).
 - `setup_hs.sh` / `run_bench_hs.sh` / `count_hs.py` / `aggregate_hs.py` — orchestration.

@@ -8,11 +8,15 @@ cache, so this is the run where "vectors don't all fit in cache" actually bites.
 The metric is the same as the MeSH/pole suites — uncached median latency, fresh query
 vector every call (no result-cache hit) — but the query type is approximate-NN search
 via each engine's native vector procedure (slater/FalkorDB `db.idx.vector.queryNodes`,
-Neo4j `db.index.vector.queryNodes`, Memgraph `vector_search.search`), plus a few graph
-baselines and a hybrid kNN→1-hop expand. Query vectors are real embeddings sampled
-from the graph, so a top hit is the node itself (score≈1) — a built-in index sanity check.
+Neo4j `db.index.vector.queryNodes`, Memgraph `vector_search.search`, LadybugDB/Kùzu
+`QUERY_VECTOR_INDEX`), plus a few graph baselines and a hybrid kNN→1-hop expand. Query
+vectors are real embeddings sampled from the graph, so a top hit is the node itself
+(score≈1 / distance≈0) — a built-in index sanity check.
 
-Usage: bench_vec.py <slater|neo4j|memgraph|falkordb>
+LadybugDB serves kNN from its native Kùzu HNSW index (built by load_ladybug.py); only
+ArcadeDB lacks a kNN procedure and runs just the non-vector subset of this suite.
+
+Usage: bench_vec.py <slater|neo4j|memgraph|falkordb|ladybug>
 Prints JSON {query_name: median_ms | null}.  A null = that engine rejected the query.
 """
 import sys, json, time, statistics as st
@@ -29,11 +33,19 @@ def knn(lab, k):
         return f"CALL db.idx.vector.queryNodes('{lab}','embedding',{k},vecf32($q)) YIELD node, score RETURN node.id AS id"
     if ENGINE == "neo4j":
         return f"CALL db.index.vector.queryNodes('{lab}_embedding',{k},$q) YIELD node, score RETURN node.id AS id"
+    if ENGINE == "ladybug":
+        # Kùzu native HNSW: index named '<Label>_embedding' on table '<Label>' (built by
+        # load_ladybug.py). The table == label in the benched graphs; QUERY_VECTOR_INDEX
+        # yields `node` + `distance`. $q binds as a plain float list (no vecf32/cast).
+        return f"CALL QUERY_VECTOR_INDEX('{lab}', '{lab}_embedding', $q, {k}) RETURN node.id AS id"
     return f"CALL vector_search.search('{lab}_embedding',{k},$q) YIELD node RETURN node.id AS id"
 
 
 def hybrid():
     """kNN top-10 over Concept, then expand 1 hop and count neighbours."""
+    if ENGINE == "ladybug":
+        return ("CALL QUERY_VECTOR_INDEX('Concept', 'Concept_embedding', $q, 10) "
+                "WITH node MATCH (node)-[r]->(m) RETURN count(m) AS c")
     if ENGINE in ("slater", "falkordb"):
         head = "CALL db.idx.vector.queryNodes('Concept','embedding',10,vecf32($q)) YIELD node"
     elif ENGINE == "neo4j":

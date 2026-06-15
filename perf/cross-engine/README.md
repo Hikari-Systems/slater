@@ -5,6 +5,10 @@ The harness behind the four-engine comparison table in `../PERF_PROGRESS.md`
 queries, run against four engines; **mean of 5 runs, each engine restarted before
 every run** (cold start).
 
+> For the **same pole shapes across all six engines** (this four plus ArcadeDB and
+> LadybugDB), see the "Pole — all six engines" table in `../cross-engine-hs/README.md`
+> (run via `bench_pole.py` through the six-engine `-hs` harness).
+
 Environment used (host ports; adjust to taste):
 
 | engine | container | endpoint | auth |
