@@ -228,6 +228,45 @@ dominated by reclaimable page cache. For load testing on this host the **1M grap
 gives clean, repeatable numbers; the 91.6M graph needs either a much larger host or a
 generous cap sized above the working set.
 
+### 5. Block-cache sizing and the `MALLOC_ARENA_MAX` trade-off
+
+Two follow-up runs probed (a) whether a smaller block cache forces eviction and (b)
+what the `MALLOC_ARENA_MAX=2` allocator cap costs.
+
+**Cache eviction is shape-dependent, not just cache-size-dependent.** The range index
+is ~5.4 MB on disk → **~29 MB decompressed** (zstd ratio ~5.4×); the cache holds
+decompressed blocks. At a **64 MiB** block cache:
+
+- `wiki_cache_churn` (point lookups / 1-hop / range scans) never evicted — resident
+  plateaued at **~39 MB, 0 evictions, ~100% hit**. Its working set is bounded by the
+  narrow seed pool, not the cache, so it fits regardless. RSS held ~0.28 GB, 0 failures.
+- `wiki_budget` (2-hop) **did** churn: resident pinned at the 64 MiB budget with
+  **~14 k evictions** (~97.6% hit), because the neighbour-of-neighbour fan-out spans far
+  more of the (~790 MB decompressed) topology than the 1-hop neighbourhoods. Still no
+  OOM, RSS ~0.38 GB, the budget guard shedding ~60% as clean errors.
+
+To actually evict the **index** you need a cache below ~half its 29 MB footprint
+(≈12 MiB); at 64 MiB the index fits and only the 2-hop topology working set spills.
+
+**`MALLOC_ARENA_MAX=2` has no usable throughput cost — it only bounds RSS.** A/B over
+the `wiki_budget` ramp (10 GB cap so the default-arena arm doesn't OOM), throughput and
+RSS at 1000 concurrent users (throughput means over 3 reps for 2/4):
+
+| `MALLOC_ARENA_MAX` | throughput @1000u | RSS @1000u |
+|---|--:|--:|
+| **2** (shipped) | ~780 rps | **0.4–0.5 GB** |
+| 4 | ~750 rps | 0.6–0.7 GB |
+| 8 | ~670 rps | 1.3 GB |
+| 128 (glibc default-ish) | ~940 rps | **3.9 GB** |
+
+Among RSS-bounded settings (2/4/8) throughput is statistically flat — raising the arena
+cap buys **no** speed, only resident memory, because the knee here is CPU-bound
+closed-loop queueing (high cache-hit rate), not allocator-lock contention. The only
+config that gained throughput (~+20%) was *unconstrained* arenas, which drove RSS to
+3.9 GB and re-introduced the 4 GB-cap OOM — not a usable operating point. So `2` is the
+sweet spot and is what the runtime image ships. (p99 at 1000 users is 5–10 s and highly
+variable across all arms — closed-loop tail, not an allocator signal.)
+
 ## Reproducing
 
 See [`perf/loadtest/README.md`](../perf/loadtest/README.md). In short, with a graph
