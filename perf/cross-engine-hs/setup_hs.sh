@@ -15,6 +15,9 @@ PY=/tmp/pole_venv/bin/python
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK=/tmp/bench-hs
 SKIP_ARCADE="${SKIP_ARCADE:-0}"
+# slater image to build the generation with and serve — override to benchmark a
+# published release, e.g. SLATER_IMG=hikarisystems/slater:v0.8.0
+SLATER_IMG="${SLATER_IMG:-slater:local}"
 mkdir -p "$WORK/cypher"
 # argon2id hash for password "polereader" (known-good, from PERF_PROGRESS).
 HASH='$argon2id$v=19$m=19456,t=2,p=1$R3VyS8OJIiG2Q7ihG1WlJQ$WAnkFldoPaMdxe1lAxUt/qio1Ny/jTV5aeo3p2h7ZuU'
@@ -50,12 +53,12 @@ JSON
 echo "### slater-build $GRAPH -> volume slater_hs (stamping --acl)"
 docker run --rm --user 0 -v slater_hs:/data -v "$WORK/cypher":/dumps:ro \
   -v "$WORK/acl.json":/acl.json:ro \
-  --entrypoint /app/slater-build slater:local \
+  --entrypoint /app/slater-build "$SLATER_IMG" \
   --input "/dumps/${GRAPH}.cypher" --graph "$GRAPH" --data-dir /data --acl /acl.json
 
 echo "### launch engines"
 docker run -d --name slater-hs -p 7700:7687 \
-  -v slater_hs:/data:ro -v "$WORK/acl.json":/config/acl.json:ro slater:local >/dev/null
+  -v slater_hs:/data:ro -v "$WORK/acl.json":/config/acl.json:ro "$SLATER_IMG" >/dev/null
 docker run -d --name neo4j-hs -p 7701:7687 \
   -e NEO4J_AUTH=neo4j/polepole12 -e NEO4J_server_memory_pagecache_size=512M neo4j:5 >/dev/null
 docker run -d --name memgraph-hs -p 7702:7687 \
@@ -85,6 +88,12 @@ for i in $(seq 1 60); do
   sleep 2
 done
 fi
+
+echo "### wait for neo4j Bolt readiness"
+for i in $(seq 1 60); do
+  $PY -c "from neo4j import GraphDatabase as G; G.driver('bolt://localhost:7701',auth=('neo4j','polepole12')).session().run('RETURN 1').consume()" >/dev/null 2>&1 && break
+  sleep 2
+done
 
 echo "### load neo4j / memgraph / falkordb from $WCY"
 $PY "$HERE/load_cypher.py" neo4j    "$WCY" --uri bolt://localhost:7701 --pass polepole12
