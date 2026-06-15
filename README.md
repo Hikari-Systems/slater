@@ -13,6 +13,8 @@ resident, Slater holds only bounded caches and reads everything else from disk o
 demand, including the disk-native approximate-nearest-neighbour (Vamana/PQ) vector
 path.
 
+**Shortcuts**
+
 |  |  |  |  |
 |:--|:--|:--|:--|
 | [Features](#features) | [GQL subset](#supported-gql-subset) | [Running with Docker](#running-with-docker) | [How it works](#how-it-works) |
