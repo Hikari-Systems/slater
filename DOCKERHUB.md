@@ -420,15 +420,15 @@ shortestPath traversals at 766M need its read pool raised to ≥2 GiB, vs slater
 | indexed point lookup | 1.95 | 3.9 | **0.48** | **0.48** | 0.65 | 8.8 |
 | idx-eq count | **0.60** | 4.9 | 5.0 | 2.0 | 381 | 2.5 |
 | 1-hop (indexed anchor) | 1.32 | 5.8 | **1.21** | 4.1 | 390 | 4.9 |
-| 2-hop (unanchored) | 33.1 | **5.6** | 8.5 | 16.7 | 444 | 6.4 |
+| 2-hop (unanchored) | **1.9** | 5.6 | 8.5 | 16.7 | 444 | 6.4 |
 | group-by / count(DISTINCT) | **0.50** | 47–51 | 63–64 | 31–39 | 411 | 5.3 |
 | full-scan `CONTAINS` | **0.59** | 5.4 | 24.1 | 1.7 | 16.3 | 4.1 |
 
-slater owns the **metadata / index / scan** shapes (10–150× the service engines) and, via a
-build-time value→count histogram on the indexed grouping key, the **whole-label group-by /
-count(DISTINCT)** (0.5 ms — ahead of LadybugDB's columnar 5.3 ms); the in-memory servers win
-**point lookups & raw 1-hop** (0.5 ms). slater's one clear miss is the **unanchored 2-hop** — it
-label-scans all 341k anchors (33 ms vs Neo4j 5.6).
+slater owns the **metadata / index / scan** shapes (10–150× the service engines), the
+**unanchored multi-hop** (2-hop 1.9 ms via the relationship-type scan, fastest in the field), and
+— via a build-time value→count histogram on the indexed grouping key — the **whole-label group-by
+/ count(DISTINCT)** (0.5 ms, ahead of LadybugDB's columnar 5.3 ms). The in-memory servers keep
+only **point lookups & raw 1-hop** (0.5 ms vs slater's 1–2 ms).
 
 ### Latency (median ms) — vectors (EU-AI-Act kNN, 15k × 1024-dim)
 
@@ -478,7 +478,7 @@ vs v0.8.0:
 | resident memory, any scale | 11–584 MiB (62k → 91.6M) | in-memory 1.5–2.7 GiB; can't load 766M | **slater** |
 | count / metadata / scan | ~0.6 ms | service engines 5–80 ms | **slater** (10–150×) |
 | indexed point / 1-hop | 1–2 ms | Memgraph · FalkorDB **0.5 ms** | trails the in-memory pair |
-| unanchored multi-hop (rows) | 33 ms | Neo4j **5.6 ms** | trails (label-scans all anchors) |
+| unanchored multi-hop (rows) | **1.9 ms** (MeSH 2-hop) | Neo4j 5.6 ms | **slater** (relationship-type scan) |
 | aggregation (group-by / DISTINCT) | **0.5 ms** | LadybugDB 5 ms (columnar) | **slater** (build-time histogram) |
 | kNN | 17–23 ms (exact) | FalkorDB **1.2 ms** (HNSW) | trails (below ANN threshold) |
 | traversal at 91.6M (≫ RAM) | 0.6–53 ms | Neo4j 10–4,000 ms; in-mem can't load | **slater** |
