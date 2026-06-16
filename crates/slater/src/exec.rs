@@ -115,14 +115,74 @@ impl Hop {
 }
 
 /// One in-flight branch of the parallel chain walk ([`Engine::expand_chain_par`]):
-/// the node reached so far, the bindings accumulated along the way (cloned per
-/// branch — the sequential walk's mutate-in-place frame can't be shared across a
-/// live breadth of branches), and the path hops (tracked only when the pattern
-/// binds a path variable, else left empty to avoid the clone).
+/// the node reached so far, the bindings accumulated along the way (a shared
+/// [`Frame`] — the sequential walk's mutate-in-place map can't be shared across a
+/// live breadth of branches, but an `Arc`-linked frame can, so a branch that binds
+/// no new variable just bumps the parent's refcount instead of cloning the map),
+/// and the path hops (tracked only when the pattern binds a path variable, else
+/// left empty to avoid the clone).
 struct ChainBranch {
     cur: u64,
-    binding: HashMap<String, Val>,
+    binding: std::sync::Arc<Frame>,
     walk: Vec<Hop>,
+}
+
+/// An immutable, structurally-shared variable→value scope for the parallel chain
+/// walk. Each hop that binds a variable layers a small `delta` over an `Arc` to its
+/// parent, so sibling branches that share a prefix share that prefix's storage
+/// (O(1) `Arc` clone instead of copying the whole inherited map per neighbour). A
+/// hop that binds nothing reuses the parent frame outright. The owned
+/// `HashMap<String, Val>` every consumer downstream of the walk expects is produced
+/// once, at the leaf, by [`Frame::flatten`].
+struct Frame {
+    parent: Option<std::sync::Arc<Frame>>,
+    /// Variables bound *at this layer* (≤ 2 in the walk: a rel var and a next-node
+    /// var). Searched last-first so a later write shadows an earlier one in-layer.
+    delta: Vec<(Box<str>, Val)>,
+}
+
+impl Frame {
+    /// A root frame wrapping the anchor's inherited binding (one allocation per
+    /// anchor; thereafter the walk only layers small deltas).
+    fn root(base: &HashMap<String, Val>) -> std::sync::Arc<Frame> {
+        std::sync::Arc::new(Frame {
+            parent: None,
+            delta: base
+                .iter()
+                .map(|(k, v)| (k.as_str().into(), v.clone()))
+                .collect(),
+        })
+    }
+
+    /// The value bound to `name`, searching this layer (last write wins) before
+    /// recursing to the parent so a child frame shadows its parent — the same
+    /// precedence [`Frame::flatten`] reproduces.
+    fn get(&self, name: &str) -> Option<&Val> {
+        self.delta
+            .iter()
+            .rev()
+            .find(|(k, _)| &**k == name)
+            .map(|(_, v)| v)
+            .or_else(|| self.parent.as_ref().and_then(|p| p.get(name)))
+    }
+
+    /// Materialise the whole chain into an owned map. Root-first so children
+    /// overwrite parents on a name clash — matching [`Scope::collect_into`] and the
+    /// sequential walk's LIFO restore (deepest binding wins).
+    fn flatten(&self) -> HashMap<String, Val> {
+        let mut out = HashMap::new();
+        self.collect_into(&mut out);
+        out
+    }
+
+    fn collect_into(&self, out: &mut HashMap<String, Val>) {
+        if let Some(p) = &self.parent {
+            p.collect_into(out);
+        }
+        for (k, v) in &self.delta {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
 }
 
 // ── Runtime value ─────────────────────────────────────────────────────────────
@@ -1013,6 +1073,8 @@ enum Scope<'a> {
     Empty,
     Map(&'a HashMap<String, Val>),
     Row(&'a [String], &'a [Val]),
+    /// A shared chain-walk [`Frame`] (read without flattening it to a map).
+    Frame(&'a Frame),
     /// Parent scope with one extra binding layered on top (list predicates).
     With(&'a Scope<'a>, &'a str, &'a Val),
     /// Two scopes; the first wins on a name clash (`ORDER BY` alias over input).
@@ -1024,6 +1086,7 @@ impl<'a> Scope<'a> {
         match self {
             Scope::Empty => None,
             Scope::Map(m) => m.get(name).cloned(),
+            Scope::Frame(f) => f.get(name).cloned(),
             Scope::Row(cols, row) => cols.iter().position(|c| c == name).map(|i| row[i].clone()),
             Scope::With(parent, n, v) => {
                 if *n == name {
@@ -1059,6 +1122,7 @@ impl<'a> Scope<'a> {
                     out.insert(c.clone(), v.clone());
                 }
             }
+            Scope::Frame(f) => f.collect_into(out),
             // Parent first, then the layered binding wins on a name clash.
             Scope::With(parent, n, v) => {
                 parent.collect_into(out);
@@ -2217,7 +2281,7 @@ impl<'g> Engine<'g> {
                 let guaranteed = self.scan_guaranteed_labels(&scan);
                 let mut out = Vec::new();
                 for c in self.scan_candidates(&scan)? {
-                    if self.node_ok(c, node, binding, &guaranteed)? {
+                    if self.node_ok(c, node, &Scope::Map(binding), &guaranteed)? {
                         out.push(c);
                     }
                 }
@@ -2648,7 +2712,7 @@ impl<'g> Engine<'g> {
                 if cap.is_some_and(|cc| out_rows.len() >= cc) {
                     break 'outer;
                 }
-                if !self.node_ok(c, start, &in_binding, guaranteed)? {
+                if !self.node_ok(c, start, &Scope::Map(&in_binding), guaranteed)? {
                     continue;
                 }
                 let mut row = in_row.clone();
@@ -3700,7 +3764,7 @@ impl<'g> Engine<'g> {
             }
             // Already filtered in parallel above when `prefilter`; otherwise check the
             // anchor's labels/inline props inline (with the loop's early-exit break).
-            if !prefilter && !self.node_ok(c, start, &frame, &guaranteed)? {
+            if !prefilter && !self.node_ok(c, start, &Scope::Map(&frame), &guaranteed)? {
                 continue;
             }
             let prev = start
@@ -3829,7 +3893,7 @@ impl<'g> Engine<'g> {
         );
         let init = vec![ChainBranch {
             cur,
-            binding: base.clone(),
+            binding: Frame::root(base),
             walk: Vec::new(),
         }];
         self.par_walk(pattern, 0, cur, init, out)
@@ -3855,7 +3919,9 @@ impl<'g> Engine<'g> {
             // terminal — one intermediate per emitted row, path bound if requested).
             for b in frontier {
                 self.charge(1)?;
-                let mut binding = b.binding;
+                // The owned map every downstream consumer expects is built here, once
+                // per completed row — the only flatten in the walk.
+                let mut binding = b.binding.flatten();
                 if let Some(pv) = &pattern.path_var {
                     binding.insert(pv.clone(), make_path(start, &b.walk));
                 }
@@ -3895,7 +3961,7 @@ impl<'g> Engine<'g> {
             for (b, hops) in chunk.iter().zip(neigh) {
                 for hop in hops {
                     let nb = hop.neighbour;
-                    if !self.node_ok(nb, next, &b.binding, &[])? {
+                    if !self.node_ok(nb, next, &Scope::Frame(&b.binding), &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -3905,13 +3971,25 @@ impl<'g> Engine<'g> {
                             }
                         }
                     }
-                    let mut binding = b.binding.clone();
-                    if let Some(v) = &rel.var {
-                        binding.insert(v.clone(), hop.as_rel());
-                    }
-                    if let Some(v) = &next.var {
-                        binding.insert(v.clone(), Val::Node(nb));
-                    }
+                    // Structural share: a hop that binds no variable carries the
+                    // parent frame unchanged (an `Arc` bump, no allocation — the
+                    // anonymous-intermediate hot path); a binding hop layers a small
+                    // delta over the shared parent.
+                    let binding = if rel.var.is_none() && next.var.is_none() {
+                        b.binding.clone()
+                    } else {
+                        let mut delta: Vec<(Box<str>, Val)> = Vec::with_capacity(2);
+                        if let Some(v) = &rel.var {
+                            delta.push((v.as_str().into(), hop.as_rel()));
+                        }
+                        if let Some(v) = &next.var {
+                            delta.push((v.as_str().into(), Val::Node(nb)));
+                        }
+                        std::sync::Arc::new(Frame {
+                            parent: Some(b.binding.clone()),
+                            delta,
+                        })
+                    };
                     let walk = if track_walk {
                         let mut w = b.walk.clone();
                         w.push(hop);
@@ -3996,7 +4074,7 @@ impl<'g> Engine<'g> {
                         break;
                     }
                     let nb = hop.neighbour;
-                    if !self.node_ok(nb, next, binding, &[])? {
+                    if !self.node_ok(nb, next, &Scope::Map(binding), &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -4055,7 +4133,7 @@ impl<'g> Engine<'g> {
                     if cap.is_some_and(|c| out.len() >= c) {
                         break;
                     }
-                    if !self.node_ok(endnode, next, binding, &[])? {
+                    if !self.node_ok(endnode, next, &Scope::Map(binding), &[])? {
                         continue;
                     }
                     if let Some(v) = &next.var {
@@ -4365,13 +4443,7 @@ impl<'g> Engine<'g> {
     /// (see [`scan_guaranteed_labels`]); those are skipped so the common
     /// label-scan/index-scan path never decodes a label record. Downstream
     /// (traversal) callers pass `&[]` — their candidates carry no such proof.
-    fn node_ok(
-        &self,
-        id: u64,
-        pat: &NodePat,
-        binding: &HashMap<String, Val>,
-        guaranteed: &[u32],
-    ) -> Result<bool> {
+    fn node_ok(&self, id: u64, pat: &NodePat, scope: &Scope, guaranteed: &[u32]) -> Result<bool> {
         if let Some(expr) = &pat.label_expr {
             // Fast path, byte-for-byte as cheap as the pre-GQL single-label check: a
             // lone positive atom `(:Person)` the anchor scan already proved needs no
@@ -4407,7 +4479,7 @@ impl<'g> Engine<'g> {
             }
         }
         for (k, e) in &pat.props {
-            let want = self.eval(e, &Scope::Map(binding), None)?;
+            let want = self.eval(e, scope, None)?;
             let got = self.node_prop(id, k)?;
             if got.loose_eq(&want) != Some(true) {
                 return Ok(false);
