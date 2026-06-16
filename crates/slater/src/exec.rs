@@ -1252,6 +1252,14 @@ pub struct Engine<'g> {
     /// a query cannot grow unbounded memory inside the `timeout_ms` window.
     max_intermediate: u64,
     budget_used: Cell<u64>,
+    /// Transient walk-work budget (config `query.maxScan`); 0 disables. Charged only by
+    /// the count-pushdown chain walk (adjacency reads + per-row tallies that retain
+    /// nothing), routed via [`charge_walk`](Self::charge_walk). Unlike `max_intermediate`
+    /// it holds no memory, so it does not touch the server-wide aggregate — it is a
+    /// runaway-work backstop, with `timeout_ms` the primary governor. Per-query, touched
+    /// only on the calling thread, like `budget_used`.
+    max_scan: u64,
+    scan_used: Cell<u64>,
     /// Count-pushdown accumulator. `Some(n)` ⇒ the chain-walk emit leaves tally a
     /// completed row here and skip materialising it (the `RETURN count(*)` fast
     /// path); `None` ⇒ normal row-building. Per-query, touched only on the calling
@@ -1305,6 +1313,8 @@ impl<'g> Engine<'g> {
             beam_width: 64,
             max_intermediate: 0,
             budget_used: Cell::new(0),
+            max_scan: 0,
+            scan_used: Cell::new(0),
             count_acc: Cell::new(None),
             global_budget: None,
             global_charged: Cell::new(0),
@@ -1344,6 +1354,13 @@ impl<'g> Engine<'g> {
     /// (config `query.maxIntermediate`); 0 disables the budget.
     pub fn with_max_intermediate(mut self, max_intermediate: u64) -> Self {
         self.max_intermediate = max_intermediate;
+        self
+    }
+
+    /// Cap the transient walk-work a count-pushdown traversal may do (config
+    /// `query.maxScan`); 0 disables it. Memory-safe to set high — see [`charge_walk`].
+    pub fn with_max_scan(mut self, max_scan: u64) -> Self {
+        self.max_scan = max_scan;
         self
     }
 
@@ -1521,6 +1538,41 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
+    /// Charge `n` *transient* walk elements against the scan budget (config
+    /// `query.maxScan`; 0 disables). Cumulative like [`charge`](Self::charge) so a
+    /// geometric blow-up trips early, but — unlike `charge` — it touches neither the
+    /// retained per-query budget nor the server-wide aggregate: count-pushdown work
+    /// holds no memory, so there is nothing for a concurrent query to compete over.
+    fn charge_scan(&self, n: u64) -> Result<()> {
+        if self.max_scan != 0 {
+            let used = self.scan_used.get().saturating_add(n);
+            self.scan_used.set(used);
+            if used > self.max_scan {
+                bail!(
+                    "query exceeded the scan budget of {} elements (query.maxScan)",
+                    self.max_scan
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Charge `n` chain-walk elements, routed by retention. In count-pushdown mode
+    /// (`count_acc` set) the walk tallies and discards every row, frees each adjacency
+    /// buffer per chunk, and holds only a structurally bounded frontier — nothing is
+    /// retained, so the charge is transient ([`charge_scan`](Self::charge_scan)). In
+    /// row-building mode the same elements materialise, so it is the retained
+    /// [`charge`](Self::charge). This is the split that lets a memory-flat `count(*)`
+    /// run to the timeout without being gated by the tight memory budget, while a
+    /// materialising walk stays bounded exactly as before.
+    fn charge_walk(&self, n: u64) -> Result<()> {
+        if self.count_acc.get().is_some() {
+            self.charge_scan(n)
+        } else {
+            self.charge(n)
+        }
+    }
+
     /// In count-pushdown mode (`count_acc` set), tally one completed row and return
     /// `true` so the caller skips materialising it. `false` in normal row-building
     /// mode. Charging is unchanged and happens at the call site either way, so the
@@ -1556,6 +1608,7 @@ impl<'g> Engine<'g> {
 
     fn run_inner(&self, q: &Query) -> Result<QueryResult> {
         self.budget_used.set(0); // per-run budget; engines may be reused
+        self.scan_used.set(0);
         self.global_charged.set(0);
         let mut result = self.run_single(&q.head)?;
         for (union_all, part) in &q.tail {
@@ -4070,7 +4123,7 @@ impl<'g> Engine<'g> {
             // Completion: charge + emit each branch in order (mirrors `expand_chain`'s
             // terminal — one intermediate per emitted row, path bound if requested).
             for b in frontier {
-                self.charge(1)?;
+                self.charge_walk(1)?;
                 // Count-pushdown: tally the row and skip building it (no flatten, no
                 // alloc) — the whole point of the fast path.
                 if self.count_tally() {
@@ -4112,7 +4165,7 @@ impl<'g> Engine<'g> {
             // charge stays here on the calling thread once the buffer is materialised —
             // before the merge below clones it into per-branch bindings.
             let produced: u64 = neigh.iter().map(|h| h.len() as u64).sum();
-            self.charge(produced)?;
+            self.charge_walk(produced)?;
             // Merge in input order — the sequential `expand_chain` per-neighbour body:
             // `node_ok`, the next-var equality guard, rel/next binding.
             for (b, hops) in chunk.iter().zip(neigh) {
@@ -4210,7 +4263,7 @@ impl<'g> Engine<'g> {
             // the budget here — otherwise `partial` balloons RSS to an OOM before the
             // charged terminal is ever reached. The double count over the two buffers
             // mirrors their genuine combined peak (conservative on purpose).
-            self.charge(1)?;
+            self.charge_walk(1)?;
             // Count-pushdown: tally the row and skip building it (no clone).
             if self.count_tally() {
                 return Ok(());
@@ -4434,7 +4487,9 @@ impl<'g> Engine<'g> {
     /// type alternation and relationship property predicates, each resolved to a
     /// [`Hop`] (edge, neighbour, type, and stored src→dst endpoints).
     ///
-    /// Charges the produced hops against the intermediate budget (root cause 2b):
+    /// Charges the produced hops via [`charge_walk`](Self::charge_walk) — the retained
+    /// `maxIntermediate` budget in row-building mode, the transient `maxScan` budget in
+    /// count-pushdown mode where the adjacency Vec is read-then-discarded (root cause 2b):
     /// expanding a hub reads its whole adjacency and builds one `Hop` per matching
     /// edge — a `Vec<Hop>` that, summed over a depth-first chain walk, is the bulk
     /// of an expansion-heavy query's transient allocation. Without this charge the
@@ -4455,7 +4510,7 @@ impl<'g> Engine<'g> {
         binding: &HashMap<String, Val>,
     ) -> Result<Vec<Hop>> {
         let hops = self.expand_with_dir(node, rel, rel.dir, binding)?;
-        self.charge(hops.len() as u64)?;
+        self.charge_walk(hops.len() as u64)?;
         Ok(hops)
     }
 
@@ -9765,6 +9820,14 @@ mod tests {
             .is_some_and(|e| format!("{e:#}").contains("server-wide intermediate budget"))
     }
 
+    /// True if `res` is the transient walk-work (`query.maxScan`) error — the budget a
+    /// count-pushdown traversal charges instead of the retained `maxIntermediate`.
+    fn is_scan_budget_err(res: &Result<QueryResult>) -> bool {
+        res.as_ref()
+            .err()
+            .is_some_and(|e| format!("{e:#}").contains("scan budget"))
+    }
+
     #[test]
     fn regex_pattern_length_is_capped() {
         // A pattern past MAX_REGEX_PATTERN_BYTES is refused before compilation.
@@ -10210,6 +10273,7 @@ mod tests {
         tag: &str,
         n: u64,
         per_query: u64,
+        scan: u64,
         global: u64,
         with_pool: bool,
         q: &str,
@@ -10220,6 +10284,7 @@ mod tests {
         let budget = GlobalIntermediateBudget::new(global);
         let mut engine = Engine::new(&gen, &cache)
             .with_max_intermediate(per_query)
+            .with_max_scan(scan)
             .with_global_budget(&budget);
         if with_pool {
             engine = engine.with_fanout_pool(Some(std::sync::Arc::new(
@@ -10240,96 +10305,157 @@ mod tests {
         (res, peak)
     }
 
+    // ── Per-query-type budget routing (the retention split) ───────────────────
+    // The same hub adjacency read is charged against a *different* budget depending on
+    // what the query does with the rows. `RETURN count(*)` is count-pushdown — it
+    // retains nothing, so its reads charge the transient `maxScan` budget and never the
+    // retained `maxIntermediate` nor the server-wide aggregate. A row-returning or
+    // var-length traversal materialises, so the same reads charge `maxIntermediate`
+    // (and the global budget). run_hub args: (tag, n, maxIntermediate, maxScan, global).
+
     #[test]
-    fn hub_one_hop_trips_per_query_budget() {
-        // Reading the centre's `HUB_N`-edge adjacency in one hop already charges
-        // `HUB_N`, well past the tight cap — no need to complete any row.
+    fn hub_count_one_hop_trips_scan_budget() {
+        // count-pushdown: the centre's `HUB_N`-edge read charges scan, tripping the
+        // tight scan cap — with the retained and global budgets *disabled*, proving the
+        // count is bounded by `maxScan` alone.
+        let (res, _) = run_hub(
+            "exec_hub_1hop_scan",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
+        );
+        assert!(
+            is_scan_budget_err(&res),
+            "a count's hub read must trip maxScan: {res:?}"
+        );
+    }
+
+    #[test]
+    fn hub_count_two_hop_trips_scan_budget() {
+        let (res, _) = run_hub(
+            "exec_hub_2hop_scan",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y)",
+        );
+        assert!(is_scan_budget_err(&res), "got: {res:?}");
+    }
+
+    #[test]
+    fn hub_count_filtered_trips_scan_with_zero_rows() {
+        // 2b for counts: `:Hub` matches only the centre, so every neighbour is rejected
+        // and ZERO rows complete — yet the adjacency read still charges scan and trips.
+        let (res, _) = run_hub(
+            "exec_hub_filt_scan",
+            HUB_N,
+            0,
+            HUB_TIGHT,
+            0,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x:Hub) RETURN count(x)",
+        );
+        assert!(
+            is_scan_budget_err(&res),
+            "a filtered count read (no rows complete) must still trip maxScan: {res:?}"
+        );
+    }
+
+    #[test]
+    fn hub_count_ignores_retained_and_global_budgets() {
+        // The crux of the split: with the retained *and* global budgets tight (well
+        // below `HUB_N`) but scan generous, the count still completes with the right
+        // answer — it draws neither — and never charges the server-wide aggregate.
+        let (res, peak) = run_hub(
+            "exec_hub_count_iso",
+            HUB_N,
+            HUB_TIGHT,
+            HUB_GENEROUS,
+            HUB_TIGHT,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x) AS n",
+        );
+        let res = res.expect("a count must not draw the retained/global budgets");
+        assert_eq!(col0(&res), vec![HUB_N.to_string()]);
+        assert!(
+            peak < HUB_N,
+            "count-pushdown must not charge the per-edge reads to the server-wide \
+             aggregate: peak={peak}"
+        );
+    }
+
+    #[test]
+    fn hub_materialize_one_hop_trips_per_query_budget() {
+        // Row-returning: the same read materialises, so it charges the retained budget.
         let (res, _) = run_hub(
             "exec_hub_1hop_pq",
             HUB_N,
             HUB_TIGHT,
             0,
+            0,
             false,
-            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN x",
         );
         assert!(
             is_per_query_budget_err(&res),
-            "a hub's one-hop expansion must trip the per-query budget: {res:?}"
+            "a materialising hub read must trip maxIntermediate: {res:?}"
         );
     }
 
     #[test]
-    fn hub_one_hop_trips_global_budget() {
+    fn hub_materialize_one_hop_trips_global_budget() {
         let (res, _) = run_hub(
             "exec_hub_1hop_g",
             HUB_N,
             0,
+            0,
             HUB_TIGHT,
             false,
-            "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN x",
         );
         assert!(
             is_global_budget_err(&res),
-            "a hub's one-hop expansion must trip the server-wide budget: {res:?}"
+            "a materialising hub read must trip the server-wide budget: {res:?}"
         );
     }
 
     #[test]
-    fn hub_two_hop_trips_per_query_budget() {
+    fn hub_materialize_two_hop_trips_per_query_budget() {
         let (res, _) = run_hub(
             "exec_hub_2hop_pq",
             HUB_N,
             HUB_TIGHT,
             0,
+            0,
             false,
-            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y)",
+            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN y",
         );
         assert!(is_per_query_budget_err(&res), "got: {res:?}");
     }
 
     #[test]
-    fn hub_two_hop_trips_global_budget() {
+    fn hub_varlen_count_charges_retained_not_scan() {
+        // The two-regime nuance the sweep found: a *var-length* `count(*)` still
+        // materialises its per-node path set, so even under count-pushdown it charges
+        // the retained budget (and trips it) — unlike a fixed-hop count, which is pure
+        // scan. With scan disabled, the trip can only be the retained path materialise.
         let (res, _) = run_hub(
-            "exec_hub_2hop_g",
-            HUB_N,
-            0,
-            HUB_TIGHT,
-            false,
-            "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y)",
-        );
-        assert!(is_global_budget_err(&res), "got: {res:?}");
-    }
-
-    #[test]
-    fn hub_expansion_charges_before_any_row_completes() {
-        // The crux of 2b: the charge is on the adjacency read, not on completed rows.
-        // `:Hub` matches only the centre, never a leaf, so every expanded neighbour is
-        // rejected by `node_ok` and ZERO rows complete — the pre-fix terminal
-        // `charge(1)` would never fire and a tight budget would (wrongly) pass. Reading
-        // the centre's `HUB_N`-edge adjacency must trip it regardless. Both guards.
-        let (pq, _) = run_hub(
-            "exec_hub_filtered_pq",
+            "exec_hub_varlen_count",
             HUB_N,
             HUB_TIGHT,
             0,
+            0,
             false,
-            "MATCH (c:Hub)-[:LINK]->(x:Hub) RETURN count(x)",
+            "MATCH (c:Hub)-[:LINK*1..2]->(x) RETURN count(*)",
         );
         assert!(
-            is_per_query_budget_err(&pq),
-            "a filtered hub read (no row completes) must still trip the per-query budget: {pq:?}"
-        );
-        let (g, _) = run_hub(
-            "exec_hub_filtered_g",
-            HUB_N,
-            0,
-            HUB_TIGHT,
-            false,
-            "MATCH (c:Hub)-[:LINK]->(x:Hub) RETURN count(x)",
-        );
-        assert!(
-            is_global_budget_err(&g),
-            "a filtered hub read must still trip the server-wide budget: {g:?}"
+            is_per_query_budget_err(&res),
+            "a var-length count materialises paths and must trip maxIntermediate: {res:?}"
         );
     }
 
@@ -10433,12 +10559,13 @@ mod tests {
 
     #[test]
     fn hub_small_expansion_succeeds_under_a_generous_budget() {
-        // The guard must bound hubs without over-charging: a generous budget lets the
-        // whole star expand and return the right count, and it really drew on the
-        // budget (≥ one charge per edge read).
-        let (res, peak) = run_hub(
+        // The guard must bound hubs without over-charging: a generous scan budget lets
+        // the whole star expand and return the right count. A materialising run of the
+        // same shape really draws the server-wide aggregate (≥ one charge per edge read).
+        let (res, _) = run_hub(
             "exec_hub_small_ok",
             HUB_N,
+            HUB_GENEROUS,
             HUB_GENEROUS,
             HUB_GENEROUS,
             false,
@@ -10446,47 +10573,69 @@ mod tests {
         );
         let res = res.expect("a generous budget must let the hub expand");
         assert_eq!(col0(&res), vec![HUB_N.to_string()]);
+        let (mat, peak) = run_hub(
+            "exec_hub_small_mat",
+            HUB_N,
+            HUB_GENEROUS,
+            0,
+            HUB_GENEROUS,
+            false,
+            "MATCH (c:Hub)-[:LINK]->(x) RETURN x",
+        );
+        mat.expect("materialise under a generous budget");
         assert!(
             peak >= HUB_N,
-            "the expansion must charge at least once per edge read: peak={peak}"
+            "a materialising expansion must charge the aggregate ≥ once per edge read: peak={peak}"
         );
     }
 
     #[test]
     fn hub_expansion_charge_on_parallel_path() {
         // The fanout pool routes a fixed multi-hop chain through `expand_chain_par`,
-        // whose adjacency reads gather on rayon — where `self.charge`'s `Cell` cannot
-        // be touched. The charge is applied on the calling thread once the buffer
-        // lands, so the same hub expansion still trips a tight budget (per-query and
-        // global) and, under a generous budget, returns exactly the sequential result.
-        // The hop-1 frontier (`HUB_N` leaves) clears `EXPAND_PAR_MIN`, so the pooled
-        // reader truly fans out rather than degrading to a sequential read.
-        let q = "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y) AS n";
-        let (tight, _) = run_hub("exec_hub_par_pq", HUB_N, HUB_TIGHT, 0, true, q);
+        // whose adjacency reads gather on rayon — where the per-query `Cell` charge
+        // state cannot be touched. The charge is applied on the calling thread once the
+        // buffer lands, so the pooled walk routes to the SAME budget as the sequential
+        // one: a count trips `maxScan`, a materialising walk trips `maxIntermediate` /
+        // the global budget, and under generous budgets both return the sequential
+        // result. The hop-1 frontier (`HUB_N` leaves) clears `EXPAND_PAR_MIN`, so the
+        // pooled reader truly fans out rather than degrading to a sequential read.
+        let cq = "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN count(y) AS n";
+        let mq = "MATCH (c:Hub)-[:LINK]->(x)-[:LINK]->(y) RETURN y";
+        // count-pushdown on the pooled path → scan budget.
+        let (scan, _) = run_hub("exec_hub_par_scan", HUB_N, 0, HUB_TIGHT, 0, true, cq);
         assert!(
-            is_per_query_budget_err(&tight),
-            "the pooled hub expansion must trip the per-query budget: {tight:?}"
+            is_scan_budget_err(&scan),
+            "the pooled count must trip maxScan: {scan:?}"
         );
-        let (tight_g, _) = run_hub("exec_hub_par_g", HUB_N, 0, HUB_TIGHT, true, q);
+        // materialising on the pooled path → retained + global budgets.
+        let (pq, _) = run_hub("exec_hub_par_pq", HUB_N, HUB_TIGHT, 0, 0, true, mq);
         assert!(
-            is_global_budget_err(&tight_g),
-            "the pooled hub expansion must trip the server-wide budget: {tight_g:?}"
+            is_per_query_budget_err(&pq),
+            "the pooled materialising walk must trip maxIntermediate: {pq:?}"
         );
+        let (g, _) = run_hub("exec_hub_par_g", HUB_N, 0, 0, HUB_TIGHT, true, mq);
+        assert!(
+            is_global_budget_err(&g),
+            "the pooled materialising walk must trip the server-wide budget: {g:?}"
+        );
+        // Generous budgets: pooled and sequential counts agree exactly.
         let (par, _) = run_hub(
             "exec_hub_par_ok",
             HUB_N,
             HUB_GENEROUS,
             HUB_GENEROUS,
+            HUB_GENEROUS,
             true,
-            q,
+            cq,
         );
         let (seq, _) = run_hub(
             "exec_hub_seq_ok",
             HUB_N,
             HUB_GENEROUS,
             HUB_GENEROUS,
+            HUB_GENEROUS,
             false,
-            q,
+            cq,
         );
         let par = par.expect("pooled generous run");
         let seq = seq.expect("sequential generous run");
@@ -10496,6 +10645,27 @@ mod tests {
             "pooled and sequential expansions must agree"
         );
         assert_eq!(col0(&par), vec![HUB_N.to_string()]);
+    }
+
+    #[test]
+    fn engine_is_not_sync_rayon_invariant() {
+        // Compile-time guard-rail for the rayon-safety invariant. The entire argument
+        // that `par_gather`/`par_walk` are race-free rests on `&Engine` never crossing a
+        // thread boundary: the `Sync + Send` bound on `par_gather`'s closure can only
+        // reject a closure that captures `&self` *because* `Engine` is `!Sync` (its
+        // per-query `Cell`/`RefCell` charge state — `budget_used`, `scan_used`,
+        // `count_acc`, `global_charged`, `regex_cache`). If a future change makes that
+        // state `Sync` (e.g. swapping a `Cell` for an `Atomic` to "charge in parallel"),
+        // the `AmbiguousIfSync` resolution below becomes ambiguous and this stops
+        // compiling — forcing a deliberate re-read of `charge_walk` and the `par_gather`
+        // contract before the invariant is weakened.
+        trait AmbiguousIfSync<A> {
+            fn _f() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+        // Resolves to the blanket `()` impl unambiguously iff `Engine` is NOT `Sync`.
+        let _ = <Engine<'static> as AmbiguousIfSync<_>>::_f;
     }
 
     // ── Engine reuse: the charge resets and refunds per run ───────────────────
@@ -11096,16 +11266,18 @@ mod tests {
 
     #[test]
     fn rel_match_buffer_charges_intermediate_budget() {
-        // `match_single_pattern` buffers a relationship pattern's whole result set
-        // before the cross-pattern terminal charges it; without charging the buffer a
-        // dense expansion (every `:LINK` edge over a 1M-node graph) OOMs the process.
-        // The fixture's 3 KNOWS edges trip a budget of 2 and pass at 1M.
+        // `match_single_pattern` buffers a *materialising* relationship pattern's whole
+        // result set before the cross-pattern terminal charges it; without charging the
+        // buffer a dense expansion (every `:LINK` edge over a 1M-node graph) OOMs the
+        // process. A row-returning query (not count-pushdown — that retains nothing and
+        // is bounded by `maxScan`) exercises this retained buffer: the fixture's 3 KNOWS
+        // edges trip a retained budget of 2 and pass at 1M.
         let err = run_budgeted(
             "exec_budget_relmatch_tiny",
             2,
-            "MATCH (a)-[:KNOWS]->(b) RETURN count(*)",
+            "MATCH (a)-[:KNOWS]->(b) RETURN b.name AS b",
         )
-        .expect_err("the relationship-match buffer must charge the budget");
+        .expect_err("the relationship-match buffer must charge the retained budget");
         assert!(
             format!("{err:#}").contains("intermediate result budget"),
             "expected the budget error, got: {err:#}"
@@ -11113,10 +11285,10 @@ mod tests {
         let res = run_budgeted(
             "exec_budget_relmatch_ok",
             1_000_000,
-            "MATCH (a)-[:KNOWS]->(b) RETURN count(*)",
+            "MATCH (a)-[:KNOWS]->(b) RETURN b.name AS b",
         )
         .expect("a generous budget must not affect the query");
-        assert_eq!(res.rows[0][0].to_display(), "3");
+        assert_eq!(res.rows.len(), 3, "3 KNOWS edges materialise 3 rows");
     }
 
     #[test]

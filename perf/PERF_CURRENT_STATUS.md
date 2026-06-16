@@ -77,7 +77,77 @@ Key nuance for tuning: with count-pushdown a tripping **count** is now bounded b
 count-shaped queries is **memory-safe** (RSS stays flat). The row-materialising shapes
 (`var-length … distinct`) are the ones whose RSS still scales with the budget.
 
-## Next: maxIntermediate knee (TODO — see task)
+## maxIntermediate knee sweep (Wikidata-91.6M, fanout=8, 12 GB cap, isolated per budget)
+
+Swept `maxIntermediate` ∈ {1M, 5M, 20M, 50M, 100M, 200M}, one container per budget,
+`maxIntermediateGlobal=1B` (so the per-query cap is the only gate). 20 hub anchors per shape.
+
+**Row-materialising — `var-length *1..2 distinct`** (RSS-bound):
+
+| budget | peak anon | trips /20 |
+|--:|--:|--:|
+| 1M | 584 MiB | 8 |
+| 5M | 741 MiB | 6 |
+| 20M | 2,385 MiB | 6 |
+| 50M | 6,289 MiB | **0** |
+| 100M | 6,158 MiB | 0 |
+| 200M | 6,303 MiB | 0 |
+
+**Count — `3-hop count(m)`** (compute-bound, count-pushdown):
+
+| budget | peak anon | trips /20 | median ms |
+|--:|--:|--:|--:|
+| 1M | 2,445 MiB | 15 | 306 |
+| 5M | 1,918 MiB | 13 | 288 |
+| 20M | 2,307 MiB | 10 | 329 |
+| 50M | 2,138 MiB | 8 | 593 |
+| 100M | 2,437 MiB | 3 | 1,229 |
+| 200M | 2,621 MiB | 2 | 983 |
+
+No OOM at any budget (var-length's real result set for this hub pool caps ~6.3 GB and
+plateaus at ≥50M; budget above that is unused headroom).
+
+### The knee: no single good scalar — the two regimes want opposite settings
+
+- **Counts are memory-flat** (~2–2.6 GB **regardless of budget**); their governor is the
+  30 s *timeout*, not memory. Raising the budget is pure upside but they still need ~100M+
+  to mostly complete and the cost shows up as latency (306 → 1,229 ms), not RSS.
+- **Materialisers scale RSS with the budget** until the true result is exhausted (~6.3 GB
+  here); their governor *is* memory.
+
+A scalar `maxIntermediate` is forced to compromise: 1M (the 48 MB default sized for the
+100–200 MB deployment target) trips counts 15/20; clearing counts means ~100M, which lets a
+materialiser balloon to ~6 GB. **Recommendation:** keep the **1M default** (correctly sized
+for the 100–200 MB target — the sweep confirms it bounds the materialisers); document that on
+a large box you raise it, and that counts are memory-safe to raise. The deeper fix is to
+**split the budget by retention semantics** — a tight *retained* high-water (the real RSS/OOM
+guard, and what the global aggregate should track) plus a generous *transient/scan* ceiling
+(or fold it into the timeout). Count-pushdown retains ~0, so a retained-only cap lets counts
+run to the timeout while still bounding materialiser RSS. Keep the cumulative transient charge
+too — it trips geometric growth (`reduce(acc+acc)`) early, which a peak gauge would miss.
+
+Raw results: `/tmp/bench-camp/knee/knee-results.txt` (runner `run-knee.sh`).
+
+### Implemented: the retention split (`maxScan`)
+
+The split is shipped (branch `perf/retention-split-budget`): `query.maxScan` (default **500M**)
+bounds the *transient* count-pushdown walk work, while `query.maxIntermediate` (default 1M)
+keeps bounding *retained* materialisation. Count-pushdown charges route to `maxScan` and do
+not draw the server-wide aggregate; var-length and row-building shapes stay on the retained
+budget. End-to-end re-run on the 91.6M graph, fanout=8, **stock split defaults** (no overrides;
+the validation ran at `maxScan=200M`, which upper-bounds the 500M trip rate since the value is
+decoupled from RSS):
+
+| 3-hop count default | trips /20 | peak anon | trip budget |
+|---|--:|--:|---|
+| old single scalar `maxIntermediate=1M` | 15/20 | ~2.4 GB | maxIntermediate |
+| **new split (`1M` retained / `≥200M` scan)** | **≤2/20** | **2.15 GB** | **maxScan** |
+
+13→18 of 20 heavy hub counts now complete, RSS unchanged (~2.1 GB) — the "counts are
+memory-safe to raise" thesis as the default; the scan value is decoupled from RSS (flat
+~2–2.6 GB across the whole 1M→200M sweep), so 500M costs no memory and only lets a couple more
+mega-hubs through. A tight `maxScan=20000` re-trips them (19/20), confirming the budget still
+governs count work; the error reads `… scan budget of N elements (query.maxScan)`.
 
 Sweep `maxIntermediate` on the 91.6M graph (e.g. 1M/5M/20M/50M/100M/200M) for the heavy
 shapes; record per-budget completion rate + peak anon. Goal: a default that lets typical

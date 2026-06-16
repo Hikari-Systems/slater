@@ -351,11 +351,26 @@ pub struct QueryConfig {
     pub max_rows: u64,
     #[serde(default = "default_timeout_ms", deserialize_with = "de::u64")]
     pub timeout_ms: u64,
-    /// Per-query budget on intermediate elements materialised by comprehensions,
-    /// UNWIND, list concatenation, aggregate buffers and variable-length paths;
-    /// 0 disables the budget.
+    /// Per-query budget on intermediate elements *retained* in memory: rows
+    /// materialised by comprehensions, UNWIND, list concatenation, aggregate/DISTINCT
+    /// buffers and variable-length paths. This is the memory (OOM) guard — kept tight,
+    /// and the only budget the server-wide aggregate (`maxIntermediateGlobal`) tracks.
+    /// 0 disables it. Distinct from `maxScan` on purpose (see there): a `count(*)`
+    /// over a multi-hop expansion retains nothing (count-pushdown), so it is bounded by
+    /// `maxScan`, not this.
     #[serde(default = "default_max_intermediate", deserialize_with = "de::u64")]
     pub max_intermediate: u64,
+    /// Per-query budget on *transient* walk elements that are produced and immediately
+    /// discarded — the adjacency reads and per-row tallies of a count-pushdown
+    /// (`RETURN count(*)`) multi-hop walk, which holds O(1) rows and a structurally
+    /// bounded frontier, so its RSS is flat regardless of this value. This bounds total
+    /// walked *work* (a runaway/geometric-explosion backstop), not memory; the primary
+    /// governor for such queries is `timeoutMs`. It does **not** draw down the
+    /// server-wide `maxIntermediateGlobal` aggregate (transient work holds no memory a
+    /// concurrent query competes for). 0 disables it. Generous by default because
+    /// raising it is memory-safe — see the knee sweep in perf/PERF_CURRENT_STATUS.md.
+    #[serde(default = "default_max_scan", deserialize_with = "de::u64")]
+    pub max_scan: u64,
     /// Server-wide ceiling on the *sum* of all in-flight queries' intermediate
     /// elements. `max_intermediate` bounds one query; this bounds the aggregate so
     /// `N` concurrent heavy queries cannot multiply into an OOM. A charge that would
@@ -470,6 +485,17 @@ fn default_timeout_ms() -> u64 {
 fn default_max_intermediate() -> u64 {
     1_000_000
 }
+// Transient walk-work budget for count-pushdown traversals (`query.maxScan`). These
+// retain ~O(1) memory, so this charges no retained bytes and is memory-safe to set high —
+// it only backstops runaway *work*; the 30 s `timeoutMs` is the real governor. Peak anon
+// RSS was flat ~2–2.6 GB across the whole 1M→200M knee sweep on the 91.6M-node Wikidata
+// graph (perf/PERF_CURRENT_STATUS.md) — the budget value is decoupled from RSS, so raising
+// it costs no memory and only lets more genuinely-huge mega-hub `count(*)`s complete instead
+// of trip. 500M is chosen generously on that basis (a finite backstop still catches a
+// geometric blow-up sooner than the timeout would).
+fn default_max_scan() -> u64 {
+    500_000_000
+}
 // Server-wide companion to `max_intermediate`. At ~48 bytes per element the 8M
 // default bounds the aggregate live intermediate memory of *all* concurrent
 // queries at roughly 384 MB — generous enough for normal concurrency (a point
@@ -515,6 +541,7 @@ impl Default for QueryConfig {
             max_rows: default_max_rows(),
             timeout_ms: default_timeout_ms(),
             max_intermediate: default_max_intermediate(),
+            max_scan: default_max_scan(),
             max_intermediate_global: default_max_intermediate_global(),
             max_shortest_path_explore: default_max_shortest_path_explore(),
             max_fanout: default_max_fanout(),

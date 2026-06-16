@@ -576,6 +576,9 @@ struct ConnCtx {
     timeout_ms: u64,
     /// Per-query intermediate-element budget (`query.maxIntermediate`); 0 disables.
     max_intermediate: u64,
+    /// Per-query transient walk-work budget for count-pushdown traversals
+    /// (`query.maxScan`); memory-flat, so set high. 0 disables.
+    max_scan: u64,
     /// Server-wide ceiling on the sum of all in-flight queries' intermediate
     /// charges (`query.maxIntermediateGlobal`); shared by every per-query engine so
     /// concurrency cannot multiply the per-query budget into an OOM. 0 disables.
@@ -803,6 +806,7 @@ impl ConnCtx {
             max_rows: self.max_rows as u64,
             timeout_ms: self.timeout_ms,
             max_intermediate: self.max_intermediate,
+            max_scan: self.max_scan,
             max_intermediate_global: self.intermediate_budget.limit(),
             intermediate_global_in_use: self.intermediate_budget.in_use(),
             intermediate_global_peak: self.intermediate_budget.peak(),
@@ -1349,6 +1353,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_rows: cfg.query.max_rows as usize,
         timeout_ms: cfg.query.timeout_ms,
         max_intermediate: cfg.query.max_intermediate,
+        max_scan: cfg.query.max_scan,
         intermediate_budget: Arc::new(GlobalIntermediateBudget::new(
             cfg.query.max_intermediate_global,
         )),
@@ -2050,6 +2055,7 @@ async fn run_query(
     let max_rows = ctx.max_rows;
     let timeout_ms = ctx.timeout_ms;
     let max_intermediate = ctx.max_intermediate;
+    let max_scan = ctx.max_scan;
     let intermediate_budget = ctx.intermediate_budget.clone();
     let max_shortest_path_explore = ctx.max_shortest_path_explore;
     let fanout_pool = ctx.fanout_pool.clone();
@@ -2087,6 +2093,7 @@ async fn run_query(
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)
+                        .with_max_scan(max_scan)
                         .with_global_budget(intermediate_budget.as_ref())
                         .with_max_shortest_path_explore(max_shortest_path_explore)
                         .with_fanout_pool(fanout_pool.clone());
@@ -2778,6 +2785,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            max_scan: 500_000_000,
             intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
             fanout_pool: None,
@@ -2855,6 +2863,7 @@ mod tests {
             max_rows: 100_000,
             timeout_ms: 0,
             max_intermediate: 1_000_000,
+            max_scan: 500_000_000,
             intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
             fanout_pool: None,

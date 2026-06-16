@@ -91,9 +91,16 @@ See `THREAT_MODEL.md` "Trust boundary" for what these protections assume.
 ## Query-level DoS budgets
 
 Even an authenticated reader is bounded per query: `query.maxRows` (row cap),
-`query.timeoutMs` (wall-clock deadline), `query.maxIntermediate` (cumulative
-intermediate-element budget), a dedicated `range()` element guard, and bounded
-(length- and automaton-size-capped) regex compilation for user-supplied patterns.
+`query.timeoutMs` (wall-clock deadline), `query.maxIntermediate` (cumulative budget on
+**retained** intermediate elements — the memory/OOM guard, and the only budget the
+server-wide `query.maxIntermediateGlobal` aggregate tracks), `query.maxScan` (cumulative
+budget on **transient** count-pushdown walk work — these retain ~O(1) memory, so it is a
+runaway-*work* backstop with `timeoutMs` the real governor, and is memory-safe to set
+high), a dedicated `range()` element guard, and bounded (length- and automaton-size-capped)
+regex compilation for user-supplied patterns. The retained/transient split is why a
+`RETURN count(*)` over a deep multi-hop expansion (memory-flat under count-pushdown) is
+governed by `maxScan`, not the tight `maxIntermediate` — see the knee sweep in
+`perf/PERF_CURRENT_STATUS.md`.
 
 ## Deployment posture (network is the primary control)
 

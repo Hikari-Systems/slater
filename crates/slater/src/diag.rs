@@ -393,6 +393,9 @@ pub struct LiveGauges {
     pub max_rows: u64,
     pub timeout_ms: u64,
     pub max_intermediate: u64,
+    /// Per-query transient walk-work budget for count-pushdown traversals
+    /// (`query.maxScan`). 0 ⇒ disabled. Memory-flat; bounds work, not RSS.
+    pub max_scan: u64,
     /// Server-wide intermediate budget: the ceiling and its live/peak occupancy
     /// (`query.maxIntermediateGlobal`). 0 limit ⇒ the guard is disabled.
     pub max_intermediate_global: u64,
@@ -509,6 +512,7 @@ mod tests {
             max_rows: 100,
             timeout_ms: 30_000,
             max_intermediate: 1_000_000,
+            max_scan: 500_000_000,
             max_intermediate_global: 8_000_000,
             intermediate_global_in_use: 0,
             intermediate_global_peak: 0,
