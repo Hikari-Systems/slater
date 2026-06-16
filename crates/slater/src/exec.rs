@@ -3642,12 +3642,13 @@ impl<'g> Engine<'g> {
     /// the index group read through the block cache; scoring/selection is the pure
     /// [`vector::brute_force_knn`] over it (D26 — `score` is the distance, ascending).
     fn apply_vector_call(&self, table: Table, vc: &VectorCallClause) -> Result<Table> {
-        let desc = self
+        let (ord, desc) = self
             .gen
             .manifest()
             .vector_indexes
             .iter()
-            .find(|d| d.label == vc.label && d.property == vc.property)
+            .enumerate()
+            .find(|(_, d)| d.label == vc.label && d.property == vc.property)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "no vector index on (:{} {{{}}}) — db.idx.vector.queryNodes needs one",
@@ -3656,7 +3657,9 @@ impl<'g> Engine<'g> {
                 )
             })?;
         // Capture the small descriptor bits so the per-row loop does not hold the
-        // manifest borrow (it also calls `self` methods to read candidates).
+        // manifest borrow (it also calls `self` methods to read candidates). `ord`
+        // (the index's position) keys its resident matrix in the vector-index pool.
+        let ord = ord as u32;
         let metric = desc.metric;
         let dim = desc.dim as usize;
         let first_record = desc.first_record;
@@ -3673,11 +3676,28 @@ impl<'g> Engine<'g> {
         let mut out_cols = table.cols.clone();
         out_cols.extend(new_vars.iter().cloned());
 
-        // The brute-force arm reads the whole index group once, up front; the
+        // The brute-force arm prefers the resident, pre-decoded matrix (decode +
+        // normalize once per generation, then scan resident memory — no per-query
+        // gather/allocation). It falls back to the up-front gather when no vector
+        // pool is wired or the matrix would not fit the vector-index budget. The
         // Vamana arm navigates per query and reads nothing here.
-        let entries = match mode {
-            AnnMode::BruteForce => Some(self.vector_group(first_record, count)?),
-            AnnMode::Vamana { .. } => None,
+        let matrix = match (&mode, self.vec_cache) {
+            (AnnMode::BruteForce, Some(pool)) => {
+                let expected = count as usize * dim * std::mem::size_of::<f32>()
+                    + count as usize * std::mem::size_of::<u64>();
+                pool.matrix_or(self.gen.uuid(), ord, expected, || {
+                    vector::ResidentMatrix::from_entries(
+                        dim,
+                        metric,
+                        self.vector_group(first_record, count)?,
+                    )
+                })?
+            }
+            _ => None,
+        };
+        let entries = match (&mode, &matrix) {
+            (AnnMode::BruteForce, None) => Some(self.vector_group(first_record, count)?),
+            _ => None,
         };
 
         let mut out_rows = Vec::new();
@@ -3705,14 +3725,23 @@ impl<'g> Engine<'g> {
             // brute force scans every candidate exactly; Vamana navigates by PQ in
             // resident memory and re-ranks the beam exactly (D32).
             let neighbours = match &mode {
-                AnnMode::BruteForce => vector::brute_force_knn_par(
-                    self.fanout_pool.as_deref(),
-                    entries.as_ref().unwrap(),
-                    &query,
-                    k,
-                    metric,
-                    KNN_PAR_MIN,
-                )?,
+                AnnMode::BruteForce => match &matrix {
+                    Some(m) => vector::brute_force_knn_matrix_par(
+                        self.fanout_pool.as_deref(),
+                        m,
+                        &query,
+                        k,
+                        KNN_PAR_MIN,
+                    )?,
+                    None => vector::brute_force_knn_par(
+                        self.fanout_pool.as_deref(),
+                        entries.as_ref().unwrap(),
+                        &query,
+                        k,
+                        metric,
+                        KNN_PAR_MIN,
+                    )?,
+                },
                 AnnMode::Vamana { medoid, .. } => {
                     self.vamana_knn(&vc.label, &vc.property, *medoid, metric, &query, k)?
                 }

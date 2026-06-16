@@ -22,7 +22,7 @@
   "requireAclStamp": true,
   "cache": {
     "blockCacheBytes": 67108864,
-    "vectorCacheBytes": 33554432,
+    "vectorCacheBytes": 67108864,
     "resultCacheBytes": 16777216
   },
   "vectorIndexPins": [],

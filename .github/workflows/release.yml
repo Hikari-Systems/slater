@@ -151,10 +151,16 @@ jobs:
       matrix:
         platform: [amd64, arm64]
         include:
+          # `rustflags` tunes the hot vector-kNN kernel's codegen per arch. amd64's
+          # baseline is only SSE2, so bump to x86-64-v3 for AVX2+FMA (raises the CPU
+          # floor to Haswell, 2013+). aarch64 already mandates NEON at baseline, so
+          # no flag is needed there.
           - platform: amd64
             runner: blacksmith-2vcpu-ubuntu-2404
+            rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
+            rustflags: ""
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -179,6 +185,8 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.platform }}
+          build-args: |
+            RUSTFLAGS=${{ matrix.rustflags }}
           outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }},push-by-digest=true,push=true
 
       - name: Export digest

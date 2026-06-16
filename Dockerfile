@@ -12,6 +12,15 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
+# Per-arch codegen tuning for the hot vector-kNN dot kernel, supplied by the
+# release workflow's build matrix (amd64 → `-Ctarget-cpu=x86-64-v3` for AVX2+FMA;
+# arm64 → empty, since aarch64 already mandates NEON at baseline). Promoted to an
+# env so it applies to BOTH the dependency-cache build and the real build below.
+# Default empty → a portable baseline build for local `docker build` without the
+# arg. Note: `x86-64-v3` raises the amd64 CPU floor to Haswell (2013+).
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=$RUSTFLAGS
+
 # Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
 # C/C++ toolchain (clang), and libclang for its bindgen step. Without these the
 # rustls/aws-lc-rs build fails. `git` is already present in rust:1-bookworm and is

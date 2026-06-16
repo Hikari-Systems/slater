@@ -322,9 +322,9 @@ impl Graphs {
             vector_cache.pin(new_gen.uuid(), vi.ord, vi.pq.clone());
         }
         *slot.write().unwrap() = new_gen.clone();
-        for vi in live.vamana_indexes() {
-            vector_cache.unpin(live.uuid(), vi.ord);
-        }
+        // Free the retired generation's whole resident set — pinned PQ codes *and*
+        // lazily-built brute-force matrices — so it does not linger past the swap.
+        vector_cache.unpin_generation(live.uuid());
         Ok(Some(new_gen.uuid()))
     }
 }

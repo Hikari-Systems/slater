@@ -2,8 +2,9 @@
 """Bench one engine's uncached kNN-vector latency over the eu_ai_act graph.
 
 eu_ai_act (20,766 nodes / 44,790 edges) carries 15,238 1024-dim fp32 embeddings
-(Concept + Chunk), 54.8 MiB of vectors — larger than slater's default 32 MiB vector
-cache, so this is the run where "vectors don't all fit in cache" actually bites.
+(Concept + Chunk), 54.8 MiB of vectors. slater serves kNN from a resident,
+pre-normalised matrix in its vector cache (default 64 MiB, sized to fit this estate);
+shrinking that budget below a group falls back to a per-query gather (see README sweep).
 
 The metric is the same as the MeSH/pole suites — uncached median latency, fresh query
 vector every call (no result-cache hit) — but the query type is approximate-NN search

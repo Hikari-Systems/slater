@@ -33,6 +33,8 @@ use graph_format::blockfile::{record_range_in_block, BlockFileReader};
 use graph_format::ids::Generation as GenId;
 use graph_format::pq::ResidentPq;
 
+use crate::vector::ResidentMatrix;
+
 /// A record sliced out of a cached, decompressed block. Holds an `Arc` clone of the
 /// block so the borrowed bytes stay alive, plus the record's byte range within it.
 ///
@@ -580,8 +582,15 @@ struct VecInner {
     /// their bytes are charged against the budget so the pool stays bounded.
     pinned: HashMap<(u128, u32), Arc<ResidentPq>>,
     pinned_bytes: usize,
+    /// Resident, pre-decoded brute-force vector matrices per `(gen, ord)`. Like the
+    /// pinned PQ codes these are never evicted while their generation is live (the
+    /// no-gather kNN path scans them directly), but their bytes are charged against
+    /// the budget so the pool stays bounded; installed only when they fit (else the
+    /// caller falls back to the per-query gather path).
+    matrices: HashMap<(u128, u32), Arc<ResidentMatrix>>,
+    matrix_bytes: usize,
     /// The 1–2 MiB Vamana block LRU (decompressed), sharing the budget with the
-    /// pinned PQ codes.
+    /// pinned PQ codes and resident matrices.
     blocks: HashMap<VectorBlockKey, Entry>,
     order: BTreeMap<u64, VectorBlockKey>,
     tick: u64,
@@ -633,7 +642,9 @@ impl VecInner {
     /// evicted — it is the resident navigation set).
     fn evict_to_budget(&mut self) -> u64 {
         let mut evicted = 0;
-        while self.pinned_bytes + self.block_bytes > self.budget && self.order.len() > 1 {
+        while self.pinned_bytes + self.matrix_bytes + self.block_bytes > self.budget
+            && self.order.len() > 1
+        {
             let (&lru_tick, &lru_key) = self.order.iter().next().unwrap();
             self.order.remove(&lru_tick);
             if let Some(e) = self.blocks.remove(&lru_key) {
@@ -684,6 +695,8 @@ impl VectorIndexCache {
             inner: Mutex::new(VecInner {
                 pinned: HashMap::new(),
                 pinned_bytes: 0,
+                matrices: HashMap::new(),
+                matrix_bytes: 0,
                 blocks: HashMap::new(),
                 order: BTreeMap::new(),
                 tick: 0,
@@ -730,6 +743,84 @@ impl VectorIndexCache {
             .pinned
             .get(&(gen.0.as_u128(), ord))
             .cloned()
+    }
+
+    /// Return the resident brute-force matrix for `(gen, ord)`, building + installing
+    /// it on a miss — but only if its footprint (`expected_bytes`, computed by the
+    /// caller from `count·dim`) fits the remaining budget. Returns `Ok(None)` when it
+    /// will not fit, so the caller transparently falls back to the per-query gather
+    /// path and the pool's hard byte bound is never exceeded. `build` runs outside the
+    /// lock (it does the one-time decode); a concurrent builder that installed first
+    /// wins and its matrix is returned.
+    pub fn matrix_or(
+        &self,
+        gen: GenId,
+        ord: u32,
+        expected_bytes: usize,
+        build: impl FnOnce() -> Result<ResidentMatrix>,
+    ) -> Result<Option<Arc<ResidentMatrix>>> {
+        let key = (gen.0.as_u128(), ord);
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(m) = inner.matrices.get(&key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(m.clone()));
+            }
+            // Reject before paying the decode if it cannot fit even with every
+            // evictable block gone (pinned PQ + resident matrices are not evictable).
+            if inner.pinned_bytes + inner.matrix_bytes + expected_bytes > inner.budget {
+                return Ok(None);
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let matrix = Arc::new(build()?);
+        let bytes = matrix.resident_bytes();
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(m) = inner.matrices.get(&key) {
+            return Ok(Some(m.clone())); // lost a race; use the installed one
+        }
+        // Re-check fit against the actual footprint (the estimate could be low).
+        if inner.pinned_bytes + inner.matrix_bytes + bytes > inner.budget {
+            return Ok(None);
+        }
+        inner.matrices.insert(key, matrix.clone());
+        inner.matrix_bytes += bytes;
+        let evicted = inner.evict_to_budget();
+        drop(inner);
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+        }
+        Ok(Some(matrix))
+    }
+
+    /// Drop every pinned PQ entry and resident matrix belonging to generation `gen`
+    /// (called on generation swap, so the retired generation's resident set frees
+    /// promptly rather than waiting on the last in-flight query's `Arc`).
+    pub fn unpin_generation(&self, gen: GenId) {
+        let g = gen.0.as_u128();
+        let mut inner = self.inner.lock().unwrap();
+        let pinned: Vec<_> = inner
+            .pinned
+            .keys()
+            .filter(|(u, _)| *u == g)
+            .copied()
+            .collect();
+        for key in pinned {
+            if let Some(old) = inner.pinned.remove(&key) {
+                inner.pinned_bytes -= old.resident_bytes();
+            }
+        }
+        let mats: Vec<_> = inner
+            .matrices
+            .keys()
+            .filter(|(u, _)| *u == g)
+            .copied()
+            .collect();
+        for key in mats {
+            if let Some(old) = inner.matrices.remove(&key) {
+                inner.matrix_bytes -= old.resident_bytes();
+            }
+        }
     }
 
     /// Fetch a Vamana block, loading it with `load` on a miss (outside the lock).
@@ -792,10 +883,10 @@ impl VectorIndexCache {
         }
     }
 
-    /// Current resident byte usage: pinned PQ codes + cached blocks.
+    /// Current resident byte usage: pinned PQ codes + resident matrices + cached blocks.
     pub fn bytes(&self) -> usize {
         let inner = self.inner.lock().unwrap();
-        inner.pinned_bytes + inner.block_bytes
+        inner.pinned_bytes + inner.matrix_bytes + inner.block_bytes
     }
 
     /// Number of cached blocks (excludes pinned PQ entries).

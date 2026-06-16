@@ -21,8 +21,18 @@ RSS is the container cgroup: **anon** = heap/working set (the honest engine foot
 | | **peak anon / total** | 11 / 22 | 18 / 29 |
 | **MeSH** 341k/469k | count / 2-hop / group-by / DISTINCT / 3-hop | 0.55 · 34.1 · 23.0 · 22.5 · 9.7 | 0.54 · 34.4 · 23.5 · 23.3 · 9.8 |
 | | **peak anon / total** | 63 / 69 | 63 / 94 |
-| **EU-AI-Act** 21k/45k+vec | kNN-10/50/chunk · kNN+1hop · point | 21.3 · 23.4 · 10.3 · 25.6 · 1.02 | 17.5 · 18.4 · 10.1 · 19.6 · 1.20 |
-| | **peak anon / total** | 99 / 121 | 115 / 160 |
+| **EU-AI-Act** 21k/45k+vec | kNN-10/50/chunk · kNN+1hop · point | 3.13 · 3.35 · 2.20 · 2.71 · 1.02 | ≈fan=1 † |
+| | **peak RSS (VmHWM)** | ~156 (incl. resident matrix) | |
+
+> **v0.9.x vector update (2026-06-16):** the EU-AI-Act kNN row reflects the SIMD distance
+> kernel + resident pre-normalised matrix (`vectorCacheBytes` raised 32→64 MiB so the
+> 54.8 MiB estate fits). kNN-10 Concept 21.3 → **3.13 ms** (~7×), chunk 10.3 → **2.20**,
+> kNN+1hop 25.6 → **2.71**. Measured slater-only, 5 restart cycles, mean of medians, on
+> the same box. Peak process RSS rose 99 → **~156 MiB** (the resident matrix is held for
+> the generation's life; still the smallest of the cross-engine field). † The matrix scan
+> is ~fanout-insensitive at this group size (the per-query gather that fanout used to hide
+> is gone), so fanout=8 ≈ fanout=1 here; the precise anon/total cgroup split wants a full
+> `run_bench_hs.sh` re-run.
 | **Wikidata-1M** | count/point/degree/1h/2h/3h · varlen · sp≤6 | 0.54·1.73·1.75·2.09·2.49·2.61 · 2.08 · 2.04 | 0.57·1.89·2.04·1.92·2.83·2.71 · 1.96 · 2.05 |
 | | **peak anon / total** | 335 / 568 | 462 / 633 |
 | **Wikidata-91.6M** | count/point/degree/1h | 0.56·1.53·1.75·3.43 | 0.56·1.60·1.93·3.99 |
@@ -46,7 +56,9 @@ RSS is the container cgroup: **anon** = heap/working set (the honest engine foot
 
 Helps the **cold, disk-bound, large-working-set** shapes; flat on small/warm ones:
 - 91.6M **shortestPath ≤6**: 307 → **76 ms** (4×). **3-hop count**: 547 → **298 ms** (1.8×).
-  **kNN-10**: 21.3 → 17.5 ms. **var-length**: 7.6 → 5.5 ms.
+  **var-length**: 7.6 → 5.5 ms. (kNN-10 was 21.3 → 17.5 ms when fanout parallelised the
+  per-query vector *gather*; the v0.9.x resident matrix removes that gather, so kNN is now
+  ~3 ms and fanout-insensitive at this scale.)
 - Costs more anon (parallel worker buffers): 91.6M 3-hop count anon 661 → 1,912 MiB.
 - pole/MeSH/EU/wiki-1M: within noise (working set already small/cached).
 

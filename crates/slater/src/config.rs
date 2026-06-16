@@ -459,7 +459,13 @@ fn default_block_cache() -> usize {
     64 * 1024 * 1024
 }
 fn default_vector_cache() -> usize {
-    32 * 1024 * 1024
+    // Sized to hold a typical brute-force estate's resident, pre-decoded vector
+    // matrices (the no-gather kNN path) as well as Vamana PQ codes. It is a *cap*,
+    // not a reservation — empty for deployments without vector indexes — and the
+    // matrix path falls back to the per-query gather when a group does not fit, so
+    // the bound is never exceeded. With block (64 MiB) + result (16 MiB) this keeps
+    // the default envelope at ~144 MiB, inside the 100–200 MiB target.
+    64 * 1024 * 1024
 }
 fn default_result_cache() -> usize {
     16 * 1024 * 1024

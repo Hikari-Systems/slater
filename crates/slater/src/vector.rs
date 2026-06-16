@@ -23,8 +23,12 @@
 // score are broken by ascending node id so a query is deterministic.
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use anyhow::{bail, Result};
 use rayon::prelude::*;
+use wide::f32x8;
 
 use graph_format::manifest::Metric;
 use graph_format::vectors::VectorEntry;
@@ -105,19 +109,197 @@ pub fn distance(metric: Metric, query: &[f32], candidate: &[f32]) -> f64 {
     }
 }
 
+// ── Fast scoring kernels ─────────────────────────────────────────────────────
+//
+// The brute-force scan is compute-bound on the per-candidate distance over
+// 1024-dim vectors, so the kernels below vectorize it with explicit SIMD
+// (`wide::f32x8`) and accumulate in f32 — guaranteed vectorization regardless of
+// the `opt-level = "s"` release profile's (largely absent) autovectorization, and
+// half the data width of the f64 reference in [`cosine_similarity`] et al. The
+// f64 reference functions above are kept verbatim as the *exact* contract used by
+// the `similarity()`/`*Distance()` Cypher builtins and the Vamana re-rank; these
+// kernels are the **ordering** path (kNN selection), where an f32 reduction error
+// in the ~6th–7th significant digit is invisible at the 3-decimal score contract
+// but lets the scan run several times faster. The reduction order is fixed (lane
+// count + in-order chunking), so results are deterministic run-to-run.
+
+/// `a·b` over equal-length slices, f32 SIMD with a scalar tail.
+#[inline]
+fn dot_simd(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = f32x8::ZERO;
+    let mut ar = a.chunks_exact(8);
+    let mut br = b.chunks_exact(8);
+    for (ac, bc) in ar.by_ref().zip(br.by_ref()) {
+        let av = f32x8::from(<[f32; 8]>::try_from(ac).unwrap());
+        let bv = f32x8::from(<[f32; 8]>::try_from(bc).unwrap());
+        acc = av.mul_add(bv, acc);
+    }
+    let mut sum = acc.reduce_add();
+    for (x, y) in ar.remainder().iter().zip(br.remainder()) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// One fused SIMD pass returning `(q·v, v·v)` — the dot product and the
+/// candidate's squared norm, so cosine needs a single sweep over `v`.
+#[inline]
+fn dot_and_norm2(q: &[f32], v: &[f32]) -> (f32, f32) {
+    let mut accd = f32x8::ZERO;
+    let mut accn = f32x8::ZERO;
+    let mut qr = q.chunks_exact(8);
+    let mut vr = v.chunks_exact(8);
+    for (qc, vc) in qr.by_ref().zip(vr.by_ref()) {
+        let qv = f32x8::from(<[f32; 8]>::try_from(qc).unwrap());
+        let vv = f32x8::from(<[f32; 8]>::try_from(vc).unwrap());
+        accd = qv.mul_add(vv, accd);
+        accn = vv.mul_add(vv, accn);
+    }
+    let (mut d, mut n) = (accd.reduce_add(), accn.reduce_add());
+    for (x, y) in qr.remainder().iter().zip(vr.remainder()) {
+        d += x * y;
+        n += y * y;
+    }
+    (d, n)
+}
+
+/// Squared Euclidean distance `Σ(q-v)²`, f32 SIMD with a scalar tail. Monotonic in
+/// the true L2 distance (same ordering as the f64 reference's `Metric::L2`).
+#[inline]
+fn l2_sq_simd(q: &[f32], v: &[f32]) -> f32 {
+    let mut acc = f32x8::ZERO;
+    let mut qr = q.chunks_exact(8);
+    let mut vr = v.chunks_exact(8);
+    for (qc, vc) in qr.by_ref().zip(vr.by_ref()) {
+        let qv = f32x8::from(<[f32; 8]>::try_from(qc).unwrap());
+        let vv = f32x8::from(<[f32; 8]>::try_from(vc).unwrap());
+        let d = qv - vv;
+        acc = d.mul_add(d, acc);
+    }
+    let mut sum = acc.reduce_add();
+    for (x, y) in qr.remainder().iter().zip(vr.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
+}
+
+/// The ascending distance score under `metric` for `query` vs `candidate`, using
+/// the fast f32 kernels. `query_norm` is `|query|` (hoisted once per query — it is
+/// constant across all candidates, so the reference's per-candidate recompute is
+/// pure waste). Same contract as [`distance`], at f32-reduction precision.
+#[inline]
+fn score_fast(metric: Metric, query: &[f32], query_norm: f64, candidate: &[f32]) -> f64 {
+    match metric {
+        Metric::Cosine => {
+            let (dot, vn2) = dot_and_norm2(query, candidate);
+            // Zero-norm vector has no direction → similarity 0 → distance 1
+            // (mirrors [`cosine_similarity`]'s defined-as-0 behaviour).
+            if query_norm == 0.0 || vn2 == 0.0 {
+                return 1.0;
+            }
+            let sim = dot as f64 / (query_norm * (vn2 as f64).sqrt());
+            1.0 - sim
+        }
+        Metric::Dot => -(dot_simd(query, candidate) as f64),
+        Metric::L2 => l2_sq_simd(query, candidate) as f64,
+    }
+}
+
+/// `|query|` for the cosine path (f64 sum for stability; once per query). Returns
+/// `0.0` for the other metrics, which don't use it.
+#[inline]
+fn query_norm_for(metric: Metric, query: &[f32]) -> f64 {
+    match metric {
+        Metric::Cosine => query
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt(),
+        _ => 0.0,
+    }
+}
+
+/// A bounded top-`k` collector: keeps only the `k` lowest-distance neighbours in a
+/// `k`-capped max-heap (the worst sits at the top, ready to be evicted), so the
+/// scan is O(N log k) and allocates `O(k)` instead of sorting all N. The heap
+/// order is the exact `(score asc, node_id asc)` contract, so `into_sorted`
+/// returns the same deterministic ascending list the old full sort produced.
+struct TopK {
+    k: usize,
+    heap: BinaryHeap<HeapItem>,
+}
+
+#[derive(PartialEq)]
+struct HeapItem {
+    score: f64,
+    node_id: u64,
+}
+impl Eq for HeapItem {}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl TopK {
+    fn new(k: usize) -> Self {
+        TopK {
+            k,
+            heap: BinaryHeap::with_capacity(k.saturating_add(1).min(1 << 16)),
+        }
+    }
+    #[inline]
+    fn push(&mut self, node_id: u64, score: f64) {
+        if self.k == 0 {
+            return;
+        }
+        let item = HeapItem { score, node_id };
+        if self.heap.len() < self.k {
+            self.heap.push(item);
+        } else if let Some(worst) = self.heap.peek() {
+            // Strictly better than the current worst → it takes its place.
+            if item < *worst {
+                self.heap.pop();
+                self.heap.push(item);
+            }
+        }
+    }
+    fn into_sorted(self) -> Vec<Neighbour> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|h| Neighbour {
+                node_id: h.node_id,
+                score: h.score,
+            })
+            .collect()
+    }
+}
+
 /// Brute-force `k`-nearest-neighbour scan over a vector index group.
 ///
 /// Every entry must have the same dimensionality as `query` (the store is
 /// self-describing about `dim`, so a mismatch is a hard error rather than a
 /// silently-wrong score). Returns the `k` lowest-distance neighbours, ascending
-/// by score then by node id; fewer than `k` if the group is smaller.
+/// by score then by node id; fewer than `k` if the group is smaller. Scoring uses
+/// the fast f32 SIMD kernels and a bounded top-`k` heap (see [`score_fast`] /
+/// [`TopK`]).
 pub fn brute_force_knn(
     entries: &[VectorEntry],
     query: &[f32],
     k: usize,
     metric: Metric,
 ) -> Result<Vec<Neighbour>> {
-    let mut scored = Vec::with_capacity(entries.len());
+    let query_norm = query_norm_for(metric, query);
+    let mut topk = TopK::new(k);
     for e in entries {
         if e.vector.len() != query.len() {
             bail!(
@@ -127,19 +309,9 @@ pub fn brute_force_knn(
                 e.vector.len()
             );
         }
-        scored.push(Neighbour {
-            node_id: e.node_id,
-            score: distance(metric, query, &e.vector),
-        });
+        topk.push(e.node_id, score_fast(metric, query, query_norm, &e.vector));
     }
-    // Ascending by distance, ties broken by node id for a deterministic result.
-    scored.sort_by(|a, b| {
-        a.score
-            .total_cmp(&b.score)
-            .then_with(|| a.node_id.cmp(&b.node_id))
-    });
-    scored.truncate(k);
-    Ok(scored)
+    Ok(topk.into_sorted())
 }
 
 /// Parallel brute-force kNN over a vector index group — identical contract and result
@@ -175,15 +347,207 @@ pub fn brute_force_knn_par(
             .map(|c| brute_force_knn(c, query, k, metric))
             .collect::<Result<Vec<_>>>()
     })?;
-    // Merge the per-chunk top-k lists with the global comparator, then keep the best k.
-    let mut merged: Vec<Neighbour> = partials.into_iter().flatten().collect();
-    merged.sort_by(|a, b| {
-        a.score
-            .total_cmp(&b.score)
-            .then_with(|| a.node_id.cmp(&b.node_id))
+    // Merge the per-chunk top-k lists into one bounded top-k. The global k-smallest
+    // are a subset of the union of the per-chunk k-smallest, so this yields the
+    // exact same ordered list as the sequential scan (scores are per-candidate, so
+    // chunking cannot change them; the `(score, node_id)` order is a total order).
+    let mut merged = TopK::new(k);
+    for n in partials.into_iter().flatten() {
+        merged.push(n.node_id, n.score);
+    }
+    Ok(merged.into_sorted())
+}
+
+// ── Resident pre-decoded matrix (the no-gather kNN path) ─────────────────────
+//
+// The [`brute_force_knn`] path above takes `&[VectorEntry]` — a slice the caller
+// gathers per query by reading + decoding every record through the block cache,
+// allocating a fresh `Vec<f32>` per vector (tens of MiB of alloc churn per query
+// for a 10k-vector group). [`ResidentMatrix`] instead holds the whole index group
+// **decoded once** into one contiguous row-major buffer (unit-normalized up front
+// for cosine, so scoring is a single dot product), so repeat queries scan resident
+// memory with no gather, no allocation, and no per-row pointer chasing. It lives in
+// the vector-index pool, charged to `vector_cache_bytes` (see [`crate::cache`]).
+
+/// A whole vector index group decoded once into a contiguous, row-major f32 matrix
+/// (`rows × dim`), with `node_ids[i]` the dense id of row `i`. For [`Metric::Cosine`]
+/// every row is L2-normalized to unit length, so the cosine distance to a (likewise
+/// normalized) query is `1 - dot`. Built once per `(generation, index)` and reused.
+pub struct ResidentMatrix {
+    pub dim: usize,
+    pub metric: Metric,
+    pub node_ids: Vec<u64>,
+    /// Row-major `node_ids.len() * dim`. Unit-normalized rows when `metric == Cosine`.
+    pub data: Vec<f32>,
+}
+
+impl ResidentMatrix {
+    /// Decode an index group (one [`VectorEntry`] per row) into the contiguous,
+    /// (for cosine) unit-normalized matrix. Errors if any row's dimension differs.
+    pub fn from_entries(dim: usize, metric: Metric, entries: Vec<VectorEntry>) -> Result<Self> {
+        let mut node_ids = Vec::with_capacity(entries.len());
+        let mut data = Vec::with_capacity(entries.len() * dim);
+        for e in entries {
+            if e.vector.len() != dim {
+                bail!(
+                    "indexed node {} has dimension {} but the index is {}-dimensional",
+                    e.node_id,
+                    e.vector.len(),
+                    dim
+                );
+            }
+            node_ids.push(e.node_id);
+            if metric == Metric::Cosine {
+                let norm = e
+                    .vector
+                    .iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                if norm > 0.0 {
+                    let inv = (1.0 / norm) as f32;
+                    data.extend(e.vector.iter().map(|x| x * inv));
+                } else {
+                    data.extend_from_slice(&e.vector); // zero stays zero (sim 0 → dist 1)
+                }
+            } else {
+                data.extend_from_slice(&e.vector);
+            }
+        }
+        Ok(Self {
+            dim,
+            metric,
+            node_ids,
+            data,
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.node_ids.len()
+    }
+
+    /// Resident footprint charged against the vector-index budget.
+    pub fn resident_bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<f32>()
+            + self.node_ids.len() * std::mem::size_of::<u64>()
+            + std::mem::size_of::<Self>()
+    }
+}
+
+/// A query prepared once for a whole matrix scan: for cosine, the unit-normalized
+/// query (or a flag that the query is zero-norm); for L2/Dot, the raw query.
+enum PreparedQuery<'a> {
+    CosineUnit(Vec<f32>),
+    CosineZero,
+    Raw(&'a [f32]),
+}
+
+impl PreparedQuery<'_> {
+    fn prepare(metric: Metric, query: &[f32]) -> PreparedQuery<'_> {
+        match metric {
+            Metric::Cosine => {
+                let n = query
+                    .iter()
+                    .map(|x| (*x as f64) * (*x as f64))
+                    .sum::<f64>()
+                    .sqrt();
+                if n == 0.0 {
+                    PreparedQuery::CosineZero
+                } else {
+                    let inv = (1.0 / n) as f32;
+                    PreparedQuery::CosineUnit(query.iter().map(|x| x * inv).collect())
+                }
+            }
+            _ => PreparedQuery::Raw(query),
+        }
+    }
+}
+
+/// Score matrix rows `[start, end)` against the prepared query into a bounded top-k.
+fn scan_matrix_range(
+    m: &ResidentMatrix,
+    pq: &PreparedQuery,
+    metric: Metric,
+    start: usize,
+    end: usize,
+    k: usize,
+) -> TopK {
+    let mut topk = TopK::new(k);
+    for i in start..end {
+        let row = &m.data[i * m.dim..(i + 1) * m.dim];
+        let score = match pq {
+            // Rows are unit-normalized, so cosine distance is `1 - dot`.
+            PreparedQuery::CosineUnit(q) => 1.0 - dot_simd(q, row) as f64,
+            PreparedQuery::CosineZero => 1.0,
+            PreparedQuery::Raw(q) => match metric {
+                Metric::L2 => l2_sq_simd(q, row) as f64,
+                Metric::Dot => -(dot_simd(q, row) as f64),
+                Metric::Cosine => unreachable!("cosine uses CosineUnit/CosineZero"),
+            },
+        };
+        topk.push(m.node_ids[i], score);
+    }
+    topk
+}
+
+/// Brute-force kNN over a [`ResidentMatrix`] — same contract and result as
+/// [`brute_force_knn`] (ascending by score then node id), but scanning the resident
+/// contiguous matrix instead of a gathered `&[VectorEntry]`.
+pub fn brute_force_knn_matrix(
+    m: &ResidentMatrix,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<Neighbour>> {
+    if query.len() != m.dim {
+        bail!(
+            "query vector has dimension {} but the index is {}-dimensional",
+            query.len(),
+            m.dim
+        );
+    }
+    let pq = PreparedQuery::prepare(m.metric, query);
+    Ok(scan_matrix_range(m, &pq, m.metric, 0, m.rows(), k).into_sorted())
+}
+
+/// Parallel [`brute_force_knn_matrix`] — identical result, chunked one range per
+/// worker (scores are per-row, so the merged top-k matches the sequential scan).
+pub fn brute_force_knn_matrix_par(
+    pool: Option<&rayon::ThreadPool>,
+    m: &ResidentMatrix,
+    query: &[f32],
+    k: usize,
+    min_par: usize,
+) -> Result<Vec<Neighbour>> {
+    if query.len() != m.dim {
+        bail!(
+            "query vector has dimension {} but the index is {}-dimensional",
+            query.len(),
+            m.dim
+        );
+    }
+    let n = m.rows();
+    let pool = match pool {
+        Some(p) if k > 0 && n >= min_par => p,
+        _ => return brute_force_knn_matrix(m, query, k),
+    };
+    let pq = PreparedQuery::prepare(m.metric, query);
+    let metric = m.metric;
+    let chunk = n.div_ceil(pool.current_num_threads().max(1)).max(1);
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .step_by(chunk)
+        .map(|s| (s, (s + chunk).min(n)))
+        .collect();
+    let partials: Vec<Vec<Neighbour>> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, e)| scan_matrix_range(m, &pq, metric, s, e, k).into_sorted())
+            .collect()
     });
-    merged.truncate(k);
-    Ok(merged)
+    let mut merged = TopK::new(k);
+    for nb in partials.into_iter().flatten() {
+        merged.push(nb.node_id, nb.score);
+    }
+    Ok(merged.into_sorted())
 }
 
 #[cfg(test)]
@@ -247,8 +611,12 @@ mod tests {
             got.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             reference.iter().map(|n| n.node_id).collect::<Vec<_>>()
         );
+        // The kNN path scores with the fast f32 SIMD kernel, so it tracks the f64
+        // reference to ~1e-5, not bit-for-bit (the f64 reference itself is asserted
+        // to 1e-12 in `cosine_similarity_matches_hand_computation`). This is well
+        // inside the 3-decimal score contract.
         for (g, r) in got.iter().zip(&reference) {
-            assert!((g.score - r.score).abs() < 1e-12, "score {g:?} vs {r:?}");
+            assert!((g.score - r.score).abs() < 1e-5, "score {g:?} vs {r:?}");
         }
         // Sanity: node 3 (smallest angle to +x) is closest, then node 1; node 2
         // (orthogonal) is third and node 0 (-x) is furthest, so it falls outside k=3.
@@ -345,5 +713,54 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.to_string().contains("dimension"), "got: {err}");
+    }
+
+    #[test]
+    fn matrix_knn_matches_entry_scan() {
+        // The resident-matrix path must return the same ordered ids and (to f32
+        // tolerance) the same scores as the gathered `&[VectorEntry]` path, across
+        // metrics and a range of k, including the parallel matrix scan.
+        let entries = spread(1000);
+        let query = [0.3f32, -0.2, 0.8];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let m = ResidentMatrix::from_entries(3, metric, entries.clone()).unwrap();
+            for k in [1usize, 5, 50, 999, 1000, 2000] {
+                let want = brute_force_knn(&entries, &query, k, metric).unwrap();
+                let mat = brute_force_knn_matrix(&m, &query, k).unwrap();
+                let mat_par = brute_force_knn_matrix_par(Some(&pool), &m, &query, k, 1).unwrap();
+                assert_eq!(
+                    mat.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+                    want.iter().map(|n| n.node_id).collect::<Vec<_>>(),
+                    "ids differ, metric {metric:?}, k {k}"
+                );
+                assert_eq!(mat, mat_par, "seq vs par matrix, metric {metric:?}, k {k}");
+                for (g, r) in mat.iter().zip(&want) {
+                    assert!(
+                        (g.score - r.score).abs() < 1e-5,
+                        "score {g:?} vs {r:?}, metric {metric:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_zero_query_and_zero_row_are_maximally_distant() {
+        // Zero-norm query → every distance 1; zero-norm row → that row's distance 1.
+        let entries = vec![entry(0, &[0.0, 0.0]), entry(1, &[1.0, 1.0])];
+        let m = ResidentMatrix::from_entries(2, Metric::Cosine, entries).unwrap();
+        let zero_q = brute_force_knn_matrix(&m, &[0.0, 0.0], 2).unwrap();
+        for n in &zero_q {
+            assert!((n.score - 1.0).abs() < 1e-6, "{n:?}");
+        }
+        let real_q = brute_force_knn_matrix(&m, &[1.0, 1.0], 2).unwrap();
+        // Node 1 (same direction) is closest (~0); node 0 (zero) is distance 1.
+        assert_eq!(real_q[0].node_id, 1);
+        assert!(real_q[0].score < 1e-6);
+        assert!((real_q[1].score - 1.0).abs() < 1e-6);
     }
 }

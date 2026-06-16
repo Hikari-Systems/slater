@@ -26,12 +26,13 @@ graph can't:
   shape that exercises slater's `ANY SHORTEST` global-visited BFS.
 - **EU-AI-Act** — the *vector* case: 15,238 1024-dim embeddings (54.8 MiB; a
   Concept group of 41 MiB + a Chunk group of 18 MiB). Adds a kNN query suite.
-  Note (see the cache sweep below): slater serves kNN today via an **exact
-  brute-force** scan that reads full-precision vectors **through the block cache**
-  (`blockCacheBytes`), *not* the vector cache (`vectorCacheBytes`, which backs the
-  not-yet-active Vamana/PQ path). At the default 64 MiB block budget the 54.8 MiB
-  of vectors fit and stay resident; the interesting behaviour is what happens when
-  you size that budget *below* a vector group.
+  Note (see the cache sweep below): slater serves kNN via an **exact brute-force**
+  scan, but with a SIMD distance kernel over a **resident, pre-normalised vector
+  matrix** held in the vector cache (`vectorCacheBytes`, default raised 32→64 MiB so
+  the 54.8 MiB estate fits) — decoded once, scanned with no per-query gather. If a
+  group does not fit the budget, kNN falls back to reading full-precision vectors
+  **through the block cache** (`blockCacheBytes`); the sweep below shows that fallback
+  regime and what happens when you size a budget *below* a vector group.
 
 Engines are the four from pole — **slater / Neo4j 5 / Memgraph / FalkorDB** — plus
 two more: **ArcadeDB** (multi-model JVM server, openCypher over its Neo4j-Bolt
@@ -449,68 +450,84 @@ HNSW index.
 
 | query | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| kNN top-10 Concept | 22.97 ms | 8.55 ms | 1.85 ms | 1.23 ms | — | 2.80 ms |
-| kNN top-50 Concept | 24.50 ms | 9.47 ms | 2.11 ms | 1.39 ms | — | 2.81 ms |
-| kNN top-10 Chunk | 10.37 ms | 5.71 ms | 1.93 ms | 1.48 ms | — | 3.18 ms |
-| kNN-10 + 1-hop expand | 28.00 ms | 6.29 ms | 1.82 ms | 1.27 ms | — | 9.23 ms |
+| kNN top-10 Concept | 3.13 ms | 8.55 ms | 1.85 ms | 1.23 ms | — | 2.80 ms |
+| kNN top-50 Concept | 3.35 ms | 9.47 ms | 2.11 ms | 1.39 ms | — | 2.81 ms |
+| kNN top-10 Chunk | 2.20 ms | 5.71 ms | 1.93 ms | 1.48 ms | — | 3.18 ms |
+| kNN-10 + 1-hop expand | 2.71 ms | 6.29 ms | 1.82 ms | 1.27 ms | — | 9.23 ms |
 | count all nodes | **0.57 ms 🟢** | 2.85 ms | 1.32 ms | 1.42 ms | 10.15 ms | 1.76 ms |
 | Concept label count | **0.57 ms 🟢** | 2.93 ms | 1.55 ms | 1.01 ms | 0.83 ms | 1.28 ms |
 | point lookup (idx id) | 1.07 ms | 4.16 ms | 0.46 ms | 0.48 ms | 0.81 ms | 1.04 ms |
 
 | resident memory | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| **peak RSS** | **119 MiB 🟢** | 729 MiB | 229 MiB | 312 MiB | 1948 MiB | 286 MiB |
-| steady RSS | 88 MiB 🟢 | 725 MiB | 226 MiB | 283 MiB | 1944 MiB | 286 MiB |
+| **peak RSS** | **156 MiB 🟢** | 729 MiB | 229 MiB | 312 MiB | 1948 MiB | 286 MiB |
+| steady RSS | ~156 MiB 🟢 | 725 MiB | 226 MiB | 283 MiB | 1944 MiB | 286 MiB |
 
-(slater sole-smallest — the next engine, Memgraph at 229 MiB, is ~2× larger. LadybugDB's
-286 MiB is its embedded process `ru_maxrss`, not a server cgroup — see the consistency
-note in *Method*; it includes the Python driver + query-vector pool, so it isn't strictly
-comparable to the server cgroup figures.)
+(slater still sole-smallest — the next engine, Memgraph at 229 MiB, is ~1.5× larger.
+LadybugDB's 286 MiB is its embedded process `ru_maxrss`, not a server cgroup — see the
+consistency note in *Method*; it includes the Python driver + query-vector pool, so it
+isn't strictly comparable to the server cgroup figures.)
 
-slater serves the whole graph at **119 MiB — the smallest of the six, ~6× below
-Neo4j.** At the default 64 MiB block budget its 54.8 MiB of vectors *are* resident
-(they fit), so the kNN gap is **not** paging — it is purely **algorithmic**: slater does
-an exact brute-force O(N) scan (these indexes are below its 50k-vector ANN threshold)
-where the others answer from a resident HNSW, so slater is ~23 ms where FalkorDB is 1.2
-ms. **LadybugDB lands at ~2.8 ms** — it answers from its native disk-based HNSW (between
-Neo4j's ~8.5 ms and Memgraph's ~1.9 ms), i.e. **~8× faster than slater's brute-force** on
-the Concept set, confirming the gap is algorithm, not memory: an ANN index beats an exact
-scan here, at the cost slater pays deliberately to stay bounded and exact. (LadybugDB's
-hybrid kNN→1-hop is 9.3 ms — the graph expansion, not the kNN, dominates that row.) The
-bounded-memory dial shows up only when you size the budget below the vector set — see the
-sweep next.
+slater serves the whole graph at **156 MiB — still the smallest of the six.** It answers
+kNN with an **exact brute-force scan** (these indexes are below its 50k-vector ANN
+threshold), where the others use an approximate resident HNSW — so slater's results are
+exact (recall 1.0) where theirs are approximate. Two optimisations (v0.9.x) closed most of
+the old gap to the HNSW field:
+
+- a **SIMD distance kernel** (`wide::f32x8` dot, f32 accumulation, hoisted query norm,
+  bounded top-k heap), and
+- a **resident, pre-normalised vector matrix** — each index group is decoded + unit-
+  normalised **once** into a contiguous buffer in the vector-index pool, so a query scans
+  resident memory with no per-query gather/allocation (cosine collapses to a single dot).
+
+Together these took Concept top-10 from **~23 ms → ~3.1 ms (~7×)** and Chunk from
+**~10 ms → ~2.2 ms**, so slater now **beats Neo4j and LadybugDB on every kNN shape** and is
+**within ~1.4× of Memgraph**, trailing only FalkorDB — while staying exact. The residual
+gap to FalkorDB/Memgraph is the floor of an exact, memory-bandwidth-bound scan; closing it
+further needs quantisation (the M7 Vamana/PQ path), which trades exactness.
+
+The resident matrix is the **speed-for-memory dial**. It lives in `vectorCacheBytes`
+(default raised 32 → 64 MiB so the 54.8 MiB estate fits), which lifts peak RSS from the
+pre-optimisation **119 MiB → 156 MiB** — still the smallest of the six. It is strictly
+budget-gated: if a group does not fit, kNN transparently falls back to the gather path
+(no bound is ever exceeded). Keeping `vectorCacheBytes` at the old 32 MiB reverts to the
+119 MiB footprint at the SIMD-kernel-only speed (Concept ~10 ms). The opposite dial —
+sizing the budget *below* the vector set to force paging — is shown in the sweep next.
 
 ### Cache-budget sweep (slater only) — and the right knob
 
-Brute-force kNN reads full-precision vectors **through the block cache**
-(`exec.rs` `vector_group`; the test `vector_knn_reads_route_through_the_block_cache`
-asserts it). So the lever for vector residency is **`blockCacheBytes`**, *not*
-`vectorCacheBytes` (the latter backs the not-yet-active Vamana/PQ pool — sweeping
-it leaves brute-force kNN untouched, a trap worth flagging). Sweeping the **block**
-budget below the vector-group sizes (Concept 41 MiB, Chunk 18 MiB):
+The residency lever is now **`vectorCacheBytes`**: when a cosine group fits, it is held
+as the resident, pre-normalised matrix in the `VectorIndexCache` and kNN scans it directly
+(the figures in the table above). Sizing `vectorCacheBytes` below a group disables that
+path for it, and kNN falls back to reading full-precision vectors **through the block
+cache** per query (`exec.rs` `vector_group`; the test
+`vector_knn_reads_route_through_the_block_cache` asserts the fallback path). In that
+fallback regime `blockCacheBytes` becomes the secondary dial, and sweeping it below the
+group sizes (Concept 41 MiB, Chunk 18 MiB) shows the bounded-memory cliff:
 
-| block cache | Concept kNN-10 | Chunk kNN-10 | note |
+| block cache (matrix off) | Concept kNN-10 | Chunk kNN-10 | note |
 |---:|---:|---:|---|
-| 64 MiB (default) | 16.9 ms | 8.6 ms | both groups resident |
+| 64 MiB | 16.9 ms | 8.6 ms | both groups resident in the block LRU |
 | 48 MiB | 16.4 ms | 8.2 ms | Concept (41 MiB) still fits |
 | 40 MiB | 43.6 ms | 8.3 ms | **Concept evicts → re-read/decompress each scan** |
 | 24 MiB | 43.0 ms | 8.2 ms | Concept thrashes, Chunk (18 MiB) still fits |
 | 16 MiB | 42.8 ms | 22.3 ms | **Chunk now evicts too** |
 
-The cliff lands **exactly at each group's working-set size** (Concept ~46 MiB incl.
-graph blocks, Chunk ~22 MiB) — a clean, reproducible signal, not a flat line. This
-**is** the bounded-memory dial: shrink the budget below a vector group and slater
-keeps serving, paying ~2.7× kNN latency (16→44 ms) to re-fetch+re-decompress the
-group per query, while RSS falls. The in-memory engines have no equivalent — they
-hold the whole graph + HNSW resident or they don't run. (Caveat: the 54.8 MiB file
-stays in the host OS page cache, so the degradation here is re-decompression cost,
-not physical-disk I/O; a true disk-bound measurement needs a graph larger than RAM.)
+(These absolute numbers predate the SIMD kernel — they characterise the *shape* of the
+fallback path, not current latency; with the SIMD kernel the gather path is ~2.3× faster,
+e.g. Concept ~10 ms at the 64 MiB block budget. The cliff still lands **exactly at each
+group's working-set size**.) This **is** the bounded-memory dial: shrink the budget below a
+vector group and slater keeps serving, paying re-fetch+re-decompress cost per query while
+RSS falls — the in-memory engines have no equivalent. (Caveat: the 54.8 MiB file stays in
+the host OS page cache, so the degradation is re-decompression cost, not physical-disk I/O;
+a true disk-bound measurement needs a graph larger than RAM.)
 
-Because brute-force vectors share the block LRU with graph reads, a vector-heavy
-deployment should size `blockCacheBytes` ≥ its largest vector group. The dedicated
-`VectorIndexCache` was built to isolate the large-vector path from graph blocks —
-that isolation activates once the Vamana/PQ (M7) path ships and PQ codes (~32×
-smaller than full f32) carry the search.
+So: a vector deployment wanting the fast path sizes `vectorCacheBytes` ≥ its largest cosine
+group (the resident matrix, isolated from graph blocks in the `VectorIndexCache`); one
+trading latency for a smaller footprint shrinks `vectorCacheBytes` below the group (gather
+fallback) and, if it wants to shrink further, `blockCacheBytes` below the group too. The
+M7 Vamana/PQ path will add a third regime: PQ codes (~32× smaller than full f32) resident
+in the same pool, navigated by an ANN search instead of an exact scan.
 
 MeSH (no vectors), block cache 64 → 256 → 512 MiB: latencies and RSS **flat** — its
 hot blocks already fit in the default 64 MiB, so a bigger budget changes nothing.

@@ -8,7 +8,7 @@ resolver = "2"
 members = ["crates/graph-format", "crates/slater-build", "crates/slater"]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
@@ -56,8 +56,18 @@ clap = { version = "4", features = ["derive"] }
 # Parallel query execution (slater).
 rayon = "1"
 
+# Portable explicit SIMD for the brute-force vector-kNN dot kernel (slater). Gives
+# guaranteed vectorization independent of the optimizer's autovectorizer (which the
+# `opt-level = "s"` release profile largely suppresses): SSE2/NEON at each arch's
+# baseline, widening to AVX2 when the x86 image is built with `-Ctarget-cpu=x86-64-v3`.
+wide = "0.7"
+
 # Regular expressions (slater: `=~` operator + `string.*RegEx` functions).
 regex = "1"
+
+# Microbenchmark harness (slater dev-only): the vector-kNN kernel bench. Lean
+# build — no plotters/gnuplot HTML reports, just the `cargo bench` harness.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 # Calendar arithmetic for the temporal value types (slater: date/localtime/
 # localdatetime/duration). `clock` is disabled — Slater never reads the wall
@@ -67,6 +77,15 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [profile.release]
 strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+# Benchmarks must reflect the *deployed* codegen, not cargo's opt-level=3 bench
+# default — the vector-kNN kernel is hot and size-vs-speed (`opt-level`) changes
+# its autovectorization materially. Mirror `release` so `cargo bench` numbers
+# track production. (See `[profile.release.package.slater]` for the hot crate.)
+[profile.bench]
 lto = true
 codegen-units = 1
 opt-level = "s"
