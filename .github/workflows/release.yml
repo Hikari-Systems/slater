@@ -100,6 +100,21 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # Warm-start from the corpus the nightly fuzzer (fuzz-nightly.yml) accumulates
+      # on the default branch — caches created there are restorable from this tag
+      # push, so the gate fuzzes a known-interesting corpus instead of starting from
+      # empty. Restore-only: the nightly owns the saves (a save from this tag ref
+      # would be tag-scoped and unreusable by other refs). The unique run_id key
+      # never hits exactly, so the restore always falls through to the prefix and
+      # picks up the newest nightly save.
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       # `cargo fuzz run` builds just this target before running it, so a build
       # error (a target that no longer matches the API) still fails the leg.
       #

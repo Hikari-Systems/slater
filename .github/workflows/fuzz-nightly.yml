@@ -1,0 +1,114 @@
+name: fuzz-nightly
+
+# Continuous fuzzing of the untrusted-input decoders (the Cypher parser + the
+# Bolt/PackStream decoders — the same targets the release gate runs). This job
+# PERSISTS libFuzzer's coverage corpus in the GitHub Actions cache so coverage
+# accumulates across runs instead of restarting from empty each time; the release
+# gate (release.yml's `fuzz` job) then restores this same corpus for a fast,
+# warm-started regression run.
+#
+# Why nightly + cache, and why it runs here:
+#   * An Actions cache is evicted after 7 days without access. A nightly run
+#     restores the rolling corpus cache every 24h < 7 days, so it never evicts
+#     between (possibly infrequent) releases — without this, two releases >7 days
+#     apart would each fuzz from an empty cache.
+#   * Scheduled workflows always run on the default branch (main), and caches
+#     created on the default branch are restorable from the tag pushes that drive
+#     release.yml — so accumulating here is exactly what the release gate needs.
+#   * runs-on: ubuntu-latest — this repo is public, so GitHub-hosted minutes are
+#     free; no reason to spend the billed Blacksmith runners on a nightly long-run.
+on:
+  schedule:
+    # 04:37 UTC — off the top of the hour to dodge scheduler congestion/delay.
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+# Don't stack nightly runs if one overruns. (matrix.* is not available at the
+# workflow-level concurrency scope, so key on the ref, not the target.)
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The targets fan out one-per-runner across the matrix (as the release gate
+  # does), so they fuzz in parallel and each persists its own corpus.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_query, packstream_decode, chunk_decode]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # Restore the rolling corpus from the most recent prior nightly. The unique
+      # run_id key never collides, so the restore always falls through to the
+      # prefix and picks up the newest save; the first-ever run is a clean miss.
+      - name: Restore fuzz corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      # Longer run than the release gate (15 min vs 5) to grow coverage. `--target`
+      # is pinned to the glibc host for the same reason as in release.yml: the
+      # install-action cargo-fuzz is a musl build and would otherwise compile the
+      # target for musl, which the minimal nightly toolchain has no std for.
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            --target x86_64-unknown-linux-gnu -- \
+            -max_total_time=900 -rss_limit_mb=2048 -max_len=65536
+
+      # Minimise to a coverage-equivalent set so the cached corpus stays small and
+      # the next run starts fast. continue-on-error: a cmin hiccup (e.g. replaying
+      # a crashing input) must not lose the save — worst case we cache the
+      # un-minimised corpus, which is still correct, just larger.
+      - name: Minimise corpus
+        if: always()
+        continue-on-error: true
+        run: |
+          cargo +nightly fuzz cmin "${{ matrix.target }}" \
+            --target x86_64-unknown-linux-gnu
+
+      # Save under a fresh unique key so the immutable cache write always succeeds;
+      # the next run's restore-keys prefix picks this up as the newest entry.
+      # if: always() so a crash still persists the corpus discovered up to it.
+      - name: Save fuzz corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      # On a crash, libFuzzer writes a reproducer under fuzz/artifacts — keep it.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
