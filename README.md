@@ -534,7 +534,10 @@ footprint tracks the *query working set*, not the graph (idle ~16–71 MiB throu
 in-memory trio grows ~linearly and can't load the 766M graph; Neo4j commits a ~2 GiB heap
 regardless of query. († LadybugDB on the bounded shapes only — its hub / var-length /
 shortestPath traversals at 766M need its read pool raised to ≥2 GiB, vs slater's automatic
-`maxIntermediate` cap.)
+`maxIntermediate` cap.) The build-time value→count histograms add negligible resident memory —
+a few KB for a low-cardinality indexed column, and *zero* for unique-key graphs like Wikidata
+(`wikidata_id` exceeds the histogram cardinality cap, so none is stored) — so these figures are
+unchanged by that feature.
 
 ### Latency (median ms) — graph fits in RAM (MeSH, 341k / 469k)
 
