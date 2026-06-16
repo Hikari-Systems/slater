@@ -457,16 +457,14 @@ slater is **sole-fastest on every shape** at a fraction of the RAM — count is 
 
 ### Multi-hop `count(*)` — memory decoupled from result size
 
-Uncapped multi-hop `RETURN count(*)` now counts *during* expansion instead of materialising
-the matched rows. Same hub anchors on the 91.6M graph, `maxIntermediate=20M`, current `main`
-vs v0.8.0:
+Uncapped multi-hop `RETURN count(*)` counts *during* expansion instead of materialising
+the matched rows. Same hub anchors on the 91.6M graph, `maxIntermediate=20M`:
 
 | 3-hop count(*) @ 91.6M | fanout=1 | fanout=8 |
 |---|--:|--:|
-| v0.8.0 — latency / peak working set | 955 ms / **7.7 GiB** | 617 ms / **9.5 GiB** |
-| current — latency / peak working set | **554 ms / 0.66 GiB** | **298 ms / 1.9 GiB** |
+| latency / peak working set | **554 ms / 0.66 GiB** | **298 ms / 1.9 GiB** |
 
-~24× / 5× less memory **and** faster — the count holds O(1) rows. A mega-hub count still trips
+The count holds O(1) rows. A mega-hub count still trips
 `maxIntermediate` on *compute* (adjacency reads), bounded as before. (Per-query parallelism
 `maxFanout` is the latency dial for cold disk-bound shapes — shortestPath ≤6 918→608 ms,
 3-hop count 547→298 ms; `maxFanout=1` is the throughput default.)
@@ -482,7 +480,7 @@ vs v0.8.0:
 | aggregation (group-by / DISTINCT) | **0.5 ms** | LadybugDB 5 ms (columnar) | **slater** (build-time histogram) |
 | kNN | 17–23 ms (exact) | FalkorDB **1.2 ms** (HNSW) | trails (below ANN threshold) |
 | traversal at 91.6M (≫ RAM) | 0.6–53 ms | Neo4j 10–4,000 ms; in-mem can't load | **slater** |
-| multi-hop `count(*)` at scale | 0.3–0.6 GiB | (was 7.7–9.5 GiB pre-pushdown) | **slater**, bounded |
+| multi-hop `count(*)` at scale | 0.3–0.6 GiB | in-memory engines materialise the row set | **slater**, bounded |
 
 Full per-engine tables are in the
 [cross-engine benchmark README](https://github.com/Hikari-Systems/slater/tree/main/perf/cross-engine-hs).
