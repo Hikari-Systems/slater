@@ -350,7 +350,7 @@ secondary-index-less scan that a bigger pool does *not* fix).
 | anon RSS | slater | Neo4j 5 |
 |---|--:|--:|
 | idle | **71 MiB** | 1344 MiB |
-| shortestPath sweep | 700 MiB (fanout 1) · 925 MiB (fanout 8) | **2911 MiB** |
+| shortestPath sweep | **700 MiB (fanout 1) · 925 MiB (fanout 8)** | 2911 MiB |
 
 (Embedded **LadybugDB** has no server cgroup; its `ru_maxrss` on the count/point/degree/
 1-hop shapes is **652 MiB** with the 512 MiB read pool. The heavier shapes need a larger
@@ -398,19 +398,26 @@ the cold 2-hop, and is faster on shortestPath. Notes:
   shortestPath latency is cache-sensitive (slater ranged 53–177 ms across cache states);
   the same-build fanout 1→8 speedup is the stable signal.
 
-**Per-query parallelism on the full graph** (the `maxFanout` track) — same build,
-sequential vs 8-way:
+**Per-query parallelism + count-pushdown on the full graph** (the `maxFanout` track).
+The uncapped multi-hop `RETURN count(*)` shapes now **count during expansion instead of
+materialising the result rows** (the count-pushdown executor change), so their memory is
+decoupled from result size. Isolated A/B on the 91.6M graph, **same hub anchors**,
+`maxIntermediate=20M`, v0.8.0 vs current `main`:
 
-| query (slater) | fanout=1 | fanout=8 | speedup |
-|---|--:|--:|--:|
-| shortestPath ≤6 | 82.6 ms | 52.6 ms | 1.6× |
-| 2-hop count(*) | 127.9 ms | 60.3 ms | 2.1× |
-| 3-hop count(*) | 923.3 ms | 503.3 ms | 1.8× |
+| 3-hop count(*) | fanout=1 | fanout=8 |
+|---|--:|--:|
+| v0.8.0 — latency / peak anon | 955 ms / **7.7 GiB** | 617 ms / **9.5 GiB** |
+| current — latency / peak anon | **554 ms / 0.66 GiB** | **298 ms / 1.9 GiB** |
 
-The `count(*)`-over-expansion rows are the unbounded 2-/3-hop reductions (no `LIMIT`),
-exercising the parallel anchor-scan + expand + count path. Parallelism trades memory for
-latency — the fanout=8 3-hop count's anon working set rises to ~5.2 GiB (8 worker
-frontiers) — but stays bounded and well under the in-memory engines' resident graph.
+The old ~5.2 GiB "worker-frontier" high-water is **gone**: the count holds O(1) rows, so the
+fanout=8 residual (~1.9 GiB) is the **parallel adjacency-read buffers**, not the row set —
+and latency drops too (no per-row alloc/flatten). Charging is unchanged, so a count over a
+mega-hub still trips `maxIntermediate` on *adjacency reads* (compute), bounded as before.
+
+Per-query parallelism still helps the cold disk-bound shapes — shortestPath ≤6 (307→76 ms in
+this fresh run), 3-hop count (547→298 ms) — at the cost of more transient worker memory;
+`maxFanout=1` is the throughput default. Full fresh slater-only numbers (both fanouts, every
+dataset) are in [`perf/PERF_CURRENT_STATUS.md`](../PERF_CURRENT_STATUS.md).
 
 **Bulk build / load** — the irony this whole effort resolved: slater can now *build* a
 graph larger than RAM (the in-memory builder was OOM-killed on this one).

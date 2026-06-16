@@ -493,109 +493,136 @@ the milestone ledger, and the decision log.
 
 ## Performance
 
-`perf/` ships the harnesses behind the headline claim: **resident memory bounded by cache
-budgets, not graph size, at comparable query speed.** One single-client suite, six engines,
-five graphs (62k-node toy → **Wikidata 91.6M nodes / 766M edges**). Each engine is
-**measured in isolation** (all others stopped — so RSS and latency are its own footprint),
-restarted + warmed, median of 25 fresh-parameter calls (result cache always misses), mean
-of 5 runs. slater is the published **v0.8.0** image on default budgets (block 64 + vector 32
-+ result 16 MiB). A correctness-and-footprint check, not a throughput benchmark — one story
-in two regimes: memory stays bounded whether the graph **fits in RAM** or is **far larger**.
+Six engines, one single-client suite, five graphs from a 62k-node toy to **Wikidata
+91.6M nodes / 766M edges**. Each engine is **measured in isolation** (every other container
+stopped — RSS and latency are its own footprint). **slater is current `main`**; the other
+engines are the established cross-engine run (their performance is unchanged). All figures
+are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold = best in
+row.**
 
-**The field** — six engines in three classes; **bold** marks the strongest per row in the
-tables below:
-
-| engine | class | how it bounds memory |
+| engine | class | memory bound |
 |---|---|---|
-| **slater** | disk-backed, paged | `query.maxIntermediate` caps the working set automatically, at any pool size |
-| Neo4j 5 | disk-backed, JVM | 2 GiB heap + off-heap buffers, committed regardless of query |
-| Memgraph · FalkorDB | in-memory | whole graph held resident in RAM |
-| ArcadeDB | in-memory, JVM multi-model | whole graph resident; heaviest footprint |
-| LadybugDB | embedded, columnar (Kùzu) | manually-sized buffer pool that must exceed the query |
+| **slater** | disk-backed, paged | `query.maxIntermediate` caps the working set automatically |
+| Neo4j 5 | disk-backed, JVM | ~2 GiB heap + off-heap, committed regardless of query |
+| Memgraph · FalkorDB | in-memory | whole graph resident in RAM |
+| ArcadeDB | in-memory, JVM | whole graph resident; heaviest |
+| LadybugDB | embedded, columnar | manual buffer pool that must exceed the query |
 
-Only the two **disk-backed** engines — slater and LadybugDB — serve every graph; the
-in-memory trio can't load the 766M graph and ArcadeDB's importer can't finish it.
+The three engines that **page from disk** — slater, Neo4j 5, and LadybugDB — load all five
+graphs. The **in-memory trio** (Memgraph · FalkorDB · ArcadeDB) cannot hold the 766M graph at
+all (it needs ~64–128 GiB resident), and ArcadeDB's importer can't finish it either.
 
-### Memory — bounded as the graph grows ~1,500×
+### Resident memory (MiB) — bounded as the graph grows ~1,500×
 
-Peak RSS while serving (MiB; **bold = lowest**):
+Each figure is **committed working memory** — what the OS cannot reclaim. Every engine *except*
+slater holds its graph in committed anonymous memory (own heap, Neo4j's off-heap page cache, or
+a buffer pool), so its peak RSS *is* its committed footprint. slater alone serves from the
+**reclaimable OS page cache** of its on-disk store, so its figure is the anon working set; the
+store's page cache (evictable under pressure — slater keeps serving) is excluded, and shown as
+*total* in parentheses for the two wiki graphs. **Bold = lowest.**
 
 | graph (nodes / edges) | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| pole — 62k / 106k | **50** | 746 | 114 | 140 | 1,556 | 198 |
-| MeSH — 340k / 469k | 197 | 1,083 | 358 | 455 | 1,631 | **121** |
-| EU-AI-Act — 21k / 45k (+54.8 MiB vec) | **119** | 729 | 229 | 312 | 1,948 | 286 |
-| Wikidata — 1M / 13.8M | **~150** | ~2,330 | 2,716 | 1,506 | 2,247 | ~774 |
-| Wikidata — 91.6M / 766M | **~700** † | ~2,900 | cannot-load | cannot-load | cannot-load | ~652 ‡ |
+| pole — 62k / 106k | **11** | 746 | 114 | 140 | 1,556 | 198 |
+| MeSH — 341k / 469k | **63** | 1,083 | 358 | 455 | 1,631 | 121 |
+| EU-AI-Act — 21k / 45k (+55 MiB vec) | **99** | 729 | 229 | 312 | 1,948 | 286 |
+| Wikidata — 1M / 13.8M | **33** *(295 total)* | ~2,330 | 2,716 | 1,506 | 2,247 | ~774 |
+| Wikidata — 91.6M / 766M | **584** *(4,595 total)* | ~2,900 | cannot-load | cannot-load | cannot-load | ~652 † |
 
-† slater anon high-water (the engine's own footprint; idle ~16–89 MiB at every scale,
-tracking the **query working set**, not the graph). ‡ LadybugDB on the bounded shapes only —
-its hub / var-length / shortestPath traversals at 766M need the read pool raised to ≥2 GiB.
+slater is the **lowest at every scale** and grows ~50× while the graph grows ~1,500× — its
+footprint tracks the *query working set*, not the graph (idle ~16–71 MiB throughout). The
+in-memory trio grows ~linearly and can't load the 766M graph; Neo4j commits a ~2 GiB heap
+regardless of query. († LadybugDB on the bounded shapes only — its hub / var-length /
+shortestPath traversals at 766M need its read pool raised to ≥2 GiB, vs slater's automatic
+`maxIntermediate` cap.)
 
-slater and LadybugDB are the only engines that stay bounded as the graph grows ~1,500×; the
-in-memory trio grows ~linearly. At Wikidata-1M slater (~150 MiB) is smaller than every engine
-including embedded LadybugDB, while the in-memory servers hold 1.5–2.7 GiB. The difference
-between the two bounded engines is *how*: slater's `query.maxIntermediate` caps the working
-set automatically at any pool size; LadybugDB's bound is a manually-sized buffer pool that
-must exceed the query or it fails.
+### Latency (median ms) — graph fits in RAM (MeSH, 341k / 469k)
 
-### Latency — comparable-to-faster
+| shape | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|--:|
+| count(*) all nodes | **0.57** | 15.0 | 23.8 | 16.4 | 82.0 | 2.2 |
+| label count | **0.58** | 4.2 | 20.7 | 1.1 | 4.4 | 4.3 |
+| indexed point lookup | 1.95 | 3.9 | **0.48** | **0.48** | 0.65 | 8.8 |
+| idx-eq count | **0.60** | 4.9 | 5.0 | 2.0 | 381 | 2.5 |
+| 1-hop (indexed anchor) | 1.32 | 5.8 | **1.21** | 4.1 | 390 | 4.9 |
+| 2-hop (unanchored) | 33.1 | **5.6** | 8.5 | 16.7 | 444 | 6.4 |
+| group-by / count(DISTINCT) | 20.1 | 47–51 | 63–64 | 31–39 | 411 | **5.3** |
+| full-scan `CONTAINS` | **0.59** | 5.4 | 24.1 | 1.7 | 16.3 | 4.1 |
 
-Median ms; **bold = fastest in row**. The `strongest` column names the class winner and why.
+slater owns the **metadata / index / scan** shapes (count, label, idx-eq, scan — 10–150× the
+service engines); the in-memory servers win **point lookups & raw 1-hop** (0.5 ms); LadybugDB's
+columnar engine wins **aggregations** (5 ms). slater's one clear miss is the **unanchored
+2-hop** — it label-scans all 341k anchors (33 ms vs Neo4j 5.6). (pole 62k/106k looks the same:
+slater sole-fastest on count/scan, ~2–3 ms on hops.)
 
-**In-RAM (MeSH 340k / 469k; kNN row from the EU-AI-Act vector suite):**
+### Latency (median ms) — vectors (EU-AI-Act kNN, 15k × 1024-dim)
 
-| shape | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB | strongest |
-|---|--:|--:|--:|--:|--:|--:|---|
-| count(*) all nodes | **0.57** | 15.0 | 23.8 | 16.4 | 82.0 | 2.2 | slater — metadata |
-| indexed point lookup | 2.0 | 3.9 | **0.5** | **0.5** | 0.7 | 8.8 | Memgraph · FalkorDB |
-| 1-hop traversal | 1.3 | 5.8 | **1.2** | 4.1 | 389.6 | 4.9 | Memgraph |
-| group-by / count(DISTINCT) | 20.1 | 47–51 | 63–64 | 31–39 | 411 | **5.3** | LadybugDB — columnar |
-| kNN top-10 | 23.0 | 8.6 | 1.9 | **1.2** | — | 2.8 | FalkorDB — resident HNSW |
+| shape | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
+|---|--:|--:|--:|--:|--:|
+| kNN top-10 Concept | 23.0 | 8.6 | 1.9 | **1.2** | 2.8 |
+| kNN top-10 Chunk | 10.4 | 5.7 | 1.9 | **1.5** | 3.2 |
 
-**Disk-bound (Wikidata 91.6M / 766M — only the disk-backed engines load it):**
+The one shape slater clearly trails: an **exact brute-force** scan (these sets are below its
+50k-vector ANN threshold) vs the others' resident HNSW — an *algorithmic* gap, not paging.
 
-| shape | slater | Neo4j 5 | LadybugDB | strongest |
-|---|--:|--:|--:|---|
-| count all nodes | **0.58** | ~4,000 | 34 | slater — metadata |
-| point lookup (indexed) | **1.30** | 9.7 | ~2,300 ‡ | slater |
-| 1-hop neighbours | **4.25** | 12.3 | 23 | slater |
-| 3-hop | **26.7** | 74.9 | over-budget* | slater |
-| shortestPath ≤6 | **52.6** (fanout 8) · 82.6 (1) | 131.9 | ~2,000* | slater |
+### Latency (median ms) — graph ≫ RAM (Wikidata 91.6M / 766M)
 
-(‡ LadybugDB builds no secondary index — the point lookup is a full columnar scan. * at the
-default 512 MiB read pool; the hub-expansion shapes complete at a ≥2 GiB pool — pool-bound,
-not fundamental.)
+Only the disk-backed engines load it (Memgraph / FalkorDB / ArcadeDB: cannot-load).
 
-**The two regimes.** When the graph **fits in RAM** no engine sweeps — slater wins counts /
-indexed-filter / scan shapes (metadata + index fast paths), the in-memory servers win raw
-multi-hop and point lookups, LadybugDB's columnar engine wins aggregations, and FalkorDB's
-resident HNSW wins kNN. That kNN row is the one shape slater trails (exact brute-force scan
-~17–23 ms vs a resident HNSW's 1–9 ms — an algorithmic gap, not paging; `blockCacheBytes`
-trades that latency for less RAM). When the graph is **far larger than RAM** slater is
-sole-fastest on every shape but the cold 2-hop, at a fraction of the RAM — count is
-metadata-served (0.58 ms vs Neo4j's ~4 s disk scan, ≈7000×).
+| shape | slater | Neo4j 5 | LadybugDB |
+|---|--:|--:|--:|
+| count(*) all nodes | **0.58** | ~4,000 | 34 |
+| point lookup (indexed) | **1.30** | 9.7 | ~2,337 † |
+| 1-hop neighbours | **4.25** | 12.3 | 22.9 |
+| 2-hop | **17.4** ‡ | 17.4 | over-budget |
+| 3-hop | **26.7** | 74.9 | over-budget |
+| var-length `*1..2` distinct | **9.1** | 116 | over-budget |
+| shortestPath ≤6 | **52.6** (fan 8) | 131.9 | over-budget |
+
+slater is **sole-fastest on every shape** at a fraction of the RAM — `count` is metadata-served
+(0.58 ms vs Neo4j's ~4 s disk scan, ≈7000×). († LadybugDB builds no secondary index → the point
+lookup is a full columnar scan; its hub/var-length shapes need its read pool raised to ≥2 GiB.
+‡ cold 2-hop is the one ~tie with Neo4j.)
+
+### Multi-hop `count(*)` — memory decoupled from result size
+
+Uncapped multi-hop `RETURN count(*)` now counts *during* expansion instead of materialising
+the matched rows. Same hub anchors on the 91.6M graph, `maxIntermediate=20M`, current `main`
+vs v0.8.0:
+
+| 3-hop count(*) @ 91.6M | fanout=1 | fanout=8 |
+|---|--:|--:|
+| v0.8.0 — latency / peak working set | 955 ms / **7.7 GiB** | 617 ms / **9.5 GiB** |
+| current — latency / peak working set | **554 ms / 0.66 GiB** | **298 ms / 1.9 GiB** |
+
+~24× / 5× less memory **and** faster — the count holds O(1) rows. Charging is unchanged, so a
+mega-hub count still trips `maxIntermediate` on *compute* (adjacency reads), bounded as before.
 
 ### Per-query parallelism (`maxFanout`)
 
-Raising `query.maxFanout` overlaps a query's **cold, I/O-bound** CSR block reads across
-cores — so it helps disk-bound shapes with a large cold working set and is flat on
-warm/in-cache shapes (why the tables above don't move). Fresh v0.8.0, **cold** (page cache
-dropped + restart before *every* call), shortestPath ≤6 on the 766M graph:
+Raising `query.maxFanout` overlaps a query's **cold, I/O-bound** block reads across cores —
+it helps large-cold-working-set disk-bound shapes and is flat on warm shapes. On the 766M
+graph: shortestPath ≤6 **918 → 608 ms** (1.5×, largest search 6,269 → 2,350 ms, 2.7×);
+3-hop count **547 → 298 ms**. `maxFanout=1` is the default (throughput-oriented); `8` is the
+latency dial, at more transient worker memory.
 
-| slater @ Wikidata-91.6M, cold | fanout=1 | fanout=8 | speedup |
-|---|--:|--:|--:|
-| shortestPath ≤6 (median of 6 pairs) | 918 ms | 608 ms | 1.5× |
-| largest search in the set | 6,269 ms | 2,350 ms | **2.7×** |
+### Where slater wins / trails
 
-The speedup scales with the cold working-set size — small searches flat, large ones approach
-core count. `maxFanout=1` is the default (the safe choice for a throughput-oriented read
-server); it trades memory for latency but stays bounded.
+| dimension | slater | best of the field | verdict |
+|---|---|---|---|
+| resident memory, any scale | 11–584 MiB (62k → 91.6M) | in-memory 1.5–2.7 GiB; can't load 766M | **slater** |
+| count / metadata / scan | ~0.6 ms | service engines 5–80 ms | **slater** (10–150×) |
+| indexed point / 1-hop | 1–2 ms | Memgraph · FalkorDB **0.5 ms** | trails the in-memory pair |
+| unanchored multi-hop (rows) | 33 ms (MeSH 2-hop) | Neo4j **5.6 ms** | trails (label-scans all anchors) |
+| aggregation (group-by / DISTINCT) | 20 ms | LadybugDB **5 ms** (columnar) | trails columnar |
+| kNN | 17–23 ms (exact) | FalkorDB **1.2 ms** (HNSW) | trails (below ANN threshold) |
+| traversal at 91.6M (≫ RAM) | 0.6–53 ms | Neo4j 10–4,000 ms; in-mem can't load | **slater** |
+| multi-hop `count(*)` at scale | 0.3–0.6 GiB | (was 7.7–9.5 GiB pre-pushdown) | **slater**, bounded |
 
-Full per-engine tables — pole, MeSH, the EU-AI-Act vector suite + the `blockCacheBytes`
-RAM↔latency dial, and Wikidata 1M & 91.6M — are in
-[`perf/cross-engine-hs/README.md`](perf/cross-engine-hs/README.md); the pole harness and method
-are in [`perf/PERF_PROGRESS.md`](perf/PERF_PROGRESS.md).
+Full per-engine tables (pole, MeSH, EU-AI-Act + the `blockCacheBytes` RAM↔latency dial,
+Wikidata 1M & 91.6M) are in
+[`perf/cross-engine-hs/README.md`](perf/cross-engine-hs/README.md); the fresh slater-only pass
+(both fanouts, every dataset) is in [`perf/PERF_CURRENT_STATUS.md`](perf/PERF_CURRENT_STATUS.md).
 
 ### Concurrency & brown-out (load testing)
 

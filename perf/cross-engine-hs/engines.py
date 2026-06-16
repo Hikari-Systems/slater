@@ -6,13 +6,17 @@ all rows (the timed path); `rows(q, params)` returns the rows as a list (for bui
 parameter pools / sanity checks). Dedicated `-hs` ports so the pole stack is untouched.
 """
 
+import os
 # (uri/port, auth, db) per engine — dedicated -hs port block.
 SLATER_USER, SLATER_PASS = "reporting", "polereader"
 NEO4J_USER, NEO4J_PASS = "neo4j", "polepole12"
 ARCADE_USER, ARCADE_PASS = "root", "playwithdata"
 # slater/neo4j/memgraph/falkordb/arcadedb are service containers; ladybug is an
-# embedded library (no port) run inside the slater-ladybug image.
-PORTS = {"slater": 7700, "neo4j": 7701, "memgraph": 7702, "falkordb": 6401, "arcadedb": 7703}
+# embedded library (no port) run inside the slater-ladybug image. The slater port
+# is overridable via SLATER_PORT so a one-at-a-time isolated slater run can use a
+# free port while another slater container holds 7700.
+PORTS = {"slater": int(os.environ.get("SLATER_PORT", "7700")),
+         "neo4j": 7701, "memgraph": 7702, "falkordb": 6401, "arcadedb": 7703}
 
 
 def _ladybug_rewriter(graph):
