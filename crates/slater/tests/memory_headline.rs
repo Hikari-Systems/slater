@@ -258,6 +258,8 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
                 pq_bits: PQ_BITS,
             },
         }],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,

@@ -27,6 +27,7 @@ use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
 use graph_format::nodelabels::{encode_labels_record, NodeLabelsWriter};
+use graph_format::postings::write_endpoint_postings_from_sorted;
 use graph_format::topology::{Adj, CsrStreamWriter};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
@@ -1288,6 +1289,14 @@ fn build_inner(
     })?;
 
     let mut rev_sorter = ExtSorter::<EdgeRev>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
+    // Endpoint postings: collect (reltype, src) on the forward pass and
+    // (reltype, dst) on the reverse pass, externally sorted by (reltype, node) so
+    // we can drain one ascending-distinct record per reltype within the memory
+    // budget — the bounded-memory analog of the in-memory build's bucket pass.
+    let mut src_post_sorter =
+        ExtSorter::<RelEndpoint>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
+    let mut tgt_post_sorter =
+        ExtSorter::<RelEndpoint>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
     for (final_edge_id, r) in fwd_sorter.sorted()?.enumerate() {
         let final_edge_id = final_edge_id as u64;
         let ef = r?;
@@ -1299,6 +1308,14 @@ fn build_inner(
                 edge: EdgeId(final_edge_id),
             },
         )?;
+        src_post_sorter.push(RelEndpoint {
+            reltype: ef.reltype,
+            node: ef.final_src,
+        })?;
+        tgt_post_sorter.push(RelEndpoint {
+            reltype: ef.reltype,
+            node: ef.final_dst,
+        })?;
         edge_props_w.append_raw(&ef.props_blob)?;
         for spec in &edge_range {
             if let (Some(rid), Some(kid)) = (spec.reltype_id, spec.key_id) {
@@ -1336,6 +1353,31 @@ fn build_inner(
     edge_props_w.finish()?;
     block_sizes.insert("edge_props.blk".into(), opts.block_size as u32);
     block_sizes.insert("topology.csr.blk".into(), opts.block_size as u32);
+
+    // Drain the endpoint posting sorters into reltype_src.post / reltype_tgt.post.
+    let reltype_count = reltypes.names().len() as u32;
+    let reltype_source_counts = write_endpoint_postings_from_sorted(
+        tmp_dir.join("reltype_src.post"),
+        reltype_count,
+        src_post_sorter
+            .sorted()?
+            .map(|r| r.map(|e| (e.reltype, e.node))),
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    let reltype_target_counts = write_endpoint_postings_from_sorted(
+        tmp_dir.join("reltype_tgt.post"),
+        reltype_count,
+        tgt_post_sorter
+            .sorted()?
+            .map(|r| r.map(|e| (e.reltype, e.node))),
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    block_sizes.insert("reltype_src.post".into(), opts.block_size as u32);
+    block_sizes.insert("reltype_tgt.post".into(), opts.block_size as u32);
 
     // --- vectors.f32.blk + any Vamana/PQ files (shared with the in-memory build) ---
     let (vector_indexes, vector_files) =
@@ -1377,6 +1419,8 @@ fn build_inner(
         property_keys: keys.into_names(),
         range_indexes,
         vector_indexes,
+        reltype_source_counts,
+        reltype_target_counts,
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
@@ -1550,6 +1594,33 @@ impl SortRecord for EdgeRev {
     }
     fn size_hint(&self) -> usize {
         32
+    }
+}
+
+/// A `(reltype, node)` endpoint posting entry, sorted by reltype then node so the
+/// drain can write one ascending-distinct record per reltype. Used for both the
+/// source posting (node = edge source) and the target posting (node = edge dest).
+struct RelEndpoint {
+    reltype: u32,
+    node: u64,
+}
+impl SortRecord for RelEndpoint {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        write_uvarint(buf, self.reltype as u64);
+        write_uvarint(buf, self.node);
+    }
+    fn decode(r: &mut &[u8]) -> Result<Self> {
+        let reltype = read_uvarint(r)? as u32;
+        let node = read_uvarint(r)?;
+        Ok(RelEndpoint { reltype, node })
+    }
+    fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        self.reltype
+            .cmp(&other.reltype)
+            .then(self.node.cmp(&other.node))
+    }
+    fn size_hint(&self) -> usize {
+        16
     }
 }
 

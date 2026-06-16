@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use graph_format::blockfile::BlockFileReader;
 use graph_format::columns::PropsReader;
 use graph_format::crypto::{self, BlockCipher};
 use graph_format::ids::Generation as GenId;
@@ -29,6 +30,7 @@ use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
+use graph_format::postings::decode_endpoint_posting;
 use graph_format::pq::{PqReader, ResidentPq};
 use graph_format::topology::TopologyReader;
 use graph_format::vamana::VamanaReader;
@@ -39,6 +41,16 @@ use tracing::info;
 /// An opened, validated graph generation. Immutable for its lifetime — a new
 /// generation is a *new* `Generation` value, never an in-place mutation, so the
 /// caches can key on the generation UUID and orphan stale entries on swap.
+/// Which endpoint of a typed relationship a rel-type scan drives from:
+/// `Source` for an outgoing first hop, `Target` for incoming, `Either` (the
+/// union) for undirected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelEndpointSide {
+    Source,
+    Target,
+    Either,
+}
+
 pub struct Generation {
     graph: String,
     uuid: GenId,
@@ -49,6 +61,12 @@ pub struct Generation {
     node_labels: NodeLabelsReader,
     edge_props: PropsReader,
     topology: TopologyReader,
+    /// Per-reltype endpoint postings (`reltype_src.post` / `reltype_tgt.post`),
+    /// record index = reltype id. `None` ⇒ the generation predates the postings;
+    /// the planner then simply never offers a relationship-type scan. Each holds
+    /// only its sparse directory at open — records are read lazily per query.
+    reltype_src_post: Option<BlockFileReader>,
+    reltype_tgt_post: Option<BlockFileReader>,
     vectors: VectorStoreReader,
     /// Range (ISAM) indexes keyed by their MANIFEST `name` (= file stem under `range/`).
     range_indexes: HashMap<String, IsamReader>,
@@ -171,6 +189,22 @@ impl Generation {
         let edge_props = PropsReader::open_with_cipher(dir.join("edge_props.blk"), cipher.clone())?;
         let topology =
             TopologyReader::open_with_cipher(dir.join("topology.csr.blk"), cipher.clone())?;
+        // Endpoint postings (format v2+). Gate on file existence so a hand-built
+        // fixture without them still opens; the format-version check already
+        // fences real generations.
+        let open_post = |name: &str| -> Result<Option<BlockFileReader>> {
+            let path = dir.join(name);
+            if path.exists() {
+                Ok(Some(BlockFileReader::open_with_cipher(
+                    path,
+                    cipher.clone(),
+                )?))
+            } else {
+                Ok(None)
+            }
+        };
+        let reltype_src_post = open_post("reltype_src.post")?;
+        let reltype_tgt_post = open_post("reltype_tgt.post")?;
         let vectors =
             VectorStoreReader::open_with_cipher(dir.join("vectors.f32.blk"), cipher.clone())?;
 
@@ -240,6 +274,8 @@ impl Generation {
             node_labels,
             edge_props,
             topology,
+            reltype_src_post,
+            reltype_tgt_post,
             vectors,
             range_indexes,
             vamana_indexes,
@@ -349,6 +385,73 @@ impl Generation {
     /// Number of edges of relationship type `reltype_id` (precomputed at open; O(1)).
     pub fn reltype_edge_count(&self, reltype_id: u32) -> u64 {
         self.reltype_counts.get(&reltype_id).copied().unwrap_or(0)
+    }
+
+    /// True when this generation carries the per-reltype endpoint postings (format
+    /// v2+), so a relationship-type scan can drive a typed first hop.
+    pub fn has_reltype_postings(&self) -> bool {
+        self.reltype_src_post.is_some() && self.reltype_tgt_post.is_some()
+    }
+
+    /// Distinct **source** node count for `reltype_id` — nodes with an outgoing
+    /// edge of that type (O(1), from the manifest). 0 if absent/unknown.
+    pub fn reltype_source_count(&self, reltype_id: u32) -> u64 {
+        self.manifest
+            .reltype_source_counts
+            .get(reltype_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Distinct **target** node count for `reltype_id` — nodes with an incoming
+    /// edge of that type (O(1), from the manifest). 0 if absent/unknown.
+    pub fn reltype_target_count(&self, reltype_id: u32) -> u64 {
+        self.manifest
+            .reltype_target_counts
+            .get(reltype_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Ascending distinct node ids that carry an edge of any reltype in
+    /// `reltype_ids` on the requested `side` (union over the types; for
+    /// [`RelEndpointSide::Either`], also the union of source and target). One
+    /// record read per (reltype, side); the single-reltype single-side case
+    /// returns the decoded posting directly. Errors if the postings are absent —
+    /// callers must gate on [`Self::has_reltype_postings`].
+    pub fn collect_endpoint_nodes_for_reltypes(
+        &self,
+        reltype_ids: &[u32],
+        side: RelEndpointSide,
+    ) -> Result<Vec<u64>> {
+        let (Some(src), Some(tgt)) = (&self.reltype_src_post, &self.reltype_tgt_post) else {
+            bail!("generation has no reltype endpoint postings");
+        };
+        let read = |reader: &BlockFileReader, t: u32| -> Result<Vec<u64>> {
+            if (t as u64) < reader.total_records() {
+                decode_endpoint_posting(&reader.read_record_global(t as u64)?)
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        // Single reltype on a single side: the posting is already ascending+distinct.
+        if reltype_ids.len() == 1 {
+            match side {
+                RelEndpointSide::Source => return read(src, reltype_ids[0]),
+                RelEndpointSide::Target => return read(tgt, reltype_ids[0]),
+                RelEndpointSide::Either => {}
+            }
+        }
+        let mut set = std::collections::BTreeSet::new();
+        for &t in reltype_ids {
+            if matches!(side, RelEndpointSide::Source | RelEndpointSide::Either) {
+                set.extend(read(src, t)?);
+            }
+            if matches!(side, RelEndpointSide::Target | RelEndpointSide::Either) {
+                set.extend(read(tgt, t)?);
+            }
+        }
+        Ok(set.into_iter().collect())
     }
 
     /// Dense node ids carrying `label_id`, ascending — re-derived on demand by a
@@ -618,6 +721,20 @@ mod tests {
         )
         .unwrap();
 
+        // reltype_src.post / reltype_tgt.post — KNOWS(0): src{0} tgt{1};
+        // WORKS_AT(1): src{0} tgt{2}.
+        let (reltype_source_counts, reltype_target_counts) =
+            graph_format::postings::write_reltype_endpoint_postings(
+                dir.join("reltype_src.post"),
+                dir.join("reltype_tgt.post"),
+                2,
+                &edges,
+                BLOCK,
+                LEVEL,
+                cipher.clone(),
+            )
+            .unwrap();
+
         // vectors.f32.blk — one vector for node 0 under the (Person, embedding) index.
         let mut vw = VectorStoreWriter::create_with_cipher(
             dir.join("vectors.f32.blk"),
@@ -661,6 +778,8 @@ mod tests {
             "node_labels.blk",
             "edge_props.blk",
             "topology.csr.blk",
+            "reltype_src.post",
+            "reltype_tgt.post",
             "vectors.f32.blk",
             "range/node_Person_name.isam",
         ] {
@@ -704,6 +823,8 @@ mod tests {
                 first_record: 0,
                 mode: AnnMode::BruteForce,
             }],
+            reltype_source_counts,
+            reltype_target_counts,
             acl_blake3: None,
             mac: None,
             files,
@@ -755,6 +876,39 @@ mod tests {
             .unwrap();
         assert_eq!(hits, vec![1]);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reltype_endpoint_postings_resolve() {
+        let (root, graph, _) = write_fixture("reltype_endpoint_postings_resolve");
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert!(gen.has_reltype_postings());
+        // KNOWS(0): src {0}, tgt {1}; WORKS_AT(1): src {0}, tgt {2}.
+        assert_eq!(gen.reltype_source_count(0), 1);
+        assert_eq!(gen.reltype_target_count(0), 1);
+        assert_eq!(
+            gen.collect_endpoint_nodes_for_reltypes(&[0], RelEndpointSide::Source)
+                .unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            gen.collect_endpoint_nodes_for_reltypes(&[0], RelEndpointSide::Target)
+                .unwrap(),
+            vec![1]
+        );
+        // Either over both types: sources {0} ∪ targets {1,2} = {0,1,2}.
+        assert_eq!(
+            gen.collect_endpoint_nodes_for_reltypes(&[0, 1], RelEndpointSide::Either)
+                .unwrap(),
+            vec![0, 1, 2]
+        );
+        // Union of sources across both types is just {0}.
+        assert_eq!(
+            gen.collect_endpoint_nodes_for_reltypes(&[0, 1], RelEndpointSide::Source)
+                .unwrap(),
+            vec![0]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

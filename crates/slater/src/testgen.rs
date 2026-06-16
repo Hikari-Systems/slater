@@ -263,6 +263,8 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
             first_record: 0,
             mode: AnnMode::BruteForce,
         }],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -404,6 +406,8 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
         property_keys: vec!["name".into()],
         range_indexes: vec![],
         vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -416,6 +420,160 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
     )
     .unwrap();
 
+    (root, graph)
+}
+
+/// A **sparse-reltype** fixture for the relationship-type-scan tests. Six `:N`
+/// nodes (label id 0), where only a few are edge endpoints — so a typed first hop
+/// drives from far fewer nodes than the 6-node label posting:
+/// ```text
+/// reltype T (id 0): (0)-[:T]->(1), (1)-[:T]->(2)   sources {0,1}, targets {1,2}
+/// reltype U (id 1): (0)-[:U]->(3)                  source {0},    target {3}
+/// ```
+/// Nodes 4 and 5 are isolated. Carries the endpoint postings + manifest counts, so
+/// `has_reltype_postings()` is true and `maybe_rel_type_scan` can fire.
+pub fn write_rel_sparse(tag: &str) -> (PathBuf, String) {
+    write_rel_sparse_opt(tag, true)
+}
+
+/// As [`write_rel_sparse`] but without the endpoint postings — the *same* graph
+/// (identical node ids and edges), so a rel-type-scan-on vs -off comparison runs
+/// over byte-identical data. `has_reltype_postings()` is false, so every query
+/// drives from the label scan.
+pub fn write_rel_sparse_no_postings(tag: &str) -> (PathBuf, String) {
+    write_rel_sparse_opt(tag, false)
+}
+
+fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0009);
+    let graph = "relsparse".to_string();
+    let root = std::env::temp_dir().join(format!("slater_relspx_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        np.append(&[(0, Value::Str(name.into()))]).unwrap();
+    }
+    np.finish().unwrap();
+
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..6 {
+        nl.append(&[0]).unwrap(); // all :N
+    }
+    nl.finish().unwrap();
+
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..3 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    let edges = vec![
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(1),
+            reltype: 0,
+            edge: EdgeId(0),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(2),
+            reltype: 0,
+            edge: EdgeId(1),
+        },
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(3),
+            reltype: 1,
+            edge: EdgeId(2),
+        },
+    ];
+    write_csr(dir.join("topology.csr.blk"), 6, &edges, BLOCK, LEVEL).unwrap();
+
+    let (reltype_source_counts, reltype_target_counts) = if with_postings {
+        graph_format::postings::write_reltype_endpoint_postings(
+            dir.join("reltype_src.post"),
+            dir.join("reltype_tgt.post"),
+            2,
+            &edges,
+            BLOCK,
+            LEVEL,
+            None,
+        )
+        .unwrap()
+    } else {
+        (vec![], vec![])
+    };
+
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    let mut names = vec![
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ];
+    if with_postings {
+        names.push("reltype_src.post");
+        names.push("reltype_tgt.post");
+    }
+    for name in names {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        encryption: None,
+        node_count: 6,
+        edge_count: 3,
+        labels: vec!["N".into()],
+        reltypes: vec!["T".into(), "U".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        reltype_source_counts,
+        reltype_target_counts,
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
     (root, graph)
 }
 
@@ -558,6 +716,8 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
         property_keys: vec!["name".into()],
         range_indexes: vec![],
         vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -669,6 +829,8 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
         property_keys: vec!["name".into(), "team".into()],
         range_indexes: vec![],
         vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -807,6 +969,8 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
         property_keys: vec!["name".into()],
         range_indexes: vec![],
         vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -991,6 +1155,8 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
                 pq_bits: f.pq_bits,
             },
         }],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
         acl_blake3: None,
         mac: None,
         files,

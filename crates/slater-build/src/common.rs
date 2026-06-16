@@ -81,6 +81,10 @@ pub struct PublishInputs<'a> {
     pub property_keys: Vec<String>,
     pub range_indexes: Vec<RangeIndexDesc>,
     pub vector_indexes: Vec<VectorIndexDesc>,
+    /// Per-reltype distinct source/target node counts for the endpoint postings
+    /// (`reltype_src.post` / `reltype_tgt.post`), index = reltype id.
+    pub reltype_source_counts: Vec<u64>,
+    pub reltype_target_counts: Vec<u64>,
     pub encryption_header: Option<EncryptionHeader>,
     pub encryption_key: &'a Option<Vec<u8>>,
     pub acl_blake3: Option<String>,
@@ -99,6 +103,8 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         "edge_props.blk".into(),
         "topology.csr.blk".into(),
         "vectors.f32.blk".into(),
+        "reltype_src.post".into(),
+        "reltype_tgt.post".into(),
     ];
     for ri in &inp.range_indexes {
         file_names.push(format!("range/{}.isam", ri.name));
@@ -143,6 +149,8 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         property_keys: inp.property_keys,
         range_indexes: inp.range_indexes,
         vector_indexes: inp.vector_indexes,
+        reltype_source_counts: inp.reltype_source_counts,
+        reltype_target_counts: inp.reltype_target_counts,
         acl_blake3: inp.acl_blake3,
         mac: None,
         files,

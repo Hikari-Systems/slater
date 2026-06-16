@@ -134,6 +134,18 @@ pub struct Manifest {
     pub range_indexes: Vec<RangeIndexDesc>,
     #[serde(default)]
     pub vector_indexes: Vec<VectorIndexDesc>,
+    /// Per-reltype distinct **source** node counts (index = reltype id, aligned
+    /// with `reltypes`). Non-empty ⇒ the generation carries `reltype_src.post`;
+    /// the planner uses these to cost a relationship-type scan against a label
+    /// scan, and the posting ids drive an outgoing typed first hop. Empty ⇒ no
+    /// posting (the rel-type scan is simply unavailable, never incorrect).
+    #[serde(default)]
+    pub reltype_source_counts: Vec<u64>,
+    /// Per-reltype distinct **target** node counts (index = reltype id). The
+    /// `reltype_tgt.post` analog of [`Self::reltype_source_counts`], for incoming
+    /// (and, unioned with sources, undirected) typed first hops.
+    #[serde(default)]
+    pub reltype_target_counts: Vec<u64>,
     /// BLAKE3 digest (hex) of the live `acl.json` this generation was built
     /// against (`slater-build --acl`). `None` ⇒ not stamped (older images, or the
     /// flag was not given). When present, the server re-hashes the configured live
@@ -273,6 +285,8 @@ mod tests {
                 first_record: 0,
                 mode: AnnMode::BruteForce,
             }],
+            reltype_source_counts: vec![],
+            reltype_target_counts: vec![],
             acl_blake3: None,
             mac: None,
             files,

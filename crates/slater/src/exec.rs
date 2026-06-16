@@ -39,7 +39,7 @@ use crate::algo;
 use crate::cache::{BlockCache, FileKind, VectorIndexCache};
 use crate::generation::Generation;
 use crate::parser::ast::*;
-use crate::plan::{choose_node_scan, index_for, is_id_anchored, NodeScan};
+use crate::plan::{choose_node_scan, index_for, is_id_anchored, maybe_rel_type_scan, NodeScan};
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{NodeId, Value};
@@ -3904,6 +3904,14 @@ impl<'g> Engine<'g> {
                     // bound variable (`{p: w}` / `WHERE n.p = w`) seek the index.
                     let bound = bound_scalars(binding);
                     let scan = choose_node_scan(self.gen, start, where_, &self.plan_params, &bound);
+                    // If the (post-reroot) pattern's first hop is a required,
+                    // fixed-length typed edge, drive from that reltype's endpoint
+                    // posting instead of a label/full scan — skipping the nodes
+                    // that have no such edge. Sound for any context (incl.
+                    // OPTIONAL): only reached for an unbound anchor, and an
+                    // edgeless anchor yields no row under either plan, so the
+                    // matched set is identical. See `maybe_rel_type_scan`.
+                    let scan = maybe_rel_type_scan(self.gen, &scan, pattern).unwrap_or(scan);
                     let guaranteed = self.scan_guaranteed_labels(&scan);
                     (self.scan_candidates(&scan)?, guaranteed)
                 }
@@ -4604,6 +4612,14 @@ impl<'g> Engine<'g> {
                 ),
             NodeScan::LabelScan { label_id } => self.gen.collect_nodes_with_label(*label_id),
             NodeScan::AllNodes => Ok((0..self.gen.node_count()).collect()),
+            // Distinct edge-having endpoint nodes for the typed first hop (the
+            // precomputed posting). Ascending+deduped, same contract as a label
+            // scan; the first hop re-filters by reltype so this only narrows.
+            NodeScan::RelTypeScan {
+                reltype_ids, side, ..
+            } => self
+                .gen
+                .collect_endpoint_nodes_for_reltypes(reltype_ids, *side),
         }
     }
 
@@ -4625,6 +4641,12 @@ impl<'g> Engine<'g> {
                 .into_iter()
                 .collect(),
             NodeScan::IdSeek { .. } | NodeScan::AllNodes => Vec::new(),
+            // The posting proves an *edge*, not a label; carry the anchor's lone
+            // required label (lifted from the replaced LabelScan) so `node_ok`
+            // still skips that label record, but re-checks anything else.
+            NodeScan::RelTypeScan {
+                guaranteed_label, ..
+            } => guaranteed_label.iter().copied().collect(),
         }
     }
 
@@ -14228,5 +14250,85 @@ mod tests {
         for p in [root, root2] {
             let _ = std::fs::remove_dir_all(&p);
         }
+    }
+
+    // ── relationship-type scan: identical results with the posting on vs off ───
+
+    /// Run `q` over the sparse-reltype fixture and return the sorted display rows.
+    /// `postings` toggles the endpoint postings: on ⇒ the planner drives typed
+    /// first hops from the rel-type posting; off ⇒ the identical graph with no
+    /// postings, so every query falls back to the label scan.
+    fn rel_rows(tag: &str, q: &str, postings: bool) -> Vec<String> {
+        let (root, graph) = if postings {
+            testgen::write_rel_sparse(tag)
+        } else {
+            testgen::write_rel_sparse_no_postings(tag)
+        };
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let res = parser::parse(q)
+            .map_err(|e| e.to_string())
+            .and_then(|ast| engine.run(&ast).map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"));
+        let mut rows: Vec<String> = res
+            .rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| v.to_display())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        rows.sort();
+        let _ = std::fs::remove_dir_all(&root);
+        rows
+    }
+
+    #[test]
+    fn rel_type_scan_matches_label_scan_results() {
+        // Every shape the rel-type scan can fire on must return byte-identical rows
+        // to the label-scan plan over the same graph. The fixture: 6 :N nodes,
+        // T-edges a->b, b->c (sources {a,b}, targets {b,c}), U-edge a->d.
+        let cases = [
+            // outgoing 1-hop
+            "MATCH (a:N)-[:T]->(b) RETURN a.name AS x, b.name AS y",
+            // outgoing 1-hop, unlabelled anchor (base AllNodes)
+            "MATCH (a)-[:T]->(b) RETURN a.name AS x, b.name AS y",
+            // incoming
+            "MATCH (a:N)<-[:T]-(b) RETURN a.name AS x, b.name AS y",
+            // undirected
+            "MATCH (a:N)-[:T]-(b) RETURN a.name AS x, b.name AS y",
+            // 2-hop
+            "MATCH (a:N)-[:T]->(b)-[:T]->(c) RETURN c.name AS y",
+            // with LIMIT (early-exit path)
+            "MATCH (a:N)-[:T]->(b) RETURN b.name AS y LIMIT 1",
+            // multi-type union
+            "MATCH (a:N)-[:T|U]->(b) RETURN a.name AS x, b.name AS y",
+            // count (uncapped, parallel-eligible)
+            "MATCH (a:N)-[:T]->(b) RETURN count(*) AS n",
+            // OPTIONAL with an unbound anchor: edgeless nodes must not change the
+            // outcome — both plans yield the same matched set (and the same
+            // null-row behaviour, driven by whether anything matched at all).
+            "OPTIONAL MATCH (a:N)-[:T]->(b) RETURN a.name AS x, b.name AS y",
+        ];
+        for (i, q) in cases.iter().enumerate() {
+            let on = rel_rows(&format!("exec_relscan_on_{i}"), q, true);
+            let off = rel_rows(&format!("exec_relscan_off_{i}"), q, false);
+            assert_eq!(on, off, "rel-scan vs label-scan mismatch for: {q}");
+        }
+    }
+
+    #[test]
+    fn rel_type_scan_concrete_rows() {
+        // Pin the actual rows (not just on==off), so a bug that breaks *both*
+        // plans identically can't hide. T-edges: a->b, b->c.
+        let rows = rel_rows(
+            "exec_relscan_concrete",
+            "MATCH (a:N)-[:T]->(b) RETURN a.name, b.name",
+            true,
+        );
+        assert_eq!(rows, vec!["a|b".to_string(), "b|c".to_string()]);
     }
 }

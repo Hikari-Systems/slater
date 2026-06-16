@@ -12,7 +12,10 @@
 // the MANIFEST schema, or an index encoding changes incompatibly. The reader
 // refuses a generation whose `formatVersion` it does not understand.
 /// On-disk format version understood by this build.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v2 adds the per-reltype endpoint postings (`reltype_src.post` /
+/// `reltype_tgt.post`) and their manifest count vectors — see [`postings`].
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -28,6 +31,7 @@ pub mod integrity;
 pub mod isam;
 pub mod manifest;
 pub mod nodelabels;
+pub mod postings;
 pub mod pq;
 pub mod topology;
 pub mod vamana;
@@ -41,7 +45,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

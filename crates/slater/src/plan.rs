@@ -23,8 +23,8 @@
 // Consumed by the executor (`exec`); the standalone planner is unit-tested here.
 #![allow(dead_code)]
 
-use crate::generation::Generation;
-use crate::parser::ast::{CmpOp, Expr, FuncArgs, NodePat};
+use crate::generation::{Generation, RelEndpointSide};
+use crate::parser::ast::{CmpOp, Direction, Expr, FuncArgs, NodePat, Pattern};
 use graph_format::ids::Value;
 use graph_format::manifest::EntityKind;
 use std::collections::HashMap;
@@ -51,6 +51,21 @@ pub enum NodeScan {
     LabelScan { label_id: u32 },
     /// Full node sweep `0..node_count`. Residual filters in `exec`.
     AllNodes,
+    /// Drive the anchor from the precomputed endpoint postings of one or more
+    /// relationship types — the distinct nodes that actually carry an edge of
+    /// `reltype_ids` on `side` (source for an outgoing first hop, target for
+    /// incoming, either for undirected). Chosen by [`maybe_rel_type_scan`] in
+    /// place of a `LabelScan`/`AllNodes` when the pattern's first hop is a
+    /// required, fixed-length typed edge and the posting is more selective than
+    /// the label. The executor's expand pipeline re-filters by reltype, so an
+    /// over-broad driving set stays correct; `guaranteed_label` carries the
+    /// anchor's lone required label (if any), lifted from the replaced
+    /// `LabelScan`, so `node_ok` keeps skipping that label record.
+    RelTypeScan {
+        reltype_ids: Vec<u32>,
+        side: RelEndpointSide,
+        guaranteed_label: Option<u32>,
+    },
 }
 
 /// A constant predicate extracted on `var.<prop>` for planning.
@@ -97,6 +112,80 @@ pub fn choose_node_scan(
         collect_where_preds(w, var, params, bound, &mut preds);
     }
     choose_from_preds(gen, node, &preds)
+}
+
+/// Consider driving the anchor from a relationship-type scan instead of the
+/// already-chosen `base` node scan. Returns `Some(RelTypeScan)` only when it is
+/// both **sound** and **cheaper**; otherwise `None` (keep `base`).
+///
+/// Soundness: restricting the driving set to nodes that carry the first hop's
+/// edge is valid only for a **required, fixed-length, single-direction** first
+/// hop — an edgeless node then yields no rows under either plan. So we bail on
+/// variable-length first hops, untyped / non-positive type expressions,
+/// quantified or shortest-path patterns, and any base more selective than a label
+/// scan (an id-seek or range lookup already beats us). The caller is responsible
+/// for not offering this on an OPTIONAL match (an edgeless anchor must still
+/// produce a null-padded row there). The executor re-checks the reltype on the
+/// first hop and re-checks the anchor's labels in `node_ok`, so the posting only
+/// ever narrows the candidate set — never changes results.
+pub(crate) fn maybe_rel_type_scan(
+    gen: &Generation,
+    base: &NodeScan,
+    pattern: &Pattern,
+) -> Option<NodeScan> {
+    if !gen.has_reltype_postings() {
+        return None;
+    }
+    // Only replace a non-selective base; an id-seek / range lookup already wins.
+    let (base_cost, guaranteed_label) = match base {
+        NodeScan::LabelScan { label_id } => (gen.label_node_count(*label_id), Some(*label_id)),
+        NodeScan::AllNodes => (gen.node_count(), None),
+        _ => return None,
+    };
+    // Plain chain only: quantified groups and shortest-path selectors drive their
+    // own search and don't go through the anchor-then-expand path.
+    if pattern.segments.is_some() || pattern.selector.is_some() {
+        return None;
+    }
+    let (rel, _) = pattern.rels.first()?;
+    // Fixed-length, single hop — a `*`/`*0..` walk can match with zero edges.
+    if rel.var_length.is_some() {
+        return None;
+    }
+    let side = match rel.dir {
+        Direction::Outgoing => RelEndpointSide::Source,
+        Direction::Incoming => RelEndpointSide::Target,
+        Direction::Undirected => RelEndpointSide::Either,
+    };
+    // A concrete positive reltype set (`:T` or `:T1|T2`); `&`/`!`/absent ⇒ no
+    // posting to drive from.
+    let names = rel.type_expr.as_ref()?.positive_atoms()?;
+    let reltype_ids: Vec<u32> = names.iter().filter_map(|n| gen.reltype_id(n)).collect();
+    if reltype_ids.is_empty() {
+        return None;
+    }
+    // Candidate-count estimate for the cost gate. Summing per-type counts (and, for
+    // undirected, source+target) is an upper bound — a node may carry several of
+    // the types — so the gate is conservative: we only switch when even the upper
+    // bound beats the label/full scan.
+    let cand_est: u64 = reltype_ids
+        .iter()
+        .map(|&t| match side {
+            RelEndpointSide::Source => gen.reltype_source_count(t),
+            RelEndpointSide::Target => gen.reltype_target_count(t),
+            RelEndpointSide::Either => gen
+                .reltype_source_count(t)
+                .saturating_add(gen.reltype_target_count(t)),
+        })
+        .fold(0u64, |a, b| a.saturating_add(b));
+    if cand_est >= base_cost {
+        return None;
+    }
+    Some(NodeScan::RelTypeScan {
+        reltype_ids,
+        side,
+        guaranteed_label,
+    })
 }
 
 /// If the top-level `AND`-conjuncts of `where_` pin `id(var)` to concrete node ids
@@ -723,6 +812,121 @@ mod tests {
         let gen = Generation::open(&root, &graph).unwrap();
         let scan = plan_for(&gen, "MATCH (n) WHERE id(n) > 1 RETURN n");
         assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── relationship-type scan selection ───────────────────────────────────────
+
+    /// Plan the anchor as the executor would: the base node scan, then the
+    /// rel-type-scan override if `maybe_rel_type_scan` fires.
+    fn rel_plan_for(gen: &Generation, query: &str) -> NodeScan {
+        let q = parser::parse(query).unwrap();
+        let parser::ast::Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a leading MATCH");
+        };
+        let pattern = &m.patterns[0];
+        let base = choose_node_scan(
+            gen,
+            &pattern.start,
+            m.where_.as_ref(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        maybe_rel_type_scan(gen, &base, pattern).unwrap_or(base)
+    }
+
+    #[test]
+    fn outgoing_typed_first_hop_picks_rel_source_scan() {
+        // `(:N)` label posting is 6 nodes; reltype T has only 2 distinct sources,
+        // so the outgoing typed hop drives from the source posting.
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_out");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = rel_plan_for(&gen, "MATCH (a:N)-[:T]->(b) RETURN b");
+        assert_eq!(
+            scan,
+            NodeScan::RelTypeScan {
+                reltype_ids: vec![0],
+                side: RelEndpointSide::Source,
+                guaranteed_label: Some(0),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incoming_typed_first_hop_picks_rel_target_scan() {
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_in");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = rel_plan_for(&gen, "MATCH (a:N)<-[:T]-(b) RETURN b");
+        assert_eq!(
+            scan,
+            NodeScan::RelTypeScan {
+                reltype_ids: vec![0],
+                side: RelEndpointSide::Target,
+                guaranteed_label: Some(0),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn undirected_typed_first_hop_picks_either_side() {
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_undir");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = rel_plan_for(&gen, "MATCH (a:N)-[:T]-(b) RETURN b");
+        assert_eq!(
+            scan,
+            NodeScan::RelTypeScan {
+                reltype_ids: vec![0],
+                side: RelEndpointSide::Either,
+                guaranteed_label: Some(0),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unlabelled_anchor_typed_hop_still_picks_rel_scan_over_all_nodes() {
+        // No anchor label ⇒ base is AllNodes (6); source count 2 < 6 ⇒ rel scan,
+        // with no guaranteed label.
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_nolbl");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = rel_plan_for(&gen, "MATCH (a)-[:T]->(b) RETURN b");
+        assert_eq!(
+            scan,
+            NodeScan::RelTypeScan {
+                reltype_ids: vec![0],
+                side: RelEndpointSide::Source,
+                guaranteed_label: None,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rel_scan_negatives_keep_the_base_scan() {
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_neg");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let label_scan = NodeScan::LabelScan { label_id: 0 };
+        // Untyped relationship — no posting to drive from.
+        assert_eq!(rel_plan_for(&gen, "MATCH (a:N)-->(b) RETURN b"), label_scan);
+        // Variable-length first hop — an edgeless anchor could match `*0..`.
+        assert_eq!(
+            rel_plan_for(&gen, "MATCH (a:N)-[:T*1..2]->(b) RETURN b"),
+            label_scan
+        );
+        // Negated type expression — `positive_atoms()` is None.
+        assert_eq!(
+            rel_plan_for(&gen, "MATCH (a:N)-[:!U]->(b) RETURN b"),
+            label_scan
+        );
+        // Cost gate: reltype U has 1 source but so does... it still beats 6, so
+        // pick a query where the gate fails — drive an id-seek base, which must
+        // never be overridden.
+        assert_eq!(
+            rel_plan_for(&gen, "MATCH (a:N)-[:T]->(b) WHERE id(a) = 0 RETURN b"),
+            NodeScan::IdSeek { ids: vec![0] }
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

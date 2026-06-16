@@ -31,6 +31,7 @@ use graph_format::ids::{EdgeId, Generation, NodeId};
 use graph_format::isam::write_isam_with_cipher;
 use graph_format::manifest::{AnnMode, EntityKind, Metric, RangeIndexDesc, VectorIndexDesc};
 use graph_format::nodelabels::NodeLabelsWriter;
+use graph_format::postings::write_reltype_endpoint_postings;
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
 use graph_format::topology::{write_csr_with_cipher, Edge};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
@@ -390,6 +391,21 @@ pub fn build(
     )?;
     block_sizes.insert("topology.csr.blk".into(), opts.block_size as u32);
 
+    // reltype_src.post / reltype_tgt.post — per-reltype distinct endpoint postings
+    // that let a relationship-type scan drive an unanchored typed hop from the
+    // nodes that actually carry the edge. Derived from the same `edges` slice.
+    let (reltype_source_counts, reltype_target_counts) = write_reltype_endpoint_postings(
+        tmp_dir.join("reltype_src.post"),
+        tmp_dir.join("reltype_tgt.post"),
+        reltypes.names().len() as u32,
+        &edges,
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    block_sizes.insert("reltype_src.post".into(), opts.block_size as u32);
+    block_sizes.insert("reltype_tgt.post".into(), opts.block_size as u32);
+
     // ---- vector indexes ----------------------------------------------------
     // First gather each index's `(node_id, vector)` set, then route each by
     // cardinality: below `--ann-threshold` it is full-precision in
@@ -513,6 +529,8 @@ pub fn build(
         property_keys: keys.into_names(),
         range_indexes,
         vector_indexes,
+        reltype_source_counts,
+        reltype_target_counts,
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
