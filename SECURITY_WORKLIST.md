@@ -78,6 +78,14 @@ authenticated principals over Bolt).
   ~80 GB before reading any body. **Fixed** by bounding the pre-allocation to the bytes
   remaining (`n.min(self.remaining())`); regression test
   `forged_length_headers_bail_without_huge_allocation`. Parser and chunk targets fuzz clean.
+  *Update (2026-06-16):* the nightly fuzz run surfaced a second finding in the same decoder — a
+  **pre-auth stack-overflow** from unbounded container recursion. `read_list`/`read_map`/`read_struct`
+  recurse into `read_value` with no depth limit, so a tiny message that is just a run of nesting
+  markers (e.g. repeated `0x91` tiny-list-of-one, or `0xA6` tiny-map as in the crash corpus) drives
+  recursion one level per byte and aborts the process via ASan stack-overflow — before any length or
+  allocation guard fires. **Fixed** by capping nesting at `MAX_DEPTH = 256` (a guarded `read_value`
+  wrapper increments/decrements a `depth` counter and bails past the cap); regression test
+  `deeply_nested_value_bails_without_stack_overflow`, and the real crash reproducer now returns `Err`.
   *Update (connection hardening):* the pre-auth reassembly budget is now **differential** —
   the framer carries a per-connection `max_body` that starts at the tight `server.maxPreAuthBytes`
   (default 64 KiB) and only ratchets up to `server.maxMessageBytes` after a verified `LOGON`, so

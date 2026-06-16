@@ -178,15 +178,30 @@ fn encode_int(v: i64, out: &mut Vec<u8>) {
 
 // ── Decoding ────────────────────────────────────────────────────────────────
 
+/// Maximum container nesting the decoder will follow before bailing. PackStream
+/// containers (list / map / struct) decode by recursing into `read_value`, so an
+/// attacker can force unbounded recursion with a tiny message — e.g. a chain of
+/// `0x91` (tiny-list-of-one) bytes nests one level per byte and overflows the
+/// stack long before any length or allocation guard fires. Cap the depth so an
+/// over-nested value comes back as `Err` instead of aborting the process.
+/// 256 is far beyond any legitimate query parameter shape yet trivially safe on
+/// the smallest worker-thread stack.
+const MAX_DEPTH: usize = 256;
+
 /// A cursor over a PackStream byte buffer.
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     /// Bytes not yet consumed.
@@ -217,8 +232,19 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    /// Decode the next value.
+    /// Decode the next value, guarding against unbounded container recursion.
     pub fn read_value(&mut self) -> Result<PsValue> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            bail!("packstream: value nesting exceeds {MAX_DEPTH} levels");
+        }
+        let r = self.read_value_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn read_value_inner(&mut self) -> Result<PsValue> {
         let m = self.u8()?;
         match m {
             // Tiny ints.
@@ -375,6 +401,22 @@ mod tests {
         // `0xB?` tiny-struct is ≤15 fields, but the u32 list path above is the
         // unbounded one; also check a u16 list length with no body.
         assert!(from_slice(&[0xD5, 0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_value_bails_without_stack_overflow() {
+        // Regression (found by the `packstream_decode` fuzz target): each `0x91`
+        // is a tiny-list-of-one whose sole element is decoded by recursing into
+        // `read_value`, so a long run of them nests one container level per byte.
+        // Without a depth cap this overflowed the stack (ASan stack-overflow);
+        // now it must come back as `Err`. Use far more than MAX_DEPTH markers.
+        let nested = vec![0x91u8; MAX_DEPTH + 1000];
+        assert!(from_slice(&nested).is_err());
+        // A nesting depth within the cap still decodes successfully (each level
+        // is a 1-element list; close it with a Null leaf so the body is valid).
+        let mut ok = vec![0x91u8; MAX_DEPTH - 1];
+        ok.push(0xC0); // Null
+        assert!(from_slice(&ok).is_ok());
     }
 
     #[test]
