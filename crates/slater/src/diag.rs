@@ -193,27 +193,35 @@ impl Diagnostics {
 
     /// A query is about to execute on the blocking pool.
     pub fn on_query_start(&self) {
+        // `queries_in_flight` is maintained unconditionally (two relaxed atomics —
+        // negligible on the hot path) so the allocator-trim idle gate can read it
+        // even when load-test diagnostics are off; the rest stays gated.
+        self.queries_in_flight.fetch_add(1, Ordering::Relaxed);
         if self.enabled {
             self.queries_started.fetch_add(1, Ordering::Relaxed);
-            self.queries_in_flight.fetch_add(1, Ordering::Relaxed);
         }
     }
     /// A query finished successfully; `total_ms` is its wall-clock (exec+encode).
     pub fn on_query_ok(&self, total_ms: f64) {
+        self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         if self.enabled {
-            self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
             self.queries_ok.fetch_add(1, Ordering::Relaxed);
             self.latency.record(total_ms);
         }
+    }
+    /// Live count of queries currently executing (always tracked). Used by the
+    /// allocator-trim task to fire only when the server is idle.
+    pub fn in_flight(&self) -> i64 {
+        self.queries_in_flight.load(Ordering::Relaxed)
     }
     /// A query failed; classify the `anyhow` error into the right reason counter
     /// by its message (the same string signatures `Failure::from_query_error`
     /// keys on, plus the executor's budget / deadline / shortest-path messages).
     pub fn on_query_err(&self, err: &anyhow::Error) {
+        self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         if !self.enabled {
             return;
         }
-        self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         let m = err.to_string();
         let counter = if m.contains("server-wide intermediate budget") {
             &self.fail_global_budget
