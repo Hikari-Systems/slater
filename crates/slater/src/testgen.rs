@@ -32,11 +32,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use graph_format::columns::PropsWriter;
+use graph_format::histogram::{
+    derive_histogram_from_isam, encode_histogram, write_property_histograms,
+};
 use graph_format::ids::{EdgeId, Generation as GenId, NodeId, Value};
 use graph_format::integrity::hash_file;
 use graph_format::isam::write_isam;
 use graph_format::manifest::{
-    AnnMode, EntityKind, FileEntry, Manifest, Metric, RangeIndexDesc, VectorIndexDesc,
+    AnnMode, EntityKind, FileEntry, Manifest, Metric, PropertyHistogramDesc, RangeIndexDesc,
+    VectorIndexDesc,
 };
 use graph_format::nodelabels::NodeLabelsWriter;
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
@@ -52,6 +56,18 @@ const LEVEL: i32 = 3;
 /// Returns `(data_dir, graph, uuid)`. Each `tag` gets its own root so tests can
 /// run (and tear down) in parallel.
 pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
+    write_basic_opt(tag, false)
+}
+
+/// Like [`write_basic`] but also emits the `prop_hist.blk` value→count histograms
+/// for the node range indexes (the format-v3 precompute), so the grouped-index
+/// fast path answers group-by / count(DISTINCT) from the histogram instead of
+/// walking the ISAM. Used by the histogram-on vs histogram-off parity test.
+pub fn write_basic_with_histograms(tag: &str) -> (PathBuf, String, uuid::Uuid) {
+    write_basic_opt(tag, true)
+}
+
+fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::Uuid) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0002);
     let graph = "people".to_string();
     let root = std::env::temp_dir().join(format!("slater_fixture_{}_{tag}", std::process::id()));
@@ -179,6 +195,36 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
     )
     .unwrap();
 
+    // prop_hist.blk — value→count histograms for the three node range indexes,
+    // derived from the just-written ISAMs (same path as the builder), so the
+    // grouped-index fast path reads them instead of walking the index.
+    let node_indexes = [
+        ("node_Person_name", "name"),
+        ("node_Person_age", "age"),
+        ("node_Person_team", "team"),
+    ];
+    let mut property_histograms: Vec<PropertyHistogramDesc> = Vec::new();
+    if with_histogram {
+        let mut records = Vec::new();
+        for (name, prop) in node_indexes {
+            let pairs = derive_histogram_from_isam(
+                dir.join("range").join(format!("{name}.isam")),
+                None,
+                4096,
+            )
+            .unwrap()
+            .expect("low-cardinality fixture index is under the cap");
+            property_histograms.push(PropertyHistogramDesc {
+                index_name: name.into(),
+                label: "Person".into(),
+                property: prop.into(),
+                distinct_count: pairs.len() as u64,
+            });
+            records.push(encode_histogram(&pairs));
+        }
+        write_property_histograms(dir.join("prop_hist.blk"), &records, BLOCK, LEVEL, None).unwrap();
+    }
+
     // Inventory + manifest.
     let mut block_sizes = BTreeMap::new();
     let mut files = Vec::new();
@@ -192,7 +238,7 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
-    for name in [
+    let mut inv_names = vec![
         "node_props.blk",
         "node_labels.blk",
         "edge_props.blk",
@@ -201,7 +247,11 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         "range/node_Person_name.isam",
         "range/node_Person_age.isam",
         "range/node_Person_team.isam",
-    ] {
+    ];
+    if with_histogram {
+        inv_names.push("prop_hist.blk");
+    }
+    for name in inv_names {
         add(name, &mut files, &mut block_sizes);
     }
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -265,6 +315,7 @@ pub fn write_basic(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         }],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms,
         acl_blake3: None,
         mac: None,
         files,
@@ -408,6 +459,7 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -564,6 +616,7 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts,
         reltype_target_counts,
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -718,6 +771,7 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -831,6 +885,7 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -971,6 +1026,7 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,
@@ -1157,6 +1213,7 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
         }],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        property_histograms: vec![],
         acl_blake3: None,
         mac: None,
         files,

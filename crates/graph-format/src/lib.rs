@@ -15,7 +15,9 @@
 ///
 /// v2 adds the per-reltype endpoint postings (`reltype_src.post` /
 /// `reltype_tgt.post`) and their manifest count vectors — see [`postings`].
-pub const FORMAT_VERSION: u32 = 2;
+/// v3 adds the per-(label, property) value→count histograms (`prop_hist.blk`)
+/// and their manifest descriptors — see [`histogram`].
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -26,6 +28,7 @@ pub mod codec;
 pub mod columns;
 pub mod crypto;
 pub mod extsort;
+pub mod histogram;
 pub mod ids;
 pub mod integrity;
 pub mod isam;
@@ -45,7 +48,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(FORMAT_VERSION, 3);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

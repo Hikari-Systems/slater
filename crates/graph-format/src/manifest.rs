@@ -62,6 +62,23 @@ pub struct RangeIndexDesc {
     pub property: String,
 }
 
+/// Descriptor for one stored per-(label, property) value→count histogram. Aligned
+/// by position with the records in `prop_hist.blk`. Present ⇒ the generation can
+/// answer a whole-label group-by / `count(DISTINCT)` on this `(label, property)`
+/// from O(distinct) instead of an O(index) `distinct_key_counts` walk. Absent (the
+/// index is over an edge, or its distinct count exceeded `--histogram-max-distinct`)
+/// ⇒ the query path falls back to the walk: slower, never incorrect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PropertyHistogramDesc {
+    /// Range-index file stem this histogram derives from (= [`RangeIndexDesc::name`]).
+    pub index_name: String,
+    pub label: String,
+    pub property: String,
+    /// Number of distinct non-null values (= record's pair count = ISAM key count).
+    pub distinct_count: u64,
+}
+
 /// Descriptor for one declared vector index over a `(label, property)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,6 +163,13 @@ pub struct Manifest {
     /// (and, unioned with sources, undirected) typed first hops.
     #[serde(default)]
     pub reltype_target_counts: Vec<u64>,
+    /// Per-(label, property) value→count histograms carried in `prop_hist.blk`,
+    /// one descriptor per stored histogram, aligned by position with the file's
+    /// records. Non-empty ⇒ the grouped-index fast path reads these instead of
+    /// walking the ISAM. Empty ⇒ no histograms (every group-by/count(DISTINCT)
+    /// falls back to `distinct_key_counts`). See [`PropertyHistogramDesc`].
+    #[serde(default)]
+    pub property_histograms: Vec<PropertyHistogramDesc>,
     /// BLAKE3 digest (hex) of the live `acl.json` this generation was built
     /// against (`slater-build --acl`). `None` ⇒ not stamped (older images, or the
     /// flag was not given). When present, the server re-hashes the configured live
@@ -287,6 +311,7 @@ mod tests {
             }],
             reltype_source_counts: vec![],
             reltype_target_counts: vec![],
+            property_histograms: vec![],
             acl_blake3: None,
             mac: None,
             files,

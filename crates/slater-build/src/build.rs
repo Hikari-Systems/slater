@@ -50,6 +50,11 @@ pub struct BuildOptions {
     /// Target block size for the vector store, bytes.
     pub vector_block_size: usize,
     pub zstd_level: i32,
+    /// Cap on a per-(label, property) histogram's distinct-key count: a node range
+    /// index with more distinct values than this is not given a `prop_hist.blk`
+    /// histogram (it would be as large as the index for no benefit). `0` disables
+    /// histograms entirely. See [`graph_format::histogram`].
+    pub histogram_max_distinct: u64,
     /// Optional `VectorIndexSpec[]` JSON sidecar (label/property/dim/metric).
     pub vector_index_json: Option<PathBuf>,
     /// At-rest encryption master key (raw bytes). `None` ⇒ plaintext image, the
@@ -93,6 +98,7 @@ impl Default for BuildOptions {
             block_size: 256 * 1024,
             vector_block_size: 256 * 1024,
             zstd_level: 3,
+            histogram_max_distinct: graph_format::histogram::DEFAULT_HISTOGRAM_MAX_DISTINCT,
             vector_index_json: None,
             encryption_key: None,
             acl_blake3: None,
@@ -513,6 +519,20 @@ pub fn build(
         });
     }
 
+    // prop_hist.blk — per-(label, property) value→count histograms derived from the
+    // node range ISAMs just written, so the grouped-index fast path answers a
+    // whole-label group-by / count(DISTINCT) in O(distinct) instead of an O(index)
+    // walk. Skips high-cardinality / disabled indexes (logged in the helper).
+    let property_histograms = common::build_property_histograms(
+        &tmp_dir,
+        &range_indexes,
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+        opts.histogram_max_distinct,
+    )?;
+    block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
+
     // ---- inventory, MANIFEST, atomic publish (shared with build_external) --
     common::write_manifest_and_publish(PublishInputs {
         tmp_dir: &tmp_dir,
@@ -531,6 +551,7 @@ pub fn build(
         vector_indexes,
         reltype_source_counts,
         reltype_target_counts,
+        property_histograms,
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),

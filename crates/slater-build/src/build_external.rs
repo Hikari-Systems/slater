@@ -1403,6 +1403,19 @@ fn build_inner(
         });
     }
 
+    // prop_hist.blk — value→count histograms from the node range ISAMs just
+    // written (same derivation as the in-memory path: run-length-count the finished
+    // ISAM, so both builders agree). High-cardinality / disabled indexes skipped.
+    let property_histograms = common::build_property_histograms(
+        tmp_dir,
+        &range_indexes,
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+        opts.histogram_max_distinct,
+    )?;
+    block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
+
     // ---- publish (shared with the in-memory build) ----
     common::write_manifest_and_publish(PublishInputs {
         tmp_dir,
@@ -1421,6 +1434,7 @@ fn build_inner(
         vector_indexes,
         reltype_source_counts,
         reltype_target_counts,
+        property_histograms,
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),

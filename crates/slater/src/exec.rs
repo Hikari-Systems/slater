@@ -2004,7 +2004,14 @@ impl<'g> Engine<'g> {
             .gen
             .range_index(&idx_name)
             .expect("index_for only returns open indexes");
-        let groups = reader.distinct_key_counts()?;
+        // Prefer the build-time histogram (O(distinct)); it is byte-identical to
+        // `distinct_key_counts` (derived from this very index), so the answer is the
+        // same. Absent (over the cardinality cap / pre-v3 generation) ⇒ walk the
+        // index, exactly as before.
+        let groups = match self.gen.property_histogram(&idx_name) {
+            Some(h) => h.to_vec(),
+            None => reader.distinct_key_counts()?,
+        };
 
         let columns: Vec<String> = body
             .items
@@ -8418,6 +8425,65 @@ mod tests {
             "the general path must exhaust the tiny budget (proving the fast path \
              above genuinely avoided the scan)"
         );
+    }
+
+    #[test]
+    fn grouped_index_histogram_matches_scan() {
+        // Level-1 precompute correctness: a histogram-ON generation answers
+        // group-by / count(DISTINCT) from `prop_hist.blk`; an otherwise-identical
+        // histogram-OFF generation answers them by walking the ISAM. Every query
+        // must return identical rows AND identical row order.
+        let ordered = |res: &QueryResult| -> Vec<Vec<String>> {
+            res.rows
+                .iter()
+                .map(|r| r.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        let exec = |root: &std::path::Path, graph: &str, q: &str| -> QueryResult {
+            let gen = Generation::open(root, graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let out = Engine::new(&gen, &cache)
+                .run(&parser::parse(q).unwrap())
+                .unwrap();
+            out
+        };
+
+        let queries = [
+            "MATCH (n:Person) RETURN n.team AS t, count(*) AS c ORDER BY c DESC",
+            "MATCH (n:Person) RETURN n.team AS t, count(*) AS c",
+            "MATCH (n:Person) RETURN count(DISTINCT n.team) AS c",
+            "MATCH (n:Person) RETURN n.age AS a, count(*) AS c ORDER BY a ASC",
+            "MATCH (n:Person) RETURN count(DISTINCT n.age) AS c, 7 AS k",
+        ];
+        for (i, q) in queries.iter().enumerate() {
+            let (root_off, g_off, _) = testgen::write_basic(&format!("exec_hist_off_{i}"));
+            // The OFF generation carries no histogram → fallback (index walk).
+            let gen_off = Generation::open(&root_off, &g_off).unwrap();
+            assert!(gen_off.property_histogram("node_Person_team").is_none());
+            drop(gen_off);
+            let off = exec(&root_off, &g_off, q);
+            let _ = std::fs::remove_dir_all(&root_off);
+
+            let (root_on, g_on, _) =
+                testgen::write_basic_with_histograms(&format!("exec_hist_on_{i}"));
+            // The ON generation's histogram is byte-identical to the walk it replaces.
+            let gen_on = Generation::open(&root_on, &g_on).unwrap();
+            let hist = gen_on
+                .property_histogram("node_Person_team")
+                .expect("histogram present in the ON generation");
+            let walk = gen_on
+                .range_index("node_Person_team")
+                .unwrap()
+                .distinct_key_counts()
+                .unwrap();
+            assert_eq!(hist, walk.as_slice(), "histogram must equal the index walk");
+            drop(gen_on);
+            let on = exec(&root_on, &g_on, q);
+            let _ = std::fs::remove_dir_all(&root_on);
+
+            assert_eq!(on.columns, off.columns, "columns differ for `{q}`");
+            assert_eq!(ordered(&on), ordered(&off), "rows/order differ for `{q}`");
+        }
     }
 
     #[test]

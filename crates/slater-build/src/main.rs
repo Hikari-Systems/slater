@@ -53,6 +53,13 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     zstd_level: i32,
 
+    /// Cap on a per-(label, property) value→count histogram's distinct-key count.
+    /// A node range index with more distinct values is not given a histogram (it
+    /// would be as large as the index for no benefit); whole-label group-by /
+    /// count(DISTINCT) on it then scans the index. `0` disables histograms.
+    #[arg(long, default_value_t = graph_format::histogram::DEFAULT_HISTOGRAM_MAX_DISTINCT)]
+    histogram_max_distinct: u64,
+
     /// Optional `VectorIndexSpec[]` JSON sidecar declaring vector indexes.
     #[arg(long)]
     vector_index_json: Option<PathBuf>,
@@ -189,6 +196,7 @@ fn main() -> Result<()> {
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
         zstd_level: cli.zstd_level,
+        histogram_max_distinct: cli.histogram_max_distinct,
         vector_index_json: cli.vector_index_json.clone(),
         encryption_key,
         acl_blake3,

@@ -14,9 +14,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 
 use graph_format::crypto::{self, BlockCipher};
+use graph_format::histogram::{
+    derive_histogram_from_isam, encode_histogram, write_property_histograms,
+};
 use graph_format::ids::Generation;
 use graph_format::integrity::{content_hash, hash_file};
-use graph_format::manifest::{EncryptionHeader, Manifest, RangeIndexDesc, VectorIndexDesc};
+use graph_format::manifest::{
+    EncryptionHeader, EntityKind, Manifest, PropertyHistogramDesc, RangeIndexDesc, VectorIndexDesc,
+};
 
 /// Derive the per-generation block cipher and the MANIFEST encryption header (which
 /// records the KDF salt, never the key) when encryption is requested.
@@ -85,6 +90,10 @@ pub struct PublishInputs<'a> {
     /// (`reltype_src.post` / `reltype_tgt.post`), index = reltype id.
     pub reltype_source_counts: Vec<u64>,
     pub reltype_target_counts: Vec<u64>,
+    /// Per-(label, property) value→count histogram descriptors (`prop_hist.blk`),
+    /// aligned by position with that file's records. Produced by
+    /// [`build_property_histograms`].
+    pub property_histograms: Vec<PropertyHistogramDesc>,
     pub encryption_header: Option<EncryptionHeader>,
     pub encryption_key: &'a Option<Vec<u8>>,
     pub acl_blake3: Option<String>,
@@ -105,6 +114,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         "vectors.f32.blk".into(),
         "reltype_src.post".into(),
         "reltype_tgt.post".into(),
+        "prop_hist.blk".into(),
     ];
     for ri in &inp.range_indexes {
         file_names.push(format!("range/{}.isam", ri.name));
@@ -151,6 +161,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         vector_indexes: inp.vector_indexes,
         reltype_source_counts: inp.reltype_source_counts,
         reltype_target_counts: inp.reltype_target_counts,
+        property_histograms: inp.property_histograms,
         acl_blake3: inp.acl_blake3,
         mac: None,
         files,
@@ -186,4 +197,61 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         node_count: inp.node_count,
         edge_count: inp.edge_count,
     })
+}
+
+/// Derive per-(label, property) value→count histograms from the already-written
+/// **node** range-index ISAMs under `tmp_dir/range/`, write them into
+/// `tmp_dir/prop_hist.blk`, and return the aligned descriptors for the MANIFEST.
+///
+/// Shared by both build paths and called *after* the range indexes are written, so
+/// each histogram run-length-counts the finished ISAM via the same
+/// `distinct_key_counts` the query path uses — the two builders are therefore
+/// guaranteed to agree. A node index whose distinct count exceeds `max_distinct`
+/// (or any index, when `max_distinct == 0`) is skipped and logged; edge indexes
+/// never get a histogram. `prop_hist.blk` is always written (empty if nothing
+/// qualifies) so the inventory and content hash stay stable.
+pub fn build_property_histograms(
+    tmp_dir: &Path,
+    range_indexes: &[RangeIndexDesc],
+    block_size: usize,
+    zstd_level: i32,
+    cipher: Option<Arc<BlockCipher>>,
+    max_distinct: u64,
+) -> Result<Vec<PropertyHistogramDesc>> {
+    let mut descs = Vec::new();
+    let mut records = Vec::new();
+    for ri in range_indexes {
+        if ri.entity != EntityKind::Node {
+            continue;
+        }
+        let isam_path = tmp_dir.join(format!("range/{}.isam", ri.name));
+        match derive_histogram_from_isam(&isam_path, cipher.clone(), max_distinct)? {
+            Some(pairs) => {
+                descs.push(PropertyHistogramDesc {
+                    index_name: ri.name.clone(),
+                    label: ri.label_or_type.clone(),
+                    property: ri.property.clone(),
+                    distinct_count: pairs.len() as u64,
+                });
+                records.push(encode_histogram(&pairs));
+            }
+            None => {
+                tracing::info!(
+                    "histogram skipped for ({}, {}): distinct values exceed \
+                     --histogram-max-distinct {} (group-by/count(DISTINCT) will scan the index)",
+                    ri.label_or_type,
+                    ri.property,
+                    max_distinct
+                );
+            }
+        }
+    }
+    write_property_histograms(
+        tmp_dir.join("prop_hist.blk"),
+        &records,
+        block_size,
+        zstd_level,
+        cipher,
+    )?;
+    Ok(descs)
 }

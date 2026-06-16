@@ -24,7 +24,9 @@ use anyhow::{bail, Context, Result};
 use graph_format::blockfile::BlockFileReader;
 use graph_format::columns::PropsReader;
 use graph_format::crypto::{self, BlockCipher};
+use graph_format::histogram::decode_histogram;
 use graph_format::ids::Generation as GenId;
+use graph_format::ids::Value;
 use graph_format::integrity::hash_file;
 use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
@@ -70,6 +72,11 @@ pub struct Generation {
     vectors: VectorStoreReader,
     /// Range (ISAM) indexes keyed by their MANIFEST `name` (= file stem under `range/`).
     range_indexes: HashMap<String, IsamReader>,
+    /// Per-(label, property) value→count histograms (`prop_hist.blk`), keyed by the
+    /// range-index `name` they derive from. Tiny and few, so decoded resident at
+    /// open; the grouped-index fast path reads them in place of an ISAM walk. Empty
+    /// ⇒ no precompute (the fast path falls back to `distinct_key_counts`).
+    prop_histograms: HashMap<String, Vec<(Value, u64)>>,
     /// Disk-native Vamana/PQ indexes (above the ANN threshold), keyed by
     /// `(label, property)`. Each holds its block reader, its position in
     /// `manifest.vector_indexes` (the cache ordinal), and its resident PQ codes.
@@ -216,6 +223,22 @@ impl Generation {
             range_indexes.insert(ri.name.clone(), reader);
         }
 
+        // Value→count histograms (format v3+). Gate on file existence (a hand-built
+        // fixture may omit it). Records align by position with `property_histograms`;
+        // decode them resident, keyed by index name.
+        let mut prop_histograms = HashMap::new();
+        let hist_path = dir.join("prop_hist.blk");
+        if hist_path.exists() && !manifest.property_histograms.is_empty() {
+            let reader = BlockFileReader::open_with_cipher(&hist_path, cipher.clone())
+                .with_context(|| format!("open histogram store {}", hist_path.display()))?;
+            for (i, d) in manifest.property_histograms.iter().enumerate() {
+                let rec = reader.read_record_global(i as u64).with_context(|| {
+                    format!("read histogram record {i} for index {}", d.index_name)
+                })?;
+                prop_histograms.insert(d.index_name.clone(), decode_histogram(&rec)?);
+            }
+        }
+
         // Open the disk-native Vamana/PQ indexes (above the ANN threshold). Each
         // reads only its block-file footer + PQ codebook header at open; the
         // resident PQ codes are loaded once here (the navigation set the beam search
@@ -278,6 +301,7 @@ impl Generation {
             reltype_tgt_post,
             vectors,
             range_indexes,
+            prop_histograms,
             vamana_indexes,
             label_ids,
             reltype_ids,
@@ -360,6 +384,15 @@ impl Generation {
     }
     pub fn range_index(&self, name: &str) -> Option<&IsamReader> {
         self.range_indexes.get(name)
+    }
+
+    /// The precomputed value→count histogram for the range index `name`, if the
+    /// generation carries one (it does not when the index is over an edge or its
+    /// distinct count exceeded the build's `--histogram-max-distinct`). The pairs
+    /// are ascending by key and identical to `range_index(name).distinct_key_counts()`
+    /// — the grouped-index fast path uses them to skip the O(index) walk.
+    pub fn property_histogram(&self, name: &str) -> Option<&[(Value, u64)]> {
+        self.prop_histograms.get(name).map(Vec::as_slice)
     }
 
     /// The opened Vamana/PQ index over `(label, property)`, if one exists (i.e. the
@@ -825,6 +858,7 @@ mod tests {
             }],
             reltype_source_counts,
             reltype_target_counts,
+            property_histograms: vec![],
             acl_blake3: None,
             mac: None,
             files,
