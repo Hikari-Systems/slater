@@ -1252,6 +1252,12 @@ pub struct Engine<'g> {
     /// a query cannot grow unbounded memory inside the `timeout_ms` window.
     max_intermediate: u64,
     budget_used: Cell<u64>,
+    /// Count-pushdown accumulator. `Some(n)` ⇒ the chain-walk emit leaves tally a
+    /// completed row here and skip materialising it (the `RETURN count(*)` fast
+    /// path); `None` ⇒ normal row-building. Per-query, touched only on the calling
+    /// thread (the walk's parallelism is confined to `par_gather`), like
+    /// `budget_used`.
+    count_acc: Cell<Option<u64>>,
     /// Server-wide intermediate budget shared across every concurrent query
     /// (`query.maxIntermediateGlobal`); `None` ⇒ no global guard. Charged in
     /// lock-step with `budget_used`; `global_charged` is this query's running
@@ -1299,6 +1305,7 @@ impl<'g> Engine<'g> {
             beam_width: 64,
             max_intermediate: 0,
             budget_used: Cell::new(0),
+            count_acc: Cell::new(None),
             global_budget: None,
             global_charged: Cell::new(0),
             max_shortest_path_explore: 0,
@@ -1514,6 +1521,21 @@ impl<'g> Engine<'g> {
         Ok(())
     }
 
+    /// In count-pushdown mode (`count_acc` set), tally one completed row and return
+    /// `true` so the caller skips materialising it. `false` in normal row-building
+    /// mode. Charging is unchanged and happens at the call site either way, so the
+    /// intermediate budget bounds a counted walk exactly as it bounds a materialised
+    /// one.
+    fn count_tally(&self) -> bool {
+        match self.count_acc.get() {
+            Some(n) => {
+                self.count_acc.set(Some(n + 1));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Refund this query's whole global-budget charge. Idempotent: a second call
     /// (e.g. `Drop` after `run` already released) refunds nothing.
     fn release_global(&self) {
@@ -1574,6 +1596,12 @@ impl<'g> Engine<'g> {
         // and `RETURN count(DISTINCT n.p)` are answered from the range index over
         // (L, p) — one sequential index walk, no per-node property decode.
         if let Some(res) = self.try_grouped_index_fast_path(sq)? {
+            return Ok(res);
+        }
+        // Stage B: `MATCH (…)-[…]->(…) [WHERE …] RETURN count(*)|count(v)` — a
+        // multi-hop count walks but counts during expansion instead of materialising
+        // the row set (the fanout RSS peak).
+        if let Some(res) = self.try_count_walk_fast_path(sq)? {
             return Ok(res);
         }
         self.run_single_seeded(sq, Table::singleton())
@@ -1701,6 +1729,130 @@ impl<'g> Engine<'g> {
             }
         }
         Ok(Some((columns, row)))
+    }
+
+    /// Recognise a bare `RETURN count(*) | count(v)` over a single non-OPTIONAL
+    /// `MATCH` (optional `WHERE`) whose pattern has relationships, and answer it by
+    /// **counting matched rows during expansion** instead of materialising every
+    /// completed binding. This is the multi-hop / WHERE sibling of
+    /// [`Self::try_count_fast_path`] (which answers single-node counts from
+    /// metadata) — it still walks, but never builds the row set, so a high-degree
+    /// hub `count(*)` runs in O(1) result memory instead of the
+    /// `query.maxIntermediate`-bounded `Vec<HashMap>` that is the fanout RSS peak.
+    ///
+    /// Guards (anything else returns `None` → the materialising path runs, still
+    /// correct): one MATCH reading clause, non-OPTIONAL, no quantified/selector/
+    /// restrictor pattern, at least one relationship; the RETURN is non-`*`, has no
+    /// ORDER BY/SKIP/LIMIT, and its items are exactly one `count(*)`/`count(v)` (with
+    /// `v` a variable this MATCH binds — always non-null on a completed non-OPTIONAL
+    /// match, so `count(v) == count(*)`) plus any number of **constant** items.
+    /// `count(DISTINCT …)`, `count(expr)`, a second aggregate, a grouping item, or a
+    /// trailing clause all fall back (pushdown would miscount).
+    fn try_count_walk_fast_path(&self, sq: &SingleQuery) -> Result<Option<QueryResult>> {
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        // OPTIONAL emits outer-join rows whose pattern vars are null: count(v) would
+        // then skip them (≠ count(*)) and count(*) over a no-match seed is 1, not 0.
+        if m.optional {
+            return Ok(None);
+        }
+        if m.patterns
+            .iter()
+            .any(|p| p.segments.is_some() || p.selector.is_some() || p.restrictor.is_some())
+        {
+            return Ok(None);
+        }
+        // Must actually walk — a pure single-node count is the metadata fast path's job.
+        if m.patterns.iter().all(|p| p.rels.is_empty()) {
+            return Ok(None);
+        }
+
+        let body = &sq.ret.body;
+        if body.star
+            || body.items.is_empty()
+            || !body.order_by.is_empty()
+            || body.skip.is_some()
+            || body.limit.is_some()
+        {
+            return Ok(None);
+        }
+
+        // Variables this MATCH binds; each is non-null on a completed non-OPTIONAL
+        // match, so `count(v)` over any of them equals `count(*)`.
+        let mut bound: Vec<String> = Vec::new();
+        for p in &m.patterns {
+            collect_pattern_vars(p, &[], &mut bound);
+        }
+
+        // Exactly one count item; every other item a constant (one group).
+        let mut count_idx = None;
+        for (i, it) in body.items.iter().enumerate() {
+            if is_count_star_or_var(&it.expr, &bound) {
+                if count_idx.is_some() {
+                    return Ok(None); // two counts — not our shape
+                }
+                count_idx = Some(i);
+            } else if !matches!(it.expr, Expr::Param(_) | Expr::Literal(_)) {
+                return Ok(None); // grouping key / other aggregate
+            }
+        }
+        let Some(count_idx) = count_idx else {
+            return Ok(None);
+        };
+
+        let n = self.count_match(m)?;
+
+        // One output row: the count in its column, constants evaluated.
+        let empty: HashMap<String, Val> = HashMap::new();
+        let mut columns = Vec::with_capacity(body.items.len());
+        let mut row = Vec::with_capacity(body.items.len());
+        for (i, it) in body.items.iter().enumerate() {
+            columns.push(it.alias.clone().unwrap_or_else(|| expr_name(&it.expr)));
+            if i == count_idx {
+                row.push(Val::Int(n as i64));
+            } else {
+                row.push(self.eval(&it.expr, &Scope::Map(&empty), None)?);
+            }
+        }
+        Ok(Some(QueryResult {
+            columns,
+            rows: vec![row],
+        }))
+    }
+
+    /// Count the rows a non-OPTIONAL `MATCH` produces.
+    ///
+    /// For a single pattern with no `WHERE`, drive the ordinary matcher with the
+    /// count accumulator armed: the chain-walk leaves tally completed rows and never
+    /// materialise them (`out` stays empty), so a high-degree-hub `count(*)` runs in
+    /// O(1) result memory — the fanout RSS win. Charging is unchanged, so the
+    /// intermediate budget still bounds the walk exactly as before.
+    ///
+    /// A `WHERE` (the survivor filter is applied at the `match_patterns` terminal,
+    /// after `match_single_pattern` has produced the rows) or a multi-pattern
+    /// conjunction falls back to the materialising path — correct, just without the
+    /// memory win (these are not the fanout-count hot shape).
+    fn count_match(&self, m: &MatchClause) -> Result<u64> {
+        if m.patterns.len() == 1 && m.where_.is_none() {
+            debug_assert!(
+                self.count_acc.get().is_none(),
+                "count_match is not re-entrant"
+            );
+            self.count_acc.set(Some(0));
+            let mut sink: Vec<HashMap<String, Val>> = Vec::new();
+            let res =
+                self.match_single_pattern(&m.patterns[0], &HashMap::new(), None, &mut sink, None);
+            let n = self.count_acc.replace(None).unwrap_or(0);
+            res?;
+            debug_assert!(sink.is_empty(), "count-pushdown must not materialise rows");
+            return Ok(n);
+        }
+        let table = self.apply_match(Table::singleton(), m, None)?;
+        Ok(table.rows.len() as u64)
     }
 
     /// Recognise a single-node aggregation whose grouping/distinct key is an
@@ -3919,6 +4071,11 @@ impl<'g> Engine<'g> {
             // terminal — one intermediate per emitted row, path bound if requested).
             for b in frontier {
                 self.charge(1)?;
+                // Count-pushdown: tally the row and skip building it (no flatten, no
+                // alloc) — the whole point of the fast path.
+                if self.count_tally() {
+                    continue;
+                }
                 // The owned map every downstream consumer expects is built here, once
                 // per completed row — the only flatten in the walk.
                 let mut binding = b.binding.flatten();
@@ -4054,6 +4211,10 @@ impl<'g> Engine<'g> {
             // charged terminal is ever reached. The double count over the two buffers
             // mirrors their genuine combined peak (conservative on purpose).
             self.charge(1)?;
+            // Count-pushdown: tally the row and skip building it (no clone).
+            if self.count_tally() {
+                return Ok(());
+            }
             if let Some(pv) = &pattern.path_var {
                 // Bind the path for this completed walk, snapshot the row, then
                 // restore so sibling branches don't inherit a stale path value.
@@ -7757,6 +7918,31 @@ fn is_count_of(e: &Expr, var: Option<&str>) -> bool {
     }
 }
 
+/// Is `e` a non-DISTINCT `count(*)`, or `count(v)` where `v` is any of `bound`
+/// (the variables a non-OPTIONAL MATCH binds, so `v` is never null and the count
+/// equals `count(*)`)? Used by the multi-hop count-walk fast path
+/// (see `try_count_walk_fast_path`).
+fn is_count_star_or_var(e: &Expr, bound: &[String]) -> bool {
+    let Expr::Function {
+        name,
+        distinct: false,
+        args,
+    } = e
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("count") {
+        return false;
+    }
+    match args {
+        FuncArgs::Star => true,
+        FuncArgs::Args(a) if a.len() == 1 => {
+            matches!(&a[0], Expr::Var(v) if bound.iter().any(|b| b == v))
+        }
+        FuncArgs::Args(_) => false,
+    }
+}
+
 /// If `e` is a bare property access `var.p` on the anchor node's variable,
 /// return the property name `p`. Used by the Stage-7 grouped-index fast path.
 fn node_property(e: &Expr, var: Option<&str>) -> Option<String> {
@@ -10148,6 +10334,104 @@ mod tests {
     }
 
     #[test]
+    fn frame_get_flatten_shadowing() {
+        // Pins the shadowing convention that makes the parallel walk match the
+        // sequential LIFO oracle: a child frame shadows its parent, the last write in
+        // a layer wins, and `flatten` (root-first) reproduces both.
+        use std::sync::Arc;
+        let mut base = HashMap::new();
+        base.insert("a".to_string(), Val::Int(1));
+        base.insert("b".to_string(), Val::Int(2));
+        let root = Frame::root(&base);
+        let child = Arc::new(Frame {
+            parent: Some(root),
+            delta: vec![("b".into(), Val::Int(20))],
+        });
+        let grand = Arc::new(Frame {
+            parent: Some(child),
+            delta: vec![("a".into(), Val::Int(100)), ("a".into(), Val::Int(101))],
+        });
+        assert!(
+            matches!(grand.get("b"), Some(Val::Int(20))),
+            "child shadows parent"
+        );
+        assert!(
+            matches!(grand.get("a"), Some(Val::Int(101))),
+            "last delta wins"
+        );
+        assert!(grand.get("c").is_none());
+        let flat = grand.flatten();
+        assert_eq!(flat.len(), 2);
+        assert!(matches!(flat.get("a"), Some(Val::Int(101))));
+        assert!(matches!(flat.get("b"), Some(Val::Int(20))));
+    }
+
+    #[test]
+    fn count_pushdown_matches_materialized() {
+        // The pushed-down `count(*)`/`count(v)` must equal the row count the
+        // materialising path produces — across 1/2/3-hop, a constant co-item, and an
+        // empty match. (write_basic: KNOWS Alice->Bob, Bob->Carol.)
+        let count_of = |tag: &str, q: &str| -> i64 {
+            match &run_budgeted(tag, 1_000_000, q).unwrap().rows[0][0] {
+                Val::Int(n) => *n,
+                o => panic!("count is not an Int: {o:?}"),
+            }
+        };
+        let rows_of =
+            |tag: &str, q: &str| -> usize { run_budgeted(tag, 1_000_000, q).unwrap().rows.len() };
+        let cases = [
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(*) AS c",
+                "MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name AS b",
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(c) AS c",
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS x",
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(*) AS c, 7 AS k",
+                "MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name AS b",
+            ),
+            (
+                // empty: 3-hop KNOWS dead-ends at Carol.
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(d) RETURN count(*) AS c",
+                "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(d) RETURN d.name AS d",
+            ),
+        ];
+        for (cq, rq) in cases {
+            assert_eq!(
+                count_of("cpd_eq", cq) as usize,
+                rows_of("cpd_eq", rq),
+                "`{cq}`"
+            );
+        }
+    }
+
+    #[test]
+    fn count_pushdown_falls_back_but_correct() {
+        // Shapes that must NOT push down still return the correct count via the
+        // materialising path.
+        let count_of = |q: &str| -> i64 {
+            match &run_budgeted("cpd_fb", 1_000_000, q).unwrap().rows[0][0] {
+                Val::Int(n) => *n,
+                o => panic!("count is not an Int: {o:?}"),
+            }
+        };
+        // count(DISTINCT) — KNOWS targets {Bob, Carol} = 2 distinct (not pushed: needs
+        // the value set), vs 3 total KNOWS edges (Alice->Bob, Bob->Carol, Alice->Carol).
+        assert_eq!(
+            count_of("MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b) AS c"),
+            2
+        );
+        // WHERE survivor filter — only Alice->Bob of the 3 KNOWS edges (falls back to
+        // the materialising path, which applies WHERE).
+        assert_eq!(
+            count_of("MATCH (a:Person)-[:KNOWS]->(b) WHERE b.name = 'Bob' RETURN count(*) AS c"),
+            1
+        );
+    }
+
+    #[test]
     fn hub_small_expansion_succeeds_under_a_generous_budget() {
         // The guard must bound hubs without over-charging: a generous budget lets the
         // whole star expand and return the right count, and it really drew on the
@@ -10524,6 +10808,9 @@ mod tests {
              RETURN length(p) AS len, nodes(p) AS ns",
             // Type alternation + an anchor with no LIMIT/ORDER (pushed-cap off).
             "MATCH (a:Person {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b ORDER BY b",
+            // Inline property on a non-anchor node — exercises `node_ok` reading the
+            // shared `Scope::Frame` on the parallel walk (Bob KNOWS Carol).
+            "MATCH (a:Person)-[:KNOWS]->(b {name:'Carol'}) RETURN a.name AS a ORDER BY a",
             // Pushed LIMIT on a 2-hop — gated to the sequential early-exit path under
             // both engines (a capped chain must not breadth-first over-read).
             "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS c LIMIT 1",
