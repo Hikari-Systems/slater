@@ -247,14 +247,12 @@ fn collect_id_eq(expr: &Expr, var: &str, ids: &mut Vec<u64>, found: &mut bool) {
         }
         // `id(var) IN [<int>, …]` — a seek only when every element is a constant
         // integer (otherwise the full id-set is unknown → fall back to a scan).
-        Expr::In(lhs, rhs) => {
-            if is_id_of(lhs, var) {
-                if let Expr::List(items) = &**rhs {
-                    let consts: Option<Vec<i64>> = items.iter().map(const_int).collect();
-                    if let Some(values) = consts {
-                        *found = true;
-                        ids.extend(values.into_iter().filter(|&i| i >= 0).map(|i| i as u64));
-                    }
+        Expr::In(lhs, rhs) if is_id_of(lhs, var) => {
+            if let Expr::List(items) = &**rhs {
+                let consts: Option<Vec<i64>> = items.iter().map(const_int).collect();
+                if let Some(values) = consts {
+                    *found = true;
+                    ids.extend(values.into_iter().filter(|&i| i >= 0).map(|i| i as u64));
                 }
             }
         }

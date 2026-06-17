@@ -410,11 +410,12 @@ fn hops_par(
                         continue;
                     }
                 }
-                Some(TypeFilter::Expr(e)) => {
-                    if !e.eval(&|name| gen.reltype_id(name) == Some(a.reltype)) {
-                        continue;
-                    }
+                Some(TypeFilter::Expr(e))
+                    if !e.eval(&|name| gen.reltype_id(name) == Some(a.reltype)) =>
+                {
+                    continue;
                 }
+                Some(TypeFilter::Expr(_)) => {}
             }
             let (start, end) = if incoming {
                 (a.neighbour.0, node)
@@ -4597,13 +4598,14 @@ impl<'g> Engine<'g> {
                             continue;
                         }
                     }
-                    Some(TypeFilter::Expr(e)) => {
-                        // A relationship carries exactly one type, so evaluate the
-                        // expression over the singleton present-set {this edge's type}.
-                        if !e.eval(&|name| self.gen.reltype_id(name) == Some(a.reltype)) {
-                            continue;
-                        }
+                    // A relationship carries exactly one type, so evaluate the
+                    // expression over the singleton present-set {this edge's type}.
+                    Some(TypeFilter::Expr(e))
+                        if !e.eval(&|name| self.gen.reltype_id(name) == Some(a.reltype)) =>
+                    {
+                        continue;
                     }
+                    Some(TypeFilter::Expr(_)) => {}
                 }
                 if !self.rel_ok(a.edge.0, rel, binding)? {
                     continue;
