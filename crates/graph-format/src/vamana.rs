@@ -177,16 +177,12 @@ fn greedy_search_build(
     let mut beam: Vec<(f64, u32)> = vec![(d(start), start as u32)];
     let mut expanded = vec![false; vectors.len()];
     let mut visited = Vec::new();
-    loop {
-        // Closest unexpanded node in the beam.
-        let Some((_, cur)) = beam
-            .iter()
-            .copied()
-            .filter(|(_, i)| !expanded[*i as usize])
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-        else {
-            break;
-        };
+    while let Some((_, cur)) = beam
+        .iter()
+        .copied()
+        .filter(|(_, i)| !expanded[*i as usize])
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+    {
         expanded[cur as usize] = true;
         visited.push(cur);
         for &nb in &adjacency[cur as usize] {
