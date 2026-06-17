@@ -427,15 +427,12 @@ where
     let mut beam: Vec<(f32, VamanaIndex)> = vec![(estimate(medoid), medoid)];
     let mut hits: Vec<SearchHit> = Vec::new();
 
-    loop {
-        let Some((_, cur)) = beam
-            .iter()
-            .copied()
-            .filter(|(_, i)| !expanded[*i as usize])
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-        else {
-            break;
-        };
+    while let Some((_, cur)) = beam
+        .iter()
+        .copied()
+        .filter(|(_, i)| !expanded[*i as usize])
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+    {
         expanded[cur as usize] = true;
         let (vector, neighbours) = fetch(cur)?;
         hits.push(SearchHit {
