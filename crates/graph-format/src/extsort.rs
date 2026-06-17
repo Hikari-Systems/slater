@@ -18,9 +18,11 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use crate::ids::BlockId;
@@ -32,6 +34,132 @@ const RUN_BLOCK_BYTES: usize = 256 * 1024;
 /// Globally-unique suffix so concurrent/sequential sorters never collide on a run
 /// path within one process.
 static SORTER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// ── parallel run-formation (Option A) ────────────────────────────────────────
+//
+// `spill_run` — sort a full in-RAM buffer, zstd-compress it, write the run file —
+// is the CPU-heavy part of the external sort, and it ran inline on the single
+// thread that pushes records (so emit.topology sat at ~1 core). We move it onto a
+// shared, bounded worker pool: the push thread hands off a full buffer and keeps
+// filling the next, while up to N buffers sort+compress in parallel. The k-way
+// merge in `sorted()` is unchanged; correctness is unaffected because `cmp_key` is
+// a total order, so the merged output is identical regardless of the order runs
+// complete in.
+//
+// Memory faithfulness: each sorter splits its byte budget across (max_inflight + 1)
+// smaller buffers, so peak resident bytes per sorter stay ≈ `budget_bytes` — just
+// more, smaller runs (a slightly larger but still single-pass merge heap).
+
+/// One queued spill: sort + write, executed on a pool worker.
+type SpillJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Process-wide worker pool that executes spill jobs. Lazily started; sized by
+/// `SLATER_EXTSORT_SPILL_THREADS` (default: online cores, capped at 16). Bounding
+/// the thread count here means N concurrent ExtSorters don't each spawn their own
+/// pool — they all submit into this one.
+static SPILL_POOL: OnceLock<Sender<SpillJob>> = OnceLock::new();
+
+/// Caller-configured spill-worker cap (`0` = unset). Set once by
+/// [`configure_spill_threads`] before any sorter is used.
+static CONFIGURED_SPILL_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the spill-worker cap (e.g. from `--threads`). Must be called before the
+/// first `ExtSorter`; later calls are ignored once the pool has started. The
+/// `SLATER_EXTSORT_SPILL_THREADS` env var still overrides this.
+pub fn configure_spill_threads(n: usize) {
+    CONFIGURED_SPILL_THREADS.store(n.max(1), AtomicOrdering::Relaxed);
+}
+
+/// Resolved spill-worker count. `1` means "spill inline" (the original behaviour,
+/// kept as an escape hatch). Precedence: env override → configured cap → cores.
+fn spill_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SLATER_EXTSORT_SPILL_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or_else(
+                || match CONFIGURED_SPILL_THREADS.load(AtomicOrdering::Relaxed) {
+                    0 => std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4),
+                    n => n,
+                },
+            )
+            .clamp(1, 64)
+    })
+}
+
+fn spill_pool() -> &'static Sender<SpillJob> {
+    SPILL_POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<SpillJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..spill_threads() {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name("slater-extsort-spill".into())
+                .spawn(move || loop {
+                    // Hold the lock only to dequeue; run the job unlocked.
+                    let job = { rx.lock().unwrap().recv() };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break, // sender dropped (never, in practice)
+                    }
+                })
+                .expect("spawn extsort spill worker");
+        }
+        tx
+    })
+}
+
+/// Shared completion state for one sorter's in-flight spills.
+struct SpillState {
+    /// Spills submitted but not yet finished (queued or running).
+    pending: Mutex<usize>,
+    cv: Condvar,
+    /// Completed run files tagged with their dispatch index. Sorted back into
+    /// dispatch order before merging so the run sequence — and thus the merge's
+    /// tie-break for any equal-keyed records — is identical to the old inline path,
+    /// regardless of the order workers finish in.
+    runs: Mutex<Vec<(u64, PathBuf)>>,
+    /// First error a worker hit, surfaced on the next push / on `sorted()`.
+    err: Mutex<Option<anyhow::Error>>,
+}
+
+impl SpillState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(0),
+            cv: Condvar::new(),
+            runs: Mutex::new(Vec::new()),
+            err: Mutex::new(None),
+        })
+    }
+    /// Block until every submitted spill has finished.
+    fn drain(&self) {
+        let mut p = self.pending.lock().unwrap();
+        while *p > 0 {
+            p = self.cv.wait(p).unwrap();
+        }
+    }
+    fn take_err(&self) -> Option<anyhow::Error> {
+        self.err.lock().unwrap().take()
+    }
+}
+
+/// Sort a buffer by key and write it as one run file. The unit of pool work.
+fn write_run<R: SortRecord>(mut buf: Vec<R>, path: &Path, level: i32) -> Result<()> {
+    buf.sort_by(|a, b| a.cmp_key(b));
+    let mut w = BlockFileWriter::create(path, RUN_BLOCK_BYTES, level)?;
+    let mut enc = Vec::new();
+    for rec in &buf {
+        enc.clear();
+        rec.encode(&mut enc);
+        w.append_record(&enc)?;
+    }
+    w.finish()?;
+    Ok(())
+}
 
 /// A record that can be spilled to a run and merged back by a total-order key.
 ///
@@ -51,83 +179,149 @@ pub trait SortRecord: Sized {
 }
 
 /// External sorter: feed records with [`ExtSorter::push`], then [`ExtSorter::sorted`].
-pub struct ExtSorter<R: SortRecord> {
+pub struct ExtSorter<R: SortRecord + Send + 'static> {
     temp_dir: PathBuf,
-    budget_bytes: usize,
+    /// Per-buffer spill threshold (the budget split across in-flight buffers).
+    buf_threshold: usize,
+    /// Max spills outstanding at once (`1` ⇒ inline, original behaviour).
+    max_inflight: usize,
     level: i32,
     seq: u64,
     buf: Vec<R>,
     buf_bytes: usize,
-    runs: Vec<PathBuf>,
+    /// Monotonic run index for unique run-file names (workers complete out of order).
+    next_run: u64,
+    state: Arc<SpillState>,
+    /// Set once `sorted()` has moved the run paths out, so `Drop` doesn't re-clean.
+    consumed: bool,
 }
 
-impl<R: SortRecord> ExtSorter<R> {
-    /// Create a sorter spilling under `temp_dir`, forming runs of at most
-    /// `budget_bytes` of in-RAM records. `zstd_level` compresses the run files.
+impl<R: SortRecord + Send + 'static> ExtSorter<R> {
+    /// Create a sorter spilling under `temp_dir`, holding at most `budget_bytes` of
+    /// records resident. `zstd_level` compresses the run files. Run formation
+    /// (sort + compress + write) runs on the shared spill pool; the budget is split
+    /// across the in-flight buffers so peak resident bytes stay ≈ `budget_bytes`.
     pub fn new(temp_dir: &Path, budget_bytes: usize, zstd_level: i32) -> Result<Self> {
         std::fs::create_dir_all(temp_dir)
             .with_context(|| format!("create extsort temp dir {}", temp_dir.display()))?;
+        let max_inflight = spill_threads();
+        let budget = budget_bytes.max(1);
+        // Split the budget across (in-flight + the one being filled). With inline
+        // spilling (max_inflight == 1) this is budget/2; round up and never zero.
+        let buf_threshold = (budget / (max_inflight + 1)).max(1);
         Ok(Self {
             temp_dir: temp_dir.to_path_buf(),
-            budget_bytes: budget_bytes.max(1),
+            buf_threshold,
+            max_inflight,
             level: zstd_level,
             seq: SORTER_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
             buf: Vec::new(),
             buf_bytes: 0,
-            runs: Vec::new(),
+            next_run: 0,
+            state: SpillState::new(),
+            consumed: false,
         })
     }
 
-    /// Push one record; spills a sorted run when the buffer reaches the budget.
+    /// Push one record; spills a sorted run when the buffer reaches its threshold.
     pub fn push(&mut self, rec: R) -> Result<()> {
         self.buf_bytes += rec.size_hint();
         self.buf.push(rec);
-        if self.buf_bytes >= self.budget_bytes {
+        if self.buf_bytes >= self.buf_threshold {
             self.spill_run()?;
         }
         Ok(())
     }
 
-    fn spill_run(&mut self) -> Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        self.buf.sort_by(|a, b| a.cmp_key(b));
+    fn run_path(&mut self) -> (u64, PathBuf) {
+        let idx = self.next_run;
+        self.next_run += 1;
         let path = self.temp_dir.join(format!(
             "slater_extsort_{}_{}_{}.run",
             std::process::id(),
             self.seq,
-            self.runs.len()
+            idx
         ));
-        let mut w = BlockFileWriter::create(&path, RUN_BLOCK_BYTES, self.level)?;
-        let mut enc = Vec::new();
-        for rec in &self.buf {
-            enc.clear();
-            rec.encode(&mut enc);
-            w.append_record(&enc)?;
+        (idx, path)
+    }
+
+    /// Hand the current buffer off to the spill pool (or write it inline when
+    /// `max_inflight == 1`). Surfaces any prior worker error eagerly so a failing
+    /// build aborts promptly instead of at `sorted()`.
+    fn spill_run(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
         }
-        w.finish()?;
-        self.buf.clear();
+        if let Some(e) = self.state.take_err() {
+            return Err(e);
+        }
+        let (idx, path) = self.run_path();
+        let buf = std::mem::take(&mut self.buf);
         self.buf_bytes = 0;
-        self.runs.push(path);
+
+        if self.max_inflight <= 1 {
+            // Inline: original single-threaded behaviour.
+            write_run(buf, &path, self.level)?;
+            self.state.runs.lock().unwrap().push((idx, path));
+            return Ok(());
+        }
+
+        // Backpressure: block until fewer than `max_inflight` spills are outstanding,
+        // so the number of resident buffers (and thus memory) stays bounded.
+        {
+            let mut p = self.state.pending.lock().unwrap();
+            while *p >= self.max_inflight {
+                p = self.state.cv.wait(p).unwrap();
+            }
+            *p += 1;
+        }
+        let state = Arc::clone(&self.state);
+        let level = self.level;
+        spill_pool()
+            .send(Box::new(move || {
+                match write_run(buf, &path, level) {
+                    Ok(()) => state.runs.lock().unwrap().push((idx, path)),
+                    Err(e) => {
+                        let mut slot = state.err.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                    }
+                }
+                let mut p = state.pending.lock().unwrap();
+                *p -= 1;
+                state.cv.notify_all();
+            }))
+            .map_err(|_| anyhow!("extsort spill pool unavailable"))?;
         Ok(())
     }
 
     /// Finish input and return a merging iterator over all records in key order.
-    /// The tail buffer is spilled first so every record reaches the merge the same
-    /// way (no special in-RAM-vs-on-disk path).
+    /// Spills the tail buffer, waits for every in-flight run to land, then merges.
     pub fn sorted(mut self) -> Result<SortedIter<R>> {
         self.spill_run()?;
-        let runs = std::mem::take(&mut self.runs);
-        SortedIter::open(runs)
+        self.state.drain();
+        if let Some(e) = self.state.take_err() {
+            return Err(e);
+        }
+        self.consumed = true;
+        let mut runs = std::mem::take(&mut *self.state.runs.lock().unwrap());
+        // Restore dispatch order so the merge is deterministic for equal keys.
+        runs.sort_by_key(|(idx, _)| *idx);
+        SortedIter::open(runs.into_iter().map(|(_, p)| p).collect())
     }
 }
 
-impl<R: SortRecord> Drop for ExtSorter<R> {
+impl<R: SortRecord + Send + 'static> Drop for ExtSorter<R> {
     fn drop(&mut self) {
-        // Only fires if `sorted()` was never called (e.g. an error aborted the
-        // build); otherwise `runs` was moved out and this removes nothing.
-        for p in &self.runs {
+        // Only meaningful if `sorted()` was never called (e.g. an error aborted the
+        // build). Wait for any in-flight spills to finish so their files are closed,
+        // then unlink every run.
+        if self.consumed {
+            return;
+        }
+        self.state.drain();
+        for (_, p) in self.state.runs.lock().unwrap().iter() {
             let _ = std::fs::remove_file(p);
         }
     }

@@ -90,6 +90,10 @@ pub struct BuildOptions {
     /// Resume an interrupted external build from its surviving scratch, instead of
     /// starting fresh.
     pub resume: bool,
+    /// Worker-thread cap for the parallel build stages (pass 1, resolve, external
+    /// sort spill pool, and the global rayon pool). Defaults at the CLI to
+    /// `max(online_cores - 2, 1)`.
+    pub threads: usize,
 }
 
 impl Default for BuildOptions {
@@ -113,6 +117,9 @@ impl Default for BuildOptions {
             cluster_passes: 3,
             keep_temp: false,
             resume: false,
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(1),
         }
     }
 }
@@ -190,15 +197,21 @@ pub fn build(
     graph: &str,
     data_dir: &Path,
     opts: &BuildOptions,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<BuildOutcome> {
     // ---- bucket statements -------------------------------------------------
+    let parse_g = diag.phase("parse");
+    diag.set_op("parse + bucket statements", "statements", 0);
     let mut node_stmts = Vec::new();
     let mut edge_stmts = Vec::new();
     let mut range_stmts = Vec::new();
     let mut vector_stmts: Vec<VectorIndexStmt> = Vec::new();
 
     let mut reader = StatementReader::new(input);
+    let mut parsed: u64 = 0;
     while let Some(raw) = reader.next_statement()? {
+        parsed += 1;
+        diag.tick(parsed);
         match parse_statement(&raw)
             .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
         {
@@ -223,6 +236,7 @@ pub fn build(
     // Dedup vector indexes by (label, property); first declaration wins.
     let mut seen = std::collections::HashSet::new();
     vector_stmts.retain(|v| seen.insert((v.label.clone(), v.property.clone())));
+    drop(parse_g);
 
     // ---- symbol tables -----------------------------------------------------
     let mut labels = Interner::default();
@@ -236,11 +250,18 @@ pub fn build(
         .collect();
 
     // ---- pass 1: nodes -----------------------------------------------------
+    let pass1_g = diag.phase("pass1_nodes");
+    diag.set_op(
+        "ingest nodes (assign ids, intern, route vectors)",
+        "nodes",
+        node_stmts.len() as u64,
+    );
     let mut nodes: Vec<NodeRec> = Vec::with_capacity(node_stmts.len());
     let mut dump_to_node: HashMap<i64, NodeId> = HashMap::new();
 
     for stmt in node_stmts {
         let node_id = NodeId(nodes.len() as u64);
+        diag.tick(node_id.0);
 
         let mut label_names: Vec<String> = Vec::new();
         for l in &stmt.labels {
@@ -286,11 +307,20 @@ pub fn build(
         });
     }
 
+    drop(pass1_g);
+
     // ---- pass 2: edges -----------------------------------------------------
+    let pass2_g = diag.phase("pass2_edges");
+    diag.set_op(
+        "ingest edges (resolve ids, build edge list)",
+        "edges",
+        edge_stmts.len() as u64,
+    );
     let mut edges: Vec<Edge> = Vec::with_capacity(edge_stmts.len());
     let mut edge_props: Vec<Vec<(u32, Value)>> = Vec::with_capacity(edge_stmts.len());
 
     for stmt in edge_stmts {
+        diag.tick(edges.len() as u64);
         let src = *dump_to_node.get(&stmt.src_dump_id).with_context(|| {
             format!(
                 "edge references unknown source __dump_id__ {}",
@@ -319,8 +349,17 @@ pub fn build(
         edge_props.push(props);
     }
 
+    drop(pass2_g);
+
     let node_count = nodes.len() as u64;
     let edge_count = edges.len() as u64;
+
+    let emit_g = diag.phase("emit");
+    diag.set_op(
+        "write stores (props/labels/topology/postings)",
+        "nodes",
+        node_count,
+    );
 
     // ---- stage the generation directory ------------------------------------
     let graph_dir = data_dir.join(graph);
@@ -452,10 +491,16 @@ pub fn build(
         });
     }
 
+    diag.set_op(
+        "write vector indexes (vamana/pq/brute)",
+        "indexes",
+        pending.len() as u64,
+    );
     let (vector_indexes, vector_files) =
         write_vector_indexes(&tmp_dir, &pending, opts, cipher.clone(), &mut block_sizes)?;
 
     // range/<name>.isam
+    diag.set_op("write range ISAMs", "indexes", range_stmts.len() as u64);
     let mut range_indexes: Vec<RangeIndexDesc> = Vec::new();
     for ri in &range_stmts {
         let (entity, name) = match ri.entity {
@@ -503,6 +548,7 @@ pub fn build(
             }
         };
         let rel_path = format!("range/{name}.isam");
+        diag.set_op_detail(&name);
         write_isam_with_cipher(
             tmp_dir.join(&rel_path),
             entries,
@@ -523,6 +569,11 @@ pub fn build(
     // node range ISAMs just written, so the grouped-index fast path answers a
     // whole-label group-by / count(DISTINCT) in O(distinct) instead of an O(index)
     // walk. Skips high-cardinality / disabled indexes (logged in the helper).
+    diag.set_op(
+        "derive prop_hist.blk",
+        "indexes",
+        range_indexes.len() as u64,
+    );
     let property_histograms = common::build_property_histograms(
         &tmp_dir,
         &range_indexes,
@@ -532,8 +583,11 @@ pub fn build(
         opts.histogram_max_distinct,
     )?;
     block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
+    drop(emit_g);
 
     // ---- inventory, MANIFEST, atomic publish (shared with build_external) --
+    let _publish_g = diag.phase("publish");
+    diag.set_op("manifest + fsync + atomic rename", "", 0);
     common::write_manifest_and_publish(PublishInputs {
         tmp_dir: &tmp_dir,
         graph_dir: &graph_dir,
@@ -868,7 +922,14 @@ mod tests {
             pq_bits: 8,
             ..Default::default()
         };
-        let outcome = build(script.as_bytes(), "docs", &data_dir, &opts).unwrap();
+        let outcome = build(
+            script.as_bytes(),
+            "docs",
+            &data_dir,
+            &opts,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
 
         // The descriptor records Vamana mode with the build parameters.
         let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();
@@ -968,6 +1029,7 @@ mod tests {
             "docs",
             &data_dir,
             &BuildOptions::default(),
+            &crate::diag::BuildDiag::disabled(),
         )
         .unwrap();
         let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();

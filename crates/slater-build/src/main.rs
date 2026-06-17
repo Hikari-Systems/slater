@@ -11,19 +11,23 @@ mod build;
 mod build_external;
 mod cluster;
 mod common;
+mod diag;
 mod model;
 mod parser;
 mod resolve;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde_json::json;
 
 use crate::build::{build, BuildOptions};
 use crate::build_external::{build_external, ExternalMode};
 use crate::cluster::ClusterMode;
+use crate::diag::BuildDiag;
 
 /// Build an immutable Slater graph generation from a primitive-Cypher dump.
 #[derive(Debug, Parser)]
@@ -138,6 +142,93 @@ struct Cli {
     /// phases it already completed.
     #[arg(long)]
     resume: bool,
+
+    /// Diagnostic mode: sample process resource counters (RSS, cgroup memory,
+    /// CPU, IO, threads, PSI stall) on a background thread and append a JSONL log
+    /// of what the build was doing at each moment, for later bottleneck analysis.
+    /// OFF by default (zero overhead). Also enabled by `SLATER_BUILD_DIAG=1`.
+    #[arg(long)]
+    diagnostics: bool,
+
+    /// Where to write the diagnostics JSONL (with `--diagnostics`). Defaults to
+    /// `<data-dir>/build-diag-<graph>-<pid>.jsonl`.
+    #[arg(long)]
+    diagnostics_log: Option<PathBuf>,
+
+    /// Sampling interval for diagnostic mode, milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    diagnostics_interval_ms: u64,
+
+    /// Worker-thread cap for the parallel build stages (pass 1, resolve, cluster,
+    /// and the external-sort spill pool). Defaults to `max(online_cores - 2, 1)`.
+    #[arg(long, short = 'j')]
+    threads: Option<usize>,
+}
+
+/// Resolve the worker-thread cap: the `--threads` value, else
+/// `max(online_cores - 2, 1)`.
+fn resolve_threads(cli: &Cli) -> usize {
+    cli.threads.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        cores.saturating_sub(2).max(1)
+    })
+}
+
+/// Whether diagnostic mode is on: the `--diagnostics` flag, or a truthy
+/// `SLATER_BUILD_DIAG` env var.
+fn diagnostics_enabled(cli: &Cli) -> bool {
+    if cli.diagnostics {
+        return true;
+    }
+    matches!(
+        std::env::var("SLATER_BUILD_DIAG").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// Construct the `BuildDiag` for this run: inert unless diagnostics are enabled,
+/// otherwise opens the JSONL log (creating `--data-dir` if needed, falling back to
+/// the CWD) and writes a header describing the run's cost-relevant options.
+fn make_diag(cli: &Cli, data_dir: &std::path::Path) -> Result<BuildDiag> {
+    if !diagnostics_enabled(cli) {
+        return Ok(BuildDiag::disabled());
+    }
+    let log_path = match &cli.diagnostics_log {
+        Some(p) => p.clone(),
+        None => {
+            let name = format!("build-diag-{}-{}.jsonl", cli.graph, std::process::id());
+            // Prefer the data dir (create it if missing); fall back to the CWD.
+            if std::fs::create_dir_all(data_dir).is_ok() {
+                data_dir.join(name)
+            } else {
+                PathBuf::from(name)
+            }
+        }
+    };
+    let header = json!({
+        "graph": cli.graph,
+        "input": cli.input,
+        "external": format!("{:?}", cli.external),
+        "max_memory_bytes": cli.max_memory,
+        "zstd_level": cli.zstd_level,
+        "block_size": cli.block_size,
+        "vector_block_size": cli.vector_block_size,
+        "cluster": format!("{:?}", cli.cluster),
+        "cluster_passes": cli.cluster_passes,
+        "ann_threshold": cli.ann_threshold,
+        "resume": cli.resume,
+        "threads": resolve_threads(cli),
+    });
+    let diag = BuildDiag::new(
+        &log_path,
+        Duration::from_millis(cli.diagnostics_interval_ms.max(1)),
+        header,
+    )
+    .with_context(|| format!("open diagnostics log {}", log_path.display()))?;
+    eprintln!("slater-build: diagnostics → {}", log_path.display());
+    Ok(diag)
 }
 
 /// Parse a human byte size like `4g`, `512m`, `1024k`, or a plain byte count.
@@ -192,6 +283,7 @@ fn main() -> Result<()> {
         ),
         None => None,
     };
+    let threads = resolve_threads(&cli);
     let opts = BuildOptions {
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
@@ -211,8 +303,17 @@ fn main() -> Result<()> {
         cluster_passes: cli.cluster_passes,
         keep_temp: cli.keep_temp,
         resume: cli.resume,
+        threads,
     };
+    // Pin the global rayon pool and the external-sort spill pool to the cap, so
+    // every parallel build stage respects `--threads`.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+    graph_format::extsort::configure_spill_threads(threads);
+
     let data_dir = PathBuf::from(&cli.data_dir);
+    let mut diag = make_diag(&cli, &data_dir)?;
 
     let outcome = match cli.external {
         ExternalMode::Off => {
@@ -225,12 +326,13 @@ fn main() -> Result<()> {
                     .with_context(|| format!("open input script {}", cli.input))?;
                 Box::new(BufReader::new(f))
             };
-            build(reader, &cli.graph, &data_dir, &opts)?
+            build(reader, &cli.graph, &data_dir, &opts, &diag)?
         }
         ExternalMode::On | ExternalMode::Auto => {
-            build_external(&cli.input, &cli.graph, &data_dir, &opts)?
+            build_external(&cli.input, &cli.graph, &data_dir, &opts, &diag)?
         }
     };
+    diag.finish();
     // Stdout is the machine-facing channel: print the generation UUID + content
     // hash so a publishing pipeline can record exactly what it built.
     println!(

@@ -218,6 +218,83 @@ impl CsrStreamWriter {
     }
 }
 
+/// Writes **one CSR half** for a contiguous node range `[lo, hi)`: exactly `hi - lo`
+/// records (an empty record for any node with no pushed adjacency), so concatenating
+/// the bands' half-files in node order — then the forward set before the reverse set
+/// — reproduces the full 2N-record CSR that [`CsrStreamWriter`] would have streamed.
+/// This is the per-band writer for the range-partitioned parallel emit; the bands are
+/// stitched with [`crate::blockfile::concat_block_files`].
+pub struct CsrHalfWriter {
+    inner: BlockFileWriter,
+    lo: u64,
+    hi: u64,
+    next_node: u64,
+    cur: Vec<Adj>,
+}
+
+impl CsrHalfWriter {
+    pub fn create_with_cipher(
+        path: impl AsRef<Path>,
+        lo: u64,
+        hi: u64,
+        target_block_bytes: usize,
+        zstd_level: i32,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: BlockFileWriter::create_with_cipher(
+                path,
+                target_block_bytes,
+                zstd_level,
+                cipher,
+            )?,
+            lo,
+            hi,
+            next_node: lo,
+            cur: Vec::new(),
+        })
+    }
+
+    fn emit_one(&mut self) -> Result<()> {
+        let rec = encode_adj(&self.cur);
+        self.inner.append_record(&rec)?;
+        self.cur.clear();
+        self.next_node += 1;
+        Ok(())
+    }
+
+    /// Push `adj` onto node `key_node`'s adjacency. `key_node` must be in `[lo, hi)`
+    /// and non-decreasing across calls; gaps emit empty records.
+    pub fn push(&mut self, key_node: u64, adj: Adj) -> Result<()> {
+        if key_node < self.lo || key_node >= self.hi {
+            bail!(
+                "csr-half key {key_node} outside band [{}, {})",
+                self.lo,
+                self.hi
+            );
+        }
+        if key_node < self.next_node {
+            bail!(
+                "csr-half edges not ascending by node (got {key_node}, already at {})",
+                self.next_node
+            );
+        }
+        while self.next_node < key_node {
+            self.emit_one()?;
+        }
+        self.cur.push(adj);
+        Ok(())
+    }
+
+    /// Pad empty records through `hi - 1` and flush; returns the block count.
+    pub fn finish(mut self) -> Result<u64> {
+        while self.next_node < self.hi {
+            self.emit_one()?;
+        }
+        self.inner.finish()
+    }
+}
+
 /// Reader over the CSR adjacency.
 pub struct TopologyReader {
     inner: BlockFileReader,
@@ -468,5 +545,98 @@ mod tests {
         assert!(r2.outgoing(NodeId(2)).unwrap().is_empty());
         let _ = std::fs::remove_file(&ref_path);
         let _ = std::fs::remove_file(&s_path);
+    }
+
+    #[test]
+    fn banded_half_writers_concat_matches_csr() {
+        // The Option-B path: forward + reverse CSR halves written per node band by
+        // `CsrHalfWriter`, then stitched with `concat_block_files`, must be logically
+        // identical to a single streamed CSR.
+        let node_count = 6u64;
+        let mk = |s, d, rt, ed| Edge {
+            src: NodeId(s),
+            dst: NodeId(d),
+            reltype: rt,
+            edge: EdgeId(ed),
+        };
+        let edges = vec![
+            mk(0, 1, 0, 0),
+            mk(0, 5, 1, 1),
+            mk(1, 2, 0, 2),
+            mk(3, 0, 1, 3),
+            mk(4, 4, 2, 4),
+            mk(5, 1, 0, 5),
+        ];
+        let ref_path = tmp("csr_band_ref");
+        write_csr(&ref_path, node_count, &edges, 256, 3).unwrap();
+
+        let bands = [(0u64, 2u64), (2, 4), (4, 6)];
+        let mut fwd = edges.clone();
+        fwd.sort_by_key(|e| (e.src.0, e.edge.0));
+        let mut rev = edges.clone();
+        rev.sort_by_key(|e| (e.dst.0, e.edge.0));
+        let mut parts = Vec::new();
+        for (bi, (lo, hi)) in bands.iter().enumerate() {
+            let p = tmp(&format!("csr_fwd{bi}"));
+            let mut w = CsrHalfWriter::create_with_cipher(&p, *lo, *hi, 256, 3, None).unwrap();
+            for e in fwd.iter().filter(|e| e.src.0 >= *lo && e.src.0 < *hi) {
+                w.push(
+                    e.src.0,
+                    Adj {
+                        reltype: e.reltype,
+                        neighbour: e.dst,
+                        edge: e.edge,
+                    },
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+            parts.push(p);
+        }
+        for (bi, (lo, hi)) in bands.iter().enumerate() {
+            let p = tmp(&format!("csr_rev{bi}"));
+            let mut w = CsrHalfWriter::create_with_cipher(&p, *lo, *hi, 256, 3, None).unwrap();
+            for e in rev.iter().filter(|e| e.dst.0 >= *lo && e.dst.0 < *hi) {
+                w.push(
+                    e.dst.0,
+                    Adj {
+                        reltype: e.reltype,
+                        neighbour: e.src,
+                        edge: e.edge,
+                    },
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+            parts.push(p);
+        }
+        let out = tmp("csr_band_concat");
+        crate::blockfile::concat_block_files(&out, &parts).unwrap();
+
+        let r1 = TopologyReader::open(&ref_path).unwrap();
+        let r2 = TopologyReader::open(&out).unwrap();
+        assert_eq!(r2.node_count(), node_count);
+        let key = |a: &Adj| (a.reltype, a.neighbour.0, a.edge.0);
+        for n in 0..node_count {
+            let (mut o1, mut o2) = (
+                r1.outgoing(NodeId(n)).unwrap(),
+                r2.outgoing(NodeId(n)).unwrap(),
+            );
+            o1.sort_by_key(key);
+            o2.sort_by_key(key);
+            assert_eq!(o1, o2, "outgoing {n}");
+            let (mut i1, mut i2) = (
+                r1.incoming(NodeId(n)).unwrap(),
+                r2.incoming(NodeId(n)).unwrap(),
+            );
+            i1.sort_by_key(key);
+            i2.sort_by_key(key);
+            assert_eq!(i1, i2, "incoming {n}");
+        }
+        for p in &parts {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&ref_path);
+        let _ = std::fs::remove_file(&out);
     }
 }

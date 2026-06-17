@@ -26,6 +26,11 @@ use graph_format::wire::{read_uvarint, write_uvarint};
 
 const UNASSIGNED: u32 = u32::MAX;
 const ADJ_BLOCK_BYTES: usize = 256 * 1024;
+/// Nodes per LDG **stripe** — the parallelism + restreaming unit. A fixed constant
+/// (not derived from `--threads`) so the resulting permutation is identical
+/// regardless of the worker count; `--threads` only sets how many stripes run at
+/// once. Larger ⇒ more within-stripe live-greedy quality, fewer parallel units.
+const STRIPE_NODES: u64 = 1 << 16;
 
 /// How node ids are reordered for on-disk locality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -48,6 +53,8 @@ pub struct ClusterParams {
     pub mem_budget: usize,
     pub temp_dir: PathBuf,
     pub zstd_level: i32,
+    /// Worker cap for the parallel restreaming passes (does not affect the result).
+    pub threads: usize,
 }
 
 /// A `prov_node_id → final_node_id` bijection on `0..node_count`.
@@ -131,11 +138,12 @@ where
         );
     }
     let n = node_count as usize;
-    // Budget guard: the node→partition map is the one large resident.
-    let part_bytes = (n as u128) * 4;
+    // Budget guard: the two node→partition maps (double-buffered for the parallel
+    // restreaming passes) are the large residents.
+    let part_bytes = (n as u128) * 8;
     if part_bytes > params.mem_budget as u128 {
         bail!(
-            "ldg node→partition map needs {} MiB which exceeds the build memory budget; \
+            "ldg node→partition maps need {} MiB which exceeds the build memory budget; \
              use --cluster=none or raise --max-memory",
             part_bytes / (1024 * 1024)
         );
@@ -143,12 +151,17 @@ where
 
     let cap = params.block_capacity.max(1) as u64;
     let p = node_count.div_ceil(cap).max(1) as usize;
+    let nstripes = node_count.div_ceil(STRIPE_NODES).max(1) as usize;
 
-    // 1) Build the sorted undirected adjacency on disk (each edge → both directions,
-    //    self-loops dropped — they carry no proximity signal).
-    let adj_path = params
-        .temp_dir
-        .join(format!("slater_cluster_adj_{}.blk", std::process::id()));
+    // 1) Build the sorted undirected adjacency, routed into per-stripe files (by node
+    //    id). Each edge → both directions; self-loops carry no proximity signal.
+    let stripe_adj = |s: usize| -> PathBuf {
+        params.temp_dir.join(format!(
+            "slater_cluster_adj_{}_{}.blk",
+            std::process::id(),
+            s
+        ))
+    };
     {
         let mut sorter =
             ExtSorter::<AdjPair>::new(&params.temp_dir, params.mem_budget, params.zstd_level)?;
@@ -159,108 +172,194 @@ where
             }
             Ok(())
         })?;
-        let mut w = BlockFileWriter::create(&adj_path, ADJ_BLOCK_BYTES, params.zstd_level)?;
+        let mut writers: Vec<BlockFileWriter> = (0..nstripes)
+            .map(|s| BlockFileWriter::create(stripe_adj(s), ADJ_BLOCK_BYTES, params.zstd_level))
+            .collect::<Result<_>>()?;
         let mut buf = Vec::new();
         for rec in sorter.sorted()? {
             let a = rec?;
+            let s = (a.node / STRIPE_NODES) as usize;
             buf.clear();
             a.encode(&mut buf);
-            w.append_record(&buf)?;
+            writers[s].append_record(&buf)?;
         }
-        w.finish()?;
+        for w in writers {
+            w.finish()?;
+        }
     }
 
-    // 2) LDG refinement passes over the (reusable) sorted adjacency.
-    let mut part_of = vec![UNASSIGNED; n];
-    let mut load = vec![0u32; p];
+    // 2) Block-parallel restreaming LDG. Double-buffer the partition map: each pass
+    //    reads the frozen previous assignment (so stripes are independent) and writes
+    //    the next. Within a stripe, nodes are placed serially in id order using live
+    //    in-stripe reads (full greedy locality) and the frozen previous assignment
+    //    for cross-stripe neighbours. Deterministic regardless of worker count.
     let cap_f = (node_count as f64 / p as f64).max(1.0);
-    let result = (|| -> Result<()> {
+    // Seed empty (every node unassigned) so the greedy has room to pack clusters;
+    // pass 0 places against partial state, later passes refine against the frozen
+    // prior assignment.
+    let mut part_prev: Vec<u32> = vec![UNASSIGNED; n];
+    let mut part_next: Vec<u32> = vec![UNASSIGNED; n];
+
+    let run = (|| -> Result<()> {
         for _ in 0..params.passes.max(1) {
-            ldg_pass(&adj_path, &mut part_of, &mut load, cap_f)?;
+            let mut load_prev = vec![0u32; p];
+            for &pp in &part_prev {
+                if pp != UNASSIGNED {
+                    load_prev[pp as usize] += 1;
+                }
+            }
+            let next_stripe = std::sync::atomic::AtomicU64::new(0);
+            let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+            let part_next_ptr = SyncMutPtr(part_next.as_mut_ptr());
+            let part_prev_r = &part_prev;
+            let load_prev_r = &load_prev;
+            let next_r = &next_stripe;
+            let err_r = &err;
+            std::thread::scope(|scope| {
+                for _ in 0..params.threads.max(1) {
+                    scope.spawn(|| {
+                        let pp = &part_next_ptr;
+                        loop {
+                            if err_r.lock().unwrap().is_some() {
+                                break;
+                            }
+                            let s = next_r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if s as usize >= nstripes {
+                                break;
+                            }
+                            let lo = s * STRIPE_NODES;
+                            let hi = ((s + 1) * STRIPE_NODES).min(node_count);
+                            if let Err(e) = ldg_stripe_pass(
+                                &stripe_adj(s as usize),
+                                lo,
+                                hi,
+                                part_prev_r,
+                                load_prev_r,
+                                cap_f,
+                                p,
+                                pp,
+                            ) {
+                                let mut g = err_r.lock().unwrap();
+                                if g.is_none() {
+                                    *g = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(e) = err.into_inner().unwrap() {
+                return Err(e);
+            }
+            std::mem::swap(&mut part_prev, &mut part_next);
         }
         Ok(())
     })();
-    let _ = std::fs::remove_file(&adj_path);
-    result?;
-
-    // 3) Place any node with no edges (never seen in the adjacency) for balance.
-    let mut rr = 0usize;
-    for slot in part_of.iter_mut() {
-        if *slot == UNASSIGNED {
-            let pp = rr;
-            rr = (rr + 1) % p;
-            *slot = pp as u32;
-            load[pp] += 1;
-        }
+    for s in 0..nstripes {
+        let _ = std::fs::remove_file(stripe_adj(s));
     }
+    run?;
 
-    Ok(to_permutation(part_of, &load))
+    // Final assignment is in `part_prev` (post-swap). Place any still-unassigned
+    // (edge-less) node round-robin for balance, then lay partitions out consecutively.
+    let mut load = vec![0u32; p];
+    let mut rr = 0usize;
+    for slot in part_prev.iter_mut() {
+        if *slot == UNASSIGNED {
+            *slot = rr as u32;
+            rr = (rr + 1) % p;
+        }
+        load[*slot as usize] += 1;
+    }
+    Ok(to_permutation(part_prev, &load))
 }
 
-/// One LDG sweep over the sorted adjacency: process nodes in id order, placing each
-/// into the partition holding most of its already-placed neighbours (penalised by
-/// partition load for balance). Re-runs re-place every node against the latest state.
-fn ldg_pass(adj_path: &Path, part_of: &mut [u32], load: &mut [u32], cap_f: f64) -> Result<()> {
+/// `*mut u32` wrapper letting stripe workers write **disjoint** ranges of the shared
+/// `part_next` in parallel (each stripe owns `[lo, hi)`; no two threads touch the
+/// same slot, so the aliasing is sound).
+struct SyncMutPtr(*mut u32);
+unsafe impl Send for SyncMutPtr {}
+unsafe impl Sync for SyncMutPtr {}
+
+/// One restreaming-LDG sweep over a single stripe `[lo, hi)`. Reads neighbour
+/// partitions from the live in-stripe chunk (for already-placed, lower-id, in-stripe
+/// neighbours) or the frozen `part_prev` (everything else); writes the stripe's slots
+/// of `part_next` via `ptr`. `local_load` starts from the frozen global histogram and
+/// tracks this stripe's own moves so within-stripe balance stays live.
+#[allow(clippy::too_many_arguments)]
+fn ldg_stripe_pass(
+    adj_path: &Path,
+    lo: u64,
+    hi: u64,
+    part_prev: &[u32],
+    load_prev: &[u32],
+    cap_f: f64,
+    p: usize,
+    ptr: &SyncMutPtr,
+) -> Result<()> {
+    let len = (hi - lo) as usize;
+    // SAFETY: stripes are disjoint and each is processed by exactly one worker, so
+    // this `&mut` slice never overlaps another's.
+    let chunk: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(lo as usize), len) };
+    // Unseen (edge-less) nodes keep their previous assignment (balanced seed).
+    for (i, slot) in chunk.iter_mut().enumerate() {
+        *slot = part_prev[lo as usize + i];
+    }
+    let mut local_load: Vec<u32> = load_prev.to_vec();
+
+    let place = |v: u64, tally: &HashMap<u32, u32>, local_load: &mut [u32], chunk: &mut [u32]| {
+        let prev = part_prev[v as usize];
+        if prev != UNASSIGNED {
+            local_load[prev as usize] -= 1;
+        }
+        // Deterministic no-overlap baseline (independent of processing order).
+        let mut best_p = (v as usize) % p;
+        let mut best_score = tally
+            .get(&(best_p as u32))
+            .map(|&c| c as f64 * (1.0 - local_load[best_p] as f64 / cap_f))
+            .unwrap_or(0.0);
+        for (&pp, &cnt) in tally.iter() {
+            let score = cnt as f64 * (1.0 - local_load[pp as usize] as f64 / cap_f);
+            if score > best_score || (score == best_score && (pp as usize) < best_p) {
+                best_score = score;
+                best_p = pp as usize;
+            }
+        }
+        chunk[(v - lo) as usize] = best_p as u32;
+        local_load[best_p] += 1;
+    };
+
     let r = BlockFileReader::open(adj_path)?;
-    let p_count = load.len();
     let mut cur: Option<u64> = None;
     let mut tally: HashMap<u32, u32> = HashMap::new();
-    let mut rr = 0usize;
     r.for_each_record(|_, rec| {
         let mut s = rec;
         let a = AdjPair::decode(&mut s)?;
         match cur {
             Some(v) if v == a.node => {}
             Some(v) => {
-                place_node(v, &tally, part_of, load, cap_f, &mut rr, p_count);
+                place(v, &tally, &mut local_load, chunk);
                 tally.clear();
             }
             None => {}
         }
         cur = Some(a.node);
-        let np = part_of[a.nbr as usize];
+        // Live in-stripe read for already-placed lower-id neighbours; frozen otherwise.
+        let np = if a.nbr >= lo && a.nbr < a.node {
+            chunk[(a.nbr - lo) as usize]
+        } else {
+            part_prev[a.nbr as usize]
+        };
         if np != UNASSIGNED {
             *tally.entry(np).or_insert(0) += 1;
         }
         Ok(())
     })?;
     if let Some(v) = cur {
-        place_node(v, &tally, part_of, load, cap_f, &mut rr, p_count);
+        place(v, &tally, &mut local_load, chunk);
     }
     Ok(())
-}
-
-/// Assign node `v` to its best partition, updating `load`. `rr` round-robins the
-/// no-overlap fallback so balance is kept without an `O(P)` least-loaded scan.
-fn place_node(
-    v: u64,
-    tally: &HashMap<u32, u32>,
-    part_of: &mut [u32],
-    load: &mut [u32],
-    cap_f: f64,
-    rr: &mut usize,
-    p_count: usize,
-) {
-    let old = part_of[v as usize];
-    if old != UNASSIGNED {
-        load[old as usize] -= 1;
-    }
-    // Baseline: a rotating partition (overlap 0 ⇒ score 0).
-    let mut best_p = *rr;
-    *rr = (*rr + 1) % p_count;
-    let mut best_score = match tally.get(&(best_p as u32)) {
-        Some(&c) => (c as f64) * (1.0 - load[best_p] as f64 / cap_f),
-        None => 0.0,
-    };
-    for (&pp, &cnt) in tally.iter() {
-        let score = (cnt as f64) * (1.0 - load[pp as usize] as f64 / cap_f);
-        if score > best_score || (score == best_score && (pp as usize) < best_p) {
-            best_score = score;
-            best_p = pp as usize;
-        }
-    }
-    part_of[v as usize] = best_p as u32;
-    load[best_p] += 1;
 }
 
 /// Lay partitions out consecutively (ascending partition id; ascending prov id
@@ -292,6 +391,7 @@ mod tests {
             mem_budget: 1 << 28,
             temp_dir: dir.to_path_buf(),
             zstd_level: 1,
+            threads: 4,
         }
     }
 

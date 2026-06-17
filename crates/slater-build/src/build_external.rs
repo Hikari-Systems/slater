@@ -15,20 +15,23 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use graph_format::blockfile::{concat_block_files, BlockFileReader, BlockFileWriter};
 use graph_format::columns::{encode_props_record, PropsWriter};
+use graph_format::crypto::BlockCipher;
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
 use graph_format::nodelabels::{encode_labels_record, NodeLabelsWriter};
 use graph_format::postings::write_endpoint_postings_from_sorted;
-use graph_format::topology::{Adj, CsrStreamWriter};
+use graph_format::topology::{Adj, CsrHalfWriter};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
 use crate::buckets::{self, read_blob, write_blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge};
@@ -48,8 +51,26 @@ const BUCKET_BLOCK: usize = 1 << 20;
 /// are deleted at the end of the build, so favour speed (level 1) over ratio — the
 /// final published stores still use `--zstd-level`.
 const SCRATCH_ZSTD: i32 = 1;
-/// Pass 1 parses this many statements per rayon batch before applying them in order.
-const PARSE_BATCH: usize = 8192;
+/// Default node-id band width for the range-partitioned parallel `emit.topology`.
+/// Fixed (not derived from `--threads`) so the band boundaries — and therefore the
+/// emitted block layout and content hash — are independent of the worker count,
+/// exactly like the cluster phase's `STRIPE_NODES`.
+const BAND_NODES_DEFAULT: u64 = 1 << 20;
+
+/// Resolved band width. The `SLATER_EMIT_BAND_NODES` override exists only so tests
+/// can force many small bands over a tiny fixture (production leaves it unset and
+/// gets the fixed default). Cached so every call site agrees within a run.
+fn band_nodes() -> u64 {
+    use std::sync::OnceLock;
+    static BAND: OnceLock<u64> = OnceLock::new();
+    *BAND.get_or_init(|| {
+        std::env::var("SLATER_EMIT_BAND_NODES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(BAND_NODES_DEFAULT)
+    })
+}
 /// Checkpoint file (in scratch) recording how far a build got, for `--resume`.
 const STATE_FILE: &str = "BUILD-STATE.json";
 
@@ -85,28 +106,7 @@ struct BuildState {
     /// Valid once `phase >= Clustered`: whether the permutation is the identity
     /// (so no `perm.bin` was written).
     cluster_identity: bool,
-    /// Mid-pass-1 progress, present (with `phase == Start`) only while pass 1 is
-    /// in flight and the input is a seekable file. Lets an interrupted pass 1 pick
-    /// up from the last completed bucket segment rather than restarting.
-    #[serde(default)]
-    pass1: Option<Pass1Progress>,
 }
-
-/// A pass-1 checkpoint taken at a bucket-segment boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pass1Progress {
-    /// Absolute input byte offset of the next statement to read.
-    input_offset: u64,
-    /// Nodes / unresolved edges written so far.
-    node_count: u64,
-    uedge_count: u64,
-    /// Completed segment counts (the next segment to write is this index).
-    node_segments: u64,
-    uedge_segments: u64,
-    /// Whether any node has been seen (for the vector-DDL-before-nodes check).
-    seen_node: bool,
-}
-
 /// Atomically write the checkpoint (temp file + rename).
 fn checkpoint(scratch_dir: &Path, state: &BuildState) -> Result<()> {
     let path = scratch_dir.join(STATE_FILE);
@@ -189,71 +189,6 @@ fn open_input(input_path: &str, offset: u64) -> Result<Box<dyn BufRead>> {
         Ok(Box::new(BufReader::new(f)))
     }
 }
-
-/// Remove bucket segments `>= from` (an interrupted run's incomplete trailing
-/// segment, plus any stragglers) before resuming pass 1 into segment `from`.
-fn cleanup_partial_segments(base: &Path, from: u64) {
-    let mut n = from;
-    while crate::buckets::seg_path(base, n).exists() {
-        let _ = std::fs::remove_file(crate::buckets::seg_path(base, n));
-        n += 1;
-    }
-}
-
-/// Records per pass-1 bucket segment (a checkpoint boundary). Overridable via
-/// `SLATER_PASS1_SEGMENT` for tests; defaults to 5M.
-fn pass1_segment_records() -> u64 {
-    std::env::var("SLATER_PASS1_SEGMENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5_000_000)
-}
-
-/// Statements parsed per rayon batch. Overridable via `SLATER_PARSE_BATCH` for
-/// tests; defaults to [`PARSE_BATCH`].
-fn pass1_parse_batch() -> usize {
-    std::env::var("SLATER_PARSE_BATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(PARSE_BATCH)
-}
-
-/// Experimental: run pass 1 as a parallel reader→worker pool where each worker
-/// parses *and applies* (interns, encodes, compresses, writes) into its **own**
-/// bucket segment, out of original order. Gated by `SLATER_PARALLEL_PASS1=1`.
-/// Sound because pass 2 re-keys everything by `__dump_id__` (provisional ids are
-/// just the segment-concatenation order) and sorts — so write order is irrelevant
-/// to the result. It is *not* deterministic/resumable (interner ids depend on
-/// thread race order), so it falls back to serial when resuming.
-fn pass1_parallel() -> bool {
-    matches!(
-        std::env::var("SLATER_PARALLEL_PASS1").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
-    )
-}
-
-fn pass1_workers() -> usize {
-    std::env::var("SLATER_PASS1_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        })
-}
-
-/// Block size the parallel reader hands to workers (default 8 MiB).
-fn pass1_block_bytes() -> usize {
-    std::env::var("SLATER_PASS1_BLOCK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 4096)
-        .unwrap_or(8 << 20)
-}
-
 /// Quote-aware scan mirroring [`StatementReader`]'s tokenizer: byte offset just
 /// past the **last top-level `;`** in `buf` (the end of the last *complete*
 /// statement), or 0 if `buf` holds no complete statement. Because the cut lands
@@ -283,308 +218,333 @@ fn last_statement_end(buf: &[u8]) -> usize {
     }
     last_end
 }
+// ── shard-parallel pass 1 ────────────────────────────────────────────────────
 
-/// Outputs of pass 1, however it was run (serial or parallel).
-struct Pass1Out {
-    nodes: u64,
-    uedges: u64,
-    labels: Interner,
-    reltypes: Interner,
-    keys: Interner,
-    rstmts: Vec<RangeIndexStmt>,
-    vstmts: Vec<VectorIndexStmt>,
-    seen_node: bool,
+/// One bordered input range handed to a pass-1 worker.
+struct ShardChunk {
+    shard: u64,
+    input_start: u64,
+    input_end: u64,
+    bytes: Vec<u8>,
 }
 
-/// Parallel pass 1: a single reader thread splits the input into statement batches
-/// and fans them to `nworkers`; each worker parses + applies into its own segment
-/// (`<bucket>.<worker>`). Interners are shared behind a mutex with a per-worker
-/// read-through cache (so the lock is hit only on first-sight of each distinct
-/// label/key/reltype — negligible for low-cardinality schemas).
-#[allow(clippy::too_many_arguments)]
-fn run_pass1_parallel(
+/// Target bytes per shard (resume + segment granularity). `SLATER_SHARD_BYTES`
+/// overrides; default 64 MiB (≈ 2800 shards for the 180 GB wiki dump).
+fn shard_bytes_target() -> usize {
+    std::env::var("SLATER_SHARD_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.max(1)) // tiny values allowed for tests (forces many shards)
+        .unwrap_or(64 << 20)
+}
+
+/// Parse one shard chunk into shard-indexed node + unresolved-edge segments using a
+/// **local** interner (workers share nothing), then finalize it (sidecar). The
+/// sidecar's presence marks the shard durably complete — the resume signal.
+fn process_shard(
+    chunk: ShardChunk,
+    node_bkt: &Path,
+    uedge_bkt: &Path,
+    vec_index_set: &std::collections::HashSet<(String, String)>,
+) -> Result<()> {
+    let shard_index = chunk.shard;
+    let mut labels = Interner::default();
+    let mut reltypes = Interner::default();
+    let mut keys = Interner::default();
+    let mut rstmts: Vec<RangeIndexStmt> = Vec::new();
+    let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
+    let mut node_w = BucketWriter::create(
+        buckets::seg_path(node_bkt, chunk.shard),
+        BUCKET_BLOCK,
+        SCRATCH_ZSTD,
+    )?;
+    let mut uedge_w = BucketWriter::create(
+        buckets::seg_path(uedge_bkt, chunk.shard),
+        BUCKET_BLOCK,
+        SCRATCH_ZSTD,
+    )?;
+    let mut node_count = 0u64;
+    let mut uedge_count = 0u64;
+    let mut scalar_props: Vec<(u32, Value)> = Vec::new();
+    let mut sr = StatementReader::new(std::io::Cursor::new(&chunk.bytes));
+    while let Some(raw) = sr.next_statement()? {
+        match parse_statement(&raw)
+            .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
+        {
+            Statement::Node(n) => {
+                let mut label_names: Vec<&str> = Vec::new();
+                let mut label_ids = Vec::new();
+                for l in &n.labels {
+                    if l != DUMP_VERTEX {
+                        label_names.push(l);
+                        label_ids.push(labels.intern(l));
+                    }
+                }
+                scalar_props.clear();
+                let mut vec_props: Vec<(String, Vec<f32>)> = Vec::new();
+                let mut dump_id = NO_DUMP;
+                for (k, v) in n.props {
+                    if k == DUMP_ID {
+                        match v {
+                            Value::Int(id) => dump_id = id,
+                            _ => bail!("__dump_id__ must be an integer"),
+                        }
+                        continue;
+                    }
+                    match v {
+                        Value::Vector(xs)
+                            if label_names
+                                .iter()
+                                .any(|l| vec_index_set.contains(&(l.to_string(), k.clone()))) =>
+                        {
+                            vec_props.push((k, xs));
+                        }
+                        other => {
+                            let kid = keys.intern(&k);
+                            scalar_props.push((kid, other));
+                        }
+                    }
+                }
+                let labels_blob = encode_labels_record(&label_ids);
+                let props_blob = encode_props_record(&scalar_props);
+                node_w.append_node(&NodeRec {
+                    dump_id: if dump_id == NO_DUMP {
+                        None
+                    } else {
+                        Some(dump_id)
+                    },
+                    labels_blob,
+                    props_blob,
+                    vec_props,
+                })?;
+                node_count += 1;
+            }
+            Statement::Edge(e) => {
+                let reltype = reltypes.intern(&e.reltype);
+                scalar_props.clear();
+                for (k, v) in e.props {
+                    let kid = keys.intern(&k);
+                    scalar_props.push((kid, v));
+                }
+                let props_blob = encode_props_record(&scalar_props);
+                uedge_w.append_unresolved_edge(&UnresolvedEdge {
+                    src_dump: e.src_dump_id,
+                    dst_dump: e.dst_dump_id,
+                    reltype,
+                    props_blob,
+                })?;
+                uedge_count += 1;
+            }
+            Statement::RangeIndex(r) => {
+                if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
+                    rstmts.push(r);
+                }
+            }
+            Statement::VectorIndex(v) => {
+                if !vstmts
+                    .iter()
+                    .any(|e: &VectorIndexStmt| e.label == v.label && e.property == v.property)
+                {
+                    vstmts.push(v);
+                }
+            }
+            Statement::Ignored => {}
+        }
+    }
+    node_w.finish()?;
+    uedge_w.finish()?;
+    let meta = buckets::ShardMeta {
+        shard: chunk.shard,
+        input_start: chunk.input_start,
+        input_end: chunk.input_end,
+        node_count,
+        uedge_count,
+        labels: labels.into_names(),
+        reltypes: reltypes.into_names(),
+        keys: keys.into_names(),
+        range_stmts: rstmts,
+        vector_stmts: vstmts,
+    };
+    buckets::finalize_shard(node_bkt, uedge_bkt, &meta)?;
+    // Test hook: crash right after a given shard is durably finalized, to exercise
+    // shard-granular pass-1 resume (use `--threads 1` for a deterministic order).
+    if std::env::var("SLATER_BUILD_FAIL_AFTER_SHARD")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(shard_index)
+    {
+        eprintln!("SLATER_BUILD_FAIL_AFTER_SHARD={shard_index}: simulating a mid-pass-1 crash");
+        std::process::exit(70);
+    }
+    Ok(())
+}
+
+/// Read the input sequentially, cutting it into ~`target`-byte shards at statement
+/// boundaries (string-aware via [`last_statement_end`]), and dispatch each
+/// not-yet-complete shard to a worker. On resume, shards whose sidecar already
+/// exists are re-read but not re-dispatched (their work is durable). Works for both
+/// a file and stdin (stdin: fresh only — no sidecars exist).
+fn shard_reader(
+    mut r: Box<dyn BufRead>,
+    target: usize,
+    node_bkt: &Path,
+    tx: &std::sync::mpsc::SyncSender<ShardChunk>,
+    err: &std::sync::Mutex<Option<anyhow::Error>>,
+) -> Result<()> {
+    let mut shard = 0u64;
+    let mut consumed = 0u64; // input offset of bytes already cut into prior shards
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; target];
+    loop {
+        if err.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        // Accumulate ≥ target bytes ending at a statement boundary (or hit EOF).
+        let mut eof = false;
+        let mut cut = last_statement_end(&carry);
+        while cut == 0 || carry.len() < target {
+            let n = std::io::Read::read(&mut r, &mut buf).context("read dump")?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            carry.extend_from_slice(&buf[..n]);
+            cut = last_statement_end(&carry);
+        }
+        if carry.is_empty() {
+            break;
+        }
+        let (bytes, end) = if eof {
+            // Final shard: take everything (the last statement may lack a `;`).
+            let all = std::mem::take(&mut carry);
+            let end = consumed + all.len() as u64;
+            (all, end)
+        } else {
+            let rest = carry.split_off(cut);
+            let chunk = std::mem::replace(&mut carry, rest);
+            let end = consumed + chunk.len() as u64;
+            (chunk, end)
+        };
+        let start = consumed;
+        consumed = end;
+        // Skip shards already finalized by an earlier (interrupted) run.
+        let complete = buckets::read_shard_meta(node_bkt, shard)?.is_some();
+        if !complete
+            && tx
+                .send(ShardChunk {
+                    shard,
+                    input_start: start,
+                    input_end: end,
+                    bytes,
+                })
+                .is_err()
+        {
+            break; // workers gone (an error elsewhere)
+        }
+        shard += 1;
+        if eof {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Shard-parallel pass 1: fan bordered input shards across `threads` independent
+/// workers, each writing a self-contained segment + sidecar. Returns every shard's
+/// metadata (complete-from-a-prior-run + freshly written), read back from disk in
+/// shard order, for the deterministic symbol merge.
+fn run_pass1_sharded(
     input_path: &str,
-    start_offset: u64,
     node_bkt: &Path,
     uedge_bkt: &Path,
     vec_index_set: std::collections::HashSet<(String, String)>,
-    rstmts0: Vec<RangeIndexStmt>,
-    vstmts0: Vec<VectorIndexStmt>,
-    parse_batch: usize,
-) -> Result<Pass1Out> {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    threads: usize,
+    diag: &crate::diag::BuildDiag,
+) -> Result<Vec<buckets::ShardMeta>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Mutex};
 
-    let nworkers = pass1_workers();
-    let labels = Arc::new(Mutex::new(Interner::default()));
-    let keys = Arc::new(Mutex::new(Interner::default()));
-    let reltypes = Arc::new(Mutex::new(Interner::default()));
+    let nworkers = threads.max(1);
     let vec_index_set = Arc::new(vec_index_set);
-    let rstmts = Arc::new(Mutex::new(rstmts0));
-    let vstmts = Arc::new(Mutex::new(vstmts0));
-    let seen_node = Arc::new(AtomicBool::new(false));
-    let total_nodes = Arc::new(AtomicU64::new(0));
-    let total_uedges = Arc::new(AtomicU64::new(0));
+    let target = shard_bytes_target();
+    let seekable = input_path != "-";
+    let file_len = if seekable {
+        std::fs::metadata(input_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    diag.set_op("shard-parallel parse → buckets", "bytes", file_len);
+    diag.set_active_workers(nworkers as u64);
 
-    let _ = parse_batch; // block-streaming sizes work by bytes, not statement count
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(nworkers * 2);
+    let err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = sync_channel::<ShardChunk>(nworkers);
     let rx = Arc::new(Mutex::new(rx));
 
-    // Reader thread: stream large raw byte blocks, cut each at the last complete
-    // statement boundary, carry the partial tail to the next block, and hand whole
-    // blocks (groups of complete statements) to workers. It does *no* per-statement
-    // allocation and *no* parsing — that all moves onto the workers — so a single
-    // sequential reader (stdin-safe, no seek) can feed every core. Dropping `tx` on
-    // exit disconnects the channel so workers drain and stop.
-    let reader_path = input_path.to_string();
-    let block_bytes = pass1_block_bytes();
-    let reader = std::thread::spawn(move || -> Result<()> {
-        let mut r = open_input(&reader_path, start_offset)?;
-        let mut carry: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; block_bytes];
-        loop {
-            // Fill up to a full block (BufRead can return short reads).
-            let mut filled = 0usize;
-            while filled < block_bytes {
-                let n =
-                    std::io::Read::read(&mut r, &mut chunk[filled..]).context("read dump block")?;
-                if n == 0 {
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for _ in 0..nworkers {
+            let rx = Arc::clone(&rx);
+            let err = Arc::clone(&err);
+            let done = Arc::clone(&done);
+            let vis = Arc::clone(&vec_index_set);
+            handles.push(scope.spawn(move || loop {
+                if err.lock().unwrap().is_some() {
                     break;
                 }
-                filled += n;
-            }
-            if filled == 0 {
-                // EOF: flush the trailing partial statement(s); StatementReader's
-                // own EOF handling emits a final statement with no terminating `;`.
-                if !carry.is_empty() && tx.send(std::mem::take(&mut carry)).is_err() {
-                    break;
-                }
-                break;
-            }
-            let mut work = std::mem::take(&mut carry);
-            work.extend_from_slice(&chunk[..filled]);
-            let cut = last_statement_end(&work);
-            if cut == 0 {
-                // No complete statement yet (a statement longer than one block);
-                // keep accumulating.
-                carry = work;
-                continue;
-            }
-            carry = work[cut..].to_vec();
-            work.truncate(cut);
-            if tx.send(work).is_err() {
-                break; // workers gone (an error elsewhere)
-            }
-        }
-        Ok(())
-    });
-
-    let mut workers = Vec::with_capacity(nworkers);
-    for w in 0..nworkers {
-        let rx = rx.clone();
-        let labels = labels.clone();
-        let keys = keys.clone();
-        let reltypes = reltypes.clone();
-        let vec_index_set = vec_index_set.clone();
-        let rstmts = rstmts.clone();
-        let vstmts = vstmts.clone();
-        let seen_node = seen_node.clone();
-        let total_nodes = total_nodes.clone();
-        let total_uedges = total_uedges.clone();
-        let node_seg = buckets::seg_path(node_bkt, w as u64);
-        let uedge_seg = buckets::seg_path(uedge_bkt, w as u64);
-        workers.push(std::thread::spawn(move || -> Result<()> {
-            let mut node_w = BucketWriter::create(node_seg, BUCKET_BLOCK, SCRATCH_ZSTD)?;
-            let mut uedge_w = BucketWriter::create(uedge_seg, BUCKET_BLOCK, SCRATCH_ZSTD)?;
-            let mut lcache: HashMap<String, u32> = HashMap::new();
-            let mut kcache: HashMap<String, u32> = HashMap::new();
-            let mut rcache: HashMap<String, u32> = HashMap::new();
-            let mut scalar_props: Vec<(u32, Value)> = Vec::new();
-            let mut lnodes = 0u64;
-            let mut luedges = 0u64;
-            loop {
                 let msg = {
-                    let g = rx.lock().expect("rx poisoned");
+                    let g = rx.lock().unwrap();
                     g.recv()
                 };
-                let block = match msg {
-                    Ok(b) => b,
+                let chunk = match msg {
+                    Ok(c) => c,
                     Err(_) => break,
                 };
-                // Split the block into statements here (in parallel) — the reader
-                // never did this, which is what frees it to feed every worker.
-                let mut sr = StatementReader::new(std::io::Cursor::new(block));
-                while let Some(raw) = sr.next_statement()? {
-                    let raw = raw.as_str();
-                    let stmt = parse_statement(raw)
-                        .with_context(|| format!("in statement: {}", truncate(raw, 120)))?;
-                    match stmt {
-                        Statement::Node(n) => {
-                            seen_node.store(true, Ordering::Relaxed);
-                            let mut label_names: Vec<&str> = Vec::new();
-                            let mut label_ids = Vec::new();
-                            for l in &n.labels {
-                                if l != DUMP_VERTEX {
-                                    label_names.push(l);
-                                    let id = match lcache.get(l) {
-                                        Some(&id) => id,
-                                        None => {
-                                            let id = labels.lock().unwrap().intern(l);
-                                            lcache.insert(l.clone(), id);
-                                            id
-                                        }
-                                    };
-                                    label_ids.push(id);
-                                }
-                            }
-                            scalar_props.clear();
-                            let mut vec_props: Vec<(String, Vec<f32>)> = Vec::new();
-                            let mut dump_id = NO_DUMP;
-                            for (k, v) in n.props {
-                                if k == DUMP_ID {
-                                    match v {
-                                        Value::Int(id) => dump_id = id,
-                                        _ => bail!("__dump_id__ must be an integer"),
-                                    }
-                                    continue;
-                                }
-                                match v {
-                                    Value::Vector(xs)
-                                        if label_names.iter().any(|l| {
-                                            vec_index_set.contains(&(l.to_string(), k.clone()))
-                                        }) =>
-                                    {
-                                        vec_props.push((k, xs));
-                                    }
-                                    other => {
-                                        let kid = match kcache.get(&k) {
-                                            Some(&id) => id,
-                                            None => {
-                                                let id = keys.lock().unwrap().intern(&k);
-                                                kcache.insert(k.clone(), id);
-                                                id
-                                            }
-                                        };
-                                        scalar_props.push((kid, other));
-                                    }
-                                }
-                            }
-                            let labels_blob = encode_labels_record(&label_ids);
-                            let props_blob = encode_props_record(&scalar_props);
-                            node_w.append_node(&NodeRec {
-                                dump_id: if dump_id == NO_DUMP {
-                                    None
-                                } else {
-                                    Some(dump_id)
-                                },
-                                labels_blob,
-                                props_blob,
-                                vec_props,
-                            })?;
-                            lnodes += 1;
+                let len = chunk.bytes.len() as u64;
+                match process_shard(chunk, node_bkt, uedge_bkt, &vis) {
+                    Ok(()) => {
+                        diag.progress_add(len);
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        if diag.enabled() {
+                            diag.set_op_detail(&format!("shards done {d}"));
                         }
-                        Statement::Edge(e) => {
-                            let reltype = match rcache.get(&e.reltype) {
-                                Some(&id) => id,
-                                None => {
-                                    let id = reltypes.lock().unwrap().intern(&e.reltype);
-                                    rcache.insert(e.reltype.clone(), id);
-                                    id
-                                }
-                            };
-                            scalar_props.clear();
-                            for (k, v) in e.props {
-                                let kid = match kcache.get(&k) {
-                                    Some(&id) => id,
-                                    None => {
-                                        let id = keys.lock().unwrap().intern(&k);
-                                        kcache.insert(k.clone(), id);
-                                        id
-                                    }
-                                };
-                                scalar_props.push((kid, v));
-                            }
-                            let props_blob = encode_props_record(&scalar_props);
-                            uedge_w.append_unresolved_edge(&UnresolvedEdge {
-                                src_dump: e.src_dump_id,
-                                dst_dump: e.dst_dump_id,
-                                reltype,
-                                props_blob,
-                            })?;
-                            luedges += 1;
+                    }
+                    Err(e) => {
+                        let mut s = err.lock().unwrap();
+                        if s.is_none() {
+                            *s = Some(e);
                         }
-                        Statement::RangeIndex(r) => {
-                            if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
-                                rstmts.lock().unwrap().push(r);
-                            }
-                        }
-                        Statement::VectorIndex(v) => {
-                            // Ordering check is relaxed in parallel mode (it's a
-                            // best-effort guard; sidecar declarations are the
-                            // supported route for the parallel path).
-                            let mut vs = vstmts.lock().unwrap();
-                            if !vs
-                                .iter()
-                                .any(|e| e.label == v.label && e.property == v.property)
-                            {
-                                vs.push(v);
-                            }
-                        }
-                        Statement::Ignored => {}
+                        break;
                     }
                 }
-            }
-            node_w.finish()?;
-            uedge_w.finish()?;
-            total_nodes.fetch_add(lnodes, Ordering::Relaxed);
-            total_uedges.fetch_add(luedges, Ordering::Relaxed);
-            Ok(())
-        }));
-    }
-
-    // Only the workers hold the receiver now; drop ours so that when the workers
-    // finish (or die), the channel disconnects and the reader's `send` unblocks.
-    drop(rx);
-    let mut first_err: Option<anyhow::Error> = None;
-    for h in workers {
-        match h.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                first_err.get_or_insert(e);
-            }
-            Err(_) => {
-                first_err.get_or_insert_with(|| anyhow::anyhow!("pass-1 worker panicked"));
-            }
+            }));
         }
-    }
-    let reader_res = reader.join();
-    if let Some(e) = first_err {
+        let reader_input = open_input(input_path, 0)?;
+        let reader_res = shard_reader(reader_input, target, node_bkt, &tx, &err);
+        drop(tx);
+        for h in handles {
+            let _ = h.join();
+        }
+        reader_res
+    })?;
+
+    if let Some(e) = Arc::try_unwrap(err)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .flatten()
+    {
         return Err(e);
     }
-    reader_res.map_err(|_| anyhow::anyhow!("pass-1 reader panicked"))??;
 
-    let unwrap_interner = |a: Arc<Mutex<Interner>>| {
-        Arc::try_unwrap(a)
-            .map_err(|_| anyhow::anyhow!("dangling interner ref"))
-            .map(|m| m.into_inner().expect("interner poisoned"))
-    };
-    Ok(Pass1Out {
-        nodes: total_nodes.load(Ordering::Relaxed),
-        uedges: total_uedges.load(Ordering::Relaxed),
-        labels: unwrap_interner(labels)?,
-        reltypes: unwrap_interner(reltypes)?,
-        keys: unwrap_interner(keys)?,
-        rstmts: Arc::try_unwrap(rstmts)
-            .map_err(|_| anyhow::anyhow!("dangling rstmts ref"))?
-            .into_inner()
-            .expect("rstmts poisoned"),
-        vstmts: Arc::try_unwrap(vstmts)
-            .map_err(|_| anyhow::anyhow!("dangling vstmts ref"))?
-            .into_inner()
-            .expect("vstmts poisoned"),
-        seen_node: seen_node.load(Ordering::Relaxed),
-    })
+    // Authoritative shard list: every shard 0..K now has a sidecar on disk.
+    let mut metas = Vec::new();
+    let mut n = 0u64;
+    while let Some(m) = buckets::read_shard_meta(node_bkt, n)? {
+        metas.push(m);
+        n += 1;
+    }
+    Ok(metas)
 }
 
 /// Load a permutation table written by [`save_perm`].
@@ -623,6 +583,7 @@ pub fn build_external(
     graph: &str,
     data_dir: &Path,
     opts: &BuildOptions,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<BuildOutcome> {
     let graph_dir = data_dir.join(graph);
     std::fs::create_dir_all(&graph_dir)
@@ -676,6 +637,7 @@ pub fn build_external(
         &final_dir,
         &scratch_dir,
         resume_state,
+        diag,
     );
     match &result {
         // Success: drop the scratch (unless asked to keep it).
@@ -703,6 +665,7 @@ fn build_inner(
     final_dir: &Path,
     scratch_dir: &Path,
     resume: Option<BuildState>,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<BuildOutcome> {
     let (cipher, encryption_header) = common::derive_cipher(&opts.encryption_key);
     let node_bkt = scratch_dir.join("nodes.bkt");
@@ -711,287 +674,115 @@ fn build_inner(
     let perm_path = scratch_dir.join("perm.bin");
     let resume_phase = resume.as_ref().map(|s| s.phase).unwrap_or(Phase::Start);
 
-    let mut labels;
-    let mut reltypes;
-    let mut keys;
     let range_stmts: Vec<RangeIndexStmt>;
     let vector_stmts: Vec<VectorIndexStmt>;
-    let node_count: u64;
 
-    // ---- pass 1: stream the dump into node + unresolved-edge buckets ----------
-    if resume_phase >= Phase::Pass1 {
-        let s = resume.as_ref().unwrap();
-        labels = Interner::from_names(s.labels.clone());
-        reltypes = Interner::from_names(s.reltypes.clone());
-        keys = Interner::from_names(s.property_keys.clone());
-        range_stmts = s.range_stmts.clone();
-        vector_stmts = s.vector_stmts.clone();
-        node_count = s.node_count;
-    } else {
-        // Fresh pass 1, or resume mid-pass-1 from the last completed bucket segment.
-        let p1 = resume.as_ref().and_then(|s| s.pass1.clone());
-        let mut rstmts;
-        let mut vstmts: Vec<VectorIndexStmt>;
+    // Per-shard local→global symbol remaps, used by resolve (reltype/key ids) and
+    // emit (label/key ids) to translate the buckets' local ids to global.
+
+    // ---- pass 1: shard-parallel parse into node + unresolved-edge buckets -------
+    let pass1_g = diag.phase("pass1");
+    if resume_phase < Phase::Pass1 {
+        // Vector-index routing set: which `(label, property)` vecf32 values go to the
+        // vector store. The parallel workers see shards out of order, so they need
+        // this up front. The dump format puts ALL index DDL before any node data, so
+        // a cheap pre-scan of the header (stops at the first node) plus the optional
+        // sidecar gives the complete set.
         let mut vec_index_set: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        if let (Some(s), Some(_)) = (resume.as_ref(), &p1) {
-            // Restore interners + declarations captured by the pass-1 checkpoint.
-            labels = Interner::from_names(s.labels.clone());
-            reltypes = Interner::from_names(s.reltypes.clone());
-            keys = Interner::from_names(s.property_keys.clone());
-            rstmts = s.range_stmts.clone();
-            vstmts = s.vector_stmts.clone();
-            for v in &vstmts {
+        if let Some(path) = &opts.vector_index_json {
+            for v in crate::build::load_vector_sidecar(path)? {
                 vec_index_set.insert((v.label.clone(), v.property.clone()));
             }
-        } else {
-            labels = Interner::default();
-            reltypes = Interner::default();
-            keys = Interner::default();
-            rstmts = Vec::new();
-            vstmts = Vec::new();
-            // Vector index declarations must be known before the nodes they cover so
-            // an indexed `vecf32` is routed to the vector store. A sidecar is known
-            // up front; inline declarations must precede node data (the dump tool's
-            // output does this).
-            if let Some(path) = &opts.vector_index_json {
-                for v in crate::build::load_vector_sidecar(path)? {
-                    if vec_index_set.insert((v.label.clone(), v.property.clone())) {
-                        vstmts.push(v);
+        }
+        {
+            let mut sr = StatementReader::new(open_input(input_path, 0)?);
+            while let Some(raw) = sr.next_statement()? {
+                match parse_statement(&raw)
+                    .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
+                {
+                    Statement::VectorIndex(v) => {
+                        vec_index_set.insert((v.label, v.property));
                     }
+                    Statement::Node(_) => break, // DDL header ends at the first node
+                    _ => {}
                 }
             }
         }
+        // Mark the scratch resumable *before* the long parallel pass: a mid-pass-1
+        // crash then leaves this `Phase::Start` state + the finalized shard sidecars,
+        // and `--resume` re-enters pass 1, skipping shards whose sidecar exists.
+        checkpoint(
+            scratch_dir,
+            &BuildState {
+                generation: generation.0.to_string(),
+                phase: Phase::Start,
+                node_count: 0,
+                edge_count: 0,
+                labels: Vec::new(),
+                reltypes: Vec::new(),
+                property_keys: Vec::new(),
+                range_stmts: Vec::new(),
+                vector_stmts: Vec::new(),
+                cluster_identity: false,
+            },
+        )?;
+        run_pass1_sharded(
+            input_path,
+            &node_bkt,
+            &uedge_bkt,
+            vec_index_set,
+            opts.threads,
+            diag,
+        )?;
+    }
 
-        // Segment / offset state — resumed from the checkpoint, or fresh at zero.
-        let (
-            start_offset,
-            mut node_seg,
-            mut uedge_seg,
-            mut total_nodes,
-            mut total_uedges,
-            mut seen_node,
-        ) = match &p1 {
-            Some(p) => (
-                p.input_offset,
-                p.node_segments,
-                p.uedge_segments,
-                p.node_count,
-                p.uedge_count,
-                p.seen_node,
-            ),
-            None => (0, 0, 0, 0, 0, false),
-        };
-        // Drop any incomplete trailing segment a crash left behind before appending.
-        cleanup_partial_segments(&node_bkt, node_seg);
-        cleanup_partial_segments(&uedge_bkt, uedge_seg);
-
-        let seekable = input_path != "-";
-        let seg_records = pass1_segment_records();
-        let parse_batch = pass1_parse_batch();
-        if pass1_parallel() && start_offset == 0 && node_seg == 0 && uedge_seg == 0 {
-            // Experimental fully-parallel pass 1 (workers write their own segments,
-            // out of order). Only on a fresh build — resume needs the serial,
-            // deterministic path.
-            let out = run_pass1_parallel(
-                input_path,
-                start_offset,
-                &node_bkt,
-                &uedge_bkt,
-                vec_index_set,
-                rstmts,
-                vstmts,
-                parse_batch,
-            )?;
-            total_nodes = out.nodes;
-            total_uedges = out.uedges;
-            labels = out.labels;
-            reltypes = out.reltypes;
-            keys = out.keys;
-            rstmts = out.rstmts;
-            vstmts = out.vstmts;
-            // `seen_node` only gated the vector-DDL-before-nodes check during pass 1;
-            // it is unused afterwards, so the parallel path doesn't propagate it.
-            let _ = (out.seen_node, seekable, seg_records, node_seg, uedge_seg);
-        } else {
-            let reader = open_input(input_path, start_offset)?;
-            let mut sreader = StatementReader::new(reader);
-            let mut scalar_props: Vec<(u32, Value)> = Vec::new();
-            let mut node_w = BucketWriter::create(
-                buckets::seg_path(&node_bkt, node_seg),
-                BUCKET_BLOCK,
-                SCRATCH_ZSTD,
-            )?;
-            let mut uedge_w = BucketWriter::create(
-                buckets::seg_path(&uedge_bkt, uedge_seg),
-                BUCKET_BLOCK,
-                SCRATCH_ZSTD,
-            )?;
-            let mut records_in_seg = 0u64;
-
-            // Pass 1 is parse-bound: parse a batch in parallel (rayon), then apply the
-            // results in order — interning + bucket writes stay sequential so
-            // provisional-id assignment is deterministic.
-            let mut batch: Vec<String> = Vec::with_capacity(parse_batch);
-            loop {
-                batch.clear();
-                while batch.len() < parse_batch {
-                    match sreader.next_statement()? {
-                        Some(s) => batch.push(s),
-                        None => break,
-                    }
-                }
-                if batch.is_empty() {
-                    break;
-                }
-                let parsed: Vec<Result<Statement>> =
-                    batch.par_iter().map(|raw| parse_statement(raw)).collect();
-                for (raw, parsed) in batch.iter().zip(parsed) {
-                    let stmt =
-                        parsed.with_context(|| format!("in statement: {}", truncate(raw, 120)))?;
-                    match stmt {
-                        Statement::Node(n) => {
-                            seen_node = true;
-                            let mut label_names: Vec<&str> = Vec::new();
-                            let mut label_ids = Vec::new();
-                            for l in &n.labels {
-                                if l != DUMP_VERTEX {
-                                    label_names.push(l);
-                                    label_ids.push(labels.intern(l));
-                                }
-                            }
-                            scalar_props.clear();
-                            let mut vec_props: Vec<(String, Vec<f32>)> = Vec::new();
-                            let mut dump_id = NO_DUMP;
-                            for (k, v) in n.props {
-                                if k == DUMP_ID {
-                                    match v {
-                                        Value::Int(id) => dump_id = id,
-                                        _ => bail!("__dump_id__ must be an integer"),
-                                    }
-                                    continue;
-                                }
-                                match v {
-                                    Value::Vector(xs)
-                                        if label_names.iter().any(|l| {
-                                            vec_index_set.contains(&(l.to_string(), k.clone()))
-                                        }) =>
-                                    {
-                                        // Routed to the vector store (a declared index covers it).
-                                        vec_props.push((k, xs));
-                                    }
-                                    other => {
-                                        let kid = keys.intern(&k);
-                                        scalar_props.push((kid, other));
-                                    }
-                                }
-                            }
-                            let labels_blob = encode_labels_record(&label_ids);
-                            let props_blob = encode_props_record(&scalar_props);
-                            node_w.append_node(&NodeRec {
-                                dump_id: if dump_id == NO_DUMP {
-                                    None
-                                } else {
-                                    Some(dump_id)
-                                },
-                                labels_blob,
-                                props_blob,
-                                vec_props,
-                            })?;
-                            total_nodes += 1;
-                            records_in_seg += 1;
-                        }
-                        Statement::Edge(e) => {
-                            let reltype = reltypes.intern(&e.reltype);
-                            scalar_props.clear();
-                            for (k, v) in e.props {
-                                let kid = keys.intern(&k);
-                                scalar_props.push((kid, v));
-                            }
-                            let props_blob = encode_props_record(&scalar_props);
-                            uedge_w.append_unresolved_edge(&UnresolvedEdge {
-                                src_dump: e.src_dump_id,
-                                dst_dump: e.dst_dump_id,
-                                reltype,
-                                props_blob,
-                            })?;
-                            total_uedges += 1;
-                            records_in_seg += 1;
-                        }
-                        Statement::RangeIndex(r) => {
-                            if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
-                                rstmts.push(r);
-                            }
-                        }
-                        Statement::VectorIndex(v) => {
-                            if seen_node {
-                                bail!(
-                                    "vector index declaration for {}.{} appears after node data; \
-                                 the external build needs vector-index DDL before the nodes it \
-                                 covers (the dump tool emits it first)",
-                                    v.label,
-                                    v.property
-                                );
-                            }
-                            if vec_index_set.insert((v.label.clone(), v.property.clone())) {
-                                vstmts.push(v);
-                            }
-                        }
-                        Statement::Ignored => {}
-                    }
-                }
-                // Roll a segment + checkpoint at the boundary (seekable inputs only — a
-                // stdin pipe can't be resumed mid-stream regardless).
-                if seekable && records_in_seg >= seg_records {
-                    node_w.finish()?;
-                    uedge_w.finish()?;
-                    node_seg += 1;
-                    uedge_seg += 1;
-                    records_in_seg = 0;
-                    checkpoint(
-                        scratch_dir,
-                        &BuildState {
-                            generation: generation.0.to_string(),
-                            phase: Phase::Start,
-                            node_count: total_nodes,
-                            edge_count: 0,
-                            labels: labels.names().to_vec(),
-                            reltypes: reltypes.names().to_vec(),
-                            property_keys: keys.names().to_vec(),
-                            range_stmts: rstmts.clone(),
-                            vector_stmts: vstmts.clone(),
-                            cluster_identity: false,
-                            pass1: Some(Pass1Progress {
-                                input_offset: start_offset + sreader.byte_offset(),
-                                node_count: total_nodes,
-                                uedge_count: total_uedges,
-                                node_segments: node_seg,
-                                uedge_segments: uedge_seg,
-                                seen_node,
-                            }),
-                        },
-                    )?;
-                    fault_after("pass1_partial");
-                    node_w = BucketWriter::create(
-                        buckets::seg_path(&node_bkt, node_seg),
-                        BUCKET_BLOCK,
-                        SCRATCH_ZSTD,
-                    )?;
-                    uedge_w = BucketWriter::create(
-                        buckets::seg_path(&uedge_bkt, uedge_seg),
-                        BUCKET_BLOCK,
-                        SCRATCH_ZSTD,
-                    )?;
+    // Merge the shards' local symbol tables (in shard = input order) into the global
+    // tables + per-shard remaps. Done fresh or on resume (the node sidecars persist
+    // until publish), so the global ids reproduce the historical first-seen order.
+    diag.set_op("merge shard symbol tables", "shards", 0);
+    let metas = {
+        let mut v = Vec::new();
+        let mut n = 0u64;
+        while let Some(m) = buckets::read_shard_meta(&node_bkt, n)? {
+            v.push(m);
+            n += 1;
+        }
+        if v.is_empty() {
+            bail!("pass 1 produced no shards");
+        }
+        v
+    };
+    let (g_labels, g_reltypes, g_keys, rmaps) = buckets::merge_shard_symbols(&metas);
+    let remaps: Vec<buckets::ShardRemap> = rmaps;
+    let labels: Interner = Interner::from_names(g_labels);
+    let reltypes: Interner = Interner::from_names(g_reltypes);
+    let keys: Interner = Interner::from_names(g_keys);
+    let node_count: u64 = metas.iter().map(|m| m.node_count).sum();
+    // Union the index DDL across shards (it lives in shard 0; dedup defensively).
+    {
+        let mut rs: Vec<RangeIndexStmt> = Vec::new();
+        let mut vs: Vec<VectorIndexStmt> = Vec::new();
+        for m in &metas {
+            for r in &m.range_stmts {
+                if !rs.contains(r) {
+                    rs.push(r.clone());
                 }
             }
-            node_w.finish()?;
-            uedge_w.finish()?;
+            for v in &m.vector_stmts {
+                if !vs
+                    .iter()
+                    .any(|e| e.label == v.label && e.property == v.property)
+                {
+                    vs.push(v.clone());
+                }
+            }
         }
-        let _ = total_uedges;
+        range_stmts = rs;
+        vector_stmts = vs;
+    }
 
-        range_stmts = rstmts;
-        vector_stmts = vstmts;
-        node_count = total_nodes;
+    if resume_phase < Phase::Pass1 {
         checkpoint(
             scratch_dir,
             &BuildState {
@@ -1005,51 +796,136 @@ fn build_inner(
                 range_stmts: range_stmts.clone(),
                 vector_stmts: vector_stmts.clone(),
                 cluster_identity: false,
-                pass1: None,
             },
         )?;
         fault_after("pass1");
     }
+    drop(pass1_g);
 
     // ---- resolve dump ids → provisional node ids, write the edge bucket -------
+    let resolve_g = diag.phase("resolve");
     let edge_count: u64;
     if resume_phase >= Phase::Resolved {
         edge_count = resume.as_ref().unwrap().edge_count;
     } else {
-        // Rebuild the resolver by scanning the node bucket's dump ids (also the
-        // resume-replay path), so nothing dump-id-scale stays resident from pass 1.
+        diag.set_op("resolve dump_id → node_id (parallel)", "edges", 0);
+        diag.set_active_workers(opts.threads.max(1) as u64);
+        // Rebuild the resolver by scanning the node bucket's dump ids (read-only once
+        // built, so it is shared across resolve workers behind an `Arc`).
         let mut dump_ids: Vec<i64> = Vec::with_capacity(node_count as usize);
         buckets::for_each_node_dump_id(&node_bkt, |_, d| {
             dump_ids.push(d.unwrap_or(NO_DUMP));
             Ok(())
         })?;
-        let resolver = DumpResolver::build_dense(&dump_ids, opts.max_memory_bytes)?;
+        let resolver =
+            std::sync::Arc::new(DumpResolver::build_dense(&dump_ids, opts.max_memory_bytes)?);
         drop(dump_ids);
 
-        let mut count = 0u64;
-        {
-            let mut edge_w = BucketWriter::create(&edge_bkt, BUCKET_BLOCK, SCRATCH_ZSTD)?;
-            buckets::for_each_unresolved_edge(&uedge_bkt, |prov_edge, ue| {
-                let src = resolver.get(ue.src_dump).with_context(|| {
-                    format!("edge references unknown source __dump_id__ {}", ue.src_dump)
-                })?;
-                let dst = resolver.get(ue.dst_dump).with_context(|| {
-                    format!("edge references unknown target __dump_id__ {}", ue.dst_dump)
-                })?;
-                edge_w.append_edge(&EdgeRec {
-                    prov_edge_id: prov_edge,
-                    src_prov: src,
-                    dst_prov: dst,
-                    reltype: ue.reltype,
-                    props_blob: ue.props_blob,
-                })?;
-                count += 1;
-                Ok(())
-            })?;
-            edge_w.finish()?;
+        // Per-shard base prov_edge_id (prefix sum of uedge counts) → contiguous,
+        // input-ordered edge ids identical to the old single-threaded resolve.
+        let counts: Vec<u64> = metas.iter().map(|m| m.uedge_count).collect();
+        let mut bases: Vec<u64> = Vec::with_capacity(counts.len());
+        let mut acc = 0u64;
+        for &c in &counts {
+            bases.push(acc);
+            acc += c;
         }
-        std::fs::remove_file(&uedge_bkt).ok();
-        edge_count = count;
+        let total_edges = acc;
+        diag.set_op("resolve dump_id → node_id (parallel)", "edges", total_edges);
+
+        // Each worker resolves one unresolved-edge shard into edge_bkt.<shard> with
+        // global symbol ids (via the shard remap) and its deterministic id range.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let next = std::sync::Arc::new(AtomicU64::new(0));
+        let err: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let nshards = metas.len() as u64;
+        let bases_r = &bases;
+        let counts_r = &counts;
+        let remaps_r = &remaps;
+        let uedge_r = &uedge_bkt;
+        let edge_r = &edge_bkt;
+        std::thread::scope(|scope| {
+            for _ in 0..opts.threads.max(1) {
+                let next = std::sync::Arc::clone(&next);
+                let err = std::sync::Arc::clone(&err);
+                let resolver = std::sync::Arc::clone(&resolver);
+                scope.spawn(move || loop {
+                    if err.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= nshards {
+                        break;
+                    }
+                    let rm = &remaps_r[i as usize];
+                    let res = (|| -> Result<()> {
+                        let mut id = bases_r[i as usize];
+                        let mut edge_w = BucketWriter::create(
+                            buckets::seg_path(edge_r, i),
+                            BUCKET_BLOCK,
+                            SCRATCH_ZSTD,
+                        )?;
+                        let rdr = graph_format::blockfile::BlockFileReader::open(
+                            buckets::seg_path(uedge_r, i),
+                        )?;
+                        rdr.for_each_record(|_, rec| {
+                            let ue = buckets::UnresolvedEdge::decode(rec)?;
+                            let src = resolver.get(ue.src_dump).with_context(|| {
+                                format!(
+                                    "edge references unknown source __dump_id__ {}",
+                                    ue.src_dump
+                                )
+                            })?;
+                            let dst = resolver.get(ue.dst_dump).with_context(|| {
+                                format!(
+                                    "edge references unknown target __dump_id__ {}",
+                                    ue.dst_dump
+                                )
+                            })?;
+                            let props_blob = if rm.identity {
+                                ue.props_blob
+                            } else {
+                                buckets::remap_props_blob(&ue.props_blob, rm)?
+                            };
+                            edge_w.append_edge(&EdgeRec {
+                                prov_edge_id: id,
+                                src_prov: src,
+                                dst_prov: dst,
+                                reltype: rm.map_reltype(ue.reltype),
+                                props_blob,
+                            })?;
+                            id += 1;
+                            Ok(())
+                        })?;
+                        edge_w.finish()?;
+                        Ok(())
+                    })();
+                    match res {
+                        Ok(()) => diag.progress_add(counts_r[i as usize]),
+                        Err(e) => {
+                            let mut s = err.lock().unwrap();
+                            if s.is_none() {
+                                *s = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = std::sync::Arc::try_unwrap(err)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .flatten()
+        {
+            return Err(e);
+        }
+        // Unresolved-edge shards consumed; reclaim their scratch.
+        for i in 0..nshards {
+            let _ = std::fs::remove_file(buckets::seg_path(&uedge_bkt, i));
+        }
+        edge_count = total_edges;
         checkpoint(
             scratch_dir,
             &BuildState {
@@ -1063,13 +939,14 @@ fn build_inner(
                 range_stmts: range_stmts.clone(),
                 vector_stmts: vector_stmts.clone(),
                 cluster_identity: false,
-                pass1: None,
             },
         )?;
         fault_after("resolve");
     }
+    drop(resolve_g);
 
     // ---- pass 2: clustering → node-id permutation -----------------------------
+    let cluster_g = diag.phase("cluster");
     let perm = if resume_phase >= Phase::Clustered {
         let s = resume.as_ref().unwrap();
         if s.cluster_identity {
@@ -1078,6 +955,8 @@ fn build_inner(
             load_perm(&perm_path, node_count)?
         }
     } else {
+        diag.set_op("block-parallel LDG cluster", "nodes", node_count);
+        diag.set_active_workers(opts.threads.max(1) as u64);
         let block_capacity = (opts.block_size / 48).max(1) as u32;
         let perm = cluster::build_permutation(
             node_count,
@@ -1088,6 +967,7 @@ fn build_inner(
                 mem_budget: opts.max_memory_bytes,
                 temp_dir: scratch_dir.to_path_buf(),
                 zstd_level: SCRATCH_ZSTD,
+                threads: opts.threads,
             },
             |visit| buckets::for_each_edge(&edge_bkt, |e| visit(e.src_prov, e.dst_prov)),
         )?;
@@ -1105,12 +985,12 @@ fn build_inner(
                 range_stmts: range_stmts.clone(),
                 vector_stmts: vector_stmts.clone(),
                 cluster_identity: perm.is_identity(),
-                pass1: None,
             },
         )?;
         fault_after("cluster");
         perm
     };
+    drop(cluster_g);
 
     // ---- emit (always redone on resume) --------------------------------------
     let mut block_sizes: BTreeMap<String, u32> = BTreeMap::new();
@@ -1127,11 +1007,6 @@ fn build_inner(
     struct NodeRangeSpec {
         idx: usize,
         label_id: Option<u32>,
-        key_id: Option<u32>,
-    }
-    struct EdgeRangeSpec {
-        idx: usize,
-        reltype_id: Option<u32>,
         key_id: Option<u32>,
     }
     let mut range_metas: Vec<RangeMeta> = Vec::new();
@@ -1229,9 +1104,18 @@ fn build_inner(
             Ok(())
         };
 
+    let emit_nodes_g = diag.phase("emit.node_stores");
+    diag.set_op(
+        "scan nodes → node_props.blk + node_labels.blk",
+        "nodes",
+        node_count,
+    );
     if perm.is_identity() {
         // Fast path: final id = prov id, so byte-copy straight through in order.
-        buckets::for_each_node(&node_bkt, |prov, node| {
+        // `for_each_node_remapped` translates each shard's local symbol ids to
+        // global (identity shards byte-copy unchanged).
+        buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
+            diag.tick(prov);
             labels_w.append_raw(&node.labels_blob)?;
             props_w.append_raw(&node.props_blob)?;
             emit_node_ranges(&node, prov, &mut range_sorters)?;
@@ -1240,7 +1124,8 @@ fn build_inner(
         })?;
     } else {
         let mut node_sorter = ExtSorter::<NodeEmit>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-        buckets::for_each_node(&node_bkt, |prov, node| {
+        buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
+            diag.tick(prov);
             let final_id = perm.final_of(prov);
             emit_node_ranges(&node, final_id, &mut range_sorters)?;
             gather_node_vectors(&node, final_id, &vec_specs, &mut pending)?;
@@ -1251,115 +1136,291 @@ fn build_inner(
             })?;
             Ok(())
         })?;
+        diag.set_op("sort + write nodes (clustered order)", "nodes", node_count);
+        let mut written = 0u64;
         for r in node_sorter.sorted()? {
             let ne = r?;
             labels_w.append_raw(&ne.labels_blob)?;
             props_w.append_raw(&ne.props_blob)?;
+            written += 1;
+            diag.tick(written);
         }
     }
     props_w.finish()?;
     labels_w.finish()?;
     block_sizes.insert("node_props.blk".into(), opts.block_size as u32);
     block_sizes.insert("node_labels.blk".into(), opts.block_size as u32);
+    drop(emit_nodes_g);
 
-    // --- topology.csr.blk + edge_props.blk ---
-    let mut edge_props_w = PropsWriter::create_with_cipher(
-        tmp_dir.join("edge_props.blk"),
-        opts.block_size,
-        opts.zstd_level,
-        cipher.clone(),
-    )?;
-    let mut csr = CsrStreamWriter::create_with_cipher(
-        tmp_dir.join("topology.csr.blk"),
-        node_count,
-        opts.block_size,
-        opts.zstd_level,
-        cipher.clone(),
-    )?;
+    // --- topology.csr.blk + edge_props.blk (range-partitioned parallel emit) ---
+    //
+    // The five fused outputs (forward CSR, reverse CSR, edge_props in final-edge-id
+    // order, (reltype,src)/(reltype,dst) postings, edge range entries) are produced
+    // by partitioning the resolved edges into fixed `BAND_NODES`-wide node bands and
+    // working each band in parallel, then stitching the per-band block files with a
+    // verbatim block-concat. `final_edge_id` is `base_b + i` (band prefix-sum base +
+    // sorted position within the band) — bit-identical to the serial forward-merge
+    // position because bands partition by the primary sort key `final_src`. Only the
+    // *block layout* (boundaries fall at band edges) differs from the serial stream,
+    // so `topology.csr.blk` / `edge_props.blk` content hashes change once; the logical
+    // content (and the postings / range ISAMs) is identical.
+    let emit_topo_g = diag.phase("emit.topology");
+    let threads = opts.threads.max(1);
+    let band = band_nodes();
+    let nbands = node_count.div_ceil(band).max(1) as usize;
+    let pid = std::process::id();
+    // Local batching buffer per (worker, band); cap total batching memory at a small
+    // fraction of the budget so the route buffers never rival the sorters.
+    let batch_threshold =
+        (opts.max_memory_bytes / 32 / (nbands * threads).max(1)).clamp(16 * 1024, 1 << 20);
 
-    let mut fwd_sorter = ExtSorter::<EdgeFwd>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-    buckets::for_each_edge(&edge_bkt, |e| {
-        fwd_sorter.push(EdgeFwd {
-            final_src: perm.final_of(e.src_prov),
-            final_dst: perm.final_of(e.dst_prov),
-            prov_edge_id: e.prov_edge_id,
-            reltype: e.reltype,
-            props_blob: e.props_blob,
-        })
-    })?;
-
-    let mut rev_sorter = ExtSorter::<EdgeRev>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-    // Endpoint postings: collect (reltype, src) on the forward pass and
-    // (reltype, dst) on the reverse pass, externally sorted by (reltype, node) so
-    // we can drain one ascending-distinct record per reltype within the memory
-    // budget — the bounded-memory analog of the in-memory build's bucket pass.
-    let mut src_post_sorter =
-        ExtSorter::<RelEndpoint>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-    let mut tgt_post_sorter =
-        ExtSorter::<RelEndpoint>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-    for (final_edge_id, r) in fwd_sorter.sorted()?.enumerate() {
-        let final_edge_id = final_edge_id as u64;
-        let ef = r?;
-        csr.push(
-            ef.final_src,
-            Adj {
-                reltype: ef.reltype,
-                neighbour: NodeId(ef.final_dst),
-                edge: EdgeId(final_edge_id),
-            },
-        )?;
-        src_post_sorter.push(RelEndpoint {
-            reltype: ef.reltype,
-            node: ef.final_src,
-        })?;
-        tgt_post_sorter.push(RelEndpoint {
-            reltype: ef.reltype,
-            node: ef.final_dst,
-        })?;
-        edge_props_w.append_raw(&ef.props_blob)?;
-        for spec in &edge_range {
-            if let (Some(rid), Some(kid)) = (spec.reltype_id, spec.key_id) {
-                if ef.reltype == rid {
-                    if let Some(v) = extract_value(&ef.props_blob, kid)? {
-                        range_sorters[spec.idx].push(RangeEntry {
-                            key: v,
-                            id: final_edge_id,
-                        })?;
+    // 1) Partition resolved edges into per-src-band files (parallel over the edge
+    //    bucket's segments) and count edges per band → prefix-sum `base_b`.
+    diag.set_op("partition edges by src band", "edges", edge_count);
+    diag.set_active_workers(threads as u64);
+    let fwd_spill = BandSpill::new(nbands, |b| band_path(scratch_dir, pid, "fwd_band", b))?;
+    {
+        let segs = buckets::segments(&edge_bkt);
+        let next = AtomicU64::new(0);
+        let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let (perm_r, fwd_spill_r, segs_r, next_r, err_r) = (&perm, &fwd_spill, &segs, &next, &err);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || {
+                    let mut batcher = BandBatcher::new(fwd_spill_r, batch_threshold);
+                    loop {
+                        if err_r.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let si = next_r.fetch_add(1, Ordering::Relaxed) as usize;
+                        if si >= segs_r.len() {
+                            break;
+                        }
+                        let res = (|| -> Result<()> {
+                            let r = BlockFileReader::open(&segs_r[si])?;
+                            let mut local = 0u64;
+                            r.for_each_record(|_, rec| {
+                                let e = EdgeRec::decode(rec)?;
+                                let final_src = perm_r.final_of(e.src_prov);
+                                let final_dst = perm_r.final_of(e.dst_prov);
+                                batcher.push(
+                                    (final_src / band) as usize,
+                                    &EdgeFwd {
+                                        final_src,
+                                        final_dst,
+                                        prov_edge_id: e.prov_edge_id,
+                                        reltype: e.reltype,
+                                        props_blob: e.props_blob,
+                                    },
+                                )?;
+                                local += 1;
+                                Ok(())
+                            })?;
+                            batcher.flush_all()?;
+                            diag.progress_add(local);
+                            Ok(())
+                        })();
+                        if let Err(e) = res {
+                            let mut g = err_r.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                            break;
+                        }
                     }
-                }
+                });
             }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
         }
-        rev_sorter.push(EdgeRev {
-            final_dst: ef.final_dst,
-            final_edge_id,
-            final_src: ef.final_src,
-            reltype: ef.reltype,
-        })?;
     }
-    csr.finish_half()?; // forward records 0..N
-    for r in rev_sorter.sorted()? {
-        let er = r?;
-        csr.push(
-            er.final_dst,
-            Adj {
-                reltype: er.reltype,
-                neighbour: NodeId(er.final_src),
-                edge: EdgeId(er.final_edge_id),
-            },
-        )?;
+    let (fwd_band_paths, band_counts) = fwd_spill.finish()?;
+    let mut base = vec![0u64; nbands + 1];
+    for b in 0..nbands {
+        base[b + 1] = base[b] + band_counts[b];
     }
-    csr.finish_half()?; // reverse records N..2N
-    csr.finish()?;
-    edge_props_w.finish()?;
+
+    // Shared sinks for the forward phase. Postings and edge-range entries are fed into
+    // global externally-sorted sinks (push order is irrelevant — they sort) behind a
+    // mutex; the reverse records are range-routed by `final_dst` into per-dst-band
+    // files for the parallel reverse phase.
+    let src_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
+        scratch_dir,
+        sort_budget,
+        SCRATCH_ZSTD,
+    )?);
+    let tgt_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
+        scratch_dir,
+        sort_budget,
+        SCRATCH_ZSTD,
+    )?);
+    let range_mx = Mutex::new(range_sorters);
+    let rev_spill = BandSpill::new(nbands, |b| band_path(scratch_dir, pid, "rev_route", b))?;
+    let worker_budget = (opts.max_memory_bytes / 16 / threads).max(8 << 20);
+
+    // 2) Forward: each band sorts its edges by (final_src, final_dst, prov_edge_id),
+    //    assigns final_edge_id = base_b + i, writes its forward CSR half + edge_props
+    //    slice, feeds the postings/edge-range sinks, and routes reverse records.
+    diag.set_op(
+        "emit forward CSR + edge_props per band",
+        "edges",
+        edge_count,
+    );
+    diag.set_active_workers(threads as u64);
+    {
+        let next = AtomicU64::new(0);
+        let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let (
+            base_r,
+            fwd_band_paths_r,
+            edge_range_r,
+            src_post_r,
+            tgt_post_r,
+            range_r,
+            rev_spill_r,
+            cipher_r,
+            next_r,
+            err_r,
+        ) = (
+            &base,
+            &fwd_band_paths,
+            &edge_range,
+            &src_post_mx,
+            &tgt_post_mx,
+            &range_mx,
+            &rev_spill,
+            &cipher,
+            &next,
+            &err,
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || loop {
+                    if err_r.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let b = next_r.fetch_add(1, Ordering::Relaxed) as usize;
+                    if b >= nbands {
+                        break;
+                    }
+                    let lo = (b as u64) * band;
+                    let hi = (((b as u64) + 1) * band).min(node_count);
+                    let res = emit_forward_band(
+                        lo,
+                        hi,
+                        band,
+                        base_r[b],
+                        &fwd_band_paths_r[b],
+                        &band_path(scratch_dir, pid, "csr_fwd", b),
+                        &band_path(scratch_dir, pid, "eprops", b),
+                        edge_range_r,
+                        src_post_r,
+                        tgt_post_r,
+                        range_r,
+                        rev_spill_r,
+                        batch_threshold,
+                        scratch_dir,
+                        worker_budget,
+                        opts.block_size,
+                        opts.zstd_level,
+                        cipher_r.clone(),
+                        diag,
+                    );
+                    if let Err(e) = res {
+                        let mut g = err_r.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        break;
+                    }
+                });
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
+        }
+    }
+    for p in &fwd_band_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    let (rev_route_paths, _rev_counts) = rev_spill.finish()?;
+
+    // 3) Reverse: each dst-band sorts its routed records by (final_dst, final_edge_id)
+    //    and writes its reverse CSR half. Independent per band — no global merge.
+    diag.set_op("emit reverse CSR per band", "edges", edge_count);
+    diag.set_active_workers(threads as u64);
+    {
+        let next = AtomicU64::new(0);
+        let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let (rev_route_paths_r, cipher_r, next_r, err_r) = (&rev_route_paths, &cipher, &next, &err);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || loop {
+                    if err_r.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let b = next_r.fetch_add(1, Ordering::Relaxed) as usize;
+                    if b >= nbands {
+                        break;
+                    }
+                    let lo = (b as u64) * band;
+                    let hi = (((b as u64) + 1) * band).min(node_count);
+                    let res = emit_reverse_band(
+                        lo,
+                        hi,
+                        &rev_route_paths_r[b],
+                        &band_path(scratch_dir, pid, "csr_rev", b),
+                        scratch_dir,
+                        worker_budget,
+                        opts.block_size,
+                        opts.zstd_level,
+                        cipher_r.clone(),
+                        diag,
+                    );
+                    if let Err(e) = res {
+                        let mut g = err_r.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        break;
+                    }
+                });
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
+        }
+    }
+    for p in &rev_route_paths {
+        let _ = std::fs::remove_file(p);
+    }
+
+    // 4) Stitch: concat the per-band block files (forward halves then reverse halves
+    //    for the CSR; band order for edge_props), then drain the postings sinks.
+    diag.set_op("stitch CSR + edge_props + postings", "", 0);
+    diag.set_active_workers(1);
+    let mut csr_parts: Vec<PathBuf> = Vec::with_capacity(nbands * 2);
+    csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_fwd", b)));
+    csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_rev", b)));
+    concat_block_files(tmp_dir.join("topology.csr.blk"), &csr_parts)?;
+    let eprops_parts: Vec<PathBuf> = (0..nbands)
+        .map(|b| band_path(scratch_dir, pid, "eprops", b))
+        .collect();
+    concat_block_files(tmp_dir.join("edge_props.blk"), &eprops_parts)?;
+    for p in csr_parts.iter().chain(eprops_parts.iter()) {
+        let _ = std::fs::remove_file(p);
+    }
     block_sizes.insert("edge_props.blk".into(), opts.block_size as u32);
     block_sizes.insert("topology.csr.blk".into(), opts.block_size as u32);
 
-    // Drain the endpoint posting sorters into reltype_src.post / reltype_tgt.post.
     let reltype_count = reltypes.names().len() as u32;
     let reltype_source_counts = write_endpoint_postings_from_sorted(
         tmp_dir.join("reltype_src.post"),
         reltype_count,
-        src_post_sorter
+        src_post_mx
+            .into_inner()
+            .unwrap()
             .sorted()?
             .map(|r| r.map(|e| (e.reltype, e.node))),
         opts.block_size,
@@ -1369,7 +1430,9 @@ fn build_inner(
     let reltype_target_counts = write_endpoint_postings_from_sorted(
         tmp_dir.join("reltype_tgt.post"),
         reltype_count,
-        tgt_post_sorter
+        tgt_post_mx
+            .into_inner()
+            .unwrap()
             .sorted()?
             .map(|r| r.map(|e| (e.reltype, e.node))),
         opts.block_size,
@@ -1378,14 +1441,29 @@ fn build_inner(
     )?;
     block_sizes.insert("reltype_src.post".into(), opts.block_size as u32);
     block_sizes.insert("reltype_tgt.post".into(), opts.block_size as u32);
+    // Recover the range sorters (now carrying the edge-range entries) for the range
+    // ISAM phase below.
+    let range_sorters = range_mx.into_inner().unwrap();
+    drop(emit_topo_g);
 
     // --- vectors.f32.blk + any Vamana/PQ files (shared with the in-memory build) ---
+    let emit_vec_g = diag.phase("emit.vectors");
+    diag.set_op(
+        "write vector indexes (vamana/pq/brute)",
+        "indexes",
+        pending.len() as u64,
+    );
     let (vector_indexes, vector_files) =
         write_vector_indexes(tmp_dir, &pending, opts, cipher.clone(), &mut block_sizes)?;
+    drop(emit_vec_g);
 
     // --- range/*.isam (each fed its external-sorted stream) ---
+    let emit_range_g = diag.phase("emit.range_isam");
+    diag.set_op("write range ISAMs", "indexes", range_metas.len() as u64);
     let mut range_indexes: Vec<RangeIndexDesc> = Vec::new();
-    for (meta, sorter) in range_metas.into_iter().zip(range_sorters) {
+    for (done, (meta, sorter)) in range_metas.into_iter().zip(range_sorters).enumerate() {
+        diag.set_op_detail(&meta.name);
+        diag.set_progress(done as u64);
         let rel_path = format!("range/{}.isam", meta.name);
         write_isam_sorted(
             tmp_dir.join(&rel_path),
@@ -1402,10 +1480,17 @@ fn build_inner(
             property: meta.property,
         });
     }
+    drop(emit_range_g);
 
     // prop_hist.blk — value→count histograms from the node range ISAMs just
     // written (same derivation as the in-memory path: run-length-count the finished
     // ISAM, so both builders agree). High-cardinality / disabled indexes skipped.
+    let emit_hist_g = diag.phase("emit.prop_hist");
+    diag.set_op(
+        "derive prop_hist.blk from range ISAMs",
+        "indexes",
+        range_indexes.len() as u64,
+    );
     let property_histograms = common::build_property_histograms(
         tmp_dir,
         &range_indexes,
@@ -1415,8 +1500,11 @@ fn build_inner(
         opts.histogram_max_distinct,
     )?;
     block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
+    drop(emit_hist_g);
 
     // ---- publish (shared with the in-memory build) ----
+    let _publish_g = diag.phase("publish");
+    diag.set_op("manifest + fsync + atomic publish", "", 0);
     common::write_manifest_and_publish(PublishInputs {
         tmp_dir,
         graph_dir,
@@ -1662,4 +1750,295 @@ impl SortRecord for RangeEntry {
             _ => 16,
         }
     }
+}
+
+// ---- range-partitioned parallel emit.topology plumbing ----
+
+/// A set of per-band scratch block files written concurrently by many workers. Each
+/// band has its own lock; workers batch encoded records locally (see [`BandBatcher`])
+/// and take a band's lock only on bulk flushes, so cross-worker contention is rare.
+/// Used to range-partition the edge stream by node id — forward edges by `final_src`,
+/// reverse records by `final_dst` — into the per-band files the parallel emit drains.
+/// The files are transient scratch (plaintext, [`SCRATCH_ZSTD`]); never published.
+struct BandSpill {
+    writers: Vec<Mutex<BandWriter>>,
+    paths: Vec<PathBuf>,
+}
+
+struct BandWriter {
+    w: BlockFileWriter,
+    count: u64,
+}
+
+impl BandSpill {
+    fn new(nbands: usize, mut path_for: impl FnMut(usize) -> PathBuf) -> Result<Self> {
+        let mut writers = Vec::with_capacity(nbands);
+        let mut paths = Vec::with_capacity(nbands);
+        for b in 0..nbands {
+            let p = path_for(b);
+            let w = BlockFileWriter::create(&p, BUCKET_BLOCK, SCRATCH_ZSTD)?;
+            writers.push(Mutex::new(BandWriter { w, count: 0 }));
+            paths.push(p);
+        }
+        Ok(Self { writers, paths })
+    }
+
+    /// Finalize every band writer; returns `(paths, per-band record counts)`.
+    fn finish(self) -> Result<(Vec<PathBuf>, Vec<u64>)> {
+        let mut counts = Vec::with_capacity(self.writers.len());
+        for m in self.writers {
+            let bw = m.into_inner().unwrap();
+            counts.push(bw.count);
+            bw.w.finish()?;
+        }
+        Ok((self.paths, counts))
+    }
+}
+
+/// Per-worker local batcher over a shared [`BandSpill`]. Accumulates each band's
+/// records (length-prefixed in one contiguous buffer to avoid per-record allocation)
+/// and flushes a band under its lock once its buffer crosses `threshold` bytes.
+struct BandBatcher<'a> {
+    set: &'a BandSpill,
+    bufs: Vec<Vec<u8>>,
+    threshold: usize,
+    scratch: Vec<u8>,
+}
+
+impl<'a> BandBatcher<'a> {
+    fn new(set: &'a BandSpill, threshold: usize) -> Self {
+        let n = set.writers.len();
+        Self {
+            set,
+            bufs: (0..n).map(|_| Vec::new()).collect(),
+            threshold: threshold.max(1),
+            scratch: Vec::new(),
+        }
+    }
+
+    fn push<R: SortRecord>(&mut self, band: usize, rec: &R) -> Result<()> {
+        self.scratch.clear();
+        rec.encode(&mut self.scratch);
+        let buf = &mut self.bufs[band];
+        write_uvarint(buf, self.scratch.len() as u64);
+        buf.extend_from_slice(&self.scratch);
+        if buf.len() >= self.threshold {
+            self.flush_band(band)?;
+        }
+        Ok(())
+    }
+
+    fn flush_band(&mut self, band: usize) -> Result<()> {
+        if self.bufs[band].is_empty() {
+            return Ok(());
+        }
+        let set = self.set;
+        let buf = &mut self.bufs[band];
+        let mut g = set.writers[band].lock().unwrap();
+        let mut r: &[u8] = buf;
+        while !r.is_empty() {
+            let len = read_uvarint(&mut r)? as usize;
+            let (rec, rest) = r.split_at(len);
+            g.w.append_record(rec)?;
+            g.count += 1;
+            r = rest;
+        }
+        drop(g);
+        buf.clear();
+        Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<()> {
+        for b in 0..self.bufs.len() {
+            self.flush_band(b)?;
+        }
+        Ok(())
+    }
+}
+
+/// A resolved edge range-index spec: which (reltype, property-key) ids to extract,
+/// and the index slot to push the `(value, final_edge_id)` entry into. Module-scoped
+/// so [`emit_forward_band`] can take a slice of them.
+struct EdgeRangeSpec {
+    idx: usize,
+    reltype_id: Option<u32>,
+    key_id: Option<u32>,
+}
+
+/// Path of a per-band emit scratch file (`kind` ∈ fwd_band / rev_route / csr_fwd /
+/// csr_rev / eprops). Shared by the parallel workers and the serial stitch so the
+/// names never drift.
+fn band_path(dir: &Path, pid: u32, kind: &str, b: usize) -> PathBuf {
+    dir.join(format!("topo_{kind}_{pid}_{b}"))
+}
+
+/// How many posting/range entries a forward worker batches before taking a global
+/// sink lock — small enough that the lock is held only briefly.
+const FWD_SINK_BATCH: usize = 8192;
+
+/// Emit one forward node band `[lo, hi)`: sort the band's edges, assign
+/// `final_edge_id = base + i`, write the band's forward CSR half and `edge_props`
+/// slice, feed the global postings/edge-range sinks, and route each edge's reverse
+/// record (by `final_dst` band) into `rev_spill` for the reverse phase.
+#[allow(clippy::too_many_arguments)]
+fn emit_forward_band(
+    lo: u64,
+    hi: u64,
+    band: u64,
+    base: u64,
+    band_file: &Path,
+    csr_out: &Path,
+    eprops_out: &Path,
+    edge_range: &[EdgeRangeSpec],
+    src_post: &Mutex<ExtSorter<RelEndpoint>>,
+    tgt_post: &Mutex<ExtSorter<RelEndpoint>>,
+    range_sorters: &Mutex<Vec<ExtSorter<RangeEntry>>>,
+    rev_spill: &BandSpill,
+    batch_threshold: usize,
+    scratch_dir: &Path,
+    budget: usize,
+    block_size: usize,
+    zstd_level: i32,
+    cipher: Option<Arc<BlockCipher>>,
+    diag: &crate::diag::BuildDiag,
+) -> Result<()> {
+    // Load + sort this band's edges by (final_src, final_dst, prov_edge_id).
+    let mut sorter = ExtSorter::<EdgeFwd>::new(scratch_dir, budget, SCRATCH_ZSTD)?;
+    {
+        let r = BlockFileReader::open(band_file)?;
+        r.for_each_record(|_, rec| {
+            let mut s = rec;
+            sorter.push(EdgeFwd::decode(&mut s)?)
+        })?;
+    }
+
+    let mut csr =
+        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, block_size, zstd_level, cipher.clone())?;
+    let mut eprops =
+        BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, cipher)?;
+    let mut rev_batch = BandBatcher::new(rev_spill, batch_threshold);
+    let mut src_batch: Vec<RelEndpoint> = Vec::with_capacity(FWD_SINK_BATCH);
+    let mut tgt_batch: Vec<RelEndpoint> = Vec::with_capacity(FWD_SINK_BATCH);
+    let mut range_batch: Vec<(usize, RangeEntry)> = Vec::new();
+
+    let flush_posts =
+        |src_batch: &mut Vec<RelEndpoint>, tgt_batch: &mut Vec<RelEndpoint>| -> Result<()> {
+            {
+                let mut g = src_post.lock().unwrap();
+                for r in src_batch.drain(..) {
+                    g.push(r)?;
+                }
+            }
+            let mut g = tgt_post.lock().unwrap();
+            for r in tgt_batch.drain(..) {
+                g.push(r)?;
+            }
+            Ok(())
+        };
+
+    let mut i = 0u64;
+    for r in sorter.sorted()? {
+        let ef = r?;
+        let final_edge_id = base + i;
+        i += 1;
+        csr.push(
+            ef.final_src,
+            Adj {
+                reltype: ef.reltype,
+                neighbour: NodeId(ef.final_dst),
+                edge: EdgeId(final_edge_id),
+            },
+        )?;
+        eprops.append_record(&ef.props_blob)?;
+        src_batch.push(RelEndpoint {
+            reltype: ef.reltype,
+            node: ef.final_src,
+        });
+        tgt_batch.push(RelEndpoint {
+            reltype: ef.reltype,
+            node: ef.final_dst,
+        });
+        for spec in edge_range {
+            if let (Some(rid), Some(kid)) = (spec.reltype_id, spec.key_id) {
+                if ef.reltype == rid {
+                    if let Some(v) = extract_value(&ef.props_blob, kid)? {
+                        range_batch.push((
+                            spec.idx,
+                            RangeEntry {
+                                key: v,
+                                id: final_edge_id,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        rev_batch.push(
+            (ef.final_dst / band) as usize,
+            &EdgeRev {
+                final_dst: ef.final_dst,
+                final_edge_id,
+                final_src: ef.final_src,
+                reltype: ef.reltype,
+            },
+        )?;
+        if src_batch.len() >= FWD_SINK_BATCH {
+            flush_posts(&mut src_batch, &mut tgt_batch)?;
+        }
+    }
+    flush_posts(&mut src_batch, &mut tgt_batch)?;
+    rev_batch.flush_all()?;
+    if !range_batch.is_empty() {
+        let mut g = range_sorters.lock().unwrap();
+        for (idx, re) in range_batch {
+            g[idx].push(re)?;
+        }
+    }
+    csr.finish()?;
+    eprops.finish()?;
+    diag.progress_add(i);
+    Ok(())
+}
+
+/// Emit one reverse node band `[lo, hi)`: sort the band's routed reverse records by
+/// (final_dst, final_edge_id) and write the reverse CSR half for those nodes.
+#[allow(clippy::too_many_arguments)]
+fn emit_reverse_band(
+    lo: u64,
+    hi: u64,
+    route_file: &Path,
+    csr_out: &Path,
+    scratch_dir: &Path,
+    budget: usize,
+    block_size: usize,
+    zstd_level: i32,
+    cipher: Option<Arc<BlockCipher>>,
+    diag: &crate::diag::BuildDiag,
+) -> Result<()> {
+    let mut sorter = ExtSorter::<EdgeRev>::new(scratch_dir, budget, SCRATCH_ZSTD)?;
+    {
+        let r = BlockFileReader::open(route_file)?;
+        r.for_each_record(|_, rec| {
+            let mut s = rec;
+            sorter.push(EdgeRev::decode(&mut s)?)
+        })?;
+    }
+    let mut csr =
+        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, block_size, zstd_level, cipher)?;
+    let mut i = 0u64;
+    for r in sorter.sorted()? {
+        let er = r?;
+        csr.push(
+            er.final_dst,
+            Adj {
+                reltype: er.reltype,
+                neighbour: NodeId(er.final_src),
+                edge: EdgeId(er.final_edge_id),
+            },
+        )?;
+        i += 1;
+    }
+    csr.finish()?;
+    diag.progress_add(i);
+    Ok(())
 }

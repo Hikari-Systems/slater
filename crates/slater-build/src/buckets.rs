@@ -15,9 +15,12 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
+use graph_format::columns::{decode_props, encode_props_record};
+use graph_format::nodelabels::{decode_labels, encode_labels_record};
 use graph_format::wire::{read_uvarint, write_uvarint};
 
 #[inline]
@@ -279,6 +282,176 @@ pub fn seg_path(base: &Path, n: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
+// ── shard metadata + symbol remapping ────────────────────────────────────────
+//
+// The parallel pass-1 writes one shard per bordered input range. Each shard is a
+// self-contained unit: its node/uedge segments plus a `.meta` sidecar that records
+// the input range it covers, its counts, and its **local** symbol tables (each
+// shard interns labels/reltypes/keys independently, so workers never share state).
+// The sidecar is written *last*, atomically, so its presence means "this shard is
+// complete" — the resume signal. After pass 1, a single deterministic merge folds
+// the local tables (in shard order = input order) into the global symbol tables and
+// a per-shard local→global [`ShardRemap`], reproducing the serial first-seen ids.
+
+/// Per-shard completion record + local symbol tables (`<node_bkt>.<n>.meta`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardMeta {
+    pub shard: u64,
+    pub input_start: u64,
+    pub input_end: u64,
+    pub node_count: u64,
+    pub uedge_count: u64,
+    pub labels: Vec<String>,
+    pub reltypes: Vec<String>,
+    pub keys: Vec<String>,
+    /// Index DDL seen in this shard (range/vector index declarations live in the
+    /// dump header, i.e. shard 0). Persisted so resume — which skips a complete
+    /// shard 0 — doesn't lose them. Unioned across shards by the caller.
+    #[serde(default)]
+    pub range_stmts: Vec<crate::model::RangeIndexStmt>,
+    #[serde(default)]
+    pub vector_stmts: Vec<crate::model::VectorIndexStmt>,
+}
+
+/// Sidecar path for shard `n` (keyed off the node bucket base).
+pub fn meta_path(node_bkt: &Path, n: u64) -> PathBuf {
+    let mut s = node_bkt.as_os_str().to_os_string();
+    s.push(format!(".{n}.meta"));
+    PathBuf::from(s)
+}
+
+/// fsync a file's data to disk (best-effort durability before the sidecar claims
+/// the shard complete).
+fn fsync_file(path: &Path) -> Result<()> {
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.sync_all();
+    }
+    Ok(())
+}
+
+/// Finalize shard `n`: fsync its already-written node/uedge segments, then write the
+/// `.meta` sidecar atomically (temp + rename). Presence of the sidecar ⇒ complete.
+pub fn finalize_shard(node_bkt: &Path, uedge_bkt: &Path, meta: &ShardMeta) -> Result<()> {
+    fsync_file(&seg_path(node_bkt, meta.shard))?;
+    fsync_file(&seg_path(uedge_bkt, meta.shard))?;
+    let path = meta_path(node_bkt, meta.shard);
+    let tmp = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    std::fs::write(&tmp, serde_json::to_vec(meta)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fsync_file(&tmp)?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("commit {}", path.display()))?;
+    Ok(())
+}
+
+/// Read shard `n`'s sidecar, or `None` if it isn't complete.
+pub fn read_shard_meta(node_bkt: &Path, n: u64) -> Result<Option<ShardMeta>> {
+    let path = meta_path(node_bkt, n);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Per-shard `local symbol id → global symbol id` maps, produced by the merge.
+#[derive(Debug, Clone, Default)]
+pub struct ShardRemap {
+    pub labels: Vec<u32>,
+    pub reltypes: Vec<u32>,
+    pub keys: Vec<u32>,
+    /// True when every map is the identity (the common uniform-schema case) — lets
+    /// the reader byte-copy blobs instead of decode/remap/re-encode.
+    pub identity: bool,
+}
+
+impl ShardRemap {
+    fn compute_identity(&mut self) {
+        let is_id = |v: &[u32]| v.iter().enumerate().all(|(i, &g)| g as usize == i);
+        self.identity = is_id(&self.labels) && is_id(&self.reltypes) && is_id(&self.keys);
+    }
+    pub fn map_label(&self, local: u32) -> u32 {
+        self.labels[local as usize]
+    }
+    pub fn map_reltype(&self, local: u32) -> u32 {
+        self.reltypes[local as usize]
+    }
+    pub fn map_key(&self, local: u32) -> u32 {
+        self.keys[local as usize]
+    }
+}
+
+/// Re-encode a `node_labels.blk` blob, translating local label ids to global.
+pub fn remap_labels_blob(blob: &[u8], remap: &ShardRemap) -> Result<Vec<u8>> {
+    let ids = decode_labels(blob)?;
+    let mapped: Vec<u32> = ids.into_iter().map(|l| remap.map_label(l)).collect();
+    Ok(encode_labels_record(&mapped))
+}
+
+/// Re-encode a `node_props.blk`/`edge_props.blk` blob, translating local key ids to
+/// global (values are unchanged).
+pub fn remap_props_blob(blob: &[u8], remap: &ShardRemap) -> Result<Vec<u8>> {
+    let props = decode_props(blob)?;
+    let mapped: Vec<(u32, graph_format::ids::Value)> = props
+        .into_iter()
+        .map(|(k, v)| (remap.map_key(k), v))
+        .collect();
+    Ok(encode_props_record(&mapped))
+}
+
+/// Fold the shards' local symbol tables (in shard order = input order) into the
+/// global tables, returning the global name lists plus a per-shard local→global
+/// remap. Reproduces the serial path's first-seen id assignment exactly.
+pub fn merge_shard_symbols(
+    metas: &[ShardMeta],
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<ShardRemap>) {
+    use std::collections::HashMap;
+    let mut g_labels: Vec<String> = Vec::new();
+    let mut g_reltypes: Vec<String> = Vec::new();
+    let mut g_keys: Vec<String> = Vec::new();
+    let mut li: HashMap<String, u32> = HashMap::new();
+    let mut ri: HashMap<String, u32> = HashMap::new();
+    let mut ki: HashMap<String, u32> = HashMap::new();
+    let intern = |names: &mut Vec<String>, idx: &mut HashMap<String, u32>, s: &str| -> u32 {
+        if let Some(&g) = idx.get(s) {
+            return g;
+        }
+        let g = names.len() as u32;
+        names.push(s.to_string());
+        idx.insert(s.to_string(), g);
+        g
+    };
+    let mut remaps = Vec::with_capacity(metas.len());
+    for m in metas {
+        let mut rm = ShardRemap {
+            labels: m
+                .labels
+                .iter()
+                .map(|s| intern(&mut g_labels, &mut li, s))
+                .collect(),
+            reltypes: m
+                .reltypes
+                .iter()
+                .map(|s| intern(&mut g_reltypes, &mut ri, s))
+                .collect(),
+            keys: m
+                .keys
+                .iter()
+                .map(|s| intern(&mut g_keys, &mut ki, s))
+                .collect(),
+            identity: false,
+        };
+        rm.compute_identity();
+        remaps.push(rm);
+    }
+    (g_labels, g_reltypes, g_keys, remaps)
+}
+
 /// All segments of a bucket, in segment order. A bucket is either segmented
 /// (`<base>.0`, `<base>.1`, … — the pass-1 resumable buckets) or a single file at
 /// `base` (e.g. the resolved edge bucket); this returns whichever exists.
@@ -328,6 +501,35 @@ pub fn for_each_node(
     Ok(())
 }
 
+/// Scan a node bucket in provisional-id order, translating each node's label/prop
+/// **local** symbol ids to **global** via its shard's [`ShardRemap`] (identity
+/// shards byte-copy unchanged). `remaps` is indexed by segment (shard) order, which
+/// matches [`segments`]' ordering.
+pub fn for_each_node_remapped(
+    base: impl AsRef<Path>,
+    remaps: &[ShardRemap],
+    mut f: impl FnMut(u64, NodeRec) -> Result<()>,
+) -> Result<()> {
+    let mut prov = 0u64;
+    for (si, seg) in segments(base.as_ref()).into_iter().enumerate() {
+        let remap = remaps.get(si);
+        let r = BlockFileReader::open(&seg)?;
+        r.for_each_record(|_, rec| {
+            let mut n = NodeRec::decode(rec)?;
+            if let Some(rm) = remap {
+                if !rm.identity {
+                    n.labels_blob = remap_labels_blob(&n.labels_blob, rm)?;
+                    n.props_blob = remap_props_blob(&n.props_blob, rm)?;
+                }
+            }
+            f(prov, n)?;
+            prov += 1;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// Scan only the `__dump_id__` of each node, in provisional-id order — the cheap
 /// pass that builds the dump→provisional resolver without touching the blobs.
 pub fn for_each_node_dump_id(
@@ -357,24 +559,6 @@ pub fn for_each_edge(
         r.for_each_record(|_, rec| {
             let e = EdgeRec::decode(rec)?;
             f(e)
-        })?;
-    }
-    Ok(())
-}
-
-/// Scan an unresolved-edge bucket (all segments) in provisional-edge-id order.
-pub fn for_each_unresolved_edge(
-    base: impl AsRef<Path>,
-    mut f: impl FnMut(u64, UnresolvedEdge) -> Result<()>,
-) -> Result<()> {
-    let mut prov_edge = 0u64;
-    for seg in segments(base.as_ref()) {
-        let r = BlockFileReader::open(&seg)?;
-        r.for_each_record(|_, rec| {
-            let e = UnresolvedEdge::decode(rec)?;
-            f(prov_edge, e)?;
-            prov_edge += 1;
-            Ok(())
         })?;
     }
     Ok(())

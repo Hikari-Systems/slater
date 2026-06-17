@@ -30,7 +30,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -213,6 +213,103 @@ impl BlockFileWriter {
         self.file.get_ref().sync_all().context("fsync block file")?;
         Ok(self.dir.len() as u64)
     }
+}
+
+/// Concatenate block files (in order) into one, preserving global record order: the
+/// output's records are `inputs[0]`'s records, then `inputs[1]`'s, and so on. All
+/// inputs must share the same magic (all plaintext, or all encrypted under the same
+/// generation cipher). Block payloads are copied **verbatim** — no re-compression or
+/// re-encryption — and only the block directory's offsets are rebuilt, so this is
+/// O(total bytes) and trivially correct for both formats. Returns the total record
+/// count. This is the "cursor assembly" step for range-partitioned parallel emit:
+/// each worker writes a disjoint, contiguous slice of an output store, and this
+/// stitches the slices without a serial re-encode.
+pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Result<u64> {
+    if inputs.is_empty() {
+        bail!("concat_block_files: no inputs");
+    }
+    let mut magic = [0u8; 8];
+    File::open(&inputs[0])?.read_exact_at(&mut magic, 0)?;
+    let encrypted = match &magic {
+        m if m == BLOCKFILE_MAGIC => false,
+        m if m == BLOCKFILE_MAGIC_ENC => true,
+        _ => bail!("concat_block_files: bad magic in {}", inputs[0].display()),
+    };
+
+    let out = File::create(out_path.as_ref())
+        .with_context(|| format!("create {}", out_path.as_ref().display()))?;
+    let mut out = BufWriter::new(out);
+    out.write_all(&magic)?;
+    let mut out_pos = magic.len() as u64;
+    let mut dir_bytes: Vec<u8> = Vec::new();
+    let mut block_count: u64 = 0;
+    let mut total_records: u64 = 0;
+    let mut copy_buf = vec![0u8; 1 << 20];
+
+    for inp in inputs {
+        let f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
+        let mut m = [0u8; 8];
+        f.read_exact_at(&mut m, 0)?;
+        if m != magic {
+            bail!(
+                "concat_block_files: mixed magics ({} differs)",
+                inp.display()
+            );
+        }
+        let len = f.metadata()?.len();
+        let mut footer = [0u8; FOOTER_LEN as usize];
+        f.read_exact_at(&mut footer, len - FOOTER_LEN)?;
+        let mut fr = &footer[..];
+        let dir_offset = fr.read_u64::<LittleEndian>()?;
+        let dir_len = fr.read_u64::<LittleEndian>()?;
+        let blocks = fr.read_u64::<LittleEndian>()?;
+
+        // Copy the block region [8, dir_offset) verbatim, tracking where it lands.
+        let blocks_base_out = out_pos;
+        let mut pos = magic.len() as u64;
+        while pos < dir_offset {
+            let n = ((dir_offset - pos) as usize).min(copy_buf.len());
+            f.read_exact_at(&mut copy_buf[..n], pos)?;
+            out.write_all(&copy_buf[..n])?;
+            pos += n as u64;
+        }
+        out_pos += dir_offset - magic.len() as u64;
+
+        // Rewrite each directory entry's offset into the output's coordinate space.
+        let mut db = vec![0u8; dir_len as usize];
+        f.read_exact_at(&mut db, dir_offset)?;
+        let mut dr = &db[..];
+        for _ in 0..blocks {
+            let offset = dr.read_u64::<LittleEndian>()?;
+            let comp_len = dr.read_u32::<LittleEndian>()?;
+            let raw_len = dr.read_u32::<LittleEndian>()?;
+            let rec_count = dr.read_u32::<LittleEndian>()?;
+            let new_offset = blocks_base_out + (offset - magic.len() as u64);
+            dir_bytes.write_u64::<LittleEndian>(new_offset)?;
+            dir_bytes.write_u32::<LittleEndian>(comp_len)?;
+            dir_bytes.write_u32::<LittleEndian>(raw_len)?;
+            dir_bytes.write_u32::<LittleEndian>(rec_count)?;
+            if encrypted {
+                let mut nonce = [0u8; NONCE_LEN];
+                dr.read_exact(&mut nonce)?;
+                dir_bytes.write_all(&nonce)?;
+            }
+            block_count += 1;
+            total_records += rec_count as u64;
+        }
+    }
+
+    let dir_offset_out = out_pos;
+    out.write_all(&dir_bytes)?;
+    let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
+    footer.write_u64::<LittleEndian>(dir_offset_out)?;
+    footer.write_u64::<LittleEndian>(dir_bytes.len() as u64)?;
+    footer.write_u64::<LittleEndian>(block_count)?;
+    out.write_all(&footer)?;
+    let mut out = out.into_inner().context("flush concat block file")?;
+    out.flush()?;
+    out.sync_all().context("fsync concat block file")?;
+    Ok(total_records)
 }
 
 /// Reader holding the resident block directory; fetches blocks with `pread`.
@@ -467,6 +564,39 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("slater_bf_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn concat_preserves_records_in_order() {
+        // Three block files with multi-block content; concat must read back as the
+        // exact concatenation of their records, in order.
+        let mut parts = Vec::new();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        for (pi, base) in [(0u32, 0u32), (1, 137), (2, 999)].iter() {
+            let p = tmp(&format!("part{pi}"));
+            let mut w = BlockFileWriter::create(&p, 512, 3).unwrap();
+            for i in 0..200u32 {
+                let rec =
+                    format!("p{pi}-r{}-{}", base + i, "z".repeat((i % 30) as usize)).into_bytes();
+                w.append_record(&rec).unwrap();
+                expected.push(rec);
+            }
+            w.finish().unwrap();
+            parts.push(p);
+        }
+        let out = tmp("concat");
+        let total = concat_block_files(&out, &parts).unwrap();
+        assert_eq!(total, expected.len() as u64);
+
+        let r = BlockFileReader::open(&out).unwrap();
+        assert_eq!(r.total_records(), expected.len() as u64);
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(&r.read_record_global(i as u64).unwrap(), want, "record {i}");
+        }
+        for p in &parts {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

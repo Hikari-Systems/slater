@@ -124,8 +124,9 @@ fn run_resume_from(fail_after: &str) {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// Interrupt *inside* pass 1, after the first bucket segment is committed but with
-/// input still unread, then resume — exercising segment recovery + input seek.
+/// Interrupt *inside* pass 1, after the first shard is durably finalized but with
+/// later shards unwritten, then resume — exercising shard-granular recovery (the
+/// resume re-reads the input but skips already-complete shards via their sidecars).
 #[test]
 fn resume_mid_pass1() {
     let work = unique_dir("midp1");
@@ -134,13 +135,14 @@ fn resume_mid_pass1() {
     std::fs::write(&input, DUMP).unwrap();
     let graph_dir = data_dir.join("social");
 
-    // One statement per batch, roll a segment every record, and crash right after
-    // the first roll — so only part of the input is in committed segments.
+    // Tiny shards (so the small dump spans several) + a single worker for a
+    // deterministic shard order, and crash right after shard 0 is finalized — so
+    // only part of the input is in committed shards.
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
         .args(build_args(&input, &data_dir))
-        .env("SLATER_PARSE_BATCH", "1")
-        .env("SLATER_PASS1_SEGMENT", "1")
-        .env("SLATER_BUILD_FAIL_AFTER", "pass1_partial")
+        .args(["--threads", "1"])
+        .env("SLATER_SHARD_BYTES", "120")
+        .env("SLATER_BUILD_FAIL_AFTER_SHARD", "0")
         .output()
         .expect("run slater-build (interrupted mid pass 1)");
     assert_eq!(
@@ -156,8 +158,7 @@ fn resume_mid_pass1() {
     let out2 = Command::new(env!("CARGO_BIN_EXE_slater-build"))
         .args(build_args(&input, &data_dir))
         .arg("--resume")
-        .env("SLATER_PARSE_BATCH", "1")
-        .env("SLATER_PASS1_SEGMENT", "1")
+        .env("SLATER_SHARD_BYTES", "120")
         .output()
         .expect("run slater-build --resume (mid pass 1)");
     assert!(
