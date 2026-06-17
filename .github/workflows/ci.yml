@@ -31,6 +31,28 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+  # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
     runs-on: ubuntu-latest
