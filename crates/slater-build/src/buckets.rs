@@ -483,7 +483,10 @@ pub fn segments(base: &Path) -> Vec<PathBuf> {
     segs.into_iter().map(|(_, p)| p).collect()
 }
 
-/// Scan a node bucket (all segments) in append (provisional-id) order.
+/// Scan a node bucket (all segments) in append (provisional-id) order. Only the
+/// round-trip test needs the full-decode scan now (emit uses
+/// [`for_each_node_remapped`] and resolve uses [`for_each_node_dump_id`]).
+#[cfg(test)]
 pub fn for_each_node(
     base: impl AsRef<Path>,
     mut f: impl FnMut(u64, NodeRec) -> Result<()>,

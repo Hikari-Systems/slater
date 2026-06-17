@@ -261,24 +261,6 @@ impl BuildDiag {
         }
     }
 
-    /// Ad-hoc structured event (e.g. "segment flushed"). `fields` is merged in.
-    pub fn event(&self, msg: &str, fields: serde_json::Value) {
-        if let Some(inner) = &self.inner {
-            let mut rec = json!({
-                "kind": "event",
-                "t_ms": inner.now_ms(),
-                "phase": BuildMemo::get_str(&inner.memo.phase),
-                "msg": msg,
-            });
-            if let (Some(obj), Some(extra)) = (rec.as_object_mut(), fields.as_object()) {
-                for (k, v) in extra {
-                    obj.insert(k.clone(), v.clone());
-                }
-            }
-            inner.write_value(&rec);
-        }
-    }
-
     /// Stop the sampler, write the `footer`, and flush. Idempotent.
     pub fn finish(&mut self) {
         if let Some(inner) = &self.inner {

@@ -13,7 +13,7 @@
 //!      while a low-cardinality one in the same build still does.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use graph_format::histogram::decode_histogram;
@@ -76,7 +76,7 @@ fn build(tag: &str, external: bool, max_distinct: u64) -> PathBuf {
 }
 
 /// Decode every stored histogram, keyed by the descriptor's `index_name`.
-fn histograms_by_index(gen_dir: &PathBuf, m: &Manifest) -> BTreeMap<String, Vec<(Value, u64)>> {
+fn histograms_by_index(gen_dir: &Path, m: &Manifest) -> BTreeMap<String, Vec<(Value, u64)>> {
     let r = graph_format::blockfile::BlockFileReader::open(gen_dir.join("prop_hist.blk")).unwrap();
     assert_eq!(
         r.total_records(),

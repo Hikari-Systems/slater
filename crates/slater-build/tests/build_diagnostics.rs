@@ -8,9 +8,10 @@
 //!   * `phase_start`/`phase_end` cover the external pipeline;
 //!   * samples are self-describing (carry `phase`, `op`, `progress_*`,
 //!     `active_workers`).
+//!
 //! Also asserts the OFF path writes no log.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -44,7 +45,7 @@ fn make_dump(n: usize) -> String {
     s
 }
 
-fn run_build(work: &PathBuf, extra: &[&str]) -> std::process::Output {
+fn run_build(work: &Path, extra: &[&str]) -> std::process::Output {
     let data_dir = work.join("data");
     let input = work.join("dump.cypher");
     std::fs::write(&input, make_dump(20_000)).unwrap();

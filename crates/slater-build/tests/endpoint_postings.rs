@@ -11,7 +11,7 @@
 //!      topology. This proves the precomputed posting matches the graph.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use graph_format::manifest::Manifest;
@@ -77,7 +77,7 @@ fn build(tag: &str, external: bool) -> PathBuf {
 /// Distinct source / target node id sets per reltype, derived straight from the
 /// CSR topology (the ground truth the posting must match).
 fn endpoints_from_topology(
-    gen_dir: &PathBuf,
+    gen_dir: &Path,
     reltype_count: usize,
 ) -> (Vec<BTreeSet<u64>>, Vec<BTreeSet<u64>>) {
     let topo = TopologyReader::open(gen_dir.join("topology.csr.blk")).unwrap();
@@ -102,7 +102,7 @@ fn decode_all(path: PathBuf, reltype_count: usize) -> Vec<Vec<u64>> {
 }
 
 /// Within one build, every reltype's posting equals the topology-derived set.
-fn assert_postings_match_topology(gen_dir: &PathBuf, m: &Manifest) {
+fn assert_postings_match_topology(gen_dir: &Path, m: &Manifest) {
     let rt = m.reltypes.len();
     let (src, tgt) = endpoints_from_topology(gen_dir, rt);
     let src_post = decode_all(gen_dir.join("reltype_src.post"), rt);

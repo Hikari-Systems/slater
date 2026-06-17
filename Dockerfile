@@ -41,10 +41,12 @@ COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
 COPY crates/slater-build/Cargo.toml crates/slater-build/Cargo.toml
 COPY crates/slater/Cargo.toml crates/slater/Cargo.toml
 RUN mkdir -p crates/graph-format/src crates/slater-build/src crates/slater/src \
+       crates/slater/benches \
     && echo '' > crates/graph-format/src/lib.rs \
     && echo 'fn main() {}' > crates/slater-build/src/main.rs \
     && echo '' > crates/slater/src/lib.rs \
     && echo 'fn main() {}' > crates/slater/src/main.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
     && cargo build --release --locked \
     && rm -rf crates/*/src \
        target/release/slater target/release/slater-build \

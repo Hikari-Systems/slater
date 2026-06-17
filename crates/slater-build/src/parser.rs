@@ -40,7 +40,6 @@ pub struct StatementReader<R: BufRead> {
     in_string: Option<u8>,
     escaped: bool,
     done: bool,
-    consumed_total: u64,
 }
 
 impl<R: BufRead> StatementReader<R> {
@@ -51,15 +50,7 @@ impl<R: BufRead> StatementReader<R> {
             in_string: None,
             escaped: false,
             done: false,
-            consumed_total: 0,
         }
-    }
-
-    /// Total bytes consumed from the underlying reader. Between statements (when
-    /// the internal buffer is empty) this is the exact input byte offset — the
-    /// value `--resume` seeks a file input back to.
-    pub fn byte_offset(&self) -> u64 {
-        self.consumed_total
     }
 
     /// Return the next non-empty statement (trimmed), or `None` at end of input.
@@ -97,7 +88,6 @@ impl<R: BufRead> StatementReader<R> {
                         b';' => {
                             // Statement boundary.
                             self.reader.consume(consumed);
-                            self.consumed_total += consumed as u64;
                             if let Some(s) = self.take_statement() {
                                 return Ok(Some(s));
                             }
@@ -109,7 +99,6 @@ impl<R: BufRead> StatementReader<R> {
                 }
             }
             self.reader.consume(consumed);
-            self.consumed_total += consumed as u64;
         }
     }
 
