@@ -3,23 +3,40 @@
 [![CI](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml/badge.svg)](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Hikari-Systems/slater?sort=semver)](https://github.com/Hikari-Systems/slater/releases/latest)
 
-A low-memory, read-only, Bolt-speaking graph engine.
+> **In one line:** Slater serves a graph database the way SQLite serves a relational one — you bake the data into an immutable file, ship it anywhere, and serve it read-only with **memory cost that's flat no matter how big the graph gets**.
 
-Slater serves an **immutable, on-disk** graph image over the **Bolt** protocol
-(so any standard neo4j driver can talk to it), keeping **resident memory bounded
-by its cache budgets — independent of graph size**. It replaces an in-memory
-engine whose RSS scaled with the graph: where that engine held the whole graph
-resident, Slater holds only bounded caches and reads everything else from disk on
-demand, including the disk-native approximate-nearest-neighbour (Vamana/PQ) vector
-path.
+---
 
 **Shortcuts**
 
 |  |  |  |  |
 |:--|:--|:--|:--|
-| [Features](#features) | [GQL subset](#supported-gql-subset) | [Running with Docker](#running-with-docker) | [How it works](#how-it-works) |
-| [Mounts](#mounts) | [Configuration](#environment--configuration) | [ACL](#acl) | [Health check](#health-check) |
-| [Worked example](#worked-example) | [Development](#development) | [Performance](#performance) | [License](#license) |
+| [Why Slater exists](#why-slater-exists) | [What you get](#what-you-get) | [Features](#features) | [GQL subset](#supported-gql-subset) |
+ | [Running with Docker](#running-with-docker) | [How it works](#how-it-works) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
+| [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
+| [Performance](#performance) | [License](#license) |
+## Why Slater exists
+
+A **graph database** stores data as *things* (nodes) and the *relationships between them* (edges), with the relationships as first-class citizens. That's what you want when your questions are about connections rather than rows — "who's within three hops of this account?", "what's the full dependency chain behind this build?", "which accounts share a device, an address, and a card?" — the queries that become a swamp of recursive joins in SQL but fall out naturally in a graph.
+
+The catch with most graph databases (neo4j, Memgraph, FalkorDB) is that they're built to *write* as much as read: transactional, clustered, and holding the whole graph resident in RAM. A 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill.
+
+Slater is built for the other half of the problem: graphs that are **mostly read and rebuilt in batches** — knowledge graphs for RAG, recommendation and identity graphs, dependency graphs. You build the graph once, offline, into an immutable on-disk image; then any number of Slater servers serve it read-only over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve.**
+
+> **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
+> who insists on going by a single name — "Just… Slater" — and one of my favourite
+> characters in it. See the
+> [character wiki page](https://archer.fandom.com/wiki/Slater).
+
+### What you get
+
+- **RAM set by your cache budget, not your graph size** — fan out as many read replicas as you like.
+- **A drop-in for the read path** — speaks Bolt, so any standard neo4j driver (JS, Python, Go…) works unchanged. It's the read subset of Cypher; nothing new to learn.
+- **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
+- **Vector search built in** — disk-native approximate-nearest-neighbour (cosine KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline.
+- **Locked down by design** — read-only by construction, optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, read-only container rootfs.
+
+**When *not* to use it:** if you need live writes, transactional mutation, or full Cypher write semantics, Slater isn't your engine — it's deliberately the serving half. Pair it with whatever builds your graph upstream.
 
 ## Features
 
@@ -157,11 +174,6 @@ nothing today but lets a GQL-aware client be explicit:
 GQL MATCH (n:Person) RETURN n
 CYPHER MATCH (n:Person) RETURN n
 ```
-
-> **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
-> who insists on going by a single name — "Just… Slater" — and one of my favourite
-> characters in it. See the
-> [character wiki page](https://archer.fandom.com/wiki/Slater).
 
 ## Running with Docker
 
@@ -409,20 +421,47 @@ CREATE INDEX FOR (p:Person) ON (p.name);
 CALL db.idx.vector.createNodeIndex('Person', 'embedding', 3, 'COSINE');
 ```
 
+First mint a password hash and write the `acl.json` — it has to exist
+*before* the build, because `slater-build --acl` stamps the file's BLAKE3
+digest into the manifest and the server refuses a generation whose stamp
+doesn't match the live ACL (`requireAclStamp` is on by default):
+
+```sh
+slater hash-password 'pw'   # prints a $argon2id$… string — copy it
+```
+
+`acl.json` (next to `config.json`), granting the `myuser` user **read**
+on the `people` graph:
+
+```json
+{
+  "users": {
+    "myuser": {
+      "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$…paste the hash here…",
+      "grants": {
+        "people": ["read"]
+      }
+    }
+  }
+}
+```
+
+Now build the generation, stamping that ACL into the manifest:
+
 ```sh
 slater-build \
   --input people.cypher \
   --graph people \
-  --data-dir ./data
+  --data-dir ./data \
+  --acl ./acl.json
 # prints the new generation UUID + content hash; writes ./data/people/<uuid>/
 # and ./data/people/current
 ```
 
-Mint an ACL entry and start the server (plaintext, for local dev):
+Then start the server:
 
 ```sh
-slater hash-password 'pw'   # paste the hash into acl.json under users.reporting
-slater                      # reads ./config.json (dataDir ./data, port 7687)
+slater    # looks for configuration options in ./config.json (default is dataDir ./data, port 7687)
 ```
 
 ### 2. Connect with the neo4j JavaScript driver
@@ -432,7 +471,7 @@ import neo4j from 'neo4j-driver';
 
 // Use 'bolt://' for plaintext dev, 'bolt+s://' when TLS is configured.
 const driver = neo4j.driver('bolt://localhost:7687',
-  neo4j.auth.basic('reporting', 'pw'));
+  neo4j.auth.basic('myuser', 'pw'));
 const session = driver.session({ database: 'people' });
 
 // A plain MATCH … RETURN.
@@ -457,7 +496,7 @@ await driver.close();
 from neo4j import GraphDatabase
 
 # 'bolt://' plaintext for dev, 'bolt+s://' once TLS is configured.
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("reporting", "pw"))
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("myuser", "pw"))
 
 with driver.session(database="people") as session:
     # A plain MATCH … RETURN.
