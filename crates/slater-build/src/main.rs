@@ -7,7 +7,6 @@
 //! never in the serving hot path, so it may use whatever memory it likes.
 
 mod buckets;
-mod build;
 mod build_external;
 mod cluster;
 mod common;
@@ -15,8 +14,8 @@ mod diag;
 mod model;
 mod parser;
 mod resolve;
+mod shared;
 
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,10 +24,32 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::json;
 
-use crate::build::{build, BuildOptions};
-use crate::build_external::{build_external, ExternalMode};
+use crate::build_external::build_external;
 use crate::cluster::ClusterMode;
 use crate::diag::BuildDiag;
+use crate::shared::BuildOptions;
+
+// Candidate zstd levels per backend-aware profile. zstd decode speed is ~level
+// independent, so a higher build level shrinks on-disk/on-wire bytes (and thus read
+// time) without slowing the hot read path. These are starting points; the
+// `bench-codec` harness measures the per-backend knee and these get pinned to it.
+const LOCAL_ZSTD_LEVEL: i32 = 9; // balanced: NVMe reads are cheap, keep build CPU sane
+const REMOTE_ZSTD_LEVEL: i32 = 19; // object store: every saved byte is network/RTT
+const MAX_ZSTD_LEVEL: i32 = 22; // squeeze hardest, build cost no object
+
+/// Backend-aware compression profile. Selects the zstd level for published files
+/// when `--zstd-level` is not given explicitly.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum CompressionProfile {
+    /// `remote` when a `--publish-s3-bucket` target is configured, else `local`.
+    Auto,
+    /// Balanced for local/NVMe reads (decompress CPU is a larger share there).
+    Local,
+    /// Max ratio for remote/object-store reads (bytes-on-the-wire dominate).
+    Remote,
+    /// Highest ratio regardless of build cost.
+    Max,
+}
 
 /// Build an immutable Slater graph generation from a primitive-Cypher dump.
 #[derive(Debug, Parser)]
@@ -54,9 +75,18 @@ struct Cli {
     #[arg(long, default_value_t = 256 * 1024)]
     vector_block_size: usize,
 
-    /// zstd compression level for all `.blk`/index files.
-    #[arg(long, default_value_t = 3)]
-    zstd_level: i32,
+    /// Explicit zstd level for all published `.blk`/index files. When given it
+    /// overrides `--compression-profile` (manifest profile is recorded as
+    /// `"manual"`). Omit to let the profile choose the level.
+    #[arg(long)]
+    zstd_level: Option<i32>,
+
+    /// Backend-aware compression profile selecting the zstd level when
+    /// `--zstd-level` is not given. `auto` ⇒ `remote` if a `--publish-s3-bucket`
+    /// target is set, else `local`. zstd decode speed is ~level-independent, so a
+    /// higher level shrinks read I/O without slowing queries.
+    #[arg(long, value_enum, default_value_t = CompressionProfile::Auto)]
+    compression_profile: CompressionProfile,
 
     /// Cap on a per-(label, property) value→count histogram's distinct-key count.
     /// A node range index with more distinct values is not given a histogram (it
@@ -109,11 +139,6 @@ struct Cli {
     /// this generation if the configured live `acl.json` later differs.
     #[arg(long)]
     acl: Option<PathBuf>,
-
-    /// Build path: `off` is the in-memory build; `on`/`auto` use the external,
-    /// bounded-memory build that spills to disk (needed for graphs larger than RAM).
-    #[arg(long, value_enum, default_value_t = ExternalMode::Off)]
-    external: ExternalMode,
 
     /// Working-memory budget for the external build (e.g. `4g`, `512m`). The build
     /// sizes its spill/sort/cluster state to this and aborts rather than exceeding it.
@@ -233,9 +258,9 @@ fn make_diag(cli: &Cli, data_dir: &std::path::Path) -> Result<BuildDiag> {
     let header = json!({
         "graph": cli.graph,
         "input": cli.input,
-        "external": format!("{:?}", cli.external),
         "max_memory_bytes": cli.max_memory,
         "zstd_level": cli.zstd_level,
+        "compression_profile": format!("{:?}", cli.compression_profile),
         "block_size": cli.block_size,
         "vector_block_size": cli.vector_block_size,
         "cluster": format!("{:?}", cli.cluster),
@@ -295,6 +320,28 @@ fn resolve_master_key(cli: &Cli) -> Result<Option<Vec<u8>>> {
     Ok(Some(key))
 }
 
+/// Resolve the effective zstd level and the profile name recorded in the manifest.
+/// An explicit `--zstd-level N` always wins (recorded as `"manual"`); otherwise the
+/// chosen profile maps to a level, with `auto` deferring to whether a remote publish
+/// target is configured (`publishing_remote`).
+fn resolve_compression(cli: &Cli, publishing_remote: bool) -> (i32, String) {
+    if let Some(level) = cli.zstd_level {
+        return (level, "manual".into());
+    }
+    let profile = match cli.compression_profile {
+        CompressionProfile::Auto if publishing_remote => CompressionProfile::Remote,
+        CompressionProfile::Auto => CompressionProfile::Local,
+        p => p,
+    };
+    match profile {
+        CompressionProfile::Local => (LOCAL_ZSTD_LEVEL, "local".into()),
+        CompressionProfile::Remote => (REMOTE_ZSTD_LEVEL, "remote".into()),
+        CompressionProfile::Max => (MAX_ZSTD_LEVEL, "max".into()),
+        // `auto` is resolved to local/remote above.
+        CompressionProfile::Auto => unreachable!("auto resolved to local/remote"),
+    }
+}
+
 /// Build the optional remote publish target from the `--publish-s3-*` flags.
 /// `None` ⇒ filesystem-only publish. Errors if an S3 target is requested but the
 /// binary was built without the `s3` feature.
@@ -338,10 +385,12 @@ fn main() -> Result<()> {
     };
     let threads = resolve_threads(&cli);
     let publish_store = resolve_publish_store(&cli)?;
+    let (zstd_level, compression_profile) = resolve_compression(&cli, publish_store.is_some());
     let opts = BuildOptions {
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
-        zstd_level: cli.zstd_level,
+        zstd_level,
+        compression_profile,
         histogram_max_distinct: cli.histogram_max_distinct,
         vector_index_json: cli.vector_index_json.clone(),
         encryption_key,
@@ -370,23 +419,10 @@ fn main() -> Result<()> {
     let data_dir = PathBuf::from(&cli.data_dir);
     let mut diag = make_diag(&cli, &data_dir)?;
 
-    let outcome = match cli.external {
-        ExternalMode::Off => {
-            // The in-memory build streams from a reader; the external build opens
-            // the path itself (so it can seek a file for mid-pass-1 resume).
-            let reader: Box<dyn BufRead> = if cli.input == "-" {
-                Box::new(BufReader::new(std::io::stdin().lock()))
-            } else {
-                let f = std::fs::File::open(&cli.input)
-                    .with_context(|| format!("open input script {}", cli.input))?;
-                Box::new(BufReader::new(f))
-            };
-            build(reader, &cli.graph, &data_dir, &opts, &diag)?
-        }
-        ExternalMode::On | ExternalMode::Auto => {
-            build_external(&cli.input, &cli.graph, &data_dir, &opts, &diag)?
-        }
-    };
+    // The bounded-memory external build is the only build path: it opens the input
+    // path itself (so it can seek a file for mid-pass-1 resume) and spills to disk,
+    // so it serves graphs of any size without holding the whole graph in RAM.
+    let outcome = build_external(&cli.input, &cli.graph, &data_dir, &opts, &diag)?;
     diag.finish();
     // Stdout is the machine-facing channel: print the generation UUID + content
     // hash so a publishing pipeline can record exactly what it built.

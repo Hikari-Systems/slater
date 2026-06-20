@@ -56,8 +56,6 @@ fn run_build(work: &Path, extra: &[&str]) -> std::process::Output {
         "g",
         "--data-dir",
         data_dir.to_str().unwrap(),
-        "--external",
-        "on",
     ];
     args.extend_from_slice(extra);
     Command::new(env!("CARGO_BIN_EXE_slater-build"))

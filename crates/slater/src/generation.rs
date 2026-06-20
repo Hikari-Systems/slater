@@ -892,6 +892,7 @@ mod tests {
             block_sizes,
             codec: "zstd".into(),
             zstd_level: LEVEL,
+            compression_profile: String::new(),
             encryption,
             node_count: 3,
             edge_count: 2,

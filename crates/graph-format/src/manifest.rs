@@ -143,6 +143,13 @@ pub struct Manifest {
     pub block_sizes: BTreeMap<String, u32>,
     pub codec: String,
     pub zstd_level: i32,
+    /// Which backend-aware compression profile produced `zstd_level` — `"local"`,
+    /// `"remote"`, `"max"`, or `"manual"` (an explicit `--zstd-level`). Purely
+    /// informational (like [`Self::block_sizes`]): the reader needs nothing here
+    /// because zstd streams are self-describing. Empty on images built before the
+    /// profile existed. See `slater-build --compression-profile`.
+    #[serde(default)]
+    pub compression_profile: String,
     #[serde(default)]
     pub encryption: Option<EncryptionHeader>,
     pub node_count: u64,
@@ -312,6 +319,7 @@ mod tests {
             block_sizes: BTreeMap::from([("node_props.blk".to_string(), 262_144)]),
             codec: "zstd".into(),
             zstd_level: 3,
+            compression_profile: String::new(),
             encryption: None,
             node_count: 1,
             edge_count: 0,

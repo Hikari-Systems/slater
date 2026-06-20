@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Round-trip for the external (bounded-memory) build.
+//! Round-trip for the build.
 //!
-//! Builds a small dump with `--external=on` under both `--cluster=none` and
-//! `--cluster=ldg`, then re-opens the `graph-format` readers. Because the external
-//! build permutes node/edge ids for on-disk locality, the assertions recover each
-//! node by a stable property (`name`) and verify labels, properties, adjacency and
-//! the range index *relative to the recovered ids* — proving the graph survived
-//! build → permute → emit semantically intact.
+//! Builds a small dump under both `--cluster=none` and `--cluster=ldg`, then
+//! re-opens the `graph-format` readers. Because the build permutes node/edge ids
+//! for on-disk locality, the assertions recover each node by a stable property
+//! (`name`) and verify labels, properties, adjacency and the range index *relative
+//! to the recovered ids* — proving the graph survived build → permute → emit
+//! semantically intact. Further tests round-trip a brute-force vector index and an
+//! `--encrypt`ed build (every store sealed at rest).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +21,8 @@ use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::topology::TopologyReader;
 
 // dump ids start at 100 (offset, contiguous) — exercises the dense resolver. No
-// vector index (unsupported by the external path yet); one node range index.
+// vector index in this dump; `external_build_routes_and_emits_a_vector_index` and
+// the encrypted round-trip below cover the vector store. One node range index.
 const DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);
 CREATE INDEX FOR (n:Concept) ON (n.name);
 CREATE (:Person:__DumpVertex__ {__dump_id__: 100, name: 'Alice', age: 30});
@@ -58,16 +60,14 @@ fn run_external(cluster: &str) {
             "social",
             "--data-dir",
             data_dir.to_str().unwrap(),
-            "--external",
-            "on",
             "--cluster",
             cluster,
         ])
         .output()
-        .expect("run slater-build --external=on");
+        .expect("run slater-build");
     assert!(
         out.status.success(),
-        "external build ({cluster}) failed: {}",
+        "build ({cluster}) failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -224,16 +224,14 @@ fn external_build_routes_and_emits_a_vector_index() {
             "docs",
             "--data-dir",
             data_dir.to_str().unwrap(),
-            "--external",
-            "on",
             "--cluster",
             "none",
         ])
         .output()
-        .expect("run slater-build --external=on (vectors)");
+        .expect("run slater-build (vectors)");
     assert!(
         out.status.success(),
-        "external vector build failed: {}",
+        "vector build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -275,6 +273,137 @@ fn external_build_routes_and_emits_a_vector_index() {
         };
         assert_eq!(rec.vector, want);
     }
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+// A dump exercising every encrypted store at once: multi-label nodes with scalar /
+// list properties, an edge with a property, a brute-force vector index, and a node
+// range index. Built `--cluster none` so dump node `i` keeps dense id `i`.
+const ENC_DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);
+CALL db.idx.vector.createNodeIndex('Chunk', 'embedding', 3, 'cosine');
+CREATE INDEX FOR (n:Concept) ON (n.name);
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 0, title: 'First chunk', n: 10, tags: ['eu', 'ai'], embedding: vecf32([1.0, 0.0, 0.0])});
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 1, title: 'Second; with semicolon and \'quote\'', n: 20, embedding: vecf32([0.0, 1.0, 0.0])});
+CREATE (:Concept:__DumpVertex__ {__dump_id__: 2, name: 'Alpha'});
+MATCH (a:__DumpVertex__ {__dump_id__: 0}), (b:__DumpVertex__ {__dump_id__: 2}) CREATE (a)-[:MENTIONS {w: 5}]->(b);
+MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;
+DROP INDEX ON :__DumpVertex__(__dump_id__);
+"#;
+
+/// The same build, but `--encrypt`ed: every data block is sealed at rest, the
+/// MANIFEST carries the KDF salt (never the key), and the readers round-trip the
+/// data only when handed the derived cipher. Absent the key they refuse.
+#[test]
+fn external_encrypted_build_then_reopen_with_key() {
+    use std::sync::Arc;
+
+    use graph_format::crypto::{self, BlockCipher};
+    use graph_format::vectors::VectorStoreReader;
+
+    let work = unique_dir("enc");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, ENC_DUMP).unwrap();
+
+    // A 32-byte master key, hex-encoded, handed to the build via an env var.
+    let key_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    std::env::set_var("SLATER_GOLDEN_ENC_KEY", key_hex);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "eu_ai_act",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+            "--encrypt",
+            "--key-env",
+            "SLATER_GOLDEN_ENC_KEY",
+        ])
+        .output()
+        .expect("run slater-build --encrypt");
+    assert!(
+        out.status.success(),
+        "encrypted build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("eu_ai_act");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+
+    // The MANIFEST records the AEAD/KDF + salt, but never the key.
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+    let header = m.encryption.as_ref().expect("encryption header present");
+    assert_eq!(header.aead, crypto::AEAD_NAME);
+    assert_eq!(header.kdf, crypto::KDF_NAME);
+    assert!(!header.salt_hex.is_empty());
+
+    // The plaintext title must not be readable in the raw block file.
+    let raw = std::fs::read(gen_dir.join("node_props.blk")).unwrap();
+    assert!(!raw
+        .windows(b"First chunk".len())
+        .any(|w| w == b"First chunk"));
+
+    // Derive the per-generation cipher exactly as the reader does, then re-open
+    // every store and assert the data survived encrypt→build→decrypt unchanged.
+    // `--cluster none` ⇒ dense id == dump id, so positional lookups are valid.
+    let key = crypto::hex_decode(key_hex).unwrap();
+    let salt = crypto::hex_decode(&header.salt_hex).unwrap();
+    let cipher = Arc::new(BlockCipher::from_master(&key, &salt));
+
+    let np = PropsReader::open_with_cipher(gen_dir.join("node_props.blk"), Some(cipher.clone()))
+        .unwrap();
+    assert_eq!(np.len(), 3);
+    assert_eq!(
+        prop(&np.props(0).unwrap(), &m.property_keys, "title"),
+        Some(&Value::Str("First chunk".into()))
+    );
+    assert_eq!(
+        prop(&np.props(1).unwrap(), &m.property_keys, "title"),
+        Some(&Value::Str("Second; with semicolon and 'quote'".into()))
+    );
+
+    let nl =
+        NodeLabelsReader::open_with_cipher(gen_dir.join("node_labels.blk"), Some(cipher.clone()))
+            .unwrap();
+    assert_eq!(nl.labels(2).unwrap().len(), 1);
+
+    let topo =
+        TopologyReader::open_with_cipher(gen_dir.join("topology.csr.blk"), Some(cipher.clone()))
+            .unwrap();
+    assert_eq!(topo.node_count(), 3);
+    assert_eq!(
+        topo.outgoing(NodeId(0)).unwrap()[0].neighbour.0,
+        2,
+        "Chunk 0 -MENTIONS-> Concept 2"
+    );
+
+    let vs =
+        VectorStoreReader::open_with_cipher(gen_dir.join("vectors.f32.blk"), Some(cipher.clone()))
+            .unwrap();
+    let vi = &m.vector_indexes[0];
+    let group = vs.group(vi.first_record, vi.count).unwrap();
+    assert_eq!(group[0].vector, vec![1.0, 0.0, 0.0]);
+
+    let ri = &m.range_indexes[0];
+    let isam = IsamReader::open_with_cipher(
+        gen_dir.join(format!("range/{}.isam", ri.name)),
+        Some(cipher),
+    )
+    .unwrap();
+    assert_eq!(
+        isam.lookup_eq(&Value::Str("Alpha".into())).unwrap(),
+        vec![2]
+    );
+
+    // Absent the key, the encrypted store is refused — not silently misread.
+    assert!(PropsReader::open(gen_dir.join("node_props.blk")).is_err());
 
     let _ = std::fs::remove_dir_all(&work);
 }

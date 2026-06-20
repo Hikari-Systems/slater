@@ -46,23 +46,27 @@ COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
 COPY crates/slater-build/Cargo.toml crates/slater-build/Cargo.toml
 COPY crates/slater/Cargo.toml crates/slater/Cargo.toml
-RUN mkdir -p crates/graph-format/src crates/slater-build/src crates/slater/src \
+RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
+       crates/slater-build/src crates/slater-build/src/bin crates/slater/src \
        crates/slater/benches \
     && echo '' > crates/graph-format/src/lib.rs \
+    && echo 'fn main() {}' > crates/graph-format/benches/codec.rs \
     && echo 'fn main() {}' > crates/slater-build/src/main.rs \
+    && echo 'fn main() {}' > crates/slater-build/src/bin/bench_codec.rs \
     && echo '' > crates/slater/src/lib.rs \
     && echo 'fn main() {}' > crates/slater/src/main.rs \
     && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
     && cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
     && rm -rf crates/*/src \
-       target/release/slater target/release/slater-build \
+       target/release/slater target/release/slater-build target/release/bench-codec \
        target/release/deps/slater-* target/release/deps/slater_build-* \
+       target/release/deps/bench_codec-* \
        target/release/deps/graph_format-* target/release/deps/libgraph_format-*
 
 # ── Real build ────────────────────────────────────────────────────────────────
 COPY crates ./crates
 RUN cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
-        --bin slater --bin slater-build
+        --bin slater --bin slater-build --bin bench-codec
 
 FROM debian:bookworm-slim AS runtime
 
@@ -74,6 +78,10 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/slater ./slater
 COPY --from=builder /app/target/release/slater-build ./slater-build
+# Compression trade-off benchmark (zstd-level sweep + real GET latency). Run with
+# `docker run --rm --entrypoint /app/bench-codec <image> --graph … --s3-bucket …`.
+# The S3 leg is only valid in-region (EC2), never from a laptop, never on MinIO.
+COPY --from=builder /app/target/release/bench-codec ./bench-codec
 # Baked-in defaults; per-environment overrides arrive via the /sandbox overlay
 # and `KEY__sub` env vars (hs-utils layered config), see docker-compose.yml.
 COPY config.json ./config.json

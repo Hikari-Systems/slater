@@ -61,8 +61,6 @@ fn build(work: &Path, tag: &str, cluster: &str) -> BTreeMap<String, String> {
             "g",
             "--data-dir",
             data_dir.to_str().unwrap(),
-            "--external",
-            "on",
             "--cluster",
             cluster,
         ])

@@ -4,8 +4,8 @@
 //!
 //! Edges in the dump reference their endpoints by `__dump_id__` (an arbitrary
 //! `i64`, e.g. wikidata starts at 368640), so the builder needs a `dump_id →
-//! provisional_node_id` map. The in-memory builder used a `HashMap` (3–6 GB at
-//! 91.6M nodes); here we use a **dense `Vec<u32>`** keyed by `dump_id - min`,
+//! provisional_node_id` map. A naive `HashMap` would cost 3–6 GB at 91.6M nodes;
+//! instead we use a **dense `Vec<u32>`** keyed by `dump_id - min`,
 //! which is ~366 MB at 91.6M nodes and independent of the edge count. When the
 //! dump ids are too sparse for a dense table to fit the budget we would fall back
 //! to an external merge-join (not yet implemented — the target datasets are dense

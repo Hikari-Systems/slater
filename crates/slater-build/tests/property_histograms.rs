@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-(label, property) value→count histograms (`prop_hist.blk`).
 //!
-//! Three invariants:
+//! Two invariants:
 //!   1. **Consistency** — within a build, each stored histogram equals the
 //!      `(value, count)` pairs independently derived from the node properties in
 //!      the dump (and equals what `distinct_key_counts` would walk off the ISAM).
-//!   2. **Parity** — the in-memory and external (bounded-memory) builds produce
-//!      identical histograms (value→count is permutation-invariant, so the
-//!      external build's node-id permutation must not change them).
-//!   3. **Cap** — a `(label, property)` whose distinct count exceeds
+//!   2. **Cap** — a `(label, property)` whose distinct count exceeds
 //!      `--histogram-max-distinct` gets no histogram (the descriptor is absent),
 //!      while a low-cardinality one in the same build still does.
 
@@ -38,15 +35,15 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Build the DUMP and return the generation dir. `external` toggles the
-/// bounded-memory path; `max_distinct` is passed to `--histogram-max-distinct`.
-fn build(tag: &str, external: bool, max_distinct: u64) -> PathBuf {
+/// Build the DUMP and return the generation dir. `max_distinct` is passed to
+/// `--histogram-max-distinct`.
+fn build(tag: &str, max_distinct: u64) -> PathBuf {
     let work = unique_dir(tag);
     let data_dir = work.join("data");
     let input = work.join("dump.cypher");
     std::fs::write(&input, DUMP).unwrap();
 
-    let mut args = vec![
+    let args = vec![
         "--input".to_string(),
         input.to_str().unwrap().to_string(),
         "--graph".to_string(),
@@ -56,17 +53,13 @@ fn build(tag: &str, external: bool, max_distinct: u64) -> PathBuf {
         "--histogram-max-distinct".to_string(),
         max_distinct.to_string(),
     ];
-    if external {
-        args.push("--external".to_string());
-        args.push("on".to_string());
-    }
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
         .args(&args)
         .output()
         .expect("run slater-build");
     assert!(
         out.status.success(),
-        "build (external={external}) failed: {}",
+        "build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -94,18 +87,14 @@ fn histograms_by_index(gen_dir: &Path, m: &Manifest) -> BTreeMap<String, Vec<(Va
 }
 
 #[test]
-fn histograms_consistent_parity_and_capped() {
+fn histograms_consistent_and_capped() {
     // Default cap: both `kind` and `name` are under 4096, so both are stored.
-    let inmem = build("inmem", false, 4096);
-    let extern_ = build("extern", true, 4096);
+    let g = build("hist", 4096);
 
-    let mi = Manifest::read_from_dir(&inmem).unwrap();
-    let me = Manifest::read_from_dir(&extern_).unwrap();
-    mi.verify_content_hash().unwrap();
-    me.verify_content_hash().unwrap();
+    let m = Manifest::read_from_dir(&g).unwrap();
+    m.verify_content_hash().unwrap();
 
-    let hi = histograms_by_index(&inmem, &mi);
-    let he = histograms_by_index(&extern_, &me);
+    let h = histograms_by_index(&g, &m);
 
     // Consistency: the kind histogram is exactly {x:2, y:1, z:1}, ascending key.
     let want_kind = vec![
@@ -113,27 +102,20 @@ fn histograms_consistent_parity_and_capped() {
         (Value::Str("y".into()), 1),
         (Value::Str("z".into()), 1),
     ];
-    assert_eq!(hi["node_T_kind"], want_kind);
+    assert_eq!(h["node_T_kind"], want_kind);
     // name is unique: 4 distinct values, each count 1.
-    assert_eq!(hi["node_T_name"].len(), 4);
-    assert!(hi["node_T_name"].iter().all(|(_, n)| *n == 1));
-
-    // Parity: in-memory and external builds agree on every histogram (value→count
-    // is permutation-invariant), aligned by index name.
-    assert_eq!(
-        hi, he,
-        "histograms differ between in-memory and external builds"
-    );
+    assert_eq!(h["node_T_name"].len(), 4);
+    assert!(h["node_T_name"].iter().all(|(_, n)| *n == 1));
 
     // The descriptor's distinct_count matches the record length.
-    for d in &mi.property_histograms {
-        assert_eq!(d.distinct_count, hi[&d.index_name].len() as u64);
+    for d in &m.property_histograms {
+        assert_eq!(d.distinct_count, h[&d.index_name].len() as u64);
     }
 
     // Cap: with --histogram-max-distinct 2, `kind` (3 distinct) is skipped but a
     // 1-distinct property would still store. Here both kind(3) and name(4) exceed
     // 2, so NO histograms are stored — yet prop_hist.blk still exists (empty).
-    let capped = build("capped", false, 2);
+    let capped = build("capped", 2);
     let mc = Manifest::read_from_dir(&capped).unwrap();
     mc.verify_content_hash().unwrap();
     assert!(
@@ -144,7 +126,7 @@ fn histograms_consistent_parity_and_capped() {
     assert_eq!(r.total_records(), 0, "prop_hist.blk is written but empty");
 
     // Disabled: --histogram-max-distinct 0 stores nothing either.
-    let off = build("off", false, 0);
+    let off = build("off", 0);
     let mo = Manifest::read_from_dir(&off).unwrap();
     assert!(mo.property_histograms.is_empty());
 }

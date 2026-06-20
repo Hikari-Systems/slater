@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-reltype endpoint postings (`reltype_src.post` / `reltype_tgt.post`).
 //!
-//! Two invariants:
-//!   1. **Parity** — the in-memory and external (bounded-memory) builds produce
-//!      identical `reltype_source_counts` / `reltype_target_counts`. Distinct
-//!      endpoint counts are permutation-invariant, so even though the external
-//!      build permutes node ids the *counts* must match exactly.
-//!   2. **Consistency** — within each build, every reltype's posting equals the
-//!      distinct source/target node ids independently derived from the CSR
-//!      topology. This proves the precomputed posting matches the graph.
+//! One invariant:
+//!   **Consistency** — every reltype's posting equals the distinct source/target
+//!   node ids independently derived from the CSR topology. This proves the
+//!   precomputed posting matches the graph. A shape spot-check then pins the known
+//!   per-reltype counts for the fixture.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -39,15 +36,14 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Build the DUMP and return the generation dir. `external` toggles the
-/// bounded-memory path.
-fn build(tag: &str, external: bool) -> PathBuf {
+/// Build the DUMP and return the generation dir.
+fn build(tag: &str) -> PathBuf {
     let work = unique_dir(tag);
     let data_dir = work.join("data");
     let input = work.join("dump.cypher");
     std::fs::write(&input, DUMP).unwrap();
 
-    let mut args = vec![
+    let args = vec![
         "--input".to_string(),
         input.to_str().unwrap().to_string(),
         "--graph".to_string(),
@@ -55,17 +51,13 @@ fn build(tag: &str, external: bool) -> PathBuf {
         "--data-dir".to_string(),
         data_dir.to_str().unwrap().to_string(),
     ];
-    if external {
-        args.push("--external".to_string());
-        args.push("on".to_string());
-    }
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
         .args(&args)
         .output()
         .expect("run slater-build");
     assert!(
         out.status.success(),
-        "build (external={external}) failed: {}",
+        "build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -126,43 +118,26 @@ fn assert_postings_match_topology(gen_dir: &Path, m: &Manifest) {
 }
 
 #[test]
-fn endpoint_postings_consistent_and_parity_across_builds() {
-    let inmem = build("inmem", false);
-    let extern_ = build("extern", true);
+fn endpoint_postings_match_topology() {
+    let gen_dir = build("ep");
 
-    let mi = Manifest::read_from_dir(&inmem).unwrap();
-    let me = Manifest::read_from_dir(&extern_).unwrap();
-    mi.verify_content_hash().unwrap();
-    me.verify_content_hash().unwrap();
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
 
-    // Consistency: each build's postings match its own topology.
-    assert_postings_match_topology(&inmem, &mi);
-    assert_postings_match_topology(&extern_, &me);
+    // Consistency: the build's postings match its own topology.
+    assert_postings_match_topology(&gen_dir, &m);
 
-    // Parity: counts are permutation-invariant, so they must match across builds.
-    // Align by reltype NAME (the two builds may intern reltype ids in any order).
-    let count_by_name = |m: &Manifest, counts: &[u64]| -> std::collections::BTreeMap<String, u64> {
+    // Spot-check the known shape, aligned by reltype NAME (ids intern in any order):
+    // DRAWS has 2 distinct sources (100,101) and 2 distinct targets (101,102).
+    let count_by_name = |counts: &[u64]| -> std::collections::BTreeMap<String, u64> {
         m.reltypes
             .iter()
             .cloned()
             .zip(counts.iter().copied())
             .collect()
     };
-    assert_eq!(
-        count_by_name(&mi, &mi.reltype_source_counts),
-        count_by_name(&me, &me.reltype_source_counts),
-        "source counts differ between in-memory and external builds"
-    );
-    assert_eq!(
-        count_by_name(&mi, &mi.reltype_target_counts),
-        count_by_name(&me, &me.reltype_target_counts),
-        "target counts differ between in-memory and external builds"
-    );
-
-    // Spot-check the known shape: DRAWS has 2 distinct sources (100,101) and 2
-    // distinct targets (101,102).
-    let src = count_by_name(&mi, &mi.reltype_source_counts);
-    let tgt = count_by_name(&mi, &mi.reltype_target_counts);
+    let src = count_by_name(&m.reltype_source_counts);
+    let tgt = count_by_name(&m.reltype_target_counts);
     assert_eq!(src["DRAWS"], 2);
     assert_eq!(tgt["DRAWS"], 2);
     assert_eq!(src["LOOPS"], 1); // self-loop: node 101 is both source and target

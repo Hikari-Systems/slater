@@ -10,6 +10,13 @@ license.workspace = true
 name = "slater-build"
 path = "src/main.rs"
 
+# Compression trade-off benchmark: sweeps zstd levels over a real generation's
+# `.blk` blocks (local or S3) and prints ratio / decode speed / GET latency / the
+# per-backend knee. The S3 leg is meant to run in-region on EC2 (build `--features s3`).
+[[bin]]
+name = "bench-codec"
+path = "src/bin/bench_codec.rs"
+
 [features]
 default = []
 # Enable publishing a built generation to an S3 / object-store target.

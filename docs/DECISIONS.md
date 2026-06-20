@@ -486,7 +486,7 @@ so duplicating the full vectors there would only waste space; `VectorIndexDesc`
 `first_record` (a `vectors.f32.blk` offset) is therefore irrelevant for a Vamana
 index and is recorded as `0`. Below-threshold indexes are unchanged — full-precision
 in `vectors.f32.blk`, the M5 brute-force path. The build gathers each index's vector
-set first, then routes by cardinality (`build.rs` `PendingIndex` → `build_vamana_index`).
+set first, then routes by cardinality (`shared.rs` `PendingIndex` → `build_vamana_index`).
 
 ### D32 — The vector-index pool: a second cache pool, resident PQ pinned + Vamana block LRU
 `slater::cache::VectorIndexCache` is the **second** cache pool (alongside the M4

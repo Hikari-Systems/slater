@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Build scaffolding shared by the in-memory [`crate::build`] and the external
-//! [`crate::build_external`] paths: cipher derivation, the file inventory +
-//! MANIFEST, and the atomic publish. Both paths produce the identical generation
-//! format — only how they get the records into the stores differs — so this is the
-//! single owner of "seal it and swap `current` into place".
+//! Build scaffolding for the [`crate::build_external`] path: cipher derivation,
+//! the file inventory + MANIFEST, and the atomic publish. This is the single owner
+//! of "seal it and swap `current` into place".
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -79,6 +77,9 @@ pub struct PublishInputs<'a> {
     pub generation: Generation,
     pub graph: &'a str,
     pub zstd_level: i32,
+    /// Name of the backend-aware profile that produced `zstd_level` (`"local"` /
+    /// `"remote"` / `"max"` / `"manual"`); recorded in the manifest for inspection.
+    pub compression_profile: String,
     pub block_sizes: BTreeMap<String, u32>,
     pub node_count: u64,
     pub edge_count: u64,
@@ -160,6 +161,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         block_sizes: inp.block_sizes,
         codec: "zstd".into(),
         zstd_level: inp.zstd_level,
+        compression_profile: inp.compression_profile,
         encryption: inp.encryption_header,
         node_count: inp.node_count,
         edge_count: inp.edge_count,

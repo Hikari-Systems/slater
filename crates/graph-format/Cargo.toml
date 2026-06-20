@@ -39,3 +39,16 @@ default = []
 # Enable the S3 / object-store backend (`store::s3::S3ObjectStore`) and its
 # optional local-disk block cache (`store::diskcache::CachingObjectStore`).
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio", "dep:crc32fast"]
+
+[dev-dependencies]
+criterion.workspace = true
+# LZ4 is benched only as a comparison point against zstd (the "is a faster-decode,
+# lower-ratio codec ever a win?" question). It is NOT a runtime dependency — the
+# storage codec stays zstd unless the benchmark shows a measured win.
+lz4_flex = "0.11"
+
+# CPU/ratio micro-bench: zstd levels vs LZ4 on representative payloads. The
+# backend I/O leg (GET + decompress, real S3) lives in the `bench-codec` binary.
+[[bench]]
+name = "codec"
+harness = false

@@ -49,8 +49,6 @@ fn build_args(input: &Path, data_dir: &Path) -> Vec<String> {
         "social".into(),
         "--data-dir".into(),
         data_dir.to_string_lossy().into(),
-        "--external".into(),
-        "on".into(),
         "--cluster".into(),
         "ldg".into(),
     ]

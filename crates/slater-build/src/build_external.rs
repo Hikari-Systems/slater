@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The external, bounded-memory build.
+//! The build: a bounded-memory, external-sort offline writer.
 //!
-//! Where [`crate::build`] holds the whole parsed graph in RAM, this path streams
-//! the dump into on-disk buckets (pass 1), computes a locality-aware node-id
-//! permutation under a memory cap (pass 2 / clustering), then emits the final
-//! stores by external sort — so peak memory is independent of the edge count.
-//! The published generation is byte-format-identical to the in-memory build's
-//! (the server reads it unchanged); only record *order* (and thus the dense ids)
-//! differs, which the MANIFEST does not constrain.
+//! This is the sole build path. It streams the dump into on-disk buckets (pass 1),
+//! computes a locality-aware node-id permutation under a memory cap (pass 2 /
+//! clustering), then emits the final stores by external sort — so peak memory is
+//! independent of the edge count and a graph larger than RAM still builds. The
+//! published generation is the format the server reads unchanged.
 //!
 //! All scratch lives under a per-generation directory **outside** the staged
 //! generation (so the publish rename never drags 20+ GB of buckets into the
@@ -35,12 +33,12 @@ use graph_format::topology::{Adj, CsrHalfWriter};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
 use crate::buckets::{self, read_blob, write_blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge};
-use crate::build::{parse_metric, write_vector_indexes, BuildOptions, Interner, PendingIndex};
 use crate::cluster::{self, ClusterParams, Permutation};
 use crate::common::{self, BuildOutcome, PublishInputs};
 use crate::model::{Entity, RangeIndexStmt, Statement, VectorIndexStmt};
 use crate::parser::{parse_statement, StatementReader};
 use crate::resolve::{DumpResolver, NO_DUMP};
+use crate::shared::{parse_metric, write_vector_indexes, BuildOptions, Interner, PendingIndex};
 
 const DUMP_VERTEX: &str = "__DumpVertex__";
 const DUMP_ID: &str = "__dump_id__";
@@ -564,17 +562,6 @@ fn load_perm(path: &Path, node_count: u64) -> Result<Permutation> {
     Ok(Permutation::Table(table))
 }
 
-/// Which build path the binary selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum ExternalMode {
-    /// In-memory build ([`crate::build::build`]).
-    Off,
-    /// External bounded-memory build.
-    On,
-    /// External build (same as `On` today; reserved for a future size heuristic).
-    Auto,
-}
-
 /// Build a generation with bounded memory. `input_path` is the dump script path,
 /// or `-` for stdin (stdin cannot be sought, so mid-pass-1 resume needs a file).
 /// See module docs.
@@ -691,7 +678,7 @@ fn build_inner(
         let mut vec_index_set: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
         if let Some(path) = &opts.vector_index_json {
-            for v in crate::build::load_vector_sidecar(path)? {
+            for v in crate::shared::load_vector_sidecar(path)? {
                 vec_index_set.insert((v.label.clone(), v.property.clone()));
             }
         }
@@ -1446,7 +1433,7 @@ fn build_inner(
     let range_sorters = range_mx.into_inner().unwrap();
     drop(emit_topo_g);
 
-    // --- vectors.f32.blk + any Vamana/PQ files (shared with the in-memory build) ---
+    // --- vectors.f32.blk + any Vamana/PQ files (via the shared writer) ---
     let emit_vec_g = diag.phase("emit.vectors");
     diag.set_op(
         "write vector indexes (vamana/pq/brute)",
@@ -1483,8 +1470,8 @@ fn build_inner(
     drop(emit_range_g);
 
     // prop_hist.blk — value→count histograms from the node range ISAMs just
-    // written (same derivation as the in-memory path: run-length-count the finished
-    // ISAM, so both builders agree). High-cardinality / disabled indexes skipped.
+    // written (run-length-count the finished ISAM). High-cardinality / disabled
+    // indexes are skipped.
     let emit_hist_g = diag.phase("emit.prop_hist");
     diag.set_op(
         "derive prop_hist.blk from range ISAMs",
@@ -1502,7 +1489,7 @@ fn build_inner(
     block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
     drop(emit_hist_g);
 
-    // ---- publish (shared with the in-memory build) ----
+    // ---- publish (via the shared scaffolding) ----
     let _publish_g = diag.phase("publish");
     diag.set_op("manifest + fsync + atomic publish", "", 0);
     common::write_manifest_and_publish(PublishInputs {
@@ -1512,6 +1499,7 @@ fn build_inner(
         generation,
         graph,
         zstd_level: opts.zstd_level,
+        compression_profile: opts.compression_profile.clone(),
         block_sizes,
         node_count,
         edge_count,
@@ -2042,4 +2030,229 @@ fn emit_reverse_band(
     csr.finish()?;
     diag.progress_add(i);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph_format::manifest::{AnnMode, Manifest};
+    use graph_format::pq::{AdcTable, PqReader};
+    use graph_format::vamana::{beam_search, VamanaReader};
+
+    /// A deterministic LCG so the synthetic dump is reproducible without a `rand`
+    /// dependency (mirrors graph-format's training RNG).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn unit(v: &[f32]) -> Vec<f32> {
+        let n: f64 = v
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            .sqrt();
+        v.iter().map(|&x| (x as f64 / n) as f32).collect()
+    }
+
+    fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0f64;
+        let (mut na, mut nb) = (0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(b) {
+            dot += *x as f64 * *y as f64;
+            na += *x as f64 * *x as f64;
+            nb += *y as f64 * *y as f64;
+        }
+        (1.0 - dot / (na.sqrt() * nb.sqrt())) as f32
+    }
+
+    /// Build a dump script of `n` nodes each carrying a `dim`-dim `vecf32`
+    /// embedding, plus a cosine vector index over `(:Doc, embedding)`. Returns the
+    /// script and the raw (un-normalised) vectors for ground-truth checks.
+    fn synthetic_dump(n: usize, dim: usize) -> (String, Vec<Vec<f32>>) {
+        let mut rng = Lcg(0xDEAD_BEEF_1234);
+        let mut script = String::new();
+        script.push_str("CALL db.idx.vector.createNodeIndex('Doc', 'embedding', ");
+        script.push_str(&format!("{dim}, 'cosine');\n"));
+        let mut vectors = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+            let body: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+            script.push_str(&format!(
+                "CREATE (:Doc:__DumpVertex__ {{__dump_id__: {i}, embedding: vecf32([{}])}});\n",
+                body.join(", ")
+            ));
+            vectors.push(v);
+        }
+        (script, vectors)
+    }
+
+    /// Run the external build over `script` in a fresh temp dir. `--cluster none`
+    /// keeps dump order, so the dense node id of dump node `i` is exactly `i` — the
+    /// recall check below maps Vamana hits back to dump indices on that basis. The
+    /// caller tweaks `opts` (threshold / Vamana / PQ knobs / publish store).
+    fn run_build(tag: &str, script: &str, tweak: impl FnOnce(&mut BuildOptions)) -> BuildOutcome {
+        let work = std::env::temp_dir().join(format!("slater_be_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let input = work.join("dump.cypher");
+        std::fs::write(&input, script).unwrap();
+        let data_dir = work.join("data");
+
+        let mut opts = BuildOptions {
+            cluster: crate::cluster::ClusterMode::None,
+            ..Default::default()
+        };
+        tweak(&mut opts);
+        build_external(
+            input.to_str().unwrap(),
+            "docs",
+            &data_dir,
+            &opts,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn above_threshold_builds_vamana_and_pq_files_with_acceptable_recall() {
+        let dim = 16;
+        let n = 400;
+        let (script, vectors) = synthetic_dump(n, dim);
+        let outcome = run_build("vam", &script, |o| {
+            // A low threshold forces the Vamana path on this small synthetic set.
+            o.ann_threshold = 50;
+            o.vamana_r = 24;
+            o.vamana_alpha = 1.2;
+            o.pq_subspaces = 8;
+            o.pq_bits = 8;
+        });
+
+        // The descriptor records Vamana mode with the build parameters.
+        let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();
+        assert_eq!(manifest.vector_indexes.len(), 1);
+        let desc = &manifest.vector_indexes[0];
+        assert_eq!(desc.count, n as u64);
+        let (medoid, pqm) = match desc.mode {
+            AnnMode::Vamana {
+                r,
+                medoid,
+                pq_subspaces,
+                ..
+            } => {
+                assert_eq!(r, 24);
+                (medoid, pq_subspaces)
+            }
+            AnnMode::BruteForce => panic!("expected Vamana mode above the threshold"),
+        };
+        assert_eq!(pqm, 8);
+
+        // The two ANN files were written and are in the manifest inventory.
+        let vam_path = outcome.dir.join("vector/Doc.embedding.vamana");
+        let pq_path = outcome.dir.join("vector/Doc.embedding.pq");
+        assert!(vam_path.exists() && pq_path.exists());
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.name == "vector/Doc.embedding.vamana"));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.name == "vector/Doc.embedding.pq"));
+
+        // Read the ANN files back and run the same beam search the server will,
+        // checking recall@k against brute-force ground truth.
+        let vam = VamanaReader::open_with_cipher(&vam_path, None).unwrap();
+        let pq = PqReader::open_with_cipher(&pq_path, None).unwrap();
+        let resident = pq.load_resident().unwrap();
+        assert_eq!(vam.len(), n as u64);
+        assert_eq!(resident.len(), n);
+
+        let k = 10;
+        let queries = 15;
+        let mut recall_sum = 0.0f64;
+        for q in 0..queries {
+            let query = unit(&vectors[(q * 23) % n]);
+            let adc = AdcTable::new(&resident.codebook, &query).unwrap();
+            let hits = beam_search(
+                medoid as u32,
+                64,
+                k,
+                n,
+                |i| adc.estimate(resident.codes_of(i as usize)),
+                |i| {
+                    let node = vam.node(i).unwrap();
+                    Ok((node.vector, node.neighbours))
+                },
+                |v| cosine_distance(&query, v),
+            )
+            .unwrap();
+            // Map hits back to dense node ids and compare with brute force over the
+            // original (raw) vectors. `--cluster none` ⇒ dense id == dump index.
+            let got: std::collections::HashSet<u64> = hits
+                .iter()
+                .map(|h| vam.node(h.index).unwrap().node_id)
+                .collect();
+            let mut truth: Vec<(f32, u64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (cosine_distance(&query, &unit(v)), i as u64))
+                .collect();
+            truth.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let found = truth
+                .iter()
+                .take(k)
+                .filter(|(_, id)| got.contains(id))
+                .count();
+            recall_sum += found as f64 / k as f64;
+        }
+        let recall = recall_sum / queries as f64;
+        assert!(recall >= 0.8, "build→read recall@{k} was {recall:.3}");
+    }
+
+    #[test]
+    fn below_threshold_stays_brute_force() {
+        let dim = 8;
+        let n = 30;
+        let (script, _) = synthetic_dump(n, dim);
+        // Default threshold (50k) ⇒ this 30-vector index stays brute-force.
+        let outcome = run_build("bf", &script, |_| {});
+        let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();
+        assert!(matches!(
+            manifest.vector_indexes[0].mode,
+            AnnMode::BruteForce
+        ));
+        // No ANN files written for a brute-force index.
+        assert!(!outcome.dir.join("vector/Doc.embedding.vamana").exists());
+    }
+
+    #[test]
+    fn publishes_finished_generation_to_object_store() {
+        use graph_format::store::mem::MemObjectStore;
+        use graph_format::store::{join_key, ObjectStore};
+
+        let (script, _) = synthetic_dump(20, 8);
+        let mem = Arc::new(MemObjectStore::new());
+        let outcome = run_build("pub", &script, |o| {
+            o.publish_store = Some(mem.clone() as Arc<dyn ObjectStore>);
+        });
+
+        let base = join_key("docs", &outcome.generation.0.to_string());
+        // The current pointer was written to the store and names the built generation.
+        let current =
+            String::from_utf8(mem.read_all(&join_key("docs", "current")).unwrap()).unwrap();
+        assert_eq!(current.trim(), outcome.generation.0.to_string());
+        // The MANIFEST and a data file landed in the store with the right bytes.
+        assert!(mem.exists(&join_key(&base, "MANIFEST.json")).unwrap());
+        let np_key = join_key(&base, "node_props.blk");
+        let from_store = mem.read_all(&np_key).unwrap();
+        let from_disk = std::fs::read(outcome.dir.join("node_props.blk")).unwrap();
+        assert_eq!(from_store, from_disk);
+    }
 }

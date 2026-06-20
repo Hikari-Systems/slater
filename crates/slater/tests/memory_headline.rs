@@ -237,6 +237,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
         block_sizes,
         codec: "zstd".into(),
         zstd_level: LEVEL,
+        compression_profile: String::new(),
         encryption: None,
         node_count: N as u64,
         edge_count: 0,

@@ -33,7 +33,7 @@ backpressure semaphore, and completed runs are re-sorted into dispatch order so 
 merge is bit-identical regardless of completion order (safe even for non-total keys
 like `cluster`'s `AdjPair`).
 
-**Measured (1M wikidata, --external on, --max-memory 1g, 16-core WSL2):**
+**Measured (1M wikidata, --max-memory 1g, 16-core WSL2):**
 
 | phase | baseline | Option A | speedup |
 |---|---|---|---|

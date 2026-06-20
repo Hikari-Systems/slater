@@ -425,7 +425,7 @@ graph larger than RAM (the in-memory builder was OOM-killed on this one).
 
 | engine | on-disk | builder / loader | build cost |
 |---|--:|---|---|
-| slater | **14 GB** | `slater-build --external on` (spill-to-disk) | ~25 min serial · **~18 min** with parallel pass-1, peak **3.6 GiB** RSS under a **4 GiB** cap |
+| slater | **14 GB** | `slater-build` (spill-to-disk, `--max-memory 4g`) | ~25 min serial · **~18 min** with parallel pass-1, peak **3.6 GiB** RSS under a **4 GiB** cap |
 | Neo4j 5 | 41.8 GB | `neo4j-admin database import` (offline → volume) | not re-timed (focus is RAM) |
 | LadybugDB | 21 GB | Kùzu `COPY FROM` CSV (embedded) | ~4.2 min, peak **13 GiB** RSS (needs a tuned ~8 GiB pool) |
 
