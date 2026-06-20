@@ -117,6 +117,13 @@ pub struct FileEntry {
     pub name: String,
     pub bytes: u64,
     pub blake3: String,
+    /// Base64 SHA-256 of the file content (the `x-amz-checksum-sha256` form).
+    /// Optional and additive: absent on generations built before it existed, and
+    /// omitted from the JSON when `None` so those manifests are byte-unchanged.
+    /// The S3 backend compares it to S3's server-computed object checksum to
+    /// verify integrity from object metadata, without reading the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 /// The full generation manifest.
@@ -265,6 +272,17 @@ impl Manifest {
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         Ok(m)
     }
+
+    /// Read and parse `MANIFEST.json` for the generation rooted at `base_key`
+    /// in an [`ObjectStore`](crate::store::ObjectStore) (any backend).
+    pub fn read_via(store: &dyn crate::store::ObjectStore, base_key: &str) -> Result<Self> {
+        let key = crate::store::join_key(base_key, "MANIFEST.json");
+        let bytes = store
+            .read_all(&key)
+            .with_context(|| format!("read {key}"))?;
+        let m: Manifest = serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
+        Ok(m)
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +294,7 @@ mod tests {
             name: "node_props.blk".into(),
             bytes: 123,
             blake3: "deadbeef".into(),
+            sha256: None,
         }];
         let content_hash = crate::integrity::content_hash(
             &files

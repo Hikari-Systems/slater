@@ -42,9 +42,14 @@ fn main() -> anyhow::Result<()> {
     // before any async machinery), then hand off to the Bolt listener, which opens
     // every graph under `data_dir`, loads the ACL, and serves connections until the
     // process is signalled.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // Query execution and storage reads run on the blocking pool; raise its size
+    // for a remote backend, where each in-flight cold read parks one thread on
+    // the network round-trip. 0 keeps the tokio default.
+    if cfg.server.max_blocking_threads > 0 {
+        builder.max_blocking_threads(cfg.server.max_blocking_threads);
+    }
+    let runtime = builder.build().context("build tokio runtime")?;
     runtime.block_on(server::serve(cfg))
 }

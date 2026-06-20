@@ -34,7 +34,6 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
-use crate::ids::BlockId;
 use crate::wire::{read_uvarint, write_uvarint};
 
 /// PQ structural parameters, recorded so the store is self-describing.
@@ -416,7 +415,16 @@ impl PqReader {
         path: impl AsRef<Path>,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
-        let inner = BlockFileReader::open_with_cipher(path, cipher)?;
+        let src = Arc::new(crate::store::fs::FileObject::open(path)?);
+        Self::open_src(src, cipher)
+    }
+
+    /// Open from any positional-read source (local file or remote object).
+    pub fn open_src(
+        src: Arc<dyn crate::store::RandomReadAt>,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        let inner = BlockFileReader::open_src(src, cipher)?;
         let hdr = inner
             .read_record_global(0)
             .context("read PQ codebook header (record 0)")?;
@@ -454,9 +462,11 @@ impl PqReader {
         let mut node_ids = Vec::with_capacity(total.saturating_sub(1) as usize);
         let mut codes = Vec::with_capacity(total.saturating_sub(1) as usize * m);
         let mut global: u64 = 0;
-        for b in 0..self.inner.num_blocks() {
-            let raw = self.inner.read_block(BlockId(b as u32))?;
-            let (offsets, data) = parse_block(&raw)?;
+        // Whole-file load via a bounded concurrent read-ahead, so a remote backend
+        // overlaps its fetch round-trips at generation open without holding more
+        // than the read-ahead window resident (no-op fan-out on a local file).
+        self.inner.for_each_block(|_bi, raw| {
+            let (offsets, data) = parse_block(raw)?;
             for slot in 0..offsets.len().saturating_sub(1) {
                 // Skip record 0 (the codebook header).
                 if global == 0 {
@@ -474,7 +484,8 @@ impl PqReader {
                 codes.extend_from_slice(&buf);
                 global += 1;
             }
-        }
+            Ok(())
+        })?;
         Ok(ResidentPq {
             codebook: self.codebook.clone(),
             node_ids,

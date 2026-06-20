@@ -18,6 +18,7 @@ mod resolve;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -163,6 +164,28 @@ struct Cli {
     /// and the external-sort spill pool). Defaults to `max(online_cores - 2, 1)`.
     #[arg(long, short = 'j')]
     threads: Option<usize>,
+
+    /// Also publish the finished generation to this S3 bucket, after the local
+    /// publish to `--data-dir`. Requires a binary built with the `s3` feature.
+    /// Credentials come from the standard AWS chain (env / profile / instance role).
+    #[arg(long)]
+    publish_s3_bucket: Option<String>,
+
+    /// AWS region for `--publish-s3-bucket` (e.g. `eu-west-2`).
+    #[arg(long, default_value = "")]
+    publish_s3_region: String,
+
+    /// Custom endpoint URL for an S3-compatible publish target (MinIO, localstack).
+    #[arg(long, default_value = "")]
+    publish_s3_endpoint: String,
+
+    /// Key prefix under which the generation is published in the bucket.
+    #[arg(long, default_value = "")]
+    publish_s3_prefix: String,
+
+    /// Use path-style S3 addressing (required by most S3-compatible servers).
+    #[arg(long)]
+    publish_s3_path_style: bool,
 }
 
 /// Resolve the worker-thread cap: the `--threads` value, else
@@ -272,6 +295,36 @@ fn resolve_master_key(cli: &Cli) -> Result<Option<Vec<u8>>> {
     Ok(Some(key))
 }
 
+/// Build the optional remote publish target from the `--publish-s3-*` flags.
+/// `None` ⇒ filesystem-only publish. Errors if an S3 target is requested but the
+/// binary was built without the `s3` feature.
+fn resolve_publish_store(cli: &Cli) -> Result<Option<Arc<dyn graph_format::store::ObjectStore>>> {
+    let Some(bucket) = &cli.publish_s3_bucket else {
+        return Ok(None);
+    };
+    #[cfg(feature = "s3")]
+    {
+        let cfg = graph_format::store::s3::S3Config {
+            bucket: bucket.clone(),
+            region: cli.publish_s3_region.clone(),
+            endpoint: (!cli.publish_s3_endpoint.is_empty())
+                .then(|| cli.publish_s3_endpoint.clone()),
+            prefix: cli.publish_s3_prefix.clone(),
+            path_style: cli.publish_s3_path_style,
+        };
+        let store = graph_format::store::s3::S3ObjectStore::connect(&cfg)
+            .context("connect S3 publish target")?;
+        Ok(Some(Arc::new(store)))
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        let _ = bucket;
+        anyhow::bail!(
+            "--publish-s3-bucket given but slater-build was built without the `s3` cargo feature"
+        )
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -284,6 +337,7 @@ fn main() -> Result<()> {
         None => None,
     };
     let threads = resolve_threads(&cli);
+    let publish_store = resolve_publish_store(&cli)?;
     let opts = BuildOptions {
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
@@ -304,6 +358,7 @@ fn main() -> Result<()> {
         keep_temp: cli.keep_temp,
         resume: cli.resume,
         threads,
+        publish_store,
     };
     // Pin the global rayon pool and the external-sort spill pool to the cap, so
     // every parallel build stage respects `--threads`.

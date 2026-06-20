@@ -16,3 +16,20 @@ zstd.workspace = true
 blake3.workspace = true
 byteorder.workspace = true
 chacha20poly1305.workspace = true
+# SHA-256 (base64) per-file digest baked into the manifest alongside BLAKE3, so
+# the S3 backend can verify integrity from S3's server-computed object checksum
+# via a metadata request (no body read). Computed at build for every generation.
+sha2 = "0.10"
+base64 = "0.22"
+# S3 backend (optional). aws-sdk-s3 is used (not a blocking client) because it is
+# the only client that surfaces S3 object checksums (`x-amz-checksum-sha256`) on
+# put/head; it is async, so `store::s3` bridges it with an owned current-thread
+# runtime — contained entirely in that module, the storage trait stays sync.
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+
+[features]
+default = []
+# Enable the S3 / object-store backend (`store::s3::S3ObjectStore`).
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]

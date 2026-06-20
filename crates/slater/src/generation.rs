@@ -27,13 +27,14 @@ use graph_format::crypto::{self, BlockCipher};
 use graph_format::histogram::decode_histogram;
 use graph_format::ids::Generation as GenId;
 use graph_format::ids::Value;
-use graph_format::integrity::hash_file;
 use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::postings::decode_endpoint_posting;
 use graph_format::pq::{PqReader, ResidentPq};
+use graph_format::store::fs::FsObjectStore;
+use graph_format::store::{join_key, FileIntegrity, ObjectStore};
 use graph_format::topology::TopologyReader;
 use graph_format::vamana::VamanaReader;
 use graph_format::vectors::VectorStoreReader;
@@ -124,16 +125,49 @@ impl Generation {
     /// used to derive this generation's block cipher. The key is required iff the
     /// MANIFEST carries an `encryption` header; an encrypted generation opened
     /// without a key is refused with a clear error (never garbage).
+    ///
+    /// Opens from the local filesystem rooted at `data_dir`; the serve path uses
+    /// [`Generation::open_with_store`] to open from any configured backend.
     pub fn open_with_key(
         data_dir: impl AsRef<Path>,
         graph: &str,
         master_key: Option<&[u8]>,
     ) -> Result<Self> {
-        let graph_dir = data_dir.as_ref().join(graph);
-        let uuid = GenId(read_current(&graph_dir)?);
-        let dir = graph_dir.join(uuid.to_string());
+        let store = FsObjectStore::new(data_dir.as_ref());
+        Self::open_with_store(&store, graph, master_key)
+    }
 
-        let manifest = Manifest::read_from_dir(&dir)
+    /// Resolve `<graph>/current` in `store`, open that generation, validate it,
+    /// and build its in-memory indexes — the backend-agnostic core. The local
+    /// filesystem is one backend ([`open_with_key`](Generation::open_with_key));
+    /// an object store (S3) is another. Every file is read positionally through
+    /// the store so the on-disk format, the readers, and validation are identical
+    /// across backends.
+    pub fn open_with_store(
+        store: &dyn ObjectStore,
+        graph: &str,
+        master_key: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::open_with_store_opts(store, graph, master_key, true)
+    }
+
+    /// As [`open_with_store`](Generation::open_with_store), but `verify_integrity`
+    /// controls the copy-completeness re-hash at open. The filesystem backend
+    /// keeps it on; a remote backend may disable it (re-hashing every object over
+    /// the network at open is expensive) and rely on the manifest MAC + per-block
+    /// AEAD instead — see `THREAT_MODEL.md`.
+    pub fn open_with_store_opts(
+        store: &dyn ObjectStore,
+        graph: &str,
+        master_key: Option<&[u8]>,
+        verify_integrity: bool,
+    ) -> Result<Self> {
+        let uuid = GenId(Self::current_uuid_in(store, graph)?);
+        // Backend-relative key prefix for this generation's files.
+        let base = join_key(graph, &uuid.to_string());
+        let dir = PathBuf::from(&base);
+
+        let manifest = Manifest::read_via(store, &base)
             .with_context(|| format!("read MANIFEST for generation {} of graph {graph}", uuid))?;
 
         // Sniff the magic and format version before trusting anything else.
@@ -176,10 +210,14 @@ impl Generation {
             }
         }
 
-        // Copy-completeness guard: re-hash every inventory file from disk and
-        // refuse on the first mismatch, then confirm the manifest's own content
-        // hash is self-consistent with that inventory.
-        verify_against_disk(&dir, &manifest)?;
+        // Copy-completeness guard: re-hash every inventory file through the store
+        // and refuse on the first mismatch, then confirm the manifest's own
+        // content hash is self-consistent with that inventory. Skipped when the
+        // backend opts out (see `verify_integrity`); the keyed-MANIFEST MAC and
+        // per-block AEAD still authenticate an encrypted generation regardless.
+        if verify_integrity {
+            verify_against_store(store, &base, &manifest)?;
+        }
 
         // Derive the per-generation block cipher from the runtime master key and
         // the MANIFEST salt. The key is required iff the generation is encrypted;
@@ -187,23 +225,24 @@ impl Generation {
         let cipher = derive_cipher(&manifest, master_key, graph, &uuid)?;
 
         // Open every reader. Each only reads its footer/sparse index at open
-        // (block bytes stay lazy via pread — D16), so this is cheap and keeps
-        // resident memory to the directories alone. Each reader is handed the
+        // (block bytes stay lazy via positional reads — D16), so this is cheap and
+        // keeps resident memory to the directories alone. Each reader is handed the
         // cipher so a cache-miss block read decrypts before decompressing (D28).
-        let node_props = PropsReader::open_with_cipher(dir.join("node_props.blk"), cipher.clone())?;
-        let node_labels =
-            NodeLabelsReader::open_with_cipher(dir.join("node_labels.blk"), cipher.clone())?;
-        let edge_props = PropsReader::open_with_cipher(dir.join("edge_props.blk"), cipher.clone())?;
-        let topology =
-            TopologyReader::open_with_cipher(dir.join("topology.csr.blk"), cipher.clone())?;
-        // Endpoint postings (format v2+). Gate on file existence so a hand-built
+        let open_blk = |name: &str| -> Result<Arc<dyn graph_format::store::RandomReadAt>> {
+            store.open(&join_key(&base, name))
+        };
+        let node_props = PropsReader::open_src(open_blk("node_props.blk")?, cipher.clone())?;
+        let node_labels = NodeLabelsReader::open_src(open_blk("node_labels.blk")?, cipher.clone())?;
+        let edge_props = PropsReader::open_src(open_blk("edge_props.blk")?, cipher.clone())?;
+        let topology = TopologyReader::open_src(open_blk("topology.csr.blk")?, cipher.clone())?;
+        // Endpoint postings (format v2+). Gate on existence so a hand-built
         // fixture without them still opens; the format-version check already
         // fences real generations.
         let open_post = |name: &str| -> Result<Option<BlockFileReader>> {
-            let path = dir.join(name);
-            if path.exists() {
-                Ok(Some(BlockFileReader::open_with_cipher(
-                    path,
+            let key = join_key(&base, name);
+            if store.exists(&key)? {
+                Ok(Some(BlockFileReader::open_src(
+                    store.open(&key)?,
                     cipher.clone(),
                 )?))
             } else {
@@ -212,25 +251,24 @@ impl Generation {
         };
         let reltype_src_post = open_post("reltype_src.post")?;
         let reltype_tgt_post = open_post("reltype_tgt.post")?;
-        let vectors =
-            VectorStoreReader::open_with_cipher(dir.join("vectors.f32.blk"), cipher.clone())?;
+        let vectors = VectorStoreReader::open_src(open_blk("vectors.f32.blk")?, cipher.clone())?;
 
         let mut range_indexes = HashMap::new();
         for ri in &manifest.range_indexes {
-            let path = dir.join("range").join(format!("{}.isam", ri.name));
-            let reader = IsamReader::open_with_cipher(&path, cipher.clone())
-                .with_context(|| format!("open range index {}", path.display()))?;
+            let key = join_key(&base, &format!("range/{}.isam", ri.name));
+            let reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
+                .with_context(|| format!("open range index {key}"))?;
             range_indexes.insert(ri.name.clone(), reader);
         }
 
-        // Value→count histograms (format v3+). Gate on file existence (a hand-built
+        // Value→count histograms (format v3+). Gate on existence (a hand-built
         // fixture may omit it). Records align by position with `property_histograms`;
         // decode them resident, keyed by index name.
         let mut prop_histograms = HashMap::new();
-        let hist_path = dir.join("prop_hist.blk");
-        if hist_path.exists() && !manifest.property_histograms.is_empty() {
-            let reader = BlockFileReader::open_with_cipher(&hist_path, cipher.clone())
-                .with_context(|| format!("open histogram store {}", hist_path.display()))?;
+        let hist_key = join_key(&base, "prop_hist.blk");
+        if store.exists(&hist_key)? && !manifest.property_histograms.is_empty() {
+            let reader = BlockFileReader::open_src(store.open(&hist_key)?, cipher.clone())
+                .with_context(|| format!("open histogram store {hist_key}"))?;
             for (i, d) in manifest.property_histograms.iter().enumerate() {
                 let rec = reader.read_record_global(i as u64).with_context(|| {
                     format!("read histogram record {i} for index {}", d.index_name)
@@ -250,11 +288,16 @@ impl Generation {
                 continue;
             }
             let stem = format!("vector/{}.{}", vi.label, vi.property);
-            let reader =
-                VamanaReader::open_with_cipher(dir.join(format!("{stem}.vamana")), cipher.clone())
-                    .with_context(|| format!("open Vamana store {stem}.vamana"))?;
-            let pq = PqReader::open_with_cipher(dir.join(format!("{stem}.pq")), cipher.clone())
-                .with_context(|| format!("open PQ store {stem}.pq"))?;
+            let reader = VamanaReader::open_src(
+                store.open(&join_key(&base, &format!("{stem}.vamana")))?,
+                cipher.clone(),
+            )
+            .with_context(|| format!("open Vamana store {stem}.vamana"))?;
+            let pq = PqReader::open_src(
+                store.open(&join_key(&base, &format!("{stem}.pq")))?,
+                cipher.clone(),
+            )
+            .with_context(|| format!("open PQ store {stem}.pq"))?;
             let resident = Arc::new(
                 pq.load_resident()
                     .with_context(|| format!("load resident PQ codes for {stem}.pq"))?,
@@ -317,7 +360,15 @@ impl Generation {
     /// storage (e.g. NFS), so we poll
     /// this small text file rather than watch it for events (D14/D16).
     pub fn current_uuid(data_dir: impl AsRef<Path>, graph: &str) -> Result<uuid::Uuid> {
-        read_current(&data_dir.as_ref().join(graph))
+        let store = FsObjectStore::new(data_dir.as_ref());
+        Self::current_uuid_in(&store, graph)
+    }
+
+    /// As [`current_uuid`](Generation::current_uuid) but against any backend —
+    /// the generation guard uses this to detect a published swap over the
+    /// configured store.
+    pub fn current_uuid_in(store: &dyn ObjectStore, graph: &str) -> Result<uuid::Uuid> {
+        read_current_via(store, graph)
     }
 
     // ── Identity / metadata ────────────────────────────────────────────────
@@ -503,14 +554,17 @@ impl Generation {
     }
 }
 
-/// Read and parse `<graph_dir>/current` into a generation UUID.
-fn read_current(graph_dir: &Path) -> Result<uuid::Uuid> {
-    let path = graph_dir.join("current");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read current pointer {}", path.display()))?;
+/// Read and parse `<graph>/current` into a generation UUID via the store.
+fn read_current_via(store: &dyn ObjectStore, graph: &str) -> Result<uuid::Uuid> {
+    let key = join_key(graph, "current");
+    let bytes = store
+        .read_all(&key)
+        .with_context(|| format!("read current pointer {key}"))?;
+    let text =
+        String::from_utf8(bytes).with_context(|| format!("current pointer {key} is not UTF-8"))?;
     let trimmed = text.trim();
     uuid::Uuid::parse_str(trimmed)
-        .with_context(|| format!("parse generation uuid {trimmed:?} from {}", path.display()))
+        .with_context(|| format!("parse generation uuid {trimmed:?} from {key}"))
 }
 
 /// Derive this generation's block cipher from the runtime master key and the
@@ -549,25 +603,27 @@ fn derive_cipher(
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
 }
 
-/// Re-hash every file in the manifest inventory from disk and compare to the
-/// declared per-file hash, then confirm the overall content hash is consistent.
-fn verify_against_disk(dir: &Path, manifest: &Manifest) -> Result<()> {
+/// Verify every file in the manifest inventory through the store, then confirm
+/// the overall content hash is self-consistent. Each file's check is delegated
+/// to [`ObjectStore::verify_file`], so the backend picks the cheapest sound
+/// method — a local file re-hashes its bytes (BLAKE3); S3 compares the object's
+/// size from a metadata `HEAD` with no body read.
+fn verify_against_store(store: &dyn ObjectStore, base: &str, manifest: &Manifest) -> Result<()> {
     for fe in &manifest.files {
-        let path = dir.join(&fe.name);
-        let computed = hash_file(&path)
-            .with_context(|| format!("re-hash generation file {}", path.display()))?;
-        if computed != fe.blake3 {
-            bail!(
-                "generation file {} failed its integrity check \
-                 (manifest {}, on-disk {}) — refusing to serve an incomplete copy",
-                fe.name,
-                fe.blake3,
-                computed
-            );
-        }
+        let key = join_key(base, &fe.name);
+        store
+            .verify_file(
+                &key,
+                &FileIntegrity {
+                    size: fe.bytes,
+                    blake3: &fe.blake3,
+                    sha256: fe.sha256.as_deref(),
+                },
+            )
+            .with_context(|| format!("verify generation file {}", fe.name))?;
     }
-    // Every file matched its declared hash; the manifest's own content_hash must
-    // therefore equal the hash over the (name, hash) inventory.
+    // Every file matched what the manifest asserts; the manifest's own
+    // content_hash must therefore equal the hash over the (name, hash) inventory.
     manifest
         .verify_content_hash()
         .context("manifest content hash is inconsistent with its file inventory")?;
@@ -802,7 +858,8 @@ mod tests {
             files.push(FileEntry {
                 name: name.to_string(),
                 bytes,
-                blake3: hash_file(&path).unwrap(),
+                blake3: graph_format::integrity::hash_file(&path).unwrap(),
+                sha256: None,
             });
             bs.insert(name.to_string(), BLOCK as u32);
         };
@@ -873,6 +930,66 @@ mod tests {
         .unwrap();
 
         (root, graph, uuid)
+    }
+
+    /// Recursively load every file under `root` into a `MemObjectStore`, keyed by
+    /// its `/`-joined path relative to `root` — i.e. the same keys the store
+    /// abstraction builds (`<graph>/current`, `<graph>/<uuid>/<file>`, …).
+    fn load_dir_into_mem(
+        store: &graph_format::store::mem::MemObjectStore,
+        root: &Path,
+        dir: &Path,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                load_dir_into_mem(store, root, &path);
+            } else {
+                let rel = path.strip_prefix(root).unwrap();
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                store
+                    .put(&key, &std::fs::read(&path).unwrap(), None)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// The same generation opens identically through a non-filesystem backend:
+    /// every reader, the integrity re-hash, and the `current` pointer resolve
+    /// through the `ObjectStore` abstraction with no filesystem access.
+    #[test]
+    fn opens_through_in_memory_backend() {
+        let (root, graph, uuid) = write_fixture("opens_through_in_memory_backend");
+        let mem = graph_format::store::mem::MemObjectStore::new();
+        load_dir_into_mem(&mem, &root, &root);
+
+        let gen = Generation::open_with_store(&mem, &graph, None).unwrap();
+        assert_eq!(gen.uuid(), GenId(uuid));
+        assert_eq!(gen.node_count(), 3);
+        // A property read, a label read, a topology read, a vector read, and a
+        // range-index lookup all flow through the in-memory store.
+        let alice = gen.node_props().props(0).unwrap();
+        assert!(alice.contains(&(0, Value::Str("Alice".into()))));
+        assert_eq!(gen.node_labels().labels(2).unwrap(), vec![1]);
+        assert_eq!(gen.topology().outgoing(NodeId(0)).unwrap().len(), 2);
+        assert_eq!(
+            gen.vectors().group(0, 1).unwrap()[0].vector,
+            vec![0.1, 0.2, 0.3]
+        );
+        let hits = gen
+            .range_index("node_Person_name")
+            .unwrap()
+            .lookup_eq(&Value::Str("Bob".into()))
+            .unwrap();
+        assert_eq!(hits, vec![1]);
+
+        // Discovery and the swap-detection pointer read also work via the store.
+        assert_eq!(Generation::current_uuid_in(&mem, &graph).unwrap(), uuid);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

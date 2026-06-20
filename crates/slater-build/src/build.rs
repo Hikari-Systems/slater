@@ -94,6 +94,11 @@ pub struct BuildOptions {
     /// sort spill pool, and the global rayon pool). Defaults at the CLI to
     /// `max(online_cores - 2, 1)`.
     pub threads: usize,
+    /// When set, also publish the finished generation to this object store (e.g.
+    /// S3) after the local atomic publish: the local build dir is the staging
+    /// area, every file is uploaded, then the remote `current` pointer is written
+    /// last. `None` ⇒ filesystem-only publish (the default).
+    pub publish_store: Option<Arc<dyn graph_format::store::ObjectStore>>,
 }
 
 impl Default for BuildOptions {
@@ -117,6 +122,7 @@ impl Default for BuildOptions {
             cluster_passes: 3,
             keep_temp: false,
             resume: false,
+            publish_store: None,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(2).max(1))
                 .unwrap_or(1),
@@ -610,6 +616,7 @@ pub fn build(
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
         extra_files: vector_files,
+        store: opts.publish_store.clone(),
     })
 }
 
@@ -1039,6 +1046,45 @@ mod tests {
         ));
         // No ANN files written for a brute-force index.
         assert!(!outcome.dir.join("vector/Doc.embedding.vamana").exists());
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn publishes_finished_generation_to_object_store() {
+        use graph_format::store::mem::MemObjectStore;
+        use graph_format::store::{join_key, ObjectStore};
+
+        let (script, _) = synthetic_dump(20, 8);
+        let data_dir =
+            std::env::temp_dir().join(format!("slater_build_pub_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&data_dir);
+
+        let mem = Arc::new(MemObjectStore::new());
+        let opts = BuildOptions {
+            publish_store: Some(mem.clone() as Arc<dyn ObjectStore>),
+            ..Default::default()
+        };
+        let outcome = build(
+            script.as_bytes(),
+            "docs",
+            &data_dir,
+            &opts,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
+
+        let base = join_key("docs", &outcome.generation.0.to_string());
+        // The current pointer was written to the store and names the built generation.
+        let current =
+            String::from_utf8(mem.read_all(&join_key("docs", "current")).unwrap()).unwrap();
+        assert_eq!(current.trim(), outcome.generation.0.to_string());
+        // The MANIFEST and a data file landed in the store with the right bytes.
+        assert!(mem.exists(&join_key(&base, "MANIFEST.json")).unwrap());
+        let np_key = join_key(&base, "node_props.blk");
+        let from_store = mem.read_all(&np_key).unwrap();
+        let from_disk = fs::read(outcome.dir.join("node_props.blk")).unwrap();
+        assert_eq!(from_store, from_disk);
+
         let _ = fs::remove_dir_all(&data_dir);
     }
 }

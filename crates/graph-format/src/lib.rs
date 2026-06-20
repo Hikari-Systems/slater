@@ -36,6 +36,7 @@ pub mod manifest;
 pub mod nodelabels;
 pub mod postings;
 pub mod pq;
+pub mod store;
 pub mod topology;
 pub mod vamana;
 pub mod vectors;

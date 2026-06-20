@@ -235,6 +235,7 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -420,6 +421,7 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -572,6 +574,7 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -732,6 +735,7 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -846,6 +850,7 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -987,6 +992,7 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
             name: name.to_string(),
             bytes,
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -1164,6 +1170,7 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
             name: name.to_string(),
             bytes: std::fs::metadata(&path).unwrap().len(),
             blake3: hash_file(&path).unwrap(),
+            sha256: None,
         });
         let bs = if name == "vector/Doc.embedding.vamana" {
             f.vector_block_size as u32

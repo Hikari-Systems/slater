@@ -18,7 +18,6 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,6 +27,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::codec;
 use crate::crypto::{BlockCipher, NONCE_LEN};
 use crate::ids::Value;
+use crate::store::fs::FileObject;
+use crate::store::RandomReadAt;
 use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
 const ISAM_MAGIC: &[u8; 8] = b"SLISM001";
@@ -236,7 +237,7 @@ struct TopEntry {
 
 /// Reader holding the resident sparse top-level.
 pub struct IsamReader {
-    file: File,
+    src: Arc<dyn RandomReadAt>,
     top: Vec<TopEntry>,
     /// Per-generation cipher, set iff the index is encrypted.
     cipher: Option<Arc<BlockCipher>>,
@@ -247,33 +248,36 @@ impl IsamReader {
         Self::open_with_cipher(path, None)
     }
 
-    /// Open an ISAM index, supplying the per-generation cipher for an encrypted
-    /// index. An encrypted index opened without a key is refused with a clear
-    /// error rather than returning garbage.
+    /// Open an ISAM index by path (local filesystem) — a convenience wrapper
+    /// over [`open_src`](IsamReader::open_src) for path-holding callers.
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .with_context(|| format!("open isam {}", path.as_ref().display()))?;
-        let len = file.metadata()?.len();
+        let src = Arc::new(FileObject::open(path.as_ref())?);
+        Self::open_src(src, cipher)
+    }
+
+    /// Open an ISAM index from any positional-read source (local file or remote
+    /// object), supplying the per-generation cipher for an encrypted index. An
+    /// encrypted index opened without a key is refused with a clear error rather
+    /// than returning garbage.
+    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
+        let len = src.len();
         if len < ISAM_MAGIC.len() as u64 + FOOTER_LEN {
-            bail!("isam too short: {}", path.as_ref().display());
+            bail!("isam too short");
         }
         let mut magic = [0u8; 8];
-        file.read_exact_at(&mut magic, 0)?;
+        src.read_exact_at(&mut magic, 0)?;
         let encrypted = match &magic {
             m if m == ISAM_MAGIC => false,
             m if m == ISAM_MAGIC_ENC => true,
-            _ => bail!("bad isam magic: {}", path.as_ref().display()),
+            _ => bail!("bad isam magic"),
         };
         let cipher = if encrypted {
             match cipher {
                 Some(c) => Some(c),
-                None => bail!(
-                    "isam index {} is encrypted but no key was supplied",
-                    path.as_ref().display()
-                ),
+                None => bail!("isam index is encrypted but no key was supplied"),
             }
         } else {
             None
@@ -284,10 +288,10 @@ impl IsamReader {
             FOOTER_LEN
         };
         if len < ISAM_MAGIC.len() as u64 + footer_len {
-            bail!("isam too short: {}", path.as_ref().display());
+            bail!("isam too short");
         }
         let mut footer = vec![0u8; footer_len as usize];
-        file.read_exact_at(&mut footer, len - footer_len)?;
+        src.read_exact_at(&mut footer, len - footer_len)?;
         let mut fr = &footer[..];
         let top_offset = fr.read_u64::<LittleEndian>()?;
         let top_len = fr.read_u64::<LittleEndian>()?;
@@ -301,7 +305,7 @@ impl IsamReader {
         };
 
         let mut stored_top = vec![0u8; top_len as usize];
-        file.read_exact_at(&mut stored_top, top_offset)?;
+        src.read_exact_at(&mut stored_top, top_offset)?;
         // Unseal the top-level when encrypted (a wrong key is caught here, at open).
         let top_bytes = match (&cipher, &top_nonce) {
             (Some(c), Some(nonce)) => c.decrypt(nonce, &stored_top)?,
@@ -329,7 +333,7 @@ impl IsamReader {
                 nonce,
             });
         }
-        Ok(Self { file, top, cipher })
+        Ok(Self { src, top, cipher })
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -339,7 +343,7 @@ impl IsamReader {
     fn read_block(&self, b: usize) -> Result<Vec<(Value, u64)>> {
         let t = &self.top[b];
         let mut stored = vec![0u8; t.comp_len as usize];
-        self.file.read_exact_at(&mut stored, t.offset)?;
+        self.src.read_exact_at(&mut stored, t.offset)?;
         let comp = match (&self.cipher, &t.nonce) {
             (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
             _ => stored,

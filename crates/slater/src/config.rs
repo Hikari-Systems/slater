@@ -110,8 +110,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub log: LogConfig,
     /// Root directory holding `<graph>/<generation>/` images and `current` pointers.
+    /// Used as the root for the `fs` storage backend (see [`DataBackendConfig`]).
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Where generations are read from: the local filesystem (`fs`, default) or an
+    /// object store (`s3`). The on-disk byte format is identical across backends.
+    #[serde(default)]
+    pub data_backend: DataBackendConfig,
     #[serde(default)]
     pub tls: TlsConfig,
     /// Path to the JSON ACL file (users → per-graph grants).
@@ -211,6 +216,15 @@ pub struct ServerConfig {
         deserialize_with = "de::usize"
     )]
     pub max_connections_per_ip: usize,
+    /// Size of the tokio blocking-thread pool that runs query execution and
+    /// storage reads. 0 keeps the tokio default (512). Raise it for a remote
+    /// backend (S3) under cold-cache bursts, where each in-flight cold read parks
+    /// one blocking thread on the network round-trip.
+    #[serde(
+        default = "default_max_blocking_threads",
+        deserialize_with = "de::usize"
+    )]
+    pub max_blocking_threads: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -235,6 +249,69 @@ impl TlsConfig {
     pub fn enabled(&self) -> bool {
         !self.cert.is_empty() && !self.key.is_empty()
     }
+}
+
+/// Which storage backend serves generation files. The byte format is identical
+/// across backends; only where the bytes come from differs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataBackendConfig {
+    /// `fs` (local filesystem rooted at `data_dir`, the default) or `s3`.
+    #[serde(default = "default_backend_kind")]
+    pub kind: String,
+    /// Verify each generation file against the manifest at open (the
+    /// copy-completeness guard). `None` ⇒ on. The check is cheap on every
+    /// backend: a local file re-hashes its bytes (BLAKE3); S3 reads its
+    /// server-computed SHA-256 object checksum from object metadata and compares
+    /// it to the manifest — one `HEAD` per file, no body read. Set `false` to
+    /// skip it entirely (the manifest MAC + per-block AEAD still apply).
+    #[serde(default)]
+    pub verify_integrity: Option<bool>,
+    /// S3 connection settings (used when `kind = "s3"`).
+    #[serde(default)]
+    pub s3: S3BackendConfig,
+}
+
+impl Default for DataBackendConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_backend_kind(),
+            verify_integrity: None,
+            s3: S3BackendConfig::default(),
+        }
+    }
+}
+
+impl DataBackendConfig {
+    /// Whether to verify each generation file against the manifest at open.
+    /// Defaults on — the check is a cheap metadata request on every backend (see
+    /// [`verify_integrity`](Self::verify_integrity)).
+    pub fn verify_integrity_resolved(&self) -> bool {
+        self.verify_integrity.unwrap_or(true)
+    }
+}
+
+/// S3 (or S3-compatible) connection settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct S3BackendConfig {
+    /// Bucket name.
+    #[serde(default)]
+    pub bucket: String,
+    /// AWS region (e.g. `eu-west-2`).
+    #[serde(default)]
+    pub region: String,
+    /// Custom endpoint URL for an S3-compatible store (MinIO, localstack); empty
+    /// uses the standard AWS endpoint for `region`.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Key prefix every generation key is joined under; empty uses the bucket root.
+    #[serde(default)]
+    pub prefix: String,
+    /// Use path-style addressing (`endpoint/bucket/key`); required by most
+    /// S3-compatible servers.
+    #[serde(default, deserialize_with = "de::bool")]
+    pub path_style: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -421,6 +498,12 @@ fn default_data_dir() -> String {
 }
 fn default_acl_path() -> String {
     "acl.json".into()
+}
+fn default_backend_kind() -> String {
+    "fs".into()
+}
+fn default_max_blocking_threads() -> usize {
+    0 // 0 ⇒ keep the tokio default (512)
 }
 fn default_bind() -> String {
     "0.0.0.0".into()

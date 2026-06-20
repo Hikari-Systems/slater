@@ -32,6 +32,11 @@ pest_derive.workspace = true
 regex.workspace = true
 chrono.workspace = true
 
+[features]
+default = []
+# Enable the S3 / object-store data backend (forwards to graph-format).
+s3 = ["graph-format/s3"]
+
 [dev-dependencies]
 criterion.workspace = true
 

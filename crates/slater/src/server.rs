@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use graph_format::ids::Generation as GenId;
+use graph_format::store::fs::FsObjectStore;
+use graph_format::store::{join_key, ObjectStore};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -106,8 +108,13 @@ const CODE_REQUEST: &str = "Neo.ClientError.Request.Invalid";
 /// for its whole life — so a swap never mixes two generations within one query;
 /// the `data_dir` + `master_key` are retained so the guard can re-open a graph.
 pub struct Graphs {
-    data_dir: PathBuf,
+    /// Storage backend the generations are read from (local filesystem by
+    /// default, or an object store). Retained so the guard can re-open a graph.
+    store: Arc<dyn ObjectStore>,
     master_key: Option<Vec<u8>>,
+    /// Run the copy-completeness re-hash when opening (and swapping in) a
+    /// generation. Default for the filesystem backend; usually off for S3.
+    verify_integrity: bool,
     graphs: HashMap<String, RwLock<Arc<Generation>>>,
     /// Live `acl.json` path used to verify per-generation `aclBlake3` stamps at
     /// open/swap time. `None` ⇒ no ACL stamp checking (e.g. unit-test fixtures).
@@ -117,30 +124,47 @@ pub struct Graphs {
 }
 
 impl Graphs {
-    /// Discover and open every graph under `data_dir`, deriving each generation's
-    /// block cipher from `master_key` (required iff a generation is encrypted).
+    /// Discover and open every graph under `data_dir` on the local filesystem,
+    /// deriving each generation's block cipher from `master_key` (required iff a
+    /// generation is encrypted). Convenience over [`open_all_with_store`] for the
+    /// filesystem backend.
+    ///
+    /// [`open_all_with_store`]: Graphs::open_all_with_store
     pub fn open_all(data_dir: &Path, master_key: Option<&[u8]>) -> Result<Self> {
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(data_dir));
+        Self::open_all_with_store(store, master_key, true)
+    }
+
+    /// Discover and open every graph in `store`, deriving each generation's block
+    /// cipher from `master_key`. A graph is a top-level name that carries a
+    /// published `current` pointer; anything else (scratch dirs, half-written
+    /// `.tmp-*` generations) is skipped. `verify_integrity` runs the
+    /// copy-completeness re-hash at open (and on later swaps).
+    pub fn open_all_with_store(
+        store: Arc<dyn ObjectStore>,
+        master_key: Option<&[u8]>,
+        verify_integrity: bool,
+    ) -> Result<Self> {
         let mut graphs = HashMap::new();
-        let entries = std::fs::read_dir(data_dir)
-            .with_context(|| format!("read data directory {}", data_dir.display()))?;
-        for entry in entries {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        let names = store.list("").context("list graphs in data store")?;
+        for name in names {
+            // A graph is one with a published `current` pointer.
+            if !store.exists(&join_key(&name, "current")).unwrap_or(false) {
                 continue;
             }
-            // A graph directory is one with a published `current` pointer; skip
-            // anything else (scratch dirs, half-written `.tmp-*` generations).
-            if !entry.path().join("current").exists() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let gen = Generation::open_with_key(data_dir, &name, master_key)
-                .with_context(|| format!("open graph {name}"))?;
+            let gen = Generation::open_with_store_opts(
+                store.as_ref(),
+                &name,
+                master_key,
+                verify_integrity,
+            )
+            .with_context(|| format!("open graph {name}"))?;
             graphs.insert(name, RwLock::new(Arc::new(gen)));
         }
         Ok(Self {
-            data_dir: data_dir.to_path_buf(),
+            store,
             master_key: master_key.map(<[u8]>::to_vec),
+            verify_integrity,
             graphs,
             acl_path: None,
             require_acl_stamp: false,
@@ -295,7 +319,7 @@ impl Graphs {
             .get(name)
             .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
         let live = slot.read().unwrap().clone();
-        let on_disk = Generation::current_uuid(&self.data_dir, name)?;
+        let on_disk = Generation::current_uuid_in(self.store.as_ref(), name)?;
         if on_disk == live.uuid().0 {
             return Ok(None);
         }
@@ -303,10 +327,13 @@ impl Graphs {
         // Open + validate the new generation. A half-rsynced/truncated copy fails
         // its content-hash check here and the caller keeps the old one serving.
         let new_gen = Arc::new(
-            Generation::open_with_key(&self.data_dir, name, self.master_key.as_deref())
-                .with_context(|| {
-                    format!("open swapped-in generation {on_disk} of graph '{name}'")
-                })?,
+            Generation::open_with_store_opts(
+                self.store.as_ref(),
+                name,
+                self.master_key.as_deref(),
+                self.verify_integrity,
+            )
+            .with_context(|| format!("open swapped-in generation {on_disk} of graph '{name}'"))?,
         );
 
         // The swapped-in generation may carry a different ACL stamp / MAC presence
@@ -358,7 +385,7 @@ fn guard_sweep(
         let Some(live) = graphs.get(&name) else {
             continue;
         };
-        let on_disk = match Generation::current_uuid(&graphs.data_dir, &name) {
+        let on_disk = match Generation::current_uuid_in(graphs.store.as_ref(), &name) {
             Ok(u) => u,
             Err(e) => {
                 warn!(graph = %name, error = %e, "generation guard could not read the current pointer");
@@ -1282,6 +1309,39 @@ pub async fn serve(cfg: AppConfig) -> Result<()> {
     serve_with_listener(cfg, listener).await
 }
 
+/// Construct the storage backend from config: the local filesystem rooted at
+/// `data_dir` (default), or an S3 object store. The `s3` backend requires the
+/// binary to be built with the `s3` cargo feature.
+fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
+    match cfg.data_backend.kind.as_str() {
+        "fs" | "" => Ok(Arc::new(FsObjectStore::new(&cfg.data_dir))),
+        "s3" => {
+            #[cfg(feature = "s3")]
+            {
+                let s = &cfg.data_backend.s3;
+                let scfg = graph_format::store::s3::S3Config {
+                    bucket: s.bucket.clone(),
+                    region: s.region.clone(),
+                    endpoint: (!s.endpoint.is_empty()).then(|| s.endpoint.clone()),
+                    prefix: s.prefix.clone(),
+                    path_style: s.path_style,
+                };
+                let store = graph_format::store::s3::S3ObjectStore::connect(&scfg)
+                    .context("connect S3 data backend")?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                bail!(
+                    "data_backend.kind = \"s3\" but this slater binary was built without the \
+                     `s3` cargo feature"
+                )
+            }
+        }
+        other => bail!("unknown data_backend.kind {other:?} (expected \"fs\" or \"s3\")"),
+    }
+}
+
 // DESIGN: the crate is a library + thin binary, and `serve` is split into a
 // bind step + [`serve_with_listener`], so the bounded-RSS *headline* test can
 // drive the real production wiring in-process over an ephemeral loopback port
@@ -1301,7 +1361,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         .encryption
         .load_key()
         .context("load at-rest encryption key")?;
-    let mut graphs = Graphs::open_all(Path::new(&cfg.data_dir), master_key.as_deref())?;
+    let store = build_store(&cfg)?;
+    let verify_integrity = cfg.data_backend.verify_integrity_resolved();
+    let mut graphs = Graphs::open_all_with_store(store, master_key.as_deref(), verify_integrity)?;
     graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
     graphs
         .verify_manifest_policy()

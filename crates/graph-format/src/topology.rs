@@ -311,7 +311,16 @@ impl TopologyReader {
         path: impl AsRef<Path>,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
-        let inner = BlockFileReader::open_with_cipher(path, cipher)?;
+        let src = Arc::new(crate::store::fs::FileObject::open(path)?);
+        Self::open_src(src, cipher)
+    }
+
+    /// Open from any positional-read source (local file or remote object).
+    pub fn open_src(
+        src: Arc<dyn crate::store::RandomReadAt>,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        let inner = BlockFileReader::open_src(src, cipher)?;
         let total = inner.total_records();
         if total % 2 != 0 {
             bail!("topology record count {total} is not even (forward+reverse)");

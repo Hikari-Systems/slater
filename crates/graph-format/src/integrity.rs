@@ -13,6 +13,39 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use base64::Engine;
+use sha2::{Digest, Sha256};
+
+/// Base64 of a raw SHA-256 digest — the exact form S3 stores and returns as the
+/// `x-amz-checksum-sha256` object checksum, so a value computed here can be sent
+/// on upload (S3 verifies it against the bytes) and compared to S3's
+/// server-computed checksum at open without reading the object body.
+pub fn sha256_base64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
+}
+
+/// Stream a file through BOTH BLAKE3 and SHA-256 in a single read pass, returning
+/// `(blake3_hex, sha256_base64)`. The builder uses this for the inventory so each
+/// file is read once for both the canonical content digest (BLAKE3) and the
+/// S3-comparable checksum (SHA-256).
+pub fn hash_file_blake3_and_sha256(path: impl AsRef<Path>) -> Result<(String, String)> {
+    let f = File::open(path.as_ref())
+        .with_context(|| format!("open for hashing {}", path.as_ref().display()))?;
+    let mut reader = BufReader::new(f);
+    let mut b3 = blake3::Hasher::new();
+    let mut sha = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        b3.update(&buf[..n]);
+        sha.update(&buf[..n]);
+    }
+    let sha_b64 = base64::engine::general_purpose::STANDARD.encode(sha.finalize());
+    Ok((b3.finalize().to_hex().to_string(), sha_b64))
+}
 
 /// Stream a file through BLAKE3 and return the lowercase hex digest.
 pub fn hash_file(path: impl AsRef<Path>) -> Result<String> {
@@ -27,6 +60,25 @@ pub fn hash_file(path: impl AsRef<Path>) -> Result<String> {
             break;
         }
         hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Stream an object through BLAKE3 via positional reads and return the
+/// lowercase hex digest. Identical result to [`hash_file`] over the same bytes,
+/// so it works for any backend (local file or remote object) behind a
+/// [`RandomReadAt`](crate::store::RandomReadAt) handle.
+pub fn hash_object(src: &dyn crate::store::RandomReadAt) -> Result<String> {
+    let len = src.len();
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut off = 0u64;
+    while off < len {
+        let n = ((len - off) as usize).min(buf.len());
+        src.read_exact_at(&mut buf[..n], off)
+            .context("read object chunk for hashing")?;
+        hasher.update(&buf[..n]);
+        off += n as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

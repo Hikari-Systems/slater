@@ -21,6 +21,12 @@ WORKDIR /app
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=$RUSTFLAGS
 
+# Cargo features to compile into the binaries. Defaults to the S3 / object-store
+# data backend so the image can serve from (and publish to) S3/MinIO out of the
+# box (see docker-compose.yml's `s3` profile). Set `--build-arg CARGO_FEATURES=`
+# for a leaner filesystem-only image.
+ARG CARGO_FEATURES="slater/s3,slater-build/s3"
+
 # Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
 # C/C++ toolchain (clang), and libclang for its bindgen step. Without these the
 # rustls/aws-lc-rs build fails. `git` is already present in rust:1-bookworm and is
@@ -47,7 +53,7 @@ RUN mkdir -p crates/graph-format/src crates/slater-build/src crates/slater/src \
     && echo '' > crates/slater/src/lib.rs \
     && echo 'fn main() {}' > crates/slater/src/main.rs \
     && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
-    && cargo build --release --locked \
+    && cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
     && rm -rf crates/*/src \
        target/release/slater target/release/slater-build \
        target/release/deps/slater-* target/release/deps/slater_build-* \
@@ -55,7 +61,8 @@ RUN mkdir -p crates/graph-format/src crates/slater-build/src crates/slater/src \
 
 # ── Real build ────────────────────────────────────────────────────────────────
 COPY crates ./crates
-RUN cargo build --release --locked --bin slater --bin slater-build
+RUN cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
+        --bin slater --bin slater-build
 
 FROM debian:bookworm-slim AS runtime
 

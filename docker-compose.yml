@@ -73,5 +73,117 @@ services:
       - 'slater-data:/data'
       - './dumps:/dumps:ro'
 
+  # ── S3 / object-store backend (profile `s3`) ───────────────────────────────
+  # `docker compose --profile s3 up` brings up MinIO (an S3-compatible object
+  # store), creates the `slater` bucket, and runs a slater server that reads its
+  # generations from that bucket instead of the local volume. Publish a
+  # generation into the bucket with the `builder-s3` service below, then
+  # (re)start `slater-s3` so it discovers the new graph at open.
+  #
+  # The image is built with the `s3` cargo feature by default (Dockerfile
+  # CARGO_FEATURES build arg), so the same binary speaks both backends.
+
+  minio:
+    image: minio/minio:latest
+    profiles: ['s3']
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: 'minioadmin'
+      MINIO_ROOT_PASSWORD: 'minioadmin'
+    ports:
+      - '9000:9000'   # S3 API
+      - '9001:9001'   # web console (http://localhost:9001, minioadmin/minioadmin)
+    volumes:
+      - 'minio-data:/data'
+
+  # One-shot: wait for MinIO to accept connections, then create the `slater`
+  # bucket. Its successful completion is the readiness gate the server/builder
+  # depend on (so we don't rely on a MinIO healthcheck).
+  createbucket:
+    image: minio/mc:latest
+    profiles: ['s3']
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minioadmin minioadmin; do
+        echo 'waiting for minio...'; sleep 1;
+      done;
+      mc mb --ignore-existing local/slater;
+      echo 'slater bucket ready';
+      "
+
+  # A slater server that serves generations from the MinIO `slater` bucket. Uses
+  # the baked-in config.json + acl.json; the dataBackend__* env vars switch it to
+  # the S3 backend and the AWS_* vars supply the MinIO credentials (rust-s3
+  # resolves them from the standard AWS env chain).
+  slater-s3:
+    build:
+      context: .
+    profiles: ['s3']
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    ports:
+      # Distinct host port so it can run alongside the filesystem `slater`.
+      - '7688:7687'
+    environment:
+      server__bind: '0.0.0.0'
+      server__port: '7687'
+      aclPath: '/app/acl.json'
+      # Switch the storage backend to S3 (MinIO). The byte format is identical to
+      # the filesystem backend — only where the bytes come from changes.
+      dataBackend__kind: 's3'
+      dataBackend__s3__bucket: 'slater'
+      dataBackend__s3__region: 'us-east-1'
+      dataBackend__s3__endpoint: 'http://minio:9000'
+      dataBackend__s3__pathStyle: 'true'   # required by MinIO and most S3-compatibles
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
+      # The demo publishes unstamped generations; relax the ACL-stamp requirement
+      # (build with `--acl` and drop this for a stamped deployment).
+      requireAclStamp: 'false'
+      cache__blockCacheBytes: '268435456'
+      cache__vectorCacheBytes: '134217728'
+      cache__resultCacheBytes: '33554432'
+      generationPollMs: '5000'
+      reloadStrategy: 'exit'
+      log__level: 'info'
+    healthcheck:
+      test: ['CMD', '/app/slater', 'healthcheck']
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # The offline writer, publishing to MinIO. The local `--data-dir` stays the
+  # staging area (temp/intermediate files are always written locally); the
+  # finished generation is uploaded to the bucket and the remote `current`
+  # pointer is written last. Run a build with, e.g.:
+  #   docker compose --profile s3 run --rm builder-s3 \
+  #     --input /dumps/people.cypher --graph people --data-dir /data \
+  #     --publish-s3-bucket slater --publish-s3-endpoint http://minio:9000 \
+  #     --publish-s3-region us-east-1 --publish-s3-prefix '' --publish-s3-path-style
+  builder-s3:
+    build:
+      context: .
+    profiles: ['s3']
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    entrypoint: ['/app/slater-build']
+    command: ['--help']
+    environment:
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
+    volumes:
+      - 'slater-data:/data'
+      - './dumps:/dumps:ro'
+
 volumes:
   slater-data:
+  minio-data:

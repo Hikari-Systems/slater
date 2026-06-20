@@ -18,10 +18,11 @@ use graph_format::histogram::{
     derive_histogram_from_isam, encode_histogram, write_property_histograms,
 };
 use graph_format::ids::Generation;
-use graph_format::integrity::{content_hash, hash_file};
+use graph_format::integrity::content_hash;
 use graph_format::manifest::{
     EncryptionHeader, EntityKind, Manifest, PropertyHistogramDesc, RangeIndexDesc, VectorIndexDesc,
 };
+use graph_format::store::{join_key, ObjectStore};
 
 /// Derive the per-generation block cipher and the MANIFEST encryption header (which
 /// records the KDF salt, never the key) when encryption is requested.
@@ -99,6 +100,10 @@ pub struct PublishInputs<'a> {
     pub acl_blake3: Option<String>,
     /// Extra inventory files beyond the fixed stores (the Vamana/PQ vector files).
     pub extra_files: Vec<String>,
+    /// When set, also publish the finished generation to this object store after
+    /// the local atomic publish (upload every file, then write the remote
+    /// `current` pointer last). `None` ⇒ filesystem-only publish.
+    pub store: Option<Arc<dyn ObjectStore>>,
 }
 
 /// Inventory every file (size + BLAKE3), assemble + (optionally) MAC-seal the
@@ -128,11 +133,15 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         let bytes = fs::metadata(&path)
             .with_context(|| format!("stat {}", path.display()))?
             .len();
-        let blake3 = hash_file(&path)?;
+        // One read pass yields both the canonical BLAKE3 and the S3-comparable
+        // SHA-256 (base64), so an S3-served generation can be integrity-checked
+        // from S3's object checksum metadata without a body read.
+        let (blake3, sha256) = graph_format::integrity::hash_file_blake3_and_sha256(&path)?;
         files.push(graph_format::manifest::FileEntry {
             name: name.clone(),
             bytes,
             blake3,
+            sha256: Some(sha256),
         });
     }
     let inventory: Vec<(String, String)> = files
@@ -190,6 +199,22 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
     fs::rename(&current_tmp, &current).with_context(|| format!("swap {}", current.display()))?;
     fsync_dir(inp.graph_dir)?;
 
+    // ---- optional remote publish ----
+    // The local generation dir is now the validated staging area. Upload every
+    // file to the object store, then write the remote `current` pointer last so a
+    // reader never sees a pointer to a partially-uploaded generation (the same
+    // copy-completeness barrier the local rename-current-last provides).
+    if let Some(store) = &inp.store {
+        upload_generation(
+            store.as_ref(),
+            inp.graph,
+            inp.generation,
+            inp.final_dir,
+            &manifest.files,
+        )
+        .with_context(|| format!("upload generation {} to object store", inp.generation.0))?;
+    }
+
     Ok(BuildOutcome {
         generation: inp.generation,
         content_hash,
@@ -197,6 +222,41 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         node_count: inp.node_count,
         edge_count: inp.edge_count,
     })
+}
+
+/// Upload a finished, locally-published generation to an object store: every
+/// data file (with its SHA-256 so S3 validates and stores the object checksum),
+/// then the MANIFEST, then the `current` pointer **last** (the publish barrier —
+/// `current` only ever names a fully-uploaded generation).
+fn upload_generation(
+    store: &dyn ObjectStore,
+    graph: &str,
+    generation: Generation,
+    dir: &Path,
+    files: &[graph_format::manifest::FileEntry],
+) -> Result<()> {
+    let base = join_key(graph, &generation.0.to_string());
+    for fe in files {
+        let bytes =
+            fs::read(dir.join(&fe.name)).with_context(|| format!("read {} for upload", fe.name))?;
+        store
+            .put(&join_key(&base, &fe.name), &bytes, fe.sha256.as_deref())
+            .with_context(|| format!("upload {}", fe.name))?;
+    }
+    // The MANIFEST and current pointer carry no inventory checksum (the MANIFEST
+    // is authenticated by its own MAC; current is a tiny pointer).
+    let manifest = fs::read(dir.join("MANIFEST.json")).context("read MANIFEST.json for upload")?;
+    store
+        .put(&join_key(&base, "MANIFEST.json"), &manifest, None)
+        .context("upload MANIFEST.json")?;
+    store
+        .put(
+            &join_key(graph, "current"),
+            format!("{}\n", generation.0).as_bytes(),
+            None,
+        )
+        .context("write remote current pointer")?;
+    Ok(())
 }
 
 /// Derive per-(label, property) value→count histograms from the already-written

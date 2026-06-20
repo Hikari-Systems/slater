@@ -1527,6 +1527,7 @@ fn build_inner(
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
         extra_files: vector_files,
+        store: opts.publish_store.clone(),
     })
 }
 

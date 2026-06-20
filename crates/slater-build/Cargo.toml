@@ -10,6 +10,11 @@ license.workspace = true
 name = "slater-build"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable publishing a built generation to an S3 / object-store target.
+s3 = ["graph-format/s3"]
+
 [dependencies]
 graph-format.workspace = true
 anyhow.workspace = true

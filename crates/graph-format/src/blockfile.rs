@@ -39,6 +39,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::codec;
 use crate::crypto::{BlockCipher, NONCE_LEN};
 use crate::ids::BlockId;
+use crate::store::fs::FileObject;
+use crate::store::RandomReadAt;
 
 const BLOCKFILE_MAGIC: &[u8; 8] = b"SLBLK001";
 /// Magic for an AEAD-encrypted block file. The directory entries are wider (they
@@ -312,9 +314,10 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
     Ok(total_records)
 }
 
-/// Reader holding the resident block directory; fetches blocks with `pread`.
+/// Reader holding the resident block directory; fetches blocks positionally
+/// from the backing object (a local file's `pread`, or a remote range read).
 pub struct BlockFileReader {
-    file: File,
+    src: Arc<dyn RandomReadAt>,
     dir: Vec<DirEntry>,
     /// Prefix sums of records-per-block: `block_start[i]` is the global index of
     /// block `i`'s first record. Length `dir.len() + 1`; the last entry is the
@@ -331,53 +334,57 @@ impl BlockFileReader {
         Self::open_with_cipher(path, None)
     }
 
-    /// Open a block file, validating the magic and loading the block directory.
-    /// An encrypted file requires `cipher = Some(..)`; an encrypted file opened
-    /// without a key is refused with a clear error rather than returning garbage.
+    /// Open a block file by path (local filesystem), validating the magic and
+    /// loading the block directory. A convenience wrapper over [`open_src`] for
+    /// callers (tests, tools) that hold a path; the serve path opens through an
+    /// [`ObjectStore`](crate::store::ObjectStore) and calls [`open_src`].
+    ///
+    /// [`open_src`]: BlockFileReader::open_src
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
-        let file = File::open(path.as_ref())
-            .with_context(|| format!("open block file {}", path.as_ref().display()))?;
-        let len = file.metadata()?.len();
+        let src = Arc::new(FileObject::open(path.as_ref())?);
+        Self::open_src(src, cipher)
+    }
+
+    /// Open a block file from any positional-read source (local file or remote
+    /// object), validating the magic and loading the block directory.
+    /// An encrypted file requires `cipher = Some(..)`; an encrypted file opened
+    /// without a key is refused with a clear error rather than returning garbage.
+    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
+        let len = src.len();
         if len < BLOCKFILE_MAGIC.len() as u64 + FOOTER_LEN {
-            bail!(
-                "block file too short to be valid: {}",
-                path.as_ref().display()
-            );
+            bail!("block file too short to be valid");
         }
 
         let mut magic = [0u8; 8];
-        file.read_exact_at(&mut magic, 0)?;
+        src.read_exact_at(&mut magic, 0)?;
         let encrypted = match &magic {
             m if m == BLOCKFILE_MAGIC => false,
             m if m == BLOCKFILE_MAGIC_ENC => true,
-            _ => bail!("bad block file magic in {}", path.as_ref().display()),
+            _ => bail!("bad block file magic"),
         };
         // Bind the cipher to what the file actually is: an encrypted file with no
         // key is refused; a plaintext file ignores any key it was handed.
         let cipher = if encrypted {
             match cipher {
                 Some(c) => Some(c),
-                None => bail!(
-                    "block file {} is encrypted but no key was supplied",
-                    path.as_ref().display()
-                ),
+                None => bail!("block file is encrypted but no key was supplied"),
             }
         } else {
             None
         };
 
         let mut footer = [0u8; FOOTER_LEN as usize];
-        file.read_exact_at(&mut footer, len - FOOTER_LEN)?;
+        src.read_exact_at(&mut footer, len - FOOTER_LEN)?;
         let mut fr = &footer[..];
         let dir_offset = fr.read_u64::<LittleEndian>()?;
         let dir_len = fr.read_u64::<LittleEndian>()?;
         let block_count = fr.read_u64::<LittleEndian>()?;
 
         let mut dir_bytes = vec![0u8; dir_len as usize];
-        file.read_exact_at(&mut dir_bytes, dir_offset)?;
+        src.read_exact_at(&mut dir_bytes, dir_offset)?;
         let mut dr = &dir_bytes[..];
         let mut dir = Vec::with_capacity(block_count as usize);
         let mut block_start = Vec::with_capacity(block_count as usize + 1);
@@ -406,7 +413,7 @@ impl BlockFileReader {
         }
         block_start.push(acc);
         Ok(Self {
-            file,
+            src,
             dir,
             block_start,
             cipher,
@@ -448,6 +455,17 @@ impl BlockFileReader {
         self.read_record(loc)
     }
 
+    /// Decrypt-then-decompress a block's stored (on-disk) bytes into its raw form.
+    /// An encrypted file's stored bytes are the compressed block sealed with the
+    /// AEAD, so we unseal before inflating.
+    fn decode_stored(&self, e: &DirEntry, stored: Vec<u8>) -> Result<Vec<u8>> {
+        let comp = match (&self.cipher, &e.nonce) {
+            (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
+            _ => stored,
+        };
+        codec::decompress(&comp, e.raw_len as usize)
+    }
+
     /// Read and decompress a whole block by id.
     pub fn read_block(&self, block: BlockId) -> Result<Vec<u8>> {
         let e = self
@@ -455,15 +473,8 @@ impl BlockFileReader {
             .get(block.index())
             .with_context(|| format!("block {} out of range", block.0))?;
         let mut stored = vec![0u8; e.comp_len as usize];
-        self.file.read_exact_at(&mut stored, e.offset)?;
-        // Decrypt-before-decompress on a (cache) miss: an encrypted file's bytes
-        // are sealed compressed blocks. The cache above us keeps the plaintext
-        // decompressed result, so this AEAD pass runs once per cold block.
-        let comp = match (&self.cipher, &e.nonce) {
-            (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
-            _ => stored,
-        };
-        codec::decompress(&comp, e.raw_len as usize)
+        self.src.read_exact_at(&mut stored, e.offset)?;
+        self.decode_stored(e, stored)
     }
 
     /// Read a single record by location (decompresses its block, copies the slot).
@@ -483,6 +494,38 @@ impl BlockFileReader {
         Ok(data[start..end].to_vec())
     }
 
+    /// Read-ahead window: how many blocks a whole-file scan fetches concurrently.
+    /// Over a remote backend this many round-trips overlap; resident memory is
+    /// bounded to this many blocks (not the whole object), so a large store does
+    /// not balloon RSS. On a local file the batch reads serially (no benefit, no
+    /// harm). 16 hides typical S3 RTT without an aggressive preload.
+    const SCAN_READAHEAD: usize = 16;
+
+    /// Visit every block once, in ascending order, decompressed exactly once,
+    /// using a bounded concurrent read-ahead so a remote backend overlaps its
+    /// fetch round-trips. `f` receives `(block_index, raw_block_bytes)`.
+    pub fn for_each_block(&self, mut f: impl FnMut(usize, &[u8]) -> Result<()>) -> Result<()> {
+        let n = self.dir.len();
+        let mut bi = 0;
+        while bi < n {
+            let hi = (bi + Self::SCAN_READAHEAD).min(n);
+            // Fetch this window's stored bytes — concurrently on a remote backend
+            // (overlapping RTTs), serially on a local file.
+            let ranges: Vec<(u64, u64)> = self.dir[bi..hi]
+                .iter()
+                .map(|e| (e.offset, e.comp_len as u64))
+                .collect();
+            let stored_batch = self.src.read_ranges(&ranges)?;
+            for (k, stored) in stored_batch.into_iter().enumerate() {
+                let idx = bi + k;
+                let raw = self.decode_stored(&self.dir[idx], stored)?;
+                f(idx, &raw)?;
+            }
+            bi = hi;
+        }
+        Ok(())
+    }
+
     /// Visit every record once, in ascending global order, decompressing each
     /// block a single time. `f` borrows each record (no per-record allocation).
     ///
@@ -490,18 +533,21 @@ impl BlockFileReader {
     /// postings at generation open). The per-record [`read_record_global`] path
     /// re-decompresses a record's *entire* block on every call, so scanning all
     /// N records that way does O(records-per-block) redundant zstd work per
-    /// block — quadratic-feeling on a large store. This pass is O(total bytes).
+    /// block — quadratic-feeling on a large store. This pass is O(total bytes)
+    /// and uses a bounded concurrent read-ahead (see [`for_each_block`]) so a
+    /// remote backend overlaps its fetch round-trips.
+    ///
+    /// [`for_each_block`]: BlockFileReader::for_each_block
     pub fn for_each_record(&self, mut f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
-        for bi in 0..self.dir.len() {
-            let raw = self.read_block(BlockId(bi as u32))?;
-            let (offsets, data) = parse_block(&raw)?;
+        self.for_each_block(|bi, raw| {
+            let (offsets, data) = parse_block(raw)?;
             let start = self.block_start[bi];
             for slot in 0..self.dir[bi].rec_count {
                 let rec = record_from_block(&offsets, data, slot)?;
                 f(start + slot as u64, rec)?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 

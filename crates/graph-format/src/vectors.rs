@@ -114,8 +114,17 @@ impl VectorStoreReader {
         path: impl AsRef<Path>,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
+        let src = Arc::new(crate::store::fs::FileObject::open(path)?);
+        Self::open_src(src, cipher)
+    }
+
+    /// Open from any positional-read source (local file or remote object).
+    pub fn open_src(
+        src: Arc<dyn crate::store::RandomReadAt>,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: BlockFileReader::open_with_cipher(path, cipher)?,
+            inner: BlockFileReader::open_src(src, cipher)?,
         })
     }
 
