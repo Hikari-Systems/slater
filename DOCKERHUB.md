@@ -176,7 +176,15 @@ So these are equivalent ways to set the block-cache budget:
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `dataDir` | `dataDir` | `/data` | Root dir of generations (`<graph>/<uuid>/`). |
+| `dataDir` | `dataDir` | `/data` | Root dir of generations (`<graph>/<uuid>/`); the `fs` backend reads from here. |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local `/data`) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket (required when `kind=s3`). |
+| `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ from the environment. |
+| `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint for an S3-compatible store (MinIO/localstack). |
+| `dataBackend.s3.prefix` | `dataBackend__s3__prefix` | _(empty)_ | Key prefix under which generations live in the bucket. |
+| `dataBackend.s3.pathStyle` | `dataBackend__s3__pathStyle` | `false` | Path-style addressing; required by most S3-compatible servers. |
+| `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Local-disk block cache budget (second tier). `0` = off; when set, also set `diskCacheDir`. |
+| `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Writable dir for the disk cache — a **real volume, not `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |
 | `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
 | `server.port` | `server__port` | `7687` | Bolt port. |
@@ -225,6 +233,80 @@ vector_cache_…    result_cache_…
 
 High `misses`/`evictions` on one pool while another sits idle means it's time to
 rebalance the budgets.
+
+---
+
+## Storage backends (filesystem / S3)
+
+Slater serves the **same** immutable generation byte-format from either local
+storage or an object store — only `dataBackend.kind` changes, never the data.
+
+- **`fs` (default)** — generations live under `/data` (the mounted volume). This
+  is the right choice for almost everyone: build a generation, mount it
+  read-only, serve it. Nothing else to configure.
+- **`s3`** — generations live in an **S3 (or S3-compatible: MinIO/localstack)
+  bucket**; the image already ships with S3 support, so this is config-only.
+  Integrity is checked from S3's server-computed SHA-256 via a metadata request
+  (no body download). Credentials come from the standard AWS chain — pass
+  `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (or use an instance role).
+
+**Use S3 when** you want generations in durable, central object storage that many
+stateless, disk-less server replicas can all read — publish once, fan out — or to
+decouple the build host from the serve hosts. The cost is latency: a cold block
+is a network round-trip instead of a local read. The in-memory caches hide most
+of it; the **local-disk block cache** below hides the rest. If your data already
+sits on a fast local/NFS/EBS volume, `fs` is simpler and faster.
+
+```bash
+docker run -d --name slater-s3 -p 7687:7687 \
+  -v "$PWD/acl.json:/config/acl.json:ro" \
+  -e dataBackend__kind=s3 \
+  -e dataBackend__s3__bucket=slater \
+  -e dataBackend__s3__region=eu-west-2 \
+  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
+  hikarisystems/slater:latest
+```
+
+### Local-disk block cache (S3 second tier)
+
+Optional, opt-in: set `dataBackend.s3.diskCacheBytes > 0` and mount a **writable
+volume** for `diskCacheDir`. A block evicted from the in-memory cache is then
+served from local SSD (~0.1 ms) instead of a fresh S3 GET — so an S3-backed node
+performs close to a local one once warm, and your S3 request count/cost drops.
+It caches the bytes exactly as fetched (still compressed and, for encrypted
+generations, still sealed — it never holds the key), writes them behind the query
+on a background thread, evicts to stay within budget, and self-heals a corrupt
+cache file with a checksum verified on every read.
+
+> **Must be a real writable volume, never `tmpfs`.** tmpfs is RAM and would break
+> the bounded-memory guarantee. Size the cache **≫ `blockCacheBytes`**.
+
+```bash
+docker run -d --name slater-s3 -p 7687:7687 \
+  -v "$PWD/acl.json:/config/acl.json:ro" \
+  -v slater-s3-cache:/var/cache/slater \
+  -e dataBackend__kind=s3 \
+  -e dataBackend__s3__bucket=slater \
+  -e dataBackend__s3__region=eu-west-2 \
+  -e dataBackend__s3__diskCacheBytes=10737418240 \
+  -e dataBackend__s3__diskCacheDir=/var/cache/slater \
+  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
+  hikarisystems/slater:latest
+```
+
+### Publishing a generation to S3
+
+`slater-build` writes to `--data-dir` first, then optionally uploads to a bucket
+(the remote `current` pointer is written last, so a serving node never sees a
+half-published generation):
+
+```bash
+docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
+  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
+  --entrypoint /app/slater-build hikarisystems/slater:latest \
+  --input /dumps/people.cypher --graph people --data-dir /data \
+  --publish-s3-bucket slater --publish-s3-region eu-west-2
+```
 
 ---
 

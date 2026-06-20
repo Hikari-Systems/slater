@@ -298,6 +298,83 @@ at build time by the `--ann-threshold` (default 50 000 vectors):
     read from disk. That resident PQ set is what the `cache.vectorCacheBytes` pool
     pins.
 
+## Storage backends (filesystem / S3)
+
+Every generation file is opened through an **`ObjectStore`** abstraction rather
+than `std::fs` directly, so the *same* on-disk byte format — blocks, indexes,
+manifest, `current` pointer — can be served from different storage without
+changing the readers, the query engine, or the integrity checks. Only *where the
+bytes come from* differs. The hot path is positional reads (`read_exact_at`),
+which map onto a `pread` on a local file and an HTTP `Range` GET on an object
+store; Slater never mmaps, so the explicit, bounded-read model is identical
+across backends. The backend is selected by `dataBackend.kind`:
+
+* **`fs` (default) — local filesystem**, rooted at `dataDir`. This is the right
+  choice for the overwhelming majority of deployments: a generation on a local
+  SSD (or an NFS/EBS mount) served read-only. Integrity is a BLAKE3 re-hash of
+  every file at open.
+
+* **`s3` — an S3 (or S3-compatible: MinIO, localstack) bucket.** Generation files
+  are objects under a key prefix; the readers' positional reads become `Range`
+  GETs. The published image is built with the `s3` feature, so this needs no
+  custom build — just configuration. Integrity is verified from S3's
+  **server-computed SHA-256 object checksum** via a metadata `HEAD` (no body
+  read): `slater-build` sends each object's SHA-256 on upload (S3 validates and
+  stores it), and the server reads it back at open and compares it to the
+  manifest. Credentials come from the standard AWS chain (env / profile /
+  instance role).
+
+**When is S3 appropriate?** Reach for it when you want generations to live in
+durable, central object storage rather than on a node's disk — typically:
+publish once and fan out to many stateless, disk-less server replicas that all
+read the same bucket; decouple the build host from the serve hosts; or lean on
+S3's durability/versioning/lifecycle instead of managing volumes. The trade-off
+is latency: a cold block is a network round-trip (~10–50 ms) instead of a local
+read (~0.1 ms). Slater hides much of this with the in-memory block cache and
+concurrent read-ahead, **and** with the optional disk cache below — but if your
+generations already sit on fast local storage and you don't need the
+central-bucket model, `fs` is simpler and faster. The byte format is identical,
+so you can switch backends without rebuilding a generation.
+
+### S3 local-disk block cache (second tier)
+
+The in-memory `BlockCache` is deliberately small (bounded RSS is the headline
+guarantee), so on a working set larger than RAM the same blocks would be
+re-fetched from S3 on every spill. An **optional local-SSD second cache tier**
+fixes that: a block evicted from RAM is served from local disk (~0.1 ms) instead
+of a fresh S3 GET, surviving in-memory eviction and cutting S3 request
+count/cost — bringing an S3-backed node close to local-filesystem performance
+once warm. It is **opt-in** for the `s3` backend, enabled by setting
+`dataBackend.s3.diskCacheBytes > 0` and a writable `diskCacheDir`.
+
+* It caches the **sealed** S3 bytes exactly as fetched — already compressed, and
+  (for `--encrypt` generations) still AEAD-sealed — *below* decrypt/decompress.
+  The cache layer never holds the encryption key and never re-encrypts, so
+  at-rest status is preserved for free: an encrypted generation lands on disk
+  still sealed.
+* Writes are **write-behind**: a miss returns the S3 bytes to the query
+  immediately, then a background thread does the disk write and LRU trim, so the
+  query path never blocks on disk I/O. Eviction keeps the cache within its byte
+  budget; a per-file checksum verified on every read self-heals a corrupt cache
+  file to a miss (→ S3 refetch).
+* `diskCacheDir` **must point at a real writable volume — never `tmpfs`** (tmpfs
+  is RAM and would defeat the bounded-RSS guarantee). The in-memory index that
+  tracks it costs a little RAM (~tens of bytes per cached block), which counts
+  against your RSS ceiling — size the directory ≫ the in-memory block cache.
+
+### Publishing to S3
+
+`slater-build` always writes the finished generation to `--data-dir` first (its
+local staging area), and can **additionally** upload it to a bucket with the
+`--publish-s3-*` flags — the remote `current` pointer is written last, so a
+serving node never sees a half-published generation:
+
+```sh
+slater-build --input people.cypher --graph people --data-dir /data \
+  --publish-s3-bucket slater --publish-s3-region eu-west-2 \
+  --publish-s3-prefix prod            # add --publish-s3-endpoint / --publish-s3-path-style for MinIO
+```
+
 ## Mounts
 
 The container runs with a **read-only root filesystem** and a non-root user
@@ -307,7 +384,8 @@ The container runs with a **read-only root filesystem** and a non-root user
 | --- | --- | --- |
 | `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | **Read-only**; produced by `slater-build`. May live on remote/network storage (e.g. NFS), so reads are not assumed to be fast local-SSD latencies. |
 | `/sandbox` | Per-environment config overlay + secrets. | `/sandbox/config.json` is deep-merged over the baked-in `config.json`; also holds `acl.json`, TLS PEM material, the at-rest key file. |
-| `/tmp`, `/run` | Scratch (`tmpfs`). | Slater itself never writes to disk. |
+| `/tmp`, `/run` | Scratch (`tmpfs`). | Slater itself never writes to disk by default. |
+| _(optional)_ disk cache | The S3 local-disk block cache, when `dataBackend.s3.diskCacheBytes > 0`. | **Writable**, and a **real volume — not `tmpfs`**. Only used by the `s3` backend; see [Storage backends](#storage-backends-filesystem--s3). |
 
 ## Environment / configuration
 
@@ -326,7 +404,16 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `server.maxMessageBytes` | `server__maxMessageBytes` | 67108864 | Largest Bolt message accepted from an **authenticated** reader (64 MiB). |
 | `server.loginTimeoutMs` | `server__loginTimeoutMs` | 10000 | Deadline for an unauthenticated peer to finish handshake → `LOGON` (0 ⇒ none); closes the slow-loris a byte cap alone leaves open. |
 | `server.idleTimeoutMs` | `server__idleTimeoutMs` | 0 | Idle read timeout for an **authenticated** connection (0 ⇒ none, the default — pooled drivers legitimately hold idle connections). |
-| `dataDir` | `dataDir` | `/data` | Root holding `<graph>/<generation>/`. |
+| `dataDir` | `dataDir` | `/data` | Root holding `<graph>/<generation>/` (the `fs` backend, and the local staging area for `slater-build`). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open (a cheap metadata check on every backend). |
+| `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket name (required when `kind=s3`). |
+| `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ resolved from the environment. |
+| `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint URL for an S3-compatible store (MinIO, localstack); empty ⇒ standard AWS endpoint. |
+| `dataBackend.s3.prefix` | `dataBackend__s3__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
+| `dataBackend.s3.pathStyle` | `dataBackend__s3__pathStyle` | `false` | Path-style addressing (`endpoint/bucket/key`); required by most S3-compatible servers. |
+| `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index counts against the RSS ceiling. |
+| `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Directory for the disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
 | `requireAclStamp` | `requireAclStamp` | `true` | Refuse a generation with no `aclBlake3` stamp (closes the stamp-strip downgrade); build images with `--acl`. A generation with no manifest MAC is always refused when a master key is configured — that check has no off switch. |
 | `cache.blockCacheBytes` | `cache__blockCacheBytes` | 64 MiB | Decompressed block LRU budget. |
