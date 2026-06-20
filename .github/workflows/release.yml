@@ -126,9 +126,16 @@ jobs:
       # target (what we build and ship) so it compiles and actually fuzzes.
       - name: Fuzz ${{ matrix.target }}
         run: |
+          # `-malloc_limit_mb` is the real guard: it fails on any *single*
+          # allocation over the limit — the unbounded-allocation DoS class we
+          # actually care about in these decoders. `-rss_limit_mb` is the total
+          # process RSS and must sit *above* libFuzzer's own footprint (the
+          # warm-started corpus + coverage tables grow over a multi-minute run),
+          # or it false-positives as an OOM a few MB over the line. Keep the
+          # single-allocation guard at 2 GiB; give total RSS 4 GiB of headroom.
           cargo +nightly fuzz run "${{ matrix.target }}" \
             --target x86_64-unknown-linux-gnu -- \
-            -max_total_time=300 -rss_limit_mb=2048 -max_len=65536
+            -max_total_time=300 -malloc_limit_mb=2048 -rss_limit_mb=4096 -max_len=65536
 
       # On a crash, libFuzzer writes a reproducer under fuzz/artifacts — keep it.
       - name: Upload crash artifacts

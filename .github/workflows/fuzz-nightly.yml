@@ -78,9 +78,14 @@ jobs:
       # target for musl, which the minimal nightly toolchain has no std for.
       - name: Fuzz ${{ matrix.target }}
         run: |
+          # See release.yml: `-malloc_limit_mb` catches a single oversized
+          # allocation (the real bug); `-rss_limit_mb` must sit above libFuzzer's
+          # own corpus/coverage footprint or it false-positives as an OOM. The
+          # 15-minute nightly run accumulates more corpus, so give it the same
+          # 4 GiB total-RSS headroom over the 2 GiB single-allocation guard.
           cargo +nightly fuzz run "${{ matrix.target }}" \
             --target x86_64-unknown-linux-gnu -- \
-            -max_total_time=900 -rss_limit_mb=2048 -max_len=65536
+            -max_total_time=900 -malloc_limit_mb=2048 -rss_limit_mb=4096 -max_len=65536
 
       # Minimise to a coverage-equivalent set so the cached corpus stays small and
       # the next run starts fast. continue-on-error: a cmin hiccup (e.g. replaying
