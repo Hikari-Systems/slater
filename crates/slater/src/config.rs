@@ -138,6 +138,17 @@ pub struct AppConfig {
     pub query: QueryConfig,
     #[serde(default)]
     pub vector_query: VectorQueryConfig,
+    /// Cypher query run once at boot against every served graph, with its results
+    /// discarded. Its only effect is to fault the blocks needed to answer it into
+    /// the block (and vector) cache, so the first real client query of that shape
+    /// is served warm rather than paying the cold-read penalty. Empty (default)
+    /// disables warming. A parse error is logged and warming is skipped (a bad
+    /// warming query must never take the server down); a per-graph execution error
+    /// is likewise logged and that graph skipped, since the query need not be valid
+    /// against every graph's schema. The configured `query.*` limits and
+    /// `query.timeoutMs` apply, so a warming run is bounded exactly like a real query.
+    #[serde(default)]
+    pub cache_warming_query: String,
     /// Enable load-test diagnostics: maintain extra per-connection / per-query
     /// counters and a latency histogram, and answer `CALL slater.diagnostics()`
     /// with live RSS/CPU/cgroup, connection-cap headroom, and failure tallies.

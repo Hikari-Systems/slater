@@ -430,6 +430,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | 64 | Vamana beam-search list size. |
 | `generationPollMs` | `generationPollMs` | 5000 | How often to poll each graph's `current`. |
 | `reloadStrategy` | `reloadStrategy` | `exit` | `exit` or `swap` on a generation change. |
+| `cacheWarmingQuery` | `cacheWarmingQuery` | _(empty)_ | Cypher query run once at boot against every served graph, results discarded — faults the blocks needed to answer it into the block/vector cache so the first matching client query is served warm. Empty ⇒ disabled. A parse error is logged and warming is skipped; a per-graph execution error is logged and that graph skipped (the query need not be valid against every graph). Bounded by the same `query.*` limits and `query.timeoutMs` as a real query. |
 
 **Resident memory** is approximately
 `blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead,

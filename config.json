@@ -50,5 +50,6 @@
   },
   "generationPollMs": 5000,
   "reloadStrategy": "exit",
+  "cacheWarmingQuery": "",
   "loadTestDiagnostics": false
 }

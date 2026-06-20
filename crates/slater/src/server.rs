@@ -1513,7 +1513,92 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     // the cache TTL above.
     spawn_allocator_trim(ctx.diag.clone());
 
+    // Warm the block/vector cache by running the configured query and discarding
+    // its results, before we accept any connection — so the first real client
+    // query of that shape is served from a warm cache.
+    warm_cache(&cfg.cache_warming_query, &ctx).await;
+
     accept_loop(listener, ctx, tls, conn_limit, shutdown_rx).await
+}
+
+/// Run the configured cache-warming query against every served graph and throw
+/// the rows away — the read pulls the blocks it touches into the caches so the
+/// first matching client query is warm. No-op when `cacheWarmingQuery` is empty.
+///
+/// A parse error is logged and warming skipped — a fat-fingered warming query is
+/// never a reason to take the server down, warming is a pure optimisation. A
+/// per-graph execution error is likewise logged and skipped: the same string is
+/// run against every graph and need not be valid against each one's schema. The
+/// query is bounded by the same `query.*` limits and timeout a real client query
+/// gets, so warming can never run unbounded.
+async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
+    let query = warming_query.trim();
+    if query.is_empty() {
+        return;
+    }
+    let ast = match parser::parse(query) {
+        Ok(ast) => Arc::new(ast),
+        Err(e) => {
+            // Don't abort boot for a bad warming query — log it and serve cold.
+            error!(error = %e, "cache-warming query failed to parse; skipping warm-up");
+            return;
+        }
+    };
+
+    let generations = ctx.graphs.current_generations();
+    let cache = ctx.cache.clone();
+    let vector_cache = ctx.vector_cache.clone();
+    let beam_width = ctx.beam_width;
+    let max_rows = ctx.max_rows;
+    let max_intermediate = ctx.max_intermediate;
+    let max_scan = ctx.max_scan;
+    let intermediate_budget = ctx.intermediate_budget.clone();
+    let max_shortest_path_explore = ctx.max_shortest_path_explore;
+    let fanout_pool = ctx.fanout_pool.clone();
+    let timeout_ms = ctx.timeout_ms;
+
+    // Execution is blocking and CPU-bound — keep it off the async runtime.
+    let started = Instant::now();
+    let _ = tokio::task::spawn_blocking(move || {
+        for gen in generations {
+            let g_start = Instant::now();
+            let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
+                .with_vector_cache(vector_cache.as_ref(), beam_width)
+                .with_max_rows(max_rows)
+                .with_max_intermediate(max_intermediate)
+                .with_max_scan(max_scan)
+                .with_global_budget(intermediate_budget.as_ref())
+                .with_max_shortest_path_explore(max_shortest_path_explore)
+                .with_fanout_pool(fanout_pool.clone());
+            if timeout_ms > 0 {
+                engine = engine.with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+            }
+            match engine.run(&ast) {
+                Ok(result) => {
+                    info!(
+                        graph = gen.graph(),
+                        rows = result.rows.len(),
+                        ms = g_start.elapsed().as_millis() as u64,
+                        "cache-warming query completed"
+                    );
+                    // Results discarded — the side effect (warm cache) is the point.
+                    drop(result);
+                }
+                Err(e) => {
+                    warn!(
+                        graph = gen.graph(),
+                        error = %e,
+                        "cache-warming query failed for graph; skipping it"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+    info!(
+        ms = started.elapsed().as_millis() as u64,
+        "cache warm-up finished"
+    );
 }
 
 /// The connection accept loop: reserve a global slot, accept, apply the per-source
@@ -3040,6 +3125,45 @@ mod tests {
             .await
             .is_ok());
         assert!(sess.tx_graph.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_cache_pulls_blocks_into_a_cold_cache() {
+        let (root, ctx) = build_ctx("warm_cache_warms");
+        // A fresh block cache holds nothing until something reads.
+        assert_eq!(ctx.cache.bytes(), 0, "cache should start cold");
+        warm_cache("MATCH (n:Person) RETURN n.name", &ctx).await;
+        assert!(
+            ctx.cache.bytes() > 0,
+            "warming query should have faulted blocks into the cache"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn warm_cache_is_a_noop_when_unset() {
+        let (root, ctx) = build_ctx("warm_cache_noop");
+        // Empty and whitespace-only both mean "disabled" — neither touches the cache.
+        warm_cache("", &ctx).await;
+        warm_cache("   \n  ", &ctx).await;
+        assert_eq!(
+            ctx.cache.bytes(),
+            0,
+            "an unset warming query must not read anything"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn warm_cache_survives_a_bad_query() {
+        let (root, ctx) = build_ctx("warm_cache_bad");
+        // A parse error must not panic or abort — it logs and leaves the cache cold.
+        warm_cache("THIS IS NOT CYPHER", &ctx).await;
+        assert_eq!(ctx.cache.bytes(), 0, "a bad warming query warms nothing");
+        // A syntactically valid query against a label that does not exist executes
+        // (and warms whatever it scans) without taking the server down.
+        warm_cache("MATCH (n:NoSuchLabel) RETURN n", &ctx).await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Spawn the connection handler over a fresh loopback listener, returning the

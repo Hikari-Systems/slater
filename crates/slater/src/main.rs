@@ -12,10 +12,13 @@
 //! and hand off to [`slater::server::serve`].
 
 use anyhow::Context;
-use slater::{acl, config, health, server};
+use slater::{acl, config, health, help, server};
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    // `--help`/`help` runs before any config load so it works with no config file
+    // present, and lists the subcommands + config knobs the server has no flags for.
+    help::help_subcommand();
     // Stdlib-only subcommands run before anything else and without the async
     // runtime, mirroring the house pattern. `hash-password` mints an argon2id
     // hash for the ACL and exits; the health probe speaks Bolt (not HTTP, unlike

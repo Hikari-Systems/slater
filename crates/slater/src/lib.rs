@@ -23,6 +23,7 @@ pub mod diag;
 pub mod exec;
 pub mod generation;
 pub mod health;
+pub mod help;
 pub mod introspect;
 pub mod parser;
 pub mod plan;

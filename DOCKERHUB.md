@@ -198,6 +198,7 @@ So these are equivalent ways to set the block-cache budget:
 | `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | `64` | Vamana beam-search width. |
 | `generationPollMs` | `generationPollMs` | `5000` | How often to poll each graph's `current` pointer. |
 | `reloadStrategy` | `reloadStrategy` | `exit` | On a generation change: `exit` (let the orchestrator restart) or `swap` (hot-swap in place). |
+| `cacheWarmingQuery` | `cacheWarmingQuery` | _(empty)_ | Cypher query run once at boot against every served graph, results discarded — pre-faults the blocks it touches into the caches so the first matching client query is warm. Empty = off. Bounded by the same `query.*` limits/timeout as a real query. |
 | `log.level` | `log__level` | `info` | Log level. |
 
 Example — a memory-tight server with a 10-minute idle TTL:
