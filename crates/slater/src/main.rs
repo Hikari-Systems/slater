@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     info!(
         bind = %cfg.server.bind,
         port = cfg.server.port,
-        data_dir = %cfg.data_dir,
+        data_dir = %cfg.data_dir(),
         tls = cfg.tls.enabled(),
         "starting slater (read-only Bolt graph engine)"
     );

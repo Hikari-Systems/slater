@@ -84,7 +84,7 @@ blocks the release). It found and closed the pre-auth allocation OOM noted above
   and the last-good ACL kept. The legitimate path to change access is to rebuild and
   publish a stamped generation. (`requireAclStamp`, default on.)
 - **Key-location tripwire:** the server refuses to start if the at-rest key file resolves
-  inside the (attacker-writable) `dataDir`.
+  inside the (attacker-writable) `dataBackend.fs.dir`.
 
 See `THREAT_MODEL.md` "Trust boundary" for what these protections assume.
 

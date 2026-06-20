@@ -298,7 +298,7 @@ fn build_config(root: &Path, acl_path: &Path) -> slater::config::AppConfig {
     // the store, and the generation poll is slow so the guard never fires mid-test.
     let value = serde_json::json!({
         "server": { "bind": "127.0.0.1", "port": 0 },
-        "dataDir": root.to_str().unwrap(),
+        "dataBackend": { "kind": "fs", "fs": { "dir": root.to_str().unwrap() } },
         "aclPath": acl_path.to_str().unwrap(),
         // The fixture is built unstamped on purpose — this test exercises the
         // memory headline, not manifest authentication (requireAclStamp defaults

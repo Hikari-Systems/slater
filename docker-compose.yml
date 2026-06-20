@@ -32,7 +32,7 @@ services:
       # baked-in config.json supplies the defaults.
       server__bind: '0.0.0.0'
       server__port: '7687'
-      dataDir: '/data'
+      dataBackend__fs__dir: '/data'   # root of the local `fs` storage backend
       aclPath: '/sandbox/acl.json'
       # Bounded resident memory — the headline guarantee. Resident ≈ these three
       # budgets + a small fixed overhead, independent of graph size.

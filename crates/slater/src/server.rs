@@ -1314,7 +1314,7 @@ pub async fn serve(cfg: AppConfig) -> Result<()> {
 /// binary to be built with the `s3` cargo feature.
 fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
     match cfg.data_backend.kind.as_str() {
-        "fs" | "" => Ok(Arc::new(FsObjectStore::new(&cfg.data_dir))),
+        "fs" | "" => Ok(Arc::new(FsObjectStore::new(cfg.data_dir()))),
         "s3" => {
             #[cfg(feature = "s3")]
             {
@@ -1374,7 +1374,7 @@ fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
 pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Result<()> {
     let acl = Arc::new(AclHandle::load(&cfg.acl_path).context("load ACL")?);
     cfg.encryption
-        .check_key_file_outside_data_dir(&cfg.data_dir)
+        .check_key_file_outside_data_dir(cfg.data_dir())
         .context("validate at-rest encryption key location")?;
     let master_key = cfg
         .encryption
@@ -1389,7 +1389,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         .context("manifest authentication policy")?;
     let graphs = Arc::new(graphs);
     if graphs.is_empty() {
-        warn!(data_dir = %cfg.data_dir, "no graphs found to serve");
+        warn!(data_dir = %cfg.data_dir(), "no graphs found to serve");
     }
     let cache = Arc::new(BlockCache::new(cfg.cache.block_cache_bytes));
     let result_cache = Arc::new(ResultCache::new(cfg.cache.result_cache_bytes));

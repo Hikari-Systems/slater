@@ -109,12 +109,9 @@ pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub log: LogConfig,
-    /// Root directory holding `<graph>/<generation>/` images and `current` pointers.
-    /// Used as the root for the `fs` storage backend (see [`DataBackendConfig`]).
-    #[serde(default = "default_data_dir")]
-    pub data_dir: String,
-    /// Where generations are read from: the local filesystem (`fs`, default) or an
-    /// object store (`s3`). The on-disk byte format is identical across backends.
+    /// Where generations are read from: the local filesystem (`fs`, default,
+    /// rooted at `dataBackend.fs.dir`) or an object store (`s3`). The on-disk byte
+    /// format is identical across backends.
     #[serde(default)]
     pub data_backend: DataBackendConfig,
     #[serde(default)]
@@ -161,6 +158,16 @@ pub struct AppConfig {
     /// `db` field — slater never silently serves a graph the client did not name.
     #[serde(default)]
     pub default_graph: String,
+}
+
+impl AppConfig {
+    /// Root directory of the local `fs` storage backend (`dataBackend.fs.dir`).
+    /// Also the local area the at-rest key file must stay outside of, and the
+    /// staging root regardless of which backend serves — kept behind an accessor
+    /// so the many call sites read one canonical place.
+    pub fn data_dir(&self) -> &str {
+        &self.data_backend.fs.dir
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,7 +263,7 @@ impl TlsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataBackendConfig {
-    /// `fs` (local filesystem rooted at `data_dir`, the default) or `s3`.
+    /// `fs` (local filesystem rooted at `fs.dir`, the default) or `s3`.
     #[serde(default = "default_backend_kind")]
     pub kind: String,
     /// Verify each generation file against the manifest at open (the
@@ -267,6 +274,9 @@ pub struct DataBackendConfig {
     /// skip it entirely (the manifest MAC + per-block AEAD still apply).
     #[serde(default)]
     pub verify_integrity: Option<bool>,
+    /// Local-filesystem backend settings (used when `kind = "fs"`).
+    #[serde(default)]
+    pub fs: FsBackendConfig,
     /// S3 connection settings (used when `kind = "s3"`).
     #[serde(default)]
     pub s3: S3BackendConfig,
@@ -277,7 +287,29 @@ impl Default for DataBackendConfig {
         Self {
             kind: default_backend_kind(),
             verify_integrity: None,
+            fs: FsBackendConfig::default(),
             s3: S3BackendConfig::default(),
+        }
+    }
+}
+
+/// Local-filesystem backend settings: the symmetric `fs` counterpart to
+/// [`S3BackendConfig`], so the root directory lives under `dataBackend` like the
+/// bucket/prefix do — not at the top level.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsBackendConfig {
+    /// Root directory holding `<graph>/<generation>/` images and `current`
+    /// pointers. The `fs` backend serves from here; it is also the local area the
+    /// at-rest key file must stay outside of.
+    #[serde(default = "default_data_dir")]
+    pub dir: String,
+}
+
+impl Default for FsBackendConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_data_dir(),
         }
     }
 }

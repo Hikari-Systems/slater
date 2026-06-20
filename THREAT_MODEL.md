@@ -15,7 +15,7 @@ offline by `slater-build` and published to a data directory the `slater` server 
 - **The at-rest master key** — supplied to both `slater-build` and `slater` out of band (an
   env var or a mounted secret file). It is **never** written into the data directory.
 - **The server configuration** — `config.json`, the `/sandbox` overlay deep-merged over it,
-  and the process environment, which together set `dataDir`, `aclPath`, the
+  and the process environment, which together set `dataBackend.fs.dir`, `aclPath`, the
   `encryption.keyFile`/`keyEnv` that *name where the master key is read from*, and the
   security flags. This surface is **trusted** (part of the TCB) — see "Trust boundary" below.
 
@@ -206,7 +206,7 @@ the real key:
 No MAC hardening can close this: the MAC only ever proves "built by someone who knew the
 configured key", and here the attacker *chose* the configured key. The same config-write access
 is independently fatal by other routes — repoint `aclPath` at a permissive ACL, repoint
-`dataDir` at staged data, or drop the key reference to disable verification — so **config-write
+`dataBackend.fs.dir` at staged data, or drop the key reference to disable verification — so **config-write
 is equivalent to full compromise** and is out of scope for the at-rest model. (The substitution
 requires a server **restart**: the key is read once at boot and retained across generation swaps,
 so a running server does not pick up an edited `keyFile` until it restarts — an attacker who can
@@ -227,7 +227,7 @@ they are deployment obligations:
 - **Place the master key outside every attacker-writable path.** `keyFile` must point at a
   location the data-publishing principal cannot write (ideally a mounted secret with `0400`,
   owned by the server user). As a tripwire, the server **refuses to start** if `keyFile`
-  resolves *inside* `dataDir` (`EncryptionConfig::check_key_file_outside_data_dir`). This is
+  resolves *inside* `dataBackend.fs.dir` (`EncryptionConfig::check_key_file_outside_data_dir`). This is
   defence-in-depth, not a complete defence — it does not catch a `keyFile` pointing at some
   *other* writable path (e.g. `/tmp`); only the isolation above does.
 - **Restrict the data directory** to the publishing principal and the server user, so the

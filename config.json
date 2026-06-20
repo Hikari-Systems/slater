@@ -13,7 +13,12 @@
   "log": {
     "level": "info"
   },
-  "dataDir": "/data",
+  "dataBackend": {
+    "kind": "fs",
+    "fs": {
+      "dir": "/data"
+    }
+  },
   "tls": {
     "cert": "",
     "key": ""

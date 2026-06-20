@@ -36,6 +36,7 @@ reads fast and memory bounded.
 | **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Querying with GQL](#querying-with-gql). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
+| **Pluggable storage backends** | Serve the same generation format from a local volume **or** an S3 (S3-compatible) bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of S3. See [Storage backends](#storage-backends-filesystem--s3). |
 
 ---
 
@@ -176,8 +177,8 @@ So these are equivalent ways to set the block-cache budget:
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `dataDir` | `dataDir` | `/data` | Root dir of generations (`<graph>/<uuid>/`); the `fs` backend reads from here. |
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local `/data`) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root dir of generations (`<graph>/<uuid>/`) for the `fs` backend. |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket (required when `kind=s3`). |
 | `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ from the environment. |
 | `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint for an S3-compatible store (MinIO/localstack). |
@@ -455,7 +456,9 @@ Six engines, one single-client suite, five graphs from a 62k-node toy to **Wikid
 stopped — RSS and latency are its own footprint). **slater is current `main`**; the other
 engines are the established cross-engine run (their performance is unchanged). All figures
 are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold = best in
-row.**
+row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 backend trades local-read
+latency for object-store round-trips (mitigated by the in-memory caches and the optional local-disk
+cache tier), so these figures characterise the engine, not a network-storage deployment.
 
 | engine | class | memory bound |
 |---|---|---|

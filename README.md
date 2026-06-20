@@ -53,6 +53,7 @@ Slater is built for the other half of the problem: graphs that are **mostly read
 | **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Supported GQL subset](#supported-gql-subset). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
+| **Pluggable storage backends** | Serve the same generation format from a local filesystem **or** an S3 (S3-compatible) bucket — publish once, fan out to stateless replicas — with an optional local-SSD cache tier in front of S3. See [Storage backends](#storage-backends-filesystem--s3). |
 
 Two binaries make up the workspace:
 
@@ -309,7 +310,7 @@ which map onto a `pread` on a local file and an HTTP `Range` GET on an object
 store; Slater never mmaps, so the explicit, bounded-read model is identical
 across backends. The backend is selected by `dataBackend.kind`:
 
-* **`fs` (default) — local filesystem**, rooted at `dataDir`. This is the right
+* **`fs` (default) — local filesystem**, rooted at `dataBackend.fs.dir`. This is the right
   choice for the overwhelming majority of deployments: a generation on a local
   SSD (or an NFS/EBS mount) served read-only. Integrity is a BLAKE3 re-hash of
   every file at open.
@@ -404,8 +405,8 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `server.maxMessageBytes` | `server__maxMessageBytes` | 67108864 | Largest Bolt message accepted from an **authenticated** reader (64 MiB). |
 | `server.loginTimeoutMs` | `server__loginTimeoutMs` | 10000 | Deadline for an unauthenticated peer to finish handshake → `LOGON` (0 ⇒ none); closes the slow-loris a byte cap alone leaves open. |
 | `server.idleTimeoutMs` | `server__idleTimeoutMs` | 0 | Idle read timeout for an **authenticated** connection (0 ⇒ none, the default — pooled drivers legitimately hold idle connections). |
-| `dataDir` | `dataDir` | `/data` | Root holding `<graph>/<generation>/` (the `fs` backend, and the local staging area for `slater-build`). |
 | `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root holding `<graph>/<generation>/` for the `fs` backend (and the local area the at-rest key file must stay outside of). |
 | `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open (a cheap metadata check on every backend). |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket name (required when `kind=s3`). |
 | `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ resolved from the environment. |
@@ -420,7 +421,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 64 MiB | Vector pool budget: resident brute-force kNN matrix (pre-normalised, no-gather scan) + resident PQ + Vamana-block LRU. kNN falls back to the block-cache gather path for any group that does not fit. |
 | `cache.resultCacheBytes` | `cache__resultCacheBytes` | 16 MiB | Result LRU budget. |
 | `tls.cert` / `tls.key` | `tls__cert` / `tls__key` | _(empty)_ | PEM material; both set ⇒ `bolt+s`. Empty ⇒ plaintext (loopback dev). |
-| `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataDir` and any attacker-writable path (server refuses to start if it resolves inside `dataDir`); see `THREAT_MODEL.md` "Trust boundary". |
+| `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataBackend.fs.dir` and any attacker-writable path (server refuses to start if it resolves inside it); see `THREAT_MODEL.md` "Trust boundary". |
 | `encryption.keyEnv` | `encryption__keyEnv` | _(empty)_ | Env var holding the hex at-rest master key. |
 | `query.maxRows` | `query__maxRows` | 100000 | Per-query row cap. |
 | `query.timeoutMs` | `query__timeoutMs` | 30000 | Per-query wall-clock deadline (0 ⇒ none). |
@@ -548,7 +549,7 @@ slater-build \
 Then start the server:
 
 ```sh
-slater    # looks for configuration options in ./config.json (default is dataDir ./data, port 7687)
+slater    # looks for configuration options in ./config.json (default fs dir ./data, port 7687)
 ```
 
 ### 2. Connect with the neo4j JavaScript driver
@@ -624,7 +625,9 @@ Six engines, one single-client suite, five graphs from a 62k-node toy to **Wikid
 stopped — RSS and latency are its own footprint). **slater is current `main`**; the other
 engines are the established cross-engine run (their performance is unchanged). All figures
 are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold = best in
-row.**
+row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 backend trades local-read
+latency for object-store round-trips (mitigated by the in-memory caches and the optional local-disk
+cache tier), so these figures characterise the engine, not a network-storage deployment.
 
 | engine | class | memory bound |
 |---|---|---|

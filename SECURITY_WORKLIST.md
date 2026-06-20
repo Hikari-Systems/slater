@@ -141,6 +141,6 @@ authenticated principals over Bolt).
   assets/TCB, adds a "Trust boundary" section explaining the substitution and the deployment
   mitigations required where the config/data surface is not fully trusted (read-only config mount,
   key outside every attacker-writable path, restricted data dir), and marks config-write as out of
-  scope. *Hardening:* the server refuses to start if `keyFile` resolves inside `dataDir`
+  scope. *Hardening:* the server refuses to start if `keyFile` resolves inside `dataBackend.fs.dir`
   (`EncryptionConfig::check_key_file_outside_data_dir`) — a defence-in-depth tripwire, not a
   complete defence.
