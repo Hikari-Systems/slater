@@ -312,6 +312,20 @@ pub struct S3BackendConfig {
     /// S3-compatible servers.
     #[serde(default, deserialize_with = "de::bool")]
     pub path_style: bool,
+    /// Byte budget for an optional **local-disk second cache tier** in front of
+    /// S3 (`store::diskcache`). `0` (the default) disables it. When `> 0` a
+    /// cold-from-RAM block is served from local SSD (~0.1 ms) instead of a fresh
+    /// S3 GET, surviving in-memory eviction and cutting S3 request count/cost.
+    /// `diskCacheDir` is required when this is non-zero. The in-memory LRU index
+    /// costs RAM proportional to entry count (~tens of bytes/entry), so it counts
+    /// against the configured RSS ceiling.
+    #[serde(default, deserialize_with = "de::usize")]
+    pub disk_cache_bytes: usize,
+    /// Directory for the S3 disk cache (used iff `diskCacheBytes > 0`). Must be a
+    /// **real writable volume — never tmpfs** (tmpfs is RAM and would defeat the
+    /// bounded-RSS guarantee).
+    #[serde(default)]
+    pub disk_cache_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -17,3 +17,6 @@ __pycache__/
 /client-gaps/
 
 perf/datasets
+
+# Out-of-tree build dir used to work around a stale root-owned lock in /target.
+/target-dc

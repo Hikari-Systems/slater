@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "s3")]
+pub mod diskcache;
 pub mod fs;
 pub mod mem;
 #[cfg(feature = "s3")]

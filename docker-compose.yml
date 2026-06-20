@@ -142,6 +142,13 @@ services:
       dataBackend__s3__region: 'us-east-1'
       dataBackend__s3__endpoint: 'http://minio:9000'
       dataBackend__s3__pathStyle: 'true'   # required by MinIO and most S3-compatibles
+      # Optional local-disk second cache tier: a cold-from-RAM block is served from
+      # this volume (~0.1 ms) instead of a fresh S3 GET, surviving in-memory
+      # eviction and cutting S3 request count/cost. Points at the writable named
+      # volume below — NOT the tmpfs `/tmp` (tmpfs is RAM and would break
+      # bounded-RSS). 1 GiB here for the demo; size it ≫ the RAM block cache.
+      dataBackend__s3__diskCacheBytes: '1073741824'
+      dataBackend__s3__diskCacheDir: '/var/cache/slater'
       AWS_ACCESS_KEY_ID: 'minioadmin'
       AWS_SECRET_ACCESS_KEY: 'minioadmin'
       # The demo publishes unstamped generations; relax the ACL-stamp requirement
@@ -153,6 +160,11 @@ services:
       generationPollMs: '5000'
       reloadStrategy: 'exit'
       log__level: 'info'
+    # A writable mount for the disk cache — the read-only rootfs already permits
+    # specific writable mounts; this one is a persistent named volume so the cache
+    # survives restarts (the in-memory index rebuilds cold, then re-warms).
+    volumes:
+      - 'slater-s3-cache:/var/cache/slater'
     healthcheck:
       test: ['CMD', '/app/slater', 'healthcheck']
       interval: 10s
@@ -187,3 +199,4 @@ services:
 volumes:
   slater-data:
   minio-data:
+  slater-s3-cache:

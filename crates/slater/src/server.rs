@@ -1328,7 +1328,26 @@ fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
                 };
                 let store = graph_format::store::s3::S3ObjectStore::connect(&scfg)
                     .context("connect S3 data backend")?;
-                Ok(Arc::new(store))
+                let store: Arc<dyn ObjectStore> = Arc::new(store);
+                // Optional local-disk second cache tier in front of S3.
+                if s.disk_cache_bytes > 0 {
+                    if s.disk_cache_dir.is_empty() {
+                        bail!(
+                            "dataBackend.s3.diskCacheBytes is set but diskCacheDir is empty — \
+                             a writable cache directory is required (and must not be tmpfs)"
+                        );
+                    }
+                    let cache = graph_format::store::diskcache::DiskCache::open(
+                        &s.disk_cache_dir,
+                        s.disk_cache_bytes as u64,
+                    )
+                    .context("open S3 disk cache")?;
+                    Ok(Arc::new(
+                        graph_format::store::diskcache::CachingObjectStore::new(store, cache),
+                    ))
+                } else {
+                    Ok(store)
+                }
             }
             #[cfg(not(feature = "s3"))]
             {

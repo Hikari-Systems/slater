@@ -10,9 +10,14 @@
 //! ```
 #![cfg(feature = "s3")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use anyhow::Result;
 use graph_format::integrity::sha256_base64;
+use graph_format::store::diskcache::{CachingObjectStore, DiskCache};
 use graph_format::store::s3::{S3Config, S3ObjectStore};
-use graph_format::store::{FileIntegrity, ObjectStore};
+use graph_format::store::{FileIntegrity, ObjectStore, RandomReadAt};
 
 fn config_or_skip() -> Option<S3Config> {
     let endpoint = std::env::var("SLATER_S3_TEST_ENDPOINT").ok()?;
@@ -107,4 +112,101 @@ fn s3_roundtrip_and_sha256_verify() {
     );
 
     eprintln!("S3/MinIO integration: all assertions passed");
+}
+
+/// An [`ObjectStore`] that counts positional reads reaching the inner store, so
+/// the test can prove the disk cache absorbs the warm read instead of issuing a
+/// second S3 GET.
+struct CountingStore {
+    inner: S3ObjectStore,
+    reads: Arc<AtomicUsize>,
+}
+struct CountingObj {
+    inner: Arc<dyn RandomReadAt>,
+    reads: Arc<AtomicUsize>,
+}
+impl RandomReadAt for CountingObj {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_ranges(&self, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>> {
+        self.reads.fetch_add(ranges.len(), Ordering::SeqCst);
+        self.inner.read_ranges(ranges)
+    }
+}
+impl ObjectStore for CountingStore {
+    fn open(&self, key: &str) -> Result<Arc<dyn RandomReadAt>> {
+        Ok(Arc::new(CountingObj {
+            inner: self.inner.open(key)?,
+            reads: self.reads.clone(),
+        }))
+    }
+    fn read_all(&self, key: &str) -> Result<Vec<u8>> {
+        self.inner.read_all(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key)
+    }
+}
+
+/// End-to-end: the [`CachingObjectStore`] disk tier over a real S3 (MinIO) store
+/// serves a warm block from local disk, so the second read of the same block does
+/// not issue a second S3 GET.
+#[test]
+fn disk_cache_absorbs_warm_reads_over_s3() {
+    let Some(cfg) = config_or_skip() else {
+        eprintln!("skipping disk_cache_absorbs_warm_reads_over_s3: set SLATER_S3_TEST_ENDPOINT");
+        return;
+    };
+    let s3 = S3ObjectStore::connect(&cfg).expect("connect S3");
+
+    let key = "g/u/cached.blk";
+    let data: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+    s3.put(key, &data, Some(&sha256_base64(&data)))
+        .expect("put");
+
+    // Unique temp dir for the cache (removed at the end).
+    let cache_dir = std::env::temp_dir().join(format!(
+        "slater-diskcache-itest-{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    let cache = DiskCache::open(&cache_dir, 64 << 20).expect("open disk cache");
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let store = CachingObjectStore::new(
+        Arc::new(CountingStore {
+            inner: s3,
+            reads: reads.clone(),
+        }),
+        cache.clone(),
+    );
+
+    let obj = store.open(key).expect("open");
+    let mut buf = vec![0u8; 1000];
+    obj.read_exact_at(&mut buf, 500).expect("cold read");
+    assert_eq!(buf, data[500..1500]);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "cold read hits S3");
+    cache.flush();
+
+    // Warm read of the same block: served from local disk, no second S3 GET.
+    let obj2 = store.open(key).expect("reopen");
+    let mut buf2 = vec![0u8; 1000];
+    obj2.read_exact_at(&mut buf2, 500).expect("warm read");
+    assert_eq!(buf2, data[500..1500]);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "warm read served from disk — no second S3 GET"
+    );
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    eprintln!("S3/MinIO disk-cache integration: all assertions passed");
 }
