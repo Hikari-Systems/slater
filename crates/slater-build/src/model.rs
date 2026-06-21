@@ -32,6 +32,11 @@ pub enum Statement {
     /// A vector index declaration (either the `CALL …createNodeIndex` form or the
     /// `createNodeVectorIndex(..)` helper form).
     VectorIndex(VectorIndexStmt),
+    /// `MERGE (n:L {k:v}) SET …` / `MATCH (n:L {k:v}) SET …` — overwrite the
+    /// properties of node(s) created earlier in the same build (overlay dialect).
+    NodeOverwrite(NodeOverwriteStmt),
+    /// `MERGE|MATCH (a:L {k:v})-[r:T]->(b:M {j:w}) SET …` — overwrite edge props.
+    EdgeOverwrite(EdgeOverwriteStmt),
     /// A marker-setup, cleanup or drop line with nothing to persist.
     Ignored,
 }
@@ -48,6 +53,39 @@ pub struct EdgeStmt {
     pub dst_dump_id: i64,
     pub reltype: String,
     pub props: Vec<(String, Value)>,
+}
+
+/// One half of an edge-overwrite endpoint match: locate a node by `label` having
+/// property `key == value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeMatch {
+    pub label: String,
+    pub key: String,
+    pub value: Value,
+}
+
+/// `MERGE|MATCH (n:L {k:v}) SET …`. `is_merge` selects create-on-absent semantics:
+/// a MERGE with zero matches creates a node (label `L`, property `k=v`, plus the
+/// SET props); a MATCH with zero matches is a no-op (with a stderr warning).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeOverwriteStmt {
+    pub match_: NodeMatch,
+    pub is_merge: bool,
+    pub set_props: Vec<(String, Value)>,
+}
+
+/// `MERGE|MATCH (a:L {k:v})-[r:T]->(b:M {j:w}) SET r.… = …`. Endpoints are matched
+/// by label+property like [`NodeOverwriteStmt`]; the edge is then located by
+/// `(matched src, matched dst, reltype)`. Edge create-on-absent is not supported in
+/// v1, so `is_merge` differs from MATCH only in the (currently identical) 0-match
+/// error path — retained for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EdgeOverwriteStmt {
+    pub src: NodeMatch,
+    pub dst: NodeMatch,
+    pub reltype: String,
+    pub is_merge: bool,
+    pub set_props: Vec<(String, Value)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

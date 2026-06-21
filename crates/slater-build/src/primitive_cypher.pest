@@ -17,6 +17,12 @@
 //   6. vector idx help createNodeVectorIndex('Label', dim, 'cosine', 'property')
 // plus the ignorable marker/cleanup lines (DROP INDEX …, MATCH … REMOVE …), which
 // parse but carry no data (the marker label/property are simply never persisted).
+//
+// An *overlay* dump (hand-authored, never emitted by GRAPH.DUMP) may additionally
+// carry overwrite statements that mutate nodes/edges created earlier in the same
+// build, matched by label + property key:
+//   7. node overwrite  MERGE|MATCH (n:L {k: v}) SET n.a = …, n.b = …
+//   8. edge overwrite  MERGE|MATCH (a:L {k: v})-[r:T]->(b:M {j: w}) SET r.a = …
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
@@ -26,6 +32,8 @@ stmt = {
     create_index
   | vector_index_call
   | vector_index_helper
+  | edge_overwrite
+  | node_overwrite
   | edge_create
   | node_create
   | ignored
@@ -47,6 +55,28 @@ rel_create = {
 }
 
 rel_detail = { ":" ~ reltype ~ prop_map? }
+
+// --- overwrite (overlay patch) statements --------------------------------------
+//
+// NOT emitted by FalkorDB GRAPH.DUMP (which is CREATE-only) — these are for
+// hand-authored overlay dumps that overwrite property values of nodes/edges created
+// earlier in the SAME build input. Match is by label + property key (the
+// `prop_map` inside the matched pattern); SET assignments are last-writer-wins.
+//
+// Ordering note: `edge_overwrite` precedes `node_overwrite` so the rel form is tried
+// before the single-node form (whose MERGE arm has an OPTIONAL set_clause and would
+// otherwise commit to just the source node). `match_set_node` REQUIRES its set_clause,
+// so MATCH-without-SET still falls through to a parse error rather than a no-op line.
+
+node_overwrite = { merge_node | match_set_node }
+merge_node = { ^"merge" ~ node_pattern ~ set_clause? }
+match_set_node = { ^"match" ~ node_pattern ~ set_clause }
+
+edge_overwrite = { (^"merge" | ^"match") ~ overwrite_rel ~ set_clause }
+overwrite_rel = { node_pattern ~ "-" ~ "[" ~ var? ~ rel_detail ~ "]" ~ "->" ~ node_pattern }
+
+set_clause = { ^"set" ~ set_assign ~ ("," ~ set_assign)* }
+set_assign = { var ~ "." ~ key ~ "=" ~ value }
 
 labels = { (":" ~ label)+ }
 

@@ -251,6 +251,8 @@ fn process_shard(
     let mut keys = Interner::default();
     let mut rstmts: Vec<RangeIndexStmt> = Vec::new();
     let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
+    let mut node_ovr: Vec<crate::model::NodeOverwriteStmt> = Vec::new();
+    let mut edge_ovr: Vec<crate::model::EdgeOverwriteStmt> = Vec::new();
     let mut node_w = BucketWriter::create(
         buckets::seg_path(node_bkt, chunk.shard),
         BUCKET_BLOCK,
@@ -346,6 +348,11 @@ fn process_shard(
                     vstmts.push(v);
                 }
             }
+            // Overlay overwrites: stash verbatim (in statement order) for the global
+            // pass-1.9 — matching is by label+property against ALL nodes, so it can't
+            // be resolved shard-locally.
+            Statement::NodeOverwrite(o) => node_ovr.push(o),
+            Statement::EdgeOverwrite(o) => edge_ovr.push(o),
             Statement::Ignored => {}
         }
     }
@@ -362,6 +369,8 @@ fn process_shard(
         keys: keys.into_names(),
         range_stmts: rstmts,
         vector_stmts: vstmts,
+        node_overwrites: node_ovr,
+        edge_overwrites: edge_ovr,
     };
     buckets::finalize_shard(node_bkt, uedge_bkt, &meta)?;
     // Test hook: crash right after a given shard is durably finalized, to exercise
@@ -614,6 +623,33 @@ pub fn build_external(
         .with_context(|| format!("create {}", tmp_dir.display()))?;
     std::fs::create_dir_all(tmp_dir.join("vector"))?;
 
+    // stdin can only be read once, but the build reads the input twice (a header
+    // pre-scan for the vector-index routing, then pass 1) and may re-read it on
+    // resume. A pipe can't be rewound, so spool it to a scratch file once and build
+    // from that — making stdin behave exactly like a file input. On resume the spool
+    // already exists (scratch persists), so we reuse it rather than draining the
+    // now-empty pipe.
+    let spooled_input;
+    let input_path: &str = if input_path == "-" {
+        let spool = scratch_dir.join("stdin-input.cypher");
+        if !spool.exists() {
+            let mut w = std::io::BufWriter::new(
+                std::fs::File::create(&spool)
+                    .with_context(|| format!("create stdin spool {}", spool.display()))?,
+            );
+            std::io::copy(&mut std::io::stdin().lock(), &mut w)
+                .context("spool stdin to scratch")?;
+            w.into_inner()
+                .context("flush stdin spool")?
+                .sync_all()
+                .context("fsync stdin spool")?;
+        }
+        spooled_input = spool.to_string_lossy().into_owned();
+        &spooled_input
+    } else {
+        input_path
+    };
+
     let result = build_inner(
         input_path,
         graph,
@@ -742,10 +778,13 @@ fn build_inner(
     };
     let (g_labels, g_reltypes, g_keys, rmaps) = buckets::merge_shard_symbols(&metas);
     let remaps: Vec<buckets::ShardRemap> = rmaps;
-    let labels: Interner = Interner::from_names(g_labels);
+    let mut labels: Interner = Interner::from_names(g_labels);
     let reltypes: Interner = Interner::from_names(g_reltypes);
-    let keys: Interner = Interner::from_names(g_keys);
-    let node_count: u64 = metas.iter().map(|m| m.node_count).sum();
+    let mut keys: Interner = Interner::from_names(g_keys);
+    let mut node_count: u64 = metas.iter().map(|m| m.node_count).sum();
+    // Provisional ids `[0, base_node_count)` are the parsed (CREATEd) nodes; any
+    // MERGE-created overlay nodes follow at `base_node_count + i`.
+    let base_node_count = node_count;
     // Union the index DDL across shards (it lives in shard 0; dedup defensively).
     {
         let mut rs: Vec<RangeIndexStmt> = Vec::new();
@@ -767,6 +806,24 @@ fn build_inner(
         }
         range_stmts = rs;
         vector_stmts = vs;
+    }
+
+    // ---- pass 1.9: resolve overlay overwrites (MERGE|MATCH … SET …) -----------
+    // Re-derived every run (incl. resume) from the persisted shard sidecars + node
+    // buckets — deterministic, so no separate checkpoint is needed. Extends the
+    // global label/key tables with SET targets and MERGE-created labels, and grows
+    // `node_count` by the MERGE-created nodes so clustering covers them. `None` ⇒ a
+    // plain CREATE-only dump, which pays nothing here.
+    let overlay = crate::overlay::Overlay::build(
+        &node_bkt,
+        &remaps,
+        &metas,
+        &mut labels,
+        &mut keys,
+        &reltypes,
+    )?;
+    if let Some(ov) = &overlay {
+        node_count += ov.created.len() as u64;
     }
 
     if resume_phase < Phase::Pass1 {
@@ -832,6 +889,10 @@ fn build_inner(
         let remaps_r = &remaps;
         let uedge_r = &uedge_bkt;
         let edge_r = &edge_bkt;
+        // Overlay edge patches are folded here (this pass already holds the resolved
+        // src/dst provs + global reltype). `Option<&Overlay>` is `Copy` + `Sync`, so
+        // each worker shares it read-only; matched patches mark themselves hit.
+        let overlay_r = overlay.as_ref();
         std::thread::scope(|scope| {
             for _ in 0..opts.threads.max(1) {
                 let next = std::sync::Arc::clone(&next);
@@ -875,11 +936,18 @@ fn build_inner(
                             } else {
                                 buckets::remap_props_blob(&ue.props_blob, rm)?
                             };
+                            let reltype = rm.map_reltype(ue.reltype);
+                            let props_blob = match overlay_r {
+                                Some(ov) if ov.has_edge_patches() => ov
+                                    .fold_edge(src, dst, reltype, &props_blob)?
+                                    .unwrap_or(props_blob),
+                                _ => props_blob,
+                            };
                             edge_w.append_edge(&EdgeRec {
                                 prov_edge_id: id,
                                 src_prov: src,
                                 dst_prov: dst,
-                                reltype: rm.map_reltype(ue.reltype),
+                                reltype,
                                 props_blob,
                             })?;
                             id += 1;
@@ -907,6 +975,19 @@ fn build_inner(
             .flatten()
         {
             return Err(e);
+        }
+        // An overlay edge patch that matched no resolved edge means the targeted
+        // relationship does not exist — and edge create-on-absent is not a v1 feature.
+        if let Some(ov) = overlay.as_ref() {
+            let unmatched = ov.unmatched_edges();
+            if let Some(&(s, d, rt)) = unmatched.first() {
+                bail!(
+                    "{} overlay edge overwrite(s) matched no existing relationship \
+                     (e.g. src node {s} → dst node {d}, reltype id {rt}); edge \
+                     create-on-absent is not supported",
+                    unmatched.len()
+                );
+            }
         }
         // Unresolved-edge shards consumed; reclaim their scratch.
         for i in 0..nshards {
@@ -1097,22 +1178,52 @@ fn build_inner(
         "nodes",
         node_count,
     );
+    // Fold overlay set-prop patches onto a node (keyed by provisional id) before any
+    // node-derived output, so the rewritten value flows into props, labels-independent
+    // range indexes and histograms alike. A no-op when the node has no patch.
+    let fold_node = |node: NodeRec, prov: u64| -> Result<NodeRec> {
+        if let Some(ov) = overlay.as_ref() {
+            if ov.has_node_patches() {
+                if let Some(folded) = ov.fold_node(prov, &node.props_blob)? {
+                    return Ok(NodeRec {
+                        props_blob: folded,
+                        ..node
+                    });
+                }
+            }
+        }
+        Ok(node)
+    };
     if perm.is_identity() {
         // Fast path: final id = prov id, so byte-copy straight through in order.
         // `for_each_node_remapped` translates each shard's local symbol ids to
         // global (identity shards byte-copy unchanged).
         buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
             diag.tick(prov);
+            let node = fold_node(node, prov)?;
             labels_w.append_raw(&node.labels_blob)?;
             props_w.append_raw(&node.props_blob)?;
             emit_node_ranges(&node, prov, &mut range_sorters)?;
             gather_node_vectors(&node, prov, &vec_specs, &mut pending)?;
             Ok(())
         })?;
+        // MERGE-created overlay nodes follow at prov = base_node_count + i (= final id
+        // under the identity permutation), in creation order.
+        if let Some(ov) = overlay.as_ref() {
+            for (i, cnode) in ov.created.iter().enumerate() {
+                let final_id = base_node_count + i as u64;
+                diag.tick(final_id);
+                labels_w.append_raw(&cnode.labels_blob)?;
+                props_w.append_raw(&cnode.props_blob)?;
+                emit_node_ranges(cnode, final_id, &mut range_sorters)?;
+                gather_node_vectors(cnode, final_id, &vec_specs, &mut pending)?;
+            }
+        }
     } else {
         let mut node_sorter = ExtSorter::<NodeEmit>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
         buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
             diag.tick(prov);
+            let node = fold_node(node, prov)?;
             let final_id = perm.final_of(prov);
             emit_node_ranges(&node, final_id, &mut range_sorters)?;
             gather_node_vectors(&node, final_id, &vec_specs, &mut pending)?;
@@ -1123,6 +1234,20 @@ fn build_inner(
             })?;
             Ok(())
         })?;
+        // MERGE-created overlay nodes carry provisional ids base_node_count + i; route
+        // them through the same final-id sort.
+        if let Some(ov) = overlay.as_ref() {
+            for (i, cnode) in ov.created.iter().enumerate() {
+                let final_id = perm.final_of(base_node_count + i as u64);
+                emit_node_ranges(cnode, final_id, &mut range_sorters)?;
+                gather_node_vectors(cnode, final_id, &vec_specs, &mut pending)?;
+                node_sorter.push(NodeEmit {
+                    final_id,
+                    labels_blob: cnode.labels_blob.clone(),
+                    props_blob: cnode.props_blob.clone(),
+                })?;
+            }
+        }
         diag.set_op("sort + write nodes (clustered order)", "nodes", node_count);
         let mut written = 0u64;
         for r in node_sorter.sorted()? {

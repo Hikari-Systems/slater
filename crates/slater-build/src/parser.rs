@@ -15,7 +15,10 @@ use pest_derive::Parser;
 
 use graph_format::ids::Value;
 
-use crate::model::{EdgeStmt, Entity, NodeStmt, RangeIndexStmt, Statement, VectorIndexStmt};
+use crate::model::{
+    EdgeOverwriteStmt, EdgeStmt, Entity, NodeMatch, NodeOverwriteStmt, NodeStmt, RangeIndexStmt,
+    Statement, VectorIndexStmt,
+};
 
 #[derive(Parser)]
 #[grammar = "primitive_cypher.pest"]
@@ -132,6 +135,8 @@ pub fn parse_statement(input: &str) -> Result<Statement> {
     match form.as_rule() {
         Rule::node_create => parse_node_create(form),
         Rule::edge_create => parse_edge_create(form),
+        Rule::node_overwrite => parse_node_overwrite(form),
+        Rule::edge_overwrite => parse_edge_overwrite(form),
         Rule::create_index => parse_create_index(form),
         Rule::vector_index_call => parse_vector_index(form, ArgOrder::Call),
         Rule::vector_index_helper => parse_vector_index(form, ArgOrder::Helper),
@@ -219,6 +224,133 @@ fn parse_edge_create(pair: Pair<Rule>) -> Result<Statement> {
         dst_dump_id: lookup(&dst_var)?,
         reltype,
         props,
+    }))
+}
+
+/// Extract a single-node match (`label` + one `{key: value}`) from a matched
+/// pattern. v1 requires exactly one label and exactly one match property.
+fn node_match_from_pattern(pair: Pair<Rule>) -> Result<NodeMatch> {
+    let (_var, labels, props) = parse_node_pattern(pair)?;
+    if labels.len() != 1 {
+        bail!(
+            "overwrite match pattern must have exactly one label, got {}",
+            labels.len()
+        );
+    }
+    if props.len() != 1 {
+        bail!(
+            "overwrite match pattern must have exactly one {{key: value}} entry, got {}",
+            props.len()
+        );
+    }
+    let label = labels.into_iter().next().unwrap();
+    let (key, value) = props.into_iter().next().unwrap();
+    Ok(NodeMatch { label, key, value })
+}
+
+/// Parse a `set_clause` (`SET v.k = val, …`) into `(key, value)` assignments. The
+/// binding variable (`v`) is ignored — v1 patterns bind a single entity.
+fn parse_set_clause(pair: Pair<Rule>) -> Result<Vec<(String, Value)>> {
+    let mut out = Vec::new();
+    for assign in pair.into_inner() {
+        if assign.as_rule() != Rule::set_assign {
+            continue;
+        }
+        let mut key: Option<String> = None;
+        let mut value: Option<Value> = None;
+        for c in assign.into_inner() {
+            match c.as_rule() {
+                Rule::key => key = Some(unquote_key(c.as_str())),
+                Rule::value => value = Some(parse_value(c)?),
+                _ => {}
+            }
+        }
+        let key = key.ok_or_else(|| anyhow!("SET assignment missing property key"))?;
+        let value = value.ok_or_else(|| anyhow!("SET assignment missing value"))?;
+        out.push((key, value));
+    }
+    if out.is_empty() {
+        bail!("SET clause must assign at least one property");
+    }
+    Ok(out)
+}
+
+fn parse_node_overwrite(pair: Pair<Rule>) -> Result<Statement> {
+    // node_overwrite = merge_node | match_set_node
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty node overwrite"))?;
+    let is_merge = inner.as_rule() == Rule::merge_node;
+    let mut node_pattern: Option<Pair<Rule>> = None;
+    let mut set_props: Vec<(String, Value)> = Vec::new();
+    for c in inner.into_inner() {
+        match c.as_rule() {
+            Rule::node_pattern => node_pattern = Some(c),
+            Rule::set_clause => set_props = parse_set_clause(c)?,
+            _ => {}
+        }
+    }
+    let np = node_pattern.ok_or_else(|| anyhow!("overwrite missing node pattern"))?;
+    let match_ = node_match_from_pattern(np)?;
+    Ok(Statement::NodeOverwrite(NodeOverwriteStmt {
+        match_,
+        is_merge,
+        set_props,
+    }))
+}
+
+fn parse_edge_overwrite(pair: Pair<Rule>) -> Result<Statement> {
+    // The MERGE/MATCH keyword is an inline literal (not a captured rule), so detect
+    // it from the leading token.
+    let is_merge = pair
+        .as_str()
+        .get(..5)
+        .map(|s| s.eq_ignore_ascii_case("merge"))
+        .unwrap_or(false);
+    let mut rel: Option<Pair<Rule>> = None;
+    let mut set_props: Vec<(String, Value)> = Vec::new();
+    for c in pair.into_inner() {
+        match c.as_rule() {
+            Rule::overwrite_rel => rel = Some(c),
+            Rule::set_clause => set_props = parse_set_clause(c)?,
+            _ => {}
+        }
+    }
+    let rel = rel.ok_or_else(|| anyhow!("edge overwrite missing relationship pattern"))?;
+
+    // overwrite_rel = node_pattern "-[" var? rel_detail "]->" node_pattern
+    let mut patterns: Vec<Pair<Rule>> = Vec::new();
+    let mut reltype = String::new();
+    for c in rel.into_inner() {
+        match c.as_rule() {
+            Rule::node_pattern => patterns.push(c),
+            Rule::rel_detail => {
+                for d in c.into_inner() {
+                    if d.as_rule() == Rule::reltype {
+                        reltype = d.as_str().to_string();
+                    }
+                    // A property map on the matched relationship is ignored: edges are
+                    // located by (src, dst, reltype), not by rel-property in v1.
+                }
+            }
+            _ => {}
+        }
+    }
+    if patterns.len() != 2 {
+        bail!("edge overwrite must match exactly two endpoints");
+    }
+    if reltype.is_empty() {
+        bail!("edge overwrite missing relationship type");
+    }
+    let src = node_match_from_pattern(patterns.remove(0))?;
+    let dst = node_match_from_pattern(patterns.remove(0))?;
+    Ok(Statement::EdgeOverwrite(EdgeOverwriteStmt {
+        src,
+        dst,
+        reltype,
+        is_merge,
+        set_props,
     }))
 }
 
@@ -628,9 +760,82 @@ mod tests {
         assert!(parse_statement("MATCH (a:X {__dump_id__: 1}) CREATE (a)-[:R]->").is_err());
         // Not a dump statement at all.
         assert!(parse_statement("SELECT * FROM whatever").is_err());
-        // MERGE is not part of the dump dialect.
-        assert!(parse_statement("MERGE (a:L {id: 1})").is_err());
+        // A bare MATCH with no SET / CREATE / REMOVE is still not a statement.
+        assert!(parse_statement("MATCH (n:L {id: 1})").is_err());
+        // An overwrite match pattern needs exactly one label and one match property.
+        assert!(parse_statement("MATCH (n {id: 1}) SET n.a = 2").is_err());
+        assert!(parse_statement("MATCH (n:L) SET n.a = 2").is_err());
+        assert!(parse_statement("MATCH (n:L {a: 1, b: 2}) SET n.x = 3").is_err());
+        // SET with no assignment.
+        assert!(parse_statement("MATCH (n:L {id: 1}) SET").is_err());
         // Malformed vecf32.
         assert!(parse_statement("CREATE (:L {e: vecf32([1.0, 2.0)})").is_err());
+    }
+
+    #[test]
+    fn accepts_node_overwrite_merge_and_match() {
+        // MERGE with a SET clause.
+        let Statement::NodeOverwrite(m) =
+            parse_statement("MERGE (n:Concept {name: 'A'}) SET n.score = 99, n.note = 'x'")
+                .unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        assert!(m.is_merge);
+        assert_eq!(m.match_.label, "Concept");
+        assert_eq!(m.match_.key, "name");
+        assert_eq!(m.match_.value, Value::Str("A".into()));
+        assert_eq!(
+            m.set_props,
+            vec![
+                ("score".to_string(), Value::Int(99)),
+                ("note".to_string(), Value::Str("x".into())),
+            ]
+        );
+
+        // MATCH … SET is an overwrite, not is_merge.
+        let Statement::NodeOverwrite(m) =
+            parse_statement("MATCH (n:Concept {name: 'A'}) SET n.score = 1").unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        assert!(!m.is_merge);
+        assert_eq!(m.set_props, vec![("score".to_string(), Value::Int(1))]);
+
+        // MERGE with no SET (ensure-exists) parses with empty set_props.
+        let Statement::NodeOverwrite(m) = parse_statement("MERGE (n:Concept {name: 'A'})").unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        assert!(m.is_merge);
+        assert!(m.set_props.is_empty());
+    }
+
+    #[test]
+    fn accepts_edge_overwrite() {
+        let Statement::EdgeOverwrite(e) = parse_statement(
+            "MATCH (a:Concept {name: 'A'})-[r:LINK]->(b:Concept {name: 'B'}) SET r.w = 7",
+        )
+        .unwrap() else {
+            panic!("expected edge overwrite");
+        };
+        assert!(!e.is_merge);
+        assert_eq!(e.reltype, "LINK");
+        assert_eq!(
+            (e.src.label.as_str(), e.src.key.as_str()),
+            ("Concept", "name")
+        );
+        assert_eq!(e.src.value, Value::Str("A".into()));
+        assert_eq!(e.dst.value, Value::Str("B".into()));
+        assert_eq!(e.set_props, vec![("w".to_string(), Value::Int(7))]);
+
+        // The MERGE form and a relationship without an `r` variable both parse.
+        let Statement::EdgeOverwrite(e) =
+            parse_statement("MERGE (a:L {k: 1})-[:T]->(b:M {j: 2}) SET r.x = 0").unwrap()
+        else {
+            panic!("expected edge overwrite");
+        };
+        assert!(e.is_merge);
+        assert_eq!(e.reltype, "T");
     }
 }

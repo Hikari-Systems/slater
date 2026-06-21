@@ -12,6 +12,7 @@ mod cluster;
 mod common;
 mod diag;
 mod model;
+mod overlay;
 mod parser;
 mod resolve;
 mod shared;
