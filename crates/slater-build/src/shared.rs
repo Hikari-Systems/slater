@@ -24,6 +24,17 @@ use crate::model::VectorIndexStmt;
 
 /// Tunables for one build (all have sensible defaults in the CLI).
 pub struct BuildOptions {
+    /// Identity model of the input dump.
+    ///
+    /// `None` (default) ⇒ **merge** style: nodes/edges are business-key `MERGE`
+    /// statements, the per-pattern business key is the node identity, and edges resolve
+    /// endpoints by it (see [`crate::merge_build`]); dumps must be self-contained.
+    ///
+    /// `Some(field)` ⇒ **single-global-key** ("dump_id style") import: `field` is the
+    /// unique node identity across the whole dump (label-agnostic, integer-valued),
+    /// edges reference endpoints by it, and `field` is stored as a queryable property.
+    /// `Some("__dump_id__")` ingests legacy FalkorDB `GRAPH.DUMP` files.
+    pub pk: Option<String>,
     /// Target block size for prop/label/topology/range files, bytes.
     pub block_size: usize,
     /// Target block size for the vector store, bytes.
@@ -89,6 +100,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
+            pk: None,
             block_size: 256 * 1024,
             vector_block_size: 256 * 1024,
             zstd_level: 3,

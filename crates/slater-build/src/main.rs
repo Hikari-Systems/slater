@@ -11,6 +11,7 @@ mod build_external;
 mod cluster;
 mod common;
 mod diag;
+mod merge_build;
 mod model;
 mod overlay;
 mod parser;
@@ -67,6 +68,17 @@ struct Cli {
     /// Root data directory under which `<graph>/<generation>/` is written.
     #[arg(long)]
     data_dir: String,
+
+    /// Primary-key field for single-global-key ("dump_id style") import. When given,
+    /// `<FIELD>` is the unique node identity across the whole dump (label-agnostic,
+    /// integer-valued) and edges reference endpoints by it; `<FIELD>` is stored as a
+    /// queryable node property. `--pk __dump_id__` ingests legacy FalkorDB `GRAPH.DUMP`
+    /// files. When omitted (the default), the dump is parsed as business-key `MERGE`
+    /// statements (`MERGE (n:L {k:'v'}) [SET …]` for nodes, `MERGE (a:L {k:'v'})-[r:T]->
+    /// (b:M {j:'w'}) [SET …]` for edges), where the per-pattern business key is the node
+    /// identity and edges resolve endpoints by it; such dumps must be self-contained.
+    #[arg(long)]
+    pk: Option<String>,
 
     /// Target block size (bytes) for prop/label/topology/range files.
     #[arg(long, default_value_t = 256 * 1024)]
@@ -388,6 +400,7 @@ fn main() -> Result<()> {
     let publish_store = resolve_publish_store(&cli)?;
     let (zstd_level, compression_profile) = resolve_compression(&cli, publish_store.is_some());
     let opts = BuildOptions {
+        pk: cli.pk.clone(),
         block_size: cli.block_size,
         vector_block_size: cli.vector_block_size,
         zstd_level,

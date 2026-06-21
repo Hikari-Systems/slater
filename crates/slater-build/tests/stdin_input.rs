@@ -54,6 +54,7 @@ fn builds_from_stdin_pipe() {
     let dump = make_dump(200);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             "-",

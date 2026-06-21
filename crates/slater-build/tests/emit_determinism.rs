@@ -54,6 +54,7 @@ fn build(work: &Path, tag: &str, cluster: &str) -> BTreeMap<String, String> {
     let input = work.join(format!("dump_{tag}.cypher"));
     std::fs::write(&input, make_dump(64)).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),

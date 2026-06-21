@@ -52,6 +52,7 @@ fn build(tag: &str) -> PathBuf {
         data_dir.to_str().unwrap().to_string(),
     ];
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args(&args)
         .output()
         .expect("run slater-build");

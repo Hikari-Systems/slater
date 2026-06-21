@@ -74,11 +74,15 @@ pub struct NodeOverwriteStmt {
     pub set_props: Vec<(String, Value)>,
 }
 
-/// `MERGE|MATCH (a:L {k:v})-[r:T]->(b:M {j:w}) SET r.… = …`. Endpoints are matched
+/// `MERGE|MATCH (a:L {k:v})-[r:T]->(b:M {j:w}) [SET r.… = …]`. Endpoints are matched
 /// by label+property like [`NodeOverwriteStmt`]; the edge is then located by
-/// `(matched src, matched dst, reltype)`. Edge create-on-absent is not supported in
-/// v1, so `is_merge` differs from MATCH only in the (currently identical) 0-match
-/// error path — retained for forward compatibility.
+/// `(matched src, matched dst, reltype)`.
+///
+/// In the overlay dialect (a patch over a base built in the same run), this overwrites
+/// an existing edge's properties; edge create-on-absent is not supported there. In a
+/// business-key MERGE dump (the default import, see [`crate::merge_build`]) the same
+/// statement *creates* the relationship, resolving endpoints by business key. `set_props`
+/// may be empty (the bare `MERGE (a)-[r:T]->(b)` form ⇒ a property-less edge).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeOverwriteStmt {
     pub src: NodeMatch,

@@ -60,6 +60,7 @@ fn run_overwrite(cluster: &str) {
     std::fs::write(&input, DUMP).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -204,6 +205,7 @@ fn external_overwrite_preserves_order_under_parallel_shards() {
     std::fs::write(&input, ORDER_DUMP).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -270,6 +272,7 @@ fn build_overlay_hashes(work: &std::path::Path, tag: &str) -> BTreeMap<String, S
     let input = work.join(format!("dump_{tag}.cypher"));
     std::fs::write(&input, DUMP).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -320,6 +323,7 @@ fn external_overwrite_missing_edge_fails() {
     std::fs::write(&input, EDGE_MISSING_DUMP).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),

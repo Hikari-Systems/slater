@@ -67,12 +67,15 @@ rel_detail = { ":" ~ reltype ~ prop_map? }
 // before the single-node form (whose MERGE arm has an OPTIONAL set_clause and would
 // otherwise commit to just the source node). `match_set_node` REQUIRES its set_clause,
 // so MATCH-without-SET still falls through to a parse error rather than a no-op line.
+// `edge_overwrite`'s set_clause is OPTIONAL too: a bare `MERGE (a)-[r:T]->(b)` (no SET)
+// is a property-less relationship — used by business-key MERGE dumps (the default import)
+// that create edges with no properties.
 
 node_overwrite = { merge_node | match_set_node }
 merge_node = { ^"merge" ~ node_pattern ~ set_clause? }
 match_set_node = { ^"match" ~ node_pattern ~ set_clause }
 
-edge_overwrite = { (^"merge" | ^"match") ~ overwrite_rel ~ set_clause }
+edge_overwrite = { (^"merge" | ^"match") ~ overwrite_rel ~ set_clause? }
 overwrite_rel = { node_pattern ~ "-" ~ "[" ~ var? ~ rel_detail ~ "]" ~ "->" ~ node_pattern }
 
 set_clause = { ^"set" ~ set_assign ~ ("," ~ set_assign)* }

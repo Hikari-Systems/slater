@@ -336,11 +336,15 @@ fn fsync_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Finalize shard `n`: fsync its already-written node/uedge segments, then write the
+/// Finalize shard `n`: fsync its already-written segment files, then write the
 /// `.meta` sidecar atomically (temp + rename). Presence of the sidecar ⇒ complete.
-pub fn finalize_shard(node_bkt: &Path, uedge_bkt: &Path, meta: &ShardMeta) -> Result<()> {
-    fsync_file(&seg_path(node_bkt, meta.shard))?;
-    fsync_file(&seg_path(uedge_bkt, meta.shard))?;
+/// `seg_files` are the data segments to fsync first (node/uedge for the `dump-id`
+/// path, node-merge/edge-merge for the `merge` path); the sidecar is always keyed off
+/// `node_bkt` so resume detection is mode-independent.
+pub fn finalize_shard(node_bkt: &Path, seg_files: &[PathBuf], meta: &ShardMeta) -> Result<()> {
+    for seg in seg_files {
+        fsync_file(seg)?;
+    }
     let path = meta_path(node_bkt, meta.shard);
     let tmp = {
         let mut s = path.as_os_str().to_os_string();
