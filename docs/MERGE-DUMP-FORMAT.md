@@ -1,5 +1,11 @@
 # Dump formats (default merge; `--pk` for dump_id-style)
 
+> **Breaking change in v0.14.0 — import file format.** The default dump format is now
+> business-key `MERGE` statements, and the old `--dump-format` flag has been removed.
+> Existing CREATE / `__dump_id__` dump files (e.g. `GRAPH.DUMP` output) no longer build
+> by default — pass **`--pk __dump_id__`** to ingest them. Already-built generations are
+> unaffected; only how source dumps are parsed has changed.
+
 `slater-build` accepts two input dump identity models, selected by the **`--pk`** flag:
 
 - **merge** (default, no `--pk`) — the dump is *entirely* business-key `MERGE` statements.
