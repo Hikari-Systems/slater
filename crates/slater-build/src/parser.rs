@@ -121,8 +121,16 @@ impl<R: BufRead> StatementReader<R> {
 // Statement parsing
 // ---------------------------------------------------------------------------
 
-/// Parse one statement string (no trailing `;`) into a typed [`Statement`].
+/// Parse one statement string (no trailing `;`) into a typed [`Statement`], using the
+/// default `__dump_id__` identity field for legacy edge endpoints.
 pub fn parse_statement(input: &str) -> Result<Statement> {
+    parse_statement_with_id_field(input, "__dump_id__")
+}
+
+/// Parse one statement, reading legacy `MATCH … CREATE` edge endpoints by the
+/// configurable identity property `id_field` (`--pk`) instead of the hardcoded
+/// `__dump_id__`. Only affects `edge_create`; all other forms are field-agnostic.
+pub fn parse_statement_with_id_field(input: &str, id_field: &str) -> Result<Statement> {
     let mut pairs =
         PrimitiveCypher::parse(Rule::statement, input).map_err(|e| anyhow!("parse error: {e}"))?;
     // statement -> stmt -> <one concrete form>
@@ -134,7 +142,7 @@ pub fn parse_statement(input: &str) -> Result<Statement> {
         .ok_or_else(|| anyhow!("empty stmt"))?;
     match form.as_rule() {
         Rule::node_create => parse_node_create(form),
-        Rule::edge_create => parse_edge_create(form),
+        Rule::edge_create => parse_edge_create(form, id_field),
         Rule::node_overwrite => parse_node_overwrite(form),
         Rule::edge_overwrite => parse_edge_overwrite(form),
         Rule::create_index => parse_create_index(form),
@@ -159,7 +167,7 @@ fn parse_node_create(pair: Pair<Rule>) -> Result<Statement> {
     Ok(Statement::Node(NodeStmt { labels, props }))
 }
 
-fn parse_edge_create(pair: Pair<Rule>) -> Result<Statement> {
+fn parse_edge_create(pair: Pair<Rule>, id_field: &str) -> Result<Statement> {
     // edge_create = node_pattern ~ node_pattern ~ rel_create
     let mut endpoints: Vec<(String, i64)> = Vec::new();
     let mut rel: Option<Pair<Rule>> = None;
@@ -172,9 +180,9 @@ fn parse_edge_create(pair: Pair<Rule>) -> Result<Statement> {
                 })?;
                 let dump_id = props
                     .iter()
-                    .find(|(k, _)| k == "__dump_id__")
+                    .find(|(k, _)| k == id_field)
                     .and_then(|(_, v)| as_int(v))
-                    .ok_or_else(|| anyhow!("edge MATCH endpoint missing integer __dump_id__"))?;
+                    .ok_or_else(|| anyhow!("edge MATCH endpoint missing integer {id_field}"))?;
                 endpoints.push((var, dump_id));
             }
             Rule::rel_create => rel = Some(child),
@@ -837,5 +845,19 @@ mod tests {
         };
         assert!(e.is_merge);
         assert_eq!(e.reltype, "T");
+
+        // The bare edge MERGE form (no SET) parses with empty set_props — a
+        // property-less relationship, as emitted by business-key MERGE dumps.
+        let Statement::EdgeOverwrite(e) = parse_statement(
+            "MERGE (a:Person {id: '9e'})-[r:SOURCED_FROM]->(b:Source {sourceId: '0001'})",
+        )
+        .unwrap() else {
+            panic!("expected edge overwrite");
+        };
+        assert!(e.is_merge);
+        assert_eq!(e.reltype, "SOURCED_FROM");
+        assert_eq!(e.src.value, Value::Str("9e".into()));
+        assert_eq!(e.dst.value, Value::Str("0001".into()));
+        assert!(e.set_props.is_empty(), "bare edge MERGE has no SET props");
     }
 }

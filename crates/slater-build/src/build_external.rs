@@ -35,8 +35,9 @@ use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, wr
 use crate::buckets::{self, read_blob, write_blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge};
 use crate::cluster::{self, ClusterParams, Permutation};
 use crate::common::{self, BuildOutcome, PublishInputs};
+use crate::merge_build;
 use crate::model::{Entity, RangeIndexStmt, Statement, VectorIndexStmt};
-use crate::parser::{parse_statement, StatementReader};
+use crate::parser::{parse_statement, parse_statement_with_id_field, StatementReader};
 use crate::resolve::{DumpResolver, NO_DUMP};
 use crate::shared::{parse_metric, write_vector_indexes, BuildOptions, Interner, PendingIndex};
 
@@ -79,6 +80,8 @@ enum Phase {
     Start,
     /// Node + unresolved-edge buckets written; interners/counts captured.
     Pass1,
+    /// (`merge` dumps only) deduped node bucket + node-key stream written.
+    Deduped,
     /// Provisional-id edge bucket written.
     Resolved,
     /// Node-id permutation computed (perm.bin written, or identity).
@@ -239,12 +242,20 @@ fn shard_bytes_target() -> usize {
 /// Parse one shard chunk into shard-indexed node + unresolved-edge segments using a
 /// **local** interner (workers share nothing), then finalize it (sidecar). The
 /// sidecar's presence marks the shard durably complete — the resume signal.
+#[allow(clippy::too_many_arguments)]
 fn process_shard(
     chunk: ShardChunk,
     node_bkt: &Path,
     uedge_bkt: &Path,
+    merge_mode: bool,
+    node_merge_bkt: &Path,
+    edge_merge_bkt: &Path,
+    pk_field: &str,
     vec_index_set: &std::collections::HashSet<(String, String)>,
 ) -> Result<()> {
+    if merge_mode {
+        return process_shard_merge(chunk, node_bkt, node_merge_bkt, edge_merge_bkt);
+    }
     let shard_index = chunk.shard;
     let mut labels = Interner::default();
     let mut reltypes = Interner::default();
@@ -268,7 +279,7 @@ fn process_shard(
     let mut scalar_props: Vec<(u32, Value)> = Vec::new();
     let mut sr = StatementReader::new(std::io::Cursor::new(&chunk.bytes));
     while let Some(raw) = sr.next_statement()? {
-        match parse_statement(&raw)
+        match parse_statement_with_id_field(&raw, pk_field)
             .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
         {
             Statement::Node(n) => {
@@ -284,11 +295,15 @@ fn process_shard(
                 let mut vec_props: Vec<(String, Vec<f32>)> = Vec::new();
                 let mut dump_id = NO_DUMP;
                 for (k, v) in n.props {
-                    if k == DUMP_ID {
-                        match v {
-                            Value::Int(id) => dump_id = id,
-                            _ => bail!("__dump_id__ must be an integer"),
-                        }
+                    if k == pk_field {
+                        // The pk field is the node identity AND a stored, queryable
+                        // property (unlike the legacy consumed `__dump_id__`).
+                        let Value::Int(id) = v else {
+                            bail!("pk field '{pk_field}' must be an integer");
+                        };
+                        dump_id = id;
+                        let kid = keys.intern(&k);
+                        scalar_props.push((kid, Value::Int(id)));
                         continue;
                     }
                     match v {
@@ -336,7 +351,7 @@ fn process_shard(
                 uedge_count += 1;
             }
             Statement::RangeIndex(r) => {
-                if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
+                if r.label_or_type != DUMP_VERTEX && r.property != pk_field {
                     rstmts.push(r);
                 }
             }
@@ -372,9 +387,123 @@ fn process_shard(
         node_overwrites: node_ovr,
         edge_overwrites: edge_ovr,
     };
-    buckets::finalize_shard(node_bkt, uedge_bkt, &meta)?;
+    buckets::finalize_shard(
+        node_bkt,
+        &[
+            buckets::seg_path(node_bkt, chunk.shard),
+            buckets::seg_path(uedge_bkt, chunk.shard),
+        ],
+        &meta,
+    )?;
     // Test hook: crash right after a given shard is durably finalized, to exercise
     // shard-granular pass-1 resume (use `--threads 1` for a deterministic order).
+    if std::env::var("SLATER_BUILD_FAIL_AFTER_SHARD")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        == Some(shard_index)
+    {
+        eprintln!("SLATER_BUILD_FAIL_AFTER_SHARD={shard_index}: simulating a mid-pass-1 crash");
+        std::process::exit(70);
+    }
+    Ok(())
+}
+
+/// Pass-1 for a merge-style shard (the default, no `--pk`): parse business-key
+/// node/edge MERGEs into the per-shard node-merge / edge-merge buckets (LOCAL symbol
+/// ids), then finalize the sidecar. Node dedup and endpoint resolution happen globally
+/// in later phases. CREATE (`__dump_id__`) statements and MATCH overwrites are rejected
+/// — merge dumps are MERGE-only (use `--pk <field>` for dump_id-style CREATE imports).
+fn process_shard_merge(
+    chunk: ShardChunk,
+    node_bkt: &Path,
+    node_merge_bkt: &Path,
+    edge_merge_bkt: &Path,
+) -> Result<()> {
+    let shard_index = chunk.shard;
+    let mut labels = Interner::default();
+    let mut reltypes = Interner::default();
+    let mut keys = Interner::default();
+    let mut rstmts: Vec<RangeIndexStmt> = Vec::new();
+    let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
+    let mut mw = merge_build::MergeShardWriters::create(
+        &buckets::seg_path(node_merge_bkt, chunk.shard),
+        &buckets::seg_path(edge_merge_bkt, chunk.shard),
+        SCRATCH_ZSTD,
+    )?;
+    let mut node_count = 0u64;
+    let mut edge_count = 0u64;
+    let mut sr = StatementReader::new(std::io::Cursor::new(&chunk.bytes));
+    while let Some(raw) = sr.next_statement()? {
+        match parse_statement(&raw)
+            .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
+        {
+            Statement::NodeOverwrite(o) => {
+                if !o.is_merge {
+                    bail!(
+                        "merge dumps expect MERGE node statements, not MATCH … SET: {}",
+                        truncate(&raw, 120)
+                    );
+                }
+                let rec = merge_build::build_node_merge_rec(&o, &mut labels, &mut keys)?;
+                mw.append_node(&rec)?;
+                node_count += 1;
+            }
+            Statement::EdgeOverwrite(o) => {
+                if !o.is_merge {
+                    bail!(
+                        "merge dumps expect MERGE edge statements, not MATCH … SET: {}",
+                        truncate(&raw, 120)
+                    );
+                }
+                let rec =
+                    merge_build::build_edge_merge_rec(&o, &mut labels, &mut reltypes, &mut keys)?;
+                mw.append_edge(&rec)?;
+                edge_count += 1;
+            }
+            Statement::RangeIndex(r) => {
+                if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
+                    rstmts.push(r);
+                }
+            }
+            Statement::VectorIndex(v) => {
+                if !vstmts
+                    .iter()
+                    .any(|e: &VectorIndexStmt| e.label == v.label && e.property == v.property)
+                {
+                    vstmts.push(v);
+                }
+            }
+            Statement::Node(_) | Statement::Edge(_) => bail!(
+                "merge dump does not accept __dump_id__ CREATE statements; emit business-key \
+                 MERGE statements, or pass --pk <field> for a dump_id-style import: {}",
+                truncate(&raw, 120)
+            ),
+            Statement::Ignored => {}
+        }
+    }
+    mw.finish()?;
+    let meta = buckets::ShardMeta {
+        shard: chunk.shard,
+        input_start: chunk.input_start,
+        input_end: chunk.input_end,
+        node_count,
+        uedge_count: edge_count,
+        labels: labels.into_names(),
+        reltypes: reltypes.into_names(),
+        keys: keys.into_names(),
+        range_stmts: rstmts,
+        vector_stmts: vstmts,
+        node_overwrites: Vec::new(),
+        edge_overwrites: Vec::new(),
+    };
+    buckets::finalize_shard(
+        node_bkt,
+        &[
+            buckets::seg_path(node_merge_bkt, chunk.shard),
+            buckets::seg_path(edge_merge_bkt, chunk.shard),
+        ],
+        &meta,
+    )?;
     if std::env::var("SLATER_BUILD_FAIL_AFTER_SHARD")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -460,10 +589,15 @@ fn shard_reader(
 /// workers, each writing a self-contained segment + sidecar. Returns every shard's
 /// metadata (complete-from-a-prior-run + freshly written), read back from disk in
 /// shard order, for the deterministic symbol merge.
+#[allow(clippy::too_many_arguments)]
 fn run_pass1_sharded(
     input_path: &str,
     node_bkt: &Path,
     uedge_bkt: &Path,
+    merge_mode: bool,
+    node_merge_bkt: &Path,
+    edge_merge_bkt: &Path,
+    pk_field: &str,
     vec_index_set: std::collections::HashSet<(String, String)>,
     threads: usize,
     diag: &crate::diag::BuildDiag,
@@ -509,7 +643,16 @@ fn run_pass1_sharded(
                     Err(_) => break,
                 };
                 let len = chunk.bytes.len() as u64;
-                match process_shard(chunk, node_bkt, uedge_bkt, &vis) {
+                match process_shard(
+                    chunk,
+                    node_bkt,
+                    uedge_bkt,
+                    merge_mode,
+                    node_merge_bkt,
+                    edge_merge_bkt,
+                    pk_field,
+                    &vis,
+                ) {
                     Ok(()) => {
                         diag.progress_add(len);
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -691,9 +834,19 @@ fn build_inner(
     diag: &crate::diag::BuildDiag,
 ) -> Result<BuildOutcome> {
     let (cipher, encryption_header) = common::derive_cipher(&opts.encryption_key);
+    // No `--pk` ⇒ merge style (business-key MERGE engine). `--pk FIELD` ⇒ the legacy
+    // dense-id pipeline keyed on FIELD (the configurable, stored `__dump_id__`).
+    let merge_mode = opts.pk.is_none();
+    let pk_field: &str = opts.pk.as_deref().unwrap_or(DUMP_ID);
     let node_bkt = scratch_dir.join("nodes.bkt");
     let uedge_bkt = scratch_dir.join("edges_unresolved.bkt");
     let edge_bkt = scratch_dir.join("edges.bkt");
+    // `merge` dumps spill business-key node/edge MERGEs into these per-shard buckets in
+    // pass 1; the deduped node bucket (`node_bkt`) and resolved `edge_bkt` are produced
+    // by the dedup / resolve phases. The node-key stream feeds the edge merge-join.
+    let node_merge_bkt = scratch_dir.join("nodes_merge.bkt");
+    let edge_merge_bkt = scratch_dir.join("edges_merge.bkt");
+    let node_keys_bkt = scratch_dir.join("node_keys.bkt");
     let perm_path = scratch_dir.join("perm.bin");
     let resume_phase = resume.as_ref().map(|s| s.phase).unwrap_or(Phase::Start);
 
@@ -727,7 +880,11 @@ fn build_inner(
                     Statement::VectorIndex(v) => {
                         vec_index_set.insert((v.label, v.property));
                     }
-                    Statement::Node(_) => break, // DDL header ends at the first node
+                    // DDL header ends at the first data statement — a CREATE node in a
+                    // `dump-id` dump, or a business-key MERGE in a `merge` dump.
+                    Statement::Node(_)
+                    | Statement::NodeOverwrite(_)
+                    | Statement::EdgeOverwrite(_) => break,
                     _ => {}
                 }
             }
@@ -754,6 +911,10 @@ fn build_inner(
             input_path,
             &node_bkt,
             &uedge_bkt,
+            merge_mode,
+            &node_merge_bkt,
+            &edge_merge_bkt,
+            pk_field,
             vec_index_set,
             opts.threads,
             diag,
@@ -814,14 +975,18 @@ fn build_inner(
     // global label/key tables with SET targets and MERGE-created labels, and grows
     // `node_count` by the MERGE-created nodes so clustering covers them. `None` ⇒ a
     // plain CREATE-only dump, which pays nothing here.
-    let overlay = crate::overlay::Overlay::build(
-        &node_bkt,
-        &remaps,
-        &metas,
-        &mut labels,
-        &mut keys,
-        &reltypes,
-    )?;
+    let overlay = if merge_mode {
+        None
+    } else {
+        crate::overlay::Overlay::build(
+            &node_bkt,
+            &remaps,
+            &metas,
+            &mut labels,
+            &mut keys,
+            &reltypes,
+        )?
+    };
     if let Some(ov) = &overlay {
         node_count += ov.created.len() as u64;
     }
@@ -846,11 +1011,83 @@ fn build_inner(
     }
     drop(pass1_g);
 
+    // ---- pass 1.5 (merge dumps): dedup business-key node MERGEs ----------------
+    // Collapse same-identity node MERGEs into one node each (SET props last-wins) via an
+    // external sort, writing the deduped node bucket + the `(identity → prov)` key stream
+    // the edge resolve below joins against. `node_count` becomes the distinct-node count.
+    if merge_mode {
+        let dedup_g = diag.phase("dedup");
+        if resume_phase < Phase::Deduped {
+            diag.set_op("dedup business-key nodes (external sort)", "nodes", 0);
+            let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
+            node_count = merge_build::dedup_nodes(
+                &node_merge_bkt,
+                &remaps,
+                &node_bkt,
+                &node_keys_bkt,
+                scratch_dir,
+                sort_budget,
+                SCRATCH_ZSTD,
+            )?;
+            checkpoint(
+                scratch_dir,
+                &BuildState {
+                    generation: generation.0.to_string(),
+                    phase: Phase::Deduped,
+                    node_count,
+                    edge_count: 0,
+                    labels: labels.names().to_vec(),
+                    reltypes: reltypes.names().to_vec(),
+                    property_keys: keys.names().to_vec(),
+                    range_stmts: range_stmts.clone(),
+                    vector_stmts: vector_stmts.clone(),
+                    cluster_identity: false,
+                },
+            )?;
+            fault_after("deduped");
+        } else {
+            node_count = resume.as_ref().unwrap().node_count;
+        }
+        drop(dedup_g);
+    }
+
     // ---- resolve dump ids → provisional node ids, write the edge bucket -------
     let resolve_g = diag.phase("resolve");
     let edge_count: u64;
     if resume_phase >= Phase::Resolved {
         edge_count = resume.as_ref().unwrap().edge_count;
+    } else if merge_mode {
+        // Resolve each edge MERGE's endpoints by business key against the node-key
+        // stream (sort-merge-join), collapse identical (src, reltype, dst) edges, and
+        // write the final edge bucket — the same `EdgeRec` shape cluster/emit consume.
+        diag.set_op("resolve business keys (merge-join)", "edges", 0);
+        let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
+        edge_count = merge_build::resolve_edges(
+            &edge_merge_bkt,
+            &remaps,
+            &node_keys_bkt,
+            &edge_bkt,
+            scratch_dir,
+            sort_budget,
+            opts.threads,
+            SCRATCH_ZSTD,
+        )?;
+        checkpoint(
+            scratch_dir,
+            &BuildState {
+                generation: generation.0.to_string(),
+                phase: Phase::Resolved,
+                node_count,
+                edge_count,
+                labels: labels.names().to_vec(),
+                reltypes: reltypes.names().to_vec(),
+                property_keys: keys.names().to_vec(),
+                range_stmts: range_stmts.clone(),
+                vector_stmts: vector_stmts.clone(),
+                cluster_identity: false,
+            },
+        )?;
+        fault_after("resolve");
     } else {
         diag.set_op("resolve dump_id → node_id (parallel)", "edges", 0);
         diag.set_active_workers(opts.threads.max(1) as u64);
@@ -1063,6 +1300,10 @@ fn build_inner(
     // ---- emit (always redone on resume) --------------------------------------
     let mut block_sizes: BTreeMap<String, u32> = BTreeMap::new();
     let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
+    // In `merge` mode the deduped node bucket already holds GLOBAL symbol ids (the
+    // pass-1 remaps applied during dedup), so the node scan must NOT remap again —
+    // an empty slice makes `for_each_node_remapped` byte-copy each blob unchanged.
+    let emit_remaps: &[buckets::ShardRemap] = if merge_mode { &[] } else { &remaps };
 
     // Range-index plumbing: one external sorter per declared index, plus the
     // resolved (label/reltype id, key id) needed to extract entries during emit.
@@ -1198,7 +1439,7 @@ fn build_inner(
         // Fast path: final id = prov id, so byte-copy straight through in order.
         // `for_each_node_remapped` translates each shard's local symbol ids to
         // global (identity shards byte-copy unchanged).
-        buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
+        buckets::for_each_node_remapped(&node_bkt, emit_remaps, |prov, node| {
             diag.tick(prov);
             let node = fold_node(node, prov)?;
             labels_w.append_raw(&node.labels_blob)?;
@@ -1221,7 +1462,7 @@ fn build_inner(
         }
     } else {
         let mut node_sorter = ExtSorter::<NodeEmit>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
-        buckets::for_each_node_remapped(&node_bkt, &remaps, |prov, node| {
+        buckets::for_each_node_remapped(&node_bkt, emit_remaps, |prov, node| {
             diag.tick(prov);
             let node = fold_node(node, prov)?;
             let final_id = perm.final_of(prov);
@@ -2231,6 +2472,8 @@ mod tests {
         let data_dir = work.join("data");
 
         let mut opts = BuildOptions {
+            // The synthetic dumps use the `__dump_id__`/CREATE shape.
+            pk: Some("__dump_id__".into()),
             cluster: crate::cluster::ClusterMode::None,
             ..Default::default()
         };

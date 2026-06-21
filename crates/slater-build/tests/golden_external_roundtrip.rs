@@ -53,6 +53,7 @@ fn run_external(cluster: &str) {
     std::fs::write(&input, DUMP).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -217,6 +218,7 @@ fn external_build_routes_and_emits_a_vector_index() {
     std::fs::write(&input, VEC_DUMP).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -311,6 +313,7 @@ fn external_encrypted_build_then_reopen_with_key() {
     std::env::set_var("SLATER_GOLDEN_ENC_KEY", key_hex);
 
     let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),

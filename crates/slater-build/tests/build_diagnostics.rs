@@ -59,6 +59,7 @@ fn run_build(work: &Path, extra: &[&str]) -> std::process::Output {
     ];
     args.extend_from_slice(extra);
     Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
         .args(&args)
         .output()
         .expect("run slater-build")
