@@ -11,7 +11,12 @@
 //! open the backend reads it back with `HEAD` + checksum mode and compares it to
 //! the value recorded in the manifest. SHA-256 is collision-resistant and the
 //! stored checksum is server-authoritative, so this is a content-grade check at
-//! one metadata request per file.
+//! one metadata request per file. When an object carries no server-stored
+//! SHA-256 (e.g. it was uploaded with S3's default full-object checksum,
+//! CRC64-NVME, which the manifest's SHA-256 cannot be compared against), the
+//! check falls back to copy-completeness (byte length) — S3 still validated the
+//! object against its own checksum at upload, so this confirms an intact, complete
+//! copy, just not a manifest content-match. See [`S3ObjectStore::verify_file`].
 //!
 //! `aws-sdk-s3` is async; the [`ObjectStore`] trait is synchronous (the serve
 //! path runs under `spawn_blocking`). The bridge is contained entirely here: the
@@ -48,11 +53,40 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
+/// Wraps the backend runtime so its `Drop` is **non-blocking**. A tokio
+/// [`Runtime`]'s default `Drop` performs a *blocking* shutdown, which panics
+/// ("Cannot drop a runtime in a context where blocking is not allowed") if it
+/// runs while the thread is already inside another runtime's async context.
+/// That is exactly what happens when the server drops a partially-constructed
+/// S3 store on an error path — graph open, disk-cache open, checksum verify all
+/// run on the main runtime, so a failure there unwinds and drops this store on
+/// an async thread. `shutdown_background()` releases the runtime without
+/// blocking, so the *real* open error surfaces instead of a masking panic.
+struct BackgroundRuntime(Option<Runtime>);
+
+impl std::ops::Deref for BackgroundRuntime {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        // `Some` for the whole lifetime; only `Drop` takes it.
+        self.0
+            .as_ref()
+            .expect("S3 backend runtime present until drop")
+    }
+}
+
+impl Drop for BackgroundRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// S3-backed object store. Credentials come from the standard AWS chain
 /// (environment, profile, or instance role), resolved at construction.
 pub struct S3ObjectStore {
     client: Client,
-    rt: Arc<Runtime>,
+    rt: Arc<BackgroundRuntime>,
     bucket: String,
     prefix: String,
 }
@@ -121,13 +155,13 @@ impl S3ObjectStore {
         // [`run_blocking`] (never `block_on`), so the bridge works from the
         // server's main runtime (graph open) and from spawn_blocking workers
         // (query execution) alike.
-        let rt = Arc::new(
+        let rt = Arc::new(BackgroundRuntime(Some(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .build()
                 .context("build S3 backend runtime")?,
-        );
+        )));
         let region = cfg.region.clone();
         let endpoint = cfg.endpoint.clone();
         let path_style = cfg.path_style;
@@ -164,7 +198,7 @@ impl S3ObjectStore {
 /// each positional read drives the async SDK from a synchronous caller.
 struct S3Object {
     client: Client,
-    rt: Arc<Runtime>,
+    rt: Arc<BackgroundRuntime>,
     bucket: String,
     key: String,
     len: u64,
@@ -358,14 +392,28 @@ impl ObjectStore for S3ObjectStore {
                 .send()
                 .await
                 .map_err(|e| sdk_err(&format!("S3 HEAD {full} for integrity check"), e))?;
-            match want {
-                Some(want) => {
-                    let got = head.checksum_sha256().ok_or_else(|| {
-                        anyhow!(
-                            "object {full} has no stored SHA-256 checksum to verify against \
-                             (was it uploaded with checksums enabled?)"
-                        )
-                    })?;
+            // Right-sized object ⇒ a complete copy. S3 validates every object
+            // against its own server-stored full-object checksum at upload, so an
+            // object present at the manifest's byte length is intact-at-rest. This
+            // is the integrity floor when a content-grade SHA-256 comparison is not
+            // available.
+            let check_complete = || -> Result<()> {
+                let len = head
+                    .content_length()
+                    .ok_or_else(|| anyhow!("S3 HEAD {full} has no content length"))?;
+                if len as u64 != size {
+                    bail!(
+                        "object {full} failed its copy-completeness check \
+                         (manifest {size} bytes, S3 reports {len}) — refusing to serve an incomplete copy"
+                    );
+                }
+                Ok(())
+            };
+            match (want, head.checksum_sha256()) {
+                // Strong path: the object carries a server-stored SHA-256; compare
+                // it to the manifest's. SHA-256 is collision-resistant and the
+                // stored value is server-authoritative, so this is content-grade.
+                (Some(want), Some(got)) => {
                     if got != want {
                         bail!(
                             "object {full} failed its SHA-256 integrity check \
@@ -373,17 +421,18 @@ impl ObjectStore for S3ObjectStore {
                         );
                     }
                 }
-                None => {
-                    let len = head
-                        .content_length()
-                        .ok_or_else(|| anyhow!("S3 HEAD {full} has no content length"))?;
-                    if len as u64 != size {
-                        bail!(
-                            "object {full} failed its copy-completeness check \
-                             (manifest {size} bytes, S3 reports {len}) — refusing to serve an incomplete copy"
-                        );
-                    }
-                }
+                // The object has no server-stored SHA-256 — it was uploaded with
+                // S3's default full-object checksum (CRC64-NVME) instead of SHA-256,
+                // so the manifest's SHA-256 has nothing to compare against. S3 still
+                // validated the object against its CRC64-NVME at upload, so fall back
+                // to the completeness check rather than refusing to serve. Weaker
+                // than the SHA-256 comparison: it proves the copy is complete and
+                // intact-at-rest, not that its bytes match the manifest.
+                (_, None) => check_complete()?,
+                // No manifest SHA-256 (a generation built before checksums): the
+                // object's own checksum is irrelevant to a content comparison, so
+                // fall back to completeness as before.
+                (None, Some(_)) => check_complete()?,
             }
             Ok(())
         })
