@@ -33,7 +33,7 @@ use graph_format::nodelabels::{decode_labels, encode_labels_record};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_value};
 
 use crate::buckets::{self, NodeRec, ShardMeta, ShardRemap};
-use crate::model::NodeMatch;
+use crate::model::{NodeMatch, SetExpr};
 use crate::shared::Interner;
 
 /// One edge's accumulated patches plus a hit flag (set when emit/resolve finds the
@@ -168,7 +168,7 @@ impl Overlay {
 
         // Resolve node overwrites.
         for (o, &ri) in node_ovr.iter().zip(&node_req) {
-            let set_props = intern_set_props(&o.set_props, keys)?;
+            let set_props = intern_node_set_props(&o.set_props, keys)?;
             let provs = std::mem::take(&mut reqs[ri].provs);
             if !provs.is_empty() {
                 for p in provs {
@@ -297,6 +297,31 @@ fn intern_set_props(
             bail!("SET {k} = vecf32(…): overwriting a vector property is not supported in v1");
         }
         out.push((keys.intern(k), v.clone()));
+    }
+    Ok(out)
+}
+
+/// Like [`intern_set_props`] but for node overwrites, whose SET right-hand sides may
+/// be expressions. The overlay patch path applies after the base build and has no
+/// per-node accumulated state to evaluate against, so only literals are accepted;
+/// function calls and property references (a merge-dump feature) are rejected.
+fn intern_node_set_props(
+    set_props: &[(String, SetExpr)],
+    keys: &mut Interner,
+) -> Result<Vec<(u32, Value)>> {
+    let mut out = Vec::with_capacity(set_props.len());
+    for (k, e) in set_props {
+        let v = match e {
+            SetExpr::Lit(v) => v.clone(),
+            SetExpr::Prop(_) | SetExpr::Func { .. } => bail!(
+                "overlay SET supports only literal values (got a function or property \
+                 reference for `{k}`); functions are a merge-dump feature"
+            ),
+        };
+        if matches!(v, Value::Vector(_)) {
+            bail!("SET {k} = vecf32(…): overwriting a vector property is not supported in v1");
+        }
+        out.push((keys.intern(k), v));
     }
     Ok(out)
 }

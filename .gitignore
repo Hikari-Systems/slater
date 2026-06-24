@@ -7,6 +7,12 @@ Cargo.lock.orig
 /testdata/generated
 *.profraw
 
+# Large local input dumps used for import testing (root-level only) — never
+# committed. In-tree test fixtures embed their dumps as string constants.
+/*.cypher
+/*.import
+/*.dump
+
 # Python bytecode from the perf harnesses.
 __pycache__/
 *.pyc

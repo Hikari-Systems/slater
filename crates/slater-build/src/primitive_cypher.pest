@@ -79,7 +79,18 @@ edge_overwrite = { (^"merge" | ^"match") ~ overwrite_rel ~ set_clause? }
 overwrite_rel = { node_pattern ~ "-" ~ "[" ~ var? ~ rel_detail ~ "]" ~ "->" ~ node_pattern }
 
 set_clause = { ^"set" ~ set_assign ~ ("," ~ set_assign)* }
-set_assign = { var ~ "." ~ key ~ "=" ~ value }
+set_assign = { var ~ "." ~ key ~ "=" ~ set_expr }
+
+// A node SET right-hand side: a pure scalar function call, a literal, or a
+// same-node property reference. `func_call` is tried first (it needs a trailing
+// `(`); `value` comes before `prop_ref` so a numeric literal like `2.5` is not
+// mis-parsed as `var.key` (both `var` and `key` admit leading digits). The fold
+// evaluator (and the edge / overlay paths) restrict which of these are allowed in
+// each context.
+set_expr  = { func_call | value | prop_ref }
+func_call = { fn_name ~ "(" ~ (set_expr ~ ("," ~ set_expr)*)? ~ ")" }
+prop_ref  = { var ~ "." ~ key }
+fn_name   = @{ (ASCII_ALPHANUMERIC | "_" | ".")+ }
 
 labels = { (":" ~ label)+ }
 

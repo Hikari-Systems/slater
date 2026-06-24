@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "graph-format"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -2607,7 +2607,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slater"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2624,6 +2624,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "slater-scalar",
  "thiserror",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -2634,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "slater-build"
-version = "0.14.1"
+version = "0.14.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2644,9 +2645,18 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "slater-scalar",
  "thiserror",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "slater-scalar"
+version = "0.14.2"
+dependencies = [
+ "anyhow",
+ "graph-format",
 ]
 
 [[package]]

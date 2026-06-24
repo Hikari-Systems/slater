@@ -17,7 +17,7 @@ use graph_format::ids::Value;
 
 use crate::model::{
     EdgeOverwriteStmt, EdgeStmt, Entity, NodeMatch, NodeOverwriteStmt, NodeStmt, RangeIndexStmt,
-    Statement, VectorIndexStmt,
+    SetExpr, Statement, VectorIndexStmt,
 };
 
 #[derive(Parser)]
@@ -256,31 +256,81 @@ fn node_match_from_pattern(pair: Pair<Rule>) -> Result<NodeMatch> {
     Ok(NodeMatch { label, key, value })
 }
 
-/// Parse a `set_clause` (`SET v.k = val, …`) into `(key, value)` assignments. The
-/// binding variable (`v`) is ignored — v1 patterns bind a single entity.
-fn parse_set_clause(pair: Pair<Rule>) -> Result<Vec<(String, Value)>> {
+/// Parse a `set_clause` (`SET v.k = rhs, …`) into `(key, expr)` assignments, where
+/// each `rhs` is a literal, a same-node property reference, or a pure scalar
+/// function call. The binding variable (`v`) is ignored — v1 patterns bind a
+/// single entity.
+fn parse_set_clause(pair: Pair<Rule>) -> Result<Vec<(String, SetExpr)>> {
     let mut out = Vec::new();
     for assign in pair.into_inner() {
         if assign.as_rule() != Rule::set_assign {
             continue;
         }
         let mut key: Option<String> = None;
-        let mut value: Option<Value> = None;
+        let mut expr: Option<SetExpr> = None;
         for c in assign.into_inner() {
             match c.as_rule() {
                 Rule::key => key = Some(unquote_key(c.as_str())),
-                Rule::value => value = Some(parse_value(c)?),
+                Rule::set_expr => expr = Some(parse_set_expr(c)?),
                 _ => {}
             }
         }
         let key = key.ok_or_else(|| anyhow!("SET assignment missing property key"))?;
-        let value = value.ok_or_else(|| anyhow!("SET assignment missing value"))?;
-        out.push((key, value));
+        let expr = expr.ok_or_else(|| anyhow!("SET assignment missing value"))?;
+        out.push((key, expr));
     }
     if out.is_empty() {
         bail!("SET clause must assign at least one property");
     }
     Ok(out)
+}
+
+/// Like [`parse_set_clause`] but for contexts that accept only literal values
+/// (edge SET, overlay patches). A function call or property reference is an error.
+fn parse_set_clause_literal(pair: Pair<Rule>) -> Result<Vec<(String, Value)>> {
+    parse_set_clause(pair)?
+        .into_iter()
+        .map(|(k, e)| match e {
+            SetExpr::Lit(v) => Ok((k, v)),
+            SetExpr::Prop(_) | SetExpr::Func { .. } => bail!(
+                "edge SET supports only literal values, not functions or property references (for `{k}`)"
+            ),
+        })
+        .collect()
+}
+
+/// Parse one `set_expr` node: `func_call | prop_ref | value`.
+fn parse_set_expr(pair: Pair<Rule>) -> Result<SetExpr> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| anyhow!("empty SET expression"))?;
+    match inner.as_rule() {
+        Rule::value => Ok(SetExpr::Lit(parse_value(inner)?)),
+        Rule::prop_ref => {
+            // prop_ref = var "." key ; keep the key, drop the variable.
+            let key = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::key)
+                .map(|p| unquote_key(p.as_str()))
+                .ok_or_else(|| anyhow!("property reference missing key"))?;
+            Ok(SetExpr::Prop(key))
+        }
+        Rule::func_call => {
+            let mut name: Option<String> = None;
+            let mut args = Vec::new();
+            for c in inner.into_inner() {
+                match c.as_rule() {
+                    Rule::fn_name => name = Some(c.as_str().to_string()),
+                    Rule::set_expr => args.push(parse_set_expr(c)?),
+                    _ => {}
+                }
+            }
+            let name = name.ok_or_else(|| anyhow!("function call missing name"))?;
+            Ok(SetExpr::Func { name, args })
+        }
+        other => bail!("unexpected SET expression rule {other:?}"),
+    }
 }
 
 fn parse_node_overwrite(pair: Pair<Rule>) -> Result<Statement> {
@@ -291,7 +341,7 @@ fn parse_node_overwrite(pair: Pair<Rule>) -> Result<Statement> {
         .ok_or_else(|| anyhow!("empty node overwrite"))?;
     let is_merge = inner.as_rule() == Rule::merge_node;
     let mut node_pattern: Option<Pair<Rule>> = None;
-    let mut set_props: Vec<(String, Value)> = Vec::new();
+    let mut set_props: Vec<(String, SetExpr)> = Vec::new();
     for c in inner.into_inner() {
         match c.as_rule() {
             Rule::node_pattern => node_pattern = Some(c),
@@ -321,7 +371,9 @@ fn parse_edge_overwrite(pair: Pair<Rule>) -> Result<Statement> {
     for c in pair.into_inner() {
         match c.as_rule() {
             Rule::overwrite_rel => rel = Some(c),
-            Rule::set_clause => set_props = parse_set_clause(c)?,
+            // Edges store only literal SET values; functions / prop refs are a
+            // node-only feature, rejected here.
+            Rule::set_clause => set_props = parse_set_clause_literal(c)?,
             _ => {}
         }
     }
@@ -796,8 +848,8 @@ mod tests {
         assert_eq!(
             m.set_props,
             vec![
-                ("score".to_string(), Value::Int(99)),
-                ("note".to_string(), Value::Str("x".into())),
+                ("score".to_string(), SetExpr::Lit(Value::Int(99))),
+                ("note".to_string(), SetExpr::Lit(Value::Str("x".into()))),
             ]
         );
 
@@ -808,7 +860,10 @@ mod tests {
             panic!("expected node overwrite");
         };
         assert!(!m.is_merge);
-        assert_eq!(m.set_props, vec![("score".to_string(), Value::Int(1))]);
+        assert_eq!(
+            m.set_props,
+            vec![("score".to_string(), SetExpr::Lit(Value::Int(1)))]
+        );
 
         // MERGE with no SET (ensure-exists) parses with empty set_props.
         let Statement::NodeOverwrite(m) = parse_statement("MERGE (n:Concept {name: 'A'})").unwrap()
@@ -817,6 +872,53 @@ mod tests {
         };
         assert!(m.is_merge);
         assert!(m.set_props.is_empty());
+    }
+
+    #[test]
+    fn parses_coalesce_and_function_set_rhs() {
+        let Statement::NodeOverwrite(m) = parse_statement(
+            "MERGE (n:Company {ticker: 'IMC'}) SET n.name = coalesce(n.name, n.canonicalName, 'X (Y), Z')",
+        )
+        .unwrap() else {
+            panic!("expected node overwrite");
+        };
+        assert_eq!(
+            m.set_props,
+            vec![(
+                "name".to_string(),
+                SetExpr::Func {
+                    name: "coalesce".to_string(),
+                    args: vec![
+                        SetExpr::Prop("name".to_string()),
+                        SetExpr::Prop("canonicalName".to_string()),
+                        SetExpr::Lit(Value::Str("X (Y), Z".into())),
+                    ],
+                }
+            )]
+        );
+
+        // Nested calls and a dotted function name parse.
+        let Statement::NodeOverwrite(m) =
+            parse_statement("MERGE (n:X {id: 'a'}) SET n.u = toUpper(n.name)").unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        assert_eq!(
+            m.set_props,
+            vec![(
+                "u".to_string(),
+                SetExpr::Func {
+                    name: "toUpper".to_string(),
+                    args: vec![SetExpr::Prop("name".to_string())],
+                }
+            )]
+        );
+
+        // A function in an edge SET is rejected (literal-only context).
+        assert!(parse_statement(
+            "MERGE (a:X {id: 'a'})-[r:T]->(b:Y {id: 'b'}) SET r.w = toUpper('a')"
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[package]
+name = "slater-scalar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Pure, deterministic scalar-function evaluator over the on-disk `graph_format::Value`.
+# Shared single source of truth between the query engine (`slater`) and the offline
+# builder (`slater-build`). Deliberately tiny deps: no graph/runtime, no regex/chrono,
+# no vector kernel — those back impure functions that stay in the query engine.
+
+[dependencies]
+graph-format.workspace = true
+anyhow.workspace = true

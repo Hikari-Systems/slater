@@ -55,6 +55,23 @@ pub struct EdgeStmt {
     pub props: Vec<(String, Value)>,
 }
 
+/// The right-hand side of a node `SET n.k = …` assignment. A literal value, a
+/// reference to another property of the *same* node (`n.other`, resolved against
+/// the node's accumulated state at fold time), or a pure scalar function call
+/// (`coalesce(n.name, n.canonicalName, 'x')`, `toUpper(n.name)`, …). Functions are
+/// evaluated at build time via [`slater_scalar`]; only `Lit` is permitted on edge
+/// SET and in the overlay-patch dialect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SetExpr {
+    Lit(Value),
+    /// `n.<key>` — the variable is dropped (v1 patterns bind a single node).
+    Prop(String),
+    Func {
+        name: String,
+        args: Vec<SetExpr>,
+    },
+}
+
 /// One half of an edge-overwrite endpoint match: locate a node by `label` having
 /// property `key == value`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,7 +88,7 @@ pub struct NodeMatch {
 pub struct NodeOverwriteStmt {
     pub match_: NodeMatch,
     pub is_merge: bool,
-    pub set_props: Vec<(String, Value)>,
+    pub set_props: Vec<(String, SetExpr)>,
 }
 
 /// `MERGE|MATCH (a:L {k:v})-[r:T]->(b:M {j:w}) [SET r.… = …]`. Endpoints are matched
