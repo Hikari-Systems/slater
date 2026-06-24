@@ -630,11 +630,12 @@ mod tests {
     #[test]
     fn containers() {
         let xs = Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
-        assert_eq!(ev("size", &[xs.clone()]), Value::Int(3));
-        assert_eq!(ev("head", &[xs.clone()]), Value::Int(3));
-        assert_eq!(ev("last", &[xs.clone()]), Value::Int(2));
+        let one = std::slice::from_ref(&xs);
+        assert_eq!(ev("size", one), Value::Int(3));
+        assert_eq!(ev("head", one), Value::Int(3));
+        assert_eq!(ev("last", one), Value::Int(2));
         assert_eq!(
-            ev("list.sort", &[xs.clone()]),
+            ev("list.sort", one),
             Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
         assert_eq!(ev("isempty", &[Value::List(vec![])]), Value::Bool(true));
