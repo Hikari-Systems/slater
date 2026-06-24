@@ -44,13 +44,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
+COPY crates/slater-scalar/Cargo.toml crates/slater-scalar/Cargo.toml
 COPY crates/slater-build/Cargo.toml crates/slater-build/Cargo.toml
 COPY crates/slater/Cargo.toml crates/slater/Cargo.toml
 RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
+       crates/slater-scalar/src \
        crates/slater-build/src crates/slater-build/src/bin crates/slater/src \
        crates/slater/benches \
     && echo '' > crates/graph-format/src/lib.rs \
     && echo 'fn main() {}' > crates/graph-format/benches/codec.rs \
+    && echo '' > crates/slater-scalar/src/lib.rs \
     && echo 'fn main() {}' > crates/slater-build/src/main.rs \
     && echo 'fn main() {}' > crates/slater-build/src/bin/bench_codec.rs \
     && echo '' > crates/slater/src/lib.rs \
@@ -60,6 +63,7 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && rm -rf crates/*/src \
        target/release/slater target/release/slater-build target/release/bench-codec \
        target/release/deps/slater-* target/release/deps/slater_build-* \
+       target/release/deps/slater_scalar-* target/release/deps/libslater_scalar-* \
        target/release/deps/bench_codec-* \
        target/release/deps/graph_format-* target/release/deps/libgraph_format-*
 
