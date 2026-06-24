@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 graph-format.workspace = true
+slater-scalar.workspace = true
 hs-utils.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

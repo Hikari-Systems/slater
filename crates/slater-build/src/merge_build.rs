@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use graph_format::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use graph_format::columns::{decode_props, encode_props_record};
@@ -42,6 +42,8 @@ use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 use crate::buckets::{
     read_blob, seg_path, segments, write_blob, BucketWriter, EdgeRec, NodeRec, ShardRemap,
 };
+use crate::model::SetExpr;
+use crate::set_eval::validate_set_expr;
 
 /// Bigger blocks for transient buckets, mirroring `build_external::BUCKET_BLOCK`.
 const BUCKET_BLOCK: usize = 1 << 20;
@@ -241,6 +243,158 @@ fn fold_props(into: &mut Vec<(u32, Value)>, add: &[(u32, Value)]) {
     }
 }
 
+/// A node `SET` right-hand side with its property-key references interned to local
+/// (then global) symbol ids — the spill-resident mirror of [`SetExpr`]. Functions
+/// are evaluated at fold time against the node's accumulated props, so the whole
+/// expression tree must survive the external sort.
+pub(crate) enum SetExprI {
+    Lit(Value),
+    Prop(u32),
+    Func { name: String, args: Vec<SetExprI> },
+}
+
+/// Intern a parsed [`SetExpr`]'s property references against the local key interner.
+/// Validates that any function is build-evaluable and rejects vector literals.
+fn intern_set_expr(e: &SetExpr, keys: &mut crate::shared::Interner) -> Result<SetExprI> {
+    Ok(match e {
+        SetExpr::Lit(v) => {
+            reject_vector(v, "node MERGE SET")?;
+            SetExprI::Lit(v.clone())
+        }
+        SetExpr::Prop(name) => SetExprI::Prop(keys.intern(name)),
+        SetExpr::Func { name, args } => SetExprI::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| intern_set_expr(a, keys))
+                .collect::<Result<_>>()?,
+        },
+    })
+}
+
+/// Rewrite the interned property-key ids inside an expression tree when a shard's
+/// local symbol ids are remapped to global ids in [`dedup_nodes`].
+fn remap_set_expr(e: &mut SetExprI, rm: &ShardRemap) {
+    match e {
+        SetExprI::Lit(_) => {}
+        SetExprI::Prop(k) => *k = rm.map_key(*k),
+        SetExprI::Func { args, .. } => {
+            for a in args {
+                remap_set_expr(a, rm);
+            }
+        }
+    }
+}
+
+fn encode_set_expr(buf: &mut Vec<u8>, e: &SetExprI) {
+    match e {
+        SetExprI::Lit(v) => {
+            buf.push(0);
+            write_value(buf, v);
+        }
+        SetExprI::Prop(k) => {
+            buf.push(1);
+            write_uvarint(buf, *k as u64);
+        }
+        SetExprI::Func { name, args } => {
+            buf.push(2);
+            write_uvarint(buf, name.len() as u64);
+            buf.extend_from_slice(name.as_bytes());
+            write_uvarint(buf, args.len() as u64);
+            for a in args {
+                encode_set_expr(buf, a);
+            }
+        }
+    }
+}
+
+fn decode_set_expr(r: &mut &[u8]) -> Result<SetExprI> {
+    let tag = read_u8(r)?;
+    Ok(match tag {
+        0 => SetExprI::Lit(read_value(r)?),
+        1 => SetExprI::Prop(read_uvarint(r)? as u32),
+        2 => {
+            let nlen = read_uvarint(r)? as usize;
+            if r.len() < nlen {
+                bail!("truncated function name in node SET spill");
+            }
+            let name = std::str::from_utf8(&r[..nlen])
+                .context("function name is not valid UTF-8")?
+                .to_string();
+            *r = &r[nlen..];
+            let n = read_uvarint(r)? as usize;
+            let mut args = Vec::with_capacity(n);
+            for _ in 0..n {
+                args.push(decode_set_expr(r)?);
+            }
+            SetExprI::Func { name, args }
+        }
+        other => bail!("unknown SET-expr tag {other}"),
+    })
+}
+
+fn encode_node_set_props(buf: &mut Vec<u8>, props: &[(u32, SetExprI)]) {
+    write_uvarint(buf, props.len() as u64);
+    for (k, e) in props {
+        write_uvarint(buf, *k as u64);
+        encode_set_expr(buf, e);
+    }
+}
+
+fn decode_node_set_props(r: &mut &[u8]) -> Result<Vec<(u32, SetExprI)>> {
+    let n = read_uvarint(r)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let k = read_uvarint(r)? as u32;
+        out.push((k, decode_set_expr(r)?));
+    }
+    Ok(out)
+}
+
+fn read_u8(r: &mut &[u8]) -> Result<u8> {
+    let (first, rest) = r
+        .split_first()
+        .ok_or_else(|| anyhow!("unexpected end of spill"))?;
+    *r = rest;
+    Ok(*first)
+}
+
+/// Evaluate a node `SET` expression against the node's accumulated props (`props`),
+/// in file order — so a property reference resolves to the value folded *before*
+/// this statement, matching Cypher MERGE execution order.
+fn eval_set_expr(e: &SetExprI, props: &[(u32, Value)]) -> Result<Value> {
+    match e {
+        SetExprI::Lit(v) => Ok(v.clone()),
+        SetExprI::Prop(k) => Ok(props
+            .iter()
+            .find(|(ek, _)| ek == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null)),
+        SetExprI::Func { name, args } => {
+            let vs: Vec<Value> = args
+                .iter()
+                .map(|a| eval_set_expr(a, props))
+                .collect::<Result<_>>()?;
+            slater_scalar::eval_pure(name, &vs)?
+                .ok_or_else(|| anyhow!("function `{name}` is not supported in build-time SET"))
+        }
+    }
+}
+
+/// Fold a statement's `SET` assignments into the accumulating node props, evaluating
+/// each right-hand side against the state so far (last-writer-wins per key).
+fn fold_node_props(into: &mut Vec<(u32, Value)>, add: &[(u32, SetExprI)]) -> Result<()> {
+    for (k, e) in add {
+        let v = eval_set_expr(e, into)?;
+        if let Some(slot) = into.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1 = v;
+        } else {
+            into.push((*k, v));
+        }
+    }
+    Ok(())
+}
+
 // ── pass-1 spill records (per-shard, LOCAL symbol ids) ─────────────────────────
 
 /// A node MERGE as spilled in pass 1. `label`/`key`/set-prop keys are the shard's
@@ -251,7 +405,7 @@ pub(crate) struct NodeMergeRec {
     pub label: u32,
     pub key: u32,
     pub value: Value,
-    pub set_props: Vec<(u32, Value)>,
+    pub set_props: Vec<(u32, SetExprI)>,
     pub seq: u64,
 }
 
@@ -279,14 +433,14 @@ impl SortRecord for NodeMergeRec {
         write_uvarint(buf, self.label as u64);
         write_uvarint(buf, self.key as u64);
         write_value(buf, &self.value);
-        encode_props(buf, &self.set_props);
+        encode_node_set_props(buf, &self.set_props);
         write_uvarint(buf, self.seq);
     }
     fn decode(r: &mut &[u8]) -> Result<Self> {
         let label = read_uvarint(r)? as u32;
         let key = read_uvarint(r)? as u32;
         let value = read_value(r)?;
-        let set_props = decode_props_pairs(r)?;
+        let set_props = decode_node_set_props(r)?;
         let seq = read_uvarint(r)?;
         Ok(NodeMergeRec {
             label,
@@ -409,9 +563,9 @@ pub(crate) fn build_node_merge_rec(
     let label = labels.intern(&o.match_.label);
     let key = keys.intern(&o.match_.key);
     let mut set_props = Vec::with_capacity(o.set_props.len());
-    for (k, v) in &o.set_props {
-        reject_vector(v, "node MERGE SET")?;
-        set_props.push((keys.intern(k), v.clone()));
+    for (k, e) in &o.set_props {
+        validate_set_expr(e)?;
+        set_props.push((keys.intern(k), intern_set_expr(e, keys)?));
     }
     Ok(NodeMergeRec {
         label,
@@ -514,8 +668,9 @@ pub(crate) fn dedup_nodes(
                 if !rm.identity {
                     nm.label = rm.map_label(nm.label);
                     nm.key = rm.map_key(nm.key);
-                    for (k, _) in nm.set_props.iter_mut() {
+                    for (k, e) in nm.set_props.iter_mut() {
                         *k = rm.map_key(*k);
+                        remap_set_expr(e, rm);
                     }
                 }
             }
@@ -576,7 +731,7 @@ pub(crate) fn dedup_nodes(
             // Identity prop first; SET props then fold over it last-wins.
             props = vec![(nm.key, nm.value.clone())];
         }
-        fold_props(&mut props, &nm.set_props);
+        fold_node_props(&mut props, &nm.set_props)?;
     }
     flush(&mut cur, &mut props, &mut nodes_w, &mut keys_w, &mut prov)?;
     nodes_w.finish()?;

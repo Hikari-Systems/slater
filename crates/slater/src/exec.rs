@@ -272,6 +272,13 @@ fn val_to_value(v: &Val) -> Option<Value> {
     })
 }
 
+/// Project every argument to an on-disk [`Value`], or `None` if any is a
+/// runtime-only shape. Used to decide whether a pure scalar call can be delegated
+/// to the shared [`slater_scalar`] evaluator (which is keyed on `Value`).
+fn try_all_values(args: &[Val]) -> Option<Vec<Value>> {
+    args.iter().map(val_to_value).collect()
+}
+
 /// Project the index-keyable scalars of a per-row binding into a planning map, so
 /// the planner can turn `MATCH (n:L {p: w})` / `WHERE n.p = w` — where `w` was
 /// bound at runtime by `UNWIND`/`WITH`/a prior `MATCH` — into a per-row index seek
@@ -5714,11 +5721,26 @@ impl<'g> Engine<'g> {
                 .into_iter()
                 .find(|v| !matches!(v, Val::Null))
                 .unwrap_or(Val::Null),
-            "tolower" | "lower" => str_fn(&a0(0), |s| s.to_lowercase()),
-            "toupper" | "upper" => str_fn(&a0(0), |s| s.to_uppercase()),
-            "trim" => str_fn(&a0(0), |s| s.trim().to_string()),
-            "ltrim" => str_fn(&a0(0), |s| s.trim_start().to_string()),
-            "rtrim" => str_fn(&a0(0), |s| s.trim_end().to_string()),
+            // Pure, deterministic scalar functions whose result depends only on
+            // their argument values are single-sourced in the `slater-scalar`
+            // crate (shared with the offline builder). Convert the runtime args to
+            // on-disk `Value`s and delegate; a runtime-only argument (node / map /
+            // path / temporal) can never satisfy these string/numeric/conversion
+            // functions and yields NULL — exactly the old `str_fn`/`num_fn`
+            // behaviour for a non-scalar argument.
+            "tolower" | "lower" | "toupper" | "upper" | "trim" | "ltrim" | "rtrim"
+            | "tointeger" | "tointegerornull" | "tofloat" | "tofloatornull" | "toboolean"
+            | "tobooleanornull" | "abs" | "ceil" | "floor" | "round" | "sqrt" | "log" | "log10"
+            | "exp" | "e" | "pi" | "pow" | "sign" | "sin" | "cos" | "tan" | "cot" | "asin"
+            | "acos" | "atan" | "atan2" | "degrees" | "radians" | "haversin" => {
+                match try_all_values(&args) {
+                    Some(vs) => Val::from_value(
+                        slater_scalar::eval_pure(&n, &vs)?
+                            .expect("listed name is handled by slater-scalar"),
+                    ),
+                    None => Val::Null,
+                }
+            }
             "reverse" => match a0(0) {
                 Val::Str(s) => Val::Str(s.chars().rev().collect()),
                 Val::List(mut xs) => {
@@ -5770,69 +5792,18 @@ impl<'g> Engine<'g> {
             // `tostring`/`toString` and the `*OrNull` variant. FalkorDB's plain
             // `toString` errors on a non-convertible type while `toStringOrNull`
             // yields NULL; our renderer never errors, so the two coincide here.
+            // `toString`/`toStringOrNull`: the renderer never errors, so the two
+            // coincide. Kept here (not delegated) because a runtime-only argument
+            // (node / temporal / point) must render via `Val::to_display`, not NULL.
             "tostring" | "tostringornull" => match a0(0) {
                 Val::Null => Val::Null,
-                v => Val::Str(v.to_display()),
-            },
-            // `toInteger`/`toFloat`/`toBoolean` already return NULL on a failed
-            // coercion, so the `*OrNull` forms (which never error) are aliases.
-            "tointeger" | "tointegerornull" => match a0(0) {
-                Val::Int(i) => Val::Int(i),
-                Val::Float(f) => Val::Int(f as i64),
-                Val::Str(s) => s.trim().parse::<i64>().map(Val::Int).unwrap_or(Val::Null),
-                Val::Bool(b) => Val::Int(b as i64),
-                _ => Val::Null,
-            },
-            "tofloat" | "tofloatornull" => match a0(0) {
-                Val::Int(i) => Val::Float(i as f64),
-                Val::Float(f) => Val::Float(f),
-                Val::Str(s) => s.trim().parse::<f64>().map(Val::Float).unwrap_or(Val::Null),
-                _ => Val::Null,
-            },
-            "toboolean" | "tobooleanornull" => match a0(0) {
-                Val::Bool(b) => Val::Bool(b),
-                Val::Str(s) => match s.trim().to_lowercase().as_str() {
-                    "true" => Val::Bool(true),
-                    "false" => Val::Bool(false),
-                    _ => Val::Null,
+                v => match val_to_value(&v) {
+                    Some(vv) => Val::from_value(
+                        slater_scalar::eval_pure("tostring", &[vv])?.expect("handled"),
+                    ),
+                    None => Val::Str(v.to_display()),
                 },
-                _ => Val::Null,
             },
-            "abs" => num_fn(&a0(0), |x| x.abs()),
-            "ceil" => num_fn(&a0(0), |x| x.ceil()),
-            "floor" => num_fn(&a0(0), |x| x.floor()),
-            "round" => num_fn(&a0(0), |x| x.round()),
-            "sqrt" => num_fn(&a0(0), |x| x.sqrt()),
-            // Natural log / base-10 log. Like FalkorDB these wrap libm directly, so
-            // a non-positive argument yields the IEEE result (`log(0) = -inf`,
-            // `log(-1) = NaN`) rather than an error — matching its `AR_LOG`/`AR_LOG10`.
-            "log" => num_fn(&a0(0), |x| x.ln()),
-            "log10" => num_fn(&a0(0), |x| x.log10()),
-            "exp" => num_fn(&a0(0), |x| x.exp()),
-            "e" => Val::Float(std::f64::consts::E),
-            "pi" => Val::Float(std::f64::consts::PI),
-            "pow" => match (a0(0).as_num(), a0(1).as_num()) {
-                (Some(b), Some(e)) => Val::Float(b.powf(e)),
-                _ => Val::Null,
-            },
-            "sign" => num_fn(&a0(0), |x| x.signum().trunc()),
-            // Trigonometric family — like FalkorDB these wrap libm directly and
-            // return NULL for a non-numeric (incl. NULL) argument.
-            "sin" => num_fn(&a0(0), |x| x.sin()),
-            "cos" => num_fn(&a0(0), |x| x.cos()),
-            "tan" => num_fn(&a0(0), |x| x.tan()),
-            "cot" => num_fn(&a0(0), |x| x.cos() / x.sin()),
-            "asin" => num_fn(&a0(0), |x| x.asin()),
-            "acos" => num_fn(&a0(0), |x| x.acos()),
-            "atan" => num_fn(&a0(0), |x| x.atan()),
-            "atan2" => match (a0(0).as_num(), a0(1).as_num()) {
-                (Some(y), Some(x)) => Val::Float(y.atan2(x)),
-                _ => Val::Null,
-            },
-            "degrees" => num_fn(&a0(0), |x| x.to_degrees()),
-            "radians" => num_fn(&a0(0), |x| x.to_radians()),
-            // haversin(x) = (1 - cos x) / 2 (FalkorDB AR_HAVERSIN).
-            "haversin" => num_fn(&a0(0), |x| (1.0 - x.cos()) / 2.0),
             // left/right: the n leftmost/rightmost characters. n must be >= 0;
             // when the string is shorter than n the whole string is returned.
             "left" => self.left_right(&args, true)?,
@@ -7770,21 +7741,6 @@ fn type_name(v: &Val) -> &'static str {
     }
 }
 
-fn str_fn(v: &Val, f: impl Fn(&str) -> String) -> Val {
-    match v {
-        Val::Str(s) => Val::Str(f(s)),
-        Val::Null => Val::Null,
-        _ => Val::Null,
-    }
-}
-
-fn num_fn(v: &Val, f: impl Fn(f64) -> f64) -> Val {
-    match v.as_num() {
-        Some(x) => Val::Float(f(x)),
-        None => Val::Null,
-    }
-}
-
 /// Coerce a value to a vector for the similarity functions: a `Vector` directly,
 /// or a list of numbers (the shape an inlined literal / `$param` takes).
 fn as_vector(v: &Val) -> Option<Vec<f32>> {
@@ -8092,6 +8048,49 @@ mod tests {
     use super::*;
     use crate::parser;
     use crate::testgen;
+
+    /// Every pure scalar function delegated to `slater-scalar` must still be
+    /// advertised by `CALL dbms.functions()` (the registry the planner validates
+    /// against), so the extraction did not silently drop a name.
+    #[test]
+    fn pure_functions_are_advertised() {
+        for name in slater_scalar::PURE_FUNCTIONS {
+            assert!(
+                IMPLEMENTED_FUNCTIONS.contains(name),
+                "slater-scalar advertises `{name}` but IMPLEMENTED_FUNCTIONS does not"
+            );
+        }
+    }
+
+    /// Smoke-test the delegation path: a scalar call routes through `slater-scalar`
+    /// and a `coalesce` over a runtime-only `Val` still uses the local fallback.
+    #[test]
+    fn scalar_delegation_and_runtime_fallback() {
+        let (root, graph, _) = testgen::write_basic("scalar_delegation");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(64 << 20);
+        let eng = Engine::new(&gen, &cache);
+        // delegated to slater-scalar (compare via to_display — Val is not PartialEq)
+        assert_eq!(
+            eng.call_function("toUpper", false, vec![Val::Str("ab".into())])
+                .unwrap()
+                .to_display(),
+            "AB"
+        );
+        assert_eq!(
+            eng.call_function("round", false, vec![Val::Float(2.5)])
+                .unwrap()
+                .to_display(),
+            "3"
+        );
+        // coalesce with a runtime-only first arg keeps the local fallback (returns
+        // the node, which has no `Value` projection)
+        assert!(matches!(
+            eng.call_function("coalesce", false, vec![Val::Node(7), Val::Null])
+                .unwrap(),
+            Val::Node(7)
+        ));
+    }
 
     /// Open the shared fixture and run `q`, returning the result.
     fn run(root_tag: &str, q: &str) -> (std::path::PathBuf, QueryResult) {

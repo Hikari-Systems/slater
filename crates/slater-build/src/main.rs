@@ -16,6 +16,7 @@ mod model;
 mod overlay;
 mod parser;
 mod resolve;
+mod set_eval;
 mod shared;
 
 use std::path::PathBuf;
