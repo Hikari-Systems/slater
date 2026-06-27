@@ -13,6 +13,9 @@ Cargo.lock.orig
 /*.import
 /*.dump
 
+# Local, uncommitted helper scripts.
+/scripts/stargazers.sh
+
 # Python bytecode from the perf harnesses.
 __pycache__/
 *.pyc
