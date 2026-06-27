@@ -185,10 +185,19 @@ struct Cli {
     #[arg(long)]
     resume: bool,
 
+    /// Suppress the progress log. By default the build emits hs-utils-style
+    /// progress lines (phase start/finish with timings, and per-phase work
+    /// milestones) to stdout while it runs; `-q`/`--quiet` turns that off (errors
+    /// still surface). Independent of `--diagnostics`.
+    #[arg(long, short = 'q')]
+    quiet: bool,
+
     /// Diagnostic mode: sample process resource counters (RSS, cgroup memory,
     /// CPU, IO, threads, PSI stall) on a background thread and append a JSONL log
     /// of what the build was doing at each moment, for later bottleneck analysis.
     /// OFF by default (zero overhead). Also enabled by `SLATER_BUILD_DIAG=1`.
+    /// Orthogonal to the progress log above — this is the detailed machine-readable
+    /// trace, not the human narrative.
     #[arg(long)]
     diagnostics: bool,
 
@@ -278,47 +287,51 @@ fn diagnostics_enabled(cli: &Cli) -> bool {
     )
 }
 
-/// Construct the `BuildDiag` for this run: inert unless diagnostics are enabled,
-/// otherwise opens the JSONL log (creating `--data-dir` if needed, falling back to
-/// the CWD) and writes a header describing the run's cost-relevant options.
+/// Construct the `BuildDiag` for this run. Two independent outputs:
+/// * the **progress log** (hs-utils-style phase/milestone lines) — on unless
+///   `--quiet`;
+/// * the **diagnostics JSONL** (detailed resource sampler) — on only with
+///   `--diagnostics` (or `SLATER_BUILD_DIAG=1`), written under `--data-dir`
+///   (falling back to the CWD).
 fn make_diag(cli: &Cli, data_dir: &std::path::Path) -> Result<BuildDiag> {
-    if !diagnostics_enabled(cli) {
-        return Ok(BuildDiag::disabled());
-    }
-    let log_path = match &cli.diagnostics_log {
-        Some(p) => p.clone(),
-        None => {
-            let name = format!("build-diag-{}-{}.jsonl", cli.graph, std::process::id());
-            // Prefer the data dir (create it if missing); fall back to the CWD.
-            if std::fs::create_dir_all(data_dir).is_ok() {
-                data_dir.join(name)
-            } else {
-                PathBuf::from(name)
+    let log_enabled = !cli.quiet;
+    let jsonl = if diagnostics_enabled(cli) {
+        let log_path = match &cli.diagnostics_log {
+            Some(p) => p.clone(),
+            None => {
+                let name = format!("build-diag-{}-{}.jsonl", cli.graph, std::process::id());
+                // Prefer the data dir (create it if missing); fall back to the CWD.
+                if std::fs::create_dir_all(data_dir).is_ok() {
+                    data_dir.join(name)
+                } else {
+                    PathBuf::from(name)
+                }
             }
-        }
+        };
+        let header = json!({
+            "graph": cli.graph,
+            "input": cli.input,
+            "max_memory_bytes": cli.max_memory,
+            "zstd_level": cli.zstd_level,
+            "compression_profile": format!("{:?}", cli.compression_profile),
+            "block_size": cli.block_size,
+            "vector_block_size": cli.vector_block_size,
+            "cluster": format!("{:?}", cli.cluster),
+            "cluster_passes": cli.cluster_passes,
+            "ann_threshold": cli.ann_threshold,
+            "resume": cli.resume,
+            "threads": resolve_threads(cli),
+        });
+        eprintln!("slater-build: diagnostics → {}", log_path.display());
+        Some(crate::diag::JsonlConfig {
+            path: log_path,
+            interval: Duration::from_millis(cli.diagnostics_interval_ms.max(1)),
+            header,
+        })
+    } else {
+        None
     };
-    let header = json!({
-        "graph": cli.graph,
-        "input": cli.input,
-        "max_memory_bytes": cli.max_memory,
-        "zstd_level": cli.zstd_level,
-        "compression_profile": format!("{:?}", cli.compression_profile),
-        "block_size": cli.block_size,
-        "vector_block_size": cli.vector_block_size,
-        "cluster": format!("{:?}", cli.cluster),
-        "cluster_passes": cli.cluster_passes,
-        "ann_threshold": cli.ann_threshold,
-        "resume": cli.resume,
-        "threads": resolve_threads(cli),
-    });
-    let diag = BuildDiag::new(
-        &log_path,
-        Duration::from_millis(cli.diagnostics_interval_ms.max(1)),
-        header,
-    )
-    .with_context(|| format!("open diagnostics log {}", log_path.display()))?;
-    eprintln!("slater-build: diagnostics → {}", log_path.display());
-    Ok(diag)
+    BuildDiag::start(log_enabled, jsonl).context("start build diagnostics/logging")
 }
 
 /// Parse a human byte size like `4g`, `512m`, `1024k`, or a plain byte count.
@@ -451,6 +464,13 @@ fn resolve_publish_store(cli: &Cli) -> Result<Option<Arc<dyn graph_format::store
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Install hs-utils-style logging so the build's progress lines (and any
+    // warnings) reach stdout. `-q`/`--quiet` skips the subscriber, so the macros
+    // become no-ops and the build runs silent but for errors.
+    if !cli.quiet {
+        hs_utils::logging::init("info");
+    }
 
     let encryption_key = resolve_master_key(&cli)?;
     let acl_blake3 = match &cli.acl {

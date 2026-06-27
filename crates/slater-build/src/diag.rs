@@ -19,7 +19,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -27,6 +27,13 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::json;
+use tracing::info;
+
+/// Granularity of the human progress log: emit a line each time a phase's work
+/// counter crosses another N%. This is **curated narrative**, driven by the
+/// build's own progress counters — deliberately *not* a re-emit of the JSONL
+/// resource sampler (which stays a separate, `--diagnostics`-only concern).
+const PROGRESS_LOG_STEP_PCT: u64 = 10;
 
 const PAGE_SIZE: u64 = 4096;
 /// `sysconf(_SC_CLK_TCK)` is 100 on every Linux we target; hard-coded to avoid a
@@ -52,6 +59,9 @@ struct BuildMemo {
     active_workers: AtomicU64,
     /// Peak RSS seen since the current phase started (sampler `fetch_max`es it).
     rss_peak: AtomicU64,
+    /// Highest progress decile (0..=10) already logged for the current op, so the
+    /// human progress line fires once per `PROGRESS_LOG_STEP_PCT`, not per tick.
+    last_log_decile: AtomicU64,
 }
 
 impl BuildMemo {
@@ -72,7 +82,12 @@ struct Inner {
     start: Instant,
     interval: Duration,
     memo: BuildMemo,
-    writer: Mutex<BufWriter<File>>,
+    /// JSONL sink — `Some` only when `--diagnostics` is on. `None` ⇒ human progress
+    /// logging only, no file.
+    writer: Option<Mutex<BufWriter<File>>>,
+    /// Emit hs-utils-style progress logs (phase boundaries + heartbeat). Off under
+    /// `--quiet`.
+    log: bool,
     stop: AtomicBool,
 }
 
@@ -82,26 +97,39 @@ impl Inner {
     }
 
     /// Append one JSON record + newline; best-effort (a write error must never
-    /// derail a build).
+    /// derail a build). No-op when there is no JSONL sink.
     fn write_value(&self, v: &serde_json::Value) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = serde_json::to_writer(&mut *w, v);
-            let _ = w.write_all(b"\n");
-            let _ = w.flush();
+        if let Some(writer) = &self.writer {
+            if let Ok(mut w) = writer.lock() {
+                let _ = serde_json::to_writer(&mut *w, v);
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
         }
     }
 
     fn write_sample(&self, s: &Sample) {
-        if let Ok(mut w) = self.writer.lock() {
-            let _ = serde_json::to_writer(&mut *w, s);
-            let _ = w.write_all(b"\n");
-            let _ = w.flush();
+        if let Some(writer) = &self.writer {
+            if let Ok(mut w) = writer.lock() {
+                let _ = serde_json::to_writer(&mut *w, s);
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
         }
     }
 }
 
-/// Opt-in build diagnostics. `disabled()` is the inert default; `new()` opens the
-/// log and spawns the sampler. Cheap, no-op methods when disabled.
+/// Where (and how often) to write the detailed JSONL diagnostics — the
+/// `--diagnostics` sink. Independent of human progress logging.
+pub struct JsonlConfig {
+    pub path: PathBuf,
+    pub interval: Duration,
+    pub header: serde_json::Value,
+}
+
+/// Opt-in build diagnostics. `disabled()` is the inert default; `start()` enables
+/// human progress logging and/or the JSONL sink and spawns the sampler. Cheap,
+/// no-op methods when disabled.
 pub struct BuildDiag {
     inner: Option<Arc<Inner>>,
     /// Only the owner holds the sampler handle; joining it in `finish()` drops the
@@ -119,47 +147,73 @@ impl BuildDiag {
         }
     }
 
-    /// Open `log_path`, write the `header` record, and spawn the sampler thread.
-    /// `header_fields` is merged into the header record (host + build options).
-    pub fn new(
-        log_path: &Path,
-        interval: Duration,
-        header_fields: serde_json::Value,
-    ) -> anyhow::Result<Self> {
-        let file = File::create(log_path)?;
+    /// Start diagnostics. `log_enabled` turns on hs-utils-style progress logging
+    /// (phase boundaries + a periodic heartbeat); `jsonl` additionally writes the
+    /// detailed per-sample JSONL (the `--diagnostics` file). With neither, this is
+    /// the inert [`disabled`](Self::disabled) path — no thread, no timers.
+    ///
+    /// One background sampler serves both outputs: it writes a JSONL line when a
+    /// sink is configured, and emits a throttled human progress line when logging
+    /// is on. Phase start/end is logged from [`phase`](Self::phase) directly.
+    pub fn start(log_enabled: bool, jsonl: Option<JsonlConfig>) -> anyhow::Result<Self> {
+        if !log_enabled && jsonl.is_none() {
+            return Ok(Self::disabled());
+        }
+        // Sample cadence: the diagnostics interval when JSONL is on, else a 1 s
+        // default that drives the progress heartbeat.
+        let interval = jsonl
+            .as_ref()
+            .map(|j| j.interval)
+            .unwrap_or(Duration::from_secs(1));
+        let writer = match &jsonl {
+            Some(j) => Some(Mutex::new(BufWriter::new(File::create(&j.path)?))),
+            None => None,
+        };
         let inner = Arc::new(Inner {
             start: Instant::now(),
             interval,
             memo: BuildMemo::default(),
-            writer: Mutex::new(BufWriter::new(file)),
+            writer,
+            log: log_enabled,
             stop: AtomicBool::new(false),
         });
 
-        // Header: host facts + whatever the caller passed (build options, etc.).
-        let mut header = json!({
-            "kind": "header",
-            "t_ms": 0u64,
-            "interval_ms": interval.as_millis() as u64,
-            "page_size": PAGE_SIZE,
-            "online_cores": std::thread::available_parallelism().map(|n| n.get() as u64).ok(),
-            "cgroup_mem_limit_bytes": cgroup_mem_limit(),
-            "cgroup_cpu_quota_cores": cgroup_cpu_quota_cores(),
-        });
-        if let (Some(obj), Some(extra)) = (header.as_object_mut(), header_fields.as_object()) {
-            for (k, v) in extra {
-                obj.insert(k.clone(), v.clone());
+        // Header (JSONL only): host facts + whatever the caller passed.
+        if let Some(j) = &jsonl {
+            let mut header = json!({
+                "kind": "header",
+                "t_ms": 0u64,
+                "interval_ms": interval.as_millis() as u64,
+                "page_size": PAGE_SIZE,
+                "online_cores": std::thread::available_parallelism().map(|n| n.get() as u64).ok(),
+                "cgroup_mem_limit_bytes": cgroup_mem_limit(),
+                "cgroup_cpu_quota_cores": cgroup_cpu_quota_cores(),
+            });
+            if let (Some(obj), Some(extra)) = (header.as_object_mut(), j.header.as_object()) {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
             }
+            inner.write_value(&header);
         }
-        inner.write_value(&header);
 
-        let sampler_inner = Arc::clone(&inner);
-        let sampler = std::thread::Builder::new()
-            .name("slater-build-diag".into())
-            .spawn(move || sampler_loop(sampler_inner))?;
+        // The resource sampler thread exists only to feed the JSONL sink. Human
+        // progress logging is inline (phase boundaries + work-counter milestones),
+        // so log-only mode runs no background thread at all.
+        let sampler = if inner.writer.is_some() {
+            let sampler_inner = Arc::clone(&inner);
+            Some(
+                std::thread::Builder::new()
+                    .name("slater-build-diag".into())
+                    .spawn(move || sampler_loop(sampler_inner))?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
             inner: Some(inner),
-            sampler: Some(sampler),
+            sampler,
         })
     }
 
@@ -169,8 +223,9 @@ impl BuildDiag {
         self.inner.is_some()
     }
 
-    /// Open a phase: records `phase_start`, sets the memo phase, and returns a guard
-    /// that records `phase_end` (with raw elapsed/CPU/IO/RSS-peak deltas) on drop.
+    /// Open a phase: logs a "starting …" line (human), records `phase_start`
+    /// (JSONL), sets the memo phase, and returns a guard that logs completion with
+    /// timing and records `phase_end` on drop.
     pub fn phase(&self, name: &str) -> PhaseGuard<'_> {
         if let Some(inner) = &self.inner {
             BuildMemo::set_str(&inner.memo.phase, name);
@@ -178,6 +233,7 @@ impl BuildDiag {
             inner.memo.progress_done.store(0, Ordering::Relaxed);
             inner.memo.progress_total.store(0, Ordering::Relaxed);
             inner.memo.active_workers.store(1, Ordering::Relaxed);
+            inner.memo.last_log_decile.store(0, Ordering::Relaxed);
             inner
                 .memo
                 .rss_peak
@@ -187,11 +243,15 @@ impl BuildDiag {
                 cpu: cpu_seconds_total(),
                 io: io_counters(),
             };
+            // JSONL (no-op without a sink); curated human "starting" line.
             inner.write_value(&json!({
                 "kind": "phase_start",
                 "t_ms": inner.now_ms(),
                 "phase": name,
             }));
+            if inner.log {
+                info!("▶ starting {}", friendly(name));
+            }
             PhaseGuard {
                 inner: Some(inner),
                 name: name.to_string(),
@@ -215,6 +275,16 @@ impl BuildDiag {
             BuildMemo::set_str(&inner.memo.op_detail, "");
             inner.memo.progress_total.store(total, Ordering::Relaxed);
             inner.memo.progress_done.store(0, Ordering::Relaxed);
+            inner.memo.last_log_decile.store(0, Ordering::Relaxed);
+            // Announce the start of a counted op so the log says what's now running
+            // (e.g. "scan edges → topology.csr: 0 / 15.2M edges").
+            if inner.log && !op.is_empty() {
+                if total > 0 {
+                    info!("  {} — 0 / {} {}", op, human_count(total), unit);
+                } else {
+                    info!("  {}", op);
+                }
+            }
         }
     }
 
@@ -230,6 +300,7 @@ impl BuildDiag {
     pub fn set_progress(&self, done: u64) {
         if let Some(inner) = &self.inner {
             inner.memo.progress_done.store(done, Ordering::Relaxed);
+            maybe_log_progress(inner, done);
         }
     }
 
@@ -238,7 +309,8 @@ impl BuildDiag {
     /// from many worker threads, each contributing the work it finished.
     pub fn progress_add(&self, n: u64) {
         if let Some(inner) = &self.inner {
-            inner.memo.progress_done.fetch_add(n, Ordering::Relaxed);
+            let done = inner.memo.progress_done.fetch_add(n, Ordering::Relaxed) + n;
+            maybe_log_progress(inner, done);
         }
     }
 
@@ -250,6 +322,7 @@ impl BuildDiag {
         if let Some(inner) = &self.inner {
             if counter & (PROGRESS_STRIDE - 1) == 0 {
                 inner.memo.progress_done.store(counter, Ordering::Relaxed);
+                maybe_log_progress(inner, counter);
             }
         }
     }
@@ -275,8 +348,10 @@ impl BuildDiag {
                 "t_ms": inner.now_ms(),
                 "total_ms": inner.now_ms(),
             }));
-            if let Ok(mut w) = inner.writer.lock() {
-                let _ = w.flush();
+            if let Some(writer) = &inner.writer {
+                if let Ok(mut w) = writer.lock() {
+                    let _ = w.flush();
+                }
             }
         }
     }
@@ -316,7 +391,16 @@ pub struct PhaseGuard<'a> {
 impl Drop for PhaseGuard<'_> {
     fn drop(&mut self) {
         let Some(inner) = self.inner else { return };
-        let elapsed_ms = self.base.t.elapsed().as_millis() as u64;
+        let elapsed = self.base.t.elapsed();
+        // Curated human "done" line with wall time — not a sampler row.
+        if inner.log {
+            info!("✓ {} — {}", friendly(&self.name), human_dur(elapsed));
+        }
+        // The /proc deltas are only needed for the JSONL record; skip them entirely
+        // when there is no sink (the common log-only path).
+        if inner.writer.is_none() {
+            return;
+        }
         let cpu_delta = match (cpu_seconds_total(), self.base.cpu) {
             (Some(now), Some(then)) => Some(now - then),
             _ => None,
@@ -334,12 +418,116 @@ impl Drop for PhaseGuard<'_> {
             "kind": "phase_end",
             "t_ms": inner.now_ms(),
             "phase": self.name,
-            "elapsed_ms": elapsed_ms,
+            "elapsed_ms": elapsed.as_millis() as u64,
             "cpu_seconds_delta": cpu_delta,
             "io_read_bytes_delta": io_r,
             "io_write_bytes_delta": io_w,
             "rss_peak_bytes": if rss_peak == 0 { None } else { Some(rss_peak) },
         }));
+    }
+}
+
+// ── human progress logging (curated narrative, not a sampler mirror) ─────────
+
+/// Emit a progress line when the current op's work counter crosses the next
+/// `PROGRESS_LOG_STEP_PCT`. Driven by the build's own counters (so it describes
+/// *work done*, e.g. "62% (9.4M / 15.2M edges)"), independent of the JSONL
+/// resource sampler. The `compare_exchange` makes it fire once per milestone even
+/// under many concurrent `progress_add` callers.
+fn maybe_log_progress(inner: &Inner, done: u64) {
+    if !inner.log {
+        return;
+    }
+    let total = inner.memo.progress_total.load(Ordering::Relaxed);
+    if total == 0 {
+        return;
+    }
+    let decile = (done.min(total) * 100 / total) / PROGRESS_LOG_STEP_PCT;
+    let prev = inner.memo.last_log_decile.load(Ordering::Relaxed);
+    if decile <= prev {
+        return;
+    }
+    if inner
+        .memo
+        .last_log_decile
+        .compare_exchange(prev, decile, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // another thread already logged this (or a later) milestone
+    }
+    let pct = decile * PROGRESS_LOG_STEP_PCT;
+    let op = BuildMemo::get_str(&inner.memo.op);
+    let unit = BuildMemo::get_str(&inner.memo.progress_unit);
+    let detail = BuildMemo::get_str(&inner.memo.op_detail);
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" [{detail}]")
+    };
+    let head = if op.is_empty() {
+        BuildMemo::get_str(&inner.memo.phase)
+    } else {
+        op
+    };
+    info!(
+        "  {}: {}% ({} / {} {}){}",
+        head,
+        pct,
+        human_count(done.min(total)),
+        human_count(total),
+        unit,
+        detail
+    );
+}
+
+/// Human-friendly label for a coarse phase name used in the build log.
+fn friendly(phase: &str) -> &str {
+    match phase {
+        "pass1" => "pass 1 (parse + metadata)",
+        "dedup" => "dedup keys",
+        "resolve" => "resolve edge endpoints",
+        "cluster" => "cluster (locality reorder)",
+        "emit.node_stores" => "emit node stores",
+        "emit.topology" => "emit topology (CSR + edges)",
+        "emit.vectors" => "emit vectors",
+        "emit.range_isam" => "emit range indexes",
+        "emit.prop_hist" => "emit property histograms",
+        "publish" => "publish (hash + manifest)",
+        other => other,
+    }
+}
+
+/// Compact wall-time: `450ms`, `12.3s`, `4m 07s`, `1h 03m 22s`.
+fn human_dur(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs_f = d.as_secs_f64();
+    if secs_f < 60.0 {
+        return format!("{secs_f:.1}s");
+    }
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h == 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{h}h {m:02}m {s:02}s")
+    }
+}
+
+/// Compact count: `512`, `12.3k`, `15.2M`, `1.5B`.
+fn human_count(n: u64) -> String {
+    let f = n as f64;
+    const K: f64 = 1_000.0;
+    if f < K {
+        format!("{n}")
+    } else if f < K * K {
+        format!("{:.1}k", f / K)
+    } else if f < K * K * K {
+        format!("{:.1}M", f / (K * K))
+    } else {
+        format!("{:.1}B", f / (K * K * K))
     }
 }
 
