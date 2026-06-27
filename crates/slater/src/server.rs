@@ -506,69 +506,6 @@ fn spawn_cache_maintenance(
     });
 }
 
-/// Return freed heap high-water at the top of the glibc arenas to the OS. A no-op
-/// on non-glibc targets (musl / macOS have no `malloc_trim`). We declare the symbol
-/// directly rather than pull in `libc` for one call — the same minimal-dependency
-/// stance the `/proc/self/statm` RSS read in `diag.rs` takes.
-#[allow(unsafe_code)] // the sole `unsafe` in the server: one audited libc FFI call.
-fn trim_allocator() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        // SAFETY: `malloc_trim` is thread-safe (it takes the malloc lock internally)
-        // and has no preconditions; `pad = 0` keeps no retained headroom. The return
-        // (1 if memory was actually released, else 0) is advisory — we ignore it.
-        unsafe { malloc_trim(0) };
-    }
-}
-
-/// Spawn a background task that, **only while the server is idle**, returns the
-/// freed heap high-water to the OS via [`trim_allocator`].
-///
-/// A burst of heavy/concurrent queries — wide label scans, group-by / `DISTINCT`
-/// aggregation tables, expansion frontiers — grows the glibc arenas well past the
-/// cache budgets. Rust frees those buffers when each query ends, but glibc cannot
-/// return them on its own: its `MALLOC_TRIM_THRESHOLD_` auto-trim only fires inside
-/// `free()` and only for a contiguous chunk at the *top* of an arena, not the
-/// fragmented mid-arena frees these leave; and an idle process makes no `free()`
-/// calls at all, so RSS stays pinned at the post-burst high-water indefinitely. An
-/// explicit `malloc_trim` is the only lever that reclaims it.
-///
-/// The trim is **gated on `diag.in_flight() == 0`** so it never runs concurrently
-/// with a query — it cannot contend for the malloc lock on the hot path or perturb
-/// query latency. Under sustained load it simply never fires (memory is in use);
-/// once load subsides it reclaims within one tick. Always spawned (unlike
-/// [`spawn_cache_maintenance`]); not spawned where the trim is a no-op (non-glibc).
-fn spawn_allocator_trim(diag: Arc<crate::diag::Diagnostics>) {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await; // consume the immediate first tick
-        let mut trimmed_idle = false; // trim once per idle period, not every tick
-        loop {
-            ticker.tick().await;
-            if diag.in_flight() > 0 {
-                trimmed_idle = false; // busy → arm the next idle trim
-                continue;
-            }
-            if trimmed_idle {
-                continue; // already reclaimed this idle period; nothing new freed
-            }
-            // Idle: reclaim. `malloc_trim` walks the arena free lists under the
-            // malloc lock; run it off the async reactor like the cache sweep.
-            if let Err(e) = tokio::task::spawn_blocking(trim_allocator).await {
-                warn!(error = %e, "allocator trim task failed");
-            }
-            trimmed_idle = true;
-        }
-    });
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    let _ = diag; // no-op target: nothing to trim
-}
-
 /// Build the shared worker pool for per-query parallelism (shortestPath frontier
 /// expansion, multi-hop expansion, brute-force kNN, anchor scans, …), or `None`
 /// when `fanout <= 1` (sequential). Sized to `min(fanout, cores)`; created once and
@@ -1564,10 +1501,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         );
     }
 
-    // Return the post-burst heap high-water to the OS during idle (gated on no
-    // in-flight queries, so it never perturbs query latency). Runs regardless of
-    // the cache TTL above.
-    spawn_allocator_trim(ctx.diag.clone());
+    // Returning the post-burst heap high-water to the OS during idle is jemalloc's
+    // job now (Linux global allocator with background purge threads — see main.rs),
+    // so there is no manual idle-trim task to spawn here.
 
     // Warm the block/vector cache by running the configured query and discarding
     // its results, before we accept any connection — so the first real client
@@ -2754,19 +2690,6 @@ mod tests {
                 std::fs::write(&man, serde_json::to_string_pretty(&v).unwrap()).unwrap();
             }
         }
-    }
-
-    #[test]
-    fn trim_allocator_links_and_runs() {
-        // Grow then free a large buffer, then trim. We can't assert an RSS drop
-        // deterministically (other threads' allocations share the arena), but this
-        // exercises the `malloc_trim` FFI declaration/linkage on glibc and confirms
-        // the call is a safe no-op elsewhere.
-        let big = vec![0u8; 64 * 1024 * 1024];
-        let len = big.len();
-        drop(big);
-        trim_allocator();
-        assert_eq!(len, 64 * 1024 * 1024);
     }
 
     #[test]

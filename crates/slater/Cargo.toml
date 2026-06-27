@@ -33,6 +33,11 @@ pest_derive.workspace = true
 regex.workspace = true
 chrono.workspace = true
 
+# jemalloc is the global allocator only on Linux (wired in main.rs); macOS and other
+# dev targets keep the system allocator.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator.workspace = true
+
 [features]
 default = []
 # Enable the S3 / object-store data backend (forwards to graph-format).
@@ -41,11 +46,10 @@ s3 = ["graph-format/s3"]
 gcs = ["graph-format/gcs"]
 
 [lints.rust]
-# The server's only `unsafe` is the single libc `malloc_trim` FFI call in
-# `server::trim_allocator` (idle-path heap return, not query execution), carrying a
-# scoped `#[allow(unsafe_code)]`. Deny everywhere else so no new `unsafe` slips into
-# the serving path. (Deny, not forbid, so that one audited site can opt out.)
-unsafe_code = "deny"
+# The server is entirely free of `unsafe`: heap return to the OS is now jemalloc's
+# job (see main.rs / the tikv-jemallocator dep), so the former libc `malloc_trim`
+# FFI is gone and the only remaining unsafe lives inside the audited allocator crate.
+unsafe_code = "forbid"
 
 [dev-dependencies]
 criterion.workspace = true

@@ -15,6 +15,17 @@ use anyhow::Context;
 use slater::{acl, config, health, help, query, server};
 use tracing::info;
 
+// On Linux, jemalloc is the global allocator. Built with the `background_threads`
+// feature, its purge threads return freed heap to the OS on jemalloc's decay timer
+// without the process needing to make `free()` calls — so a burst of heavy queries
+// (wide scans, aggregation tables, expansion frontiers) no longer pins RSS at its
+// post-burst high-water once load subsides. This replaces the former idle-gated
+// `malloc_trim` FFI, moving the last `unsafe` out of this crate and into the audited
+// allocator. Non-Linux targets keep the system allocator unchanged.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
     // `--help`/`help` runs before any config load so it works with no config file
     // present, and lists the subcommands + config knobs the server has no flags for.

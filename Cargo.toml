@@ -66,6 +66,13 @@ wide = "0.7"
 # Regular expressions (slater: `=~` operator + `string.*RegEx` functions).
 regex = "1"
 
+# Global allocator on Linux (slater). jemalloc's background purge threads return
+# freed heap to the OS on a decay timer without the process making free() calls,
+# replacing the former idle-gated malloc_trim FFI. The `background_threads` feature
+# bakes `background_thread:true` into the build, so no runtime config or exported
+# symbol is needed. Linux-only (glibc + musl); other targets keep the system malloc.
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
 # Microbenchmark harness (slater dev-only): the vector-kNN kernel bench. Lean
 # build — no plotters/gnuplot HTML reports, just the `cargo bench` harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
