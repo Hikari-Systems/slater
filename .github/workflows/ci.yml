@@ -53,6 +53,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # `bench-codec` is gated behind a `required-features` cargo feature, so the
+      # default `--all-targets` above skips it. Lint it explicitly (with `s3` so its
+      # backend leg is covered too) to keep the gated tuning binary from bitrotting.
+      - name: Clippy (bench-codec)
+        run: cargo clippy -p slater-build --all-targets --features bench-codec,s3 -- -D warnings
+
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
     runs-on: ubuntu-latest

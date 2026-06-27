@@ -157,17 +157,30 @@ jobs:
     strategy:
       matrix:
         platform: [amd64, arm64]
+        # Two images per arch:
+        #   * full → `hikarisystems/slater`      (Dockerfile, s3+gcs, both binaries)
+        #   * lite → `hikarisystems/slater-lite` (Dockerfile.lite, fs-only, server only)
+        variant: [full, lite]
         include:
           # `rustflags` tunes the hot vector-kNN kernel's codegen per arch. amd64's
           # baseline is only SSE2, so bump to x86-64-v3 for AVX2+FMA (raises the CPU
           # floor to Haswell, 2013+). aarch64 already mandates NEON at baseline, so
-          # no flag is needed there.
+          # no flag is needed there. (These match on `platform`, so they apply to
+          # both variants of that arch.)
           - platform: amd64
             runner: blacksmith-2vcpu-ubuntu-2404
             rustflags: "-Ctarget-cpu=x86-64-v3"
           - platform: arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
             rustflags: ""
+          # Per-variant Dockerfile + image-name suffix (match on `variant`, so they
+          # apply to both arches of that variant).
+          - variant: full
+            dockerfile: Dockerfile
+            suffix: ""
+          - variant: lite
+            dockerfile: Dockerfile.lite
+            suffix: "-lite"
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -191,10 +204,11 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.platform }}
           build-args: |
             RUSTFLAGS=${{ matrix.rustflags }}
-          outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }},push-by-digest=true,push=true
+          outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }},push-by-digest=true,push=true
 
       - name: Export digest
         run: |
@@ -205,16 +219,27 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.platform }}
+          name: digests-${{ matrix.variant }}-${{ matrix.platform }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  # ── Docker: merge the per-arch digests into one tagged manifest ────────────
+  # ── Docker: merge the per-arch digests into one tagged manifest per variant ──
+  # One manifest job per variant: full → `hikarisystems/slater`, lite →
+  # `hikarisystems/slater-lite`. Each merges only its own variant's per-arch
+  # digests (matched by the `digests-<variant>-*` artifact pattern).
   docker-manifest:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: docker-build
+    strategy:
+      matrix:
+        variant: [full, lite]
+        include:
+          - variant: full
+            suffix: ""
+          - variant: lite
+            suffix: "-lite"
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -223,7 +248,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.variant }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -239,9 +264,9 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
-            -t hikarisystems/${{ env.REPO_NAME }}:${{ github.event.inputs.tag || github.ref_name }} \
-            -t hikarisystems/${{ env.REPO_NAME }}:latest \
-            $(printf 'hikarisystems/${{ env.REPO_NAME }}@sha256:%s ' *)
+            -t hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}:${{ github.event.inputs.tag || github.ref_name }} \
+            -t hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}:latest \
+            $(printf 'hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}@sha256:%s ' *)
 
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:

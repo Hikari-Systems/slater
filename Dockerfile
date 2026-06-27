@@ -69,24 +69,26 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
        target/release/deps/graph_format-* target/release/deps/libgraph_format-*
 
 # ── Real build ────────────────────────────────────────────────────────────────
+# Only the two shipped binaries. `bench-codec` is an occasional tuning tool gated
+# behind its own cargo feature (off by default), so it is deliberately not built
+# here; build it on demand with
+# `cargo build -p slater-build --features bench-codec --bin bench-codec`.
 COPY crates ./crates
 RUN cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
-        --bin slater --bin slater-build --bin bench-codec
+        --bin slater --bin slater-build
 
-FROM debian:bookworm-slim AS runtime
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
+# libgcc/libstdc++ (Rust needs libgcc_s for unwinding) + ca-certificates (for the
+# S3/GCS TLS chains), and nothing else — no shell, apt, or coreutils — so the same
+# dynamically-linked binary runs unchanged on a far smaller, lower-CVE base than
+# `debian:bookworm-slim`. For an in-container shell while debugging, swap to the
+# `:debug` tag (adds busybox).
+FROM gcr.io/distroless/cc-debian12 AS runtime
 
 WORKDIR /app
 
 COPY --from=builder /app/target/release/slater ./slater
 COPY --from=builder /app/target/release/slater-build ./slater-build
-# Compression trade-off benchmark (zstd-level sweep + real GET latency). Run with
-# `docker run --rm --entrypoint /app/bench-codec <image> --graph … --s3-bucket …`.
-# The S3 leg is only valid in-region (EC2), never from a laptop, never on MinIO.
-COPY --from=builder /app/target/release/bench-codec ./bench-codec
 # Baked-in defaults; per-environment overrides arrive via the /sandbox overlay
 # and `KEY__sub` env vars (hs-utils layered config), see docker-compose.yml.
 COPY config.json ./config.json
@@ -104,8 +106,10 @@ COPY acl.json ./acl.json
 ENV MALLOC_ARENA_MAX=2 \
     MALLOC_TRIM_THRESHOLD_=131072
 
-RUN useradd -r -u 1000 appuser
-USER appuser
+# Run unprivileged. Distroless has no `useradd`, but a numeric USER needs no
+# /etc/passwd entry — keep uid:gid 1000:1000 so existing writable mounts (e.g. the
+# disk-cache `diskCacheDir`) chowned for the previous image keep working.
+USER 1000:1000
 
 # Bolt (optionally Bolt+TLS) — not HTTP.
 EXPOSE 7687
