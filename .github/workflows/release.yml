@@ -160,7 +160,7 @@ jobs:
         # Two variants per arch, published as TAGS of the SAME `hikarisystems/slater`
         # repo (not separate repos):
         #   * full → slater:<tag>      + slater:latest  (Dockerfile, s3+gcs, both bins)
-        #   * lite → slater:<tag>-lite + slater:lite    (Dockerfile.lite, fs-only, server)
+        #   * lite → slater:<tag>-lite + slater:latest-lite  (Dockerfile.lite, fs-only)
         variant: [full, lite]
         include:
           # `rustflags` tunes the hot vector-kNN kernel's codegen per arch. amd64's
@@ -227,7 +227,7 @@ jobs:
   # ── Docker: merge each variant's per-arch digests into a tagged manifest ─────
   # Both variants are tags of the SAME `hikarisystems/slater` repo:
   #   * full → :<tag>      + :latest
-  #   * lite → :<tag>-lite + :lite
+  #   * lite → :<tag>-lite + :latest-lite
   # Each job merges only its own variant's per-arch digests (matched by the
   # `digests-<variant>-*` artifact pattern); the digests live in the one repo.
   docker-manifest:
@@ -244,7 +244,7 @@ jobs:
             moving: latest
           - variant: lite
             tag_suffix: "-lite"
-            moving: lite
+            moving: latest-lite
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV

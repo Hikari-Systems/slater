@@ -28,7 +28,7 @@ reads fast and memory bounded.
 | **Bounded, predictable memory** | Resident memory is capped by three cache budgets *you* set — it does **not** grow with graph size. You tune the performance/RAM trade-off instead of provisioning for the whole graph. |
 | **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
 | **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
-| **Tiny, dependency-light install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
+| **Tiny, dependency-light install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:latest-lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
 | **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
 | **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
@@ -48,14 +48,14 @@ repo** (multi-arch amd64 + arm64):
 | Tag | Contains | Storage backends | Use it when |
 |---|---|---|---|
 | **`:latest`** / **`:vX.Y.Z`** (full) | both binaries (`slater` + `slater-build`) | filesystem **+ S3 + GCS** | the default — you want to build generations in-container and/or serve from (and publish to) S3 or GCS object storage. |
-| **`:lite`** / **`:vX.Y.Z-lite`** | the server only (`slater`) | filesystem **only** | a smaller image / smaller dependency surface for the common serve-only case: serve a generation built elsewhere from a local or mounted volume. No object-store backends, no `slater-build`. |
+| **`:latest-lite`** / **`:vX.Y.Z-lite`** | the server only (`slater`) | filesystem **only** | a smaller image / smaller dependency surface for the common serve-only case: serve a generation built elsewhere from a local or mounted volume. No object-store backends, no `slater-build`. |
 
 Everything below uses the full tag but applies equally to the `-lite` tag for the
 server bits (the `slater-build` and S3/GCS sections are full-only).
 
 ```bash
 docker pull hikarisystems/slater:latest   # full
-docker pull hikarisystems/slater:lite     # server only, fs backend
+docker pull hikarisystems/slater:latest-lite     # server only, fs backend
 ```
 
 ## What's in the image
@@ -68,7 +68,7 @@ The full image bundles **two binaries**:
 | `slater-build` | The offline **writer**: turns a Cypher dump into an immutable generation. | Override the entrypoint: `--entrypoint /app/slater-build`. |
 
 `slater` never writes to disk; `slater-build` produces the generations `slater`
-serves, on a shared `/data` volume. (The `:lite` tag ships only the
+serves, on a shared `/data` volume. (The `:latest-lite` tag ships only the
 `slater` server.)
 
 ```
@@ -305,7 +305,7 @@ docker run -d --name slater-s3 -p 7687:7687 \
   hikarisystems/slater:latest
 ```
 
-### Local-disk block cache (S3 second tier)
+### Local-disk block cache (S3/GCS second tier)
 
 Optional, opt-in: set `dataBackend.s3.diskCacheBytes > 0` and mount a **writable
 volume** for `diskCacheDir`. A block evicted from the in-memory cache is then
