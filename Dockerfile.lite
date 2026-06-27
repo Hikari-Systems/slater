@@ -82,11 +82,8 @@ COPY --from=builder /app/target/release/slater ./slater
 COPY config.json ./config.json
 COPY acl.json ./acl.json
 
-# Bound the glibc allocator's retained high-water under concurrency (see the full
-# Dockerfile for the rationale): cap arena count and trim freed chunks promptly so
-# a burst of concurrent queries can't drive RSS far above the cache budget.
-ENV MALLOC_ARENA_MAX=2 \
-    MALLOC_TRIM_THRESHOLD_=131072
+# (No glibc allocator tuning: the server uses jemalloc on Linux — its background
+# purge handles heap return, so the former `MALLOC_*` env knobs are inert.)
 
 # Run unprivileged as uid:gid 1000:1000 (no /etc/passwd entry needed for a numeric
 # USER), matching the full image.

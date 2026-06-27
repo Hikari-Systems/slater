@@ -816,9 +816,9 @@ Wikidata-1M graph (one 16-core box):
 
 | result | measurement |
 |---|---|
-| Holds to **1000 concurrent clients, zero failures** | throughput peaks ~3k rps; the latency knee (p99 40 → 520 ms) is queueing under core contention, not a hard cap |
+| Holds to **1000 concurrent clients, zero failures** | throughput peaks ~2.5k rps; the latency knee sets in around 750 clients (p99 51 → 750 ms) — queueing under core contention, not a hard cap (single-run, WSL2) |
 | Block cache **bounded and effective** | 100% hit rate, 0 evictions, 50 MB resident for a cache-fitting working set |
-| RSS held under sustained load | `MALLOC_ARENA_MAX=2` + trim threshold holds RSS to ~0.5–0.6 GB (was ~2.7 GB retained allocator high-water — not a leak) |
+| RSS held under sustained load | the jemalloc allocator holds RSS to ~0.6 GB across a 100→500-client `wiki_cache_churn` ramp — cache-bound and stable, with **no** `MALLOC_*` tuning (the former `MALLOC_ARENA_MAX=2` + trim threshold is retired); its background purge also returns the post-burst high-water instead of leaving it pinned |
 | Aggregate memory bounded | server-wide **`query.maxIntermediateGlobal`** + adjacency-charged expansion hold the `wiki_budget` 2-hop flood at 1000 clients without OOM (RSS ~0.6 GB; the guard sheds ~60% of hub queries as retryable budget errors) |
 
 Both memory issues the load test surfaced are now closed; all tracked in the load-testing doc.
