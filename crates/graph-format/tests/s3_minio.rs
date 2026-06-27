@@ -96,6 +96,7 @@ fn s3_roundtrip_and_sha256_verify() {
                 size: data.len() as u64,
                 blake3: "ignored",
                 sha256: Some(&sha),
+                crc32c: None,
             },
         )
         .expect("verify_file with correct sha256");
@@ -106,6 +107,7 @@ fn s3_roundtrip_and_sha256_verify() {
                 size: data.len() as u64,
                 blake3: "ignored",
                 sha256: Some(&wrong),
+                crc32c: None,
             },
         )
         .expect_err("verify_file with wrong sha256 must fail");

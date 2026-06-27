@@ -160,6 +160,7 @@ mod tests {
                 size,
                 blake3: "ignored",
                 sha256: Some(&sha),
+                crc32c: None,
             },
         )
         .unwrap();
@@ -171,6 +172,7 @@ mod tests {
                     size,
                     blake3: "ignored",
                     sha256: Some("AAAAAAAA"),
+                    crc32c: None,
                 },
             )
             .is_err());
@@ -184,6 +186,7 @@ mod tests {
                     size,
                     blake3: "ignored",
                     sha256: Some(&sha),
+                    crc32c: None,
                 },
             )
             .is_err());

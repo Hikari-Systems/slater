@@ -618,6 +618,7 @@ fn verify_against_store(store: &dyn ObjectStore, base: &str, manifest: &Manifest
                     size: fe.bytes,
                     blake3: &fe.blake3,
                     sha256: fe.sha256.as_deref(),
+                    crc32c: fe.crc32c.as_deref(),
                 },
             )
             .with_context(|| format!("verify generation file {}", fe.name))?;
@@ -860,6 +861,7 @@ mod tests {
                 bytes,
                 blake3: graph_format::integrity::hash_file(&path).unwrap(),
                 sha256: None,
+                crc32c: None,
             });
             bs.insert(name.to_string(), BLOCK as u32);
         };

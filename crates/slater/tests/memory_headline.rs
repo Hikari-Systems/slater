@@ -212,6 +212,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
             bytes: std::fs::metadata(&path).unwrap().len(),
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         let bs = if name == "vector/Doc.embedding.vamana" {
             VECTOR_BLOCK_SIZE as u32

@@ -21,6 +21,8 @@ path = "src/bin/bench_codec.rs"
 default = []
 # Enable publishing a built generation to an S3 / object-store target.
 s3 = ["graph-format/s3"]
+# Enable publishing a built generation to a GCS target.
+gcs = ["graph-format/gcs"]
 
 [dependencies]
 graph-format.workspace = true

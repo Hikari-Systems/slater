@@ -236,6 +236,7 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -423,6 +424,7 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -577,6 +579,7 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -739,6 +742,7 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -855,6 +859,7 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -998,6 +1003,7 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
             bytes,
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         bs.insert(name.to_string(), BLOCK as u32);
     };
@@ -1177,6 +1183,7 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
             bytes: std::fs::metadata(&path).unwrap().len(),
             blake3: hash_file(&path).unwrap(),
             sha256: None,
+            crc32c: None,
         });
         let bs = if name == "vector/Doc.embedding.vamana" {
             f.vector_block_size as u32

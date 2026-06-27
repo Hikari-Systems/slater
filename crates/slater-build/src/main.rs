@@ -44,7 +44,8 @@ const MAX_ZSTD_LEVEL: i32 = 22; // squeeze hardest, build cost no object
 /// when `--zstd-level` is not given explicitly.
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 enum CompressionProfile {
-    /// `remote` when a `--publish-s3-bucket` target is configured, else `local`.
+    /// `remote` when a remote publish target (`--publish-s3-bucket` /
+    /// `--publish-gcs-bucket`) is configured, else `local`.
     Auto,
     /// Balanced for local/NVMe reads (decompress CPU is a larger share there).
     Local,
@@ -96,9 +97,10 @@ struct Cli {
     zstd_level: Option<i32>,
 
     /// Backend-aware compression profile selecting the zstd level when
-    /// `--zstd-level` is not given. `auto` ⇒ `remote` if a `--publish-s3-bucket`
-    /// target is set, else `local`. zstd decode speed is ~level-independent, so a
-    /// higher level shrinks read I/O without slowing queries.
+    /// `--zstd-level` is not given. `auto` ⇒ `remote` if a remote publish target
+    /// (`--publish-s3-bucket` / `--publish-gcs-bucket`) is set, else `local`. zstd
+    /// decode speed is ~level-independent, so a higher level shrinks read I/O
+    /// without slowing queries.
     #[arg(long, value_enum, default_value_t = CompressionProfile::Auto)]
     compression_profile: CompressionProfile,
 
@@ -225,6 +227,32 @@ struct Cli {
     /// Use path-style S3 addressing (required by most S3-compatible servers).
     #[arg(long)]
     publish_s3_path_style: bool,
+
+    /// Also publish the finished generation to this GCS bucket, after the local
+    /// publish to `--data-dir`. Requires a binary built with the `gcs` feature.
+    /// Credentials come from Application Default Credentials (Workload Identity /
+    /// metadata / gcloud) unless `--publish-gcs-credentials` is given. Mutually
+    /// exclusive with `--publish-s3-bucket`.
+    #[arg(long)]
+    publish_gcs_bucket: Option<String>,
+
+    /// Key prefix under which the generation is published in the GCS bucket.
+    #[arg(long, default_value = "")]
+    publish_gcs_prefix: String,
+
+    /// Path to a service-account JSON key file for `--publish-gcs-bucket`. Empty ⇒
+    /// Application Default Credentials.
+    #[arg(long, default_value = "")]
+    publish_gcs_credentials: String,
+
+    /// Custom endpoint URL for a GCS emulator publish target (`fake-gcs-server`).
+    #[arg(long, default_value = "")]
+    publish_gcs_endpoint: String,
+
+    /// Use anonymous (unauthenticated) GCS credentials — for a `fake-gcs-server`
+    /// emulator publish target only, never against real GCS.
+    #[arg(long)]
+    publish_gcs_anonymous: bool,
 }
 
 /// Resolve the worker-thread cap: the `--threads` value, else
@@ -356,38 +384,69 @@ fn resolve_compression(cli: &Cli, publishing_remote: bool) -> (i32, String) {
     }
 }
 
-/// Build the optional remote publish target from the `--publish-s3-*` flags.
-/// `None` ⇒ filesystem-only publish. Errors if an S3 target is requested but the
-/// binary was built without the `s3` feature.
+/// Build the optional remote publish target from the `--publish-s3-*` /
+/// `--publish-gcs-*` flags. `None` ⇒ filesystem-only publish. Errors if a target
+/// is requested but the binary was built without the matching backend feature, or
+/// if both an S3 and a GCS target are given.
 fn resolve_publish_store(cli: &Cli) -> Result<Option<Arc<dyn graph_format::store::ObjectStore>>> {
-    let Some(bucket) = &cli.publish_s3_bucket else {
-        return Ok(None);
-    };
-    #[cfg(feature = "s3")]
-    {
-        let cfg = graph_format::store::s3::S3Config {
-            bucket: bucket.clone(),
-            region: cli.publish_s3_region.clone(),
-            endpoint: (!cli.publish_s3_endpoint.is_empty())
-                .then(|| cli.publish_s3_endpoint.clone()),
-            prefix: cli.publish_s3_prefix.clone(),
-            path_style: cli.publish_s3_path_style,
-            // Publish credentials come from the standard AWS chain.
-            access_key: None,
-            secret_key: None,
-            session_token: None,
-        };
-        let store = graph_format::store::s3::S3ObjectStore::connect(&cfg)
-            .context("connect S3 publish target")?;
-        Ok(Some(Arc::new(store)))
+    if cli.publish_s3_bucket.is_some() && cli.publish_gcs_bucket.is_some() {
+        anyhow::bail!("give only one of --publish-s3-bucket / --publish-gcs-bucket");
     }
-    #[cfg(not(feature = "s3"))]
-    {
-        let _ = bucket;
-        anyhow::bail!(
-            "--publish-s3-bucket given but slater-build was built without the `s3` cargo feature"
-        )
+    if let Some(bucket) = &cli.publish_s3_bucket {
+        #[cfg(feature = "s3")]
+        {
+            let cfg = graph_format::store::s3::S3Config {
+                bucket: bucket.clone(),
+                region: cli.publish_s3_region.clone(),
+                endpoint: (!cli.publish_s3_endpoint.is_empty())
+                    .then(|| cli.publish_s3_endpoint.clone()),
+                prefix: cli.publish_s3_prefix.clone(),
+                path_style: cli.publish_s3_path_style,
+                // Publish credentials come from the standard AWS chain.
+                access_key: None,
+                secret_key: None,
+                session_token: None,
+            };
+            let store = graph_format::store::s3::S3ObjectStore::connect(&cfg)
+                .context("connect S3 publish target")?;
+            return Ok(Some(Arc::new(store)));
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = bucket;
+            anyhow::bail!(
+                "--publish-s3-bucket given but slater-build was built without the `s3` cargo feature"
+            )
+        }
     }
+    if let Some(bucket) = &cli.publish_gcs_bucket {
+        #[cfg(feature = "gcs")]
+        {
+            let cfg = graph_format::store::gcs::GcsConfig {
+                bucket: bucket.clone(),
+                prefix: cli.publish_gcs_prefix.clone(),
+                endpoint: (!cli.publish_gcs_endpoint.is_empty())
+                    .then(|| cli.publish_gcs_endpoint.clone()),
+                credentials_path: (!cli.publish_gcs_credentials.is_empty())
+                    .then(|| cli.publish_gcs_credentials.clone()),
+                // The builder takes a service-account key by file path (or ADC);
+                // inline JSON is a server-side convenience only.
+                credentials_json: None,
+                anonymous: cli.publish_gcs_anonymous,
+            };
+            let store = graph_format::store::gcs::GcsObjectStore::connect(&cfg)
+                .context("connect GCS publish target")?;
+            return Ok(Some(Arc::new(store)));
+        }
+        #[cfg(not(feature = "gcs"))]
+        {
+            let _ = bucket;
+            anyhow::bail!(
+                "--publish-gcs-bucket given but slater-build was built without the `gcs` cargo feature"
+            )
+        }
+    }
+    Ok(None)
 }
 
 fn main() -> Result<()> {

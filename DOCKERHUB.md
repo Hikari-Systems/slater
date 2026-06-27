@@ -36,7 +36,7 @@ reads fast and memory bounded.
 | **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Querying with GQL](#querying-with-gql). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
-| **Pluggable storage backends** | Serve the same generation format from a local volume **or** an S3 (S3-compatible) bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of S3. See [Storage backends](#storage-backends-filesystem--s3). |
+| **Pluggable storage backends** | Serve the same generation format from a local volume, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3). |
 
 ---
 
@@ -177,7 +177,7 @@ So these are equivalent ways to set the block-cache budget:
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3). |
 | `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root dir of generations (`<graph>/<uuid>/`) for the `fs` backend. |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket (required when `kind=s3`). |
 | `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ from the environment. |
@@ -189,6 +189,14 @@ So these are equivalent ways to set the block-cache budget:
 | `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional STS session token; used only with `awsAccessKey`/`awsSecretKey`. |
 | `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Local-disk block cache budget (second tier). `0` = off; when set, also set `diskCacheDir`. |
 | `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Writable dir for the disk cache — a **real volume, not `tmpfs`**. |
+| `dataBackend.gcs.bucket` | `dataBackend__gcs__bucket` | _(empty)_ | GCS bucket (required when `kind=gcs`). |
+| `dataBackend.gcs.prefix` | `dataBackend__gcs__prefix` | _(empty)_ | Key prefix under which generations live in the bucket. |
+| `dataBackend.gcs.endpoint` | `dataBackend__gcs__endpoint` | _(empty)_ | Custom endpoint for a GCS emulator (`fake-gcs-server`); empty ⇒ standard GCS endpoint. |
+| `dataBackend.gcs.credentialsPath` | `dataBackend__gcs__credentialsPath` | _(empty)_ | Service-account JSON key file path. Empty ⇒ Application Default Credentials (Workload Identity / GCE metadata / `gcloud`). |
+| `dataBackend.gcs.credentialsJson` | `dataBackend__gcs__credentialsJson` | _(empty)_ | Inline service-account JSON key; precedence over `credentialsPath`. Empty ⇒ `credentialsPath`, else ADC. |
+| `dataBackend.gcs.anonymous` | `dataBackend__gcs__anonymous` | `false` | Unauthenticated access — a local GCS emulator (`fake-gcs-server`) **only**, never real GCS. |
+| `dataBackend.gcs.diskCacheBytes` | `dataBackend__gcs__diskCacheBytes` | `0` | Local-disk block cache budget (second tier), same as the S3 setting. `0` = off; when set, also set `diskCacheDir`. |
+| `dataBackend.gcs.diskCacheDir` | `dataBackend__gcs__diskCacheDir` | _(empty)_ | Writable dir for the GCS disk cache — a **real volume, not `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |
 | `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
 | `server.port` | `server__port` | `7687` | Bolt port. |
@@ -254,8 +262,14 @@ storage or an object store — only `dataBackend.kind` changes, never the data.
   Integrity is checked from S3's server-computed SHA-256 via a metadata request
   (no body download). Credentials come from the standard AWS chain — pass
   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (or use an instance role).
+- **`gcs`** — generations live in a **Google Cloud Storage bucket**; the image
+  ships with GCS support, so this is config-only. Integrity is checked from GCS's
+  server-computed CRC32C via a metadata request (no body download). Credentials
+  are GCP-native: Application Default Credentials by default (Workload Identity /
+  GCE metadata / `gcloud`), or a service-account JSON key via
+  `dataBackend__gcs__credentialsPath`.
 
-**Use S3 when** you want generations in durable, central object storage that many
+**Use S3 or GCS when** you want generations in durable, central object storage that many
 stateless, disk-less server replicas can all read — publish once, fan out — or to
 decouple the build host from the serve hosts. The cost is latency: a cold block
 is a network round-trip instead of a local read. The in-memory caches hide most

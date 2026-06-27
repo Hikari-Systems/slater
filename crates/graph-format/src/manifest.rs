@@ -124,6 +124,14 @@ pub struct FileEntry {
     /// verify integrity from object metadata, without reading the body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Base64 of the file content's CRC32C as a big-endian `u32` — the form GCS
+    /// stores and returns as the object's `crc32c` checksum. Optional and additive
+    /// exactly like [`Self::sha256`] (omitted from JSON when `None`, so older
+    /// manifests stay byte-unchanged). The GCS backend compares it to GCS's
+    /// server-computed object checksum to verify integrity from object metadata,
+    /// without reading the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crc32c: Option<String>,
 }
 
 /// The full generation manifest.
@@ -302,6 +310,7 @@ mod tests {
             bytes: 123,
             blake3: "deadbeef".into(),
             sha256: None,
+            crc32c: None,
         }];
         let content_hash = crate::integrity::content_hash(
             &files

@@ -32,8 +32,8 @@ use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3::Client;
-use tokio::runtime::Runtime;
 
+use super::asyncbridge::{run_blocking, BackgroundRuntime};
 use super::{join_key, FileIntegrity, ObjectStore, RandomReadAt};
 
 /// Connection parameters for an S3 (or S3-compatible, e.g. MinIO) bucket.
@@ -63,35 +63,6 @@ pub struct S3Config {
     pub session_token: Option<String>,
 }
 
-/// Wraps the backend runtime so its `Drop` is **non-blocking**. A tokio
-/// [`Runtime`]'s default `Drop` performs a *blocking* shutdown, which panics
-/// ("Cannot drop a runtime in a context where blocking is not allowed") if it
-/// runs while the thread is already inside another runtime's async context.
-/// That is exactly what happens when the server drops a partially-constructed
-/// S3 store on an error path — graph open, disk-cache open, checksum verify all
-/// run on the main runtime, so a failure there unwinds and drops this store on
-/// an async thread. `shutdown_background()` releases the runtime without
-/// blocking, so the *real* open error surfaces instead of a masking panic.
-struct BackgroundRuntime(Option<Runtime>);
-
-impl std::ops::Deref for BackgroundRuntime {
-    type Target = Runtime;
-    fn deref(&self) -> &Runtime {
-        // `Some` for the whole lifetime; only `Drop` takes it.
-        self.0
-            .as_ref()
-            .expect("S3 backend runtime present until drop")
-    }
-}
-
-impl Drop for BackgroundRuntime {
-    fn drop(&mut self) {
-        if let Some(rt) = self.0.take() {
-            rt.shutdown_background();
-        }
-    }
-}
-
 /// S3-backed object store. Credentials are taken **first** from the explicit
 /// `access_key`/`secret_key` in [`S3Config`] (the config-driven mechanism);
 /// when those are unset they fall back to the standard AWS chain (environment,
@@ -106,25 +77,6 @@ pub struct S3ObjectStore {
 /// Build a clear error from an AWS SDK error, including the full source chain.
 fn sdk_err(context: &str, e: impl std::error::Error) -> anyhow::Error {
     anyhow!("{context}: {}", DisplayErrorContext(&e))
-}
-
-/// Drive an async future to completion from a synchronous caller, **without**
-/// `block_on`. The future is spawned onto the backend's own runtime (whose
-/// worker threads drive it) and the caller blocks on a plain std channel for the
-/// result. Unlike `Runtime::block_on`, this is legal from *any* thread —
-/// including a thread already inside another tokio runtime (the server opens
-/// graphs on its main runtime) and a `spawn_blocking` worker (query execution).
-fn run_blocking<F, T>(rt: &Runtime, fut: F) -> T
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    rt.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
-    rx.recv()
-        .expect("S3 backend runtime dropped the task before returning a result")
 }
 
 /// Range GET exactly `len` bytes of `key` at `offset` and return them.
@@ -167,13 +119,13 @@ impl S3ObjectStore {
         // [`run_blocking`] (never `block_on`), so the bridge works from the
         // server's main runtime (graph open) and from spawn_blocking workers
         // (query execution) alike.
-        let rt = Arc::new(BackgroundRuntime(Some(
+        let rt = Arc::new(BackgroundRuntime::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
                 .build()
                 .context("build S3 backend runtime")?,
-        )));
+        ));
         let region = cfg.region.clone();
         let endpoint = cfg.endpoint.clone();
         let path_style = cfg.path_style;
