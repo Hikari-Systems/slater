@@ -12,13 +12,20 @@ path = "src/main.rs"
 
 # Compression trade-off benchmark: sweeps zstd levels over a real generation's
 # `.blk` blocks (local or S3) and prints ratio / decode speed / GET latency / the
-# per-backend knee. The S3 leg is meant to run in-region on EC2 (build `--features s3`).
+# per-backend knee. It is an occasional **tuning tool**, not part of building or
+# serving graphs, so it is gated behind the `bench-codec` feature and is NOT built
+# by default (`required-features`). Build it on request with
+# `cargo build -p slater-build --features bench-codec --bin bench-codec`
+# (add `--features bench-codec,s3` for the in-region S3 I/O leg).
 [[bin]]
 name = "bench-codec"
 path = "src/bin/bench_codec.rs"
+required-features = ["bench-codec"]
 
 [features]
 default = []
+# Build the `bench-codec` tuning binary (off by default — see the [[bin]] above).
+bench-codec = []
 # Enable publishing a built generation to an S3 / object-store target.
 s3 = ["graph-format/s3"]
 # Enable publishing a built generation to a GCS target.

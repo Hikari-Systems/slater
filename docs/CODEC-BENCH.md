@@ -45,8 +45,11 @@ The `bench-codec` binary (below) also prints the CPU/ratio columns, so on a lapt
 you can run it with `--no-io` to get ratio + decode speed without the misleading
 local-disk GET numbers:
 
+`bench-codec` is gated behind its own cargo feature (it is a tuning tool, not
+shipped in the image), so build/run it with `--features bench-codec`:
+
 ```bash
-cargo run --release -p slater-build --bin bench-codec -- \
+cargo run --release -p slater-build --features bench-codec --bin bench-codec -- \
   --data-dir /data --graph wikidata --no-io --levels 1,3,6,9,12,15,19,22
 ```
 
@@ -54,14 +57,28 @@ cargo run --release -p slater-build --bin bench-codec -- \
 
 ## 2. Backend I/O leg — on EC2, against real S3
 
-### 2a. Build and publish the image (from the laptop / CI)
+### 2a. Build and publish a bench image (from the laptop / CI)
 
-The benchmark binary ships in the standard slater image (built with the `s3`
-feature by default), alongside `slater` and `slater-build`:
+`bench-codec` is feature-gated and is **not** in the published `slater` image, so
+build a small purpose image for it (a container bundles its own glibc, so it runs
+on any distro regardless of the host's glibc version). Build it with
+`--features bench-codec,s3`:
 
 ```bash
-# build (amd64 example; the release matrix also builds arm64)
-docker build -t slater:bench .
+cat > Dockerfile.bench <<'EOF'
+# syntax=docker/dockerfile:1
+FROM rust:1-bookworm AS b
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev
+COPY . .
+RUN cargo build --release --locked --features bench-codec,s3 -p slater-build --bin bench-codec
+FROM gcr.io/distroless/cc-debian12
+COPY --from=b /app/target/release/bench-codec /bench-codec
+ENTRYPOINT ["/bench-codec"]
+EOF
+
+# build (amd64 example; build on/for the instance's arch)
+docker build -f Dockerfile.bench -t slater:bench .
 
 # tag + push to a registry the EC2 instance can pull from.
 # ECR is simplest because the instance role can authenticate without keys:
@@ -100,7 +117,7 @@ sudo docker pull $REPO:bench
 ### 2c. Run the benchmark against the real bucket
 
 ```bash
-sudo docker run --rm --entrypoint /app/bench-codec $REPO:bench \
+sudo docker run --rm $REPO:bench \
   --graph wikidata \
   --s3-bucket my-slater-bucket \
   --s3-region $AWS_REGION \

@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1
+#
+# Slater (lite) — a minimal image of just the online server:
+#   * slater — the online, read-only Bolt server (the only binary).
+#
+# Built WITHOUT the `s3`/`gcs` object-store backends (filesystem `fs` backend
+# only) and WITHOUT the offline writer `slater-build` (or the `bench-codec`
+# tool). The result is a smaller image with a smaller dependency/CVE surface for
+# the common case: serve a generation that was built elsewhere from a local /
+# mounted volume. Use the full `slater` image when you need to publish to (or
+# serve from) S3/GCS, or to run `slater-build` inside the container.
+#
+# House style mirrors the full Dockerfile: a `rust:1-bookworm` builder that first
+# caches dependencies against stub sources, then compiles only `slater`, and a
+# slim `debian:bookworm-slim` runtime running as the non-root `appuser:1000`.
+
+FROM rust:1-bookworm AS builder
+
+WORKDIR /app
+
+# Per-arch codegen tuning for the hot vector-kNN dot kernel, supplied by the
+# release workflow's build matrix (amd64 → `-Ctarget-cpu=x86-64-v3`; arm64 →
+# empty). Promoted to an env so it applies to both the dependency-cache build and
+# the real build. Default empty → a portable baseline build.
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=$RUSTFLAGS
+
+# Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
+# C/C++ toolchain (clang) + libclang for its bindgen step. `git` is already in
+# rust:1-bookworm and is required by `.cargo/config.toml` for the `hs-utils`
+# git+tag fetch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Dependency cache layer ────────────────────────────────────────────────────
+# Copy only the manifests (+ lockfile + the cargo config that forces the git CLI),
+# synthesise stub sources for every workspace crate, and build just `slater` once
+# so its dependency graph is cached in its own layer. No `--features`, so the AWS
+# and Google SDKs are never pulled in.
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml .cargo/config.toml
+COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
+COPY crates/slater-scalar/Cargo.toml crates/slater-scalar/Cargo.toml
+COPY crates/slater-build/Cargo.toml crates/slater-build/Cargo.toml
+COPY crates/slater/Cargo.toml crates/slater/Cargo.toml
+RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
+       crates/slater-scalar/src \
+       crates/slater-build/src crates/slater-build/src/bin crates/slater/src \
+       crates/slater/benches \
+    && echo '' > crates/graph-format/src/lib.rs \
+    && echo 'fn main() {}' > crates/graph-format/benches/codec.rs \
+    && echo '' > crates/slater-scalar/src/lib.rs \
+    && echo 'fn main() {}' > crates/slater-build/src/main.rs \
+    && echo 'fn main() {}' > crates/slater-build/src/bin/bench_codec.rs \
+    && echo '' > crates/slater/src/lib.rs \
+    && echo 'fn main() {}' > crates/slater/src/main.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
+    && cargo build --release --locked -p slater \
+    && rm -rf crates/*/src \
+       target/release/slater \
+       target/release/deps/slater-* \
+       target/release/deps/slater_scalar-* target/release/deps/libslater_scalar-* \
+       target/release/deps/graph_format-* target/release/deps/libgraph_format-*
+
+# ── Real build ────────────────────────────────────────────────────────────────
+# Only the server binary, filesystem backend only (no `--features`).
+COPY crates ./crates
+RUN cargo build --release --locked -p slater --bin slater
+
+# Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
+# libgcc/libstdc++ + ca-certificates and nothing else (no shell/apt/coreutils), so
+# the same dynamically-linked binary runs on a far smaller, lower-CVE base than
+# `debian:bookworm-slim`. Use the `:debug` tag for an in-container shell.
+FROM gcr.io/distroless/cc-debian12 AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/slater ./slater
+# Baked-in defaults; per-environment overrides arrive via the /sandbox overlay
+# and `KEY__sub` env vars (hs-utils layered config), see docker-compose.yml.
+COPY config.json ./config.json
+COPY acl.json ./acl.json
+
+# Bound the glibc allocator's retained high-water under concurrency (see the full
+# Dockerfile for the rationale): cap arena count and trim freed chunks promptly so
+# a burst of concurrent queries can't drive RSS far above the cache budget.
+ENV MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=131072
+
+# Run unprivileged as uid:gid 1000:1000 (no /etc/passwd entry needed for a numeric
+# USER), matching the full image.
+USER 1000:1000
+
+# Bolt (optionally Bolt+TLS) — not HTTP.
+EXPOSE 7687
+
+# The probe speaks Bolt (a handshake against the configured port), not HTTP.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/app/slater", "healthcheck"]
+
+ENTRYPOINT ["/app/slater"]
