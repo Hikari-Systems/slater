@@ -11,6 +11,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The push to Docker Hub authenticates with DOCKERHUB_USERNAME/TOKEN secrets, not
+# GITHUB_TOKEN; the job only checks out the repo. Pin the token to read-only.
+permissions:
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest

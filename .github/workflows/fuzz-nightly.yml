@@ -29,6 +29,11 @@ concurrency:
   group: fuzz-nightly-${{ github.ref }}
   cancel-in-progress: false
 
+# The fuzz job only checks out and runs cargo-fuzz; corpus persistence uses the
+# Actions cache, not GITHUB_TOKEN. Pin the token to read-only.
+permissions:
+  contents: read
+
 jobs:
   # The targets fan out one-per-runner across the matrix (as the release gate
   # does), so they fuzz in parallel and each persists its own corpus.

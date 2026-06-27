@@ -1,0 +1,56 @@
+name: CodeQL
+
+# Self-managed CodeQL analysis (replaces the repo's former CodeQL *default setup*).
+# Default setup gives no config control; running it ourselves lets us pin the query
+# set via .github/codeql/codeql-config.yml. Keep all three languages the default
+# setup covered — actions, python, rust — so we don't silently drop coverage.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly off-peak full scan so newly-published queries run even on quiet weeks.
+    - cron: '23 3 * * 1'
+
+# A newer push to the same ref supersedes an in-flight scan.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # security-events:write is required to upload the SARIF results; the rest are
+    # read-only. No other GITHUB_TOKEN scope is needed.
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

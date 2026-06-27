@@ -14,6 +14,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job here only checks out and builds — none write back to the repo or touch
+# other GITHUB_TOKEN-scoped APIs. Pin the token to read-only (mirrors release.yml)
+# so a compromised step can't push, open PRs, or alter releases.
+permissions:
+  contents: read
+
 jobs:
   # ── Formatting: mirror the local pre-commit hook (.githooks/pre-commit) ─────
   fmt:

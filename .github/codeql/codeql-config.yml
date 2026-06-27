@@ -1,0 +1,21 @@
+name: slater CodeQL config
+
+# Runs the default query suite for every language, with one deliberate exclusion.
+#
+# rust/hard-coded-cryptographic-value is excluded because in this repo it fires
+# ONLY on false positives the rule cannot distinguish from a real issue:
+#   * RNG-filled [0u8; N] buffers in crypto.rs (immediately overwritten by
+#     OsRng.fill_bytes — random at runtime),
+#   * an intentional constant-time argon2id dummy hash in acl.rs (timing defence
+#     against user enumeration), and
+#   * fixed salts/keys/passwords inside #[cfg(test)] modules that share their .rs
+#     file with production code (so paths-ignore cannot target them).
+# The runtime master key is injected via env var / mounted file and is never
+# committed, so genuine committed-secret risk is covered by GitHub secret scanning
+# + push protection rather than this rule.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+
+paths-ignore:
+  - 'fuzz/**'
