@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::extsort::{ExtSorter, SortRecord};
@@ -200,6 +201,14 @@ where
     let mut part_prev: Vec<u32> = vec![UNASSIGNED; n];
     let mut part_next: Vec<u32> = vec![UNASSIGNED; n];
 
+    // A scoped rayon pool honours `--threads` (the global pool would grab every core).
+    // `par_chunks_mut` hands each stripe a provably-disjoint `&mut` slice, so the
+    // no-overlap property the old raw-pointer path asserted by hand is now proven by
+    // the borrow checker. Stripe size is fixed and cross-stripe reads are frozen, so
+    // the permutation is identical regardless of worker count or scheduling.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(params.threads.max(1))
+        .build()?;
     let run = (|| -> Result<()> {
         for _ in 0..params.passes.max(1) {
             let mut load_prev = vec![0u32; p];
@@ -208,50 +217,25 @@ where
                     load_prev[pp as usize] += 1;
                 }
             }
-            let next_stripe = std::sync::atomic::AtomicU64::new(0);
-            let err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
-            let part_next_ptr = SyncMutPtr(part_next.as_mut_ptr());
             let part_prev_r = &part_prev;
             let load_prev_r = &load_prev;
-            let next_r = &next_stripe;
-            let err_r = &err;
-            std::thread::scope(|scope| {
-                for _ in 0..params.threads.max(1) {
-                    scope.spawn(|| {
-                        let pp = &part_next_ptr;
-                        loop {
-                            if err_r.lock().unwrap().is_some() {
-                                break;
-                            }
-                            let s = next_r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if s as usize >= nstripes {
-                                break;
-                            }
-                            let lo = s * STRIPE_NODES;
-                            let hi = ((s + 1) * STRIPE_NODES).min(node_count);
-                            if let Err(e) = ldg_stripe_pass(
-                                &stripe_adj(s as usize),
-                                lo,
-                                hi,
-                                part_prev_r,
-                                load_prev_r,
-                                cap_f,
-                                p,
-                                pp,
-                            ) {
-                                let mut g = err_r.lock().unwrap();
-                                if g.is_none() {
-                                    *g = Some(e);
-                                }
-                                break;
-                            }
-                        }
-                    });
-                }
-            });
-            if let Some(e) = err.into_inner().unwrap() {
-                return Err(e);
-            }
+            pool.install(|| {
+                part_next
+                    .par_chunks_mut(STRIPE_NODES as usize)
+                    .enumerate()
+                    .try_for_each(|(s, chunk)| {
+                        let lo = (s as u64) * STRIPE_NODES;
+                        ldg_stripe_pass(
+                            &stripe_adj(s),
+                            lo,
+                            part_prev_r,
+                            load_prev_r,
+                            cap_f,
+                            p,
+                            chunk,
+                        )
+                    })
+            })?;
             std::mem::swap(&mut part_prev, &mut part_next);
         }
         Ok(())
@@ -275,33 +259,21 @@ where
     Ok(to_permutation(part_prev, &load))
 }
 
-/// `*mut u32` wrapper letting stripe workers write **disjoint** ranges of the shared
-/// `part_next` in parallel (each stripe owns `[lo, hi)`; no two threads touch the
-/// same slot, so the aliasing is sound).
-struct SyncMutPtr(*mut u32);
-unsafe impl Send for SyncMutPtr {}
-unsafe impl Sync for SyncMutPtr {}
-
-/// One restreaming-LDG sweep over a single stripe `[lo, hi)`. Reads neighbour
-/// partitions from the live in-stripe chunk (for already-placed, lower-id, in-stripe
-/// neighbours) or the frozen `part_prev` (everything else); writes the stripe's slots
-/// of `part_next` via `ptr`. `local_load` starts from the frozen global histogram and
-/// tracks this stripe's own moves so within-stripe balance stays live.
+/// One restreaming-LDG sweep over a single stripe. `chunk` is this stripe's disjoint
+/// `[lo, lo + chunk.len())` slice of `part_next`. Reads neighbour partitions from the
+/// live in-stripe `chunk` (for already-placed, lower-id, in-stripe neighbours) or the
+/// frozen `part_prev` (everything else). `local_load` starts from the frozen global
+/// histogram and tracks this stripe's own moves so within-stripe balance stays live.
 #[allow(clippy::too_many_arguments)]
 fn ldg_stripe_pass(
     adj_path: &Path,
     lo: u64,
-    hi: u64,
     part_prev: &[u32],
     load_prev: &[u32],
     cap_f: f64,
     p: usize,
-    ptr: &SyncMutPtr,
+    chunk: &mut [u32],
 ) -> Result<()> {
-    let len = (hi - lo) as usize;
-    // SAFETY: stripes are disjoint and each is processed by exactly one worker, so
-    // this `&mut` slice never overlaps another's.
-    let chunk: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(lo as usize), len) };
     // Unseen (edge-less) nodes keep their previous assignment (balanced seed).
     for (i, slot) in chunk.iter_mut().enumerate() {
         *slot = part_prev[lo as usize + i];

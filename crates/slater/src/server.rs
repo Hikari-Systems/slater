@@ -510,6 +510,7 @@ fn spawn_cache_maintenance(
 /// on non-glibc targets (musl / macOS have no `malloc_trim`). We declare the symbol
 /// directly rather than pull in `libc` for one call — the same minimal-dependency
 /// stance the `/proc/self/statm` RSS read in `diag.rs` takes.
+#[allow(unsafe_code)] // the sole `unsafe` in the server: one audited libc FFI call.
 fn trim_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {

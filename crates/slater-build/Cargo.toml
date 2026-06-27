@@ -45,3 +45,9 @@ pest.workspace = true
 pest_derive.workspace = true
 tracing.workspace = true
 rayon.workspace = true
+
+[lints.rust]
+# slater-build contains no `unsafe`: the LDG clustering pass writes disjoint stripes
+# of the partition map via rayon's `par_chunks_mut`, so the borrow checker proves the
+# non-overlap that a raw-pointer split used to assert by hand. Forbid keeps it that way.
+unsafe_code = "forbid"
