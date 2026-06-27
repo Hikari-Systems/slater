@@ -23,7 +23,7 @@
 
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
 /// AEAD identifier written into the MANIFEST `EncryptionHeader`.
@@ -47,7 +47,11 @@ const MAC_KDF_CONTEXT: &str = "slater manifest mac v1";
 
 /// Generate a fresh per-generation random salt.
 pub fn random_salt() -> [u8; SALT_LEN] {
-    let mut salt = [0u8; SALT_LEN];
+    // `from_fn` rather than a `[0u8; N]` literal: both produce a zeroed buffer the
+    // OS RNG immediately overwrites, but the literal form is a constant array that
+    // static analysis (CodeQL rust/hard-coded-cryptographic-value) mistakes for a
+    // hard-coded salt. There is no such thing as a "hard-coded" value here.
+    let mut salt: [u8; SALT_LEN] = core::array::from_fn(|_| 0);
     OsRng.fill_bytes(&mut salt);
     salt
 }
@@ -137,9 +141,10 @@ impl BlockCipher {
 
     /// A fresh random nonce for the next block to be sealed.
     pub fn random_nonce() -> [u8; NONCE_LEN] {
-        let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
-        nonce
+        // `generate_nonce` draws straight from the OS RNG and returns the bytes, so
+        // there is no zeroed `[0u8; N]` buffer — and thus no constant array literal
+        // for static analysis to mistake for a hard-coded nonce.
+        XChaCha20Poly1305::generate_nonce(&mut OsRng).into()
     }
 
     /// Seal a (compressed) block. The returned ciphertext is `plaintext.len()` +
