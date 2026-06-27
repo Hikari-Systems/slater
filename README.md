@@ -637,6 +637,31 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+### Object-store backends are opt-in cargo features
+
+A plain `cargo build` produces a **filesystem-only** binary — the `s3` and `gcs`
+backends are gated behind cargo features so the default build stays small (no AWS
+or Google SDK, no async runtime). Enable whichever you need on **both** `slater`
+(serve) and `slater-build` (publish):
+
+```sh
+# S3 only / GCS only / both
+cargo build -p slater -p slater-build --features s3
+cargo build -p slater -p slater-build --features gcs
+cargo build -p slater -p slater-build --features s3,gcs
+```
+
+Each crate exposes matching `s3` / `gcs` features that forward to
+`graph-format/{s3,gcs}`. Requesting a backend at runtime
+(`dataBackend.kind=s3|gcs`, or `slater-build --publish-{s3,gcs}-*`) without its
+feature compiled in fails fast with a clear "built without the … feature" error.
+The **published Docker image enables both** (Dockerfile `CARGO_FEATURES`), so
+prebuilt images need no extra flags — this only matters when building from source.
+The integration tests are likewise gated: `--features s3 --test s3_minio`,
+`--features gcs --test gcs_emulator` (a `fake-gcs-server`), and `--features gcs
+--test gcs_real` (real GCS via ADC); each skips unless its `SLATER_*` env vars are
+set.
+
 See `docs/PLAN.md`, `docs/PROGRESS.md` and `docs/DECISIONS.md` for the design,
 the milestone ledger, and the decision log.
 

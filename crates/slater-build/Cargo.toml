@@ -27,6 +27,7 @@ gcs = ["graph-format/gcs"]
 [dependencies]
 graph-format.workspace = true
 slater-scalar.workspace = true
+hs-utils.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
