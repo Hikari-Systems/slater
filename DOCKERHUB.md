@@ -36,7 +36,7 @@ reads fast and memory bounded.
 | **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Querying with GQL](#querying-with-gql). |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
-| **Pluggable storage backends** | Serve the same generation format from a local volume, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3). |
+| **Pluggable storage backends** | Serve the same generation format from a local volume, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-disk cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
 ---
 
@@ -151,8 +151,8 @@ capability, so GQL and Cypher spellings are equivalent and may be mixed.
 
 Responses additionally carry **GQLSTATUS** status objects in the Bolt
 `SUCCESS`/`FAILURE` metadata (`gql_status` + `status_description`), added alongside
-the existing keys so older drivers are unaffected. The full mapping with examples is
-in the [README](https://github.com/Hikari-Systems/slater#supported-gql-subset).
+the existing keys so older drivers are unaffected. For source and full
+documentation see the [project repository](https://github.com/Hikari-Systems/slater).
 
 ---
 
@@ -177,7 +177,7 @@ So these are equivalent ways to set the block-cache budget:
 
 | Setting | Env var | Default | What it does |
 |---|---|---|---|
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 | `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root dir of generations (`<graph>/<uuid>/`) for the `fs` backend. |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket (required when `kind=s3`). |
 | `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ from the environment. |
@@ -249,7 +249,7 @@ rebalance the budgets.
 
 ---
 
-## Storage backends (filesystem / S3)
+## Storage backends (filesystem / S3 / GCS)
 
 Slater serves the **same** immutable generation byte-format from either local
 storage or an object store — only `dataBackend.kind` changes, never the data.
@@ -313,11 +313,16 @@ docker run -d --name slater-s3 -p 7687:7687 \
   hikarisystems/slater:latest
 ```
 
-### Publishing a generation to S3
+### Publishing a generation to S3 or GCS
 
 `slater-build` writes to `--data-dir` first, then optionally uploads to a bucket
 (the remote `current` pointer is written last, so a serving node never sees a
-half-published generation):
+half-published generation). The image ships with **both** the `s3` and `gcs`
+backends compiled in, so publishing to either needs no special image — just the
+flags.
+
+**S3** (credentials via the `AWS_*` env, an instance role, or
+`--publish-s3-*` flags for an S3-compatible endpoint):
 
 ```bash
 docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
@@ -325,6 +330,20 @@ docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
   --entrypoint /app/slater-build hikarisystems/slater:latest \
   --input /dumps/people.cypher --graph people --data-dir /data \
   --publish-s3-bucket slater --publish-s3-region eu-west-2
+#   MinIO/localstack: add  --publish-s3-endpoint http://host:9000 --publish-s3-path-style
+```
+
+**GCS** (credentials via Application Default Credentials — mount a
+service-account key and point `GOOGLE_APPLICATION_CREDENTIALS` at it, or use
+`--publish-gcs-credentials`):
+
+```bash
+docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
+  -v "$PWD/sa.json:/secrets/sa.json:ro" -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa.json \
+  --entrypoint /app/slater-build hikarisystems/slater:latest \
+  --input /dumps/people.cypher --graph people --data-dir /data \
+  --publish-gcs-bucket slater --publish-gcs-prefix prod
+#   or pass the key directly:  --publish-gcs-credentials /secrets/sa.json
 ```
 
 ---
@@ -402,9 +421,24 @@ docker exec slater /app/slater healthcheck localhost 7687   # exit 0 = healthy
 --encrypt                 Encrypt every block at rest (needs a key)
 --key-file <path>         Hex master key file        (with --encrypt)
 --key-env <name>          Env var holding the hex key (with --encrypt)
+
+  # Publish to S3 (in addition to the local --data-dir):
+--publish-s3-bucket <b>   Also upload the generation to this S3 bucket
+--publish-s3-region <r>   AWS region (e.g. eu-west-2)
+--publish-s3-endpoint <u> Custom endpoint for an S3-compatible store (MinIO…)
+--publish-s3-prefix <p>   Key prefix under which the generation is published
+--publish-s3-path-style   Path-style addressing (most S3-compatible servers)
+
+  # Publish to GCS (in addition to the local --data-dir):
+--publish-gcs-bucket <b>  Also upload the generation to this GCS bucket
+--publish-gcs-prefix <p>  Key prefix under which the generation is published
+--publish-gcs-credentials Service-account JSON key file (else ADC / Workload Id)
+--publish-gcs-endpoint <u> Custom endpoint for a GCS emulator (fake-gcs-server)
 ```
 
-Run `--help` for the authoritative list:
+Both object-store backends are compiled into the published image, so the
+`--publish-s3-*` / `--publish-gcs-*` flags work out of the box. Run `--help` for
+the authoritative list:
 
 ```bash
 docker run --rm --entrypoint /app/slater-build hikarisystems/slater:latest --help
