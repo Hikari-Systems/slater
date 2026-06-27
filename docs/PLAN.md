@@ -72,7 +72,7 @@ Confirmed call sites: the sibling read services' `src/routes/mod.rs` (e.g.
   (not observed): `UNWIND`, `CALL {}` subqueries — clear Bolt FAILURE at parse time.
 
 ### Scale & graph inventory
-- Graphs/dbs: several named graphs (e.g. `eu_ai_act`, `bioalphaengine-companies` (MeSH), and others),
+- Graphs/dbs: several named graphs (e.g. `eu_ai_act`, a MeSH terms graph, and others),
   each a few thousand nodes / tens of thousands of edges with a handful of NODE vector indexes
   (×1024-dim cosine). Names from `hs-backend-spot/falkordb-snapshot/config.json`; per-graph ACL users
   already exist. Treat graph names as data — Slater serves whatever directories exist under `data_dir`.

@@ -64,7 +64,7 @@ what lets `columns` and `topology` look an entity up by id without a separate
 Per the approved decision we follow house style (`debian:bookworm-slim`) rather
 than musl/distroless, which lets us use the C-backed `zstd` crate freely. The
 rustls default crypto backend is `aws-lc-rs`, which needs `cmake`, `clang`, and
-`libclang-dev` in the builder stage (mirrors `bioalphaengine-data-service`). The
+`libclang-dev` in the builder stage. The
 M9 Dockerfile must install these. (Switching rustls to the pure-Rust `ring`
 backend is an alternative if we ever want to drop the C toolchain — revisit only
 if the Docker build proves painful.)

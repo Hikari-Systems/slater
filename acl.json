@@ -4,8 +4,8 @@
     "reporting": {
       "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_WITH_A_REAL_SALT$REPLACE_WITH_A_REAL_HASH",
       "grants": {
-        "eu_ai_act": ["read"],
-        "bioalphaengine-companies": ["read"]
+        "people": ["read"],
+        "products": ["read"]
       }
     }
   }

@@ -449,8 +449,8 @@ A starter `acl.json` ships at the repo root; its shape is:
     "reporting": {
       "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>",
       "grants": {
-        "eu_ai_act": ["read"],
-        "bioalphaengine-companies": ["read"]
+        "people": ["read"],
+        "products": ["read"]
       }
     }
   }

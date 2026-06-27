@@ -825,5 +825,4 @@ Created the `slater` cargo workspace and a compiling, tested skeleton.
 - `config`, `logging`, `healthcheck` in `hs-utils` are NOT feature-gated → we use
   `default-features = false` and avoid the actix/sqlx stack entirely.
 - The rustls default backend pulls `aws-lc-rs`, which needs `cmake` + `clang` +
-  `libclang-dev` at build time (the M9 Dockerfile builder stage must install them,
-  matching `bioalphaengine-data-service`).
+  `libclang-dev` at build time (the M9 Dockerfile builder stage must install them).

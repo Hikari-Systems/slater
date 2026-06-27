@@ -111,7 +111,7 @@ of pole's `Crime.type`.
 python3 -m venv /tmp/pole_venv && /tmp/pole_venv/bin/pip install neo4j falkordb falkordb-bulk-loader
 SNAP=../../../hs-backend-spot/slater-snapshot/cypher
 # MeSH
-./setup_hs.sh   mesh      $SNAP/bioalphaengine-companies.cypher MeshTerm:type
+./setup_hs.sh   mesh      $SNAP/mesh.cypher MeshTerm:type
 ./run_bench_hs.sh mesh    bench_mesh.py 340839
 ./aggregate_hs.py /tmp/bench-hs/results-mesh
 # EU-AI-Act
