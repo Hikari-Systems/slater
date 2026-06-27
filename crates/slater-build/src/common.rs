@@ -134,15 +134,18 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         let bytes = fs::metadata(&path)
             .with_context(|| format!("stat {}", path.display()))?
             .len();
-        // One read pass yields both the canonical BLAKE3 and the S3-comparable
-        // SHA-256 (base64), so an S3-served generation can be integrity-checked
-        // from S3's object checksum metadata without a body read.
-        let (blake3, sha256) = graph_format::integrity::hash_file_blake3_and_sha256(&path)?;
+        // One read pass yields the canonical BLAKE3 and both server-comparable
+        // object checksums — SHA-256 (S3) and CRC32C (GCS) — so a generation served
+        // from either object store can be integrity-checked from its object-checksum
+        // metadata without a body read.
+        let (blake3, sha256, crc32c) =
+            graph_format::integrity::hash_file_blake3_sha256_crc32c(&path)?;
         files.push(graph_format::manifest::FileEntry {
             name: name.clone(),
             bytes,
             blake3,
             sha256: Some(sha256),
+            crc32c: Some(crc32c),
         });
     }
     let inventory: Vec<(String, String)> = files

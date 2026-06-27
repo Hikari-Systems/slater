@@ -199,7 +199,108 @@ services:
       - 'slater-data:/data'
       - './dumps:/dumps:ro'
 
+  # ── GCS / object-store backend (profile `gcs`) ─────────────────────────────
+  # `docker compose --profile gcs up` brings up a GCS emulator (fake-gcs-server),
+  # which starts with the `slater` bucket pre-created, and runs a slater server
+  # that reads its generations from that bucket. Publish a generation into the
+  # bucket with the `builder-gcs` service below, then (re)start `slater-gcs`.
+  #
+  # The image is built with the `gcs` cargo feature by default (Dockerfile
+  # CARGO_FEATURES), so the same binary speaks the fs, S3, and GCS backends.
+  #
+  # The emulator needs no credentials; both the server and the builder connect
+  # with anonymous auth (dataBackend__gcs__anonymous / --publish-gcs-anonymous).
+  # Against real GCS you would instead leave anonymous off and rely on Application
+  # Default Credentials (Workload Identity / metadata) or a service-account JSON
+  # via dataBackend__gcs__credentialsPath.
+
+  fake-gcs:
+    image: fsouza/fake-gcs-server:latest
+    profiles: ['gcs']
+    # -scheme http: plain HTTP (no TLS) for the demo. -public-host makes the
+    # emulator hand back download URLs that resolve from inside the compose net.
+    # The bucket is created at startup from the seed directory mounted below.
+    command:
+      [
+        '-scheme',
+        'http',
+        '-port',
+        '4443',
+        '-public-host',
+        'fake-gcs:4443',
+        '-data',
+        '/data',
+      ]
+    ports:
+      - '4443:4443'   # GCS JSON/XML API
+    volumes:
+      # `-data /data` seeds from this directory: each subdirectory becomes a
+      # pre-created bucket, so `slater/` (kept in git by its `.keep`) gives the
+      # demo an empty `slater` bucket at startup.
+      - './docker/fake-gcs-seed:/data'
+
+  # A slater server that serves generations from the GCS emulator `slater` bucket.
+  slater-gcs:
+    build:
+      context: .
+    profiles: ['gcs']
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    depends_on:
+      - fake-gcs
+    ports:
+      # Distinct host port so it can run alongside the fs / S3 servers.
+      - '7689:7687'
+    environment:
+      server__bind: '0.0.0.0'
+      server__port: '7687'
+      aclPath: '/app/acl.json'
+      # Switch the storage backend to GCS. The byte format is identical to the
+      # other backends — only where the bytes come from changes.
+      dataBackend__kind: 'gcs'
+      dataBackend__gcs__bucket: 'slater'
+      dataBackend__gcs__endpoint: 'http://fake-gcs:4443'
+      dataBackend__gcs__anonymous: 'true'   # emulator only — never against real GCS
+      # Optional local-disk second cache tier (see the S3 service for the rationale).
+      dataBackend__gcs__diskCacheBytes: '1073741824'
+      dataBackend__gcs__diskCacheDir: '/var/cache/slater'
+      requireAclStamp: 'false'
+      cache__blockCacheBytes: '268435456'
+      cache__vectorCacheBytes: '134217728'
+      cache__resultCacheBytes: '33554432'
+      generationPollMs: '5000'
+      reloadStrategy: 'exit'
+      log__level: 'info'
+    volumes:
+      - 'slater-gcs-cache:/var/cache/slater'
+    healthcheck:
+      test: ['CMD', '/app/slater', 'healthcheck']
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # The offline writer, publishing to the GCS emulator. Run a build with, e.g.:
+  #   docker compose --profile gcs run --rm builder-gcs \
+  #     --input /dumps/people.cypher --graph people --data-dir /data \
+  #     --publish-gcs-bucket slater --publish-gcs-endpoint http://fake-gcs:4443 \
+  #     --publish-gcs-anonymous
+  builder-gcs:
+    build:
+      context: .
+    profiles: ['gcs']
+    depends_on:
+      - fake-gcs
+    entrypoint: ['/app/slater-build']
+    command: ['--help']
+    volumes:
+      - 'slater-data:/data'
+      - './dumps:/dumps:ro'
+
 volumes:
   slater-data:
   minio-data:
   slater-s3-cache:
+  slater-gcs-cache:

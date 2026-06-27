@@ -11,10 +11,10 @@
 
 |  |  |  |  |
 |:--|:--|:--|:--|
-| [Why Slater exists](#why-slater-exists) | [What you get](#what-you-get) | [Features](#features) | [GQL subset](#supported-gql-subset) |
-| [Running with Docker](#running-with-docker) | [How it works](#how-it-works) | [Storage backends](#storage-backends-filesystem--s3) | [Mounts](#mounts) |
-| [Configuration](#environment--configuration) | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) |
-| [Development](#development) | [Performance](#performance) | [License](#license) |
+| [Why Slater exists](#why-slater-exists) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
+| [How it works](#how-it-works) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
+| [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
+| [Performance](#performance) | [License](#license) |
 ## Why Slater exists
 
 A **graph database** stores data as *things* (nodes) and the *relationships between them* (edges), with the relationships as first-class citizens. That's what you want when your questions are about connections rather than rows — "who's within three hops of this account?", "what's the full dependency chain behind this build?", "which accounts share a device, an address, and a card?" — the queries that become a swamp of recursive joins in SQL but fall out naturally in a graph.
@@ -50,10 +50,10 @@ Slater is built for the other half of the problem: graphs that are **mostly read
 | **Rugged under load** | Written in Rust with no `unsafe`; read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
 | **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
-| **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. See [Supported GQL subset](#supported-gql-subset). |
+| **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
-| **Pluggable storage backends** | Serve the same generation format from a local filesystem **or** an S3 (S3-compatible) bucket — publish once, fan out to stateless replicas — with an optional local-SSD cache tier in front of S3. See [Storage backends](#storage-backends-filesystem--s3). |
+| **Pluggable storage backends** | Serve the same generation format from a local filesystem, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-SSD cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
 Two binaries make up the workspace:
 
@@ -73,108 +73,6 @@ geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
 (`db.idx.vector.queryNodes`). To update a graph you build a new generation and
 atomically swap the `current` pointer; the running server picks the change up via
 its generation guard (see [Generation guard](#generation-guard)).
-
-## Supported GQL subset
-
-Slater also understands a read-only subset of **ISO GQL** (ISO/IEC 39075), the
-standardised graph query language. There is no separate endpoint or protocol: GQL
-arrives over the same Bolt connection and is parsed by the same engine, so the
-standard drivers and tools work unchanged. A statement may optionally carry a
-leading `GQL` or `CYPHER` dialect selector (mirroring the `CYPHER 5` / `CYPHER 25`
-form) — it is stripped and the remainder is parsed either way, as one parser
-serves both languages.
-
-Every GQL form below lowers onto an existing engine capability, so the two
-spellings are equivalent and may be mixed freely (even within one query):
-
-| GQL form | Cypher equivalent | Meaning |
-|---|---|---|
-| `((…)){m,n}` | `…*m..n` | Quantified path — repeat the parenthesised pattern *m* to *n* times. |
-| `WALK` / `TRAIL` / `ACYCLIC` / `SIMPLE` | (varies; `*` is `TRAIL`) | Path restrictor over a variable-length match: `WALK` allows repeats, `TRAIL` forbids repeated edges (the default for `*`), `ACYCLIC` forbids any repeated node, `SIMPLE` forbids interior repeats but lets the two endpoints coincide. |
-| `ANY SHORTEST` / `ALL SHORTEST` / `SHORTEST k` | `shortestPath(…)` | Shortest-path selector on a match: any one shortest path, all minimum-length paths, or the first *k* by length. |
-| `:A & B`, `:A \| B`, `:! A`, `:(A \| B) & C` | `:A:B` (AND), `:A\|B` (OR) | Label / relationship-type boolean expressions — `&`, `\|`, `!` and parentheses. The classic `:A:B` (AND) and `:T1\|T2` (alternation) remain valid as sugar. |
-| `FOR x IN list` | `UNWIND list AS x` | Iterate a list, emitting one row per element. |
-| `CAST(expr AS TYPE)` | `toInteger(expr)`, `toFloat(…)`, … | Typed-value conversion (`INTEGER`/`INT`, `FLOAT`/`DOUBLE`/`REAL`, `STRING`/`VARCHAR`, `BOOLEAN`/`BOOL`, `DATE`, `LOCALTIME`, `LOCALDATETIME`, `DURATION`). |
-| `GQL …` / `CYPHER …` prefix | *(none — implicit)* | Optional dialect selector at the very start of a statement; recorded and stripped, with no change of behaviour today. |
-
-GQL responses also carry additive **GQLSTATUS** status objects in the Bolt
-`SUCCESS` / `FAILURE` metadata (`gql_status` + `status_description`) alongside the
-existing keys, so GQL-aware clients see standard status codes while older drivers
-are unaffected.
-
-### Writing GQL vs Cypher
-
-Because both spellings parse to the same plan, you can use whichever reads better —
-and mix them. The pairs below return identical results.
-
-**Quantified paths** — repeat a parenthesised sub-pattern a bounded number of times
-(the quantifier sits on the group, `((…)){m,n}`):
-
-```cypher
--- GQL
-MATCH (a:Person) ((x)-[:KNOWS]->(y)){1,3} (b:Person) RETURN b
--- Cypher
-MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN b
-```
-
-**Path restrictors** — control repeated nodes/edges on a variable-length `-[:R*]->`
-match (`WALK` allows repeats, `TRAIL` = no repeated edge — the default for `*` —
-`ACYCLIC` = no repeated node, `SIMPLE` = no repeated *interior* node):
-
-```cypher
--- GQL: no node may repeat on the variable-length walk
-MATCH ACYCLIC (a)-[:KNOWS*]->(b) RETURN b
--- Cypher `*` is already edge-unique (= TRAIL); ACYCLIC has no plain-Cypher spelling
-```
-
-**Shortest-path selectors** — pick the shortest path(s) on a match:
-
-```cypher
--- GQL
-MATCH ANY SHORTEST (a {name:'Alice'})-[:KNOWS*]->(b {name:'Carol'}) RETURN b
-MATCH ALL SHORTEST (a)-[:KNOWS*]->(b) RETURN b      -- every minimum-length path
-MATCH SHORTEST 3 (a)-[:KNOWS*]->(b) RETURN b        -- first 3 by length
--- Cypher: the shortestPath() function (single shortest; endpoints bound first)
-MATCH (a {name:'Alice'}), (b {name:'Carol'})
-RETURN shortestPath((a)-[:KNOWS*]->(b))
-```
-
-**Label / type boolean expressions** — `&`, `|`, `!` and parentheses:
-
-```cypher
--- GQL
-MATCH (n:Person & Admin) RETURN n            -- both labels
-MATCH (n:Person & !Admin) RETURN n           -- Person but not Admin
-MATCH (a)-[r:KNOWS | FOLLOWS]->(b) RETURN r   -- either relationship type
--- Cypher: :Person:Admin is AND sugar; |-alternation is rel-types only; no `!`
-MATCH (n:Person:Admin) RETURN n
-```
-
-**`FOR` instead of `UNWIND`** — iterate a list:
-
-```cypher
--- GQL
-FOR x IN [1, 2, 3] RETURN x
--- Cypher
-UNWIND [1, 2, 3] AS x RETURN x
-```
-
-**`CAST` instead of the `to*` functions** — typed-value conversion:
-
-```cypher
--- GQL
-RETURN CAST('42' AS INTEGER), CAST(3 AS FLOAT), CAST('2024-01-01' AS DATE)
--- Cypher
-RETURN toInteger('42'), toFloat(3), date('2024-01-01')
-```
-
-**Dialect prefix** — optional; stripped and parsed by the one engine, so it changes
-nothing today but lets a GQL-aware client be explicit:
-
-```cypher
-GQL MATCH (n:Person) RETURN n
-CYPHER MATCH (n:Person) RETURN n
-```
 
 ## Running with Docker
 
@@ -299,86 +197,136 @@ at build time by the `--ann-threshold` (default 50 000 vectors):
     read from disk. That resident PQ set is what the `cache.vectorCacheBytes` pool
     pins.
 
-## Storage backends (filesystem / S3)
+## Storage backends (filesystem / S3 / GCS)
 
 Every generation file is opened through an **`ObjectStore`** abstraction rather
 than `std::fs` directly, so the *same* on-disk byte format — blocks, indexes,
-manifest, `current` pointer — can be served from different storage without
-changing the readers, the query engine, or the integrity checks. Only *where the
-bytes come from* differs. The hot path is positional reads (`read_exact_at`),
-which map onto a `pread` on a local file and an HTTP `Range` GET on an object
-store; Slater never mmaps, so the explicit, bounded-read model is identical
-across backends. The backend is selected by `dataBackend.kind`:
+manifest, `current` pointer — is served unchanged from any backend; only *where
+the bytes come from* differs, never the readers, the query engine, or the
+integrity checks. The hot path is positional reads (`read_exact_at`), which map
+onto a `pread` on a local file and an HTTP byte-range request on an object store
+— Slater never mmaps, so the explicit, bounded-read model is identical
+everywhere.
 
-* **`fs` (default) — local filesystem**, rooted at `dataBackend.fs.dir`. This is the right
-  choice for the overwhelming majority of deployments: a generation on a local
-  SSD (or an NFS/EBS mount) served read-only. Integrity is a BLAKE3 re-hash of
-  every file at open.
+**Three first-class backends**, selected by `dataBackend.kind`. The filesystem is
+the simple default; **Amazon S3 and Google Cloud Storage are equal, fully
+supported object-store backends** — the published image ships with both compiled
+in, so each is configuration-only, and a generation built once can be served from
+any of them (even migrated `fs` → S3 → GCS) without a rebuild.
 
-* **`s3` — an S3 (or S3-compatible: MinIO, localstack) bucket.** Generation files
-  are objects under a key prefix; the readers' positional reads become `Range`
-  GETs. The published image is built with the `s3` feature, so this needs no
-  custom build — just configuration. Integrity is verified from S3's
-  **server-computed SHA-256 object checksum** via a metadata `HEAD` (no body
-  read): `slater-build` sends each object's SHA-256 on upload (S3 validates and
-  stores it), and the server reads it back at open and compares it to the
-  manifest. Credentials are taken **first** from config —
-  `dataBackend.s3.awsAccessKey` / `awsSecretKey` (and `awsSessionToken` for
-  temporary STS credentials), settable via the `dataBackend__s3__awsAccessKey`
-  env override — and only fall back to the standard AWS chain (`AWS_ACCESS_KEY_ID`
-  / `AWS_SECRET_ACCESS_KEY` env, shared profile, or instance role) when those are
-  left empty.
+| `dataBackend.kind` | Positional read | Integrity at open (no body download) | Credentials |
+| --- | --- | --- | --- |
+| `fs` *(default)* | `pread` | full BLAKE3 re-hash of each file | — |
+| `s3` | HTTP `Range` GET | server **SHA-256** via `HEAD` (→ byte-size check if absent) | config keys, AWS chain, or IAM role |
+| `gcs` | HTTP range read | server **CRC32C** via `get_object` (→ byte-size check if absent) | ADC / Workload Identity, or service-account JSON |
 
-**When is S3 appropriate?** Reach for it when you want generations to live in
-durable, central object storage rather than on a node's disk — typically:
-publish once and fan out to many stateless, disk-less server replicas that all
-read the same bucket; decouple the build host from the serve hosts; or lean on
-S3's durability/versioning/lifecycle instead of managing volumes. The trade-off
-is latency: a cold block is a network round-trip (~10–50 ms) instead of a local
-read (~0.1 ms). Slater hides much of this with the in-memory block cache and
-concurrent read-ahead, **and** with the optional disk cache below — but if your
-generations already sit on fast local storage and you don't need the
-central-bucket model, `fs` is simpler and faster. The byte format is identical,
-so you can switch backends without rebuilding a generation.
+Both object stores verify integrity from the **checksum the store already
+computes and keeps**, fetched as object metadata: `slater-build` sends the
+checksum on upload (the store validates the bytes against it and stores it), and
+the server reads it back at open and compares it to the manifest — one metadata
+request per file, no body download. It is content-grade and identical in spirit
+across S3 (SHA-256) and GCS (CRC32C).
 
-### S3 local-disk block cache (second tier)
+### Filesystem (`fs`)
+
+The default, rooted at `dataBackend.fs.dir`. The right choice for most
+deployments: a generation on a local SSD (or an NFS/EBS mount) served read-only.
+Integrity is a full BLAKE3 re-hash of every file at open.
+
+### Amazon S3 (`s3`)
+
+An S3 or S3-compatible bucket (AWS, MinIO, localstack). Credentials come **first**
+from config (`dataBackend.s3.awsAccessKey` / `awsSecretKey`, plus
+`awsSessionToken` for temporary STS credentials) and fall back to the standard AWS
+chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env, shared profile, or
+instance/IRSA role) when left empty.
+
+```sh
+# serve from S3 (env-var form; see the config table for every key)
+dataBackend__kind=s3
+dataBackend__s3__bucket=slater
+dataBackend__s3__region=eu-west-2
+dataBackend__s3__awsAccessKey=…        # omit to use the AWS chain / instance role
+dataBackend__s3__awsSecretKey=…
+# S3-compatible (e.g. MinIO): also set
+dataBackend__s3__endpoint=http://minio:9000
+dataBackend__s3__pathStyle=true        # required by most S3-compatible servers
+```
+```sh
+# publish a generation into the bucket (remote `current` pointer written last)
+slater-build --input people.cypher --graph people --data-dir /data \
+  --publish-s3-bucket slater --publish-s3-region eu-west-2 --publish-s3-prefix prod
+#   MinIO: add  --publish-s3-endpoint http://localhost:9000 --publish-s3-path-style
+```
+
+### Google Cloud Storage (`gcs`)
+
+A GCS bucket, reached over the JSON API. Authorization is GCP-native: by default
+it resolves **Application Default Credentials** — GKE Workload Identity, the GCE
+metadata server, or a `gcloud` / `GOOGLE_APPLICATION_CREDENTIALS` key. Set
+`dataBackend.gcs.credentialsPath` (a service-account JSON key file) or inline
+`credentialsJson` for an explicit key. `dataBackend.gcs.endpoint` points at a
+`fake-gcs-server` emulator, and `dataBackend.gcs.anonymous=true` enables
+unauthenticated access **for that emulator only** — never against real GCS.
+
+```sh
+# serve from GCS (env-var form; see the config table for every key)
+dataBackend__kind=gcs
+dataBackend__gcs__bucket=slater
+dataBackend__gcs__prefix=prod
+dataBackend__gcs__credentialsPath=/secrets/sa.json   # omit for ADC / Workload Identity
+```
+```sh
+# publish a generation into the bucket (remote `current` pointer written last)
+slater-build --input people.cypher --graph people --data-dir /data \
+  --publish-gcs-bucket slater --publish-gcs-prefix prod
+#   explicit key: add  --publish-gcs-credentials /secrets/sa.json
+```
+
+In all cases `slater-build` writes the finished generation to `--data-dir` first
+(its local staging area) and **additionally** uploads it to the bucket; the remote
+`current` pointer is written last, so a serving node never sees a half-published
+generation.
+
+### When to use an object store (S3 or GCS)
+
+Reach for `s3` or `gcs` when you want generations in durable, central object
+storage rather than on a node's disk — typically: publish once and fan out to many
+stateless, disk-less server replicas that all read the same bucket; decouple the
+build host from the serve hosts; or lean on the store's
+durability/versioning/lifecycle instead of managing volumes. The trade-off is
+latency: a cold block is a network round-trip (~10–50 ms) instead of a local read
+(~0.1 ms). Slater hides most of it with the in-memory block cache, concurrent
+read-ahead, **and** the optional disk cache below. If your generations already sit
+on fast local storage and you don't need the central-bucket model, `fs` is simpler
+and faster.
+
+### Local-disk block cache (object-store second tier)
 
 The in-memory `BlockCache` is deliberately small (bounded RSS is the headline
 guarantee), so on a working set larger than RAM the same blocks would be
-re-fetched from S3 on every spill. An **optional local-SSD second cache tier**
-fixes that: a block evicted from RAM is served from local disk (~0.1 ms) instead
-of a fresh S3 GET, surviving in-memory eviction and cutting S3 request
-count/cost — bringing an S3-backed node close to local-filesystem performance
-once warm. It is **opt-in** for the `s3` backend, enabled by setting
-`dataBackend.s3.diskCacheBytes > 0` and a writable `diskCacheDir`.
+re-fetched from the object store on every spill. An **optional local-SSD second
+cache tier** fixes that: a block evicted from RAM is served from local disk
+(~0.1 ms) instead of a fresh object GET, surviving in-memory eviction and cutting
+object-store request count/cost — bringing an object-store-backed node close to
+local-filesystem performance once warm. It is **opt-in** for both `s3` and `gcs`,
+enabled by setting `dataBackend.<s3|gcs>.diskCacheBytes > 0` and a writable
+`diskCacheDir`.
 
-* It caches the **sealed** S3 bytes exactly as fetched — already compressed, and
+* It caches the **sealed** bytes exactly as fetched — already compressed, and
   (for `--encrypt` generations) still AEAD-sealed — *below* decrypt/decompress.
   The cache layer never holds the encryption key and never re-encrypts, so
   at-rest status is preserved for free: an encrypted generation lands on disk
   still sealed.
-* Writes are **write-behind**: a miss returns the S3 bytes to the query
+* Writes are **write-behind**: a miss returns the fetched bytes to the query
   immediately, then a background thread does the disk write and LRU trim, so the
   query path never blocks on disk I/O. Eviction keeps the cache within its byte
   budget; a per-file checksum verified on every read self-heals a corrupt cache
-  file to a miss (→ S3 refetch).
+  file to a miss (→ refetch from the object store).
 * `diskCacheDir` **must point at a real writable volume — never `tmpfs`** (tmpfs
   is RAM and would defeat the bounded-RSS guarantee). The in-memory index that
   tracks it costs a little RAM (~tens of bytes per cached block), which counts
   against your RSS ceiling — size the directory ≫ the in-memory block cache.
-
-### Publishing to S3
-
-`slater-build` always writes the finished generation to `--data-dir` first (its
-local staging area), and can **additionally** upload it to a bucket with the
-`--publish-s3-*` flags — the remote `current` pointer is written last, so a
-serving node never sees a half-published generation:
-
-```sh
-slater-build --input people.cypher --graph people --data-dir /data \
-  --publish-s3-bucket slater --publish-s3-region eu-west-2 \
-  --publish-s3-prefix prod            # add --publish-s3-endpoint / --publish-s3-path-style for MinIO
-```
 
 ## Mounts
 
@@ -390,7 +338,7 @@ The container runs with a **read-only root filesystem** and a non-root user
 | `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | **Read-only**; produced by `slater-build`. May live on remote/network storage (e.g. NFS), so reads are not assumed to be fast local-SSD latencies. |
 | `/sandbox` | Per-environment config overlay + secrets. | `/sandbox/config.json` is deep-merged over the baked-in `config.json`; also holds `acl.json`, TLS PEM material, the at-rest key file. |
 | `/tmp`, `/run` | Scratch (`tmpfs`). | Slater itself never writes to disk by default. |
-| _(optional)_ disk cache | The S3 local-disk block cache, when `dataBackend.s3.diskCacheBytes > 0`. | **Writable**, and a **real volume — not `tmpfs`**. Only used by the `s3` backend; see [Storage backends](#storage-backends-filesystem--s3). |
+| _(optional)_ disk cache | The local-disk block cache, when `dataBackend.s3.diskCacheBytes` / `dataBackend.gcs.diskCacheBytes > 0`. | **Writable**, and a **real volume — not `tmpfs`**. Used by the `s3` and `gcs` backends; see [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
 ## Environment / configuration
 
@@ -409,7 +357,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `server.maxMessageBytes` | `server__maxMessageBytes` | 67108864 | Largest Bolt message accepted from an **authenticated** reader (64 MiB). |
 | `server.loginTimeoutMs` | `server__loginTimeoutMs` | 10000 | Deadline for an unauthenticated peer to finish handshake → `LOGON` (0 ⇒ none); closes the slow-loris a byte cap alone leaves open. |
 | `server.idleTimeoutMs` | `server__idleTimeoutMs` | 0 | Idle read timeout for an **authenticated** connection (0 ⇒ none, the default — pooled drivers legitimately hold idle connections). |
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem) or `s3` (object store). See [Storage backends](#storage-backends-filesystem--s3). |
+| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 | `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root holding `<graph>/<generation>/` for the `fs` backend (and the local area the at-rest key file must stay outside of). |
 | `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open (a cheap metadata check on every backend). |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket name (required when `kind=s3`). |
@@ -422,6 +370,14 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional session token for temporary (STS) credentials; only used when `awsAccessKey`/`awsSecretKey` are set. |
 | `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index counts against the RSS ceiling. |
 | `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Directory for the disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
+| `dataBackend.gcs.bucket` | `dataBackend__gcs__bucket` | _(empty)_ | GCS bucket name (required when `kind=gcs`). |
+| `dataBackend.gcs.prefix` | `dataBackend__gcs__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
+| `dataBackend.gcs.endpoint` | `dataBackend__gcs__endpoint` | _(empty)_ | Custom endpoint URL for a GCS emulator (`fake-gcs-server`); empty ⇒ standard GCS endpoint. |
+| `dataBackend.gcs.credentialsPath` | `dataBackend__gcs__credentialsPath` | _(empty)_ | Path to a **service-account JSON key file**. Empty ⇒ Application Default Credentials (Workload Identity / GCE metadata / `gcloud`). |
+| `dataBackend.gcs.credentialsJson` | `dataBackend__gcs__credentialsJson` | _(empty)_ | Inline service-account JSON key; takes precedence over `credentialsPath`. Empty ⇒ `credentialsPath`, else ADC. |
+| `dataBackend.gcs.anonymous` | `dataBackend__gcs__anonymous` | `false` | Use unauthenticated access — a local GCS emulator (`fake-gcs-server`) **only**, never against real GCS. Overrides every other credential source. |
+| `dataBackend.gcs.diskCacheBytes` | `dataBackend__gcs__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier), identical to the S3 setting. `0` ⇒ disabled; when `> 0`, `diskCacheDir` is required. |
+| `dataBackend.gcs.diskCacheDir` | `dataBackend__gcs__diskCacheDir` | _(empty)_ | Directory for the GCS disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
 | `requireAclStamp` | `requireAclStamp` | `true` | Refuse a generation with no `aclBlake3` stamp (closes the stamp-strip downgrade); build images with `--acl`. A generation with no manifest MAC is always refused when a master key is configured — that check has no off switch. |
 | `cache.blockCacheBytes` | `cache__blockCacheBytes` | 64 MiB | Decompressed block LRU budget. |
@@ -484,6 +440,33 @@ Mint a hash (never store cleartext) with:
 ```sh
 slater hash-password 's3cret'        # prints a $argon2id$… string for acl.json
 ```
+
+A starter `acl.json` ships at the repo root; its shape is:
+
+```json
+{
+  "users": {
+    "reporting": {
+      "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>",
+      "grants": {
+        "eu_ai_act": ["read"],
+        "bioalphaengine-companies": ["read"]
+      }
+    }
+  }
+}
+```
+
+* **`users`** — one entry per login, keyed by username.
+* **`passwordArgon2id`** — the `$argon2id$…` string from `slater hash-password`
+  (never cleartext; the file itself is plain JSON and lives on shared storage).
+* **`grants`** — per-graph capability lists. Only **`read`** is meaningful (Slater
+  serves read-only); a user can query exactly the graphs listed and no others. A
+  graph absent from a user's grants is invisible to them.
+
+Mount it read-only at the path named by `aclPath` (default `/config/acl.json`).
+The server reloads it on each generation hot-swap, and the at-rest ACL stamp is
+re-checked on every reload (see [`requireAclStamp`](#environment--configuration)).
 
 ## Health check
 
@@ -661,10 +644,10 @@ the milestone ledger, and the decision log.
 
 Six engines, one single-client suite, five graphs from a 62k-node toy to **Wikidata
 91.6M nodes / 766M edges**. Each engine is **measured in isolation** (every other container
-stopped — RSS and latency are its own footprint). **slater is current `main`**; the other
+stopped — RSS and latency are its own footprint). Slater was tested with version 0.8.0; the other
 engines are the established cross-engine run (their performance is unchanged). All figures
 are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold = best in
-row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 backend trades local-read
+row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 and GCS backends trade local-read
 latency for object-store round-trips (mitigated by the in-memory caches and the optional local-disk
 cache tier), so these figures characterise the engine, not a network-storage deployment.
 
@@ -677,7 +660,7 @@ cache tier), so these figures characterise the engine, not a network-storage dep
 | LadybugDB | embedded, columnar | manual buffer pool that must exceed the query |
 
 The three engines that **page from disk** — slater, Neo4j 5, and LadybugDB — load all five
-graphs. The **in-memory trio** (Memgraph · FalkorDB · ArcadeDB) cannot hold the 766M graph at
+graphs. The **in-memory trio** (Memgraph · FalkorDB · ArcadeDB) cannot hold the 766M edge graph at
 all (it needs ~64–128 GiB resident), and ArcadeDB's importer can't finish it either.
 
 ### Resident memory (MiB) — bounded as the graph grows ~1,500×
@@ -701,7 +684,7 @@ slater is the **lowest at every scale** and grows ~50× while the graph grows ~1
 footprint tracks the *query working set*, not the graph (idle ~16–71 MiB throughout). The
 in-memory trio grows ~linearly and can't load the 766M graph; Neo4j commits a ~2 GiB heap
 regardless of query. († LadybugDB on the bounded shapes only — its hub / var-length /
-shortestPath traversals at 766M need its read pool raised to ≥2 GiB, vs slater's automatic
+shortestPath traversals at 766M edges need its read pool raised to ≥2 GiB, vs slater's automatic
 `maxIntermediate` cap.) The build-time value→count histograms add negligible resident memory —
 a few KB for a low-cardinality indexed column, and *zero* for unique-key graphs like Wikidata
 (`wikidata_id` exceeds the histogram cardinality cap, so none is stored) — so these figures are

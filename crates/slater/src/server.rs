@@ -1366,7 +1366,53 @@ pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
                 )
             }
         }
-        other => bail!("unknown data_backend.kind {other:?} (expected \"fs\" or \"s3\")"),
+        "gcs" => {
+            #[cfg(feature = "gcs")]
+            {
+                let g = &cfg.data_backend.gcs;
+                let gcfg = graph_format::store::gcs::GcsConfig {
+                    bucket: g.bucket.clone(),
+                    prefix: g.prefix.clone(),
+                    endpoint: (!g.endpoint.is_empty()).then(|| g.endpoint.clone()),
+                    credentials_path: (!g.credentials_path.is_empty())
+                        .then(|| g.credentials_path.clone()),
+                    credentials_json: (!g.credentials_json.is_empty())
+                        .then(|| g.credentials_json.clone()),
+                    anonymous: g.anonymous,
+                };
+                let store = graph_format::store::gcs::GcsObjectStore::connect(&gcfg)
+                    .context("connect GCS data backend")?;
+                let store: Arc<dyn ObjectStore> = Arc::new(store);
+                // Optional local-disk second cache tier in front of GCS (the same
+                // backend-agnostic decorator used for S3).
+                if g.disk_cache_bytes > 0 {
+                    if g.disk_cache_dir.is_empty() {
+                        bail!(
+                            "dataBackend.gcs.diskCacheBytes is set but diskCacheDir is empty — \
+                             a writable cache directory is required (and must not be tmpfs)"
+                        );
+                    }
+                    let cache = graph_format::store::diskcache::DiskCache::open(
+                        &g.disk_cache_dir,
+                        g.disk_cache_bytes as u64,
+                    )
+                    .context("open GCS disk cache")?;
+                    Ok(Arc::new(
+                        graph_format::store::diskcache::CachingObjectStore::new(store, cache),
+                    ))
+                } else {
+                    Ok(store)
+                }
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                bail!(
+                    "data_backend.kind = \"gcs\" but this slater binary was built without the \
+                     `gcs` cargo feature"
+                )
+            }
+        }
+        other => bail!("unknown data_backend.kind {other:?} (expected \"fs\", \"s3\", or \"gcs\")"),
     }
 }
 

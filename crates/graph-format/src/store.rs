@@ -21,9 +21,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-#[cfg(feature = "s3")]
+// The async-runtime bridge and the local-disk block cache are shared by every
+// network backend (S3, GCS), so they compile when either is enabled.
+#[cfg(any(feature = "s3", feature = "gcs"))]
+pub mod asyncbridge;
+#[cfg(any(feature = "s3", feature = "gcs"))]
 pub mod diskcache;
 pub mod fs;
+#[cfg(feature = "gcs")]
+pub mod gcs;
 pub mod mem;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -140,6 +146,10 @@ pub struct FileIntegrity<'a> {
     /// records one. The S3 backend compares it to S3's server-computed object
     /// checksum; backends that ignore it fall back to `blake3` / `size`.
     pub sha256: Option<&'a str>,
+    /// Base64 CRC32C (big-endian `u32`, the GCS `crc32c` form), when the manifest
+    /// records one. The GCS backend compares it to GCS's server-computed object
+    /// checksum; backends that ignore it fall back to `blake3` / `size`.
+    pub crc32c: Option<&'a str>,
 }
 
 /// Join a base key and a child component with the canonical `/` separator,

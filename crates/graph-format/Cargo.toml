@@ -21,6 +21,12 @@ chacha20poly1305.workspace = true
 # via a metadata request (no body read). Computed at build for every generation.
 sha2 = "0.10"
 base64 = "0.22"
+# CRC32C (base64 big-endian u32) per-file digest baked into the manifest alongside
+# BLAKE3/SHA-256, so the GCS backend can verify integrity from GCS's
+# server-computed object `crc32c` via a metadata request (no body read). Computed
+# at build for every generation (non-optional, exactly like SHA-256), so any image
+# is GCS-ready regardless of which backend features the binary was built with.
+crc32c = "0.6"
 # S3 backend (optional). aws-sdk-s3 is used (not a blocking client) because it is
 # the only client that surfaces S3 object checksums (`x-amz-checksum-sha256`) on
 # put/head; it is async, so `store::s3` bridges it with an owned current-thread
@@ -28,17 +34,30 @@ base64 = "0.22"
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
-# Per-file checksum for the S3 local-disk block cache (`store::diskcache`),
-# verified on every read to self-heal a corrupt cache file (→ S3 refetch). A
-# plain CRC-32 detects bit-rot/torn writes; it is not a security MAC (the sealed
-# generation bytes already carry their own AEAD above this layer).
+# GCS backend (optional). `gcloud-storage` talks to GCS over the **JSON API**
+# (not gRPC), which surfaces the object `crc32c` checksum on get/list, validates an
+# upload against a supplied crc32c, supports byte-range downloads, and resolves
+# GCP-native credentials (ADC / Workload Identity / GCE metadata, a service-account
+# JSON, or anonymous for an emulator). JSON (over the same endpoint real GCS and
+# `fake-gcs-server` both serve) is what lets one code path work against the
+# emulator and production alike. It is async, bridged by the same owned runtime as
+# S3 via `store::asyncbridge`.
+gcloud-storage = { version = "1", optional = true }
+# Per-file checksum for the network-backend local-disk block cache
+# (`store::diskcache`), verified on every read to self-heal a corrupt cache file
+# (→ object-store refetch). A plain CRC-32 detects bit-rot/torn writes; it is not a
+# security MAC (the sealed generation bytes already carry their own AEAD above this
+# layer).
 crc32fast = { version = "1", optional = true }
 
 [features]
 default = []
-# Enable the S3 / object-store backend (`store::s3::S3ObjectStore`) and its
-# optional local-disk block cache (`store::diskcache::CachingObjectStore`).
+# Enable the S3 / object-store backend (`store::s3::S3ObjectStore`) and the shared
+# local-disk block cache (`store::diskcache::CachingObjectStore`).
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio", "dep:crc32fast"]
+# Enable the GCS backend (`store::gcs::GcsObjectStore`) and the same shared
+# local-disk block cache.
+gcs = ["dep:gcloud-storage", "dep:tokio", "dep:crc32fast"]
 
 [dev-dependencies]
 criterion.workspace = true

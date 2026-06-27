@@ -21,11 +21,12 @@ WORKDIR /app
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=$RUSTFLAGS
 
-# Cargo features to compile into the binaries. Defaults to the S3 / object-store
-# data backend so the image can serve from (and publish to) S3/MinIO out of the
-# box (see docker-compose.yml's `s3` profile). Set `--build-arg CARGO_FEATURES=`
-# for a leaner filesystem-only image.
-ARG CARGO_FEATURES="slater/s3,slater-build/s3"
+# Cargo features to compile into the binaries. Defaults to the S3 and GCS
+# object-store data backends so the image can serve from (and publish to)
+# S3/MinIO or GCS out of the box (see docker-compose.yml's `s3` / `gcs` profiles).
+# Set `--build-arg CARGO_FEATURES=` for a leaner filesystem-only image, or pick a
+# single backend (e.g. `slater/gcs,slater-build/gcs`).
+ARG CARGO_FEATURES="slater/s3,slater-build/s3,slater/gcs,slater-build/gcs"
 
 # Build deps for aws-lc-rs (pulled in transitively by rustls — D5): cmake + a
 # C/C++ toolchain (clang), and libclang for its bindgen step. Without these the

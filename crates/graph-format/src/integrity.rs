@@ -24,16 +24,29 @@ pub fn sha256_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
 
-/// Stream a file through BOTH BLAKE3 and SHA-256 in a single read pass, returning
-/// `(blake3_hex, sha256_base64)`. The builder uses this for the inventory so each
-/// file is read once for both the canonical content digest (BLAKE3) and the
-/// S3-comparable checksum (SHA-256).
-pub fn hash_file_blake3_and_sha256(path: impl AsRef<Path>) -> Result<(String, String)> {
+/// Base64 of a CRC32C digest encoded as a big-endian `u32` — the exact form GCS
+/// stores and returns as the object's `crc32c` checksum (also what `gcloud
+/// storage objects describe` / `gsutil hash` print). A value computed here is
+/// sent on upload (GCS validates the bytes against it) and compared to GCS's
+/// server-computed checksum at open without reading the object body. The GCS
+/// backend decodes it back to a `u32` for the comparison.
+pub fn crc32c_base64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(bytes).to_be_bytes())
+}
+
+/// Stream a file through BLAKE3, SHA-256, AND CRC32C in a single read pass,
+/// returning `(blake3_hex, sha256_base64, crc32c_base64)`. The builder uses this
+/// for the inventory so each file is read once for the canonical content digest
+/// (BLAKE3) and both server-comparable object checksums: SHA-256 (S3) and CRC32C
+/// (GCS). The CRC32C is base64 of the digest as a big-endian `u32` — GCS's wire
+/// form (see [`crc32c_base64`]).
+pub fn hash_file_blake3_sha256_crc32c(path: impl AsRef<Path>) -> Result<(String, String, String)> {
     let f = File::open(path.as_ref())
         .with_context(|| format!("open for hashing {}", path.as_ref().display()))?;
     let mut reader = BufReader::new(f);
     let mut b3 = blake3::Hasher::new();
     let mut sha = Sha256::new();
+    let mut crc: u32 = 0;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
@@ -42,9 +55,11 @@ pub fn hash_file_blake3_and_sha256(path: impl AsRef<Path>) -> Result<(String, St
         }
         b3.update(&buf[..n]);
         sha.update(&buf[..n]);
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
     }
     let sha_b64 = base64::engine::general_purpose::STANDARD.encode(sha.finalize());
-    Ok((b3.finalize().to_hex().to_string(), sha_b64))
+    let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+    Ok((b3.finalize().to_hex().to_string(), sha_b64, crc_b64))
 }
 
 /// Stream a file through BLAKE3 and return the lowercase hex digest.
@@ -120,6 +135,30 @@ mod tests {
         assert_eq!(h1, h2);
         std::fs::write(&a, b"hello camelidX").unwrap();
         assert_ne!(hash_file(&a).unwrap(), h1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crc32c_base64_is_big_endian_u32_and_round_trips() {
+        // GCS returns the object's crc32c as a raw u32; the manifest stores the
+        // big-endian-u32 base64 form. Decoding our base64 back to a u32 must equal
+        // the raw crc — this is exactly the comparison the GCS backend performs, so
+        // the test fences an endianness regression.
+        let bytes = b"hello camelid";
+        let raw = crc32c::crc32c(bytes);
+        let b64 = crc32c_base64(bytes);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(u32::from_be_bytes(decoded.try_into().unwrap()), raw);
+        // Single-pass file hasher agrees with the in-memory helper.
+        let dir = std::env::temp_dir().join(format!("slater_crc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.blk");
+        std::fs::write(&p, bytes).unwrap();
+        let (_b3, _sha, crc_b64) = hash_file_blake3_sha256_crc32c(&p).unwrap();
+        assert_eq!(crc_b64, b64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

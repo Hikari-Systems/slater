@@ -37,6 +37,8 @@ chrono.workspace = true
 default = []
 # Enable the S3 / object-store data backend (forwards to graph-format).
 s3 = ["graph-format/s3"]
+# Enable the GCS data backend (forwards to graph-format).
+gcs = ["graph-format/gcs"]
 
 [dev-dependencies]
 criterion.workspace = true

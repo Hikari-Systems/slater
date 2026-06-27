@@ -291,6 +291,9 @@ pub struct DataBackendConfig {
     /// S3 connection settings (used when `kind = "s3"`).
     #[serde(default)]
     pub s3: S3BackendConfig,
+    /// GCS connection settings (used when `kind = "gcs"`).
+    #[serde(default)]
+    pub gcs: GcsBackendConfig,
 }
 
 impl Default for DataBackendConfig {
@@ -300,6 +303,7 @@ impl Default for DataBackendConfig {
             verify_integrity: None,
             fs: FsBackendConfig::default(),
             s3: S3BackendConfig::default(),
+            gcs: GcsBackendConfig::default(),
         }
     }
 }
@@ -381,6 +385,49 @@ pub struct S3BackendConfig {
     /// Directory for the S3 disk cache (used iff `diskCacheBytes > 0`). Must be a
     /// **real writable volume — never tmpfs** (tmpfs is RAM and would defeat the
     /// bounded-RSS guarantee).
+    #[serde(default)]
+    pub disk_cache_dir: String,
+}
+
+/// GCS connection settings. All fields live under `dataBackend.gcs.*` (env
+/// `dataBackend__gcs__*`), mirroring [`S3BackendConfig`] one-for-one; the
+/// disk-cache fields are backend-neutral and behave identically.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcsBackendConfig {
+    /// Bucket name (no `gs://` scheme).
+    #[serde(default)]
+    pub bucket: String,
+    /// Key prefix every generation key is joined under; empty uses the bucket root.
+    #[serde(default)]
+    pub prefix: String,
+    /// Custom endpoint URL for a GCS emulator (e.g. `fake-gcs-server`); empty uses
+    /// the standard Google Cloud Storage endpoint.
+    #[serde(default)]
+    pub endpoint: String,
+    /// Path to a **service-account JSON key file**. Empty ⇒ fall back to
+    /// Application Default Credentials (GKE Workload Identity, the GCE metadata
+    /// server, or a `gcloud`/`GOOGLE_APPLICATION_CREDENTIALS` key). Set it via
+    /// `dataBackend.gcs.credentialsPath` / `dataBackend__gcs__credentialsPath`.
+    #[serde(default)]
+    pub credentials_path: String,
+    /// Inline service-account JSON key. Takes precedence over `credentialsPath`
+    /// when both are set. Empty ⇒ use `credentialsPath`, else ADC.
+    #[serde(default)]
+    pub credentials_json: String,
+    /// Use **anonymous** (unauthenticated) credentials — for a local GCS emulator
+    /// (`fake-gcs-server`) only, never against real GCS. Overrides every other
+    /// credential source.
+    #[serde(default, deserialize_with = "de::bool")]
+    pub anonymous: bool,
+    /// Byte budget for the optional **local-disk second cache tier** in front of
+    /// GCS (`store::diskcache`); `0` (the default) disables it. Identical in
+    /// behaviour to [`S3BackendConfig::disk_cache_bytes`]. `diskCacheDir` is
+    /// required when this is non-zero.
+    #[serde(default, deserialize_with = "de::usize")]
+    pub disk_cache_bytes: usize,
+    /// Directory for the GCS disk cache (used iff `diskCacheBytes > 0`). Must be a
+    /// **real writable volume — never tmpfs**.
     #[serde(default)]
     pub disk_cache_dir: String,
 }
