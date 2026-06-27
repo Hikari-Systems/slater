@@ -157,9 +157,10 @@ jobs:
     strategy:
       matrix:
         platform: [amd64, arm64]
-        # Two images per arch:
-        #   * full → `hikarisystems/slater`      (Dockerfile, s3+gcs, both binaries)
-        #   * lite → `hikarisystems/slater-lite` (Dockerfile.lite, fs-only, server only)
+        # Two variants per arch, published as TAGS of the SAME `hikarisystems/slater`
+        # repo (not separate repos):
+        #   * full → slater:<tag>      + slater:latest  (Dockerfile, s3+gcs, both bins)
+        #   * lite → slater:<tag>-lite + slater:lite    (Dockerfile.lite, fs-only, server)
         variant: [full, lite]
         include:
           # `rustflags` tunes the hot vector-kNN kernel's codegen per arch. amd64's
@@ -173,14 +174,13 @@ jobs:
           - platform: arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
             rustflags: ""
-          # Per-variant Dockerfile + image-name suffix (match on `variant`, so they
-          # apply to both arches of that variant).
+          # Per-variant Dockerfile (match on `variant`, so they apply to both
+          # arches of that variant). Both push by digest to the same repo; the
+          # manifest job below tags them apart.
           - variant: full
             dockerfile: Dockerfile
-            suffix: ""
           - variant: lite
             dockerfile: Dockerfile.lite
-            suffix: "-lite"
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -208,7 +208,7 @@ jobs:
           platforms: linux/${{ matrix.platform }}
           build-args: |
             RUSTFLAGS=${{ matrix.rustflags }}
-          outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }},push-by-digest=true,push=true
+          outputs: type=image,name=hikarisystems/${{ env.REPO_NAME }},push-by-digest=true,push=true
 
       - name: Export digest
         run: |
@@ -224,10 +224,12 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Docker: merge the per-arch digests into one tagged manifest per variant ──
-  # One manifest job per variant: full → `hikarisystems/slater`, lite →
-  # `hikarisystems/slater-lite`. Each merges only its own variant's per-arch
-  # digests (matched by the `digests-<variant>-*` artifact pattern).
+  # ── Docker: merge each variant's per-arch digests into a tagged manifest ─────
+  # Both variants are tags of the SAME `hikarisystems/slater` repo:
+  #   * full → :<tag>      + :latest
+  #   * lite → :<tag>-lite + :lite
+  # Each job merges only its own variant's per-arch digests (matched by the
+  # `digests-<variant>-*` artifact pattern); the digests live in the one repo.
   docker-manifest:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -236,10 +238,13 @@ jobs:
       matrix:
         variant: [full, lite]
         include:
+          # `tag_suffix` distinguishes the pinned tag; `moving` is the rolling tag.
           - variant: full
-            suffix: ""
+            tag_suffix: ""
+            moving: latest
           - variant: lite
-            suffix: "-lite"
+            tag_suffix: "-lite"
+            moving: lite
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -260,13 +265,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Create the manifest tagged with the git tag and latest
+      - name: Create the manifest (pinned + rolling tag)
         working-directory: ${{ runner.temp }}/digests
         run: |
           docker buildx imagetools create \
-            -t hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}:${{ github.event.inputs.tag || github.ref_name }} \
-            -t hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}:latest \
-            $(printf 'hikarisystems/${{ env.REPO_NAME }}${{ matrix.suffix }}@sha256:%s ' *)
+            -t hikarisystems/${{ env.REPO_NAME }}:${{ github.event.inputs.tag || github.ref_name }}${{ matrix.tag_suffix }} \
+            -t hikarisystems/${{ env.REPO_NAME }}:${{ matrix.moving }} \
+            $(printf 'hikarisystems/${{ env.REPO_NAME }}@sha256:%s ' *)
 
   # ── GitHub release: compiled binaries + checksums attached to the tag ──────
   release-binaries:
