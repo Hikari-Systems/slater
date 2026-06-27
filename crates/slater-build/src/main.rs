@@ -372,6 +372,10 @@ fn resolve_publish_store(cli: &Cli) -> Result<Option<Arc<dyn graph_format::store
                 .then(|| cli.publish_s3_endpoint.clone()),
             prefix: cli.publish_s3_prefix.clone(),
             path_style: cli.publish_s3_path_style,
+            // Publish credentials come from the standard AWS chain.
+            access_key: None,
+            secret_key: None,
+            session_token: None,
         };
         let store = graph_format::store::s3::S3ObjectStore::connect(&cfg)
             .context("connect S3 publish target")?;

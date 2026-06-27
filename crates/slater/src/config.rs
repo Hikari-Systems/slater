@@ -355,6 +355,20 @@ pub struct S3BackendConfig {
     /// S3-compatible servers.
     #[serde(default, deserialize_with = "de::bool")]
     pub path_style: bool,
+    /// AWS access key id. This is the **primary** way to supply S3 credentials
+    /// (set it via `dataBackend.s3.awsAccessKey` in config or the
+    /// `dataBackend__s3__awsAccessKey` env var). Empty ⇒ fall back to the
+    /// standard AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
+    /// shared profile, or instance role).
+    #[serde(default)]
+    pub aws_access_key: String,
+    /// AWS secret access key, paired with `awsAccessKey`. Empty ⇒ AWS chain.
+    #[serde(default)]
+    pub aws_secret_key: String,
+    /// Optional AWS session token, for temporary (STS) credentials. Only used
+    /// when `awsAccessKey`/`awsSecretKey` are set.
+    #[serde(default)]
+    pub aws_session_token: String,
     /// Byte budget for an optional **local-disk second cache tier** in front of
     /// S3 (`store::diskcache`). `0` (the default) disables it. When `> 0` a
     /// cold-from-RAM block is served from local SSD (~0.1 ms) instead of a fresh

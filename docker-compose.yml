@@ -115,8 +115,9 @@ services:
 
   # A slater server that serves generations from the MinIO `slater` bucket. Uses
   # the baked-in config.json + acl.json; the dataBackend__* env vars switch it to
-  # the S3 backend and the AWS_* vars supply the MinIO credentials (rust-s3
-  # resolves them from the standard AWS env chain).
+  # the S3 backend and supply the MinIO credentials via the preferred
+  # dataBackend__s3__awsAccessKey / awsSecretKey config keys (the bare AWS_* env
+  # vars still work as a fallback).
   slater-s3:
     build:
       context: .
@@ -149,8 +150,10 @@ services:
       # bounded-RSS). 1 GiB here for the demo; size it ≫ the RAM block cache.
       dataBackend__s3__diskCacheBytes: '1073741824'
       dataBackend__s3__diskCacheDir: '/var/cache/slater'
-      AWS_ACCESS_KEY_ID: 'minioadmin'
-      AWS_SECRET_ACCESS_KEY: 'minioadmin'
+      # Preferred: supply S3 credentials via config. Leaving these empty would
+      # fall back to the standard AWS chain (AWS_ACCESS_KEY_ID / profile / role).
+      dataBackend__s3__awsAccessKey: 'minioadmin'
+      dataBackend__s3__awsSecretKey: 'minioadmin'
       # The demo publishes unstamped generations; relax the ACL-stamp requirement
       # (build with `--acl` and drop this for a stamped deployment).
       requireAclStamp: 'false'

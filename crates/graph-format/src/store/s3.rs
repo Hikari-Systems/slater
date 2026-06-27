@@ -51,6 +51,16 @@ pub struct S3Config {
     /// Path-style addressing (`endpoint/bucket/key`); required by most
     /// S3-compatible servers.
     pub path_style: bool,
+    /// AWS access key id. When `Some` (paired with `secret_key`), it is used as
+    /// an explicit static credential — the primary, config-driven mechanism.
+    /// `None` ⇒ resolve from the standard AWS chain (environment, shared
+    /// profile, or instance role).
+    pub access_key: Option<String>,
+    /// AWS secret access key, paired with `access_key`. `None` ⇒ AWS chain.
+    pub secret_key: Option<String>,
+    /// Optional AWS session token for temporary (STS) credentials. Only applied
+    /// when `access_key`/`secret_key` are both `Some`.
+    pub session_token: Option<String>,
 }
 
 /// Wraps the backend runtime so its `Drop` is **non-blocking**. A tokio
@@ -82,8 +92,10 @@ impl Drop for BackgroundRuntime {
     }
 }
 
-/// S3-backed object store. Credentials come from the standard AWS chain
-/// (environment, profile, or instance role), resolved at construction.
+/// S3-backed object store. Credentials are taken **first** from the explicit
+/// `access_key`/`secret_key` in [`S3Config`] (the config-driven mechanism);
+/// when those are unset they fall back to the standard AWS chain (environment,
+/// profile, or instance role). Resolved at construction.
 pub struct S3ObjectStore {
     client: Client,
     rt: Arc<BackgroundRuntime>,
@@ -165,6 +177,18 @@ impl S3ObjectStore {
         let region = cfg.region.clone();
         let endpoint = cfg.endpoint.clone();
         let path_style = cfg.path_style;
+        // Explicit static credentials (config-driven) take precedence; absent
+        // them the loader resolves the standard AWS chain below.
+        let static_creds = match (cfg.access_key.clone(), cfg.secret_key.clone()) {
+            (Some(ak), Some(sk)) => Some(aws_sdk_s3::config::Credentials::new(
+                ak,
+                sk,
+                cfg.session_token.clone(),
+                None,
+                "slater-config",
+            )),
+            _ => None,
+        };
         let client = run_blocking(&rt, async move {
             let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
             if !region.is_empty() {
@@ -172,6 +196,9 @@ impl S3ObjectStore {
             }
             if let Some(ep) = endpoint {
                 loader = loader.endpoint_url(ep);
+            }
+            if let Some(creds) = static_creds {
+                loader = loader.credentials_provider(creds);
             }
             let shared = loader.load().await;
             let mut b = aws_sdk_s3::config::Builder::from(&shared);

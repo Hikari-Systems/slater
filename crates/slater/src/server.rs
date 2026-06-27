@@ -1312,19 +1312,28 @@ pub async fn serve(cfg: AppConfig) -> Result<()> {
 /// Construct the storage backend from config: the local filesystem rooted at
 /// `data_dir` (default), or an S3 object store. The `s3` backend requires the
 /// binary to be built with the `s3` cargo feature.
-fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
+pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
     match cfg.data_backend.kind.as_str() {
         "fs" | "" => Ok(Arc::new(FsObjectStore::new(cfg.data_dir()))),
         "s3" => {
             #[cfg(feature = "s3")]
             {
                 let s = &cfg.data_backend.s3;
+                // Explicit config credentials are the primary mechanism; empty
+                // strings fall back to the standard AWS chain (env/profile/role).
+                let access_key = (!s.aws_access_key.is_empty()).then(|| s.aws_access_key.clone());
+                let secret_key = (!s.aws_secret_key.is_empty()).then(|| s.aws_secret_key.clone());
+                let session_token =
+                    (!s.aws_session_token.is_empty()).then(|| s.aws_session_token.clone());
                 let scfg = graph_format::store::s3::S3Config {
                     bucket: s.bucket.clone(),
                     region: s.region.clone(),
                     endpoint: (!s.endpoint.is_empty()).then(|| s.endpoint.clone()),
                     prefix: s.prefix.clone(),
                     path_style: s.path_style,
+                    access_key,
+                    secret_key,
+                    session_token,
                 };
                 let store = graph_format::store::s3::S3ObjectStore::connect(&scfg)
                     .context("connect S3 data backend")?;

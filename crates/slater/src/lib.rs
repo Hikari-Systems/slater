@@ -27,6 +27,7 @@ pub mod help;
 pub mod introspect;
 pub mod parser;
 pub mod plan;
+pub mod query;
 pub mod server;
 pub mod temporal;
 pub mod vector;

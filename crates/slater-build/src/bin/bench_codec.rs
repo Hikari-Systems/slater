@@ -212,6 +212,9 @@ fn build_store(cli: &Cli) -> Result<Arc<dyn ObjectStore>> {
                 endpoint: (!cli.s3_endpoint.is_empty()).then(|| cli.s3_endpoint.clone()),
                 prefix: cli.s3_prefix.clone(),
                 path_style: cli.s3_path_style,
+                access_key: None,
+                secret_key: None,
+                session_token: None,
             };
             let store = graph_format::store::s3::S3ObjectStore::connect(&cfg)
                 .context("connect S3 backend")?;

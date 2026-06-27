@@ -184,6 +184,9 @@ So these are equivalent ways to set the block-cache budget:
 | `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint for an S3-compatible store (MinIO/localstack). |
 | `dataBackend.s3.prefix` | `dataBackend__s3__prefix` | _(empty)_ | Key prefix under which generations live in the bucket. |
 | `dataBackend.s3.pathStyle` | `dataBackend__s3__pathStyle` | `false` | Path-style addressing; required by most S3-compatible servers. |
+| `dataBackend.s3.awsAccessKey` | `dataBackend__s3__awsAccessKey` | _(empty)_ | **Preferred** way to set the S3 access key id. Empty ⇒ standard AWS chain (`AWS_ACCESS_KEY_ID` env / profile / instance role). |
+| `dataBackend.s3.awsSecretKey` | `dataBackend__s3__awsSecretKey` | _(empty)_ | **Preferred** way to set the S3 secret key, paired with `awsAccessKey`. Empty ⇒ AWS chain. |
+| `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional STS session token; used only with `awsAccessKey`/`awsSecretKey`. |
 | `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Local-disk block cache budget (second tier). `0` = off; when set, also set `diskCacheDir`. |
 | `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Writable dir for the disk cache — a **real volume, not `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |

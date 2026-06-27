@@ -12,7 +12,7 @@
 //! and hand off to [`slater::server::serve`].
 
 use anyhow::Context;
-use slater::{acl, config, health, help, server};
+use slater::{acl, config, health, help, query, server};
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
@@ -32,6 +32,14 @@ fn main() -> anyhow::Result<()> {
     health::diagnostics_subcommand(default_port);
 
     let cfg = config::load()?;
+
+    // `query` runs one Cypher statement in-process against a mounted generation
+    // and exits — a scripting/CI convenience. It needs the resolved config (for
+    // the storage backend, encryption key, and query budgets), so unlike the
+    // stdlib-only subcommands above it runs just after config load, before the
+    // async runtime is built. It inits its own logging (or none, under `-q`).
+    query::query_subcommand(&cfg);
+
     hs_utils::logging::init(&cfg.log.level);
     info!(
         bind = %cfg.server.bind,

@@ -322,8 +322,12 @@ across backends. The backend is selected by `dataBackend.kind`:
   **server-computed SHA-256 object checksum** via a metadata `HEAD` (no body
   read): `slater-build` sends each object's SHA-256 on upload (S3 validates and
   stores it), and the server reads it back at open and compares it to the
-  manifest. Credentials come from the standard AWS chain (env / profile /
-  instance role).
+  manifest. Credentials are taken **first** from config —
+  `dataBackend.s3.awsAccessKey` / `awsSecretKey` (and `awsSessionToken` for
+  temporary STS credentials), settable via the `dataBackend__s3__awsAccessKey`
+  env override — and only fall back to the standard AWS chain (`AWS_ACCESS_KEY_ID`
+  / `AWS_SECRET_ACCESS_KEY` env, shared profile, or instance role) when those are
+  left empty.
 
 **When is S3 appropriate?** Reach for it when you want generations to live in
 durable, central object storage rather than on a node's disk — typically:
@@ -413,6 +417,9 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint URL for an S3-compatible store (MinIO, localstack); empty ⇒ standard AWS endpoint. |
 | `dataBackend.s3.prefix` | `dataBackend__s3__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
 | `dataBackend.s3.pathStyle` | `dataBackend__s3__pathStyle` | `false` | Path-style addressing (`endpoint/bucket/key`); required by most S3-compatible servers. |
+| `dataBackend.s3.awsAccessKey` | `dataBackend__s3__awsAccessKey` | _(empty)_ | **Preferred** way to supply the S3 access key id. Empty ⇒ fall back to the standard AWS credential chain (`AWS_ACCESS_KEY_ID` env, shared profile, or instance role). |
+| `dataBackend.s3.awsSecretKey` | `dataBackend__s3__awsSecretKey` | _(empty)_ | **Preferred** way to supply the S3 secret access key, paired with `awsAccessKey`. Empty ⇒ AWS chain. |
+| `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional session token for temporary (STS) credentials; only used when `awsAccessKey`/`awsSecretKey` are set. |
 | `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index counts against the RSS ceiling. |
 | `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Directory for the disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
 | `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
@@ -491,6 +498,37 @@ open socket:
 slater healthcheck localhost 7687    # exit 0 = healthy
 docker exec slater /app/slater healthcheck   # inside the container
 ```
+
+## One-shot query
+
+For scripting, CI checks, and quick lookups, `slater query` mounts a graph's
+current generation, runs a single read-only Cypher query in-process, prints the
+result as a JSON object, and exits — no server, no Bolt connection. It honours
+the same config as the server (storage backend, encryption key, query budgets):
+
+```sh
+# GRAPH defaults to `defaultGraph`. Without -q, normal datestamped logging
+# (config, "opened generation", …) is written to stdout alongside the result.
+slater query mygraph 'MATCH (n) RETURN count(n) AS c'
+
+# -q/--quiet ⇒ logging suppressed, so stdout is *only* the compact result JSON
+slater query mygraph -q 'MATCH (c:Company) RETURN c.ticker AS t LIMIT 3' | jq
+# {"columns":["t"],"rows":[["AUPH"],["KYMR"],["MREO"]]}
+```
+
+Nodes and relationships expand to their labels/type and properties. Use `-q`
+when you want machine-parseable output (the result JSON is the only thing on
+stdout); omit it for an operator-facing run with logs. Without `-q` a
+metrics-only summary is logged after each run — e.g.
+
+```text
+INFO query executed cost=2389 resultCount=10 execMs=441 limitRowCount=10
+```
+
+carrying the query `cost` (elements charged), `resultCount`, `execMs`, and
+`limitRowCount` (only when the query specifies a `LIMIT`) — never the query text
+or any result value. Exit status is `0` on success, `1` on a parse/open/execute
+error (message on stderr).
 
 ## Worked example
 

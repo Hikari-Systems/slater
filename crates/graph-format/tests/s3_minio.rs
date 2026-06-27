@@ -27,6 +27,9 @@ fn config_or_skip() -> Option<S3Config> {
         endpoint: Some(endpoint),
         prefix: "itest".into(),
         path_style: true,
+        access_key: None,
+        secret_key: None,
+        session_token: None,
     })
 }
 
@@ -209,4 +212,42 @@ fn disk_cache_absorbs_warm_reads_over_s3() {
 
     let _ = std::fs::remove_dir_all(&cache_dir);
     eprintln!("S3/MinIO disk-cache integration: all assertions passed");
+}
+
+/// Credentials supplied **explicitly** in [`S3Config`] (the config-driven path)
+/// are honoured: a round-trip read works with the keys passed in `access_key`/
+/// `secret_key` rather than relying on the ambient AWS env chain. The test reads
+/// the MinIO keys from `SLATER_S3_TEST_ACCESS_KEY`/`SLATER_S3_TEST_SECRET_KEY`,
+/// falling back to the standard `AWS_*` vars the MinIO harness already sets.
+#[test]
+fn s3_explicit_config_credentials() {
+    let Some(mut cfg) = config_or_skip() else {
+        eprintln!("skipping s3_explicit_config_credentials: set SLATER_S3_TEST_ENDPOINT");
+        return;
+    };
+    let access = std::env::var("SLATER_S3_TEST_ACCESS_KEY")
+        .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+        .ok();
+    let secret = std::env::var("SLATER_S3_TEST_SECRET_KEY")
+        .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+        .ok();
+    let (Some(access), Some(secret)) = (access, secret) else {
+        eprintln!("skipping s3_explicit_config_credentials: no access/secret key in the env");
+        return;
+    };
+    cfg.access_key = Some(access);
+    cfg.secret_key = Some(secret);
+
+    let store = S3ObjectStore::connect(&cfg).expect("connect S3 with explicit config credentials");
+    let key = "g/u/explicit_creds.blk";
+    let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    store
+        .put(key, &data, Some(&sha256_base64(&data)))
+        .expect("put with explicit config credentials");
+    assert_eq!(
+        store.read_all(key).expect("read_all"),
+        data,
+        "round-trip read using config-supplied credentials"
+    );
+    eprintln!("S3/MinIO explicit-config-credentials integration: all assertions passed");
 }

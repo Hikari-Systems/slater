@@ -50,6 +50,21 @@ SUBCOMMANDS:
         snapshot as JSON, and exit. USER/PASSWORD also read from SLATER_DIAG_USER
         / SLATER_DIAG_PASSWORD. Requires loadTestDiagnostics=true server-side.
 
+    query [GRAPH] [-q|--quiet] [-n|--repeat N] '<CYPHER>'
+        Mount GRAPH's current generation (honouring the configured storage
+        backend, encryption key, and query budgets), run one read-only Cypher
+        query in-process, print the result as a JSON object
+        {\"columns\":[...],\"rows\":[[...]]} on stdout, and exit — no server.
+        GRAPH defaults to defaultGraph when omitted. -n/--repeat N runs the query
+        N times against the warming cache (default 1), logging a summary per run
+        and printing only the final result. With -q/--quiet, house
+        logging is suppressed so stdout carries nothing but the compact result
+        JSON (pipe straight into jq). Without it, normal datestamped logging is
+        written to stdout alongside the pretty-printed result — including a
+        metrics-only 'query executed' summary (cost, resultCount, execMs, and
+        limitRowCount when a LIMIT is given). The result JSON itself is results
+        only in both cases.
+
 CONFIGURATION:
     The server takes no flags. It reads a layered JSON config and lets you
     override any field from the environment. Sources, lowest precedence first:
@@ -67,6 +82,9 @@ CONFIGURATION:
         dataBackend.s3.bucket       | dataBackend__s3__bucket      | (empty)
         dataBackend.s3.region       | dataBackend__s3__region      | (empty)
         dataBackend.s3.endpoint     | dataBackend__s3__endpoint    | (empty)
+        dataBackend.s3.awsAccessKey | dataBackend__s3__awsAccessKey | (empty)
+        dataBackend.s3.awsSecretKey | dataBackend__s3__awsSecretKey | (empty)
+        dataBackend.s3.awsSessionToken | dataBackend__s3__awsSessionToken | (empty)
         dataBackend.s3.diskCacheBytes | dataBackend__s3__diskCacheBytes | 0
         aclPath                     | aclPath                      | /config/acl.json
         requireAclStamp             | requireAclStamp              | true
@@ -86,6 +104,11 @@ CONFIGURATION:
         loadTestDiagnostics         | loadTestDiagnostics          | false
         log.level                   | log__level                   | info
 
+    S3 credentials: set them with dataBackend.s3.awsAccessKey / awsSecretKey
+    (and awsSessionToken for temporary STS creds) — this is the preferred way.
+    If left empty, Slater falls back to the standard AWS credential chain
+    (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, shared profile, or instance role).
+
     See README.md / DOCKERHUB.md for the full list and the meaning of each field.
 ";
 
@@ -97,7 +120,7 @@ mod tests {
     fn help_text_lists_the_subcommands_and_override_mechanism() {
         // The three operator subcommands are discoverable here — this is the only
         // place they are listed, so a rename must update the help in lockstep.
-        for sub in ["hash-password", "healthcheck", "diagnostics"] {
+        for sub in ["hash-password", "healthcheck", "diagnostics", "query"] {
             assert!(HELP.contains(sub), "help should mention {sub}");
         }
         // The env-override convention and a representative nested example.

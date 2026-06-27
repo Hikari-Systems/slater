@@ -1396,6 +1396,16 @@ impl<'g> Engine<'g> {
         self
     }
 
+    /// Total query cost charged by the last [`run`](Self::run): the sum of the
+    /// *retained* intermediate elements (`budget_used`, gated by
+    /// `query.maxIntermediate`) and the *transient* walk elements
+    /// (`scan_used`, gated by `query.maxScan`). A materialising query charges the
+    /// former; a count-pushdown walk the latter — so the sum is the engine's
+    /// single "elements touched" work figure. Reset at the start of each `run`.
+    pub fn cost(&self) -> u64 {
+        self.budget_used.get().saturating_add(self.scan_used.get())
+    }
+
     // ── Cached record reads (D18) ───────────────────────────────────────────
 
     fn node_props(&self, id: u64) -> Result<Vec<(u32, Value)>> {
