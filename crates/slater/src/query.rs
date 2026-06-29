@@ -24,10 +24,12 @@
 //! other subcommands. Either way the result JSON itself is results only.
 //!
 //! After a successful run a one-line `query executed` summary is logged with the
-//! query `cost` (elements charged), `resultCount`, `execMs`, and — only when the
-//! query carries a literal `LIMIT` — `limitRowCount`. It is metrics-only: it
-//! never echoes the query text or any result value, and `-q` suppresses it along
-//! with all other logging.
+//! query `cost` (elements charged), `resultCount`, `execMs`, the block-cache
+//! `blkHits`/`blkMisses` delta and `blkHitRatio`, and — only when the query
+//! carries a literal `LIMIT` — `limitRowCount`. This mirrors the per-query
+//! summary the Bolt server logs, so a one-shot CLI run and the same query over
+//! Bolt report the same metrics. It is metrics-only: it never echoes the query
+//! text or any result value, and `-q` suppresses it along with all other logging.
 //!
 //! The query path runs synchronously, before the server's tokio runtime is
 //! built (the S3 backend bridges its own async on a private runtime), mirroring
@@ -193,23 +195,31 @@ fn run(cfg: &AppConfig) -> Result<()> {
             engine =
                 engine.with_deadline(Instant::now() + Duration::from_millis(cfg.query.timeout_ms));
         }
+        // The block-cache counters are cumulative on the shared cache, so snapshot
+        // before/after to attribute hits and misses to this run alone — the same
+        // before/after delta the Bolt server logs.
+        let blk_before = cache.metrics();
         let exec_start = Instant::now();
         let r = engine
             .run(&ast)
             .with_context(|| format!("execute query (run {run}/{})", args.repeat))?;
         let exec_ms = exec_start.elapsed().as_millis();
+        let blk_after = cache.metrics();
 
         // Execution summary on the log channel (suppressed under `-q`, since no
         // subscriber is installed). Metrics only — never the query text or any
         // result value: the per-query cost (elements charged), the row count,
-        // the execution time, the `run` index when repeating, and the LIMIT row
-        // cap when the query specified one.
+        // the execution time, the block-cache hit/miss delta and hit ratio, the
+        // `run` index when repeating, and the LIMIT row cap when the query
+        // specified one.
         log_summary(
             args.repeat,
             run,
             engine.cost(),
             r.rows.len(),
             exec_ms,
+            blk_after.hits.saturating_sub(blk_before.hits),
+            blk_after.misses.saturating_sub(blk_before.misses),
             limit,
         );
         result = Some(r);
@@ -240,38 +250,65 @@ fn query_limit(ast: &parser::ast::Query) -> Option<i64> {
     }
 }
 
-/// Emit the `query executed` metrics summary for one run. The `run` index is
-/// included only when repeating (`repeat > 1`); `limitRowCount` only when the
-/// query carried a literal `LIMIT`. Static field sets force the explicit arms.
-fn log_summary(repeat: u32, run: u32, cost: u64, rows: usize, exec_ms: u128, limit: Option<i64>) {
+/// Emit the `query executed` metrics summary for one run. Always carries the
+/// per-query cost, row count, execution time, and block-cache hit/miss delta plus
+/// hit ratio (`blkHits / (blkHits + blkMisses)`) — the same fields the Bolt server
+/// logs. The `run` index is included only when repeating (`repeat > 1`);
+/// `limitRowCount` only when the query carried a literal `LIMIT`. Static field
+/// sets force the explicit arms.
+#[allow(clippy::too_many_arguments)]
+fn log_summary(
+    repeat: u32,
+    run: u32,
+    cost: u64,
+    rows: usize,
+    exec_ms: u128,
+    blk_hits: u64,
+    blk_misses: u64,
+    limit: Option<i64>,
+) {
+    let ratio = server::hit_ratio(blk_hits, blk_misses);
     match (repeat > 1, limit) {
-        (false, Some(l)) => {
-            info!(
-                cost,
-                resultCount = rows,
-                execMs = exec_ms,
-                limitRowCount = l,
-                "query executed"
-            )
-        }
-        (false, None) => info!(cost, resultCount = rows, execMs = exec_ms, "query executed"),
+        (false, Some(l)) => info!(
+            cost,
+            resultCount = rows,
+            execMs = exec_ms,
+            blkHits = blk_hits,
+            blkMisses = blk_misses,
+            blkHitRatio = format_args!("{ratio:.2}"),
+            limitRowCount = l,
+            "query executed"
+        ),
+        (false, None) => info!(
+            cost,
+            resultCount = rows,
+            execMs = exec_ms,
+            blkHits = blk_hits,
+            blkMisses = blk_misses,
+            blkHitRatio = format_args!("{ratio:.2}"),
+            "query executed"
+        ),
         (true, Some(l)) => info!(
             run,
             cost,
             resultCount = rows,
             execMs = exec_ms,
+            blkHits = blk_hits,
+            blkMisses = blk_misses,
+            blkHitRatio = format_args!("{ratio:.2}"),
             limitRowCount = l,
             "query executed"
         ),
-        (true, None) => {
-            info!(
-                run,
-                cost,
-                resultCount = rows,
-                execMs = exec_ms,
-                "query executed"
-            )
-        }
+        (true, None) => info!(
+            run,
+            cost,
+            resultCount = rows,
+            execMs = exec_ms,
+            blkHits = blk_hits,
+            blkMisses = blk_misses,
+            blkHitRatio = format_args!("{ratio:.2}"),
+            "query executed"
+        ),
     }
 }
 

@@ -2222,8 +2222,11 @@ async fn run_query(
     // Gate all per-query instrumentation on the debug level being active OR
     // load-test diagnostics being enabled: when both are off, we take no
     // timestamps and no cache snapshots, and build no QueryTiming — the hot path
-    // is exactly what it was before instrumentation. Diagnostics needs the same
-    // `total_ms` for its latency histogram, so it shares this gate.
+    // is exactly what it was before instrumentation. The default log level is
+    // `debug`, so every query emits its `query executed` summary out of the box;
+    // raising the level to `info`/`warn` restores the zero-overhead hot path.
+    // Diagnostics needs the same `total_ms` for its latency histogram, so it
+    // shares this gate.
     let instrument = tracing::enabled!(Level::DEBUG) || ctx.diag.enabled;
 
     ctx.diag.on_query_start();
@@ -2243,8 +2246,11 @@ async fn run_query(
             } else {
                 None
             };
-            let (result, result_cache_hit) = match cached {
-                Some(r) => (r, true),
+            // `cost` is the elements charged against the query budget; it is only
+            // meaningful when the query actually executed, so a result-cache hit
+            // (no engine) reports `None` and the summary omits the field.
+            let (result, result_cache_hit, cost) = match cached {
+                Some(r) => (r, true, None),
                 None => {
                     let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
@@ -2260,11 +2266,12 @@ async fn run_query(
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
                     }
                     let r = Arc::new(engine.run(&ast)?);
+                    let cost = engine.cost();
                     if cacheable {
                         let bytes = estimate_result_bytes(&r);
                         result_cache.insert(key.clone(), r.clone(), bytes);
                     }
-                    (r, false)
+                    (r, false, Some(cost))
                 }
             };
             let t_after_exec = instrument.then(Instant::now);
@@ -2289,6 +2296,7 @@ async fn run_query(
                 let t_after_exec = t_after_exec.unwrap();
                 Some(QueryTiming {
                     result_cache_hit,
+                    cost,
                     exec_ms: (t_after_exec - t_start).as_secs_f64() * 1e3,
                     encode_ms: (t_end - t_after_exec).as_secs_f64() * 1e3,
                     total_ms: (t_end - t_start).as_secs_f64() * 1e3,
@@ -2317,6 +2325,9 @@ async fn run_query(
             if let Some(t) = timing {
                 debug!(
                     graph = %graph_name,
+                    // A result-cache hit ran no engine, so it charges no budget:
+                    // `cost = 0` alongside `result_cache = "hit"`.
+                    cost = t.cost.unwrap_or(0),
                     rows = t.rows,
                     result_cache = if t.result_cache_hit { "hit" } else { "miss" },
                     exec_ms = format_args!("{:.1}", t.exec_ms),
@@ -2324,6 +2335,7 @@ async fn run_query(
                     total_ms = format_args!("{:.1}", t.total_ms),
                     blk_hits = t.blk_hits,
                     blk_misses = t.blk_misses,
+                    blk_hit_ratio = format_args!("{:.2}", hit_ratio(t.blk_hits, t.blk_misses)),
                     blk_evicted = t.blk_evictions,
                     query = %log_query(query),
                     "query executed"
@@ -2354,6 +2366,9 @@ type EncodedRows = (Vec<String>, Vec<Vec<PsValue>>);
 /// once the result returns (see [`run_query`]).
 struct QueryTiming {
     result_cache_hit: bool,
+    /// Elements charged against the query budget (`Engine::cost`); `None` on a
+    /// result-cache hit, where no engine ran.
+    cost: Option<u64>,
     exec_ms: f64,
     encode_ms: f64,
     total_ms: f64,
@@ -2361,6 +2376,18 @@ struct QueryTiming {
     blk_hits: u64,
     blk_misses: u64,
     blk_evictions: u64,
+}
+
+/// Block-cache hit ratio `hits / (hits + misses)` for a single query, as a
+/// fraction in `[0.0, 1.0]`. A query that touched no blocks (e.g. a pure
+/// `RETURN 1`, or a result-cache hit) has no accesses and reports `0.0`.
+pub(crate) fn hit_ratio(hits: u64, misses: u64) -> f64 {
+    let total = hits + misses;
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
+    }
 }
 
 /// Collapse a query's whitespace and truncate it for a single-line log field.

@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
 
     hs_utils::logging::init(&cfg.log.level);
     info!(
+        version = env!("CARGO_PKG_VERSION"),
         bind = %cfg.server.bind,
         port = cfg.server.port,
         data_dir = %cfg.data_dir(),
