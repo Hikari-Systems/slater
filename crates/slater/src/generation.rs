@@ -39,6 +39,7 @@ use graph_format::topology::TopologyReader;
 use graph_format::vamana::VamanaReader;
 use graph_format::vectors::VectorStoreReader;
 use graph_format::{FORMAT_VERSION, MAGIC};
+use rayon::prelude::*;
 use tracing::info;
 
 /// An opened, validated graph generation. Immutable for its lifetime — a new
@@ -253,13 +254,20 @@ impl Generation {
         let reltype_tgt_post = open_post("reltype_tgt.post")?;
         let vectors = VectorStoreReader::open_src(open_blk("vectors.f32.blk")?, cipher.clone())?;
 
-        let mut range_indexes = HashMap::new();
-        for ri in &manifest.range_indexes {
-            let key = join_key(&base, &format!("range/{}.isam", ri.name));
-            let reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
-                .with_context(|| format!("open range index {key}"))?;
-            range_indexes.insert(ri.name.clone(), reader);
-        }
+        // Open every range index concurrently — each is an independent S3 footer
+        // read, and large graphs carry 100+ of them, so a serial loop here is the
+        // bulk of a cold start. rayon bounds the fan-out to the core count; the
+        // store and cipher are `Send + Sync`. First error wins.
+        let range_indexes = manifest
+            .range_indexes
+            .par_iter()
+            .map(|ri| -> Result<(String, IsamReader)> {
+                let key = join_key(&base, &format!("range/{}.isam", ri.name));
+                let reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
+                    .with_context(|| format!("open range index {key}"))?;
+                Ok((ri.name.clone(), reader))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
 
         // Value→count histograms (format v3+). Gate on existence (a hand-built
         // fixture may omit it). Records align by position with `property_histograms`;
@@ -609,7 +617,10 @@ fn derive_cipher(
 /// method — a local file re-hashes its bytes (BLAKE3); S3 compares the object's
 /// size from a metadata `HEAD` with no body read.
 fn verify_against_store(store: &dyn ObjectStore, base: &str, manifest: &Manifest) -> Result<()> {
-    for fe in &manifest.files {
+    // Each file's check is one independent store round-trip (a metadata HEAD on
+    // S3), so verify them concurrently and surface the first failure. rayon bounds
+    // the fan-out to the core count; `ObjectStore` is `Send + Sync`.
+    manifest.files.par_iter().try_for_each(|fe| -> Result<()> {
         let key = join_key(base, &fe.name);
         store
             .verify_file(
@@ -621,8 +632,8 @@ fn verify_against_store(store: &dyn ObjectStore, base: &str, manifest: &Manifest
                     crc32c: fe.crc32c.as_deref(),
                 },
             )
-            .with_context(|| format!("verify generation file {}", fe.name))?;
-    }
+            .with_context(|| format!("verify generation file {}", fe.name))
+    })?;
     // Every file matched what the manifest asserts; the manifest's own
     // content_hash must therefore equal the hash over the (name, hash) inventory.
     manifest

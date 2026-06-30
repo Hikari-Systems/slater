@@ -652,7 +652,10 @@ fn default_max_connections_per_ip() -> usize {
     1_024
 }
 fn default_log_level() -> String {
-    "debug".into()
+    // `info` already surfaces the per-query `query executed` timing summary (the
+    // instrumentation gate sits at INFO), without the chatty `debug` AWS-SDK /
+    // wire tracing. Matches the documented default in `help.rs`.
+    "info".into()
 }
 // Cache defaults are sized for the typical deployment envelope of 100–200 MB
 // total resident memory (resident ≈ the three cache budgets + fixed overhead).

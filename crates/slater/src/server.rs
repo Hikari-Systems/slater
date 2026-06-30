@@ -36,6 +36,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use graph_format::ids::Generation as GenId;
 use graph_format::store::fs::FsObjectStore;
 use graph_format::store::{join_key, ObjectStore};
+use rayon::prelude::*;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -145,22 +146,29 @@ impl Graphs {
         master_key: Option<&[u8]>,
         verify_integrity: bool,
     ) -> Result<Self> {
-        let mut graphs = HashMap::new();
         let names = store.list("").context("list graphs in data store")?;
-        for name in names {
+        // Open every graph concurrently. Each open is dominated by serial S3
+        // round-trips (a HEAD per inventory file, a footer read per range index),
+        // so overlapping the graphs — and, inside each, the per-file work (see
+        // `Generation::open_with_store_opts`) — turns a sum-of-graphs cold start
+        // into roughly the slowest single graph. rayon's work-stealing pool bounds
+        // the fan-out to the core count; `ObjectStore` is `Send + Sync`. First
+        // error wins.
+        let graphs = names
+            .into_par_iter()
             // A graph is one with a published `current` pointer.
-            if !store.exists(&join_key(&name, "current")).unwrap_or(false) {
-                continue;
-            }
-            let gen = Generation::open_with_store_opts(
-                store.as_ref(),
-                &name,
-                master_key,
-                verify_integrity,
-            )
-            .with_context(|| format!("open graph {name}"))?;
-            graphs.insert(name, RwLock::new(Arc::new(gen)));
-        }
+            .filter(|name| store.exists(&join_key(name, "current")).unwrap_or(false))
+            .map(|name| -> Result<(String, RwLock<Arc<Generation>>)> {
+                let gen = Generation::open_with_store_opts(
+                    store.as_ref(),
+                    &name,
+                    master_key,
+                    verify_integrity,
+                )
+                .with_context(|| format!("open graph {name}"))?;
+                Ok((name, RwLock::new(Arc::new(gen))))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
         Ok(Self {
             store,
             master_key: master_key.map(<[u8]>::to_vec),
@@ -2219,15 +2227,15 @@ async fn run_query(
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
-    // Gate all per-query instrumentation on the debug level being active OR
+    // Gate all per-query instrumentation on the info level being active OR
     // load-test diagnostics being enabled: when both are off, we take no
     // timestamps and no cache snapshots, and build no QueryTiming — the hot path
     // is exactly what it was before instrumentation. The default log level is
-    // `debug`, so every query emits its `query executed` summary out of the box;
-    // raising the level to `info`/`warn` restores the zero-overhead hot path.
-    // Diagnostics needs the same `total_ms` for its latency histogram, so it
-    // shares this gate.
-    let instrument = tracing::enabled!(Level::DEBUG) || ctx.diag.enabled;
+    // `info`, so every query emits its `query executed` summary out of the box
+    // (without the chatty `debug` SDK/wire tracing); raising the level to `warn`
+    // restores the zero-overhead hot path. Diagnostics needs the same `total_ms`
+    // for its latency histogram, so it shares this gate.
+    let instrument = tracing::enabled!(Level::INFO) || ctx.diag.enabled;
 
     ctx.diag.on_query_start();
     let join =
@@ -2314,7 +2322,7 @@ async fn run_query(
 
     match join {
         Ok(Ok((out, timing))) => {
-            // Only ever `Some` when the debug level was active (see `instrument`).
+            // Only ever `Some` when the info level was active (see `instrument`).
             // A block-cache miss is a cold block read (pread + decompress); many
             // misses on a small query is the signature of an unindexed scan. A high
             // total_ms with result_cache=miss and many blk_misses points at exactly
@@ -2323,7 +2331,7 @@ async fn run_query(
             // diagnostics are on, `instrument` is true so `timing` is always Some.
             let total_ms = timing.as_ref().map(|t| t.total_ms);
             if let Some(t) = timing {
-                debug!(
+                info!(
                     graph = %graph_name,
                     // A result-cache hit ran no engine, so it charges no budget:
                     // `cost = 0` alongside `result_cache = "hit"`.
