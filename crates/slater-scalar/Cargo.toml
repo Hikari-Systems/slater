@@ -13,3 +13,4 @@ license.workspace = true
 [dependencies]
 graph-format.workspace = true
 anyhow.workspace = true
+serde.workspace = true

@@ -292,34 +292,58 @@ fn parse_set_clause_literal(pair: Pair<Rule>) -> Result<Vec<(String, Value)>> {
         .into_iter()
         .map(|(k, e)| match e {
             SetExpr::Lit(v) => Ok((k, v)),
-            SetExpr::Prop(_) | SetExpr::Func { .. } => bail!(
-                "edge SET supports only literal values, not functions or property references (for `{k}`)"
+            _ => bail!(
+                "edge SET supports only literal values, not functions, operators, CASE, \
+                 or property references (for `{k}`)"
             ),
         })
         .collect()
 }
 
-/// Parse one `set_expr` node: `func_call | prop_ref | value`.
+/// Whether a parse rule is a node in the `set_expr` precedence chain (as opposed to
+/// an operator token or a keyword). Used to skip operators when collecting operands.
+fn is_expr_rule(r: Rule) -> bool {
+    matches!(
+        r,
+        Rule::set_expr
+            | Rule::or_expr
+            | Rule::and_expr
+            | Rule::not_expr
+            | Rule::comparison
+            | Rule::add_expr
+            | Rule::mul_expr
+            | Rule::primary
+            | Rule::paren
+            | Rule::case_expr
+            | Rule::func_call
+            | Rule::value
+            | Rule::prop_ref
+    )
+}
+
+/// Parse any node in the `set_expr` precedence chain into a [`SetExpr`]. Single-child
+/// chain levels (no operator at that precedence) pass straight through, so a bare
+/// literal yields `SetExpr::Lit` with no wrapper nodes.
 fn parse_set_expr(pair: Pair<Rule>) -> Result<SetExpr> {
-    let inner = pair
-        .into_inner()
-        .next()
-        .ok_or_else(|| anyhow!("empty SET expression"))?;
-    match inner.as_rule() {
-        Rule::value => Ok(SetExpr::Lit(parse_value(inner)?)),
-        Rule::prop_ref => {
-            // prop_ref = var "." key ; keep the key, drop the variable.
-            let key = inner
+    match pair.as_rule() {
+        // Thin wrappers carrying exactly one inner expression.
+        Rule::set_expr | Rule::primary | Rule::paren | Rule::case_subject | Rule::else_clause => {
+            let inner = pair
                 .into_inner()
-                .find(|p| p.as_rule() == Rule::key)
-                .map(|p| unquote_key(p.as_str()))
-                .ok_or_else(|| anyhow!("property reference missing key"))?;
-            Ok(SetExpr::Prop(key))
+                .find(|p| is_expr_rule(p.as_rule()))
+                .ok_or_else(|| anyhow!("empty SET expression"))?;
+            parse_set_expr(inner)
         }
+        Rule::or_expr => parse_bool_chain(pair, true),
+        Rule::and_expr => parse_bool_chain(pair, false),
+        Rule::not_expr => parse_not(pair),
+        Rule::comparison => parse_comparison(pair),
+        Rule::add_expr | Rule::mul_expr => parse_arith_chain(pair),
+        Rule::case_expr => parse_case(pair),
         Rule::func_call => {
             let mut name: Option<String> = None;
             let mut args = Vec::new();
-            for c in inner.into_inner() {
+            for c in pair.into_inner() {
                 match c.as_rule() {
                     Rule::fn_name => name = Some(c.as_str().to_string()),
                     Rule::set_expr => args.push(parse_set_expr(c)?),
@@ -329,8 +353,154 @@ fn parse_set_expr(pair: Pair<Rule>) -> Result<SetExpr> {
             let name = name.ok_or_else(|| anyhow!("function call missing name"))?;
             Ok(SetExpr::Func { name, args })
         }
+        Rule::value => Ok(SetExpr::Lit(parse_value(pair)?)),
+        Rule::prop_ref => {
+            // prop_ref = var "." key ; keep the key, drop the variable.
+            let key = pair
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::key)
+                .map(|p| unquote_key(p.as_str()))
+                .ok_or_else(|| anyhow!("property reference missing key"))?;
+            Ok(SetExpr::Prop(key))
+        }
         other => bail!("unexpected SET expression rule {other:?}"),
     }
+}
+
+/// Left-fold an `or_expr` / `and_expr` (`a OR b OR c`) into nested `Or`/`And`. With a
+/// single operand (no operator at this level) returns it directly.
+fn parse_bool_chain(pair: Pair<Rule>, is_or: bool) -> Result<SetExpr> {
+    let mut operands = pair.into_inner().filter(|p| is_expr_rule(p.as_rule()));
+    let first = operands
+        .next()
+        .ok_or_else(|| anyhow!("empty boolean expression"))?;
+    let mut acc = parse_set_expr(first)?;
+    for next in operands {
+        let rhs = parse_set_expr(next)?;
+        acc = if is_or {
+            SetExpr::Or(Box::new(acc), Box::new(rhs))
+        } else {
+            SetExpr::And(Box::new(acc), Box::new(rhs))
+        };
+    }
+    Ok(acc)
+}
+
+/// `not_expr = kw_not* ~ comparison` → wrap the operand in `Not` once per `NOT`.
+fn parse_not(pair: Pair<Rule>) -> Result<SetExpr> {
+    let mut nots = 0usize;
+    let mut operand: Option<Pair<Rule>> = None;
+    for c in pair.into_inner() {
+        match c.as_rule() {
+            Rule::kw_not => nots += 1,
+            r if is_expr_rule(r) => operand = Some(c),
+            _ => {}
+        }
+    }
+    let operand = operand.ok_or_else(|| anyhow!("NOT missing operand"))?;
+    let mut e = parse_set_expr(operand)?;
+    for _ in 0..nots {
+        e = SetExpr::Not(Box::new(e));
+    }
+    Ok(e)
+}
+
+/// `comparison = add_expr ~ (cmp_op ~ add_expr)?` → `Cmp` when the operator is
+/// present, else the lone operand.
+fn parse_comparison(pair: Pair<Rule>) -> Result<SetExpr> {
+    let mut inner = pair.into_inner();
+    let left = inner.next().ok_or_else(|| anyhow!("empty comparison"))?;
+    let mut acc = parse_set_expr(left)?;
+    if let Some(op_pair) = inner.next() {
+        let op = parse_cmp_op(op_pair.as_str())?;
+        let right = inner
+            .next()
+            .ok_or_else(|| anyhow!("comparison missing right operand"))?;
+        acc = SetExpr::Cmp {
+            op,
+            l: Box::new(acc),
+            r: Box::new(parse_set_expr(right)?),
+        };
+    }
+    Ok(acc)
+}
+
+/// `add_expr`/`mul_expr` = operand (op operand)* → left-fold into `BinOp`.
+fn parse_arith_chain(pair: Pair<Rule>) -> Result<SetExpr> {
+    let mut inner = pair.into_inner();
+    let first = inner
+        .next()
+        .ok_or_else(|| anyhow!("empty arithmetic expression"))?;
+    let mut acc = parse_set_expr(first)?;
+    while let Some(op_pair) = inner.next() {
+        let op = parse_bin_op(op_pair.as_str())?;
+        let rhs = inner
+            .next()
+            .ok_or_else(|| anyhow!("operator `{}` missing right operand", op_pair.as_str()))?;
+        acc = SetExpr::BinOp {
+            op,
+            l: Box::new(acc),
+            r: Box::new(parse_set_expr(rhs)?),
+        };
+    }
+    Ok(acc)
+}
+
+/// Parse a `case_expr` into [`SetExpr::Case`].
+fn parse_case(pair: Pair<Rule>) -> Result<SetExpr> {
+    let mut subject = None;
+    let mut whens = Vec::new();
+    let mut els = None;
+    for c in pair.into_inner() {
+        match c.as_rule() {
+            Rule::case_subject => subject = Some(Box::new(parse_set_expr(c)?)),
+            Rule::when_clause => {
+                let mut parts = c.into_inner().filter(|p| is_expr_rule(p.as_rule()));
+                let cond = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("WHEN missing condition"))?;
+                let then = parts
+                    .next()
+                    .ok_or_else(|| anyhow!("WHEN missing THEN value"))?;
+                whens.push((parse_set_expr(cond)?, parse_set_expr(then)?));
+            }
+            Rule::else_clause => els = Some(Box::new(parse_set_expr(c)?)),
+            _ => {} // kw_case / kw_end markers
+        }
+    }
+    if whens.is_empty() {
+        bail!("CASE expression must have at least one WHEN");
+    }
+    Ok(SetExpr::Case {
+        subject,
+        whens,
+        els,
+    })
+}
+
+fn parse_cmp_op(s: &str) -> Result<slater_scalar::CmpOp> {
+    use slater_scalar::CmpOp::*;
+    Ok(match s {
+        "=" => Eq,
+        "<>" => Ne,
+        "<" => Lt,
+        "<=" => Le,
+        ">" => Gt,
+        ">=" => Ge,
+        other => bail!("unknown comparison operator `{other}`"),
+    })
+}
+
+fn parse_bin_op(s: &str) -> Result<slater_scalar::BinOp> {
+    use slater_scalar::BinOp::*;
+    Ok(match s {
+        "+" => Add,
+        "-" => Sub,
+        "*" => Mul,
+        "/" => Div,
+        "%" => Mod,
+        other => bail!("unknown arithmetic operator `{other}`"),
+    })
 }
 
 fn parse_node_overwrite(pair: Pair<Rule>) -> Result<Statement> {
@@ -736,6 +906,49 @@ mod tests {
         };
         assert_eq!(e.src_dump_id, 2);
         assert_eq!(e.dst_dump_id, 1);
+    }
+
+    #[test]
+    fn accepts_node_merge_with_case_and_operators() {
+        // The BioAperture "affiliation append" idiom: CASE + `=` + `+` in a node SET.
+        let s = "MERGE (p:Person {id: 'x'}) SET p.affiliationSummary = \
+                 CASE WHEN coalesce(p.affiliationSummary, '') = '' THEN 'Acme' \
+                 ELSE p.affiliationSummary + '; ' + 'Acme' END";
+        let Statement::NodeOverwrite(n) = parse_statement(s).unwrap() else {
+            panic!("expected node overwrite");
+        };
+        assert!(n.is_merge);
+        assert_eq!(n.set_props.len(), 1);
+        let (key, expr) = &n.set_props[0];
+        assert_eq!(key, "affiliationSummary");
+        let SetExpr::Case {
+            subject,
+            whens,
+            els,
+        } = expr
+        else {
+            panic!("expected CASE, got {expr:?}");
+        };
+        assert!(subject.is_none(), "searched CASE has no subject");
+        assert_eq!(whens.len(), 1);
+        let (cond, then) = &whens[0];
+        // condition is a `=` comparison; THEN is the bare literal.
+        assert!(matches!(
+            cond,
+            SetExpr::Cmp {
+                op: slater_scalar::CmpOp::Eq,
+                ..
+            }
+        ));
+        assert_eq!(*then, SetExpr::Lit(Value::Str("Acme".into())));
+        // ELSE is a `+` concatenation chain.
+        assert!(matches!(
+            els.as_deref(),
+            Some(SetExpr::BinOp {
+                op: slater_scalar::BinOp::Add,
+                ..
+            })
+        ));
     }
 
     #[test]

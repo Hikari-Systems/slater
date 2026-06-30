@@ -250,7 +250,28 @@ fn fold_props(into: &mut Vec<(u32, Value)>, add: &[(u32, Value)]) {
 pub(crate) enum SetExprI {
     Lit(Value),
     Prop(u32),
-    Func { name: String, args: Vec<SetExprI> },
+    Func {
+        name: String,
+        args: Vec<SetExprI>,
+    },
+    BinOp {
+        op: slater_scalar::BinOp,
+        l: Box<SetExprI>,
+        r: Box<SetExprI>,
+    },
+    Cmp {
+        op: slater_scalar::CmpOp,
+        l: Box<SetExprI>,
+        r: Box<SetExprI>,
+    },
+    And(Box<SetExprI>, Box<SetExprI>),
+    Or(Box<SetExprI>, Box<SetExprI>),
+    Not(Box<SetExprI>),
+    Case {
+        subject: Option<Box<SetExprI>>,
+        whens: Vec<(SetExprI, SetExprI)>,
+        els: Option<Box<SetExprI>>,
+    },
 }
 
 /// Intern a parsed [`SetExpr`]'s property references against the local key interner.
@@ -269,6 +290,48 @@ fn intern_set_expr(e: &SetExpr, keys: &mut crate::shared::Interner) -> Result<Se
                 .map(|a| intern_set_expr(a, keys))
                 .collect::<Result<_>>()?,
         },
+        SetExpr::BinOp { op, l, r } => SetExprI::BinOp {
+            op: *op,
+            l: Box::new(intern_set_expr(l, keys)?),
+            r: Box::new(intern_set_expr(r, keys)?),
+        },
+        SetExpr::Cmp { op, l, r } => SetExprI::Cmp {
+            op: *op,
+            l: Box::new(intern_set_expr(l, keys)?),
+            r: Box::new(intern_set_expr(r, keys)?),
+        },
+        SetExpr::And(l, r) => SetExprI::And(
+            Box::new(intern_set_expr(l, keys)?),
+            Box::new(intern_set_expr(r, keys)?),
+        ),
+        SetExpr::Or(l, r) => SetExprI::Or(
+            Box::new(intern_set_expr(l, keys)?),
+            Box::new(intern_set_expr(r, keys)?),
+        ),
+        SetExpr::Not(e) => SetExprI::Not(Box::new(intern_set_expr(e, keys)?)),
+        SetExpr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            let subject = match subject {
+                Some(s) => Some(Box::new(intern_set_expr(s, keys)?)),
+                None => None,
+            };
+            let mut iw = Vec::with_capacity(whens.len());
+            for (c, t) in whens {
+                iw.push((intern_set_expr(c, keys)?, intern_set_expr(t, keys)?));
+            }
+            let els = match els {
+                Some(e) => Some(Box::new(intern_set_expr(e, keys)?)),
+                None => None,
+            };
+            SetExprI::Case {
+                subject,
+                whens: iw,
+                els,
+            }
+        }
     })
 }
 
@@ -281,6 +344,30 @@ fn remap_set_expr(e: &mut SetExprI, rm: &ShardRemap) {
         SetExprI::Func { args, .. } => {
             for a in args {
                 remap_set_expr(a, rm);
+            }
+        }
+        SetExprI::BinOp { l, r, .. }
+        | SetExprI::Cmp { l, r, .. }
+        | SetExprI::And(l, r)
+        | SetExprI::Or(l, r) => {
+            remap_set_expr(l, rm);
+            remap_set_expr(r, rm);
+        }
+        SetExprI::Not(e) => remap_set_expr(e, rm),
+        SetExprI::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            if let Some(s) = subject {
+                remap_set_expr(s, rm);
+            }
+            for (c, t) in whens {
+                remap_set_expr(c, rm);
+                remap_set_expr(t, rm);
+            }
+            if let Some(e) = els {
+                remap_set_expr(e, rm);
             }
         }
     }
@@ -305,7 +392,107 @@ fn encode_set_expr(buf: &mut Vec<u8>, e: &SetExprI) {
                 encode_set_expr(buf, a);
             }
         }
+        SetExprI::BinOp { op, l, r } => {
+            buf.push(3);
+            buf.push(bin_op_byte(*op));
+            encode_set_expr(buf, l);
+            encode_set_expr(buf, r);
+        }
+        SetExprI::Cmp { op, l, r } => {
+            buf.push(4);
+            buf.push(cmp_op_byte(*op));
+            encode_set_expr(buf, l);
+            encode_set_expr(buf, r);
+        }
+        SetExprI::And(l, r) => {
+            buf.push(5);
+            encode_set_expr(buf, l);
+            encode_set_expr(buf, r);
+        }
+        SetExprI::Or(l, r) => {
+            buf.push(6);
+            encode_set_expr(buf, l);
+            encode_set_expr(buf, r);
+        }
+        SetExprI::Not(e) => {
+            buf.push(7);
+            encode_set_expr(buf, e);
+        }
+        SetExprI::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            buf.push(8);
+            match subject {
+                Some(s) => {
+                    buf.push(1);
+                    encode_set_expr(buf, s);
+                }
+                None => buf.push(0),
+            }
+            write_uvarint(buf, whens.len() as u64);
+            for (c, t) in whens {
+                encode_set_expr(buf, c);
+                encode_set_expr(buf, t);
+            }
+            match els {
+                Some(e) => {
+                    buf.push(1);
+                    encode_set_expr(buf, e);
+                }
+                None => buf.push(0),
+            }
+        }
     }
+}
+
+fn bin_op_byte(op: slater_scalar::BinOp) -> u8 {
+    use slater_scalar::BinOp::*;
+    match op {
+        Add => 0,
+        Sub => 1,
+        Mul => 2,
+        Div => 3,
+        Mod => 4,
+    }
+}
+
+fn bin_op_from_byte(b: u8) -> Result<slater_scalar::BinOp> {
+    use slater_scalar::BinOp::*;
+    Ok(match b {
+        0 => Add,
+        1 => Sub,
+        2 => Mul,
+        3 => Div,
+        4 => Mod,
+        other => bail!("unknown BinOp byte {other} in node SET spill"),
+    })
+}
+
+fn cmp_op_byte(op: slater_scalar::CmpOp) -> u8 {
+    use slater_scalar::CmpOp::*;
+    match op {
+        Eq => 0,
+        Ne => 1,
+        Lt => 2,
+        Le => 3,
+        Gt => 4,
+        Ge => 5,
+    }
+}
+
+fn cmp_op_from_byte(b: u8) -> Result<slater_scalar::CmpOp> {
+    use slater_scalar::CmpOp::*;
+    Ok(match b {
+        0 => Eq,
+        1 => Ne,
+        2 => Lt,
+        3 => Le,
+        4 => Gt,
+        5 => Ge,
+        other => bail!("unknown CmpOp byte {other} in node SET spill"),
+    })
 }
 
 fn decode_set_expr(r: &mut &[u8]) -> Result<SetExprI> {
@@ -328,6 +515,53 @@ fn decode_set_expr(r: &mut &[u8]) -> Result<SetExprI> {
                 args.push(decode_set_expr(r)?);
             }
             SetExprI::Func { name, args }
+        }
+        3 => {
+            let op = bin_op_from_byte(read_u8(r)?)?;
+            let l = Box::new(decode_set_expr(r)?);
+            let rr = Box::new(decode_set_expr(r)?);
+            SetExprI::BinOp { op, l, r: rr }
+        }
+        4 => {
+            let op = cmp_op_from_byte(read_u8(r)?)?;
+            let l = Box::new(decode_set_expr(r)?);
+            let rr = Box::new(decode_set_expr(r)?);
+            SetExprI::Cmp { op, l, r: rr }
+        }
+        5 => {
+            let l = Box::new(decode_set_expr(r)?);
+            let rr = Box::new(decode_set_expr(r)?);
+            SetExprI::And(l, rr)
+        }
+        6 => {
+            let l = Box::new(decode_set_expr(r)?);
+            let rr = Box::new(decode_set_expr(r)?);
+            SetExprI::Or(l, rr)
+        }
+        7 => SetExprI::Not(Box::new(decode_set_expr(r)?)),
+        8 => {
+            let subject = if read_u8(r)? != 0 {
+                Some(Box::new(decode_set_expr(r)?))
+            } else {
+                None
+            };
+            let n = read_uvarint(r)? as usize;
+            let mut whens = Vec::with_capacity(n);
+            for _ in 0..n {
+                let c = decode_set_expr(r)?;
+                let t = decode_set_expr(r)?;
+                whens.push((c, t));
+            }
+            let els = if read_u8(r)? != 0 {
+                Some(Box::new(decode_set_expr(r)?))
+            } else {
+                None
+            };
+            SetExprI::Case {
+                subject,
+                whens,
+                els,
+            }
         }
         other => bail!("unknown SET-expr tag {other}"),
     })
@@ -378,6 +612,95 @@ fn eval_set_expr(e: &SetExprI, props: &[(u32, Value)]) -> Result<Value> {
             slater_scalar::eval_pure(name, &vs)?
                 .ok_or_else(|| anyhow!("function `{name}` is not supported in build-time SET"))
         }
+        SetExprI::BinOp { op, l, r } => {
+            let a = eval_set_expr(l, props)?;
+            let b = eval_set_expr(r, props)?;
+            slater_scalar::eval_binop(*op, a, b)
+        }
+        SetExprI::Cmp { op, l, r } => {
+            let a = eval_set_expr(l, props)?;
+            let b = eval_set_expr(r, props)?;
+            Ok(slater_scalar::eval_compare(*op, &a, &b))
+        }
+        // Three-valued (Kleene) boolean logic, short-circuiting on a definite result.
+        SetExprI::And(l, r) => {
+            let a = eval_set_expr(l, props)?;
+            if matches!(a, Value::Bool(false)) {
+                return Ok(Value::Bool(false));
+            }
+            let b = eval_set_expr(r, props)?;
+            Ok(and3(&a, &b))
+        }
+        SetExprI::Or(l, r) => {
+            let a = eval_set_expr(l, props)?;
+            if matches!(a, Value::Bool(true)) {
+                return Ok(Value::Bool(true));
+            }
+            let b = eval_set_expr(r, props)?;
+            Ok(or3(&a, &b))
+        }
+        SetExprI::Not(e) => Ok(match eval_set_expr(e, props)? {
+            Value::Bool(b) => Value::Bool(!b),
+            _ => Value::Null,
+        }),
+        // CASE: only the chosen branch is evaluated (lazy). A WHEN matches when its
+        // condition is truthy (searched form) or equals the subject (simple form).
+        SetExprI::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            let subj = match subject {
+                Some(s) => Some(eval_set_expr(s, props)?),
+                None => None,
+            };
+            for (cond, then) in whens {
+                let matched = match &subj {
+                    Some(s) => {
+                        let c = eval_set_expr(cond, props)?;
+                        matches!(
+                            slater_scalar::eval_compare(slater_scalar::CmpOp::Eq, s, &c),
+                            Value::Bool(true)
+                        )
+                    }
+                    None => slater_scalar::truthy(&eval_set_expr(cond, props)?),
+                };
+                if matched {
+                    return eval_set_expr(then, props);
+                }
+            }
+            match els {
+                Some(e) => eval_set_expr(e, props),
+                None => Ok(Value::Null),
+            }
+        }
+    }
+}
+
+/// Boolean view of a value for Kleene logic: `Bool` → `Some`, everything else
+/// (including NULL) → `None` (unknown).
+fn three_valued(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Kleene AND: false dominates; both-true is true; otherwise unknown (NULL).
+fn and3(a: &Value, b: &Value) -> Value {
+    match (three_valued(a), three_valued(b)) {
+        (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+        (Some(true), Some(true)) => Value::Bool(true),
+        _ => Value::Null,
+    }
+}
+
+/// Kleene OR: true dominates; both-false is false; otherwise unknown (NULL).
+fn or3(a: &Value, b: &Value) -> Value {
+    match (three_valued(a), three_valued(b)) {
+        (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+        (Some(false), Some(false)) => Value::Bool(false),
+        _ => Value::Null,
     }
 }
 
@@ -1294,4 +1617,118 @@ fn cmp_key_triple(k: &KeyProv, ep: &EndpointRef) -> Ordering {
         .cmp(&ep.label)
         .then_with(|| k.key.cmp(&ep.key))
         .then_with(|| value_cmp_exact(&k.value, &ep.value))
+}
+
+#[cfg(test)]
+mod set_expr_tests {
+    use super::*;
+
+    fn str_lit(s: &str) -> SetExprI {
+        SetExprI::Lit(Value::Str(s.to_string()))
+    }
+
+    /// The dump's affiliation-append idiom for property `k`, appending `lit`:
+    /// `CASE WHEN coalesce(p.k,'')='' THEN lit ELSE p.k + '; ' + lit END`.
+    fn append_idiom(k: u32, lit: &str) -> SetExprI {
+        SetExprI::Case {
+            subject: None,
+            whens: vec![(
+                SetExprI::Cmp {
+                    op: slater_scalar::CmpOp::Eq,
+                    l: Box::new(SetExprI::Func {
+                        name: "coalesce".to_string(),
+                        args: vec![SetExprI::Prop(k), str_lit("")],
+                    }),
+                    r: Box::new(str_lit("")),
+                },
+                str_lit(lit),
+            )],
+            els: Some(Box::new(SetExprI::BinOp {
+                op: slater_scalar::BinOp::Add,
+                l: Box::new(SetExprI::BinOp {
+                    op: slater_scalar::BinOp::Add,
+                    l: Box::new(SetExprI::Prop(k)),
+                    r: Box::new(str_lit("; ")),
+                }),
+                r: Box::new(str_lit(lit)),
+            })),
+        }
+    }
+
+    fn get(props: &[(u32, Value)], k: u32) -> Option<Value> {
+        props
+            .iter()
+            .find(|(ek, _)| *ek == k)
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn case_append_idiom_accumulates_in_input_order() {
+        let k = 0u32;
+        let mut props: Vec<(u32, Value)> = Vec::new();
+        // First append hits the THEN branch (prop absent → coalesce empty); later
+        // appends hit the ELSE concat against the accumulated value.
+        for (lit, expected) in [("A", "A"), ("B", "A; B"), ("C", "A; B; C")] {
+            fold_node_props(&mut props, &[(k, append_idiom(k, lit))]).unwrap();
+            assert_eq!(get(&props, k), Some(Value::Str(expected.to_string())));
+        }
+    }
+
+    #[test]
+    fn binop_and_cmp_against_accumulated_props() {
+        let props: Vec<(u32, Value)> = vec![(0, Value::Int(2))];
+        let add = SetExprI::BinOp {
+            op: slater_scalar::BinOp::Add,
+            l: Box::new(SetExprI::Prop(0)),
+            r: Box::new(SetExprI::Lit(Value::Int(3))),
+        };
+        assert_eq!(eval_set_expr(&add, &props).unwrap(), Value::Int(5));
+        let cmp = SetExprI::Cmp {
+            op: slater_scalar::CmpOp::Eq,
+            l: Box::new(SetExprI::Prop(0)),
+            r: Box::new(SetExprI::Lit(Value::Int(2))),
+        };
+        assert_eq!(eval_set_expr(&cmp, &props).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn case_with_no_matching_when_and_no_else_is_null() {
+        let e = SetExprI::Case {
+            subject: None,
+            whens: vec![(
+                SetExprI::Lit(Value::Bool(false)),
+                SetExprI::Lit(Value::Int(1)),
+            )],
+            els: None,
+        };
+        assert_eq!(eval_set_expr(&e, &[]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn spill_roundtrip_preserves_all_variants() {
+        let k = 3u32;
+        let exprs = vec![
+            append_idiom(k, "Acme"),
+            SetExprI::Not(Box::new(SetExprI::Lit(Value::Bool(true)))),
+            SetExprI::And(
+                Box::new(SetExprI::Lit(Value::Bool(true))),
+                Box::new(SetExprI::Lit(Value::Bool(false))),
+            ),
+            SetExprI::Or(
+                Box::new(SetExprI::Lit(Value::Bool(false))),
+                Box::new(SetExprI::Prop(k)),
+            ),
+        ];
+        for e in &exprs {
+            let mut buf = Vec::new();
+            encode_set_expr(&mut buf, e);
+            let mut r = buf.as_slice();
+            let decoded = decode_set_expr(&mut r).unwrap();
+            assert!(r.is_empty(), "decoder must consume every byte it wrote");
+            // SetExprI has no PartialEq; assert structural equality via re-encode.
+            let mut buf2 = Vec::new();
+            encode_set_expr(&mut buf2, &decoded);
+            assert_eq!(buf, buf2, "re-encode of decoded tree must match");
+        }
+    }
 }

@@ -57,10 +57,11 @@ pub struct EdgeStmt {
 
 /// The right-hand side of a node `SET n.k = …` assignment. A literal value, a
 /// reference to another property of the *same* node (`n.other`, resolved against
-/// the node's accumulated state at fold time), or a pure scalar function call
-/// (`coalesce(n.name, n.canonicalName, 'x')`, `toUpper(n.name)`, …). Functions are
-/// evaluated at build time via [`slater_scalar`]; only `Lit` is permitted on edge
-/// SET and in the overlay-patch dialect.
+/// the node's accumulated state at fold time), a pure scalar function call
+/// (`coalesce(n.name, n.canonicalName, 'x')`, `toUpper(n.name)`, …), or an
+/// expression combining these with infix operators and `CASE`. Functions and
+/// operators are evaluated at build time via [`slater_scalar`]; only `Lit` is
+/// permitted on edge SET and in the overlay-patch dialect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SetExpr {
     Lit(Value),
@@ -69,6 +70,32 @@ pub enum SetExpr {
     Func {
         name: String,
         args: Vec<SetExpr>,
+    },
+    /// Arithmetic / concatenation: `l + r`, `l - r`, … (string-concat when either
+    /// side is a string — see [`slater_scalar::eval_binop`]).
+    BinOp {
+        op: slater_scalar::BinOp,
+        l: Box<SetExpr>,
+        r: Box<SetExpr>,
+    },
+    /// Comparison: `l = r`, `l <> r`, `l < r`, … (three-valued; see
+    /// [`slater_scalar::eval_compare`]).
+    Cmp {
+        op: slater_scalar::CmpOp,
+        l: Box<SetExpr>,
+        r: Box<SetExpr>,
+    },
+    And(Box<SetExpr>, Box<SetExpr>),
+    Or(Box<SetExpr>, Box<SetExpr>),
+    Not(Box<SetExpr>),
+    /// `CASE [subject] WHEN c THEN v … [ELSE e] END`. With `subject = None` this is
+    /// the searched form (each `when` is a boolean condition); with `subject =
+    /// Some(s)` it is the simple form (`s = when`). Branches are evaluated lazily —
+    /// only the first matching `then`, or `els`, is evaluated.
+    Case {
+        subject: Option<Box<SetExpr>>,
+        whens: Vec<(SetExpr, SetExpr)>,
+        els: Option<Box<SetExpr>>,
     },
 }
 

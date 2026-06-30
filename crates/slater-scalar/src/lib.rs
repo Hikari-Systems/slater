@@ -280,6 +280,168 @@ pub const PURE_FUNCTIONS: &[&str] = &[
     "exists",
 ];
 
+// ── operators / CASE (build-time SET expressions) ─────────────────────────────
+//
+// The offline builder evaluates dump `SET` right-hand sides that use infix
+// operators and `CASE` (e.g. `n.s = CASE WHEN coalesce(n.s,'')='' THEN x ELSE
+// n.s + '; ' + x END`). These mirror the query engine's `arith`/`compare`/
+// `loose_eq`/`truthy` (`slater/src/exec.rs`) restricted to the 7 on-disk `Value`
+// variants — the runtime-only types (Node/Rel/Path/Map/Point/temporal) cannot
+// occur in a build-time SET, so their cases are omitted. CASE short-circuiting
+// lives in the caller (only the chosen branch is evaluated); this crate supplies
+// the leaf operator / comparison / truthiness semantics.
+
+/// Binary arithmetic / concatenation operator. Mirrors the query engine's `BinOp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+/// Comparison operator. Mirrors the query engine's `CmpOp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Evaluate `a <op> b`. Mirrors `arith` in `slater/src/exec.rs`: a NULL operand
+/// yields NULL; `+` with any string operand concatenates (and with a list operand
+/// builds/extends a list); Int+Int stays Int; otherwise both sides coerce to
+/// Float. Division / modulo by zero, and arithmetic on non-numeric non-string
+/// operands, are errors.
+pub fn eval_binop(op: BinOp, a: Value, b: Value) -> Result<Value> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
+    if let BinOp::Add = op {
+        match (&a, &b) {
+            (Value::Str(_), _) | (_, Value::Str(_)) => {
+                return Ok(Value::Str(format!("{}{}", display(&a), display(&b))));
+            }
+            (Value::List(xs), Value::List(ys)) => {
+                let mut v = xs.clone();
+                v.extend(ys.clone());
+                return Ok(Value::List(v));
+            }
+            (Value::List(xs), _) => {
+                let mut v = xs.clone();
+                v.push(b);
+                return Ok(Value::List(v));
+            }
+            (_, Value::List(ys)) => {
+                let mut v = vec![a];
+                v.extend(ys.clone());
+                return Ok(Value::List(v));
+            }
+            _ => {}
+        }
+    }
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
+        return Ok(match op {
+            BinOp::Add => Value::Int(x + y),
+            BinOp::Sub => Value::Int(x - y),
+            BinOp::Mul => Value::Int(x * y),
+            BinOp::Div => {
+                if y == 0 {
+                    bail!("integer division by zero");
+                }
+                Value::Int(x / y)
+            }
+            BinOp::Mod => {
+                if y == 0 {
+                    bail!("integer modulo by zero");
+                }
+                Value::Int(x % y)
+            }
+        });
+    }
+    match (value_as_num(&a), value_as_num(&b)) {
+        (Some(x), Some(y)) => Ok(Value::Float(match op {
+            BinOp::Add => x + y,
+            BinOp::Sub => x - y,
+            BinOp::Mul => x * y,
+            BinOp::Div => x / y,
+            BinOp::Mod => x % y,
+        })),
+        _ => bail!(
+            "cannot apply arithmetic to {} and {}",
+            display(&a),
+            display(&b)
+        ),
+    }
+}
+
+/// Evaluate `a <op> b` as a boolean, three-valued: a NULL operand yields NULL.
+/// Mirrors `compare` in `slater/src/exec.rs`.
+pub fn eval_compare(op: CmpOp, a: &Value, b: &Value) -> Value {
+    match op {
+        CmpOp::Eq => loose_eq(a, b).map(Value::Bool).unwrap_or(Value::Null),
+        CmpOp::Ne => loose_eq(a, b)
+            .map(|e| Value::Bool(!e))
+            .unwrap_or(Value::Null),
+        _ => {
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Value::Null;
+            }
+            let Some(ord) = comparable(a, b) else {
+                return Value::Null;
+            };
+            Value::Bool(match op {
+                CmpOp::Lt => ord == Ordering::Less,
+                CmpOp::Le => ord != Ordering::Greater,
+                CmpOp::Gt => ord == Ordering::Greater,
+                CmpOp::Ge => ord != Ordering::Less,
+                _ => unreachable!(),
+            })
+        }
+    }
+}
+
+/// Equality core (FalkorDB loose equality) over `Value`. NULL on either side ⇒
+/// `None` (the comparison is itself NULL); Int/Float compare cross-type as f64;
+/// other types compare structurally within the same type, mixed types are unequal.
+/// Mirrors `Val::loose_eq` restricted to the on-disk variants.
+fn loose_eq(a: &Value, b: &Value) -> Option<bool> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return None;
+    }
+    if let (Some(x), Some(y)) = (value_as_num(a), value_as_num(b)) {
+        return Some(x == y);
+    }
+    Some(match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Vector(x), Value::Vector(y)) => x == y,
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| loose_eq(p, q) == Some(true))
+        }
+        _ => false,
+    })
+}
+
+/// Ordering for `<`/`>` etc — only like-typed ordered operands (numbers cross
+/// Int/Float via `f64::total_cmp`, str/str, bool/bool); anything else ⇒ `None`
+/// (the comparison is NULL). Mirrors `comparable` for the on-disk variants.
+fn comparable(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            Some(value_as_num(a)?.total_cmp(&value_as_num(b)?))
+        }
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn value_as_num(v: &Value) -> Option<f64> {
@@ -333,7 +495,10 @@ fn type_name_title(v: &Value) -> &'static str {
     }
 }
 
-fn truthy(v: &Value) -> bool {
+/// Cypher truthiness: only `true` is truthy. NULL and every non-boolean value are
+/// not truthy (so a `CASE WHEN <non-bool>` skips that branch). Mirrors `truthy` in
+/// `slater/src/exec.rs`.
+pub fn truthy(v: &Value) -> bool {
     matches!(v, Value::Bool(true))
 }
 
@@ -693,5 +858,78 @@ mod tests {
         for name in PURE_FUNCTIONS {
             assert!(handles(name), "{name} advertised but handles() is false");
         }
+    }
+
+    #[test]
+    fn binop_add_concat_and_numeric() {
+        // `+` concatenates when either side is a string (mirrors the query engine).
+        assert_eq!(eval_binop(BinOp::Add, s("a"), s("b")).unwrap(), s("ab"));
+        assert_eq!(
+            eval_binop(BinOp::Add, s("n="), Value::Int(3)).unwrap(),
+            s("n=3")
+        );
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::Float(1.5), s("x")).unwrap(),
+            s("1.5x")
+        );
+        // Int+Int stays Int; a float operand promotes to Float.
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::Int(2), Value::Int(3)).unwrap(),
+            Value::Int(5)
+        );
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::Int(2), Value::Float(0.5)).unwrap(),
+            Value::Float(2.5)
+        );
+        // NULL propagates.
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::Null, Value::Int(1)).unwrap(),
+            Value::Null
+        );
+        // list concat / append.
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::List(vec![Value::Int(1)]), Value::Int(2)).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+        // division by zero is an error for integers.
+        assert!(eval_binop(BinOp::Div, Value::Int(1), Value::Int(0)).is_err());
+        // arithmetic on two non-numeric non-strings errors.
+        assert!(eval_binop(BinOp::Sub, Value::Bool(true), Value::Bool(false)).is_err());
+    }
+
+    #[test]
+    fn compare_three_valued() {
+        assert_eq!(eval_compare(CmpOp::Eq, &s("x"), &s("x")), Value::Bool(true));
+        assert_eq!(eval_compare(CmpOp::Eq, &s(""), &s("")), Value::Bool(true));
+        assert_eq!(eval_compare(CmpOp::Ne, &s("a"), &s("b")), Value::Bool(true));
+        // cross Int/Float numeric equality.
+        assert_eq!(
+            eval_compare(CmpOp::Eq, &Value::Int(2), &Value::Float(2.0)),
+            Value::Bool(true)
+        );
+        // NULL on either side ⇒ NULL (not false).
+        assert_eq!(eval_compare(CmpOp::Eq, &Value::Null, &s("x")), Value::Null);
+        // mixed types: equality is false, ordered comparison is NULL.
+        assert_eq!(
+            eval_compare(CmpOp::Eq, &Value::Int(1), &s("1")),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_compare(CmpOp::Lt, &Value::Int(1), &s("1")),
+            Value::Null
+        );
+        assert_eq!(
+            eval_compare(CmpOp::Lt, &Value::Int(1), &Value::Int(2)),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn truthy_only_true() {
+        assert!(truthy(&Value::Bool(true)));
+        assert!(!truthy(&Value::Bool(false)));
+        assert!(!truthy(&Value::Null));
+        assert!(!truthy(&Value::Int(1)));
+        assert!(!truthy(&s("true")));
     }
 }

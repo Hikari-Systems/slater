@@ -29,5 +29,30 @@ pub(crate) fn validate_set_expr(e: &SetExpr) -> Result<()> {
             }
             Ok(())
         }
+        SetExpr::BinOp { l, r, .. }
+        | SetExpr::Cmp { l, r, .. }
+        | SetExpr::And(l, r)
+        | SetExpr::Or(l, r) => {
+            validate_set_expr(l)?;
+            validate_set_expr(r)
+        }
+        SetExpr::Not(e) => validate_set_expr(e),
+        SetExpr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            if let Some(s) = subject {
+                validate_set_expr(s)?;
+            }
+            for (c, t) in whens {
+                validate_set_expr(c)?;
+                validate_set_expr(t)?;
+            }
+            if let Some(e) = els {
+                validate_set_expr(e)?;
+            }
+            Ok(())
+        }
     }
 }

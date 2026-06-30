@@ -313,9 +313,9 @@ fn intern_node_set_props(
     for (k, e) in set_props {
         let v = match e {
             SetExpr::Lit(v) => v.clone(),
-            SetExpr::Prop(_) | SetExpr::Func { .. } => bail!(
-                "overlay SET supports only literal values (got a function or property \
-                 reference for `{k}`); functions are a merge-dump feature"
+            _ => bail!(
+                "overlay SET supports only literal values (got a function, operator, \
+                 CASE, or property reference for `{k}`); these are a merge-dump feature"
             ),
         };
         if matches!(v, Value::Vector(_)) {
