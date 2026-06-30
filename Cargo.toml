@@ -8,7 +8,7 @@ resolver = "2"
 members = ["crates/graph-format", "crates/slater-scalar", "crates/slater-build", "crates/slater"]
 
 [workspace.package]
-version = "0.17.1"
+version = "0.18.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
