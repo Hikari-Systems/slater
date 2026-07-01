@@ -164,17 +164,21 @@ where
         ))
     };
     {
-        // `mem_budget` above is the ceiling for the O(n) permutation maps, not a
-        // sort-buffer size — the adjacency `ExtSorter`'s parallel spill pool can hold
-        // close to the *entire* budget it's given resident at once (backpressure
-        // allows `spill_threads()` in-flight buffers of `budget/(spill_threads()+1)`
-        // each), so passing `mem_budget` through unscaled let this one sort alone
-        // approach the whole `--max-memory` ceiling, on top of the permutation maps
-        // that follow it. Same `/16` convention as every other phase's `sort_budget`
-        // in build_external.rs.
-        let adj_sort_budget = (params.mem_budget / 16).max(16 * 1024 * 1024);
+        // Give the adjacency sort the full `mem_budget`. This is a *single*,
+        // non-concurrent `ExtSorter`, and its run-formation buffers never coexist with
+        // the O(n) permutation maps — this block scope closes (dropping the sorter)
+        // before `part_prev`/`part_next` are allocated below. So the phase peak is
+        // max(sort, maps), not their sum, and the sort may safely use the whole budget.
+        //
+        // The `/16` `sort_budget` convention in build_external.rs exists for phases that
+        // run *many* concurrent `ExtSorter`s (per band / per partition / per thread) and
+        // must share one budget between them. Applying it here was a misdiagnosis: it
+        // shrank the run-formation buffer ~16×, which multiplied the run count by the
+        // same factor, and the k-way merge holds one decompressed block per run — so a
+        // starved budget *raised* both peak RSS and wall time. Full budget ⇒ few runs ⇒
+        // a cheap single-pass merge.
         let mut sorter =
-            ExtSorter::<AdjPair>::new(&params.temp_dir, adj_sort_budget, params.zstd_level)?;
+            ExtSorter::<AdjPair>::new(&params.temp_dir, params.mem_budget, params.zstd_level)?;
         scan_edges(&mut |s, d| {
             if s != d {
                 sorter.push(AdjPair { node: s, nbr: d })?;
