@@ -30,6 +30,13 @@ bench-codec = []
 s3 = ["graph-format/s3"]
 # Enable publishing a built generation to a GCS target.
 gcs = ["graph-format/gcs"]
+# Heap-profiling build: swaps in dhat's counting allocator and writes
+# dhat-heap.json (viewable at https://nnethercote.github.io/dh_view/dh_view.html)
+# on exit, attributing live bytes at peak RSS to allocation call stacks. For
+# ad-hoc investigation of phases whose RSS exceeds their nominal --max-memory
+# budget (e.g. resolve/cluster at Wikidata scale) — never on by default, ~2-3x
+# slowdown. `cargo build --release --features profiling`.
+profiling = ["dep:dhat"]
 
 [dependencies]
 graph-format.workspace = true
@@ -45,6 +52,7 @@ pest.workspace = true
 pest_derive.workspace = true
 tracing.workspace = true
 rayon.workspace = true
+dhat = { version = "0.3", optional = true }
 
 [lints.rust]
 # slater-build contains no `unsafe`: the LDG clustering pass writes disjoint stripes

@@ -97,3 +97,12 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 opt-level = "s"
+
+# Same deployed codegen as `release`, but keeps symbols (`release` sets
+# `strip = true`) — needed for a profiler (e.g. `dhat`, via slater-build's
+# `profiling` feature) to attribute allocations to real function names instead
+# of addresses. `cargo build --profile profiling --features profiling`.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true

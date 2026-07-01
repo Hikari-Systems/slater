@@ -19,6 +19,16 @@ mod resolve;
 mod set_eval;
 mod shared;
 
+// Heap-profiling build only (`--features profiling`, off by default): dhat's
+// counting allocator attributes live bytes at peak RSS to allocation call
+// stacks, for phases (resolve/cluster at Wikidata scale) whose observed RSS
+// exceeds their nominal `--max-memory` budget by more than the sort/spill
+// accounting alone explains. Mirrors how `slater`'s main.rs swaps in jemalloc,
+// but scoped to this one feature rather than always-on.
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -463,6 +473,11 @@ fn resolve_publish_store(cli: &Cli) -> Result<Option<Arc<dyn graph_format::store
 }
 
 fn main() -> Result<()> {
+    // Held for the whole build; its `Drop` writes dhat-heap.json on exit (including
+    // early-return error paths, since `?` still runs destructors while unwinding).
+    #[cfg(feature = "profiling")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     // Install hs-utils-style logging so the build's progress lines (and any
