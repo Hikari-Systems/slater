@@ -1330,6 +1330,11 @@ pub(crate) fn resolve_edges(
     let nthreads = threads.max(1);
     // Per-partition sort budget: at most `nthreads` partitions hold an ExtSorter live at
     // once, so divide to keep total resident ≈ sort_budget (as emit.topology does).
+    // These sorters use `new_inline` (spill on the partition worker, not the shared
+    // pool): they already run `nthreads`-wide, so parallel spill buys no cores here and
+    // would only multiply each sorter's run count — and hence the k-way merge's
+    // `#runs × RUN_BLOCK_BYTES` resident footprint — by `spill_threads()+1`, which is
+    // what drove the resolve phase far past its budget at graph scale.
     let part_budget = (sort_budget / nthreads).max(8 << 20);
     let batch_threshold =
         (sort_budget / 64 / (RESOLVE_PARTS * nthreads).max(1)).clamp(16 << 10, 1 << 20);
@@ -1444,7 +1449,8 @@ pub(crate) fn resolve_edges(
     // ── stage 1: resolve each value-partition by merge-join, repartition by edge_seq ─
     let res_spill = PartSpill::new(&res_base, zstd_level)?;
     par_partitions(nthreads, |p| {
-        let mut sorter = ExtSorter::<EndpointRef>::new(scratch_dir, part_budget, zstd_level)?;
+        let mut sorter =
+            ExtSorter::<EndpointRef>::new_inline(scratch_dir, part_budget, zstd_level)?;
         let rdr = BlockFileReader::open(seg_path(&ep_base, p as u64))?;
         rdr.for_each_record(|_, rec| {
             let mut s = rec;
@@ -1493,12 +1499,13 @@ pub(crate) fn resolve_edges(
     let ef_spill = PartSpill::new(&ef_base, zstd_level)?;
     par_partitions(nthreads, |q| {
         let mut res_sorter =
-            ExtSorter::<ResolvedEndpoint>::new(scratch_dir, part_budget, zstd_level)?;
+            ExtSorter::<ResolvedEndpoint>::new_inline(scratch_dir, part_budget, zstd_level)?;
         BlockFileReader::open(seg_path(&res_base, q as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             res_sorter.push(ResolvedEndpoint::decode(&mut s)?)
         })?;
-        let mut pay_sorter = ExtSorter::<Payload>::new(scratch_dir, part_budget, zstd_level)?;
+        let mut pay_sorter =
+            ExtSorter::<Payload>::new_inline(scratch_dir, part_budget, zstd_level)?;
         BlockFileReader::open(seg_path(&pay_base, q as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             pay_sorter.push(Payload::decode(&mut s)?)
@@ -1545,7 +1552,7 @@ pub(crate) fn resolve_edges(
     let counts: Vec<AtomicU64> = (0..RESOLVE_PARTS).map(|_| AtomicU64::new(0)).collect();
     let counts_r = &counts;
     par_partitions(nthreads, |t| {
-        let mut sorter = ExtSorter::<EdgeFinal>::new(scratch_dir, part_budget, zstd_level)?;
+        let mut sorter = ExtSorter::<EdgeFinal>::new_inline(scratch_dir, part_budget, zstd_level)?;
         BlockFileReader::open(seg_path(&ef_base, t as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             sorter.push(EdgeFinal::decode(&mut s)?)

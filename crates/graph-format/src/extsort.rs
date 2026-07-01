@@ -202,13 +202,46 @@ impl<R: SortRecord + Send + 'static> ExtSorter<R> {
     /// (sort + compress + write) runs on the shared spill pool; the budget is split
     /// across the in-flight buffers so peak resident bytes stay ≈ `budget_bytes`.
     pub fn new(temp_dir: &Path, budget_bytes: usize, zstd_level: i32) -> Result<Self> {
+        Self::with_inflight(temp_dir, budget_bytes, zstd_level, spill_threads())
+    }
+
+    /// Like [`ExtSorter::new`] but spills **inline** on the pushing thread (no parallel
+    /// spill pool) and sizes the run-formation buffer to the *whole* budget.
+    ///
+    /// Use this for a sorter that already runs inside a saturated worker pool — e.g.
+    /// one `ExtSorter` per partition inside a `par_partitions` stage. There the shared
+    /// spill pool can hand it no extra cores, so parallel spill buys nothing; worse,
+    /// splitting the budget across `spill_threads()+1` in-flight buffers multiplies the
+    /// **run count** by that factor, and the k-way merge holds one decompressed block
+    /// (`RUN_BLOCK_BYTES`) resident *per run*. With many such sorters live at once
+    /// (`par_partitions` × the sorters each worker holds) that `#runs × RUN_BLOCK_BYTES`
+    /// merge footprint is what dominates peak RSS. Inline spilling keeps a single
+    /// budget-sized buffer resident and forms the fewest possible runs, so N concurrent
+    /// inline sorters stay within ≈ N × budget instead of blowing past it.
+    pub fn new_inline(temp_dir: &Path, budget_bytes: usize, zstd_level: i32) -> Result<Self> {
+        Self::with_inflight(temp_dir, budget_bytes, zstd_level, 1)
+    }
+
+    fn with_inflight(
+        temp_dir: &Path,
+        budget_bytes: usize,
+        zstd_level: i32,
+        max_inflight: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(temp_dir)
             .with_context(|| format!("create extsort temp dir {}", temp_dir.display()))?;
-        let max_inflight = spill_threads();
+        let max_inflight = max_inflight.max(1);
         let budget = budget_bytes.max(1);
-        // Split the budget across (in-flight + the one being filled). With inline
-        // spilling (max_inflight == 1) this is budget/2; round up and never zero.
-        let buf_threshold = (budget / (max_inflight + 1)).max(1);
+        // Size the run-formation buffer. Inline spilling (max_inflight == 1) is
+        // synchronous, so only one buffer is ever resident — it can use the whole
+        // budget, which minimises the run count (and thus the merge's resident memory).
+        // Parallel spilling keeps up to `max_inflight` buffers being compressed plus the
+        // one being filled, so it splits the budget across all of them.
+        let buf_threshold = if max_inflight <= 1 {
+            budget
+        } else {
+            (budget / (max_inflight + 1)).max(1)
+        };
         Ok(Self {
             temp_dir: temp_dir.to_path_buf(),
             buf_threshold,
