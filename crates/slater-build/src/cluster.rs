@@ -164,8 +164,17 @@ where
         ))
     };
     {
+        // `mem_budget` above is the ceiling for the O(n) permutation maps, not a
+        // sort-buffer size — the adjacency `ExtSorter`'s parallel spill pool can hold
+        // close to the *entire* budget it's given resident at once (backpressure
+        // allows `spill_threads()` in-flight buffers of `budget/(spill_threads()+1)`
+        // each), so passing `mem_budget` through unscaled let this one sort alone
+        // approach the whole `--max-memory` ceiling, on top of the permutation maps
+        // that follow it. Same `/16` convention as every other phase's `sort_budget`
+        // in build_external.rs.
+        let adj_sort_budget = (params.mem_budget / 16).max(16 * 1024 * 1024);
         let mut sorter =
-            ExtSorter::<AdjPair>::new(&params.temp_dir, params.mem_budget, params.zstd_level)?;
+            ExtSorter::<AdjPair>::new(&params.temp_dir, adj_sort_budget, params.zstd_level)?;
         scan_edges(&mut |s, d| {
             if s != d {
                 sorter.push(AdjPair { node: s, nbr: d })?;
