@@ -29,58 +29,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use graph_format::blockcache::BlockCache as GfBlockCache;
+pub use graph_format::blockcache::{BlockRecord, CacheMetrics};
 use graph_format::blockfile::{record_range_in_block, BlockFileReader};
 use graph_format::ids::Generation as GenId;
 use graph_format::pq::ResidentPq;
 
 use crate::vector::ResidentMatrix;
-
-/// A record sliced out of a cached, decompressed block. Holds an `Arc` clone of the
-/// block so the borrowed bytes stay alive, plus the record's byte range within it.
-///
-/// This is the Stage-4 replacement for the old `record() -> Vec<u8>`: every node /
-/// edge / label / property / adjacency read used to `to_vec()`-copy its record off
-/// the cached block (and allocate a fresh offset table to find it). A `BlockRecord`
-/// copies nothing — it `Arc`-clones the block (one atomic increment) and remembers
-/// `start..end`. It `Deref`s to `&[u8]`, so the decoders that take a byte slice are
-/// unchanged at the call sites.
-#[derive(Clone)]
-pub struct BlockRecord {
-    block: Arc<Vec<u8>>,
-    start: usize,
-    end: usize,
-}
-
-impl BlockRecord {
-    /// The record bytes (borrowing the cached block).
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        &self.block[self.start..self.end]
-    }
-}
-
-impl std::ops::Deref for BlockRecord {
-    type Target = [u8];
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl AsRef<[u8]> for BlockRecord {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl std::fmt::Debug for BlockRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockRecord")
-            .field("len", &(self.end - self.start))
-            .finish()
-    }
-}
 
 /// Identifies which file within a generation a block belongs to. Encoded into a
 /// `u32` for the cache key; range indexes carry their MANIFEST position in the
@@ -112,178 +67,47 @@ impl FileKind {
     }
 }
 
-/// LRU key for one decompressed block.
-///
-/// `gen` is the generation UUID as a `u128`. Generation UUIDs are globally
-/// unique, so the UUID alone subsumes the `(graph, generation)` pair from the
-/// plan — two graphs can never share a generation id — and a generation swap
-/// changes the UUID, which orphans every stale entry for free.
+/// LRU key for one decompressed block — thin wrapper translating this crate's
+/// `(generation, FileKind)` into the generic cache's `(scope, sub)` key.
+/// Generation UUIDs are globally unique, so the UUID alone subsumes the
+/// `(graph, generation)` pair from the plan, and a generation swap changes the
+/// UUID, which orphans every stale entry for free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockKey {
-    pub gen: u128,
-    pub file: u32,
-    pub block: u32,
-}
+pub struct BlockKey(graph_format::blockcache::BlockKey);
 
 impl BlockKey {
     pub fn new(gen: GenId, file: FileKind, block: u32) -> Self {
-        Self {
-            gen: gen.0.as_u128(),
-            file: file.code(),
+        Self(graph_format::blockcache::BlockKey::new(
+            gen.0.as_u128(),
+            file.code(),
             block,
-        }
-    }
-}
-
-/// A point-in-time snapshot of the cache counters (for metrics/logging).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheMetrics {
-    pub hits: u64,
-    pub misses: u64,
-    pub evictions: u64,
-}
-
-struct Entry {
-    value: Arc<Vec<u8>>,
-    bytes: usize,
-    tick: u64,
-    /// Wall-clock instant of the most recent access; reset on every touch and
-    /// consulted by the idle-TTL sweep. Assigned together with `tick`, so the
-    /// `order` map (keyed by tick) is also sorted by `last_used`.
-    last_used: Instant,
-}
-
-struct Inner {
-    map: HashMap<BlockKey, Entry>,
-    /// `tick → key`, ascending — the front is the least-recently-used entry.
-    order: BTreeMap<u64, BlockKey>,
-    tick: u64,
-    bytes: usize,
-    budget: usize,
-}
-
-impl Inner {
-    fn next_tick(&mut self) -> u64 {
-        let t = self.tick;
-        self.tick += 1;
-        t
-    }
-
-    /// Look a key up and, on a hit, move it to most-recently-used.
-    fn touch_get(&mut self, key: &BlockKey) -> Option<Arc<Vec<u8>>> {
-        let (value, old_tick) = {
-            let e = self.map.get(key)?;
-            (e.value.clone(), e.tick)
-        };
-        self.order.remove(&old_tick);
-        let new_tick = self.next_tick();
-        self.order.insert(new_tick, *key);
-        let e = self.map.get_mut(key).unwrap();
-        e.tick = new_tick;
-        e.last_used = Instant::now();
-        Some(value)
-    }
-
-    /// Evict entries idle for at least `ttl`, walking the LRU order front-to-back
-    /// and stopping at the first still-live entry. Returns the count evicted.
-    /// Unlike budget eviction this has no keep-at-least-one floor — an entirely
-    /// idle cache is fully reclaimed.
-    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
-        let mut evicted = 0;
-        while let Some((&t, &key)) = self.order.iter().next() {
-            if now.saturating_duration_since(self.map[&key].last_used) <= ttl {
-                break;
-            }
-            self.order.remove(&t);
-            if let Some(e) = self.map.remove(&key) {
-                self.bytes -= e.bytes;
-            }
-            evicted += 1;
-        }
-        evicted
-    }
-
-    /// Insert `value` for `key` (or return the existing entry if a concurrent
-    /// load beat us to it), then evict LRU entries until within budget. Returns
-    /// the canonical `Arc` and the number of entries evicted.
-    fn insert(&mut self, key: BlockKey, value: Arc<Vec<u8>>) -> (Arc<Vec<u8>>, u64) {
-        if let Some(existing) = self.touch_get(&key) {
-            return (existing, 0);
-        }
-        let bytes = value.len();
-        let tick = self.next_tick();
-        self.order.insert(tick, key);
-        self.map.insert(
-            key,
-            Entry {
-                value: value.clone(),
-                bytes,
-                tick,
-                last_used: Instant::now(),
-            },
-        );
-        self.bytes += bytes;
-
-        // Evict from the LRU end. Keep at least one entry resident so a single
-        // block larger than the whole budget is still returnable.
-        let mut evicted = 0;
-        while self.bytes > self.budget && self.order.len() > 1 {
-            let (&lru_tick, &lru_key) = self.order.iter().next().unwrap();
-            self.order.remove(&lru_tick);
-            if let Some(e) = self.map.remove(&lru_key) {
-                self.bytes -= e.bytes;
-            }
-            evicted += 1;
-        }
-        (value, evicted)
+        ))
     }
 }
 
 /// Byte-budgeted LRU over decompressed blocks, safe to share across Bolt tasks.
+///
+/// Thin wrapper over [`graph_format::blockcache::BlockCache`] (shared with
+/// `slater-build`'s sequential-scan use).
 pub struct BlockCache {
-    inner: Mutex<Inner>,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    evictions: AtomicU64,
+    inner: GfBlockCache,
 }
 
 impl BlockCache {
     /// Create a cache with the given byte budget (clamped to at least 1).
     pub fn new(budget_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                map: HashMap::new(),
-                order: BTreeMap::new(),
-                tick: 0,
-                bytes: 0,
-                budget: budget_bytes.max(1),
-            }),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
+            inner: GfBlockCache::new(budget_bytes),
         }
     }
 
-    /// Fetch a block from the cache, loading it with `load` on a miss. The load
-    /// runs **outside** the lock so a slow `pread`+decompress never serialises
-    /// other readers; if two readers miss the same key at once they both load and
-    /// the second insert deduplicates to the first's `Arc`.
+    /// Fetch a block from the cache, loading it with `load` on a miss.
     pub fn get_or_try_insert(
         &self,
         key: BlockKey,
         load: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Arc<Vec<u8>>> {
-        if let Some(v) = self.inner.lock().unwrap().touch_get(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(v);
-        }
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        let value = Arc::new(load()?);
-        let (canonical, evicted) = self.inner.lock().unwrap().insert(key, value);
-        if evicted > 0 {
-            self.evictions.fetch_add(evicted, Ordering::Relaxed);
-        }
-        Ok(canonical)
+        self.inner.get_or_try_insert(key.0, load)
     }
 
     /// Read the `global`-th record of `reader` (the file identified by `file` in
@@ -296,49 +120,33 @@ impl BlockCache {
         file: FileKind,
         global: u64,
     ) -> Result<BlockRecord> {
-        let loc = reader.locate(global)?;
-        let key = BlockKey::new(gen, file, loc.block.0);
-        let raw = self.get_or_try_insert(key, || reader.read_block(loc.block))?;
-        let range = record_range_in_block(&raw[..], loc.slot)?;
-        Ok(BlockRecord {
-            block: raw,
-            start: range.start,
-            end: range.end,
-        })
+        self.inner
+            .record(reader, gen.0.as_u128(), file.code(), global)
     }
 
     /// Evict every block idle for at least `ttl` as of `now`, freeing its bytes.
-    /// Returns the number evicted; the count is folded into the `evictions`
-    /// counter. Called by the background cache-maintenance task.
+    /// Returns the number evicted. Called by the background cache-maintenance task.
     pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
-        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
-        if evicted > 0 {
-            self.evictions.fetch_add(evicted, Ordering::Relaxed);
-        }
-        evicted
+        self.inner.evict_expired(now, ttl)
     }
 
     /// Counter snapshot.
     pub fn metrics(&self) -> CacheMetrics {
-        CacheMetrics {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
-        }
+        self.inner.metrics()
     }
 
     /// Current number of cached blocks.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.inner.is_empty()
     }
 
     /// Current resident byte usage (sum of cached block sizes).
     pub fn bytes(&self) -> usize {
-        self.inner.lock().unwrap().bytes
+        self.inner.bytes()
     }
 }
 
@@ -574,6 +382,16 @@ impl VectorBlockKey {
             block,
         }
     }
+}
+
+struct Entry {
+    value: Arc<Vec<u8>>,
+    bytes: usize,
+    tick: u64,
+    /// Wall-clock instant of the most recent access; reset on every touch and
+    /// consulted by the idle-TTL sweep. Assigned together with `tick`, so the
+    /// `order` map (keyed by tick) is also sorted by `last_used`.
+    last_used: Instant,
 }
 
 struct VecInner {
@@ -857,11 +675,7 @@ impl VectorIndexCache {
         let key = VectorBlockKey::new(gen, ord, loc.block.0);
         let raw = self.get_or_try_insert(key, || reader.read_block(loc.block))?;
         let range = record_range_in_block(&raw[..], loc.slot)?;
-        Ok(BlockRecord {
-            block: raw,
-            start: range.start,
-            end: range.end,
-        })
+        Ok(BlockRecord::new(raw, range.start, range.end))
     }
 
     /// Evict every Vamana block idle for at least `ttl` as of `now`. Pinned PQ

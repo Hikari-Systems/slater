@@ -23,6 +23,7 @@ pub const FORMAT_VERSION: u32 = 3;
 /// "is this a Slater generation at all" check before any JSON parsing.
 pub const MAGIC: &[u8; 8] = b"SLATER01";
 
+pub mod blockcache;
 pub mod blockfile;
 pub mod codec;
 pub mod columns;
