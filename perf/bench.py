@@ -76,6 +76,22 @@ def query_suite():
         ("count DISTINCT type",
          "MATCH (c:Crime) RETURN count(DISTINCT c.type) AS c, $k AS k",
          lambda i, p: {"k": i}),
+        # Whole-graph label/reltype metadata introspection — must stay O(metadata)
+        # (answered from resident manifest counts, zero block reads), independent of
+        # graph size. These are the unanchored queries that OOM'd a full edge/node
+        # scan before the metadata fast paths; they are canonical regression guards.
+        ("reltype enumeration",
+         "MATCH ()-[r]->() RETURN DISTINCT type(r) AS t, $k AS k",
+         lambda i, p: {"k": i}),
+        ("reltype grouped count",
+         "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS n, $k AS k",
+         lambda i, p: {"k": i}),
+        ("label enumeration",
+         "MATCH (n) RETURN DISTINCT labels(n)[0] AS l, $k AS k",
+         lambda i, p: {"k": i}),
+        ("label grouped count",
+         "MATCH (n) RETURN labels(n)[0] AS l, count(*) AS n, $k AS k",
+         lambda i, p: {"k": i}),
     ]
 
 

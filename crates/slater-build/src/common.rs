@@ -92,6 +92,16 @@ pub struct PublishInputs<'a> {
     /// (`reltype_src.post` / `reltype_tgt.post`), index = reltype id.
     pub reltype_source_counts: Vec<u64>,
     pub reltype_target_counts: Vec<u64>,
+    /// Whole-graph metadata summaries tallied during emit (see the matching
+    /// [`Manifest`] fields). All index-aligned with `reltypes` / `labels`; the cube
+    /// marginals are sparse `(key…, count)` tuples sorted by key.
+    pub reltype_edge_counts: Vec<u64>,
+    pub reltype_self_loop_counts: Vec<u64>,
+    pub label_node_counts: Vec<u64>,
+    pub first_label_counts: Vec<u64>,
+    pub src_label_reltype_counts: Vec<(u32, u32, u64)>,
+    pub reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
+    pub schema_triple_counts: Vec<(u32, u32, u32, u64)>,
     /// Per-(label, property) value→count histogram descriptors (`prop_hist.blk`),
     /// aligned by position with that file's records. Produced by
     /// [`build_property_histograms`].
@@ -175,6 +185,13 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         vector_indexes: inp.vector_indexes,
         reltype_source_counts: inp.reltype_source_counts,
         reltype_target_counts: inp.reltype_target_counts,
+        reltype_edge_counts: inp.reltype_edge_counts,
+        reltype_self_loop_counts: inp.reltype_self_loop_counts,
+        label_node_counts: inp.label_node_counts,
+        first_label_counts: inp.first_label_counts,
+        src_label_reltype_counts: inp.src_label_reltype_counts,
+        reltype_tgt_label_counts: inp.reltype_tgt_label_counts,
+        schema_triple_counts: inp.schema_triple_counts,
         property_histograms: inp.property_histograms,
         acl_blake3: inp.acl_blake3,
         mac: None,

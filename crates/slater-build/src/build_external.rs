@@ -27,9 +27,9 @@ use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
-use graph_format::nodelabels::{encode_labels_record, NodeLabelsWriter};
+use graph_format::nodelabels::{encode_labels_record, NodeLabelsReader, NodeLabelsWriter};
 use graph_format::postings::write_endpoint_postings_from_sorted;
-use graph_format::topology::{Adj, CsrHalfWriter};
+use graph_format::topology::{Adj, CsrHalfWriter, TopologyReader};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
 use crate::buckets::{self, read_blob, write_blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge};
@@ -1799,6 +1799,21 @@ fn build_inner(
     let range_sorters = range_mx.into_inner().unwrap();
     drop(emit_topo_g);
 
+    // Whole-graph metadata summaries — one post-emit pass over the finished
+    // topology + node labels, persisted so `open` need not rescan and the
+    // label/reltype fast paths answer from resident metadata.
+    let emit_summary_g = diag.phase("emit.graph_summaries");
+    diag.set_op("tally label/reltype summaries", "nodes", node_count);
+    let summaries = compute_graph_summaries(
+        &tmp_dir.join("topology.csr.blk"),
+        &tmp_dir.join("node_labels.blk"),
+        node_count,
+        reltypes.names().len(),
+        labels.names().len(),
+        cipher.clone(),
+    )?;
+    drop(emit_summary_g);
+
     // --- vectors.f32.blk + any Vamana/PQ files (via the shared writer) ---
     let emit_vec_g = diag.phase("emit.vectors");
     diag.set_op(
@@ -1876,6 +1891,13 @@ fn build_inner(
         vector_indexes,
         reltype_source_counts,
         reltype_target_counts,
+        reltype_edge_counts: summaries.reltype_edge_counts,
+        reltype_self_loop_counts: summaries.reltype_self_loop_counts,
+        label_node_counts: summaries.label_node_counts,
+        first_label_counts: summaries.first_label_counts,
+        src_label_reltype_counts: summaries.src_label_reltype_counts,
+        reltype_tgt_label_counts: summaries.reltype_tgt_label_counts,
+        schema_triple_counts: summaries.schema_triple_counts,
         property_histograms,
         encryption_header,
         encryption_key: &opts.encryption_key,
@@ -2396,6 +2418,99 @@ fn emit_reverse_band(
     csr.finish()?;
     diag.progress_add(i);
     Ok(())
+}
+
+/// Whole-graph metadata summaries tallied in a post-emit pass over the finished
+/// topology + node labels. Persisted in the manifest so `open` need not rescan and
+/// the whole-graph label/reltype fast paths answer from resident metadata. Vectors
+/// are index-aligned with `reltypes` / `labels`; marginals are sparse `(key…, count)`
+/// tuples sorted by key for deterministic emit.
+struct GraphSummaries {
+    reltype_edge_counts: Vec<u64>,
+    reltype_self_loop_counts: Vec<u64>,
+    label_node_counts: Vec<u64>,
+    first_label_counts: Vec<u64>,
+    src_label_reltype_counts: Vec<(u32, u32, u64)>,
+    reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
+    schema_triple_counts: Vec<(u32, u32, u32, u64)>,
+}
+
+/// Compute [`GraphSummaries`] in two node-id-ordered passes over the finished stores
+/// (no resident node→label map — labels are read one node at a time). The forward
+/// pass treats the current node as the **source** of each of its outgoing edges,
+/// giving the per-reltype edge count, the self-loop count, the `(src_label, reltype)`
+/// marginal, and the per-label first/occurrence tallies; the reverse pass treats it
+/// as the **target** of each incoming edge, giving the `(reltype, tgt_label)`
+/// marginal. Each pass streams one half of the CSR sequentially.
+///
+/// The full `(src, reltype, tgt)` triple needs both endpoints' labels joined to a
+/// single edge, so it is left empty here (its fast path declines and scans) — it can
+/// be added by carrying source labels through the reverse routing.
+fn compute_graph_summaries(
+    topo_path: &Path,
+    labels_path: &Path,
+    node_count: u64,
+    n_reltypes: usize,
+    n_labels: usize,
+    cipher: Option<Arc<BlockCipher>>,
+) -> Result<GraphSummaries> {
+    use std::collections::HashMap;
+    let topo = TopologyReader::open_with_cipher(topo_path, cipher.clone())?;
+    let labels = NodeLabelsReader::open_with_cipher(labels_path, cipher)?;
+
+    let mut reltype_edge = vec![0u64; n_reltypes];
+    let mut reltype_self = vec![0u64; n_reltypes];
+    let mut label_node = vec![0u64; n_labels];
+    let mut first_label = vec![0u64; n_labels];
+    let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
+
+    // Forward pass: node id is the source of each outgoing edge.
+    for id in 0..node_count {
+        let labs = labels.labels(id)?;
+        if let Some(&f) = labs.first() {
+            first_label[f as usize] += 1;
+        }
+        for &l in &labs {
+            label_node[l as usize] += 1;
+        }
+        for adj in topo.outgoing(NodeId(id))? {
+            let t = adj.reltype;
+            reltype_edge[t as usize] += 1;
+            if adj.neighbour.0 == id {
+                reltype_self[t as usize] += 1;
+            }
+            for &a in &labs {
+                *src_marg.entry((a, t)).or_insert(0) += 1;
+            }
+        }
+    }
+    // Reverse pass: node id is the target of each incoming edge.
+    for id in 0..node_count {
+        let labs = labels.labels(id)?;
+        for adj in topo.incoming(NodeId(id))? {
+            for &b in &labs {
+                *tgt_marg.entry((adj.reltype, b)).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut src_label_reltype_counts: Vec<(u32, u32, u64)> =
+        src_marg.into_iter().map(|((a, t), c)| (a, t, c)).collect();
+    src_label_reltype_counts.sort_unstable();
+    let mut reltype_tgt_label_counts: Vec<(u32, u32, u64)> =
+        tgt_marg.into_iter().map(|((t, b), c)| (t, b, c)).collect();
+    reltype_tgt_label_counts.sort_unstable();
+
+    Ok(GraphSummaries {
+        reltype_edge_counts: reltype_edge,
+        reltype_self_loop_counts: reltype_self,
+        label_node_counts: label_node,
+        first_label_counts: first_label,
+        src_label_reltype_counts,
+        reltype_tgt_label_counts,
+        schema_triple_counts: Vec::new(),
+    })
 }
 
 #[cfg(test)]

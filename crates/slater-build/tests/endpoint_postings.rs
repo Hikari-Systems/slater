@@ -144,3 +144,100 @@ fn endpoint_postings_match_topology() {
     assert_eq!(src["LOOPS"], 1); // self-loop: node 101 is both source and target
     assert_eq!(tgt["LOOPS"], 1);
 }
+
+/// Ground-truth whole-graph metadata summaries derived straight from the CSR +
+/// node labels — the same read model the query engine uses, computed independently
+/// of what the builder wrote.
+#[allow(clippy::type_complexity)]
+fn summaries_from_stores(
+    gen_dir: &Path,
+    n_labels: usize,
+    n_reltypes: usize,
+) -> (
+    Vec<u64>,
+    Vec<u64>,
+    Vec<u64>,
+    Vec<u64>,
+    Vec<(u32, u32, u64)>,
+    Vec<(u32, u32, u64)>,
+) {
+    use std::collections::HashMap;
+    let topo = TopologyReader::open(gen_dir.join("topology.csr.blk")).unwrap();
+    let labels =
+        graph_format::nodelabels::NodeLabelsReader::open(gen_dir.join("node_labels.blk")).unwrap();
+    let mut re = vec![0u64; n_reltypes];
+    let mut rs = vec![0u64; n_reltypes];
+    let mut ln = vec![0u64; n_labels];
+    let mut fl = vec![0u64; n_labels];
+    let mut sm: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut tm: HashMap<(u32, u32), u64> = HashMap::new();
+    for id in 0..topo.node_count() {
+        let labs = labels.labels(id).unwrap();
+        if let Some(&f) = labs.first() {
+            fl[f as usize] += 1;
+        }
+        for &l in &labs {
+            ln[l as usize] += 1;
+        }
+        for a in topo.outgoing(graph_format::ids::NodeId(id)).unwrap() {
+            re[a.reltype as usize] += 1;
+            if a.neighbour.0 == id {
+                rs[a.reltype as usize] += 1;
+            }
+            for &x in &labs {
+                *sm.entry((x, a.reltype)).or_insert(0) += 1;
+            }
+        }
+        for a in topo.incoming(graph_format::ids::NodeId(id)).unwrap() {
+            for &y in &labs {
+                *tm.entry((a.reltype, y)).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut smv: Vec<(u32, u32, u64)> = sm.into_iter().map(|((a, t), c)| (a, t, c)).collect();
+    smv.sort_unstable();
+    let mut tmv: Vec<(u32, u32, u64)> = tm.into_iter().map(|((t, b), c)| (t, b, c)).collect();
+    tmv.sort_unstable();
+    (re, rs, ln, fl, smv, tmv)
+}
+
+#[test]
+fn metadata_summaries_match_topology_and_sum_invariants() {
+    let gen_dir = build("summaries");
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+
+    // The builder's persisted summaries equal a fresh scan of the same graph.
+    let (re, rs, ln, fl, sm, tm) =
+        summaries_from_stores(&gen_dir, m.labels.len(), m.reltypes.len());
+    assert_eq!(m.reltype_edge_counts, re, "reltype_edge_counts");
+    assert_eq!(m.reltype_self_loop_counts, rs, "reltype_self_loop_counts");
+    assert_eq!(m.label_node_counts, ln, "label_node_counts");
+    assert_eq!(m.first_label_counts, fl, "first_label_counts");
+    assert_eq!(m.src_label_reltype_counts, sm, "src_label_reltype_counts");
+    assert_eq!(m.reltype_tgt_label_counts, tm, "reltype_tgt_label_counts");
+
+    // Sum invariants.
+    assert_eq!(
+        m.reltype_edge_counts.iter().sum::<u64>(),
+        m.edge_count,
+        "Σ reltype_edge_counts == edge_count"
+    );
+    assert!(
+        m.first_label_counts.iter().sum::<u64>() <= m.node_count,
+        "Σ first_label_counts ≤ node_count (remainder = zero-label nodes)"
+    );
+
+    // Named spot-checks (independent of intern order): DRAWS×3, LIKES×1, LOOPS×1,
+    // and LOOPS is the only self-loop.
+    let by_name = |v: &[u64]| -> std::collections::BTreeMap<String, u64> {
+        m.reltypes.iter().cloned().zip(v.iter().copied()).collect()
+    };
+    let edges = by_name(&m.reltype_edge_counts);
+    assert_eq!(edges["DRAWS"], 3);
+    assert_eq!(edges["LIKES"], 1);
+    assert_eq!(edges["LOOPS"], 1);
+    let self_loops = by_name(&m.reltype_self_loop_counts);
+    assert_eq!(self_loops["LOOPS"], 1);
+    assert_eq!(self_loops["DRAWS"], 0);
+}

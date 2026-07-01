@@ -42,9 +42,9 @@ use graph_format::manifest::{
     AnnMode, EntityKind, FileEntry, Manifest, Metric, PropertyHistogramDesc, RangeIndexDesc,
     VectorIndexDesc,
 };
-use graph_format::nodelabels::NodeLabelsWriter;
+use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
-use graph_format::topology::{write_csr, Edge};
+use graph_format::topology::{write_csr, Edge, TopologyReader};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::{FORMAT_VERSION, MAGIC};
@@ -318,6 +318,13 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
         }],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms,
         acl_blake3: None,
         mac: None,
@@ -332,6 +339,242 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     .unwrap();
 
     (root, graph, uuid)
+}
+
+/// A richer fixture for the whole-graph label/reltype metadata fast paths. It has
+/// several labels and reltypes, a **multi-label** node (Bob `:Person:Admin`), a
+/// node with **no label** (node 4, → the `labels(n)[0]` null bucket), and a
+/// **self-loop** (Acme `OWNS` Acme):
+/// ```text
+/// [0] Alice  :Person
+/// [1] Bob    :Person:Admin        (first label Person)
+/// [2] Carol  :Admin
+/// [3] Acme   :Company
+/// [4] Ghost  (no labels)
+/// e0 (0)-[:KNOWS]->(1)
+/// e1 (1)-[:KNOWS]->(2)
+/// e2 (0)-[:WORKS_AT]->(3)
+/// e3 (3)-[:OWNS]->(3)             ← self-loop
+/// e4 (1)-[:WORKS_AT]->(3)
+/// ```
+/// Symbol tables: labels Person(0)/Company(1)/Admin(2); reltypes
+/// KNOWS(0)/WORKS_AT(1)/OWNS(2). Only the stores the metadata queries need are
+/// written; the summary vectors are computed from the written stores (via
+/// [`fixture_summaries`]) so the manifest matches the graph exactly. The
+/// `schema_triple_counts` cube is left empty (matching the current builder), so the
+/// both-endpoints-labelled fast path declines and falls back to the matcher.
+pub fn write_meta(tag: &str) -> (PathBuf, String, uuid::Uuid) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_00a0);
+    let graph = "meta".to_string();
+    let root = std::env::temp_dir().join(format!("slater_fixture_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for name in ["Alice", "Bob", "Carol", "Acme", "Ghost"] {
+        np.append(&[(0, Value::Str(name.into()))]).unwrap();
+    }
+    np.finish().unwrap();
+
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    nl.append(&[0]).unwrap(); // Alice :Person
+    nl.append(&[0, 2]).unwrap(); // Bob :Person:Admin (first label Person)
+    nl.append(&[2]).unwrap(); // Carol :Admin
+    nl.append(&[1]).unwrap(); // Acme :Company
+    nl.append(&[]).unwrap(); // Ghost (no labels)
+    nl.finish().unwrap();
+
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..5 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    let edges = vec![
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(1),
+            reltype: 0,
+            edge: EdgeId(0),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(2),
+            reltype: 0,
+            edge: EdgeId(1),
+        },
+        Edge {
+            src: NodeId(0),
+            dst: NodeId(3),
+            reltype: 1,
+            edge: EdgeId(2),
+        },
+        Edge {
+            src: NodeId(3),
+            dst: NodeId(3),
+            reltype: 2,
+            edge: EdgeId(3),
+        },
+        Edge {
+            src: NodeId(1),
+            dst: NodeId(3),
+            reltype: 1,
+            edge: EdgeId(4),
+        },
+    ];
+    write_csr(dir.join("topology.csr.blk"), 5, &edges, BLOCK, LEVEL).unwrap();
+
+    // Empty-but-present vector store (`open` opens `vectors.f32.blk` unconditionally).
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let s = fixture_summaries(&dir, 3, 3);
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: 5,
+        edge_count: 5,
+        labels: vec!["Person".into(), "Company".into(), "Admin".into()],
+        reltypes: vec!["KNOWS".into(), "WORKS_AT".into(), "OWNS".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
+        reltype_edge_counts: s.reltype_edge_counts,
+        reltype_self_loop_counts: s.reltype_self_loop_counts,
+        label_node_counts: s.label_node_counts,
+        first_label_counts: s.first_label_counts,
+        src_label_reltype_counts: s.src_label_reltype_counts,
+        reltype_tgt_label_counts: s.reltype_tgt_label_counts,
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph, uuid)
+}
+
+/// The metadata summary vectors, computed from a fixture's written stores the same
+/// way the builder does (so the fixture manifest matches its graph exactly).
+pub struct FixtureSummaries {
+    pub reltype_edge_counts: Vec<u64>,
+    pub reltype_self_loop_counts: Vec<u64>,
+    pub label_node_counts: Vec<u64>,
+    pub first_label_counts: Vec<u64>,
+    pub src_label_reltype_counts: Vec<(u32, u32, u64)>,
+    pub reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
+}
+
+/// Compute [`FixtureSummaries`] by scanning the just-written `topology.csr.blk` and
+/// `node_labels.blk` (forward pass for source-side tallies, reverse pass for the
+/// target-side marginal) — an independent re-derivation of what the builder writes.
+pub fn fixture_summaries(
+    dir: &std::path::Path,
+    n_labels: usize,
+    n_reltypes: usize,
+) -> FixtureSummaries {
+    use std::collections::HashMap;
+    let topo = TopologyReader::open(dir.join("topology.csr.blk")).unwrap();
+    let labels = NodeLabelsReader::open(dir.join("node_labels.blk")).unwrap();
+    let node_count = topo.node_count();
+
+    let mut reltype_edge = vec![0u64; n_reltypes];
+    let mut reltype_self = vec![0u64; n_reltypes];
+    let mut label_node = vec![0u64; n_labels];
+    let mut first_label = vec![0u64; n_labels];
+    let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
+
+    for id in 0..node_count {
+        let labs = labels.labels(id).unwrap();
+        if let Some(&f) = labs.first() {
+            first_label[f as usize] += 1;
+        }
+        for &l in &labs {
+            label_node[l as usize] += 1;
+        }
+        for adj in topo.outgoing(NodeId(id)).unwrap() {
+            reltype_edge[adj.reltype as usize] += 1;
+            if adj.neighbour.0 == id {
+                reltype_self[adj.reltype as usize] += 1;
+            }
+            for &a in &labs {
+                *src_marg.entry((a, adj.reltype)).or_insert(0) += 1;
+            }
+        }
+        for adj in topo.incoming(NodeId(id)).unwrap() {
+            for &b in &labs {
+                *tgt_marg.entry((adj.reltype, b)).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut src_label_reltype_counts: Vec<(u32, u32, u64)> =
+        src_marg.into_iter().map(|((a, t), c)| (a, t, c)).collect();
+    src_label_reltype_counts.sort_unstable();
+    let mut reltype_tgt_label_counts: Vec<(u32, u32, u64)> =
+        tgt_marg.into_iter().map(|((t, b), c)| (t, b, c)).collect();
+    reltype_tgt_label_counts.sort_unstable();
+
+    FixtureSummaries {
+        reltype_edge_counts: reltype_edge,
+        reltype_self_loop_counts: reltype_self,
+        label_node_counts: label_node,
+        first_label_counts: first_label,
+        src_label_reltype_counts,
+        reltype_tgt_label_counts,
+    }
 }
 
 /// A tiny **cyclic** fixture for the GQL path-restrictor tests (PR 2). Three
@@ -465,6 +708,13 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -625,6 +875,13 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts,
         reltype_target_counts,
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -783,6 +1040,13 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -900,6 +1164,13 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -1044,6 +1315,13 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
         vector_indexes: vec![],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -1234,6 +1512,13 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
         }],
         reltype_source_counts: vec![],
         reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,

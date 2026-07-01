@@ -2353,10 +2353,26 @@ async fn run_query(
             Ok(out)
         }
         Ok(Err(e)) => {
+            // A failed query emits no `query executed` summary (that only fires on
+            // success), so without this line a budget trip / timeout is invisible in
+            // the logs. Log at warn with the graph, reason and (truncated) query so
+            // the next such failure is diagnosable.
+            warn!(
+                graph = %graph_name,
+                error = %format!("{e:#}"),
+                query = %log_query(query),
+                "query failed"
+            );
             ctx.diag.on_query_err(&e);
             Err(Failure::from_query_error(&e))
         }
         Err(e) => {
+            warn!(
+                graph = %graph_name,
+                error = %e,
+                query = %log_query(query),
+                "query task failed"
+            );
             ctx.diag.on_query_task_failed();
             Err(Failure::new(
                 CODE_EXECUTION,
@@ -4103,6 +4119,77 @@ mod tests {
 
         let (tag, _) = c.recv().await;
         assert_eq!(tag, message::tag::SUCCESS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn whole_graph_reltype_metadata_over_bolt() {
+        // The unanchored introspection queries that broke the incident, answered
+        // over the wire from resident metadata. Fixture: KNOWS×3, WORKS_AT×2.
+        let (root, ctx) = build_ctx("server_reltype_meta");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        c.recv().await;
+        c.send(Client::logon("reporting", "pw")).await;
+        c.recv().await;
+
+        // A1 — DISTINCT type(r): one column `t`, one record per reltype.
+        c.send(Client::run("MATCH ()-[r]->() RETURN DISTINCT type(r) AS t"))
+            .await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(
+            fields[0].get("fields"),
+            Some(&PsValue::List(vec![PsValue::str("t")]))
+        );
+        c.send(Client::pull_all()).await;
+        let mut types = Vec::new();
+        loop {
+            let (tag, fields) = c.recv().await;
+            if tag == message::tag::RECORD {
+                let PsValue::List(vals) = &fields[0] else {
+                    panic!("expected a record list, got {:?}", fields[0]);
+                };
+                types.push(vals[0].as_str().unwrap().to_string());
+            } else {
+                assert_eq!(tag, message::tag::SUCCESS);
+                break;
+            }
+        }
+        types.sort();
+        assert_eq!(types, vec!["KNOWS".to_string(), "WORKS_AT".to_string()]);
+
+        // B1 — type(r), count(*): two columns, per-reltype edge counts.
+        c.send(Client::run(
+            "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c",
+        ))
+        .await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(
+            fields[0].get("fields"),
+            Some(&PsValue::List(vec![PsValue::str("t"), PsValue::str("c")]))
+        );
+        c.send(Client::pull_all()).await;
+        let mut counts = std::collections::HashMap::new();
+        loop {
+            let (tag, fields) = c.recv().await;
+            if tag == message::tag::RECORD {
+                let PsValue::List(vals) = &fields[0] else {
+                    panic!("expected a record list, got {:?}", fields[0]);
+                };
+                counts.insert(
+                    vals[0].as_str().unwrap().to_string(),
+                    vals[1].as_int().unwrap(),
+                );
+            } else {
+                assert_eq!(tag, message::tag::SUCCESS);
+                break;
+            }
+        }
+        assert_eq!(counts.get("KNOWS"), Some(&3));
+        assert_eq!(counts.get("WORKS_AT"), Some(&2));
         let _ = std::fs::remove_dir_all(&root);
     }
 

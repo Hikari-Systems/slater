@@ -1675,6 +1675,17 @@ impl<'g> Engine<'g> {
         if let Some(res) = self.try_count_walk_fast_path(sq)? {
             return Ok(res);
         }
+        // Stage M: a whole-graph label/reltype *metadata* enumeration or grouped
+        // count — `MATCH ()-[r]->() RETURN [DISTINCT] type(r) [, count(*)]` and
+        // `MATCH (n) RETURN [DISTINCT] labels(n)[0] [, count(*)]` (plus the labelled
+        // schema-marginal variants) — answered from resident metadata with zero
+        // block reads, instead of materialising every edge/node binding.
+        if let Some(res) = self.try_reltype_meta_fast_path(sq)? {
+            return Ok(res);
+        }
+        if let Some(res) = self.try_label_meta_fast_path(sq)? {
+            return Ok(res);
+        }
         self.run_single_seeded(sq, Table::singleton())
     }
 
@@ -1800,6 +1811,259 @@ impl<'g> Engine<'g> {
             }
         }
         Ok(Some((columns, row)))
+    }
+
+    /// Recognise a whole-graph relationship-type metadata query and answer it from
+    /// resident metadata (the per-reltype edge counts / edge-schema marginals),
+    /// touching no blocks. Handles the enumeration `MATCH ()-[r]->() RETURN DISTINCT
+    /// type(r)` and the grouped count `RETURN type(r), count(*)`, plus the
+    /// source/target-labelled marginals `(:A)-[r]->()` / `()-[r]->(:B)` (in either
+    /// arrow direction) when the generation carries the schema marginals.
+    ///
+    /// Declines (→ `None`, the matcher runs) on anything that makes it more than a
+    /// whole-graph metadata question: a WHERE, a rel-type filter or rel property, an
+    /// endpoint property or boolean/multi-label expr, both endpoints labelled (the
+    /// full cube — currently unbuilt), an undirected relationship (the `2·edge −
+    /// self_loop` semantics are deferred to a parity-checked follow-up), any extra
+    /// non-constant projection, additional pattern segments, or ORDER BY/SKIP/LIMIT.
+    fn try_reltype_meta_fast_path(&self, sq: &SingleQuery) -> Result<Option<QueryResult>> {
+        // ---- pattern shape ----
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        if m.optional || m.where_.is_some() || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pat = &m.patterns[0];
+        if pat.segments.is_some() || pat.selector.is_some() || pat.restrictor.is_some() {
+            return Ok(None);
+        }
+        if pat.rels.len() != 1 {
+            return Ok(None); // exactly one relationship (a whole-graph edge scan)
+        }
+        let (rel, right) = &pat.rels[0];
+        let left = &pat.start;
+        // The relationship must be an unfiltered single hop, bound to a variable so
+        // `type(r)` can reference it.
+        if rel.type_expr.is_some() || !rel.props.is_empty() || rel.var_length.is_some() {
+            return Ok(None);
+        }
+        let Some(relvar) = rel.var.as_deref() else {
+            return Ok(None);
+        };
+        // Endpoints carry no properties; direction picks which endpoint is the
+        // source and which the target (undirected is declined above via the match).
+        if !left.props.is_empty() || !right.props.is_empty() {
+            return Ok(None);
+        }
+        let (src_node, tgt_node) = match rel.dir {
+            Direction::Outgoing => (left, right),
+            Direction::Incoming => (right, left),
+            Direction::Undirected => return Ok(None),
+        };
+        // Each endpoint is bare (no constraint) or a single positive label atom.
+        let atom = |n: &NodePat| -> Result<Option<Option<String>>> {
+            match &n.label_expr {
+                None => Ok(Some(None)),
+                Some(e) => match e.as_single_atom() {
+                    Some(l) => Ok(Some(Some(l.clone()))),
+                    None => Ok(None), // boolean / multi-label ⇒ decline
+                },
+            }
+        };
+        let (Some(src_label), Some(tgt_label)) = (atom(src_node)?, atom(tgt_node)?) else {
+            return Ok(None);
+        };
+
+        // ---- projection shape ----
+        let Some((key_idx, count_idx)) =
+            self.classify_meta_projection(sq, |e| is_type_of(e, Some(relvar)), relvar)
+        else {
+            return Ok(None);
+        };
+
+        // ---- resolve the metadata source and compute per-reltype counts ----
+        // `None` ⇒ bare endpoint; `Some(id)` ⇒ labelled (id resolved, or absent).
+        let src = src_label.map(|n| self.gen.label_id(&n));
+        let tgt = tgt_label.map(|n| self.gen.label_id(&n));
+        let count_for = |t: u32| -> Option<u64> {
+            // `None` ⇒ decline (the required marginal is unavailable in this
+            // generation); `Some(c)` is the edge count for reltype `t`.
+            Some(match (src, tgt) {
+                (None, None) => self.gen.reltype_edge_count(t),
+                // A labelled endpoint whose label is absent from the graph matches
+                // no edges.
+                (Some(None), _) | (_, Some(None)) => 0,
+                (Some(Some(a)), None) => self.gen.src_label_reltype_count(a, t)?,
+                (None, Some(Some(b))) => self.gen.reltype_tgt_label_count(t, b)?,
+                (Some(Some(a)), Some(Some(b))) => self.gen.schema_triple_count(a, t, b)?,
+            })
+        };
+
+        let n = self.gen.manifest().reltypes.len();
+        let mut groups: Vec<(Val, u64)> = Vec::new();
+        for t in 0..n as u32 {
+            let Some(c) = count_for(t) else {
+                return Ok(None); // marginal not present in this generation
+            };
+            if c > 0 {
+                let name = self.gen.reltype_name(t).unwrap_or("").to_string();
+                groups.push((Val::Str(name), c));
+            }
+        }
+        Ok(Some(
+            self.build_meta_result(sq, key_idx, count_idx, groups)?,
+        ))
+    }
+
+    /// Recognise a whole-graph `labels(n)[0]` metadata query and answer it from the
+    /// resident first-label counts, touching no blocks. Handles `MATCH (n) RETURN
+    /// DISTINCT labels(n)[0]` and `RETURN labels(n)[0], count(*)`. Requires the
+    /// generation's `first_label_counts` (so first-label semantics are reproduced
+    /// exactly, even with multi-label nodes); the null bucket (zero-label nodes) is
+    /// `node_count − Σ first_label_counts`. Declines on any node label/property
+    /// constraint, a WHERE, a non-`[0]` index, extra non-constant projection,
+    /// `count(DISTINCT …)`, or ORDER BY/SKIP/LIMIT.
+    fn try_label_meta_fast_path(&self, sq: &SingleQuery) -> Result<Option<QueryResult>> {
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        if m.optional || m.where_.is_some() || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pat = &m.patterns[0];
+        if !pat.rels.is_empty() || pat.segments.is_some() {
+            return Ok(None); // single-node pattern only
+        }
+        let node = &pat.start;
+        if node.label_expr.is_some() || !node.props.is_empty() {
+            return Ok(None); // whole-graph: no endpoint constraint
+        }
+        let Some(nodevar) = node.var.as_deref() else {
+            return Ok(None);
+        };
+        // Requires exact first-label counts — otherwise first-label semantics can't
+        // be reproduced from per-label occurrence counts under multi-label nodes.
+        if !self.gen.has_first_label_counts() {
+            return Ok(None);
+        }
+
+        let Some((key_idx, count_idx)) =
+            self.classify_meta_projection(sq, |e| is_first_label_of(e, Some(nodevar)), nodevar)
+        else {
+            return Ok(None);
+        };
+
+        let n = self.gen.manifest().labels.len();
+        let mut groups: Vec<(Val, u64)> = Vec::new();
+        for lid in 0..n as u32 {
+            let c = self.gen.first_label_count(lid);
+            if c > 0 {
+                let name = self.gen.label_name(lid).unwrap_or("").to_string();
+                groups.push((Val::Str(name), c));
+            }
+        }
+        // Zero-label nodes project `labels(n)[0] == null`.
+        let null_count = self
+            .gen
+            .node_count()
+            .saturating_sub(self.gen.first_labelled_node_count());
+        if null_count > 0 {
+            groups.push((Val::Null, null_count));
+        }
+        Ok(Some(
+            self.build_meta_result(sq, key_idx, count_idx, groups)?,
+        ))
+    }
+
+    /// Shared projection guard for the metadata fast paths. Returns
+    /// `Some((key_idx, count_idx))` when the RETURN is exactly one group key (matched
+    /// by `is_key`) plus, for a grouped count, one `count(*)`/`count(var)` and any
+    /// number of constant items — and the DISTINCT flag is consistent with that
+    /// shape (enumeration must be DISTINCT; a grouped count must not be). `None`
+    /// otherwise (the caller then declines).
+    fn classify_meta_projection(
+        &self,
+        sq: &SingleQuery,
+        is_key: impl Fn(&Expr) -> bool,
+        countvar: &str,
+    ) -> Option<(usize, Option<usize>)> {
+        let body = &sq.ret.body;
+        if body.star
+            || body.items.is_empty()
+            || !body.order_by.is_empty()
+            || body.skip.is_some()
+            || body.limit.is_some()
+        {
+            return None;
+        }
+        let mut key_idx = None;
+        let mut count_idx = None;
+        for (i, it) in body.items.iter().enumerate() {
+            if is_key(&it.expr) {
+                if key_idx.is_some() {
+                    return None;
+                }
+                key_idx = Some(i);
+            } else if is_count_of(&it.expr, Some(countvar)) {
+                if count_idx.is_some() {
+                    return None;
+                }
+                count_idx = Some(i);
+            } else if matches!(it.expr, Expr::Param(_) | Expr::Literal(_)) {
+                // a constant grouping-neutral column (one group) — allowed
+            } else {
+                return None;
+            }
+        }
+        let key_idx = key_idx?;
+        // Enumeration (no count) must be DISTINCT, else it is a per-edge/-node
+        // projection, not a metadata question. A grouped count must not be DISTINCT.
+        match count_idx {
+            None if !sq.ret.distinct => return None,
+            Some(_) if sq.ret.distinct => return None,
+            _ => {}
+        }
+        Some((key_idx, count_idx))
+    }
+
+    /// Assemble the single-column-per-projection-item result of a metadata fast path
+    /// from the computed `(key_value, count)` groups, honouring the original item
+    /// order (group key, optional count aggregate, and any constant items).
+    fn build_meta_result(
+        &self,
+        sq: &SingleQuery,
+        key_idx: usize,
+        count_idx: Option<usize>,
+        groups: Vec<(Val, u64)>,
+    ) -> Result<QueryResult> {
+        let items = &sq.ret.body.items;
+        let columns: Vec<String> = items
+            .iter()
+            .map(|it| it.alias.clone().unwrap_or_else(|| expr_name(&it.expr)))
+            .collect();
+        let empty: HashMap<String, Val> = HashMap::new();
+        let mut rows = Vec::with_capacity(groups.len());
+        for (key, count) in groups {
+            let mut row = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                if i == key_idx {
+                    row.push(key.clone());
+                } else if Some(i) == count_idx {
+                    row.push(Val::Int(count as i64));
+                } else {
+                    row.push(self.eval(&it.expr, &Scope::Map(&empty), None)?);
+                }
+            }
+            rows.push(row);
+        }
+        Ok(QueryResult { columns, rows })
     }
 
     /// Recognise a bare `RETURN count(*) | count(v)` over a single non-OPTIONAL
@@ -7999,6 +8263,32 @@ fn is_count_of(e: &Expr, var: Option<&str>) -> bool {
     }
 }
 
+/// Is `e` a non-DISTINCT `type(<relvar>)` — the reltype group key of the
+/// relationship-metadata fast path?
+fn is_type_of(e: &Expr, relvar: Option<&str>) -> bool {
+    matches!(e,
+        Expr::Function { name, distinct: false, args: FuncArgs::Args(a) }
+            if name.eq_ignore_ascii_case("type")
+                && a.len() == 1
+                && matches!(&a[0], Expr::Var(v) if Some(v.as_str()) == relvar))
+}
+
+/// Is `e` exactly `labels(<nodevar>)[0]` — the first-label group key of the
+/// label-metadata fast path? Only a literal `0` index qualifies.
+fn is_first_label_of(e: &Expr, nodevar: Option<&str>) -> bool {
+    let Expr::Index(base, idx) = e else {
+        return false;
+    };
+    if !matches!(idx.as_ref(), Expr::Literal(Value::Int(0))) {
+        return false;
+    }
+    matches!(base.as_ref(),
+        Expr::Function { name, distinct: false, args: FuncArgs::Args(a) }
+            if name.eq_ignore_ascii_case("labels")
+                && a.len() == 1
+                && matches!(&a[0], Expr::Var(v) if Some(v.as_str()) == nodevar))
+}
+
 /// Is `e` a non-DISTINCT `count(*)`, or `count(v)` where `v` is any of `bound`
 /// (the variables a non-OPTIONAL MATCH binds, so `v` is never null and the count
 /// equals `count(*)`)? Used by the multi-hop count-walk fast path
@@ -8173,6 +8463,263 @@ mod tests {
         // An unknown label counts zero (not an error, not a full scan).
         let (root, res) = run("exec_count_unknown", "MATCH (n:Nope) RETURN count(*) AS c");
         assert!(matches!(res.rows[0][0], Val::Int(0)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- whole-graph label/reltype metadata fast paths (Stage M) ----
+
+    /// Open the richer metadata fixture (multi-label node, no-label node, self-loop).
+    fn meta_gen(tag: &str) -> (std::path::PathBuf, Generation) {
+        let (root, graph, _) = testgen::write_meta(tag);
+        let gen = Generation::open(&root, &graph).unwrap();
+        (root, gen)
+    }
+
+    #[test]
+    fn meta_reltype_enumeration_and_grouped_counts() {
+        let (root, gen) = meta_gen("meta_reltype");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let run = |q: &str| eng.run(&parser::parse(q).unwrap()).unwrap();
+
+        // A1 — DISTINCT type(r): the reltype list.
+        let a1 = run("MATCH ()-[r]->() RETURN DISTINCT type(r) AS t");
+        assert_eq!(a1.columns, vec!["t"]);
+        assert_eq!(col0(&a1), vec!["KNOWS", "OWNS", "WORKS_AT"]);
+
+        // B1 — type(r), count(*): edges per reltype (KNOWS 2, WORKS_AT 2, OWNS 1).
+        let b1 = run("MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c");
+        assert_eq!(
+            rows_disp(&b1),
+            vec![
+                vec!["KNOWS".to_string(), "2".to_string()],
+                vec!["OWNS".to_string(), "1".to_string()],
+                vec!["WORKS_AT".to_string(), "2".to_string()],
+            ]
+        );
+
+        // Reverse arrow gives the same totals; count(r) == count(*).
+        let b1r = run("MATCH ()<-[r]-() RETURN type(r) AS t, count(r) AS c");
+        assert_eq!(rows_disp(&b1r), rows_disp(&b1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_first_label_enumeration_and_counts() {
+        let (root, gen) = meta_gen("meta_label");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let run = |q: &str| eng.run(&parser::parse(q).unwrap()).unwrap();
+
+        // A2 — DISTINCT labels(n)[0]: includes the null bucket (the label-less node).
+        let a2 = run("MATCH (n) RETURN DISTINCT labels(n)[0] AS l");
+        assert_eq!(col0(&a2), vec!["Admin", "Company", "Person", "null"]);
+
+        // B2 — labels(n)[0], count(*): Person 2 (Alice+Bob first-label), Admin 1
+        // (Carol), Company 1 (Acme), null 1 (Ghost).
+        let b2 = run("MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c");
+        assert_eq!(
+            rows_disp(&b2),
+            vec![
+                vec!["Admin".to_string(), "1".to_string()],
+                vec!["Company".to_string(), "1".to_string()],
+                vec!["Person".to_string(), "2".to_string()],
+                vec!["null".to_string(), "1".to_string()],
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_fast_paths_match_the_scan() {
+        // Every fast-pathed form must equal the general matcher on the same query;
+        // appending an always-true WHERE forces the matcher (its independent truth).
+        let (root, gen) = meta_gen("meta_parity");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let parity = |fast: &str, slow: &str| {
+            let f = eng.run(&parser::parse(fast).unwrap()).unwrap();
+            let s = eng.run(&parser::parse(slow).unwrap()).unwrap();
+            assert_eq!(f.columns, s.columns, "columns: {fast}");
+            assert_eq!(rows_disp(&f), rows_disp(&s), "rows: {fast} vs {slow}");
+        };
+        // bare enumerations + counts, both arrow directions
+        parity(
+            "MATCH ()-[r]->() RETURN DISTINCT type(r) AS t",
+            "MATCH ()-[r]->() WHERE 1 = 1 RETURN DISTINCT type(r) AS t",
+        );
+        parity(
+            "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c",
+            "MATCH ()-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH (n) RETURN DISTINCT labels(n)[0] AS l",
+            "MATCH (n) WHERE 1 = 1 RETURN DISTINCT labels(n)[0] AS l",
+        );
+        parity(
+            "MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c",
+            "MATCH (n) WHERE 1 = 1 RETURN labels(n)[0] AS l, count(*) AS c",
+        );
+        // labelled schema marginals: source-, target-, reverse-arrow-, multi-label.
+        parity(
+            "MATCH (:Person)-[r]->() RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Person)-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH ()-[r]->(:Company) RETURN type(r) AS t, count(*) AS c",
+            "MATCH ()-[r]->(:Company) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH ()<-[r]-(:Person) RETURN type(r) AS t, count(*) AS c",
+            "MATCH ()<-[r]-(:Person) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH (:Admin)-[r]->() RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Admin)-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_fast_path_reads_no_blocks_under_tiny_budget() {
+        // The regression guard: with `maxIntermediate` far below the edge count the
+        // metadata queries still SUCCEED (no materialisation), read zero blocks, and
+        // charge no budget — while the scanning form of the same question trips.
+        let (root, gen) = meta_gen("meta_perf");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache).with_max_intermediate(1);
+        for q in [
+            "MATCH ()-[r]->() RETURN DISTINCT type(r) AS t",
+            "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c",
+            "MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c",
+        ] {
+            let before = cache.metrics().misses;
+            let res = eng.run(&parser::parse(q).unwrap()).unwrap();
+            assert!(!res.rows.is_empty(), "empty result for {q}");
+            assert_eq!(cache.metrics().misses, before, "fast path read blocks: {q}");
+            assert_eq!(eng.cost(), 0, "fast path charged budget: {q}");
+        }
+        // The materialising form of the same question DOES trip the tiny budget —
+        // exactly the failure the fast path removes.
+        let scan = eng.run(
+            &parser::parse("MATCH ()-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c")
+                .unwrap(),
+        );
+        assert!(scan.is_err(), "scan should trip maxIntermediate=1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_declines_still_correct() {
+        // Each "do NOT fast-path" shape falls back to the matcher and stays correct.
+        let (root, gen) = meta_gen("meta_decline");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let rows = |q: &str| rows_disp(&eng.run(&parser::parse(q).unwrap()).unwrap());
+
+        // both endpoints labelled — the triple cube is unbuilt, so it declines.
+        assert_eq!(
+            rows("MATCH (:Person)-[r]->(:Company) RETURN type(r) AS t, count(*) AS c"),
+            vec![vec!["WORKS_AT".to_string(), "2".to_string()]],
+        );
+        // rel-type filter.
+        assert_eq!(
+            rows("MATCH ()-[r:KNOWS]->() RETURN type(r) AS t, count(*) AS c"),
+            vec![vec!["KNOWS".to_string(), "2".to_string()]],
+        );
+        // WHERE predicate.
+        assert_eq!(
+            rows("MATCH ()-[r]->() WHERE type(r) = 'KNOWS' RETURN type(r) AS t, count(*) AS c"),
+            vec![vec!["KNOWS".to_string(), "2".to_string()]],
+        );
+        // count(DISTINCT …) — declines; here it equals count(*) (all edges distinct).
+        assert_eq!(
+            rows("MATCH ()-[r]->() RETURN type(r) AS t, count(DISTINCT r) AS c"),
+            rows("MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c"),
+        );
+        // undirected — declines (2·edge − self_loop semantics deferred); DISTINCT
+        // type still enumerates the reltypes.
+        assert_eq!(
+            rows("MATCH ()-[r]-() RETURN DISTINCT type(r) AS t"),
+            vec![
+                vec!["KNOWS".to_string()],
+                vec!["OWNS".to_string()],
+                vec!["WORKS_AT".to_string()],
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_where_clause_is_not_ignored() {
+        // A WHERE narrows the match, so the whole-graph metadata counts would be
+        // WRONG — the fast path must decline and the matcher return the *filtered*
+        // answer. Each case is chosen so the correct answer DIFFERS from the
+        // metadata count, proving the resident counts are not reused.
+        let (root, gen) = meta_gen("meta_where");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let rows = |q: &str| rows_disp(&eng.run(&parser::parse(q).unwrap()).unwrap());
+
+        // Whole-graph baseline (fast path): KNOWS 2, WORKS_AT 2, OWNS 1.
+        let base = rows("MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c");
+        assert_eq!(
+            base,
+            vec![
+                vec!["KNOWS".to_string(), "2".to_string()],
+                vec!["OWNS".to_string(), "1".to_string()],
+                vec!["WORKS_AT".to_string(), "2".to_string()],
+            ]
+        );
+
+        // WHERE on a source property → only Alice's out-edges (KNOWS 1, WORKS_AT 1).
+        let by_src =
+            rows("MATCH (a)-[r]->() WHERE a.name = 'Alice' RETURN type(r) AS t, count(*) AS c");
+        assert_eq!(
+            by_src,
+            vec![
+                vec!["KNOWS".to_string(), "1".to_string()],
+                vec!["WORKS_AT".to_string(), "1".to_string()],
+            ]
+        );
+        assert_ne!(
+            by_src, base,
+            "WHERE on source property must change the counts"
+        );
+
+        // WHERE that prunes an entire reltype group — OWNS must disappear, not be
+        // reported with its metadata count of 1.
+        let pruned =
+            rows("MATCH ()-[r]->() WHERE type(r) <> 'OWNS' RETURN type(r) AS t, count(*) AS c");
+        assert_eq!(
+            pruned,
+            vec![
+                vec!["KNOWS".to_string(), "2".to_string()],
+                vec!["WORKS_AT".to_string(), "2".to_string()],
+            ]
+        );
+        assert!(
+            !pruned.iter().any(|r| r[0] == "OWNS"),
+            "WHERE must prune the OWNS group entirely"
+        );
+
+        // WHERE that matches nothing → zero rows, NOT the metadata counts.
+        let none =
+            rows("MATCH ()-[r]->() WHERE r.no_such_prop = 99 RETURN type(r) AS t, count(*) AS c");
+        assert!(
+            none.is_empty(),
+            "a WHERE matching no edges must yield no rows"
+        );
+
+        // Label side: a WHERE on a node property → only the matching node's first
+        // label (Bob → Person 1), not the whole-graph Person count of 2.
+        let base_l = rows("MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c");
+        let one = rows("MATCH (n) WHERE n.name = 'Bob' RETURN labels(n)[0] AS l, count(*) AS c");
+        assert_eq!(one, vec![vec!["Person".to_string(), "1".to_string()]]);
+        assert_ne!(
+            one, base_l,
+            "WHERE on a node property must change the counts"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

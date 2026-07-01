@@ -185,6 +185,54 @@ pub struct Manifest {
     /// (and, unioned with sources, undirected) typed first hops.
     #[serde(default)]
     pub reltype_target_counts: Vec<u64>,
+    /// Per-reltype **edge** counts (index = reltype id, aligned with `reltypes`) —
+    /// the number of relationships of each type. Distinct from
+    /// [`Self::reltype_source_counts`] (those are distinct *node* counts). Non-empty
+    /// ⇒ the whole-graph `type(r), count(*)` fast path and open-time `reltype_counts`
+    /// read this directly; empty ⇒ recomputed at open by a CSR scan (older images),
+    /// never incorrect. `sum(reltype_edge_counts) == edge_count`.
+    #[serde(default)]
+    pub reltype_edge_counts: Vec<u64>,
+    /// Per-reltype **self-loop** edge counts (index = reltype id) — edges whose
+    /// source and target are the same node. Lets the undirected `()-[r]-()` count
+    /// fast path compute `2·edge − self_loop` exactly. Empty ⇒ unknown (the
+    /// undirected fast path declines and scans).
+    #[serde(default)]
+    pub reltype_self_loop_counts: Vec<u64>,
+    /// Per-label node **occurrence** counts (index = label id, aligned with
+    /// `labels`) — the number of nodes carrying each label (a multi-label node is
+    /// counted under every one of its labels). Persists what `build_label_counts`
+    /// recomputes at open; non-empty ⇒ open skips that scan. `label_node_count`
+    /// reads this. Empty ⇒ recomputed at open (older images), never incorrect.
+    #[serde(default)]
+    pub label_node_counts: Vec<u64>,
+    /// Per-label **first-label** counts (index = label id) — the number of nodes
+    /// whose `labels(n)[0]` (first stored label) is this label. Answers
+    /// `labels(n)[0], count(*)` / `DISTINCT labels(n)[0]` with exact first-label
+    /// semantics even when multi-label nodes exist. The null bucket (zero-label
+    /// nodes) is `node_count − sum(first_label_counts)`. Empty ⇒ the label-metadata
+    /// fast path declines (cannot reproduce first-label semantics from occurrences).
+    #[serde(default)]
+    pub first_label_counts: Vec<u64>,
+    /// Sparse `(src_label_id, reltype_id) → edge count` marginal of the edge schema
+    /// cube — edges whose source **carries** `src_label`, by reltype (a multi-label
+    /// source contributes to each of its labels). Answers `(:A)-[r]->() RETURN
+    /// type(r), count(*)`. Sorted by key for deterministic emit. Empty ⇒ the labeled
+    /// rel fast path declines for source-labelled patterns.
+    #[serde(default)]
+    pub src_label_reltype_counts: Vec<(u32, u32, u64)>,
+    /// Sparse `(reltype_id, tgt_label_id) → edge count` marginal — edges whose
+    /// target **carries** `tgt_label`, by reltype. Answers `()-[r]->(:B) RETURN
+    /// type(r), count(*)`. Sorted by key. Empty ⇒ decline for target-labelled patterns.
+    #[serde(default)]
+    pub reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
+    /// Sparse `(src_label_id, reltype_id, tgt_label_id) → edge count` — the full
+    /// edge schema cube (source carries `src_label` **and** target carries
+    /// `tgt_label`). Answers `(:A)-[r]->(:B)` / `(:A)-[:R]->(:B) RETURN count(*)`.
+    /// Sorted by key. Empty ⇒ decline for both-endpoints-labelled patterns. Read a
+    /// single cell only — never sum across a label axis (multi-label double-counts).
+    #[serde(default)]
+    pub schema_triple_counts: Vec<(u32, u32, u32, u64)>,
     /// Per-(label, property) value→count histograms carried in `prop_hist.blk`,
     /// one descriptor per stored histogram, aligned by position with the file's
     /// records. Non-empty ⇒ the grouped-index fast path reads these instead of
@@ -347,6 +395,13 @@ mod tests {
             }],
             reltype_source_counts: vec![],
             reltype_target_counts: vec![],
+            reltype_edge_counts: vec![],
+            reltype_self_loop_counts: vec![],
+            label_node_counts: vec![1],
+            first_label_counts: vec![1],
+            src_label_reltype_counts: vec![],
+            reltype_tgt_label_counts: vec![],
+            schema_triple_counts: vec![],
             property_histograms: vec![],
             acl_blake3: None,
             mac: None,
@@ -369,6 +424,34 @@ mod tests {
         // Tamper with a file hash without updating content_hash.
         m.files[0].blake3 = "cafebabe".into();
         assert!(m.verify_content_hash().is_err());
+    }
+
+    #[test]
+    fn manifest_without_summary_fields_defaults_to_empty() {
+        // A generation built before the whole-graph metadata summaries existed has a
+        // MANIFEST.json lacking those keys. They must deserialize to empty vectors
+        // (⇒ the query paths fall back to an open-time scan), never error.
+        let mut v = serde_json::to_value(sample()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in [
+            "reltypeEdgeCounts",
+            "reltypeSelfLoopCounts",
+            "labelNodeCounts",
+            "firstLabelCounts",
+            "srcLabelReltypeCounts",
+            "reltypeTgtLabelCounts",
+            "schemaTripleCounts",
+        ] {
+            assert!(obj.remove(k).is_some(), "sample manifest should carry {k}");
+        }
+        let back: Manifest = serde_json::from_value(v).unwrap();
+        assert!(back.reltype_edge_counts.is_empty());
+        assert!(back.reltype_self_loop_counts.is_empty());
+        assert!(back.label_node_counts.is_empty());
+        assert!(back.first_label_counts.is_empty());
+        assert!(back.src_label_reltype_counts.is_empty());
+        assert!(back.reltype_tgt_label_counts.is_empty());
+        assert!(back.schema_triple_counts.is_empty());
     }
 
     #[test]

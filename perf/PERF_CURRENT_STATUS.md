@@ -12,6 +12,16 @@ each dataset in an **isolated** container (spun up, benched, torn down — one a
 RSS is the container cgroup: **anon** = heap/working set (the honest engine footprint);
 **total** includes reclaimable OS page cache of the paged store.
 
+> **Whole-graph metadata fast paths (2026-07):** `bench.py` now carries four canonical
+> introspection shapes — `MATCH ()-[r]->() RETURN DISTINCT type(r)` / `… type(r),
+> count(*)` and `MATCH (n) RETURN DISTINCT labels(n)[0]` / `… labels(n)[0], count(*)`.
+> These are answered from resident manifest counts (`reltype_edge_counts` /
+> `first_label_counts` / schema marginals) with **zero block reads** and cost
+> ~O(reltypes|labels), so they must stay flat as the graph grows regardless of edge
+> count — the regression guard for the unanchored-scan incident. Requires a generation
+> built with the metadata summaries; older generations answer `type(r)` via the
+> open-time scan fallback and decline the labelled / `labels(n)[0]` variants.
+
 ## Latency (median ms) + peak RSS (MiB), fanout=1 / fanout=8
 
 | dataset | shape | fan=1 | fan=8 |

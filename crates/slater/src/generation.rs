@@ -324,8 +324,19 @@ impl Generation {
         let reltype_ids = invert_symbols(&manifest.reltypes);
         let property_key_ids = invert_symbols(&manifest.property_keys);
 
-        let label_counts = build_label_counts(&node_labels)?;
-        let reltype_counts = build_reltype_counts(&topology)?;
+        // Prefer the per-label / per-reltype counts persisted in the manifest
+        // (tallied once at build), falling back to an open-time scan only for
+        // generations built before those fields existed (empty ⇒ scan, never wrong).
+        let label_counts = if manifest.label_node_counts.is_empty() {
+            build_label_counts(&node_labels)?
+        } else {
+            counts_from_vec(&manifest.label_node_counts)
+        };
+        let reltype_counts = if manifest.reltype_edge_counts.is_empty() {
+            build_reltype_counts(&topology)?
+        } else {
+            counts_from_vec(&manifest.reltype_edge_counts)
+        };
 
         info!(
             graph,
@@ -477,6 +488,97 @@ impl Generation {
     /// Number of edges of relationship type `reltype_id` (precomputed at open; O(1)).
     pub fn reltype_edge_count(&self, reltype_id: u32) -> u64 {
         self.reltype_counts.get(&reltype_id).copied().unwrap_or(0)
+    }
+
+    /// Number of self-loop edges of relationship type `reltype_id` (edges whose
+    /// source and target are the same node). Reads the manifest directly; 0 when the
+    /// generation predates the field (the undirected fast path then declines).
+    pub fn reltype_self_loop_count(&self, reltype_id: u32) -> u64 {
+        self.manifest
+            .reltype_self_loop_counts
+            .get(reltype_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// True when this generation carries per-reltype self-loop counts.
+    pub fn has_reltype_self_loop_counts(&self) -> bool {
+        !self.manifest.reltype_self_loop_counts.is_empty()
+    }
+
+    /// Number of nodes whose **first** label (`labels(n)[0]`) is `label_id` (O(1),
+    /// from the manifest). 0 when absent/unknown — callers detect that via
+    /// [`Self::has_first_label_counts`].
+    pub fn first_label_count(&self, label_id: u32) -> u64 {
+        self.manifest
+            .first_label_counts
+            .get(label_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// True when this generation carries first-label counts (⇒ the `labels(n)[0]`
+    /// metadata fast path can reproduce first-label semantics exactly).
+    pub fn has_first_label_counts(&self) -> bool {
+        !self.manifest.first_label_counts.is_empty()
+    }
+
+    /// Sum of [`Self::first_label_count`] over all labels — the number of nodes with
+    /// at least one label. The whole-graph `labels(n)[0]` null bucket (zero-label
+    /// nodes) is `node_count − first_labelled_node_count`.
+    pub fn first_labelled_node_count(&self) -> u64 {
+        self.manifest.first_label_counts.iter().sum()
+    }
+
+    /// Edge-schema **source** marginal: edges of type `reltype_id` whose source
+    /// carries `src_label_id`. `None` when the generation lacks the marginal (⇒ the
+    /// source-labelled rel fast path declines); `Some(0)` for an absent key.
+    pub fn src_label_reltype_count(&self, src_label_id: u32, reltype_id: u32) -> Option<u64> {
+        let v = &self.manifest.src_label_reltype_counts;
+        if v.is_empty() {
+            return None;
+        }
+        Some(
+            match v.binary_search_by(|e| (e.0, e.1).cmp(&(src_label_id, reltype_id))) {
+                Ok(i) => v[i].2,
+                Err(_) => 0,
+            },
+        )
+    }
+
+    /// Edge-schema **target** marginal: edges of type `reltype_id` whose target
+    /// carries `tgt_label_id`. `None` when the generation lacks the marginal.
+    pub fn reltype_tgt_label_count(&self, reltype_id: u32, tgt_label_id: u32) -> Option<u64> {
+        let v = &self.manifest.reltype_tgt_label_counts;
+        if v.is_empty() {
+            return None;
+        }
+        Some(
+            match v.binary_search_by(|e| (e.0, e.1).cmp(&(reltype_id, tgt_label_id))) {
+                Ok(i) => v[i].2,
+                Err(_) => 0,
+            },
+        )
+    }
+
+    /// Full edge-schema cube cell: edges of type `reltype_id` whose source carries
+    /// `src_label_id` and target carries `tgt_label_id`. `None` when the generation
+    /// lacks the cube (⇒ the both-endpoints-labelled fast path declines).
+    pub fn schema_triple_count(
+        &self,
+        src_label_id: u32,
+        reltype_id: u32,
+        tgt_label_id: u32,
+    ) -> Option<u64> {
+        let v = &self.manifest.schema_triple_counts;
+        if v.is_empty() {
+            return None;
+        }
+        let key = (src_label_id, reltype_id, tgt_label_id);
+        Some(match v.binary_search_by(|e| (e.0, e.1, e.2).cmp(&key)) {
+            Ok(i) => v[i].3,
+            Err(_) => 0,
+        })
     }
 
     /// True when this generation carries the per-reltype endpoint postings (format
@@ -640,6 +742,18 @@ fn verify_against_store(store: &dyn ObjectStore, base: &str, manifest: &Manifest
         .verify_content_hash()
         .context("manifest content hash is inconsistent with its file inventory")?;
     Ok(())
+}
+
+/// Turn a persisted per-id count vector (index = id) into the resident `id → count`
+/// map, keeping only non-zero entries so the footprint stays O(#present symbols).
+/// Used to skip the open-time label/reltype scans when the manifest carries the
+/// counts (built once at build time).
+fn counts_from_vec(v: &[u64]) -> HashMap<u32, u64> {
+    v.iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| (i as u32, c))
+        .collect()
 }
 
 /// Build `name → id` from a MANIFEST symbol-table vector (id = index).
@@ -929,6 +1043,16 @@ mod tests {
             }],
             reltype_source_counts,
             reltype_target_counts,
+            // Left empty so this fixture exercises the open-time scan fallback for
+            // the whole-graph metadata counts; the persisted path is covered by the
+            // slater-build goldens and the exec metadata fast-path tests.
+            reltype_edge_counts: vec![],
+            reltype_self_loop_counts: vec![],
+            label_node_counts: vec![],
+            first_label_counts: vec![],
+            src_label_reltype_counts: vec![],
+            reltype_tgt_label_counts: vec![],
+            schema_triple_counts: vec![],
             property_histograms: vec![],
             acl_blake3: None,
             mac: None,
