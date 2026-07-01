@@ -160,6 +160,7 @@ fn summaries_from_stores(
     Vec<u64>,
     Vec<(u32, u32, u64)>,
     Vec<(u32, u32, u64)>,
+    Vec<(u32, u32, u32, u64)>,
 ) {
     use std::collections::HashMap;
     let topo = TopologyReader::open(gen_dir.join("topology.csr.blk")).unwrap();
@@ -171,6 +172,7 @@ fn summaries_from_stores(
     let mut fl = vec![0u64; n_labels];
     let mut sm: HashMap<(u32, u32), u64> = HashMap::new();
     let mut tm: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut cube: HashMap<(u32, u32, u32), u64> = HashMap::new();
     for id in 0..topo.node_count() {
         let labs = labels.labels(id).unwrap();
         if let Some(&f) = labs.first() {
@@ -184,8 +186,12 @@ fn summaries_from_stores(
             if a.neighbour.0 == id {
                 rs[a.reltype as usize] += 1;
             }
+            let dst_labs = labels.labels(a.neighbour.0).unwrap();
             for &x in &labs {
                 *sm.entry((x, a.reltype)).or_insert(0) += 1;
+                for &y in &dst_labs {
+                    *cube.entry((x, a.reltype, y)).or_insert(0) += 1;
+                }
             }
         }
         for a in topo.incoming(graph_format::ids::NodeId(id)).unwrap() {
@@ -198,7 +204,12 @@ fn summaries_from_stores(
     smv.sort_unstable();
     let mut tmv: Vec<(u32, u32, u64)> = tm.into_iter().map(|((t, b), c)| (t, b, c)).collect();
     tmv.sort_unstable();
-    (re, rs, ln, fl, smv, tmv)
+    let mut cv: Vec<(u32, u32, u32, u64)> = cube
+        .into_iter()
+        .map(|((a, t, b), c)| (a, t, b, c))
+        .collect();
+    cv.sort_unstable();
+    (re, rs, ln, fl, smv, tmv, cv)
 }
 
 #[test]
@@ -208,7 +219,7 @@ fn metadata_summaries_match_topology_and_sum_invariants() {
     m.verify_content_hash().unwrap();
 
     // The builder's persisted summaries equal a fresh scan of the same graph.
-    let (re, rs, ln, fl, sm, tm) =
+    let (re, rs, ln, fl, sm, tm, cube) =
         summaries_from_stores(&gen_dir, m.labels.len(), m.reltypes.len());
     assert_eq!(m.reltype_edge_counts, re, "reltype_edge_counts");
     assert_eq!(m.reltype_self_loop_counts, rs, "reltype_self_loop_counts");
@@ -216,6 +227,7 @@ fn metadata_summaries_match_topology_and_sum_invariants() {
     assert_eq!(m.first_label_counts, fl, "first_label_counts");
     assert_eq!(m.src_label_reltype_counts, sm, "src_label_reltype_counts");
     assert_eq!(m.reltype_tgt_label_counts, tm, "reltype_tgt_label_counts");
+    assert_eq!(m.schema_triple_counts, cube, "schema_triple_counts");
 
     // Sum invariants.
     assert_eq!(
@@ -226,6 +238,13 @@ fn metadata_summaries_match_topology_and_sum_invariants() {
     assert!(
         m.first_label_counts.iter().sum::<u64>() <= m.node_count,
         "Σ first_label_counts ≤ node_count (remainder = zero-label nodes)"
+    );
+    // Every node in this dump carries exactly one label, so each edge contributes
+    // exactly one triple cell — Σ triple counts == edge_count.
+    assert_eq!(
+        m.schema_triple_counts.iter().map(|&(.., c)| c).sum::<u64>(),
+        m.edge_count,
+        "Σ schema_triple_counts == edge_count (single-label graph)"
     );
 
     // Named spot-checks (independent of intern order): DRAWS×3, LIKES×1, LOOPS×1,

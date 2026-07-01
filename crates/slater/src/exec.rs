@@ -1854,16 +1854,10 @@ impl<'g> Engine<'g> {
         let Some(relvar) = rel.var.as_deref() else {
             return Ok(None);
         };
-        // Endpoints carry no properties; direction picks which endpoint is the
-        // source and which the target (undirected is declined above via the match).
+        // Endpoints carry no properties.
         if !left.props.is_empty() || !right.props.is_empty() {
             return Ok(None);
         }
-        let (src_node, tgt_node) = match rel.dir {
-            Direction::Outgoing => (left, right),
-            Direction::Incoming => (right, left),
-            Direction::Undirected => return Ok(None),
-        };
         // Each endpoint is bare (no constraint) or a single positive label atom.
         let atom = |n: &NodePat| -> Result<Option<Option<String>>> {
             match &n.label_expr {
@@ -1874,8 +1868,20 @@ impl<'g> Engine<'g> {
                 },
             }
         };
-        let (Some(src_label), Some(tgt_label)) = (atom(src_node)?, atom(tgt_node)?) else {
+        let (Some(left_label), Some(right_label)) = (atom(left)?, atom(right)?) else {
             return Ok(None);
+        };
+        // Direction maps the labelled endpoint onto the source/target marginal axis.
+        // Undirected is supported only for the bare whole-graph case — a labelled
+        // endpoint under `()-[r]-()` means "on either end", which needs an
+        // inclusion-exclusion over the two marginals we do not compute here.
+        let undirected = matches!(rel.dir, Direction::Undirected);
+        if undirected && (left_label.is_some() || right_label.is_some()) {
+            return Ok(None);
+        }
+        let (src_label, tgt_label) = match rel.dir {
+            Direction::Outgoing | Direction::Undirected => (left_label, right_label),
+            Direction::Incoming => (right_label, left_label),
         };
 
         // ---- projection shape ----
@@ -1890,6 +1896,12 @@ impl<'g> Engine<'g> {
         let src = src_label.map(|n| self.gen.label_id(&n));
         let tgt = tgt_label.map(|n| self.gen.label_id(&n));
         let count_for = |t: u32| -> Option<u64> {
+            // An undirected pattern matches each edge in both orientations — and the
+            // matcher counts a self-loop twice as well — so the count is exactly
+            // 2× the directed edge count. Only the bare case reaches here.
+            if undirected {
+                return Some(2 * self.gen.reltype_edge_count(t));
+            }
             // `None` ⇒ decline (the required marginal is unavailable in this
             // generation); `Some(c)` is the edge count for reltype `t`.
             Some(match (src, tgt) {
@@ -8543,7 +8555,7 @@ mod tests {
             assert_eq!(f.columns, s.columns, "columns: {fast}");
             assert_eq!(rows_disp(&f), rows_disp(&s), "rows: {fast} vs {slow}");
         };
-        // bare enumerations + counts, both arrow directions
+        // bare enumerations + counts, both arrow directions + undirected
         parity(
             "MATCH ()-[r]->() RETURN DISTINCT type(r) AS t",
             "MATCH ()-[r]->() WHERE 1 = 1 RETURN DISTINCT type(r) AS t",
@@ -8551,6 +8563,17 @@ mod tests {
         parity(
             "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c",
             "MATCH ()-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        // undirected: each edge matches in both orientations (self-loops counted
+        // twice), so the fast path returns 2× the directed count — verified equal to
+        // the matcher.
+        parity(
+            "MATCH ()-[r]-() RETURN type(r) AS t, count(*) AS c",
+            "MATCH ()-[r]-() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH ()-[r]-() RETURN DISTINCT type(r) AS t",
+            "MATCH ()-[r]-() WHERE 1 = 1 RETURN DISTINCT type(r) AS t",
         );
         parity(
             "MATCH (n) RETURN DISTINCT labels(n)[0] AS l",
@@ -8576,6 +8599,20 @@ mod tests {
         parity(
             "MATCH (:Admin)-[r]->() RETURN type(r) AS t, count(*) AS c",
             "MATCH (:Admin)-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        // both-endpoints-labelled (the full schema-triple cube), grouped + fully
+        // specified, including a multi-label endpoint.
+        parity(
+            "MATCH (:Person)-[r]->(:Company) RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Person)-[r]->(:Company) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH (:Company)-[r]->(:Company) RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Company)-[r]->(:Company) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH (:Admin)-[r]->(:Company) RETURN DISTINCT type(r) AS t",
+            "MATCH (:Admin)-[r]->(:Company) WHERE 1 = 1 RETURN DISTINCT type(r) AS t",
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8617,11 +8654,6 @@ mod tests {
         let eng = Engine::new(&gen, &cache);
         let rows = |q: &str| rows_disp(&eng.run(&parser::parse(q).unwrap()).unwrap());
 
-        // both endpoints labelled — the triple cube is unbuilt, so it declines.
-        assert_eq!(
-            rows("MATCH (:Person)-[r]->(:Company) RETURN type(r) AS t, count(*) AS c"),
-            vec![vec!["WORKS_AT".to_string(), "2".to_string()]],
-        );
         // rel-type filter.
         assert_eq!(
             rows("MATCH ()-[r:KNOWS]->() RETURN type(r) AS t, count(*) AS c"),
@@ -8637,15 +8669,13 @@ mod tests {
             rows("MATCH ()-[r]->() RETURN type(r) AS t, count(DISTINCT r) AS c"),
             rows("MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c"),
         );
-        // undirected — declines (2·edge − self_loop semantics deferred); DISTINCT
-        // type still enumerates the reltypes.
+        // labelled endpoint under an UNDIRECTED relationship — "on either end"
+        // needs inclusion-exclusion the fast path doesn't do, so it declines; the
+        // matcher enumerates the reltypes incident to a Person (KNOWS, WORKS_AT;
+        // not OWNS, whose only edge is Acme→Acme).
         assert_eq!(
-            rows("MATCH ()-[r]-() RETURN DISTINCT type(r) AS t"),
-            vec![
-                vec!["KNOWS".to_string()],
-                vec!["OWNS".to_string()],
-                vec!["WORKS_AT".to_string()],
-            ],
+            rows("MATCH (:Person)-[r]-() RETURN DISTINCT type(r) AS t"),
+            vec![vec!["KNOWS".to_string()], vec!["WORKS_AT".to_string()]],
         );
         let _ = std::fs::remove_dir_all(&root);
     }

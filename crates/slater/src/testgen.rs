@@ -359,10 +359,9 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
 /// ```
 /// Symbol tables: labels Person(0)/Company(1)/Admin(2); reltypes
 /// KNOWS(0)/WORKS_AT(1)/OWNS(2). Only the stores the metadata queries need are
-/// written; the summary vectors are computed from the written stores (via
-/// [`fixture_summaries`]) so the manifest matches the graph exactly. The
-/// `schema_triple_counts` cube is left empty (matching the current builder), so the
-/// both-endpoints-labelled fast path declines and falls back to the matcher.
+/// written; all summary vectors — including the full `schema_triple_counts` cube —
+/// are computed from the written stores (via [`fixture_summaries`]) so the manifest
+/// matches the graph exactly.
 pub fn write_meta(tag: &str) -> (PathBuf, String, uuid::Uuid) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_00a0);
     let graph = "meta".to_string();
@@ -489,7 +488,7 @@ pub fn write_meta(tag: &str) -> (PathBuf, String, uuid::Uuid) {
         first_label_counts: s.first_label_counts,
         src_label_reltype_counts: s.src_label_reltype_counts,
         reltype_tgt_label_counts: s.reltype_tgt_label_counts,
-        schema_triple_counts: vec![],
+        schema_triple_counts: s.schema_triple_counts,
         property_histograms: vec![],
         acl_blake3: None,
         mac: None,
@@ -515,6 +514,7 @@ pub struct FixtureSummaries {
     pub first_label_counts: Vec<u64>,
     pub src_label_reltype_counts: Vec<(u32, u32, u64)>,
     pub reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
+    pub schema_triple_counts: Vec<(u32, u32, u32, u64)>,
 }
 
 /// Compute [`FixtureSummaries`] by scanning the just-written `topology.csr.blk` and
@@ -536,6 +536,7 @@ pub fn fixture_summaries(
     let mut first_label = vec![0u64; n_labels];
     let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
     let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut cube: HashMap<(u32, u32, u32), u64> = HashMap::new();
 
     for id in 0..node_count {
         let labs = labels.labels(id).unwrap();
@@ -550,8 +551,14 @@ pub fn fixture_summaries(
             if adj.neighbour.0 == id {
                 reltype_self[adj.reltype as usize] += 1;
             }
+            // Random dst-label lookup — fine for a tiny test fixture (the builder
+            // does this join via an external sort-merge instead).
+            let dst_labs = labels.labels(adj.neighbour.0).unwrap();
             for &a in &labs {
                 *src_marg.entry((a, adj.reltype)).or_insert(0) += 1;
+                for &b in &dst_labs {
+                    *cube.entry((a, adj.reltype, b)).or_insert(0) += 1;
+                }
             }
         }
         for adj in topo.incoming(NodeId(id)).unwrap() {
@@ -566,6 +573,11 @@ pub fn fixture_summaries(
     let mut reltype_tgt_label_counts: Vec<(u32, u32, u64)> =
         tgt_marg.into_iter().map(|((t, b), c)| (t, b, c)).collect();
     reltype_tgt_label_counts.sort_unstable();
+    let mut schema_triple_counts: Vec<(u32, u32, u32, u64)> = cube
+        .into_iter()
+        .map(|((a, t, b), c)| (a, t, b, c))
+        .collect();
+    schema_triple_counts.sort_unstable();
 
     FixtureSummaries {
         reltype_edge_counts: reltype_edge,
@@ -574,6 +586,7 @@ pub fn fixture_summaries(
         first_label_counts: first_label,
         src_label_reltype_counts,
         reltype_tgt_label_counts,
+        schema_triple_counts,
     }
 }
 

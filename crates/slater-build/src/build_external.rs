@@ -1811,6 +1811,8 @@ fn build_inner(
         reltypes.names().len(),
         labels.names().len(),
         cipher.clone(),
+        scratch_dir,
+        (opts.max_memory_bytes / 16).max(16 << 20),
     )?;
     drop(emit_summary_g);
 
@@ -2073,6 +2075,39 @@ impl SortRecord for EdgeRev {
     }
     fn size_hint(&self) -> usize {
         32
+    }
+}
+
+/// One `(dst, src_label, reltype)` spill record for the edge-schema-cube join —
+/// one per (edge × source label). Sorted by `dst` so the drain merges linearly with
+/// a node-id-ordered walk of `node_labels`, which supplies the target labels to
+/// complete each `(src_label, reltype, tgt_label)` triple without a resident map.
+struct TripleSpill {
+    dst: u64,
+    src_label: u32,
+    reltype: u32,
+}
+impl SortRecord for TripleSpill {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        write_uvarint(buf, self.dst);
+        write_uvarint(buf, self.src_label as u64);
+        write_uvarint(buf, self.reltype as u64);
+    }
+    fn decode(r: &mut &[u8]) -> Result<Self> {
+        let dst = read_uvarint(r)?;
+        let src_label = read_uvarint(r)? as u32;
+        let reltype = read_uvarint(r)? as u32;
+        Ok(TripleSpill {
+            dst,
+            src_label,
+            reltype,
+        })
+    }
+    fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        self.dst.cmp(&other.dst)
+    }
+    fn size_hint(&self) -> usize {
+        16
     }
 }
 
@@ -2435,17 +2470,17 @@ struct GraphSummaries {
     schema_triple_counts: Vec<(u32, u32, u32, u64)>,
 }
 
-/// Compute [`GraphSummaries`] in two node-id-ordered passes over the finished stores
-/// (no resident node→label map — labels are read one node at a time). The forward
-/// pass treats the current node as the **source** of each of its outgoing edges,
-/// giving the per-reltype edge count, the self-loop count, the `(src_label, reltype)`
-/// marginal, and the per-label first/occurrence tallies; the reverse pass treats it
-/// as the **target** of each incoming edge, giving the `(reltype, tgt_label)`
-/// marginal. Each pass streams one half of the CSR sequentially.
-///
-/// The full `(src, reltype, tgt)` triple needs both endpoints' labels joined to a
-/// single edge, so it is left empty here (its fast path declines and scans) — it can
-/// be added by carrying source labels through the reverse routing.
+/// Compute [`GraphSummaries`] over the finished stores with **no resident node→label
+/// map** — labels are read one node at a time. The forward pass treats each node as
+/// the **source** of its outgoing edges (per-reltype edge + self-loop counts, the
+/// `(src_label, reltype)` marginal, per-label first/occurrence tallies) and spills a
+/// `(dst, src_label, reltype)` record per edge×source-label; the reverse pass treats
+/// each node as the **target** of its incoming edges (the `(reltype, tgt_label)`
+/// marginal). The full `(src_label, reltype, tgt_label)` cube then falls out of a
+/// linear merge of the `dst`-sorted spill with a node-id-ordered walk of
+/// `node_labels` (which supplies each edge's target labels) — a bounded external
+/// sort-merge join rather than a resident map.
+#[allow(clippy::too_many_arguments)]
 fn compute_graph_summaries(
     topo_path: &Path,
     labels_path: &Path,
@@ -2453,6 +2488,8 @@ fn compute_graph_summaries(
     n_reltypes: usize,
     n_labels: usize,
     cipher: Option<Arc<BlockCipher>>,
+    scratch_dir: &Path,
+    sort_budget: usize,
 ) -> Result<GraphSummaries> {
     use std::collections::HashMap;
     let topo = TopologyReader::open_with_cipher(topo_path, cipher.clone())?;
@@ -2464,6 +2501,11 @@ fn compute_graph_summaries(
     let mut first_label = vec![0u64; n_labels];
     let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
     let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
+    // The full triple needs both endpoints' labels joined to each edge. The forward
+    // pass has the source's labels in hand but the target is an arbitrary node, so we
+    // spill `(dst, src_label, reltype)` keyed by `dst` and resolve the target labels
+    // in a sorted merge below — no resident node→label map.
+    let mut triple_spill = ExtSorter::<TripleSpill>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
 
     // Forward pass: node id is the source of each outgoing edge.
     for id in 0..node_count {
@@ -2482,6 +2524,11 @@ fn compute_graph_summaries(
             }
             for &a in &labs {
                 *src_marg.entry((a, t)).or_insert(0) += 1;
+                triple_spill.push(TripleSpill {
+                    dst: adj.neighbour.0,
+                    src_label: a,
+                    reltype: t,
+                })?;
             }
         }
     }
@@ -2495,12 +2542,40 @@ fn compute_graph_summaries(
         }
     }
 
+    // Merge the `dst`-sorted spill with a node-id-ordered sequential walk of
+    // `node_labels`: both ascend, so each spill record's target labels are resolved
+    // in one linear pass (each label block decompressed once). Every spilled `dst`
+    // is a valid node id, so it is reached by the walk.
+    let mut cube: HashMap<(u32, u32, u32), u64> = HashMap::new();
+    let mut sorted = triple_spill.sorted()?;
+    let mut pending: Option<TripleSpill> = sorted.next().transpose()?;
+    labels.inner().for_each_record(|node_id, rec| {
+        if pending.as_ref().is_some_and(|p| p.dst == node_id) {
+            let tgt_labs = graph_format::nodelabels::decode_labels(rec)?;
+            while let Some(p) = pending.as_ref() {
+                if p.dst != node_id {
+                    break;
+                }
+                for &b in &tgt_labs {
+                    *cube.entry((p.src_label, p.reltype, b)).or_insert(0) += 1;
+                }
+                pending = sorted.next().transpose()?;
+            }
+        }
+        Ok(())
+    })?;
+
     let mut src_label_reltype_counts: Vec<(u32, u32, u64)> =
         src_marg.into_iter().map(|((a, t), c)| (a, t, c)).collect();
     src_label_reltype_counts.sort_unstable();
     let mut reltype_tgt_label_counts: Vec<(u32, u32, u64)> =
         tgt_marg.into_iter().map(|((t, b), c)| (t, b, c)).collect();
     reltype_tgt_label_counts.sort_unstable();
+    let mut schema_triple_counts: Vec<(u32, u32, u32, u64)> = cube
+        .into_iter()
+        .map(|((a, t, b), c)| (a, t, b, c))
+        .collect();
+    schema_triple_counts.sort_unstable();
 
     Ok(GraphSummaries {
         reltype_edge_counts: reltype_edge,
@@ -2509,7 +2584,7 @@ fn compute_graph_summaries(
         first_label_counts: first_label,
         src_label_reltype_counts,
         reltype_tgt_label_counts,
-        schema_triple_counts: Vec::new(),
+        schema_triple_counts,
     })
 }
 
