@@ -492,7 +492,12 @@ impl Generation {
 
     /// Number of self-loop edges of relationship type `reltype_id` (edges whose
     /// source and target are the same node). Reads the manifest directly; 0 when the
-    /// generation predates the field (the undirected fast path then declines).
+    /// generation predates the field.
+    ///
+    /// FOLLOW-UP: currently UNUSED by the query engine — the undirected count is
+    /// `2×edge` (the matcher counts a self-loop twice, so no subtraction). Kept as
+    /// genuine schema metadata (and the natural input to a future labelled-undirected
+    /// or `db.schema` feature); drop it if that never lands.
     pub fn reltype_self_loop_count(&self, reltype_id: u32) -> u64 {
         self.manifest
             .reltype_self_loop_counts

@@ -2480,6 +2480,13 @@ struct GraphSummaries {
 /// linear merge of the `dst`-sorted spill with a node-id-ordered walk of
 /// `node_labels` (which supplies each edge's target labels) — a bounded external
 /// sort-merge join rather than a resident map.
+///
+/// FOLLOW-UP (build perf at scale): the marginal/node passes read each store with
+/// per-node `read_record_global`, which re-decompresses a node's whole block on every
+/// call — the same inefficiency `Generation::build_label_counts` was written to avoid.
+/// It is negligible at a few hundred k nodes but O(records-per-block) redundant zstd
+/// work at Wikidata (91M) scale; drive both stores block-sequentially via
+/// `for_each_record` before rebuilding the giant generations.
 #[allow(clippy::too_many_arguments)]
 fn compute_graph_summaries(
     topo_path: &Path,

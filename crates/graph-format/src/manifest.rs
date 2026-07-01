@@ -231,6 +231,10 @@ pub struct Manifest {
     /// `tgt_label`). Answers `(:A)-[r]->(:B)` / `(:A)-[:R]->(:B) RETURN count(*)`.
     /// Sorted by key. Empty ⇒ decline for both-endpoints-labelled patterns. Read a
     /// single cell only — never sum across a label axis (multi-label double-counts).
+    ///
+    /// FOLLOW-UP: this cube (with the marginals above) is enough to back a
+    /// `db.schema`-style procedure that returns the labelled `(:A)-[:R]->(:B)`
+    /// metagraph with counts, parallel to `db.meta.stats()` — not yet exposed.
     #[serde(default)]
     pub schema_triple_counts: Vec<(u32, u32, u32, u64)>,
     /// Per-(label, property) value→count histograms carried in `prop_hist.blk`,

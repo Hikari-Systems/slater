@@ -1858,6 +1858,14 @@ impl<'g> Engine<'g> {
         if !left.props.is_empty() || !right.props.is_empty() {
             return Ok(None);
         }
+        // A single node variable reused on both endpoints (`(a)-[r]->(a)`) constrains
+        // the edge to a self-loop — that is not a whole-graph metadata question, so
+        // decline and let the matcher handle it.
+        if let (Some(lv), Some(rv)) = (left.var.as_deref(), right.var.as_deref()) {
+            if lv == rv {
+                return Ok(None);
+            }
+        }
         // Each endpoint is bare (no constraint) or a single positive label atom.
         let atom = |n: &NodePat| -> Result<Option<Option<String>>> {
             match &n.label_expr {
@@ -1871,18 +1879,6 @@ impl<'g> Engine<'g> {
         let (Some(left_label), Some(right_label)) = (atom(left)?, atom(right)?) else {
             return Ok(None);
         };
-        // Direction maps the labelled endpoint onto the source/target marginal axis.
-        // Undirected is supported only for the bare whole-graph case — a labelled
-        // endpoint under `()-[r]-()` means "on either end", which needs an
-        // inclusion-exclusion over the two marginals we do not compute here.
-        let undirected = matches!(rel.dir, Direction::Undirected);
-        if undirected && (left_label.is_some() || right_label.is_some()) {
-            return Ok(None);
-        }
-        let (src_label, tgt_label) = match rel.dir {
-            Direction::Outgoing | Direction::Undirected => (left_label, right_label),
-            Direction::Incoming => (right_label, left_label),
-        };
 
         // ---- projection shape ----
         let Some((key_idx, count_idx)) =
@@ -1892,27 +1888,34 @@ impl<'g> Engine<'g> {
         };
 
         // ---- resolve the metadata source and compute per-reltype counts ----
-        // `None` ⇒ bare endpoint; `Some(id)` ⇒ labelled (id resolved, or absent).
-        let src = src_label.map(|n| self.gen.label_id(&n));
-        let tgt = tgt_label.map(|n| self.gen.label_id(&n));
-        let count_for = |t: u32| -> Option<u64> {
-            // An undirected pattern matches each edge in both orientations — and the
-            // matcher counts a self-loop twice as well — so the count is exactly
-            // 2× the directed edge count. Only the bare case reaches here.
-            if undirected {
-                return Some(2 * self.gen.reltype_edge_count(t));
-            }
-            // `None` ⇒ decline (the required marginal is unavailable in this
-            // generation); `Some(c)` is the edge count for reltype `t`.
+        // Each endpoint resolves to: `None` ⇒ bare (no label); `Some(None)` ⇒ labelled
+        // but the label is absent from the graph (matches nothing); `Some(Some(id))` ⇒
+        // labelled with a known id.
+        let left_id = left_label.map(|n| self.gen.label_id(&n));
+        let right_id = right_label.map(|n| self.gen.label_id(&n));
+        // Edges of type `t` whose source satisfies `src` and target satisfies `tgt`,
+        // read from the resident whole-graph counts / schema marginals / cube. `None`
+        // ⇒ the required marginal is not present in this generation (⇒ decline).
+        let g = |src: Option<Option<u32>>, tgt: Option<Option<u32>>, t: u32| -> Option<u64> {
             Some(match (src, tgt) {
                 (None, None) => self.gen.reltype_edge_count(t),
-                // A labelled endpoint whose label is absent from the graph matches
-                // no edges.
                 (Some(None), _) | (_, Some(None)) => 0,
                 (Some(Some(a)), None) => self.gen.src_label_reltype_count(a, t)?,
                 (None, Some(Some(b))) => self.gen.reltype_tgt_label_count(t, b)?,
                 (Some(Some(a)), Some(Some(b))) => self.gen.schema_triple_count(a, t, b)?,
             })
+        };
+        // Map the pattern's directionality onto the source/target axes. An outgoing
+        // arrow binds left→source, right→target; incoming is the mirror. An undirected
+        // relationship matches each edge in *both* orientations, so its count is the
+        // sum over both axis assignments — which counts a self-loop twice and handles
+        // a labelled endpoint "on either end" without any inclusion-exclusion.
+        let count_for = |t: u32| -> Option<u64> {
+            match rel.dir {
+                Direction::Outgoing => g(left_id, right_id, t),
+                Direction::Incoming => g(right_id, left_id, t),
+                Direction::Undirected => Some(g(left_id, right_id, t)? + g(right_id, left_id, t)?),
+            }
         };
 
         let n = self.gen.manifest().reltypes.len();
@@ -1999,7 +2002,9 @@ impl<'g> Engine<'g> {
     /// by `is_key`) plus, for a grouped count, one `count(*)`/`count(var)` and any
     /// number of constant items — and the DISTINCT flag is consistent with that
     /// shape (enumeration must be DISTINCT; a grouped count must not be). `None`
-    /// otherwise (the caller then declines).
+    /// otherwise (the caller then declines). A trailing `ORDER BY` / `SKIP` / `LIMIT`
+    /// is permitted — it is applied to the finished metadata rows in
+    /// [`Self::build_meta_result`], exactly as the general path would.
     fn classify_meta_projection(
         &self,
         sq: &SingleQuery,
@@ -2007,12 +2012,7 @@ impl<'g> Engine<'g> {
         countvar: &str,
     ) -> Option<(usize, Option<usize>)> {
         let body = &sq.ret.body;
-        if body.star
-            || body.items.is_empty()
-            || !body.order_by.is_empty()
-            || body.skip.is_some()
-            || body.limit.is_some()
-        {
+        if body.star || body.items.is_empty() {
             return None;
         }
         let mut key_idx = None;
@@ -2075,6 +2075,10 @@ impl<'g> Engine<'g> {
             }
             rows.push(row);
         }
+        // Apply any trailing ORDER BY / SKIP / LIMIT over the finished rows using the
+        // same routine as the general projection, so an ordered/limited metadata query
+        // is byte-identical to the scan (the rows are already the scan's answer).
+        let rows = self.order_skip_limit_no_input(&sq.ret.body, &columns, rows)?;
         Ok(QueryResult { columns, rows })
     }
 
@@ -8614,6 +8618,60 @@ mod tests {
             "MATCH (:Admin)-[r]->(:Company) RETURN DISTINCT type(r) AS t",
             "MATCH (:Admin)-[r]->(:Company) WHERE 1 = 1 RETURN DISTINCT type(r) AS t",
         );
+        // undirected with a labelled endpoint — src+tgt marginal (one end) and
+        // triple+mirror (both ends), verified equal to the matcher.
+        parity(
+            "MATCH (:Person)-[r]-() RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Person)-[r]-() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH ()-[r]-(:Company) RETURN type(r) AS t, count(*) AS c",
+            "MATCH ()-[r]-(:Company) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        parity(
+            "MATCH (:Person)-[r]-(:Company) RETURN type(r) AS t, count(*) AS c",
+            "MATCH (:Person)-[r]-(:Company) WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_order_by_skip_limit() {
+        // A trailing ORDER BY / SKIP / LIMIT is applied to the finished metadata rows,
+        // order-identically to the matcher (compared without re-sorting).
+        let (root, gen) = meta_gen("meta_order");
+        let cache = BlockCache::new(1 << 20);
+        let eng = Engine::new(&gen, &cache);
+        let run = |q: &str| eng.run(&parser::parse(q).unwrap()).unwrap();
+        let disp = |res: &QueryResult| -> Vec<Vec<String>> {
+            res.rows
+                .iter()
+                .map(|r| r.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        // Total order (c desc, then key) so ties are deterministic across paths.
+        let ordered_parity = |fast: &str, slow: &str| {
+            let f = run(fast);
+            let s = run(slow);
+            assert_eq!(f.columns, s.columns, "cols: {fast}");
+            assert_eq!(disp(&f), disp(&s), "ordered rows: {fast} vs {slow}");
+        };
+        ordered_parity(
+            "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c ORDER BY c DESC, t",
+            "MATCH ()-[r]->() WHERE 1 = 1 RETURN type(r) AS t, count(*) AS c ORDER BY c DESC, t",
+        );
+        // LIMIT truncates after ordering: the single largest group.
+        assert_eq!(
+            disp(&run(
+                "MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c ORDER BY c DESC, t LIMIT 1"
+            )),
+            vec![vec!["KNOWS".to_string(), "2".to_string()]],
+        );
+        // SKIP + LIMIT on the label side.
+        ordered_parity(
+            "MATCH (n) RETURN labels(n)[0] AS l, count(*) AS c ORDER BY c DESC, l SKIP 1 LIMIT 2",
+            "MATCH (n) WHERE 1 = 1 RETURN labels(n)[0] AS l, count(*) AS c ORDER BY c DESC, l SKIP 1 LIMIT 2",
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8669,13 +8727,12 @@ mod tests {
             rows("MATCH ()-[r]->() RETURN type(r) AS t, count(DISTINCT r) AS c"),
             rows("MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c"),
         );
-        // labelled endpoint under an UNDIRECTED relationship — "on either end"
-        // needs inclusion-exclusion the fast path doesn't do, so it declines; the
-        // matcher enumerates the reltypes incident to a Person (KNOWS, WORKS_AT;
-        // not OWNS, whose only edge is Acme→Acme).
+        // a node variable reused on both endpoints `(a)-[r]->(a)` constrains a
+        // self-loop, so the whole-graph counts must NOT be used — it declines and the
+        // matcher returns only the self-loop (OWNS: Acme→Acme).
         assert_eq!(
-            rows("MATCH (:Person)-[r]-() RETURN DISTINCT type(r) AS t"),
-            vec![vec!["KNOWS".to_string()], vec!["WORKS_AT".to_string()]],
+            rows("MATCH (a)-[r]->(a) RETURN type(r) AS t, count(*) AS c"),
+            vec![vec!["OWNS".to_string(), "1".to_string()]],
         );
         let _ = std::fs::remove_dir_all(&root);
     }
