@@ -79,12 +79,43 @@ pub mod ast {
         Delete { detach: bool },
     }
 
+    /// One endpoint of a relationship write: a single-label node addressed by one
+    /// inline business-key property (a literal or parameter). The reduced form of a
+    /// [`WriteStmt`] anchor — an edge write has two of them and no SET.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct EndpointPat {
+        pub label: String,
+        pub key: String,
+        pub key_value: Expr,
+    }
+
+    /// A writable-layer relationship write: create or delete the edge
+    /// `(src) -[reltype]-> (dst)`, each endpoint anchored by a business key (Phase 3c).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct EdgeWriteStmt {
+        pub src: EndpointPat,
+        pub reltype: String,
+        pub dst: EndpointPat,
+        pub op: EdgeWriteOp,
+    }
+
+    /// The mutation an [`EdgeWriteStmt`] applies.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum EdgeWriteOp {
+        /// `MERGE (a)-[:R]->(b)` — create the edge if absent (auto-creating an absent
+        /// endpoint node), else a no-op (idempotent by edge identity).
+        Create,
+        /// `MATCH (a)-[r:R]->(b) DELETE r` — tombstone the edge.
+        Delete,
+    }
+
     /// A parsed statement: a read query, or a writable-layer write. The server
     /// dispatches on this — see [`super::parse_statement`].
     #[derive(Debug, Clone, PartialEq)]
     pub enum Statement {
         Read(Query),
         Write(WriteStmt),
+        WriteEdge(EdgeWriteStmt),
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -577,9 +608,129 @@ pub fn parse(input: &str) -> Result<Query> {
 pub fn parse_statement(input: &str) -> Result<ast::Statement> {
     if let Ok(mut pairs) = CypherParser::parse(Rule::write_statement, input) {
         let stmt = pairs.next().expect("write_statement rule yields one pair");
+        // A relationship write (Phase 3c) parses to a single `edge_write` child; the
+        // node write's tokens are inline. Dispatch on which is present.
+        if let Some(edge) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::edge_write) {
+            return Ok(ast::Statement::WriteEdge(lower_edge_write(edge)?));
+        }
         return Ok(ast::Statement::Write(lower_write_statement(stmt)?));
     }
     parse(input).map(ast::Statement::Read)
+}
+
+/// Lower an `edge_write` (`edge_merge` | `edge_delete`) into an [`EdgeWriteStmt`],
+/// enforcing the Phase 3c shape: two single-label, single-business-key endpoint node
+/// patterns joined by a single directed `-[:R]->` of exactly one relationship type,
+/// no variable-length and no edge properties. A `DELETE` names the relationship
+/// variable (which the pattern must bind); `MERGE` needs none.
+fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
+    let inner = only_child(pair)?; // edge_merge | edge_delete
+    let is_merge = inner.as_rule() == Rule::edge_merge;
+    let mut src: Option<NodePat> = None;
+    let mut dst: Option<NodePat> = None;
+    let mut rel: Option<RelPat> = None;
+    let mut delete: Option<(bool, String)> = None; // (detach, rel var)
+    for c in kids(inner) {
+        match c.as_rule() {
+            Rule::kw_merge | Rule::kw_match => {}
+            Rule::node_pattern => {
+                let np = lower_node_pattern(c)?;
+                if src.is_none() {
+                    src = Some(np);
+                } else {
+                    dst = Some(np);
+                }
+            }
+            Rule::rel_pattern => rel = Some(lower_rel_pattern(c)?),
+            Rule::delete_clause => {
+                let mut detach = false;
+                let mut target = None;
+                for d in kids(c) {
+                    match d.as_rule() {
+                        Rule::kw_detach => detach = true,
+                        Rule::kw_delete => {}
+                        Rule::var => target = Some(ident_text(only_child(d)?)?),
+                        other => bail!("internal: unexpected delete_clause child {other:?}"),
+                    }
+                }
+                delete = Some((detach, target.expect("delete_clause names a variable")));
+            }
+            other => bail!("internal: unexpected edge_write child {other:?}"),
+        }
+    }
+    let rel = rel.expect("edge_write always has a relationship");
+    let src = endpoint(src.expect("edge_write has a source node"), "the source")?;
+    let dst = endpoint(
+        dst.expect("edge_write has a destination node"),
+        "the destination",
+    )?;
+
+    if rel.dir != Direction::Outgoing {
+        bail!("a write relationship must point left-to-right, e.g. (a)-[:R]->(b)");
+    }
+    if rel.var_length.is_some() {
+        bail!("a write relationship cannot be variable-length");
+    }
+    if !rel.props.is_empty() {
+        bail!("relationship properties are not yet supported in a write");
+    }
+    let reltype = rel
+        .type_expr
+        .as_ref()
+        .and_then(LabelExpr::as_single_atom)
+        .ok_or_else(|| {
+            anyhow::anyhow!("a write relationship must carry exactly one type, e.g. (a)-[:R]->(b)")
+        })?
+        .clone();
+
+    let op = if is_merge {
+        EdgeWriteOp::Create
+    } else {
+        let (detach, target) = delete.expect("edge_delete has a delete_clause");
+        if detach {
+            bail!("DETACH deletes a node and its edges; to delete a relationship use MATCH (a)-[r:R]->(b) DELETE r");
+        }
+        let rvar = rel.var.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("to delete a relationship, name it: MATCH (a)-[r:R]->(b) DELETE r")
+        })?;
+        if target != rvar {
+            bail!("DELETE must target the relationship variable '{rvar}', not '{target}'");
+        }
+        EdgeWriteOp::Delete
+    };
+
+    Ok(EdgeWriteStmt {
+        src,
+        reltype,
+        dst,
+        op,
+    })
+}
+
+/// Reduce a labelled node pattern to an [`EndpointPat`] (single label, exactly one
+/// inline business-key property whose value is a literal/parameter) — the endpoint of
+/// a relationship write. `what` names the endpoint in error messages.
+fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
+    let label = node
+        .label_expr
+        .as_ref()
+        .and_then(LabelExpr::as_single_atom)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} node of a write must carry exactly one label, e.g. (a:Label {{…}})"
+            )
+        })?
+        .clone();
+    if node.props.len() != 1 {
+        bail!("{what} node of a write must carry exactly one inline business-key property, e.g. (a:Label {{key: value}})");
+    }
+    let (key, key_value) = node.props.into_iter().next().unwrap();
+    ensure_constant(&key_value, &format!("{what} business-key value"))?;
+    Ok(EndpointPat {
+        label,
+        key,
+        key_value,
+    })
 }
 
 /// Lower a `write_statement` into a [`WriteStmt`], enforcing the Phase 1c shape:
@@ -2461,13 +2612,22 @@ mod tests {
     fn write(q: &str) -> WriteStmt {
         match parse_statement(q).unwrap_or_else(|e| panic!("expected accept for {q:?}: {e}")) {
             Statement::Write(w) => w,
-            Statement::Read(_) => panic!("expected a write for {q:?}"),
+            other => panic!("expected a node write for {q:?}, got {other:?}"),
+        }
+    }
+
+    fn edge_write(q: &str) -> EdgeWriteStmt {
+        match parse_statement(q).unwrap_or_else(|e| panic!("expected accept for {q:?}: {e}")) {
+            Statement::WriteEdge(w) => w,
+            other => panic!("expected an edge write for {q:?}, got {other:?}"),
         }
     }
 
     fn write_err(q: &str) -> String {
         match parse_statement(q) {
-            Ok(Statement::Write(_)) => panic!("expected reject for {q:?}"),
+            Ok(Statement::Write(_) | Statement::WriteEdge(_)) => {
+                panic!("expected reject for {q:?}")
+            }
             // An unsupported write shape falls through to the read parser, which
             // rejects it; either way `parse_statement` must not yield a Write.
             Ok(Statement::Read(_)) => "read-only".to_string(),
@@ -2552,6 +2712,74 @@ mod tests {
             e.contains("MERGE cannot be combined with DELETE") || e == "read-only",
             "got: {e}"
         );
+    }
+
+    #[test]
+    fn merge_edge_lowers_to_a_create() {
+        let w = edge_write("MERGE (a:Person {name: 'Ann'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+        assert_eq!(w.op, EdgeWriteOp::Create);
+        assert_eq!(w.reltype, "KNOWS");
+        assert_eq!(w.src.label, "Person");
+        assert_eq!(w.src.key, "name");
+        assert_eq!(w.src.key_value, Expr::Literal(Value::Str("Ann".into())));
+        assert_eq!(w.dst.label, "Person");
+        assert_eq!(w.dst.key_value, Expr::Literal(Value::Str("Bob".into())));
+    }
+
+    #[test]
+    fn merge_edge_accepts_params_and_an_ignored_rel_var() {
+        let w = edge_write("MERGE (a:Company {ticker: $s})-[r:OWNS]->(b:Drug {id: $d})");
+        assert_eq!(w.reltype, "OWNS");
+        assert_eq!(w.src.key_value, Expr::Param("s".into()));
+        assert_eq!(w.dst.key_value, Expr::Param("d".into()));
+    }
+
+    #[test]
+    fn delete_edge_lowers_and_checks_the_rel_var() {
+        let w = edge_write(
+            "MATCH (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) DELETE r",
+        );
+        assert_eq!(w.op, EdgeWriteOp::Delete);
+        assert_eq!(w.reltype, "KNOWS");
+
+        // DELETE must name the bound relationship variable.
+        let e = write_err(
+            "MATCH (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) DELETE x",
+        );
+        assert!(
+            e.contains("DELETE must target the relationship variable") || e == "read-only",
+            "got: {e}"
+        );
+
+        // A rel variable is required to delete (there is nothing to name otherwise).
+        let e =
+            write_err("MATCH (a:Person {name: 'Ann'})-[:KNOWS]->(b:Person {name: 'Bob'}) DELETE r");
+        assert!(e.contains("name it") || e == "read-only", "got: {e}");
+    }
+
+    #[test]
+    fn edge_write_rejects_unsupported_shapes() {
+        // Undirected / right-to-left relationships are not writes.
+        assert!(edge_or_read_reject(
+            "MERGE (a:Person {name: 'Ann'})-[:KNOWS]-(b:Person {name: 'Bob'})"
+        ));
+        assert!(edge_or_read_reject(
+            "MERGE (a:Person {name: 'Ann'})<-[:KNOWS]-(b:Person {name: 'Bob'})"
+        ));
+        // Variable-length is not a write.
+        assert!(edge_or_read_reject(
+            "MERGE (a:Person {name: 'Ann'})-[:KNOWS*1..2]->(b:Person {name: 'Bob'})"
+        ));
+        // An endpoint needs exactly one label + one business-key property.
+        assert!(edge_or_read_reject(
+            "MERGE (a:Person)-[:KNOWS]->(b:Person {name: 'Bob'})"
+        ));
+    }
+
+    /// A write shape that must not lower to an `EdgeWriteStmt` — either it errors, or
+    /// it falls through to the read parser (which also rejects it).
+    fn edge_or_read_reject(q: &str) -> bool {
+        !matches!(parse_statement(q), Ok(Statement::WriteEdge(_)))
     }
 
     #[test]

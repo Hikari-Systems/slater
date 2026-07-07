@@ -102,12 +102,31 @@ union = { kw_union ~ kw_all? }
 // entry (`parser::parse_statement`), tried before the read grammar; broader write
 // shapes (multi-node, relationships, REMOVE, computed RHS) are rejected at lowering
 // with a clear message, and stay rejected as read-only when the layer is disabled.
-write_statement = { SOI ~ (kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause? ~ ";"? ~ EOI }
+// The edge shapes are tried first (they start with the same `(node)` prefix, so a
+// node write only reaches its arm when no relationship follows the anchor).
+write_statement = {
+    SOI ~ (
+        edge_write
+      | ((kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause?)
+    ) ~ ";"? ~ EOI
+}
 set_clause = { kw_set ~ set_item ~ ("," ~ set_item)* }
 set_item = { var ~ property_access ~ "=" ~ expr }
 // `[DETACH] DELETE var` tombstones the anchored node (Phase 2). DETACH is accepted
 // but a no-op until the Phase 3 topology overlay removes incident edges.
 delete_clause = { kw_detach? ~ kw_delete ~ var }
+
+// ── Relationship write (Phase 3c) ─────────────────────────────────────────────
+// `MERGE (a:L {k:v})-[:R]->(b:M {j:w})` creates a relationship (create-if-absent by
+// edge identity, auto-creating an absent endpoint node); `MATCH (a:L {k:v})-[r:R]->
+// (b:M {j:w}) DELETE r` removes one. Both endpoints are single-label, single
+// business-key node patterns (same shape as the node anchor); the relationship must
+// be a single directed `-[:R]->` with one type and no variable-length / properties
+// (validated at lowering, reusing the read grammar's `rel_pattern`). A rel variable
+// is required for DELETE (it names the edge) and optional for MERGE.
+edge_write = { edge_merge | edge_delete }
+edge_merge = { kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern }
+edge_delete = { kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
 
 // A bare metadata `CALL proc()` (no trailing RETURN) is a complete query — its
 // yielded outputs are the result columns. The middle alternative greedily

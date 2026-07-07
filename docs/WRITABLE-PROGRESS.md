@@ -324,10 +324,29 @@ Running ledger for the `writeable` track. Pairs with the design in
     edge) and `edge_overlay_suppresses_edge_to_tombstoned_node` (a core edge to a
     `DELETE`d node vanishes on read). Whole slater+slater-delta green; clippy+fmt clean;
     empty-delta bench within noise of core.
-  - **3c — relationship write grammar + write path.** `MERGE (a)-[:R]->(b)` create
-    and an edge `DELETE`; parser lowering; `execute_write` edge dispatch (resolve both
-    endpoints, bounded core-adjacency dedup so a MERGE of an existing core edge is a
-    no-op).
+  - **3c — relationship write grammar + write path. ✅ DONE** (this commit). Grammar
+    (`cypher.pest`): `write_statement` now tries an `edge_write` alt first
+    (`edge_merge = MERGE (a)-rel->(b)` create, `edge_delete = MATCH (a)-[r:R]->(b)
+    DELETE r`) before the node arm — the shared `(node)` prefix means a node write
+    only reaches its arm when no relationship follows. Reuses the read grammar's
+    `rel_pattern`, validated at lowering (must be a single directed `-[:R]->`, one
+    type, no var-length/props). Parser: `ast::{EndpointPat, EdgeWriteStmt, EdgeWriteOp}`
+    + `Statement::WriteEdge`; `lower_edge_write` + a shared `endpoint()` helper (single
+    label + one constant business-key prop, like the node anchor); a `DELETE` names the
+    bound rel var (required), `DETACH`/undirected/var-length/edge-props rejected with
+    clear messages. Write path (`server::execute_edge_write`): the reltype must
+    pre-exist (`gen.reltype_id`, so the overlay can map it — mirrors born-node labels),
+    both endpoints resolve via `resolve_endpoint` (`Unique`→dense, `Absent`→`None` for a
+    MERGE born-endpoint create / DELETE no-op, ambiguous/unindexed→error); a MERGE whose
+    endpoints are both core nodes is deduped against the existing **core** edge
+    (`core_edge_exists` scans the src's `outgoing_adj` over an empty-delta view — a born
+    duplicate is already prevented by the memtable's identity idempotency), so a re-MERGE
+    of a core edge is a no-op. `writer.write(op, OpResolution::Edge{src,dst})`. Tests:
+    parser (MERGE-edge create, params + ignored rel var, DELETE rel-var check, rejected
+    shapes) + server (`edge_write_grammar_end_to_end`: create + walk, idempotent MERGE of
+    a core edge, born-endpoint auto-create, DELETE, unknown-reltype reject;
+    `edge_writes_survive_a_reopen`: created + deleted edges durable across a WAL replay).
+    Whole slater+slater-delta+workspace green; clippy+fmt clean. See D46.
   - **3d — consolidation folds delta edges.** `serialise_merge_dump` emits born edges
     and drops tombstoned / incident-to-tombstoned-node edges; determinism test.
 
@@ -358,44 +377,33 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Phases 3a + 3b are done: the memtable edge layer (3a) and the exec traversal read
-overlay (3b) are in and tested. A relationship written into the delta is now walkable
-in every traversal path (sequential + parallel), a deleted edge and an edge to a
-deleted node are suppressed, and consolidation's `outgoing_adj` already overlays edges
-(it delegates to the same `outgoing`). What's missing is the **write grammar** — edges
-can only be written by hand-building a `WalOp` today.
+Phases 3a–3c are done: the memtable edge layer, the traversal read overlay, and the
+`MERGE`/`DELETE` relationship write grammar are all in and tested end-to-end (create +
+walk, idempotent MERGE, born-endpoint auto-create, delete, WAL-reopen durability). The
+two open Phase-2 gaps are closed. What remains is **3d — confirming consolidation folds
+delta edges**, which is *mostly a test* because 3b already made the consolidation edge
+walk (`Engine::outgoing_adj` → `outgoing` → `read_adj_overlaid`) overlay-aware:
 
-The recommended next step is **3c — the relationship write grammar + write path**:
-- **Grammar (`cypher.pest`).** Extend `write_statement` with an edge shape:
-  `MERGE (a:L {k:v})-[:R]->(b:M {j:w})` for create, and an edge delete
-  (`MATCH (a:L {k:v})-[r:R]->(b:M {j:w}) DELETE r`, or a rel-less
-  `MATCH (a)-[:R]->(b) DELETE` form — pick one; a rel variable + `DELETE r` is the
-  openCypher-faithful spelling). Keep it as narrow as the node shape: two labelled
-  business-key anchors, one reltype, no edge properties yet.
-- **Parser (`parser.rs`).** A new `WriteStmt` variant (or an `op`/target enum) carrying
-  the two endpoint identities + reltype; lower with the same constant-only checks as
-  the node path. `MERGE` create vs `MATCH` update/delete semantics per D45.
-- **Write path (`server::execute_write`).** Build `WalOp::{UpsertEdge,DeleteEdge}`;
-  resolve **both** endpoints via `resolve_business_key` (each must be `Unique` for a
-  core endpoint, or `Absent` under `MERGE` to auto-create a born endpoint; ambiguous /
-  unindexed → the existing clear errors). For a `MERGE` edge, **dedup against an
-  existing core edge**: scan the resolved src's `outgoing_adj` for a matching
-  `(reltype-id, dst-dense)` and skip the write if present (idempotent MERGE — the
-  memtable is already identity-idempotent, but this avoids a born duplicate of a core
-  edge). Require the reltype to pre-exist in the core (`gen.reltype_id(R).is_some()`),
-  matching the 3b overlay's skip-unknown-reltype behaviour — reject with a clear error
-  otherwise. Pass `OpResolution::Edge { src, dst }` to `writer.write`.
-- Then **3d** is mostly tests: `serialise_merge_dump` already walks `outgoing_adj`
-  (overlay-aware as of 3b) and skips tombstoned nodes/edges, so born edges emit and
-  deleted edges drop; add a determinism/round-trip test and confirm a born edge between
-  two born nodes serialises.
+- `consolidate::serialise_merge_dump` walks `0..node_count` (born nodes included via
+  `MergedView::node_count`), skips tombstoned nodes in `emit_node`, and for each
+  surviving src emits `engine.outgoing_adj(src)` — which now yields **born** edges and
+  drops **tombstoned** edges and edges to tombstoned nodes. So a born edge between two
+  born nodes, and the drop of a deleted edge, should already round-trip through a
+  rebuild. Verify with a test (extend `consolidate.rs`'s test module or add a server
+  consolidation test): create a born edge (both endpoints born, and one core→born) plus
+  delete a core edge, run `serialise_merge_dump` over the `MergedView`, and assert the
+  dump contains the born `MERGE (…)-[:R]->(…)` lines and omits the deleted one. Watch
+  for: a born edge's `rel_record` type name resolves through the **core** reltype id
+  (3b maps it), and the born-edge props are empty — both already handled. If a real gap
+  surfaces (e.g. `emit_edges_from` re-checks `is_tombstoned(src)` but a born src is fine),
+  fix it there.
+- After 3d, Phase 3 is complete; update the Phase 3 header to ✅ and move to Phase 4/5
+  (L0 flush + the `CALL slater.consolidate()` Bolt trigger).
 
-Handy 3b resume detail: `overlay_adj` + `read_adj_overlaid` free fns in `exec.rs` (used
-by `Engine::{outgoing,incoming,outgoing_adj}`, `hops_par`, `neighbours_par`);
-`MergedView::edge_count` += `born_edge_count`; born-edge id guards in
-`edge_props`/`edge_prop_par`. Write-path resume detail (3a): `server::resolve_op`
-builds `OpResolution`; `DeltaWriter::write(op, OpResolution)`; endpoint dense ids come
-from `resolve_business_key` (`KeyResolution`).
+Handy 3c resume detail: grammar `edge_write`/`edge_merge`/`edge_delete` in
+`cypher.pest`; `parser::lower_edge_write` + `endpoint()` → `ast::EdgeWriteStmt`
+(`Statement::WriteEdge`); `server::{execute_edge_write, resolve_endpoint,
+core_edge_exists}`. 3b: `overlay_adj`/`read_adj_overlaid` in `exec.rs`.
 
 Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
 - **moved indexed value** (deferred from 2d): relocate a patched core node in a range

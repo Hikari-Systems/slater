@@ -2339,6 +2339,9 @@ async fn handle_request(
                         parser::ast::Statement::Write(stmt) => {
                             execute_write(w, gen.as_ref(), &stmt, &param_vals)?
                         }
+                        parser::ast::Statement::WriteEdge(stmt) => {
+                            execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?
+                        }
                         parser::ast::Statement::Read(ast) => {
                             // Overlay this graph's delta iff it was resolved against the
                             // generation we're about to read (dense ids are per-build).
@@ -2615,6 +2618,133 @@ fn execute_write(
     };
     writer
         .write(op, OpResolution::Node(resolved))
+        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// Resolve an edge-write endpoint's business key to a current-core dense id.
+/// `Unique` → the id; `Absent` → `None` (a `MERGE` auto-creates a delta-born endpoint,
+/// a `DELETE` no-ops if it is also not a born node); ambiguous / unindexed is a clear
+/// error, exactly as the node write path.
+fn resolve_endpoint(
+    gen: &Generation,
+    ep: &parser::ast::EndpointPat,
+    value: &Value,
+) -> std::result::Result<Option<u64>, Failure> {
+    match resolve_business_key(gen, &ep.label, &ep.key, value) {
+        KeyResolution::Unique(id) => Ok(Some(id)),
+        KeyResolution::Absent => Ok(None),
+        KeyResolution::Ambiguous => Err(Failure::new(
+            CODE_EXECUTION,
+            format!(
+                "the business key {}({} = …) matches more than one node — writes require a \
+                 unique business key",
+                ep.label, ep.key
+            ),
+        )),
+        KeyResolution::Unindexed => Err(Failure::new(
+            CODE_EXECUTION,
+            format!(
+                "cannot write a relationship to {}({} = …): the business key must be range-indexed \
+                 to resolve it",
+                ep.label, ep.key
+            ),
+        )),
+    }
+}
+
+/// Whether the core already carries an edge `src -[reltype]-> dst` — the `MERGE`
+/// idempotency check that stops a re-`MERGE` of an existing core edge from adding a
+/// duplicate delta-born edge. Scans only the source's core outgoing adjacency (bounded
+/// by its out-degree) over an empty-delta view, so it sees core edges only (a born
+/// duplicate is already prevented by the memtable's identity idempotency).
+fn core_edge_exists(
+    gen: &Generation,
+    src: u64,
+    reltype: u32,
+    dst: u64,
+) -> std::result::Result<bool, Failure> {
+    let cache = BlockCache::new(1 << 16);
+    let view = MergedView::read_only(gen);
+    let engine = crate::exec::Engine::new(&view, &cache);
+    let adj = engine.outgoing_adj(src).map_err(|e| {
+        Failure::new(
+            CODE_EXECUTION,
+            format!("check for an existing relationship: {e:#}"),
+        )
+    })?;
+    Ok(adj
+        .iter()
+        .any(|a| a.reltype == reltype && a.neighbour.0 == dst))
+}
+
+/// Execute one durable relationship write (Phase 3c): resolve both endpoints, build
+/// the WAL edge op, and hand it to the writer. A `MERGE` of an edge that already
+/// exists in the core is an idempotent no-op; the relationship type must already
+/// exist (the traversal overlay maps it to a core reltype id).
+fn execute_edge_write(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    stmt: &parser::ast::EdgeWriteStmt,
+    params: &HashMap<String, Val>,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    use parser::ast::EdgeWriteOp;
+    // The reltype must pre-exist: the read overlay resolves a born edge's type through
+    // the core symbol table, so a brand-new type would be invisible to traversal.
+    let Some(reltype_id) = gen.reltype_id(&stmt.reltype) else {
+        return Err(Failure::new(
+            CODE_EXECUTION,
+            format!(
+                "cannot write a :{} relationship: the relationship type must already exist in the \
+                 graph",
+                stmt.reltype
+            ),
+        ));
+    };
+    let src_value = write_value(&stmt.src.key_value, params, "the source business-key value")?;
+    let dst_value = write_value(
+        &stmt.dst.key_value,
+        params,
+        "the destination business-key value",
+    )?;
+    let src = resolve_endpoint(gen, &stmt.src, &src_value)?;
+    let dst = resolve_endpoint(gen, &stmt.dst, &dst_value)?;
+
+    // A MERGE of an edge whose endpoints are both existing core nodes is idempotent —
+    // skip the write if the core already has it (a born duplicate would double the edge
+    // on traversal). If either endpoint is delta-born there can be no matching core
+    // edge, so no check is needed.
+    if stmt.op == EdgeWriteOp::Create {
+        if let (Some(s), Some(d)) = (src, dst) {
+            if core_edge_exists(gen, s, reltype_id, d)? {
+                return Ok((Vec::new(), Vec::new()));
+            }
+        }
+    }
+
+    let op = match stmt.op {
+        EdgeWriteOp::Create => WalOp::UpsertEdge {
+            src_label: stmt.src.label.clone(),
+            src_key: stmt.src.key.clone(),
+            src_value,
+            reltype: stmt.reltype.clone(),
+            dst_label: stmt.dst.label.clone(),
+            dst_key: stmt.dst.key.clone(),
+            dst_value,
+            patches: Vec::new(),
+        },
+        EdgeWriteOp::Delete => WalOp::DeleteEdge {
+            src_label: stmt.src.label.clone(),
+            src_key: stmt.src.key.clone(),
+            src_value,
+            reltype: stmt.reltype.clone(),
+            dst_label: stmt.dst.label.clone(),
+            dst_key: stmt.dst.key.clone(),
+            dst_value,
+        },
+    };
+    writer
+        .write(op, OpResolution::Edge { src, dst })
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
@@ -3939,6 +4069,162 @@ mod tests {
         assert!(
             hop().is_empty(),
             "the core edge to the now-tombstoned Bob is suppressed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 3c: the relationship write grammar, end to end. `MERGE (a)-[:R]->(b)`
+    /// creates a walkable edge (idempotent against an existing core edge, and
+    /// auto-creating an absent endpoint); `MATCH (a)-[r:R]->(b) DELETE r` removes one;
+    /// an unknown relationship type is rejected.
+    #[test]
+    fn edge_write_grammar_end_to_end() {
+        let (root, _g) = testgen::write_indexed_people("edge_write_3c");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run_write = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected an edge write for {q:?}, got {other:?}"),
+            }
+        };
+        let names = |q: &str| -> Vec<String> {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast = parser::parse(q).unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            let mut out: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("expected str, got {v:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        // Create Bob-KNOWS->Carol.
+        run_write("MERGE (a:Person {name:'Bob'})-[:KNOWS]->(b:Person {name:'Carol'})").unwrap();
+        assert_eq!(
+            names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Carol".to_string()]
+        );
+
+        // Idempotent MERGE of the existing core edge Alice-KNOWS->Bob: no duplicate.
+        run_write("MERGE (a:Person {name:'Alice'})-[:KNOWS]->(b:Person {name:'Bob'})").unwrap();
+        assert_eq!(
+            names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Bob".to_string()],
+            "MERGE of an existing core edge does not duplicate it"
+        );
+
+        // MERGE with an absent destination auto-creates the born node + edge.
+        run_write("MERGE (a:Person {name:'Bob'})-[:KNOWS]->(b:Person {name:'Zoe'})").unwrap();
+        assert_eq!(
+            names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Carol".to_string(), "Zoe".to_string()],
+            "born endpoint Zoe is created and reachable"
+        );
+        assert!(
+            names("MATCH (n:Person) RETURN n.name").contains(&"Zoe".to_string()),
+            "born endpoint Zoe is a Person node"
+        );
+
+        // Delete the core edge Alice-KNOWS->Bob.
+        run_write("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r")
+            .unwrap();
+        assert!(
+            names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name").is_empty(),
+            "the deleted core edge no longer traverses"
+        );
+
+        // An unknown relationship type is rejected.
+        let err = run_write("MERGE (a:Person {name:'Alice'})-[:NOPE]->(b:Person {name:'Carol'})")
+            .unwrap_err();
+        assert!(
+            err.message.contains("must already exist"),
+            "unknown reltype rejected: {}",
+            err.message
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 3c durability: a created edge and a deleted core edge survive a WAL
+    /// reopen — the edge WAL ops replay and re-resolve their endpoints deterministically
+    /// (born endpoints re-allocate their synthetic ids in replay order).
+    #[test]
+    fn edge_writes_survive_a_reopen() {
+        let (root, _g) = testgen::write_indexed_people("edge_durable_3c");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        {
+            let writer = graphs.writer("people").unwrap();
+            // Create Bob-KNOWS->Carol and delete the core Alice-KNOWS->Bob.
+            let mk = |q: &str| match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected an edge write"),
+            };
+            mk("MERGE (a:Person {name:'Bob'})-[:KNOWS]->(b:Person {name:'Carol'})");
+            mk("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r");
+        }
+
+        // Reopen the writer over the same WAL and re-run the reads over the fresh delta.
+        let reopened = Arc::new(
+            DeltaWriter::open(
+                wal.join("people"),
+                "people",
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
+            .unwrap(),
+        );
+        let names = |q: &str| -> Vec<String> {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(reopened.snapshot()),
+            );
+            let ast = parser::parse(q).unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("expected str, got {v:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Carol".to_string()],
+            "created edge is durable"
+        );
+        assert!(
+            names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name").is_empty(),
+            "deleted edge stays deleted across a reopen"
         );
         std::fs::remove_dir_all(&root).ok();
     }

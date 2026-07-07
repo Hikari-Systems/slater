@@ -841,3 +841,30 @@ and consolidation serialises the merged state back to `MERGE` (D-less; see
 considered and deferred: a distinct `CREATE` clause (most honest create/update split,
 but two write grammars to carry and `CREATE` on an existing unique key would have to
 error anyway — `MERGE` subsumes it).
+
+### D46 — Relationship writes: `MERGE (a)-[:R]->(b)` create, `MATCH …-[r:R]->… DELETE r`
+Phase 3c adds relationship writes to the writable layer (`crates/slater`). The grammar
+(`cypher.pest` `write_statement`) gains an `edge_write` alternative, tried *before* the
+node arm because both start with a `(node)` prefix — a node write only reaches its arm
+when no relationship follows the anchor. Two shapes, as narrow as the node write: a
+single directed `-[:R]->` (one type, no variable-length, no edge properties — validated
+at lowering, reusing the read grammar's `rel_pattern`) between two single-label,
+single-business-key endpoint node patterns. `MERGE (a:L {k:v})-[:R]->(b:M {j:w})`
+**creates** the edge (create-if-absent by edge identity), **auto-creating an absent
+endpoint node** as a delta-born node — the openCypher MERGE-on-a-path semantics, and it
+falls out of the memtable's `endpoint_dense_or_create`. `MATCH (a:L {k:v})-[r:R]->
+(b:M {j:w}) DELETE r` removes one (the rel variable is required — it names the edge;
+`DETACH` is a node concept and rejected). Two deliberate constraints, both surfaced as
+clear errors: (1) **the relationship type must already exist in the core** — the
+traversal read overlay maps a born edge's reltype *name* to a core reltype id, so a
+brand-new type would be invisible to `:R` traversal (mirrors the born-node rule that a
+label must pre-exist); (2) **a `MERGE` of an edge whose endpoints are both existing core
+nodes is deduped against the core** (`server::core_edge_exists` scans the source's
+`outgoing_adj` over an empty-delta view) so it does not add a born duplicate of a core
+edge — a born-vs-born duplicate is already impossible because the memtable is idempotent
+by edge identity. Edge *properties* are deferred: `WalOp::UpsertEdge` carries a reserved
+`patches` field and `EdgeDelta` a `patches` map, but the grammar creates topology only
+for now. Rejected alternative: keying the delete on a `MATCH`-bound edge dense id
+(a full traversal to bind `r`), rather than the edge business key — the business key
+`(src, reltype, dst)` is the stable identity the whole delta layer binds to, so the
+delete resolves it directly, no traversal needed.
