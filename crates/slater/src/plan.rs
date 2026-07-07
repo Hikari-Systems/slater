@@ -5,7 +5,7 @@
 //! sweep* for the anchor of a `MATCH` — a selective range-index lookup, the
 //! inverted label postings, or (last resort) the whole node space. This module is
 //! that decision and nothing more: it is a pure, side-effect-free function over the
-//! pattern, the optional `WHERE`, and the open [`Generation`] (so it can see which
+//! pattern, the optional `WHERE`, and the open [`Generation`](crate::generation::Generation) (so it can see which
 //! indexes and labels actually exist).
 //!
 //! Correctness does **not** depend on the planner being clever. The executor always
@@ -23,8 +23,9 @@
 // Consumed by the executor (`exec`); the standalone planner is unit-tested here.
 #![allow(dead_code)]
 
-use crate::generation::{Generation, RelEndpointSide};
+use crate::generation::RelEndpointSide;
 use crate::parser::ast::{CmpOp, Direction, Expr, FuncArgs, NodePat, Pattern};
+use crate::read_view::ReadView;
 use graph_format::ids::Value;
 use graph_format::manifest::EntityKind;
 use std::collections::HashMap;
@@ -81,7 +82,7 @@ enum Pred {
 /// name); `where_` is the clause's optional predicate. Preference order:
 /// range-index equality → range-index range → smallest label posting → full scan.
 pub fn choose_node_scan(
-    gen: &Generation,
+    gen: &dyn ReadView,
     node: &NodePat,
     where_: Option<&Expr>,
     params: &HashMap<String, Value>,
@@ -129,7 +130,7 @@ pub fn choose_node_scan(
 /// first hop and re-checks the anchor's labels in `node_ok`, so the posting only
 /// ever narrows the candidate set — never changes results.
 pub(crate) fn maybe_rel_type_scan(
-    gen: &Generation,
+    gen: &dyn ReadView,
     base: &NodeScan,
     pattern: &Pattern,
 ) -> Option<NodeScan> {
@@ -308,7 +309,7 @@ fn inline_preds(
         .collect()
 }
 
-fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)]) -> NodeScan {
+fn choose_from_preds(gen: &dyn ReadView, node: &NodePat, preds: &[(String, Pred)]) -> NodeScan {
     // The labels the planner may treat as positively required. For a single positive
     // atom or a `:A:B` conjunction this is exactly the old `node.labels`, so existing
     // plans are unchanged; a disjunctive/negated expression yields none, falling back
@@ -357,7 +358,7 @@ fn choose_from_preds(gen: &Generation, node: &NodePat, preds: &[(String, Pred)])
 }
 
 /// Find an *open* range index over `(label ∈ labels, prop)` for a node entity.
-pub(crate) fn index_for(gen: &Generation, labels: &[String], prop: &str) -> Option<String> {
+pub(crate) fn index_for(gen: &dyn ReadView, labels: &[String], prop: &str) -> Option<String> {
     for ri in &gen.manifest().range_indexes {
         if ri.entity == EntityKind::Node
             && ri.property == prop
@@ -470,6 +471,7 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::Generation;
     use crate::parser;
 
     /// Pull the anchor node pattern and the (single) MATCH `WHERE` out of a query.

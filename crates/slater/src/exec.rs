@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Volcano-style executor: an AST [`Query`] → result rows, pulled from the
-//! immutable [`Generation`] through the decompressed-block [`BlockCache`].
+//! immutable [`Generation`](crate::generation::Generation) through the
+//! decompressed-block [`BlockCache`].
 //!
 //! The executor is the consumer of everything M4 built before it: it scans
 //! candidate nodes via the [`plan`](crate::plan) module's chosen strategy (range
@@ -37,9 +38,9 @@ use anyhow::{bail, Result};
 
 use crate::algo;
 use crate::cache::{BlockCache, FileKind, VectorIndexCache};
-use crate::generation::Generation;
 use crate::parser::ast::*;
 use crate::plan::{choose_node_scan, index_for, is_id_anchored, maybe_rel_type_scan, NodeScan};
+use crate::read_view::ReadView;
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{NodeId, Value};
@@ -336,7 +337,7 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
 /// `cache`, never the executor's interior-mutable state, so it carries no rel-property
 /// predicate (the caller restricts the parallel path to property-free patterns).
 fn neighbours_par(
-    gen: &Generation,
+    gen: &dyn ReadView,
     cache: &BlockCache,
     node: u64,
     dir: Direction,
@@ -370,7 +371,7 @@ fn neighbours_par(
 /// expression (`&`/`!`) keeps the AST for per-edge evaluation. Used by both
 /// [`Engine::expand_with_dir`] and the parallel [`hops_par`] reader; touches only
 /// the (Sync) symbol table, so it is safe to call before fanning out.
-fn resolve_type_filter<'a>(gen: &Generation, rel: &'a RelPat) -> Option<TypeFilter<'a>> {
+fn resolve_type_filter<'a>(gen: &dyn ReadView, rel: &'a RelPat) -> Option<TypeFilter<'a>> {
     rel.type_expr.as_ref().map(|e| match e.positive_atoms() {
         Some(names) => TypeFilter::AnyOf(names.iter().filter_map(|t| gen.reltype_id(t)).collect()),
         None => TypeFilter::Expr(e),
@@ -387,7 +388,7 @@ fn resolve_type_filter<'a>(gen: &Generation, rel: &'a RelPat) -> Option<TypeFilt
 /// the stored src→dst direction — both exactly as the sequential reader, so the hop
 /// order (and thus the emitted-row order) is identical.
 fn hops_par(
-    gen: &Generation,
+    gen: &dyn ReadView,
     cache: &BlockCache,
     node: u64,
     dir: Direction,
@@ -468,7 +469,7 @@ const EXPAND_READ_CHUNK: usize = EXPAND_PAR_MIN;
 /// behind the parallel brute-force kNN gather — it takes only `&Generation`/`&BlockCache`
 /// (both `Send + Sync`) so it can run off-thread; mirrors [`Engine::vector_group`]'s
 /// per-record body.
-fn read_vector(gen: &Generation, cache: &BlockCache, global: u64) -> Result<VectorEntry> {
+fn read_vector(gen: &dyn ReadView, cache: &BlockCache, global: u64) -> Result<VectorEntry> {
     let rec = cache.record(gen.vectors().inner(), gen.uuid(), FileKind::Vectors, global)?;
     vectors::decode_vector(&rec)
 }
@@ -482,7 +483,7 @@ const KNN_PAR_MIN: usize = 256;
 /// Thread-safe read+decode of node `id`'s resident label-id set through the (Sync)
 /// block cache. The free-fn body behind [`Engine::node_label_ids`] so the parallel
 /// anchor filter ([`node_ok_par`], Task 10) can read labels off-thread.
-fn node_label_ids_par(gen: &Generation, cache: &BlockCache, id: u64) -> Result<Vec<u32>> {
+fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result<Vec<u32>> {
     let rec = cache.record(
         gen.node_labels().inner(),
         gen.uuid(),
@@ -495,7 +496,7 @@ fn node_label_ids_par(gen: &Generation, cache: &BlockCache, id: u64) -> Result<V
 /// Thread-safe read of node `id`'s value for property `key` (or `Null` if absent),
 /// decoding only the requested key from the cached record. The free-fn body behind
 /// [`Engine::node_prop`]; used by the parallel anchor filter ([`node_ok_par`]).
-fn node_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
     };
@@ -521,7 +522,7 @@ fn node_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Re
 /// [`Engine::scan_guaranteed_labels`]); they skip the label-record decode exactly as
 /// the sequential path does, so the accept/reject decision is byte-for-byte identical.
 fn node_ok_par(
-    gen: &Generation,
+    gen: &dyn ReadView,
     cache: &BlockCache,
     id: u64,
     label_expr: Option<&LabelExpr>,
@@ -563,7 +564,7 @@ fn node_ok_par(
 /// touching only the Sync `gen`/`cache`. Used by [`property_val`] (and thus the
 /// parallel aggregation precompute, Task 12) and by `Engine::edge_prop`, so the two
 /// stay byte-for-byte identical.
-fn edge_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
     };
@@ -583,7 +584,7 @@ fn edge_prop_par(gen: &Generation, cache: &BlockCache, id: u64, key: &str) -> Re
 /// Map/Point/temporal/Null arms are pure value logic. `Engine::property` delegates
 /// here, and the parallel aggregation precompute ([`eval_simple`], Task 12) calls it
 /// directly, so the two paths produce identical `Val`s for the same input.
-fn property_val(gen: &Generation, cache: &BlockCache, base: &Val, key: &str) -> Result<Val> {
+fn property_val(gen: &dyn ReadView, cache: &BlockCache, base: &Val, key: &str) -> Result<Val> {
     match base {
         Val::Node(id) => node_prop_par(gen, cache, *id, key),
         Val::Rel { id, .. } => edge_prop_par(gen, cache, *id, key),
@@ -639,7 +640,7 @@ fn simple_readable(expr: &Expr) -> bool {
 /// identical [`Val`] for the same expression and row. A non-simple form is a caller
 /// bug (the call site is gated by [`simple_readable`]) and bails rather than panics.
 fn eval_simple(
-    gen: &Generation,
+    gen: &dyn ReadView,
     cache: &BlockCache,
     params: &HashMap<String, Val>,
     cols: &[String],
@@ -1238,8 +1239,8 @@ impl GlobalIntermediateBudget {
 // ── Engine ─────────────────────────────────────────────────────────────────
 
 /// Per-query execution context over one generation and its block cache.
-pub struct Engine<'g> {
-    gen: &'g Generation,
+pub struct Engine<'g, V: ReadView> {
+    gen: &'g V,
     cache: &'g BlockCache,
     /// The vector-index pool, needed only by the `AnnMode::Vamana` arm. The
     /// brute-force arm and all non-vector queries leave it `None`.
@@ -1299,7 +1300,7 @@ pub struct Engine<'g> {
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
 }
 
-impl Drop for Engine<'_> {
+impl<V: ReadView> Drop for Engine<'_, V> {
     /// Backstop for the global-budget refund if `run` is bypassed or unwound by a
     /// panic mid-query; after a normal `run` the charge is already 0, so this is a
     /// no-op on the hot path.
@@ -1308,8 +1309,8 @@ impl Drop for Engine<'_> {
     }
 }
 
-impl<'g> Engine<'g> {
-    pub fn new(gen: &'g Generation, cache: &'g BlockCache) -> Self {
+impl<'g, V: ReadView> Engine<'g, V> {
+    pub fn new(gen: &'g V, cache: &'g BlockCache) -> Self {
         Self {
             gen,
             cache,
@@ -7726,7 +7727,7 @@ fn comparable(a: &Val, b: &Val) -> Option<std::cmp::Ordering> {
 // cached per query so a constant pattern compiles once rather than once per row.
 // The regex crate is an RE2-style linear-time engine (no backtracking), so with
 // compile cost and automaton size bounded, match time is bounded too.
-impl<'g> Engine<'g> {
+impl<'g, V: ReadView> Engine<'g, V> {
     /// Compile `pattern`, or fetch it from the per-query cache. `anchored` wraps
     /// it as `\A(?:…)\z` so `=~` requires the entire subject to match —
     /// openCypher / FalkorDB `=~` semantics; the unanchored form scans for every
@@ -8362,6 +8363,7 @@ fn count_distinct_property(e: &Expr, var: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generation::Generation;
     use crate::parser;
     use crate::testgen;
 
@@ -11427,7 +11429,7 @@ mod tests {
         impl<T: ?Sized> AmbiguousIfSync<()> for T {}
         impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
         // Resolves to the blanket `()` impl unambiguously iff `Engine` is NOT `Sync`.
-        let _ = <Engine<'static> as AmbiguousIfSync<_>>::_f;
+        let _ = <Engine<'static, Generation> as AmbiguousIfSync<_>>::_f;
     }
 
     // ── Engine reuse: the charge resets and refunds per run ───────────────────

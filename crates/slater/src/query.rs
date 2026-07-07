@@ -44,6 +44,7 @@ use crate::cache::BlockCache;
 use crate::config::AppConfig;
 use crate::exec::{Engine, QueryResult, Val};
 use crate::generation::Generation;
+use crate::read_view::ReadView;
 use crate::{parser, server};
 
 /// Handle the `query` CLI subcommand and exit if present.
@@ -313,7 +314,7 @@ fn log_summary(
 }
 
 /// Render a [`QueryResult`] as `{"columns": [...], "rows": [[...], ...]}`.
-fn result_to_json(engine: &Engine, result: &QueryResult) -> Result<Json> {
+fn result_to_json<V: ReadView>(engine: &Engine<'_, V>, result: &QueryResult) -> Result<Json> {
     let rows = result
         .rows
         .iter()
@@ -331,7 +332,7 @@ fn result_to_json(engine: &Engine, result: &QueryResult) -> Result<Json> {
 /// shapes (see `server.rs`) but targets JSON: nodes/relationships expand to
 /// their labels/type + properties, temporals render as their ISO strings (JSON
 /// has no temporal type), and a point becomes a `{latitude, longitude}` object.
-fn val_to_json(engine: &Engine, v: &Val) -> Result<Json> {
+fn val_to_json<V: ReadView>(engine: &Engine<'_, V>, v: &Val) -> Result<Json> {
     Ok(match v {
         Val::Null => Json::Null,
         Val::Bool(b) => Json::Bool(*b),
@@ -402,7 +403,10 @@ fn val_to_json(engine: &Engine, v: &Val) -> Result<Json> {
 
 /// Convert a list of named [`Val`]s (node/rel properties, or a map) to a JSON
 /// object, preserving key order.
-fn pairs_to_json(engine: &Engine, pairs: &[(String, Val)]) -> Result<Map<String, Json>> {
+fn pairs_to_json<V: ReadView>(
+    engine: &Engine<'_, V>,
+    pairs: &[(String, Val)],
+) -> Result<Map<String, Json>> {
     let mut obj = Map::new();
     for (k, v) in pairs {
         obj.insert(k.clone(), val_to_json(engine, v)?);

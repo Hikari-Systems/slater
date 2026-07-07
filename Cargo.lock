@@ -3197,6 +3197,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "slater-delta",
  "slater-scalar",
  "thiserror",
  "tikv-jemallocator",

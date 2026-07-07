@@ -779,3 +779,44 @@ type name to the matching function and emits an ordinary `Expr::Function` — `I
 `BOOLEAN`/`BOOL`→`toBoolean`, plus `DATE`/`LOCALTIME`/`LOCALDATETIME`/`DURATION`. The
 same additive discipline as D39. Exotic GQL types (zoned temporals, typed lists,
 user-defined types) are deferred — they would need genuine new conversion logic.
+
+### D43 — Writable layer reads through a generic `ReadView` seam, not a `dyn` overlay
+The writable layer (the `writeable` track) overlays a delta on the immutable core
+*below* the executor's read surface (option A — storage-reader overlay, not
+executor-level merge). The executor and planner read the graph through the
+`ReadView` trait (`crates/slater/src/read_view.rs`), which lifts the ~30 methods
+they called inherently on `Generation` (the six readers + `.inner()`, the symbol
+lookups both directions, the count/marginal accessors, `range_index`/
+`property_histogram`/`vamana_index`, the two scans, `manifest`/`uuid`) plus two new
+handles: `delta()` (the overlay, empty for a bare generation) and
+`core_generation()`. `Generation` implements it as an identity pass-through;
+`MergedView` overlays a `DeltaSnapshot`. `Engine` is made **generic**
+(`Engine<'g, V: ReadView>`) rather than holding a `&dyn ReadView`: monomorphisation
+means the read-only path compiles to `Engine<'_, Generation>` — byte-identical
+codegen to before the seam existed, no vtable — and the empty-delta path
+(`Engine<'_, MergedView>`) inlines its forwards to the core. The `delta_overlay`
+bench (`--features testkit`) confirms the empty-delta arm sits within noise of the
+core arm. `ReadView: Send + Sync` so a view is still usable by the rayon fan-out
+readers. Keeping the whole surface in one trait is what lets a future delta overlay
+be added purely inside `MergedView`'s method bodies without touching the executor.
+
+### D44 — WAL durability has two seams: a local floor and object-store shipping
+The write-ahead log is split across two seams with **contradictory contracts** that
+must never be folded together (`crates/slater-delta/src/wal.rs`;
+`docs/WRITABLE-PLAN.md`). `WalSink` is the **local durability floor**: ordered,
+append-structured, fsync-durable at sub-millisecond latency, and **not
+parameterised by the storage backend** — a record never travels through
+`ObjectStore`, and a Bolt `SUCCESS` is returned strictly after the group-commit
+`sync()` that covers it. `ObjectStore` is used **only** to ship *sealed* WAL
+segments as numbered, immutable, content-addressed objects (S3/GCS have no append),
+with a `wal/HEAD` pointer written last as the copy-completeness barrier — the same
+pointer-last discipline as `current` in `write_manifest_and_publish` (D14), reusing
+`ObjectStore::put` verbatim with no WAL-shaped trait methods added. So `fs`/`s3`/
+`gcs` governs only the shipping tier; the floor is always local. This is a *core*
+concern, not a clustering one: even a plain local-disk + S3 single-writer
+deployment needs it to get its un-consolidated write tail off the writer node
+(durability + read-replica visibility). Consequences: a local segment is not
+retired until its PUT is acked; freeze ships the frozen tail before spawning the
+consolidation builder; the writeback interval is simultaneously the object-store
+RPO and the cross-replica read-visibility lag; and the writer node therefore needs
+a durable local volume, not ephemeral instance storage.

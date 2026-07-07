@@ -56,6 +56,7 @@ use crate::exec::{Engine, GlobalIntermediateBudget, QueryResult, Val};
 use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
+use crate::read_view::ReadView;
 
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 const TAG_NODE: u8 = 0x4E;
@@ -2483,7 +2484,7 @@ fn val_bytes(v: &Val) -> usize {
 /// Encode a runtime [`Val`] as a Bolt [`PsValue`]. `Node`/`Relationship` are
 /// resolved against the engine (labels, type, properties); element-id fields are
 /// emitted only for Bolt ≥ 5 (`version.0 >= 5`), matching the drivers' decoders.
-fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
+fn encode_val<V: ReadView>(engine: &Engine<'_, V>, version: (u8, u8), v: &Val) -> Result<PsValue> {
     Ok(match v {
         Val::Null => PsValue::Null,
         Val::Bool(b) => PsValue::Bool(*b),
@@ -2646,7 +2647,11 @@ fn encode_val(engine: &Engine, version: (u8, u8), v: &Val) -> Result<PsValue> {
 /// Encode a `Val::Rel` as a Bolt `UnboundRelationship` (0x72): `[id, type, props]`
 /// (plus the element-id field for Bolt ≥ 5). Endpoints are omitted — a path's node
 /// list supplies them.
-fn encode_unbound_rel(engine: &Engine, version: (u8, u8), r: &Val) -> Result<PsValue> {
+fn encode_unbound_rel<V: ReadView>(
+    engine: &Engine<'_, V>,
+    version: (u8, u8),
+    r: &Val,
+) -> Result<PsValue> {
     let Val::Rel { id, reltype, .. } = r else {
         bail!("encode_unbound_rel expects a relationship value");
     };
@@ -2665,8 +2670,8 @@ fn encode_unbound_rel(engine: &Engine, version: (u8, u8), r: &Val) -> Result<PsV
     })
 }
 
-fn encode_pairs(
-    engine: &Engine,
+fn encode_pairs<V: ReadView>(
+    engine: &Engine<'_, V>,
     version: (u8, u8),
     pairs: &[(String, Val)],
 ) -> Result<Vec<(String, PsValue)>> {

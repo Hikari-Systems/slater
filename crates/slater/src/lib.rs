@@ -28,6 +28,7 @@ pub mod introspect;
 pub mod parser;
 pub mod plan;
 pub mod query;
+pub mod read_view;
 pub mod server;
 pub mod temporal;
 pub mod vector;
@@ -35,5 +36,8 @@ pub mod vector;
 // Shared in-crate test fixture (built directly with the `graph-format` writers).
 // Compiled only for the crate's own unit tests; the `tests/` integration crate
 // builds its own (much larger) fixture from the public `graph-format` API.
-#[cfg(test)]
-mod testgen;
+// Gated `pub` under `testkit` (as well as `test`) so the delta-overlay benchmark
+// can build a real generation from the public `graph-format` API without shipping
+// the fixture code in a normal `slater` build.
+#[cfg(any(test, feature = "testkit"))]
+pub mod testgen;

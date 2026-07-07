@@ -26,7 +26,7 @@
 //! (Person,embedding) holding the three Person embeddings (Alice/Bob/Carol), in
 //! node order, so the KNN path has a real candidate set to rank.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "testkit"))]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

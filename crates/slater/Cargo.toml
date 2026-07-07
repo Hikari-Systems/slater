@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 graph-format.workspace = true
 slater-scalar.workspace = true
+slater-delta.workspace = true
 hs-utils.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -44,6 +45,9 @@ default = []
 s3 = ["graph-format/s3"]
 # Enable the GCS data backend (forwards to graph-format).
 gcs = ["graph-format/gcs"]
+# Expose the `testgen` fixture builder to benchmarks (off by default; not shipped
+# in a normal build). Required by the `delta_overlay` read-regression bench.
+testkit = []
 
 [lints.rust]
 # The server is entirely free of `unsafe`: heap return to the OS is now jemalloc's
@@ -57,3 +61,11 @@ criterion.workspace = true
 [[bench]]
 name = "vector_knn"
 harness = false
+
+# Proves the writable layer's empty-delta read path is a zero-cost pass-through:
+# A/Bs a node-materialisation loop over a bare `Generation` vs a `MergedView` with
+# an empty delta. Run: `cargo bench -p slater --features testkit --bench delta_overlay`.
+[[bench]]
+name = "delta_overlay"
+harness = false
+required-features = ["testkit"]
