@@ -121,9 +121,48 @@ Running ledger for the `writeable` track. Pairs with the design in
       group-commit batching (WAL already supports it, writer commits per-op);
       labelled-scan fallback for an unindexed business key; edge + tombstone deltas
       (Phases 2–3).
-  - **1d — consolidation (4a) + orchestrator.** `slater-build --consolidate`
-    (dump-and-rebuild); freeze → spawn builder → retire delta on exit 0; end-to-end
-    "write → read merged → consolidate → value in core, delta gone" + crash test. ⬜ TODO
+  - **1d — consolidation (4a) + orchestrator.** 🔨 IN PROGRESS.
+    - **1d-A — merged-view → MERGE dump serialiser. ✅ DONE** (commit `ed16742`).
+      `consolidate::serialise_merge_dump` reads a `ReadView`, so pointing it at a
+      `MergedView` folds the delta in for free — the dump *is* the consolidated
+      state and the builder runs unchanged (**key deviation from the plan: the
+      serialiser lives in `slater` and reads the merged view, rather than the
+      builder reading the generation offline — far less code and the delta fold is
+      automatic**). Emits `CREATE INDEX` DDL + business-key `MERGE` nodes/edges in
+      slater-build's default dialect; grammar-exact Cypher escaper; refuses (never
+      corrupts) a node whose identity isn't recoverable from a range index. New
+      `Engine::outgoing_adj`; `testgen::write_indexed_people` fixture.
+    - **1d-B — orchestrator + end-to-end + crash test. ⬜ TODO.** Resume plan:
+      1. **Freeze/retire on `DeltaWriter`.** Add `freeze()` — seal the current WAL
+         segment, open a fresh one, return `(frozen_snapshot: Arc<Memtable>,
+         consumed_segments)` — and `retire(consumed, new_core_uuid)` — delete the
+         consumed segments, reset memtable + `by_dense` empty against the new core.
+         Phase-1 simplification: consolidation just takes the single-writer path
+         (concurrent writes block on the writer lock during the build); the
+         freeze-to-a-fresh-live-memtable "writes never block" behaviour is Phase 4
+         admission control, not needed here.
+      2. **Server `consolidate_graph(graph)`.** freeze → build a
+         `MergedView(core, frozen delta)` → `serialise_merge_dump` to a temp file →
+         invoke the builder → on success the new generation is published
+         (`write_manifest_and_publish` swaps `current`); reopen the served
+         `Arc<Generation>` slot + reopen the writer against it + `retire`. Non-zero
+         builder exit keeps serving the old core (nothing mutated in place).
+      3. **Builder invocation seam (testability).** `slater-build` is **bin-only
+         and not a `slater` dep**, and `cargo test -p slater` does not build it — so
+         make the builder step an injected `Fn(dump, graph, data_dir) -> Result<()>`.
+         Production wires it to spawn the binary at a **config-supplied path**
+         (`delta.builder_bin`, default `slater-build` on `PATH`); the automated test
+         injects a closure that publishes a known-correct consolidated generation
+         (built with `testgen`, values independently asserted — no impl-vs-impl
+         parity), so the orchestration logic (freeze/serialise/retire/reopen) is
+         tested deterministically without the subprocess. Add a separate
+         `#[ignore]` true-e2e test that spawns the real binary.
+      4. **Trigger.** Phase 1 = a manual lever only; expose `consolidate_graph` as a
+         callable server method for the test. The Bolt surface (`CALL
+         slater.consolidate()`) + the automatic L0-soft-cap trigger are Phase 4/5.
+      5. **Crash test.** `SLATER_*_FAIL_AFTER`-style hook between freeze and the
+         `current` swap → assert the WAL still replays the write (no loss) and the
+         old core is still served (mirror `slater-build/tests/resume.rs`).
 
 - Phases 2–5: see `docs/WRITABLE-PLAN.md`.
 
@@ -152,25 +191,18 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 1d — consolidation (4a) + orchestrator** (`slater-build` +
-`crates/slater/`). Phase 1c gives durable property overwrites read-your-writes;
-1d folds the frozen delta back into a fresh core so the memtable can be retired.
-Steps:
-1. `slater-build --consolidate` (dump-and-rebuild): serialise the frozen delta to
-   business-key `MERGE` text (`Memtable::iter_nodes` is the input) and re-parse it
-   through the existing overlay/merge build path (`overlay.rs` / `merge_build.rs`),
-   layered on the current core generation → a new generation via
-   `common::write_manifest_and_publish` (D14 atomic swap).
-2. Orchestrator in the server: freeze the memtable (seal the WAL segment, open a
-   fresh one), spawn the builder, and on exit 0 retire the frozen delta + rebuild
-   the writer's `by_dense` empty against the new core (dense ids permute across the
-   rebuild — see `DeltaWriter::core_uuid` and the `delta_for_read` uuid guard).
-3. End-to-end test: write → read merged → consolidate → value is in the core and
-   the delta is gone; plus a crash-between-freeze-and-swap replay test (the WAL
-   still replays the write, so no data loss on a mid-consolidation kill).
+Implement **Phase 1d-B — consolidation orchestrator** (`crates/slater/`). 1d-A
+(the `consolidate::serialise_merge_dump` serialiser) is done and green; 1d-B wires
+freeze → serialise → build → swap/retire around it. The full step-by-step resume
+plan (freeze/retire on `DeltaWriter`, the injected builder seam that dodges the
+bin-only `slater-build` test friction, the manual trigger, the crash test) is in
+the **Phase 1d-B ⬜ TODO** block above — read that first.
 
-Handy resume detail: the write flow lands in `server.rs` (`execute_write`,
-`resolve_dense_id`, `delta_for_read`, `run_query`'s `ReadOverlay`); the writer is
-`crates/slater/src/delta_writer.rs`; the read overlay is `exec.rs`
-(`overlay_node_props`, `node_prop_par`).
+Handy resume detail: the serialiser is `crates/slater/src/consolidate.rs`
+(`serialise_merge_dump`, reads any `ReadView` — hand it a `MergedView`); the write
+flow lands in `server.rs` (`execute_write`, `resolve_dense_id`, `delta_for_read`,
+`run_query`'s `ReadOverlay`); the writer is `crates/slater/src/delta_writer.rs`
+(add `freeze`/`retire` here); the read overlay is `exec.rs` (`overlay_node_props`,
+`node_prop_par`); `testgen::write_indexed_people` is the fully-indexed fixture for
+the e2e test.
 
