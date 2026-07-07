@@ -144,8 +144,9 @@ fn emit_edges_from<V: ReadView>(
     src: u64,
     out: &mut impl Write,
 ) -> Result<()> {
-    // Edges incident to a deleted node vanish with it (topology tombstones join in
-    // Phase 3, but a node tombstone already removes its own incident edges here).
+    // A deleted source node vanishes with its edges. (`outgoing_adj` is overlay-aware
+    // as of Phase 3b: it already appends delta-born edges and drops tombstoned ones,
+    // so this loop folds the topology delta for free.)
     if view.delta().is_tombstoned(src) {
         return Ok(());
     }
@@ -153,6 +154,8 @@ fn emit_edges_from<V: ReadView>(
     let (sl, sk, sv) = node_identity(view, src, &slabels, &sprops)?;
     for adj in engine.outgoing_adj(src)? {
         let dst = adj.neighbour.0;
+        // Belt-and-braces: `outgoing_adj` already drops an edge to a tombstoned node,
+        // but a node tombstone must never leak an edge into the rebuild.
         if view.delta().is_tombstoned(dst) {
             continue;
         }
@@ -371,6 +374,113 @@ mod tests {
         // The core people survive alongside it.
         assert!(
             out.contains("MERGE (n:Person {name: 'Alice'})"),
+            "dump:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn serialise_emits_a_delta_born_edge() {
+        // Edges created only in the delta (Phase 3) must appear in the consolidated
+        // dump so a rebuild carries the topology forward — both a born edge between two
+        // existing core nodes and one to a delta-born endpoint node.
+        let (root, graph) = testgen::write_indexed_people("consolidate_born_edge");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Core: Alice(0), Bob(1), Carol(2); one core edge Alice-KNOWS->Bob.
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        // Born edge between two core nodes: Bob-KNOWS->Carol.
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            Some(1),
+            Some(2),
+            [],
+        );
+        // Born edge to a born endpoint: Carol-KNOWS->Dave (Dave absent from the core).
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            Some(2),
+            None,
+            [],
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        // The original core edge is still there.
+        assert!(
+            out.contains(
+                "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020;"
+            ),
+            "core edge survives:\n{out}"
+        );
+        // Both born edges (no properties → no SET) round-trip.
+        assert!(
+            out.contains("MERGE (a:Person {name: 'Bob'})-[r:KNOWS]->(b:Person {name: 'Carol'});"),
+            "born core→core edge emitted:\n{out}"
+        );
+        assert!(
+            out.contains("MERGE (a:Person {name: 'Carol'})-[r:KNOWS]->(b:Person {name: 'Dave'});"),
+            "born edge to a born endpoint emitted:\n{out}"
+        );
+        // The born endpoint node itself is emitted (so the rebuild can resolve it).
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Dave'});"),
+            "born endpoint node emitted:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn serialise_drops_a_deleted_edge() {
+        // Deleting the core edge Alice-KNOWS->Bob must remove it from the dump while
+        // keeping both endpoint nodes — otherwise a rebuild would resurrect the edge.
+        let (root, graph) = testgen::write_indexed_people("consolidate_del_edge");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        mem.delete_edge(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            !out.contains("-[r:KNOWS]->"),
+            "the deleted edge must not appear:\n{out}"
+        );
+        // Both endpoint nodes survive the edge delete.
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Alice'})"),
+            "dump:\n{out}"
+        );
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Bob'})"),
             "dump:\n{out}"
         );
         std::fs::remove_dir_all(&root).ok();

@@ -269,9 +269,10 @@ Running ledger for the `writeable` track. Pairs with the design in
     nodes — the `0..node_count` node/edge iteration must extend over the synthetic id
     range once 2c lands. (Small once 2c–2d are in.)
 
-- **Phase 3 — topology (edge) overlay. 🔨 IN PROGRESS.** Closes the two open
-  Phase-2 gaps: a core edge to a tombstoned node still traverses (2b), and delta-born
-  nodes have no edges (2c). Sub-milestones:
+- **Phase 3 — topology (edge) overlay. ✅ DONE.** Closed the two open Phase-2 gaps: a
+  core edge to a tombstoned node still traversed (2b), and delta-born nodes had no
+  edges (2c). Relationships can now be created/deleted through the delta, are walkable
+  in every traversal path, and survive consolidation. Sub-milestones:
   - **3a — edge WAL ops + memtable edge overlay (pure `slater-delta`). ✅ DONE**
     (this commit). WAL: `WalOp::{UpsertEdge,DeleteEdge}` (op-tags 3/4, names inline,
     encode/decode/replay round-trip; `patches` on `UpsertEdge` reserved for a later
@@ -347,8 +348,17 @@ Running ledger for the `writeable` track. Pairs with the design in
     a core edge, born-endpoint auto-create, DELETE, unknown-reltype reject;
     `edge_writes_survive_a_reopen`: created + deleted edges durable across a WAL replay).
     Whole slater+slater-delta+workspace green; clippy+fmt clean. See D46.
-  - **3d — consolidation folds delta edges.** `serialise_merge_dump` emits born edges
-    and drops tombstoned / incident-to-tombstoned-node edges; determinism test.
+  - **3d — consolidation folds delta edges. ✅ DONE** (this commit). No production
+    code change was needed: `serialise_merge_dump` walks `Engine::outgoing_adj`, which
+    3b made overlay-aware, so born edges emit as `MERGE (…)-[:R]->(…)` lines and
+    deleted / incident-to-tombstoned-node edges are dropped, and born nodes emit via the
+    existing `0..node_count` loop. Tests added (`consolidate.rs`):
+    `serialise_emits_a_delta_born_edge` (a born edge between two core nodes *and* one to
+    a born endpoint node both round-trip, alongside the surviving core edge) and
+    `serialise_drops_a_deleted_edge` (a deleted core edge is gone while both endpoint
+    nodes survive). Refreshed the now-stale "Phase 3" comment in `emit_edges_from`.
+    Whole slater+slater-delta+workspace green (determinism goldens included); clippy+fmt
+    clean.
 
 - Phases 4–5: see `docs/WRITABLE-PLAN.md`.
 
@@ -377,35 +387,43 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Phases 3a–3c are done: the memtable edge layer, the traversal read overlay, and the
-`MERGE`/`DELETE` relationship write grammar are all in and tested end-to-end (create +
-walk, idempotent MERGE, born-endpoint auto-create, delete, WAL-reopen durability). The
-two open Phase-2 gaps are closed. What remains is **3d — confirming consolidation folds
-delta edges**, which is *mostly a test* because 3b already made the consolidation edge
-walk (`Engine::outgoing_adj` → `outgoing` → `read_adj_overlaid`) overlay-aware:
+**Phase 3 is complete** (3a–3d all shipped): relationships can be created and deleted
+through the delta (`MERGE (a)-[:R]->(b)` / `MATCH (a)-[r:R]->(b) DELETE r`), are walkable
+in every traversal path (sequential + parallel + shortestPath), a deleted edge and an
+edge to a deleted node are suppressed on read, and consolidation folds all of it into a
+rebuild. Both open Phase-2 gaps are closed. Nodes **and** edges — create, update
+(properties), delete — are now a durable, consolidatable writable layer.
 
-- `consolidate::serialise_merge_dump` walks `0..node_count` (born nodes included via
-  `MergedView::node_count`), skips tombstoned nodes in `emit_node`, and for each
-  surviving src emits `engine.outgoing_adj(src)` — which now yields **born** edges and
-  drops **tombstoned** edges and edges to tombstoned nodes. So a born edge between two
-  born nodes, and the drop of a deleted edge, should already round-trip through a
-  rebuild. Verify with a test (extend `consolidate.rs`'s test module or add a server
-  consolidation test): create a born edge (both endpoints born, and one core→born) plus
-  delete a core edge, run `serialise_merge_dump` over the `MergedView`, and assert the
-  dump contains the born `MERGE (…)-[:R]->(…)` lines and omits the deleted one. Watch
-  for: a born edge's `rel_record` type name resolves through the **core** reltype id
-  (3b maps it), and the born-edge props are empty — both already handled. If a real gap
-  surfaces (e.g. `emit_edges_from` re-checks `is_tombstoned(src)` but a born src is fine),
-  fix it there.
-- After 3d, Phase 3 is complete; update the Phase 3 header to ✅ and move to Phase 4/5
-  (L0 flush + the `CALL slater.consolidate()` Bolt trigger).
+The recommended next step is **Phase 4 / 5** (see `docs/WRITABLE-PLAN.md` §Execution
+order). Pick one, in rough priority:
+- **Phase 5 Bolt trigger — `CALL slater.consolidate()`.** The orchestrator
+  (`Graphs::consolidate_graph`, prod builder seam `server::run_builder`) already works
+  end-to-end and is unit-tested; it just isn't reachable from a client. Wire a
+  metadata-procedure `CALL slater.consolidate()` (whitelist it in `cypher.pest`'s
+  `read_proc` / forbidden-clause carve-out like the other `CALL`s, dispatch it in the
+  RUN handler to `consolidate_graph`). Smallest, highest-leverage — it makes the whole
+  write→consolidate loop usable without a server restart.
+- **Phase 4 — L0 flush + backpressure.** Spill the memtable to immutable L0 delta
+  segments under a byte budget, add an admission/backpressure knob, and an automatic
+  L0-soft-cap consolidation trigger. Larger; needed before the layer takes sustained
+  write volume.
 
-Handy 3c resume detail: grammar `edge_write`/`edge_merge`/`edge_delete` in
-`cypher.pest`; `parser::lower_edge_write` + `endpoint()` → `ast::EdgeWriteStmt`
-(`Statement::WriteEdge`); `server::{execute_edge_write, resolve_endpoint,
-core_edge_exists}`. 3b: `overlay_adj`/`read_adj_overlaid` in `exec.rs`.
+Handy Phase-3 resume detail (all landed): memtable edges
+`Memtable::{upsert_edge,delete_edge,out_edges,in_edges,iter_edges,with_bases}` +
+`DeltaEdge`/`OpResolution` (`slater-delta/memtable.rs`); read overlay
+`overlay_adj`/`read_adj_overlaid` (`exec.rs`, used by
+`Engine::{outgoing,incoming,outgoing_adj}` + `hops_par`/`neighbours_par`); grammar
+`edge_write`/`edge_merge`/`edge_delete` (`cypher.pest`) → `parser::lower_edge_write`
+→ `ast::EdgeWriteStmt` (`Statement::WriteEdge`); write path
+`server::{execute_edge_write, resolve_endpoint, core_edge_exists}`; consolidation is
+overlay-transparent (`consolidate.rs` unchanged). See D45 (MERGE-vs-MATCH), D46 (edge
+write grammar).
 
 Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
+- **edge properties** (deferred from 3c): `WalOp::UpsertEdge.patches` + `EdgeDelta.patches`
+  already exist; add `SET r.p = …` to the edge grammar, an edge-property read overlay in
+  `edge_prop_par`/`edge_props` (a born-or-patched edge's props), and emit them in
+  consolidation (`emit_edges_from` already calls `emit_set(&eprops, …)`).
 - **moved indexed value** (deferred from 2d): relocate a patched core node in a range
   index when its *indexed* property changes (memtable tracks the per-index value,
   remove-old/add-new). Only index *membership* is stale today; the value read back is
