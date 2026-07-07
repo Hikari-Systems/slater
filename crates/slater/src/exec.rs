@@ -7843,6 +7843,9 @@ fn arith(op: BinOp, a: Val, b: Val) -> Result<Val> {
                 }
                 Val::Int(x % y)
             }
+            // Exponentiation always yields a Float, even for integer operands
+            // (`2 ^ 3` = 8.0), matching Neo4j.
+            BinOp::Pow => Val::Float((x as f64).powf(y as f64)),
         });
     }
     match (a.as_num(), b.as_num()) {
@@ -7852,6 +7855,7 @@ fn arith(op: BinOp, a: Val, b: Val) -> Result<Val> {
             BinOp::Mul => x * y,
             BinOp::Div => x / y,
             BinOp::Mod => x % y,
+            BinOp::Pow => x.powf(y),
         })),
         _ => bail!(
             "cannot apply arithmetic to {} and {}",
@@ -8680,6 +8684,37 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn power_operator_and_float_literals_eval() {
+        // `^` always yields a Float, even for integer operands (Neo4j semantics),
+        // and the new float lexis (`1e3`, `.5`) evaluates to the right numbers.
+        let (root, res) = run(
+            "exec_pow",
+            "RETURN 2 ^ 3 AS a, 2 ^ 10 AS b, -2 ^ 2 AS c, 2 ^ 3 ^ 2 AS d, \
+             1e3 AS e, .5 AS f, 4 ^ 0.5 AS g",
+        );
+        let r = &res.rows[0];
+        let f = |v: &Val| match v {
+            Val::Float(x) => *x,
+            other => panic!("expected Float, got {other:?}"),
+        };
+        assert_eq!(f(&r[0]), 8.0);
+        assert_eq!(f(&r[1]), 1024.0);
+        assert_eq!(f(&r[2]), 4.0); // (-2) ^ 2
+        assert_eq!(f(&r[3]), 64.0); // (2 ^ 3) ^ 2, left-assoc
+        assert_eq!(f(&r[4]), 1000.0);
+        assert_eq!(f(&r[5]), 0.5);
+        assert_eq!(f(&r[6]), 2.0); // 4 ^ 0.5 == sqrt(4)
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trailing_semicolon_is_accepted() {
+        let (root, res) = run("exec_semi", "MATCH (n) RETURN count(*) AS c;");
+        assert!(matches!(res.rows[0][0], Val::Int(5)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

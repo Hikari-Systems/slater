@@ -421,6 +421,8 @@ pub mod ast {
         Mul,
         Div,
         Mod,
+        /// Exponentiation (`^`). Always evaluates to a Float (Neo4j semantics).
+        Pow,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1785,6 +1787,7 @@ fn lower_expr(pair: Pair<Rule>) -> Result<Expr> {
         Rule::comparison => lower_comparison(pair),
         Rule::add_expr => lower_arith(pair),
         Rule::mul_expr => lower_arith(pair),
+        Rule::pow_expr => lower_arith(pair),
         Rule::unary_expr => lower_unary(pair),
         Rule::postfix_expr => lower_postfix(pair),
         other => bail!("internal: lower_expr on {other:?}"),
@@ -1864,6 +1867,7 @@ fn lower_arith(pair: Pair<Rule>) -> Result<Expr> {
             "*" => BinOp::Mul,
             "/" => BinOp::Div,
             "%" => BinOp::Mod,
+            "^" => BinOp::Pow,
             other => bail!("internal: bad arith op {other:?}"),
         };
         let right = lower_expr(inner.next().unwrap())?;
@@ -2934,6 +2938,69 @@ mod tests {
                 assert!(matches!(**r, Expr::Arith(BinOp::Mul, _, _)));
             }
             other => panic!("expected Add at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn power_operator_precedence_and_associativity() {
+        // `^` binds tighter than `*` and looser than a unary sign, and is
+        // left-associative — matching the openCypher reference grammar.
+        // 2 * 3 ^ 2 == 2 * (3 ^ 2).
+        let q = ok("RETURN 2 * 3 ^ 2 AS v");
+        match &q.head.ret.body.items[0].expr {
+            Expr::Arith(BinOp::Mul, l, r) => {
+                assert_eq!(**l, Expr::Literal(Value::Int(2)));
+                assert!(matches!(**r, Expr::Arith(BinOp::Pow, _, _)));
+            }
+            other => panic!("expected Mul at top, got {other:?}"),
+        }
+        // -2 ^ 2 == (-2) ^ 2: the unary sign is part of the left operand.
+        let q = ok("RETURN -2 ^ 2 AS v");
+        assert!(matches!(
+            &q.head.ret.body.items[0].expr,
+            Expr::Arith(BinOp::Pow, l, _) if matches!(**l, Expr::Neg(_))
+        ));
+        // 2 ^ 3 ^ 2 == (2 ^ 3) ^ 2 (left-assoc).
+        let q = ok("RETURN 2 ^ 3 ^ 2 AS v");
+        assert!(matches!(
+            &q.head.ret.body.items[0].expr,
+            Expr::Arith(BinOp::Pow, l, _) if matches!(**l, Expr::Arith(BinOp::Pow, _, _))
+        ));
+    }
+
+    #[test]
+    fn accepts_opencypher_lexical_extensions() {
+        // Gaps closed against the openCypher reference grammar: trailing `;`,
+        // block comments, exponent/leading-dot floats, and the `^` operator.
+        for q in [
+            "MATCH (n) RETURN n;",            // trailing semicolon
+            "MATCH (n) RETURN n ;",           // …with space before it
+            "MATCH (n) /* block */ RETURN n", // inline block comment
+            "/* leading */ RETURN 1 AS x",    // leading block comment
+            "RETURN 1 /* a */ + /* b */ 2 AS x",
+            "RETURN 1e10 AS x",   // exponent, no decimal point
+            "RETURN 1E10 AS x",   // capital E
+            "RETURN 1.5e-3 AS x", // signed exponent
+            "RETURN .5 AS x",     // leading-dot float
+            "RETURN -.5 AS x",
+            "RETURN 2 ^ 3 AS x", // power operator
+        ] {
+            assert!(parse(q).is_ok(), "expected {q:?} to parse");
+        }
+        // A plain integer still lowers to Int (float must not shadow it).
+        let q = ok("RETURN 123 AS x");
+        assert_eq!(
+            q.head.ret.body.items[0].expr,
+            Expr::Literal(Value::Int(123))
+        );
+        // The new float forms lower to Float with the right value.
+        for (src, want) in [("1e3", 1000.0_f64), (".5", 0.5), ("1.5e-3", 0.0015)] {
+            let q = ok(&format!("RETURN {src} AS x"));
+            assert_eq!(
+                q.head.ret.body.items[0].expr,
+                Expr::Literal(Value::Float(want)),
+                "for {src:?}"
+            );
         }
     }
 

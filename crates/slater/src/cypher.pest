@@ -15,7 +15,9 @@
 // `ORDER`, nor `in` the `IN` inside `index`.
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+// Line (`// …`) and block (`/* … */`) comments, matching the openCypher reference
+// grammar. Block comments are non-nesting (the first `*/` closes), like C.
+COMMENT = _{ ("//" ~ (!"\n" ~ ANY)*) | ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
 
 // ── Keyword terminals (word-boundary guarded) ───────────────────────────────
 
@@ -83,7 +85,10 @@ kw_allshortestpaths = @{ ^"allshortestpaths" ~ !ident_cont }
 
 // ── Top level ────────────────────────────────────────────────────────────────
 
-query = { SOI ~ single_query ~ (union ~ single_query)* ~ EOI }
+// A single optional trailing `;` is tolerated (the openCypher `Statement`
+// terminator) — many clients/tools append it. Slater serves one statement per RUN,
+// so only a *trailing* semicolon is accepted, not a `;`-separated batch.
+query = { SOI ~ single_query ~ (union ~ single_query)* ~ ";"? ~ EOI }
 union = { kw_union ~ kw_all? }
 
 // ── Write statement (Phase 1c writable layer) ─────────────────────────────────
@@ -97,7 +102,7 @@ union = { kw_union ~ kw_all? }
 // entry (`parser::parse_statement`), tried before the read grammar; broader write
 // shapes (multi-node, relationships, REMOVE, computed RHS) are rejected at lowering
 // with a clear message, and stay rejected as read-only when the layer is disabled.
-write_statement = { SOI ~ (kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause? ~ EOI }
+write_statement = { SOI ~ (kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause? ~ ";"? ~ EOI }
 set_clause = { kw_set ~ set_item ~ ("," ~ set_item)* }
 set_item = { var ~ property_access ~ "=" ~ expr }
 // `[DETACH] DELETE var` tombstones the anchored node (Phase 2). DETACH is accepted
@@ -305,8 +310,14 @@ null_test = { kw_is ~ kw_not? ~ kw_null }
 
 add_expr = { mul_expr ~ (add_op ~ mul_expr)* }
 add_op = { "+" | "-" }
-mul_expr = { unary_expr ~ (mul_op ~ unary_expr)* }
+mul_expr = { pow_expr ~ (mul_op ~ pow_expr)* }
 mul_op = { "*" | "/" | "%" }
+// Exponentiation `^` binds tighter than `* / %` and looser than a unary sign, so
+// `-2 ^ 2` is `(-2) ^ 2` — matching the openCypher reference grammar (PowerOf sits
+// between MultiplyDivideModulo and UnaryAddOrSubtract). Left-associative like the
+// reference. `^` always yields a Float (Neo4j semantics), handled at eval.
+pow_expr = { unary_expr ~ (pow_op ~ unary_expr)* }
+pow_op = { "^" }
 
 unary_expr = { sign* ~ postfix_expr }
 sign = { "+" | "-" }
@@ -441,7 +452,19 @@ literal = { float | integer | boolean | null | string }
 null = { kw_null }
 boolean = { kw_true | kw_false }
 integer = @{ ("-")? ~ ASCII_DIGIT+ }
-float = @{ ("-")? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+// A double literal, tried before `integer` in `literal` so a fractional/exponent
+// form wins. Two shapes, matching the openCypher reference `DoubleLiteral`:
+//   * a decimal point with a fractional part — `1.5`, `.5` (no integer part), each
+//     with an optional exponent (`1.5e3`, `.5E-2`);
+//   * an integer mantissa with a *required* exponent — `1e10` (no decimal point).
+// A plain `123` (no dot, no exponent) fails both shapes and falls through to
+// `integer`. Rust's `f64::from_str` parses every string this rule accepts.
+float = @{
+    ("-")? ~ (
+        (ASCII_DIGIT* ~ "." ~ ASCII_DIGIT+ ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)?)
+      | (ASCII_DIGIT+ ~ ^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)
+    )
+}
 string = ${ "'" ~ sq_inner ~ "'" | "\"" ~ dq_inner ~ "\"" }
 sq_inner = @{ (escape | (!"'" ~ !"\\" ~ ANY))* }
 dq_inner = @{ (escape | (!"\"" ~ !"\\" ~ ANY))* }
