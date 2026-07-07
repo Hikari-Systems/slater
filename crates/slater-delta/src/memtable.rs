@@ -270,6 +270,14 @@ impl DeltaSnapshot {
         self.mem.node_patch(dense_id)
     }
 
+    /// Whether the core node `dense_id` is tombstoned by the delta (deleted): reads
+    /// must suppress it (Phase 2). `false` for an absent or merely property-patched
+    /// node.
+    #[inline]
+    pub fn is_tombstoned(&self, dense_id: u64) -> bool {
+        self.node_patch(dense_id).is_some_and(|nd| nd.tombstoned)
+    }
+
     /// Count of delta-born-or-patched node identities, for scan-range planning.
     pub fn node_delta_count(&self) -> usize {
         self.mem.node_delta_count()

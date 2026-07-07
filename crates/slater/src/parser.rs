@@ -50,7 +50,7 @@ pub mod ast {
     /// time, when their values are known.
     #[derive(Debug, Clone, PartialEq)]
     pub struct WriteStmt {
-        /// The anchor variable (the SET assignments must all target it).
+        /// The anchor variable (a SET assignment must target it; DELETE names it).
         pub var: String,
         /// The single anchor label — the business key's label half.
         pub label: String,
@@ -58,11 +58,21 @@ pub mod ast {
         pub key: String,
         /// The inline business-key value (a literal or a parameter).
         pub key_value: Expr,
-        /// Property overwrites, in source order (later wins), each a literal or
-        /// parameter value.
-        pub sets: Vec<(String, Expr)>,
+        /// The mutation applied to the anchored node.
+        pub op: WriteOp,
         /// An optional `RETURN` projecting the (post-write) anchor node.
         pub ret: Option<ReturnClause>,
+    }
+
+    /// The mutation a [`WriteStmt`] applies to its business-key-anchored node.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum WriteOp {
+        /// Overwrite properties (Phase 1c): `(prop, value)` pairs in source order
+        /// (later wins), each right-hand side a literal or parameter.
+        Set(Vec<(String, Expr)>),
+        /// Tombstone the node (Phase 2). `detach` records a `DETACH DELETE` — a no-op
+        /// distinction until the Phase 3 topology overlay removes incident edges.
+        Delete { detach: bool },
     }
 
     /// A parsed statement: a read query, or a writable-layer write. The server
@@ -574,6 +584,7 @@ pub fn parse_statement(input: &str) -> Result<ast::Statement> {
 fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let mut node: Option<NodePat> = None;
     let mut sets: Vec<(String, String, Expr)> = Vec::new();
+    let mut delete: Option<(bool, String)> = None; // (detach, target var)
     let mut ret: Option<ReturnClause> = None;
     for child in kids(pair) {
         match child.as_rule() {
@@ -590,6 +601,19 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
                     let value = lower_expr(it.next().expect("set_item has a value expression"))?;
                     sets.push((var, prop, value));
                 }
+            }
+            Rule::delete_clause => {
+                let mut detach = false;
+                let mut target = None;
+                for c in kids(child) {
+                    match c.as_rule() {
+                        Rule::kw_detach => detach = true,
+                        Rule::kw_delete => {}
+                        Rule::var => target = Some(ident_text(only_child(c)?)?),
+                        other => bail!("internal: unexpected delete_clause child {other:?}"),
+                    }
+                }
+                delete = Some((detach, target.expect("delete_clause names a variable")));
             }
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
             Rule::EOI => {}
@@ -617,26 +641,35 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let (key, key_value) = node.props.into_iter().next().unwrap();
     ensure_constant(&key_value, "the anchor business-key value")?;
 
-    if sets.is_empty() {
-        bail!("a write must SET at least one property");
-    }
-    let mut out_sets = Vec::with_capacity(sets.len());
-    for (set_var, prop, value) in sets {
-        if set_var != var {
-            bail!(
-                "SET must target the anchor variable '{var}', not '{set_var}' (Phase 1c writes one node)"
-            );
+    // Exactly one of SET / DELETE fired (the grammar alternates them).
+    let op = if let Some((detach, target)) = delete {
+        if target != var {
+            bail!("DELETE must target the anchor variable '{var}', not '{target}'");
         }
-        ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
-        out_sets.push((prop, value));
-    }
+        WriteOp::Delete { detach }
+    } else {
+        if sets.is_empty() {
+            bail!("a write must SET at least one property");
+        }
+        let mut out_sets = Vec::with_capacity(sets.len());
+        for (set_var, prop, value) in sets {
+            if set_var != var {
+                bail!(
+                    "SET must target the anchor variable '{var}', not '{set_var}' (a write mutates one node)"
+                );
+            }
+            ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
+            out_sets.push((prop, value));
+        }
+        WriteOp::Set(out_sets)
+    };
 
     Ok(WriteStmt {
         var,
         label,
         key,
         key_value,
-        sets: out_sets,
+        op,
         ret,
     })
 }
@@ -2435,14 +2468,14 @@ mod tests {
         assert_eq!(w.key, "ticker");
         assert_eq!(w.key_value, Expr::Literal(Value::Str("ABC".into())));
         assert_eq!(
-            w.sets,
-            vec![
+            w.op,
+            WriteOp::Set(vec![
                 ("price".to_string(), Expr::Literal(Value::Int(10))),
                 (
                     "sector".to_string(),
                     Expr::Literal(Value::Str("Tech".into()))
                 ),
-            ]
+            ])
         );
         assert!(w.ret.is_none());
     }
@@ -2451,8 +2484,31 @@ mod tests {
     fn write_statement_accepts_params_and_return() {
         let w = write("MATCH (c:Company {ticker: $t}) SET c.price = $p RETURN c");
         assert_eq!(w.key_value, Expr::Param("t".into()));
-        assert_eq!(w.sets, vec![("price".to_string(), Expr::Param("p".into()))]);
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![("price".to_string(), Expr::Param("p".into()))])
+        );
         assert!(w.ret.is_some());
+    }
+
+    #[test]
+    fn write_statement_lowers_delete() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) DELETE n");
+        assert_eq!(w.var, "n");
+        assert_eq!(w.label, "Company");
+        assert_eq!(w.key, "ticker");
+        assert_eq!(w.op, WriteOp::Delete { detach: false });
+        assert!(w.ret.is_none());
+
+        let d = write("MATCH (n:Company {ticker: 'ABC'}) DETACH DELETE n");
+        assert_eq!(d.op, WriteOp::Delete { detach: true });
+
+        // DELETE must name the anchor variable.
+        let e = write_err("MATCH (n:Company {ticker: 'ABC'}) DELETE m");
+        assert!(
+            e.contains("DELETE must target") || e == "read-only",
+            "got: {e}"
+        );
     }
 
     #[test]

@@ -52,6 +52,8 @@ kw_then = @{ ^"then" ~ !ident_cont }
 kw_else = @{ ^"else" ~ !ident_cont }
 kw_end = @{ ^"end" ~ !ident_cont }
 kw_set = @{ ^"set" ~ !ident_cont }
+kw_delete = @{ ^"delete" ~ !ident_cont }
+kw_detach = @{ ^"detach" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
@@ -92,9 +94,12 @@ union = { kw_union ~ kw_all? }
 // the read grammar; broader write shapes (multi-node, relationships, MERGE, DELETE,
 // REMOVE, computed RHS) are rejected at lowering with a clear message rather than
 // parsed here, and stay rejected as read-only when the writable layer is disabled.
-write_statement = { SOI ~ kw_match ~ node_pattern ~ set_clause ~ return_clause? ~ EOI }
+write_statement = { SOI ~ kw_match ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause? ~ EOI }
 set_clause = { kw_set ~ set_item ~ ("," ~ set_item)* }
 set_item = { var ~ property_access ~ "=" ~ expr }
+// `[DETACH] DELETE var` tombstones the anchored node (Phase 2). DETACH is accepted
+// but a no-op until the Phase 3 topology overlay removes incident edges.
+delete_clause = { kw_detach? ~ kw_delete ~ var }
 
 // A bare metadata `CALL proc()` (no trailing RETURN) is a complete query — its
 // yielded outputs are the result columns. The middle alternative greedily

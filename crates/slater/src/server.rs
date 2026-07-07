@@ -2472,39 +2472,50 @@ fn write_value(
 /// parameters, resolve the anchor's business key to a current-core dense id, and
 /// hand it to the writer (WAL append + fsync commit + memtable apply + publish).
 /// Returns an empty result — read-back is a separate `MATCH … RETURN` over the
-/// overlaid view. A `RETURN` after `SET` is not yet supported in Phase 1c.
+/// overlaid view. A `RETURN` after a write is not yet supported.
 fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
     stmt: &parser::ast::WriteStmt,
     params: &HashMap<String, Val>,
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    use parser::ast::WriteOp;
     if stmt.ret.is_some() {
         return Err(Failure::new(
             CODE_REQUEST,
-            "RETURN after SET is not yet supported; issue a separate MATCH … RETURN to read back \
-             the written values"
+            "RETURN after a write is not yet supported; issue a separate MATCH … RETURN to read \
+             back the written values"
                 .into(),
         ));
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
-    let mut patches = Vec::with_capacity(stmt.sets.len());
-    for (prop, expr) in &stmt.sets {
-        let v = write_value(expr, params, "a SET value")?;
-        patches.push((prop.clone(), v));
-    }
-    let op = WalOp::UpsertNode {
-        label: stmt.label.clone(),
-        key: stmt.key.clone(),
-        value: key_value,
-        patches,
+    let op = match &stmt.op {
+        WriteOp::Set(sets) => {
+            let mut patches = Vec::with_capacity(sets.len());
+            for (prop, expr) in sets {
+                patches.push((prop.clone(), write_value(expr, params, "a SET value")?));
+            }
+            WalOp::UpsertNode {
+                label: stmt.label.clone(),
+                key: stmt.key.clone(),
+                value: key_value,
+                patches,
+            }
+        }
+        // DETACH is accepted but a no-op until the Phase 3 topology overlay removes
+        // incident edges; the node is tombstoned either way.
+        WriteOp::Delete { detach: _ } => WalOp::DeleteNode {
+            label: stmt.label.clone(),
+            key: stmt.key.clone(),
+            value: key_value,
+        },
     };
     let resolved = resolve_dense_id(gen, &op).ok_or_else(|| {
         Failure::new(
             CODE_EXECUTION,
             format!(
                 "no unique {}({} = …) node to write: the business key must be range-indexed and \
-                 match exactly one existing node (Phase 1c overwrites existing nodes only)",
+                 match exactly one existing node (writes address existing nodes only)",
                 stmt.label, stmt.key
             ),
         )
@@ -3390,7 +3401,76 @@ mod tests {
                 _ => unreachable!(),
             };
         let e = execute_write(&writer, gen.as_ref(), &with_ret, &HashMap::new()).unwrap_err();
-        assert!(e.message.contains("RETURN after SET"), "got: {}", e.message);
+        assert!(
+            e.message.contains("RETURN after a write"),
+            "got: {}",
+            e.message
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Phase 2b: a business-key `DELETE` tombstones the anchor; a
+    /// subsequent read no longer binds it (read-your-deletes), a whole-label count
+    /// drops it (the count fast path falls back to a real scan under a live delta),
+    /// and the tombstone survives a writer reopen (WAL replay).
+    #[test]
+    fn delete_then_read_suppresses_node_and_survives_reopen() {
+        let (root, _g, _) = testgen::write_basic("delete_ryow");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Helpers reading through the live overlay.
+        let alice_rows = |w: &Arc<DeltaWriter>| -> usize {
+            let view = MergedView::new(gen.as_ref(), DeltaSnapshot::from_memtable(w.snapshot()));
+            let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.name").unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows.len()
+        };
+        let person_count = |w: &Arc<DeltaWriter>| -> i64 {
+            let view = MergedView::new(gen.as_ref(), DeltaSnapshot::from_memtable(w.snapshot()));
+            let ast = parser::parse("MATCH (n:Person) RETURN count(*)").unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            match res.rows[0][0] {
+                Val::Int(n) => n,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+
+        // Baseline: Alice present, 3 Person nodes (Alice, Bob, Carol).
+        assert_eq!(alice_rows(&writer), 1);
+        assert_eq!(person_count(&writer), 3);
+
+        // Delete Alice.
+        let stmt =
+            match parser::parse_statement("MATCH (n:Person {name:'Alice'}) DELETE n").unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write"),
+            };
+        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        // Read-your-deletes: the anchor scan no longer yields Alice, the count drops,
+        // and her tombstone is stored under dense id 0.
+        assert_eq!(alice_rows(&writer), 0, "Alice suppressed after delete");
+        assert_eq!(person_count(&writer), 2, "tombstoned node not counted");
+        assert!(writer.snapshot().node_patch(0).unwrap().tombstoned);
+
+        // Durability: a fresh writer over the same WAL replays the tombstone.
+        drop(writer);
+        let reopened = DeltaWriter::open(wal.join("people"), "people", gen.uuid(), |op| {
+            resolve_dense_id(&gen, op)
+        })
+        .unwrap();
+        assert!(
+            reopened.snapshot().node_patch(0).unwrap().tombstoned,
+            "the delete is durable across a reopen (WAL replay)"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

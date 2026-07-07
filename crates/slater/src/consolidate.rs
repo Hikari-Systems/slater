@@ -121,6 +121,10 @@ fn emit_node<V: ReadView>(
     id: u64,
     out: &mut impl Write,
 ) -> Result<()> {
+    // A tombstoned node is deleted — the consolidated core must not carry it.
+    if view.delta().is_tombstoned(id) {
+        return Ok(());
+    }
     let (labels, props) = engine.node_record(id)?;
     let (label, key, key_value) = node_identity(view, id, &labels, &props)?;
     write!(out, "MERGE (n:{label} {{{key}: {}}})", literal(&key_value))?;
@@ -137,10 +141,18 @@ fn emit_edges_from<V: ReadView>(
     src: u64,
     out: &mut impl Write,
 ) -> Result<()> {
+    // Edges incident to a deleted node vanish with it (topology tombstones join in
+    // Phase 3, but a node tombstone already removes its own incident edges here).
+    if view.delta().is_tombstoned(src) {
+        return Ok(());
+    }
     let (slabels, sprops) = engine.node_record(src)?;
     let (sl, sk, sv) = node_identity(view, src, &slabels, &sprops)?;
     for adj in engine.outgoing_adj(src)? {
         let dst = adj.neighbour.0;
+        if view.delta().is_tombstoned(dst) {
+            continue;
+        }
         let (dlabels, dprops) = engine.node_record(dst)?;
         let (dl, dk, dv) = node_identity(view, dst, &dlabels, &dprops)?;
         let (rtype, eprops) = engine.rel_record(adj.edge.0, adj.reltype)?;
@@ -323,6 +335,37 @@ mod tests {
         assert!(
             out.contains("MERGE (n:Person {name: 'Alice'}) SET n.age = 99;"),
             "merged dump should carry the overlaid age:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn serialise_drops_a_tombstoned_node_and_its_edge() {
+        // Deleting Alice must remove both her node line and the Alice-KNOWS->Bob edge
+        // from the consolidated dump — otherwise consolidation would resurrect her.
+        let (root, graph) = testgen::write_indexed_people("consolidate_tombstone");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut mem = Memtable::new();
+        mem.delete_node("Person", "name", Value::Str("Alice".into()), Some(0));
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            !out.contains("{name: 'Alice'}"),
+            "tombstoned Alice must not appear (node or edge endpoint):\n{out}"
+        );
+        // Bob and Carol survive.
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Bob'})"),
+            "dump:\n{out}"
+        );
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Carol'})"),
+            "dump:\n{out}"
         );
         std::fs::remove_dir_all(&root).ok();
     }

@@ -1696,39 +1696,50 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn run_single(&self, sq: &SingleQuery) -> Result<QueryResult> {
-        // Stage 3: a bare `MATCH (n[:L][{p: v}]) RETURN count(*)|count(n)` is answered
-        // from resident metadata / a single index lookup, skipping row materialisation.
-        // Only reachable here (top-level / UNION part), where the seed is the empty
-        // singleton — a `CALL { … }` subquery seeds outer rows via `run_single_seeded`
-        // and never takes this path, so the count is always over the whole match.
-        if let Some((columns, row)) = self.try_count_fast_path(sq)? {
-            return Ok(QueryResult {
-                columns,
-                rows: vec![row],
-            });
-        }
-        // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
-        // and `RETURN count(DISTINCT n.p)` are answered from the range index over
-        // (L, p) — one sequential index walk, no per-node property decode.
-        if let Some(res) = self.try_grouped_index_fast_path(sq)? {
-            return Ok(res);
-        }
-        // Stage B: `MATCH (…)-[…]->(…) [WHERE …] RETURN count(*)|count(v)` — a
-        // multi-hop count walks but counts during expansion instead of materialising
-        // the row set (the fanout RSS peak).
-        if let Some(res) = self.try_count_walk_fast_path(sq)? {
-            return Ok(res);
-        }
-        // Stage M: a whole-graph label/reltype *metadata* enumeration or grouped
-        // count — `MATCH ()-[r]->() RETURN [DISTINCT] type(r) [, count(*)]` and
-        // `MATCH (n) RETURN [DISTINCT] labels(n)[0] [, count(*)]` (plus the labelled
-        // schema-marginal variants) — answered from resident metadata with zero
-        // block reads, instead of materialising every edge/node binding.
-        if let Some(res) = self.try_reltype_meta_fast_path(sq)? {
-            return Ok(res);
-        }
-        if let Some(res) = self.try_label_meta_fast_path(sq)? {
-            return Ok(res);
+        // The count / whole-graph-metadata fast paths answer from the immutable
+        // core's resident marginals and range indexes without materialising rows —
+        // but a live delta can change those answers (a tombstone removes a node from
+        // a count/label enumeration; a property patch on an indexed key moves it in
+        // the index). So they run only against a pure core; with any delta present we
+        // fall through to full execution, where `scan_candidates` suppresses
+        // tombstones and the property overlay corrects patched values. The empty
+        // delta is the overwhelming common case, so read-only performance is intact.
+        if self.gen.delta().is_empty() {
+            // Stage 3: a bare `MATCH (n[:L][{p: v}]) RETURN count(*)|count(n)` from
+            // resident metadata / a single index lookup, skipping materialisation.
+            // Only reachable here (top-level / UNION part), where the seed is the
+            // empty singleton — a `CALL { … }` subquery seeds outer rows via
+            // `run_single_seeded` and never takes this path, so the count is always
+            // over the whole match.
+            if let Some((columns, row)) = self.try_count_fast_path(sq)? {
+                return Ok(QueryResult {
+                    columns,
+                    rows: vec![row],
+                });
+            }
+            // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
+            // and `RETURN count(DISTINCT n.p)` are answered from the range index over
+            // (L, p) — one sequential index walk, no per-node property decode.
+            if let Some(res) = self.try_grouped_index_fast_path(sq)? {
+                return Ok(res);
+            }
+            // Stage B: `MATCH (…)-[…]->(…) [WHERE …] RETURN count(*)|count(v)` — a
+            // multi-hop count walks but counts during expansion instead of
+            // materialising the row set (the fanout RSS peak).
+            if let Some(res) = self.try_count_walk_fast_path(sq)? {
+                return Ok(res);
+            }
+            // Stage M: a whole-graph label/reltype *metadata* enumeration or grouped
+            // count — `MATCH ()-[r]->() RETURN [DISTINCT] type(r) [, count(*)]` and
+            // `MATCH (n) RETURN [DISTINCT] labels(n)[0] [, count(*)]` (plus the
+            // labelled schema-marginal variants) — answered from resident metadata
+            // with zero block reads, instead of materialising every binding.
+            if let Some(res) = self.try_reltype_meta_fast_path(sq)? {
+                return Ok(res);
+            }
+            if let Some(res) = self.try_label_meta_fast_path(sq)? {
+                return Ok(res);
+            }
         }
         self.run_single_seeded(sq, Table::singleton())
     }
@@ -4970,15 +4981,15 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
     /// Candidate node ids for a chosen scan strategy.
     fn scan_candidates(&self, scan: &NodeScan) -> Result<Vec<u64>> {
-        match scan {
+        let ids = match scan {
             // Already bounds-checked + deduped by the planner; yield as-is. An
             // empty list is a seek that matched no node.
-            NodeScan::IdSeek { ids } => Ok(ids.clone()),
+            NodeScan::IdSeek { ids } => ids.clone(),
             NodeScan::RangeEq { index, key } => self
                 .gen
                 .range_index(index)
                 .expect("planner only picks open indexes")
-                .lookup_eq(key),
+                .lookup_eq(key)?,
             NodeScan::RangeRange { index, lo, hi } => self
                 .gen
                 .range_index(index)
@@ -4988,9 +4999,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
                     hi.as_ref().map(|(v, _)| v),
                     hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
-                ),
-            NodeScan::LabelScan { label_id } => self.gen.collect_nodes_with_label(*label_id),
-            NodeScan::AllNodes => Ok((0..self.gen.node_count()).collect()),
+                )?,
+            NodeScan::LabelScan { label_id } => self.gen.collect_nodes_with_label(*label_id)?,
+            NodeScan::AllNodes => (0..self.gen.node_count()).collect(),
             // Distinct edge-having endpoint nodes for the typed first hop (the
             // precomputed posting). Ascending+deduped, same contract as a label
             // scan; the first hop re-filters by reltype so this only narrows.
@@ -4998,8 +5009,22 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 reltype_ids, side, ..
             } => self
                 .gen
-                .collect_endpoint_nodes_for_reltypes(reltype_ids, *side),
+                .collect_endpoint_nodes_for_reltypes(reltype_ids, *side)?,
+        };
+        Ok(self.suppress_tombstoned(ids))
+    }
+
+    /// Drop candidate dense ids the live delta has tombstoned (Phase 2): a deleted
+    /// node must never bind as an anchor. The empty-delta fast path returns the input
+    /// untouched, so the read-only path pays nothing.
+    fn suppress_tombstoned(&self, ids: Vec<u64>) -> Vec<u64> {
+        let delta = self.gen.delta();
+        if delta.is_empty() {
+            return ids;
         }
+        ids.into_iter()
+            .filter(|&id| !delta.is_tombstoned(id))
+            .collect()
     }
 
     /// The label ids a chosen anchor scan already proves every candidate carries,

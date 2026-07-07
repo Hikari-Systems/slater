@@ -176,14 +176,26 @@ Running ledger for the `writeable` track. Pairs with the design in
     `upsert_node` now clears the tombstone (LWW resurrect). No read-path effect yet —
     that's 2b. slater-delta tests: WAL delete round-trip, tombstone-then-resurrect,
     apply-vs-direct parity. Whole slater+slater-delta green, clippy+fmt clean.
-  - **2b — tombstone read overlay (`slater`). ⬜ TODO.** In `exec.rs`, honour
-    `delta.node_patch(id).tombstoned` on the read paths that Phase 1 property overlay
-    already threads: node materialisation (`node_record`/`overlay_node_props`/
-    `node_prop_par`), `scan_candidates` (drop tombstoned dense ids), label scans
-    (`collect_nodes_with_label`), and the whole-graph count fast paths (a tombstoned
-    node must not count). Server `execute_write` grows a `DELETE`/`SET`-shaped
-    dispatch (parser already splits Read/Write — extend `write_statement` grammar with
-    `MATCH (n:L {k:v}) DELETE n`). Read-your-deletes + reopen-durability tests.
+  - **2b — tombstone read overlay + DELETE write path. ✅ DONE** (this commit).
+    Grammar: `write_statement` now alternates `set_clause | delete_clause`
+    (`[DETACH] DELETE var`); `WriteStmt.sets` → `WriteStmt.op: WriteOp::{Set(..),
+    Delete{detach}}`; `execute_write` dispatches Delete → `WalOp::DeleteNode`
+    (`resolve_dense_id` uses the new `business_key()`, so it resolves a delete's
+    anchor unchanged). Read overlay (`exec.rs`): `scan_candidates` post-filters
+    tombstoned dense ids via new `DeltaSnapshot::is_tombstoned` (covers every anchor
+    scan — IdSeek/RangeEq/RangeRange/LabelScan/AllNodes/RelTypeScan) behind the
+    empty-delta fast path; `run_single` gates **all** count/metadata fast paths on
+    `delta.is_empty()` — with any live delta present it falls through to full
+    execution (a tombstone removes a node from a count; a property patch on an indexed
+    key would move it in the index — both make the manifest/index shortcuts wrong).
+    Consolidation (`consolidate.rs`): `emit_node`/`emit_edges_from` skip a tombstoned
+    node and its incident edges, so a delete survives a rebuild. Tests: parser
+    lowers/rejects `DELETE`, WAL/memtable delete (2a), read-your-deletes +
+    whole-label-count-drops + reopen-durability (`server.rs`), serialiser drops a
+    tombstoned node+edge. **Known gap → Phase 3:** a *core* edge pointing at a
+    tombstoned node still lets traversal reach it (`MATCH (a)-->(b)` where `b` is
+    deleted) — the topology overlay is Phase 3; direct scans/lookups/counts are
+    correct now. Whole slater+slater-delta+slater-build green; clippy+fmt clean.
   - **2c — delta-born nodes (synthetic dense ids). ⬜ TODO.** `MergedView`/exec expose
     ids `[core.node_count, core.node_count+new_count)`; scans yield core then synthetic;
     property/label reads for a synthetic id route to the delta; `resolved = None`
@@ -192,9 +204,10 @@ Running ledger for the `writeable` track. Pairs with the design in
   - **2d — range-index probe overlay. ⬜ TODO.** Union core ISAM hits with matching
     delta nodes minus tombstoned; equality = hashmap probe, range = merge-walk over a
     new per-index `BTreeMap` in the memtable. Threads through `plan.rs` index seeks.
-  - **2e — consolidation folds tombstones + delta-born nodes.** `serialise_merge_dump`
-    must skip tombstoned nodes and emit delta-born ones; the `MergedView` node
-    iteration must cover synthetic ids. (Small once 2b–2d land.)
+  - **2e — consolidation folds delta-born nodes.** `serialise_merge_dump` already
+    skips tombstoned nodes (done in 2b); the remaining work is emitting delta-born
+    nodes — the `0..node_count` node/edge iteration must extend over the synthetic id
+    range once 2c lands. (Small once 2c–2d are in.)
 
 - Phases 3–5: see `docs/WRITABLE-PLAN.md`.
 
@@ -223,26 +236,34 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 2b — tombstone read overlay** (`crates/slater/`). Phase 1 is
-complete; Phase 2a (the pure `slater-delta` delete op + memtable tombstone path) is
-done and green. 2b makes deletes *visible*: honour `delta.node_patch(id).tombstoned`
-on every read path the Phase 1 property overlay already threads, and add the
-`DELETE`-shaped write dispatch. Read the **Phase 2b ⬜ TODO** block above first.
+Implement **Phase 2c — delta-born nodes (synthetic dense ids)** (`crates/slater/` +
+`crates/slater-delta/`). Phase 2a/2b are done: property overwrites + deletes are
+durable, visible on read (scans + counts), and consolidation-safe. 2c adds *creating*
+nodes that don't exist in the core.
 
-The read-side edit points (all in `exec.rs`, mirroring the Phase 1 property overlay
-at the same sites): `node_prop_par` (~L499) + `overlay_node_props` (~L1517) already
-fetch `delta.node_patch(id)` — extend to suppress a tombstoned node; the scan choke
-point `scan_candidates` (~L4928) and `collect_nodes_with_label` must drop tombstoned
-dense ids; the whole-graph count fast paths (see [[metadata-fast-paths]]) must not
-count a tombstoned node. Write side: `parser.rs` `write_statement` grammar gains
-`MATCH (n:L {k:v}) DELETE n`; `server.rs::execute_write` dispatches it to
-`DeltaWriter::write(WalOp::DeleteNode{…}, resolved)` (resolver already handles the
-delete's business key). `testgen::write_indexed_people` is the fixture; add a
-read-your-deletes + reopen-durability test mirroring
-`write_then_read_your_writes_and_survives_reopen`.
+Design (from `docs/WRITABLE-PLAN.md` §Read-merge overlay): a write whose business
+key resolves to `None` (absent from the core — currently rejected in
+`execute_write`) becomes a node creation. The memtable allocates a synthetic dense id
+in `[core.node_count, core.node_count + new_count)` (add an allocator + a
+`by_synthetic` reverse map to `Memtable`; the synthetic id must be stable across the
+WAL replay, so derive it deterministically from replay order, not a random counter).
+`MergedView`/exec must: report `node_count() = core + born`; make scans yield core ids
+then synthetic ids (`scan_candidates` AllNodes/LabelScan append matching synthetic
+ids); route property/label reads for an id `>= core.node_count` to the delta only
+(no core block read). `execute_write` stops rejecting `resolved = None` for a create.
+Then 2e extends `serialise_merge_dump`'s `0..node_count` loop over the synthetic
+range. Fixture: `testgen::write_indexed_people`; test create-then-read-back +
+appears-in-label-scan + count-grows + reopen-durability + consolidation-emits-it.
 
-Other tracks still open (not the recommended next step, but valid): the Phase 5 Bolt
-trigger `CALL slater.consolidate()` (method exists as `Graphs::consolidate_graph`,
-prod seam `server::run_builder`) + the Phase 4 auto L0-soft-cap trigger; and the
-independent `slater dump` CLI (§ above).
+Handy resume detail: the delete slice landed at `WalOp::DeleteNode` +
+`Memtable::delete_node`/`is_tombstoned` (slater-delta); `WriteOp` in `parser.rs`
+(`ast` + `lower_write_statement` + `cypher.pest` `delete_clause`); `execute_write`
+dispatch + `scan_candidates` suppression + `run_single` fast-path gate (`exec.rs`);
+`emit_node`/`emit_edges_from` tombstone-skip (`consolidate.rs`).
+
+Other tracks still open (valid but not the recommended next step): Phase 3 topology
+overlay (needed to close the traversal-to-a-tombstoned-node gap); the Phase 5 Bolt
+trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`, prod seam
+`server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
+`slater dump` CLI (§ above).
 
