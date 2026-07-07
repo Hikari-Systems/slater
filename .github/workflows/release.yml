@@ -15,11 +15,23 @@ on:
   push:
     tags:
       - 'v*.*.*'
+    # The `writeable` long-lived track adds new untrusted-input surface (the write
+    # grammar extends the Cypher parser), so run the fuzz gate on every push to it —
+    # NOT the publishing jobs. The `test` job's `if` below keeps the build/Docker/
+    # release-binaries steps tag-only; a branch push runs `fuzz` and nothing else.
+    branches:
+      - writeable
   workflow_dispatch:
     inputs:
       tag:
         description: 'Existing tag to build, push and attach binaries to (e.g. v0.1.1)'
         required: true
+
+# A newer push to the same ref supersedes an in-flight run — but only for the
+# branch-push fuzz runs; a tag release must never cancel itself mid-publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 # The release job needs write access to create/update the release and upload assets.
 permissions:
@@ -29,7 +41,13 @@ jobs:
   # ── Gate: the whole workspace test suite must pass before anything ships ───
   # Every publishing job below `needs: [test, fuzz]`, so a red test run or a fuzz
   # crash blocks the Docker push and the binary release for this tag.
+  #
+  # Tag-push / manual-dispatch only: on a `writeable` branch push this job (and so,
+  # transitively via `needs: test`, docker-build → docker-manifest and
+  # release-binaries) is skipped, leaving `fuzz` as the only job that runs. Nothing
+  # publishes off a branch push.
   test:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -64,13 +82,16 @@ jobs:
 
   # ── Gate: fuzz the untrusted-input decoders before shipping a tag ──────────
   # The Cypher parser and the Bolt/PackStream decoders (targets in `fuzz/`) each
-  # get a time-boxed libFuzzer run. Run only on tagged builds — not on every CI
-  # iteration — so each target can fuzz for several minutes rather than seconds.
-  # The targets fan out one-per-runner across a Blacksmith matrix (as the Docker
-  # build does), so they run in parallel and a crash fails only its own leg while
-  # still blocking the release. cargo-fuzz needs nightly + libFuzzer.
+  # get a time-boxed libFuzzer run. Runs on tag pushes, manual dispatch, and every
+  # `writeable` branch push (the only job that does the last — see the `test` gate),
+  # so the new write-grammar parser surface is fuzzed per commit. The targets fan
+  # out one-per-runner across the matrix so they run in parallel and a crash fails
+  # only its own leg while still blocking the release. cargo-fuzz needs nightly +
+  # libFuzzer. Runs on free GitHub-hosted runners (this repo is public, so the
+  # minutes are free) rather than the billed Blacksmith runners — the Docker build
+  # below keeps Blacksmith for its native per-arch (incl. arm64) compiles.
   fuzz:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
