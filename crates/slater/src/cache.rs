@@ -160,15 +160,30 @@ impl BlockCache {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResultKey {
     pub gen: u128,
+    /// The writable-layer delta epoch this result was produced under. A write
+    /// bumps the graph's epoch (see `delta_writer::DeltaWriter`), so a result
+    /// overlaid before the write keys differently from one after it and can never
+    /// be served stale — the same "identity in the key orphans the old entry"
+    /// trick the generation UUID provides across a swap. Always 0 when the
+    /// writable layer is disabled, so the read-only path is byte-identical.
+    pub delta_epoch: u64,
     pub query: String,
 }
 
 impl ResultKey {
     /// Build a key from a generation and an already-normalised query string
-    /// (collapsed whitespace + serialised params — see `server::result_key`).
+    /// (collapsed whitespace + serialised params — see `server::result_key`), with
+    /// no delta overlay (epoch 0).
     pub fn new(gen: GenId, query: impl Into<String>) -> Self {
+        Self::with_delta_epoch(gen, 0, query)
+    }
+
+    /// Build a key that also pins the writable-layer delta epoch, so an overlaid
+    /// result is invalidated by the next write.
+    pub fn with_delta_epoch(gen: GenId, delta_epoch: u64, query: impl Into<String>) -> Self {
         Self {
             gen: gen.0.as_u128(),
+            delta_epoch,
             query: query.into(),
         }
     }

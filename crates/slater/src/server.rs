@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use graph_format::ids::Generation as GenId;
+use graph_format::ids::Value;
 use graph_format::store::fs::FsObjectStore;
 use graph_format::store::{join_key, ObjectStore};
 use rayon::prelude::*;
@@ -51,12 +52,14 @@ use crate::bolt::handshake;
 use crate::bolt::message;
 use crate::bolt::packstream::PsValue;
 use crate::cache::{BlockCache, ResultCache, ResultKey, VectorIndexCache};
-use crate::config::{AppConfig, ReloadStrategy, TlsConfig};
+use crate::config::{AppConfig, DeltaConfig, ReloadStrategy, TlsConfig};
+use crate::delta_writer::DeltaWriter;
 use crate::exec::{Engine, GlobalIntermediateBudget, QueryResult, Val};
 use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
-use crate::read_view::ReadView;
+use crate::read_view::{MergedView, ReadView};
+use slater_delta::{DeltaSnapshot, WalOp};
 
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 const TAG_NODE: u8 = 0x4E;
@@ -123,6 +126,11 @@ pub struct Graphs {
     acl_path: Option<PathBuf>,
     /// Refuse to serve a generation whose manifest carries no ACL stamp.
     require_acl_stamp: bool,
+    /// Per-graph writable-layer writers, populated only when the delta layer is
+    /// enabled (`config.delta.enabled`). Empty otherwise — the read-only server is
+    /// exactly what it was. Each writer is bound to the generation it resolved its
+    /// dense ids against (`DeltaWriter::core_uuid`).
+    writers: HashMap<String, Arc<DeltaWriter>>,
 }
 
 impl Graphs {
@@ -177,7 +185,43 @@ impl Graphs {
             graphs,
             acl_path: None,
             require_acl_stamp: false,
+            writers: HashMap::new(),
         })
+    }
+
+    /// Bring the writable layer online: open a [`DeltaWriter`] per served graph,
+    /// replaying each graph's WAL against its current generation. A relative
+    /// `cfg.wal_dir` is resolved under `data_dir`; one graph's segments live under
+    /// `<wal_dir>/<graph>/`. Called once at boot only when `cfg.enabled`. Idempotent
+    /// per graph — a graph that fails to open its writer aborts boot (a durable
+    /// write layer that silently isn't there is worse than a hard failure).
+    pub fn enable_writable_layer(&mut self, cfg: &DeltaConfig, data_dir: &Path) -> Result<()> {
+        let base = {
+            let p = Path::new(&cfg.wal_dir);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                data_dir.join(p)
+            }
+        };
+        for (name, slot) in &self.graphs {
+            let gen = slot.read().unwrap().clone();
+            let dir = base.join(name);
+            let writer = DeltaWriter::open(&dir, name, gen.uuid(), |op| resolve_dense_id(&gen, op))
+                .with_context(|| format!("open writable layer for graph '{name}'"))?;
+            let n = writer.node_delta_count();
+            if n > 0 {
+                info!(graph = %name, node_deltas = n, "writable layer replayed WAL");
+            }
+            self.writers.insert(name.clone(), Arc::new(writer));
+        }
+        Ok(())
+    }
+
+    /// The writable-layer writer for `name`, or `None` when the layer is disabled
+    /// or the graph has none.
+    fn writer(&self, name: &str) -> Option<Arc<DeltaWriter>> {
+        self.writers.get(name).cloned()
     }
 
     /// Install the manifest-authentication policy before the graphs go live. The
@@ -1087,6 +1131,7 @@ fn is_memgraph_dialect_query(q: &str) -> bool {
 // ── Failure ────────────────────────────────────────────────────────────────
 
 /// A Bolt `FAILURE` to send: a status code and a human message.
+#[derive(Debug)]
 struct Failure {
     code: &'static str,
     message: String,
@@ -1389,6 +1434,12 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     graphs
         .verify_manifest_policy()
         .context("manifest authentication policy")?;
+    if cfg.delta.enabled {
+        graphs
+            .enable_writable_layer(&cfg.delta, Path::new(cfg.data_dir()))
+            .context("enable writable layer")?;
+        info!(wal_dir = %cfg.delta.wal_dir, "writable layer enabled");
+    }
     let graphs = Arc::new(graphs);
     if graphs.is_empty() {
         warn!(data_dir = %cfg.data_dir(), "no graphs found to serve");
@@ -2136,13 +2187,42 @@ async fn handle_request(
             let gen = ctx.graphs.get(&graph).ok_or_else(|| {
                 Failure::new(CODE_NOT_FOUND, format!("graph '{graph}' is not served"))
             })?;
-            // Parse synchronously so a syntax / read-only error is classified
-            // cleanly; only the (blocking) execution moves to the blocking pool.
-            let ast = parser::parse(&query).map_err(|e| Failure::from_query_error(&e))?;
             let param_vals = params_to_vals(&params)?;
-
-            let (columns, rows) =
-                run_query(ctx, gen, &query, ast, param_vals, sess.version).await?;
+            // The writable layer is per-graph and off unless configured; when it is
+            // on, a query may be a write. Parse synchronously so a syntax /
+            // read-only error is classified cleanly.
+            let writer = ctx.graphs.writer(&graph);
+            let (columns, rows) = match &writer {
+                Some(w) => {
+                    match parser::parse_statement(&query)
+                        .map_err(|e| Failure::from_query_error(&e))?
+                    {
+                        parser::ast::Statement::Write(stmt) => {
+                            execute_write(w, gen.as_ref(), &stmt, &param_vals)?
+                        }
+                        parser::ast::Statement::Read(ast) => {
+                            // Overlay this graph's delta iff it was resolved against the
+                            // generation we're about to read (dense ids are per-build).
+                            let overlay = delta_for_read(w, &gen);
+                            run_query(ctx, gen, &query, ast, param_vals, sess.version, overlay)
+                                .await?
+                        }
+                    }
+                }
+                None => {
+                    let ast = parser::parse(&query).map_err(|e| Failure::from_query_error(&e))?;
+                    run_query(
+                        ctx,
+                        gen,
+                        &query,
+                        ast,
+                        param_vals,
+                        sess.version,
+                        ReadOverlay::empty(),
+                    )
+                    .await?
+                }
+            };
             sess.pending = Some(Pending { rows, sent: 0 });
             Ok(vec![message::success(vec![(
                 "fields".into(),
@@ -2204,6 +2284,130 @@ async fn handle_request(
 /// version-independent `QueryResult`, so encoding — which still resolves node/rel
 /// records through the block cache — is the only per-connection work). A miss
 /// executes, caches the result, then encodes.
+/// Resolve a write's business key `(label, key, value)` to its unique current-core
+/// dense id via the label/property range index (an ISAM equality probe). `None`
+/// when the property is not range-indexed for that label, the key is absent, or —
+/// Phase 1 assumes a unique business key — the probe is ambiguous. The overlay's
+/// dense-id read index ([`slater_delta::Memtable::by_dense`]) is built from this.
+fn resolve_dense_id(gen: &Generation, op: &WalOp) -> Option<u64> {
+    let WalOp::UpsertNode {
+        label, key, value, ..
+    } = op;
+    let idx = crate::plan::index_for(gen, std::slice::from_ref(label), key)?;
+    let ids = gen.range_index(&idx)?.lookup_eq(value).ok()?;
+    match ids.as_slice() {
+        [only] => Some(*only),
+        _ => None, // absent (0) or ambiguous (>1) — not a resolvable single node
+    }
+}
+
+/// The delta snapshot + epoch to overlay when reading `gen`. The writer's delta
+/// is only valid against the core generation it resolved its dense ids against;
+/// after a generation swap the dense ids no longer line up, so we fail safe to the
+/// pure core (empty delta) rather than mis-overlay. Phase 1c runs with
+/// `reloadStrategy = exit` in practice, so this guard is defence in depth.
+fn delta_for_read(writer: &Arc<DeltaWriter>, gen: &Arc<Generation>) -> ReadOverlay {
+    if writer.core_uuid() == gen.uuid() {
+        ReadOverlay {
+            delta: DeltaSnapshot::from_memtable(writer.snapshot()),
+            epoch: writer.epoch(),
+        }
+    } else {
+        warn!(
+            graph = %gen.graph(),
+            "writable-layer delta resolved against a superseded generation — serving pure core"
+        );
+        ReadOverlay::empty()
+    }
+}
+
+/// Evaluate a Phase 1c write's constant expression (a literal or a parameter) to a
+/// storable [`Value`] against the query's parameters.
+fn write_value(
+    e: &parser::ast::Expr,
+    params: &HashMap<String, Val>,
+    what: &str,
+) -> std::result::Result<Value, Failure> {
+    use parser::ast::Expr;
+    let val = match e {
+        Expr::Literal(v) => return Ok(v.clone()),
+        Expr::Param(name) => params.get(name).ok_or_else(|| {
+            Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
+        })?,
+        _ => unreachable!("lower_write_statement rejects non-constant {what}"),
+    };
+    crate::exec::val_to_value(val).ok_or_else(|| {
+        Failure::new(
+            CODE_REQUEST,
+            format!("{what} is not a storable scalar value"),
+        )
+    })
+}
+
+/// Execute one durable write: build the WAL op from the parsed statement +
+/// parameters, resolve the anchor's business key to a current-core dense id, and
+/// hand it to the writer (WAL append + fsync commit + memtable apply + publish).
+/// Returns an empty result — read-back is a separate `MATCH … RETURN` over the
+/// overlaid view. A `RETURN` after `SET` is not yet supported in Phase 1c.
+fn execute_write(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    stmt: &parser::ast::WriteStmt,
+    params: &HashMap<String, Val>,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    if stmt.ret.is_some() {
+        return Err(Failure::new(
+            CODE_REQUEST,
+            "RETURN after SET is not yet supported; issue a separate MATCH … RETURN to read back \
+             the written values"
+                .into(),
+        ));
+    }
+    let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
+    let mut patches = Vec::with_capacity(stmt.sets.len());
+    for (prop, expr) in &stmt.sets {
+        let v = write_value(expr, params, "a SET value")?;
+        patches.push((prop.clone(), v));
+    }
+    let op = WalOp::UpsertNode {
+        label: stmt.label.clone(),
+        key: stmt.key.clone(),
+        value: key_value,
+        patches,
+    };
+    let resolved = resolve_dense_id(gen, &op).ok_or_else(|| {
+        Failure::new(
+            CODE_EXECUTION,
+            format!(
+                "no unique {}({} = …) node to write: the business key must be range-indexed and \
+                 match exactly one existing node (Phase 1c overwrites existing nodes only)",
+                stmt.label, stmt.key
+            ),
+        )
+    })?;
+    writer
+        .write(op, Some(resolved))
+        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// The writable-layer overlay a read runs under: the delta snapshot pinned for the
+/// query's whole life and the epoch that keys its cached result. `empty()` is the
+/// read-only path (no delta, epoch 0), behaviourally identical to reading the core.
+struct ReadOverlay {
+    delta: DeltaSnapshot,
+    epoch: u64,
+}
+
+impl ReadOverlay {
+    fn empty() -> Self {
+        Self {
+            delta: DeltaSnapshot::empty(),
+            epoch: 0,
+        }
+    }
+}
+
 async fn run_query(
     ctx: &Arc<ConnCtx>,
     gen: Arc<Generation>,
@@ -2211,11 +2415,17 @@ async fn run_query(
     ast: parser::ast::Query,
     params: HashMap<String, Val>,
     version: (u8, u8),
+    overlay: ReadOverlay,
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    let ReadOverlay {
+        delta,
+        epoch: delta_epoch,
+    } = overlay;
     let cache = ctx.cache.clone();
     let vector_cache = ctx.vector_cache.clone();
     let result_cache = ctx.result_cache.clone();
-    let key = ResultKey::new(gen.uuid(), result_query_key(query, &params));
+    let key =
+        ResultKey::with_delta_epoch(gen.uuid(), delta_epoch, result_query_key(query, &params));
     // Queries calling `rand()`/`randomUUID()`/`timestamp()` must re-run every
     // time, so they bypass the result cache (both lookup and store).
     let cacheable = !parser::is_nondeterministic(&ast);
@@ -2258,10 +2468,14 @@ async fn run_query(
             // `cost` is the elements charged against the query budget; it is only
             // meaningful when the query actually executed, so a result-cache hit
             // (no engine) reports `None` and the summary omits the field.
+            // Overlay the writable-layer delta on the pinned core for this query's
+            // whole life (`MergedView`). The empty-delta fast path makes the
+            // read-only case behaviourally identical to reading the bare core.
+            let view = MergedView::new(gen.as_ref(), delta);
             let (result, result_cache_hit, cost) = match cached {
                 Some(r) => (r, true, None),
                 None => {
-                    let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
+                    let mut engine = Engine::new(&view, cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
                         .with_params(params)
                         .with_max_rows(max_rows)
@@ -2286,8 +2500,10 @@ async fn run_query(
             let t_after_exec = instrument.then(Instant::now);
 
             // Encode for this connection's version. A plain engine (no params/limits
-            // needed) resolves Node/Relationship records through the shared block cache.
-            let engine = Engine::new(gen.as_ref(), cache.as_ref());
+            // needed) resolves Node/Relationship records through the shared block
+            // cache — over the same merged view, so a returned node carries its
+            // overlaid (patched) properties.
+            let engine = Engine::new(&view, cache.as_ref());
             let mut rows = Vec::with_capacity(result.rows.len());
             for row in &result.rows {
                 let mut encoded = Vec::with_capacity(row.len());
@@ -2929,6 +3145,139 @@ mod tests {
         let mut graphs = Graphs::open_all(&root, Some(b"master")).unwrap();
         graphs.set_manifest_policy(Some(acl_path), false);
         assert!(graphs.verify_manifest_policy().is_err());
+    }
+
+    /// A `DeltaConfig` with the writable layer on and a throwaway WAL directory.
+    fn delta_cfg(wal_dir: &Path) -> DeltaConfig {
+        DeltaConfig {
+            enabled: true,
+            wal_dir: wal_dir.to_string_lossy().into_owned(),
+            memtable_bytes: 64 << 20,
+        }
+    }
+
+    /// End-to-end Phase 1c: a business-key `SET` resolves the anchor to a core
+    /// dense id, is durably logged + folded into the memtable, and a subsequent
+    /// read sees the overwrite through the overlay — read-your-writes — with the
+    /// value surviving a writer reopen (WAL replay).
+    #[test]
+    fn write_then_read_your_writes_and_survives_reopen() {
+        let (root, _g, _) = testgen::write_basic("ryow");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").expect("writable layer is on");
+        let epoch0 = writer.epoch();
+
+        // Overwrite Alice's age and add a new property.
+        let stmt = match parser::parse_statement(
+            "MATCH (n:Person {name: 'Alice'}) SET n.age = 99, n.rating = 'AAA'",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a write"),
+        };
+        let out = execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        assert_eq!(
+            out,
+            (Vec::new(), Vec::new()),
+            "a no-RETURN write acks empty"
+        );
+        assert!(writer.epoch() > epoch0, "the write bumps the delta epoch");
+
+        // The write resolved Alice to dense id 0 and folded the patch.
+        let snap = writer.snapshot();
+        let d = snap.node_patch(0).expect("resolved by dense id");
+        assert_eq!(d.patches.get("age"), Some(&Value::Int(99)));
+        drop(snap);
+
+        // Read-your-writes through the merged view.
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::new(
+            gen.as_ref(),
+            DeltaSnapshot::from_memtable(writer.snapshot()),
+        );
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age, n.rating").unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert!(
+            matches!(res.rows[0][0], Val::Int(99)),
+            "overwritten age read back"
+        );
+        assert!(
+            matches!(&res.rows[0][1], Val::Str(s) if s == "AAA"),
+            "new property read back"
+        );
+
+        // Durability: a fresh writer over the same WAL replays the committed write.
+        drop(writer);
+        let reopened = DeltaWriter::open(wal.join("people"), "people", gen.uuid(), |op| {
+            resolve_dense_id(&gen, op)
+        })
+        .unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .node_patch(0)
+                .unwrap()
+                .patches
+                .get("age"),
+            Some(&Value::Int(99)),
+            "the write is durable across a reopen (WAL replay)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A write whose business key matches no existing node (or is not range-indexed)
+    /// is a clean execution error, and a `RETURN` after `SET` is refused for now.
+    #[test]
+    fn write_errors_are_clean() {
+        let (root, _g, _) = testgen::write_basic("write_err");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+
+        // No such Person.
+        let absent = match parser::parse_statement("MATCH (n:Person {name:'Nobody'}) SET n.age = 1")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        let e = execute_write(&writer, gen.as_ref(), &absent, &HashMap::new()).unwrap_err();
+        assert!(e.message.contains("no unique"), "got: {}", e.message);
+
+        // RETURN after SET is not yet supported.
+        let with_ret =
+            match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 1 RETURN n")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+        let e = execute_write(&writer, gen.as_ref(), &with_ret, &HashMap::new()).unwrap_err();
+        assert!(e.message.contains("RETURN after SET"), "got: {}", e.message);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The result-cache key includes the delta epoch, so a write invalidates an
+    /// overlaid result rather than serving it stale.
+    #[test]
+    fn result_key_binds_delta_epoch() {
+        let g = GenId(uuid::Uuid::from_u128(7));
+        let k0 = ResultKey::with_delta_epoch(g, 0, "q");
+        let k1 = ResultKey::with_delta_epoch(g, 1, "q");
+        assert_ne!(k0, k1, "a bumped epoch keys differently");
+        assert_eq!(k0, ResultKey::new(g, "q"), "epoch 0 == the read-only key");
     }
 
     /// Stand up a ConnCtx over the shared fixture graph + a temp ACL.

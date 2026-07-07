@@ -96,10 +96,31 @@ Running ledger for the `writeable` track. Pairs with the design in
     (`resolved` passed in by the caller — no `Generation` needed for unit tests),
     `apply(&WalOp, resolved)` shared by live writes + replay, `node_patch(dense_id)`,
     `iter_nodes()` (consolidation input). 18 slater-delta tests green.
-  - **1c — server integration.** Relax parser write rejection; write-ingestion single
-    -writer thread (parse → WAL `commit` → memtable apply → ack); `MergedView` node
-    -property overlay in `Engine` materialisation; `ResultKey` delta epoch; ArcSwap
-    publish; read-your-writes test. ⬜ TODO
+  - **1c — server integration. ✅ DONE** (commits `193fe17`, `d17d98f`, +this).
+    Shipped in three green sub-slices:
+    - **1c-A** (`193fe17`): read overlay in `exec.rs` (`node_prop_par` single-prop +
+      `overlay_node_props` for `node_record`/`all_properties`, name-space LWW,
+      empty-delta fast path); `delta_writer::DeltaWriter` (single-writer WAL floor +
+      authoritative `Memtable` + published `RwLock<Arc<Memtable>>` snapshot + epoch;
+      `write` = append+commit(fsync ack)+apply+publish; `open` replays WAL, opens a
+      fresh segment); `config::DeltaConfig` (off by default); `Memtable: Clone`.
+    - **1c-B** (`d17d98f`): `parse_statement` → `ast::Statement::{Read,Write}`; a
+      narrow `write_statement` grammar (`MATCH (n:L {k:v}) SET n.p = <lit|param> …`)
+      tried before the read grammar; `lower_write_statement` enforces the shape.
+      `parse` unchanged (still rejects SET read-only when the layer is off).
+    - **1c-C** (this commit): per-graph `DeltaWriter` registry in `Graphs`
+      (`enable_writable_layer`, boot-gated on `delta.enabled`); RUN-handler dispatch
+      (write → `execute_write`: resolve business key to dense id via ISAM →
+      WAL commit → memtable apply → ack; read → `MergedView` over the pinned delta);
+      `ResultKey` delta epoch; `delta_for_read` uuid guard (fail safe to pure core on
+      a superseded generation). Read-your-writes + reopen-durability + error + epoch
+      tests. Whole workspace green.
+    - **Deferred out of 1c** (each a clean later refinement, none blocking 1d):
+      `RETURN` after `SET` (rejected for now — read back with a separate `MATCH…RETURN`);
+      re-resolving a live delta across a hot-reload swap (run `reloadStrategy=exit`);
+      group-commit batching (WAL already supports it, writer commits per-op);
+      labelled-scan fallback for an unindexed business key; edge + tombstone deltas
+      (Phases 2–3).
   - **1d — consolidation (4a) + orchestrator.** `slater-build --consolidate`
     (dump-and-rebuild); freeze → spawn builder → retire delta on exit 0; end-to-end
     "write → read merged → consolidate → value in core, delta gone" + crash test. ⬜ TODO
@@ -131,21 +152,25 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 1c — server integration** (`crates/slater/`). The pure
-`slater-delta` layer (1a WAL + 1b memtable) is complete; 1c wires it into the
-server. Steps:
-1. `config.rs` — a `DeltaConfig` (memtable budget, WAL dir, enable flag) mirroring
-   `CacheConfig`; off by default.
-2. `parser.rs` — relax the write rejection (`lower_single_query` ~L697,
-   `lower_call_clause` ~L820) for the minimal business-key `SET` shape only.
-3. A single-writer `DeltaWriter` (owns `WalSink` + authoritative `Memtable`,
-   publishes `ArcSwap<Memtable>` snapshots). Write flow: parse → resolve business
-   key to dense id via ISAM (`plan::index_for` + `IsamReader::lookup_eq`) → WAL
-   `append`+`commit` (ack barrier) → `memtable.apply` → publish snapshot.
-4. `MergedView` — carry the live `DeltaSnapshot`; overlay `node_patch(dense_id)`
-   into node materialisation. The overlay point is `Engine::node_record` /
-   `node_props(id)` in `exec.rs` (~L1411–1490), folding patches in name-space.
-5. `cache.rs` — extend `ResultKey` with a monotonic delta epoch so overlaid results
-   invalidate on write.
-6. Read-your-writes integration test (build a fixture, `SET`, read merged).
+Implement **Phase 1d — consolidation (4a) + orchestrator** (`slater-build` +
+`crates/slater/`). Phase 1c gives durable property overwrites read-your-writes;
+1d folds the frozen delta back into a fresh core so the memtable can be retired.
+Steps:
+1. `slater-build --consolidate` (dump-and-rebuild): serialise the frozen delta to
+   business-key `MERGE` text (`Memtable::iter_nodes` is the input) and re-parse it
+   through the existing overlay/merge build path (`overlay.rs` / `merge_build.rs`),
+   layered on the current core generation → a new generation via
+   `common::write_manifest_and_publish` (D14 atomic swap).
+2. Orchestrator in the server: freeze the memtable (seal the WAL segment, open a
+   fresh one), spawn the builder, and on exit 0 retire the frozen delta + rebuild
+   the writer's `by_dense` empty against the new core (dense ids permute across the
+   rebuild — see `DeltaWriter::core_uuid` and the `delta_for_read` uuid guard).
+3. End-to-end test: write → read merged → consolidate → value is in the core and
+   the delta is gone; plus a crash-between-freeze-and-swap replay test (the WAL
+   still replays the write, so no data loss on a mid-consolidation kill).
+
+Handy resume detail: the write flow lands in `server.rs` (`execute_write`,
+`resolve_dense_id`, `delta_for_read`, `run_query`'s `ReadOverlay`); the writer is
+`crates/slater/src/delta_writer.rs`; the read overlay is `exec.rs`
+(`overlay_node_props`, `node_prop_par`).
 

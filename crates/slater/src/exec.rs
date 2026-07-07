@@ -252,7 +252,7 @@ pub enum Val {
 /// maps, points, temporals) the on-disk index can never hold — the planner then
 /// drops that `$param` predicate and falls back to a scan. The inverse of
 /// [`Val::from_value`].
-fn val_to_value(v: &Val) -> Option<Value> {
+pub(crate) fn val_to_value(v: &Val) -> Option<Value> {
     Some(match v {
         Val::Null => Value::Null,
         Val::Bool(b) => Value::Bool(*b),
