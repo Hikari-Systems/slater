@@ -196,11 +196,42 @@ Running ledger for the `writeable` track. Pairs with the design in
     tombstoned node still lets traversal reach it (`MATCH (a)-->(b)` where `b` is
     deleted) — the topology overlay is Phase 3; direct scans/lookups/counts are
     correct now. Whole slater+slater-delta+slater-build green; clippy+fmt clean.
-  - **2c — delta-born nodes (synthetic dense ids). ⬜ TODO.** `MergedView`/exec expose
-    ids `[core.node_count, core.node_count+new_count)`; scans yield core then synthetic;
-    property/label reads for a synthetic id route to the delta; `resolved = None`
-    upserts (currently rejected in `execute_write`) become node creation. Needs a
-    delta-local synthetic-id allocator in the memtable + a `by_synthetic` reverse map.
+  - **2c — delta-born nodes (synthetic dense ids). ✅ DONE** (this commit). A new
+    **`MERGE`** anchor keyword is the create spelling (user decision): `MERGE (n:L
+    {k:v}) SET n.p = x` = create-if-absent / patch-if-present; `MATCH … SET` stays
+    update-only (absent → error, pointing at MERGE); `MERGE … DELETE` rejected.
+    Memtable (`slater-delta`): `Memtable::with_synthetic_base(base)` (= core
+    `node_count`); `upsert_node(resolved=None)` allocates one synthetic dense id
+    `synthetic_base + born.len()` per identity, once (stable across re-upsert), pushed
+    into a `born: Vec<ck>` (index = id offset, so allocation = WAL-replay order =
+    deterministic); `by_dense` now holds synthetic ids too so `node_patch` resolves
+    them uniformly; `node_identity_by_dense` (recover label/key/value) +
+    `born_ids_with_label` + `synthetic_base`/`born_count` accessors on
+    `Memtable`/`DeltaSnapshot`. Read overlay (`exec.rs`, all gated so the empty-delta
+    path is untouched): `MergedView::node_count() = core + born_count`;
+    `scan_candidates` LabelScan appends `born_ids_with_label` (AllNodes covered by the
+    grown `node_count`); a synthetic id (`>= core.node_count()`) routes **all** reads
+    to the delta only — `node_prop_par` (business key from identity, patches, else
+    Null), `node_label_ids_par` (single identity label via `gen.label_id`),
+    `node_props` (empty core props), `overlay_node_props` (seed the business-key prop
+    then fold patches), `outgoing_adj` (empty — no edges yet). Writer: `DeltaWriter::
+    open`/`retire` take the core `node_count` to seed/re-base `synthetic_base`.
+    `execute_write`: `resolve_business_key` → `KeyResolution::{Unique,Absent,Ambiguous,
+    Unindexed}`; a `MERGE` + `Absent` writes with `resolved=None` (create), every
+    other absent/ambiguous/unindexed is a clear error. Consolidation: no code change —
+    the `0..node_count` loop + synthetic-aware `node_record`/`outgoing_adj` emit a
+    born node for free (test added). Tests: memtable (stable/replay-deterministic
+    alloc, label filter, delete-survives), parser (MERGE lowers to upsert, MERGE+DELETE
+    reject), server (`merge_creates_delta_born_node_and_survives_reopen`:
+    create→label-scan-read-back→count-grows→patch-existing-no-dup→reopen-durability),
+    consolidate (`serialise_emits_a_delta_born_node`). Whole slater+slater-delta+
+    slater-build green; clippy+fmt clean; empty-delta bench within noise.
+    **Known gap → 2d:** addressing a born node by an *indexed key seek*
+    (`MATCH (n:L {k:v})`) misses it — the range-index probe overlay is 2d; a born node
+    is found by a label scan / AllNodes until then. Also deferred: deleting a born node
+    by business key (the core probe returns Absent → rejected; the memtable
+    `delete_node` already handles it, just needs `execute_write` to resolve against the
+    delta).
   - **2d — range-index probe overlay. ⬜ TODO.** Union core ISAM hits with matching
     delta nodes minus tombstoned; equality = hashmap probe, range = merge-walk over a
     new per-index `BTreeMap` in the memtable. Threads through `plan.rs` index seeks.
@@ -236,34 +267,46 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 2c — delta-born nodes (synthetic dense ids)** (`crates/slater/` +
-`crates/slater-delta/`). Phase 2a/2b are done: property overwrites + deletes are
-durable, visible on read (scans + counts), and consolidation-safe. 2c adds *creating*
-nodes that don't exist in the core.
+Implement **Phase 2d — range-index probe overlay** (`crates/slater/` +
+`crates/slater-delta/`). Phase 2c is done: `MERGE` creates delta-born nodes with
+synthetic dense ids, visible through label scans / AllNodes / counts, durable, and
+consolidation-safe. The one gap 2d closes: an *indexed key seek*
+(`MATCH (n:L {k:v})` → `NodeScan::RangeEq`/`RangeRange`) does **not** see a delta-born
+node or a delta-patched-into-range value, and does not drop a tombstoned hit — it
+reads the core ISAM only.
 
-Design (from `docs/WRITABLE-PLAN.md` §Read-merge overlay): a write whose business
-key resolves to `None` (absent from the core — currently rejected in
-`execute_write`) becomes a node creation. The memtable allocates a synthetic dense id
-in `[core.node_count, core.node_count + new_count)` (add an allocator + a
-`by_synthetic` reverse map to `Memtable`; the synthetic id must be stable across the
-WAL replay, so derive it deterministically from replay order, not a random counter).
-`MergedView`/exec must: report `node_count() = core + born`; make scans yield core ids
-then synthetic ids (`scan_candidates` AllNodes/LabelScan append matching synthetic
-ids); route property/label reads for an id `>= core.node_count` to the delta only
-(no core block read). `execute_write` stops rejecting `resolved = None` for a create.
-Then 2e extends `serialise_merge_dump`'s `0..node_count` loop over the synthetic
-range. Fixture: `testgen::write_indexed_people`; test create-then-read-back +
-appears-in-label-scan + count-grows + reopen-durability + consolidation-emits-it.
+Design (from `docs/WRITABLE-PLAN.md` §Read-merge overlay): union the core ISAM hits
+with matching delta nodes, minus tombstoned. Equality (`RangeEq`) = a hashmap probe
+over the memtable; range (`RangeRange`) = a merge-walk over a new **per-index
+`BTreeMap<Value, dense_id>`** in the memtable. Threads through `scan_candidates`'s
+`RangeEq`/`RangeRange` arms (like the LabelScan born-append already there) and needs
+the memtable to index delta nodes (born **and** patched) by (index, value). Note the
+subtlety: a *patch* that changes an indexed property moves the node in the index
+(remove old value, add new) — the memtable must track the indexed value per node, or
+2d restricts to born-node + tombstone overlay and defers moved-key handling. Suggested
+scope: born-node + tombstone RangeEq/RangeRange overlay first (mirrors 2c's label
+scan), moved-indexed-value as a follow-up. Fixture: `testgen::write_indexed_people`;
+test seek-finds-born + seek-drops-tombstoned + range-includes-born.
 
-Handy resume detail: the delete slice landed at `WalOp::DeleteNode` +
-`Memtable::delete_node`/`is_tombstoned` (slater-delta); `WriteOp` in `parser.rs`
-(`ast` + `lower_write_statement` + `cypher.pest` `delete_clause`); `execute_write`
-dispatch + `scan_candidates` suppression + `run_single` fast-path gate (`exec.rs`);
-`emit_node`/`emit_edges_from` tombstone-skip (`consolidate.rs`).
+Handy resume detail (2c landed): MERGE grammar in `cypher.pest`
+(`kw_merge`, `write_statement` anchor alt) + `WriteStmt.upsert` + `lower_write_statement`
+(`parser.rs`); `Memtable::with_synthetic_base`/`born`/`synthetic`/`node_identity_by_dense`/
+`born_ids_with_label` (`slater-delta/memtable.rs`); read overlay in `exec.rs`
+(`node_prop_par`, `node_label_ids_par`, `node_props`, `overlay_node_props`,
+`outgoing_adj`, `scan_candidates` LabelScan append) all gated by
+`id >= core_generation().node_count()`; `MergedView::node_count` (`read_view.rs`);
+`resolve_business_key`→`KeyResolution` + `execute_write` create path + `DeltaWriter::
+open`/`retire` node_count threading (`server.rs`/`delta_writer.rs`); consolidation
+needed no change. See D45 for the MERGE-vs-MATCH semantics.
+
+Then **2e — consolidation folds delta-born nodes** is already effectively done (the
+`0..node_count` loop + synthetic-aware `node_record` emit born nodes; test
+`serialise_emits_a_delta_born_node`); the only 2e leftover once 2d lands is emitting
+edges *from/to* born nodes (Phase 3 topology overlay).
 
 Other tracks still open (valid but not the recommended next step): Phase 3 topology
-overlay (needed to close the traversal-to-a-tombstoned-node gap); the Phase 5 Bolt
-trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`, prod seam
-`server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
+overlay (needed to close the traversal-to-a-tombstoned-node gap + born-node edges);
+the Phase 5 Bolt trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`,
+prod seam `server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
 `slater dump` CLI (§ above).
 

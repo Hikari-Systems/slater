@@ -484,6 +484,19 @@ const KNN_PAR_MIN: usize = 256;
 /// block cache. The free-fn body behind [`Engine::node_label_ids`] so the parallel
 /// anchor filter ([`node_ok_par`], Task 10) can read labels off-thread.
 fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result<Vec<u32>> {
+    // A delta-born node (Phase 2c) carries the single label of its business identity
+    // and has no core label record — resolve the label name from the delta and map it
+    // through the core symbol table (the write path requires the label to pre-exist).
+    // The id-threshold compare gates the delta probe, so the read-only/empty-delta
+    // path (every id is a core id) never even consults the delta here.
+    if id >= gen.core_generation().node_count() {
+        return Ok(gen
+            .delta()
+            .node_identity_by_dense(id)
+            .and_then(|(label, _, _)| gen.label_id(label))
+            .into_iter()
+            .collect());
+    }
     let rec = cache.record(
         gen.node_labels().inner(),
         gen.uuid(),
@@ -507,6 +520,17 @@ fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
                 return Ok(Val::from_value(v.clone()));
             }
         }
+        // A delta-born node (Phase 2c) has no core row: its only non-patch property is
+        // the business key, recovered from the delta identity. Never read a core block
+        // for a synthetic id.
+        if id >= gen.core_generation().node_count() {
+            if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
+                if kname == key {
+                    return Ok(Val::from_value(kval.clone()));
+                }
+            }
+            return Ok(Val::Null);
+        }
     }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
@@ -520,6 +544,18 @@ fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
     Ok(columns::decode_one(&rec, key_id)?
         .map(Val::from_value)
         .unwrap_or(Val::Null))
+}
+
+/// Last-writer-wins insert of `(name, value)` into a name-space property list: an
+/// existing entry for `name` is overwritten, otherwise the pair is appended. The
+/// overlay fold ([`Engine::overlay_node_props`]) uses this for both patched and
+/// business-key properties.
+fn overlay_named(named: &mut NamedProps, name: &str, value: Val) {
+    if let Some(slot) = named.iter_mut().find(|(k, _)| k == name) {
+        slot.1 = value;
+    } else {
+        named.push((name.to_string(), value));
+    }
 }
 
 /// Thread-safe counterpart to [`Engine::node_ok`] for the parallel anchor filter
@@ -1421,6 +1457,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
     // ── Cached record reads (D18) ───────────────────────────────────────────
 
     fn node_props(&self, id: u64) -> Result<Vec<(u32, Value)>> {
+        // A delta-born node (Phase 2c) has no core props record; its properties are
+        // the delta patches plus the business key, folded in by `overlay_node_props`.
+        if id >= self.gen.core_generation().node_count() {
+            return Ok(Vec::new());
+        }
         let rec = self.cache.record(
             self.gen.node_props().inner(),
             self.gen.uuid(),
@@ -1512,31 +1553,39 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// Fold the live delta's property patches for node `id` onto `named` (the core
     /// props already resolved into name-space), last-writer-wins: a patched name
     /// replaces the core value, a new name is appended. The empty-delta fast path
-    /// (the overwhelming common case) returns immediately. Phase 1c overlays
-    /// property overwrites only; tombstones join in Phase 2.
+    /// (the overwhelming common case) returns immediately. Phase 1c overlays property
+    /// overwrites; Phase 2c also seeds a delta-born node's business-key property.
     fn overlay_node_props(&self, id: u64, named: &mut NamedProps) {
         let delta = self.gen.delta();
         if delta.is_empty() {
             return;
         }
+        // A delta-born node (Phase 2c) starts from empty core props: seed its
+        // business-key property from the identity (it is not stored as a patch) before
+        // folding the patches over it.
+        if id >= self.gen.core_generation().node_count() {
+            if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
+                overlay_named(named, kname, Val::from_value(kval.clone()));
+            }
+        }
         let Some(nd) = delta.node_patch(id) else {
             return;
         };
         for (name, value) in &nd.patches {
-            let v = Val::from_value(value.clone());
-            if let Some(slot) = named.iter_mut().find(|(k, _)| k == name) {
-                slot.1 = v;
-            } else {
-                named.push((name.clone(), v));
-            }
+            overlay_named(named, name, Val::from_value(value.clone()));
         }
     }
 
     /// The outgoing adjacency of node `id` (dst, reltype, edge id) through the
     /// block cache — the edge-walk surface the consolidation serialiser
     /// ([`crate::consolidate`]) uses to emit every edge exactly once (from its
-    /// source). Reads the immutable core topology; Phase 1c has no edge deltas.
+    /// source). Reads the immutable core topology. A delta-born node (Phase 2c) has no
+    /// core topology record and no edges yet (edge deltas are Phase 3), so it has an
+    /// empty adjacency.
     pub fn outgoing_adj(&self, id: u64) -> Result<Vec<topology::Adj>> {
+        if id >= self.gen.core_generation().node_count() {
+            return Ok(Vec::new());
+        }
         self.outgoing(id)
     }
 
@@ -5000,7 +5049,20 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     hi.as_ref().map(|(v, _)| v),
                     hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
                 )?,
-            NodeScan::LabelScan { label_id } => self.gen.collect_nodes_with_label(*label_id)?,
+            NodeScan::LabelScan { label_id } => {
+                let mut ids = self.gen.collect_nodes_with_label(*label_id)?;
+                // Delta-born nodes (Phase 2c) are not in the core label postings —
+                // append the synthetic ids carrying this label so a created node shows
+                // up in a label scan. Tombstoned ids are dropped by the suppression
+                // below. The empty-delta fast path skips the lookup entirely.
+                let delta = self.gen.delta();
+                if !delta.is_empty() {
+                    if let Some(label) = self.gen.label_name(*label_id) {
+                        ids.extend(delta.born_ids_with_label(label));
+                    }
+                }
+                ids
+            }
             NodeScan::AllNodes => (0..self.gen.node_count()).collect(),
             // Distinct edge-having endpoint nodes for the typed first hop (the
             // precomputed posting). Ascending+deduped, same contract as a label

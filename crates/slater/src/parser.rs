@@ -42,12 +42,12 @@ pub mod ast {
         pub ret: ReturnClause,
     }
 
-    /// The single durable write shape the writable layer accepts (Phase 1c):
-    /// `MATCH (var:Label {key: <literal|param>}) SET var.prop = <literal|param>[, …]
-    /// [RETURN …]`. It anchors exactly one existing node by a business key and
-    /// overwrites properties. The key value and every SET right-hand side are held
-    /// as [`Expr`] (a literal or a parameter) so parameters resolve at execution
-    /// time, when their values are known.
+    /// The single durable write shape the writable layer accepts:
+    /// `(MATCH|MERGE) (var:Label {key: <literal|param>})
+    ///  (SET var.prop = <literal|param>[, …] | [DETACH] DELETE var) [RETURN …]`.
+    /// It anchors one node by a business key and mutates it. The key value and every
+    /// SET right-hand side are held as [`Expr`] (a literal or a parameter) so
+    /// parameters resolve at execution time, when their values are known.
     #[derive(Debug, Clone, PartialEq)]
     pub struct WriteStmt {
         /// The anchor variable (a SET assignment must target it; DELETE names it).
@@ -58,6 +58,10 @@ pub mod ast {
         pub key: String,
         /// The inline business-key value (a literal or a parameter).
         pub key_value: Expr,
+        /// Anchor create-semantics (Phase 2c): `true` for `MERGE` (create the node if
+        /// the business key is absent, else patch it); `false` for `MATCH` (address an
+        /// existing node only — an absent key is an error). Always `false` for DELETE.
+        pub upsert: bool,
         /// The mutation applied to the anchored node.
         pub op: WriteOp,
         /// An optional `RETURN` projecting the (post-write) anchor node.
@@ -586,8 +590,11 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let mut sets: Vec<(String, String, Expr)> = Vec::new();
     let mut delete: Option<(bool, String)> = None; // (detach, target var)
     let mut ret: Option<ReturnClause> = None;
+    let mut upsert = false; // MERGE anchor (create-if-absent) vs MATCH (update only)
     for child in kids(pair) {
         match child.as_rule() {
+            Rule::kw_match => {}
+            Rule::kw_merge => upsert = true,
             Rule::node_pattern => node = Some(lower_node_pattern(child)?),
             Rule::set_clause => {
                 for item in kids(child) {
@@ -643,6 +650,9 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
 
     // Exactly one of SET / DELETE fired (the grammar alternates them).
     let op = if let Some((detach, target)) = delete {
+        if upsert {
+            bail!("MERGE cannot be combined with DELETE — use MATCH … DELETE to remove a node");
+        }
         if target != var {
             bail!("DELETE must target the anchor variable '{var}', not '{target}'");
         }
@@ -669,6 +679,7 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         label,
         key,
         key_value,
+        upsert,
         op,
         ret,
     })
@@ -2507,6 +2518,34 @@ mod tests {
         let e = write_err("MATCH (n:Company {ticker: 'ABC'}) DELETE m");
         assert!(
             e.contains("DELETE must target") || e == "read-only",
+            "got: {e}"
+        );
+    }
+
+    #[test]
+    fn merge_lowers_to_an_upsert_anchor() {
+        // MERGE carries the same shape as MATCH … SET but flags create-if-absent.
+        let w = write("MERGE (n:Company {ticker: 'ABC'}) SET n.price = 10");
+        assert!(w.upsert, "MERGE sets the upsert flag");
+        assert_eq!(w.label, "Company");
+        assert_eq!(w.key, "ticker");
+        assert_eq!(w.key_value, Expr::Literal(Value::Str("ABC".into())));
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![("price".to_string(), Expr::Literal(Value::Int(10)))])
+        );
+
+        // MATCH is update-only (no create).
+        let m = write("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10");
+        assert!(!m.upsert, "MATCH does not set the upsert flag");
+    }
+
+    #[test]
+    fn merge_cannot_delete() {
+        // MERGE … DELETE is nonsensical (create-or-match then remove) — rejected.
+        let e = write_err("MERGE (n:Company {ticker: 'ABC'}) DELETE n");
+        assert!(
+            e.contains("MERGE cannot be combined with DELETE") || e == "read-only",
             "got: {e}"
         );
     }

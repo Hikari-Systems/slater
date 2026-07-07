@@ -73,6 +73,11 @@ impl NodeDelta {
 struct NodeEntry {
     identity: NodeIdentity,
     delta: NodeDelta,
+    /// For a **delta-born** node (a business key absent from the core, created by a
+    /// `MERGE` write, Phase 2c) its allocated synthetic dense id in
+    /// `[synthetic_base, synthetic_base + born_count)`. `None` for a core-resolved
+    /// node (its current-core dense id lives in [`Memtable::by_dense`] only).
+    synthetic: Option<u64>,
 }
 
 /// The single-writer in-RAM memtable.
@@ -88,8 +93,19 @@ pub struct Memtable {
     /// Authoritative store, keyed by canonical business identity.
     nodes: HashMap<Vec<u8>, NodeEntry>,
     edges: HashMap<Vec<u8>, EdgeDelta>,
-    /// Read index: current-core dense id → the node's canonical identity key.
+    /// Read index: dense id → the node's canonical identity key. Holds both
+    /// current-core dense ids (property/tombstone deltas on existing nodes) and the
+    /// synthetic dense ids of delta-born nodes, so a read resolves either uniformly.
     by_dense: HashMap<u64, Vec<u8>>,
+    /// Base of the synthetic dense-id space = the core generation's `node_count` at
+    /// open time. A delta-born node's id is `synthetic_base + born.len()` at the
+    /// moment it is allocated, so the ids are `[synthetic_base, synthetic_base +
+    /// born_count)` and never collide with a core dense id.
+    synthetic_base: u64,
+    /// Delta-born canonical identity keys in **allocation order** (index = the id's
+    /// offset from `synthetic_base`). Allocation order is WAL-replay order, so the
+    /// synthetic id a business key receives is deterministic across a reopen.
+    born: Vec<Vec<u8>>,
     /// Running resident-size estimate (approximate, monotonically conservative),
     /// checked against the memtable byte budget.
     bytes: usize,
@@ -98,6 +114,28 @@ pub struct Memtable {
 impl Memtable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A memtable whose delta-born nodes allocate synthetic dense ids starting at
+    /// `base` — the core generation's `node_count`, so the synthetic space begins
+    /// exactly past the last core dense id. The writer constructs the memtable this
+    /// way (from the generation it resolves against) before replaying the WAL.
+    pub fn with_synthetic_base(base: u64) -> Self {
+        Self {
+            synthetic_base: base,
+            ..Self::default()
+        }
+    }
+
+    /// The base of the synthetic dense-id space (the core `node_count` at open).
+    pub fn synthetic_base(&self) -> u64 {
+        self.synthetic_base
+    }
+
+    /// The number of delta-born nodes (each holds one synthetic dense id). The merged
+    /// `node_count` is `core.node_count() + born_count()`.
+    pub fn born_count(&self) -> u64 {
+        self.born.len() as u64
     }
 
     /// No node or edge deltas — the reader can skip the overlay entirely.
@@ -117,7 +155,10 @@ impl Memtable {
 
     /// Overwrite (last-writer-wins) `patches` onto the node identified by
     /// `(label, key, value)`. `resolved` is the node's current-core dense id (an
-    /// ISAM probe on the `slater` side); `None` marks a delta-born node (Phase 2).
+    /// ISAM probe on the `slater` side); `None` marks a **delta-born** node, which is
+    /// allocated a synthetic dense id in `[synthetic_base, …)` the first time it is
+    /// seen (Phase 2c). This is the `MERGE` create-or-patch path — a resolved key
+    /// patches the existing core node, an absent key creates a new one.
     ///
     /// Shared by live writes and WAL replay so the two paths cannot diverge.
     pub fn upsert_node(
@@ -141,6 +182,7 @@ impl Memtable {
         let entry = self.nodes.entry(ck.clone()).or_insert_with(|| NodeEntry {
             identity,
             delta: NodeDelta::default(),
+            synthetic: None,
         });
         // An upsert resurrects a tombstoned node (last-writer-wins at node level).
         entry.delta.tombstoned = false;
@@ -148,8 +190,24 @@ impl Memtable {
             self.bytes += name.len() + value_size(&val);
             entry.delta.patches.insert(name, val);
         }
-        if let Some(dense) = resolved {
-            self.by_dense.insert(dense, ck);
+        let already_synthetic = entry.synthetic;
+        match resolved {
+            Some(dense) => {
+                self.by_dense.insert(dense, ck);
+            }
+            // Delta-born: allocate one synthetic dense id per identity, once. A later
+            // upsert of the same key reuses it (and never re-pushes into `born`), so
+            // the synthetic id is stable for the delta's whole life.
+            None if already_synthetic.is_none() => {
+                let dense = self.synthetic_base + self.born.len() as u64;
+                self.born.push(ck.clone());
+                self.by_dense.insert(dense, ck.clone());
+                self.nodes
+                    .get_mut(&ck)
+                    .expect("entry just inserted")
+                    .synthetic = Some(dense);
+            }
+            None => {}
         }
     }
 
@@ -174,6 +232,7 @@ impl Memtable {
         let entry = self.nodes.entry(ck.clone()).or_insert_with(|| NodeEntry {
             identity,
             delta: NodeDelta::default(),
+            synthetic: None,
         });
         entry.delta.tombstoned = true;
         entry.delta.patches.clear();
@@ -209,6 +268,38 @@ impl Memtable {
     /// intended for tests and same-memtable probes).
     pub fn lookup_node(&self, id: &NodeIdentity) -> Option<&NodeDelta> {
         self.nodes.get(&id.canonical_key()).map(|e| &e.delta)
+    }
+
+    /// Recover the `(label, key-property, key-value)` business identity of the node
+    /// at `dense_id` (either a core-resolved or a synthetic id). The read overlay
+    /// uses this to materialise a delta-born node's label + business-key property,
+    /// neither of which is stored as a patch. `None` if `dense_id` carries no delta.
+    pub fn node_identity_by_dense(&self, dense_id: u64) -> Option<(&str, &str, &Value)> {
+        let ck = self.by_dense.get(&dense_id)?;
+        let e = self.nodes.get(ck)?;
+        Some((
+            self.interner.name(e.identity.label).unwrap_or(""),
+            self.interner.name(e.identity.key).unwrap_or(""),
+            &e.identity.value,
+        ))
+    }
+
+    /// The synthetic dense ids of every delta-born node carrying `label` (ascending
+    /// by allocation order). A label scan appends these to the core hits; tombstoned
+    /// entries are included and dropped by the caller's tombstone suppression, so the
+    /// contract matches the core scan (which likewise leaves suppression to the read).
+    pub fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for ck in &self.born {
+            if let Some(e) = self.nodes.get(ck) {
+                if self.interner.name(e.identity.label) == Some(label) {
+                    if let Some(dense) = e.synthetic {
+                        out.push(dense);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Iterate stored nodes as `(label, key, value, delta)` with identity names
@@ -281,6 +372,35 @@ impl DeltaSnapshot {
     /// Count of delta-born-or-patched node identities, for scan-range planning.
     pub fn node_delta_count(&self) -> usize {
         self.mem.node_delta_count()
+    }
+
+    /// The base of the synthetic dense-id space (the core `node_count` this delta was
+    /// opened against): an id `>= synthetic_base` is a delta-born node whose reads
+    /// route to the delta only, never a core block.
+    #[inline]
+    pub fn synthetic_base(&self) -> u64 {
+        self.mem.synthetic_base()
+    }
+
+    /// The number of delta-born nodes overlaid — the merged `node_count` is
+    /// `core.node_count() + born_count()`.
+    #[inline]
+    pub fn born_count(&self) -> u64 {
+        self.mem.born_count()
+    }
+
+    /// Recover a node's `(label, key, key-value)` business identity by dense id — the
+    /// material a delta-born node's label + business-key property are read from.
+    #[inline]
+    pub fn node_identity_by_dense(&self, dense_id: u64) -> Option<(&str, &str, &Value)> {
+        self.mem.node_identity_by_dense(dense_id)
+    }
+
+    /// The synthetic dense ids of delta-born nodes carrying `label`, appended to a
+    /// core label scan (tombstone suppression happens in the caller).
+    #[inline]
+    pub fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
+        self.mem.born_ids_with_label(label)
     }
 }
 
@@ -390,6 +510,95 @@ mod tests {
         direct.delete_node("L", "k", Value::Int(3), Some(9));
         assert_eq!(viae.node_patch(9), direct.node_patch(9));
         assert!(viae.node_patch(9).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn delta_born_nodes_allocate_stable_synthetic_ids() {
+        // Core has 100 nodes; delta-born nodes take ids 100, 101, … in first-seen
+        // order, and re-upserting a born key keeps its id (never re-allocates).
+        let mut m = Memtable::with_synthetic_base(100);
+        assert_eq!(m.synthetic_base(), 100);
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None,
+            [("age".to_string(), Value::Int(40))],
+        );
+        m.upsert_node("Person", "name", Value::Str("Erin".into()), None, []);
+        assert_eq!(m.born_count(), 2);
+        // First born → 100, second → 101.
+        let dave = 100;
+        let erin = 101;
+        assert_eq!(
+            m.node_patch(dave).unwrap().patches.get("age"),
+            Some(&Value::Int(40))
+        );
+        assert!(m.node_patch(erin).unwrap().patches.is_empty());
+        assert_eq!(
+            m.node_identity_by_dense(dave),
+            Some(("Person", "name", &Value::Str("Dave".into())))
+        );
+
+        // Re-upsert Dave with a new property: same synthetic id, no new born slot.
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None,
+            [("city".to_string(), Value::Str("NYC".into()))],
+        );
+        assert_eq!(m.born_count(), 2, "re-upsert does not allocate a new id");
+        assert_eq!(
+            m.node_patch(dave).unwrap().patches.get("city"),
+            Some(&Value::Str("NYC".into()))
+        );
+        assert_eq!(
+            m.node_patch(dave).unwrap().patches.get("age"),
+            Some(&Value::Int(40))
+        );
+    }
+
+    #[test]
+    fn born_ids_with_label_filters_and_survives_delete() {
+        let mut m = Memtable::with_synthetic_base(10);
+        m.upsert_node("Person", "name", Value::Str("Dave".into()), None, []);
+        m.upsert_node("Company", "ticker", Value::Str("ZZZ".into()), None, []);
+        m.upsert_node("Person", "name", Value::Str("Erin".into()), None, []);
+        assert_eq!(m.born_ids_with_label("Person"), vec![10, 12]);
+        assert_eq!(m.born_ids_with_label("Company"), vec![11]);
+
+        // Deleting a born node keeps it in the label list (the caller suppresses the
+        // tombstone) but marks it tombstoned.
+        m.delete_node("Person", "name", Value::Str("Dave".into()), None);
+        assert_eq!(m.born_ids_with_label("Person"), vec![10, 12]);
+        assert!(m.node_patch(10).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn born_id_allocation_is_replay_order_deterministic() {
+        // Applying the same op sequence twice (the live path vs. a WAL replay) yields
+        // identical synthetic ids, because allocation follows first-seen order.
+        let ops = [
+            ("Person", "name", Value::Str("A".into())),
+            ("Person", "name", Value::Str("B".into())),
+            ("Person", "name", Value::Str("A".into())), // repeat: reuses A's id
+            ("Person", "name", Value::Str("C".into())),
+        ];
+        let build = || {
+            let mut m = Memtable::with_synthetic_base(5);
+            for (l, k, v) in &ops {
+                m.upsert_node(l, k, v.clone(), None, []);
+            }
+            m
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.born_ids_with_label("Person"), vec![5, 6, 7]);
+        assert_eq!(
+            a.born_ids_with_label("Person"),
+            b.born_ids_with_label("Person")
+        );
     }
 
     #[test]

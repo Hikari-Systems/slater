@@ -261,7 +261,11 @@ impl ReadView for MergedView<'_> {
         self.core.manifest()
     }
     fn node_count(&self) -> u64 {
-        self.core.node_count()
+        // Delta-born nodes (Phase 2c) occupy synthetic dense ids past the core count,
+        // so the merged count includes them. A full scan (`0..node_count`) therefore
+        // yields the core ids then the synthetic ones; tombstone suppression drops any
+        // deleted id (core or born) at the scan boundary.
+        self.core.node_count() + self.delta.born_count()
     }
     fn edge_count(&self) -> u64 {
         self.core.edge_count()

@@ -820,3 +820,24 @@ retired until its PUT is acked; freeze ships the frozen tail before spawning the
 consolidation builder; the writeback interval is simultaneously the object-store
 RPO and the cross-replica read-visibility lag; and the writer node therefore needs
 a durable local volume, not ephemeral instance storage.
+
+### D45 — Writable-layer create is spelled `MERGE`; `MATCH … SET` is update-only
+Phase 2c adds node *creation* to the writable layer (`crates/slater`). The write
+grammar (`cypher.pest` `write_statement`) accepts two anchor keywords with distinct
+create-semantics: `MERGE (n:L {k:v}) SET n.p = x` **creates** the node when the
+business key `k=v` is absent from the core (else patches it in place — upsert by
+business key), while `MATCH (n:L {k:v}) SET …` addresses an **existing** node only
+and errors on an absent key (the error points at `MERGE`). `MERGE … DELETE` is
+rejected. This keeps the layer honest to openCypher (a bare `MATCH` that matches
+nothing is a no-op, never a silent create) while giving creation the spelling that
+matches Slater's identity model — the builder already compiles business-key `MERGE`,
+and consolidation serialises the merged state back to `MERGE` (D-less; see
+`consolidate.rs`). Mechanically a `MERGE` create resolves its business key to
+`KeyResolution::Absent` and writes with `resolved = None`; the memtable allocates a
+**synthetic dense id** past the core's `node_count` (`Memtable::with_synthetic_base`
++ `born`), deterministic across WAL replay because allocation follows first-seen
+(= replay) order. Rejected alternative: overloading `MATCH … SET` to create on a miss
+(smaller change, but a create-on-miss `MATCH` is a real openCypher surprise). Also
+considered and deferred: a distinct `CREATE` clause (most honest create/update split,
+but two write grammars to carry and `CREATE` on an existing unique key would have to
+error anyway — `MERGE` subsumes it).

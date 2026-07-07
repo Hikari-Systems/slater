@@ -207,8 +207,10 @@ impl Graphs {
         for (name, slot) in &self.graphs {
             let gen = slot.read().unwrap().clone();
             let dir = base.join(name);
-            let writer = DeltaWriter::open(&dir, name, gen.uuid(), |op| resolve_dense_id(&gen, op))
-                .with_context(|| format!("open writable layer for graph '{name}'"))?;
+            let writer = DeltaWriter::open(&dir, name, gen.uuid(), gen.node_count(), |op| {
+                resolve_dense_id(&gen, op)
+            })
+            .with_context(|| format!("open writable layer for graph '{name}'"))?;
             let n = writer.node_delta_count();
             if n > 0 {
                 info!(graph = %name, node_deltas = n, "writable layer replayed WAL");
@@ -503,9 +505,13 @@ impl Graphs {
             })?;
 
         // Retire: the delta now lives in the new core, so drop the consumed WAL
-        // segments and re-bind the writer to the new generation.
+        // segments and re-bind the writer to the new generation (re-basing the
+        // synthetic id space on the new core's node_count).
+        let new_node_count = self.get(name).map(|g| g.node_count()).ok_or_else(|| {
+            anyhow!("consolidated generation for '{name}' vanished before retire")
+        })?;
         writer
-            .retire(&frozen.consumed, new_uuid)
+            .retire(&frozen.consumed, new_uuid, new_node_count)
             .with_context(|| format!("retire consolidated delta for '{name}'"))?;
 
         info!(graph = %name, generation = %new_uuid, "consolidated writable delta into a fresh generation");
@@ -2416,12 +2422,45 @@ async fn handle_request(
 /// dense-id read index ([`slater_delta::Memtable::by_dense`]) is built from this.
 fn resolve_dense_id(gen: &Generation, op: &WalOp) -> Option<u64> {
     let (label, key, value) = op.business_key();
+    match resolve_business_key(gen, label, key, value) {
+        KeyResolution::Unique(id) => Some(id),
+        // Absent → a delta-born node (WAL replay re-allocates its synthetic id in
+        // order); ambiguous/unindexed are not resolvable to a single core node.
+        _ => None,
+    }
+}
+
+/// The outcome of probing a write's business key against the current-core range
+/// index. Distinguishing *absent* from *ambiguous*/*unindexed* is what lets a
+/// `MERGE` create a delta-born node only when the key is genuinely new (Phase 2c).
+enum KeyResolution {
+    /// Exactly one existing core node — its dense id.
+    Unique(u64),
+    /// The key is range-indexed but matches no core node (a `MERGE` create candidate).
+    Absent,
+    /// More than one core node carries the key (Phase 1 assumes a unique business key).
+    Ambiguous,
+    /// The `(label, key)` pair has no range index, so the write cannot be resolved.
+    Unindexed,
+}
+
+/// Probe `(label, key, value)` against the label/property range index (an ISAM
+/// equality probe). The overlay's dense-id read index is built from a `Unique` hit.
+fn resolve_business_key(gen: &Generation, label: &str, key: &str, value: &Value) -> KeyResolution {
     let labels = [label.to_string()];
-    let idx = crate::plan::index_for(gen, &labels, key)?;
-    let ids = gen.range_index(&idx)?.lookup_eq(value).ok()?;
+    let Some(idx) = crate::plan::index_for(gen, &labels, key) else {
+        return KeyResolution::Unindexed;
+    };
+    let Some(reader) = gen.range_index(&idx) else {
+        return KeyResolution::Unindexed;
+    };
+    let Ok(ids) = reader.lookup_eq(value) else {
+        return KeyResolution::Unindexed;
+    };
     match ids.as_slice() {
-        [only] => Some(*only),
-        _ => None, // absent (0) or ambiguous (>1) — not a resolvable single node
+        [] => KeyResolution::Absent,
+        [only] => KeyResolution::Unique(*only),
+        _ => KeyResolution::Ambiguous,
     }
 }
 
@@ -2510,18 +2549,54 @@ fn execute_write(
             value: key_value,
         },
     };
-    let resolved = resolve_dense_id(gen, &op).ok_or_else(|| {
-        Failure::new(
-            CODE_EXECUTION,
-            format!(
-                "no unique {}({} = …) node to write: the business key must be range-indexed and \
-                 match exactly one existing node (writes address existing nodes only)",
-                stmt.label, stmt.key
-            ),
-        )
-    })?;
+    // Resolve the anchor's business key against the current core. A `MERGE` whose key
+    // is genuinely absent creates a delta-born node (`resolved = None`); every other
+    // absent/ambiguous/unindexed case is a clear error rather than a silent write.
+    let (label, key, value) = op.business_key();
+    // `is_set` = the op mutates properties (a `SET`), vs. a `DELETE`. A `MERGE … SET`
+    // (`stmt.upsert`) is the only shape that may create on an absent key.
+    let is_set = matches!(op, WalOp::UpsertNode { .. });
+    let resolved = match resolve_business_key(gen, label, key, value) {
+        KeyResolution::Unique(id) => Some(id),
+        KeyResolution::Absent if is_set && stmt.upsert => None, // MERGE create
+        KeyResolution::Absent => {
+            let action = if is_set { "update" } else { "delete" };
+            return Err(Failure::new(
+                CODE_EXECUTION,
+                format!(
+                    "no {}({} = …) node to {action}: the business key matches no existing node{}",
+                    stmt.label,
+                    stmt.key,
+                    if is_set {
+                        " (use MERGE to create it)"
+                    } else {
+                        ""
+                    },
+                ),
+            ));
+        }
+        KeyResolution::Ambiguous => {
+            return Err(Failure::new(
+                CODE_EXECUTION,
+                format!(
+                    "the business key {}({} = …) matches more than one node — writes require a \
+                     unique business key",
+                    stmt.label, stmt.key
+                ),
+            ));
+        }
+        KeyResolution::Unindexed => {
+            return Err(Failure::new(
+                CODE_EXECUTION,
+                format!(
+                    "cannot write {}({} = …): the business key must be range-indexed to resolve it",
+                    stmt.label, stmt.key
+                ),
+            ));
+        }
+    };
     writer
-        .write(op, Some(resolved))
+        .write(op, resolved)
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
@@ -3352,9 +3427,13 @@ mod tests {
 
         // Durability: a fresh writer over the same WAL replays the committed write.
         drop(writer);
-        let reopened = DeltaWriter::open(wal.join("people"), "people", gen.uuid(), |op| {
-            resolve_dense_id(&gen, op)
-        })
+        let reopened = DeltaWriter::open(
+            wal.join("people"),
+            "people",
+            gen.uuid(),
+            gen.node_count(),
+            |op| resolve_dense_id(&gen, op),
+        )
         .unwrap();
         assert_eq!(
             reopened
@@ -3382,7 +3461,8 @@ mod tests {
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
 
-        // No such Person.
+        // No such Person: a MATCH … SET on an absent key is an error (MATCH does not
+        // create — the message points at MERGE, which does).
         let absent = match parser::parse_statement("MATCH (n:Person {name:'Nobody'}) SET n.age = 1")
             .unwrap()
         {
@@ -3390,7 +3470,11 @@ mod tests {
             _ => unreachable!(),
         };
         let e = execute_write(&writer, gen.as_ref(), &absent, &HashMap::new()).unwrap_err();
-        assert!(e.message.contains("no unique"), "got: {}", e.message);
+        assert!(
+            e.message.contains("node to update") && e.message.contains("MERGE"),
+            "got: {}",
+            e.message
+        );
 
         // RETURN after SET is not yet supported.
         let with_ret =
@@ -3463,13 +3547,134 @@ mod tests {
 
         // Durability: a fresh writer over the same WAL replays the tombstone.
         drop(writer);
-        let reopened = DeltaWriter::open(wal.join("people"), "people", gen.uuid(), |op| {
-            resolve_dense_id(&gen, op)
-        })
+        let reopened = DeltaWriter::open(
+            wal.join("people"),
+            "people",
+            gen.uuid(),
+            gen.node_count(),
+            |op| resolve_dense_id(&gen, op),
+        )
         .unwrap();
         assert!(
             reopened.snapshot().node_patch(0).unwrap().tombstoned,
             "the delete is durable across a reopen (WAL replay)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Phase 2c: a `MERGE` on an absent business key creates a delta-born
+    /// node with a synthetic dense id. It reads back through a label scan, grows the
+    /// whole-label count, and survives a writer reopen (WAL replay re-allocates the
+    /// same synthetic id). A `MERGE` on an *existing* key patches it in place (no
+    /// duplicate). NB: addressing a born node by an *indexed* key seek
+    /// (`MATCH (n:Person {name:'Dave'})`) needs the Phase 2d index overlay — until
+    /// then a born node is found by a label scan, not a range-index probe.
+    #[test]
+    fn merge_creates_delta_born_node_and_survives_reopen() {
+        let (root, _g, _) = testgen::write_basic("merge_create");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Read all Person (name, age) rows through the live overlay (a label scan, so
+        // it enumerates core nodes then delta-born ones).
+        let people = |w: &Arc<DeltaWriter>| -> Vec<(String, Option<i64>)> {
+            let view = MergedView::new(gen.as_ref(), DeltaSnapshot::from_memtable(w.snapshot()));
+            let ast = parser::parse("MATCH (n:Person) RETURN n.name, n.age").unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| {
+                    let name = match &r[0] {
+                        Val::Str(s) => s.clone(),
+                        v => panic!("name not str: {v:?}"),
+                    };
+                    let age = match &r[1] {
+                        Val::Int(n) => Some(*n),
+                        Val::Null => None,
+                        v => panic!("age not int/null: {v:?}"),
+                    };
+                    (name, age)
+                })
+                .collect()
+        };
+
+        let base = people(&writer);
+        assert!(
+            !base.iter().any(|(n, _)| n == "Dave"),
+            "Dave absent at start"
+        );
+        let base_n = base.len();
+
+        // Create Dave via MERGE on an absent business key.
+        let stmt = match parser::parse_statement("MERGE (n:Person {name:'Dave'}) SET n.age = 50")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a write"),
+        };
+        assert!(stmt.upsert, "MERGE lowers to an upsert anchor");
+        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        // Read-your-writes: Dave appears in the label scan with both his business-key
+        // (name) and his SET property (age), and the count grew by exactly one.
+        let after = people(&writer);
+        assert_eq!(after.len(), base_n + 1, "count grew by one");
+        assert!(
+            after.contains(&("Dave".to_string(), Some(50))),
+            "born Dave reads back with name+age: {after:?}"
+        );
+
+        // MERGE on an existing key patches in place (no second Bob).
+        let patch = match parser::parse_statement("MERGE (n:Person {name:'Bob'}) SET n.age = 123")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a write"),
+        };
+        execute_write(&writer, gen.as_ref(), &patch, &HashMap::new()).unwrap();
+        let patched = people(&writer);
+        assert_eq!(
+            patched.len(),
+            base_n + 1,
+            "MERGE on an existing key does not duplicate"
+        );
+        assert_eq!(
+            patched.iter().filter(|(n, _)| n == "Bob").count(),
+            1,
+            "exactly one Bob"
+        );
+        assert!(
+            patched.contains(&("Bob".to_string(), Some(123))),
+            "Bob patched in place: {patched:?}"
+        );
+
+        // Durability: a fresh writer over the same WAL replays create + patch, and the
+        // born node keeps its synthetic id (allocation follows replay order).
+        drop(writer);
+        let reopened = DeltaWriter::open(
+            wal.join("people"),
+            "people",
+            gen.uuid(),
+            gen.node_count(),
+            |op| resolve_dense_id(&gen, op),
+        )
+        .unwrap();
+        let reopened = Arc::new(reopened);
+        let replayed = people(&reopened);
+        assert!(
+            replayed.contains(&("Dave".to_string(), Some(50))),
+            "born Dave is durable across a reopen: {replayed:?}"
+        );
+        assert!(
+            replayed.contains(&("Bob".to_string(), Some(123))),
+            "patch is durable across a reopen: {replayed:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3624,10 +3829,11 @@ mod tests {
         assert!(!root.join("people").join(".consolidate.cypher").exists());
 
         // Durability: a fresh writer over the WAL replays the write.
-        let reopened = DeltaWriter::open(&wal_dir, "people", gen0.uuid(), |op| {
-            resolve_dense_id(&gen0, op)
-        })
-        .unwrap();
+        let reopened =
+            DeltaWriter::open(&wal_dir, "people", gen0.uuid(), gen0.node_count(), |op| {
+                resolve_dense_id(&gen0, op)
+            })
+            .unwrap();
         assert_eq!(
             reopened
                 .snapshot()
