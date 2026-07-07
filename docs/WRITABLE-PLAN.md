@@ -195,6 +195,63 @@ disk.
 - **Client-facing ids** — expose the business key as `element_id`; keep the numeric
   id ephemeral and generation-scoped.
 
+## Per-graph dump CLI (`slater dump`) — operator tool
+
+A per-graph exporter that dumps a graph from a **running** server to
+slater-build-compatible **business-key `MERGE` Cypher**, so a graph can be
+round-tripped (dump → `slater-build` → new generation), migrated, or backed up in
+text form. Folded in at the user's request; it is an **independent operator-tool
+workstream** (does not gate Phases 0–5) that shares the `MERGE` dump *format* with,
+but is distinct in code from, the Phase 4a consolidation serialiser.
+
+**Transport — Bolt client (decided).** Not offline/in-process: it connects over
+Bolt, authenticates, and honours per-graph ACLs, so it works against a live
+deployment without disk access. Reuses `BoltConn` (currently private in
+`health.rs` — promote to a shared `bolt` module) and the existing `basic`-scheme
+flow: `HELLO → LOGON {scheme:"basic", principal, credentials} → RUN/PULL`, checked
+by `Acl::verify`/`can_read`. *(Consolidation Phase 4a needs an **offline**
+generation→`MERGE` serialiser instead — same text format, different data source
+(generation readers, not Bolt records); built separately there.)*
+
+**Args (clap-derive; align the workspace on one arg style).** The existing `slater
+query` subcommand hand-rolls `std::env::args()` while `slater-build` uses
+clap-derive — standardise new tools on clap-derive and (recommended) migrate
+`slater query` to match, sharing flag names:
+- `graph` — positional or `--graph` (required).
+- `--host` (default `localhost`), `--port` (default config `server.port` / 7687).
+- `-u`/`--user` (required).
+- **password** — from **stdin** (default, tty-safe) or env `SLATER_DUMP_PASSWORD`;
+  no plaintext `--password` flag (avoid `ps`/shell-history leaks). A
+  `--password-stdin` toggle mirrors Docker's convention.
+- `-o`/`--out` — output file (default stdout).
+- `--key Label=prop` (repeatable) and global `--pk <field>` — identity-key
+  overrides (see below).
+- TLS passthrough if the server requires it (`--tls`, `--ca-cert`).
+
+**Identity-key resolution — infer from range indexes + override (decided).** The
+core does **not** record which property is a node's business key. Default: treat
+each label's range-indexed property (`manifest.range_indexes` → exposed over Bolt
+via schema introspection, e.g. `SHOW INDEXES` / `CALL db.indexes()` — verify
+`introspect.rs` supports this, else add) as its identity key. `--key Label=prop`
+overrides per label; `--pk <field>` selects a global dump_id-style key. Emits
+`MERGE (n:Label {key: value})`.
+
+**Dump procedure.** (1) connect + auth; (2) enumerate labels → identity key (schema
++ overrides); (3) emit `CREATE INDEX` DDL so the rebuild recreates indexes; (4)
+nodes — per node emit `MERGE (n:Label {key: value}) SET n.p = …;` for the remaining
+properties; (5) edges — `MATCH (a…),(b…) MERGE (a)-[:TYPE {props}]->(b);` using both
+endpoints' business keys (so the edge query returns endpoint labels + key props);
+(6) a Cypher-literal escaper for string/number/bool/null/list values.
+
+**Known limitation — vectors.** `vecf32` properties cannot be carried in a `MERGE`
+dump (the build path rejects vector values; see the vectors non-goal). A dump of a
+graph with embeddings either omits them or must use the `--pk`/`CREATE`-style
+offline rebuild path — flag this in the tool's output and docs.
+
+**Net-new pieces / dependencies:** promote `BoltConn` to shared; a schema-introspection
+query for range indexes; the `MERGE` serialiser + Cypher-literal escaper; clap args
+(+ optional `slater query` migration).
+
 ## Consistency & correctness model
 
 - **Snapshot isolation across a swap** is free: a query pins one `(core Arc, delta

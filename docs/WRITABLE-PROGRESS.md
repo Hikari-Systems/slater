@@ -106,6 +106,15 @@ Running ledger for the `writeable` track. Pairs with the design in
 
 - Phases 2–5: see `docs/WRITABLE-PLAN.md`.
 
+- **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
+  See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
+  not gate them). **Decided:** Bolt-client transport (user/pass, honours ACLs — reuse
+  `BoltConn` from `health.rs`, promote to shared); identity keys inferred from range
+  indexes with `--key Label=prop` / `--pk` overrides; clap-derive args, password via
+  stdin/env (no plaintext flag). Distinct in code from Phase 4a's offline
+  generation→MERGE serialiser (shares only the text format). NB: `vecf32` props can't
+  ride a MERGE dump (vectors non-goal).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -138,5 +147,3 @@ server. Steps:
    invalidate on write.
 6. Read-your-writes integration test (build a fixture, `SET`, read merged).
 
-NOTE: also plan the **per-graph dump CLI** (see "Dump CLI" section below) — its
-offline core→MERGE serialiser is the same primitive Phase 1d/4a consolidation needs.
