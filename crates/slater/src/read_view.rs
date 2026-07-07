@@ -268,7 +268,9 @@ impl ReadView for MergedView<'_> {
         self.core.node_count() + self.delta.born_count()
     }
     fn edge_count(&self) -> u64 {
-        self.core.edge_count()
+        // Delta-born edges (Phase 3) occupy synthetic dense edge ids past the core
+        // count, so the merged count includes them (matching the node overlay above).
+        self.core.edge_count() + self.delta.born_edge_count()
     }
     fn label_id(&self, name: &str) -> Option<u32> {
         self.core.label_id(name)

@@ -301,12 +301,29 @@ Running ledger for the `writeable` track. Pairs with the design in
     core-edge tombstone-only, MERGE-then-DELETE, absent-endpoint no-op, resurrect,
     apply-vs-direct parity, `iter_edges` name recovery). Whole workspace green;
     clippy + fmt clean. **No read-path effect yet** — traversal overlay is 3b.
-  - **3b — exec traversal read overlay.** Thread delta edges into
-    `outgoing`/`incoming`/`hops_par`/`neighbours_par`/`outgoing_adj`: append born
-    edges (map reltype name→core id), suppress tombstoned edges, and suppress edges
-    incident to a tombstoned node (closes the 2b gap). `MergedView::edge_count` adds
-    `born_edge_count`; a born edge id routes `rel_record` to the delta. Gated by the
-    empty-delta fast path. Server-level read-your-writes tests.
+  - **3b — exec traversal read overlay. ✅ DONE** (this commit). Two new exec free
+    fns: `overlay_adj(gen, node, outgoing, core)` folds the edge delta into a core
+    adjacency list — drops core edges a delta tombstone suppresses (matched on
+    `(reltype-id, neighbour)`) and any edge whose neighbour is a tombstoned **node**
+    (closing the 2b core-edge-to-deleted-node gap), then appends the node's born edges
+    (reltype **name** → core id via `gen.reltype_id`, skipped if the reltype is absent
+    from the core — the write path requires it to pre-exist, mirroring born-node
+    labels); `read_adj_overlaid(gen, cache, node, outgoing)` is the single overlay-aware
+    directional reader (a born node has an empty core adjacency), behind the
+    `delta.is_empty()` fast path. `Engine::{outgoing,incoming}` and the free
+    `hops_par`/`neighbours_par` (parallel multi-hop + shortestPath BFS) now route
+    through it, so every traversal path — sequential and parallel — applies the
+    identical overlay; `Engine::outgoing_adj` (consolidation edge walk) delegates to
+    `outgoing`, so 3d's born/tombstoned-edge folding falls out for free.
+    `MergedView::edge_count` adds `born_edge_count`; `edge_props`/`edge_prop_par` return
+    empty/Null for a born edge id (`>= core edge_count`), so a traversed born edge
+    materialises as a `Relationship` with its type and no properties. Tests
+    (`server.rs`, driving edges through `DeltaWriter::write` since the grammar is 3c):
+    `edge_overlay_folds_born_and_deleted_edges` (born edge walkable both directions;
+    deleted core edge stops walking both directions; unrelated delete leaves the born
+    edge) and `edge_overlay_suppresses_edge_to_tombstoned_node` (a core edge to a
+    `DELETE`d node vanishes on read). Whole slater+slater-delta green; clippy+fmt clean;
+    empty-delta bench within noise of core.
   - **3c — relationship write grammar + write path.** `MERGE (a)-[:R]->(b)` create
     and an edge `DELETE`; parser lowering; `execute_write` edge dispatch (resolve both
     endpoints, bounded core-adjacency dedup so a MERGE of an existing core edge is a
@@ -341,37 +358,44 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Phase 3a is done: the pure `slater-delta` edge layer (WAL `UpsertEdge`/`DeleteEdge`,
-the `EdgeIdentity`-keyed memtable edge store with `out_adj`/`in_adj` dense-id read
-indexes, born endpoint/edge synthetic id allocation, tombstone-only core-edge
-suppression entries, and the `OpResolution` apply plumbing) is in and unit-tested;
-`slater` compiles and runs on it but the edge grammar/read overlay aren't wired yet,
-so it has **no runtime effect** — the whole workspace is green.
+Phases 3a + 3b are done: the memtable edge layer (3a) and the exec traversal read
+overlay (3b) are in and tested. A relationship written into the delta is now walkable
+in every traversal path (sequential + parallel), a deleted edge and an edge to a
+deleted node are suppressed, and consolidation's `outgoing_adj` already overlays edges
+(it delegates to the same `outgoing`). What's missing is the **write grammar** — edges
+can only be written by hand-building a `WalOp` today.
 
-The recommended next step is **3b — the exec traversal read overlay**. Fold the delta
-edges into the adjacency readers so a `MERGE`-created relationship is traversable and a
-deleted/incident-to-deleted edge is suppressed. The read paths to thread (all behind
-the empty-delta fast path):
-- `Engine::outgoing`/`incoming` (exec.rs ~1488) — the sequential `expand_with_dir`
-  source; append `delta.out_edges(node)`/`in_edges(node)` born edges (map reltype
-  name→core id via `gen.reltype_id`, skip if the reltype is absent from core), drop
-  core `Adj` that a delta edge tombstones (match on `(reltype-id, neighbour)`), and
-  drop any `Adj` whose neighbour `delta.is_tombstoned(..)` (this closes the 2b gap).
-- `hops_par` / `neighbours_par` (free fns, exec.rs ~339/390) — the parallel multi-hop
-  + shortestPath readers; the same fold, but they take `&dyn ReadView` so read the
-  delta off `gen.delta()`.
-- `outgoing_adj` (exec.rs ~1585) — the consolidation edge walk; extend it to born
-  nodes/edges (feeds 3d) and drop tombstoned edges.
-- `MergedView::edge_count` (read_view.rs ~270) — add `delta.born_edge_count()`; a born
-  edge id (`>= edge_synthetic_base`) must route `rel_record`/`edge_prop` to the delta
-  (empty core props + reltype from the born edge's identity).
-Also confirm the count/metadata fast paths already fall through when the delta is
-non-empty (2b gated them on `delta.is_empty()`), so a born/tombstoned edge can't be
-served from a stale manifest edge count.
-Handy 3a resume detail: `Memtable::{upsert_edge,delete_edge,out_edges,in_edges,
-iter_edges,born_edge_count,edge_synthetic_base}` + `DeltaEdge` + `OpResolution` in
-`slater-delta/memtable.rs`, all re-exported from the crate root and wrapped on
-`DeltaSnapshot`; `server::resolve_op` builds the `OpResolution`.
+The recommended next step is **3c — the relationship write grammar + write path**:
+- **Grammar (`cypher.pest`).** Extend `write_statement` with an edge shape:
+  `MERGE (a:L {k:v})-[:R]->(b:M {j:w})` for create, and an edge delete
+  (`MATCH (a:L {k:v})-[r:R]->(b:M {j:w}) DELETE r`, or a rel-less
+  `MATCH (a)-[:R]->(b) DELETE` form — pick one; a rel variable + `DELETE r` is the
+  openCypher-faithful spelling). Keep it as narrow as the node shape: two labelled
+  business-key anchors, one reltype, no edge properties yet.
+- **Parser (`parser.rs`).** A new `WriteStmt` variant (or an `op`/target enum) carrying
+  the two endpoint identities + reltype; lower with the same constant-only checks as
+  the node path. `MERGE` create vs `MATCH` update/delete semantics per D45.
+- **Write path (`server::execute_write`).** Build `WalOp::{UpsertEdge,DeleteEdge}`;
+  resolve **both** endpoints via `resolve_business_key` (each must be `Unique` for a
+  core endpoint, or `Absent` under `MERGE` to auto-create a born endpoint; ambiguous /
+  unindexed → the existing clear errors). For a `MERGE` edge, **dedup against an
+  existing core edge**: scan the resolved src's `outgoing_adj` for a matching
+  `(reltype-id, dst-dense)` and skip the write if present (idempotent MERGE — the
+  memtable is already identity-idempotent, but this avoids a born duplicate of a core
+  edge). Require the reltype to pre-exist in the core (`gen.reltype_id(R).is_some()`),
+  matching the 3b overlay's skip-unknown-reltype behaviour — reject with a clear error
+  otherwise. Pass `OpResolution::Edge { src, dst }` to `writer.write`.
+- Then **3d** is mostly tests: `serialise_merge_dump` already walks `outgoing_adj`
+  (overlay-aware as of 3b) and skips tombstoned nodes/edges, so born edges emit and
+  deleted edges drop; add a determinism/round-trip test and confirm a born edge between
+  two born nodes serialises.
+
+Handy 3b resume detail: `overlay_adj` + `read_adj_overlaid` free fns in `exec.rs` (used
+by `Engine::{outgoing,incoming,outgoing_adj}`, `hops_par`, `neighbours_par`);
+`MergedView::edge_count` += `born_edge_count`; born-edge id guards in
+`edge_props`/`edge_prop_par`. Write-path resume detail (3a): `server::resolve_op`
+builds `OpResolution`; `DeltaWriter::write(op, OpResolution)`; endpoint dense ids come
+from `resolve_business_key` (`KeyResolution`).
 
 Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
 - **moved indexed value** (deferred from 2d): relocate a patched core node in a range

@@ -3779,6 +3779,170 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 3b: the traversal read overlay. A `MERGE`-created relationship is
+    /// walkable (both directions), a deleted core edge no longer traverses, and an
+    /// edge to a tombstoned node is suppressed (closing the 2b gap). Edges are written
+    /// directly through the `DeltaWriter` (the write *grammar* is 3c) on the
+    /// `write_indexed_people` fixture: Alice(0)-[:KNOWS]->Bob(1), plus Carol(2), with a
+    /// `(Person, name)` index that resolves the anchors.
+    #[test]
+    fn edge_overlay_folds_born_and_deleted_edges() {
+        let (root, _g) = testgen::write_indexed_people("edge_overlay_3b");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Run `q` over the live overlay, returning the single string column.
+        let names = |q: &str| -> Vec<String> {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast = parser::parse(q).unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            let mut out: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("expected str, got {v:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let edge = |create: bool, src: u64, dst: u64| {
+            let (sname, dname) = (
+                ["Alice", "Bob", "Carol"][src as usize],
+                ["Alice", "Bob", "Carol"][dst as usize],
+            );
+            let op = if create {
+                WalOp::UpsertEdge {
+                    src_label: "Person".into(),
+                    src_key: "name".into(),
+                    src_value: Value::Str(sname.into()),
+                    reltype: "KNOWS".into(),
+                    dst_label: "Person".into(),
+                    dst_key: "name".into(),
+                    dst_value: Value::Str(dname.into()),
+                    patches: vec![],
+                }
+            } else {
+                WalOp::DeleteEdge {
+                    src_label: "Person".into(),
+                    src_key: "name".into(),
+                    src_value: Value::Str(sname.into()),
+                    reltype: "KNOWS".into(),
+                    dst_label: "Person".into(),
+                    dst_key: "name".into(),
+                    dst_value: Value::Str(dname.into()),
+                }
+            };
+            writer
+                .write(
+                    op,
+                    OpResolution::Edge {
+                        src: Some(src),
+                        dst: Some(dst),
+                    },
+                )
+                .unwrap();
+        };
+
+        // Baseline: only the core edge Alice-KNOWS->Bob.
+        assert_eq!(
+            names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Bob".to_string()]
+        );
+        assert!(names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name").is_empty());
+
+        // Create a born edge Bob-KNOWS->Carol: now traversable outgoing from Bob and
+        // incoming to Carol.
+        edge(true, 1, 2);
+        assert_eq!(
+            names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Carol".to_string()],
+            "born edge is walkable outgoing"
+        );
+        assert_eq!(
+            names("MATCH (a)-[:KNOWS]->(b:Person {name:'Carol'}) RETURN a.name"),
+            vec!["Bob".to_string()],
+            "born edge is walkable incoming"
+        );
+
+        // Delete the core edge Alice-KNOWS->Bob: it stops traversing (both directions).
+        edge(false, 0, 1);
+        assert!(
+            names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name").is_empty(),
+            "deleted core edge no longer walks outgoing"
+        );
+        assert!(
+            names("MATCH (a)-[:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name").is_empty(),
+            "deleted core edge no longer walks incoming"
+        );
+        // The born edge is unaffected by the unrelated delete.
+        assert_eq!(
+            names("MATCH (a:Person {name:'Bob'})-[:KNOWS]->(b) RETURN b.name"),
+            vec!["Carol".to_string()]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 3b (the closed 2b gap): a core edge to a node deleted via the delta is no
+    /// longer reachable by traversal — the node tombstone suppresses its incident core
+    /// edges on read.
+    #[test]
+    fn edge_overlay_suppresses_edge_to_tombstoned_node() {
+        let (root, _g) = testgen::write_indexed_people("edge_overlay_tomb_3b");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let hop = || -> Vec<String> {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast = parser::parse("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name")
+                .unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("expected str, got {v:?}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(hop(), vec!["Bob".to_string()], "core edge reaches Bob");
+
+        // Delete Bob (the edge's destination) through the write path.
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) DELETE n").unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a write"),
+        };
+        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        assert!(
+            hop().is_empty(),
+            "the core edge to the now-tombstoned Bob is suppressed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The result-cache key includes the delta epoch, so a write invalidates an
     /// overlaid result rather than serving it stale.
     #[test]

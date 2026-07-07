@@ -43,7 +43,7 @@ use crate::plan::{choose_node_scan, index_for, is_id_anchored, maybe_rel_type_sc
 use crate::read_view::ReadView;
 use crate::temporal::{self, TKind};
 use crate::vector;
-use graph_format::ids::{NodeId, Value};
+use graph_format::ids::{EdgeId, NodeId, Value};
 use graph_format::manifest::{AnnMode, EntityKind};
 use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
@@ -330,6 +330,85 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
     }
 }
 
+/// Fold the writable-layer edge delta (Phase 3) into node `node`'s core adjacency
+/// for one direction (`outgoing` = out-edges, else in-edges). Drops core edges the
+/// delta tombstones and any edge (core or born) whose neighbour is a **tombstoned
+/// node** — this is the traversal side of a relationship / node `DELETE`, and it
+/// closes the Phase-2b gap where a core edge to a deleted node was still walkable.
+/// Appends the node's delta-born edges, mapping each reltype **name** to its core id
+/// (a born edge of a reltype absent from the core cannot be represented as an `Adj`,
+/// so it is skipped — the write path requires the reltype to pre-exist). Callers gate
+/// on `delta.is_empty()`, so this runs only when a live delta is present.
+fn overlay_adj(
+    gen: &dyn ReadView,
+    node: u64,
+    outgoing: bool,
+    mut core: Vec<topology::Adj>,
+) -> Vec<topology::Adj> {
+    let delta = gen.delta();
+    let deltas = if outgoing {
+        delta.out_edges(node)
+    } else {
+        delta.in_edges(node)
+    };
+    // `(reltype-id, neighbour)` pairs a delta tombstone removes from the core list.
+    let mut suppress: HashSet<(u32, u64)> = HashSet::new();
+    let mut born: Vec<topology::Adj> = Vec::new();
+    for e in deltas {
+        let Some(rt) = gen.reltype_id(&e.reltype) else {
+            continue;
+        };
+        if e.tombstoned {
+            suppress.insert((rt, e.other));
+        } else if let Some(eid) = e.edge_id {
+            born.push(topology::Adj {
+                reltype: rt,
+                neighbour: NodeId(e.other),
+                edge: EdgeId(eid),
+            });
+        }
+    }
+    core.retain(|a| {
+        !suppress.contains(&(a.reltype, a.neighbour.0)) && !delta.is_tombstoned(a.neighbour.0)
+    });
+    for a in born {
+        if !delta.is_tombstoned(a.neighbour.0) {
+            core.push(a);
+        }
+    }
+    core
+}
+
+/// Read node `node`'s adjacency in one direction (`outgoing` = out-edges) through the
+/// (Sync) block cache and fold the edge delta over it. A **delta-born** node has no
+/// core topology record, so its core adjacency is empty and only its born edges
+/// remain. The single reader behind the sequential [`Engine::outgoing`]/[`incoming`]
+/// and the parallel [`hops_par`]/[`neighbours_par`], so every traversal path applies
+/// the identical overlay. The empty-delta fast path returns the bare core adjacency.
+fn read_adj_overlaid(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    node: u64,
+    outgoing: bool,
+) -> Result<Vec<topology::Adj>> {
+    let core = if node >= gen.core_generation().node_count() {
+        Vec::new()
+    } else {
+        let topo = gen.topology();
+        let global = if outgoing {
+            topo.outgoing_global(NodeId(node))
+        } else {
+            topo.incoming_global(NodeId(node))
+        };
+        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+        topology::decode_adj(&rec)?
+    };
+    if gen.delta().is_empty() {
+        return Ok(core);
+    }
+    Ok(overlay_adj(gen, node, outgoing, core))
+}
+
 /// Thread-safe single-node neighbour read for the parallel `shortestPath()` BFS:
 /// read+decode `node`'s adjacency in direction `dir` through the (Sync) block cache,
 /// keeping neighbours whose reltype passes `type_ids` (`None` = any type). Run
@@ -343,11 +422,9 @@ fn neighbours_par(
     dir: Direction,
     type_ids: Option<&[u32]>,
 ) -> Result<Vec<u64>> {
-    let topo = gen.topology();
     let mut out = Vec::new();
-    let mut take = |global: u64| -> Result<()> {
-        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-        for a in topology::decode_adj(&rec)? {
+    let mut take = |outgoing: bool| -> Result<()> {
+        for a in read_adj_overlaid(gen, cache, node, outgoing)? {
             if type_ids.map_or(true, |ids| ids.contains(&a.reltype)) {
                 out.push(a.neighbour.0);
             }
@@ -355,11 +432,11 @@ fn neighbours_par(
         Ok(())
     };
     match dir {
-        Direction::Outgoing => take(topo.outgoing_global(NodeId(node)))?,
-        Direction::Incoming => take(topo.incoming_global(NodeId(node)))?,
+        Direction::Outgoing => take(true)?,
+        Direction::Incoming => take(false)?,
         Direction::Undirected => {
-            take(topo.outgoing_global(NodeId(node)))?;
-            take(topo.incoming_global(NodeId(node)))?;
+            take(true)?;
+            take(false)?;
         }
     }
     Ok(out)
@@ -394,18 +471,13 @@ fn hops_par(
     dir: Direction,
     tf: Option<&TypeFilter>,
 ) -> Result<Vec<Hop>> {
-    let topo = gen.topology();
-    let read = |global: u64| -> Result<Vec<topology::Adj>> {
-        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-        topology::decode_adj(&rec)
-    };
     let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
     match dir {
-        Direction::Outgoing => sources.push((read(topo.outgoing_global(NodeId(node)))?, false)),
-        Direction::Incoming => sources.push((read(topo.incoming_global(NodeId(node)))?, true)),
+        Direction::Outgoing => sources.push((read_adj_overlaid(gen, cache, node, true)?, false)),
+        Direction::Incoming => sources.push((read_adj_overlaid(gen, cache, node, false)?, true)),
         Direction::Undirected => {
-            sources.push((read(topo.outgoing_global(NodeId(node)))?, false));
-            sources.push((read(topo.incoming_global(NodeId(node)))?, true));
+            sources.push((read_adj_overlaid(gen, cache, node, true)?, false));
+            sources.push((read_adj_overlaid(gen, cache, node, false)?, true));
         }
     }
     let mut out = Vec::new();
@@ -612,6 +684,11 @@ fn node_ok_par(
 /// parallel aggregation precompute, Task 12) and by `Engine::edge_prop`, so the two
 /// stay byte-for-byte identical.
 fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+    // A delta-born edge (Phase 3) has no core edge-props record and carries no
+    // properties yet (the write grammar creates topology only), so any key reads Null.
+    if !gen.delta().is_empty() && id >= gen.core_generation().edge_count() {
+        return Ok(Val::Null);
+    }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
     };
@@ -1472,6 +1549,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn edge_props(&self, id: u64) -> Result<Vec<(u32, Value)>> {
+        // A delta-born edge (Phase 3) has no core record and no properties yet.
+        if !self.gen.delta().is_empty() && id >= self.gen.core_generation().edge_count() {
+            return Ok(Vec::new());
+        }
         let rec = self.cache.record(
             self.gen.edge_props().inner(),
             self.gen.uuid(),
@@ -1486,21 +1567,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn outgoing(&self, id: u64) -> Result<Vec<topology::Adj>> {
-        let topo = self.gen.topology();
-        let global = topo.outgoing_global(NodeId(id));
-        let rec = self
-            .cache
-            .record(topo.inner(), self.gen.uuid(), FileKind::Topology, global)?;
-        topology::decode_adj(&rec)
+        read_adj_overlaid(self.gen, self.cache, id, true)
     }
 
     fn incoming(&self, id: u64) -> Result<Vec<topology::Adj>> {
-        let topo = self.gen.topology();
-        let global = topo.incoming_global(NodeId(id));
-        let rec = self
-            .cache
-            .record(topo.inner(), self.gen.uuid(), FileKind::Topology, global)?;
-        topology::decode_adj(&rec)
+        read_adj_overlaid(self.gen, self.cache, id, false)
     }
 
     /// Read a vector index group `[first_record, first_record + count)` from
@@ -1576,16 +1647,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
         }
     }
 
-    /// The outgoing adjacency of node `id` (dst, reltype, edge id) through the
-    /// block cache — the edge-walk surface the consolidation serialiser
-    /// ([`crate::consolidate`]) uses to emit every edge exactly once (from its
-    /// source). Reads the immutable core topology. A delta-born node (Phase 2c) has no
-    /// core topology record and no edges yet (edge deltas are Phase 3), so it has an
-    /// empty adjacency.
+    /// The outgoing adjacency of node `id` (dst, reltype, edge id) — the edge-walk
+    /// surface the consolidation serialiser ([`crate::consolidate`]) uses to emit
+    /// every edge exactly once (from its source). Overlays the edge delta (Phase 3):
+    /// a delta-born node's edges are its born out-edges, a tombstoned edge (or an edge
+    /// to a tombstoned node) is dropped — so a rebuild carries the writes forward.
     pub fn outgoing_adj(&self, id: u64) -> Result<Vec<topology::Adj>> {
-        if id >= self.gen.core_generation().node_count() {
-            return Ok(Vec::new());
-        }
         self.outgoing(id)
     }
 
