@@ -1,0 +1,24 @@
+[package]
+name = "slater-delta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Slater writable layer — the shared owner of the delta byte formats (WAL record
+# format, L0 segment format, delta-index format) and the read-merge fold logic.
+# Analogous to how `graph-format` owns the immutable core format: keeping the
+# writer (`slater`) and the consolidation reader (`slater-build`) in one crate is
+# what stops the two sides drifting. British English throughout.
+
+[dependencies]
+graph-format.workspace = true
+slater-scalar.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+
+[lints.rust]
+# slater-delta contains no `unsafe`: the memtable is a plain owned map behind an
+# `ArcSwap` snapshot and the segment writers delegate to `graph-format`'s
+# (already-unsafe-free) block/ISAM writers. Forbid keeps it that way.
+unsafe_code = "forbid"

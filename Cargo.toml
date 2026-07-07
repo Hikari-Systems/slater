@@ -5,7 +5,7 @@
 # though Slater is itself a workspace.
 [workspace]
 resolver = "2"
-members = ["crates/graph-format", "crates/slater-scalar", "crates/slater-build", "crates/slater"]
+members = ["crates/graph-format", "crates/slater-scalar", "crates/slater-delta", "crates/slater-build", "crates/slater"]
 
 [workspace.package]
 version = "0.21.0"
@@ -25,6 +25,7 @@ hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.17
 # Workspace-internal.
 graph-format = { path = "crates/graph-format" }
 slater-scalar = { path = "crates/slater-scalar" }
+slater-delta = { path = "crates/slater-delta" }
 
 # Core.
 anyhow = "1"
