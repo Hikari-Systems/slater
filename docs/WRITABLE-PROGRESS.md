@@ -90,10 +90,12 @@ Running ledger for the `writeable` track. Pairs with the design in
     (names inline), `WalSink::{append,commit,seal}` (commit marker + fsync = ack
     barrier), `replay_segment`/`replay_dir` (keep only to last commit marker). 6 unit
     tests incl. dropped-uncommitted-tail + torn-frame truncation. `crc32c` dep added.
-  - **1b — memtable mutation + resolved index.** `Memtable` upsert (LWW), business-key
-    map + resolved dense-id index built via an injected resolver closure
-    (`NodeIdentity -> Option<u64>`, so it unit-tests without a real `Generation`);
-    `DeltaSnapshot` exposes `node_patch(dense_id)`. ⬜ TODO
+  - **1b — memtable mutation + resolved index. ✅ DONE.** `memtable.rs`:
+    `Memtable::upsert_node` (LWW fold, patches name-keyed, identity interned +
+    stored for name recovery), `by_dense: dense_id → canonical_key` read index
+    (`resolved` passed in by the caller — no `Generation` needed for unit tests),
+    `apply(&WalOp, resolved)` shared by live writes + replay, `node_patch(dense_id)`,
+    `iter_nodes()` (consolidation input). 18 slater-delta tests green.
   - **1c — server integration.** Relax parser write rejection; write-ingestion single
     -writer thread (parse → WAL `commit` → memtable apply → ack); `MergedView` node
     -property overlay in `Engine` materialisation; `ResultKey` delta epoch; ArcSwap
@@ -118,12 +120,23 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 1b — memtable mutation + resolved dense-id index** in
-`crates/slater-delta/src/memtable.rs`:
-- `Memtable::upsert_node(NodeIdentity, patches)` folding LWW into the business-key
-  map, updating the `bytes` estimate.
-- A resolved read index `HashMap<u64 dense_id, NodeDelta>` populated via an injected
-  resolver `Fn(&NodeIdentity) -> Option<u64>` (so it unit-tests without a real
-  `Generation`).
-- `DeltaSnapshot::node_patch(dense_id) -> Option<&NodeDelta>` for the read overlay.
-- Apply a `WalRecord`/`WalOp` to the memtable (shared by live writes and replay).
+Implement **Phase 1c — server integration** (`crates/slater/`). The pure
+`slater-delta` layer (1a WAL + 1b memtable) is complete; 1c wires it into the
+server. Steps:
+1. `config.rs` — a `DeltaConfig` (memtable budget, WAL dir, enable flag) mirroring
+   `CacheConfig`; off by default.
+2. `parser.rs` — relax the write rejection (`lower_single_query` ~L697,
+   `lower_call_clause` ~L820) for the minimal business-key `SET` shape only.
+3. A single-writer `DeltaWriter` (owns `WalSink` + authoritative `Memtable`,
+   publishes `ArcSwap<Memtable>` snapshots). Write flow: parse → resolve business
+   key to dense id via ISAM (`plan::index_for` + `IsamReader::lookup_eq`) → WAL
+   `append`+`commit` (ack barrier) → `memtable.apply` → publish snapshot.
+4. `MergedView` — carry the live `DeltaSnapshot`; overlay `node_patch(dense_id)`
+   into node materialisation. The overlay point is `Engine::node_record` /
+   `node_props(id)` in `exec.rs` (~L1411–1490), folding patches in name-space.
+5. `cache.rs` — extend `ResultKey` with a monotonic delta epoch so overlaid results
+   invalidate on write.
+6. Read-your-writes integration test (build a fixture, `SET`, read merged).
+
+NOTE: also plan the **per-graph dump CLI** (see "Dump CLI" section below) — its
+offline core→MERGE serialiser is the same primitive Phase 1d/4a consolidation needs.
