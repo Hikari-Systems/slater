@@ -42,6 +42,37 @@ pub mod ast {
         pub ret: ReturnClause,
     }
 
+    /// The single durable write shape the writable layer accepts (Phase 1c):
+    /// `MATCH (var:Label {key: <literal|param>}) SET var.prop = <literal|param>[, …]
+    /// [RETURN …]`. It anchors exactly one existing node by a business key and
+    /// overwrites properties. The key value and every SET right-hand side are held
+    /// as [`Expr`] (a literal or a parameter) so parameters resolve at execution
+    /// time, when their values are known.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct WriteStmt {
+        /// The anchor variable (the SET assignments must all target it).
+        pub var: String,
+        /// The single anchor label — the business key's label half.
+        pub label: String,
+        /// The inline business-key property name.
+        pub key: String,
+        /// The inline business-key value (a literal or a parameter).
+        pub key_value: Expr,
+        /// Property overwrites, in source order (later wins), each a literal or
+        /// parameter value.
+        pub sets: Vec<(String, Expr)>,
+        /// An optional `RETURN` projecting the (post-write) anchor node.
+        pub ret: Option<ReturnClause>,
+    }
+
+    /// A parsed statement: a read query, or a writable-layer write. The server
+    /// dispatches on this — see [`super::parse_statement`].
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Statement {
+        Read(Query),
+        Write(WriteStmt),
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub enum Clause {
         Match(MatchClause),
@@ -519,6 +550,105 @@ pub fn parse(input: &str) -> Result<Query> {
         .map_err(|e| anyhow::anyhow!("syntax error: {e}"))?;
     let query = pairs.next().expect("query rule yields one pair");
     lower_query(query)
+}
+
+/// Parse a statement that may be a read query **or** a writable-layer write
+/// ([`ast::Statement`]). The narrow write grammar (`MATCH … SET …`) is tried
+/// first; anything that is not that exact shape falls through to the read parser
+/// (so an unsupported write is still rejected there as read-only). The server
+/// calls this only when the writable layer is enabled; otherwise it calls
+/// [`parse`], which never yields a write.
+pub fn parse_statement(input: &str) -> Result<ast::Statement> {
+    if let Ok(mut pairs) = CypherParser::parse(Rule::write_statement, input) {
+        let stmt = pairs.next().expect("write_statement rule yields one pair");
+        return Ok(ast::Statement::Write(lower_write_statement(stmt)?));
+    }
+    parse(input).map(ast::Statement::Read)
+}
+
+/// Lower a `write_statement` into a [`WriteStmt`], enforcing the Phase 1c shape:
+/// a single labelled anchor node with exactly one inline business-key property
+/// (a literal or parameter), and SET assignments that all target that anchor
+/// variable with literal/parameter right-hand sides. Anything outside the shape
+/// is a clear error rather than a silent mis-parse.
+fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
+    let mut node: Option<NodePat> = None;
+    let mut sets: Vec<(String, String, Expr)> = Vec::new();
+    let mut ret: Option<ReturnClause> = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::node_pattern => node = Some(lower_node_pattern(child)?),
+            Rule::set_clause => {
+                for item in kids(child) {
+                    debug_assert_eq!(item.as_rule(), Rule::set_item);
+                    let mut it = kids(item);
+                    let var = ident_text(only_child(
+                        it.next().expect("set_item has a target variable"),
+                    )?)?;
+                    let prop_access = it.next().expect("set_item has a property access");
+                    let prop = ident_text(only_child(prop_access)?)?;
+                    let value = lower_expr(it.next().expect("set_item has a value expression"))?;
+                    sets.push((var, prop, value));
+                }
+            }
+            Rule::return_clause => ret = Some(lower_return_clause(child)?),
+            Rule::EOI => {}
+            other => bail!("internal: unexpected write_statement child {other:?}"),
+        }
+    }
+
+    let node = node.expect("write_statement always has a node pattern");
+    let var = node.var.ok_or_else(|| {
+        anyhow::anyhow!("a write's anchor node must be named, e.g. (n:Label {{…}})")
+    })?;
+    let label = node
+        .label_expr
+        .as_ref()
+        .and_then(LabelExpr::as_single_atom)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "a write's anchor node must carry exactly one label, e.g. (n:Label {{…}})"
+            )
+        })?
+        .clone();
+    if node.props.len() != 1 {
+        bail!("a write's anchor node must carry exactly one inline business-key property, e.g. (n:Label {{key: value}})");
+    }
+    let (key, key_value) = node.props.into_iter().next().unwrap();
+    ensure_constant(&key_value, "the anchor business-key value")?;
+
+    if sets.is_empty() {
+        bail!("a write must SET at least one property");
+    }
+    let mut out_sets = Vec::with_capacity(sets.len());
+    for (set_var, prop, value) in sets {
+        if set_var != var {
+            bail!(
+                "SET must target the anchor variable '{var}', not '{set_var}' (Phase 1c writes one node)"
+            );
+        }
+        ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
+        out_sets.push((prop, value));
+    }
+
+    Ok(WriteStmt {
+        var,
+        label,
+        key,
+        key_value,
+        sets: out_sets,
+        ret,
+    })
+}
+
+/// A Phase 1c write's business-key value and every SET right-hand side must be a
+/// value known without reading the graph: a literal or a parameter. (Computed
+/// right-hand sides such as `n.x + 1` land in a later phase.)
+fn ensure_constant(e: &Expr, what: &str) -> Result<()> {
+    match e {
+        Expr::Literal(_) | Expr::Param(_) => Ok(()),
+        _ => bail!("{what} must be a literal or a parameter in a Phase 1c write"),
+    }
 }
 
 /// Builtins whose result depends on the wall clock or an entropy source. A query
@@ -2158,6 +2288,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_then
             | Rule::kw_else
             | Rule::kw_end
+            | Rule::kw_set
             | Rule::kw_call
             | Rule::kw_yield
             | Rule::kw_unwind
@@ -2277,6 +2408,87 @@ mod tests {
             Ok(_) => panic!("expected reject for {q:?}"),
             Err(e) => e.to_string(),
         }
+    }
+
+    fn write(q: &str) -> WriteStmt {
+        match parse_statement(q).unwrap_or_else(|e| panic!("expected accept for {q:?}: {e}")) {
+            Statement::Write(w) => w,
+            Statement::Read(_) => panic!("expected a write for {q:?}"),
+        }
+    }
+
+    fn write_err(q: &str) -> String {
+        match parse_statement(q) {
+            Ok(Statement::Write(_)) => panic!("expected reject for {q:?}"),
+            // An unsupported write shape falls through to the read parser, which
+            // rejects it; either way `parse_statement` must not yield a Write.
+            Ok(Statement::Read(_)) => "read-only".to_string(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn write_statement_lowers_business_key_set() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10, n.sector = 'Tech'");
+        assert_eq!(w.var, "n");
+        assert_eq!(w.label, "Company");
+        assert_eq!(w.key, "ticker");
+        assert_eq!(w.key_value, Expr::Literal(Value::Str("ABC".into())));
+        assert_eq!(
+            w.sets,
+            vec![
+                ("price".to_string(), Expr::Literal(Value::Int(10))),
+                (
+                    "sector".to_string(),
+                    Expr::Literal(Value::Str("Tech".into()))
+                ),
+            ]
+        );
+        assert!(w.ret.is_none());
+    }
+
+    #[test]
+    fn write_statement_accepts_params_and_return() {
+        let w = write("MATCH (c:Company {ticker: $t}) SET c.price = $p RETURN c");
+        assert_eq!(w.key_value, Expr::Param("t".into()));
+        assert_eq!(w.sets, vec![("price".to_string(), Expr::Param("p".into()))]);
+        assert!(w.ret.is_some());
+    }
+
+    #[test]
+    fn read_query_is_not_a_write() {
+        assert!(matches!(
+            parse_statement("MATCH (n:Person) RETURN n").unwrap(),
+            Statement::Read(_)
+        ));
+    }
+
+    #[test]
+    fn unsupported_write_shapes_are_rejected() {
+        // No label on the anchor.
+        assert!(write_err("MATCH (n {ticker: 'A'}) SET n.p = 1").contains("label"));
+        // No inline business key.
+        assert!(write_err("MATCH (n:Company) SET n.p = 1").contains("business-key"));
+        // SET targets a different variable than the anchor.
+        assert!(
+            write_err("MATCH (n:Company {ticker: 'A'}) SET m.p = 1").contains("anchor variable")
+        );
+        // Computed right-hand side is out of scope for Phase 1c.
+        assert!(write_err("MATCH (n:Company {ticker: 'A'}) SET n.p = n.p + 1").contains("literal"));
+        // Anonymous anchor node.
+        assert!(write_err("MATCH (:Company {ticker: 'A'}) SET n.p = 1").contains("named"));
+        // Multi-node writes and relationships fall through to read-only rejection.
+        assert!(
+            write_err("MATCH (a:Company {ticker:'A'})-[:OWNS]->(b) SET a.p = 1")
+                .contains("read-only")
+        );
+    }
+
+    #[test]
+    fn disabled_layer_still_rejects_writes_via_parse() {
+        // `parse` (the read entry the server uses when the writable layer is off)
+        // must keep rejecting a SET as read-only.
+        assert!(err("MATCH (n:Company {ticker:'A'}) SET n.p = 1").contains("read-only"));
     }
 
     /// The WHERE expression of the first MATCH clause (for predicate-lowering
