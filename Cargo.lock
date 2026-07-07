@@ -3233,6 +3233,7 @@ name = "slater-delta"
 version = "0.21.0"
 dependencies = [
  "anyhow",
+ "crc32c",
  "graph-format",
  "serde",
  "slater-scalar",

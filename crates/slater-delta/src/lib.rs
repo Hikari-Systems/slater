@@ -40,3 +40,4 @@ pub mod wal;
 
 pub use identity::{EdgeIdentity, NodeIdentity};
 pub use memtable::{DeltaSnapshot, EdgeDelta, Memtable, NodeDelta};
+pub use wal::{replay_dir, replay_segment, Replay, SealedSegment, Seq, WalOp, WalRecord, WalSink};

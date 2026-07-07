@@ -16,6 +16,7 @@ graph-format.workspace = true
 slater-scalar.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+crc32c.workspace = true
 
 [lints.rust]
 # slater-delta contains no `unsafe`: the memtable is a plain owned map behind an
