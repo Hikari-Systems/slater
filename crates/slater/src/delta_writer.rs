@@ -310,7 +310,7 @@ mod tests {
 
     /// A resolver that maps the fixture's tickers to fixed dense ids.
     fn resolve_ticker(op: &WalOp) -> Option<u64> {
-        let WalOp::UpsertNode { value, .. } = op;
+        let (_, _, value) = op.business_key();
         match value {
             Value::Str(s) if s == "A" => Some(10),
             Value::Str(s) if s == "B" => Some(20),

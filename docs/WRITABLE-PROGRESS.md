@@ -162,7 +162,41 @@ Running ledger for the `writeable` track. Pairs with the design in
       only for now; group-commit; the freeze-to-a-live-memtable "writes never block"
       admission control (Phase 1 runs consolidation on the single-writer path).
 
-- Phases 2–5: see `docs/WRITABLE-PLAN.md`.
+- **Phase 2 — new nodes + deletes (tombstones) + index overlay. 🔨 IN PROGRESS.**
+  The overlay cases (`docs/WRITABLE-PLAN.md` §Read-merge overlay): tombstones
+  suppress the core row on read; delta-born nodes get synthetic dense ids in
+  `[core.node_count, …)`; range-index probes union core ISAM hits with matching
+  delta nodes minus tombstones. Sub-milestones (each independently green + committed):
+  - **2a — WAL delete op + memtable tombstone path (pure `slater-delta`). ✅ DONE**
+    (this commit). `WalOp::DeleteNode { label, key, value }` (op-tag 2, encode/decode/
+    replay round-trip) + `WalOp::business_key()` (variant-agnostic `(label,key,value)`
+    accessor — `resolve_dense_id` + the test resolver no longer irrefutable-let on
+    `UpsertNode`); `Memtable::delete_node` (tombstone the entry, drop its patches,
+    index by dense id) + `apply` `DeleteNode` arm (shared live/replay path);
+    `upsert_node` now clears the tombstone (LWW resurrect). No read-path effect yet —
+    that's 2b. slater-delta tests: WAL delete round-trip, tombstone-then-resurrect,
+    apply-vs-direct parity. Whole slater+slater-delta green, clippy+fmt clean.
+  - **2b — tombstone read overlay (`slater`). ⬜ TODO.** In `exec.rs`, honour
+    `delta.node_patch(id).tombstoned` on the read paths that Phase 1 property overlay
+    already threads: node materialisation (`node_record`/`overlay_node_props`/
+    `node_prop_par`), `scan_candidates` (drop tombstoned dense ids), label scans
+    (`collect_nodes_with_label`), and the whole-graph count fast paths (a tombstoned
+    node must not count). Server `execute_write` grows a `DELETE`/`SET`-shaped
+    dispatch (parser already splits Read/Write — extend `write_statement` grammar with
+    `MATCH (n:L {k:v}) DELETE n`). Read-your-deletes + reopen-durability tests.
+  - **2c — delta-born nodes (synthetic dense ids). ⬜ TODO.** `MergedView`/exec expose
+    ids `[core.node_count, core.node_count+new_count)`; scans yield core then synthetic;
+    property/label reads for a synthetic id route to the delta; `resolved = None`
+    upserts (currently rejected in `execute_write`) become node creation. Needs a
+    delta-local synthetic-id allocator in the memtable + a `by_synthetic` reverse map.
+  - **2d — range-index probe overlay. ⬜ TODO.** Union core ISAM hits with matching
+    delta nodes minus tombstoned; equality = hashmap probe, range = merge-walk over a
+    new per-index `BTreeMap` in the memtable. Threads through `plan.rs` index seeks.
+  - **2e — consolidation folds tombstones + delta-born nodes.** `serialise_merge_dump`
+    must skip tombstoned nodes and emit delta-born ones; the `MergedView` node
+    iteration must cover synthetic ids. (Small once 2b–2d land.)
+
+- Phases 3–5: see `docs/WRITABLE-PLAN.md`.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -189,25 +223,26 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Phase 1 is complete** (1a–1d all done and green). Durable property overwrites +
-dump-and-rebuild consolidation are shipped end-to-end. Pick the next track:
+Implement **Phase 2b — tombstone read overlay** (`crates/slater/`). Phase 1 is
+complete; Phase 2a (the pure `slater-delta` delete op + memtable tombstone path) is
+done and green. 2b makes deletes *visible*: honour `delta.node_patch(id).tombstoned`
+on every read path the Phase 1 property overlay already threads, and add the
+`DELETE`-shaped write dispatch. Read the **Phase 2b ⬜ TODO** block above first.
 
-1. **Wire the consolidation trigger (Phase 4 lead-in).** `Graphs::consolidate_graph`
-   exists as a callable method; expose it as `CALL slater.consolidate()` over Bolt
-   (mirror an existing `CALL slater.*` proc), gate it on ACL/admin, and add the
-   automatic L0-soft-cap trigger (fire when `DeltaWriter::bytes()` crosses
-   `delta.memtable_bytes`). Production build seam is `server::run_builder`.
-2. **Phase 2 — edge + tombstone deltas** (see `docs/WRITABLE-PLAN.md`): `WalOp` gains
-   edge upsert + node/edge delete; memtable grows an `EdgeDelta` write path +
-   tombstones; the read overlay and `serialise_merge_dump` already have edge-shaped
-   hooks to extend. Delta-born nodes (`resolved = None`) also land here.
-3. **Parallel workstream — `slater dump` CLI** (§ below): independent of Phases 2–5.
+The read-side edit points (all in `exec.rs`, mirroring the Phase 1 property overlay
+at the same sites): `node_prop_par` (~L499) + `overlay_node_props` (~L1517) already
+fetch `delta.node_patch(id)` — extend to suppress a tombstoned node; the scan choke
+point `scan_candidates` (~L4928) and `collect_nodes_with_label` must drop tombstoned
+dense ids; the whole-graph count fast paths (see [[metadata-fast-paths]]) must not
+count a tombstoned node. Write side: `parser.rs` `write_statement` grammar gains
+`MATCH (n:L {k:v}) DELETE n`; `server.rs::execute_write` dispatches it to
+`DeltaWriter::write(WalOp::DeleteNode{…}, resolved)` (resolver already handles the
+delete's business key). `testgen::write_indexed_people` is the fixture; add a
+read-your-deletes + reopen-durability test mirroring
+`write_then_read_your_writes_and_survives_reopen`.
 
-Handy resume detail: consolidation orchestration is `server.rs`
-(`Graphs::consolidate_graph`, `run_builder`); freeze/retire live on
-`crates/slater/src/delta_writer.rs` (`Frozen`, `freeze`, `retire`); the serialiser is
-`crates/slater/src/consolidate.rs` (`serialise_merge_dump`, reads any `ReadView`);
-the write flow is `execute_write`/`resolve_dense_id`/`delta_for_read`;
-`testgen::write_indexed_people` + `write_indexed_people_at` are the fully-indexed
-fixtures (the latter republishes a fresh generation for the consolidation e2e test).
+Other tracks still open (not the recommended next step, but valid): the Phase 5 Bolt
+trigger `CALL slater.consolidate()` (method exists as `Graphs::consolidate_graph`,
+prod seam `server::run_builder`) + the Phase 4 auto L0-soft-cap trigger; and the
+independent `slater dump` CLI (§ above).
 

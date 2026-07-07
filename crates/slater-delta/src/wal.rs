@@ -82,6 +82,7 @@ const KIND_RECORD: u8 = 1;
 const KIND_COMMIT: u8 = 2;
 
 const OP_UPSERT_NODE: u8 = 1;
+const OP_DELETE_NODE: u8 = 2;
 
 /// A monotonic per-graph WAL sequence number.
 ///
@@ -96,8 +97,8 @@ impl Seq {
     }
 }
 
-/// A primitive write operation. Phase 1 carries only node property upserts on an
-/// existing (indexable) business key; deletes and edges join in Phases 2–3.
+/// A primitive write operation. Every op names its target node by a business key
+/// `(label, key, value)`; edges join in Phase 3.
 ///
 /// Symbol *names* are carried inline (not delta-local ids) so replay re-interns to
 /// identical ids deterministically and the segment is self-describing.
@@ -112,6 +113,27 @@ pub enum WalOp {
         /// `(property-name, value)` patches, applied in order (later wins).
         patches: Vec<(String, Value)>,
     },
+    /// Tombstone the node identified by `(label, key, value)`: the core row is
+    /// suppressed on read and dropped at consolidation (Phase 2). Last-writer-wins
+    /// with [`WalOp::UpsertNode`] — a later upsert on the same key resurrects it.
+    DeleteNode {
+        label: String,
+        key: String,
+        value: Value,
+    },
+}
+
+impl WalOp {
+    /// The `(label, key, value)` business key every op targets — the identity the
+    /// writer resolves to a current-core dense id, variant-agnostic.
+    pub fn business_key(&self) -> (&str, &str, &Value) {
+        match self {
+            WalOp::UpsertNode {
+                label, key, value, ..
+            }
+            | WalOp::DeleteNode { label, key, value } => (label, key, value),
+        }
+    }
 }
 
 /// One durable WAL entry: a sequence number and the operation it records.
@@ -142,6 +164,12 @@ impl WalRecord {
                     write_value(buf, val);
                 }
             }
+            WalOp::DeleteNode { label, key, value } => {
+                buf.push(OP_DELETE_NODE);
+                write_str(buf, label);
+                write_str(buf, key);
+                write_value(buf, value);
+            }
         }
     }
 
@@ -169,6 +197,15 @@ impl WalRecord {
                         value,
                         patches,
                     },
+                })
+            }
+            OP_DELETE_NODE => {
+                let label = read_str(r)?;
+                let key = read_str(r)?;
+                let value = read_value(r)?;
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::DeleteNode { label, key, value },
                 })
             }
             other => bail!("unknown WAL op tag {other}"),
@@ -431,6 +468,35 @@ mod tests {
                     .collect(),
             },
         }
+    }
+
+    #[test]
+    fn delete_op_round_trips_through_a_segment() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_del_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let up = upsert(1, "Company", "ticker", Value::Str("A".into()), &[]);
+        let del = WalRecord {
+            seq: Seq(2),
+            op: WalOp::DeleteNode {
+                label: "Company".into(),
+                key: "ticker".into(),
+                value: Value::Str("A".into()),
+            },
+        };
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            sink.append(&up).unwrap();
+            sink.append(&del).unwrap();
+            sink.commit(Seq(2)).unwrap();
+        }
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![up, del.clone()]);
+        // The decoded op exposes its business key variant-agnostically.
+        assert_eq!(
+            del.op.business_key(),
+            ("Company", "ticker", &Value::Str("A".into()))
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

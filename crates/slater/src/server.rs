@@ -2415,10 +2415,9 @@ async fn handle_request(
 /// Phase 1 assumes a unique business key — the probe is ambiguous. The overlay's
 /// dense-id read index ([`slater_delta::Memtable::by_dense`]) is built from this.
 fn resolve_dense_id(gen: &Generation, op: &WalOp) -> Option<u64> {
-    let WalOp::UpsertNode {
-        label, key, value, ..
-    } = op;
-    let idx = crate::plan::index_for(gen, std::slice::from_ref(label), key)?;
+    let (label, key, value) = op.business_key();
+    let labels = [label.to_string()];
+    let idx = crate::plan::index_for(gen, &labels, key)?;
     let ids = gen.range_index(&idx)?.lookup_eq(value).ok()?;
     match ids.as_slice() {
         [only] => Some(*only),

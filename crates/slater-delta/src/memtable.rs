@@ -142,10 +142,41 @@ impl Memtable {
             identity,
             delta: NodeDelta::default(),
         });
+        // An upsert resurrects a tombstoned node (last-writer-wins at node level).
+        entry.delta.tombstoned = false;
         for (name, val) in patches {
             self.bytes += name.len() + value_size(&val);
             entry.delta.patches.insert(name, val);
         }
+        if let Some(dense) = resolved {
+            self.by_dense.insert(dense, ck);
+        }
+    }
+
+    /// Tombstone the node identified by `(label, key, value)`: reads suppress the
+    /// core row and it is dropped at consolidation. `resolved` is the node's
+    /// current-core dense id (an ISAM probe on the `slater` side); `None` for a
+    /// business key absent from the core (a harmless no-op tombstone until Phase 2
+    /// delta-born nodes). A tombstone drops any prior patches — a deleted node
+    /// carries no properties — and wins last-writer-wins with [`Self::upsert_node`].
+    ///
+    /// Shared by live writes and WAL replay so the two paths cannot diverge.
+    pub fn delete_node(&mut self, label: &str, key: &str, value: Value, resolved: Option<u64>) {
+        let identity = NodeIdentity::new(
+            self.interner.intern(label),
+            self.interner.intern(key),
+            value,
+        );
+        let ck = identity.canonical_key();
+        if !self.nodes.contains_key(&ck) {
+            self.bytes += ck.len() + std::mem::size_of::<NodeEntry>();
+        }
+        let entry = self.nodes.entry(ck.clone()).or_insert_with(|| NodeEntry {
+            identity,
+            delta: NodeDelta::default(),
+        });
+        entry.delta.tombstoned = true;
+        entry.delta.patches.clear();
         if let Some(dense) = resolved {
             self.by_dense.insert(dense, ck);
         }
@@ -162,6 +193,9 @@ impl Memtable {
                 value,
                 patches,
             } => self.upsert_node(label, key, value.clone(), resolved, patches.iter().cloned()),
+            WalOp::DeleteNode { label, key, value } => {
+                self.delete_node(label, key, value.clone(), resolved)
+            }
         }
     }
 
@@ -300,6 +334,54 @@ mod tests {
         assert_eq!(d.patches.get("sector"), Some(&Value::Str("Tech".into())));
         assert!(!m.is_empty());
         assert!(m.bytes() > 0);
+    }
+
+    #[test]
+    fn delete_tombstones_and_upsert_resurrects_last_writer_wins() {
+        let mut m = Memtable::new();
+        // Patch then delete: the node is tombstoned and its patches are dropped.
+        m.upsert_node(
+            "Company",
+            "ticker",
+            Value::Str("A".into()),
+            Some(7),
+            [("price".to_string(), Value::Int(10))],
+        );
+        m.delete_node("Company", "ticker", Value::Str("A".into()), Some(7));
+        let d = m.node_patch(7).expect("tombstone is a stored delta");
+        assert!(d.tombstoned, "delete tombstones the node");
+        assert!(d.patches.is_empty(), "a deleted node carries no properties");
+        assert_eq!(m.node_delta_count(), 1);
+
+        // A later upsert on the same key resurrects it (last-writer-wins).
+        m.upsert_node(
+            "Company",
+            "ticker",
+            Value::Str("A".into()),
+            Some(7),
+            [("price".to_string(), Value::Int(20))],
+        );
+        let d = m.node_patch(7).expect("resurrected");
+        assert!(!d.tombstoned, "an upsert clears the tombstone");
+        assert_eq!(d.patches.get("price"), Some(&Value::Int(20)));
+    }
+
+    #[test]
+    fn apply_delete_matches_direct_delete() {
+        // The WAL-replay path (`apply`) and the direct call must not diverge.
+        let mut viae = Memtable::new();
+        viae.apply(
+            &WalOp::DeleteNode {
+                label: "L".into(),
+                key: "k".into(),
+                value: Value::Int(3),
+            },
+            Some(9),
+        );
+        let mut direct = Memtable::new();
+        direct.delete_node("L", "k", Value::Int(3), Some(9));
+        assert_eq!(viae.node_patch(9), direct.node_patch(9));
+        assert!(viae.node_patch(9).unwrap().tombstoned);
     }
 
     #[test]
