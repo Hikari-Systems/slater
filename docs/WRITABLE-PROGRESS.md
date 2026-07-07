@@ -111,7 +111,9 @@ Running ledger for the `writeable` track. Pairs with the design in
   not gate them). **Decided:** Bolt-client transport (user/pass, honours ACLs — reuse
   `BoltConn` from `health.rs`, promote to shared); identity keys inferred from range
   indexes with `--key Label=prop` / `--pk` overrides; clap-derive args, password via
-  stdin/env (no plaintext flag). Distinct in code from Phase 4a's offline
+  stdin/env (no plaintext flag). Also a `-l`/`--list` mode: print the graphs the
+  authed user can read (backed by `Acl::readable_graphs`, surfaced via a Bolt
+  list-graphs call — verify/add). Distinct in code from Phase 4a's offline
   generation→MERGE serialiser (shares only the text format). NB: `vecf32` props can't
   ride a MERGE dump (vectors non-goal).
 

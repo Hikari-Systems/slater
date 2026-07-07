@@ -217,7 +217,13 @@ generation→`MERGE` serialiser instead — same text format, different data sou
 query` subcommand hand-rolls `std::env::args()` while `slater-build` uses
 clap-derive — standardise new tools on clap-derive and (recommended) migrate
 `slater query` to match, sharing flag names:
-- `graph` — positional or `--graph` (required).
+- `graph` — positional or `--graph` (required **unless** `--list`).
+- `-l`/`--list` — connect + authenticate, then print the graph names the
+  authenticated user may read (one per line, to stdout) and exit; no `graph` arg
+  needed. Backed server-side by `Acl::readable_graphs(user)` (`acl.rs:88`) —
+  surfaced over Bolt by a list-graphs call (verify an existing one, e.g.
+  `SHOW DATABASES` / `CALL db.info` / a `slater.graphs()` procedure; else add a
+  small read-only introspection proc that returns the caller's readable graphs).
 - `--host` (default `localhost`), `--port` (default config `server.port` / 7687).
 - `-u`/`--user` (required).
 - **password** — from **stdin** (default, tty-safe) or env `SLATER_DUMP_PASSWORD`;
@@ -249,8 +255,9 @@ graph with embeddings either omits them or must use the `--pk`/`CREATE`-style
 offline rebuild path — flag this in the tool's output and docs.
 
 **Net-new pieces / dependencies:** promote `BoltConn` to shared; a schema-introspection
-query for range indexes; the `MERGE` serialiser + Cypher-literal escaper; clap args
-(+ optional `slater query` migration).
+query for range indexes; a **list-readable-graphs** call over Bolt for `-l`/`--list`
+(backed by `Acl::readable_graphs`); the `MERGE` serialiser + Cypher-literal escaper;
+clap args (+ optional `slater query` migration).
 
 ## Consistency & correctness model
 
