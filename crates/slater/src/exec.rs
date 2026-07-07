@@ -497,6 +497,17 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
 /// decoding only the requested key from the cached record. The free-fn body behind
 /// [`Engine::node_prop`]; used by the parallel anchor filter ([`node_ok_par`]).
 fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+    // Writable-layer overlay (Phase 1c): a live delta patch on this property wins
+    // last-writer-wins over the core value, and can introduce a property the core
+    // never had. The empty-delta fast path skips the whole probe.
+    let delta = gen.delta();
+    if !delta.is_empty() {
+        if let Some(nd) = delta.node_patch(id) {
+            if let Some(v) = nd.patches.get(key) {
+                return Ok(Val::from_value(v.clone()));
+            }
+        }
+    }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
     };
@@ -1489,12 +1500,36 @@ impl<'g, V: ReadView> Engine<'g, V> {
             .into_iter()
             .filter_map(|l| self.gen.label_name(l).map(|s| s.to_string()))
             .collect();
-        let props = self
+        let mut props: NamedProps = self
             .node_props(id)?
             .into_iter()
             .map(|(kid, v)| (self.key_name(kid), Val::from_value(v)))
             .collect();
+        self.overlay_node_props(id, &mut props);
         Ok((labels, props))
+    }
+
+    /// Fold the live delta's property patches for node `id` onto `named` (the core
+    /// props already resolved into name-space), last-writer-wins: a patched name
+    /// replaces the core value, a new name is appended. The empty-delta fast path
+    /// (the overwhelming common case) returns immediately. Phase 1c overlays
+    /// property overwrites only; tombstones join in Phase 2.
+    fn overlay_node_props(&self, id: u64, named: &mut NamedProps) {
+        let delta = self.gen.delta();
+        if delta.is_empty() {
+            return;
+        }
+        let Some(nd) = delta.node_patch(id) else {
+            return;
+        };
+        for (name, value) in &nd.patches {
+            let v = Val::from_value(value.clone());
+            if let Some(slot) = named.iter_mut().find(|(k, _)| k == name) {
+                slot.1 = v;
+            } else {
+                named.push((name.clone(), v));
+            }
+        }
     }
 
     /// Resolve a relationship's type name and named properties — the material a
@@ -5844,6 +5879,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
             let name = self.gen.property_key_name(kid).unwrap_or("?").to_string();
             out.push((name, Val::from_value(v)));
         }
+        // Writable-layer overlay: fold delta patches for a node in name-space, LWW.
+        // (Edges have no delta in Phase 1c.) No-op on the empty-delta fast path.
+        if let Val::Node(id) = base {
+            self.overlay_node_props(*id, &mut out);
+        }
         Ok(out)
     }
 
@@ -8366,6 +8406,68 @@ mod tests {
     use crate::generation::Generation;
     use crate::parser;
     use crate::testgen;
+
+    /// The writable-layer read overlay (Phase 1c): a delta patch on an existing
+    /// node's property overrides the core value last-writer-wins, a delta patch on
+    /// a *new* property name appears, and both the all-props path (`node_record` /
+    /// `properties()`) and the single-prop path (`n.key`) reflect it.
+    #[test]
+    fn delta_overlay_folds_node_property_patches() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph, _) = testgen::write_basic("delta_overlay_unit");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Patch node 0 (Alice :Person, age=30): overwrite `age`, add new `rating`.
+        let mut mem = Memtable::new();
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(0),
+            [
+                ("age".to_string(), Value::Int(99)),
+                ("rating".to_string(), Value::Str("AAA".into())),
+            ],
+        );
+        let delta = DeltaSnapshot::from_memtable(Arc::new(mem));
+        let view = MergedView::new(&gen, delta);
+
+        // All-props path: node_record reflects the overwrite and the new property.
+        let engine = Engine::new(&view, &cache);
+        let (_labels, props) = engine.node_record(0).unwrap();
+        let age = props.iter().find(|(k, _)| k == "age").map(|(_, v)| v);
+        assert!(
+            matches!(age, Some(Val::Int(99))),
+            "age overwritten: {props:?}"
+        );
+        let rating = props.iter().find(|(k, _)| k == "rating").map(|(_, v)| v);
+        assert!(
+            matches!(rating, Some(Val::Str(s)) if s == "AAA"),
+            "new property present: {props:?}"
+        );
+        // An unpatched node is untouched by the overlay.
+        let (_l, p1) = engine.node_record(1).unwrap();
+        let age1 = p1.iter().find(|(k, _)| k == "age").map(|(_, v)| v);
+        assert!(
+            matches!(age1, Some(Val::Int(25))),
+            "node 1 untouched: {p1:?}"
+        );
+
+        // Single-prop path: `n.age` / `n.rating` read through the overlay too.
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age, n.rating").unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert_eq!(res.rows.len(), 1);
+        assert!(matches!(res.rows[0][0], Val::Int(99)), "n.age via overlay");
+        assert!(
+            matches!(&res.rows[0][1], Val::Str(s) if s == "AAA"),
+            "n.rating via overlay"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// Every pure scalar function delegated to `slater-scalar` must still be
     /// advertised by `CALL dbms.functions()` (the registry the planner validates

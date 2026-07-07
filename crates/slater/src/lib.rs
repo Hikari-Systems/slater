@@ -19,6 +19,7 @@ pub mod algo;
 pub mod bolt;
 pub mod cache;
 pub mod config;
+pub mod delta_writer;
 pub mod diag;
 pub mod exec;
 pub mod generation;

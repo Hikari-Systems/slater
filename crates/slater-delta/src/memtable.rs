@@ -76,7 +76,12 @@ struct NodeEntry {
 }
 
 /// The single-writer in-RAM memtable.
-#[derive(Debug, Default)]
+///
+/// `Clone` is how the writer publishes an immutable read snapshot: after a commit
+/// it clones the authoritative table into a fresh `Arc<Memtable>` and swaps it in
+/// (writes are deliberately un-optimised in Phase 1 — a per-commit clone is the
+/// simplest correct publish).
+#[derive(Debug, Default, Clone)]
 pub struct Memtable {
     /// Delta-local interner for identity symbols (label, key-property names).
     interner: Interner,

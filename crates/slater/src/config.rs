@@ -129,6 +129,10 @@ pub struct AppConfig {
     pub require_acl_stamp: bool,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Writable-layer (delta) configuration. Off by default; when disabled the
+    /// server is exactly the read-only server it was before this field existed.
+    #[serde(default)]
+    pub delta: DeltaConfig,
     /// `(label, property)` vector indexes to pin resident for the generation's lifetime.
     #[serde(default)]
     pub vector_index_pins: Vec<VectorIndexPin>,
@@ -745,6 +749,48 @@ impl Default for CacheConfig {
         }
     }
 }
+/// Writable-layer (delta) configuration. **Off by default** — with `enabled`
+/// false every query serves the pure immutable core exactly as before, no WAL is
+/// opened, and write statements are rejected as read-only. See
+/// `docs/WRITABLE-PLAN.md` and D44.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeltaConfig {
+    /// Master switch for the writable layer. Off ⇒ reads never build a
+    /// `MergedView` and writes are refused.
+    #[serde(default = "default_false", deserialize_with = "de::bool")]
+    pub enabled: bool,
+    /// Directory holding per-graph WAL segments (the local durability floor). A
+    /// relative path is resolved under the data directory; one graph's segments
+    /// live under `<walDir>/<graph>/`. Must be a durable local volume, never
+    /// ephemeral instance storage (see D44 — the floor is always local disk).
+    #[serde(default = "default_wal_dir")]
+    pub wal_dir: String,
+    /// Byte budget for a graph's in-RAM memtable before it must spill / trigger a
+    /// consolidation. Phase 1c only meters against it; spill and the consolidation
+    /// trigger land in Phases 1d/4. Defaults to 64 MiB.
+    #[serde(default = "default_memtable_bytes", deserialize_with = "de::usize")]
+    pub memtable_bytes: usize,
+}
+
+impl Default for DeltaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            wal_dir: default_wal_dir(),
+            memtable_bytes: default_memtable_bytes(),
+        }
+    }
+}
+
+fn default_wal_dir() -> String {
+    "wal".to_string()
+}
+
+fn default_memtable_bytes() -> usize {
+    64 << 20
+}
+
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
