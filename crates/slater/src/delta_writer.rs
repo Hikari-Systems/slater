@@ -43,6 +43,19 @@ use anyhow::{Context, Result};
 use graph_format::ids::Generation as GenId;
 use slater_delta::{replay_dir, Memtable, Seq, WalOp, WalRecord, WalSink};
 
+/// A frozen delta handed to consolidation: an immutable snapshot of every
+/// committed write, plus the WAL segments those writes live in. The snapshot feeds
+/// the merged-view dump; the segments are deleted by [`DeltaWriter::retire`] once
+/// the fresh generation is published (see Phase 1d in `docs/WRITABLE-PROGRESS.md`).
+pub struct Frozen {
+    /// The memtable snapshot at freeze time — the delta the dump folds into the core.
+    pub snapshot: Arc<Memtable>,
+    /// Every committed WAL segment that the snapshot represents. `retire` removes
+    /// exactly these; any segment opened after the freeze (post-freeze writes) is
+    /// left untouched.
+    pub consumed: Vec<PathBuf>,
+}
+
 /// Serialised writer state — reached only under the `Mutex`, never by readers.
 struct WriterInner {
     dir: PathBuf,
@@ -57,8 +70,10 @@ struct WriterInner {
 /// The per-graph writable-layer writer. Cheap to clone-share behind an `Arc`.
 pub struct DeltaWriter {
     graph: String,
-    /// The core generation the delta's dense ids were resolved against.
-    core_uuid: GenId,
+    /// The core generation the delta's dense ids were resolved against. Interior
+    /// mutable because [`DeltaWriter::retire`] re-binds it to the freshly
+    /// consolidated generation without reopening the writer.
+    core_uuid: RwLock<GenId>,
     /// Single-writer serialisation of every mutation.
     inner: Mutex<WriterInner>,
     /// The published immutable read snapshot (readers clone the `Arc`).
@@ -95,7 +110,7 @@ impl DeltaWriter {
         let snapshot = Arc::new(mem.clone());
         Ok(Self {
             graph: graph.to_string(),
-            core_uuid,
+            core_uuid: RwLock::new(core_uuid),
             inner: Mutex::new(WriterInner {
                 dir,
                 sink,
@@ -115,7 +130,7 @@ impl DeltaWriter {
     /// The core generation the delta's dense ids were resolved against. The server
     /// overlays this delta only on a generation with this UUID.
     pub fn core_uuid(&self) -> GenId {
-        self.core_uuid
+        *self.core_uuid.read().expect("delta core-uuid lock")
     }
 
     /// A consistent immutable snapshot of the memtable — one `Arc` clone, no writer
@@ -150,6 +165,68 @@ impl DeltaWriter {
         Ok(seq)
     }
 
+    /// Begin a consolidation: seal the WAL segment currently open for appends, open
+    /// a fresh one for any subsequent write, and hand back an immutable snapshot of
+    /// the committed delta together with the segments that snapshot lives in.
+    ///
+    /// Freeze is *non-destructive* — the authoritative memtable and the published
+    /// read snapshot are untouched, so reads keep overlaying the delta and a
+    /// consolidation that fails (or crashes) before publishing loses nothing: the
+    /// sealed segments are still on disk and replay the writes. [`Self::retire`] is
+    /// the only step that discards them, and only after the fresh generation is live.
+    ///
+    /// Phase 1 runs consolidation on the single-writer path (the caller does not
+    /// admit concurrent writes during the build), so the fresh segment stays empty
+    /// until `retire`; the freeze-to-a-live-memtable "writes never block" behaviour
+    /// is Phase 4 admission control.
+    pub fn freeze(&self) -> Result<Frozen> {
+        let mut inner = self.inner.lock().expect("delta writer lock");
+        // Everything committed so far — including the segment about to be sealed —
+        // is represented by the current published snapshot. Capture the paths before
+        // opening the fresh segment so the fresh one is never in the consumed set.
+        let consumed = wal_segment_paths(&inner.dir)?;
+        let next = next_segment_number(&inner.dir)?;
+        let fresh = WalSink::create(&inner.dir, next).with_context(|| {
+            format!("open post-freeze WAL segment {next} under {:?}", inner.dir)
+        })?;
+        let old = std::mem::replace(&mut inner.sink, fresh);
+        old.seal().context("seal WAL segment at freeze")?;
+        let snapshot = self.snapshot.read().expect("delta snapshot lock").clone();
+        Ok(Frozen { snapshot, consumed })
+    }
+
+    /// Complete a consolidation: delete the `consumed` WAL segments (their writes now
+    /// live in the freshly built core), reset the memtable + resolved index empty,
+    /// and re-bind the writer to `new_core_uuid` so subsequent writes resolve their
+    /// business keys against the new generation.
+    ///
+    /// Ordering is chosen so a lock-free reader never overlays a stale delta on the
+    /// new core: the empty snapshot is published *before* the core UUID is re-bound,
+    /// so any reader that observes `core_uuid == new_core_uuid` also observes the
+    /// empty overlay. (A reader straddling the swap may momentarily miss the just-
+    /// consolidated writes on the *old* core — a benign visibility blip that Phase 4
+    /// admission control removes; the writes themselves are durable in the new core.)
+    pub fn retire(&self, consumed: &[PathBuf], new_core_uuid: GenId) -> Result<()> {
+        let mut inner = self.inner.lock().expect("delta writer lock");
+        for path in consumed {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("remove consumed WAL segment {path:?}"))
+                }
+            }
+        }
+        inner.mem = Memtable::new();
+        // Publish the empty overlay first, then re-bind the core UUID (see the
+        // ordering note above). The seq counter stays monotonic — the fresh segment
+        // is empty, so a later replay simply restarts it from zero.
+        *self.snapshot.write().expect("delta snapshot lock") = Arc::new(inner.mem.clone());
+        *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     /// Number of distinct node identities currently carrying a delta (diagnostics).
     pub fn node_delta_count(&self) -> usize {
         self.snapshot().node_delta_count()
@@ -164,6 +241,25 @@ impl DeltaWriter {
     pub fn wal_dir(&self) -> PathBuf {
         self.inner.lock().expect("delta writer lock").dir.clone()
     }
+}
+
+/// Every `*.wal` segment file currently under `dir` (unordered). A missing
+/// directory yields an empty list. Used by [`DeltaWriter::freeze`] to record which
+/// segments a frozen snapshot consumes.
+fn wal_segment_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("list WAL dir {dir:?}")),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("wal") {
+            out.push(path);
+        }
+    }
+    Ok(out)
 }
 
 /// The next unused segment number under `dir`: one past the highest `NNNN.wal`, or
@@ -307,6 +403,101 @@ mod tests {
             w3.snapshot().node_patch(10).unwrap().patches.get("price"),
             Some(&Value::Int(99)),
             "last-writer-wins survives across segments"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn freeze_captures_snapshot_and_retire_resets_against_new_core() {
+        let dir = tmp("freeze");
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_core = GenId(uuid::Uuid::from_u128(1));
+        let new_core = GenId(uuid::Uuid::from_u128(2));
+        let w = DeltaWriter::open(&dir, "g", old_core, resolve_ticker).unwrap();
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(42))],
+            ),
+            Some(10),
+        )
+        .unwrap();
+
+        // Freeze: the snapshot captures the committed write, and the consumed set is
+        // the sealed segment(s) — while a fresh, empty segment is now open.
+        let frozen = w.freeze().unwrap();
+        assert_eq!(
+            frozen.snapshot.node_patch(10).unwrap().patches.get("price"),
+            Some(&Value::Int(42))
+        );
+        assert!(
+            !frozen.consumed.is_empty(),
+            "freeze records consumed segments"
+        );
+        for p in &frozen.consumed {
+            assert!(
+                p.exists(),
+                "consumed segment still on disk until retire: {p:?}"
+            );
+        }
+        // The live overlay is untouched by a freeze (reads keep seeing the delta).
+        assert_eq!(
+            w.snapshot().node_patch(10).unwrap().patches.get("price"),
+            Some(&Value::Int(42))
+        );
+        assert_eq!(w.core_uuid(), old_core);
+        let epoch_before = w.epoch();
+
+        // Retire against the new core: consumed segments gone, overlay empty, rebind.
+        w.retire(&frozen.consumed, new_core).unwrap();
+        for p in &frozen.consumed {
+            assert!(!p.exists(), "retire deletes the consumed segment: {p:?}");
+        }
+        assert_eq!(w.snapshot().node_delta_count(), 0, "delta retired");
+        assert!(w.snapshot().node_patch(10).is_none());
+        assert_eq!(w.core_uuid(), new_core, "writer re-bound to the new core");
+        assert!(w.epoch() > epoch_before, "retire bumps the epoch");
+
+        // A reopen after retire replays nothing (the only remaining segment is the
+        // fresh empty one), so the writer comes up clean against the new core.
+        let reopened = DeltaWriter::open(&dir, "g", new_core, resolve_ticker).unwrap();
+        assert_eq!(reopened.snapshot().node_delta_count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn freeze_without_retire_keeps_the_write_durable() {
+        // Models a consolidation that fails/crashes after freeze but before publish:
+        // the sealed segment must still replay the committed write (no loss).
+        let dir = tmp("freeze_crash");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(3));
+        let w = DeltaWriter::open(&dir, "g", core, resolve_ticker).unwrap();
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("B".into()),
+                &[("price", Value::Int(7))],
+            ),
+            Some(20),
+        )
+        .unwrap();
+        let _frozen = w.freeze().unwrap(); // freeze, then "crash" (drop, no retire)
+        drop(w);
+
+        let reopened = DeltaWriter::open(&dir, "g", core, resolve_ticker).unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .node_patch(20)
+                .unwrap()
+                .patches
+                .get("price"),
+            Some(&Value::Int(7)),
+            "a frozen-but-not-retired write survives a reopen"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

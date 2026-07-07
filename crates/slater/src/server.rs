@@ -407,6 +407,131 @@ impl Graphs {
         vector_cache.unpin_generation(live.uuid());
         Ok(Some(new_gen.uuid()))
     }
+
+    /// Consolidate `name`'s writable delta into a fresh immutable generation
+    /// (Phase 1d, *dump-and-rebuild*): freeze the delta, dump the merged
+    /// (core ⊕ delta) view as a business-key `MERGE` script, hand that to `build` to
+    /// rebuild a fresh generation, then swap to the new generation and retire the
+    /// consumed WAL segments. Returns the new generation's UUID.
+    ///
+    /// # Failure is non-destructive
+    /// If `build` fails (a non-zero builder exit, an unwritable dump, …) nothing is
+    /// mutated in place: the old core keeps serving, the frozen delta stays live in
+    /// the memtable (the freeze only *sealed* its WAL segments, it did not clear
+    /// them), and a crash before the `current` swap replays every write on reopen.
+    /// Retirement — the only step that discards the delta — runs solely after the
+    /// new generation is published and swapped in.
+    ///
+    /// # The `build` seam
+    /// `build(dump, graph, data_dir)` rebuilds `graph` from the `dump` file and
+    /// publishes a fresh generation under `data_dir` (updating its `current`
+    /// pointer). Production passes [`run_builder`] (spawns the configured
+    /// `slater-build`); tests inject a closure that publishes a known-correct
+    /// generation, so the orchestration is exercised without a subprocess.
+    ///
+    /// Phase 1 runs on the single-writer path — the caller must not admit concurrent
+    /// writes for the duration; the manual trigger and the Bolt surface are Phase 4.
+    pub fn consolidate_graph(
+        &self,
+        name: &str,
+        cache: &BlockCache,
+        vector_cache: &VectorIndexCache,
+        data_dir: &Path,
+        build: impl Fn(&Path, &str, &Path) -> Result<()>,
+    ) -> Result<GenId> {
+        let writer = self
+            .writer(name)
+            .ok_or_else(|| anyhow!("graph '{name}' has no writable layer to consolidate"))?;
+        let core = self
+            .get(name)
+            .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
+        // The delta's dense ids only line up with the core it was resolved against.
+        // A mismatch means the served generation already moved on (a prior swap) and
+        // the delta is orphaned — refuse rather than dump a mis-resolved view.
+        if writer.core_uuid() != core.uuid() {
+            bail!(
+                "cannot consolidate '{name}': the writable delta was resolved against generation \
+                 {} but the served core is {} — the delta is orphaned",
+                writer.core_uuid(),
+                core.uuid()
+            );
+        }
+
+        // Freeze first: seal the WAL, capture the merged snapshot. Everything after
+        // this is either fully applied (swap + retire) or fully reverted (the sealed
+        // segments still replay the writes).
+        let frozen = writer
+            .freeze()
+            .with_context(|| format!("freeze writable delta for '{name}'"))?;
+
+        // Dump the merged (core ⊕ delta) view to a scratch script beside the graph.
+        let dump_path = data_dir.join(name).join(".consolidate.cypher");
+        let dump_res = (|| -> Result<()> {
+            let view = MergedView::new(
+                core.as_ref(),
+                DeltaSnapshot::from_memtable(frozen.snapshot.clone()),
+            );
+            let engine = Engine::new(&view, cache);
+            let mut file = std::io::BufWriter::new(
+                std::fs::File::create(&dump_path)
+                    .with_context(|| format!("create consolidation dump {dump_path:?}"))?,
+            );
+            crate::consolidate::serialise_merge_dump(&engine, &view, &mut file)?;
+            std::io::Write::flush(&mut file).context("flush consolidation dump")?;
+            Ok(())
+        })();
+        if let Err(e) = dump_res {
+            let _ = std::fs::remove_file(&dump_path);
+            return Err(e).with_context(|| format!("serialise consolidation dump for '{name}'"));
+        }
+
+        // Rebuild. A builder failure leaves the delta live (no retire) and the old
+        // core serving; propagate the error after removing the scratch dump.
+        if let Err(e) = build(&dump_path, name, data_dir) {
+            let _ = std::fs::remove_file(&dump_path);
+            return Err(e).with_context(|| format!("rebuild consolidated generation for '{name}'"));
+        }
+        let _ = std::fs::remove_file(&dump_path);
+
+        // Publish: pick up the freshly built generation (validated + PQ-pinned) and
+        // swap the served slot to it.
+        let new_uuid = self
+            .swap_if_changed(name, vector_cache)
+            .with_context(|| format!("swap in consolidated generation for '{name}'"))?
+            .ok_or_else(|| {
+                anyhow!("builder for '{name}' did not publish a new generation (current unchanged)")
+            })?;
+
+        // Retire: the delta now lives in the new core, so drop the consumed WAL
+        // segments and re-bind the writer to the new generation.
+        writer
+            .retire(&frozen.consumed, new_uuid)
+            .with_context(|| format!("retire consolidated delta for '{name}'"))?;
+
+        info!(graph = %name, generation = %new_uuid, "consolidated writable delta into a fresh generation");
+        Ok(new_uuid)
+    }
+}
+
+/// Spawn the configured `slater-build` binary to rebuild `graph` from the `dump`
+/// script into `data_dir`, publishing a fresh generation — the production `build`
+/// seam for [`Graphs::consolidate_graph`]. A bare `builder_bin` resolves on `PATH`.
+/// A non-zero exit is an error, so the caller keeps the old core serving. The
+/// invocation mirrors a normal business-key `MERGE` import (no `--pk`).
+pub fn run_builder(builder_bin: &str, dump: &Path, graph: &str, data_dir: &Path) -> Result<()> {
+    let status = std::process::Command::new(builder_bin)
+        .arg("--input")
+        .arg(dump)
+        .arg("--graph")
+        .arg(graph)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .status()
+        .with_context(|| format!("spawn builder '{builder_bin}'"))?;
+    if !status.success() {
+        bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'");
+    }
+    Ok(())
 }
 
 // ── Generation guard (poll → exit / swap) ─────────────────────────────────────
@@ -3153,6 +3278,7 @@ mod tests {
             enabled: true,
             wal_dir: wal_dir.to_string_lossy().into_owned(),
             memtable_bytes: 64 << 20,
+            builder_bin: "slater-build".to_string(),
         }
     }
 
@@ -3278,6 +3404,214 @@ mod tests {
         let k1 = ResultKey::with_delta_epoch(g, 1, "q");
         assert_ne!(k0, k1, "a bumped epoch keys differently");
         assert_eq!(k0, ResultKey::new(g, "q"), "epoch 0 == the read-only key");
+    }
+
+    /// Count the `*.wal` segment files under a WAL directory.
+    fn wal_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("wal"))
+            .count()
+    }
+
+    /// End-to-end Phase 1d-B: a durable delta is folded into a fresh generation by
+    /// consolidation. The injected builder inspects the dump (proving the serialiser
+    /// saw the *merged* state) and independently publishes the known-correct
+    /// consolidated generation; afterwards the served core carries the write with no
+    /// delta, the writer is re-bound to the new core, and the consumed WAL segments
+    /// are gone — leaving only the fresh post-freeze segment.
+    #[test]
+    fn consolidate_folds_delta_into_fresh_generation() {
+        let (root, _graph) = testgen::write_indexed_people("consolidate_e2e");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen0 = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let wal_dir = writer.wal_dir();
+
+        // Overwrite Alice's age via the delta.
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        assert!(
+            !writer.snapshot().is_empty(),
+            "delta live before consolidation"
+        );
+
+        // Builder stand-in: assert the dump reflects the merged age, then publish an
+        // independently-correct consolidated generation (Alice age 99) at a new uuid.
+        let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0099);
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+            let text = std::fs::read_to_string(dump)?;
+            assert!(
+                text.contains("MERGE (n:Person {name: 'Alice'}) SET n.age = 99;"),
+                "dump should carry the merged age:\n{text}"
+            );
+            assert_eq!(g, "people");
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
+        };
+        let published = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+        assert_eq!(published.0, new_uuid, "swapped to the new generation");
+
+        // The served core is now the new generation with the write baked in, and a
+        // read through it (delta now empty) returns the consolidated age.
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.uuid().0, new_uuid);
+        let view = MergedView::new(
+            gen1.as_ref(),
+            DeltaSnapshot::from_memtable(writer.snapshot()),
+        );
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(99)),
+            "consolidated age served from the core"
+        );
+
+        // The writer is re-bound and emptied; the scratch dump is cleaned up; only
+        // the fresh post-freeze segment remains.
+        assert_eq!(
+            writer.core_uuid(),
+            gen1.uuid(),
+            "writer re-bound to new core"
+        );
+        assert!(writer.snapshot().is_empty(), "delta retired");
+        assert!(!root.join("people").join(".consolidate.cypher").exists());
+        assert_eq!(wal_count(&wal_dir), 1, "only the fresh segment remains");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A consolidation whose rebuild fails (modelled as the builder erroring before
+    /// it publishes anything — the crash window between freeze and the `current`
+    /// swap) is non-destructive: the old core keeps serving, the delta stays live,
+    /// and the durable write replays on a fresh reopen (the freeze sealed but did not
+    /// delete its segments).
+    #[test]
+    fn failed_consolidation_preserves_the_write_and_old_core() {
+        let (root, _graph) = testgen::write_indexed_people("consolidate_crash");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen0 = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let wal_dir = writer.wal_dir();
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let build =
+            |_d: &Path, _g: &str, _dd: &Path| -> Result<()> { bail!("simulated builder crash") };
+        let err = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("simulated builder crash"));
+
+        // Old core still served (unchanged uuid); delta still live (age 99 overlaid);
+        // the scratch dump is cleaned up.
+        let gen_after = graphs.get("people").unwrap();
+        assert_eq!(gen_after.uuid(), gen0.uuid(), "old core keeps serving");
+        assert!(
+            !writer.snapshot().is_empty(),
+            "delta not retired on failure"
+        );
+        assert_eq!(
+            writer.snapshot().node_patch(0).unwrap().patches.get("age"),
+            Some(&Value::Int(99))
+        );
+        assert!(!root.join("people").join(".consolidate.cypher").exists());
+
+        // Durability: a fresh writer over the WAL replays the write.
+        let reopened = DeltaWriter::open(&wal_dir, "people", gen0.uuid(), |op| {
+            resolve_dense_id(&gen0, op)
+        })
+        .unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .node_patch(0)
+                .unwrap()
+                .patches
+                .get("age"),
+            Some(&Value::Int(99)),
+            "the write survives a failed consolidation + reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// True end-to-end consolidation through the real `slater-build` binary. Ignored
+    /// by default — `cargo test -p slater` does not build the builder. Run it with
+    /// the binary located via `SLATER_BUILD_BIN` (or on `PATH`):
+    /// ```text
+    /// cargo build -p slater-build
+    /// SLATER_BUILD_BIN=$CARGO_TARGET_DIR/debug/slater-build \
+    ///   cargo test -p slater -- --ignored consolidate_via_real_builder
+    /// ```
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see the doc comment"]
+    fn consolidate_via_real_builder() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let (root, _graph) = testgen::write_indexed_people("consolidate_real");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen0 = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let new = graphs
+            .consolidate_graph("people", &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+        assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
+
+        let gen1 = graphs.get("people").unwrap();
+        let view = MergedView::new(
+            gen1.as_ref(),
+            DeltaSnapshot::from_memtable(writer.snapshot()),
+        );
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(99)),
+            "the real builder folded the delta into the core"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Stand up a ConnCtx over the shared fixture graph + a temp ACL.

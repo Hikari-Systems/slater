@@ -771,6 +771,11 @@ pub struct DeltaConfig {
     /// trigger land in Phases 1d/4. Defaults to 64 MiB.
     #[serde(default = "default_memtable_bytes", deserialize_with = "de::usize")]
     pub memtable_bytes: usize,
+    /// Path to the `slater-build` binary invoked to rebuild a fresh generation
+    /// during consolidation (Phase 1d). A bare name is resolved on `PATH`; an
+    /// absolute path pins a specific binary. Defaults to `slater-build`.
+    #[serde(default = "default_builder_bin")]
+    pub builder_bin: String,
 }
 
 impl Default for DeltaConfig {
@@ -779,12 +784,17 @@ impl Default for DeltaConfig {
             enabled: default_false(),
             wal_dir: default_wal_dir(),
             memtable_bytes: default_memtable_bytes(),
+            builder_bin: default_builder_bin(),
         }
     }
 }
 
 fn default_wal_dir() -> String {
     "wal".to_string()
+}
+
+fn default_builder_bin() -> String {
+    "slater-build".to_string()
 }
 
 fn default_memtable_bytes() -> usize {

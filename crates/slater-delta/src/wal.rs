@@ -202,6 +202,12 @@ impl WalSink {
             .with_context(|| format!("create WAL segment {path:?}"))?;
         let mut file = BufWriter::new(file);
         file.write_all(WAL_MAGIC)?;
+        // Push the magic to the file immediately (no fsync — it carries no committed
+        // data). A freshly opened segment can otherwise sit 0 bytes on disk until its
+        // first commit, and a concurrent/subsequent `replay_dir` would choke on the
+        // missing magic. (`replay_bytes` also tolerates a 0-byte segment for the
+        // power-loss-before-flush case.)
+        file.flush().context("flush WAL magic on create")?;
         Ok(Self {
             segment,
             path,
@@ -324,6 +330,12 @@ pub fn replay_dir(dir: &Path) -> Result<Replay> {
 /// Parse `bytes` (one segment image), appending committed records to `out` and
 /// advancing `out.last_seq`. Stops cleanly at the first torn frame.
 fn replay_bytes(bytes: &[u8], out: &mut Replay) -> Result<()> {
+    // A 0-byte segment is a freshly created one whose magic never reached disk (a
+    // crash/power-loss between `create` and its flush). It holds no committed record,
+    // so it replays to nothing rather than wedging the whole directory.
+    if bytes.is_empty() {
+        return Ok(());
+    }
     if bytes.len() < WAL_MAGIC.len() || &bytes[..WAL_MAGIC.len()] != WAL_MAGIC {
         bail!("bad or missing WAL magic");
     }
@@ -540,5 +552,25 @@ mod tests {
         let replay = replay_dir(&dir).unwrap();
         assert!(replay.records.is_empty());
         assert_eq!(replay.last_seq, Seq(0));
+    }
+
+    #[test]
+    fn freshly_created_and_zero_byte_segments_replay_empty() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_fresh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // `create` flushes the magic, so a fresh never-committed segment already has
+        // its 8-byte header on disk and replays to nothing (no committed records).
+        let sink = WalSink::create(&dir, 0).unwrap();
+        assert_eq!(
+            fs::metadata(sink.path()).unwrap().len(),
+            WAL_MAGIC.len() as u64
+        );
+        // A 0-byte segment (a crash/power-loss between create and its flush) is
+        // tolerated: it holds no committed record, so it must not wedge the dir.
+        fs::write(segment_path(&dir, 1), b"").unwrap();
+        let replay = replay_dir(&dir).unwrap();
+        assert!(replay.records.is_empty());
+        assert_eq!(replay.last_seq, Seq(0));
+        fs::remove_dir_all(&dir).ok();
     }
 }

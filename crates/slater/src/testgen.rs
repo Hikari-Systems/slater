@@ -29,7 +29,7 @@
 #![cfg(any(test, feature = "testkit"))]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use graph_format::columns::PropsWriter;
 use graph_format::histogram::{
@@ -354,14 +354,24 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
 /// name(0)/age(1)/since(2). One range index on (Person, name).
 pub fn write_indexed_people(tag: &str) -> (PathBuf, String) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0007);
-    let graph = "people".to_string();
     let root = std::env::temp_dir().join(format!("slater_idxfix_{}_{tag}", std::process::id()));
+    let graph = write_indexed_people_at(&root, uuid, [30, 25, 40]);
+    (root, graph)
+}
+
+/// Write the `people` generation of [`write_indexed_people`] into `root/people/<uuid>/`
+/// with the given Alice/Bob/Carol ages, updating `root/people/current` to name it.
+/// Parameterised so a consolidation test can publish a fresh, independently-known
+/// generation (a new `uuid`, patched ages) into an existing data directory — the
+/// stand-in for what the real builder produces. Returns the graph name (`people`).
+pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) -> String {
+    let graph = "people".to_string();
     let dir = root.join(&graph).join(uuid.to_string());
     std::fs::create_dir_all(dir.join("range")).unwrap();
 
     // node_props.blk — name(0) + age(1) on every node.
     let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
-    for (name, age) in [("Alice", 30), ("Bob", 25), ("Carol", 40)] {
+    for (name, age) in [("Alice", ages[0]), ("Bob", ages[1]), ("Carol", ages[2])] {
         np.append(&[(0, Value::Str(name.into())), (1, Value::Int(age))])
             .unwrap();
     }
@@ -485,7 +495,7 @@ pub fn write_indexed_people(tag: &str) -> (PathBuf, String) {
     )
     .unwrap();
 
-    (root, graph)
+    graph
 }
 
 /// A richer fixture for the whole-graph label/reltype metadata fast paths. It has

@@ -83,7 +83,7 @@ Running ledger for the `writeable` track. Pairs with the design in
   `delta_overlay` bench (empty-delta within noise); WAL two-seam correction folded
   into docs. Whole workspace green.
 
-- **Phase 1 — durable property overwrites + dump-and-rebuild consolidation. 🔨 IN PROGRESS.**
+- **Phase 1 — durable property overwrites + dump-and-rebuild consolidation. ✅ DONE.**
   Sub-milestones (each independently green + committed = a safe context-clear point):
   - **1a — `WalSink` local floor. ✅ DONE.** `wal.rs`: segment format
     (`MAGIC ‖ frame*`, frame = `len:u32 ‖ crc32c:u32 ‖ payload`), `WalOp::UpsertNode`
@@ -121,7 +121,7 @@ Running ledger for the `writeable` track. Pairs with the design in
       group-commit batching (WAL already supports it, writer commits per-op);
       labelled-scan fallback for an unindexed business key; edge + tombstone deltas
       (Phases 2–3).
-  - **1d — consolidation (4a) + orchestrator.** 🔨 IN PROGRESS.
+  - **1d — consolidation (4a) + orchestrator. ✅ DONE.**
     - **1d-A — merged-view → MERGE dump serialiser. ✅ DONE** (commit `ed16742`).
       `consolidate::serialise_merge_dump` reads a `ReadView`, so pointing it at a
       `MergedView` folds the delta in for free — the dump *is* the consolidated
@@ -132,37 +132,35 @@ Running ledger for the `writeable` track. Pairs with the design in
       slater-build's default dialect; grammar-exact Cypher escaper; refuses (never
       corrupts) a node whose identity isn't recoverable from a range index. New
       `Engine::outgoing_adj`; `testgen::write_indexed_people` fixture.
-    - **1d-B — orchestrator + end-to-end + crash test. ⬜ TODO.** Resume plan:
-      1. **Freeze/retire on `DeltaWriter`.** Add `freeze()` — seal the current WAL
-         segment, open a fresh one, return `(frozen_snapshot: Arc<Memtable>,
-         consumed_segments)` — and `retire(consumed, new_core_uuid)` — delete the
-         consumed segments, reset memtable + `by_dense` empty against the new core.
-         Phase-1 simplification: consolidation just takes the single-writer path
-         (concurrent writes block on the writer lock during the build); the
-         freeze-to-a-fresh-live-memtable "writes never block" behaviour is Phase 4
-         admission control, not needed here.
-      2. **Server `consolidate_graph(graph)`.** freeze → build a
-         `MergedView(core, frozen delta)` → `serialise_merge_dump` to a temp file →
-         invoke the builder → on success the new generation is published
-         (`write_manifest_and_publish` swaps `current`); reopen the served
-         `Arc<Generation>` slot + reopen the writer against it + `retire`. Non-zero
-         builder exit keeps serving the old core (nothing mutated in place).
-      3. **Builder invocation seam (testability).** `slater-build` is **bin-only
-         and not a `slater` dep**, and `cargo test -p slater` does not build it — so
-         make the builder step an injected `Fn(dump, graph, data_dir) -> Result<()>`.
-         Production wires it to spawn the binary at a **config-supplied path**
-         (`delta.builder_bin`, default `slater-build` on `PATH`); the automated test
-         injects a closure that publishes a known-correct consolidated generation
-         (built with `testgen`, values independently asserted — no impl-vs-impl
-         parity), so the orchestration logic (freeze/serialise/retire/reopen) is
-         tested deterministically without the subprocess. Add a separate
-         `#[ignore]` true-e2e test that spawns the real binary.
-      4. **Trigger.** Phase 1 = a manual lever only; expose `consolidate_graph` as a
-         callable server method for the test. The Bolt surface (`CALL
-         slater.consolidate()`) + the automatic L0-soft-cap trigger are Phase 4/5.
-      5. **Crash test.** `SLATER_*_FAIL_AFTER`-style hook between freeze and the
-         `current` swap → assert the WAL still replays the write (no loss) and the
-         old core is still served (mirror `slater-build/tests/resume.rs`).
+    - **1d-B — orchestrator + end-to-end + crash test. ✅ DONE** (this commit).
+      `DeltaWriter::freeze()` seals the live WAL segment, opens a fresh one, and
+      returns `Frozen { snapshot, consumed }` (non-destructive — reads keep
+      overlaying, so a failure/crash before publish loses nothing);
+      `DeltaWriter::retire(consumed, new_core_uuid)` deletes the consumed segments,
+      resets the memtable empty, and re-binds `core_uuid` (now `RwLock<GenId>`,
+      published empty-snapshot-before-rebind so a lock-free reader never overlays a
+      stale delta on the new core). `Graphs::consolidate_graph(name, cache,
+      vector_cache, data_dir, build)`: freeze → dump the `MergedView(core ⊕ delta)`
+      via `serialise_merge_dump` to `<data_dir>/<graph>/.consolidate.cypher` →
+      `build(dump, graph, data_dir)` → `swap_if_changed` picks up + validates the new
+      generation → `retire`. A builder failure is non-destructive (old core keeps
+      serving, delta stays live, scratch dump removed). The `build` seam is an
+      injected `Fn(&Path,&str,&Path)->Result<()>`; production = `run_builder`
+      (spawns `delta.builder_bin`, default `slater-build`, `--input/--graph/--data-dir`);
+      the automated test injects a closure that inspects the dump then publishes a
+      known-correct generation via `testgen::write_indexed_people_at` (no
+      impl-vs-impl parity). Tests: `consolidate_folds_delta_into_fresh_generation`
+      (e2e orchestration), `failed_consolidation_preserves_the_write_and_old_core`
+      (crash window = builder error before the `current` swap; WAL replays the write,
+      old core served), `#[ignore] consolidate_via_real_builder` (spawns the real
+      binary via `SLATER_BUILD_BIN`; verified green). Also hardened `wal.rs`:
+      `WalSink::create` flushes the magic immediately + `replay_bytes` tolerates a
+      0-byte segment (a fresh unflushed/torn-on-power-loss segment no longer wedges
+      `replay_dir`). Whole workspace green; clippy + fmt clean.
+      **Deferred (Phase 4/5):** the Bolt trigger (`CALL slater.consolidate()`) + the
+      automatic L0-soft-cap trigger — `consolidate_graph` is a callable server method
+      only for now; group-commit; the freeze-to-a-live-memtable "writes never block"
+      admission control (Phase 1 runs consolidation on the single-writer path).
 
 - Phases 2–5: see `docs/WRITABLE-PLAN.md`.
 
@@ -191,18 +189,25 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 1d-B — consolidation orchestrator** (`crates/slater/`). 1d-A
-(the `consolidate::serialise_merge_dump` serialiser) is done and green; 1d-B wires
-freeze → serialise → build → swap/retire around it. The full step-by-step resume
-plan (freeze/retire on `DeltaWriter`, the injected builder seam that dodges the
-bin-only `slater-build` test friction, the manual trigger, the crash test) is in
-the **Phase 1d-B ⬜ TODO** block above — read that first.
+**Phase 1 is complete** (1a–1d all done and green). Durable property overwrites +
+dump-and-rebuild consolidation are shipped end-to-end. Pick the next track:
 
-Handy resume detail: the serialiser is `crates/slater/src/consolidate.rs`
-(`serialise_merge_dump`, reads any `ReadView` — hand it a `MergedView`); the write
-flow lands in `server.rs` (`execute_write`, `resolve_dense_id`, `delta_for_read`,
-`run_query`'s `ReadOverlay`); the writer is `crates/slater/src/delta_writer.rs`
-(add `freeze`/`retire` here); the read overlay is `exec.rs` (`overlay_node_props`,
-`node_prop_par`); `testgen::write_indexed_people` is the fully-indexed fixture for
-the e2e test.
+1. **Wire the consolidation trigger (Phase 4 lead-in).** `Graphs::consolidate_graph`
+   exists as a callable method; expose it as `CALL slater.consolidate()` over Bolt
+   (mirror an existing `CALL slater.*` proc), gate it on ACL/admin, and add the
+   automatic L0-soft-cap trigger (fire when `DeltaWriter::bytes()` crosses
+   `delta.memtable_bytes`). Production build seam is `server::run_builder`.
+2. **Phase 2 — edge + tombstone deltas** (see `docs/WRITABLE-PLAN.md`): `WalOp` gains
+   edge upsert + node/edge delete; memtable grows an `EdgeDelta` write path +
+   tombstones; the read overlay and `serialise_merge_dump` already have edge-shaped
+   hooks to extend. Delta-born nodes (`resolved = None`) also land here.
+3. **Parallel workstream — `slater dump` CLI** (§ below): independent of Phases 2–5.
+
+Handy resume detail: consolidation orchestration is `server.rs`
+(`Graphs::consolidate_graph`, `run_builder`); freeze/retire live on
+`crates/slater/src/delta_writer.rs` (`Frozen`, `freeze`, `retire`); the serialiser is
+`crates/slater/src/consolidate.rs` (`serialise_merge_dump`, reads any `ReadView`);
+the write flow is `execute_write`/`resolve_dense_id`/`delta_for_read`;
+`testgen::write_indexed_people` + `write_indexed_people_at` are the fully-indexed
+fixtures (the latter republishes a fresh generation for the consolidation e2e test).
 
