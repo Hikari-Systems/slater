@@ -3679,6 +3679,85 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 2d: a range-index seek overlays the delta — an equality seek finds a
+    /// delta-born node and drops a tombstoned core node, and a range seek unions the
+    /// born node into the core hits. The fixture carries a `(Person, name)` index, so
+    /// `MATCH (n:Person {name: …})` plans a `RangeEq` and `WHERE n.name >= …` a
+    /// `RangeRange` (see `plan::choose_from_preds`) rather than a label scan — this is
+    /// the path 2c's label-scan overlay did *not* cover.
+    #[test]
+    fn range_index_seek_overlays_born_and_tombstoned() {
+        let (root, _g) = testgen::write_indexed_people("range_overlay_2d");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Run a query over the live overlay, returning the `name` column as a set.
+        let names = |q: &str| -> Vec<String> {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast = parser::parse(q).unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            let mut out: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("name not str: {v:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        // Baseline: an equality seek for the not-yet-created Dave finds nothing.
+        assert!(
+            names("MATCH (n:Person {name:'Dave'}) RETURN n.name").is_empty(),
+            "Dave absent before MERGE"
+        );
+
+        // Create Dave (a delta-born node) and delete Bob (a core tombstone).
+        let write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write("MATCH (n:Person {name:'Bob'}) DELETE n");
+
+        // RangeEq finds the born node — the headline 2d gap (a label scan already
+        // found it in 2c; an *indexed key seek* did not until now).
+        assert_eq!(
+            names("MATCH (n:Person {name:'Dave'}) RETURN n.name, n.age"),
+            vec!["Dave".to_string()],
+            "equality seek finds the delta-born node"
+        );
+        // RangeEq drops the tombstoned core node.
+        assert!(
+            names("MATCH (n:Person {name:'Bob'}) RETURN n.name").is_empty(),
+            "equality seek drops the tombstoned core node"
+        );
+        // RangeRange (n.name >= 'C') unions the born Dave with core Carol; Alice/Bob
+        // are below the bound (and Bob is deleted regardless).
+        assert_eq!(
+            names("MATCH (n:Person) WHERE n.name >= 'C' RETURN n.name"),
+            vec!["Carol".to_string(), "Dave".to_string()],
+            "range seek unions the delta-born node into the core hits"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// The result-cache key includes the delta epoch, so a write invalidates an
     /// overlaid result rather than serving it stale.
     #[test]

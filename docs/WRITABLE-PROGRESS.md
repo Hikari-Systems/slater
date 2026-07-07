@@ -232,9 +232,38 @@ Running ledger for the `writeable` track. Pairs with the design in
     by business key (the core probe returns Absent → rejected; the memtable
     `delete_node` already handles it, just needs `execute_write` to resolve against the
     delta).
-  - **2d — range-index probe overlay. ⬜ TODO.** Union core ISAM hits with matching
-    delta nodes minus tombstoned; equality = hashmap probe, range = merge-walk over a
-    new per-index `BTreeMap` in the memtable. Threads through `plan.rs` index seeks.
+  - **2d — range-index probe overlay. ✅ DONE** (this commit). A range-index seek now
+    overlays the delta: an equality/range seek finds a **delta-born** node and unions
+    it into the core ISAM hits, and drops a tombstoned hit. Memtable (`slater-delta`):
+    `born_ids_in_index_eq`/`born_ids_in_index_range` (+ private `born_ids_in_index`
+    driver and `born_index_value`) return the synthetic ids of born nodes carrying the
+    index's `label` whose indexed `property` satisfies the seek; comparison is
+    `Value::cmp_key` (the ISAM total order), and the indexed value follows the read
+    overlay's precedence — a patch wins over the business key (matches `node_prop_par`),
+    else the business-key value when `property` *is* the key, else the node is absent
+    from the index. Exposed on `DeltaSnapshot`. Read overlay (`exec.rs`,
+    `scan_candidates` `RangeEq`/`RangeRange` arms, both behind the empty-delta fast
+    path, mirroring 2c's `LabelScan` born-append): append the born ids matching the
+    index predicate; new `node_index_label_prop(index)` maps an index name →
+    `(label, property)` from the manifest. Born ids sort after every core id, so the
+    ascending `scan_candidates` order holds; **tombstone drop on `RangeEq`/`RangeRange`
+    was already in place since 2b** (the final `suppress_tombstoned` wraps every arm) —
+    2d confirms it with a test. Tests: memtable (`born_index_overlay_eq_and_range`,
+    `born_index_overlay_patch_wins_over_business_key`,
+    `born_index_overlay_includes_tombstoned_for_caller_suppression`); server
+    (`range_index_seek_overlays_born_and_tombstoned`: seek-finds-born +
+    seek-drops-tombstoned + range-includes-born on the `write_indexed_people` fixture's
+    `(Person, name)` index). Whole slater+slater-delta+workspace green; clippy+fmt
+    clean; empty-delta bench within noise. **Known gap → follow-up (moved indexed
+    value):** a *core* node whose property patch changes an **indexed** value is not
+    relocated in the index — `RangeEq`/`RangeRange` still read the stale core ISAM
+    membership for a patched core node (found at its old value, missed at its new one).
+    The value *read back* is already corrected by the property overlay; only index
+    *membership* is stale. Closing it needs the memtable to track each patched node's
+    indexed value per index (remove-old/add-new) — deferred, as the plan anticipated.
+    (Also still deferred from 2c: deleting a born node by business key — the core probe
+    returns Absent → rejected; `delete_node` already handles it, just needs
+    `execute_write` to resolve against the delta.)
   - **2e — consolidation folds delta-born nodes.** `serialise_merge_dump` already
     skips tombstoned nodes (done in 2b); the remaining work is emitting delta-born
     nodes — the `0..node_count` node/edge iteration must extend over the synthetic id
@@ -267,46 +296,45 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Implement **Phase 2d — range-index probe overlay** (`crates/slater/` +
-`crates/slater-delta/`). Phase 2c is done: `MERGE` creates delta-born nodes with
-synthetic dense ids, visible through label scans / AllNodes / counts, durable, and
-consolidation-safe. The one gap 2d closes: an *indexed key seek*
-(`MATCH (n:L {k:v})` → `NodeScan::RangeEq`/`RangeRange`) does **not** see a delta-born
-node or a delta-patched-into-range value, and does not drop a tombstoned hit — it
-reads the core ISAM only.
+Phase 2d is done: a range-index seek (`RangeEq`/`RangeRange`) now overlays delta-born
+nodes and drops tombstoned hits, so `MATCH (n:L {k:v})` and `WHERE n.p >= …` see a
+`MERGE`-created node. **2e — consolidation folds delta-born nodes — is already
+effectively done** (the `0..node_count` loop + synthetic-aware `node_record`/
+`outgoing_adj` in `consolidate.rs` emit born nodes; test
+`serialise_emits_a_delta_born_node`); the only 2e leftover is emitting edges *from/to*
+born nodes, which is really **Phase 3** (topology overlay) work.
 
-Design (from `docs/WRITABLE-PLAN.md` §Read-merge overlay): union the core ISAM hits
-with matching delta nodes, minus tombstoned. Equality (`RangeEq`) = a hashmap probe
-over the memtable; range (`RangeRange`) = a merge-walk over a new **per-index
-`BTreeMap<Value, dense_id>`** in the memtable. Threads through `scan_candidates`'s
-`RangeEq`/`RangeRange` arms (like the LabelScan born-append already there) and needs
-the memtable to index delta nodes (born **and** patched) by (index, value). Note the
-subtlety: a *patch* that changes an indexed property moves the node in the index
-(remove old value, add new) — the memtable must track the indexed value per node, or
-2d restricts to born-node + tombstone overlay and defers moved-key handling. Suggested
-scope: born-node + tombstone RangeEq/RangeRange overlay first (mirrors 2c's label
-scan), moved-indexed-value as a follow-up. Fixture: `testgen::write_indexed_people`;
-test seek-finds-born + seek-drops-tombstoned + range-includes-born.
+So the recommended next step is **Phase 3 — topology (edge) overlay** (see
+`docs/WRITABLE-PLAN.md`). It closes the two known Phase-2 gaps:
+- a *core* edge pointing at a tombstoned node still lets traversal reach it
+  (`MATCH (a)-->(b)` where `b` is deleted) — 2b left this open;
+- born nodes have no edges yet (`outgoing_adj` returns empty for a synthetic id, 2c),
+  so `MERGE`-created relationships and consolidation edges from/to born nodes need the
+  edge delta + `outgoing_adj` overlay.
+`EdgeDelta` + `Memtable::edges` already exist as the scaffold. New write grammar for
+relationships (`MERGE (a)-[:R]->(b)` / `DELETE` a rel) and the `outgoing_adj`/traversal
+overlay are the substance.
 
-Handy resume detail (2c landed): MERGE grammar in `cypher.pest`
-(`kw_merge`, `write_statement` anchor alt) + `WriteStmt.upsert` + `lower_write_statement`
-(`parser.rs`); `Memtable::with_synthetic_base`/`born`/`synthetic`/`node_identity_by_dense`/
-`born_ids_with_label` (`slater-delta/memtable.rs`); read overlay in `exec.rs`
-(`node_prop_par`, `node_label_ids_par`, `node_props`, `overlay_node_props`,
-`outgoing_adj`, `scan_candidates` LabelScan append) all gated by
-`id >= core_generation().node_count()`; `MergedView::node_count` (`read_view.rs`);
-`resolve_business_key`→`KeyResolution` + `execute_write` create path + `DeltaWriter::
-open`/`retire` node_count threading (`server.rs`/`delta_writer.rs`); consolidation
-needed no change. See D45 for the MERGE-vs-MATCH semantics.
+Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
+- **moved indexed value** (deferred from 2d): relocate a patched core node in a range
+  index when its *indexed* property changes (memtable tracks the per-index value,
+  remove-old/add-new). Only index *membership* is stale today; the value read back is
+  already correct.
+- **delete a born node by business key** (deferred from 2c): `execute_write` must
+  resolve a `DELETE` anchor against the delta when the core probe returns Absent
+  (`delete_node` already tombstones it).
+- the Phase 5 Bolt trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`,
+  prod seam `server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
+  `slater dump` CLI (§ above).
 
-Then **2e — consolidation folds delta-born nodes** is already effectively done (the
-`0..node_count` loop + synthetic-aware `node_record` emit born nodes; test
-`serialise_emits_a_delta_born_node`); the only 2e leftover once 2d lands is emitting
-edges *from/to* born nodes (Phase 3 topology overlay).
-
-Other tracks still open (valid but not the recommended next step): Phase 3 topology
-overlay (needed to close the traversal-to-a-tombstoned-node gap + born-node edges);
-the Phase 5 Bolt trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`,
-prod seam `server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
-`slater dump` CLI (§ above).
+Handy resume detail (2d landed): `Memtable::born_ids_in_index_eq`/`born_ids_in_index_range`
+(+ `born_ids_in_index`/`born_index_value`) in `slater-delta/memtable.rs`, exposed on
+`DeltaSnapshot`; read overlay in `exec.rs` `scan_candidates` `RangeEq`/`RangeRange`
+arms + `node_index_label_prop(index)` (manifest name → `(label, property)`), gated by
+the empty-delta fast path; tombstone drop is the pre-existing final
+`suppress_tombstoned`. Grammar/write-path resume detail for born nodes (2c): MERGE in
+`cypher.pest` (`kw_merge`, `write_statement` anchor alt) + `WriteStmt.upsert` +
+`lower_write_statement` (`parser.rs`); `resolve_business_key`→`KeyResolution` +
+`execute_write` create path + `DeltaWriter::open`/`retire` node_count threading
+(`server.rs`/`delta_writer.rs`). See D45 for MERGE-vs-MATCH semantics.
 

@@ -5034,21 +5034,53 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // Already bounds-checked + deduped by the planner; yield as-is. An
             // empty list is a seek that matched no node.
             NodeScan::IdSeek { ids } => ids.clone(),
-            NodeScan::RangeEq { index, key } => self
-                .gen
-                .range_index(index)
-                .expect("planner only picks open indexes")
-                .lookup_eq(key)?,
-            NodeScan::RangeRange { index, lo, hi } => self
-                .gen
-                .range_index(index)
-                .expect("planner only picks open indexes")
-                .lookup_range(
-                    lo.as_ref().map(|(v, _)| v),
-                    lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
-                    hi.as_ref().map(|(v, _)| v),
-                    hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
-                )?,
+            NodeScan::RangeEq { index, key } => {
+                let mut ids = self
+                    .gen
+                    .range_index(index)
+                    .expect("planner only picks open indexes")
+                    .lookup_eq(key)?;
+                // Delta-born nodes (Phase 2c) are not in the core ISAM — append the
+                // synthetic ids whose indexed property equals `key`, so a created
+                // node is found by an equality seek (Phase 2d). Born ids sort after
+                // every core id, so the ascending order holds. Tombstoned ids are
+                // dropped by the suppression below. Empty-delta fast path skips it.
+                let delta = self.gen.delta();
+                if !delta.is_empty() {
+                    if let Some((label, prop)) = self.node_index_label_prop(index) {
+                        ids.extend(delta.born_ids_in_index_eq(label, prop, key));
+                    }
+                }
+                ids
+            }
+            NodeScan::RangeRange { index, lo, hi } => {
+                let mut ids = self
+                    .gen
+                    .range_index(index)
+                    .expect("planner only picks open indexes")
+                    .lookup_range(
+                        lo.as_ref().map(|(v, _)| v),
+                        lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                        hi.as_ref().map(|(v, _)| v),
+                        hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                    )?;
+                // Delta-born nodes whose indexed property falls in the range (Phase
+                // 2d) — mirrors the `RangeEq` overlay above.
+                let delta = self.gen.delta();
+                if !delta.is_empty() {
+                    if let Some((label, prop)) = self.node_index_label_prop(index) {
+                        ids.extend(delta.born_ids_in_index_range(
+                            label,
+                            prop,
+                            lo.as_ref().map(|(v, _)| v),
+                            lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                            hi.as_ref().map(|(v, _)| v),
+                            hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                        ));
+                    }
+                }
+                ids
+            }
             NodeScan::LabelScan { label_id } => {
                 let mut ids = self.gen.collect_nodes_with_label(*label_id)?;
                 // Delta-born nodes (Phase 2c) are not in the core label postings —
@@ -5087,6 +5119,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
         ids.into_iter()
             .filter(|&id| !delta.is_tombstoned(id))
             .collect()
+    }
+
+    /// The `(label, property)` a node range index is defined on, for the delta-born
+    /// overlay (Phase 2d): a born node enters index `index` only if it carries
+    /// `label` and its `property` value satisfies the seek. `None` if the name is
+    /// not an open node range index.
+    fn node_index_label_prop(&self, index: &str) -> Option<(&str, &str)> {
+        self.gen
+            .manifest()
+            .range_indexes
+            .iter()
+            .find(|ri| ri.name == index && ri.entity == EntityKind::Node)
+            .map(|ri| (ri.label_or_type.as_str(), ri.property.as_str()))
     }
 
     /// The label ids a chosen anchor scan already proves every candidate carries,

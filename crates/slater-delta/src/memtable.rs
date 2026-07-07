@@ -302,6 +302,94 @@ impl Memtable {
         out
     }
 
+    /// The value a delta-born node's entry `e` presents for the indexed property
+    /// `prop`, matching the read overlay's precedence (a patch wins over the
+    /// business key — see `node_prop_par`): the patch value if present, else the
+    /// business-key value when `prop` *is* the key property, else `None` (the node
+    /// carries no such property and so is absent from the index).
+    fn born_index_value<'a>(&'a self, e: &'a NodeEntry, prop: &str) -> Option<&'a Value> {
+        if let Some(v) = e.delta.patches.get(prop) {
+            return Some(v);
+        }
+        if self.interner.name(e.identity.key) == Some(prop) {
+            return Some(&e.identity.value);
+        }
+        None
+    }
+
+    /// The synthetic dense ids of delta-born nodes carrying `label` whose indexed
+    /// property `prop` satisfies `pred` (ascending by allocation order). The
+    /// range-index overlay (Phase 2d) appends these to the core ISAM hits — a
+    /// created node is otherwise invisible to an indexed key seek. Tombstoned
+    /// entries are included and dropped by the caller's tombstone suppression, so
+    /// the contract matches [`Self::born_ids_with_label`].
+    fn born_ids_in_index(
+        &self,
+        label: &str,
+        prop: &str,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        for ck in &self.born {
+            let Some(e) = self.nodes.get(ck) else {
+                continue;
+            };
+            if self.interner.name(e.identity.label) != Some(label) {
+                continue;
+            }
+            let Some(dense) = e.synthetic else { continue };
+            if let Some(v) = self.born_index_value(e, prop) {
+                if pred(v) {
+                    out.push(dense);
+                }
+            }
+        }
+        out
+    }
+
+    /// Delta-born nodes carrying `label` whose indexed property `prop` equals `key`
+    /// (by [`Value::cmp_key`], the total order the ISAM uses) — the `RangeEq`
+    /// overlay (Phase 2d).
+    pub fn born_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64> {
+        use std::cmp::Ordering;
+        self.born_ids_in_index(label, prop, |v| v.cmp_key(key) == Ordering::Equal)
+    }
+
+    /// Delta-born nodes carrying `label` whose indexed property `prop` falls in the
+    /// `[lo, hi]` range with per-bound inclusivity (a `None` bound is unbounded on
+    /// that side) — the `RangeRange` overlay (Phase 2d). Comparison is
+    /// [`Value::cmp_key`], matching [`graph_format::isam`]'s `lookup_range`.
+    pub fn born_ids_in_index_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Vec<u64> {
+        use std::cmp::Ordering;
+        self.born_ids_in_index(label, prop, |v| {
+            let above_lo = match lo {
+                None => true,
+                Some(lo) => match v.cmp_key(lo) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => lo_inclusive,
+                    Ordering::Less => false,
+                },
+            };
+            let below_hi = match hi {
+                None => true,
+                Some(hi) => match v.cmp_key(hi) {
+                    Ordering::Less => true,
+                    Ordering::Equal => hi_inclusive,
+                    Ordering::Greater => false,
+                },
+            };
+            above_lo && below_hi
+        })
+    }
+
     /// Iterate stored nodes as `(label, key, value, delta)` with identity names
     /// recovered — the consolidation input (Phase 1d emits these as `MERGE` text).
     pub fn iter_nodes(&self) -> impl Iterator<Item = (&str, &str, &Value, &NodeDelta)> {
@@ -401,6 +489,31 @@ impl DeltaSnapshot {
     #[inline]
     pub fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
         self.mem.born_ids_with_label(label)
+    }
+
+    /// Delta-born nodes for the `RangeEq` overlay: those carrying `label` whose
+    /// indexed property `prop` equals `key` (Phase 2d; tombstone suppression in the
+    /// caller).
+    #[inline]
+    pub fn born_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64> {
+        self.mem.born_ids_in_index_eq(label, prop, key)
+    }
+
+    /// Delta-born nodes for the `RangeRange` overlay: those carrying `label` whose
+    /// indexed property `prop` falls in `[lo, hi]` with per-bound inclusivity
+    /// (Phase 2d; tombstone suppression in the caller).
+    #[inline]
+    pub fn born_ids_in_index_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Vec<u64> {
+        self.mem
+            .born_ids_in_index_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)
     }
 }
 
@@ -573,6 +686,111 @@ mod tests {
         m.delete_node("Person", "name", Value::Str("Dave".into()), None);
         assert_eq!(m.born_ids_with_label("Person"), vec![10, 12]);
         assert!(m.node_patch(10).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn born_index_overlay_eq_and_range() {
+        // Core has 10 nodes; born People with an indexed `age`. Some carry `age` as
+        // a patch, one as… well, `age` is not the business key here (name is), so it
+        // must come from a patch to be indexed.
+        let mut m = Memtable::with_synthetic_base(10);
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None,
+            [("age".to_string(), Value::Int(40))],
+        ); // id 10
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Erin".into()),
+            None,
+            [("age".to_string(), Value::Int(25))],
+        ); // id 11
+        m.upsert_node("Person", "name", Value::Str("Fry".into()), None, []); // id 12, no age
+        m.upsert_node(
+            "Company",
+            "ticker",
+            Value::Str("ZZZ".into()),
+            None,
+            [("age".to_string(), Value::Int(40))],
+        ); // id 13, wrong label
+
+        // Equality on the *business key* property (name) reads from identity.
+        assert_eq!(
+            m.born_ids_in_index_eq("Person", "name", &Value::Str("Dave".into())),
+            vec![10]
+        );
+        // Equality on a patched property; label-filtered (Company excluded).
+        assert_eq!(
+            m.born_ids_in_index_eq("Person", "age", &Value::Int(40)),
+            vec![10]
+        );
+        // A node without the indexed property (Fry) never appears.
+        assert_eq!(
+            m.born_ids_in_index_eq("Person", "age", &Value::Int(99)),
+            Vec::<u64>::new()
+        );
+
+        // Range [25, 40] inclusive → Erin(25) and Dave(40), ascending by id.
+        assert_eq!(
+            m.born_ids_in_index_range(
+                "Person",
+                "age",
+                Some(&Value::Int(25)),
+                true,
+                Some(&Value::Int(40)),
+                true
+            ),
+            vec![10, 11]
+        );
+        // Exclusive low bound drops Erin(25).
+        assert_eq!(
+            m.born_ids_in_index_range("Person", "age", Some(&Value::Int(25)), false, None, true),
+            vec![10]
+        );
+        // Unbounded → both aged People (Fry has no age).
+        assert_eq!(
+            m.born_ids_in_index_range("Person", "age", None, true, None, true),
+            vec![10, 11]
+        );
+    }
+
+    #[test]
+    fn born_index_overlay_patch_wins_over_business_key() {
+        // A patch on the business-key property overrides the identity value for the
+        // index, matching the read overlay's precedence.
+        let mut m = Memtable::with_synthetic_base(0);
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None,
+            [("name".to_string(), Value::Str("Dan".into()))],
+        );
+        assert_eq!(
+            m.born_ids_in_index_eq("Person", "name", &Value::Str("Dan".into())),
+            vec![0]
+        );
+        assert!(m
+            .born_ids_in_index_eq("Person", "name", &Value::Str("Dave".into()))
+            .is_empty());
+    }
+
+    #[test]
+    fn born_index_overlay_includes_tombstoned_for_caller_suppression() {
+        // A tombstoned born node still surfaces (the caller's suppression drops it),
+        // matching `born_ids_with_label`. Its patches are cleared, so only a
+        // business-key seek can still match it.
+        let mut m = Memtable::with_synthetic_base(0);
+        m.upsert_node("Person", "name", Value::Str("Dave".into()), None, []);
+        m.delete_node("Person", "name", Value::Str("Dave".into()), None);
+        assert_eq!(
+            m.born_ids_in_index_eq("Person", "name", &Value::Str("Dave".into())),
+            vec![0]
+        );
+        assert!(m.node_patch(0).unwrap().tombstoned);
     }
 
     #[test]
