@@ -341,6 +341,153 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     (root, graph, uuid)
 }
 
+/// A fully single-label, range-indexed fixture for the consolidation serialiser
+/// (every node has a recoverable business key). Three `:Person` nodes keyed by
+/// `name`, plus one `:KNOWS` edge carrying `since`:
+/// ```text
+/// [0] Alice :Person {name:'Alice', age:30}
+/// [1] Bob   :Person {name:'Bob',   age:25}
+/// [2] Carol :Person {name:'Carol', age:40}
+/// e0 (Alice)-[:KNOWS {since:2020}]->(Bob)
+/// ```
+/// Symbol tables: label Person(0); reltype KNOWS(0); property keys
+/// name(0)/age(1)/since(2). One range index on (Person, name).
+pub fn write_indexed_people(tag: &str) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0007);
+    let graph = "people".to_string();
+    let root = std::env::temp_dir().join(format!("slater_idxfix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(dir.join("range")).unwrap();
+
+    // node_props.blk — name(0) + age(1) on every node.
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for (name, age) in [("Alice", 30), ("Bob", 25), ("Carol", 40)] {
+        np.append(&[(0, Value::Str(name.into())), (1, Value::Int(age))])
+            .unwrap();
+    }
+    np.finish().unwrap();
+
+    // node_labels.blk — all :Person(0).
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..3 {
+        nl.append(&[0]).unwrap();
+    }
+    nl.finish().unwrap();
+
+    // edge_props.blk — e0 carries since(2).
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    ep.append(&[(2, Value::Int(2020))]).unwrap();
+    ep.finish().unwrap();
+
+    // topology.csr.blk — one edge Alice-KNOWS->Bob.
+    let edges = vec![Edge {
+        src: NodeId(0),
+        dst: NodeId(1),
+        reltype: 0,
+        edge: EdgeId(0),
+    }];
+    write_csr(dir.join("topology.csr.blk"), 3, &edges, BLOCK, LEVEL).unwrap();
+
+    // vectors.f32.blk — empty (no vector index), but the reader always opens it.
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    // range index on (Person, name).
+    write_isam(
+        dir.join("range").join("node_Person_name.isam"),
+        vec![
+            (Value::Str("Alice".into()), 0),
+            (Value::Str("Bob".into()), 1),
+            (Value::Str("Carol".into()), 2),
+        ],
+        BLOCK,
+        LEVEL,
+    )
+    .unwrap();
+
+    // Inventory + manifest.
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+        "range/node_Person_name.isam",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: 3,
+        edge_count: 1,
+        labels: vec!["Person".into()],
+        reltypes: vec!["KNOWS".into()],
+        property_keys: vec!["name".into(), "age".into(), "since".into()],
+        range_indexes: vec![RangeIndexDesc {
+            name: "node_Person_name".into(),
+            entity: EntityKind::Node,
+            label_or_type: "Person".into(),
+            property: "name".into(),
+        }],
+        vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
 /// A richer fixture for the whole-graph label/reltype metadata fast paths. It has
 /// several labels and reltypes, a **multi-label** node (Bob `:Person:Admin`), a
 /// node with **no label** (node 4, → the `labels(n)[0]` null bucket), and a

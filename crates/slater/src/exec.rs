@@ -1532,6 +1532,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
         }
     }
 
+    /// The outgoing adjacency of node `id` (dst, reltype, edge id) through the
+    /// block cache — the edge-walk surface the consolidation serialiser
+    /// ([`crate::consolidate`]) uses to emit every edge exactly once (from its
+    /// source). Reads the immutable core topology; Phase 1c has no edge deltas.
+    pub fn outgoing_adj(&self, id: u64) -> Result<Vec<topology::Adj>> {
+        self.outgoing(id)
+    }
+
     /// Resolve a relationship's type name and named properties — the material a
     /// Bolt `Relationship` structure carries.
     pub fn rel_record(&self, id: u64, reltype: u32) -> Result<(String, NamedProps)> {
