@@ -269,7 +269,52 @@ Running ledger for the `writeable` track. Pairs with the design in
     nodes — the `0..node_count` node/edge iteration must extend over the synthetic id
     range once 2c lands. (Small once 2c–2d are in.)
 
-- Phases 3–5: see `docs/WRITABLE-PLAN.md`.
+- **Phase 3 — topology (edge) overlay. 🔨 IN PROGRESS.** Closes the two open
+  Phase-2 gaps: a core edge to a tombstoned node still traverses (2b), and delta-born
+  nodes have no edges (2c). Sub-milestones:
+  - **3a — edge WAL ops + memtable edge overlay (pure `slater-delta`). ✅ DONE**
+    (this commit). WAL: `WalOp::{UpsertEdge,DeleteEdge}` (op-tags 3/4, names inline,
+    encode/decode/replay round-trip; `patches` on `UpsertEdge` reserved for a later
+    edge-property overlay); `WalOp::node_key()`/`edge_keys()` replace the old
+    variant-total `business_key()` (a node op returns its single key, an edge op its
+    `(src, reltype, dst)` — the two are mutually exclusive `Option`s). Memtable: an
+    `edges: HashMap<edge-ck, EdgeEntry>` authoritative store keyed by `EdgeIdentity`
+    `(src, reltype, dst)` names, with `out_adj`/`in_adj` dense-id read indexes and a
+    `born_edges` allocation vector; `with_bases(node_base, edge_base)` seeds both
+    synthetic id spaces (`edge_synthetic_base` = core `edge_count`, so a born edge id
+    never collides with a core edge id `rel_record` reads). `upsert_edge` (idempotent
+    by edge identity; **creates delta-born endpoint nodes** when an endpoint key is
+    absent from the core — the MERGE-edge endpoint-create path — via
+    `endpoint_dense_or_create`) and `delete_edge` (tombstone-only entry with no
+    synthetic edge id to suppress a **core** edge, or flip a born edge; a no-op when an
+    endpoint exists nowhere, resolved via `born_endpoint_dense`). Read accessors
+    `out_edges`/`in_edges` return `DeltaEdge { other, reltype-name, edge_id: Option,
+    tombstoned }` (reltype by **name** — the exec reader maps it to a core id, keeping
+    the memtable core-agnostic); `iter_edges` recovers identity names for
+    consolidation. `apply` now dispatches on a new `OpResolution::{Node(Option<u64>),
+    Edge{src,dst}}` — the caller-resolved dense-id context (the memtable never touches
+    the core); the `slater` resolver (`server::resolve_op`), `DeltaWriter::open`/`write`
+    (`Fn(&WalOp)->OpResolution`, `write(op, OpResolution)`) and `open`/`retire`
+    node/edge-count threading are updated to match, all still driven only by node ops
+    (the edge write grammar is 3c). 10 new slater-delta tests (WAL edge round-trip,
+    both-way indexing + synthetic id, idempotent re-MERGE, born-endpoint creation,
+    core-edge tombstone-only, MERGE-then-DELETE, absent-endpoint no-op, resurrect,
+    apply-vs-direct parity, `iter_edges` name recovery). Whole workspace green;
+    clippy + fmt clean. **No read-path effect yet** — traversal overlay is 3b.
+  - **3b — exec traversal read overlay.** Thread delta edges into
+    `outgoing`/`incoming`/`hops_par`/`neighbours_par`/`outgoing_adj`: append born
+    edges (map reltype name→core id), suppress tombstoned edges, and suppress edges
+    incident to a tombstoned node (closes the 2b gap). `MergedView::edge_count` adds
+    `born_edge_count`; a born edge id routes `rel_record` to the delta. Gated by the
+    empty-delta fast path. Server-level read-your-writes tests.
+  - **3c — relationship write grammar + write path.** `MERGE (a)-[:R]->(b)` create
+    and an edge `DELETE`; parser lowering; `execute_write` edge dispatch (resolve both
+    endpoints, bounded core-adjacency dedup so a MERGE of an existing core edge is a
+    no-op).
+  - **3d — consolidation folds delta edges.** `serialise_merge_dump` emits born edges
+    and drops tombstoned / incident-to-tombstoned-node edges; determinism test.
+
+- Phases 4–5: see `docs/WRITABLE-PLAN.md`.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -296,24 +341,37 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-Phase 2d is done: a range-index seek (`RangeEq`/`RangeRange`) now overlays delta-born
-nodes and drops tombstoned hits, so `MATCH (n:L {k:v})` and `WHERE n.p >= …` see a
-`MERGE`-created node. **2e — consolidation folds delta-born nodes — is already
-effectively done** (the `0..node_count` loop + synthetic-aware `node_record`/
-`outgoing_adj` in `consolidate.rs` emit born nodes; test
-`serialise_emits_a_delta_born_node`); the only 2e leftover is emitting edges *from/to*
-born nodes, which is really **Phase 3** (topology overlay) work.
+Phase 3a is done: the pure `slater-delta` edge layer (WAL `UpsertEdge`/`DeleteEdge`,
+the `EdgeIdentity`-keyed memtable edge store with `out_adj`/`in_adj` dense-id read
+indexes, born endpoint/edge synthetic id allocation, tombstone-only core-edge
+suppression entries, and the `OpResolution` apply plumbing) is in and unit-tested;
+`slater` compiles and runs on it but the edge grammar/read overlay aren't wired yet,
+so it has **no runtime effect** — the whole workspace is green.
 
-So the recommended next step is **Phase 3 — topology (edge) overlay** (see
-`docs/WRITABLE-PLAN.md`). It closes the two known Phase-2 gaps:
-- a *core* edge pointing at a tombstoned node still lets traversal reach it
-  (`MATCH (a)-->(b)` where `b` is deleted) — 2b left this open;
-- born nodes have no edges yet (`outgoing_adj` returns empty for a synthetic id, 2c),
-  so `MERGE`-created relationships and consolidation edges from/to born nodes need the
-  edge delta + `outgoing_adj` overlay.
-`EdgeDelta` + `Memtable::edges` already exist as the scaffold. New write grammar for
-relationships (`MERGE (a)-[:R]->(b)` / `DELETE` a rel) and the `outgoing_adj`/traversal
-overlay are the substance.
+The recommended next step is **3b — the exec traversal read overlay**. Fold the delta
+edges into the adjacency readers so a `MERGE`-created relationship is traversable and a
+deleted/incident-to-deleted edge is suppressed. The read paths to thread (all behind
+the empty-delta fast path):
+- `Engine::outgoing`/`incoming` (exec.rs ~1488) — the sequential `expand_with_dir`
+  source; append `delta.out_edges(node)`/`in_edges(node)` born edges (map reltype
+  name→core id via `gen.reltype_id`, skip if the reltype is absent from core), drop
+  core `Adj` that a delta edge tombstones (match on `(reltype-id, neighbour)`), and
+  drop any `Adj` whose neighbour `delta.is_tombstoned(..)` (this closes the 2b gap).
+- `hops_par` / `neighbours_par` (free fns, exec.rs ~339/390) — the parallel multi-hop
+  + shortestPath readers; the same fold, but they take `&dyn ReadView` so read the
+  delta off `gen.delta()`.
+- `outgoing_adj` (exec.rs ~1585) — the consolidation edge walk; extend it to born
+  nodes/edges (feeds 3d) and drop tombstoned edges.
+- `MergedView::edge_count` (read_view.rs ~270) — add `delta.born_edge_count()`; a born
+  edge id (`>= edge_synthetic_base`) must route `rel_record`/`edge_prop` to the delta
+  (empty core props + reltype from the born edge's identity).
+Also confirm the count/metadata fast paths already fall through when the delta is
+non-empty (2b gated them on `delta.is_empty()`), so a born/tombstoned edge can't be
+served from a stale manifest edge count.
+Handy 3a resume detail: `Memtable::{upsert_edge,delete_edge,out_edges,in_edges,
+iter_edges,born_edge_count,edge_synthetic_base}` + `DeltaEdge` + `OpResolution` in
+`slater-delta/memtable.rs`, all re-exported from the crate root and wrapped on
+`DeltaSnapshot`; `server::resolve_op` builds the `OpResolution`.
 
 Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
 - **moved indexed value** (deferred from 2d): relocate a patched core node in a range

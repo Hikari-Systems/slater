@@ -59,7 +59,7 @@ use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
 use crate::read_view::{MergedView, ReadView};
-use slater_delta::{DeltaSnapshot, WalOp};
+use slater_delta::{DeltaSnapshot, OpResolution, WalOp};
 
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 const TAG_NODE: u8 = 0x4E;
@@ -207,9 +207,14 @@ impl Graphs {
         for (name, slot) in &self.graphs {
             let gen = slot.read().unwrap().clone();
             let dir = base.join(name);
-            let writer = DeltaWriter::open(&dir, name, gen.uuid(), gen.node_count(), |op| {
-                resolve_dense_id(&gen, op)
-            })
+            let writer = DeltaWriter::open(
+                &dir,
+                name,
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
             .with_context(|| format!("open writable layer for graph '{name}'"))?;
             let n = writer.node_delta_count();
             if n > 0 {
@@ -506,12 +511,15 @@ impl Graphs {
 
         // Retire: the delta now lives in the new core, so drop the consumed WAL
         // segments and re-bind the writer to the new generation (re-basing the
-        // synthetic id space on the new core's node_count).
-        let new_node_count = self.get(name).map(|g| g.node_count()).ok_or_else(|| {
-            anyhow!("consolidated generation for '{name}' vanished before retire")
-        })?;
+        // synthetic node/edge id spaces on the new core's node/edge counts).
+        let (new_node_count, new_edge_count) = self
+            .get(name)
+            .map(|g| (g.node_count(), g.edge_count()))
+            .ok_or_else(|| {
+                anyhow!("consolidated generation for '{name}' vanished before retire")
+            })?;
         writer
-            .retire(&frozen.consumed, new_uuid, new_node_count)
+            .retire(&frozen.consumed, new_uuid, new_node_count, new_edge_count)
             .with_context(|| format!("retire consolidated delta for '{name}'"))?;
 
         info!(graph = %name, generation = %new_uuid, "consolidated writable delta into a fresh generation");
@@ -2420,13 +2428,23 @@ async fn handle_request(
 /// when the property is not range-indexed for that label, the key is absent, or —
 /// Phase 1 assumes a unique business key — the probe is ambiguous. The overlay's
 /// dense-id read index ([`slater_delta::Memtable::by_dense`]) is built from this.
-fn resolve_dense_id(gen: &Generation, op: &WalOp) -> Option<u64> {
-    let (label, key, value) = op.business_key();
-    match resolve_business_key(gen, label, key, value) {
+fn resolve_op(gen: &Generation, op: &WalOp) -> OpResolution {
+    // Resolve one business key to a unique current-core dense id, or `None` when it is
+    // absent (a delta-born node / endpoint, whose synthetic id the memtable allocates
+    // in replay order) or non-unique/unindexed.
+    let one = |(label, key, value): (&str, &str, &Value)| match resolve_business_key(
+        gen, label, key, value,
+    ) {
         KeyResolution::Unique(id) => Some(id),
-        // Absent → a delta-born node (WAL replay re-allocates its synthetic id in
-        // order); ambiguous/unindexed are not resolvable to a single core node.
         _ => None,
+    };
+    if let Some(node) = op.node_key() {
+        return OpResolution::Node(one(node));
+    }
+    let (src, _reltype, dst) = op.edge_keys().expect("node_key None ⇒ edge op");
+    OpResolution::Edge {
+        src: one(src),
+        dst: one(dst),
     }
 }
 
@@ -2552,7 +2570,7 @@ fn execute_write(
     // Resolve the anchor's business key against the current core. A `MERGE` whose key
     // is genuinely absent creates a delta-born node (`resolved = None`); every other
     // absent/ambiguous/unindexed case is a clear error rather than a silent write.
-    let (label, key, value) = op.business_key();
+    let (label, key, value) = op.node_key().expect("execute_write builds node ops only");
     // `is_set` = the op mutates properties (a `SET`), vs. a `DELETE`. A `MERGE … SET`
     // (`stmt.upsert`) is the only shape that may create on an absent key.
     let is_set = matches!(op, WalOp::UpsertNode { .. });
@@ -2596,7 +2614,7 @@ fn execute_write(
         }
     };
     writer
-        .write(op, resolved)
+        .write(op, OpResolution::Node(resolved))
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
@@ -3432,7 +3450,8 @@ mod tests {
             "people",
             gen.uuid(),
             gen.node_count(),
-            |op| resolve_dense_id(&gen, op),
+            gen.edge_count(),
+            |op| resolve_op(&gen, op),
         )
         .unwrap();
         assert_eq!(
@@ -3552,7 +3571,8 @@ mod tests {
             "people",
             gen.uuid(),
             gen.node_count(),
-            |op| resolve_dense_id(&gen, op),
+            gen.edge_count(),
+            |op| resolve_op(&gen, op),
         )
         .unwrap();
         assert!(
@@ -3663,7 +3683,8 @@ mod tests {
             "people",
             gen.uuid(),
             gen.node_count(),
-            |op| resolve_dense_id(&gen, op),
+            gen.edge_count(),
+            |op| resolve_op(&gen, op),
         )
         .unwrap();
         let reopened = Arc::new(reopened);
@@ -3908,11 +3929,15 @@ mod tests {
         assert!(!root.join("people").join(".consolidate.cypher").exists());
 
         // Durability: a fresh writer over the WAL replays the write.
-        let reopened =
-            DeltaWriter::open(&wal_dir, "people", gen0.uuid(), gen0.node_count(), |op| {
-                resolve_dense_id(&gen0, op)
-            })
-            .unwrap();
+        let reopened = DeltaWriter::open(
+            &wal_dir,
+            "people",
+            gen0.uuid(),
+            gen0.node_count(),
+            gen0.edge_count(),
+            |op| resolve_op(&gen0, op),
+        )
+        .unwrap();
         assert_eq!(
             reopened
                 .snapshot()

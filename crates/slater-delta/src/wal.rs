@@ -83,6 +83,8 @@ const KIND_COMMIT: u8 = 2;
 
 const OP_UPSERT_NODE: u8 = 1;
 const OP_DELETE_NODE: u8 = 2;
+const OP_UPSERT_EDGE: u8 = 3;
+const OP_DELETE_EDGE: u8 = 4;
 
 /// A monotonic per-graph WAL sequence number.
 ///
@@ -97,8 +99,13 @@ impl Seq {
     }
 }
 
-/// A primitive write operation. Every op names its target node by a business key
-/// `(label, key, value)`; edges join in Phase 3.
+/// A node business key `(label, key-property, value)` — the identity the writer
+/// resolves to a current-core dense id.
+pub type NodeKey<'a> = (&'a str, &'a str, &'a Value);
+
+/// A primitive write operation. A node op names its target by a business key
+/// `(label, key, value)`; an edge op names both endpoints by their business keys
+/// plus the relationship type (Phase 3).
 ///
 /// Symbol *names* are carried inline (not delta-local ids) so replay re-interns to
 /// identical ids deterministically and the segment is self-describing.
@@ -121,17 +128,73 @@ pub enum WalOp {
         key: String,
         value: Value,
     },
+    /// Create (or, once edge properties land, patch) the relationship identified by
+    /// `(src business key) -[reltype]-> (dst business key)` (Phase 3). A `MERGE`
+    /// create; idempotent by edge identity. `patches` is reserved for edge-property
+    /// overlays (empty for now).
+    UpsertEdge {
+        src_label: String,
+        src_key: String,
+        src_value: Value,
+        reltype: String,
+        dst_label: String,
+        dst_key: String,
+        dst_value: Value,
+        patches: Vec<(String, Value)>,
+    },
+    /// Tombstone the relationship `(src) -[reltype]-> (dst)`: the edge is suppressed
+    /// on traversal and dropped at consolidation (Phase 3). Last-writer-wins with
+    /// [`WalOp::UpsertEdge`].
+    DeleteEdge {
+        src_label: String,
+        src_key: String,
+        src_value: Value,
+        reltype: String,
+        dst_label: String,
+        dst_key: String,
+        dst_value: Value,
+    },
 }
 
 impl WalOp {
-    /// The `(label, key, value)` business key every op targets — the identity the
-    /// writer resolves to a current-core dense id, variant-agnostic.
-    pub fn business_key(&self) -> (&str, &str, &Value) {
+    /// The single node business key a *node* op targets — `None` for an edge op.
+    pub fn node_key(&self) -> Option<NodeKey<'_>> {
         match self {
             WalOp::UpsertNode {
                 label, key, value, ..
             }
-            | WalOp::DeleteNode { label, key, value } => (label, key, value),
+            | WalOp::DeleteNode { label, key, value } => Some((label, key, value)),
+            WalOp::UpsertEdge { .. } | WalOp::DeleteEdge { .. } => None,
+        }
+    }
+
+    /// The `(src key, reltype, dst key)` an *edge* op targets — `None` for a node op.
+    pub fn edge_keys(&self) -> Option<(NodeKey<'_>, &str, NodeKey<'_>)> {
+        match self {
+            WalOp::UpsertEdge {
+                src_label,
+                src_key,
+                src_value,
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value,
+                ..
+            }
+            | WalOp::DeleteEdge {
+                src_label,
+                src_key,
+                src_value,
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value,
+            } => Some((
+                (src_label, src_key, src_value),
+                reltype,
+                (dst_label, dst_key, dst_value),
+            )),
+            WalOp::UpsertNode { .. } | WalOp::DeleteNode { .. } => None,
         }
     }
 }
@@ -170,6 +233,48 @@ impl WalRecord {
                 write_str(buf, key);
                 write_value(buf, value);
             }
+            WalOp::UpsertEdge {
+                src_label,
+                src_key,
+                src_value,
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value,
+                patches,
+            } => {
+                buf.push(OP_UPSERT_EDGE);
+                write_str(buf, src_label);
+                write_str(buf, src_key);
+                write_value(buf, src_value);
+                write_str(buf, reltype);
+                write_str(buf, dst_label);
+                write_str(buf, dst_key);
+                write_value(buf, dst_value);
+                write_uvarint(buf, patches.len() as u64);
+                for (prop, val) in patches {
+                    write_str(buf, prop);
+                    write_value(buf, val);
+                }
+            }
+            WalOp::DeleteEdge {
+                src_label,
+                src_key,
+                src_value,
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value,
+            } => {
+                buf.push(OP_DELETE_EDGE);
+                write_str(buf, src_label);
+                write_str(buf, src_key);
+                write_value(buf, src_value);
+                write_str(buf, reltype);
+                write_str(buf, dst_label);
+                write_str(buf, dst_key);
+                write_value(buf, dst_value);
+            }
         }
     }
 
@@ -206,6 +311,56 @@ impl WalRecord {
                 Ok(WalRecord {
                     seq,
                     op: WalOp::DeleteNode { label, key, value },
+                })
+            }
+            OP_UPSERT_EDGE => {
+                let src_label = read_str(r)?;
+                let src_key = read_str(r)?;
+                let src_value = read_value(r)?;
+                let reltype = read_str(r)?;
+                let dst_label = read_str(r)?;
+                let dst_key = read_str(r)?;
+                let dst_value = read_value(r)?;
+                let n = read_uvarint(r)? as usize;
+                let mut patches = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let prop = read_str(r)?;
+                    let val = read_value(r)?;
+                    patches.push((prop, val));
+                }
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::UpsertEdge {
+                        src_label,
+                        src_key,
+                        src_value,
+                        reltype,
+                        dst_label,
+                        dst_key,
+                        dst_value,
+                        patches,
+                    },
+                })
+            }
+            OP_DELETE_EDGE => {
+                let src_label = read_str(r)?;
+                let src_key = read_str(r)?;
+                let src_value = read_value(r)?;
+                let reltype = read_str(r)?;
+                let dst_label = read_str(r)?;
+                let dst_key = read_str(r)?;
+                let dst_value = read_value(r)?;
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::DeleteEdge {
+                        src_label,
+                        src_key,
+                        src_value,
+                        reltype,
+                        dst_label,
+                        dst_key,
+                        dst_value,
+                    },
                 })
             }
             other => bail!("unknown WAL op tag {other}"),
@@ -491,11 +646,57 @@ mod tests {
         }
         let replay = replay_dir(&dir).unwrap();
         assert_eq!(replay.records, vec![up, del.clone()]);
-        // The decoded op exposes its business key variant-agnostically.
+        // The decoded op exposes its node business key; an edge op would be `None`.
         assert_eq!(
-            del.op.business_key(),
-            ("Company", "ticker", &Value::Str("A".into()))
+            del.op.node_key(),
+            Some(("Company", "ticker", &Value::Str("A".into())))
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edge_ops_round_trip_through_a_segment() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_edge_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let create = WalRecord {
+            seq: Seq(1),
+            op: WalOp::UpsertEdge {
+                src_label: "Company".into(),
+                src_key: "ticker".into(),
+                src_value: Value::Str("A".into()),
+                reltype: "OWNS".into(),
+                dst_label: "Drug".into(),
+                dst_key: "id".into(),
+                dst_value: Value::Int(7),
+                patches: vec![("since".into(), Value::Int(2020))],
+            },
+        };
+        let delete = WalRecord {
+            seq: Seq(2),
+            op: WalOp::DeleteEdge {
+                src_label: "Company".into(),
+                src_key: "ticker".into(),
+                src_value: Value::Str("A".into()),
+                reltype: "OWNS".into(),
+                dst_label: "Drug".into(),
+                dst_key: "id".into(),
+                dst_value: Value::Int(7),
+            },
+        };
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            sink.append(&create).unwrap();
+            sink.append(&delete).unwrap();
+            sink.commit(Seq(2)).unwrap();
+        }
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![create.clone(), delete.clone()]);
+        // An edge op exposes its endpoint keys, not a single node key.
+        assert!(create.op.node_key().is_none());
+        let (src, rel, dst) = create.op.edge_keys().expect("edge op");
+        assert_eq!(src, ("Company", "ticker", &Value::Str("A".into())));
+        assert_eq!(rel, "OWNS");
+        assert_eq!(dst, ("Drug", "id", &Value::Int(7)));
         fs::remove_dir_all(&dir).ok();
     }
 

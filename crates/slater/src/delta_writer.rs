@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use graph_format::ids::Generation as GenId;
-use slater_delta::{replay_dir, Memtable, Seq, WalOp, WalRecord, WalSink};
+use slater_delta::{replay_dir, Memtable, OpResolution, Seq, WalOp, WalRecord, WalSink};
 
 /// A frozen delta handed to consolidation: an immutable snapshot of every
 /// committed write, plus the WAL segments those writes live in. The snapshot feeds
@@ -95,14 +95,16 @@ impl DeltaWriter {
         graph: &str,
         core_uuid: GenId,
         core_node_count: u64,
-        resolve: impl Fn(&WalOp) -> Option<u64>,
+        core_edge_count: u64,
+        resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let replay = replay_dir(&dir).with_context(|| format!("replay WAL dir {dir:?}"))?;
-        // Delta-born nodes (Phase 2c) take synthetic dense ids starting at the core's
-        // node_count; seed the memtable with that base before replaying so a reopened
-        // WAL re-allocates the same ids (allocation follows replay order).
-        let mut mem = Memtable::with_synthetic_base(core_node_count);
+        // Delta-born nodes (Phase 2c) / edges (Phase 3) take synthetic dense ids
+        // starting at the core's node_count / edge_count; seed the memtable with those
+        // bases before replaying so a reopened WAL re-allocates the same ids
+        // (allocation follows replay order).
+        let mut mem = Memtable::with_bases(core_node_count, core_edge_count);
         for rec in &replay.records {
             mem.apply(&rec.op, resolve(&rec.op));
         }
@@ -150,9 +152,10 @@ impl DeltaWriter {
 
     /// Durably apply one write: append the record, commit (fsync — the ack
     /// barrier), fold it into the authoritative memtable, and publish the new
-    /// snapshot. Returns the durable sequence number. `resolved` is the business
-    /// key's current-core dense id (`None` marks a delta-born node, Phase 2).
-    pub fn write(&self, op: WalOp, resolved: Option<u64>) -> Result<Seq> {
+    /// snapshot. Returns the durable sequence number. `resolved` is the caller's
+    /// resolved dense-id context ([`OpResolution`]) — a `None` endpoint marks a
+    /// delta-born node/edge (Phase 2/3).
+    pub fn write(&self, op: WalOp, resolved: OpResolution) -> Result<Seq> {
         let mut inner = self.inner.lock().expect("delta writer lock");
         let seq = inner.seq.next();
         let rec = WalRecord { seq, op };
@@ -216,6 +219,7 @@ impl DeltaWriter {
         consumed: &[PathBuf],
         new_core_uuid: GenId,
         new_core_node_count: u64,
+        new_core_edge_count: u64,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("delta writer lock");
         for path in consumed {
@@ -227,10 +231,10 @@ impl DeltaWriter {
                 }
             }
         }
-        // Re-base the synthetic id space on the freshly built core: its node_count now
-        // includes the folded-in delta-born nodes, so the next write's synthetic ids
-        // start past them.
-        inner.mem = Memtable::with_synthetic_base(new_core_node_count);
+        // Re-base the synthetic id spaces on the freshly built core: its node/edge
+        // counts now include the folded-in delta-born nodes/edges, so the next write's
+        // synthetic ids start past them.
+        inner.mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
         // Publish the empty overlay first, then re-bind the core UUID (see the
         // ordering note above). The seq counter stays monotonic — the fresh segment
         // is empty, so a later replay simply restarts it from zero.
@@ -322,13 +326,18 @@ mod tests {
     }
 
     /// A resolver that maps the fixture's tickers to fixed dense ids.
-    fn resolve_ticker(op: &WalOp) -> Option<u64> {
-        let (_, _, value) = op.business_key();
-        match value {
+    fn resolve_ticker(op: &WalOp) -> OpResolution {
+        let (_, _, value) = op.node_key().expect("fixture uses node ops only");
+        OpResolution::Node(match value {
             Value::Str(s) if s == "A" => Some(10),
             Value::Str(s) if s == "B" => Some(20),
             _ => None,
-        }
+        })
+    }
+
+    /// Sugar for a resolved node write in the tests.
+    fn node(id: u64) -> OpResolution {
+        OpResolution::Node(Some(id))
     }
 
     fn tmp(tag: &str) -> PathBuf {
@@ -340,7 +349,7 @@ mod tests {
         let dir = tmp("publish");
         let _ = std::fs::remove_dir_all(&dir);
         let w =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, resolve_ticker).unwrap();
+            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
         assert_eq!(w.snapshot().node_delta_count(), 0);
         let e0 = w.epoch();
 
@@ -351,7 +360,7 @@ mod tests {
                 Value::Str("A".into()),
                 &[("price", Value::Int(10))],
             ),
-            Some(10),
+            node(10),
         )
         .unwrap();
 
@@ -367,7 +376,7 @@ mod tests {
         let dir = tmp("reopen");
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let w = DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, resolve_ticker)
+            let w = DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker)
                 .unwrap();
             w.write(
                 upsert(
@@ -376,7 +385,7 @@ mod tests {
                     Value::Str("A".into()),
                     &[("price", Value::Int(11))],
                 ),
-                Some(10),
+                node(10),
             )
             .unwrap();
             w.write(
@@ -386,13 +395,13 @@ mod tests {
                     Value::Str("B".into()),
                     &[("price", Value::Int(22))],
                 ),
-                Some(20),
+                node(20),
             )
             .unwrap();
         }
         // A fresh writer over the same dir must rebuild the same memtable from the WAL.
         let w2 =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, resolve_ticker).unwrap();
+            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
         let snap = w2.snapshot();
         assert_eq!(snap.node_delta_count(), 2);
         assert_eq!(
@@ -411,11 +420,11 @@ mod tests {
                 Value::Str("A".into()),
                 &[("price", Value::Int(99))],
             ),
-            Some(10),
+            node(10),
         )
         .unwrap();
         let w3 =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, resolve_ticker).unwrap();
+            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
         assert_eq!(
             w3.snapshot().node_patch(10).unwrap().patches.get("price"),
             Some(&Value::Int(99)),
@@ -430,7 +439,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let old_core = GenId(uuid::Uuid::from_u128(1));
         let new_core = GenId(uuid::Uuid::from_u128(2));
-        let w = DeltaWriter::open(&dir, "g", old_core, 100, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
         w.write(
             upsert(
                 "Company",
@@ -438,7 +447,7 @@ mod tests {
                 Value::Str("A".into()),
                 &[("price", Value::Int(42))],
             ),
-            Some(10),
+            node(10),
         )
         .unwrap();
 
@@ -468,7 +477,7 @@ mod tests {
         let epoch_before = w.epoch();
 
         // Retire against the new core: consumed segments gone, overlay empty, rebind.
-        w.retire(&frozen.consumed, new_core, 100).unwrap();
+        w.retire(&frozen.consumed, new_core, 100, 0).unwrap();
         for p in &frozen.consumed {
             assert!(!p.exists(), "retire deletes the consumed segment: {p:?}");
         }
@@ -479,7 +488,7 @@ mod tests {
 
         // A reopen after retire replays nothing (the only remaining segment is the
         // fresh empty one), so the writer comes up clean against the new core.
-        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, resolve_ticker).unwrap();
+        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, resolve_ticker).unwrap();
         assert_eq!(reopened.snapshot().node_delta_count(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -491,7 +500,7 @@ mod tests {
         let dir = tmp("freeze_crash");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(3));
-        let w = DeltaWriter::open(&dir, "g", core, 100, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
         w.write(
             upsert(
                 "Company",
@@ -499,13 +508,13 @@ mod tests {
                 Value::Str("B".into()),
                 &[("price", Value::Int(7))],
             ),
-            Some(20),
+            node(20),
         )
         .unwrap();
         let _frozen = w.freeze().unwrap(); // freeze, then "crash" (drop, no retire)
         drop(w);
 
-        let reopened = DeltaWriter::open(&dir, "g", core, 100, resolve_ticker).unwrap();
+        let reopened = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
         assert_eq!(
             reopened
                 .snapshot()

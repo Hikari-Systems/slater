@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use graph_format::ids::Value;
 
-use crate::identity::NodeIdentity;
+use crate::identity::{EdgeIdentity, NodeIdentity};
 use crate::interner::Interner;
 use crate::wal::WalOp;
 
@@ -53,11 +53,56 @@ pub struct NodeDelta {
     pub tombstoned: bool,
 }
 
-/// Per-edge delta, mirroring [`NodeDelta`] for relationship records. (Phase 3.)
+/// Per-edge delta, mirroring [`NodeDelta`] for relationship records (Phase 3):
+/// property patches (reserved — the write grammar creates topology only for now)
+/// plus a tombstone flag that suppresses the edge on traversal.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EdgeDelta {
     pub patches: BTreeMap<String, Value>,
     pub tombstoned: bool,
+}
+
+/// A stored edge entry: the recoverable business identity, both endpoints resolved
+/// to current-core-or-synthetic dense ids (the traversal read index keys on these),
+/// and the folded delta.
+#[derive(Debug, Clone)]
+struct EdgeEntry {
+    identity: EdgeIdentity,
+    /// The source endpoint's dense id (core-resolved or a synthetic born-node id).
+    src_dense: u64,
+    /// The destination endpoint's dense id (core-resolved or a synthetic born-node id).
+    dst_dense: u64,
+    /// For a **delta-born** edge (a `MERGE`-created relationship absent from the core)
+    /// its allocated synthetic dense edge id in `[edge_synthetic_base, …)`. `None` for
+    /// a tombstone-only entry that merely suppresses an existing **core** edge (which
+    /// keeps its own core edge id).
+    synthetic_edge: Option<u64>,
+    delta: EdgeDelta,
+}
+
+/// A read-side view of one delta edge incident to a queried node, handed to the
+/// traversal overlay. `reltype` is the relationship-type **name** (the reader maps
+/// it to a core reltype id); `other` is the neighbour endpoint's dense id (the dst
+/// for an outgoing read, the src for an incoming one); `edge_id` is the synthetic
+/// dense edge id for a born edge, `None` when the entry only tombstones a core edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeltaEdge {
+    pub other: u64,
+    pub reltype: String,
+    pub edge_id: Option<u64>,
+    pub tombstoned: bool,
+}
+
+/// The caller-resolved dense-id context an op needs to build the read index — the
+/// `slater` side computes it (ISAM probes) and hands it to [`Memtable::apply`] so the
+/// pure-`slater-delta` memtable never touches the core. A node op carries the single
+/// business key's dense id; an edge op carries each endpoint's. `None` marks a
+/// business key absent from the core (a delta-born node, or an endpoint to find/create
+/// among the born nodes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpResolution {
+    Node(Option<u64>),
+    Edge { src: Option<u64>, dst: Option<u64> },
 }
 
 impl NodeDelta {
@@ -90,9 +135,17 @@ struct NodeEntry {
 pub struct Memtable {
     /// Delta-local interner for identity symbols (label, key-property names).
     interner: Interner,
-    /// Authoritative store, keyed by canonical business identity.
+    /// Authoritative node store, keyed by canonical business identity.
     nodes: HashMap<Vec<u8>, NodeEntry>,
-    edges: HashMap<Vec<u8>, EdgeDelta>,
+    /// Authoritative edge store, keyed by canonical edge business identity
+    /// (`(src, reltype, dst)`).
+    edges: HashMap<Vec<u8>, EdgeEntry>,
+    /// Outgoing traversal read index: `src dense id → the edge identity keys` incident
+    /// as a source (append order = allocation order = deterministic).
+    out_adj: HashMap<u64, Vec<Vec<u8>>>,
+    /// Incoming traversal read index: `dst dense id → the edge identity keys` incident
+    /// as a destination.
+    in_adj: HashMap<u64, Vec<Vec<u8>>>,
     /// Read index: dense id → the node's canonical identity key. Holds both
     /// current-core dense ids (property/tombstone deltas on existing nodes) and the
     /// synthetic dense ids of delta-born nodes, so a read resolves either uniformly.
@@ -102,10 +155,18 @@ pub struct Memtable {
     /// moment it is allocated, so the ids are `[synthetic_base, synthetic_base +
     /// born_count)` and never collide with a core dense id.
     synthetic_base: u64,
+    /// Base of the synthetic **edge** dense-id space = the core generation's
+    /// `edge_count` at open time, so a born edge's id never collides with a core edge
+    /// id (which `rel_record` reads by id).
+    edge_synthetic_base: u64,
     /// Delta-born canonical identity keys in **allocation order** (index = the id's
     /// offset from `synthetic_base`). Allocation order is WAL-replay order, so the
     /// synthetic id a business key receives is deterministic across a reopen.
     born: Vec<Vec<u8>>,
+    /// Delta-born **edge** identity keys in allocation order (index = the id's offset
+    /// from `edge_synthetic_base`); a tombstone-only entry is *not* pushed here (it
+    /// allocates no synthetic edge id).
+    born_edges: Vec<Vec<u8>>,
     /// Running resident-size estimate (approximate, monotonically conservative),
     /// checked against the memtable byte budget.
     bytes: usize,
@@ -118,11 +179,20 @@ impl Memtable {
 
     /// A memtable whose delta-born nodes allocate synthetic dense ids starting at
     /// `base` — the core generation's `node_count`, so the synthetic space begins
-    /// exactly past the last core dense id. The writer constructs the memtable this
-    /// way (from the generation it resolves against) before replaying the WAL.
+    /// exactly past the last core dense id. Born edges start at id 0 (use
+    /// [`Self::with_bases`] to seed a non-zero core `edge_count`).
     pub fn with_synthetic_base(base: u64) -> Self {
+        Self::with_bases(base, 0)
+    }
+
+    /// A memtable seeded with both synthetic bases — the core generation's
+    /// `node_count` and `edge_count` — so delta-born nodes and edges take ids past the
+    /// last core node / core edge respectively. The writer constructs the memtable
+    /// this way (from the generation it resolves against) before replaying the WAL.
+    pub fn with_bases(node_base: u64, edge_base: u64) -> Self {
         Self {
-            synthetic_base: base,
+            synthetic_base: node_base,
+            edge_synthetic_base: edge_base,
             ..Self::default()
         }
     }
@@ -130,6 +200,17 @@ impl Memtable {
     /// The base of the synthetic dense-id space (the core `node_count` at open).
     pub fn synthetic_base(&self) -> u64 {
         self.synthetic_base
+    }
+
+    /// The base of the synthetic edge dense-id space (the core `edge_count` at open).
+    pub fn edge_synthetic_base(&self) -> u64 {
+        self.edge_synthetic_base
+    }
+
+    /// The number of delta-born edges (each holds one synthetic dense edge id). The
+    /// merged `edge_count` is `core.edge_count() + born_edge_count()`.
+    pub fn born_edge_count(&self) -> u64 {
+        self.born_edges.len() as u64
     }
 
     /// The number of delta-born nodes (each holds one synthetic dense id). The merged
@@ -241,19 +322,72 @@ impl Memtable {
         }
     }
 
-    /// Apply a decoded WAL operation, given the business key's resolved
-    /// current-core dense id (`None` for a delta-born node). The single path shared
-    /// by live writes and WAL replay, so the two can never diverge.
-    pub fn apply(&mut self, op: &WalOp, resolved: Option<u64>) {
-        match op {
-            WalOp::UpsertNode {
-                label,
-                key,
-                value,
-                patches,
-            } => self.upsert_node(label, key, value.clone(), resolved, patches.iter().cloned()),
-            WalOp::DeleteNode { label, key, value } => {
+    /// Apply a decoded WAL operation, given the caller-resolved dense-id context
+    /// ([`OpResolution`]). The single path shared by live writes and WAL replay, so
+    /// the two can never diverge. The op kind and the resolution kind must agree
+    /// (both node, or both edge) — a mismatch is a caller bug.
+    pub fn apply(&mut self, op: &WalOp, res: OpResolution) {
+        match (op, res) {
+            (
+                WalOp::UpsertNode {
+                    label,
+                    key,
+                    value,
+                    patches,
+                },
+                OpResolution::Node(resolved),
+            ) => self.upsert_node(label, key, value.clone(), resolved, patches.iter().cloned()),
+            (WalOp::DeleteNode { label, key, value }, OpResolution::Node(resolved)) => {
                 self.delete_node(label, key, value.clone(), resolved)
+            }
+            (
+                WalOp::UpsertEdge {
+                    src_label,
+                    src_key,
+                    src_value,
+                    reltype,
+                    dst_label,
+                    dst_key,
+                    dst_value,
+                    patches,
+                },
+                OpResolution::Edge { src, dst },
+            ) => self.upsert_edge(
+                src_label,
+                src_key,
+                src_value.clone(),
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value.clone(),
+                src,
+                dst,
+                patches.iter().cloned(),
+            ),
+            (
+                WalOp::DeleteEdge {
+                    src_label,
+                    src_key,
+                    src_value,
+                    reltype,
+                    dst_label,
+                    dst_key,
+                    dst_value,
+                },
+                OpResolution::Edge { src, dst },
+            ) => self.delete_edge(
+                src_label,
+                src_key,
+                src_value.clone(),
+                reltype,
+                dst_label,
+                dst_key,
+                dst_value.clone(),
+                src,
+                dst,
+            ),
+            (op, res) => {
+                unreachable!("WalOp/OpResolution kind mismatch: {op:?} vs {res:?}")
             }
         }
     }
@@ -390,6 +524,264 @@ impl Memtable {
         })
     }
 
+    /// Resolve an edge endpoint to a dense id, **creating a delta-born node** if the
+    /// business key is absent from the core and not already born (the `MERGE`-edge
+    /// endpoint-create path). A `Some(resolved)` from the caller's ISAM probe wins; a
+    /// `None` finds the existing born node or allocates a fresh one (no patches, no
+    /// tombstone touch).
+    fn endpoint_dense_or_create(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+    ) -> u64 {
+        if let Some(dense) = resolved {
+            return dense;
+        }
+        let identity = NodeIdentity::new(
+            self.interner.intern(label),
+            self.interner.intern(key),
+            value,
+        );
+        let ck = identity.canonical_key();
+        if let Some(dense) = self.nodes.get(&ck).and_then(|e| e.synthetic) {
+            return dense;
+        }
+        let dense = self.synthetic_base + self.born.len() as u64;
+        self.bytes += ck.len() + std::mem::size_of::<NodeEntry>();
+        self.born.push(ck.clone());
+        self.by_dense.insert(dense, ck.clone());
+        self.nodes.insert(
+            ck,
+            NodeEntry {
+                identity,
+                delta: NodeDelta::default(),
+                synthetic: Some(dense),
+            },
+        );
+        dense
+    }
+
+    /// Resolve an edge endpoint to a dense id **without creating** one (the delete
+    /// path): the caller's ISAM `resolved` wins, else an existing born node's
+    /// synthetic id, else `None` — an endpoint that exists nowhere means there is no
+    /// edge to tombstone.
+    fn born_endpoint_dense(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+    ) -> Option<u64> {
+        if resolved.is_some() {
+            return resolved;
+        }
+        let identity = NodeIdentity::new(
+            self.interner.intern(label),
+            self.interner.intern(key),
+            value,
+        );
+        let ck = identity.canonical_key();
+        self.nodes.get(&ck).and_then(|e| e.synthetic)
+    }
+
+    /// Create (or resurrect + patch) the relationship `(src) -[reltype]-> (dst)`,
+    /// resolving both endpoints via the caller's ISAM probes (`None` = create/find a
+    /// delta-born endpoint). A brand-new edge identity is allocated a synthetic dense
+    /// edge id and indexed into the outgoing/incoming adjacency; re-`MERGE`-ing the
+    /// same identity reuses it (idempotent, matching [`Self::upsert_node`]). Shared by
+    /// live writes and WAL replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_edge(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        src_resolved: Option<u64>,
+        dst_resolved: Option<u64>,
+        patches: impl IntoIterator<Item = (String, Value)>,
+    ) {
+        let src_dense =
+            self.endpoint_dense_or_create(src_label, src_key, src_value.clone(), src_resolved);
+        let dst_dense =
+            self.endpoint_dense_or_create(dst_label, dst_key, dst_value.clone(), dst_resolved);
+        let identity = EdgeIdentity::new(
+            NodeIdentity::new(
+                self.interner.intern(src_label),
+                self.interner.intern(src_key),
+                src_value,
+            ),
+            self.interner.intern(reltype),
+            NodeIdentity::new(
+                self.interner.intern(dst_label),
+                self.interner.intern(dst_key),
+                dst_value,
+            ),
+        );
+        let eck = identity.canonical_key();
+        if !self.edges.contains_key(&eck) {
+            self.bytes += eck.len() + std::mem::size_of::<EdgeEntry>();
+            let synthetic = self.edge_synthetic_base + self.born_edges.len() as u64;
+            self.born_edges.push(eck.clone());
+            self.out_adj.entry(src_dense).or_default().push(eck.clone());
+            self.in_adj.entry(dst_dense).or_default().push(eck.clone());
+            self.edges.insert(
+                eck.clone(),
+                EdgeEntry {
+                    identity,
+                    src_dense,
+                    dst_dense,
+                    synthetic_edge: Some(synthetic),
+                    delta: EdgeDelta::default(),
+                },
+            );
+        }
+        let entry = self.edges.get_mut(&eck).expect("edge entry just ensured");
+        entry.delta.tombstoned = false; // last-writer-wins resurrect
+        let mut added = 0usize;
+        for (name, val) in patches {
+            added += name.len() + value_size(&val);
+            entry.delta.patches.insert(name, val);
+        }
+        self.bytes += added;
+    }
+
+    /// Tombstone the relationship `(src) -[reltype]-> (dst)`: reads suppress it and
+    /// consolidation drops it. A tombstone of a **core** edge stores a new entry
+    /// (`synthetic_edge = None`) keyed by the resolved endpoint dense ids so the read
+    /// overlay can match it against a core adjacency record; a tombstone of a
+    /// delta-born edge flips its existing entry (and clears its patches). If either
+    /// endpoint exists nowhere (no core node, no born node) there is no edge to
+    /// delete — a no-op. Shared by live writes and WAL replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_edge(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        src_resolved: Option<u64>,
+        dst_resolved: Option<u64>,
+    ) {
+        let Some(src_dense) =
+            self.born_endpoint_dense(src_label, src_key, src_value.clone(), src_resolved)
+        else {
+            return;
+        };
+        let Some(dst_dense) =
+            self.born_endpoint_dense(dst_label, dst_key, dst_value.clone(), dst_resolved)
+        else {
+            return;
+        };
+        let identity = EdgeIdentity::new(
+            NodeIdentity::new(
+                self.interner.intern(src_label),
+                self.interner.intern(src_key),
+                src_value,
+            ),
+            self.interner.intern(reltype),
+            NodeIdentity::new(
+                self.interner.intern(dst_label),
+                self.interner.intern(dst_key),
+                dst_value,
+            ),
+        );
+        let eck = identity.canonical_key();
+        if !self.edges.contains_key(&eck) {
+            self.bytes += eck.len() + std::mem::size_of::<EdgeEntry>();
+            self.out_adj.entry(src_dense).or_default().push(eck.clone());
+            self.in_adj.entry(dst_dense).or_default().push(eck.clone());
+            self.edges.insert(
+                eck,
+                EdgeEntry {
+                    identity,
+                    src_dense,
+                    dst_dense,
+                    synthetic_edge: None, // tombstone-only of a core edge
+                    delta: EdgeDelta {
+                        patches: BTreeMap::new(),
+                        tombstoned: true,
+                    },
+                },
+            );
+        } else {
+            let entry = self.edges.get_mut(&eck).expect("edge present");
+            entry.delta.tombstoned = true;
+            entry.delta.patches.clear();
+        }
+    }
+
+    /// The delta edges incident to `node` as a **source** (outgoing). The reader folds
+    /// these onto the core outgoing adjacency: a born edge is appended, a tombstoned
+    /// one suppresses the matching core edge (see [`DeltaEdge`]).
+    pub fn out_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        self.edges_for(&self.out_adj, node, true)
+    }
+
+    /// The delta edges incident to `node` as a **destination** (incoming).
+    pub fn in_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        self.edges_for(&self.in_adj, node, false)
+    }
+
+    fn edges_for(
+        &self,
+        adj: &HashMap<u64, Vec<Vec<u8>>>,
+        node: u64,
+        outgoing: bool,
+    ) -> Vec<DeltaEdge> {
+        let Some(cks) = adj.get(&node) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(cks.len());
+        for eck in cks {
+            let Some(e) = self.edges.get(eck) else {
+                continue;
+            };
+            let other = if outgoing { e.dst_dense } else { e.src_dense };
+            out.push(DeltaEdge {
+                other,
+                reltype: self
+                    .interner
+                    .name(e.identity.reltype)
+                    .unwrap_or("")
+                    .to_string(),
+                edge_id: e.synthetic_edge,
+                tombstoned: e.delta.tombstoned,
+            });
+        }
+        out
+    }
+
+    /// Iterate stored edges as `(src_label, src_key, src_value, reltype, dst_label,
+    /// dst_key, dst_value, delta)` with identity names recovered — the consolidation
+    /// input (Phase 3d emits born edges as `MERGE` text and drops tombstoned ones).
+    #[allow(clippy::type_complexity)]
+    pub fn iter_edges(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &Value, &str, &str, &str, &Value, &EdgeDelta)> {
+        self.edges.values().map(move |e| {
+            let name = |s| self.interner.name(s).unwrap_or("");
+            (
+                name(e.identity.src.label),
+                name(e.identity.src.key),
+                &e.identity.src.value,
+                name(e.identity.reltype),
+                name(e.identity.dst.label),
+                name(e.identity.dst.key),
+                &e.identity.dst.value,
+                &e.delta,
+            )
+        })
+    }
+
     /// Iterate stored nodes as `(label, key, value, delta)` with identity names
     /// recovered — the consolidation input (Phase 1d emits these as `MERGE` text).
     pub fn iter_nodes(&self) -> impl Iterator<Item = (&str, &str, &Value, &NodeDelta)> {
@@ -515,6 +907,34 @@ impl DeltaSnapshot {
         self.mem
             .born_ids_in_index_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)
     }
+
+    /// The base of the synthetic edge dense-id space (the core `edge_count` this delta
+    /// was opened against): an edge id `>= edge_synthetic_base` is a delta-born edge
+    /// whose `rel_record` routes to the delta, never a core edge block (Phase 3).
+    #[inline]
+    pub fn edge_synthetic_base(&self) -> u64 {
+        self.mem.edge_synthetic_base()
+    }
+
+    /// The number of delta-born edges overlaid — the merged `edge_count` is
+    /// `core.edge_count() + born_edge_count()`.
+    #[inline]
+    pub fn born_edge_count(&self) -> u64 {
+        self.mem.born_edge_count()
+    }
+
+    /// The delta edges outgoing from `node` (Phase 3 traversal overlay): born edges to
+    /// append, tombstoned edges to suppress from the core adjacency.
+    #[inline]
+    pub fn out_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        self.mem.out_edges(node)
+    }
+
+    /// The delta edges incoming to `node` (Phase 3 traversal overlay).
+    #[inline]
+    pub fn in_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        self.mem.in_edges(node)
+    }
 }
 
 impl Default for DeltaSnapshot {
@@ -617,7 +1037,7 @@ mod tests {
                 key: "k".into(),
                 value: Value::Int(3),
             },
-            Some(9),
+            OpResolution::Node(Some(9)),
         );
         let mut direct = Memtable::new();
         direct.delete_node("L", "k", Value::Int(3), Some(9));
@@ -850,6 +1270,289 @@ mod tests {
         assert_eq!(*key, "ticker");
         assert_eq!(**value, Value::Str("A".into()));
         assert_eq!(delta.patches.get("price"), Some(&Value::Int(10)));
+    }
+
+    // ── Edge overlay (Phase 3a) ────────────────────────────────────────────────
+
+    fn edge_between(
+        m: &Memtable,
+        node: u64,
+        outgoing: bool,
+        reltype: &str,
+        other: u64,
+    ) -> Option<DeltaEdge> {
+        let edges = if outgoing {
+            m.out_edges(node)
+        } else {
+            m.in_edges(node)
+        };
+        edges
+            .into_iter()
+            .find(|e| e.reltype == reltype && e.other == other)
+    }
+
+    #[test]
+    fn upsert_edge_between_core_nodes_is_born_and_indexed_both_ways() {
+        // Two core nodes (dense 10, 20); a MERGE edge between them takes a synthetic
+        // edge id past the core edge_count and is visible outgoing from 10 / incoming
+        // to 20.
+        let mut m = Memtable::with_bases(100, 500);
+        m.upsert_edge(
+            "Company",
+            "ticker",
+            Value::Str("A".into()),
+            "OWNS",
+            "Drug",
+            "id",
+            Value::Int(7),
+            Some(10),
+            Some(20),
+            [],
+        );
+        assert_eq!(m.born_edge_count(), 1);
+        let out = m.out_edges(10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].other, 20);
+        assert_eq!(out[0].reltype, "OWNS");
+        assert_eq!(out[0].edge_id, Some(500)); // first born edge = edge_synthetic_base
+        assert!(!out[0].tombstoned);
+        let inc = m.in_edges(20);
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0].other, 10);
+        assert_eq!(inc[0].edge_id, Some(500));
+        // Not visible from the wrong ends.
+        assert!(m.out_edges(20).is_empty());
+        assert!(m.in_edges(10).is_empty());
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn upsert_edge_is_idempotent_by_identity() {
+        // Re-MERGE-ing the same edge identity reuses the synthetic id and does not
+        // duplicate the adjacency entry.
+        let mut m = Memtable::with_bases(0, 0);
+        let mk = |m: &mut Memtable| {
+            m.upsert_edge(
+                "L",
+                "k",
+                Value::Int(1),
+                "R",
+                "L",
+                "k",
+                Value::Int(2),
+                Some(1),
+                Some(2),
+                [],
+            );
+        };
+        mk(&mut m);
+        mk(&mut m);
+        assert_eq!(m.born_edge_count(), 1);
+        assert_eq!(m.out_edges(1).len(), 1);
+        assert_eq!(m.out_edges(1)[0].edge_id, Some(0));
+    }
+
+    #[test]
+    fn upsert_edge_creates_born_endpoint_nodes() {
+        // A MERGE edge whose endpoints are absent from the core (resolved None)
+        // creates delta-born nodes for them, allocating synthetic node ids in
+        // first-seen order; the edge then points at those synthetic ids.
+        let mut m = Memtable::with_bases(100, 0);
+        m.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            None,
+            None,
+            [],
+        );
+        assert_eq!(m.born_count(), 2, "both endpoints born");
+        // Ann → 100, Bob → 101 (first-seen order).
+        let out = m.out_edges(100);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].other, 101);
+        assert_eq!(
+            m.node_identity_by_dense(100),
+            Some(("Person", "name", &Value::Str("Ann".into())))
+        );
+        assert_eq!(
+            m.node_identity_by_dense(101),
+            Some(("Person", "name", &Value::Str("Bob".into())))
+        );
+    }
+
+    #[test]
+    fn delete_core_edge_stores_tombstone_only_entry() {
+        // Deleting an edge between two core nodes with no prior born edge stores a
+        // tombstone-only entry (no synthetic edge id) so the reader can suppress the
+        // matching core adjacency record.
+        let mut m = Memtable::with_bases(100, 500);
+        m.delete_edge(
+            "Company",
+            "ticker",
+            Value::Str("A".into()),
+            "OWNS",
+            "Drug",
+            "id",
+            Value::Int(7),
+            Some(10),
+            Some(20),
+        );
+        assert_eq!(m.born_edge_count(), 0, "a tombstone allocates no edge id");
+        let e = edge_between(&m, 10, true, "OWNS", 20).expect("tombstone indexed outgoing");
+        assert!(e.tombstoned);
+        assert_eq!(e.edge_id, None);
+        assert!(edge_between(&m, 20, false, "OWNS", 10).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn merge_then_delete_edge_tombstones_the_born_edge() {
+        let mut m = Memtable::with_bases(0, 0);
+        m.upsert_edge(
+            "L",
+            "k",
+            Value::Int(1),
+            "R",
+            "L",
+            "k",
+            Value::Int(2),
+            Some(1),
+            Some(2),
+            [],
+        );
+        m.delete_edge(
+            "L",
+            "k",
+            Value::Int(1),
+            "R",
+            "L",
+            "k",
+            Value::Int(2),
+            Some(1),
+            Some(2),
+        );
+        let e = edge_between(&m, 1, true, "R", 2).expect("edge present");
+        assert!(e.tombstoned, "the born edge is now tombstoned");
+        assert_eq!(m.born_edge_count(), 1, "no new edge id from the delete");
+    }
+
+    #[test]
+    fn delete_edge_with_absent_endpoint_is_a_noop() {
+        // Neither endpoint exists (not core, not born) → nothing to tombstone.
+        let mut m = Memtable::with_bases(100, 0);
+        m.delete_edge(
+            "L",
+            "k",
+            Value::Int(1),
+            "R",
+            "L",
+            "k",
+            Value::Int(2),
+            None,
+            None,
+        );
+        assert!(m.is_empty(), "no edge, no phantom born node");
+    }
+
+    #[test]
+    fn upsert_edge_resurrects_a_tombstoned_edge() {
+        let mut m = Memtable::with_bases(0, 0);
+        let mk_del = |m: &mut Memtable| {
+            m.delete_edge(
+                "L",
+                "k",
+                Value::Int(1),
+                "R",
+                "L",
+                "k",
+                Value::Int(2),
+                Some(1),
+                Some(2),
+            );
+        };
+        mk_del(&mut m);
+        assert!(edge_between(&m, 1, true, "R", 2).unwrap().tombstoned);
+        m.upsert_edge(
+            "L",
+            "k",
+            Value::Int(1),
+            "R",
+            "L",
+            "k",
+            Value::Int(2),
+            Some(1),
+            Some(2),
+            [],
+        );
+        assert!(!edge_between(&m, 1, true, "R", 2).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn apply_edge_ops_match_direct_calls() {
+        // The WAL-replay path (`apply` + `OpResolution::Edge`) must not diverge from a
+        // direct call.
+        let op = WalOp::UpsertEdge {
+            src_label: "L".into(),
+            src_key: "k".into(),
+            src_value: Value::Int(1),
+            reltype: "R".into(),
+            dst_label: "L".into(),
+            dst_key: "k".into(),
+            dst_value: Value::Int(2),
+            patches: vec![],
+        };
+        let mut viae = Memtable::with_bases(0, 0);
+        viae.apply(
+            &op,
+            OpResolution::Edge {
+                src: Some(1),
+                dst: Some(2),
+            },
+        );
+        let mut direct = Memtable::with_bases(0, 0);
+        direct.upsert_edge(
+            "L",
+            "k",
+            Value::Int(1),
+            "R",
+            "L",
+            "k",
+            Value::Int(2),
+            Some(1),
+            Some(2),
+            [],
+        );
+        assert_eq!(viae.out_edges(1), direct.out_edges(1));
+    }
+
+    #[test]
+    fn iter_edges_recovers_identity_names() {
+        let mut m = Memtable::with_bases(0, 0);
+        m.upsert_edge(
+            "Company",
+            "ticker",
+            Value::Str("A".into()),
+            "OWNS",
+            "Drug",
+            "id",
+            Value::Int(7),
+            Some(1),
+            Some(2),
+            [],
+        );
+        let rows: Vec<_> = m.iter_edges().collect();
+        assert_eq!(rows.len(), 1);
+        let (sl, sk, sv, rt, dl, dk, dv, delta) = &rows[0];
+        assert_eq!((*sl, *sk), ("Company", "ticker"));
+        assert_eq!(**sv, Value::Str("A".into()));
+        assert_eq!(*rt, "OWNS");
+        assert_eq!((*dl, *dk), ("Drug", "id"));
+        assert_eq!(**dv, Value::Int(7));
+        assert!(!delta.tombstoned);
     }
 
     #[test]
