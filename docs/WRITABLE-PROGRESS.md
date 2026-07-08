@@ -495,7 +495,7 @@ below are current, and that the latest commit hash is noted.
 ## Next action
 
 **Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
-- `cc365b3` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
+- `710912a` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
 - `12083c4` docs(delta): add explicit resume-state (commits + next task) to the ledger
 - `f04298e` docs(delta): record the Phase 4c born-across-levels design decision
 - `fcac9fb` feat(delta): L0 delta-segment format + reader (Phase 4b)
