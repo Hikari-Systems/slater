@@ -595,16 +595,40 @@ Running ledger for the `writeable` track. Pairs with the design in
     reject, env-var password). Verified e2e against a live server: `--list` prints the
     graph, wrong password fails cleanly, the dump path emits its stub. 582 slater + 53
     slater-delta green; whole workspace green; clippy `-D warnings` + fmt clean.
-  - **dump-b — schema introspection + identity-key resolution + `CREATE INDEX` DDL.**
-    📋 next. Enumerate labels / reltypes / range indexes over Bolt (`db.labels()` /
-    `SHOW INDEXES`); build `label → identity-key` with `--key`/`--pk` overrides; emit
-    the `CREATE INDEX` DDL.
-  - **dump-c — node + edge dump + PsValue Cypher-literal escaper.** 📋 planned. Stream
-    `MATCH (n) RETURN n` + `MATCH (a)-[r]->(b) RETURN a,r,b` → business-key `MERGE`;
-    a `PsValue`→literal escaper mirroring `consolidate.rs::literal` (same builder
-    dialect, different value type); `vecf32` warning; `-o`/stdout.
-  - **dump-d — round-trip e2e + docs.** 📋 planned. `#[ignore]` dump → `slater-build`
-    → verify equivalence; finalise docs.
+  - **dump-b+c — schema + identity-key resolution + node/edge dump + PsValue escaper.
+    ✅ DONE** (this commit; planned dump-b and dump-c folded — they share the arg
+    surface and the single buffered output sink, and splitting them would either
+    leave a partial dump on disk or make `--out`/`--key`/`--pk` dead code between the
+    two commits). Args grew `-o/--out`, `--key Label=prop` (repeatable), `--pk`.
+    `fetch_schema` reads `SHOW INDEXES` (RANGE only; `entityType` NODE→inferred
+    identity key + node `CREATE INDEX`, RELATIONSHIP→rel `CREATE INDEX`) + `CALL
+    db.labels()`, then folds each label's resolved identity `(label, key)` into the
+    node-index set so a `--key`/`--pk` key that is not itself range-indexed still gets
+    a `CREATE INDEX` (the rebuild needs it indexed to resolve the business key).
+    `Schema::key_for` precedence: `--key` > `--pk` > inferred. `dump_graph` buffers
+    the whole dump (so a mid-dump failure never truncates a file): `CREATE INDEX` DDL
+    first (nodes then rels, sorted → deterministic), then `MATCH (n) RETURN n` →
+    `MERGE (n:L {k:v}) SET …` (identity label chosen from the node's labels in **sorted**
+    order for determinism; a node with no resolvable key is a hard error naming the
+    labels), then `MATCH (a)-[r]->(b) RETURN a, r, b` → `MERGE (a)-[r:T]->(b) SET …`
+    (both endpoints' business keys, rel type + props from the Bolt `Relationship`
+    struct). New `literal(&PsValue) -> Option<String>` + `format_float`/`quote_str`
+    **mirror `consolidate::literal` exactly** (same builder dialect, different value
+    type); a value with no MERGE-dump spelling (vector/temporal struct, map, bytes)
+    yields `None` → the property is dropped from the `SET` with a stderr warning (the
+    identity key value must be representable, else a hard error). **No header comment:**
+    `slater-build` splits on `;` and has no comment syntax, so the dump is pure
+    rebuildable statements. Tests: 9 new unit tests (escaper-vs-dialect, key-override
+    parse + `key_for` precedence, node/edge emission over synthetic Bolt `Node`/`Rel`
+    values incl. sorted-label pick, no-key error, vector-prop drop-with-warning, SET
+    property sort). Verified e2e against a live server: `dump` reproduces the source
+    dump verbatim and **round-trips content-hash-identical** through `slater-build`
+    (`56529eec…`); `--pk`/`--key` overrides confirmed (a `--key` on a non-indexed
+    property adds its `CREATE INDEX`). 591 slater + 53 slater-delta green; clippy
+    `-D warnings` + fmt clean.
+  - **dump-d — reproducible round-trip e2e + docs.** 📋 next. An `#[ignore]`
+    server-in-process test (dump over Bolt → `slater-build` → assert equivalence),
+    mirroring `memory_headline.rs`'s harness; finalise docs.
 
 ## Recommended context-clear points
 
@@ -623,17 +647,18 @@ below are current, and that the latest commit hash is noted.
 **Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE.**
 Active work is the optional **`slater dump` CLI** parallel workstream (see its sub-milestone block
 above). Latest commits:
+- `<this>` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c) — see the follow-up doc commit for the hash
 - `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 - `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
-- `e012595` feat(delta): memtable→L0 flush + write-path born resolution (Phase 4c-B)
 
-**Next task: `slater dump` milestone dump-b** (schema introspection + identity-key resolution +
-`CREATE INDEX` DDL — see the sub-milestone block above). The Phase 0–5 delta track stays feature-complete;
-all its gates remain green (`cargo test -p slater -p slater-delta` = 582 + 53 after dump-a's 5 unit tests;
-`cargo test --workspace`; clippy `-D warnings`; fmt; the three `#[ignore]` real-builder e2es). Other
-optional/independent work:
+**`slater dump` is now functionally complete** (`--list` + full graph dump, round-trip verified
+content-hash-identical). **Next task: dump-d** — a reproducible `#[ignore]` server-in-process
+round-trip test (dump → `slater-build` → assert equivalence) + doc finalisation. The Phase 0–5 delta
+track stays feature-complete; its gates remain green (`cargo test -p slater -p slater-delta` = 591 + 53
+after the dump unit tests; `cargo test --workspace`; clippy `-D warnings`; fmt; the three `#[ignore]`
+real-builder e2es). Other optional/independent work:
 - **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
   consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
   off-heap `pread` L0 reads (bounded RSS without whole-file residency); edge properties;
