@@ -892,3 +892,29 @@ supply the seam. Rejected alternative: a dedicated `Statement`-less path that ro
 through `apply_call` like the metadata procs — that would force a read-shaped, result-cache
 -eligible, generation-pinned execution around a mutation, and re-introduce the read-only
 labelling problem.
+
+### D48 — Consolidation carries post-freeze writes forward by replaying the WAL onto the new core
+Phase 4a removes the Phase-1 restriction that no write may be admitted while a
+consolidation runs (`crates/slater/src/delta_writer.rs`, `server.rs`). Previously
+`DeltaWriter::retire` reset the live memtable to empty, so a write that arrived between
+`freeze()` and `retire()` — durable in the fresh WAL segment freeze had opened, but
+resolved against the *old* core's dense ids — was silently dropped from RAM until a process
+reopen. That was safe only because Phase 1 forbade concurrent writes during a build; an
+automatic soft-cap trigger (Phase 4d) fires while clients keep writing, so it must be
+correct. The fix leans on an existing invariant: `freeze` seals the current segment and
+rotates to a fresh one, and `Frozen.consumed` is exactly the *pre-freeze* set, so every
+post-freeze write lands in a segment that is **not** consumed. `retire` therefore (1)
+deletes the consumed segments (their writes now live in the new core), then (2) rebuilds the
+memtable by `replay_dir` over the surviving segments, applying each op through a `resolve`
+closure **bound to the new core** (`resolve_op(new_gen, op)`). Because WAL records are
+self-describing (business-key names, no dense ids), re-resolution is automatic and, crucially,
+a node that was delta-born pre-freeze (a synthetic id) and folded into the new core by the
+rebuild re-resolves to its now-real dense id. No seal/rotate is needed inside `retire` — a
+committed record is already fsync-durable (`WalSink::commit` flushes + `sync_data`), so the
+still-open post-freeze segment replays fine and keeps taking appends afterwards. The rebuilt
+snapshot is published *before* the core UUID is re-bound (rebuilt-publish-before-rebind), so a
+lock-free reader that observes the new `core_uuid` also observes the re-resolved overlay; a
+reader straddling the swap briefly falls back to the pure new core (which already holds the
+pre-freeze writes) — the same benign visibility blip Phase 1 documented. This makes an
+automatic consolidation that fires under sustained write volume non-lossy, the prerequisite
+for the L0 flush + backpressure work (Phase 4b–4d).

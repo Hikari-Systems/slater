@@ -511,15 +511,21 @@ impl Graphs {
 
         // Retire: the delta now lives in the new core, so drop the consumed WAL
         // segments and re-bind the writer to the new generation (re-basing the
-        // synthetic node/edge id spaces on the new core's node/edge counts).
-        let (new_node_count, new_edge_count) = self
-            .get(name)
-            .map(|g| (g.node_count(), g.edge_count()))
-            .ok_or_else(|| {
-                anyhow!("consolidated generation for '{name}' vanished before retire")
-            })?;
+        // synthetic node/edge id spaces on the new core's node/edge counts). Any
+        // post-freeze write is replayed onto the new core via `resolve_op` bound to the
+        // freshly-swapped generation — a business key that was delta-born pre-freeze
+        // re-resolves to its now-real dense id (Phase 4a).
+        let new_gen = self.get(name).ok_or_else(|| {
+            anyhow!("consolidated generation for '{name}' vanished before retire")
+        })?;
         writer
-            .retire(&frozen.consumed, new_uuid, new_node_count, new_edge_count)
+            .retire(
+                &frozen.consumed,
+                new_uuid,
+                new_gen.node_count(),
+                new_gen.edge_count(),
+                |op| resolve_op(new_gen.as_ref(), op),
+            )
             .with_context(|| format!("retire consolidated delta for '{name}'"))?;
 
         info!(graph = %name, generation = %new_uuid, "consolidated writable delta into a fresh generation");
@@ -4324,18 +4330,35 @@ mod tests {
             "delta live before consolidation"
         );
 
-        // Builder stand-in: assert the dump reflects the merged age, then publish an
-        // independently-correct consolidated generation (Alice age 99) at a new uuid.
+        // Builder stand-in: assert the dump reflects the merged age, then — modelling a
+        // client that keeps writing *during* the rebuild (freeze has happened, retire has
+        // not) — apply a post-freeze write (Bob's age → 77) before publishing an
+        // independently-correct consolidated generation (Alice age 99) at a new uuid. The
+        // post-freeze write is deliberately absent from the dump, so it must be carried
+        // forward onto the new core by retire (Phase 4a).
         let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0099);
         let cache = BlockCache::new(1 << 20);
         let vc = VectorIndexCache::new(1 << 20);
+        let writer_mid = writer.clone();
+        let gen_mid = gen0.clone();
         let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
             let text = std::fs::read_to_string(dump)?;
             assert!(
                 text.contains("MERGE (n:Person {name: 'Alice'}) SET n.age = 99;"),
                 "dump should carry the merged age:\n{text}"
             );
+            assert!(
+                !text.contains("age = 77"),
+                "the post-freeze write must not be in the frozen dump:\n{text}"
+            );
             assert_eq!(g, "people");
+            let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+            execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
             testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
             Ok(())
         };
@@ -4344,31 +4367,46 @@ mod tests {
             .unwrap();
         assert_eq!(published.0, new_uuid, "swapped to the new generation");
 
-        // The served core is now the new generation with the write baked in, and a
-        // read through it (delta now empty) returns the consolidated age.
+        // The served core is now the new generation with Alice's write baked in; the
+        // post-freeze Bob write survived as a delta re-resolved onto the new core.
         let gen1 = graphs.get("people").unwrap();
         assert_eq!(gen1.uuid().0, new_uuid);
-        let view = MergedView::new(
-            gen1.as_ref(),
-            DeltaSnapshot::from_memtable(writer.snapshot()),
-        );
-        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
-        let res = Engine::new(&view, &cache).run(&ast).unwrap();
         assert!(
-            matches!(res.rows[0][0], Val::Int(99)),
+            !writer.snapshot().is_empty(),
+            "the post-freeze write is carried forward, not dropped"
+        );
+        let read_age = |name: &str| -> Val {
+            let view = MergedView::new(
+                gen1.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast =
+                parser::parse(&format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.age")).unwrap();
+            let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+            age
+        };
+        assert!(
+            matches!(read_age("Alice"), Val::Int(99)),
             "consolidated age served from the core"
         );
+        assert!(
+            matches!(read_age("Bob"), Val::Int(77)),
+            "post-freeze write served from the carried-forward delta over the new core"
+        );
 
-        // The writer is re-bound and emptied; the scratch dump is cleaned up; only
-        // the fresh post-freeze segment remains.
+        // The writer is re-bound to the new core; the scratch dump is cleaned up; only
+        // the post-freeze segment remains (freeze's fresh segment, now holding Bob).
         assert_eq!(
             writer.core_uuid(),
             gen1.uuid(),
             "writer re-bound to new core"
         );
-        assert!(writer.snapshot().is_empty(), "delta retired");
         assert!(!root.join("people").join(".consolidate.cypher").exists());
-        assert_eq!(wal_count(&wal_dir), 1, "only the fresh segment remains");
+        assert_eq!(
+            wal_count(&wal_dir),
+            1,
+            "only the post-freeze segment remains"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4475,23 +4513,43 @@ mod tests {
 
         let cache = BlockCache::new(1 << 20);
         let vc = VectorIndexCache::new(1 << 20);
+        // A post-freeze write (Bob's age → 77) applied while the real builder runs must
+        // be carried forward onto the new core by retire (Phase 4a).
+        let writer_mid = writer.clone();
+        let gen_mid = gen0.clone();
         let new = graphs
             .consolidate_graph("people", &cache, &vc, &root, |d, g, dd| {
+                let bob =
+                    match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                        .unwrap()
+                    {
+                        parser::ast::Statement::Write(w) => w,
+                        _ => unreachable!(),
+                    };
+                execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
                 run_builder(&bin, d, g, dd)
             })
             .unwrap();
         assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
 
         let gen1 = graphs.get("people").unwrap();
-        let view = MergedView::new(
-            gen1.as_ref(),
-            DeltaSnapshot::from_memtable(writer.snapshot()),
-        );
-        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
-        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        let read_age = |name: &str| -> Val {
+            let view = MergedView::new(
+                gen1.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let ast =
+                parser::parse(&format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.age")).unwrap();
+            let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+            age
+        };
         assert!(
-            matches!(res.rows[0][0], Val::Int(99)),
+            matches!(read_age("Alice"), Val::Int(99)),
             "the real builder folded the delta into the core"
+        );
+        assert!(
+            matches!(read_age("Bob"), Val::Int(77)),
+            "the post-freeze write survived on the carried-forward delta"
         );
         std::fs::remove_dir_all(&root).ok();
     }

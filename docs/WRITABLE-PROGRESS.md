@@ -381,8 +381,38 @@ Running ledger for the `writeable` track. Pairs with the design in
   through the real `slater-build`, verified green). Whole workspace green; clippy + fmt
   clean; empty-delta bench unaffected (the trigger is off the read path). See D47.
 
-- Remaining Phase 4: see `docs/WRITABLE-PLAN.md` (L0 flush + backpressure + auto
-  soft-cap consolidation trigger).
+- **Phase 4 — L0 flush + backpressure. 🔨 IN PROGRESS.** Bounds delta growth and lets
+  writes continue while a consolidation rebuilds the core, so the layer can take sustained
+  write volume. User-confirmed scope: land the correctness foundation (4a) first, then the
+  full L0 LSM (immutable segments + 3-level read merge). Plan sketch in
+  `~/.claude/plans/wise-wobbling-puppy.md`; design in `docs/WRITABLE-PLAN.md` §"Write path,
+  admission, consolidation". Sub-milestones:
+  - **4a — writes survive a concurrent consolidation. ✅ DONE** (this commit). Removes the
+    Phase-1 "no writes during a build" restriction. `DeltaWriter::retire` no longer resets
+    the memtable to empty (which dropped any write that arrived between `freeze()` and
+    `retire()` from RAM); it now **rebuilds** the live memtable by `replay_dir` over the
+    surviving *post-freeze* segments (the consumed set is the pre-freeze segments — freeze
+    already rotated to a fresh one), applying each op through a new `resolve: impl Fn(&WalOp)
+    -> OpResolution` param **bound to the new core**. WAL records are self-describing
+    (business-key names), so re-resolution is automatic and a pre-freeze delta-born node
+    (synthetic id) folded into the new core re-binds to its now-real dense id. No seal/rotate
+    inside `retire` — a committed record is already fsync-durable, so the still-open segment
+    replays fine and keeps taking appends. Rebuilt-snapshot-published-before-core-uuid-rebind
+    (a reader seeing the new `core_uuid` also sees the re-resolved overlay). `consolidate_graph`
+    passes `|op| resolve_op(new_gen, op)` using the freshly-swapped generation. No read-path
+    change (freeze does not swap the live memtable; only the *dump* uses the frozen clone).
+    Tests: `writes_during_consolidation_survive` + `post_freeze_write_reresolves_a_born_node_
+    to_the_new_core` (`delta_writer.rs`); `consolidate_folds_delta_into_fresh_generation` +
+    the `#[ignore]` `consolidate_via_real_builder` both now apply a post-freeze write inside
+    the build closure and assert it is carried forward onto the new core. Whole
+    slater+slater-delta+workspace green; clippy+fmt clean. See D48.
+  - **4b — L0 segment format + reader** (pure `slater-delta`, next): immutable on-disk
+    ISAM-shaped delta segment; `L0Segment::{write,open}` exposing the `DeltaSnapshot`-shaped
+    read surface via `pread`+sparse index; synthetic-id stacking across levels carried in the
+    header. **4c — multi-level read merge + memtable→L0 flush**: `DeltaSnapshot` folds
+    `mem ⊕ L0*`; `DeltaWriter::flush_to_l0`. **4d — admission/backpressure + auto soft-cap
+    consolidation**: `memtableBytes` = flush cap, new `deltaBytes` soft / `deltaHardBytes`
+    hard caps; async trigger reusing `execute_consolidate`; per-writer in-flight guard.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -409,20 +439,32 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Phase 5's Bolt trigger is complete** (this commit): `CALL slater.consolidate()` is now
-reachable from any Bolt client — it folds the delta into a fresh generation, swaps it in,
-and returns the new generation id, all without a server restart. The whole
-write→consolidate loop is now usable end-to-end. (Phase 3 before it: relationships
-create/delete/walk/consolidate; Phase 2: nodes create/update/delete. Nodes **and** edges
-are a durable, consolidatable, client-triggerable writable layer.)
+**Phase 4a is complete** (this commit): a write that arrives *during* a consolidation is no
+longer lost — `DeltaWriter::retire` rebuilds the live memtable by replaying the post-freeze
+WAL segments onto the freshly-built core (re-resolving business keys, so a pre-freeze born
+node re-binds to its now-real dense id). This removes the Phase-1 "no writes during a build"
+restriction and is the prerequisite for an automatic consolidation trigger that fires while
+clients keep writing. See D48.
 
-The recommended next step is **Phase 4 — L0 flush + backpressure** (see
-`docs/WRITABLE-PLAN.md` §Execution order): spill the memtable to immutable L0 delta
-segments under a byte budget, add an admission/backpressure knob, and an **automatic**
-L0-soft-cap consolidation trigger (the manual `CALL slater.consolidate()` trigger it would
-build on now exists — `Graphs::consolidate_graph`, dispatched from the RUN handler via
-`server::execute_consolidate`). Larger; needed before the layer takes sustained write
-volume.
+The recommended next step is **Phase 4b — L0 segment format + reader** (pure `slater-delta`;
+plan in `~/.claude/plans/wise-wobbling-puppy.md`): a new `crates/slater-delta/src/l0.rs`
+with an immutable, on-disk, ISAM-shaped delta segment — `L0Segment::write(&Memtable, path)`
+(nodes sorted by canonical business key, edges by edge key, born-order vectors + synthetic
+bases in the header) and `L0Segment::open(path)` exposing the same `DeltaSnapshot`-shaped
+read surface the memtable does (`node_patch`, `is_tombstoned`, `born_ids_*`, `out/in_edges`,
+`iter_*`) via `pread` + a resident sparse index. **Key design point:** synthetic-id stacking
+across levels — each L0 records its born-node/edge counts so the next level up opens with
+`with_bases(core_base + Σ lower born counts)`, presenting one contiguous synthetic id space.
+No `slater` wiring in 4b (that's 4c: extend `DeltaSnapshot` to fold `mem ⊕ L0*` +
+`DeltaWriter::flush_to_l0`). Then 4d: admission/backpressure + auto soft-cap trigger.
+
+Handy Phase-4a resume detail (landed): `DeltaWriter::retire(consumed, new_uuid,
+new_node_count, new_edge_count, resolve)` (`delta_writer.rs`) — the new `resolve` param is
+`|op| resolve_op(new_gen, op)` supplied by `Graphs::consolidate_graph` (`server.rs`) from
+`self.get(name)` post-swap. `freeze` unchanged (seals + rotates; `consumed` = pre-freeze
+segments). Tests in `delta_writer.rs` (`writes_during_consolidation_survive`,
+`post_freeze_write_reresolves_a_born_node_to_the_new_core`) and the two server-side
+consolidation tests (post-freeze write in the build closure).
 
 Handy Phase-3 resume detail (all landed): memtable edges
 `Memtable::{upsert_edge,delete_edge,out_edges,in_edges,iter_edges,with_bases}` +

@@ -202,26 +202,44 @@ impl DeltaWriter {
         Ok(Frozen { snapshot, consumed })
     }
 
-    /// Complete a consolidation: delete the `consumed` WAL segments (their writes now
-    /// live in the freshly built core), reset the memtable + resolved index empty
-    /// (re-based on `new_core_node_count` so delta-born ids start past the new core),
-    /// and re-bind the writer to `new_core_uuid` so subsequent writes resolve their
-    /// business keys against the new generation.
+    /// Complete a consolidation: delete the `consumed` (pre-freeze) WAL segments —
+    /// their writes now live in the freshly built core — then **rebuild** the live
+    /// memtable by replaying the surviving *post-freeze* segments against the new core
+    /// (re-based on `new_core_node_count`/`new_core_edge_count` so delta-born ids start
+    /// past the new core), and re-bind the writer to `new_core_uuid` so subsequent
+    /// writes resolve their business keys against the new generation.
     ///
-    /// Ordering is chosen so a lock-free reader never overlays a stale delta on the
-    /// new core: the empty snapshot is published *before* the core UUID is re-bound,
-    /// so any reader that observes `core_uuid == new_core_uuid` also observes the
-    /// empty overlay. (A reader straddling the swap may momentarily miss the just-
-    /// consolidated writes on the *old* core — a benign visibility blip that Phase 4
-    /// admission control removes; the writes themselves are durable in the new core.)
+    /// # Post-freeze writes are carried forward (Phase 4a)
+    /// A write that arrives between [`Self::freeze`] and this call lands in the fresh
+    /// segment freeze opened — which is **not** in `consumed`. Rather than discard it
+    /// (the Phase 1 behaviour, safe only because it forbade concurrent writes during a
+    /// build), retire re-applies it: it deletes the consumed set, then replays every
+    /// remaining segment through `resolve` (each committed record is durable — `commit`
+    /// fsyncs — so the still-open segment's tail replays fine). `resolve` is bound to the
+    /// *new* core, so each post-freeze business key re-resolves against the freshly built
+    /// generation — a pre-freeze delta-born node (a synthetic id) that consolidation
+    /// folded into the new core is thereby re-bound to its now-real dense id. This is what
+    /// lets an automatic consolidation fire while writes continue.
+    ///
+    /// # Ordering
+    /// A lock-free reader must never overlay a stale delta on the new core: the rebuilt
+    /// snapshot is published *before* the core UUID is re-bound, so any reader that
+    /// observes `core_uuid == new_core_uuid` also observes the rebuilt (re-resolved)
+    /// overlay. A reader straddling the swap may momentarily fall back to the pure new
+    /// core (which already holds the pre-freeze writes) — a benign visibility blip; the
+    /// post-freeze writes themselves are durable in the surviving segments.
     pub fn retire(
         &self,
         consumed: &[PathBuf],
         new_core_uuid: GenId,
         new_core_node_count: u64,
         new_core_edge_count: u64,
+        resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("delta writer lock");
+        // The consumed set's writes are now in the new core — drop those segments. The
+        // currently-open (post-freeze) segment is never in `consumed` (freeze rotated to
+        // it), so it survives and keeps taking appends after this rebuild.
         for path in consumed {
             match std::fs::remove_file(path) {
                 Ok(()) => {}
@@ -231,13 +249,22 @@ impl DeltaWriter {
                 }
             }
         }
-        // Re-base the synthetic id spaces on the freshly built core: its node/edge
-        // counts now include the folded-in delta-born nodes/edges, so the next write's
-        // synthetic ids start past them.
-        inner.mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
-        // Publish the empty overlay first, then re-bind the core UUID (see the
-        // ordering note above). The seq counter stays monotonic — the fresh segment
-        // is empty, so a later replay simply restarts it from zero.
+
+        // Rebuild the live memtable from the surviving (post-freeze) segments, each write
+        // re-resolved against the new core. Re-base the synthetic id spaces on the freshly
+        // built core: its node/edge counts now include the folded-in delta-born entities,
+        // so a post-freeze born id starts past them.
+        let mut mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
+        let replay = replay_dir(&inner.dir)
+            .with_context(|| format!("replay post-freeze WAL dir {:?}", inner.dir))?;
+        for rec in &replay.records {
+            mem.apply(&rec.op, resolve(&rec.op));
+        }
+        inner.seq = replay.last_seq;
+        inner.mem = mem;
+
+        // Publish the rebuilt overlay first, then re-bind the core UUID (see the ordering
+        // note above). The seq counter stays monotonic from the replayed high-water mark.
         *self.snapshot.write().expect("delta snapshot lock") = Arc::new(inner.mem.clone());
         *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -477,7 +504,10 @@ mod tests {
         let epoch_before = w.epoch();
 
         // Retire against the new core: consumed segments gone, overlay empty, rebind.
-        w.retire(&frozen.consumed, new_core, 100, 0).unwrap();
+        // No post-freeze write here, so the replayed post-freeze segment is empty and the
+        // rebuilt overlay is empty.
+        w.retire(&frozen.consumed, new_core, 100, 0, resolve_ticker)
+            .unwrap();
         for p in &frozen.consumed {
             assert!(!p.exists(), "retire deletes the consumed segment: {p:?}");
         }
@@ -490,6 +520,161 @@ mod tests {
         // fresh empty one), so the writer comes up clean against the new core.
         let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, resolve_ticker).unwrap();
         assert_eq!(reopened.snapshot().node_delta_count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writes_during_consolidation_survive() {
+        // A write that arrives after freeze but before retire must be carried forward,
+        // re-resolved against the new core — not discarded (the Phase 4a fix).
+        let dir = tmp("concurrent_write");
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_core = GenId(uuid::Uuid::from_u128(10));
+        let new_core = GenId(uuid::Uuid::from_u128(11));
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+
+        // Pre-freeze write on core node A (dense 10).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(1))],
+            ),
+            node(10),
+        )
+        .unwrap();
+
+        let frozen = w.freeze().unwrap();
+
+        // Post-freeze write on core node B (dense 20) — lands in the fresh segment.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("B".into()),
+                &[("price", Value::Int(2))],
+            ),
+            node(20),
+        )
+        .unwrap();
+
+        // Consolidation folded A's patch into a new core with permuted dense ids; the
+        // new-core resolver maps the business keys to their new ids (A→30, B→40).
+        let resolve_new = |op: &WalOp| -> OpResolution {
+            let (_, _, value) = op.node_key().expect("node ops only");
+            OpResolution::Node(match value {
+                Value::Str(s) if s == "A" => Some(30),
+                Value::Str(s) if s == "B" => Some(40),
+                _ => None,
+            })
+        };
+        w.retire(&frozen.consumed, new_core, 100, 0, resolve_new)
+            .unwrap();
+
+        // A's patch now lives in the new core (gone from the delta); B was carried
+        // forward and re-resolved onto its new dense id.
+        let snap = w.snapshot();
+        assert_eq!(
+            snap.node_delta_count(),
+            1,
+            "only the post-freeze write remains"
+        );
+        assert!(snap.node_patch(10).is_none(), "A folded into the new core");
+        assert_eq!(
+            snap.node_patch(40).unwrap().patches.get("price"),
+            Some(&Value::Int(2)),
+            "B carried forward, re-resolved to its new-core dense id"
+        );
+        assert_eq!(w.core_uuid(), new_core);
+
+        // Durable: a reopen against the new core replays the surviving segment and
+        // recovers B at the same new dense id.
+        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, resolve_new).unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .node_patch(40)
+                .unwrap()
+                .patches
+                .get("price"),
+            Some(&Value::Int(2)),
+            "post-freeze write survives a reopen after retire"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn post_freeze_write_reresolves_a_born_node_to_the_new_core() {
+        // A node created (MERGE) pre-freeze takes a synthetic id; consolidation folds it
+        // into the new core as a real node. A post-freeze patch on it must re-resolve to
+        // that real dense id at retire.
+        let dir = tmp("born_reresolve");
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_core = GenId(uuid::Uuid::from_u128(20));
+        let new_core = GenId(uuid::Uuid::from_u128(21));
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+
+        // Pre-freeze: MERGE-create born node C (absent from the old core → synthetic id 100).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C".into()),
+                &[("price", Value::Int(7))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert_eq!(w.snapshot().synthetic_base(), 100);
+        assert_eq!(
+            w.snapshot().node_patch(100).unwrap().patches.get("price"),
+            Some(&Value::Int(7)),
+            "born node sits at the synthetic id"
+        );
+
+        let frozen = w.freeze().unwrap();
+
+        // Post-freeze: patch C again. Against the old core it is still born (id 100).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C".into()),
+                &[("price", Value::Int(9))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+
+        // Consolidation folded C into the new core at a real dense id (50); node_count grew
+        // to 101. The new-core resolver now finds C.
+        let resolve_new = |op: &WalOp| -> OpResolution {
+            let (_, _, value) = op.node_key().expect("node ops only");
+            OpResolution::Node(match value {
+                Value::Str(s) if s == "C" => Some(50),
+                _ => None,
+            })
+        };
+        w.retire(&frozen.consumed, new_core, 101, 0, resolve_new)
+            .unwrap();
+
+        let snap = w.snapshot();
+        assert_eq!(snap.node_delta_count(), 1);
+        assert!(
+            snap.node_patch(100).is_none(),
+            "no longer born — folded into the core"
+        );
+        assert_eq!(
+            snap.node_patch(50).unwrap().patches.get("price"),
+            Some(&Value::Int(9)),
+            "post-freeze patch re-resolved onto the now-real dense id"
+        );
+        assert_eq!(
+            snap.synthetic_base(),
+            101,
+            "synthetic space re-based past the grown core"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
