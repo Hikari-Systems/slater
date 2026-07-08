@@ -242,6 +242,20 @@ impl DeltaWriter {
             .find_map(|m| m.born_synthetic_for_identity(label, key, value))
     }
 
+    /// The synthetic dense id of a delta-born node with this business identity, resolved
+    /// across the **whole** delta (active memtable + every L0 level) — the DELETE write
+    /// path's born-resolution hook. Unlike [`Self::born_synthetic_for_identity`] (L0
+    /// only, for MERGE create reuse), this also consults the active memtable, so a born
+    /// node deleted before it is ever flushed is found; and returning the id lets
+    /// `execute_write` plant the tombstone's `by_dense` mapping, suppressing a node
+    /// already flushed to an L0 level on read.
+    pub fn born_synthetic_in_delta(&self, label: &str, key: &str, value: &Value) -> Option<u64> {
+        self.published
+            .read()
+            .expect("delta snapshot lock")
+            .born_synthetic_for_identity(label, key, value)
+    }
+
     /// Publish `mem ⊕ l0` as one atomic [`DeltaSnapshot`], so a lock-free reader never
     /// observes a half-applied flush (data in neither or both of the memtable and a new
     /// L0 level). Called under the writer lock after every state change.

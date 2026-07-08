@@ -1637,6 +1637,26 @@ impl DeltaSnapshot {
             .collect()
     }
 
+    /// The synthetic dense id of a delta-born node with this business identity, resolved
+    /// across **every** level (active memtable, then L0 newest→oldest). A born identity
+    /// is allocated in exactly one level and its synthetic id is stable across a flush,
+    /// so the first level that carries it decides. The DELETE write path uses this to
+    /// tombstone a born node by its business key; passing the resolved id as the
+    /// delete's dense-id context plants the tombstone's `by_dense` mapping so a node
+    /// already **flushed** to L0 (whose live entry sits in an L0 level, not the active
+    /// tombstone) is still suppressed on read. Distinct from the create-side MERGE reuse
+    /// path, which consults only the L0 levels (the active memtable's `upsert_node`
+    /// idempotency covers its own born nodes there).
+    pub fn born_synthetic_for_identity(
+        &self,
+        label: &str,
+        key: &str,
+        value: &Value,
+    ) -> Option<u64> {
+        self.levels_newest_first()
+            .find_map(|m| m.born_synthetic_for_identity(label, key, value))
+    }
+
     /// Delta-born nodes for the `RangeEq` overlay: those carrying `label` whose
     /// indexed property `prop` equals `key` (Phase 2d; tombstone suppression in the
     /// caller). Unioned across levels oldest-first.

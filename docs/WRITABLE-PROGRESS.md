@@ -645,6 +645,32 @@ Running ledger for the `writeable` track. Pairs with the design in
     "STATUS: implemented" note. Whole workspace green; clippy (`--features testkit
     --all-targets -D warnings`) + fmt clean.
 
+## Deferred follow-ups (post-Phase-5)
+
+The "Smaller follow-ups" listed further down, each closed one small commit at a time
+(independent of one another; ledger updated in the same commit).
+
+- **Delete a delta-born node by business key** (deferred from 2c). ✅ DONE (this commit).
+  A `MERGE`-created (delta-born) node can now be `DELETE`d by its business key. Its DELETE
+  anchor's core probe returns `Absent` (no core row), so `execute_write` used to reject it;
+  it now resolves the born synthetic id from the delta and tombstones it. Resolution folds
+  the **whole** delta (active memtable + every L0 level) via new
+  `DeltaSnapshot::born_synthetic_for_identity` (newest-first `find_map`) →
+  `DeltaWriter::born_synthetic_in_delta` — deliberately distinct from the L0-only
+  `born_synthetic_for_identity` the MERGE-create reuse path uses: create relies on the active
+  memtable's `upsert_node` idempotency, but a DELETE must also *see* an unflushed born node
+  **and** recover the synthetic id of a **flushed** one, so the tombstone's `by_dense` mapping
+  suppresses it on read (a flushed born node's live entry sits in an L0 level, not the active
+  tombstone). Absent from core *and* delta ⇒ a clear no-such-node error; a `MATCH … SET` on an
+  absent key is unchanged ("no … node to update … use MERGE"). The reopen path was already
+  correct — `resolve_with_l0` in `open` refines a replayed `DeleteNode`'s `None` to the L0
+  synthetic id via `op.node_key()` — and `Memtable::delete_node` was already the tombstone path
+  (no change to either). Tests: `server::delete_removes_a_delta_born_node_by_key`
+  (create → delete → gone from reads + whole-label count → absent-key errors → reopen-durable),
+  `consolidate::serialise_drops_a_delta_born_then_deleted_node` (a born-then-deleted node is
+  dropped from the dump, so the delete survives a rebuild). Whole slater (593) + slater-delta
+  (53) + workspace green; clippy `-D warnings` + fmt clean.
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -669,14 +695,15 @@ dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 591 + 53; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 593 + 53; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
-  consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
-  off-heap `pread` L0 reads (bounded RSS without whole-file residency); edge properties;
-  moved-indexed-value relocation; delete-a-born-node-by-key. See the "Smaller follow-ups" list below.
+- **Deferred refinements** (each cleanly scoped, none blocking): moved-indexed-value relocation;
+  edge properties; off-peak *schedule* knob for consolidation; size-tiered partial-L0 compaction
+  (needs number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
+  whole-file residency). **delete-a-born-node-by-key is now ✅ DONE** (see "Deferred follow-ups"
+  below). See the "Smaller follow-ups" list below.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
@@ -751,9 +778,9 @@ Smaller follow-ups that are **not** the recommended next step but are cleanly sc
   index when its *indexed* property changes (memtable tracks the per-index value,
   remove-old/add-new). Only index *membership* is stale today; the value read back is
   already correct.
-- **delete a born node by business key** (deferred from 2c): `execute_write` must
-  resolve a `DELETE` anchor against the delta when the core probe returns Absent
-  (`delete_node` already tombstones it).
+- ~~**delete a born node by business key** (deferred from 2c)~~ ✅ DONE — see the
+  "Deferred follow-ups (post-Phase-5)" section above (`execute_write` resolves a `DELETE`
+  anchor against the whole delta when the core probe returns Absent).
 - Phase 4 auto L0-soft-cap trigger (the manual trigger now exists — see below); the
   independent `slater dump` CLI (§ above).
 

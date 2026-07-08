@@ -2645,19 +2645,33 @@ fn execute_write(
         KeyResolution::Absent if is_set && stmt.upsert => {
             writer.born_synthetic_for_identity(label, key, value)
         }
+        // DELETE of a delta-born node: it has no core row, but the delta may hold it
+        // (born via a prior MERGE, possibly already flushed to L0). Resolve its synthetic
+        // id across the whole delta and tombstone it — passing the id plants the
+        // tombstone's `by_dense` mapping so a node already flushed to an L0 level stays
+        // suppressed on read. Absent from core *and* delta ⇒ a genuine no-such-node error.
+        KeyResolution::Absent if !is_set => match writer.born_synthetic_in_delta(label, key, value)
+        {
+            Some(id) => Some(id),
+            None => {
+                return Err(Failure::new(
+                    CODE_EXECUTION,
+                    format!(
+                        "no {}({} = …) node to delete: the business key matches no existing node",
+                        stmt.label, stmt.key,
+                    ),
+                ));
+            }
+        },
+        // Remaining absent case: a `MATCH … SET` (update-only) whose key matches no core
+        // node. `MERGE` (create) and `DELETE` (born-node tombstone) are handled above.
         KeyResolution::Absent => {
-            let action = if is_set { "update" } else { "delete" };
             return Err(Failure::new(
                 CODE_EXECUTION,
                 format!(
-                    "no {}({} = …) node to {action}: the business key matches no existing node{}",
-                    stmt.label,
-                    stmt.key,
-                    if is_set {
-                        " (use MERGE to create it)"
-                    } else {
-                        ""
-                    },
+                    "no {}({} = …) node to update: the business key matches no existing node \
+                     (use MERGE to create it)",
+                    stmt.label, stmt.key,
                 ),
             ));
         }
@@ -4061,6 +4075,101 @@ mod tests {
             replayed.contains(&("Bob".to_string(), Some(123))),
             "patch is durable across a reopen: {replayed:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Deferred-from-2c: a `MERGE`-created (delta-born) node can be `DELETE`d by its
+    /// business key even though it has no core row. The DELETE anchor's core probe
+    /// returns `Absent`; the write path then resolves the born synthetic id from the
+    /// delta and tombstones it. The node vanishes from reads and the whole-label count,
+    /// deleting a genuinely-absent key is a clear error (not a silent no-op), and the
+    /// delete is durable across a writer reopen (WAL replay).
+    #[test]
+    fn delete_removes_a_delta_born_node_by_key() {
+        let (root, _g, _) = testgen::write_basic("delete_born");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Read the Person names through the full live overlay (label scan enumerating
+        // core then delta-born nodes).
+        let names = |w: &Arc<DeltaWriter>| -> Vec<String> {
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse("MATCH (n:Person) RETURN n.name").unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("name not str: {v:?}"),
+                })
+                .collect()
+        };
+        let write = |w: &Arc<DeltaWriter>, q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(s) => s,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(w, gen.as_ref(), &stmt, &HashMap::new())
+        };
+
+        let base_n = names(&writer).len();
+        assert!(
+            !names(&writer).contains(&"Dave".to_string()),
+            "Dave absent at start"
+        );
+
+        // Create Dave (delta-born), then DELETE him by his business key.
+        write(&writer, "MERGE (n:Person {name:'Dave'}) SET n.age = 50").unwrap();
+        assert!(
+            names(&writer).contains(&"Dave".to_string()),
+            "born Dave present after create"
+        );
+        assert_eq!(names(&writer).len(), base_n + 1, "count grew by one");
+
+        write(&writer, "MATCH (n:Person {name:'Dave'}) DELETE n").unwrap();
+        let after = names(&writer);
+        assert!(
+            !after.contains(&"Dave".to_string()),
+            "born Dave gone after delete: {after:?}"
+        );
+        assert_eq!(after.len(), base_n, "count back to the baseline");
+
+        // Deleting a business key absent from both core and delta is a clear error.
+        let err = write(&writer, "MATCH (n:Person {name:'Nobody'}) DELETE n").unwrap_err();
+        assert!(
+            err.message
+                .contains("no Person(name = …) node to delete: the business key matches no"),
+            "clear no-such-node error: {}",
+            err.message
+        );
+
+        // Durability: a fresh writer over the same WAL replays create + delete, so Dave
+        // stays gone (the DELETE's born synthetic id re-resolves on replay).
+        drop(writer);
+        let reopened = Arc::new(
+            DeltaWriter::open(
+                wal.join("people"),
+                "people",
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
+            .unwrap(),
+        );
+        let replayed = names(&reopened);
+        assert!(
+            !replayed.contains(&"Dave".to_string()),
+            "delete is durable across a reopen: {replayed:?}"
+        );
+        assert_eq!(replayed.len(), base_n, "count durable across a reopen");
         std::fs::remove_dir_all(&root).ok();
     }
 

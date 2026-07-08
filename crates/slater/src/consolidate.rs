@@ -380,6 +380,43 @@ mod tests {
     }
 
     #[test]
+    fn serialise_drops_a_delta_born_then_deleted_node() {
+        // A node created only in the delta and then deleted (MERGE then DELETE by key)
+        // must NOT appear in the consolidated dump — the tombstone suppresses it in the
+        // `0..node_count` emit loop, so the delete survives a rebuild.
+        let (root, graph) = testgen::write_indexed_people("consolidate_born_deleted");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut mem = Memtable::with_synthetic_base(gen.node_count());
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None, // delta-born: absent from the core
+            [("age".to_string(), Value::Int(50))],
+        );
+        // Tombstone the born node (resolved=None: the active memtable already holds its
+        // synthetic id, so the tombstone lands on the born entry).
+        mem.delete_node("Person", "name", Value::Str("Dave".into()), None);
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            !out.contains("'Dave'"),
+            "born-then-deleted node must be dropped from the dump:\n{out}"
+        );
+        // The core people are untouched.
+        assert!(
+            out.contains("MERGE (n:Person {name: 'Alice'})"),
+            "core nodes survive:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn serialise_emits_a_delta_born_edge() {
         // Edges created only in the delta (Phase 3) must appear in the consolidated
         // dump so a rebuild carries the topology forward — both a born edge between two
