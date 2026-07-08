@@ -671,7 +671,7 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   dropped from the dump, so the delete survives a rebuild). Whole slater (593) + slater-delta
   (53) + workspace green; clippy `-D warnings` + fmt clean.
 
-- **Moved indexed value** (deferred from 2d). ✅ DONE (this commit). A **core** node whose
+- **Moved indexed value** (deferred from 2d). ✅ DONE (`a551907`). A **core** node whose
   property patch changes an **indexed** value is now relocated in the range index — a
   `RangeEq`/`RangeRange` seek finds it at the new value and drops it at the old. (The value
   *read back* was already corrected by the property overlay; only index *membership* was stale.)
@@ -714,6 +714,7 @@ the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
+- `a551907` feat(delta): relocate a patched core node in the range index (moved indexed value)
 - `2a06264` feat(delta): delete a delta-born node by business key (follow-up from 2c)
 - `db52515` feat(dump): reproducible round-trip e2e test (dump-d)
 - `8adcbff` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c)
