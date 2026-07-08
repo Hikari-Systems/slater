@@ -851,7 +851,7 @@ the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
-- `f4f5ece` feat(delta): in-place core-edge property patching (SET r.p on an existing core edge)
+- `136f316` feat(delta): in-place core-edge property patching (SET r.p on an existing core edge)
 - `bcb109d` feat(delta): write-UNWIND batched node writes (group-commit surface)
 - `6ed7bec` feat(delta): write_batch group-commit primitive
 - `aea6f36` feat(delta): size-tiered partial-L0 compaction
