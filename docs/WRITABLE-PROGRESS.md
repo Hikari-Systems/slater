@@ -493,9 +493,24 @@ Running ledger for the `writeable` track. Pairs with the design in
     CIs), so the no-cost claim rests on the code, not the noisy criterion delta. See D49.
     **Deferred to 4d:** a flush is not admitted during an in-flight consolidation (the in-flight
     guard), and the auto flush/soft-cap triggers.
-  - **4d — admission/backpressure + auto soft-cap consolidation**: `memtableBytes` = flush
-    cap, new `deltaBytes` soft / `deltaHardBytes` hard caps; async trigger reusing
-    `execute_consolidate`; per-writer in-flight guard.
+  - **4d — two-tier compaction + admission/backpressure** (revised after the O(core)-rebuild design
+    review; full rationale in `~/.claude/plans/wise-wobbling-puppy.md` §4d). Fold-into-core is a **full `slater-build`
+    rebuild = O(core), not O(delta)** (~1h / ~180 GB dump on the 91M core), so a fixed-byte soft
+    cap that auto-rebuilds is a lose-lose (frequent → write amplification; rare → hundreds of L0
+    levels → read amplification). Split into two tiers:
+    - **4d-i — L0→L0 compaction** (cheap, frequent, O(delta), no core rebuild): a
+      `Memtable::merge_older` fold + `DeltaWriter::compact_l0()` that merges *k* small L0 segments
+      into one (reclaiming overwrites/tombstones), bounding **both** resident RAM and read fan-out.
+      This is the mechanism that sustains write volume; the read merge already exists, this just
+      persists it. New config `l0CompactionTrigger`.
+    - **4d-ii — admission + rare fraction-of-core consolidation**: `memtableBytes` = flush cap;
+      consolidation threshold is `deltaCoreFraction × core_bytes` (**fraction of core**, not an
+      absolute byte count — bounds write amplification independent of core size) plus an optional
+      off-peak **schedule** (the fold is a background read-locality optimisation, not a correctness
+      requirement — the delta is durable + read-correct + RAM-bounded via 4d-i); `deltaHardBytes`
+      hard cap → throttle (a loud operational signal, not routine). Per-writer in-flight guard
+      prevents overlapping consolidations **and** a flush/compaction during one (the guard 4c-B
+      deferred — `retire` clears the whole L0 stack). 4a keeps writes during the async build safe.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -534,14 +549,16 @@ Phases **4a + 4b + 4c (A+B) are DONE**, all gates green (`cargo test -p slater -
 empty-delta read path cost-identical — see the 4c-B note on bench jitter). The full L0 LSM is
 wired: writes spill to on-disk L0 segments under a flush, reads merge `memtable ⊕ L0* ⊕ core`,
 born identity resolves across levels, and consolidation folds + retires the levels. The **next
-task is Phase 4d** — admission/backpressure + automatic soft-cap consolidation (see the 4d bullet
-in Phase status and `~/.claude/plans/wise-wobbling-puppy.md` §4d): repurpose `memtableBytes` as
-the flush cap, add `deltaBytes` (soft → auto-consolidate) + `deltaHardBytes` (hard → throttle) to
-`DeltaConfig`; after `execute_write`/`execute_edge_write` apply, (1) memtable ≥ flush cap ⇒
-`writer.flush_to_l0()`, (2) total delta ≥ soft cap & none in flight ⇒ spawn a consolidation
-asynchronously (do **not** block the ack; add the **in-flight guard** 4c-B deferred — a flush must
-not run during a consolidation), (3) ≥ hard cap ⇒ block the writer until it drains. `total_bytes()`
-+ `l0_len()` are already on `DeltaWriter` for the cap checks. Export
+task is Phase 4d — now two-tier** (revised after the O(core)-rebuild design review; see the 4d
+bullet in Phase status and `~/.claude/plans/wise-wobbling-puppy.md` §4d). **4d-i:** L0→L0
+compaction (`Memtable::merge_older` + `DeltaWriter::compact_l0()`) — cheap, O(delta), merges small
+L0 segments to bound RAM **and** read fan-out; this is what sustains write volume, no core rebuild.
+**4d-ii:** admission/backpressure — `memtableBytes` = flush cap, `l0CompactionTrigger`,
+consolidation fires at `deltaCoreFraction × core_bytes` (**fraction of core**, not a fixed byte
+count) and/or an off-peak schedule (the fold is a background read-locality optimisation, not a
+correctness requirement), `deltaHardBytes` = throttle backstop; per-writer in-flight guard covers
+overlapping consolidations **and** the 4c-B-deferred flush/compaction-during-consolidation
+exclusion. `total_bytes()` + `l0_len()` are already on `DeltaWriter` for the cap checks. Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
 the only cost).
