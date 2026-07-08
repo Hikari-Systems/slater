@@ -36,7 +36,7 @@
 //! sanctioned path that folds the delta into a fresh core.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
@@ -97,6 +97,13 @@ pub struct DeltaWriter {
     /// Bumps on every published change; folded into the result-cache key so an
     /// overlaid result is invalidated by the next write (see `server::result_key`).
     epoch: AtomicU64,
+    /// Set for the whole duration of a consolidation (freeze → build → swap →
+    /// retire). While set, [`Self::flush_to_l0`]/[`Self::compact_l0`] are no-ops: a
+    /// flush/compaction between freeze and retire would add an L0 segment that retire
+    /// (which clears the whole stack) would then drop, losing its writes. Writes
+    /// themselves continue landing in the memtable + WAL and survive the build (Phase
+    /// 4a); the memtable simply grows until retire, bounded by the 4d-ii hard cap.
+    consolidating: AtomicBool,
 }
 
 impl DeltaWriter {
@@ -163,12 +170,33 @@ impl DeltaWriter {
             }),
             published: RwLock::new(published),
             epoch: AtomicU64::new(1),
+            consolidating: AtomicBool::new(false),
         })
     }
 
     /// The graph this writer serves.
     pub fn graph(&self) -> &str {
         &self.graph
+    }
+
+    /// Claim the exclusive right to consolidate this graph, returning `false` if a
+    /// consolidation is already running (the caller must not proceed). Held until
+    /// [`Self::end_consolidation`]; while held, auto flush/compaction is suppressed so
+    /// nothing mutates the L0 stack across the freeze→retire window (Phase 4d-ii).
+    pub fn begin_consolidation(&self) -> bool {
+        self.consolidating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the consolidation claim taken by [`Self::begin_consolidation`].
+    pub fn end_consolidation(&self) {
+        self.consolidating.store(false, Ordering::Release);
+    }
+
+    /// Whether a consolidation is currently in flight for this graph.
+    pub fn is_consolidating(&self) -> bool {
+        self.consolidating.load(Ordering::Acquire)
     }
 
     /// The core generation the delta's dense ids were resolved against. The server
@@ -297,6 +325,11 @@ impl DeltaWriter {
     /// flushed data in neither or both of the memtable and the new L0 level.
     pub fn flush_to_l0(&self) -> Result<bool> {
         let mut inner = self.inner.lock().expect("delta writer lock");
+        // Checked under the lock so it serialises with freeze/retire: a consolidation
+        // must not have an L0 segment appear between its freeze and its retire.
+        if self.consolidating.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         if inner.mem.is_empty() {
             return Ok(false);
         }
@@ -356,6 +389,10 @@ impl DeltaWriter {
     /// size-tiered partial-run policy would need that, and is a later refinement).
     pub fn compact_l0(&self) -> Result<bool> {
         let mut inner = self.inner.lock().expect("delta writer lock");
+        // As with `flush_to_l0`: never mutate the L0 stack during a consolidation.
+        if self.consolidating.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         if inner.l0.len() < 2 {
             return Ok(false);
         }
@@ -1220,6 +1257,64 @@ mod tests {
         let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
         assert_eq!(w2.l0_len(), 1);
         assert_eq!(reads(&w2), before, "compacted reads survive a reopen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn consolidation_guard_suppresses_flush_and_compact() {
+        let dir = tmp("guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(41));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // Build two L0 segments so both flush and compact would have work to do.
+        for v in ["A", "B"] {
+            w.write(
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str(v.into()),
+                    &[("p", Value::Int(1))],
+                ),
+                node(if v == "A" { 10 } else { 20 }),
+            )
+            .unwrap();
+            w.flush_to_l0().unwrap();
+        }
+        assert_eq!(w.l0_len(), 2);
+        // A live write in the active memtable.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("p", Value::Int(2))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        assert!(!w.snapshot().is_empty());
+
+        // Claim consolidation: flush + compact become no-ops (the stack must not change
+        // across a freeze→retire window).
+        assert!(w.begin_consolidation());
+        assert!(!w.begin_consolidation(), "a second claim is refused");
+        assert!(
+            !w.flush_to_l0().unwrap(),
+            "flush suppressed while consolidating"
+        );
+        assert!(
+            !w.compact_l0().unwrap(),
+            "compaction suppressed while consolidating"
+        );
+        assert_eq!(w.l0_len(), 2, "L0 stack untouched");
+        assert!(!w.snapshot().is_empty(), "memtable not flushed");
+
+        // Release: maintenance works again.
+        w.end_consolidation();
+        assert!(w.flush_to_l0().unwrap(), "flush resumes after release");
+        assert!(w.compact_l0().unwrap(), "compaction resumes after release");
+        assert_eq!(w.l0_len(), 1, "three segments compacted to one");
         std::fs::remove_dir_all(&dir).ok();
     }
 

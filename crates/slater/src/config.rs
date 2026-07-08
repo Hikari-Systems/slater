@@ -766,11 +766,21 @@ pub struct DeltaConfig {
     /// ephemeral instance storage (see D44 — the floor is always local disk).
     #[serde(default = "default_wal_dir")]
     pub wal_dir: String,
-    /// Byte budget for a graph's in-RAM memtable before it must spill / trigger a
-    /// consolidation. Phase 1c only meters against it; spill and the consolidation
-    /// trigger land in Phases 1d/4. Defaults to 64 MiB.
+    /// Byte budget for a graph's in-RAM active memtable before it is flushed to an
+    /// immutable L0 segment (Phase 4c/4d). A write that pushes the memtable past this
+    /// spills it to disk and resets it empty, bounding resident memtable RAM. Defaults
+    /// to 64 MiB.
     #[serde(default = "default_memtable_bytes", deserialize_with = "de::usize")]
     pub memtable_bytes: usize,
+    /// Number of sealed L0 segments that triggers an L0→L0 compaction (Phase 4d-i):
+    /// once the stack reaches this many levels, a write merges them into one, bounding
+    /// read fan-out and reclaiming overwritten/tombstoned space. Cheap (O(delta), no
+    /// core rebuild). Defaults to 4; set to 0 to disable auto-compaction.
+    #[serde(
+        default = "default_l0_compaction_trigger",
+        deserialize_with = "de::usize"
+    )]
+    pub l0_compaction_trigger: usize,
     /// Path to the `slater-build` binary invoked to rebuild a fresh generation
     /// during consolidation (Phase 1d). A bare name is resolved on `PATH`; an
     /// absolute path pins a specific binary. Defaults to `slater-build`.
@@ -784,9 +794,14 @@ impl Default for DeltaConfig {
             enabled: default_false(),
             wal_dir: default_wal_dir(),
             memtable_bytes: default_memtable_bytes(),
+            l0_compaction_trigger: default_l0_compaction_trigger(),
             builder_bin: default_builder_bin(),
         }
     }
+}
+
+fn default_l0_compaction_trigger() -> usize {
+    4
 }
 
 fn default_wal_dir() -> String {

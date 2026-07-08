@@ -520,16 +520,33 @@ Running ledger for the `writeable` track. Pairs with the design in
       `merge_levels_is_deterministic`; `delta_writer` `compact_l0_collapses_the_stack_preserving_reads`
       (2 levels → 1, reads unchanged, reopen). Whole slater+slater-delta green; clippy+fmt clean.
       **Policy note:** merge-all is the first-cut compaction policy; a size-tiered partial-run policy
-      (which would need number-vs-stack-order reconciliation) is a later refinement. New config
-      `l0CompactionTrigger` lands with the 4d-ii wiring.
-    - **4d-ii — admission + rare fraction-of-core consolidation**: `memtableBytes` = flush cap;
-      consolidation threshold is `deltaCoreFraction × core_bytes` (**fraction of core**, not an
-      absolute byte count — bounds write amplification independent of core size) plus an optional
-      off-peak **schedule** (the fold is a background read-locality optimisation, not a correctness
-      requirement — the delta is durable + read-correct + RAM-bounded via 4d-i); `deltaHardBytes`
-      hard cap → throttle (a loud operational signal, not routine). Per-writer in-flight guard
-      prevents overlapping consolidations **and** a flush/compaction during one (the guard 4c-B
-      deferred — `retire` clears the whole L0 stack). 4a keeps writes during the async build safe.
+      (which would need number-vs-stack-order reconciliation) is a later refinement.
+    - **4d-ii-a — in-flight guard + auto flush + auto compaction. ✅ DONE** (this commit). The write
+      path now self-maintains the cheap tiers. `DeltaWriter` gains a `consolidating: AtomicBool` +
+      `begin_consolidation()`/`end_consolidation()`/`is_consolidating()`; `flush_to_l0`/`compact_l0`
+      check it **under the inner lock** and no-op while set, so nothing mutates the L0 stack across a
+      consolidation's freeze→retire window (which `retire` clears wholesale). `consolidate_graph`
+      claims the guard before freeze (refusing an overlap) and releases it on every exit via an RAII
+      `ConsolidationGuard` — covering both the auto trigger and the manual `CALL slater.consolidate()`.
+      New `DeltaConfig.l0_compaction_trigger` (default 4; `memtableBytes` is the flush cap, default
+      64 MiB) threaded through `ConnCtx`; after `execute_write`/`execute_edge_write` the RUN handler
+      calls `maybe_maintain_delta` — flush the memtable if ≥ cap, then compact if the L0 stack ≥
+      trigger, both on `spawn_blocking` (they fsync) and both failure-swallowing (the write already
+      acked durably) and skipped while consolidating. Tests: `delta_writer`
+      `consolidation_guard_suppresses_flush_and_compact` (guard no-ops flush+compact, second claim
+      refused, resumes after release); `server` `write_path_auto_flushes_and_compacts` (1-byte cap +
+      3-segment trigger drives flush-per-write then a collapse, born rows survive). Whole
+      slater+slater-delta+workspace green; clippy+fmt clean.
+    - **4d-ii-b — rare fraction-of-core consolidation + hard-cap throttle** (next): consolidation
+      auto-fires when the delta reaches `deltaCoreFraction × core_size` (**fraction of core**, not an
+      absolute byte count — bounds write amplification independent of core size; core size via the
+      served generation's entity counts) and/or an optional off-peak **schedule** (the fold is a
+      background read-locality optimisation, not a correctness requirement — the delta is durable +
+      read-correct + RAM-bounded by 4d-i/ii-a); spawned async so the ack never blocks (guarded by the
+      4d-ii-a in-flight flag). `deltaHardBytes` hard cap → throttle the writer until the in-flight
+      consolidation drains (a loud operational signal, not routine). New config `deltaCorePercent` +
+      `deltaHardBytes`; `total_bytes()` is already on `DeltaWriter`. 4a keeps writes during the async
+      build safe.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -557,29 +574,30 @@ below are current, and that the latest commit hash is noted.
 ## Next action
 
 **Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
+- `<4d-ii-a>` feat(delta): in-flight guard + auto flush/compaction on the write path — **this commit**
+  (hash recorded in a follow-up doc commit)
 - `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
 - `e012595` feat(delta): memtable→L0 flush + write-path born resolution (Phase 4c-B)
 - `710912a` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
 - `fcac9fb` feat(delta): L0 delta-segment format + reader (Phase 4b)
-- `04806bd` feat(delta): carry post-freeze writes onto the new core (Phase 4a)
 
-Phases **4a + 4b + 4c (A+B) + 4d-i are DONE**, all gates green (`cargo test -p slater -p
-slater-delta` = 574 + 53; `cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]`
+Phases **4a + 4b + 4c (A+B) + 4d-i + 4d-ii-a are DONE**, all gates green (`cargo test -p slater -p
+slater-delta` = 576 + 53; `cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]`
 real-builder e2e; empty-delta read path cost-identical — see the 4c-B note on bench jitter). The
-full L0 LSM is wired (flush spills to on-disk segments, reads merge `memtable ⊕ L0* ⊕ core`, born
-identity resolves across levels, consolidation folds + retires) **and** the cheap L0→L0 compaction
-tier exists (`Memtable::merge_levels` + `DeltaWriter::compact_l0()`). The **next task is Phase
-4d-ii** — admission/backpressure + rare fraction-of-core consolidation (see the 4d-ii bullet in
-Phase status and `~/.claude/plans/wise-wobbling-puppy.md` §4d): `memtableBytes` = flush cap, new
-`l0CompactionTrigger` (segment-count/bytes → `compact_l0`), consolidation fires at
-`deltaCoreFraction × core_bytes` (**fraction of core**, not a fixed byte count) and/or an off-peak
-schedule (the fold is a background read-locality optimisation, not a correctness requirement),
-`deltaHardBytes` = throttle backstop. After `execute_write`/`execute_edge_write` apply: flush if
-memtable ≥ cap; `compact_l0` if L0 stack ≥ trigger; spawn a consolidation async if total delta ≥
-the fraction & none in flight (don't block the ack); block if ≥ hard cap. Per-writer in-flight
-guard (`AtomicBool`/`Semaphore(1)`) covers overlapping consolidations **and** the 4c-B/4d-i-deferred
-flush/compaction-during-consolidation exclusion (`retire` clears the whole L0 stack). `total_bytes()`
-+ `l0_len()` are already on `DeltaWriter` for the cap checks. Export
+full L0 LSM is wired, the cheap L0→L0 compaction tier exists, **and** the write path now
+self-maintains (auto flush at the memtable cap, auto compact at the L0 trigger) behind a
+consolidation in-flight guard. The **next task is Phase 4d-ii-b** — rare fraction-of-core
+consolidation + hard-cap throttle (see the 4d-ii-b bullet in Phase status and
+`~/.claude/plans/wise-wobbling-puppy.md` §4d): add `deltaCorePercent` (consolidate when the delta
+reaches that % of core size — a **fraction of core**, not a fixed byte count; core size via the
+served generation's entity counts, e.g. `node_count()+edge_count()`) + `deltaHardBytes` to
+`DeltaConfig` and `ConnCtx`; extend `maybe_maintain_delta` (or a sibling) to spawn a consolidation
+async when the delta crosses the fraction & `!is_consolidating()` (don't block the ack — reuse the
+`execute_consolidate` path / `spawn_blocking` on `graphs.consolidate_graph`), and to throttle
+(await) the writer when total delta ≥ `deltaHardBytes` while a consolidation is draining. The
+in-flight guard (`begin/end/is_consolidating`, RAII `ConsolidationGuard`) is already in place;
+`total_bytes()`/`l0_len()`/`node_delta_count()` are on `DeltaWriter` for the checks. Consider an
+optional off-peak **schedule** knob. Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
 the only cost).

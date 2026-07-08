@@ -449,6 +449,14 @@ impl Graphs {
         let writer = self
             .writer(name)
             .ok_or_else(|| anyhow!("graph '{name}' has no writable layer to consolidate"))?;
+        // Claim exclusive consolidation rights: refuse to overlap two consolidations,
+        // and suppress auto flush/compaction for the whole freeze→retire window (a new
+        // L0 segment there would be dropped by `retire`, losing its writes — Phase
+        // 4d-ii). The guard releases the claim on every exit path (RAII).
+        if !writer.begin_consolidation() {
+            bail!("a consolidation for '{name}' is already in progress");
+        }
+        let _consolidation_guard = ConsolidationGuard(writer.clone());
         let core = self
             .get(name)
             .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
@@ -553,6 +561,17 @@ pub fn run_builder(builder_bin: &str, dump: &Path, graph: &str, data_dir: &Path)
         bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'");
     }
     Ok(())
+}
+
+/// RAII release of the per-writer consolidation claim ([`DeltaWriter::begin_consolidation`]),
+/// so every exit path of [`Graphs::consolidate_graph`] — success, a dump/build/swap/retire
+/// error, or an early return — clears the in-flight flag and re-enables auto flush/compaction.
+struct ConsolidationGuard(Arc<DeltaWriter>);
+
+impl Drop for ConsolidationGuard {
+    fn drop(&mut self) {
+        self.0.end_consolidation();
+    }
 }
 
 // ── Generation guard (poll → exit / swap) ─────────────────────────────────────
@@ -815,6 +834,12 @@ struct ConnCtx {
     /// The `slater-build` binary spawned to rebuild a consolidated generation
     /// (`config.delta.builder_bin`). A bare name resolves on `PATH`.
     builder_bin: String,
+    /// Active-memtable byte budget: a write that pushes it past this flushes the
+    /// memtable to an L0 segment (`config.delta.memtable_bytes`, Phase 4d-ii).
+    memtable_bytes: usize,
+    /// L0 segment count that triggers an L0→L0 compaction after a write
+    /// (`config.delta.l0_compaction_trigger`; 0 disables — Phase 4d-ii).
+    l0_compaction_trigger: usize,
 }
 
 impl ConnCtx {
@@ -1667,6 +1692,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_pre_auth_connections: cfg.server.max_pre_auth_connections,
         data_dir: PathBuf::from(cfg.data_dir()),
         builder_bin: cfg.delta.builder_bin.clone(),
+        memtable_bytes: cfg.delta.memtable_bytes,
+        l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
     });
     if cfg.load_test_diagnostics {
         warn!(
@@ -2354,10 +2381,14 @@ async fn handle_request(
                         .map_err(|e| Failure::from_query_error(&e))?
                     {
                         parser::ast::Statement::Write(stmt) => {
-                            execute_write(w, gen.as_ref(), &stmt, &param_vals)?
+                            let out = execute_write(w, gen.as_ref(), &stmt, &param_vals)?;
+                            maybe_maintain_delta(ctx, &graph, w).await;
+                            out
                         }
                         parser::ast::Statement::WriteEdge(stmt) => {
-                            execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?
+                            let out = execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?;
+                            maybe_maintain_delta(ctx, &graph, w).await;
+                            out
                         }
                         parser::ast::Statement::Consolidate => {
                             execute_consolidate(ctx, &graph).await?
@@ -2784,6 +2815,40 @@ fn execute_edge_write(
         .write(op, OpResolution::Edge { src, dst })
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
+}
+
+/// Post-write delta maintenance (Phase 4d-ii): keep resident RAM and read fan-out
+/// bounded with the **cheap, O(delta)** tiers — flush the active memtable to an L0
+/// segment when it is over budget, then compact the L0 stack when it has grown past
+/// the trigger. Both run on a blocking thread (they fsync), and neither can fail the
+/// write: the write already committed + acked durably, so a maintenance error is logged
+/// and swallowed. Skipped entirely while a consolidation is in flight (it owns the L0
+/// stack — the guarded flush/compact would no-op anyway, this just avoids the work).
+/// The expensive fraction-of-core consolidation trigger + hard-cap throttle are 4d-ii-b.
+async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<DeltaWriter>) {
+    if writer.is_consolidating() {
+        return;
+    }
+    if ctx.memtable_bytes > 0 && writer.bytes() >= ctx.memtable_bytes {
+        let w = writer.clone();
+        match tokio::task::spawn_blocking(move || w.flush_to_l0()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(graph = %graph, error = %format!("{e:#}"), "delta flush_to_l0 failed")
+            }
+            Err(e) => warn!(graph = %graph, error = %e, "delta flush task panicked"),
+        }
+    }
+    if ctx.l0_compaction_trigger > 0 && writer.l0_len() >= ctx.l0_compaction_trigger {
+        let w = writer.clone();
+        match tokio::task::spawn_blocking(move || w.compact_l0()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(graph = %graph, error = %format!("{e:#}"), "delta compact_l0 failed")
+            }
+            Err(e) => warn!(graph = %graph, error = %e, "delta compaction task panicked"),
+        }
+    }
 }
 
 /// Execute `CALL slater.consolidate()` (Phase 5): fold the graph's writable delta
@@ -3578,6 +3643,7 @@ mod tests {
             enabled: true,
             wal_dir: wal_dir.to_string_lossy().into_owned(),
             memtable_bytes: 64 << 20,
+            l0_compaction_trigger: 4,
             builder_bin: "slater-build".to_string(),
         }
     }
@@ -4798,10 +4864,79 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 4d-ii-a: the write path auto-maintains the delta. With a 1-byte memtable
+    /// cap every write flushes to an L0 segment; with a 3-segment compaction trigger the
+    /// third flush collapses the stack. Drives `execute_write` + `maybe_maintain_delta`
+    /// exactly as the RUN handler does, and confirms the born rows survive.
+    #[tokio::test]
+    async fn write_path_auto_flushes_and_compacts() {
+        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+
+        let write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a node write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 1");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(writer.l0_len(), 1, "first write flushed");
+        assert!(writer.snapshot().is_empty(), "memtable freed by the flush");
+
+        write("MERGE (n:Person {name:'Erin'}) SET n.age = 2");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(writer.l0_len(), 2, "second write flushed");
+
+        write("MERGE (n:Person {name:'Fay'}) SET n.age = 3");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(
+            writer.l0_len(),
+            1,
+            "third flush hit the compaction trigger and collapsed the stack"
+        );
+
+        // All three born rows still read back through the compacted delta.
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+        let ast = parser::parse("MATCH (n:Person) RETURN n.name").unwrap();
+        let names: HashSet<String> = Engine::new(&view, &cache)
+            .run(&ast)
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for n in ["Dave", "Erin", "Fay"] {
+            assert!(
+                names.contains(n),
+                "born {n} survives flush+compaction: {names:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A ConnCtx over a writable-layer-enabled `people` graph, with `builder_bin`
     /// pointed at the given binary — the harness for the `CALL slater.consolidate()`
     /// trigger (`execute_consolidate`).
     fn build_writable_ctx(tag: &str, builder_bin: &str) -> (PathBuf, Arc<ConnCtx>) {
+        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4)
+    }
+
+    /// [`build_writable_ctx`] with explicit delta caps, so a test can drive the auto
+    /// flush/compaction thresholds (Phase 4d-ii).
+    fn build_writable_ctx_caps(
+        tag: &str,
+        builder_bin: &str,
+        memtable_bytes: usize,
+        l0_compaction_trigger: usize,
+    ) -> (PathBuf, Arc<ConnCtx>) {
         let (root, _graph) = testgen::write_indexed_people(tag);
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
@@ -4850,6 +4985,8 @@ mod tests {
             max_pre_auth_connections: 4_096,
             data_dir: root.clone(),
             builder_bin: builder_bin.to_string(),
+            memtable_bytes,
+            l0_compaction_trigger,
         });
         (root, ctx)
     }
@@ -5008,6 +5145,8 @@ mod tests {
             max_pre_auth_connections: limits.max_pre_auth_connections,
             data_dir: root.clone(),
             builder_bin: "slater-build".to_string(),
+            memtable_bytes: 64 << 20,
+            l0_compaction_trigger: 4,
         });
         (root, ctx)
     }
@@ -5087,6 +5226,8 @@ mod tests {
             max_pre_auth_connections: 4_096,
             data_dir: root.clone(),
             builder_bin: "slater-build".to_string(),
+            memtable_bytes: 64 << 20,
+            l0_compaction_trigger: 4,
         })
     }
 
