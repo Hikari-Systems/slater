@@ -165,3 +165,174 @@ async fn writable_layer_smoke_on_a_large_core() {
     joined.expect("smoke client task panicked");
     server.abort();
 }
+
+/// Bulk-delete stress: tombstone a ~30% segment of the graph (`:Entity` whose indexed
+/// `wikidata_id <= SLATER_SMOKE_P30`, default 332894 for the 1M Wikidata fixture) through
+/// the writable layer, then confirm the segment is gone from indexed seeks and the whole
+/// count while the rest survives. A small `memtableBytes` keeps the per-write publish
+/// cheap and lets the auto flush/compaction bound the L0 fan-out across the ~300K deletes.
+///
+/// NB — runtime is **fsync-bound**: each delete is its own fsync'd group-commit (batching
+/// was deferred in Phase 1c), so throughput is one commit per statement. On a slow-fsync
+/// box (WSL2, ~10ms) 300K deletes take ~1h (~12ms each); on NVMe (~0.1ms) it is ~30s. The
+/// *reads* afterwards are fast (an indexed range seek and a full-scan count over the 1M
+/// core with the tombstone overlay each complete in ~1.5s). Correctness is the point here,
+/// not write throughput — run it deliberately, not in a tight loop.
+///
+/// ```text
+/// SLATER_SMOKE_DATADIR=/home/rickk/perf-gens/wiki1m SLATER_SMOKE_GRAPH=wiki1m \
+///   cargo test -p slater --test smoke_1m delete_thirty_percent -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a prebuilt generation; bulk-deletes ~300K nodes"]
+async fn delete_thirty_percent_segment() {
+    let data_dir = std::env::var("SLATER_SMOKE_DATADIR")
+        .expect("set SLATER_SMOKE_DATADIR to a slater data directory");
+    let graph = std::env::var("SLATER_SMOKE_GRAPH").unwrap_or_else(|_| "wiki1m".to_string());
+    let p30: i64 = std::env::var("SLATER_SMOKE_P30")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(332894);
+
+    let scratch = std::env::temp_dir().join(format!("slater_smoke_del_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    let acl_path = write_acl(&scratch, &graph);
+    let wal_dir = scratch.join("wal");
+
+    let cfg = serde_json::json!({
+        "server": { "bind": "127.0.0.1", "port": 0 },
+        "dataBackend": { "kind": "fs", "fs": { "dir": data_dir } },
+        "aclPath": acl_path.to_str().unwrap(),
+        "requireAclStamp": false,
+        "reloadStrategy": "exit",
+        "generationPollMs": 600000,
+        "log": { "level": "warn" },
+        // Enumerating the 30% segment returns ~300K rows over a range scan — lift the
+        // per-query row / intermediate / scan caps well above that.
+        "query": { "maxRows": 5000000, "maxIntermediate": 5000000, "maxScan": 5000000 },
+        // Small active memtable so the per-write clone-on-publish stays cheap and the
+        // auto flush + L0 compaction keep the read fan-out bounded across ~300K deletes.
+        "delta": {
+            "enabled": true,
+            "walDir": wal_dir.to_str().unwrap(),
+            "memtableBytes": 1 << 20,
+            "l0CompactionTrigger": 4
+        }
+    });
+    let cfg: slater::config::AppConfig = serde_json::from_value(cfg).expect("build AppConfig");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        if let Err(e) = slater::server::serve_with_listener(cfg, listener).await {
+            eprintln!("server ended: {e:#}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let g = graph.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut c =
+            BoltClient::connect("127.0.0.1", port, Duration::from_secs(60)).expect("connect");
+        c.login("smoke-test/1", "smoke", "pw").expect("login");
+
+        // Baseline whole-label count (empty delta ⇒ answered from the manifest).
+        let total = ints(&mut c, &g, "MATCH (n:Entity) RETURN count(*)")[0];
+        println!("baseline :Entity count = {total}");
+        assert!(total > 0);
+
+        // Enumerate the 30% segment by an indexed range seek.
+        let t0 = std::time::Instant::now();
+        let victims = ints(
+            &mut c,
+            &g,
+            &format!("MATCH (n:Entity) WHERE n.wikidata_id <= {p30} RETURN n.wikidata_id"),
+        );
+        let seg = victims.len() as i64;
+        println!(
+            "selected segment: {seg} entities (wikidata_id <= {p30}) = {:.1}% in {:?}",
+            100.0 * seg as f64 / total as f64,
+            t0.elapsed()
+        );
+        assert!(seg > 0 && seg < total, "a real, partial segment");
+        // A witness entity beyond the segment (maldonite, id 412684 > p30) that must survive.
+        assert_eq!(
+            strs(
+                &mut c,
+                &g,
+                "MATCH (n:Entity {wikidata_id: 412684}) RETURN n.name"
+            ),
+            vec!["maldonite"],
+            "survivor present pre-delete"
+        );
+
+        // Delete every entity in the segment by its business key.
+        let t1 = std::time::Instant::now();
+        for (i, id) in victims.iter().enumerate() {
+            exec(
+                &mut c,
+                &g,
+                &format!("MATCH (n:Entity {{wikidata_id: {id}}}) DELETE n"),
+            );
+            if (i + 1) % 50_000 == 0 {
+                println!("  deleted {}/{seg} ({:?})", i + 1, t1.elapsed());
+            }
+        }
+        println!("deleted {seg} entities in {:?}", t1.elapsed());
+
+        // The segment is gone from an indexed range seek…
+        let t2 = std::time::Instant::now();
+        let remaining_in_seg = ints(
+            &mut c,
+            &g,
+            &format!("MATCH (n:Entity) WHERE n.wikidata_id <= {p30} RETURN n.wikidata_id"),
+        );
+        println!(
+            "range seek over the deleted segment now returns {} rows ({:?})",
+            remaining_in_seg.len(),
+            t2.elapsed()
+        );
+        assert!(
+            remaining_in_seg.is_empty(),
+            "the whole 30% segment is suppressed on an indexed range seek"
+        );
+
+        // …and from the whole-label count (full scan + tombstone suppression).
+        let t3 = std::time::Instant::now();
+        let after = ints(&mut c, &g, "MATCH (n:Entity) RETURN count(*)")[0];
+        println!(
+            "post-delete :Entity count = {after} (scan {:?})",
+            t3.elapsed()
+        );
+        assert_eq!(
+            after,
+            total - seg,
+            "count drops by exactly the deleted segment"
+        );
+
+        // A specific deleted id is gone; a survivor beyond the segment stays.
+        assert!(
+            strs(
+                &mut c,
+                &g,
+                "MATCH (n:Entity {wikidata_id: 1}) RETURN n.name"
+            )
+            .is_empty(),
+            "a deleted id no longer resolves"
+        );
+        assert_eq!(
+            strs(
+                &mut c,
+                &g,
+                "MATCH (n:Entity {wikidata_id: 412684}) RETURN n.name"
+            ),
+            vec!["maldonite"],
+            "an entity outside the segment survives"
+        );
+        println!("30% SEGMENT DELETE TEST PASSED: {seg} of {total} deleted, {after} remain");
+    })
+    .await;
+    joined.expect("delete task panicked");
+    server.abort();
+}
