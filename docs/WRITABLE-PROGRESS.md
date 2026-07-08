@@ -776,6 +776,33 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   (58) + workspace green; clippy `-D warnings` + fmt clean (MSRV 1.80 — `map_or`, not `is_none_or`);
   read path untouched (compaction is write-path maintenance; empty-delta bench unaffected).
 
+- **Group-commit batching + write-`UNWIND`** (from the 1M-smoke fsync finding; the chosen
+  alternative to the deferred off-heap L0 item). ✅ DONE (this commit). Bulk writes were
+  one-fsync-per-statement (the 300K-delete smoke run took ~1h on WSL2, fsync-bound). Two pieces:
+  - **`DeltaWriter::write_batch(&[(WalOp, OpResolution)])`** — the group-commit primitive: append
+    every record, do **one** `commit` (a single fsync — the ack barrier for the whole batch),
+    fold all ops into the memtable, and publish **once** (one epoch). Atomic on failure (the
+    memtable is applied only after the fsync, so a failed append/commit rejects the batch whole —
+    the un-committed records are dropped on replay). Empty batch = no-op.
+  - **Write-`UNWIND`** (the client surface, and the first step of FalkorDB-parity UNWIND-as-write):
+    `UNWIND $rows AS r MERGE|MATCH (n:L {k: r.k}) SET n.p = r.p` / `… DELETE n`. Grammar
+    (`cypher.pest`): an optional leading `unwind_clause` on `write_statement`. Parser: `WriteStmt`
+    gains `unwind: Option<(Expr, String)>` (source list + alias); constant-value enforcement is
+    relaxed when an UNWIND is present (values may reference the alias's fields). Server:
+    `execute_write` dispatches to `execute_write_batch`, which evaluates the `$rows` parameter list,
+    builds one WAL op per row (key + SET values via `eval_row_value` — literal / param / `r` /
+    `r.field`), resolves each via the **shared** `resolve_node_op` (factored out of `execute_write`
+    so single and batched writes share the born-create / delete-born / error semantics), and
+    applies the lot through `write_batch`. **Scope:** node writes over a **parameter** list; a
+    within-batch create-then-delete of the same *new* key is not resolved (resolution is against
+    core ⊕ delta as-of-batch-start — independent rows, the bulk-import case, are unaffected).
+    **Deferred:** edge write-UNWIND, a literal-list source (needs a public `Value`→`Val`), a
+    params-carrying Bolt client for a 1M throughput smoke, and the broader Falkor write grammar
+    (CREATE, ON CREATE/ON MATCH, multi-clause). Tests: `delta_writer::write_batch_group_commits_and_survives_reopen`;
+    `parser::write_unwind_lowers_a_batched_node_write`; `server::write_unwind_batches_node_writes_under_one_commit`
+    (batched create → one epoch → per-row SET → reopen-durable → batched DELETE → one epoch → gone).
+    Whole slater (611) + slater-delta (58) + workspace green; clippy `-D warnings` + fmt clean.
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -807,7 +834,7 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 608 + 58; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 611 + 58; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
@@ -823,9 +850,9 @@ optional/independent:
     tiered compaction + the fraction trigger bound it further), **not a correctness concern** —
     recommended for its **own dedicated session**, not a tail-of-batch rush.
   - in-place **core-edge** property patching (born-edge properties are done).
-  - **group-commit batching** for bulk writes (a 1M smoke test showed bulk writes are
-    one-fsync-per-statement — ~12ms/write on WSL2; reads over the overlay stay fast). Likely a
-    higher-impact win than the off-heap refinement.
+  - ~~**group-commit batching** for bulk writes~~ ✅ DONE — `write_batch` primitive + write-`UNWIND`
+    surface (see "Deferred follow-ups" below). Edge write-UNWIND + the broader Falkor write grammar
+    (CREATE, ON CREATE/ON MATCH) remain.
   **delete-a-born-node-by-key, moved-indexed-value, edge-properties, the off-peak
   consolidation-window knob, and size-tiered partial-L0 compaction are now ✅ DONE** (see "Deferred
   follow-ups" below). See the "Smaller follow-ups" list below.

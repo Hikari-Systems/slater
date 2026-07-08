@@ -2621,6 +2621,10 @@ fn execute_write(
                 .into(),
         ));
     }
+    // A leading `UNWIND <list> AS r` is a batched (group-committed) write.
+    if stmt.unwind.is_some() {
+        return execute_write_batch(writer, gen, stmt, params);
+    }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
     let op = match &stmt.op {
         WriteOp::Set(sets) => {
@@ -2643,75 +2647,220 @@ fn execute_write(
             value: key_value,
         },
     };
-    // Resolve the anchor's business key against the current core. A `MERGE` whose key
-    // is genuinely absent creates a delta-born node (`resolved = None`); every other
-    // absent/ambiguous/unindexed case is a clear error rather than a silent write.
-    let (label, key, value) = op.node_key().expect("execute_write builds node ops only");
-    // `is_set` = the op mutates properties (a `SET`), vs. a `DELETE`. A `MERGE … SET`
-    // (`stmt.upsert`) is the only shape that may create on an absent key.
     let is_set = matches!(op, WalOp::UpsertNode { .. });
-    let resolved = match resolve_business_key(gen, label, key, value) {
+    let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+    writer
+        .write(op, OpResolution::Node(resolved))
+        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// Resolve a node write's business key to its dense-id context for the WAL op. `Unique`
+/// → the core id; a MERGE-create (`is_set && upsert`) on an `Absent` key → a born
+/// synthetic id (reusing one already flushed to L0, else `None` to allocate); a DELETE
+/// of a born node → its synthetic id resolved across the whole delta; every other
+/// absent / ambiguous / unindexed case is a clear error. Shared by the single and
+/// batched (write-UNWIND) node write paths so their semantics cannot drift.
+fn resolve_node_op(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    op: &WalOp,
+    is_set: bool,
+    upsert: bool,
+) -> std::result::Result<Option<u64>, Failure> {
+    let (label, key, value) = op.node_key().expect("resolve_node_op is for node ops only");
+    Ok(match resolve_business_key(gen, label, key, value) {
         KeyResolution::Unique(id) => Some(id),
-        // MERGE create: a key absent from the core is a delta-born node. If it was
-        // already born and flushed to an L0 level, reuse its existing synthetic id
-        // (Phase 4c-B) rather than allocate a duplicate; otherwise `None` allocates a
-        // fresh one (the active memtable, or a live born node it still holds).
-        KeyResolution::Absent if is_set && stmt.upsert => {
+        // MERGE create: a key absent from the core is a delta-born node — reuse an id
+        // already flushed to L0, else `None` allocates a fresh one.
+        KeyResolution::Absent if is_set && upsert => {
             writer.born_synthetic_for_identity(label, key, value)
         }
-        // DELETE of a delta-born node: it has no core row, but the delta may hold it
-        // (born via a prior MERGE, possibly already flushed to L0). Resolve its synthetic
-        // id across the whole delta and tombstone it — passing the id plants the
-        // tombstone's `by_dense` mapping so a node already flushed to an L0 level stays
-        // suppressed on read. Absent from core *and* delta ⇒ a genuine no-such-node error.
-        KeyResolution::Absent if !is_set => match writer.born_synthetic_in_delta(label, key, value)
-        {
-            Some(id) => Some(id),
-            None => {
-                return Err(Failure::new(
-                    CODE_EXECUTION,
-                    format!(
-                        "no {}({} = …) node to delete: the business key matches no existing node",
-                        stmt.label, stmt.key,
-                    ),
-                ));
+        // DELETE of a delta-born node: resolve its synthetic id across the whole delta so
+        // the tombstone suppresses it (even if flushed to L0). Absent everywhere → error.
+        KeyResolution::Absent if !is_set => {
+            match writer.born_synthetic_in_delta(label, key, value) {
+                Some(id) => Some(id),
+                None => {
+                    return Err(Failure::new(
+                        CODE_EXECUTION,
+                        format!(
+                            "no {label}({key} = …) node to delete: the business key matches no \
+                             existing node"
+                        ),
+                    ))
+                }
             }
-        },
-        // Remaining absent case: a `MATCH … SET` (update-only) whose key matches no core
-        // node. `MERGE` (create) and `DELETE` (born-node tombstone) are handled above.
+        }
+        // A `MATCH … SET` (update-only) whose key matches no core node.
         KeyResolution::Absent => {
             return Err(Failure::new(
                 CODE_EXECUTION,
                 format!(
-                    "no {}({} = …) node to update: the business key matches no existing node \
-                     (use MERGE to create it)",
-                    stmt.label, stmt.key,
+                    "no {label}({key} = …) node to update: the business key matches no existing \
+                     node (use MERGE to create it)"
                 ),
-            ));
+            ))
         }
         KeyResolution::Ambiguous => {
             return Err(Failure::new(
                 CODE_EXECUTION,
                 format!(
-                    "the business key {}({} = …) matches more than one node — writes require a \
-                     unique business key",
-                    stmt.label, stmt.key
+                    "the business key {label}({key} = …) matches more than one node — writes \
+                     require a unique business key"
                 ),
-            ));
+            ))
         }
         KeyResolution::Unindexed => {
             return Err(Failure::new(
                 CODE_EXECUTION,
                 format!(
-                    "cannot write {}({} = …): the business key must be range-indexed to resolve it",
-                    stmt.label, stmt.key
+                    "cannot write {label}({key} = …): the business key must be range-indexed to \
+                     resolve it"
                 ),
-            ));
+            ))
+        }
+    })
+}
+
+/// Evaluate a write-UNWIND per-row value expression: a literal, a parameter, the row
+/// variable `var` itself, or `var.field` (a field of the current row map). Anything else
+/// is rejected — a batched write's values are the bulk-import subset, not arbitrary
+/// expressions. Returns the storable [`Value`].
+fn eval_row_value(
+    e: &parser::ast::Expr,
+    var: &str,
+    row: &Val,
+    params: &HashMap<String, Val>,
+    what: &str,
+) -> std::result::Result<Value, Failure> {
+    use parser::ast::Expr;
+    let val: Val = match e {
+        Expr::Literal(v) => return Ok(v.clone()),
+        Expr::Param(name) => params.get(name).cloned().ok_or_else(|| {
+            Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
+        })?,
+        Expr::Var(v) if v == var => row.clone(),
+        Expr::Property(base, field) => match base.as_ref() {
+            Expr::Var(v) if v == var => match row {
+                Val::Map(m) => m
+                    .iter()
+                    .find(|(k, _)| k == field)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Val::Null),
+                _ => {
+                    return Err(Failure::new(
+                        CODE_REQUEST,
+                        format!(
+                            "the UNWIND row is not a map, so {var}.{field} cannot supply {what}"
+                        ),
+                    ))
+                }
+            },
+            _ => {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    format!(
+                        "{what} may reference only the UNWIND variable '{var}' (as {var}.field)"
+                    ),
+                ))
+            }
+        },
+        _ => {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                format!("{what} must be a literal, a parameter, or {var}.field in a batched write"),
+            ))
         }
     };
+    crate::exec::val_to_value(&val).ok_or_else(|| {
+        Failure::new(
+            CODE_REQUEST,
+            format!("{what} is not a storable scalar value"),
+        )
+    })
+}
+
+/// Execute a **batched** node write (`UNWIND <list> AS r MATCH|MERGE (n:L {k: …}) …`):
+/// evaluate the source list, build one WAL op per row (its business key + SET values
+/// evaluated against that row), resolve each against the core, and apply the whole batch
+/// under a single group commit ([`DeltaWriter::write_batch`] — one fsync, one publish).
+/// Atomic: if any row fails to evaluate or resolve, the batch is rejected before it is
+/// committed. NB: resolution is against the core ⊕ the delta *as of the batch start*, so
+/// a within-batch create-then-delete of the same new key is not resolved (independent
+/// rows — the bulk-import case — are unaffected).
+fn execute_write_batch(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    stmt: &parser::ast::WriteStmt,
+    params: &HashMap<String, Val>,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    use parser::ast::{Expr, WriteOp};
+    let (source, var) = stmt
+        .unwind
+        .as_ref()
+        .expect("execute_write_batch requires an UNWIND");
+    // The UNWIND source is a parameter list (the bulk-import shape, `UNWIND $rows AS r`).
+    let list: Val = match source {
+        Expr::Param(name) => params.get(name).cloned().ok_or_else(|| {
+            Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
+        })?,
+        _ => {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                "the UNWIND source of a batched write must be a parameter list (e.g. \
+                 `UNWIND $rows AS r`)"
+                    .into(),
+            ))
+        }
+    };
+    let rows = match list {
+        Val::List(items) => items,
+        _ => {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                "the UNWIND source of a batched write is not a list".into(),
+            ))
+        }
+    };
+    let is_set = matches!(stmt.op, WriteOp::Set(_));
+    let mut ops: Vec<(WalOp, OpResolution)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let key_value = eval_row_value(
+            &stmt.key_value,
+            var,
+            row,
+            params,
+            "the anchor business-key value",
+        )?;
+        let op = match &stmt.op {
+            WriteOp::Set(sets) => {
+                let mut patches = Vec::with_capacity(sets.len());
+                for (prop, expr) in sets {
+                    patches.push((
+                        prop.clone(),
+                        eval_row_value(expr, var, row, params, "a SET value")?,
+                    ));
+                }
+                WalOp::UpsertNode {
+                    label: stmt.label.clone(),
+                    key: stmt.key.clone(),
+                    value: key_value,
+                    patches,
+                }
+            }
+            WriteOp::Delete { detach: _ } => WalOp::DeleteNode {
+                label: stmt.label.clone(),
+                key: stmt.key.clone(),
+                value: key_value,
+            },
+        };
+        let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+        ops.push((op, OpResolution::Node(resolved)));
+    }
     writer
-        .write(op, OpResolution::Node(resolved))
-        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
+        .write_batch(&ops)
+        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable batch write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
 
@@ -4233,6 +4382,130 @@ mod tests {
             "delete is durable across a reopen: {replayed:?}"
         );
         assert_eq!(replayed.len(), base_n, "count durable across a reopen");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write-UNWIND (group-commit surface): `UNWIND $rows AS r MERGE (n:Person {name:
+    /// r.name}) SET n.age = r.age` creates one node per row under a **single** group
+    /// commit (one epoch bump), each row's key + SET values evaluated against that row;
+    /// a batched `MATCH … DELETE` likewise removes them. Durable across a reopen.
+    #[test]
+    fn write_unwind_batches_node_writes_under_one_commit() {
+        let (root, _g) = testgen::write_indexed_people("unwind_batch");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let names = |w: &Arc<DeltaWriter>| -> Vec<String> {
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse("MATCH (n:Person) RETURN n.name").unwrap())
+                .unwrap();
+            let mut out: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("name not str: {v:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let age = |w: &Arc<DeltaWriter>, nm: &str| -> Vec<i64> {
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let q = format!("MATCH (n:Person {{name:'{nm}'}}) RETURN n.age");
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse(&q).unwrap())
+                .unwrap();
+            res.rows
+                .iter()
+                .filter_map(|r| match &r[0] {
+                    Val::Int(n) => Some(*n),
+                    _ => None,
+                })
+                .collect()
+        };
+        let run = |w: &Arc<DeltaWriter>, q: &str, params: &HashMap<String, Val>| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(s) => s,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(w, gen.as_ref(), &stmt, params).unwrap();
+        };
+
+        let base_n = names(&writer).len();
+        // A parameter list of row maps — the bulk-import shape.
+        let rows = Val::List(vec![
+            Val::Map(vec![
+                ("name".into(), Val::Str("Xavier".into())),
+                ("age".into(), Val::Int(10)),
+            ]),
+            Val::Map(vec![
+                ("name".into(), Val::Str("Yolanda".into())),
+                ("age".into(), Val::Int(20)),
+            ]),
+        ]);
+        let mut params = HashMap::new();
+        params.insert("rows".to_string(), rows);
+
+        // Batched create: two born nodes, ONE group-committed epoch.
+        let e0 = writer.epoch();
+        run(
+            &writer,
+            "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age",
+            &params,
+        );
+        assert_eq!(
+            writer.epoch(),
+            e0 + 1,
+            "the whole batch is one epoch (group commit)"
+        );
+        let after = names(&writer);
+        assert_eq!(
+            after.len(),
+            base_n + 2,
+            "two born nodes created by the batch"
+        );
+        assert!(after.contains(&"Xavier".to_string()) && after.contains(&"Yolanda".to_string()));
+        assert_eq!(age(&writer, "Xavier"), vec![10], "per-row SET applied");
+        assert_eq!(age(&writer, "Yolanda"), vec![20]);
+
+        // Durable across a reopen (WAL replay reconstructs the batch).
+        drop(writer);
+        let reopened = Arc::new(
+            DeltaWriter::open(
+                wal.join("people"),
+                "people",
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
+            .unwrap(),
+        );
+        assert_eq!(age(&reopened, "Xavier"), vec![10], "batched writes durable");
+
+        // Batched DELETE of the two born nodes via UNWIND (one epoch).
+        let e1 = reopened.epoch();
+        run(
+            &reopened,
+            "UNWIND $rows AS r MATCH (n:Person {name: r.name}) DELETE n",
+            &params,
+        );
+        assert_eq!(reopened.epoch(), e1 + 1, "the batched delete is one epoch");
+        let after_del = names(&reopened);
+        assert!(
+            !after_del.contains(&"Xavier".to_string())
+                && !after_del.contains(&"Yolanda".to_string()),
+            "batched delete removed both born nodes: {after_del:?}"
+        );
+        assert_eq!(after_del.len(), base_n, "count back to the baseline");
         std::fs::remove_dir_all(&root).ok();
     }
 

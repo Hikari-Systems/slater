@@ -66,6 +66,12 @@ pub mod ast {
         pub op: WriteOp,
         /// An optional `RETURN` projecting the (post-write) anchor node.
         pub ret: Option<ReturnClause>,
+        /// A leading `UNWIND <list> AS <var>` (write-UNWIND): `Some((list_expr, var))`
+        /// makes this a **batched** write — one write per list element under a single
+        /// group commit, with `key_value`/SET values evaluated per row (they may
+        /// reference `<var>`'s fields). `None` is a plain single write, whose values
+        /// must be constants (a literal or parameter).
+        pub unwind: Option<(Expr, String)>,
     }
 
     /// The mutation a [`WriteStmt`] applies to its business-key-anchored node.
@@ -795,8 +801,13 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let mut delete: Option<(bool, String)> = None; // (detach, target var)
     let mut ret: Option<ReturnClause> = None;
     let mut upsert = false; // MERGE anchor (create-if-absent) vs MATCH (update only)
+    let mut unwind: Option<(Expr, String)> = None; // write-UNWIND source + alias
     for child in kids(pair) {
         match child.as_rule() {
+            Rule::unwind_clause => {
+                let uw = lower_unwind_clause(child)?;
+                unwind = Some((uw.expr, uw.var));
+            }
             Rule::kw_match => {}
             Rule::kw_merge => upsert = true,
             Rule::node_pattern => node = Some(lower_node_pattern(child)?),
@@ -850,7 +861,11 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         bail!("a write's anchor node must carry exactly one inline business-key property, e.g. (n:Label {{key: value}})");
     }
     let (key, key_value) = node.props.into_iter().next().unwrap();
-    ensure_constant(&key_value, "the anchor business-key value")?;
+    // A plain write's values must be constants; a write-UNWIND's may reference the
+    // alias's fields (validated per-row at execution).
+    if unwind.is_none() {
+        ensure_constant(&key_value, "the anchor business-key value")?;
+    }
 
     // Exactly one of SET / DELETE fired (the grammar alternates them).
     let op = if let Some((detach, target)) = delete {
@@ -872,7 +887,9 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
                     "SET must target the anchor variable '{var}', not '{set_var}' (a write mutates one node)"
                 );
             }
-            ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
+            if unwind.is_none() {
+                ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
+            }
             out_sets.push((prop, value));
         }
         WriteOp::Set(out_sets)
@@ -886,6 +903,7 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         upsert,
         op,
         ret,
+        unwind,
     })
 }
 
@@ -2704,6 +2722,45 @@ mod tests {
             ])
         );
         assert!(w.ret.is_none());
+    }
+
+    #[test]
+    fn write_unwind_lowers_a_batched_node_write() {
+        let r = |field: &str| Expr::Property(Box::new(Expr::Var("r".into())), field.into());
+
+        let w = write("UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age");
+        assert!(w.upsert, "MERGE anchor");
+        let (src, var) = w.unwind.clone().expect("unwind captured");
+        assert_eq!(src, Expr::Param("rows".into()));
+        assert_eq!(var, "r");
+        assert_eq!(w.label, "Person");
+        assert_eq!(w.key, "name");
+        assert_eq!(
+            w.key_value,
+            r("name"),
+            "the business key reads the row field"
+        );
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![("age".to_string(), r("age"))]),
+            "SET values read row fields"
+        );
+
+        // A batched DELETE lowers too (MATCH anchor, DELETE the row's node).
+        let d = write("UNWIND $rows AS r MATCH (n:Person {name: r.name}) DELETE n");
+        assert!(d.unwind.is_some());
+        assert!(!d.upsert);
+        assert_eq!(d.op, WriteOp::Delete { detach: false });
+
+        // A plain (non-UNWIND) write carries no unwind, and still rejects non-constants.
+        assert!(write("MERGE (n:Person {name: 'Zoe'}) SET n.age = 1")
+            .unwind
+            .is_none());
+        assert!(
+            write_err("MATCH (n:Person {name: 'Zoe'}) SET n.age = n.x").contains("literal")
+                || write_err("MATCH (n:Person {name: 'Zoe'}) SET n.age = n.x") == "read-only",
+            "a plain write still forbids computed values"
+        );
     }
 
     #[test]

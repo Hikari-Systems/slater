@@ -104,9 +104,16 @@ union = { kw_union ~ kw_all? }
 // with a clear message, and stay rejected as read-only when the layer is disabled.
 // The edge shapes are tried first (they start with the same `(node)` prefix, so a
 // node write only reaches its arm when no relationship follows the anchor).
+// A leading `UNWIND <list> AS r` turns the node write into a **batched** write: the
+// anchor key + SET values may reference `r`'s fields, one write per list element, all
+// under a single group commit (write-UNWIND — the first step of UNWIND-as-write). The
+// unwind arm is tried before the plain node arm; both keep the node tokens inline, so
+// `lower_write_statement` handles them uniformly (the `unwind_clause` child, if any,
+// marks the batch).
 write_statement = {
     SOI ~ (
         edge_write
+      | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause?)
       | ((kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause?)
     ) ~ ";"? ~ EOI
 }
