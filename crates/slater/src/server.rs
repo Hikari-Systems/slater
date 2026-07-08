@@ -840,6 +840,12 @@ struct ConnCtx {
     /// L0 segment count that triggers an L0→L0 compaction after a write
     /// (`config.delta.l0_compaction_trigger`; 0 disables — Phase 4d-ii).
     l0_compaction_trigger: usize,
+    /// Auto-consolidation threshold as a percent of the served core's entity count
+    /// (`config.delta.delta_core_percent`; 0 disables — Phase 4d-ii-b).
+    delta_core_percent: usize,
+    /// Hard cap on total resident delta bytes before a write throttles
+    /// (`config.delta.delta_hard_bytes`; 0 disables — Phase 4d-ii-b).
+    delta_hard_bytes: usize,
 }
 
 impl ConnCtx {
@@ -1694,6 +1700,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         builder_bin: cfg.delta.builder_bin.clone(),
         memtable_bytes: cfg.delta.memtable_bytes,
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
+        delta_core_percent: cfg.delta.delta_core_percent,
+        delta_hard_bytes: cfg.delta.delta_hard_bytes,
     });
     if cfg.load_test_diagnostics {
         warn!(
@@ -2817,37 +2825,128 @@ fn execute_edge_write(
     Ok((Vec::new(), Vec::new()))
 }
 
-/// Post-write delta maintenance (Phase 4d-ii): keep resident RAM and read fan-out
-/// bounded with the **cheap, O(delta)** tiers — flush the active memtable to an L0
-/// segment when it is over budget, then compact the L0 stack when it has grown past
-/// the trigger. Both run on a blocking thread (they fsync), and neither can fail the
-/// write: the write already committed + acked durably, so a maintenance error is logged
-/// and swallowed. Skipped entirely while a consolidation is in flight (it owns the L0
-/// stack — the guarded flush/compact would no-op anyway, this just avoids the work).
-/// The expensive fraction-of-core consolidation trigger + hard-cap throttle are 4d-ii-b.
+/// Post-write delta maintenance — the write path's self-tuning (Phase 4d-ii). Three
+/// tiers, cheapest first:
+///
+/// 1. **Flush** the active memtable to an L0 segment when it exceeds `memtableBytes`.
+/// 2. **Compact** the L0 stack when it exceeds `l0CompactionTrigger` levels (4d-i).
+/// 3. **Consolidate** — fire a *background* full rebuild when the delta reaches
+///    `deltaCorePercent`% of the core's entity count (4d-ii-b): rare because it is
+///    O(core), triggered as a fraction of core so write amplification stays bounded.
+///
+/// Flush + compaction are cheap (O(delta), fsync only) and run on a blocking thread;
+/// neither can fail the write (it already acked durably), so an error is logged and
+/// swallowed. Both are skipped while a consolidation owns the L0 stack. The
+/// consolidation is spawned detached — it must not block the ack. Finally, if the delta
+/// has blown past the `deltaHardBytes` **hard cap**, the write **throttles**: it ensures
+/// a drain is running and waits for headroom before returning (the OOM backstop).
 async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<DeltaWriter>) {
-    if writer.is_consolidating() {
-        return;
-    }
-    if ctx.memtable_bytes > 0 && writer.bytes() >= ctx.memtable_bytes {
-        let w = writer.clone();
-        match tokio::task::spawn_blocking(move || w.flush_to_l0()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!(graph = %graph, error = %format!("{e:#}"), "delta flush_to_l0 failed")
+    if !writer.is_consolidating() {
+        if ctx.memtable_bytes > 0 && writer.bytes() >= ctx.memtable_bytes {
+            let w = writer.clone();
+            match tokio::task::spawn_blocking(move || w.flush_to_l0()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(graph = %graph, error = %format!("{e:#}"), "delta flush_to_l0 failed")
+                }
+                Err(e) => warn!(graph = %graph, error = %e, "delta flush task panicked"),
             }
-            Err(e) => warn!(graph = %graph, error = %e, "delta flush task panicked"),
+        }
+        if ctx.l0_compaction_trigger > 0 && writer.l0_len() >= ctx.l0_compaction_trigger {
+            let w = writer.clone();
+            match tokio::task::spawn_blocking(move || w.compact_l0()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(graph = %graph, error = %format!("{e:#}"), "delta compact_l0 failed")
+                }
+                Err(e) => warn!(graph = %graph, error = %e, "delta compaction task panicked"),
+            }
         }
     }
-    if ctx.l0_compaction_trigger > 0 && writer.l0_len() >= ctx.l0_compaction_trigger {
-        let w = writer.clone();
-        match tokio::task::spawn_blocking(move || w.compact_l0()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                warn!(graph = %graph, error = %format!("{e:#}"), "delta compact_l0 failed")
+
+    // Background consolidation at a fraction of the core's size (4d-ii-b). Spawned
+    // detached so the ack never waits on the O(core) rebuild; 4a keeps writes that
+    // arrive during it safe. `begin_consolidation` inside `consolidate_graph` is the
+    // real single-flight guard — the pre-check only avoids a spurious spawn.
+    if ctx.delta_core_percent > 0 && !writer.is_consolidating() {
+        if let Some(gen) = ctx.graphs.get(graph) {
+            let core_entities = gen.node_count() + gen.edge_count();
+            if consolidation_due(
+                core_entities,
+                writer.delta_entity_count() as u64,
+                ctx.delta_core_percent,
+            ) {
+                spawn_auto_consolidation(ctx.clone(), graph.to_string());
             }
-            Err(e) => warn!(graph = %graph, error = %e, "delta compaction task panicked"),
         }
+    }
+
+    // Hard-cap throttle (runs even during a consolidation — waiting for it is the
+    // point). The OOM backstop: block this write until the delta drains below the cap.
+    if ctx.delta_hard_bytes > 0 && writer.total_bytes() >= ctx.delta_hard_bytes {
+        throttle_until_drained(ctx, graph, writer).await;
+    }
+}
+
+/// Whether the delta has grown to `percent`% of the core's entity count — the
+/// fraction-of-core auto-consolidation predicate (Phase 4d-ii-b). `false` when
+/// disabled (`percent == 0`), the core is empty, or the rounded threshold is 0 (a
+/// core too small for this percent to mean one whole entity). `u128` maths avoids
+/// overflow on a large core.
+fn consolidation_due(core_entities: u64, delta_entities: u64, percent: usize) -> bool {
+    if percent == 0 || core_entities == 0 {
+        return false;
+    }
+    let threshold = (core_entities as u128 * percent as u128 / 100) as u64;
+    threshold > 0 && delta_entities >= threshold
+}
+
+/// Fire a background consolidation for `graph`, detached from the write that triggered
+/// it. Reuses the `execute_consolidate` path (dump → builder → swap → retire on a
+/// blocking thread). A lost single-flight race (another consolidation already claimed
+/// the writer) surfaces as a benign "already in progress" and is logged at debug, not
+/// warn.
+fn spawn_auto_consolidation(ctx: Arc<ConnCtx>, graph: String) {
+    tokio::spawn(async move {
+        match execute_consolidate(&ctx, &graph).await {
+            Ok(_) => info!(graph = %graph, "auto-consolidation folded the delta into a fresh core"),
+            Err(e) if e.message.contains("already in progress") => {
+                debug!(graph = %graph, "auto-consolidation skipped: one is already running")
+            }
+            Err(e) => warn!(graph = %graph, error = %e.message, "auto-consolidation failed"),
+        }
+    });
+}
+
+/// Block the calling write until the delta drains below the `deltaHardBytes` hard cap
+/// (Phase 4d-ii-b). Ensures a consolidation is draining (kicking one if none is), then
+/// awaits headroom. The await yields the reactor thread, so other connections proceed;
+/// a client whose write blocks too long times out — the correct "server saturated"
+/// signal. Re-kicks if a drain finishes/fails without clearing the cap, and bails after
+/// a generous bound so a wedged consolidation cannot hang a writer forever (logged
+/// loudly — for a very large core whose rebuild exceeds the window, the hard cap is
+/// advisory; the fraction-of-core trigger is what keeps the delta from getting there).
+async fn throttle_until_drained(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<DeltaWriter>) {
+    use std::time::Duration;
+    const STEP_MS: u64 = 50;
+    const MAX_WAIT_MS: u64 = 10 * 60 * 1000;
+    warn!(
+        graph = %graph,
+        delta_bytes = writer.total_bytes(),
+        hard_cap = ctx.delta_hard_bytes,
+        "delta hard cap reached — throttling the writer until a consolidation drains it"
+    );
+    let mut waited_ms = 0u64;
+    while writer.total_bytes() >= ctx.delta_hard_bytes {
+        if !writer.is_consolidating() {
+            spawn_auto_consolidation(ctx.clone(), graph.to_string());
+        }
+        if waited_ms >= MAX_WAIT_MS {
+            warn!(graph = %graph, "delta hard-cap throttle timed out; proceeding over cap");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(STEP_MS)).await;
+        waited_ms += STEP_MS;
     }
 }
 
@@ -3644,6 +3743,8 @@ mod tests {
             wal_dir: wal_dir.to_string_lossy().into_owned(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            delta_core_percent: 0,
+            delta_hard_bytes: 0,
             builder_bin: "slater-build".to_string(),
         }
     }
@@ -4870,7 +4971,7 @@ mod tests {
     /// exactly as the RUN handler does, and confirms the born rows survive.
     #[tokio::test]
     async fn write_path_auto_flushes_and_compacts() {
-        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3);
+        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3, 0, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
 
@@ -4922,20 +5023,97 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn consolidation_due_is_a_fraction_of_core() {
+        // Disabled / degenerate cases.
+        assert!(!consolidation_due(1_000, 500, 0), "percent 0 disables");
+        assert!(!consolidation_due(0, 5, 25), "empty core never fires");
+        assert!(
+            !consolidation_due(3, 3, 10),
+            "core too small for 10% to mean a whole entity (threshold rounds to 0)"
+        );
+        // 25% of 4 entities = 1: one changed entity fires.
+        assert!(consolidation_due(4, 1, 25));
+        assert!(!consolidation_due(4, 0, 25), "no delta yet");
+        // 10% of 100M entities = 10M: bounded write amplification on a large core.
+        assert!(consolidation_due(100_000_000, 10_000_000, 10));
+        assert!(!consolidation_due(100_000_000, 9_999_999, 10));
+        // No overflow near u64 max.
+        assert!(consolidation_due(u64::MAX, u64::MAX / 2, 25));
+    }
+
+    /// Phase 4d-ii-b end-to-end through the write path + real builder: a write that
+    /// pushes the delta past `deltaCorePercent` of the core auto-fires a background
+    /// consolidation, which folds the write into a fresh generation and retires the
+    /// delta — no manual `CALL` needed. Ignored by default (spawns `slater-build`).
+    #[tokio::test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    async fn write_path_auto_consolidates_at_core_fraction() {
+        use std::time::Duration;
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        // The `people` fixture is 3 nodes + 1 edge = 4 entities; 25% = a threshold of 1,
+        // so a single write is due. (Flush/compaction left at defaults; hard cap off.)
+        let (root, ctx) = build_writable_ctx_caps("auto_consol", &bin, 64 << 20, 4, 25, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen0 = ctx.graphs.get("people").unwrap();
+
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        assert!(consolidation_due(4, writer.delta_entity_count() as u64, 25));
+
+        // The write-path hook spawns the background consolidation.
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+
+        // Wait for the detached consolidation to publish a fresh generation.
+        let mut waited = 0u64;
+        while ctx.graphs.get("people").unwrap().uuid() == gen0.uuid() {
+            assert!(
+                waited < 120_000,
+                "auto-consolidation did not complete in time"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            waited += 100;
+        }
+        let gen1 = ctx.graphs.get("people").unwrap();
+        assert_ne!(gen1.uuid(), gen0.uuid(), "a fresh generation was published");
+
+        // Alice's write is now baked into the new core; the delta retired.
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::new(gen1.as_ref(), writer.delta_snapshot());
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+        assert!(
+            matches!(age, Val::Int(99)),
+            "folded write served from the new core"
+        );
+        assert!(
+            !writer.is_consolidating(),
+            "consolidation released its claim"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A ConnCtx over a writable-layer-enabled `people` graph, with `builder_bin`
     /// pointed at the given binary — the harness for the `CALL slater.consolidate()`
     /// trigger (`execute_consolidate`).
     fn build_writable_ctx(tag: &str, builder_bin: &str) -> (PathBuf, Arc<ConnCtx>) {
-        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4)
+        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4, 0, 0)
     }
 
     /// [`build_writable_ctx`] with explicit delta caps, so a test can drive the auto
-    /// flush/compaction thresholds (Phase 4d-ii).
+    /// flush/compaction/consolidation thresholds (Phase 4d-ii).
     fn build_writable_ctx_caps(
         tag: &str,
         builder_bin: &str,
         memtable_bytes: usize,
         l0_compaction_trigger: usize,
+        delta_core_percent: usize,
+        delta_hard_bytes: usize,
     ) -> (PathBuf, Arc<ConnCtx>) {
         let (root, _graph) = testgen::write_indexed_people(tag);
         let wal = root.join("_wal");
@@ -4987,6 +5165,8 @@ mod tests {
             builder_bin: builder_bin.to_string(),
             memtable_bytes,
             l0_compaction_trigger,
+            delta_core_percent,
+            delta_hard_bytes,
         });
         (root, ctx)
     }
@@ -5147,6 +5327,8 @@ mod tests {
             builder_bin: "slater-build".to_string(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            delta_core_percent: 0,
+            delta_hard_bytes: 0,
         });
         (root, ctx)
     }
@@ -5228,6 +5410,8 @@ mod tests {
             builder_bin: "slater-build".to_string(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            delta_core_percent: 0,
+            delta_hard_bytes: 0,
         })
     }
 

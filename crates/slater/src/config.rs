@@ -781,6 +781,23 @@ pub struct DeltaConfig {
         deserialize_with = "de::usize"
     )]
     pub l0_compaction_trigger: usize,
+    /// Auto-consolidation threshold as a **percent of the core's size** (Phase 4d-ii-b):
+    /// once the delta's changed-entity count reaches `deltaCorePercent`% of the served
+    /// generation's entity count, a background consolidation folds it into a fresh core.
+    /// Expressing it as a fraction of core (not an absolute byte count) bounds write
+    /// amplification independent of core size — the rebuild is O(core), so it must stay
+    /// rare. A full rebuild of a large core is expensive (~an hour on a 91M-node core),
+    /// so this is **off by default** (0): operators opt in, or rely on the manual `CALL
+    /// slater.consolidate()` / a schedule. Typical opt-in values are 5–25.
+    #[serde(default, deserialize_with = "de::usize")]
+    pub delta_core_percent: usize,
+    /// Hard cap on total resident delta bytes (Phase 4d-ii-b): a write that pushes the
+    /// delta past this **throttles** — it ensures a consolidation is draining and waits
+    /// for it before acking, the backstop that stops runaway delta growth from
+    /// exhausting RAM. Off by default (0 = never throttle). Set well above
+    /// `deltaCorePercent`'s working set; hitting it is an operational signal, not routine.
+    #[serde(default, deserialize_with = "de::usize")]
+    pub delta_hard_bytes: usize,
     /// Path to the `slater-build` binary invoked to rebuild a fresh generation
     /// during consolidation (Phase 1d). A bare name is resolved on `PATH`; an
     /// absolute path pins a specific binary. Defaults to `slater-build`.
@@ -795,6 +812,8 @@ impl Default for DeltaConfig {
             wal_dir: default_wal_dir(),
             memtable_bytes: default_memtable_bytes(),
             l0_compaction_trigger: default_l0_compaction_trigger(),
+            delta_core_percent: 0,
+            delta_hard_bytes: 0,
             builder_bin: default_builder_bin(),
         }
     }

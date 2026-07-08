@@ -519,6 +519,16 @@ impl DeltaWriter {
         self.inner.lock().expect("delta writer lock").l0.len()
     }
 
+    /// Total changed-entity count across the whole delta (nodes + edges, summed over
+    /// every level). Compared against a fraction of the core's entity count to decide
+    /// when to fire a background consolidation (Phase 4d-ii-b) — an over-estimate when
+    /// an entity is touched in several levels, which only makes the trigger fire a
+    /// little sooner (safe).
+    pub fn delta_entity_count(&self) -> usize {
+        let s = self.published.read().expect("delta snapshot lock");
+        s.node_delta_count() + s.edge_delta_count()
+    }
+
     /// The directory holding this graph's WAL segments.
     pub fn wal_dir(&self) -> PathBuf {
         self.inner.lock().expect("delta writer lock").dir.clone()

@@ -235,6 +235,11 @@ impl Memtable {
         self.nodes.len()
     }
 
+    /// Number of distinct edge identities carrying a delta.
+    pub fn edge_delta_count(&self) -> usize {
+        self.edges.len()
+    }
+
     /// Overwrite (last-writer-wins) `patches` onto the node identified by
     /// `(label, key, value)`. `resolved` is the node's current-core dense id (an
     /// ISAM probe on the `slater` side); `None` marks a **delta-born** node, which is
@@ -1577,6 +1582,15 @@ impl DeltaSnapshot {
     pub fn node_delta_count(&self) -> usize {
         self.levels_newest_first()
             .map(Memtable::node_delta_count)
+            .sum()
+    }
+
+    /// Count of edge identities carrying a delta across all levels (summed; an
+    /// over-estimate when the same edge is touched in several levels — fine as a
+    /// planning/threshold magnitude). Pairs with [`Self::node_delta_count`].
+    pub fn edge_delta_count(&self) -> usize {
+        self.levels_newest_first()
+            .map(Memtable::edge_delta_count)
             .sum()
     }
 

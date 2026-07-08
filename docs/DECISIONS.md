@@ -957,3 +957,41 @@ for free — `freeze` captures them into `Frozen.l0`, the dump reads through the
 `DeltaSnapshot::with_levels`, and `retire` deletes the consumed L0 files and clears the level
 stack. A flush is **not** admitted during an in-flight consolidation (that guard is Phase 4d),
 so at retire the level stack is exactly the frozen `consumed_l0`.
+
+### D50 — Delta compaction is two-tier; core consolidation fires at a fraction of core, opt-in
+Phase 4d admission (`crates/slater/src/{server.rs,config.rs,delta_writer.rs}`,
+`crates/slater-delta/src/memtable.rs`). The only fold-into-core path is a full `slater-build`
+rebuild — **O(core), not O(delta)**: it re-clusters, re-ISAMs and re-builds topology + vector
+indexes over the whole permuted dense-id space, ~an hour and a ~180 GB dump on the 91M-node core
+*regardless of how small the delta is*. So a single fixed-byte "soft cap → rebuild" trigger is a
+lose-lose: fire it often and you rebuild the whole core per fill (catastrophic **write**
+amplification — the very thing L0 exists to avoid); fire it rarely and hundreds of L0 segments
+accumulate, and every read unions/dedups across all of them (**read** amplification). The core is a
+read-optimised base whose merge is inherently expensive (read-optimised-base + write-optimised-delta,
+à la C-Store/Mesa); the fix is not to make the rebuild cheap but to make it **rare**, with a cheap
+intermediate tier absorbing the churn. So compaction is **two-tier**:
+
+- **Tier 1 (cheap, frequent, O(delta), no core rebuild):** memtable→L0 flush at `memtableBytes`
+  (4c-B) and **L0→L0 compaction** at `l0CompactionTrigger` segments (4d-i, `Memtable::merge_levels`
+  + `DeltaWriter::compact_l0`) — merge small L0 segments into one, reclaiming overwrites/tombstones
+  and bounding **both** resident RAM and read fan-out. On by default. This is what sustains write
+  volume.
+- **Tier 2 (expensive, rare, O(core)):** the full rebuild fires when the delta's changed-entity
+  count reaches **`deltaCorePercent`% of the core's entity count** — a *fraction of core*, not an
+  absolute byte count, so write amplification is bounded ~`100/percent`× independent of core size.
+  **Off by default** (`deltaCorePercent = 0`): auto-firing an ~hour-long rebuild must be opt-in;
+  otherwise the manual `CALL slater.consolidate()` (or a future schedule) is the path. It is spawned
+  **detached** (`spawn_auto_consolidation`), never blocking the write ack; 4a keeps concurrent writes
+  safe. A `deltaHardBytes` hard cap is the OOM backstop — a write past it throttles (ensure a drain,
+  await headroom, bounded so a wedged rebuild can't hang a writer forever); also off by default.
+
+The reframe that makes this sound: because the delta is already durable, read-correct and
+RAM-bounded (WAL + on-disk L0 + tier-1 compaction), tier-2 consolidation is a **background
+read-locality optimisation, not a correctness requirement** — so it can be rare, opt-in, and
+deferred to quiet periods. `consolidation_due` (`u128`-safe) is the pure predicate;
+`DeltaWriter::begin/end/is_consolidating` (a `consolidating: AtomicBool`, released by an RAII
+`ConsolidationGuard` in `consolidate_graph`) is the single-flight guard that also excludes
+flush/compaction across the freeze→retire window (which `retire` clears wholesale). Rejected:
+*partial-flush* (born entities stay resident) — degrades to no-L0 for insert-heavy loads; and a
+fixed-byte consolidation cap — unbounded write amplification on a large core. Prompted by the
+"consolidation on a 91M core takes ~an hour" review.
