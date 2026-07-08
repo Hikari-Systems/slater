@@ -626,7 +626,7 @@ Running ledger for the `writeable` track. Pairs with the design in
     (`56529eec…`); `--pk`/`--key` overrides confirmed (a `--key` on a non-indexed
     property adds its `CREATE INDEX`). 591 slater + 53 slater-delta green; clippy
     `-D warnings` + fmt clean.
-  - **dump-d — reproducible round-trip e2e + docs. ✅ DONE** (this commit). New
+  - **dump-d — reproducible round-trip e2e + docs. ✅ DONE** (commit `db52515`). New
     `#[ignore]` integration test `crates/slater/tests/dump_roundtrip.rs`
     (`dump_round_trips_through_the_real_builder`): lays down the `write_indexed_people`
     fixture, serves it via `server::serve_with_listener` on an ephemeral loopback
@@ -662,7 +662,7 @@ below are current, and that the latest commit hash is noted.
 **Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE**, and
 the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). Latest commits:
-- `<this>` feat(dump): reproducible round-trip e2e test (dump-d) — see the follow-up doc commit for the hash
+- `db52515` feat(dump): reproducible round-trip e2e test (dump-d)
 - `8adcbff` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c)
 - `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
