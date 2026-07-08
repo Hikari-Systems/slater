@@ -798,6 +798,16 @@ pub struct DeltaConfig {
     /// `deltaCorePercent`'s working set; hitting it is an operational signal, not routine.
     #[serde(default, deserialize_with = "de::usize")]
     pub delta_hard_bytes: usize,
+    /// Off-peak window (cron-style, **server-local** time) that gates the
+    /// fraction-of-core auto-consolidation (`deltaCorePercent`): a due consolidation
+    /// fires only when the current local time is inside this window (or when it is
+    /// unset). The `deltaHardBytes` throttle is unaffected — it fires anytime as the
+    /// OOM backstop. Five fields `minute hour day-of-month month day-of-week`; the
+    /// window has hour granularity (the minute field is accepted but not used). Empty
+    /// (the default) = no gating (fire whenever due). Example: `"0 1-5 * * *"` =
+    /// 01:00–05:59 daily. Parsed by [`crate::cron_window::CronWindow`].
+    #[serde(default)]
+    pub consolidate_window: String,
     /// Path to the `slater-build` binary invoked to rebuild a fresh generation
     /// during consolidation (Phase 1d). A bare name is resolved on `PATH`; an
     /// absolute path pins a specific binary. Defaults to `slater-build`.
@@ -814,6 +824,7 @@ impl Default for DeltaConfig {
             l0_compaction_trigger: default_l0_compaction_trigger(),
             delta_core_percent: 0,
             delta_hard_bytes: 0,
+            consolidate_window: String::new(),
             builder_bin: default_builder_bin(),
         }
     }
@@ -900,6 +911,24 @@ pub fn load() -> Result<AppConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_consolidate_window_deserialises_and_defaults_empty() {
+        // Absent ⇒ empty (no gating), and the camelCase key is captured verbatim for the
+        // cron parser (`crate::cron_window::CronWindow::parse`) to validate at startup.
+        let default: DeltaConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.consolidate_window, "");
+
+        let cfg: DeltaConfig =
+            serde_json::from_value(serde_json::json!({ "consolidateWindow": "0 1-5 * * *" }))
+                .unwrap();
+        assert_eq!(cfg.consolidate_window, "0 1-5 * * *");
+        assert!(
+            crate::cron_window::CronWindow::parse(&cfg.consolidate_window)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn cache_ttl_defaults_to_30_minutes() {

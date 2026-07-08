@@ -723,6 +723,30 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   consolidate (`serialise_carries_delta_born_edge_properties`). Whole slater (598) + slater-delta
   (58) + workspace green; clippy `-D warnings` + fmt clean.
 
+- **Off-peak consolidation schedule knob** (deferred from Phase 4d-ii-b). ✅ DONE (this commit).
+  A new `delta.consolidateWindow` gates the **fraction-of-core** auto-consolidation to an off-peak
+  window: when the delta reaches `deltaCorePercent`% of core but the current **server-local** time
+  is *outside* the window, the background consolidation is deferred (logged `debug`); inside the
+  window (or with no window set) it fires as before. The `deltaHardBytes` **hard-cap throttle is
+  unaffected** — it still fires anytime as the OOM backstop, so a deferral can never OOM. **User
+  decisions:** cron-ish expression, **server-local** time. New module `crate::cron_window`
+  (`CronWindow::parse` → 5-field `minute hour day-of-month month day-of-week`; `*`/number/range
+  `a-b`/list `a,c`/step `*/n`; dow `0`|`7` = Sunday; **hour granularity** — the minute field is
+  validated for cron compatibility but does not narrow the window, so `"0 1-5 * * *"` and
+  `"* 1-5 * * *"` both mean 01:00–05:59 daily). **Clock seam:** `CronWindow::contains(hour, dom,
+  month, dow)` is a pure, clock-free predicate (tests drive it directly); the real clock is read
+  only in `cron_window::local_now_hms` (chrono `Local`, so `chrono`'s `clock` feature is enabled for
+  `slater`), and the server-side gate `window_permits(&window, now)` is likewise pure over an
+  injected time. Config: `DeltaConfig.consolidate_window: String` (camelCase `consolidateWindow`,
+  empty default = no gating), parsed once at startup in `serve_with_listener` so a malformed spec
+  **fails at boot** (not silently); threaded onto `ConnCtx.consolidate_window: Option<CronWindow>`;
+  `maybe_maintain_delta` consults it only for the fraction trigger. Tests: `cron_window` unit
+  tests (hour-range window, lists/steps/weekday, dow-7, dom+month, empty=no-window, malformed
+  rejects); `config::delta_consolidate_window_deserialises_and_defaults_empty`;
+  `server::window_permits_gates_the_fraction_trigger` (None=always, inside fires, outside defers,
+  weekday gating). Whole slater (606) + slater-delta (58) + workspace green; clippy `-D warnings` +
+  fmt clean; read path + empty-delta bench untouched (write-path maintenance + config only).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -752,16 +776,16 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 598 + 58; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 606 + 58; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
-  consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
-  off-heap `pread` L0 reads (bounded RSS without whole-file residency); in-place **core-edge**
-  property patching (born-edge properties are done). **delete-a-born-node-by-key,
-  moved-indexed-value, and edge-properties are now ✅ DONE** (see "Deferred follow-ups" below).
-  See the "Smaller follow-ups" list below.
+- **Deferred refinements** (each cleanly scoped, none blocking): size-tiered partial-L0 compaction
+  (needs number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
+  whole-file residency); in-place **core-edge** property patching (born-edge properties are done).
+  **delete-a-born-node-by-key, moved-indexed-value, edge-properties, and the off-peak
+  consolidation-window knob are now ✅ DONE** (see "Deferred follow-ups" below). See the "Smaller
+  follow-ups" list below.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
@@ -837,6 +861,9 @@ Smaller follow-ups that are **not** the recommended next step but are cleanly sc
 - ~~**delete a born node by business key** (deferred from 2c)~~ ✅ DONE — see the
   "Deferred follow-ups (post-Phase-5)" section above (`execute_write` resolves a `DELETE`
   anchor against the whole delta when the core probe returns Absent).
+- ~~off-peak *schedule* knob for consolidation~~ ✅ DONE — see the "Deferred follow-ups
+  (post-Phase-5)" section above (`delta.consolidateWindow`, cron-style, server-local, gates
+  the fraction trigger; hard-cap throttle unaffected).
 - Phase 4 auto L0-soft-cap trigger (the manual trigger now exists — see below); the
   independent `slater dump` CLI (§ above).
 

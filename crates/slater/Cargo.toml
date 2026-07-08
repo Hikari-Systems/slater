@@ -32,7 +32,7 @@ clap.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
 regex.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 
 # jemalloc is the global allocator only on Linux (wired in main.rs); macOS and other
 # dev targets keep the system allocator.

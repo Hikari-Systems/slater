@@ -846,6 +846,10 @@ struct ConnCtx {
     /// Hard cap on total resident delta bytes before a write throttles
     /// (`config.delta.delta_hard_bytes`; 0 disables — Phase 4d-ii-b).
     delta_hard_bytes: usize,
+    /// Off-peak window (server-local, cron-style) gating the fraction-of-core
+    /// auto-consolidation (`config.delta.consolidate_window`). `None` = no gating: a
+    /// due consolidation fires whenever. The hard-cap throttle ignores this.
+    consolidate_window: Option<crate::cron_window::CronWindow>,
 }
 
 impl ConnCtx {
@@ -1662,6 +1666,15 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     let conn_limit = Arc::new(Semaphore::new(semaphore_permits(
         cfg.server.max_connections,
     )));
+    // Parse the off-peak consolidation window up front so a malformed cron spec fails at
+    // startup rather than silently never gating (Phase 4d follow-up).
+    let consolidate_window = crate::cron_window::CronWindow::parse(&cfg.delta.consolidate_window)
+        .with_context(|| {
+        format!(
+            "invalid delta.consolidateWindow {:?}",
+            cfg.delta.consolidate_window
+        )
+    })?;
 
     let ctx = Arc::new(ConnCtx {
         acl,
@@ -1702,6 +1715,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
         delta_core_percent: cfg.delta.delta_core_percent,
         delta_hard_bytes: cfg.delta.delta_hard_bytes,
+        consolidate_window,
     });
     if cfg.load_test_diagnostics {
         warn!(
@@ -2914,7 +2928,16 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
                 writer.delta_entity_count() as u64,
                 ctx.delta_core_percent,
             ) {
-                spawn_auto_consolidation(ctx.clone(), graph.to_string());
+                // Defer to the off-peak window if one is configured (the hard-cap
+                // throttle below still fires anytime as the OOM backstop).
+                if window_permits(&ctx.consolidate_window, crate::cron_window::local_now_hms()) {
+                    spawn_auto_consolidation(ctx.clone(), graph.to_string());
+                } else {
+                    debug!(
+                        graph = %graph,
+                        "auto-consolidation is due but deferred — outside the configured off-peak window"
+                    );
+                }
             }
         }
     }
@@ -2937,6 +2960,21 @@ fn consolidation_due(core_entities: u64, delta_entities: u64, percent: usize) ->
     }
     let threshold = (core_entities as u128 * percent as u128 / 100) as u64;
     threshold > 0 && delta_entities >= threshold
+}
+
+/// Whether the off-peak window (if any) permits a fraction-triggered consolidation at
+/// the given server-local time `(hour, day-of-month, month, day-of-week)`. `None` window
+/// ⇒ always permitted. Pure over the supplied time so it is testable without a clock —
+/// the caller reads the real clock via [`crate::cron_window::local_now_hms`]. The
+/// hard-cap throttle never consults this (it is the OOM backstop, fires anytime).
+fn window_permits(
+    window: &Option<crate::cron_window::CronWindow>,
+    (hour, dom, month, dow): (u32, u32, u32, u32),
+) -> bool {
+    match window {
+        None => true,
+        Some(w) => w.contains(hour, dom, month, dow),
+    }
 }
 
 /// Fire a background consolidation for `graph`, detached from the write that triggered
@@ -3783,6 +3821,7 @@ mod tests {
             l0_compaction_trigger: 4,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
+            consolidate_window: String::new(),
             builder_bin: "slater-build".to_string(),
         }
     }
@@ -5395,6 +5434,26 @@ mod tests {
         assert!(consolidation_due(u64::MAX, u64::MAX / 2, 25));
     }
 
+    #[test]
+    fn window_permits_gates_the_fraction_trigger() {
+        use crate::cron_window::CronWindow;
+        // No window ⇒ a due consolidation is always permitted.
+        assert!(window_permits(&None, (3, 15, 6, 3)));
+        assert!(window_permits(&None, (12, 15, 6, 3)));
+
+        // A 01:00–05:59 daily window permits inside and defers outside (hour granularity).
+        let w = CronWindow::parse("0 1-5 * * *").unwrap();
+        assert!(window_permits(&w, (1, 1, 1, 0)), "01:xx is inside");
+        assert!(window_permits(&w, (5, 28, 12, 6)), "05:xx is inside");
+        assert!(!window_permits(&w, (0, 15, 6, 3)), "00:xx is outside");
+        assert!(!window_permits(&w, (12, 15, 6, 3)), "noon is outside");
+
+        // A weekday-only window also gates on the day of week.
+        let wd = CronWindow::parse("* 1-5 * * 1-5").unwrap();
+        assert!(window_permits(&wd, (2, 10, 6, 3)), "02:xx Wednesday inside");
+        assert!(!window_permits(&wd, (2, 10, 6, 0)), "02:xx Sunday deferred");
+    }
+
     /// Phase 4d-ii-b end-to-end through the write path + real builder: a write that
     /// pushes the delta past `deltaCorePercent` of the core auto-fires a background
     /// consolidation, which folds the write into a fresh generation and retires the
@@ -5520,6 +5579,7 @@ mod tests {
             l0_compaction_trigger,
             delta_core_percent,
             delta_hard_bytes,
+            consolidate_window: None,
         });
         (root, ctx)
     }
@@ -5682,6 +5742,7 @@ mod tests {
             l0_compaction_trigger: 4,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
+            consolidate_window: None,
         });
         (root, ctx)
     }
@@ -5765,6 +5826,7 @@ mod tests {
             l0_compaction_trigger: 4,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
+            consolidate_window: None,
         })
     }
 
