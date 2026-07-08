@@ -10,6 +10,7 @@
 //! Stdlib only — no tokio, no extra dependencies — so it is safe to call at the
 //! very top of `main` before the async runtime starts.
 
+use crate::bolt::client::BoltClient;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -122,59 +123,19 @@ pub fn diagnostics_subcommand(default_port: u16) {
 /// `metric`/`value` rows as a single JSON object. Blocking, stdlib + the crate's
 /// synchronous `bolt` codec only.
 fn fetch_diagnostics(host: &str, port: u16, user: &str, password: &str) -> std::io::Result<String> {
-    use crate::bolt::message::tag;
     use crate::bolt::packstream::PsValue;
 
-    let mut conn = BoltConn::connect(host, port)?;
+    let mut conn = BoltClient::connect(host, port, Duration::from_secs(10))?;
+    conn.login("slater-diagnostics/1.0", user, password)?;
 
-    // HELLO (5.x: no auth here) → LOGON (basic auth).
-    conn.request(
-        tag::HELLO,
-        vec![PsValue::Map(vec![(
-            "user_agent".into(),
-            PsValue::str("slater-diagnostics/1.0"),
-        )])],
-    )?;
-    conn.request(
-        tag::LOGON,
-        vec![PsValue::Map(vec![
-            ("scheme".into(), PsValue::str("basic")),
-            ("principal".into(), PsValue::str(user)),
-            ("credentials".into(), PsValue::str(password)),
-        ])],
-    )?;
-
-    // RUN the diagnostics statement (server-level: no graph needed), then PULL.
-    conn.request(
-        tag::RUN,
-        vec![
-            PsValue::str("CALL slater.diagnostics()"),
-            PsValue::Map(vec![]),
-            PsValue::Map(vec![]),
-        ],
-    )?;
-    conn.send(
-        tag::PULL,
-        vec![PsValue::Map(vec![("n".into(), PsValue::Int(-1))])],
-    )?;
-
-    // Drain RECORD rows (each a [metric, value] list) until the closing SUCCESS.
+    // The diagnostics statement is server-level (no graph needed); each row is a
+    // `[metric, value]` list. A disabled/absent proc surfaces as the server's own
+    // failure message via `run_pull`.
+    let (_cols, rows) = conn.run_pull("CALL slater.diagnostics()", None)?;
     let mut obj = serde_json::Map::new();
-    loop {
-        let (t, fields) = conn.recv()?;
-        if t == tag::RECORD {
-            if let Some(PsValue::List(vals)) = fields.first() {
-                if let (Some(PsValue::String(k)), Some(v)) = (vals.first(), vals.get(1)) {
-                    obj.insert(k.clone(), ps_to_json(v));
-                }
-            }
-        } else if t == tag::SUCCESS {
-            break;
-        } else {
-            return Err(std::io::Error::other(format!(
-                "unexpected Bolt message tag {t:#x} while reading diagnostics \
-                 (is loadTestDiagnostics enabled?)"
-            )));
+    for row in rows {
+        if let (Some(PsValue::String(k)), Some(v)) = (row.first(), row.get(1)) {
+            obj.insert(k.clone(), ps_to_json(v));
         }
     }
     serde_json::to_string_pretty(&serde_json::Value::Object(obj)).map_err(std::io::Error::other)
@@ -191,100 +152,5 @@ fn ps_to_json(v: &crate::bolt::packstream::PsValue) -> serde_json::Value {
         PsValue::String(s) => serde_json::Value::String(s.clone()),
         PsValue::Bool(b) => serde_json::Value::Bool(*b),
         _ => serde_json::Value::Null,
-    }
-}
-
-/// A minimal blocking Bolt client: handshake, then request/response over the
-/// crate's synchronous chunk/packstream codec. Used only by the `diagnostics`
-/// subcommand, which runs before the async runtime is built.
-struct BoltConn {
-    stream: TcpStream,
-    buf: Vec<u8>,
-}
-
-impl BoltConn {
-    fn connect(host: &str, port: u16) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect((host, port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        // Handshake: magic + four version proposals (5.6…5.0, 4.4…4.1).
-        let mut hs = Vec::with_capacity(20);
-        hs.extend_from_slice(&BOLT_MAGIC);
-        for v in [0x0006_0605u32, 0x0003_0404, 0, 0] {
-            hs.extend_from_slice(&v.to_be_bytes());
-        }
-        stream.write_all(&hs)?;
-        let mut reply = [0u8; 4];
-        stream.read_exact(&mut reply)?;
-        if reply == [0, 0, 0, 0] {
-            return Err(std::io::Error::other(
-                "server negotiated no Bolt version (handshake rejected)",
-            ));
-        }
-        Ok(Self {
-            stream,
-            buf: Vec::new(),
-        })
-    }
-
-    /// Encode and send one Bolt message (chunked + terminated by `bolt::to_wire`).
-    fn send(
-        &mut self,
-        tag: u8,
-        fields: Vec<crate::bolt::packstream::PsValue>,
-    ) -> std::io::Result<()> {
-        let msg = crate::bolt::packstream::PsValue::Struct { tag, fields };
-        self.stream.write_all(&crate::bolt::message::to_wire(&msg))
-    }
-
-    /// Read the next decoded Bolt message as `(tag, fields)`.
-    fn recv(&mut self) -> std::io::Result<(u8, Vec<crate::bolt::packstream::PsValue>)> {
-        use crate::bolt::chunk;
-        use crate::bolt::packstream::{self, PsValue};
-        loop {
-            if let Some((body, consumed)) =
-                chunk::decode_message(&self.buf).map_err(std::io::Error::other)?
-            {
-                self.buf.drain(..consumed);
-                return match packstream::from_slice(&body).map_err(std::io::Error::other)? {
-                    PsValue::Struct { tag, fields } => Ok((tag, fields)),
-                    other => Err(std::io::Error::other(format!(
-                        "expected a Bolt struct, got {other:?}"
-                    ))),
-                };
-            }
-            let mut tmp = [0u8; 16384];
-            let n = self.stream.read(&mut tmp)?;
-            if n == 0 {
-                return Err(std::io::Error::other("server closed the connection"));
-            }
-            self.buf.extend_from_slice(&tmp[..n]);
-        }
-    }
-
-    /// Send a message and assert the reply is `SUCCESS`, returning its fields.
-    fn request(
-        &mut self,
-        tag: u8,
-        fields: Vec<crate::bolt::packstream::PsValue>,
-    ) -> std::io::Result<Vec<crate::bolt::packstream::PsValue>> {
-        use crate::bolt::message::tag as t;
-        self.send(tag, fields)?;
-        let (rt, rfields) = self.recv()?;
-        if rt == t::SUCCESS {
-            Ok(rfields)
-        } else {
-            // Surface the server's failure message (e.g. bad credentials, or
-            // diagnostics disabled) verbatim.
-            let detail = rfields
-                .first()
-                .and_then(|m| m.get("message"))
-                .and_then(crate::bolt::packstream::PsValue::as_str)
-                .unwrap_or("unknown error")
-                .to_string();
-            Err(std::io::Error::other(format!(
-                "Bolt request (tag {tag:#x}) failed: {detail}"
-            )))
-        }
     }
 }

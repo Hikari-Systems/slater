@@ -12,7 +12,7 @@
 //! and hand off to [`slater::server::serve`].
 
 use anyhow::Context;
-use slater::{acl, config, health, help, query, server};
+use slater::{acl, config, dump, health, help, query, server};
 use tracing::info;
 
 // On Linux, jemalloc is the global allocator. Built with the `background_threads`
@@ -41,6 +41,11 @@ fn main() -> anyhow::Result<()> {
     // the snapshot as JSON, and exits — an operator/CI convenience over the same
     // statement the load-test coordinator reads.
     health::diagnostics_subcommand(default_port);
+    // `dump` connects over Bolt to a running server, authenticates, and exports a
+    // graph as business-key `MERGE` Cypher (or `--list`s the caller's graphs). It
+    // is a blocking Bolt client, so like the probes above it runs before the async
+    // runtime is built; it needs only the default port from config.
+    dump::dump_subcommand(default_port);
 
     let cfg = config::load()?;
 

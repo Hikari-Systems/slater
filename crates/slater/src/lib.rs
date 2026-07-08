@@ -22,6 +22,7 @@ pub mod config;
 pub mod consolidate;
 pub mod delta_writer;
 pub mod diag;
+pub mod dump;
 pub mod exec;
 pub mod generation;
 pub mod health;

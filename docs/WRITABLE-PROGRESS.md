@@ -565,7 +565,7 @@ Running ledger for the `writeable` track. Pairs with the design in
       refinements: an off-peak *schedule* knob; size-tiered partial-L0 compaction; off-heap `pread`
       L0 (bounded-RSS reads without whole-file residency).
 
-- **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
+- **Parallel workstream — per-graph dump CLI (`slater dump`). 🔨 IN PROGRESS.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
   not gate them). **Decided:** Bolt-client transport (user/pass, honours ACLs — reuse
   `BoltConn` from `health.rs`, promote to shared); identity keys inferred from range
@@ -574,7 +574,37 @@ Running ledger for the `writeable` track. Pairs with the design in
   authed user can read (backed by `Acl::readable_graphs`, surfaced via a Bolt
   list-graphs call — verify/add). Distinct in code from Phase 4a's offline
   generation→MERGE serialiser (shares only the text format). NB: `vecf32` props can't
-  ride a MERGE dump (vectors non-goal).
+  ride a MERGE dump (vectors non-goal). Sub-milestones (each independently green +
+  committed):
+  - **dump-a — shared Bolt client + clap scaffolding + `--list`. ✅ DONE** (this
+    commit). Promoted `health.rs`'s private `BoltConn` to a shared
+    `crate::bolt::client::BoltClient` (`connect(host,port,timeout)`,
+    `login(agent,user,pass)` = HELLO+LOGON basic, `run_pull(query, db) -> (columns,
+    rows)` = RUN[+`db` selector in `extra`]+PULL-all, plus `send`/`recv`/`request`);
+    `health.rs::fetch_diagnostics` refactored onto it (old `BoltConn` deleted). New
+    `crate::dump` module + `dump_subcommand(default_port)` wired into `main.rs` beside
+    `diagnostics` (blocking Bolt client, runs before the tokio runtime). clap-derive
+    `DumpArgs` (`graph` positional, `-l/--list`, `--host`, `--port`, `-u/--user`,
+    `--password-stdin`); password from `SLATER_DUMP_PASSWORD` else stdin (never a
+    flag). `--list` = `run_pull("SHOW DATABASES")` → print the `name` column (server
+    already ACL-filters to the caller's read grants — no new proc needed). Graph selection
+    rides the RUN `extra.db` key (`select_graph`). The graph data dump (schema + nodes +
+    edges) bails with a clear "next milestone" message for now (`-o/--out`, `--key`,
+    `--pk` land with it — kept off the struct until used so each commit is warning-clean).
+    Tests: `dump.rs` unit (CLI-definition `debug_assert`, arg parsing, missing-target
+    reject, env-var password). Verified e2e against a live server: `--list` prints the
+    graph, wrong password fails cleanly, the dump path emits its stub. 582 slater + 53
+    slater-delta green; whole workspace green; clippy `-D warnings` + fmt clean.
+  - **dump-b — schema introspection + identity-key resolution + `CREATE INDEX` DDL.**
+    📋 next. Enumerate labels / reltypes / range indexes over Bolt (`db.labels()` /
+    `SHOW INDEXES`); build `label → identity-key` with `--key`/`--pk` overrides; emit
+    the `CREATE INDEX` DDL.
+  - **dump-c — node + edge dump + PsValue Cypher-literal escaper.** 📋 planned. Stream
+    `MATCH (n) RETURN n` + `MATCH (a)-[r]->(b) RETURN a,r,b` → business-key `MERGE`;
+    a `PsValue`→literal escaper mirroring `consolidate.rs::literal` (same builder
+    dialect, different value type); `vecf32` warning; `-o`/stdout.
+  - **dump-d — round-trip e2e + docs.** 📋 planned. `#[ignore]` dump → `slater-build`
+    → verify equivalence; finalise docs.
 
 ## Recommended context-clear points
 
@@ -590,26 +620,24 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
+**Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE.**
+Active work is the optional **`slater dump` CLI** parallel workstream (see its sub-milestone block
+above). Latest commits:
+- `<this>` feat(dump): shared Bolt client + `slater dump --list` (dump-a) — see the follow-up doc commit for the hash
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 - `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
 - `e012595` feat(delta): memtable→L0 flush + write-path born resolution (Phase 4c-B)
-- `710912a` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
 
-**Phases 0–5 are ALL DONE — the writable layer is feature-complete.** All gates green (`cargo test
--p slater -p slater-delta` = 577 + 53; `cargo test --workspace`; clippy `-D warnings`; fmt; the
-three `#[ignore]` real-builder e2es incl. auto-consolidation; empty-delta read path cost-identical
-— see the 4c-B note on bench jitter). Phase 4 shipped as two tiers: cheap flush + L0→L0 compaction
-(auto, on by default) absorb write churn O(delta); rare fraction-of-core consolidation (opt-in via
-`deltaCorePercent`) + a `deltaHardBytes` throttle bound the expensive O(core) rebuild. **No blocking
-next task on the Phase 0–5 track.** Remaining work is optional/independent:
-- **Parallel workstream — `slater dump` CLI** (📋 planned, not started; see below + `WRITABLE-PLAN.md`).
+**Next task: `slater dump` milestone dump-b** (schema introspection + identity-key resolution +
+`CREATE INDEX` DDL — see the sub-milestone block above). The Phase 0–5 delta track stays feature-complete;
+all its gates remain green (`cargo test -p slater -p slater-delta` = 582 + 53 after dump-a's 5 unit tests;
+`cargo test --workspace`; clippy `-D warnings`; fmt; the three `#[ignore]` real-builder e2es). Other
+optional/independent work:
 - **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
   consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
   off-heap `pread` L0 reads (bounded RSS without whole-file residency); edge properties;
   moved-indexed-value relocation; delete-a-born-node-by-key. See the "Smaller follow-ups" list below.
-- If continuing, confirm scope with the user before starting — Phase 4 closed the planned track.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
