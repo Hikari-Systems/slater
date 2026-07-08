@@ -62,6 +62,13 @@ criterion.workspace = true
 name = "vector_knn"
 harness = false
 
+# The `slater dump` round-trip e2e uses the `testgen` fixture (testkit-gated), so
+# it only compiles with the feature on; `#[ignore]` besides. Run:
+# `cargo test -p slater --features testkit --test dump_roundtrip -- --ignored`.
+[[test]]
+name = "dump_roundtrip"
+required-features = ["testkit"]
+
 # Proves the writable layer's empty-delta read path is a zero-cost pass-through:
 # A/Bs a node-materialisation loop over a bare `Generation` vs a `MergedView` with
 # an empty delta. Run: `cargo bench -p slater --features testkit --bench delta_overlay`.

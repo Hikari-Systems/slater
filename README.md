@@ -513,6 +513,32 @@ carrying the query `cost` (elements charged), `resultCount`, `execMs`, and
 or any result value. Exit status is `0` on success, `1` on a parse/open/execute
 error (message on stderr).
 
+## Export a graph (`slater dump`)
+
+`slater dump` exports a graph from a **running** server as business-key `MERGE`
+Cypher — the same dialect `slater-build` ingests — so a graph round-trips
+(dump → `slater-build` → new generation) for migration or text backup. Unlike
+`slater query`, it connects over **Bolt**, authenticates, and honours per-graph
+ACLs, so it needs no disk access to the server. The password is read from
+`SLATER_DUMP_PASSWORD` or stdin (never a flag, keeping it out of `ps`/history).
+
+```sh
+# List the graphs the authenticated user may read.
+SLATER_DUMP_PASSWORD=pw slater dump --list -u reporting
+
+# Dump a graph to a file (identity keys inferred from range indexes).
+SLATER_DUMP_PASSWORD=pw slater dump people -u reporting -o people.cypher
+
+# Rebuild it into a fresh generation.
+slater-build --input people.cypher --graph people --data-dir ./data
+```
+
+Each label's identity key is the property carried by its range index; override
+with `--key Label=prop` (repeatable) or a global `--pk <field>`. `CREATE INDEX`
+DDL is emitted first so the rebuild recreates the indexes. Vectors (and other
+values with no Cypher-literal spelling) cannot ride a `MERGE` dump and are dropped
+with a warning on stderr. Exit status is `0` on success, `1` on error.
+
 ## Worked example
 
 Build a small graph, serve it, and query it with the neo4j **JavaScript** and

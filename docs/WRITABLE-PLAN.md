@@ -197,6 +197,16 @@ disk.
 
 ## Per-graph dump CLI (`slater dump`) — operator tool
 
+> **STATUS: implemented** (`crates/slater/src/dump.rs`; shared client
+> `crates/slater/src/bolt/client.rs`; e2e `crates/slater/tests/dump_roundtrip.rs`).
+> `--list` + full schema/node/edge dump ship; round-trip verified
+> content-hash-identical through `slater-build`. See the `slater dump` sub-milestones
+> (dump-a … dump-d) in `docs/WRITABLE-PROGRESS.md`. The text below is the original
+> design; where the implementation deviated it is noted in the ledger (notably: no
+> header comment — `slater-build` has no comment syntax; `--list` reuses `SHOW
+> DATABASES` rather than a new proc; the escaper mirrors `consolidate::literal` on
+> `PsValue`).
+
 A per-graph exporter that dumps a graph from a **running** server to
 slater-build-compatible **business-key `MERGE` Cypher**, so a graph can be
 round-tripped (dump → `slater-build` → new generation), migrated, or backed up in

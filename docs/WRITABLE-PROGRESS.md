@@ -565,7 +565,7 @@ Running ledger for the `writeable` track. Pairs with the design in
       refinements: an off-peak *schedule* knob; size-tiered partial-L0 compaction; off-heap `pread`
       L0 (bounded-RSS reads without whole-file residency).
 
-- **Parallel workstream — per-graph dump CLI (`slater dump`). 🔨 IN PROGRESS.**
+- **Parallel workstream — per-graph dump CLI (`slater dump`). ✅ DONE.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
   not gate them). **Decided:** Bolt-client transport (user/pass, honours ACLs — reuse
   `BoltConn` from `health.rs`, promote to shared); identity keys inferred from range
@@ -626,9 +626,24 @@ Running ledger for the `writeable` track. Pairs with the design in
     (`56529eec…`); `--pk`/`--key` overrides confirmed (a `--key` on a non-indexed
     property adds its `CREATE INDEX`). 591 slater + 53 slater-delta green; clippy
     `-D warnings` + fmt clean.
-  - **dump-d — reproducible round-trip e2e + docs.** 📋 next. An `#[ignore]`
-    server-in-process test (dump over Bolt → `slater-build` → assert equivalence),
-    mirroring `memory_headline.rs`'s harness; finalise docs.
+  - **dump-d — reproducible round-trip e2e + docs. ✅ DONE** (this commit). New
+    `#[ignore]` integration test `crates/slater/tests/dump_roundtrip.rs`
+    (`dump_round_trips_through_the_real_builder`): lays down the `write_indexed_people`
+    fixture, serves it via `server::serve_with_listener` on an ephemeral loopback
+    port (production wiring), runs the **real `slater dump` binary** over Bolt
+    (`env!("CARGO_BIN_EXE_slater")`, password via `SLATER_DUMP_PASSWORD`, on a
+    `spawn_blocking` task so the async server keeps running), asserts the emitted dump
+    **byte-for-byte** against a known `EXPECTED_DUMP`, then — when `SLATER_BUILD_BIN`
+    is set — feeds it to the **real `slater-build`** and asserts a fresh `current`
+    generation is produced (closing the dump→build loop). Registered as a
+    `required-features = ["testkit"]` `[[test]]` so `cargo test --workspace` skips it
+    without the fixture feature. Verified green with the real builder (rebuilt 3
+    nodes/1 edge). Run:
+    `SLATER_BUILD_BIN=$CARGO_TARGET_DIR/debug/slater-build cargo test -p slater
+    --features testkit --test dump_roundtrip -- --ignored`. **This completes the
+    `slater dump` workstream.** README + `WRITABLE-PLAN.md` dump section carry a
+    "STATUS: implemented" note. Whole workspace green; clippy (`--features testkit
+    --all-targets -D warnings`) + fmt clean.
 
 ## Recommended context-clear points
 
@@ -644,21 +659,20 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE.**
-Active work is the optional **`slater dump` CLI** parallel workstream (see its sub-milestone block
-above). Latest commits:
+**Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE**, and
+the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph
+dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). Latest commits:
+- `<this>` feat(dump): reproducible round-trip e2e test (dump-d) — see the follow-up doc commit for the hash
 - `8adcbff` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c)
 - `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
-- `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
 
-**`slater dump` is now functionally complete** (`--list` + full graph dump, round-trip verified
-content-hash-identical). **Next task: dump-d** — a reproducible `#[ignore]` server-in-process
-round-trip test (dump → `slater-build` → assert equivalence) + doc finalisation. The Phase 0–5 delta
-track stays feature-complete; its gates remain green (`cargo test -p slater -p slater-delta` = 591 + 53
-after the dump unit tests; `cargo test --workspace`; clippy `-D warnings`; fmt; the three `#[ignore]`
-real-builder e2es). Other optional/independent work:
+**No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
+complete; all gates green (`cargo test -p slater -p slater-delta` = 591 + 53; `cargo test --workspace`;
+clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
+`dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
+optional/independent:
 - **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
   consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
   off-heap `pread` L0 reads (bounded RSS without whole-file residency); edge properties;
