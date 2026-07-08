@@ -498,11 +498,30 @@ Running ledger for the `writeable` track. Pairs with the design in
     rebuild = O(core), not O(delta)** (~1h / ~180 GB dump on the 91M core), so a fixed-byte soft
     cap that auto-rebuilds is a lose-lose (frequent → write amplification; rare → hundreds of L0
     levels → read amplification). Split into two tiers:
-    - **4d-i — L0→L0 compaction** (cheap, frequent, O(delta), no core rebuild): a
-      `Memtable::merge_older` fold + `DeltaWriter::compact_l0()` that merges *k* small L0 segments
-      into one (reclaiming overwrites/tombstones), bounding **both** resident RAM and read fan-out.
-      This is the mechanism that sustains write volume; the read merge already exists, this just
-      persists it. New config `l0CompactionTrigger`.
+    - **4d-i — L0→L0 compaction. ✅ DONE** (this commit; pure `slater-delta` + writer wiring, no
+      auto-trigger yet — that's 4d-ii). `Memtable::merge_levels(newest_first)` folds a contiguous,
+      stacked run of L0 levels into one equivalent memtable, **preserving every born id** (keeps the
+      oldest level's base; born-id ranges are disjoint + stacked, checked by `debug_assert`). It
+      folds newest-wins by an **interner-independent** identity key (`node_name_key`/`edge_name_key`
+      = names + type-exact value bytes, so levels with different local symbol tables combine), then
+      **replays** the folded state through the ordinary `upsert_node`/`delete_node`/`upsert_edge`/
+      `delete_edge` paths — born entities in ascending id order with endpoints resolved explicitly
+      (none re-allocated), core rows sorted by dense id, core-edge tombstones sorted by endpoint —
+      so allocation + byte accounting reuse the single tested path and the output is deterministic.
+      `DeltaWriter::compact_l0()` merges **all** current L0 levels into one (so there is only ever
+      ≤1 L0 file → segment number and age agree, no reconciliation), writes the merged file,
+      publishes the collapsed one-segment stack atomically (`republish`), and deletes the consumed
+      files once the merged file is fsynced; a no-op with <2 levels. The active memtable + core are
+      untouched, so born ids and any dense id already handed to a reader stay valid. Tests:
+      slater-delta `merge_levels_matches_the_snapshot_fold` (read-equivalence vs
+      `DeltaSnapshot::with_levels` over a 3-level run exercising core-patch/re-patch/delete, core
+      tombstone, born nodes across levels, born-node re-MERGE, born edge + its delete — the only
+      benign divergence is a tombstoned edge's unobservable `edge_id`, masked in the check) +
+      `merge_levels_is_deterministic`; `delta_writer` `compact_l0_collapses_the_stack_preserving_reads`
+      (2 levels → 1, reads unchanged, reopen). Whole slater+slater-delta green; clippy+fmt clean.
+      **Policy note:** merge-all is the first-cut compaction policy; a size-tiered partial-run policy
+      (which would need number-vs-stack-order reconciliation) is a later refinement. New config
+      `l0CompactionTrigger` lands with the 4d-ii wiring.
     - **4d-ii — admission + rare fraction-of-core consolidation**: `memtableBytes` = flush cap;
       consolidation threshold is `deltaCoreFraction × core_bytes` (**fraction of core**, not an
       absolute byte count — bounds write amplification independent of core size) plus an optional
@@ -538,27 +557,30 @@ below are current, and that the latest commit hash is noted.
 ## Next action
 
 **Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
+- `<4d-i>` feat(delta): L0→L0 compaction (Phase 4d-i) — **this commit** (hash recorded in a
+  follow-up doc commit, mirroring 4c-A/4c-B)
 - `e012595` feat(delta): memtable→L0 flush + write-path born resolution (Phase 4c-B)
-- `92f271b` docs(delta): correct the 4c-A commit hash in the resume-state ledger
 - `710912a` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
 - `fcac9fb` feat(delta): L0 delta-segment format + reader (Phase 4b)
 - `04806bd` feat(delta): carry post-freeze writes onto the new core (Phase 4a)
 
-Phases **4a + 4b + 4c (A+B) are DONE**, all gates green (`cargo test -p slater -p slater-delta` =
-573 + 51; `cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]` real-builder e2e;
-empty-delta read path cost-identical — see the 4c-B note on bench jitter). The full L0 LSM is
-wired: writes spill to on-disk L0 segments under a flush, reads merge `memtable ⊕ L0* ⊕ core`,
-born identity resolves across levels, and consolidation folds + retires the levels. The **next
-task is Phase 4d — now two-tier** (revised after the O(core)-rebuild design review; see the 4d
-bullet in Phase status and `~/.claude/plans/wise-wobbling-puppy.md` §4d). **4d-i:** L0→L0
-compaction (`Memtable::merge_older` + `DeltaWriter::compact_l0()`) — cheap, O(delta), merges small
-L0 segments to bound RAM **and** read fan-out; this is what sustains write volume, no core rebuild.
-**4d-ii:** admission/backpressure — `memtableBytes` = flush cap, `l0CompactionTrigger`,
-consolidation fires at `deltaCoreFraction × core_bytes` (**fraction of core**, not a fixed byte
-count) and/or an off-peak schedule (the fold is a background read-locality optimisation, not a
-correctness requirement), `deltaHardBytes` = throttle backstop; per-writer in-flight guard covers
-overlapping consolidations **and** the 4c-B-deferred flush/compaction-during-consolidation
-exclusion. `total_bytes()` + `l0_len()` are already on `DeltaWriter` for the cap checks. Export
+Phases **4a + 4b + 4c (A+B) + 4d-i are DONE**, all gates green (`cargo test -p slater -p
+slater-delta` = 574 + 53; `cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]`
+real-builder e2e; empty-delta read path cost-identical — see the 4c-B note on bench jitter). The
+full L0 LSM is wired (flush spills to on-disk segments, reads merge `memtable ⊕ L0* ⊕ core`, born
+identity resolves across levels, consolidation folds + retires) **and** the cheap L0→L0 compaction
+tier exists (`Memtable::merge_levels` + `DeltaWriter::compact_l0()`). The **next task is Phase
+4d-ii** — admission/backpressure + rare fraction-of-core consolidation (see the 4d-ii bullet in
+Phase status and `~/.claude/plans/wise-wobbling-puppy.md` §4d): `memtableBytes` = flush cap, new
+`l0CompactionTrigger` (segment-count/bytes → `compact_l0`), consolidation fires at
+`deltaCoreFraction × core_bytes` (**fraction of core**, not a fixed byte count) and/or an off-peak
+schedule (the fold is a background read-locality optimisation, not a correctness requirement),
+`deltaHardBytes` = throttle backstop. After `execute_write`/`execute_edge_write` apply: flush if
+memtable ≥ cap; `compact_l0` if L0 stack ≥ trigger; spawn a consolidation async if total delta ≥
+the fraction & none in flight (don't block the ack); block if ≥ hard cap. Per-writer in-flight
+guard (`AtomicBool`/`Semaphore(1)`) covers overlapping consolidations **and** the 4c-B/4d-i-deferred
+flush/compaction-during-consolidation exclusion (`retire` clears the whole L0 stack). `total_bytes()`
++ `l0_len()` are already on `DeltaWriter` for the cap checks. Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
 the only cost).

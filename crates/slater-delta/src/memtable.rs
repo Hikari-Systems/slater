@@ -814,6 +814,197 @@ impl Memtable {
         })
     }
 
+    /// Fold a **contiguous, stacked run** of L0 levels (newest-first) into one
+    /// equivalent memtable — the L0→L0 compaction primitive (Phase 4d-i). The result
+    /// answers every read identically to
+    /// [`DeltaSnapshot::with_levels`](DeltaSnapshot) over the same run, but as a single
+    /// resident level: it reclaims the space of overwritten patches and shadowed
+    /// tombstones, and (crucially) collapses the read fan-out (per-read work grows with
+    /// level count). It touches no core and no WAL — L0 is already post-WAL.
+    ///
+    /// **Synthetic ids are preserved.** The inputs' born-id ranges are disjoint and
+    /// stacked (`base_{k+1} = base_k + born_k`), so the merged level keeps the oldest
+    /// input's base and every born node/edge its exact id — the active memtable above
+    /// the stack, and any dense id already handed to a reader, stay valid. This is why
+    /// the caller must pass a **contiguous** run (a `debug_assert` checks the born-id
+    /// tiling). The merge is done by replaying the newest-wins folded state through the
+    /// ordinary [`Self::upsert_node`]/[`Self::delete_node`]/[`Self::upsert_edge`]/
+    /// [`Self::delete_edge`] paths (born entities in ascending id order, endpoints
+    /// resolved explicitly so none is re-allocated), so allocation + byte accounting
+    /// reuse the single tested code path rather than duplicating it.
+    pub fn merge_levels(newest_first: &[&Memtable]) -> Memtable {
+        let Some((oldest, _)) = newest_first.split_last() else {
+            return Memtable::default();
+        };
+        let base_node = oldest.synthetic_base;
+        let base_edge = oldest.edge_synthetic_base;
+
+        // Fold every level newest-wins, keyed by an **interner-independent** identity key
+        // (names + type-exact value bytes), so entries from levels with different local
+        // symbol tables combine correctly.
+        let mut fnodes: HashMap<Vec<u8>, FoldedNode> = HashMap::new();
+        let mut fedges: HashMap<Vec<u8>, FoldedEdge> = HashMap::new();
+        for seg in newest_first.iter().rev() {
+            // Nodes with a dense id (core-resolved or born). Entries absent from
+            // `by_dense` are inert no-op tombstones (a delete of a key absent from the
+            // core and never born) — they suppress nothing, so they are dropped.
+            for (&dense, ck) in &seg.by_dense {
+                let Some(entry) = seg.nodes.get(ck) else {
+                    continue;
+                };
+                let label = seg.interner.name(entry.identity.label).unwrap_or("");
+                let key = seg.interner.name(entry.identity.key).unwrap_or("");
+                let nk = node_name_key(label, key, &entry.identity.value);
+                let f = fnodes.entry(nk).or_insert_with(|| FoldedNode {
+                    label: label.to_string(),
+                    key: key.to_string(),
+                    value: entry.identity.value.clone(),
+                    patches: BTreeMap::new(),
+                    tombstoned: false,
+                    dense,
+                });
+                f.dense = dense;
+                fold_delta(&mut f.patches, &mut f.tombstoned, &entry.delta);
+            }
+            for entry in seg.edges.values() {
+                let sl = seg.interner.name(entry.identity.src.label).unwrap_or("");
+                let sk = seg.interner.name(entry.identity.src.key).unwrap_or("");
+                let rt = seg.interner.name(entry.identity.reltype).unwrap_or("");
+                let dl = seg.interner.name(entry.identity.dst.label).unwrap_or("");
+                let dk = seg.interner.name(entry.identity.dst.key).unwrap_or("");
+                let ek = edge_name_key(
+                    sl,
+                    sk,
+                    &entry.identity.src.value,
+                    rt,
+                    dl,
+                    dk,
+                    &entry.identity.dst.value,
+                );
+                let f = fedges.entry(ek).or_insert_with(|| FoldedEdge {
+                    src_label: sl.to_string(),
+                    src_key: sk.to_string(),
+                    src_value: entry.identity.src.value.clone(),
+                    reltype: rt.to_string(),
+                    dst_label: dl.to_string(),
+                    dst_key: dk.to_string(),
+                    dst_value: entry.identity.dst.value.clone(),
+                    patches: BTreeMap::new(),
+                    tombstoned: false,
+                    src_dense: entry.src_dense,
+                    dst_dense: entry.dst_dense,
+                    born_edge_id: None,
+                });
+                f.src_dense = entry.src_dense;
+                f.dst_dense = entry.dst_dense;
+                if f.born_edge_id.is_none() {
+                    f.born_edge_id = entry.synthetic_edge;
+                }
+                fold_delta_edge(&mut f.patches, &mut f.tombstoned, &entry.delta);
+            }
+        }
+
+        let mut m = Memtable::with_bases(base_node, base_edge);
+
+        // Born nodes first, in ascending synthetic-id order, so `upsert_node(None)`
+        // re-allocates the identical ids off the (shared) oldest base.
+        let mut born: Vec<&FoldedNode> = fnodes.values().filter(|f| f.dense >= base_node).collect();
+        born.sort_by_key(|f| f.dense);
+        for (i, f) in born.iter().enumerate() {
+            debug_assert_eq!(
+                f.dense,
+                base_node + i as u64,
+                "born node ids must tile [base, base+n) — run not contiguous?"
+            );
+            m.upsert_node(&f.label, &f.key, f.value.clone(), None, f.patches.clone());
+            if f.tombstoned {
+                m.delete_node(&f.label, &f.key, f.value.clone(), None);
+            }
+        }
+        // Core-resolved nodes (patched / tombstoned existing core rows), in dense-id
+        // order so the merged memtable is deterministic (dense is unique per core node).
+        let mut core: Vec<&FoldedNode> = fnodes.values().filter(|f| f.dense < base_node).collect();
+        core.sort_by_key(|f| f.dense);
+        for f in core {
+            if f.tombstoned {
+                m.delete_node(&f.label, &f.key, f.value.clone(), Some(f.dense));
+            } else {
+                m.upsert_node(
+                    &f.label,
+                    &f.key,
+                    f.value.clone(),
+                    Some(f.dense),
+                    f.patches.clone(),
+                );
+            }
+        }
+
+        // Born edges in ascending synthetic-edge-id order (endpoints resolved so none is
+        // re-allocated), then the core-edge tombstone-only entries.
+        let mut born_e: Vec<&FoldedEdge> = fedges
+            .values()
+            .filter(|f| f.born_edge_id.is_some())
+            .collect();
+        born_e.sort_by_key(|f| f.born_edge_id.unwrap());
+        for (i, f) in born_e.iter().enumerate() {
+            debug_assert_eq!(
+                f.born_edge_id.unwrap(),
+                base_edge + i as u64,
+                "born edge ids must tile [base, base+n) — run not contiguous?"
+            );
+            m.upsert_edge(
+                &f.src_label,
+                &f.src_key,
+                f.src_value.clone(),
+                &f.reltype,
+                &f.dst_label,
+                &f.dst_key,
+                f.dst_value.clone(),
+                Some(f.src_dense),
+                Some(f.dst_dense),
+                f.patches.clone(),
+            );
+            if f.tombstoned {
+                m.delete_edge(
+                    &f.src_label,
+                    &f.src_key,
+                    f.src_value.clone(),
+                    &f.reltype,
+                    &f.dst_label,
+                    &f.dst_key,
+                    f.dst_value.clone(),
+                    Some(f.src_dense),
+                    Some(f.dst_dense),
+                );
+            }
+        }
+        // Core-edge tombstone-only entries, in endpoint/reltype order for determinism.
+        let mut core_e: Vec<&FoldedEdge> = fedges
+            .values()
+            .filter(|f| f.born_edge_id.is_none())
+            .collect();
+        core_e.sort_by(|a, b| {
+            (a.src_dense, a.dst_dense, &a.reltype).cmp(&(b.src_dense, b.dst_dense, &b.reltype))
+        });
+        for f in core_e {
+            // A `born_edge_id`-less entry can only be a tombstone that suppresses a core
+            // edge (a live born edge always carries an id).
+            debug_assert!(f.tombstoned);
+            m.delete_edge(
+                &f.src_label,
+                &f.src_key,
+                f.src_value.clone(),
+                &f.reltype,
+                &f.dst_label,
+                &f.dst_key,
+                f.dst_value.clone(),
+                Some(f.src_dense),
+                Some(f.dst_dense),
+            );
+        }
+        m
+    }
+
     /// Serialise the whole memtable to a self-describing byte image — the body of an
     /// **L0 delta segment** (Phase 4b). The image is complete: it carries the interner
     /// name table (so identities' delta-local [`SymbolId`]s round-trip), every folded
@@ -967,6 +1158,97 @@ impl Memtable {
             bytes: bytes_est,
         })
     }
+}
+
+/// The newest-wins fold of one node identity across a run of L0 levels
+/// ([`Memtable::merge_levels`]). Identity is carried as recoverable names + value so it
+/// is interner-independent; `dense` is the stable core-or-synthetic id.
+struct FoldedNode {
+    label: String,
+    key: String,
+    value: Value,
+    patches: BTreeMap<String, Value>,
+    tombstoned: bool,
+    dense: u64,
+}
+
+/// The newest-wins fold of one edge identity across a run of L0 levels. `born_edge_id`
+/// is `Some` iff the edge was ever born (carries a synthetic edge id); `None` marks a
+/// tombstone-only entry that suppresses a core edge.
+struct FoldedEdge {
+    src_label: String,
+    src_key: String,
+    src_value: Value,
+    reltype: String,
+    dst_label: String,
+    dst_key: String,
+    dst_value: Value,
+    patches: BTreeMap<String, Value>,
+    tombstoned: bool,
+    src_dense: u64,
+    dst_dense: u64,
+    born_edge_id: Option<u64>,
+}
+
+/// Fold one level's node/edge delta onto an accumulator newest-wins (the accumulator
+/// is the *older* state, `src` the newer): a newer tombstone clears the patches and
+/// tombstones; a newer upsert resurrects and its properties win per key. Matches
+/// [`DeltaSnapshot::node_patch`]'s across-levels merge.
+fn fold_delta(patches: &mut BTreeMap<String, Value>, tombstoned: &mut bool, src: &NodeDelta) {
+    if src.tombstoned {
+        patches.clear();
+        *tombstoned = true;
+    } else {
+        *tombstoned = false;
+        for (k, v) in &src.patches {
+            patches.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// Overload of [`fold_delta`] for an [`EdgeDelta`] (identical LWW semantics).
+fn fold_delta_edge(patches: &mut BTreeMap<String, Value>, tombstoned: &mut bool, src: &EdgeDelta) {
+    if src.tombstoned {
+        patches.clear();
+        *tombstoned = true;
+    } else {
+        *tombstoned = false;
+        for (k, v) in &src.patches {
+            patches.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// An **interner-independent** identity key for a node: length-prefixed label + key
+/// names followed by the type-exact value bytes. Two levels with different local symbol
+/// tables produce the same key for the same business identity, so the fold combines
+/// them correctly.
+fn node_name_key(label: &str, key: &str, value: &Value) -> Vec<u8> {
+    let mut b = Vec::with_capacity(label.len() + key.len() + 8);
+    write_uvarint(&mut b, label.len() as u64);
+    b.extend_from_slice(label.as_bytes());
+    write_uvarint(&mut b, key.len() as u64);
+    b.extend_from_slice(key.as_bytes());
+    write_value(&mut b, value);
+    b
+}
+
+/// An interner-independent identity key for an edge: `src ‖ reltype ‖ dst`.
+#[allow(clippy::too_many_arguments)]
+fn edge_name_key(
+    src_label: &str,
+    src_key: &str,
+    src_value: &Value,
+    reltype: &str,
+    dst_label: &str,
+    dst_key: &str,
+    dst_value: &Value,
+) -> Vec<u8> {
+    let mut b = node_name_key(src_label, src_key, src_value);
+    write_uvarint(&mut b, reltype.len() as u64);
+    b.extend_from_slice(reltype.as_bytes());
+    b.extend_from_slice(&node_name_key(dst_label, dst_key, dst_value));
+    b
 }
 
 /// L0 segment body format version (see [`Memtable::serialise`]).
@@ -2368,6 +2650,196 @@ mod tests {
         let s = DeltaSnapshot::from_memtable(arc.clone());
         assert_eq!(s.node_patch(3), arc.node_patch(3).cloned());
         assert!(!s.is_empty());
+    }
+
+    /// A three-level stacked run — a core patch that is re-patched then deleted, a core
+    /// tombstone, born nodes across all levels, a born node re-MERGE'd in a newer level,
+    /// and a born edge later deleted — exercising every fold path.
+    fn stacked_run() -> Vec<Memtable> {
+        // Oldest (L0_0): base nodes 100, edges 500.
+        let mut l0 = Memtable::with_bases(100, 500);
+        l0.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Al".into()),
+            Some(5),
+            [("age".into(), Value::Int(40))],
+        );
+        l0.delete_node("Person", "name", Value::Str("Bob".into()), Some(7));
+        l0.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            None,
+            [("age".into(), Value::Int(1))],
+        ); // 100
+        l0.upsert_node("Company", "ticker", Value::Str("BBB".into()), None, []); // 101
+        l0.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Company",
+            "ticker",
+            Value::Str("BBB".into()),
+            Some(100),
+            Some(101),
+            [],
+        ); // edge 500
+
+        // Middle (L0_1): base nodes 102, edges 501.
+        let mut l1 = Memtable::with_bases(102, 501);
+        l1.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Al".into()),
+            Some(5),
+            [
+                ("age".into(), Value::Int(41)),
+                ("city".into(), Value::Str("NYC".into())),
+            ],
+        );
+        l1.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            Some(100),
+            [("age".into(), Value::Int(2))],
+        ); // re-MERGE born A
+        l1.upsert_node("Person", "name", Value::Str("Cy".into()), None, []); // 102
+        l1.delete_edge(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Company",
+            "ticker",
+            Value::Str("BBB".into()),
+            Some(100),
+            Some(101),
+        ); // tombstone the core-of-this-run edge 500
+        l1.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Cy".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            Some(102),
+            Some(100),
+            [],
+        ); // edge 501
+
+        // Newest (L0_2): base nodes 103, edges 502.
+        let mut l2 = Memtable::with_bases(103, 502);
+        l2.delete_node("Person", "name", Value::Str("Al".into()), Some(5)); // tombstone core 5
+        l2.upsert_node(
+            "Company",
+            "ticker",
+            Value::Str("DDD".into()),
+            None,
+            [("rank".into(), Value::Int(9))],
+        ); // 103
+
+        vec![l2, l1, l0] // newest-first
+    }
+
+    /// Normalise a delta-edge list to its **observable** form for equivalence checks:
+    /// a tombstoned edge's `edge_id` is never materialised (it only suppresses a core
+    /// edge by `(reltype, neighbour)`), so it is masked to `None` — the one field where
+    /// a born-then-deleted edge's merged canonical form legitimately differs from the
+    /// multi-level stack's shadowing tombstone. Result is sorted for order-independence.
+    fn norm_edges(v: Vec<DeltaEdge>) -> Vec<(String, u64, bool, Option<u64>)> {
+        let mut out: Vec<(String, u64, bool, Option<u64>)> = v
+            .into_iter()
+            .map(|e| {
+                let id = if e.tombstoned { None } else { e.edge_id };
+                (e.reltype, e.other, e.tombstoned, id)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn merge_levels_matches_the_snapshot_fold() {
+        let run = stacked_run();
+        let refs: Vec<&Memtable> = run.iter().collect();
+        let merged = Memtable::merge_levels(&refs);
+
+        let stack = DeltaSnapshot::with_levels(
+            Arc::new(run[0].clone()),
+            run[1..].iter().map(|m| Arc::new(m.clone())).collect(),
+        );
+        let merged_snap = DeltaSnapshot::from_memtable(Arc::new(merged));
+
+        // Bases + counts.
+        assert_eq!(stack.synthetic_base(), merged_snap.synthetic_base());
+        assert_eq!(
+            stack.edge_synthetic_base(),
+            merged_snap.edge_synthetic_base()
+        );
+        assert_eq!(stack.born_count(), merged_snap.born_count());
+        assert_eq!(stack.born_edge_count(), merged_snap.born_edge_count());
+
+        let hi = stack.synthetic_base() + stack.born_count();
+        for id in 0..hi {
+            assert_eq!(
+                stack.node_patch(id),
+                merged_snap.node_patch(id),
+                "node_patch({id})"
+            );
+            assert_eq!(
+                stack.is_tombstoned(id),
+                merged_snap.is_tombstoned(id),
+                "is_tombstoned({id})"
+            );
+            assert_eq!(
+                norm_edges(stack.out_edges(id)),
+                norm_edges(merged_snap.out_edges(id)),
+                "out_edges({id})"
+            );
+            assert_eq!(
+                norm_edges(stack.in_edges(id)),
+                norm_edges(merged_snap.in_edges(id)),
+                "in_edges({id})"
+            );
+        }
+        for lbl in ["Person", "Company"] {
+            assert_eq!(
+                stack.born_ids_with_label(lbl),
+                merged_snap.born_ids_with_label(lbl),
+                "born_ids_with_label({lbl})"
+            );
+        }
+
+        // Concrete spot-checks of the headline folds.
+        assert!(
+            merged_snap.is_tombstoned(5),
+            "core 5 deleted in the newest level"
+        );
+        assert!(
+            merged_snap.is_tombstoned(7),
+            "core 7 deleted in the oldest level"
+        );
+        assert_eq!(
+            merged_snap.node_patch(100).unwrap().patches.get("age"),
+            Some(&Value::Int(2)),
+            "born A's newer age wins"
+        );
+        assert_eq!(merged_snap.born_ids_with_label("Company"), vec![101, 103]);
+    }
+
+    #[test]
+    fn merge_levels_is_deterministic() {
+        let run = stacked_run();
+        let refs: Vec<&Memtable> = run.iter().collect();
+        assert_eq!(
+            Memtable::merge_levels(&refs).serialise(),
+            Memtable::merge_levels(&refs).serialise(),
+            "equal runs merge to byte-identical segments"
+        );
     }
 
     #[test]

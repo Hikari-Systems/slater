@@ -340,6 +340,51 @@ impl DeltaWriter {
         Ok(true)
     }
 
+    /// Compact the sealed L0 stack into a single merged segment (Phase 4d-i) — the
+    /// cheap, O(delta), no-core-rebuild tier that lets the layer sustain write volume.
+    /// It merges the current L0 levels via [`Memtable::merge_levels`] (reclaiming
+    /// overwritten patches + shadowed tombstones and collapsing read fan-out), writes
+    /// the result to a fresh L0 file, publishes the one-segment stack atomically, and
+    /// deletes the consumed files once the merged file is fsynced. A no-op (returns
+    /// `false`) with fewer than two levels — nothing to collapse.
+    ///
+    /// The active memtable and the core are untouched, so born ids (and any dense id
+    /// already handed to a reader) stay valid: `merge_levels` keeps the oldest level's
+    /// base and every born entity its exact id. Merging **all** levels means there is
+    /// only ever ≤ 1 L0 file afterwards, so the new file's (highest) segment number and
+    /// its (oldest) age agree — no number-vs-stack-order reconciliation is needed (a
+    /// size-tiered partial-run policy would need that, and is a later refinement).
+    pub fn compact_l0(&self) -> Result<bool> {
+        let mut inner = self.inner.lock().expect("delta writer lock");
+        if inner.l0.len() < 2 {
+            return Ok(false);
+        }
+
+        // Merge every current L0 level (newest-first) into one equivalent segment.
+        let levels: Vec<&Memtable> = inner.l0.iter().map(|s| s.memtable().as_ref()).collect();
+        let merged = Memtable::merge_levels(&levels);
+
+        let l0_dir = inner.dir.join("l0");
+        let n = next_l0_number(&l0_dir)?;
+        let path = l0_dir.join(format!("{n:010}.l0"));
+        L0Segment::write(&merged, &path)
+            .with_context(|| format!("write compacted L0 segment {path:?}"))?;
+        let seg = L0Segment::open(&path)
+            .with_context(|| format!("reopen compacted L0 segment {path:?}"))?;
+
+        let consumed: Vec<PathBuf> = inner.l0.iter().map(|s| s.path().to_path_buf()).collect();
+        inner.l0 = vec![seg]; // one merged level replaces the run
+
+        // Publish the collapsed stack, then delete the consumed files (durable in the
+        // merged file) — publish-before-delete so a reader never loses the data.
+        self.republish(&inner);
+        for p in &consumed {
+            remove_if_present(p)?;
+        }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+
     /// Complete a consolidation: delete the `consumed` (pre-freeze) WAL segments —
     /// their writes now live in the freshly built core — then **rebuild** the live
     /// memtable by replaying the surviving *post-freeze* segments against the new core
@@ -1091,6 +1136,90 @@ mod tests {
             Some(&Value::Int(9)),
             "the re-MERGE patch survives a reopen"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compact_l0_collapses_the_stack_preserving_reads() {
+        let dir = tmp("compact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(40));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // Nothing to compact yet.
+        assert!(!w.compact_l0().unwrap());
+
+        // Segment 0: born node C (resolve None → synthetic 100).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C".into()),
+                &[("price", Value::Int(1))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+
+        // Segment 1: patch core node A (dense 10) + born node D (synthetic 101).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(5))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("D".into()),
+                &[("price", Value::Int(2))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 2, "two L0 levels before compaction");
+
+        let reads = |w: &DeltaWriter| {
+            let s = w.delta_snapshot();
+            (
+                s.born_count(),
+                s.synthetic_base(),
+                s.node_patch(100)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                s.node_patch(10)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                s.node_patch(101)
+                    .and_then(|d| d.patches.get("price").cloned()),
+            )
+        };
+        let before = reads(&w);
+        assert_eq!(
+            before,
+            (
+                2,
+                100,
+                Some(Value::Int(1)),
+                Some(Value::Int(5)),
+                Some(Value::Int(2))
+            )
+        );
+
+        // Compact: one merged level, identical reads.
+        assert!(w.compact_l0().unwrap());
+        assert_eq!(w.l0_len(), 1, "stack collapsed to one level");
+        assert_eq!(reads(&w), before, "reads unchanged by compaction");
+
+        // Reopen reloads the single compacted segment.
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        assert_eq!(w2.l0_len(), 1);
+        assert_eq!(reads(&w2), before, "compacted reads survive a reopen");
         std::fs::remove_dir_all(&dir).ok();
     }
 
