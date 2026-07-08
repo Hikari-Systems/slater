@@ -748,7 +748,7 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   weekday gating). Whole slater (606) + slater-delta (58) + workspace green; clippy `-D warnings` +
   fmt clean; read path + empty-delta bench untouched (write-path maintenance + config only).
 
-- **Size-tiered partial-L0 compaction** (deferred from Phase 4d-i). ✅ DONE (this commit).
+- **Size-tiered partial-L0 compaction** (deferred from Phase 4d-i). ✅ DONE (`aea6f36`).
   `DeltaWriter::compact_l0` no longer merges the **whole** L0 stack; it now merges only a
   contiguous run of **similar-sized** levels, so a large level is not repeatedly rewritten with
   tiny new ones (write amplification). New pure `select_compaction_run(&sizes)` picks the longest
@@ -795,6 +795,7 @@ the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
+- `aea6f36` feat(delta): size-tiered partial-L0 compaction
 - `215b3d4` feat(delta): off-peak window for the fraction-of-core auto-consolidation
 - `80f976b` feat(delta): edge properties on delta-born relationships (SET r.p on an edge MERGE)
 - `a551907` feat(delta): relocate a patched core node in the range index (moved indexed value)
