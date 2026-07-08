@@ -460,7 +460,20 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Phase 4b is complete** (this commit): the L0 delta-segment format lands in `slater-delta`.
+**Resume state:** on branch `writeable`, **not** pushed to origin (local ahead of
+`origin/writeable` by three commits). Latest commits:
+- `f04298e` docs(delta): record the Phase 4c born-across-levels design decision
+- `fcac9fb` feat(delta): L0 delta-segment format + reader (Phase 4b)
+- `04806bd` feat(delta): carry post-freeze writes onto the new core (Phase 4a)
+
+Phases **4a + 4b are DONE**, all gates green (`cargo test -p slater -p slater-delta` = 569 + 42;
+`cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]` real-builder e2e). The
+**next task is Phase 4c-A** (multi-level read merge in `DeltaSnapshot`). Approved plan file:
+`~/.claude/plans/wise-wobbling-puppy.md`. Export
+`CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
+before building.
+
+**Phase 4b is complete**: the L0 delta-segment format lands in `slater-delta`.
 `Memtable::{serialise,deserialise}` round-trip the whole folded delta (interner names, all
 node/edge entries, derived indexes, born vectors) deterministically, and `l0::L0Segment::
 {write,open}` frame it on disk as `MAGIC ‖ crc32c ‖ body` (temp+rename+fsync, magic/crc/version
