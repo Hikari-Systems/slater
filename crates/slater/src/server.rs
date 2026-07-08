@@ -2517,10 +2517,28 @@ fn resolve_op(gen: &Generation, op: &WalOp) -> OpResolution {
     if let Some(node) = op.node_key() {
         return OpResolution::Node(one(node));
     }
-    let (src, _reltype, dst) = op.edge_keys().expect("node_key None ⇒ edge op");
+    let (src, reltype, dst) = op.edge_keys().expect("node_key None ⇒ edge op");
+    let src_id = one(src);
+    let dst_id = one(dst);
+    // An `UpsertEdge` whose endpoints are both core *and* whose edge already exists in
+    // the core is an in-place property patch — resolve its core edge id so `apply`
+    // routes it to `patch_core_edge` (rather than allocating a duplicate born edge).
+    // A born-edge create (no core edge) or any delete resolves to `None`. Re-scanned
+    // against the *current* core on every replay, so a born edge folded into a fresh
+    // core (post-consolidation) correctly becomes a core-edge patch. An I/O error while
+    // scanning collapses to `None` (a replay-time read failure is catastrophic anyway,
+    // and this matches how endpoint resolution swallows a failed probe).
+    let edge_id = match op {
+        WalOp::UpsertEdge { .. } => match (src_id, dst_id, gen.reltype_id(reltype)) {
+            (Some(s), Some(d), Some(rt)) => find_core_edge_id(gen, s, rt, d).unwrap_or(None),
+            _ => None,
+        },
+        _ => None,
+    };
     OpResolution::Edge {
-        src: one(src),
-        dst: one(dst),
+        src: src_id,
+        dst: dst_id,
+        edge_id,
     }
 }
 
@@ -2895,17 +2913,19 @@ fn resolve_endpoint(
     }
 }
 
-/// Whether the core already carries an edge `src -[reltype]-> dst` — the `MERGE`
-/// idempotency check that stops a re-`MERGE` of an existing core edge from adding a
-/// duplicate delta-born edge. Scans only the source's core outgoing adjacency (bounded
-/// by its out-degree) over an empty-delta view, so it sees core edges only (a born
-/// duplicate is already prevented by the memtable's identity idempotency).
-fn core_edge_exists(
+/// The core edge id of `src -[reltype]-> dst` if the core already carries that edge,
+/// else `None`. This is both the `MERGE` idempotency check (a re-`MERGE` of an existing
+/// core edge must not add a duplicate delta-born edge) and the resolver for an in-place
+/// core-edge property patch (the id keys the patch overlay). Scans only the source's
+/// core outgoing adjacency (bounded by its out-degree) over an **empty-delta** view, so
+/// it sees core edges only — a born duplicate is prevented by the memtable's identity
+/// idempotency, and a patch must land on the genuine core edge id, never a synthetic one.
+fn find_core_edge_id(
     gen: &Generation,
     src: u64,
     reltype: u32,
     dst: u64,
-) -> std::result::Result<bool, Failure> {
+) -> std::result::Result<Option<u64>, Failure> {
     let cache = BlockCache::new(1 << 16);
     let view = MergedView::read_only(gen);
     let engine = crate::exec::Engine::new(&view, &cache);
@@ -2917,7 +2937,8 @@ fn core_edge_exists(
     })?;
     Ok(adj
         .iter()
-        .any(|a| a.reltype == reltype && a.neighbour.0 == dst))
+        .find(|a| a.reltype == reltype && a.neighbour.0 == dst)
+        .map(|a| a.edge.0))
 }
 
 /// Execute one durable relationship write (Phase 3c): resolve both endpoints, build
@@ -2963,28 +2984,17 @@ fn execute_edge_write(
     let src_core = resolve_endpoint(gen, &stmt.src, &src_value)?;
     let dst_core = resolve_endpoint(gen, &stmt.dst, &dst_value)?;
 
-    // A MERGE of an edge whose endpoints are both existing core nodes is idempotent —
-    // skip the write if the core already has it (a born duplicate would double the edge
-    // on traversal). If either endpoint is delta-born there can be no matching core
-    // edge, so no check is needed.
+    // A MERGE of an edge whose endpoints are both existing core nodes may already exist
+    // in the core. If it does, a bare re-MERGE is an idempotent no-op, and a
+    // `SET r.p = …` is an **in-place property patch** of that core edge (resolved to its
+    // core edge id, which routes the write to `patch_core_edge`). If either endpoint is
+    // delta-born there can be no matching core edge, so no check is needed.
+    let mut core_edge_id = None;
     if stmt.op == EdgeWriteOp::Create {
         if let (Some(s), Some(d)) = (src_core, dst_core) {
-            if core_edge_exists(gen, s, reltype_id, d)? {
-                // A bare re-MERGE of a core edge stays an idempotent no-op. Patching a
-                // *core* edge's properties in place needs a core-edge-id overlay (a
-                // distinct mechanism, not wired yet), so reject it clearly rather than
-                // silently drop the SET.
-                if !patches.is_empty() {
-                    return Err(Failure::new(
-                        CODE_EXECUTION,
-                        format!(
-                            "cannot SET properties on the existing base relationship \
-                             (:{})-[:{}]->(:{}): editing a core edge's properties is not yet \
-                             supported — only delta-born relationships carry editable properties",
-                            stmt.src.label, stmt.reltype, stmt.dst.label
-                        ),
-                    ));
-                }
+            core_edge_id = find_core_edge_id(gen, s, reltype_id, d)?;
+            if core_edge_id.is_some() && patches.is_empty() {
+                // Bare re-MERGE of an existing core edge: nothing to write.
                 return Ok((Vec::new(), Vec::new()));
             }
         }
@@ -3020,8 +3030,17 @@ fn execute_edge_write(
             dst_value,
         },
     };
+    // `edge_id` is `Some` only for a core-edge patch (a Create whose edge exists in the
+    // core); a born-edge create and every delete leave it `None`.
     writer
-        .write(op, OpResolution::Edge { src, dst })
+        .write(
+            op,
+            OpResolution::Edge {
+                src,
+                dst,
+                edge_id: core_edge_id,
+            },
+        )
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
@@ -4763,6 +4782,7 @@ mod tests {
                     OpResolution::Edge {
                         src: Some(src),
                         dst: Some(dst),
+                        edge_id: None,
                     },
                 )
                 .unwrap();
@@ -5016,8 +5036,9 @@ mod tests {
     /// Edge properties (follow-up from 3c): `MERGE (a)-[r:R]->(b) SET r.p = …` gives a
     /// delta-born edge properties; a re-`MERGE` patches them in place; they read back via
     /// `RETURN r.p`, and survive a reopen. Patching a *core* edge's properties in place is
-    /// not yet supported and is rejected clearly. (`write_indexed_people` carries a
-    /// core edge Alice-KNOWS->Bob with `since = 2020`.)
+    /// now supported too — a `SET` on an existing core edge updates it, a bare re-`MERGE`
+    /// stays an idempotent no-op, and the patch replays across a reopen. (`write_indexed_people`
+    /// carries a core edge Alice-KNOWS->Bob with `since = 2020`.)
     #[test]
     fn edge_properties_end_to_end() {
         let (root, _g) = testgen::write_indexed_people("edge_props_3");
@@ -5090,21 +5111,40 @@ mod tests {
             "a second property is added"
         );
 
-        // Patching a CORE edge's properties in place is rejected (deferred mechanism).
-        let err = run_write(
+        // Patching a CORE edge's properties in place now updates it (was rejected before).
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN r.since"
+            ),
+            vec![2020],
+            "the core edge's original property reads from the core"
+        );
+        run_write(
             "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) SET r.since = 7",
         )
-        .unwrap_err();
-        assert!(
-            err.message
-                .contains("editing a core edge's properties is not yet supported"),
-            "core-edge property patch rejected: {}",
-            err.message
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN r.since"
+            ),
+            vec![7],
+            "the core edge's property is patched in place"
         );
-        // A bare re-MERGE of that same core edge is still an idempotent no-op (not an error).
+        // A bare re-MERGE of that same core edge is still an idempotent no-op — the patch stands.
         run_write("MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'})").unwrap();
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN r.since"
+            ),
+            vec![7],
+            "a bare re-MERGE leaves the core-edge patch intact"
+        );
 
-        // Durable across a reopen: the born edge's patched properties replay.
+        // Durable across a reopen: the born edge's patched properties AND the core-edge
+        // patch replay (the latter re-resolves its core edge id via `resolve_op`).
         drop(writer);
         let reopened = Arc::new(
             DeltaWriter::open(
@@ -5123,7 +5163,15 @@ mod tests {
                 "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) RETURN r.since"
             ),
             vec![2000],
-            "edge properties are durable across a reopen"
+            "born edge properties are durable across a reopen"
+        );
+        assert_eq!(
+            scalar(
+                &reopened,
+                "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN r.since"
+            ),
+            vec![7],
+            "the core-edge patch is durable across a reopen"
         );
         std::fs::remove_dir_all(&root).ok();
     }

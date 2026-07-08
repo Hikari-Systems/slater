@@ -995,3 +995,30 @@ flush/compaction across the freeze→retire window (which `retire` clears wholes
 *partial-flush* (born entities stay resident) — degrades to no-L0 for insert-heavy loads; and a
 fixed-byte consolidation cap — unbounded write amplification on a large core. Prompted by the
 "consolidation on a 91M core takes ~an hour" review.
+
+### D51 — In-place core-edge property patching keys on the resolved core edge id
+Follow-up from D46/3c (`crates/slater-delta/src/memtable.rs`, `crates/slater/src/{server.rs,exec.rs}`).
+`MERGE (a)-[r:R]->(b) SET r.p = …` on an edge that **already exists in the core** now patches that
+core edge's properties in place, rather than being rejected. The read path materialises a
+relationship only from an **edge id** (bound by traversal), never from its identity, so the patch
+must be reachable **by core edge id** — exactly the node-patch overlay shape (`by_dense`), transposed
+to edges. So: a new `Memtable::by_edge_id` (core edge id → identity key) indexes a
+`synthetic_edge = None` patch entry (distinct from a delta-**born** edge, which uses `synthetic_edge`,
+and from a tombstone-only entry, which carries neither); `EdgeEntry.core_edge` records the id and is
+persisted, with `by_edge_id` **rebuilt** from it on deserialise (not serialised — the entries are
+authoritative). `edge_delta_by_id` resolves a core edge id through `by_edge_id`, and the
+`DeltaSnapshot` edge-property accessors fold **newest-wins across levels** (a core edge may be
+patched in several L0 levels — unlike a born edge, whose id lives in exactly one level).
+
+**The write path re-resolves the core edge id against the *current* core on every replay**, never
+storing it in the WAL: the same `find_core_edge_id` scan that provides `MERGE` idempotency yields the
+id, carried on `OpResolution::Edge { edge_id }`; `apply` routes `Some` → `patch_core_edge`, `None` →
+`upsert_edge` (born create). This is load-bearing for correctness after consolidation — a born edge
+folded into a fresh core *becomes* a core edge, so a later patch of it must resolve as a core-edge
+patch against the new core, which a WAL-stored flag could not express. A core-edge patch **does not**
+touch the born vector or the adjacency indexes (traversal reads the edge from the core; only its
+properties overlay), so topology is unchanged and consolidation carries the patch for free (the dump
+reads `edge_props`, now overlay-aware, exactly like a patched core node). **Scope unchanged
+otherwise:** a delete of a core edge still resolves by identity (no id needed), and a
+patched-then-deleted-across-levels edge reads stale props *only via a path traversal never reaches*
+(the tombstone suppresses it in the adjacency overlay), so it is unobservable.

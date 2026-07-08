@@ -692,11 +692,15 @@ fn resolve_with_l0(op: &WalOp, base: OpResolution, l0: &[L0Segment]) -> OpResolu
     };
     match base {
         OpResolution::Node(None) => OpResolution::Node(op.node_key().and_then(born)),
-        OpResolution::Edge { src, dst } => {
+        OpResolution::Edge { src, dst, edge_id } => {
             let (s_key, _reltype, d_key) = op.edge_keys().expect("edge op has edge keys");
+            // `edge_id` (a core-edge-patch resolution) is already bound to the core, not
+            // to an L0 level, so it passes through unchanged; only the born-endpoint
+            // fallback consults L0.
             OpResolution::Edge {
                 src: src.or_else(|| born(s_key)),
                 dst: dst.or_else(|| born(d_key)),
+                edge_id,
             }
         }
         other => other,

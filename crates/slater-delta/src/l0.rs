@@ -177,6 +177,7 @@ mod tests {
             OpResolution::Edge {
                 src: Some(5),
                 dst: None,
+                edge_id: None,
             },
         );
         // Tombstone a core edge (both endpoints core).
@@ -193,6 +194,7 @@ mod tests {
             OpResolution::Edge {
                 src: Some(5),
                 dst: Some(8),
+                edge_id: None,
             },
         );
         m

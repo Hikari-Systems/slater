@@ -684,14 +684,21 @@ fn node_ok_par(
 /// parallel aggregation precompute, Task 12) and by `Engine::edge_prop`, so the two
 /// stay byte-for-byte identical.
 fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
-    // A delta-born edge (Phase 3) has no core edge-props record — read its property from
-    // the delta overlay (edge properties). `id >= core edge_count` marks it born.
-    if !gen.delta().is_empty() && id >= gen.core_generation().edge_count() {
-        return Ok(gen
-            .delta()
-            .edge_patch_value(id, key)
-            .map(Val::from_value)
-            .unwrap_or(Val::Null));
+    if !gen.delta().is_empty() {
+        // A delta-born edge (Phase 3, `id >= core edge_count`) has no core edge-props
+        // record — its property lives only in the delta.
+        if id >= gen.core_generation().edge_count() {
+            return Ok(gen
+                .delta()
+                .edge_patch_value(id, key)
+                .map(Val::from_value)
+                .unwrap_or(Val::Null));
+        }
+        // A **core** edge patched in place (`SET r.p` on an existing edge): the delta
+        // patch wins over the core value; absent, fall through to the core read.
+        if let Some(v) = gen.delta().edge_patch_value(id, key) {
+            return Ok(Val::from_value(v));
+        }
     }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
@@ -1553,12 +1560,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn edge_props(&self, id: u64) -> Result<Vec<(u32, Value)>> {
-        // A delta-born edge's properties live in the delta overlay. Map each patch name
-        // to its property-key id; a name absent from the core symbol table has no id and
-        // is dropped from this id-keyed view (still readable by name via `RETURN r.p`).
-        if !self.gen.delta().is_empty() && id >= self.gen.core_generation().edge_count() {
+        let delta = self.gen.delta();
+        // A delta-born edge's properties live entirely in the delta overlay. Map each
+        // patch name to its property-key id; a name absent from the core symbol table has
+        // no id and is dropped from this id-keyed view (still readable by name via
+        // `RETURN r.p`).
+        if !delta.is_empty() && id >= self.gen.core_generation().edge_count() {
             let mut out = Vec::new();
-            for (name, value) in self.gen.delta().edge_patches(id) {
+            for (name, value) in delta.edge_patches(id) {
                 if let Some(kid) = self.gen.property_key_id(&name) {
                     out.push((kid, value));
                 }
@@ -1571,7 +1580,20 @@ impl<'g, V: ReadView> Engine<'g, V> {
             FileKind::EdgeProps,
             id,
         )?;
-        columns::decode_props(&rec)
+        let mut props = columns::decode_props(&rec)?;
+        // A **core** edge patched in place: fold its delta patches over the core record
+        // (replace an existing key, append a new one), mirroring the node patch overlay.
+        if !delta.is_empty() {
+            for (name, value) in delta.edge_patches(id) {
+                if let Some(kid) = self.gen.property_key_id(&name) {
+                    match props.iter_mut().find(|(k, _)| *k == kid) {
+                        Some(slot) => slot.1 = value,
+                        None => props.push((kid, value)),
+                    }
+                }
+            }
+        }
+        Ok(props)
     }
 
     fn node_label_ids(&self, id: u64) -> Result<Vec<u32>> {

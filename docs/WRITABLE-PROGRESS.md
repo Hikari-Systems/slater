@@ -803,6 +803,35 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
     (batched create → one epoch → per-row SET → reopen-durable → batched DELETE → one epoch → gone).
     Whole slater (611) + slater-delta (58) + workspace green; clippy `-D warnings` + fmt clean.
 
+- **In-place core-edge property patching** (deferred from 3c). ✅ DONE (this commit). `MERGE
+  (a)-[r:R]->(b) SET r.p = …` on an edge that **already exists in the core** now patches that core
+  edge's properties **in place** (was rejected). It reads back via `RETURN r.p` / a full `RETURN r`,
+  a bare re-`MERGE` stays an idempotent no-op, and consolidation carries the new value into the
+  rebuild. Because a relationship is materialised only from an **edge id** (never its identity), the
+  patch is keyed **by core edge id** — the node-patch overlay shape (`by_dense`) transposed to edges.
+  slater-delta (`memtable.rs`): new `Memtable::patch_core_edge` stores the patch on a
+  `synthetic_edge = None` entry (distinct from a **born** edge, which uses `synthetic_edge`, and from
+  a tombstone-only entry, which carries neither), a new `by_edge_id` (core edge id → identity key)
+  indexes it, and `EdgeEntry.core_edge` records the id (persisted; `by_edge_id` is **rebuilt** from it
+  on `deserialise`, not serialised). `edge_delta_by_id` resolves a core edge id through `by_edge_id`;
+  `DeltaSnapshot::{edge_patch_value, edge_patches}` now **fold newest-wins across levels** (a core edge
+  may be patched in several L0 levels — unlike a born edge, whose id lives in exactly one). `OpResolution::Edge`
+  gains `edge_id: Option<u64>`; `apply` routes `Some` → `patch_core_edge`, `None` → `upsert_edge`
+  (born). `merge_levels` reconstructs a folded patch-only core edge via `patch_core_edge`. Write path
+  (`server.rs`): `core_edge_exists` → `find_core_edge_id` (returns the id); `execute_edge_write`
+  patches on a core-edge hit with `SET`, and **`resolve_op` re-resolves the core edge id against the
+  *current* core on every replay** (never stored in the WAL — so a born edge folded into a fresh core
+  correctly becomes a core-edge patch after consolidation). Read overlay (`exec.rs`): `edge_prop_par`
+  overlays a core edge's patch over the core value; `edge_props` folds patches over the core record
+  (replace/append) — so `rel_record`/consolidation carry them for free. A core-edge patch **does not**
+  touch the born vector or the adjacency indexes (topology unchanged; only properties overlay). See
+  D51. Tests: slater-delta (`core_edge_patch_reads_back_and_folds_across_levels`,
+  `core_edge_patch_survives_serialise_roundtrip`, `merge_levels_preserves_a_core_edge_patch`); server
+  (`edge_properties_end_to_end` extended: core-edge patch → read-back → bare-re-MERGE-no-op →
+  reopen-durable); consolidate (`serialise_carries_a_core_edge_patch`). Whole slater (612) +
+  slater-delta (61) + workspace green; clippy `-D warnings` + fmt clean; empty-delta bench within
+  noise (all overlay code is behind the `!is_empty` guard).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -817,11 +846,12 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE**, and
+**Resume state:** on branch `writeable`, **not yet** pushed to origin. **Phases 0–5 are ALL DONE**, and
 the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
+- `f4f5ece` feat(delta): in-place core-edge property patching (SET r.p on an existing core edge)
 - `bcb109d` feat(delta): write-UNWIND batched node writes (group-commit surface)
 - `6ed7bec` feat(delta): write_batch group-commit primitive
 - `aea6f36` feat(delta): size-tiered partial-L0 compaction
@@ -836,7 +866,7 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 611 + 58; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 612 + 61; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
@@ -851,7 +881,9 @@ optional/independent:
     notes L0 RSS is already bounded by the delta byte budget and never grows with core size; size-
     tiered compaction + the fraction trigger bound it further), **not a correctness concern** —
     recommended for its **own dedicated session**, not a tail-of-batch rush.
-  - in-place **core-edge** property patching (born-edge properties are done).
+  - ~~in-place **core-edge** property patching~~ ✅ DONE — see the "Deferred follow-ups
+    (post-Phase-5)" section above (`SET r.p` on an existing core edge patches it in place, keyed by
+    core edge id; re-resolved against the current core on replay). See D51.
   - ~~**group-commit batching** for bulk writes~~ ✅ DONE — `write_batch` primitive + write-`UNWIND`
     surface (see "Deferred follow-ups" below). Edge write-UNWIND + the broader Falkor write grammar
     (CREATE, ON CREATE/ON MATCH) remain.

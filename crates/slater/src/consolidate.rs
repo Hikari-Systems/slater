@@ -519,6 +519,58 @@ mod tests {
     }
 
     #[test]
+    fn serialise_carries_a_core_edge_patch() {
+        // Patching a *core* edge's property in place (`SET r.since = 7` on the existing
+        // Alice-KNOWS->Bob, `since = 2020`) must carry the new value into the dump so a
+        // rebuild preserves it — like a patched core node.
+        let (root, graph) = testgen::write_indexed_people("consolidate_core_edge_patch");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Resolve the core edge id of Alice(0)-KNOWS->Bob(1) over an empty-delta view.
+        let empty = MergedView::read_only(&gen);
+        let core_edge_id = Engine::new(&empty, &cache)
+            .outgoing_adj(0)
+            .unwrap()
+            .iter()
+            .find(|a| a.neighbour.0 == 1)
+            .expect("core edge Alice-KNOWS->Bob")
+            .edge
+            .0;
+
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        mem.patch_core_edge(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            core_edge_id,
+            [("since".to_string(), Value::Int(7))],
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains(
+                "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 7;"
+            ),
+            "the core-edge patch is carried into the dump:\n{out}"
+        );
+        assert!(
+            !out.contains("r.since = 2020"),
+            "the stale core value must not appear:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn serialise_drops_a_deleted_edge() {
         // Deleting the core edge Alice-KNOWS->Bob must remove it from the dump while
         // keeping both endpoint nodes — otherwise a rebuild would resurrect the edge.
