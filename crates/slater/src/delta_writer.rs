@@ -387,20 +387,32 @@ impl DeltaWriter {
         Ok(true)
     }
 
-    /// Compact the sealed L0 stack into a single merged segment (Phase 4d-i) — the
-    /// cheap, O(delta), no-core-rebuild tier that lets the layer sustain write volume.
-    /// It merges the current L0 levels via [`Memtable::merge_levels`] (reclaiming
-    /// overwritten patches + shadowed tombstones and collapsing read fan-out), writes
-    /// the result to a fresh L0 file, publishes the one-segment stack atomically, and
-    /// deletes the consumed files once the merged file is fsynced. A no-op (returns
-    /// `false`) with fewer than two levels — nothing to collapse.
+    /// Compact a **size-tier** of the sealed L0 stack into one merged segment (Phase
+    /// 4d-i) — the cheap, O(delta), no-core-rebuild tier that lets the layer sustain
+    /// write volume. Rather than merge *all* levels (the first-cut policy), it selects a
+    /// contiguous run of similar-sized levels ([`select_compaction_run`]) and merges only
+    /// that run via [`Memtable::merge_levels`] (reclaiming overwritten patches + shadowed
+    /// tombstones and collapsing read fan-out within the tier), leaving differently-sized
+    /// levels alone so a large level is never repeatedly rewritten with tiny new ones
+    /// (write amplification). A no-op (returns `false`) with fewer than two levels, or
+    /// when no two adjacent levels are same-tier (a healthy size ladder). This is
+    /// self-balancing: equal-sized flushes form same-tier runs that merge, and the merged
+    /// results are themselves same-tier and merge in turn, so fan-out stays bounded.
     ///
-    /// The active memtable and the core are untouched, so born ids (and any dense id
-    /// already handed to a reader) stay valid: `merge_levels` keeps the oldest level's
-    /// base and every born entity its exact id. Merging **all** levels means there is
-    /// only ever ≤ 1 L0 file afterwards, so the new file's (highest) segment number and
-    /// its (oldest) age agree — no number-vs-stack-order reconciliation is needed (a
-    /// size-tiered partial-run policy would need that, and is a later refinement).
+    /// **Number-vs-stack-order reconciliation.** Merging a *partial* run leaves several
+    /// L0 files, so their on-disk numbers must still agree with age/born-id-base order
+    /// (`open` sorts by number). The merged segment therefore **reuses the run's oldest
+    /// (minimum) file number** — the oldest run member's slot, whose file number and
+    /// born-id base are both the run's minimum, which is exactly the merged segment's base
+    /// (`merge_levels` keeps the oldest level's base). Reusing that slot keeps number
+    /// order == base order with no change to `open`. The active memtable and core are
+    /// untouched, so every born id (and any dense id already handed to a reader) stays
+    /// valid.
+    ///
+    /// Crash posture matches the first-cut merge-all policy: publish-before-delete
+    /// protects live readers, but a crash between writing the merged file and deleting the
+    /// run's newer members would leave both on disk (a redundant born-id range) until the
+    /// next compaction — a pre-existing limitation, not worsened here.
     pub fn compact_l0(&self) -> Result<bool> {
         let mut inner = self.inner.lock().expect("delta writer lock");
         // As with `flush_to_l0`: never mutate the L0 stack during a consolidation.
@@ -411,20 +423,42 @@ impl DeltaWriter {
             return Ok(false);
         }
 
-        // Merge every current L0 level (newest-first) into one equivalent segment.
-        let levels: Vec<&Memtable> = inner.l0.iter().map(|s| s.memtable().as_ref()).collect();
-        let merged = Memtable::merge_levels(&levels);
+        // Pick a contiguous run of similar-sized levels (over the newest-first stack).
+        let sizes: Vec<u64> = inner
+            .l0
+            .iter()
+            .map(|s| s.memtable().bytes() as u64)
+            .collect();
+        let Some((start, end)) = select_compaction_run(&sizes) else {
+            return Ok(false); // a healthy size ladder — nothing same-tier to merge
+        };
 
-        let l0_dir = inner.dir.join("l0");
-        let n = next_l0_number(&l0_dir)?;
-        let path = l0_dir.join(format!("{n:010}.l0"));
-        L0Segment::write(&merged, &path)
-            .with_context(|| format!("write compacted L0 segment {path:?}"))?;
-        let seg = L0Segment::open(&path)
-            .with_context(|| format!("reopen compacted L0 segment {path:?}"))?;
+        // Merge the run (newest-first) into one equivalent segment.
+        let run: Vec<&Memtable> = inner.l0[start..end]
+            .iter()
+            .map(|s| s.memtable().as_ref())
+            .collect();
+        let merged = Memtable::merge_levels(&run);
 
-        let consumed: Vec<PathBuf> = inner.l0.iter().map(|s| s.path().to_path_buf()).collect();
-        inner.l0 = vec![seg]; // one merged level replaces the run
+        // Reuse the run's OLDEST file slot (`inner.l0[end - 1]`) — its number and born-id
+        // base are the run's minimum, matching the merged segment's base, so on-disk
+        // number order stays == age/base order without reconciling in `open`.
+        let oldest_path = inner.l0[end - 1].path().to_path_buf();
+        L0Segment::write(&merged, &oldest_path)
+            .with_context(|| format!("write compacted L0 segment {oldest_path:?}"))?;
+        let seg = L0Segment::open(&oldest_path)
+            .with_context(|| format!("reopen compacted L0 segment {oldest_path:?}"))?;
+
+        // The run's newer members (all but the oldest slot we overwrote) are now folded
+        // into the merged segment; delete them after publishing.
+        let consumed: Vec<PathBuf> = inner.l0[start..end - 1]
+            .iter()
+            .map(|s| s.path().to_path_buf())
+            .collect();
+
+        // Splice the run out, in place, for the single merged segment (stack stays
+        // newest-first + number-ordered).
+        inner.l0.splice(start..end, std::iter::once(seg));
 
         // Publish the collapsed stack, then delete the consumed files (durable in the
         // merged file) — publish-before-delete so a reader never loses the data.
@@ -665,12 +699,60 @@ fn l0_segment_paths_sorted(l0_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
 }
 
 /// The next unused L0 segment number under `l0_dir`: one past the highest, or 0 when
-/// none exist. Monotonic across the writer's life so an L0 file is never overwritten.
+/// none exist. Monotonic across the writer's life so an L0 file is never overwritten
+/// by a flush. (Compaction deliberately *reuses* the run's oldest number — see
+/// [`DeltaWriter::compact_l0`].)
 fn next_l0_number(l0_dir: &Path) -> Result<u64> {
     Ok(match l0_segment_paths_sorted(l0_dir)?.last() {
         Some((n, _)) => n + 1,
         None => 0,
     })
+}
+
+/// Levels within this byte-size factor of each other are the **same tier** and worth
+/// compacting together; a level larger than `RATIO×` its neighbours is a different tier
+/// (merging it in would be write amplification — rewriting a big level for a few small
+/// writes). A first-cut ratio; not yet configurable.
+const SIZE_TIER_RATIO: u64 = 4;
+
+/// Choose a contiguous run of similar-sized L0 levels to compact, as a half-open range
+/// over the newest-first stack sizes. Returns the **longest** maximal run whose byte
+/// sizes are all within [`SIZE_TIER_RATIO`]× of the run's smallest (length ≥ 2); ties
+/// break to the **oldest** run (largest start index). `None` when no adjacent pair is
+/// same-tier — a healthy size ladder that needs no compaction. Pure + deterministic.
+fn select_compaction_run(sizes: &[u64]) -> Option<(usize, usize)> {
+    let n = sizes.len();
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < n {
+        // Extend a maximal run `[i, j)` whose min/max stay within RATIO. A zero-byte
+        // level (only inert tombstones) is treated as size 1 so it never divides by zero
+        // and always joins a neighbour tier.
+        let mut lo = sizes[i].max(1);
+        let mut hi = sizes[i].max(1);
+        let mut j = i + 1;
+        while j < n {
+            let s = sizes[j].max(1);
+            let nlo = lo.min(s);
+            let nhi = hi.max(s);
+            if nhi > nlo.saturating_mul(SIZE_TIER_RATIO) {
+                break;
+            }
+            lo = nlo;
+            hi = nhi;
+            j += 1;
+        }
+        let len = j - i;
+        if len >= 2 {
+            // `>=` so a later (older) run of equal length wins the tie → oldest-first.
+            let take = best.map_or(true, |(bs, be)| len >= be - bs);
+            if take {
+                best = Some((i, j));
+            }
+        }
+        i = j.max(i + 1);
+    }
+    best
 }
 
 #[cfg(test)]
@@ -1281,6 +1363,134 @@ mod tests {
         let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
         assert_eq!(w2.l0_len(), 1);
         assert_eq!(reads(&w2), before, "compacted reads survive a reopen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn select_compaction_run_picks_a_same_size_tier() {
+        // Fewer than two, or no adjacent same-tier pair (a clean size ladder) → nothing.
+        assert_eq!(select_compaction_run(&[]), None);
+        assert_eq!(select_compaction_run(&[100]), None);
+        assert_eq!(
+            select_compaction_run(&[1000, 200, 40, 8]),
+            None,
+            "size ladder"
+        );
+        // A run of equal-sized levels merges wholesale.
+        assert_eq!(select_compaction_run(&[100, 100, 100]), Some((0, 3)));
+        // A big level (newest) is left out; the trailing similar-sized run merges.
+        assert_eq!(select_compaction_run(&[10_000, 100, 120, 90]), Some((1, 4)));
+        // Two same-tier runs of equal length → the OLDEST (largest start) wins the tie.
+        assert_eq!(
+            select_compaction_run(&[100, 100, 9_000, 50, 60]),
+            Some((3, 5))
+        );
+        // Within-ratio (4×) is same tier; just over is not.
+        assert_eq!(select_compaction_run(&[100, 400]), Some((0, 2)));
+        assert_eq!(select_compaction_run(&[100, 401]), None);
+    }
+
+    #[test]
+    fn compact_l0_merges_only_the_matching_size_tier() {
+        // Three L0 levels: two small (same tier) beneath one much larger level. Size-
+        // tiered compaction merges only the two small ones, leaving the large level and
+        // every born id intact — a *partial* compaction, not merge-all.
+        let dir = tmp("compact_partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(41));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // Level 0 (oldest): one born node — synthetic id 100.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("p", Value::Int(1))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        // Level 1: one born node — synthetic id 101.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("B".into()),
+                &[("p", Value::Int(2))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        // Level 2 (newest): many born nodes, so this level is a different (larger) tier.
+        for i in 0..64u64 {
+            w.write(
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str(format!("big{i}")),
+                    &[("p", Value::Int(i as i64))],
+                ),
+                OpResolution::Node(None),
+            )
+            .unwrap();
+        }
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 3, "three levels before compaction");
+
+        // Snapshot the reads that must be preserved: the two small levels' born nodes and
+        // a couple from the big level, plus the born count.
+        let reads = |w: &DeltaWriter| {
+            let s = w.delta_snapshot();
+            (
+                s.born_count(),
+                s.node_patch(100).and_then(|d| d.patches.get("p").cloned()),
+                s.node_patch(101).and_then(|d| d.patches.get("p").cloned()),
+                s.node_patch(102).and_then(|d| d.patches.get("p").cloned()),
+                s.node_patch(165).and_then(|d| d.patches.get("p").cloned()),
+            )
+        };
+        let before = reads(&w);
+        assert_eq!(
+            before,
+            (
+                66,
+                Some(Value::Int(1)),
+                Some(Value::Int(2)),
+                Some(Value::Int(0)),
+                Some(Value::Int(63))
+            ),
+            "2 small born + 64 big born = 66; ids 100/101 small, 102.. big"
+        );
+
+        // Partial compaction: the two small levels merge, the big one is untouched.
+        assert!(w.compact_l0().unwrap());
+        assert_eq!(w.l0_len(), 2, "only the small tier merged (not merge-all)");
+        assert_eq!(
+            reads(&w),
+            before,
+            "reads unchanged by the partial compaction"
+        );
+
+        // A second compaction now sees the merged small level and the big level — either
+        // same-tier (merge) or not; either way reads stay identical and born ids hold.
+        let _ = w.compact_l0().unwrap();
+        assert_eq!(
+            reads(&w),
+            before,
+            "reads unchanged after a further compaction"
+        );
+
+        // Durable + correctly ordered across a reopen (the merged segment reused the
+        // run's oldest file number, so number order still matches born-id base order).
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        assert_eq!(
+            reads(&w2),
+            before,
+            "partial-compacted reads survive a reopen"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

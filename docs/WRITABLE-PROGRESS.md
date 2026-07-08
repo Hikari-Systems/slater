@@ -521,8 +521,9 @@ Running ledger for the `writeable` track. Pairs with the design in
       benign divergence is a tombstoned edge's unobservable `edge_id`, masked in the check) +
       `merge_levels_is_deterministic`; `delta_writer` `compact_l0_collapses_the_stack_preserving_reads`
       (2 levels → 1, reads unchanged, reopen). Whole slater+slater-delta green; clippy+fmt clean.
-      **Policy note:** merge-all is the first-cut compaction policy; a size-tiered partial-run policy
-      (which would need number-vs-stack-order reconciliation) is a later refinement.
+      **Policy note:** merge-all was the first-cut compaction policy; the size-tiered partial-run
+      policy (with number-vs-stack-order reconciliation via oldest-slot reuse) landed as a later
+      refinement — see the "Deferred follow-ups (post-Phase-5)" section.
     - **4d-ii-a — in-flight guard + auto flush + auto compaction. ✅ DONE** (this commit). The write
       path now self-maintains the cheap tiers. `DeltaWriter` gains a `consolidating: AtomicBool` +
       `begin_consolidation()`/`end_consolidation()`/`is_consolidating()`; `flush_to_l0`/`compact_l0`
@@ -747,6 +748,34 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   weekday gating). Whole slater (606) + slater-delta (58) + workspace green; clippy `-D warnings` +
   fmt clean; read path + empty-delta bench untouched (write-path maintenance + config only).
 
+- **Size-tiered partial-L0 compaction** (deferred from Phase 4d-i). ✅ DONE (this commit).
+  `DeltaWriter::compact_l0` no longer merges the **whole** L0 stack; it now merges only a
+  contiguous run of **similar-sized** levels, so a large level is not repeatedly rewritten with
+  tiny new ones (write amplification). New pure `select_compaction_run(&sizes)` picks the longest
+  maximal run whose byte sizes are all within `SIZE_TIER_RATIO` (=4)× of the run's smallest
+  (length ≥ 2; ties → the oldest run); `None` for a healthy size ladder (no adjacent same-tier
+  pair) — the policy is self-balancing (equal-sized flushes form same-tier runs that merge, and
+  the merged results are themselves same-tier and merge in turn, bounding fan-out).
+  **Number-vs-stack-order reconciliation:** a partial merge leaves several L0 files, so their
+  on-disk numbers must still agree with age / born-id-base order (`open` sorts by number). The
+  merged segment **reuses the run's oldest (minimum) file number** (overwriting that slot via
+  `L0Segment::write`'s temp+rename) — its number *and* born-id base are the run's minimum, which
+  is exactly the merged segment's base (`merge_levels` keeps the oldest level's base) — so number
+  order stays == base order with **no change to `open`**. `merge_levels` (already generic over a
+  contiguous run) is called on the sub-slice; born ids are preserved; the active memtable + core
+  are untouched. Crash posture is unchanged from the merge-all policy (publish-before-delete
+  protects live readers; a crash between writing the merged file and deleting the run's newer
+  members leaves a redundant born-id range until the next compaction — a pre-existing limitation,
+  not worsened). Tests: `delta_writer::select_compaction_run_picks_a_same_size_tier` (pure policy:
+  ladder→None, equal→whole, big-newest excluded, oldest-tie, 4× boundary) and
+  `compact_l0_merges_only_the_matching_size_tier` (three levels — two small + one 64-node big;
+  only the small tier merges → `l0_len` 3→2, big untouched, born ids + reads preserved, a further
+  compaction still correct, reopen-durable). Existing merge-all-shaped tests
+  (`compact_l0_collapses_the_stack_preserving_reads`, the auto flush/compact server test) still
+  pass (equal-sized levels are one tier → merged wholesale). Whole slater (608) + slater-delta
+  (58) + workspace green; clippy `-D warnings` + fmt clean (MSRV 1.80 — `map_or`, not `is_none_or`);
+  read path untouched (compaction is write-path maintenance; empty-delta bench unaffected).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -777,16 +806,17 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 606 + 58; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 608 + 58; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): size-tiered partial-L0 compaction
-  (needs number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
-  whole-file residency); in-place **core-edge** property patching (born-edge properties are done).
-  **delete-a-born-node-by-key, moved-indexed-value, edge-properties, and the off-peak
-  consolidation-window knob are now ✅ DONE** (see "Deferred follow-ups" below). See the "Smaller
-  follow-ups" list below.
+- **Deferred refinements** (each cleanly scoped, none blocking): off-heap `pread` L0 reads
+  (bounded RSS without whole-file residency); in-place **core-edge** property patching (born-edge
+  properties are done); **group-commit batching** for bulk writes (a 1M smoke test showed bulk
+  writes are one-fsync-per-statement — ~12ms/write on WSL2; reads over the overlay stay fast).
+  **delete-a-born-node-by-key, moved-indexed-value, edge-properties, the off-peak
+  consolidation-window knob, and size-tiered partial-L0 compaction are now ✅ DONE** (see "Deferred
+  follow-ups" below). See the "Smaller follow-ups" list below.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
