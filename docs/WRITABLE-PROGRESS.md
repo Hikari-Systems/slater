@@ -591,8 +591,7 @@ below are current, and that the latest commit hash is noted.
 ## Next action
 
 **Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
-- `<4d-ii-b>` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle — **this commit**
-  (completes Phase 4; hash recorded in a follow-up doc commit)
+- `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 - `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
 - `e012595` feat(delta): memtable→L0 flush + write-path born resolution (Phase 4c-B)
