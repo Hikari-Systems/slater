@@ -406,13 +406,34 @@ Running ledger for the `writeable` track. Pairs with the design in
     the `#[ignore]` `consolidate_via_real_builder` both now apply a post-freeze write inside
     the build closure and assert it is carried forward onto the new core. Whole
     slater+slater-delta+workspace green; clippy+fmt clean. See D48.
-  - **4b — L0 segment format + reader** (pure `slater-delta`, next): immutable on-disk
-    ISAM-shaped delta segment; `L0Segment::{write,open}` exposing the `DeltaSnapshot`-shaped
-    read surface via `pread`+sparse index; synthetic-id stacking across levels carried in the
-    header. **4c — multi-level read merge + memtable→L0 flush**: `DeltaSnapshot` folds
-    `mem ⊕ L0*`; `DeltaWriter::flush_to_l0`. **4d — admission/backpressure + auto soft-cap
-    consolidation**: `memtableBytes` = flush cap, new `deltaBytes` soft / `deltaHardBytes`
-    hard caps; async trigger reusing `execute_consolidate`; per-writer in-flight guard.
+  - **4b — L0 segment format + reader. ✅ DONE** (this commit; pure `slater-delta`). An L0
+    segment is a **frozen memtable spilled to disk**. `Memtable::serialise()` /
+    `Memtable::deserialise()` (`memtable.rs`) round-trip the whole folded delta — interner
+    name table (so identities' delta-local `SymbolId`s survive), every node/edge entry, the
+    derived read indexes (`by_dense`/`out_adj`/`in_adj`) and the born-order vectors verbatim,
+    entries + patches emitted in sorted/`BTreeMap` order so equal memtables serialise to
+    identical bytes (a determinism property). New `crates/slater-delta/src/l0.rs`:
+    `L0Segment::{write,open}` frames the body as `MAGIC("SLL0SEG1") ‖ crc32c ‖ body`, writes
+    temp-then-`rename`+fsync (no torn reads), and verifies magic+crc+version on open, reloading
+    the segment as an immutable `Arc<Memtable>` — so it answers the **full `DeltaSnapshot`
+    read surface via the existing memtable methods** (no reimplementation). **Deliberate
+    deviation from the plan:** the reloaded body is held **resident** (whole-file load), not
+    off-heap `pread`+sparse-index; RSS is still bounded by the delta byte budget (never grows
+    with core size), and the off-heap variant is a later pure-RSS refinement, not a correctness
+    concern (and the format is freely changeable — no back-compat, an L0 segment lives only
+    between a flush and the next consolidation). Synthetic-id stacking across levels is carried
+    by each segment persisting its own `synthetic_base`/`edge_synthetic_base` + born counts, so
+    4c rebases the active memtable past all levels. Tests (`l0.rs`): serialise/deserialise
+    round-trips every read over a memtable exercising core-patch + born node + tombstone + born
+    edge + core-edge-tombstone; empty round-trip; segment write→open; magic/checksum rejection.
+    42 slater-delta tests green; clippy+fmt clean; slater unaffected (no wiring yet).
+  - **4c — multi-level read merge + memtable→L0 flush** (next): `DeltaSnapshot` folds
+    `mem ⊕ L0*` (newest-wins) behind the empty fast path; `DeltaWriter::flush_to_l0` seals the
+    memtable to an `L0Segment`, rebases the active memtable past all levels, and rotates the
+    WAL; `open` reloads existing L0 files; consolidation/retire fold+retire the L0 layers.
+  - **4d — admission/backpressure + auto soft-cap consolidation**: `memtableBytes` = flush
+    cap, new `deltaBytes` soft / `deltaHardBytes` hard caps; async trigger reusing
+    `execute_consolidate`; per-writer in-flight guard.
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -439,32 +460,46 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Phase 4a is complete** (this commit): a write that arrives *during* a consolidation is no
-longer lost — `DeltaWriter::retire` rebuilds the live memtable by replaying the post-freeze
-WAL segments onto the freshly-built core (re-resolving business keys, so a pre-freeze born
-node re-binds to its now-real dense id). This removes the Phase-1 "no writes during a build"
-restriction and is the prerequisite for an automatic consolidation trigger that fires while
-clients keep writing. See D48.
+**Phase 4b is complete** (this commit): the L0 delta-segment format lands in `slater-delta`.
+`Memtable::{serialise,deserialise}` round-trip the whole folded delta (interner names, all
+node/edge entries, derived indexes, born vectors) deterministically, and `l0::L0Segment::
+{write,open}` frame it on disk as `MAGIC ‖ crc32c ‖ body` (temp+rename+fsync, magic/crc/version
+checked on open), reloading as an immutable `Arc<Memtable>` that answers the full
+`DeltaSnapshot` read surface via the existing memtable methods. The reloaded body is held
+resident (bounded by the delta byte budget); the off-heap `pread` variant is a deferred RSS
+refinement (see the Phase-4 ledger note). No `slater` wiring yet.
 
-The recommended next step is **Phase 4b — L0 segment format + reader** (pure `slater-delta`;
-plan in `~/.claude/plans/wise-wobbling-puppy.md`): a new `crates/slater-delta/src/l0.rs`
-with an immutable, on-disk, ISAM-shaped delta segment — `L0Segment::write(&Memtable, path)`
-(nodes sorted by canonical business key, edges by edge key, born-order vectors + synthetic
-bases in the header) and `L0Segment::open(path)` exposing the same `DeltaSnapshot`-shaped
-read surface the memtable does (`node_patch`, `is_tombstoned`, `born_ids_*`, `out/in_edges`,
-`iter_*`) via `pread` + a resident sparse index. **Key design point:** synthetic-id stacking
-across levels — each L0 records its born-node/edge counts so the next level up opens with
-`with_bases(core_base + Σ lower born counts)`, presenting one contiguous synthetic id space.
-No `slater` wiring in 4b (that's 4c: extend `DeltaSnapshot` to fold `mem ⊕ L0*` +
-`DeltaWriter::flush_to_l0`). Then 4d: admission/backpressure + auto soft-cap trigger.
+The recommended next step is **Phase 4c — multi-level read merge + memtable→L0 flush** (plan in
+`~/.claude/plans/wise-wobbling-puppy.md`):
+- `crates/slater-delta/src/memtable.rs` — grow `DeltaSnapshot` from a single `Arc<Memtable>`
+  to `{ mem: Arc<Memtable>, l0: Vec<Arc<Memtable>> }` (or `Vec<Arc<L0Segment>>`), newest-first.
+  Every read accessor folds across levels with LWW precedence `mem ⊕ newer-L0 ⊕ older-L0` (first
+  hit wins for `node_patch`/tombstones; born-id sets union; edges union then tombstone-drop).
+  `is_empty()` = `mem` empty **and** no L0 — the empty-delta fast path must still hold (`exec.rs`
+  call sites are untouched: they already go through `DeltaSnapshot`). Watch the dense-id dispatch:
+  a synthetic id belongs to exactly one level's `[base, base+born)` range; a core-node dense id
+  may be patched in several levels (newest wins).
+- `crates/slater/src/delta_writer.rs` — `DeltaWriter::flush_to_l0()`: `L0Segment::write` the live
+  memtable to `<wal_dir>/<graph>/l0/<n>.l0`, push its reload onto the published L0 list, reset the
+  active memtable rebased on `core_base + Σ born counts of all L0 levels` (node **and** edge
+  bases), then seal+rotate the WAL and record which segments the flush consumed (retire once the
+  L0 file is durable). `open` reloads existing L0 files (sorted) before replaying the live WAL
+  tail. `freeze`/`consolidate_graph`/`retire` fold the L0 layers into the dump (the merged view
+  already reads through the multi-level `DeltaSnapshot`) and delete the consumed L0 files.
+- Then **4d**: admission/backpressure + auto soft-cap consolidation (`config.rs` caps; async
+  trigger reusing `execute_consolidate`; per-writer in-flight guard).
+
+Handy Phase-4b resume detail (landed): `Memtable::serialise() -> Vec<u8>` /
+`Memtable::deserialise(&[u8]) -> Result<Memtable>` (`slater-delta/memtable.rs`, with private
+`w_*`/`r_*` wire helpers; format version `L0_FORMAT_VERSION = 1`); `l0::L0Segment`
+(`slater-delta/src/l0.rs`, re-exported as `slater_delta::L0Segment`) — `write(&Memtable, path)`,
+`open(path) -> L0Segment`, `.memtable() -> &Arc<Memtable>`, `.path()`. Tests in `l0.rs`.
 
 Handy Phase-4a resume detail (landed): `DeltaWriter::retire(consumed, new_uuid,
-new_node_count, new_edge_count, resolve)` (`delta_writer.rs`) — the new `resolve` param is
+new_node_count, new_edge_count, resolve)` (`delta_writer.rs`) — the `resolve` param is
 `|op| resolve_op(new_gen, op)` supplied by `Graphs::consolidate_graph` (`server.rs`) from
 `self.get(name)` post-swap. `freeze` unchanged (seals + rotates; `consumed` = pre-freeze
-segments). Tests in `delta_writer.rs` (`writes_during_consolidation_survive`,
-`post_freeze_write_reresolves_a_born_node_to_the_new_core`) and the two server-side
-consolidation tests (post-freeze write in the build closure).
+segments). Tests in `delta_writer.rs` + the two server-side consolidation tests. See D48.
 
 Handy Phase-3 resume detail (all landed): memtable edges
 `Memtable::{upsert_edge,delete_edge,out_edges,in_edges,iter_edges,with_bases}` +

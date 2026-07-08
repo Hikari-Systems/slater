@@ -37,8 +37,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use graph_format::ids::Value;
+use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
-use crate::identity::{EdgeIdentity, NodeIdentity};
+use crate::identity::{EdgeIdentity, NodeIdentity, SymbolId};
 use crate::interner::Interner;
 use crate::wal::WalOp;
 
@@ -791,6 +792,318 @@ impl Memtable {
             (label, key, &e.identity.value, &e.delta)
         })
     }
+
+    /// Serialise the whole memtable to a self-describing byte image — the body of an
+    /// **L0 delta segment** (Phase 4b). The image is complete: it carries the interner
+    /// name table (so identities' delta-local [`SymbolId`]s round-trip), every folded
+    /// node/edge entry, and the derived read indexes (`by_dense`, `out_adj`, `in_adj`)
+    /// and born-order vectors verbatim, so [`Memtable::deserialise`] reconstructs a
+    /// byte-for-byte equivalent memtable that answers every read identically. The
+    /// serialised order is deterministic: `BTreeMap` patches keep property order, and
+    /// entries are emitted sorted by canonical key so two equal memtables serialise to
+    /// identical bytes (a determinism-golden property).
+    ///
+    /// Format is versioned but **not** back-compatible (zero legacy installs — an L0
+    /// segment lives only between a flush and the next consolidation), so it may change
+    /// freely; a version mismatch is a hard error on load.
+    pub fn serialise(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, L0_FORMAT_VERSION);
+
+        // Interner name table (id == index).
+        let names = self.interner.names();
+        write_uvarint(&mut buf, names.len() as u64);
+        for n in names {
+            w_str(&mut buf, n);
+        }
+
+        write_uvarint(&mut buf, self.synthetic_base);
+        write_uvarint(&mut buf, self.edge_synthetic_base);
+        write_uvarint(&mut buf, self.bytes as u64);
+
+        // Nodes, sorted by canonical key for deterministic output.
+        let mut nodes: Vec<(&Vec<u8>, &NodeEntry)> = self.nodes.iter().collect();
+        nodes.sort_by(|a, b| a.0.cmp(b.0));
+        write_uvarint(&mut buf, nodes.len() as u64);
+        for (ck, e) in nodes {
+            w_bytes(&mut buf, ck);
+            w_node_identity(&mut buf, &e.identity);
+            w_delta(&mut buf, &e.delta.patches, e.delta.tombstoned);
+            w_opt_u64(&mut buf, e.synthetic);
+        }
+
+        // Edges, sorted by canonical key.
+        let mut edges: Vec<(&Vec<u8>, &EdgeEntry)> = self.edges.iter().collect();
+        edges.sort_by(|a, b| a.0.cmp(b.0));
+        write_uvarint(&mut buf, edges.len() as u64);
+        for (ck, e) in edges {
+            w_bytes(&mut buf, ck);
+            w_node_identity(&mut buf, &e.identity.src);
+            write_uvarint(&mut buf, e.identity.reltype as u64);
+            w_node_identity(&mut buf, &e.identity.dst);
+            write_uvarint(&mut buf, e.src_dense);
+            write_uvarint(&mut buf, e.dst_dense);
+            w_opt_u64(&mut buf, e.synthetic_edge);
+            w_delta(&mut buf, &e.delta.patches, e.delta.tombstoned);
+        }
+
+        w_dense_index(&mut buf, &self.by_dense);
+        w_adj(&mut buf, &self.out_adj);
+        w_adj(&mut buf, &self.in_adj);
+        w_key_vec(&mut buf, &self.born);
+        w_key_vec(&mut buf, &self.born_edges);
+        buf
+    }
+
+    /// Reconstruct a memtable from a [`Memtable::serialise`] image. Every field is
+    /// restored verbatim, so the result answers all reads identically to the original.
+    pub fn deserialise(mut bytes: &[u8]) -> anyhow::Result<Self> {
+        let r = &mut bytes;
+        let version = read_uvarint(r)?;
+        if version != L0_FORMAT_VERSION {
+            anyhow::bail!(
+                "unsupported L0 segment version {version} (expected {L0_FORMAT_VERSION})"
+            );
+        }
+
+        let n_names = read_uvarint(r)? as usize;
+        let mut names = Vec::with_capacity(n_names);
+        for _ in 0..n_names {
+            names.push(r_str(r)?);
+        }
+        let interner = Interner::from_names(names);
+
+        let synthetic_base = read_uvarint(r)?;
+        let edge_synthetic_base = read_uvarint(r)?;
+        let bytes_est = read_uvarint(r)? as usize;
+
+        let n_nodes = read_uvarint(r)? as usize;
+        let mut nodes = HashMap::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let ck = r_bytes(r)?;
+            let identity = r_node_identity(r)?;
+            let (patches, tombstoned) = r_delta(r)?;
+            let synthetic = r_opt_u64(r)?;
+            nodes.insert(
+                ck,
+                NodeEntry {
+                    identity,
+                    delta: NodeDelta {
+                        patches,
+                        tombstoned,
+                    },
+                    synthetic,
+                },
+            );
+        }
+
+        let n_edges = read_uvarint(r)? as usize;
+        let mut edges = HashMap::with_capacity(n_edges);
+        for _ in 0..n_edges {
+            let ck = r_bytes(r)?;
+            let src = r_node_identity(r)?;
+            let reltype = read_uvarint(r)? as SymbolId;
+            let dst = r_node_identity(r)?;
+            let src_dense = read_uvarint(r)?;
+            let dst_dense = read_uvarint(r)?;
+            let synthetic_edge = r_opt_u64(r)?;
+            let (patches, tombstoned) = r_delta(r)?;
+            edges.insert(
+                ck,
+                EdgeEntry {
+                    identity: EdgeIdentity { src, reltype, dst },
+                    src_dense,
+                    dst_dense,
+                    synthetic_edge,
+                    delta: EdgeDelta {
+                        patches,
+                        tombstoned,
+                    },
+                },
+            );
+        }
+
+        let by_dense = r_dense_index(r)?;
+        let out_adj = r_adj(r)?;
+        let in_adj = r_adj(r)?;
+        let born = r_key_vec(r)?;
+        let born_edges = r_key_vec(r)?;
+
+        if !r.is_empty() {
+            anyhow::bail!("L0 segment has {} trailing bytes", r.len());
+        }
+        Ok(Self {
+            interner,
+            nodes,
+            edges,
+            out_adj,
+            in_adj,
+            by_dense,
+            synthetic_base,
+            edge_synthetic_base,
+            born,
+            born_edges,
+            bytes: bytes_est,
+        })
+    }
+}
+
+/// L0 segment body format version (see [`Memtable::serialise`]).
+const L0_FORMAT_VERSION: u64 = 1;
+
+fn w_str(buf: &mut Vec<u8>, s: &str) {
+    write_uvarint(buf, s.len() as u64);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn r_str(r: &mut &[u8]) -> anyhow::Result<String> {
+    let len = read_uvarint(r)? as usize;
+    if r.len() < len {
+        anyhow::bail!("L0 string truncated");
+    }
+    let (s, rest) = r.split_at(len);
+    *r = rest;
+    String::from_utf8(s.to_vec()).map_err(|_| anyhow::anyhow!("L0 string not utf-8"))
+}
+
+fn w_bytes(buf: &mut Vec<u8>, b: &[u8]) {
+    write_uvarint(buf, b.len() as u64);
+    buf.extend_from_slice(b);
+}
+
+fn r_bytes(r: &mut &[u8]) -> anyhow::Result<Vec<u8>> {
+    let len = read_uvarint(r)? as usize;
+    if r.len() < len {
+        anyhow::bail!("L0 byte string truncated");
+    }
+    let (b, rest) = r.split_at(len);
+    *r = rest;
+    Ok(b.to_vec())
+}
+
+fn w_opt_u64(buf: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        Some(x) => {
+            buf.push(1);
+            write_uvarint(buf, x);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn r_opt_u64(r: &mut &[u8]) -> anyhow::Result<Option<u64>> {
+    match read_u8(r)? {
+        0 => Ok(None),
+        1 => Ok(Some(read_uvarint(r)?)),
+        t => anyhow::bail!("L0 bad Option tag {t}"),
+    }
+}
+
+fn read_u8(r: &mut &[u8]) -> anyhow::Result<u8> {
+    let (&b, rest) = r
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("L0 truncated"))?;
+    *r = rest;
+    Ok(b)
+}
+
+fn w_node_identity(buf: &mut Vec<u8>, id: &NodeIdentity) {
+    write_uvarint(buf, id.label as u64);
+    write_uvarint(buf, id.key as u64);
+    write_value(buf, &id.value);
+}
+
+fn r_node_identity(r: &mut &[u8]) -> anyhow::Result<NodeIdentity> {
+    let label = read_uvarint(r)? as SymbolId;
+    let key = read_uvarint(r)? as SymbolId;
+    let value = read_value(r)?;
+    Ok(NodeIdentity { label, key, value })
+}
+
+fn w_delta(buf: &mut Vec<u8>, patches: &BTreeMap<String, Value>, tombstoned: bool) {
+    buf.push(tombstoned as u8);
+    write_uvarint(buf, patches.len() as u64);
+    for (k, v) in patches {
+        w_str(buf, k);
+        write_value(buf, v);
+    }
+}
+
+fn r_delta(r: &mut &[u8]) -> anyhow::Result<(BTreeMap<String, Value>, bool)> {
+    let tombstoned = read_u8(r)? != 0;
+    let n = read_uvarint(r)? as usize;
+    let mut patches = BTreeMap::new();
+    for _ in 0..n {
+        let k = r_str(r)?;
+        let v = read_value(r)?;
+        patches.insert(k, v);
+    }
+    Ok((patches, tombstoned))
+}
+
+fn w_dense_index(buf: &mut Vec<u8>, idx: &HashMap<u64, Vec<u8>>) {
+    let mut pairs: Vec<(&u64, &Vec<u8>)> = idx.iter().collect();
+    pairs.sort_by_key(|(id, _)| **id);
+    write_uvarint(buf, pairs.len() as u64);
+    for (id, ck) in pairs {
+        write_uvarint(buf, *id);
+        w_bytes(buf, ck);
+    }
+}
+
+fn r_dense_index(r: &mut &[u8]) -> anyhow::Result<HashMap<u64, Vec<u8>>> {
+    let n = read_uvarint(r)? as usize;
+    let mut idx = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let id = read_uvarint(r)?;
+        let ck = r_bytes(r)?;
+        idx.insert(id, ck);
+    }
+    Ok(idx)
+}
+
+fn w_adj(buf: &mut Vec<u8>, adj: &HashMap<u64, Vec<Vec<u8>>>) {
+    let mut pairs: Vec<(&u64, &Vec<Vec<u8>>)> = adj.iter().collect();
+    pairs.sort_by_key(|(id, _)| **id);
+    write_uvarint(buf, pairs.len() as u64);
+    for (id, cks) in pairs {
+        write_uvarint(buf, *id);
+        write_uvarint(buf, cks.len() as u64);
+        for ck in cks {
+            w_bytes(buf, ck);
+        }
+    }
+}
+
+fn r_adj(r: &mut &[u8]) -> anyhow::Result<HashMap<u64, Vec<Vec<u8>>>> {
+    let n = read_uvarint(r)? as usize;
+    let mut adj = HashMap::with_capacity(n);
+    for _ in 0..n {
+        let id = read_uvarint(r)?;
+        let m = read_uvarint(r)? as usize;
+        let mut cks = Vec::with_capacity(m);
+        for _ in 0..m {
+            cks.push(r_bytes(r)?);
+        }
+        adj.insert(id, cks);
+    }
+    Ok(adj)
+}
+
+fn w_key_vec(buf: &mut Vec<u8>, v: &[Vec<u8>]) {
+    write_uvarint(buf, v.len() as u64);
+    for ck in v {
+        w_bytes(buf, ck);
+    }
+}
+
+fn r_key_vec(r: &mut &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let n = read_uvarint(r)? as usize;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(r_bytes(r)?);
+    }
+    Ok(v)
 }
 
 /// Rough resident size of a value, for the budget estimate.
