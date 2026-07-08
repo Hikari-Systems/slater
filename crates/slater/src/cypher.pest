@@ -125,7 +125,7 @@ delete_clause = { kw_detach? ~ kw_delete ~ var }
 // (validated at lowering, reusing the read grammar's `rel_pattern`). A rel variable
 // is required for DELETE (it names the edge) and optional for MERGE.
 edge_write = { edge_merge | edge_delete }
-edge_merge = { kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern }
+edge_merge = { kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause? }
 edge_delete = { kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
 
 // ── Consolidation trigger (Phase 5) ───────────────────────────────────────────

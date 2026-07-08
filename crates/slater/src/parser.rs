@@ -97,6 +97,10 @@ pub mod ast {
         pub reltype: String,
         pub dst: EndpointPat,
         pub op: EdgeWriteOp,
+        /// Relationship property assignments from an optional `SET r.p = …` on a
+        /// `MERGE` (each value a literal or parameter). Empty for a bare `MERGE` or a
+        /// `DELETE`. Only a **delta-born** edge carries editable properties for now.
+        pub sets: Vec<(String, Expr)>,
     }
 
     /// The mutation an [`EdgeWriteStmt`] applies.
@@ -640,6 +644,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
     let mut dst: Option<NodePat> = None;
     let mut rel: Option<RelPat> = None;
     let mut delete: Option<(bool, String)> = None; // (detach, rel var)
+    let mut sets: Vec<(String, String, Expr)> = Vec::new(); // (var, prop, value)
     for c in kids(inner) {
         match c.as_rule() {
             Rule::kw_merge | Rule::kw_match => {}
@@ -652,6 +657,20 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                 }
             }
             Rule::rel_pattern => rel = Some(lower_rel_pattern(c)?),
+            Rule::set_clause => {
+                for item in kids(c) {
+                    debug_assert_eq!(item.as_rule(), Rule::set_item);
+                    let mut it = kids(item);
+                    let var = ident_text(only_child(
+                        it.next().expect("set_item has a target variable"),
+                    )?)?;
+                    let prop = ident_text(only_child(
+                        it.next().expect("set_item has a property access"),
+                    )?)?;
+                    let value = lower_expr(it.next().expect("set_item has a value expression"))?;
+                    sets.push((var, prop, value));
+                }
+            }
             Rule::delete_clause => {
                 let mut detach = false;
                 let mut target = None;
@@ -693,6 +712,27 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         })?
         .clone();
 
+    // A `SET` (only the grammar's `edge_merge` alt carries one) must target the bound
+    // relationship variable with literal/parameter right-hand sides — the reduced shape
+    // of a node write's SET, one edge only.
+    let mut out_sets = Vec::with_capacity(sets.len());
+    if !sets.is_empty() {
+        let rvar = rel.var.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "to SET a relationship property, name the relationship: MERGE (a)-[r:R]->(b) SET r.p = …"
+            )
+        })?;
+        for (set_var, prop, value) in sets {
+            if set_var != rvar {
+                bail!(
+                    "SET must target the relationship variable '{rvar}', not '{set_var}' (a relationship write mutates one edge)"
+                );
+            }
+            ensure_constant(&value, &format!("the value assigned to {rvar}.{prop}"))?;
+            out_sets.push((prop, value));
+        }
+    }
+
     let op = if is_merge {
         EdgeWriteOp::Create
     } else {
@@ -714,6 +754,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         reltype,
         dst,
         op,
+        sets: out_sets,
     })
 }
 
@@ -2742,6 +2783,55 @@ mod tests {
         assert_eq!(w.reltype, "OWNS");
         assert_eq!(w.src.key_value, Expr::Param("s".into()));
         assert_eq!(w.dst.key_value, Expr::Param("d".into()));
+    }
+
+    #[test]
+    fn merge_edge_lowers_set_properties() {
+        let w = edge_write(
+            "MERGE (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020, r.weight = $w",
+        );
+        assert_eq!(w.op, EdgeWriteOp::Create);
+        assert_eq!(
+            w.sets,
+            vec![
+                ("since".to_string(), Expr::Literal(Value::Int(2020))),
+                ("weight".to_string(), Expr::Param("w".into())),
+            ]
+        );
+        // A bare MERGE (and a DELETE) carries no SET.
+        assert!(
+            edge_write("MERGE (a:Person {name: 'Ann'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+                .sets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn edge_set_requires_a_named_rel_var_and_constant_values() {
+        // SET without naming the relationship is rejected.
+        let e = write_err(
+            "MERGE (a:Person {name: 'Ann'})-[:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020",
+        );
+        assert!(
+            e.contains("name the relationship") || e == "read-only",
+            "got: {e}"
+        );
+        // SET targeting a variable other than the relationship is rejected.
+        let e = write_err(
+            "MERGE (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET x.since = 2020",
+        );
+        assert!(
+            e.contains("SET must target the relationship variable") || e == "read-only",
+            "got: {e}"
+        );
+        // A non-constant SET value is rejected.
+        let e = write_err(
+            "MERGE (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = a.x",
+        );
+        assert!(
+            e.contains("must be a literal or a parameter") || e == "read-only",
+            "got: {e}"
+        );
     }
 
     #[test]

@@ -483,6 +483,42 @@ mod tests {
     }
 
     #[test]
+    fn serialise_carries_delta_born_edge_properties() {
+        // A born edge created with a property (edge-property overlay) must carry its
+        // SET into the consolidated dump so a rebuild preserves it.
+        let (root, graph) = testgen::write_indexed_people("consolidate_edge_props");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Core: Alice(0), Bob(1), Carol(2). Born edge Bob-KNOWS->Carol with `since`.
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            Some(1),
+            Some(2),
+            [("since".to_string(), Value::Int(1999))],
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let mut out = Vec::new();
+        serialise_merge_dump(&Engine::new(&merged, &cache), &merged, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        assert!(
+            out.contains(
+                "MERGE (a:Person {name: 'Bob'})-[r:KNOWS]->(b:Person {name: 'Carol'}) SET r.since = 1999;"
+            ),
+            "born edge property carried into the dump:\n{out}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn serialise_drops_a_deleted_edge() {
         // Deleting the core edge Alice-KNOWS->Bob must remove it from the dump while
         // keeping both endpoint nodes — otherwise a rebuild would resurrect the edge.

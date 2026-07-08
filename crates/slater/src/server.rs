@@ -2786,6 +2786,15 @@ fn execute_edge_write(
         params,
         "the destination business-key value",
     )?;
+    // Evaluate the optional `SET r.p = …` property patches (empty for a bare MERGE or a
+    // DELETE). They are carried on the WAL op and stored on the delta-born edge.
+    let mut patches = Vec::with_capacity(stmt.sets.len());
+    for (prop, expr) in &stmt.sets {
+        patches.push((
+            prop.clone(),
+            write_value(expr, params, "a relationship SET value")?,
+        ));
+    }
     // Core-only resolution first (`None` = absent from the core): the duplicate check
     // below must run against genuine core dense ids, never a delta-born synthetic id.
     let src_core = resolve_endpoint(gen, &stmt.src, &src_value)?;
@@ -2798,6 +2807,21 @@ fn execute_edge_write(
     if stmt.op == EdgeWriteOp::Create {
         if let (Some(s), Some(d)) = (src_core, dst_core) {
             if core_edge_exists(gen, s, reltype_id, d)? {
+                // A bare re-MERGE of a core edge stays an idempotent no-op. Patching a
+                // *core* edge's properties in place needs a core-edge-id overlay (a
+                // distinct mechanism, not wired yet), so reject it clearly rather than
+                // silently drop the SET.
+                if !patches.is_empty() {
+                    return Err(Failure::new(
+                        CODE_EXECUTION,
+                        format!(
+                            "cannot SET properties on the existing base relationship \
+                             (:{})-[:{}]->(:{}): editing a core edge's properties is not yet \
+                             supported — only delta-born relationships carry editable properties",
+                            stmt.src.label, stmt.reltype, stmt.dst.label
+                        ),
+                    ));
+                }
                 return Ok((Vec::new(), Vec::new()));
             }
         }
@@ -2821,7 +2845,7 @@ fn execute_edge_write(
             dst_label: stmt.dst.label.clone(),
             dst_key: stmt.dst.key.clone(),
             dst_value,
-            patches: Vec::new(),
+            patches,
         },
         EdgeWriteOp::Delete => WalOp::DeleteEdge {
             src_label: stmt.src.label.clone(),
@@ -4673,6 +4697,121 @@ mod tests {
         assert!(
             names("MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name").is_empty(),
             "deleted edge stays deleted across a reopen"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Edge properties (follow-up from 3c): `MERGE (a)-[r:R]->(b) SET r.p = …` gives a
+    /// delta-born edge properties; a re-`MERGE` patches them in place; they read back via
+    /// `RETURN r.p`, and survive a reopen. Patching a *core* edge's properties in place is
+    /// not yet supported and is rejected clearly. (`write_indexed_people` carries a
+    /// core edge Alice-KNOWS->Bob with `since = 2020`.)
+    #[test]
+    fn edge_properties_end_to_end() {
+        let (root, _g) = testgen::write_indexed_people("edge_props_3");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run_write = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected an edge write for {q:?}, got {other:?}"),
+            }
+        };
+        // Read a single scalar column over the live overlay (Int, or -1 for Null).
+        let scalar = |w: &Arc<DeltaWriter>, q: &str| -> Vec<i64> {
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse(q).unwrap())
+                .unwrap();
+            res.rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Int(n) => *n,
+                    Val::Null => -1,
+                    v => panic!("expected int/null, got {v:?}"),
+                })
+                .collect()
+        };
+
+        // Create a born edge Bob-KNOWS->Carol with a property.
+        run_write(
+            "MERGE (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) SET r.since = 1999",
+        )
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) RETURN r.since"
+            ),
+            vec![1999],
+            "born edge property reads back"
+        );
+
+        // Re-MERGE patches the property in place and adds a second one (no duplicate edge).
+        run_write(
+            "MERGE (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) SET r.since = 2000, r.weight = 5",
+        )
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) RETURN r.since"
+            ),
+            vec![2000],
+            "re-MERGE patches the property"
+        );
+        assert_eq!(
+            scalar(
+                &writer,
+                "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) RETURN r.weight"
+            ),
+            vec![5],
+            "a second property is added"
+        );
+
+        // Patching a CORE edge's properties in place is rejected (deferred mechanism).
+        let err = run_write(
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) SET r.since = 7",
+        )
+        .unwrap_err();
+        assert!(
+            err.message
+                .contains("editing a core edge's properties is not yet supported"),
+            "core-edge property patch rejected: {}",
+            err.message
+        );
+        // A bare re-MERGE of that same core edge is still an idempotent no-op (not an error).
+        run_write("MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'})").unwrap();
+
+        // Durable across a reopen: the born edge's patched properties replay.
+        drop(writer);
+        let reopened = Arc::new(
+            DeltaWriter::open(
+                wal.join("people"),
+                "people",
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            scalar(
+                &reopened,
+                "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) RETURN r.since"
+            ),
+            vec![2000],
+            "edge properties are durable across a reopen"
         );
         std::fs::remove_dir_all(&root).ok();
     }

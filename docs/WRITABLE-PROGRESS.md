@@ -695,6 +695,34 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   Whole slater (594) + slater-delta (55) + workspace green; clippy `-D warnings` + fmt clean;
   empty-delta read path untouched by construction (overlay is inside the `!is_empty` guard).
 
+- **Edge properties** (deferred from 3c). ✅ DONE (this commit). `MERGE (a)-[r:R]->(b) SET
+  r.p = <lit|param>` now gives a **delta-born** relationship properties; a re-`MERGE` patches
+  them in place, they read back via `RETURN r.p` (and materialise on a full `RETURN r`), and
+  consolidation carries them into the rebuild. Grammar (`cypher.pest`): `edge_merge` gains a
+  trailing `set_clause?`. Parser: `EdgeWriteStmt` gains `sets: Vec<(String, Expr)>`;
+  `lower_edge_write` validates each `SET` targets the **named** relationship variable with
+  literal/parameter values (unnamed rel, wrong var, or non-constant value → clear error).
+  Write path (`server::execute_edge_write`): evaluates the patches onto `WalOp::UpsertEdge.patches`
+  (already WAL-encoded + replayed). Read overlay: new `Memtable::edge_delta_by_id` (born edge id →
+  its `EdgeDelta`, owning-level-scoped) + `DeltaSnapshot::{edge_patch_value, edge_patches}` (fold to
+  the level whose stacked born-edge id range owns the id; tombstoned → empty); `exec.rs`
+  `edge_prop_par` returns a born edge's patch value by name, `edge_props` maps its patches to
+  `(key_id, value)` (so `rel_record`/consolidation carry them — a name absent from the core symbol
+  table is still readable by `RETURN r.p` but drops from the id-keyed full view). `Memtable::
+  upsert_edge` already stored patches (reserved 3a) — no memtable-write change. `DeltaEdge` is
+  unchanged (props are fetched lazily by edge id, not carried on the traversal record).
+  **Scope / deliberate deferral:** only **delta-born** edges carry editable properties. Patching a
+  **core** edge's properties *in place* needs a distinct core-edge-id patch overlay (like the node
+  patch overlay) + a write-path dedup change + replay resolution; a `MERGE` that carries a `SET`
+  onto an existing core edge is **rejected** with a clear message (a bare re-`MERGE` of a core edge
+  stays an idempotent no-op). Tests: parser (`merge_edge_lowers_set_properties`,
+  `edge_set_requires_a_named_rel_var_and_constant_values`); slater-delta
+  (`edge_properties_read_back_through_the_overlay`, `edge_properties_patch_then_tombstone`,
+  `edge_properties_resolve_from_the_owning_level`); server (`edge_properties_end_to_end`:
+  create-with-prop → read → re-MERGE-patch + second prop → core-edge-patch-rejected → reopen-durable);
+  consolidate (`serialise_carries_delta_born_edge_properties`). Whole slater (598) + slater-delta
+  (58) + workspace green; clippy `-D warnings` + fmt clean.
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -723,15 +751,16 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 594 + 55; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 598 + 58; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): edge properties; off-peak
-  *schedule* knob for consolidation; size-tiered partial-L0 compaction (needs
-  number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
-  whole-file residency). **delete-a-born-node-by-key and moved-indexed-value are now ✅ DONE**
-  (see "Deferred follow-ups" below). See the "Smaller follow-ups" list below.
+- **Deferred refinements** (each cleanly scoped, none blocking): off-peak *schedule* knob for
+  consolidation; size-tiered partial-L0 compaction (needs number-vs-stack-order reconciliation);
+  off-heap `pread` L0 reads (bounded RSS without whole-file residency); in-place **core-edge**
+  property patching (born-edge properties are done). **delete-a-born-node-by-key,
+  moved-indexed-value, and edge-properties are now ✅ DONE** (see "Deferred follow-ups" below).
+  See the "Smaller follow-ups" list below.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
@@ -798,10 +827,9 @@ overlay-transparent (`consolidate.rs` unchanged). See D45 (MERGE-vs-MATCH), D46 
 write grammar).
 
 Smaller follow-ups that are **not** the recommended next step but are cleanly scoped:
-- **edge properties** (deferred from 3c): `WalOp::UpsertEdge.patches` + `EdgeDelta.patches`
-  already exist; add `SET r.p = …` to the edge grammar, an edge-property read overlay in
-  `edge_prop_par`/`edge_props` (a born-or-patched edge's props), and emit them in
-  consolidation (`emit_edges_from` already calls `emit_set(&eprops, …)`).
+- ~~**edge properties** (deferred from 3c)~~ ✅ DONE — see the "Deferred follow-ups
+  (post-Phase-5)" section above (`SET r.p` on an edge `MERGE` gives a **delta-born** edge
+  properties; core-edge in-place patch stays deferred).
 - ~~**moved indexed value** (deferred from 2d)~~ ✅ DONE — see the "Deferred follow-ups
   (post-Phase-5)" section above (`scan_candidates` drops moved-out core hits and adds
   moved-in ones via the `slater-delta` overlay; membership uses the merged patched value).

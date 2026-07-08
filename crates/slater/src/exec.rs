@@ -684,10 +684,14 @@ fn node_ok_par(
 /// parallel aggregation precompute, Task 12) and by `Engine::edge_prop`, so the two
 /// stay byte-for-byte identical.
 fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
-    // A delta-born edge (Phase 3) has no core edge-props record and carries no
-    // properties yet (the write grammar creates topology only), so any key reads Null.
+    // A delta-born edge (Phase 3) has no core edge-props record — read its property from
+    // the delta overlay (edge properties). `id >= core edge_count` marks it born.
     if !gen.delta().is_empty() && id >= gen.core_generation().edge_count() {
-        return Ok(Val::Null);
+        return Ok(gen
+            .delta()
+            .edge_patch_value(id, key)
+            .map(Val::from_value)
+            .unwrap_or(Val::Null));
     }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
@@ -1549,9 +1553,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn edge_props(&self, id: u64) -> Result<Vec<(u32, Value)>> {
-        // A delta-born edge (Phase 3) has no core record and no properties yet.
+        // A delta-born edge's properties live in the delta overlay. Map each patch name
+        // to its property-key id; a name absent from the core symbol table has no id and
+        // is dropped from this id-keyed view (still readable by name via `RETURN r.p`).
         if !self.gen.delta().is_empty() && id >= self.gen.core_generation().edge_count() {
-            return Ok(Vec::new());
+            let mut out = Vec::new();
+            for (name, value) in self.gen.delta().edge_patches(id) {
+                if let Some(kid) = self.gen.property_key_id(&name) {
+                    out.push((kid, value));
+                }
+            }
+            return Ok(out);
         }
         let rec = self.cache.record(
             self.gen.edge_props().inner(),

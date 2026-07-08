@@ -797,6 +797,21 @@ impl Memtable {
         out
     }
 
+    /// The folded delta of the **delta-born** edge with synthetic id `edge_id`, if this
+    /// level owns it — `edge_id` in `[edge_synthetic_base, edge_synthetic_base +
+    /// born_edges.len())`. `None` for a core edge id or one owned by another level (born
+    /// edge id ranges are disjoint + stacked across levels). The read overlay reads a
+    /// born edge's **properties** through this (edge-property overlay), mirroring
+    /// [`node_patch`](Self::node_patch) for nodes.
+    fn edge_delta_by_id(&self, edge_id: u64) -> Option<&EdgeDelta> {
+        let base = self.edge_synthetic_base;
+        if edge_id < base {
+            return None; // a core edge, or one belonging to an older level
+        }
+        let eck = self.born_edges.get((edge_id - base) as usize)?;
+        self.edges.get(eck).map(|e| &e.delta)
+    }
+
     /// Iterate stored edges as `(src_label, src_key, src_value, reltype, dst_label,
     /// dst_key, dst_value, delta)` with identity names recovered — the consolidation
     /// input (Phase 3d emits born edges as `MERGE` text and drops tombstoned ones).
@@ -1895,6 +1910,37 @@ impl DeltaSnapshot {
         }
         out
     }
+
+    // ── Edge-property overlay ──────────────────────────────────────────────────
+    // A delta-born edge (created by `MERGE (a)-[r:R]->(b) SET r.p = …`) carries its
+    // properties in the delta, not in any core edge-props record. These read them by
+    // synthetic edge id (which the traversal overlay hands out on each `DeltaEdge`).
+    // The owning level is the one whose stacked born-edge id range contains the id, so a
+    // plain `find_map` over the levels resolves it. A tombstoned edge is suppressed on
+    // traversal, so its (cleared) properties are never asked for; it reads as empty here
+    // defensively. In-place patching of a *core* edge's properties is a separate overlay
+    // (a core-edge-id patch index) and is not wired yet — see the write path.
+
+    /// The value a delta-born edge presents for property `prop`, or `None` if it has no
+    /// such patch (or `edge_id` is a core edge / a tombstoned born edge).
+    pub fn edge_patch_value(&self, edge_id: u64, prop: &str) -> Option<Value> {
+        self.levels_newest_first()
+            .find_map(|m| m.edge_delta_by_id(edge_id))
+            .filter(|d| !d.tombstoned)
+            .and_then(|d| d.patches.get(prop).cloned())
+    }
+
+    /// Every property patch of the delta-born edge with synthetic id `edge_id` (name →
+    /// value). Empty if it carries no properties, is tombstoned, or `edge_id` is a core
+    /// edge id. Used to materialise a born edge's full property set (`RETURN r`) and to
+    /// carry its properties through consolidation.
+    pub fn edge_patches(&self, edge_id: u64) -> BTreeMap<String, Value> {
+        self.levels_newest_first()
+            .find_map(|m| m.edge_delta_by_id(edge_id))
+            .filter(|d| !d.tombstoned)
+            .map(|d| d.patches.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for DeltaSnapshot {
@@ -2801,6 +2847,85 @@ mod tests {
             .is_empty());
         assert!(s.core_hit_survives_eq(5, "age", &Value::Int(99)));
         assert!(!s.core_hit_survives_eq(5, "age", &Value::Int(30)));
+    }
+
+    /// Helper: MERGE the born edge Ann-KNOWS->Bob (endpoints core nodes 0/1) with `patches`.
+    fn merge_ann_knows_bob(m: &mut Memtable, patches: Vec<(String, Value)>) {
+        m.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            patches,
+        );
+    }
+
+    #[test]
+    fn edge_properties_read_back_through_the_overlay() {
+        // Core has 10 nodes / 5 edges; a born edge takes edge id `edge_synthetic_base` = 5.
+        let mut mem = Memtable::with_bases(10, 5);
+        merge_ann_knows_bob(&mut mem, vec![("since".into(), Value::Int(2020))]);
+        let s = snap(mem, vec![]);
+
+        assert_eq!(s.edge_patch_value(5, "since"), Some(Value::Int(2020)));
+        assert_eq!(s.edge_patch_value(5, "weight"), None);
+        assert_eq!(s.edge_patches(5).len(), 1);
+        assert_eq!(s.edge_patches(5).get("since"), Some(&Value::Int(2020)));
+        // A core edge id (`< base`) carries no delta patches.
+        assert_eq!(s.edge_patch_value(4, "since"), None);
+        assert!(s.edge_patches(4).is_empty());
+    }
+
+    #[test]
+    fn edge_properties_patch_then_tombstone() {
+        let mut mem = Memtable::with_bases(10, 5);
+        merge_ann_knows_bob(&mut mem, vec![("since".into(), Value::Int(2020))]);
+        // Re-MERGE with new values patches the same born edge in place (idempotent id).
+        merge_ann_knows_bob(
+            &mut mem,
+            vec![
+                ("since".into(), Value::Int(2021)),
+                ("weight".into(), Value::Int(3)),
+            ],
+        );
+        let s = snap(mem.clone(), vec![]);
+        assert_eq!(s.edge_patch_value(5, "since"), Some(Value::Int(2021)));
+        assert_eq!(s.edge_patch_value(5, "weight"), Some(Value::Int(3)));
+
+        // Deleting the edge clears its properties (and suppresses it on traversal).
+        mem.delete_edge(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+        );
+        let s = snap(mem, vec![]);
+        assert!(
+            s.edge_patches(5).is_empty(),
+            "a tombstoned edge reads no props"
+        );
+        assert_eq!(s.edge_patch_value(5, "since"), None);
+    }
+
+    #[test]
+    fn edge_properties_resolve_from_the_owning_level() {
+        // The born edge (id 5) lives in an older L0 level; the active memtable is empty.
+        // `edge_patch_value`/`edge_patches` must find the owning level.
+        let mut older = Memtable::with_bases(10, 5);
+        merge_ann_knows_bob(&mut older, vec![("since".into(), Value::Int(2020))]);
+        let s = snap(Memtable::with_bases(10, 6), vec![older]);
+        assert_eq!(s.edge_patch_value(5, "since"), Some(Value::Int(2020)));
+        assert_eq!(s.edge_patches(5).get("since"), Some(&Value::Int(2020)));
     }
 
     #[test]
