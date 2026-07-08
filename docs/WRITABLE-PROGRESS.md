@@ -596,7 +596,7 @@ Running ledger for the `writeable` track. Pairs with the design in
     graph, wrong password fails cleanly, the dump path emits its stub. 582 slater + 53
     slater-delta green; whole workspace green; clippy `-D warnings` + fmt clean.
   - **dump-b+c — schema + identity-key resolution + node/edge dump + PsValue escaper.
-    ✅ DONE** (this commit; planned dump-b and dump-c folded — they share the arg
+    ✅ DONE** (commit `8adcbff`; planned dump-b and dump-c folded — they share the arg
     surface and the single buffered output sink, and splitting them would either
     leave a partial dump on disk or make `--out`/`--key`/`--pk` dead code between the
     two commits). Args grew `-o/--out`, `--key Label=prop` (repeatable), `--pk`.
@@ -647,7 +647,7 @@ below are current, and that the latest commit hash is noted.
 **Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE.**
 Active work is the optional **`slater dump` CLI** parallel workstream (see its sub-milestone block
 above). Latest commits:
-- `<this>` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c) — see the follow-up doc commit for the hash
+- `8adcbff` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c)
 - `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
