@@ -576,8 +576,8 @@ Running ledger for the `writeable` track. Pairs with the design in
   generation→MERGE serialiser (shares only the text format). NB: `vecf32` props can't
   ride a MERGE dump (vectors non-goal). Sub-milestones (each independently green +
   committed):
-  - **dump-a — shared Bolt client + clap scaffolding + `--list`. ✅ DONE** (this
-    commit). Promoted `health.rs`'s private `BoltConn` to a shared
+  - **dump-a — shared Bolt client + clap scaffolding + `--list`. ✅ DONE** (commit
+    `998ec09`). Promoted `health.rs`'s private `BoltConn` to a shared
     `crate::bolt::client::BoltClient` (`connect(host,port,timeout)`,
     `login(agent,user,pass)` = HELLO+LOGON basic, `run_pull(query, db) -> (columns,
     rows)` = RUN[+`db` selector in `extra`]+PULL-all, plus `send`/`recv`/`request`);
@@ -623,7 +623,7 @@ below are current, and that the latest commit hash is noted.
 **Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE.**
 Active work is the optional **`slater dump` CLI** parallel workstream (see its sub-milestone block
 above). Latest commits:
-- `<this>` feat(dump): shared Bolt client + `slater dump --list` (dump-a) — see the follow-up doc commit for the hash
+- `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
 - `8b0afac` feat(delta): fraction-of-core auto-consolidation + hard-cap throttle (Phase 4d-ii-b) — completes Phase 4
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 - `fd3bac6` feat(delta): L0→L0 compaction (Phase 4d-i)
