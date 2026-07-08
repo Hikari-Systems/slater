@@ -650,7 +650,7 @@ Running ledger for the `writeable` track. Pairs with the design in
 The "Smaller follow-ups" listed further down, each closed one small commit at a time
 (independent of one another; ledger updated in the same commit).
 
-- **Delete a delta-born node by business key** (deferred from 2c). ✅ DONE (this commit).
+- **Delete a delta-born node by business key** (deferred from 2c). ✅ DONE (`2a06264`).
   A `MERGE`-created (delta-born) node can now be `DELETE`d by its business key. Its DELETE
   anchor's core probe returns `Absent` (no core row), so `execute_write` used to reject it;
   it now resolves the born synthetic id from the delta and tombstones it. Resolution folds
@@ -687,7 +687,10 @@ below are current, and that the latest commit hash is noted.
 
 **Resume state:** on branch `writeable`, **not** pushed to origin. **Phases 0–5 are ALL DONE**, and
 the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph
-dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). Latest commits:
+dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
+follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
+(post-Phase-5)" section above). Latest commits:
+- `2a06264` feat(delta): delete a delta-born node by business key (follow-up from 2c)
 - `db52515` feat(dump): reproducible round-trip e2e test (dump-d)
 - `8adcbff` feat(dump): schema + identity-key resolution + node/edge dump (dump-b+c)
 - `998ec09` feat(dump): shared Bolt client + `slater dump --list` (dump-a)
