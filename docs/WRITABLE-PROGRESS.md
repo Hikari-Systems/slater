@@ -723,7 +723,7 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   consolidate (`serialise_carries_delta_born_edge_properties`). Whole slater (598) + slater-delta
   (58) + workspace green; clippy `-D warnings` + fmt clean.
 
-- **Off-peak consolidation schedule knob** (deferred from Phase 4d-ii-b). ✅ DONE (this commit).
+- **Off-peak consolidation schedule knob** (deferred from Phase 4d-ii-b). ✅ DONE (`215b3d4`).
   A new `delta.consolidateWindow` gates the **fraction-of-core** auto-consolidation to an off-peak
   window: when the delta reaches `deltaCorePercent`% of core but the current **server-local** time
   is *outside* the window, the background consolidation is deferred (logged `debug`); inside the
@@ -766,6 +766,7 @@ the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
+- `215b3d4` feat(delta): off-peak window for the fraction-of-core auto-consolidation
 - `80f976b` feat(delta): edge properties on delta-born relationships (SET r.p on an edge MERGE)
 - `a551907` feat(delta): relocate a patched core node in the range index (moved indexed value)
 - `2a06264` feat(delta): delete a delta-born node by business key (follow-up from 2c)
