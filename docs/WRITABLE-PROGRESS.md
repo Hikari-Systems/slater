@@ -777,7 +777,7 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   read path untouched (compaction is write-path maintenance; empty-delta bench unaffected).
 
 - **Group-commit batching + write-`UNWIND`** (from the 1M-smoke fsync finding; the chosen
-  alternative to the deferred off-heap L0 item). ✅ DONE (this commit). Bulk writes were
+  alternative to the deferred off-heap L0 item). ✅ DONE (`6ed7bec` primitive, `bcb109d` surface). Bulk writes were
   one-fsync-per-statement (the 300K-delete smoke run took ~1h on WSL2, fsync-bound). Two pieces:
   - **`DeltaWriter::write_batch(&[(WalOp, OpResolution)])`** — the group-commit primitive: append
     every record, do **one** `commit` (a single fsync — the ack barrier for the whole batch),
@@ -822,6 +822,8 @@ the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (
 dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
 follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
 (post-Phase-5)" section above). Latest commits:
+- `bcb109d` feat(delta): write-UNWIND batched node writes (group-commit surface)
+- `6ed7bec` feat(delta): write_batch group-commit primitive
 - `aea6f36` feat(delta): size-tiered partial-L0 compaction
 - `215b3d4` feat(delta): off-peak window for the fraction-of-core auto-consolidation
 - `80f976b` feat(delta): edge properties on delta-born relationships (SET r.p on an edge MERGE)
