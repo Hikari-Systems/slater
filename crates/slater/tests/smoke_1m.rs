@@ -14,6 +14,7 @@
 //! `name`), joined by `:LINK` edges.
 
 use slater::bolt::client::BoltClient;
+use slater::bolt::packstream::PsValue;
 use std::path::Path;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -54,6 +55,29 @@ fn ints(c: &mut BoltClient, graph: &str, q: &str) -> Vec<i64> {
 fn exec(c: &mut BoltClient, graph: &str, q: &str) {
     c.run_pull(q, Some(graph))
         .unwrap_or_else(|e| panic!("write failed: {q}\n  {e}"));
+}
+
+/// Delete `ids` by business key in `chunk`-sized batches via a **write-`UNWIND`** —
+/// each batch is one group-committed statement (one fsync), the point of the
+/// group-commit primitive. Returns the number of batches issued.
+fn delete_in_batches(c: &mut BoltClient, graph: &str, ids: &[i64], chunk: usize) -> usize {
+    let mut batches = 0;
+    for slice in ids.chunks(chunk) {
+        let rows = PsValue::List(
+            slice
+                .iter()
+                .map(|id| PsValue::Map(vec![("id".into(), PsValue::Int(*id))]))
+                .collect(),
+        );
+        c.run_pull_params(
+            "UNWIND $rows AS r MATCH (n:Entity {wikidata_id: r.id}) DELETE n",
+            vec![("rows".into(), rows)],
+            Some(graph),
+        )
+        .unwrap_or_else(|e| panic!("batched delete failed ({} ids)\n  {e}", slice.len()));
+        batches += 1;
+    }
+    batches
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -172,12 +196,13 @@ async fn writable_layer_smoke_on_a_large_core() {
 /// count while the rest survives. A small `memtableBytes` keeps the per-write publish
 /// cheap and lets the auto flush/compaction bound the L0 fan-out across the ~300K deletes.
 ///
-/// NB — runtime is **fsync-bound**: each delete is its own fsync'd group-commit (batching
-/// was deferred in Phase 1c), so throughput is one commit per statement. On a slow-fsync
-/// box (WSL2, ~10ms) 300K deletes take ~1h (~12ms each); on NVMe (~0.1ms) it is ~30s. The
-/// *reads* afterwards are fast (an indexed range seek and a full-scan count over the 1M
-/// core with the tombstone overlay each complete in ~1.5s). Correctness is the point here,
-/// not write throughput — run it deliberately, not in a tight loop.
+/// The deletes go through a **write-`UNWIND`** in group-committed batches (default 10 000
+/// ids per batch, `SLATER_SMOKE_DELETE_CHUNK`): one fsync per *batch*, not per delete — so
+/// the ~300K deletes are ~30 commits instead of 300K, and the earlier fsync-bound ~1h on
+/// WSL2 collapses to well under a minute even on a slow-fsync box. (The per-statement path
+/// was what surfaced the group-commit finding; this test now exercises the primitive that
+/// fixed it.) The *reads* afterwards are fast too — an indexed range seek and a full-scan
+/// count over the 1M core with the tombstone overlay each complete in ~1.5s.
 ///
 /// ```text
 /// SLATER_SMOKE_DATADIR=/home/rickk/perf-gens/wiki1m SLATER_SMOKE_GRAPH=wiki1m \
@@ -267,19 +292,19 @@ async fn delete_thirty_percent_segment() {
             "survivor present pre-delete"
         );
 
-        // Delete every entity in the segment by its business key.
+        // Delete every entity in the segment by its business key, in group-committed
+        // batches (write-`UNWIND`): one fsync per batch, not per delete. The env knob
+        // `SLATER_SMOKE_DELETE_CHUNK` (default 10 000) sizes each batch.
+        let chunk: usize = std::env::var("SLATER_SMOKE_DELETE_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
         let t1 = std::time::Instant::now();
-        for (i, id) in victims.iter().enumerate() {
-            exec(
-                &mut c,
-                &g,
-                &format!("MATCH (n:Entity {{wikidata_id: {id}}}) DELETE n"),
-            );
-            if (i + 1) % 50_000 == 0 {
-                println!("  deleted {}/{seg} ({:?})", i + 1, t1.elapsed());
-            }
-        }
-        println!("deleted {seg} entities in {:?}", t1.elapsed());
+        let batches = delete_in_batches(&mut c, &g, &victims, chunk);
+        println!(
+            "deleted {seg} entities in {batches} group-committed batches of {chunk} in {:?}",
+            t1.elapsed()
+        );
 
         // The segment is gone from an indexed range seek…
         let t2 = std::time::Instant::now();

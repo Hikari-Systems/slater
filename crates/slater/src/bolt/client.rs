@@ -83,6 +83,18 @@ impl BoltClient {
         query: &str,
         db: Option<&str>,
     ) -> std::io::Result<(Vec<String>, Vec<Vec<PsValue>>)> {
+        self.run_pull_params(query, Vec::new(), db)
+    }
+
+    /// As [`Self::run_pull`], but with query **parameters** (the RUN message's second
+    /// field) — e.g. a `$rows` list to drive a batched write-`UNWIND` under one
+    /// group-commit. `params` is the parameter map; pass an empty vec for none.
+    pub fn run_pull_params(
+        &mut self,
+        query: &str,
+        params: Vec<(String, PsValue)>,
+        db: Option<&str>,
+    ) -> std::io::Result<(Vec<String>, Vec<Vec<PsValue>>)> {
         let mut extra: Vec<(String, PsValue)> = Vec::new();
         if let Some(db) = db.filter(|s| !s.is_empty()) {
             extra.push(("db".into(), PsValue::str(db)));
@@ -91,7 +103,7 @@ impl BoltClient {
             tag::RUN,
             vec![
                 PsValue::str(query),
-                PsValue::Map(vec![]),
+                PsValue::Map(params),
                 PsValue::Map(extra),
             ],
         )?;
