@@ -811,10 +811,21 @@ complete; all gates green (`cargo test -p slater -p slater-delta` = 608 + 58; `c
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): off-heap `pread` L0 reads
-  (bounded RSS without whole-file residency); in-place **core-edge** property patching (born-edge
-  properties are done); **group-commit batching** for bulk writes (a 1M smoke test showed bulk
-  writes are one-fsync-per-statement — ~12ms/write on WSL2; reads over the overlay stay fast).
+- **Deferred refinements** (each cleanly scoped, none blocking):
+  - **off-heap `pread` L0 reads** — *materially larger than items 1–5*: `L0Segment::open` currently
+    deserialises the **whole** segment into an `Arc<Memtable>` and `DeltaSnapshot` holds
+    `Vec<Arc<Memtable>>`, calling `Memtable` methods per level. An off-heap variant means either
+    reimplementing the **entire per-level read surface** (`node_patch`, `is_tombstoned`,
+    `born_ids_*`, `core_ids_patched_on_index`, `out_edges`/`in_edges`, `edge_delta_by_id`, bases,
+    counts …) against `pread` + a sparse in-RAM index, or refactoring `DeltaSnapshot` to hold a
+    `dyn LevelRead` (resident **or** off-heap) and dispatch every accessor. Pure-RSS (the ledger
+    notes L0 RSS is already bounded by the delta byte budget and never grows with core size; size-
+    tiered compaction + the fraction trigger bound it further), **not a correctness concern** —
+    recommended for its **own dedicated session**, not a tail-of-batch rush.
+  - in-place **core-edge** property patching (born-edge properties are done).
+  - **group-commit batching** for bulk writes (a 1M smoke test showed bulk writes are
+    one-fsync-per-statement — ~12ms/write on WSL2; reads over the overlay stay fast). Likely a
+    higher-impact win than the off-heap refinement.
   **delete-a-born-node-by-key, moved-indexed-value, edge-properties, the off-peak
   consolidation-window knob, and size-tiered partial-L0 compaction are now ✅ DONE** (see "Deferred
   follow-ups" below). See the "Smaller follow-ups" list below.
