@@ -918,3 +918,42 @@ reader straddling the swap briefly falls back to the pure new core (which alread
 pre-freeze writes) — the same benign visibility blip Phase 1 documented. This makes an
 automatic consolidation that fires under sustained write volume non-lossy, the prerequisite
 for the L0 flush + backpressure work (Phase 4b–4d).
+
+### D49 — L0 flush publishes levels atomically; born identity resolves across levels
+Phase 4c-B wires the L0 LSM into the writer (`crates/slater/src/delta_writer.rs`,
+`server.rs`). Two decisions make the multi-level layer correct.
+
+**(1) Atomic level publish.** `DeltaWriter::flush_to_l0` seals the active memtable to an
+immutable `L0Segment` under `<wal_dir>/<graph>/l0/<n>.l0`, rebases a fresh active memtable
+past every level (node **and** edge synthetic id spaces), rotates the WAL and deletes the
+pre-flush segments (their writes are now fsync-durable in the L0 file). The subtlety is the
+read view: a flush moves a node from the memtable into a new L0 level, and a lock-free reader
+that read the memtable and the L0 list *separately* could see the datum in **neither** (read
+new-empty memtable, then old L0 list) or, worse, see a delta-born node's synthetic id in
+**both** levels (born-id sets union across levels → the same id listed twice in a label scan).
+So the writer publishes the whole `DeltaSnapshot { mem, l0 }` as **one** `RwLock` swap
+(`republish`), and `delta_for_read` clones that single value — a reader can never straddle a
+flush. This replaces the Phase-1 `RwLock<Arc<Memtable>>` (active memtable only); `snapshot()`
+still returns the active memtable for the writer's diagnostics/tests via
+`DeltaSnapshot::active_memtable`.
+
+**(2) Born identity resolves across levels (the flush crux).** With full-flush, a delta-born
+node created before a flush lives in an L0 level while later writes land in the active
+memtable — born entities span levels. A re-`MERGE` of such a node must resolve to its
+**existing** synthetic id, not allocate a duplicate. The primitive is
+`Memtable::born_synthetic_for_identity(label, key, value)` — non-mutating (it resolves names
+through the memtable's interner via `Interner::get`, so a name absent there short-circuits to
+`None`) — folded over the sealed L0 levels by `DeltaWriter::born_synthetic_for_identity`. The
+live write path consults it in `execute_write`'s MERGE-`Absent` branch (nodes) and after the
+core-only duplicate check in `execute_edge_write` (born endpoints — the check must run on
+genuine core dense ids, never a synthetic id, so the L0 fallback happens *after* it). The
+**same** substitution runs on the WAL-tail replay path (`resolve_with_l0` in
+`DeltaWriter::open`), so a reopen re-resolves a re-`MERGE` against the reloaded L0 files
+identically — no duplicate on replay. A born edge re-`MERGE` is not separately de-duplicated:
+the read merge already dedups edges by `(reltype, neighbour)` newest-wins, so traversal and
+consolidation stay correct (the only residue is a harmless `edge_count` over-estimate, gated
+off the count fast paths whenever the delta is non-empty). Consolidation folds the L0 levels
+for free — `freeze` captures them into `Frozen.l0`, the dump reads through the multi-level
+`DeltaSnapshot::with_levels`, and `retire` deletes the consumed L0 files and clears the level
+stack. A flush is **not** admitted during an in-flight consolidation (that guard is Phase 4d),
+so at retire the level stack is exactly the frozen `consumed_l0`.

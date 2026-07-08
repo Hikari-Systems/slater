@@ -419,6 +419,27 @@ impl Memtable {
         ))
     }
 
+    /// The synthetic dense id of the **delta-born** node with this business identity,
+    /// if this memtable holds it as a born node (not a core-resolved patch/tombstone).
+    /// `None` when the identity is absent here or is a core-resolved entry.
+    ///
+    /// The write path uses this to resolve a re-`MERGE` of a node already flushed to an
+    /// L0 level to its **existing** synthetic id (Phase 4c-B) rather than allocate a
+    /// duplicate. Non-mutating: it resolves the label/key names through this memtable's
+    /// interner without interning (a name absent from the interner can't identify a
+    /// stored node, so it short-circuits to `None`).
+    pub fn born_synthetic_for_identity(
+        &self,
+        label: &str,
+        key: &str,
+        value: &Value,
+    ) -> Option<u64> {
+        let l = self.interner.get(label)?;
+        let k = self.interner.get(key)?;
+        let ck = NodeIdentity::new(l, k, value.clone()).canonical_key();
+        self.nodes.get(&ck).and_then(|e| e.synthetic)
+    }
+
     /// The synthetic dense ids of every delta-born node carrying `label` (ascending
     /// by allocation order). A label scan appends these to the core hits; tombstoned
     /// entries are included and dropped by the caller's tombstone suppression, so the
@@ -1172,6 +1193,20 @@ impl DeltaSnapshot {
     /// read folds `mem ⊕ L0*`.
     pub fn with_levels(mem: Arc<Memtable>, l0: Vec<Arc<Memtable>>) -> Self {
         Self { mem, l0 }
+    }
+
+    /// The active (newest, writable) memtable level — the writer's `snapshot()` returns
+    /// this for its single-memtable accessors and tests.
+    #[inline]
+    pub fn active_memtable(&self) -> &Arc<Memtable> {
+        &self.mem
+    }
+
+    /// The sealed L0 segments beneath the active memtable, **newest first** (empty on
+    /// the common no-flush path). The writer folds born-id resolution over these.
+    #[inline]
+    pub fn l0_levels(&self) -> &[Arc<Memtable>] {
+        &self.l0
     }
 
     /// The delta levels in **newest-first** precedence order (active memtable, then the
@@ -2333,5 +2368,44 @@ mod tests {
         let s = DeltaSnapshot::from_memtable(arc.clone());
         assert_eq!(s.node_patch(3), arc.node_patch(3).cloned());
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn born_synthetic_for_identity_resolves_only_born_nodes() {
+        // The write path (Phase 4c-B) resolves a re-MERGE of an already-flushed born
+        // node to its existing synthetic id; a core-resolved patch and an unknown key
+        // both resolve to `None`.
+        let mut m = Memtable::with_synthetic_base(100);
+        // A born node (absent from the core) → synthetic id 100.
+        m.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Zoe".into()),
+            None,
+            [("age".to_string(), Value::Int(9))],
+        );
+        // A core-resolved patch on dense id 5 — not a born node.
+        m.upsert_node("Person", "name", Value::Str("Al".into()), Some(5), []);
+
+        assert_eq!(
+            m.born_synthetic_for_identity("Person", "name", &Value::Str("Zoe".into())),
+            Some(100),
+            "the born node resolves to its synthetic id"
+        );
+        assert_eq!(
+            m.born_synthetic_for_identity("Person", "name", &Value::Str("Al".into())),
+            None,
+            "a core-resolved node is not born"
+        );
+        assert_eq!(
+            m.born_synthetic_for_identity("Person", "name", &Value::Str("Nobody".into())),
+            None,
+            "an unknown key resolves to None"
+        );
+        assert_eq!(
+            m.born_synthetic_for_identity("Ghost", "name", &Value::Str("Zoe".into())),
+            None,
+            "a label absent from the interner short-circuits to None"
+        );
     }
 }

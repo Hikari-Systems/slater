@@ -476,7 +476,7 @@ impl Graphs {
         let dump_res = (|| -> Result<()> {
             let view = MergedView::new(
                 core.as_ref(),
-                DeltaSnapshot::from_memtable(frozen.snapshot.clone()),
+                DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
             );
             let engine = Engine::new(&view, cache);
             let mut file = std::io::BufWriter::new(
@@ -521,6 +521,7 @@ impl Graphs {
         writer
             .retire(
                 &frozen.consumed,
+                &frozen.consumed_l0,
                 new_uuid,
                 new_gen.node_count(),
                 new_gen.edge_count(),
@@ -2512,7 +2513,7 @@ fn resolve_business_key(gen: &Generation, label: &str, key: &str, value: &Value)
 fn delta_for_read(writer: &Arc<DeltaWriter>, gen: &Arc<Generation>) -> ReadOverlay {
     if writer.core_uuid() == gen.uuid() {
         ReadOverlay {
-            delta: DeltaSnapshot::from_memtable(writer.snapshot()),
+            delta: writer.delta_snapshot(),
             epoch: writer.epoch(),
         }
     } else {
@@ -2598,7 +2599,13 @@ fn execute_write(
     let is_set = matches!(op, WalOp::UpsertNode { .. });
     let resolved = match resolve_business_key(gen, label, key, value) {
         KeyResolution::Unique(id) => Some(id),
-        KeyResolution::Absent if is_set && stmt.upsert => None, // MERGE create
+        // MERGE create: a key absent from the core is a delta-born node. If it was
+        // already born and flushed to an L0 level, reuse its existing synthetic id
+        // (Phase 4c-B) rather than allocate a duplicate; otherwise `None` allocates a
+        // fresh one (the active memtable, or a live born node it still holds).
+        KeyResolution::Absent if is_set && stmt.upsert => {
+            writer.born_synthetic_for_identity(label, key, value)
+        }
         KeyResolution::Absent => {
             let action = if is_set { "update" } else { "delete" };
             return Err(Failure::new(
@@ -2726,20 +2733,31 @@ fn execute_edge_write(
         params,
         "the destination business-key value",
     )?;
-    let src = resolve_endpoint(gen, &stmt.src, &src_value)?;
-    let dst = resolve_endpoint(gen, &stmt.dst, &dst_value)?;
+    // Core-only resolution first (`None` = absent from the core): the duplicate check
+    // below must run against genuine core dense ids, never a delta-born synthetic id.
+    let src_core = resolve_endpoint(gen, &stmt.src, &src_value)?;
+    let dst_core = resolve_endpoint(gen, &stmt.dst, &dst_value)?;
 
     // A MERGE of an edge whose endpoints are both existing core nodes is idempotent —
     // skip the write if the core already has it (a born duplicate would double the edge
     // on traversal). If either endpoint is delta-born there can be no matching core
     // edge, so no check is needed.
     if stmt.op == EdgeWriteOp::Create {
-        if let (Some(s), Some(d)) = (src, dst) {
+        if let (Some(s), Some(d)) = (src_core, dst_core) {
             if core_edge_exists(gen, s, reltype_id, d)? {
                 return Ok((Vec::new(), Vec::new()));
             }
         }
     }
+
+    // Resolve the WAL op's endpoints: an endpoint absent from the core but already born
+    // and flushed to an L0 level reuses its synthetic id (Phase 4c-B) rather than
+    // allocating a duplicate born endpoint; a still-`None` endpoint is a fresh born node
+    // (MERGE) or a no-op (DELETE), exactly as before.
+    let src = src_core
+        .or_else(|| writer.born_synthetic_for_identity(&stmt.src.label, &stmt.src.key, &src_value));
+    let dst = dst_core
+        .or_else(|| writer.born_synthetic_for_identity(&stmt.dst.label, &stmt.dst.key, &dst_value));
 
     let op = match stmt.op {
         EdgeWriteOp::Create => WalOp::UpsertEdge {
@@ -4407,6 +4425,232 @@ mod tests {
             1,
             "only the post-freeze segment remains"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Number of `*.l0` segment files under `<wal>/<graph>/l0/`.
+    fn l0_count(wal_dir: &Path) -> usize {
+        let l0 = wal_dir.join("l0");
+        std::fs::read_dir(&l0)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("l0"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Phase 4c-B end-to-end through the query overlay: a MERGE-born node and a core
+    /// property patch, once flushed to an L0 level, still read back through the full
+    /// `MergedView` (label scan **and** index seek), a re-MERGE of the flushed born node
+    /// reuses its synthetic id (no duplicate), and everything survives a reopen (the L0
+    /// file reloads, the WAL-tail re-MERGE re-resolves against it).
+    #[test]
+    fn flush_to_l0_overlay_reads_and_born_reuse_survive_reopen() {
+        let (root, _g) = testgen::write_indexed_people("flush_overlay_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+
+        // A query over the writer's full published delta (active memtable ⊕ L0 levels).
+        let names_ages = |graphs: &Graphs, q: &str| -> Vec<(String, Option<i64>)> {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let mut out: Vec<(String, Option<i64>)> = Engine::new(&view, &cache)
+                .run(&ast)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| {
+                    let name = match &r[0] {
+                        Val::Str(s) => s.clone(),
+                        v => panic!("name not str: {v:?}"),
+                    };
+                    let age = match r.get(1) {
+                        Some(Val::Int(n)) => Some(*n),
+                        _ => None,
+                    };
+                    (name, age)
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a node write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        // MERGE-create Dave (born) and patch a core node (Alice.age = 99).
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+
+        // Flush the memtable to an L0 level — the active memtable is now empty.
+        let writer = graphs.writer("people").unwrap();
+        assert!(writer.flush_to_l0().unwrap());
+        assert_eq!(writer.l0_len(), 1);
+        assert!(
+            writer.snapshot().is_empty(),
+            "active memtable freed by flush"
+        );
+        assert_eq!(l0_count(&writer.wal_dir()), 1, "one L0 file on disk");
+
+        // Read back through the L0 level: index seek finds Dave, label scan lists him,
+        // Alice's patched age is served.
+        assert_eq!(
+            names_ages(
+                &graphs,
+                "MATCH (n:Person {name:'Dave'}) RETURN n.name, n.age"
+            ),
+            vec![("Dave".to_string(), Some(50))],
+            "index seek finds the flushed born node"
+        );
+        assert_eq!(
+            names_ages(
+                &graphs,
+                "MATCH (n:Person {name:'Alice'}) RETURN n.name, n.age"
+            ),
+            vec![("Alice".to_string(), Some(99))],
+            "the flushed core patch is served"
+        );
+        let all = names_ages(&graphs, "MATCH (n:Person) RETURN n.name");
+        assert!(
+            all.iter().any(|(n, _)| n == "Dave"),
+            "label scan lists the flushed born node: {all:?}"
+        );
+
+        // Re-MERGE the flushed born Dave (post-flush, into the active memtable). It must
+        // reuse the L0 synthetic id — no duplicate — and the newer age wins.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 55");
+        assert_eq!(
+            writer.delta_snapshot().born_count(),
+            1,
+            "re-MERGE reuses the flushed born id, no duplicate"
+        );
+        assert_eq!(
+            names_ages(
+                &graphs,
+                "MATCH (n:Person {name:'Dave'}) RETURN n.name, n.age"
+            ),
+            vec![("Dave".to_string(), Some(55))],
+            "the re-MERGE patch (active memtable) wins over the flushed value"
+        );
+
+        // Reopen: the L0 file reloads and the WAL-tail re-MERGE re-resolves against it.
+        drop(writer);
+        drop(graphs);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        assert_eq!(
+            graphs.writer("people").unwrap().l0_len(),
+            1,
+            "reopen reloads L0"
+        );
+        assert_eq!(
+            graphs
+                .writer("people")
+                .unwrap()
+                .delta_snapshot()
+                .born_count(),
+            1,
+            "reopen does not duplicate the born node"
+        );
+        assert_eq!(
+            names_ages(
+                &graphs,
+                "MATCH (n:Person {name:'Dave'}) RETURN n.name, n.age"
+            ),
+            vec![("Dave".to_string(), Some(55))],
+            "Dave (age 55) survives the reopen via the L0 file + WAL tail"
+        );
+        assert_eq!(
+            names_ages(
+                &graphs,
+                "MATCH (n:Person {name:'Alice'}) RETURN n.name, n.age"
+            ),
+            vec![("Alice".to_string(), Some(99))],
+            "Alice's flushed patch survives the reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4c-B: consolidation folds a flushed L0 level. A born node lives in an L0
+    /// segment (not the active memtable); the consolidation dump must still carry it
+    /// (proving `frozen.l0` reached the merged view), and `retire` deletes the L0 file
+    /// and clears the level stack.
+    #[test]
+    fn consolidation_folds_a_flushed_l0_level() {
+        let (root, _graph) = testgen::write_indexed_people("consolidate_l0");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+
+        let gen0 = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let wal_dir = writer.wal_dir();
+
+        // MERGE-born Dave + a core patch, then flush both into an L0 level.
+        for q in [
+            "MERGE (n:Person {name:'Dave'}) SET n.age = 50",
+            "MATCH (n:Person {name:'Alice'}) SET n.age = 99",
+        ] {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+            execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        }
+        assert!(writer.flush_to_l0().unwrap());
+        assert_eq!(writer.l0_len(), 1);
+        assert!(writer.snapshot().is_empty(), "everything flushed to L0");
+        assert_eq!(l0_count(&wal_dir), 1);
+
+        // The injected builder proves the dump folded the L0 level (Dave's MERGE + the
+        // merged Alice age), then publishes a canned consolidated generation.
+        let new_uuid = uuid::Uuid::from_u128(0x4c0b_0000_0000_0000_0000_0000_0000_0001);
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+            let text = std::fs::read_to_string(dump)?;
+            assert!(
+                text.contains("MERGE (n:Person {name: 'Dave'})"),
+                "the flushed born node must be in the dump:\n{text}"
+            );
+            assert!(
+                text.contains("SET n.age = 99"),
+                "the flushed core patch must be in the dump:\n{text}"
+            );
+            assert_eq!(g, "people");
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
+        };
+        let published = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+        assert_eq!(published.0, new_uuid);
+
+        // Retire folded + deleted the L0 level: no level stack, no L0 file.
+        let writer = graphs.writer("people").unwrap();
+        assert_eq!(writer.l0_len(), 0, "L0 stack cleared by retire");
+        assert_eq!(l0_count(&wal_dir), 0, "L0 file deleted by retire");
+        assert!(!root.join("people").join(".consolidate.cypher").exists());
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -40,20 +40,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
-use graph_format::ids::Generation as GenId;
-use slater_delta::{replay_dir, Memtable, OpResolution, Seq, WalOp, WalRecord, WalSink};
+use graph_format::ids::{Generation as GenId, Value};
+use slater_delta::{
+    replay_dir, DeltaSnapshot, L0Segment, Memtable, OpResolution, Seq, WalOp, WalRecord, WalSink,
+};
 
 /// A frozen delta handed to consolidation: an immutable snapshot of every
-/// committed write, plus the WAL segments those writes live in. The snapshot feeds
-/// the merged-view dump; the segments are deleted by [`DeltaWriter::retire`] once
-/// the fresh generation is published (see Phase 1d in `docs/WRITABLE-PROGRESS.md`).
+/// committed write (the active memtable **and** every sealed L0 level), plus the
+/// on-disk segments those writes live in. The snapshot feeds the merged-view dump;
+/// the segments are deleted by [`DeltaWriter::retire`] once the fresh generation is
+/// published (see Phase 1d / 4c in `docs/WRITABLE-PROGRESS.md`).
 pub struct Frozen {
-    /// The memtable snapshot at freeze time — the delta the dump folds into the core.
+    /// The active memtable at freeze time — the newest delta level the dump folds in.
     pub snapshot: Arc<Memtable>,
-    /// Every committed WAL segment that the snapshot represents. `retire` removes
+    /// The sealed L0 levels at freeze time, **newest first** — the dump folds these
+    /// beneath the active memtable via [`DeltaSnapshot::with_levels`].
+    pub l0: Vec<Arc<Memtable>>,
+    /// Every committed WAL segment the frozen delta represents. `retire` removes
     /// exactly these; any segment opened after the freeze (post-freeze writes) is
     /// left untouched.
     pub consumed: Vec<PathBuf>,
+    /// The L0 segment files the frozen delta represents — folded into the new core by
+    /// the consolidation, so `retire` deletes exactly these once the swap is live.
+    pub consumed_l0: Vec<PathBuf>,
 }
 
 /// Serialised writer state — reached only under the `Mutex`, never by readers.
@@ -61,8 +70,12 @@ struct WriterInner {
     dir: PathBuf,
     /// The segment currently open for appends.
     sink: WalSink,
-    /// The authoritative memtable; the published snapshot is a clone of it.
+    /// The authoritative active memtable; the published snapshot's newest level is a
+    /// clone of it.
     mem: Memtable,
+    /// The sealed L0 segments beneath the active memtable, **newest first** (empty on
+    /// the common no-flush path). Each flush prepends one; consolidation clears them.
+    l0: Vec<L0Segment>,
     /// The last sequence number assigned (0 before the first write).
     seq: Seq,
 }
@@ -76,8 +89,11 @@ pub struct DeltaWriter {
     core_uuid: RwLock<GenId>,
     /// Single-writer serialisation of every mutation.
     inner: Mutex<WriterInner>,
-    /// The published immutable read snapshot (readers clone the `Arc`).
-    snapshot: RwLock<Arc<Memtable>>,
+    /// The published immutable read snapshot: the active memtable **and** the sealed L0
+    /// levels, folded atomically (readers clone the whole [`DeltaSnapshot`], so a flush
+    /// that moves data from the memtable into a new L0 level can never split a read's
+    /// view — see [`Self::republish`]).
+    published: RwLock<DeltaSnapshot>,
     /// Bumps on every published change; folded into the result-cache key so an
     /// overlaid result is invalidated by the next write (see `server::result_key`).
     epoch: AtomicU64,
@@ -99,21 +115,42 @@ impl DeltaWriter {
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+
+        // Reload the sealed L0 segments first (Phase 4c). They stack past the core: the
+        // active memtable resumes past every level's synthetic id space, so a WAL-tail
+        // born node never collides with an already-flushed one. `l0` ends **newest
+        // first** (the read-stack order); the bases are the max over levels (= the
+        // newest level's `base + born`, since bases stack monotonically).
+        let l0_dir = dir.join("l0");
+        let mut l0: Vec<L0Segment> = Vec::new();
+        let mut node_base = core_node_count;
+        let mut edge_base = core_edge_count;
+        for (_, path) in l0_segment_paths_sorted(&l0_dir)? {
+            let seg =
+                L0Segment::open(&path).with_context(|| format!("reload L0 segment {path:?}"))?;
+            let m = seg.memtable();
+            node_base = node_base.max(m.synthetic_base() + m.born_count());
+            edge_base = edge_base.max(m.edge_synthetic_base() + m.born_edge_count());
+            l0.push(seg);
+        }
+        l0.reverse(); // ascending on disk (oldest→newest) → newest-first read order
+
+        // Replay the live WAL tail (writes since the last flush rotated the WAL) into a
+        // fresh active memtable rebased past all L0 levels. A born key that is Absent from
+        // the core is resolved against the L0 levels first (Phase 4c-B) so a re-`MERGE` of
+        // an already-flushed born node reuses its synthetic id rather than duplicating it.
+        let mut mem = Memtable::with_bases(node_base, edge_base);
         let replay = replay_dir(&dir).with_context(|| format!("replay WAL dir {dir:?}"))?;
-        // Delta-born nodes (Phase 2c) / edges (Phase 3) take synthetic dense ids
-        // starting at the core's node_count / edge_count; seed the memtable with those
-        // bases before replaying so a reopened WAL re-allocates the same ids
-        // (allocation follows replay order).
-        let mut mem = Memtable::with_bases(core_node_count, core_edge_count);
         for rec in &replay.records {
-            mem.apply(&rec.op, resolve(&rec.op));
+            let res = resolve_with_l0(&rec.op, resolve(&rec.op), &l0);
+            mem.apply(&rec.op, res);
         }
 
         let next_segment = next_segment_number(&dir)?;
         let sink = WalSink::create(&dir, next_segment)
             .with_context(|| format!("open WAL segment {next_segment} under {dir:?}"))?;
 
-        let snapshot = Arc::new(mem.clone());
+        let published = published_snapshot(&mem, &l0);
         Ok(Self {
             graph: graph.to_string(),
             core_uuid: RwLock::new(core_uuid),
@@ -121,9 +158,10 @@ impl DeltaWriter {
                 dir,
                 sink,
                 mem,
+                l0,
                 seq: replay.last_seq,
             }),
-            snapshot: RwLock::new(snapshot),
+            published: RwLock::new(published),
             epoch: AtomicU64::new(1),
         })
     }
@@ -139,10 +177,49 @@ impl DeltaWriter {
         *self.core_uuid.read().expect("delta core-uuid lock")
     }
 
-    /// A consistent immutable snapshot of the memtable — one `Arc` clone, no writer
-    /// contention. A query pins this for its whole life.
+    /// A consistent immutable snapshot of the **active memtable** — one `Arc` clone, no
+    /// writer contention. Used by the writer's single-memtable diagnostics and tests; a
+    /// read overlay wants [`Self::delta_snapshot`] (which also carries the L0 levels).
     pub fn snapshot(&self) -> Arc<Memtable> {
-        self.snapshot.read().expect("delta snapshot lock").clone()
+        self.published
+            .read()
+            .expect("delta snapshot lock")
+            .active_memtable()
+            .clone()
+    }
+
+    /// The full published delta — the active memtable **and** every sealed L0 level,
+    /// folded atomically. A query pins this for its whole life; the read overlay
+    /// (`server::delta_for_read`) builds its `MergedView` from it.
+    pub fn delta_snapshot(&self) -> DeltaSnapshot {
+        self.published.read().expect("delta snapshot lock").clone()
+    }
+
+    /// The synthetic dense id of a delta-born node with this business identity that is
+    /// resident in a **sealed L0 level** — the write path's Phase 4c-B born-resolution
+    /// hook. A re-`MERGE` of a node already flushed to L0 must reuse this id rather than
+    /// allocate a duplicate; the active memtable resolves its own born nodes through
+    /// [`Memtable::upsert_node`] idempotency, so only the L0 levels are consulted here.
+    pub fn born_synthetic_for_identity(
+        &self,
+        label: &str,
+        key: &str,
+        value: &Value,
+    ) -> Option<u64> {
+        self.published
+            .read()
+            .expect("delta snapshot lock")
+            .l0_levels()
+            .iter()
+            .find_map(|m| m.born_synthetic_for_identity(label, key, value))
+    }
+
+    /// Publish `mem ⊕ l0` as one atomic [`DeltaSnapshot`], so a lock-free reader never
+    /// observes a half-applied flush (data in neither or both of the memtable and a new
+    /// L0 level). Called under the writer lock after every state change.
+    fn republish(&self, inner: &WriterInner) {
+        let published = published_snapshot(&inner.mem, &inner.l0);
+        *self.published.write().expect("delta snapshot lock") = published;
     }
 
     /// The current delta epoch (monotonic; bumps on every published write).
@@ -163,11 +240,10 @@ impl DeltaWriter {
         inner.sink.commit(seq).context("commit WAL batch")?;
         inner.seq = seq;
         inner.mem.apply(&rec.op, resolved);
-        // Publish an immutable clone, then bump the epoch so readers keying on it
-        // see the new state (publish-before-bump: an observer that reads the higher
-        // epoch is guaranteed to also see the swapped-in snapshot).
-        let published = Arc::new(inner.mem.clone());
-        *self.snapshot.write().expect("delta snapshot lock") = published;
+        // Publish the new delta (active memtable ⊕ unchanged L0 levels), then bump the
+        // epoch so readers keying on it see the new state (publish-before-bump: an
+        // observer that reads the higher epoch also sees the swapped-in snapshot).
+        self.republish(&inner);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(seq)
     }
@@ -188,18 +264,80 @@ impl DeltaWriter {
     /// is Phase 4 admission control.
     pub fn freeze(&self) -> Result<Frozen> {
         let mut inner = self.inner.lock().expect("delta writer lock");
-        // Everything committed so far — including the segment about to be sealed —
-        // is represented by the current published snapshot. Capture the paths before
-        // opening the fresh segment so the fresh one is never in the consumed set.
+        // Everything committed so far — the active memtable, the sealed L0 levels, and
+        // the WAL segment about to be sealed — is the frozen delta. Capture the paths
+        // before opening the fresh segment so the fresh one is never in the consumed set.
         let consumed = wal_segment_paths(&inner.dir)?;
+        let consumed_l0: Vec<PathBuf> = inner.l0.iter().map(|s| s.path().to_path_buf()).collect();
         let next = next_segment_number(&inner.dir)?;
         let fresh = WalSink::create(&inner.dir, next).with_context(|| {
             format!("open post-freeze WAL segment {next} under {:?}", inner.dir)
         })?;
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at freeze")?;
-        let snapshot = self.snapshot.read().expect("delta snapshot lock").clone();
-        Ok(Frozen { snapshot, consumed })
+        let snapshot = Arc::new(inner.mem.clone());
+        let l0: Vec<Arc<Memtable>> = inner.l0.iter().map(|s| s.memtable().clone()).collect();
+        Ok(Frozen {
+            snapshot,
+            l0,
+            consumed,
+            consumed_l0,
+        })
+    }
+
+    /// Flush the active memtable to a new immutable **L0 segment** on disk, bounding
+    /// resident delta size without a full core rebuild (Phase 4c-B). A no-op (returns
+    /// `false`) when the memtable is empty.
+    ///
+    /// Under the writer lock: seal the memtable to `<wal_dir>/l0/<n>.l0` (fsync-durable),
+    /// prepend it to the L0 read stack, reset the active memtable **rebased past every
+    /// level** (both the node and edge synthetic id spaces), seal + rotate the WAL, and
+    /// delete the pre-flush WAL segments (their writes now live in the durable L0 file).
+    /// The new levels are published atomically, so a concurrent reader never sees the
+    /// flushed data in neither or both of the memtable and the new L0 level.
+    pub fn flush_to_l0(&self) -> Result<bool> {
+        let mut inner = self.inner.lock().expect("delta writer lock");
+        if inner.mem.is_empty() {
+            return Ok(false);
+        }
+
+        // 1. Seal the active memtable to a fresh, content-checked L0 file (fsync-durable).
+        let l0_dir = inner.dir.join("l0");
+        std::fs::create_dir_all(&l0_dir)
+            .with_context(|| format!("create L0 directory {l0_dir:?}"))?;
+        let n = next_l0_number(&l0_dir)?;
+        let path = l0_dir.join(format!("{n:010}.l0"));
+        L0Segment::write(&inner.mem, &path)
+            .with_context(|| format!("write L0 segment {path:?}"))?;
+        let seg = L0Segment::open(&path).with_context(|| format!("reopen L0 segment {path:?}"))?;
+
+        // 2. Rebase the active memtable past every level (the flushed one is the newest
+        //    L0, so the next born id starts at its base + its born count).
+        let node_base = inner.mem.synthetic_base() + inner.mem.born_count();
+        let edge_base = inner.mem.edge_synthetic_base() + inner.mem.born_edge_count();
+
+        // 3. Rotate the WAL: the flushed writes now live in the L0 file, so seal the
+        //    current segment and open a fresh one before deleting the consumed segments.
+        let consumed = wal_segment_paths(&inner.dir)?;
+        let next = next_segment_number(&inner.dir)?;
+        let fresh = WalSink::create(&inner.dir, next)
+            .with_context(|| format!("open post-flush WAL segment {next} under {:?}", inner.dir))?;
+        let old = std::mem::replace(&mut inner.sink, fresh);
+        old.seal().context("seal WAL segment at flush")?;
+
+        inner.mem = Memtable::with_bases(node_base, edge_base);
+        inner.l0.insert(0, seg); // newest-first
+
+        // 4. The flushed writes are durable in the L0 file (fsynced above), so the
+        //    pre-flush WAL segments can go.
+        for p in &consumed {
+            remove_if_present(p)?;
+        }
+
+        // 5. Publish the reset memtable + grown L0 stack atomically.
+        self.republish(&inner);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
     }
 
     /// Complete a consolidation: delete the `consumed` (pre-freeze) WAL segments —
@@ -231,29 +369,33 @@ impl DeltaWriter {
     pub fn retire(
         &self,
         consumed: &[PathBuf],
+        consumed_l0: &[PathBuf],
         new_core_uuid: GenId,
         new_core_node_count: u64,
         new_core_edge_count: u64,
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("delta writer lock");
-        // The consumed set's writes are now in the new core — drop those segments. The
-        // currently-open (post-freeze) segment is never in `consumed` (freeze rotated to
-        // it), so it survives and keeps taking appends after this rebuild.
+        // The consumed WAL segments' + L0 levels' writes are now in the new core — drop
+        // them. The currently-open (post-freeze) WAL segment is never in `consumed`
+        // (freeze rotated to it), so it survives and keeps taking appends after this
+        // rebuild. Every L0 level present at freeze was folded into the new core, so the
+        // whole stack retires; 4c-B does not admit a flush during a consolidation (that
+        // in-flight guard is 4d), so the stack at retire is exactly `consumed_l0`.
         for path in consumed {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("remove consumed WAL segment {path:?}"))
-                }
-            }
+            remove_if_present(path)?;
         }
+        for path in consumed_l0 {
+            remove_if_present(path)?;
+        }
+        inner.l0.clear();
 
-        // Rebuild the live memtable from the surviving (post-freeze) segments, each write
-        // re-resolved against the new core. Re-base the synthetic id spaces on the freshly
-        // built core: its node/edge counts now include the folded-in delta-born entities,
-        // so a post-freeze born id starts past them.
+        // Rebuild the live memtable from the surviving (post-freeze) WAL segments, each
+        // write re-resolved against the new core. Re-base the synthetic id spaces on the
+        // freshly built core: its node/edge counts now include the folded-in delta-born
+        // entities (including any that were flushed to an L0 level), so a post-freeze
+        // born id starts past them and a post-freeze re-write of a folded born key
+        // re-resolves to its now-real dense id.
         let mut mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
         let replay = replay_dir(&inner.dir)
             .with_context(|| format!("replay post-freeze WAL dir {:?}", inner.dir))?;
@@ -263,9 +405,10 @@ impl DeltaWriter {
         inner.seq = replay.last_seq;
         inner.mem = mem;
 
-        // Publish the rebuilt overlay first, then re-bind the core UUID (see the ordering
-        // note above). The seq counter stays monotonic from the replayed high-water mark.
-        *self.snapshot.write().expect("delta snapshot lock") = Arc::new(inner.mem.clone());
+        // Publish the rebuilt overlay first (no L0 now), then re-bind the core UUID (see
+        // the ordering note above). The seq counter stays monotonic from the replayed
+        // high-water mark.
+        self.republish(&inner);
         *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -276,9 +419,22 @@ impl DeltaWriter {
         self.snapshot().node_delta_count()
     }
 
-    /// Approximate resident memtable size in bytes (diagnostics / budget checks).
+    /// Approximate resident **active-memtable** size in bytes — checked against the
+    /// memtable→L0 flush cap (a full memtable flushes; the L0 levels don't count here).
     pub fn bytes(&self) -> usize {
         self.inner.lock().expect("delta writer lock").mem.bytes()
+    }
+
+    /// Approximate resident size of the **whole** delta (active memtable + every L0
+    /// level) — checked against the total-delta soft/hard caps (Phase 4d).
+    pub fn total_bytes(&self) -> usize {
+        let inner = self.inner.lock().expect("delta writer lock");
+        inner.mem.bytes() + inner.l0.iter().map(|s| s.memtable().bytes()).sum::<usize>()
+    }
+
+    /// The number of sealed L0 levels currently overlaid (diagnostics / tests).
+    pub fn l0_len(&self) -> usize {
+        self.inner.lock().expect("delta writer lock").l0.len()
     }
 
     /// The directory holding this graph's WAL segments.
@@ -331,6 +487,82 @@ fn next_segment_number(dir: &Path) -> Result<u64> {
     }
     Ok(match max {
         Some(m) => m + 1,
+        None => 0,
+    })
+}
+
+/// Build the atomic published [`DeltaSnapshot`] from the active memtable and the L0
+/// stack (newest-first): clone the memtable into a fresh level and gather the L0
+/// segments' immutable memtable handles.
+fn published_snapshot(mem: &Memtable, l0: &[L0Segment]) -> DeltaSnapshot {
+    let mem = Arc::new(mem.clone());
+    let levels: Vec<Arc<Memtable>> = l0.iter().map(|s| s.memtable().clone()).collect();
+    DeltaSnapshot::with_levels(mem, levels)
+}
+
+/// Refine a base (core-only) resolution against the sealed L0 levels: a node/endpoint
+/// key that the core reports Absent (`None`) but that is a **delta-born** node resident
+/// in an L0 level resolves to that born node's existing synthetic id, so a re-`MERGE`
+/// on the WAL-tail replay path reuses it rather than allocating a duplicate (Phase
+/// 4c-B). Mirrors the live write path's `DeltaWriter::born_synthetic_for_identity`.
+fn resolve_with_l0(op: &WalOp, base: OpResolution, l0: &[L0Segment]) -> OpResolution {
+    let born = |(label, key, value): (&str, &str, &Value)| {
+        l0.iter()
+            .find_map(|s| s.memtable().born_synthetic_for_identity(label, key, value))
+    };
+    match base {
+        OpResolution::Node(None) => OpResolution::Node(op.node_key().and_then(born)),
+        OpResolution::Edge { src, dst } => {
+            let (s_key, _reltype, d_key) = op.edge_keys().expect("edge op has edge keys");
+            OpResolution::Edge {
+                src: src.or_else(|| born(s_key)),
+                dst: dst.or_else(|| born(d_key)),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Remove `path`, tolerating an already-absent file (idempotent cleanup).
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove file {path:?}")),
+    }
+}
+
+/// Every `*.l0` segment under `l0_dir` as `(number, path)`, **sorted ascending** by
+/// number (oldest→newest). A missing directory yields an empty list.
+fn l0_segment_paths_sorted(l0_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let rd = match std::fs::read_dir(l0_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("list L0 dir {l0_dir:?}")),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("l0") {
+            continue;
+        }
+        if let Some(n) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            out.push((n, path));
+        }
+    }
+    out.sort_by_key(|(n, _)| *n);
+    Ok(out)
+}
+
+/// The next unused L0 segment number under `l0_dir`: one past the highest, or 0 when
+/// none exist. Monotonic across the writer's life so an L0 file is never overwritten.
+fn next_l0_number(l0_dir: &Path) -> Result<u64> {
+    Ok(match l0_segment_paths_sorted(l0_dir)?.last() {
+        Some((n, _)) => n + 1,
         None => 0,
     })
 }
@@ -506,8 +738,15 @@ mod tests {
         // Retire against the new core: consumed segments gone, overlay empty, rebind.
         // No post-freeze write here, so the replayed post-freeze segment is empty and the
         // rebuilt overlay is empty.
-        w.retire(&frozen.consumed, new_core, 100, 0, resolve_ticker)
-            .unwrap();
+        w.retire(
+            &frozen.consumed,
+            &frozen.consumed_l0,
+            new_core,
+            100,
+            0,
+            resolve_ticker,
+        )
+        .unwrap();
         for p in &frozen.consumed {
             assert!(!p.exists(), "retire deletes the consumed segment: {p:?}");
         }
@@ -569,8 +808,15 @@ mod tests {
                 _ => None,
             })
         };
-        w.retire(&frozen.consumed, new_core, 100, 0, resolve_new)
-            .unwrap();
+        w.retire(
+            &frozen.consumed,
+            &frozen.consumed_l0,
+            new_core,
+            100,
+            0,
+            resolve_new,
+        )
+        .unwrap();
 
         // A's patch now lives in the new core (gone from the delta); B was carried
         // forward and re-resolved onto its new dense id.
@@ -656,8 +902,15 @@ mod tests {
                 _ => None,
             })
         };
-        w.retire(&frozen.consumed, new_core, 101, 0, resolve_new)
-            .unwrap();
+        w.retire(
+            &frozen.consumed,
+            &frozen.consumed_l0,
+            new_core,
+            101,
+            0,
+            resolve_new,
+        )
+        .unwrap();
 
         let snap = w.snapshot();
         assert_eq!(snap.node_delta_count(), 1);
@@ -709,6 +962,134 @@ mod tests {
                 .get("price"),
             Some(&Value::Int(7)),
             "a frozen-but-not-retired write survives a reopen"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_to_l0_seals_memtable_and_reopen_reloads_l0() {
+        let dir = tmp("flush_reload");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(30));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // Empty flush is a no-op.
+        assert!(!w.flush_to_l0().unwrap(), "nothing to flush");
+        assert_eq!(w.l0_len(), 0);
+
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(11))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        assert!(
+            !w.snapshot().is_empty(),
+            "write lands in the active memtable"
+        );
+
+        // Flush spills the memtable to an L0 level and resets the active memtable empty.
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 1);
+        assert!(
+            w.snapshot().is_empty(),
+            "active memtable freed by the flush"
+        );
+        assert!(
+            w.snapshot().node_patch(10).is_none(),
+            "the write no longer lives in the active memtable"
+        );
+        // …but the full delta still overlays it (from the L0 level).
+        assert_eq!(
+            w.delta_snapshot()
+                .node_patch(10)
+                .unwrap()
+                .patches
+                .get("price"),
+            Some(&Value::Int(11)),
+            "the flushed write reads back through the L0 level"
+        );
+
+        // A reopen reloads the L0 segment before replaying the (now-empty) WAL tail.
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        assert_eq!(w2.l0_len(), 1, "reopen reloads the L0 segment");
+        assert_eq!(
+            w2.delta_snapshot()
+                .node_patch(10)
+                .unwrap()
+                .patches
+                .get("price"),
+            Some(&Value::Int(11)),
+            "the flushed write survives a reopen via the L0 file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remerge_of_a_flushed_born_node_reuses_its_synthetic_id() {
+        // Phase 4c-B write-path born resolution: a MERGE-born node flushed to an L0
+        // level, re-MERGE'd afterwards, must reuse its synthetic id — not duplicate.
+        let dir = tmp("flush_born_reuse");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(31));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // MERGE-create born node C (absent from the core → synthetic id 100).
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C".into()),
+                &[("price", Value::Int(7))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 1);
+        assert_eq!(w.delta_snapshot().born_count(), 1);
+
+        // The writer resolves the flushed born key to its existing synthetic id — this is
+        // exactly what `execute_write`'s MERGE-Absent branch consults.
+        let reused = w.born_synthetic_for_identity("Company", "ticker", &Value::Str("C".into()));
+        assert_eq!(reused, Some(100), "re-MERGE resolves to the L0 born id");
+
+        // Re-MERGE with that resolution → patches the existing born node, no duplicate.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C".into()),
+                &[("price", Value::Int(9))],
+            ),
+            OpResolution::Node(reused),
+        )
+        .unwrap();
+        let snap = w.delta_snapshot();
+        assert_eq!(snap.born_count(), 1, "no duplicate born node allocated");
+        assert_eq!(
+            snap.node_patch(100).unwrap().patches.get("price"),
+            Some(&Value::Int(9)),
+            "the newer patch wins over the flushed value"
+        );
+
+        // A reopen reproduces the resolution: the WAL-tail re-MERGE re-resolves against
+        // the reloaded L0 level, so the born id stays 100 (no duplicate on replay).
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let snap2 = w2.delta_snapshot();
+        assert_eq!(
+            snap2.born_count(),
+            1,
+            "reopen does not duplicate the born node"
+        );
+        assert_eq!(
+            snap2.node_patch(100).unwrap().patches.get("price"),
+            Some(&Value::Int(9)),
+            "the re-MERGE patch survives a reopen"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
