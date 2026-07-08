@@ -427,10 +427,44 @@ Running ledger for the `writeable` track. Pairs with the design in
     round-trips every read over a memtable exercising core-patch + born node + tombstone + born
     edge + core-edge-tombstone; empty round-trip; segment write→open; magic/checksum rejection.
     42 slater-delta tests green; clippy+fmt clean; slater unaffected (no wiring yet).
-  - **4c — multi-level read merge + memtable→L0 flush** (next): `DeltaSnapshot` folds
-    `mem ⊕ L0*` (newest-wins) behind the empty fast path; `DeltaWriter::flush_to_l0` seals the
-    memtable to an `L0Segment`, rebases the active memtable past all levels, and rotates the
-    WAL; `open` reloads existing L0 files; consolidation/retire fold+retire the L0 layers.
+  - **4c-A — multi-level read merge in `DeltaSnapshot`. ✅ DONE** (this commit; pure
+    `slater-delta`). `DeltaSnapshot` grows from a single `Arc<Memtable>` to
+    `{ mem: Arc<Memtable>, l0: Vec<Arc<Memtable>> }` (sealed segments newest-first) and folds
+    every read accessor across levels with last-writer-wins precedence `mem ⊕ newer-L0 ⊕
+    older-L0`, behind the preserved empty fast path (`is_empty` = mem empty **and** every L0
+    empty; the common no-flush path leaves `l0` an empty vector so it stays a single check).
+    Two private level iterators (`levels_newest_first`/`levels_oldest_first`) drive the fold:
+    **`node_patch`** now returns an **owned** merged `NodeDelta` — a core dense id's patches
+    split across levels merge per-property newest-wins, a tombstone clears+deletes and a newer
+    upsert resurrects (LSM tombstone semantics); a synthetic id lives in one level so its entry
+    passes through (single-level fast path just clones the sole memtable's entry). The two exec
+    call sites (`node_prop_par` @590, `overlay_node_props` @1642) already `if let Some(nd)`, so
+    owned needed no change. **`is_tombstoned`** folds newest-first over just the tombstone flags
+    (no patch clone — it's the hot suppression-filter path). Born-id sets (`born_ids_with_label`/
+    `born_ids_in_index_{eq,range}`) **union** oldest-first (stacked synthetic ranges stay
+    ascending, matching the core scan order); `born_count`/`born_edge_count`/`node_delta_count`
+    **sum**; `synthetic_base`/`edge_synthetic_base` are the **min** (= core count);
+    `node_identity_by_dense` takes the newest level touching the id. **`out_edges`/`in_edges`**
+    (new `merge_edges`) dedup by `(reltype, neighbour)` newest-wins, so a born edge flushed to
+    L0 and later deleted surfaces once tombstoned (the traversal overlay then suppresses it —
+    no double-count/resurrect); output order is deterministic. New constructor
+    `DeltaSnapshot::with_levels(mem, l0)` for 4c-B to publish flushed segments;
+    `from_memtable`/`empty` keep `l0` empty. 8 new tests (`memtable.rs`) stacking two memtables
+    directly (no flush needed): per-property merge, delete-newest-wins, re-MERGE-shadows-older-
+    tombstone, born-id/born-index union across levels, edge LWW merge, is-empty fold, single-
+    level parity. Whole workspace green (50 slater-delta + 569 slater); clippy+fmt clean;
+    empty-delta bench: no change on every arm.
+  - **4c-B — memtable→L0 flush + write-path born resolution + wiring** (next):
+    `DeltaWriter::flush_to_l0` seals the memtable to an `L0Segment` under `<wal_dir>/<graph>/l0/`,
+    pushes its reload (as `Arc<Memtable>`) onto the published L0 list via `with_levels`, rebases
+    the active memtable past all levels (node **and** edge bases), and seals+rotates the WAL
+    (record + retire the consumed segments once the L0 file is fsynced); `open` reloads existing
+    L0 files (sorted) before replaying the live WAL tail; consolidation/`retire` fold+delete the
+    L0 layers. **Plus the write-path born-resolution** (the 4c design crux part 2): a re-`MERGE`
+    of a born node/edge now resident in an L0 level must resolve to its **existing** synthetic id,
+    not duplicate — `execute_write`/`execute_edge_write`'s core-`Absent` branch consults the
+    writer's L0 levels (new `Memtable::born_synthetic_for_identity` + a `DeltaWriter` helper) and
+    writes `resolved = Some(l0_synthetic_id)` on a hit.
   - **4d — admission/backpressure + auto soft-cap consolidation**: `memtableBytes` = flush
     cap, new `deltaBytes` soft / `deltaHardBytes` hard caps; async trigger reusing
     `execute_consolidate`; per-writer in-flight guard.
@@ -460,18 +494,21 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **not** pushed to origin (local ahead of
-`origin/writeable` by three commits). Latest commits:
+**Resume state:** on branch `writeable`, **not** pushed to origin. Latest commits:
+- `cc365b3` feat(delta): multi-level read merge in DeltaSnapshot (Phase 4c-A)
+- `12083c4` docs(delta): add explicit resume-state (commits + next task) to the ledger
 - `f04298e` docs(delta): record the Phase 4c born-across-levels design decision
 - `fcac9fb` feat(delta): L0 delta-segment format + reader (Phase 4b)
 - `04806bd` feat(delta): carry post-freeze writes onto the new core (Phase 4a)
 
-Phases **4a + 4b are DONE**, all gates green (`cargo test -p slater -p slater-delta` = 569 + 42;
-`cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]` real-builder e2e). The
-**next task is Phase 4c-A** (multi-level read merge in `DeltaSnapshot`). Approved plan file:
-`~/.claude/plans/wise-wobbling-puppy.md`. Export
+Phases **4a + 4b + 4c-A are DONE**, all gates green (`cargo test -p slater -p slater-delta` =
+569 + 50; `cargo test --workspace`; clippy `-D warnings`; fmt; the `#[ignore]` real-builder e2e;
+empty-delta bench no-change on every arm). The **next task is Phase 4c-B** (memtable→L0 flush +
+write-path born resolution + wiring — see the 4c-B bullet in Phase status and the design crux
+below). Approved plan file: `~/.claude/plans/wise-wobbling-puppy.md`. Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
-before building.
+before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
+the only cost).
 
 **Phase 4b is complete**: the L0 delta-segment format lands in `slater-delta`.
 `Memtable::{serialise,deserialise}` round-trip the whole folded delta (interner names, all
