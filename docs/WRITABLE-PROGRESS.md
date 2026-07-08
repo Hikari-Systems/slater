@@ -469,8 +469,37 @@ checked on open), reloading as an immutable `Arc<Memtable>` that answers the ful
 resident (bounded by the delta byte budget); the off-heap `pread` variant is a deferred RSS
 refinement (see the Phase-4 ledger note). No `slater` wiring yet.
 
-The recommended next step is **Phase 4c — multi-level read merge + memtable→L0 flush** (plan in
-`~/.claude/plans/wise-wobbling-puppy.md`):
+**Phase 4c design crux — delta-born entities spanning L0 levels (decided: full-flush +
+level-aware everything).** With full-flush (the approved plan: reset the active memtable
+rebased past all levels), a delta-born node/edge created before a flush lives in an L0 level,
+while later writes land in the active memtable — so born entities span levels. Two consequences
+must both be handled or born identity breaks:
+1. **Read merge** — `born_ids_with_label` / `born_ids_in_index_*` / `node_identity_by_dense`
+   (born) / `born_count` / `born_edge_count` **union across all levels** (born id ranges are
+   disjoint — each level keeps its own stacked `synthetic_base`); `synthetic_base`/
+   `edge_synthetic_base` = **min** across levels (= core count). `node_patch`/`is_tombstoned`
+   for a **core** dense id **merge per-property newest-wins** across levels (a core node's
+   patches split across levels; a tombstone in an older level is shadowed by a newer re-`MERGE`
+   — LSM tombstone semantics), so `DeltaSnapshot::node_patch` returns an **owned** merged
+   `NodeDelta` (callers `exec.rs:590,1642` use `if let Some(nd)`, owned works). `out_edges`/
+   `in_edges` union across levels. `node_delta_count` sum (over-estimate ok). `is_empty` = all
+   levels empty (keeps the zero-cost fast path).
+2. **Write-path born resolution (4c-B)** — a re-`MERGE` of a born node/edge now flushed to an L0
+   level must resolve to its **existing** synthetic id, not allocate a duplicate. `execute_write`/
+   `execute_edge_write`'s core-`Absent` branch must consult the writer's L0 levels
+   (new `Memtable::born_synthetic_for_identity` + a `DeltaWriter` helper) and, on a hit, write
+   `resolved = Some(l0_synthetic_id)` (the active memtable then patches by that dense id; reads
+   merge it with the L0 level's born delta). A born node whose **indexed** property is patched in
+   a newer level than where it was born is **not** relocated in the index — the same class as the
+   already-deferred 2d "moved indexed value" limitation; the value read back is still correct.
+Alternative considered and rejected: *partial-flush* (only core-keyed deltas spill to L0, born
+entities stay resident until consolidation) — avoids the write-path change entirely, but degrades
+to no-L0 behaviour for insert-heavy workloads (born RAM then bounded only by the consolidation
+cap), so it does not serve the "sustained write volume" goal the user chose L0 for.
+
+The recommended next step is **Phase 4c-A — multi-level read merge in `DeltaSnapshot`** (pure
+`slater-delta`, testable by stacking 2–3 memtables directly, no flush needed), then **4c-B —
+flush + write-path born resolution + wiring**. Plan in `~/.claude/plans/wise-wobbling-puppy.md`:
 - `crates/slater-delta/src/memtable.rs` — grow `DeltaSnapshot` from a single `Arc<Memtable>`
   to `{ mem: Arc<Memtable>, l0: Vec<Arc<Memtable>> }` (or `Vec<Arc<L0Segment>>`), newest-first.
   Every read accessor folds across levels with LWW precedence `mem ⊕ newer-L0 ⊕ older-L0` (first
