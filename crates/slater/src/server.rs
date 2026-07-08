@@ -4252,6 +4252,111 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Follow-up from 2d ("moved indexed value"): a *core* node whose property patch
+    /// changes an INDEXED value is relocated in the range index. `write_indexed_people`
+    /// carries a (Person, name) RANGE index; patching Alice's `name` to 'Alicia' must
+    /// move her — an equality seek finds her at the NEW value and misses her at the OLD
+    /// one, and a range seek relocates her likewise. (The value read back was already
+    /// correct via the property overlay; this closes the index-*membership* gap.)
+    /// Durable across a writer reopen.
+    #[test]
+    fn moved_indexed_value_relocates_a_patched_core_node() {
+        let (root, _g) = testgen::write_indexed_people("moved_index_2d");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let names = |w: &Arc<DeltaWriter>, q: &str| -> Vec<String> {
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse(q).unwrap())
+                .unwrap();
+            let mut out: Vec<String> = res
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("name not str: {v:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+
+        // Baseline: Alice at her core value; nothing at 'Alicia'; a `>= 'Alicia'` range
+        // excludes her (Alice < Alicia < Bob, Carol).
+        assert_eq!(
+            names(&writer, "MATCH (n:Person {name:'Alice'}) RETURN n.name"),
+            vec!["Alice"]
+        );
+        assert!(names(&writer, "MATCH (n:Person {name:'Alicia'}) RETURN n.name").is_empty());
+        assert_eq!(
+            names(
+                &writer,
+                "MATCH (n:Person) WHERE n.name >= 'Alicia' RETURN n.name"
+            ),
+            vec!["Bob", "Carol"]
+        );
+
+        // Patch the indexed value: Alice → 'Alicia'.
+        let stmt =
+            match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.name = 'Alicia'")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write"),
+            };
+        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        // Equality seek: found at the NEW value (moved in), missed at the OLD one (moved
+        // out). The "moved in" is the load-bearing case — the relocated node is absent
+        // from the core ISAM at 'Alicia', so without the overlay it is never a candidate.
+        assert_eq!(
+            names(&writer, "MATCH (n:Person {name:'Alicia'}) RETURN n.name"),
+            vec!["Alicia"],
+            "equality seek at the new indexed value finds the relocated node"
+        );
+        assert!(
+            names(&writer, "MATCH (n:Person {name:'Alice'}) RETURN n.name").is_empty(),
+            "equality seek at the old indexed value no longer finds it"
+        );
+        // Range seek relocates her into `[>= 'Alicia']`.
+        assert_eq!(
+            names(
+                &writer,
+                "MATCH (n:Person) WHERE n.name >= 'Alicia' RETURN n.name"
+            ),
+            vec!["Alicia", "Bob", "Carol"],
+            "range seek unions the relocated core node into the hits"
+        );
+
+        // Durable across a reopen (WAL replay re-applies the patch onto the same dense id).
+        drop(writer);
+        let reopened = Arc::new(
+            DeltaWriter::open(
+                wal.join("people"),
+                "people",
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                |op| resolve_op(&gen, op),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            names(&reopened, "MATCH (n:Person {name:'Alicia'}) RETURN n.name"),
+            vec!["Alicia"],
+            "relocation is durable across a reopen"
+        );
+        assert!(names(&reopened, "MATCH (n:Person {name:'Alice'}) RETURN n.name").is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 3b: the traversal read overlay. A `MERGE`-created relationship is
     /// walkable (both directions), a deleted core edge no longer traverses, and an
     /// edge to a tombstoned node is suppressed (closing the 2b gap). Edges are written

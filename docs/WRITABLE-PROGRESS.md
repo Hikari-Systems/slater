@@ -671,6 +671,30 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   dropped from the dump, so the delete survives a rebuild). Whole slater (593) + slater-delta
   (53) + workspace green; clippy `-D warnings` + fmt clean.
 
+- **Moved indexed value** (deferred from 2d). ✅ DONE (this commit). A **core** node whose
+  property patch changes an **indexed** value is now relocated in the range index — a
+  `RangeEq`/`RangeRange` seek finds it at the new value and drops it at the old. (The value
+  *read back* was already corrected by the property overlay; only index *membership* was stale.)
+  The overlay lives in `slater-delta`, mirroring 2d's born-index overlay, and the `exec`
+  `scan_candidates` `RangeEq`/`RangeRange` arms just call it: **drop** a core ISAM hit whose
+  patched value moved out of the predicate (`DeltaSnapshot::core_hit_survives_{eq,range}`), then
+  **add** core nodes whose patched value moved in (`moved_core_ids_in_index_{eq,range}`, inserted
+  in sorted position so the ascending scan order holds), before appending born ids. The **add**
+  is the load-bearing case — a relocated node is absent from the core ISAM at its new value, so
+  without the overlay it is never a candidate and a residual filter never sees it; the **drop** is
+  defence-in-depth (a residual re-filter usually masks a stale hit, but a covering/count-cover
+  scan has none — those are gated off with a live delta anyway). Membership uses the **merged**
+  (newest-wins across levels) patched value via `node_patch`, so a node patched across L0 levels
+  is judged once; candidates come from new `Memtable::core_ids_patched_on_index`. A shared
+  `value_in_range` helper is factored out (born range now uses it too). All gated behind the
+  empty-delta fast path (read-only path pays nothing). Tests: slater-delta
+  `moved_indexed_value_relocates_a_patched_core_node` +
+  `moved_indexed_value_uses_the_merged_value_across_levels` (single- and multi-level, eq + range,
+  label/prop discrimination); `server::moved_indexed_value_relocates_a_patched_core_node` (patch
+  Alice's indexed `name`→'Alicia': eq seek finds new / misses old, range relocates, reopen-durable).
+  Whole slater (594) + slater-delta (55) + workspace green; clippy `-D warnings` + fmt clean;
+  empty-delta read path untouched by construction (overlay is inside the `!is_empty` guard).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -698,15 +722,15 @@ follow-ups** are now being closed one small commit at a time (see the "Deferred 
 - `8c0f49b` feat(delta): in-flight guard + auto flush/compaction on the write path (Phase 4d-ii-a)
 
 **No blocking next task.** Both the Phase 0–5 delta track and the `slater dump` workstream are
-complete; all gates green (`cargo test -p slater -p slater-delta` = 593 + 53; `cargo test --workspace`;
+complete; all gates green (`cargo test -p slater -p slater-delta` = 594 + 55; `cargo test --workspace`;
 clippy `-D warnings` incl. `--features testkit`; fmt; the `#[ignore]` real-builder e2es incl. the new
 `dump_roundtrip`). If continuing, confirm scope with the user first. Remaining work is
 optional/independent:
-- **Deferred refinements** (each cleanly scoped, none blocking): moved-indexed-value relocation;
-  edge properties; off-peak *schedule* knob for consolidation; size-tiered partial-L0 compaction
-  (needs number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
-  whole-file residency). **delete-a-born-node-by-key is now ✅ DONE** (see "Deferred follow-ups"
-  below). See the "Smaller follow-ups" list below.
+- **Deferred refinements** (each cleanly scoped, none blocking): edge properties; off-peak
+  *schedule* knob for consolidation; size-tiered partial-L0 compaction (needs
+  number-vs-stack-order reconciliation); off-heap `pread` L0 reads (bounded RSS without
+  whole-file residency). **delete-a-born-node-by-key and moved-indexed-value are now ✅ DONE**
+  (see "Deferred follow-ups" below). See the "Smaller follow-ups" list below.
 Export
 `CARGO_TARGET_DIR=/tmp/claude-1000/-home-rickk-git-hs-slater/6a6f382f-eb59-4b50-8ebb-050f63801623/scratchpad/target`
 before building (if that scratch dir is gone, any writable dir works — a fresh full compile is
@@ -777,10 +801,9 @@ Smaller follow-ups that are **not** the recommended next step but are cleanly sc
   already exist; add `SET r.p = …` to the edge grammar, an edge-property read overlay in
   `edge_prop_par`/`edge_props` (a born-or-patched edge's props), and emit them in
   consolidation (`emit_edges_from` already calls `emit_set(&eprops, …)`).
-- **moved indexed value** (deferred from 2d): relocate a patched core node in a range
-  index when its *indexed* property changes (memtable tracks the per-index value,
-  remove-old/add-new). Only index *membership* is stale today; the value read back is
-  already correct.
+- ~~**moved indexed value** (deferred from 2d)~~ ✅ DONE — see the "Deferred follow-ups
+  (post-Phase-5)" section above (`scan_candidates` drops moved-out core hits and adds
+  moved-in ones via the `slater-delta` overlay; membership uses the merged patched value).
 - ~~**delete a born node by business key** (deferred from 2c)~~ ✅ DONE — see the
   "Deferred follow-ups (post-Phase-5)" section above (`execute_write` resolves a `DELETE`
   anchor against the whole delta when the core probe returns Absent).

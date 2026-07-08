@@ -529,26 +529,36 @@ impl Memtable {
         hi: Option<&Value>,
         hi_inclusive: bool,
     ) -> Vec<u64> {
-        use std::cmp::Ordering;
         self.born_ids_in_index(label, prop, |v| {
-            let above_lo = match lo {
-                None => true,
-                Some(lo) => match v.cmp_key(lo) {
-                    Ordering::Greater => true,
-                    Ordering::Equal => lo_inclusive,
-                    Ordering::Less => false,
-                },
-            };
-            let below_hi = match hi {
-                None => true,
-                Some(hi) => match v.cmp_key(hi) {
-                    Ordering::Less => true,
-                    Ordering::Equal => hi_inclusive,
-                    Ordering::Greater => false,
-                },
-            };
-            above_lo && below_hi
+            value_in_range(v, lo, lo_inclusive, hi, hi_inclusive)
         })
+    }
+
+    /// Core dense ids (`dense < synthetic_base`) carrying `label` that carry a **patch
+    /// on the indexed property `prop`** — the candidate set for the "moved indexed
+    /// value" overlay. A core node whose indexed property is patched is still listed at
+    /// its *original* value in the core ISAM, so a range seek must reconsider these
+    /// against their patched value. Value-agnostic: the caller ([`DeltaSnapshot`]) tests
+    /// the *merged* (newest-wins) patched value, so a node patched across several levels
+    /// is judged once by its newest value. A tombstone clears the patches, so a deleted
+    /// node never appears here (and is suppressed separately anyway).
+    pub fn core_ids_patched_on_index(&self, label: &str, prop: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (&dense, ck) in &self.by_dense {
+            if dense >= self.synthetic_base {
+                continue; // a born node — handled by `born_ids_in_index_*`
+            }
+            let Some(e) = self.nodes.get(ck) else {
+                continue;
+            };
+            if self.interner.name(e.identity.label) != Some(label) {
+                continue;
+            }
+            if e.delta.patches.contains_key(prop) {
+                out.push(dense);
+            }
+        }
+        out
     }
 
     /// Resolve an edge endpoint to a dense id, **creating a delta-born node** if the
@@ -1425,6 +1435,37 @@ fn value_size(v: &Value) -> usize {
     }
 }
 
+/// Whether `v` falls in `[lo, hi]` with per-bound inclusivity (a `None` bound is
+/// unbounded on that side), by [`Value::cmp_key`] — the ISAM total order used by
+/// `graph_format::isam`'s `lookup_range`. Shared by the delta-born and moved-core
+/// range-index overlays.
+fn value_in_range(
+    v: &Value,
+    lo: Option<&Value>,
+    lo_inclusive: bool,
+    hi: Option<&Value>,
+    hi_inclusive: bool,
+) -> bool {
+    use std::cmp::Ordering;
+    let above_lo = match lo {
+        None => true,
+        Some(lo) => match v.cmp_key(lo) {
+            Ordering::Greater => true,
+            Ordering::Equal => lo_inclusive,
+            Ordering::Less => false,
+        },
+    };
+    let below_hi = match hi {
+        None => true,
+        Some(hi) => match v.cmp_key(hi) {
+            Ordering::Less => true,
+            Ordering::Equal => hi_inclusive,
+            Ordering::Greater => false,
+        },
+    };
+    above_lo && below_hi
+}
+
 /// An immutable, read-side handle over the delta layers, captured at query start.
 ///
 /// A query pins one `DeltaSnapshot` for its whole life (alongside the core `Arc`),
@@ -1699,6 +1740,96 @@ impl DeltaSnapshot {
                 m.born_ids_in_index_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)
             })
             .collect()
+    }
+
+    // ── Moved-indexed-value overlay ────────────────────────────────────────────
+    // A *core* node whose indexed property is patched keeps its **original** value in
+    // the core ISAM, so a range seek reads a stale membership: it is found at the old
+    // value and missed at the new one. These accessors relocate it — a seek drops a
+    // core hit whose patched value moved out of the predicate (`core_hit_survives_*`)
+    // and adds a core node whose patched value moved into it (`moved_core_ids_in_index_*`).
+    // The value *read back* is already corrected by the property overlay; this fixes
+    // only index *membership*. Born nodes are covered by `born_ids_in_index_*`; these
+    // deal exclusively with core dense ids (`< synthetic_base`).
+
+    /// The **merged** patched value a core node presents for the indexed property
+    /// `prop` (newest level wins per property), or `None` if it is not patched on
+    /// `prop` (its core ISAM value stands) or is tombstoned (suppressed separately).
+    fn patched_index_value(&self, dense: u64, prop: &str) -> Option<Value> {
+        self.node_patch(dense)
+            .filter(|nd| !nd.tombstoned)
+            .and_then(|nd| nd.patches.get(prop).cloned())
+    }
+
+    /// Whether a core ISAM hit at an **equality** seek on `prop` survives the overlay.
+    /// A node whose patched value for `prop` moved *away* from `key` is dropped (the
+    /// ISAM still lists it at its stale original value); an unpatched hit always survives.
+    pub fn core_hit_survives_eq(&self, dense: u64, prop: &str, key: &Value) -> bool {
+        match self.patched_index_value(dense, prop) {
+            Some(v) => v.cmp_key(key) == std::cmp::Ordering::Equal,
+            None => true,
+        }
+    }
+
+    /// Whether a core ISAM hit at a **range** seek on `prop` survives the overlay — its
+    /// patched value stays within `[lo, hi]`. An unpatched hit always survives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn core_hit_survives_range(
+        &self,
+        dense: u64,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> bool {
+        match self.patched_index_value(dense, prop) {
+            Some(v) => value_in_range(&v, lo, lo_inclusive, hi, hi_inclusive),
+            None => true,
+        }
+    }
+
+    /// Core dense ids whose **patched** indexed value for `prop` satisfies `pred` —
+    /// nodes relocated *into* a range seek by a property patch (the core ISAM lists them
+    /// at their old value). Candidates are unioned across levels (patched on `prop`,
+    /// carrying `label`) and each is judged by its *merged* (newest-wins) value, so a
+    /// node patched across levels is decided once. Ascending (`BTreeSet`).
+    fn moved_core_ids_in_index(
+        &self,
+        label: &str,
+        prop: &str,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<u64> {
+        let mut cand = std::collections::BTreeSet::new();
+        for level in self.levels_newest_first() {
+            cand.extend(level.core_ids_patched_on_index(label, prop));
+        }
+        cand.into_iter()
+            .filter(|&d| self.patched_index_value(d, prop).is_some_and(|v| pred(&v)))
+            .collect()
+    }
+
+    /// Core nodes relocated *into* an **equality** seek: patched indexed value == `key`.
+    #[inline]
+    pub fn moved_core_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64> {
+        self.moved_core_ids_in_index(label, prop, |v| v.cmp_key(key) == std::cmp::Ordering::Equal)
+    }
+
+    /// Core nodes relocated *into* a **range** seek: patched indexed value in `[lo, hi]`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn moved_core_ids_in_index_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Vec<u64> {
+        self.moved_core_ids_in_index(label, prop, |v| {
+            value_in_range(v, lo, lo_inclusive, hi, hi_inclusive)
+        })
     }
 
     /// The base of the synthetic edge dense-id space (the core `edge_count` this delta
@@ -2584,6 +2715,92 @@ mod tests {
             s.born_ids_in_index_range("Person", "age", Some(&Value::Int(30)), true, None, true),
             vec![100, 101]
         );
+    }
+
+    #[test]
+    fn moved_indexed_value_relocates_a_patched_core_node() {
+        // A *core* node (dense id 5, core has 10 nodes) whose indexed `age` is patched to
+        // 99. The overlay must relocate it: found at the new value, dropped at the old.
+        let mut mem = Memtable::with_synthetic_base(10);
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(5),
+            [("age".to_string(), Value::Int(99))],
+        );
+        let s = snap(mem, vec![]);
+
+        // It is a candidate patched on `age`, and moves *into* an eq/range seek at 99.
+        assert_eq!(
+            s.moved_core_ids_in_index_eq("Person", "age", &Value::Int(99)),
+            vec![5]
+        );
+        assert!(s
+            .moved_core_ids_in_index_eq("Person", "age", &Value::Int(30))
+            .is_empty());
+        assert_eq!(
+            s.moved_core_ids_in_index_range(
+                "Person",
+                "age",
+                Some(&Value::Int(50)),
+                true,
+                None,
+                true
+            ),
+            vec![5]
+        );
+
+        // A hit survives an eq/range seek only at its patched value; a stale hit moves out.
+        assert!(s.core_hit_survives_eq(5, "age", &Value::Int(99)));
+        assert!(!s.core_hit_survives_eq(5, "age", &Value::Int(30)));
+        assert!(s.core_hit_survives_range(5, "age", Some(&Value::Int(50)), true, None, true));
+        assert!(!s.core_hit_survives_range(5, "age", None, true, Some(&Value::Int(50)), true));
+
+        // An unpatched core hit (a different id) always survives and is not a candidate.
+        assert!(s.core_hit_survives_eq(6, "age", &Value::Int(30)));
+        // A different label does not match.
+        assert!(s
+            .moved_core_ids_in_index_eq("Company", "age", &Value::Int(99))
+            .is_empty());
+        // A different (unpatched) property is not relocated.
+        assert!(s
+            .moved_core_ids_in_index_eq("Person", "salary", &Value::Int(99))
+            .is_empty());
+    }
+
+    #[test]
+    fn moved_indexed_value_uses_the_merged_value_across_levels() {
+        // Core node 5 patched `age=30` in an older L0 level, then `age=99` in the newer
+        // active memtable. The overlay must judge it by the *merged* (newest) value 99.
+        let mut older = Memtable::with_synthetic_base(10);
+        older.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(5),
+            [("age".to_string(), Value::Int(30))],
+        );
+        let mut newer = Memtable::with_synthetic_base(10);
+        newer.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(5),
+            [("age".to_string(), Value::Int(99))],
+        );
+        let s = snap(newer, vec![older]);
+
+        // Moves into a seek at the newest value 99, not the shadowed 30.
+        assert_eq!(
+            s.moved_core_ids_in_index_eq("Person", "age", &Value::Int(99)),
+            vec![5]
+        );
+        assert!(s
+            .moved_core_ids_in_index_eq("Person", "age", &Value::Int(30))
+            .is_empty());
+        assert!(s.core_hit_survives_eq(5, "age", &Value::Int(99)));
+        assert!(!s.core_hit_survives_eq(5, "age", &Value::Int(30)));
     }
 
     #[test]

@@ -5107,14 +5107,25 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     .range_index(index)
                     .expect("planner only picks open indexes")
                     .lookup_eq(key)?;
-                // Delta-born nodes (Phase 2c) are not in the core ISAM — append the
-                // synthetic ids whose indexed property equals `key`, so a created
-                // node is found by an equality seek (Phase 2d). Born ids sort after
-                // every core id, so the ascending order holds. Tombstoned ids are
-                // dropped by the suppression below. Empty-delta fast path skips it.
                 let delta = self.gen.delta();
                 if !delta.is_empty() {
                     if let Some((label, prop)) = self.node_index_label_prop(index) {
+                        // Moved-indexed-value overlay: a core node whose indexed property
+                        // was patched is still listed at its *old* value in the ISAM.
+                        // Drop hits whose patched value moved out of the seek, and add
+                        // core nodes whose patched value moved in (inserted in sorted
+                        // position so the ascending order holds).
+                        ids.retain(|&x| delta.core_hit_survives_eq(x, prop, key));
+                        for id in delta.moved_core_ids_in_index_eq(label, prop, key) {
+                            if let Err(pos) = ids.binary_search(&id) {
+                                ids.insert(pos, id);
+                            }
+                        }
+                        // Delta-born nodes (Phase 2c) are not in the core ISAM — append
+                        // the synthetic ids whose indexed property equals `key`, so a
+                        // created node is found by an equality seek (Phase 2d). Born ids
+                        // sort after every core id, so the ascending order holds.
+                        // Tombstoned ids are dropped by the suppression below.
                         ids.extend(delta.born_ids_in_index_eq(label, prop, key));
                     }
                 }
@@ -5131,19 +5142,28 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         hi.as_ref().map(|(v, _)| v),
                         hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
                     )?;
-                // Delta-born nodes whose indexed property falls in the range (Phase
-                // 2d) — mirrors the `RangeEq` overlay above.
+                // Mirrors the `RangeEq` overlay above: relocate patched core nodes in
+                // the range index, then append matching delta-born nodes (Phase 2d).
                 let delta = self.gen.delta();
                 if !delta.is_empty() {
                     if let Some((label, prop)) = self.node_index_label_prop(index) {
-                        ids.extend(delta.born_ids_in_index_range(
-                            label,
-                            prop,
-                            lo.as_ref().map(|(v, _)| v),
-                            lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
-                            hi.as_ref().map(|(v, _)| v),
-                            hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
-                        ));
+                        let lo_v = lo.as_ref().map(|(v, _)| v);
+                        let lo_i = lo.as_ref().map(|(_, i)| *i).unwrap_or(true);
+                        let hi_v = hi.as_ref().map(|(v, _)| v);
+                        let hi_i = hi.as_ref().map(|(_, i)| *i).unwrap_or(true);
+                        ids.retain(|&x| {
+                            delta.core_hit_survives_range(x, prop, lo_v, lo_i, hi_v, hi_i)
+                        });
+                        for id in
+                            delta.moved_core_ids_in_index_range(label, prop, lo_v, lo_i, hi_v, hi_i)
+                        {
+                            if let Err(pos) = ids.binary_search(&id) {
+                                ids.insert(pos, id);
+                            }
+                        }
+                        ids.extend(
+                            delta.born_ids_in_index_range(label, prop, lo_v, lo_i, hi_v, hi_i),
+                        );
                     }
                 }
                 ids
