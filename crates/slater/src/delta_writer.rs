@@ -290,6 +290,46 @@ impl DeltaWriter {
         Ok(seq)
     }
 
+    /// Durably apply a **batch** of writes under a single group commit — the fix for the
+    /// one-fsync-per-statement cost that dominates bulk-write throughput. It appends every
+    /// record, then does **one** `commit` (a single fsync — the ack barrier for the whole
+    /// batch), folds all ops into the memtable, and does **one** publish + epoch bump.
+    /// Returns the durable sequence number of the last op (the whole batch is durable
+    /// once this returns).
+    ///
+    /// **Atomic on failure:** the memtable is applied only *after* the commit fsync
+    /// succeeds, so if any append or the commit fails, no op in the batch is applied or
+    /// published, and the un-committed records are dropped on replay (no commit marker) —
+    /// the batch is rejected whole, never half-applied. An empty batch is a no-op.
+    pub fn write_batch(&self, ops: &[(WalOp, OpResolution)]) -> Result<Seq> {
+        let mut inner = self.inner.lock().expect("delta writer lock");
+        if ops.is_empty() {
+            return Ok(inner.seq);
+        }
+        // 1. Append every record (fast; no fsync yet).
+        let mut last = inner.seq;
+        for (op, _) in ops {
+            let seq = inner.seq.next();
+            let rec = WalRecord {
+                seq,
+                op: op.clone(),
+            };
+            inner.sink.append(&rec).context("append WAL record")?;
+            inner.seq = seq;
+            last = seq;
+        }
+        // 2. One commit = one fsync for the whole batch (the ack barrier).
+        inner.sink.commit(last).context("commit WAL batch")?;
+        // 3. Fold every op into the authoritative memtable (only after the fsync).
+        for (op, resolved) in ops {
+            inner.mem.apply(op, *resolved);
+        }
+        // 4. One publish + epoch bump for the batch (publish-before-bump, as in `write`).
+        self.republish(&inner);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        Ok(last)
+    }
+
     /// Begin a consolidation: seal the WAL segment currently open for appends, open
     /// a fresh one for any subsequent write, and hand back an immutable snapshot of
     /// the committed delta together with the segments that snapshot lives in.
@@ -876,6 +916,87 @@ mod tests {
             w3.snapshot().node_patch(10).unwrap().patches.get("price"),
             Some(&Value::Int(99)),
             "last-writer-wins survives across segments"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_batch_group_commits_and_survives_reopen() {
+        let dir = tmp("batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let core = GenId(uuid::Uuid::from_u128(77));
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+
+        // An empty batch is a no-op that returns the current seq without publishing.
+        let e0 = w.epoch();
+        assert_eq!(w.write_batch(&[]).unwrap(), Seq(0));
+        assert_eq!(w.epoch(), e0, "empty batch does not bump the epoch");
+
+        // A batch: patch core node 10, and create two born nodes (synthetic 100, 101).
+        let batch = vec![
+            (
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("A".into()),
+                    &[("price", Value::Int(1))],
+                ),
+                node(10),
+            ),
+            (
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("X".into()),
+                    &[("price", Value::Int(2))],
+                ),
+                OpResolution::Node(None),
+            ),
+            (
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("Y".into()),
+                    &[("price", Value::Int(3))],
+                ),
+                OpResolution::Node(None),
+            ),
+        ];
+        let last = w.write_batch(&batch).unwrap();
+        assert_eq!(last, Seq(3), "three ops advance the seq by three");
+        assert_eq!(w.epoch(), e0 + 1, "the whole batch is ONE published epoch");
+
+        let read = |w: &DeltaWriter| {
+            let s = w.delta_snapshot();
+            (
+                s.born_count(),
+                s.node_patch(10)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                s.node_patch(100)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                s.node_patch(101)
+                    .and_then(|d| d.patches.get("price").cloned()),
+            )
+        };
+        let want = (
+            2,
+            Some(Value::Int(1)),
+            Some(Value::Int(2)),
+            Some(Value::Int(3)),
+        );
+        assert_eq!(
+            read(&w),
+            want,
+            "every op in the batch is applied + published"
+        );
+
+        // The single group commit (one commit marker for seq 3) replays the whole batch.
+        drop(w);
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        assert_eq!(
+            read(&w2),
+            want,
+            "the batched writes are durable across a reopen"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
