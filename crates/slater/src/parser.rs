@@ -116,6 +116,11 @@ pub mod ast {
         Read(Query),
         Write(WriteStmt),
         WriteEdge(EdgeWriteStmt),
+        /// `CALL slater.consolidate()` — fold the writable delta into a fresh
+        /// generation and swap it in (Phase 5). Takes no arguments and targets the
+        /// session's current graph; the server dispatches it to
+        /// `Graphs::consolidate_graph`.
+        Consolidate,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -606,6 +611,11 @@ pub fn parse(input: &str) -> Result<Query> {
 /// calls this only when the writable layer is enabled; otherwise it calls
 /// [`parse`], which never yields a write.
 pub fn parse_statement(input: &str) -> Result<ast::Statement> {
+    // `CALL slater.consolidate()` — the Phase 5 consolidation trigger. Its own SOI/EOI
+    // anchored rule, so a successful parse means the whole input is exactly that call.
+    if CypherParser::parse(Rule::consolidate_call, input).is_ok() {
+        return Ok(ast::Statement::Consolidate);
+    }
     if let Ok(mut pairs) = CypherParser::parse(Rule::write_statement, input) {
         let stmt = pairs.next().expect("write_statement rule yields one pair");
         // A relationship write (Phase 3c) parses to a single `edge_write` child; the
@@ -2625,7 +2635,7 @@ mod tests {
 
     fn write_err(q: &str) -> String {
         match parse_statement(q) {
-            Ok(Statement::Write(_) | Statement::WriteEdge(_)) => {
+            Ok(Statement::Write(_) | Statement::WriteEdge(_) | Statement::Consolidate) => {
                 panic!("expected reject for {q:?}")
             }
             // An unsupported write shape falls through to the read parser, which
@@ -3036,6 +3046,39 @@ mod tests {
         );
         assert!(cc.where_.is_some());
         assert!(!q.head.ret.body.star);
+    }
+
+    #[test]
+    fn parse_statement_recognises_the_consolidate_trigger() {
+        // The exact shape — case-insensitive, whitespace-tolerant, optional `;` — is
+        // the Phase 5 consolidation trigger.
+        for q in [
+            "CALL slater.consolidate()",
+            "call slater.consolidate()",
+            "  CALL   slater.consolidate ()  ",
+            "CALL slater.consolidate();",
+        ] {
+            assert!(
+                matches!(parse_statement(q), Ok(Statement::Consolidate)),
+                "expected Consolidate for {q:?}"
+            );
+        }
+        // Arguments, a trailing YIELD/RETURN, or a longer name are not the trigger:
+        // they fall through to the read parser (which rejects the CALL as read-only).
+        for q in [
+            "CALL slater.consolidate(1)",
+            "CALL slater.consolidate() YIELD x RETURN x",
+            "CALL slater.consolidateX()",
+        ] {
+            assert!(
+                !matches!(parse_statement(q), Ok(Statement::Consolidate)),
+                "should not be the consolidate trigger: {q:?}"
+            );
+        }
+        // With the writable layer off the server calls `parse`, which — the proc being
+        // deliberately absent from the read-only whitelist — rejects it as a forbidden
+        // (write/admin) CALL rather than serving it as a metadata read.
+        assert!(parse("CALL slater.consolidate()").is_err());
     }
 
     #[test]

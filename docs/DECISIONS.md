@@ -868,3 +868,27 @@ for now. Rejected alternative: keying the delete on a `MATCH`-bound edge dense i
 (a full traversal to bind `r`), rather than the edge business key — the business key
 `(src, reltype, dst)` is the stable identity the whole delta layer binds to, so the
 delete resolves it directly, no traversal needed.
+
+### D47 — `CALL slater.consolidate()` is a write-layer statement, not a read `read_proc`
+Phase 5 makes consolidation client-reachable: `CALL slater.consolidate()` folds the
+writable delta into a fresh generation and swaps it in, returning the new generation's id
+as a `generation` column. **It is parsed as a `parser::parse_statement` entry** (a new
+`ast::Statement::Consolidate`, matched by its own SOI/EOI-anchored `consolidate_call`
+grammar rule, tried before the node/edge write shapes) — **deliberately *not* added to the
+read grammar's `read_proc` whitelist**, even though the plan's shorthand suggested "like
+the other CALLs". Reasoning: `read_proc` (and its `dbms.procedures` self-report) is
+documented as read-only, and consolidation mutates — mixing a write proc into the
+read-only carve-out would misrepresent the model. Keeping it in the write parse entry also
+means it is only reachable when the writable layer is enabled (the server calls
+`parse_statement` only then); with the layer off the read parser rejects the `CALL` as a
+forbidden write, which is the correct answer (nothing to consolidate). The RUN handler
+dispatches `Statement::Consolidate` to `execute_consolidate`, which runs
+`Graphs::consolidate_graph` (with the production `run_builder` seam) on a
+`tokio::task::spawn_blocking` thread — the dump/subprocess/validate/swap work must never
+park the Bolt reactor. A builder failure is surfaced as a query `Failure`,
+non-destructively (old core keeps serving, delta stays live), exactly as the direct
+orchestrator path. `ConnCtx` gains `data_dir` + `builder_bin` (from `config.delta`) to
+supply the seam. Rejected alternative: a dedicated `Statement`-less path that routes
+through `apply_call` like the metadata procs — that would force a read-shaped, result-cache
+-eligible, generation-pinned execution around a mutation, and re-introduce the read-only
+labelling problem.

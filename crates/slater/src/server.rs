@@ -800,6 +800,14 @@ struct ConnCtx {
     /// diagnostics snapshot next to live occupancy.
     max_connections: usize,
     max_pre_auth_connections: usize,
+
+    // ── Writable-layer consolidation (`CALL slater.consolidate()`) ────────────
+    /// The data directory holding each graph's generations + scratch consolidation
+    /// dump. Passed to [`Graphs::consolidate_graph`].
+    data_dir: PathBuf,
+    /// The `slater-build` binary spawned to rebuild a consolidated generation
+    /// (`config.delta.builder_bin`). A bare name resolves on `PATH`.
+    builder_bin: String,
 }
 
 impl ConnCtx {
@@ -1650,6 +1658,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         conn_limit: conn_limit.clone(),
         max_connections: cfg.server.max_connections,
         max_pre_auth_connections: cfg.server.max_pre_auth_connections,
+        data_dir: PathBuf::from(cfg.data_dir()),
+        builder_bin: cfg.delta.builder_bin.clone(),
     });
     if cfg.load_test_diagnostics {
         warn!(
@@ -2342,6 +2352,9 @@ async fn handle_request(
                         parser::ast::Statement::WriteEdge(stmt) => {
                             execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?
                         }
+                        parser::ast::Statement::Consolidate => {
+                            execute_consolidate(ctx, &graph).await?
+                        }
                         parser::ast::Statement::Read(ast) => {
                             // Overlay this graph's delta iff it was resolved against the
                             // generation we're about to read (dense ids are per-build).
@@ -2747,6 +2760,36 @@ fn execute_edge_write(
         .write(op, OpResolution::Edge { src, dst })
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
+}
+
+/// Execute `CALL slater.consolidate()` (Phase 5): fold the graph's writable delta
+/// into a fresh generation and swap it in, returning the new generation's id as a
+/// single `generation` column. The heavy work — dumping the merged view, spawning the
+/// builder subprocess, validating and swapping the new generation — runs on a blocking
+/// thread so the Bolt reactor is never parked on it. Only reached when the writable
+/// layer is enabled for this graph (the caller already resolved a `writer`).
+async fn execute_consolidate(
+    ctx: &Arc<ConnCtx>,
+    graph: &str,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    let graphs = ctx.graphs.clone();
+    let cache = ctx.cache.clone();
+    let vector_cache = ctx.vector_cache.clone();
+    let data_dir = ctx.data_dir.clone();
+    let builder_bin = ctx.builder_bin.clone();
+    let graph = graph.to_string();
+    let new_uuid = tokio::task::spawn_blocking(move || {
+        graphs.consolidate_graph(&graph, &cache, &vector_cache, &data_dir, |dump, g, dd| {
+            run_builder(&builder_bin, dump, g, dd)
+        })
+    })
+    .await
+    .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation task failed: {e}")))?
+    .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation failed: {e:#}")))?;
+    Ok((
+        vec!["generation".to_string()],
+        vec![vec![PsValue::String(new_uuid.to_string())]],
+    ))
 }
 
 /// The writable-layer overlay a read runs under: the delta snapshot pinned for the
@@ -4453,6 +4496,137 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A ConnCtx over a writable-layer-enabled `people` graph, with `builder_bin`
+    /// pointed at the given binary — the harness for the `CALL slater.consolidate()`
+    /// trigger (`execute_consolidate`).
+    fn build_writable_ctx(tag: &str, builder_bin: &str) -> (PathBuf, Arc<ConnCtx>) {
+        let (root, _graph) = testgen::write_indexed_people(tag);
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .unwrap();
+        let graphs = Arc::new(graphs);
+        // A minimal ACL (unused by consolidation, but ConnCtx requires one).
+        let acl_path = root.join("acl.json");
+        let json = serde_json::json!({
+            "users": { "writer": {
+                "passwordArgon2id": hash_password("pw").unwrap(),
+                "grants": { "people": ["read"] }
+            }}
+        });
+        std::fs::write(&acl_path, json.to_string()).unwrap();
+        let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
+        let ctx = Arc::new(ConnCtx {
+            acl,
+            graphs,
+            cache: Arc::new(BlockCache::new(1 << 20)),
+            vector_cache: Arc::new(VectorIndexCache::new(1 << 20)),
+            result_cache: Arc::new(ResultCache::new(1 << 20)),
+            max_rows: 100_000,
+            timeout_ms: 0,
+            max_intermediate: 1_000_000,
+            max_scan: 500_000_000,
+            intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
+            max_shortest_path_explore: 0,
+            fanout_pool: None,
+            beam_width: 64,
+            bind_addr: "127.0.0.1:7687".to_string(),
+            default_graph: Some("people".to_string()),
+            use_selection: RwLock::new(HashMap::new()),
+            memgraph_users: RwLock::new(HashSet::new()),
+            max_message_bytes: 64 * 1024 * 1024,
+            max_pre_auth_bytes: 64 * 1024,
+            login_timeout_ms: 0,
+            idle_timeout_ms: 0,
+            pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
+            per_ip: Arc::new(Mutex::new(HashMap::new())),
+            max_per_ip: 0,
+            diag: Arc::new(crate::diag::Diagnostics::new(false)),
+            conn_limit: Arc::new(Semaphore::new(semaphore_permits(16_384))),
+            max_connections: 16_384,
+            max_pre_auth_connections: 4_096,
+            data_dir: root.clone(),
+            builder_bin: builder_bin.to_string(),
+        });
+        (root, ctx)
+    }
+
+    /// Drive a durable `SET` on Alice through the writable layer — a small helper for
+    /// the consolidation-trigger tests so there is a live delta to fold.
+    fn write_alice_age_99(ctx: &Arc<ConnCtx>) {
+        let gen0 = ctx.graphs.get("people").unwrap();
+        let writer = ctx.graphs.writer("people").unwrap();
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    }
+
+    /// The `CALL slater.consolidate()` trigger reaches consolidation and surfaces a
+    /// builder failure as a query `Failure` (not a panic), non-destructively: a missing
+    /// builder binary fails the rebuild, the old core keeps serving, and the delta stays
+    /// live. Proves the RUN-handler → `execute_consolidate` → `consolidate_graph` wiring
+    /// (data dir, builder bin, caches, `spawn_blocking`, error propagation).
+    #[tokio::test]
+    async fn bolt_consolidate_surfaces_a_builder_failure() {
+        let (root, ctx) =
+            build_writable_ctx("bolt_consolidate_fail", "/nonexistent/slater-build-xyz");
+        write_alice_age_99(&ctx);
+        let gen0 = ctx.graphs.get("people").unwrap();
+
+        let err = execute_consolidate(&ctx, "people").await.unwrap_err();
+        assert!(
+            err.message.contains("consolidation failed"),
+            "expected a surfaced builder failure, got: {}",
+            err.message
+        );
+        // Non-destructive: old core still served, the write still overlaid.
+        assert_eq!(ctx.graphs.get("people").unwrap().uuid(), gen0.uuid());
+        let writer = ctx.graphs.writer("people").unwrap();
+        assert!(
+            !writer.snapshot().is_empty(),
+            "the delta must survive a failed consolidation"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// True end-to-end through the Bolt trigger and the real `slater-build` binary:
+    /// `CALL slater.consolidate()` folds the delta into a fresh generation, returns its
+    /// id as the `generation` column, and retires the delta. Ignored by default (needs
+    /// the builder) — run it exactly like `consolidate_via_real_builder`, with
+    /// `SLATER_BUILD_BIN` pointing at the built binary.
+    #[tokio::test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    async fn bolt_consolidate_trigger_folds_delta_via_real_builder() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let (root, ctx) = build_writable_ctx("bolt_consolidate_real", &bin);
+        write_alice_age_99(&ctx);
+        let gen0 = ctx.graphs.get("people").unwrap();
+
+        let (cols, rows) = execute_consolidate(&ctx, "people").await.unwrap();
+        assert_eq!(cols, vec!["generation".to_string()]);
+        let new_uuid = ctx.graphs.get("people").unwrap().uuid();
+        assert_ne!(
+            new_uuid,
+            gen0.uuid(),
+            "consolidation rebuilt a new generation"
+        );
+        assert!(
+            matches!(&rows[0][0], PsValue::String(s) if *s == new_uuid.to_string()),
+            "the trigger returns the new generation id"
+        );
+        let writer = ctx.graphs.writer("people").unwrap();
+        assert!(
+            writer.snapshot().is_empty(),
+            "the delta is retired once folded into the core"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Stand up a ConnCtx over the shared fixture graph + a temp ACL.
     /// Per-connection security limits for the test ConnCtx builders. Defaults are
     /// generous/on so existing tests are unaffected; the connection-security tests
@@ -4530,6 +4704,8 @@ mod tests {
             conn_limit: Arc::new(Semaphore::new(semaphore_permits(16_384))),
             max_connections: 16_384,
             max_pre_auth_connections: limits.max_pre_auth_connections,
+            data_dir: root.clone(),
+            builder_bin: "slater-build".to_string(),
         });
         (root, ctx)
     }
@@ -4607,6 +4783,8 @@ mod tests {
             conn_limit: Arc::new(Semaphore::new(semaphore_permits(16_384))),
             max_connections: 16_384,
             max_pre_auth_connections: 4_096,
+            data_dir: root.clone(),
+            builder_bin: "slater-build".to_string(),
         })
     }
 

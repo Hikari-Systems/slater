@@ -360,7 +360,29 @@ Running ledger for the `writeable` track. Pairs with the design in
     Whole slater+slater-delta+workspace green (determinism goldens included); clippy+fmt
     clean.
 
-- Phases 4–5: see `docs/WRITABLE-PLAN.md`.
+- **Phase 5 — Bolt consolidation trigger `CALL slater.consolidate()`. ✅ DONE** (this
+  commit). The orchestrator (`Graphs::consolidate_graph` + `run_builder`) is now reachable
+  from a client. Grammar (`cypher.pest`): a SOI/EOI-anchored `consolidate_call` /
+  `consolidate_proc` rule — deliberately **not** in the read-only `read_proc` whitelist
+  (consolidation mutates; see D47), so it is tried only in `parser::parse_statement`
+  (writable-layer path) and, with the layer off, the read parser rejects the `CALL` as a
+  forbidden write. Parser: new `ast::Statement::Consolidate`, returned by `parse_statement`
+  when the input is exactly the trigger. Server: the RUN handler dispatches
+  `Statement::Consolidate` → `execute_consolidate`, which clones the ctx seams and runs
+  `consolidate_graph(…, run_builder)` on a `spawn_blocking` thread (never parks the Bolt
+  reactor), returning the new generation id as a single `generation` column; a builder
+  failure surfaces as a query `Failure`, non-destructively. `ConnCtx` gains `data_dir` +
+  `builder_bin` (from `config.delta`). Tests: parser
+  (`parse_statement_recognises_the_consolidate_trigger` — accepts the exact shape
+  case/whitespace-insensitively, rejects args/YIELD/longer-name, and confirms the
+  layer-off read parser rejects it); server (`bolt_consolidate_surfaces_a_builder_failure`
+  — wiring + non-destructive error via a missing builder binary;
+  `#[ignore] bolt_consolidate_trigger_folds_delta_via_real_builder` — true end-to-end
+  through the real `slater-build`, verified green). Whole workspace green; clippy + fmt
+  clean; empty-delta bench unaffected (the trigger is off the read path). See D47.
+
+- Remaining Phase 4: see `docs/WRITABLE-PLAN.md` (L0 flush + backpressure + auto
+  soft-cap consolidation trigger).
 
 - **Parallel workstream — per-graph dump CLI (`slater dump`). 📋 PLANNED, not started.**
   See `docs/WRITABLE-PLAN.md` §"Per-graph dump CLI". Independent of Phases 0–5 (does
@@ -387,26 +409,20 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Phase 3 is complete** (3a–3d all shipped): relationships can be created and deleted
-through the delta (`MERGE (a)-[:R]->(b)` / `MATCH (a)-[r:R]->(b) DELETE r`), are walkable
-in every traversal path (sequential + parallel + shortestPath), a deleted edge and an
-edge to a deleted node are suppressed on read, and consolidation folds all of it into a
-rebuild. Both open Phase-2 gaps are closed. Nodes **and** edges — create, update
-(properties), delete — are now a durable, consolidatable writable layer.
+**Phase 5's Bolt trigger is complete** (this commit): `CALL slater.consolidate()` is now
+reachable from any Bolt client — it folds the delta into a fresh generation, swaps it in,
+and returns the new generation id, all without a server restart. The whole
+write→consolidate loop is now usable end-to-end. (Phase 3 before it: relationships
+create/delete/walk/consolidate; Phase 2: nodes create/update/delete. Nodes **and** edges
+are a durable, consolidatable, client-triggerable writable layer.)
 
-The recommended next step is **Phase 4 / 5** (see `docs/WRITABLE-PLAN.md` §Execution
-order). Pick one, in rough priority:
-- **Phase 5 Bolt trigger — `CALL slater.consolidate()`.** The orchestrator
-  (`Graphs::consolidate_graph`, prod builder seam `server::run_builder`) already works
-  end-to-end and is unit-tested; it just isn't reachable from a client. Wire a
-  metadata-procedure `CALL slater.consolidate()` (whitelist it in `cypher.pest`'s
-  `read_proc` / forbidden-clause carve-out like the other `CALL`s, dispatch it in the
-  RUN handler to `consolidate_graph`). Smallest, highest-leverage — it makes the whole
-  write→consolidate loop usable without a server restart.
-- **Phase 4 — L0 flush + backpressure.** Spill the memtable to immutable L0 delta
-  segments under a byte budget, add an admission/backpressure knob, and an automatic
-  L0-soft-cap consolidation trigger. Larger; needed before the layer takes sustained
-  write volume.
+The recommended next step is **Phase 4 — L0 flush + backpressure** (see
+`docs/WRITABLE-PLAN.md` §Execution order): spill the memtable to immutable L0 delta
+segments under a byte budget, add an admission/backpressure knob, and an **automatic**
+L0-soft-cap consolidation trigger (the manual `CALL slater.consolidate()` trigger it would
+build on now exists — `Graphs::consolidate_graph`, dispatched from the RUN handler via
+`server::execute_consolidate`). Larger; needed before the layer takes sustained write
+volume.
 
 Handy Phase-3 resume detail (all landed): memtable edges
 `Memtable::{upsert_edge,delete_edge,out_edges,in_edges,iter_edges,with_bases}` +
@@ -431,9 +447,14 @@ Smaller follow-ups that are **not** the recommended next step but are cleanly sc
 - **delete a born node by business key** (deferred from 2c): `execute_write` must
   resolve a `DELETE` anchor against the delta when the core probe returns Absent
   (`delete_node` already tombstones it).
-- the Phase 5 Bolt trigger `CALL slater.consolidate()` (`Graphs::consolidate_graph`,
-  prod seam `server::run_builder`) + Phase 4 auto L0-soft-cap trigger; the independent
-  `slater dump` CLI (§ above).
+- Phase 4 auto L0-soft-cap trigger (the manual trigger now exists — see below); the
+  independent `slater dump` CLI (§ above).
+
+Handy Phase-5 resume detail (all landed): grammar `consolidate_call`/`consolidate_proc`
+(`cypher.pest`, not in `read_proc`) → `parser::parse_statement` → `ast::Statement::
+Consolidate`; RUN-handler dispatch → `server::execute_consolidate` (clones ctx seams,
+`spawn_blocking` → `Graphs::consolidate_graph(…, run_builder)`, returns a `generation`
+column); `ConnCtx.{data_dir,builder_bin}` supply the seam. See D47.
 
 Handy resume detail (2d landed): `Memtable::born_ids_in_index_eq`/`born_ids_in_index_range`
 (+ `born_ids_in_index`/`born_index_value`) in `slater-delta/memtable.rs`, exposed on

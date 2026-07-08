@@ -128,6 +128,16 @@ edge_write = { edge_merge | edge_delete }
 edge_merge = { kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern }
 edge_delete = { kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
 
+// ── Consolidation trigger (Phase 5) ───────────────────────────────────────────
+// `CALL slater.consolidate()` folds the writable delta into a fresh generation and
+// swaps it in. It is a write-layer *admin* operation, so — like the node/edge writes
+// above — it is a `parser::parse_statement` entry rather than a read `call_clause`,
+// tried before them. When the writable layer is disabled it never reaches this rule
+// (the server calls the read parser, which rejects the `CALL` as read-only), so it is
+// deliberately kept out of the read grammar's read-only `read_proc` whitelist.
+consolidate_call = { SOI ~ kw_call ~ consolidate_proc ~ "(" ~ ")" ~ ";"? ~ EOI }
+consolidate_proc = @{ ^"slater.consolidate" ~ !ident_cont }
+
 // A bare metadata `CALL proc()` (no trailing RETURN) is a complete query — its
 // yielded outputs are the result columns. The middle alternative greedily
 // consumes a `CALL … YIELD … RETURN …` (the call is a `reading_clause`), so the
