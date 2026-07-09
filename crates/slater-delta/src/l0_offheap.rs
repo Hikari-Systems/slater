@@ -31,7 +31,7 @@
 //! No back-compat: an L0 segment lives only between a flush and the next consolidation, so
 //! the format may change freely; a magic/version/crc mismatch is a hard error on open.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,7 +42,7 @@ use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::ids::Value;
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
-use crate::memtable::{DeltaEdge, EdgeDelta, LevelRead, NodeDelta};
+use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta};
 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 const OFFHEAP_VERSION: u64 = 1;
@@ -233,136 +233,255 @@ fn decode_edge(mut r: &[u8]) -> Result<EdgeDelta> {
 
 // ── writer ──────────────────────────────────────────────────────────────────────────
 
-/// Write `data` as an off-heap L0 segment directory at `dir` (created fresh). Block
-/// sections are sized at `target_block_bytes` (zstd level `zstd_level`). Written to a
-/// sibling `.tmp` directory then atomically `rename`d into place, so a reader never
-/// observes a partial segment.
+/// A **streaming** writer for an off-heap L0 segment. Payload records are appended to the
+/// four block sections incrementally (`BlockFileWriter` buffers one block at a time), while
+/// only the compact meta accumulates in RAM (scalars, per-section `u64` key columns, the
+/// secondary indexes). So a *merge* streams sorted runs through here without ever holding
+/// the merged payloads resident — the whole point of the disk-native compaction (D54).
+/// `push_*` **must** be called in ascending key order per section (records are key-sorted).
+/// The image is staged in a sibling `.tmp` directory and atomically `rename`d in at `finish`.
+pub struct OffheapSegmentWriter {
+    tmp: PathBuf,
+    dir: PathBuf,
+    /// A unique id for this written segment, persisted in the meta and used as the shared
+    /// cache **scope** — fresh on every (re)write, so a compaction that reuses a segment
+    /// directory can never collide with the pre-merge segment's stale cached blocks.
+    scope: u128,
+    node: BlockFileWriter,
+    node_keys: Vec<u64>,
+    adj_out: BlockFileWriter,
+    adj_out_keys: Vec<u64>,
+    adj_in: BlockFileWriter,
+    adj_in_keys: Vec<u64>,
+    edge: BlockFileWriter,
+    edge_keys: Vec<u64>,
+    synthetic_base: u64,
+    edge_synthetic_base: u64,
+    node_delta_count: u64,
+    edge_delta_count: u64,
+    born_count: u64,
+    born_edge_count: u64,
+    born_by_label: Vec<(String, Vec<u64>)>,
+    born_index: Vec<BornIndexEntry>,
+    core_patched: Vec<(String, String, u64)>,
+    born_by_identity: Vec<(Vec<u8>, u64)>,
+}
+
+impl OffheapSegmentWriter {
+    pub fn create(
+        dir: impl AsRef<Path>,
+        scope: u128,
+        target_block_bytes: usize,
+        zstd_level: i32,
+    ) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let tmp = dir.with_extension("tmp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).with_context(|| format!("create L0 tmp dir {tmp:?}"))?;
+        let mk = |name: &str| -> Result<BlockFileWriter> {
+            let p = tmp.join(name);
+            BlockFileWriter::create(&p, target_block_bytes, zstd_level)
+                .with_context(|| format!("create block file {p:?}"))
+        };
+        Ok(Self {
+            node: mk("node.blk")?,
+            node_keys: Vec::new(),
+            adj_out: mk("adj_out.blk")?,
+            adj_out_keys: Vec::new(),
+            adj_in: mk("adj_in.blk")?,
+            adj_in_keys: Vec::new(),
+            edge: mk("edge.blk")?,
+            edge_keys: Vec::new(),
+            tmp,
+            dir,
+            scope,
+            synthetic_base: 0,
+            edge_synthetic_base: 0,
+            node_delta_count: 0,
+            edge_delta_count: 0,
+            born_count: 0,
+            born_edge_count: 0,
+            born_by_label: Vec::new(),
+            born_index: Vec::new(),
+            core_patched: Vec::new(),
+            born_by_identity: Vec::new(),
+        })
+    }
+
+    pub fn push_node(
+        &mut self,
+        dense: u64,
+        label: &str,
+        key: &str,
+        value: &Value,
+        delta: &NodeDelta,
+    ) -> Result<()> {
+        self.node
+            .append_record(&encode_node(label, key, value, delta))?;
+        self.node_keys.push(dense);
+        Ok(())
+    }
+
+    pub fn push_adj_out(&mut self, node: u64, edges: &[DeltaEdge]) -> Result<()> {
+        self.adj_out.append_record(&encode_adj(edges))?;
+        self.adj_out_keys.push(node);
+        Ok(())
+    }
+
+    pub fn push_adj_in(&mut self, node: u64, edges: &[DeltaEdge]) -> Result<()> {
+        self.adj_in.append_record(&encode_adj(edges))?;
+        self.adj_in_keys.push(node);
+        Ok(())
+    }
+
+    pub fn push_edge(&mut self, edge_id: u64, delta: &EdgeDelta) -> Result<()> {
+        self.edge.append_record(&encode_edge(delta))?;
+        self.edge_keys.push(edge_id);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scalars(
+        &mut self,
+        synthetic_base: u64,
+        edge_synthetic_base: u64,
+        node_delta_count: u64,
+        edge_delta_count: u64,
+        born_count: u64,
+        born_edge_count: u64,
+    ) {
+        self.synthetic_base = synthetic_base;
+        self.edge_synthetic_base = edge_synthetic_base;
+        self.node_delta_count = node_delta_count;
+        self.edge_delta_count = edge_delta_count;
+        self.born_count = born_count;
+        self.born_edge_count = born_edge_count;
+    }
+
+    pub fn set_secondaries(
+        &mut self,
+        born_by_label: Vec<(String, Vec<u64>)>,
+        born_index: Vec<BornIndexEntry>,
+        core_patched: Vec<(String, String, u64)>,
+        born_by_identity: Vec<(Vec<u8>, u64)>,
+    ) {
+        self.born_by_label = born_by_label;
+        self.born_index = born_index;
+        self.core_patched = core_patched;
+        self.born_by_identity = born_by_identity;
+    }
+
+    pub fn finish(self) -> Result<()> {
+        let meta = self.meta_bytes();
+        self.node.finish().context("finish node.blk")?;
+        self.adj_out.finish().context("finish adj_out.blk")?;
+        self.adj_in.finish().context("finish adj_in.blk")?;
+        self.edge.finish().context("finish edge.blk")?;
+        std::fs::write(self.tmp.join("meta.bin"), &meta).context("write L0 meta.bin")?;
+        let _ = std::fs::remove_dir_all(&self.dir);
+        std::fs::rename(&self.tmp, &self.dir)
+            .with_context(|| format!("rename L0 segment into place {:?}", self.dir))?;
+        if let Some(parent) = self.dir.parent() {
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    fn meta_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_uvarint(&mut body, OFFHEAP_VERSION);
+        body.extend_from_slice(&self.scope.to_le_bytes());
+        for s in [
+            self.synthetic_base,
+            self.edge_synthetic_base,
+            self.node_delta_count,
+            self.edge_delta_count,
+            self.born_count,
+            self.born_edge_count,
+        ] {
+            write_uvarint(&mut body, s);
+        }
+        w_u64s(&mut body, self.node_keys.iter().copied());
+        w_u64s(&mut body, self.adj_out_keys.iter().copied());
+        w_u64s(&mut body, self.adj_in_keys.iter().copied());
+        w_u64s(&mut body, self.edge_keys.iter().copied());
+        write_uvarint(&mut body, self.born_by_label.len() as u64);
+        for (label, ids) in &self.born_by_label {
+            w_str(&mut body, label);
+            w_u64s(&mut body, ids.iter().copied());
+        }
+        write_uvarint(&mut body, self.born_index.len() as u64);
+        for e in &self.born_index {
+            w_str(&mut body, &e.label);
+            write_uvarint(&mut body, e.id);
+            write_uvarint(&mut body, e.props.len() as u64);
+            for (p, v) in &e.props {
+                w_str(&mut body, p);
+                write_value(&mut body, v);
+            }
+        }
+        write_uvarint(&mut body, self.core_patched.len() as u64);
+        for (label, prop, id) in &self.core_patched {
+            w_str(&mut body, label);
+            w_str(&mut body, prop);
+            write_uvarint(&mut body, *id);
+        }
+        write_uvarint(&mut body, self.born_by_identity.len() as u64);
+        for (ck, id) in &self.born_by_identity {
+            write_uvarint(&mut body, ck.len() as u64);
+            body.extend_from_slice(ck);
+            write_uvarint(&mut body, *id);
+        }
+
+        let crc = crc32c::crc32c(&body);
+        let mut out = Vec::with_capacity(body.len() + 12);
+        out.extend_from_slice(META_MAGIC);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+}
+
+/// Write `data` as an off-heap L0 segment directory at `dir` (created fresh), tagged with
+/// cache `scope` (persisted in the meta). The flush path's materialised writer — a merge
+/// uses [`OffheapSegmentWriter`] + [`merge_run`] directly to stream.
 pub fn write_segment(
     data: &SegmentData,
     dir: impl AsRef<Path>,
+    scope: u128,
     target_block_bytes: usize,
     zstd_level: i32,
 ) -> Result<()> {
-    let dir = dir.as_ref();
-    let tmp = dir.with_extension("tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).with_context(|| format!("create L0 tmp dir {tmp:?}"))?;
-
-    write_blk(&tmp.join("node.blk"), target_block_bytes, zstd_level, |w| {
-        for (_, label, key, value, delta) in &data.nodes {
-            w.append_record(&encode_node(label, key, value, delta))?;
-        }
-        Ok(())
-    })?;
-    write_blk(
-        &tmp.join("adj_out.blk"),
-        target_block_bytes,
-        zstd_level,
-        |w| {
-            for (_, edges) in &data.adj_out {
-                w.append_record(&encode_adj(edges))?;
-            }
-            Ok(())
-        },
-    )?;
-    write_blk(
-        &tmp.join("adj_in.blk"),
-        target_block_bytes,
-        zstd_level,
-        |w| {
-            for (_, edges) in &data.adj_in {
-                w.append_record(&encode_adj(edges))?;
-            }
-            Ok(())
-        },
-    )?;
-    write_blk(&tmp.join("edge.blk"), target_block_bytes, zstd_level, |w| {
-        for (_, delta) in &data.edges {
-            w.append_record(&encode_edge(delta))?;
-        }
-        Ok(())
-    })?;
-
-    let meta = encode_meta(data);
-    std::fs::write(tmp.join("meta.bin"), &meta).with_context(|| "write L0 meta.bin")?;
-
-    let _ = std::fs::remove_dir_all(dir);
-    std::fs::rename(&tmp, dir).with_context(|| format!("rename L0 segment into place {dir:?}"))?;
-    if let Some(parent) = dir.parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
+    let mut w = OffheapSegmentWriter::create(dir, scope, target_block_bytes, zstd_level)?;
+    for (dense, label, key, value, delta) in &data.nodes {
+        w.push_node(*dense, label, key, value, delta)?;
     }
-    Ok(())
-}
-
-fn write_blk(
-    path: &Path,
-    target: usize,
-    level: i32,
-    fill: impl FnOnce(&mut BlockFileWriter) -> Result<()>,
-) -> Result<()> {
-    let mut w = BlockFileWriter::create(path, target, level)
-        .with_context(|| format!("create block file {path:?}"))?;
-    fill(&mut w)?;
-    w.finish()
-        .with_context(|| format!("finish block file {path:?}"))?;
-    Ok(())
-}
-
-fn encode_meta(data: &SegmentData) -> Vec<u8> {
-    let mut body = Vec::new();
-    write_uvarint(&mut body, OFFHEAP_VERSION);
-    for s in [
+    for (node, edges) in &data.adj_out {
+        w.push_adj_out(*node, edges)?;
+    }
+    for (node, edges) in &data.adj_in {
+        w.push_adj_in(*node, edges)?;
+    }
+    for (id, delta) in &data.edges {
+        w.push_edge(*id, delta)?;
+    }
+    w.set_scalars(
         data.synthetic_base,
         data.edge_synthetic_base,
         data.node_delta_count,
         data.edge_delta_count,
         data.born_count,
         data.born_edge_count,
-    ] {
-        write_uvarint(&mut body, s);
-    }
-    // Key columns (record order == on-disk order == the vectors below).
-    w_u64s(&mut body, data.nodes.iter().map(|e| e.0));
-    w_u64s(&mut body, data.adj_out.iter().map(|e| e.0));
-    w_u64s(&mut body, data.adj_in.iter().map(|e| e.0));
-    w_u64s(&mut body, data.edges.iter().map(|e| e.0));
-    // Secondary indexes.
-    write_uvarint(&mut body, data.born_by_label.len() as u64);
-    for (label, ids) in &data.born_by_label {
-        w_str(&mut body, label);
-        w_u64s(&mut body, ids.iter().copied());
-    }
-    write_uvarint(&mut body, data.born_index.len() as u64);
-    for e in &data.born_index {
-        w_str(&mut body, &e.label);
-        write_uvarint(&mut body, e.id);
-        write_uvarint(&mut body, e.props.len() as u64);
-        for (p, v) in &e.props {
-            w_str(&mut body, p);
-            write_value(&mut body, v);
-        }
-    }
-    write_uvarint(&mut body, data.core_patched.len() as u64);
-    for (label, prop, id) in &data.core_patched {
-        w_str(&mut body, label);
-        w_str(&mut body, prop);
-        write_uvarint(&mut body, *id);
-    }
-    write_uvarint(&mut body, data.born_by_identity.len() as u64);
-    for (ck, id) in &data.born_by_identity {
-        write_uvarint(&mut body, ck.len() as u64);
-        body.extend_from_slice(ck);
-        write_uvarint(&mut body, *id);
-    }
-
-    let crc = crc32c::crc32c(&body);
-    let mut out = Vec::with_capacity(body.len() + 12);
-    out.extend_from_slice(META_MAGIC);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&body);
-    out
+    );
+    w.set_secondaries(
+        data.born_by_label.clone(),
+        data.born_index.clone(),
+        data.core_patched.clone(),
+        data.born_by_identity.clone(),
+    );
+    w.finish()
 }
 
 fn w_u64s(buf: &mut Vec<u8>, it: impl ExactSizeIterator<Item = u64>) {
@@ -426,10 +545,11 @@ impl std::fmt::Debug for L0Reader {
 
 impl L0Reader {
     /// Open the segment directory `dir`, verifying `meta.bin` and opening the four block
-    /// sections. `scope` must be unique per live segment (it namespaces this segment's
-    /// blocks in the shared `cache`); a retired segment's scope is simply never queried
-    /// again, so its blocks age out of the LRU.
-    pub fn open(dir: impl AsRef<Path>, scope: u128, cache: Arc<BlockCache>) -> Result<Self> {
+    /// sections. The shared-cache **scope** is read from the meta (persisted, fresh per
+    /// write), so it is unique per live segment and stable across a reopen — even when a
+    /// compaction reuses a segment directory. A retired segment's scope is simply never
+    /// queried again, so its blocks age out of the LRU.
+    pub fn open(dir: impl AsRef<Path>, cache: Arc<BlockCache>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let meta = std::fs::read(dir.join("meta.bin"))
             .with_context(|| format!("read L0 meta {dir:?}/meta.bin"))?;
@@ -446,6 +566,11 @@ impl L0Reader {
         if version != OFFHEAP_VERSION {
             bail!("unsupported off-heap L0 version {version} (expected {OFFHEAP_VERSION})");
         }
+        if r.len() < 16 {
+            bail!("L0 segment {dir:?}: short meta (scope)");
+        }
+        let scope = u128::from_le_bytes(r[..16].try_into().unwrap());
+        r = &r[16..];
         let synthetic_base = read_uvarint(&mut r)?;
         let edge_synthetic_base = read_uvarint(&mut r)?;
         let node_delta_count = read_uvarint(&mut r)?;
@@ -528,6 +653,34 @@ impl L0Reader {
     /// The segment directory (retired at consolidation).
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    // ── merge accessors (resident key columns + secondary indexes) ──────────────────
+    // A disk-native compaction ([`merge_run`]) enumerates the sorted union of keys from
+    // these resident columns, then folds the payloads through a `DeltaSnapshot`.
+    pub fn node_dense_ids(&self) -> &[u64] {
+        &self.node_keys
+    }
+    pub fn adj_out_nodes(&self) -> &[u64] {
+        &self.adj_out_keys
+    }
+    pub fn adj_in_nodes(&self) -> &[u64] {
+        &self.adj_in_keys
+    }
+    pub fn edge_ids(&self) -> &[u64] {
+        &self.edge_keys
+    }
+    pub fn born_by_label_ref(&self) -> &HashMap<String, Vec<u64>> {
+        &self.born_by_label
+    }
+    pub fn born_index_ref(&self) -> &[BornIndexEntry] {
+        &self.born_index
+    }
+    pub fn core_patched_ref(&self) -> &[(String, String, u64)] {
+        &self.core_patched
+    }
+    pub fn born_by_identity_ref(&self) -> &HashMap<Vec<u8>, u64> {
+        &self.born_by_identity
     }
 
     /// Fetch record `idx` of `reader` (section `sub`) through the shared cache, returning
@@ -694,6 +847,128 @@ pub fn identity_key_bytes(label: &str, key: &str, value: &Value) -> Vec<u8> {
     buf
 }
 
+/// Merge a **contiguous, stacked run** of off-heap L0 segments (newest-first) into one
+/// off-heap segment at `out_dir`, tagged `scope`. Streaming + disk-native: the run is
+/// folded through a `DeltaSnapshot` and each merged record is written out immediately, so
+/// the merged payloads are **never all held resident** — peak RSS is the key columns +
+/// secondaries + a block window (the point of the off-heap compaction, D54). The result is
+/// read-equivalent to `DeltaSnapshot::with_levels(run)`; born ids are preserved (the run's
+/// synthetic ranges are disjoint + stacked, so `synthetic_base` is the oldest member's base
+/// and every born id passes through at its original value).
+pub fn merge_run(
+    run: &[Arc<L0Reader>],
+    out_dir: impl AsRef<Path>,
+    scope: u128,
+    target_block_bytes: usize,
+    zstd_level: i32,
+) -> Result<()> {
+    assert!(!run.is_empty(), "merge_run needs at least one segment");
+    let oldest = run.last().unwrap();
+
+    // Fold the run through a DeltaSnapshot whose active memtable is empty but carries the
+    // oldest member's bases — so `synthetic_base`/`edge_synthetic_base` (the min across
+    // levels) stay correct while the empty level contributes no read.
+    let empty = Arc::new(Memtable::with_bases(
+        oldest.synthetic_base(),
+        oldest.edge_synthetic_base(),
+    ));
+    let levels: Vec<Arc<dyn LevelRead>> = run
+        .iter()
+        .map(|r| r.clone() as Arc<dyn LevelRead>)
+        .collect();
+    let snap = DeltaSnapshot::with_levels(empty, levels);
+
+    let mut w = OffheapSegmentWriter::create(out_dir, scope, target_block_bytes, zstd_level)?;
+
+    // Node section: sorted union of dense ids, folded newest-wins (a tombstoned entry is
+    // kept — it must keep suppressing the core row).
+    let mut node_count = 0u64;
+    for id in sorted_union(run.iter().map(|r| r.node_dense_ids())) {
+        let (Some(delta), Some((label, key, value))) =
+            (snap.node_patch(id), snap.node_identity_by_dense(id))
+        else {
+            continue;
+        };
+        w.push_node(id, &label, &key, &value, &delta)?;
+        node_count += 1;
+    }
+
+    // Adjacency: sorted union of endpoints, deduped by (reltype, neighbour) newest-wins.
+    for node in sorted_union(run.iter().map(|r| r.adj_out_nodes())) {
+        let edges = snap.out_edges(node);
+        if !edges.is_empty() {
+            w.push_adj_out(node, &edges)?;
+        }
+    }
+    for node in sorted_union(run.iter().map(|r| r.adj_in_nodes())) {
+        let edges = snap.in_edges(node);
+        if !edges.is_empty() {
+            w.push_adj_in(node, &edges)?;
+        }
+    }
+
+    // Edge section: sorted union of edge ids, folded newest-wins. The newest level that
+    // touches an id decides `tombstoned`; `edge_patches` folds the properties (and clears
+    // them on a newer tombstone).
+    let mut edge_count = 0u64;
+    for id in sorted_union(run.iter().map(|r| r.edge_ids())) {
+        let Some(newest) = run.iter().find_map(|r| r.edge_delta_owned(id)) else {
+            continue;
+        };
+        let merged = EdgeDelta {
+            patches: snap.edge_patches(id),
+            tombstoned: newest.tombstoned,
+        };
+        w.push_edge(id, &merged)?;
+        edge_count += 1;
+    }
+
+    w.set_scalars(
+        snap.synthetic_base(),
+        snap.edge_synthetic_base(),
+        node_count,
+        edge_count,
+        snap.born_count(),
+        snap.born_edge_count(),
+    );
+
+    // Secondary indexes: concatenate the run's resident structures **oldest-first**,
+    // preserving the exact per-level born-index semantics (a born id lives in one level;
+    // born-id ranges stack ascending, so oldest-first concatenation keeps lists ascending).
+    let mut by_label: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut born_index: Vec<BornIndexEntry> = Vec::new();
+    let mut core_patched: Vec<(String, String, u64)> = Vec::new();
+    let mut born_by_identity: Vec<(Vec<u8>, u64)> = Vec::new();
+    for r in run.iter().rev() {
+        for (label, ids) in r.born_by_label_ref() {
+            by_label
+                .entry(label.clone())
+                .or_default()
+                .extend_from_slice(ids);
+        }
+        born_index.extend(r.born_index_ref().iter().cloned());
+        core_patched.extend(r.core_patched_ref().iter().cloned());
+        for (ck, id) in r.born_by_identity_ref() {
+            born_by_identity.push((ck.clone(), *id));
+        }
+    }
+    w.set_secondaries(
+        by_label.into_iter().collect(),
+        born_index,
+        core_patched,
+        born_by_identity,
+    );
+    w.finish()
+}
+
+/// Sorted, de-duplicated union of several `u64` key columns.
+fn sorted_union<'a>(cols: impl Iterator<Item = &'a [u64]>) -> Vec<u64> {
+    let mut all: Vec<u64> = cols.flatten().copied().collect();
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,9 +1088,9 @@ mod tests {
     fn roundtrip(m: &Memtable, tag: &str) -> (PathBuf, L0Reader) {
         let dir = tmp(tag);
         let _ = std::fs::remove_dir_all(&dir);
-        write_segment(&m.to_segment_data(), &dir, 256, 3).unwrap();
+        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3).unwrap();
         let cache = Arc::new(BlockCache::new(1 << 20));
-        let reader = L0Reader::open(&dir, 0x1234, cache).unwrap();
+        let reader = L0Reader::open(&dir, cache).unwrap();
         (dir, reader)
     }
 
@@ -934,13 +1209,150 @@ mod tests {
         let m = populate();
         let dir = tmp("corrupt");
         let _ = std::fs::remove_dir_all(&dir);
-        write_segment(&m.to_segment_data(), &dir, 256, 3).unwrap();
+        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3).unwrap();
         let mut meta = std::fs::read(dir.join("meta.bin")).unwrap();
         let last = meta.len() - 1;
         meta[last] ^= 0xff;
         std::fs::write(dir.join("meta.bin"), &meta).unwrap();
         let cache = Arc::new(BlockCache::new(1 << 20));
-        assert!(L0Reader::open(&dir, 1, cache).is_err());
+        assert!(L0Reader::open(&dir, cache).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn sort_edges(mut v: Vec<DeltaEdge>) -> Vec<DeltaEdge> {
+        v.sort_by(|a, b| (a.other, &a.reltype).cmp(&(b.other, &b.reltype)));
+        v
+    }
+
+    /// A disk-native merge of a stacked off-heap run is read-equivalent to the
+    /// `DeltaSnapshot` fold over that run (the compaction invariant), exercising a
+    /// cross-level core patch, disjoint born unions, a tombstone, and a born edge —
+    /// with a small block size so payloads span multiple paged blocks.
+    #[test]
+    fn merge_run_matches_the_snapshot_fold() {
+        let base = tmp("merge_run");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let cache = Arc::new(BlockCache::new(1 << 20));
+
+        // Oldest level: core 5 patched (age=1), born Zoe→100, born edge 5→Zoe.
+        let mut older = Memtable::with_bases(100, 10);
+        upsert(&mut older, "Alice", &[("age", Value::Int(1))], Some(5));
+        upsert(&mut older, "Zoe", &[("age", Value::Int(9))], None); // born 100
+        older.apply(
+            &WalOp::UpsertEdge {
+                src_label: "Person".into(),
+                src_key: "name".into(),
+                src_value: Value::Str("Alice".into()),
+                reltype: "KNOWS".into(),
+                dst_label: "Person".into(),
+                dst_key: "name".into(),
+                dst_value: Value::Str("Zoe".into()),
+                patches: Default::default(),
+            },
+            OpResolution::Edge {
+                src: Some(5),
+                dst: None,
+                edge_id: None,
+            },
+        );
+
+        // Newer level (rebased past `older`): core 5 re-patched (age=2 wins, +city),
+        // tombstone core 7, born Yan→101.
+        let mut newer =
+            Memtable::with_bases(100 + older.born_count(), 10 + older.born_edge_count());
+        upsert(
+            &mut newer,
+            "Alice",
+            &[("age", Value::Int(2)), ("city", Value::Str("NYC".into()))],
+            Some(5),
+        );
+        newer.apply(
+            &WalOp::DeleteNode {
+                label: "Person".into(),
+                key: "name".into(),
+                value: Value::Str("Bob".into()),
+            },
+            OpResolution::Node(Some(7)),
+        );
+        upsert(&mut newer, "Yan", &[("age", Value::Int(20))], None); // born 101
+
+        // Write each off-heap (tiny blocks → multi-block sections), open as readers.
+        write_segment(&older.to_segment_data(), base.join("old.l0"), 1, 64, 3).unwrap();
+        write_segment(&newer.to_segment_data(), base.join("new.l0"), 2, 64, 3).unwrap();
+        let r_old = Arc::new(L0Reader::open(base.join("old.l0"), cache.clone()).unwrap());
+        let r_new = Arc::new(L0Reader::open(base.join("new.l0"), cache.clone()).unwrap());
+        let run = vec![r_new.clone(), r_old.clone()]; // newest-first
+
+        let mk_snap = |levels: Vec<Arc<dyn LevelRead>>, oldest: &Arc<L0Reader>| {
+            let empty = Arc::new(Memtable::with_bases(
+                oldest.synthetic_base(),
+                oldest.edge_synthetic_base(),
+            ));
+            DeltaSnapshot::with_levels(empty, levels)
+        };
+        let reference = mk_snap(
+            run.iter()
+                .map(|r| r.clone() as Arc<dyn LevelRead>)
+                .collect(),
+            &r_old,
+        );
+
+        // Merge, reopen, wrap in a snapshot the same way.
+        let merged_dir = base.join("merged.l0");
+        merge_run(&run, &merged_dir, 99, 64, 3).unwrap();
+        let merged = Arc::new(L0Reader::open(&merged_dir, cache.clone()).unwrap());
+        let folded = mk_snap(vec![merged.clone() as Arc<dyn LevelRead>], &merged);
+
+        assert_eq!(reference.synthetic_base(), folded.synthetic_base());
+        assert_eq!(
+            reference.edge_synthetic_base(),
+            folded.edge_synthetic_base()
+        );
+        assert_eq!(reference.born_count(), folded.born_count());
+        assert_eq!(reference.born_edge_count(), folded.born_edge_count());
+        let hi = reference.synthetic_base() + reference.born_count();
+        for id in 0..hi + 3 {
+            assert_eq!(
+                reference.node_patch(id),
+                folded.node_patch(id),
+                "node_patch({id})"
+            );
+            assert_eq!(
+                reference.is_tombstoned(id),
+                folded.is_tombstoned(id),
+                "tombstoned({id})"
+            );
+            assert_eq!(
+                sort_edges(reference.out_edges(id)),
+                sort_edges(folded.out_edges(id)),
+                "out_edges({id})",
+            );
+            assert_eq!(
+                sort_edges(reference.in_edges(id)),
+                sort_edges(folded.in_edges(id)),
+                "in_edges({id})",
+            );
+        }
+        assert_eq!(
+            reference.born_ids_with_label("Person"),
+            folded.born_ids_with_label("Person"),
+        );
+        assert_eq!(
+            reference.born_ids_in_index_eq("Person", "name", &Value::Str("Yan".into())),
+            folded.born_ids_in_index_eq("Person", "name", &Value::Str("Yan".into())),
+        );
+        // Headline folds: core 5 has the newer age + city; core 7 deleted; both born nodes.
+        assert_eq!(
+            folded.node_patch(5).unwrap().patches.get("age"),
+            Some(&Value::Int(2))
+        );
+        assert_eq!(
+            folded.node_patch(5).unwrap().patches.get("city"),
+            Some(&Value::Str("NYC".into())),
+        );
+        assert!(folded.is_tombstoned(7));
+        assert_eq!(folded.born_count(), 2);
+        std::fs::remove_dir_all(&base).ok();
     }
 }

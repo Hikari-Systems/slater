@@ -970,8 +970,28 @@ correctness concern**. Three green slices:
   `dyn LevelRead`, merged-view read). clippy `-D warnings` + fmt clean. See D54.
 
   **Deferred (documented):** the secondary scan/write indexes remain resident (Phase B
-  note — insert-heavy born *values*); and off-heap mode skips L0→L0 compaction (relies on
-  consolidation to bound level count). Both are cleanly-scoped follow-ups, not correctness gaps.
+  note — insert-heavy born *values*). A cleanly-scoped follow-up, not a correctness gap.
+
+- **Off-heap L0→L0 compaction (the disk-native streaming merge). ✅ DONE** (this commit;
+  option (b) from the follow-up). `compact_l0` no longer no-ops in off-heap mode — it now
+  merges a size-tier run via `slater_delta::l0_offheap::merge_run`, a **disk-native
+  streaming** merge: the run is folded through a `DeltaSnapshot` (an empty active memtable
+  carrying the oldest member's bases keeps `synthetic_base = min` correct) and each merged
+  record is written out immediately through the new incremental `OffheapSegmentWriter`, so
+  the merged payloads are **never all held resident** — peak RSS is the key columns +
+  secondaries + a block window (not the whole merged result). Reuses the tested read/fold
+  semantics (`node_patch`/`out_edges`/`edge_patches`) rather than re-implementing them;
+  born ids preserved (disjoint + stacked); secondary indexes concatenated oldest-first
+  (exact per-level semantics). **Cache-scope correctness:** a merge reuses the run's oldest
+  segment *directory*, so a path-derived cache scope would collide with the pre-merge
+  segment's stale blocks — fixed by persisting a **fresh unique scope** (a v4 UUID) in each
+  segment's `meta.bin` at write, read back by `L0Reader::open(dir, cache)` (the `scope` param
+  is gone), so a reopen is stable and every (re)write gets a distinct scope. Tests:
+  `l0_offheap::merge_run_matches_the_snapshot_fold` (a stacked 2-level off-heap run merged →
+  read-for-read equal to the `DeltaSnapshot` fold over the run, tiny blocks so payloads span
+  multiple paged blocks) + `delta_writer::offheap_compaction_streams_and_collapses_the_stack`
+  (3 same-tier flushes → compact collapses the stack, cross-level core-patch fold + disjoint
+  born ids preserved, reopen-durable). 615 slater + 65 slater-delta green; clippy + fmt clean.
 
 ## Recommended context-clear points
 
@@ -994,10 +1014,10 @@ ISAM-resolve floor is RESOLVED** (D52 decoded-block cache + D53 smaller range-in
 (the big deferred RSS item) are ✅ DONE — all three phases** (see the "Off-heap L0 reads"
 section above): A the `LevelRead` seam (`65d3aa5`), B the block-addressable format + `L0Reader`
 with proven read-for-read parity (`3194cb6`), C the writer/server wiring behind `delta.offHeapL0`
-(default off) sharing the columnar `BlockCache` (`016aff3`, D54). **Open follow-ups** (all
-optional, none blocking): block the resident **secondary indexes** for insert-heavy deltas;
-**L0→L0 compaction** in off-heap mode; and (independent) removing the now-dead `FileKind::Range`
-cache variant. Latest commits:
+(default off) sharing the columnar `BlockCache` (`016aff3`, D54), plus off-heap **L0→L0
+compaction** as a disk-native streaming merge (`merge_run`, option (b)). **Open follow-ups**
+(all optional, none blocking): block the resident **secondary indexes** for insert-heavy
+deltas; and (independent) removing the now-dead `FileKind::Range` cache variant. Latest commits:
 - `016aff3` feat(delta): wire off-heap L0 into the writer/server (Phase C) — D54
 - `3194cb6` feat(delta): off-heap L0 segment format + reader (Phase B)
 - `65d3aa5` refactor(delta): LevelRead seam for off-heap L0 (Phase A)

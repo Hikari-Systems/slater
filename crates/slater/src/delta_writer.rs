@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use graph_format::blockcache::BlockCache as GfBlockCache;
 use graph_format::ids::{Generation as GenId, Value};
-use slater_delta::l0_offheap::write_segment;
+use slater_delta::l0_offheap::{merge_run, write_segment};
 use slater_delta::{
     replay_dir, DeltaSnapshot, L0Reader, L0Segment, LevelRead, Memtable, OpResolution, Seq, WalOp,
     WalRecord, WalSink,
@@ -106,14 +106,23 @@ impl L0Level {
         }
     }
 
-    /// The resident memtable behind a [`L0Level::Resident`] — for L0→L0 compaction, which
-    /// runs only in the resident mode (the caller returns early for off-heap).
+    /// The resident memtable behind a [`L0Level::Resident`] — for resident L0→L0
+    /// compaction (`merge_levels`), which the caller uses only on resident levels.
     fn resident_memtable(&self) -> &Arc<Memtable> {
         match self {
             L0Level::Resident(s) => s.memtable(),
             L0Level::OffHeap { .. } => {
-                unreachable!("L0→L0 compaction is disabled in off-heap mode")
+                unreachable!("resident merge_levels called on an off-heap level")
             }
+        }
+    }
+
+    /// The off-heap reader behind a [`L0Level::OffHeap`] — for the disk-native streaming
+    /// compaction ([`merge_run`]); `None` for a resident level.
+    fn offheap_reader(&self) -> Option<Arc<L0Reader>> {
+        match self {
+            L0Level::OffHeap { reader, .. } => Some(reader.clone()),
+            L0Level::Resident(_) => None,
         }
     }
 }
@@ -513,8 +522,14 @@ impl DeltaWriter {
                 .clone()
                 .context("off-heap L0 flush requires a block cache")?;
             let data = inner.mem.to_segment_data();
-            write_segment(&data, &path, OFFHEAP_L0_BLOCK_BYTES, OFFHEAP_L0_ZSTD_LEVEL)
-                .with_context(|| format!("write off-heap L0 segment {path:?}"))?;
+            write_segment(
+                &data,
+                &path,
+                new_segment_scope(),
+                OFFHEAP_L0_BLOCK_BYTES,
+                OFFHEAP_L0_ZSTD_LEVEL,
+            )
+            .with_context(|| format!("write off-heap L0 segment {path:?}"))?;
             open_l0_level(&path, Some(&cache))
                 .with_context(|| format!("reopen off-heap L0 segment {path:?}"))?
         } else {
@@ -558,10 +573,15 @@ impl DeltaWriter {
     /// 4d-i) — the cheap, O(delta), no-core-rebuild tier that lets the layer sustain
     /// write volume. Rather than merge *all* levels (the first-cut policy), it selects a
     /// contiguous run of similar-sized levels ([`select_compaction_run`]) and merges only
-    /// that run via [`Memtable::merge_levels`] (reclaiming overwritten patches + shadowed
-    /// tombstones and collapsing read fan-out within the tier), leaving differently-sized
-    /// levels alone so a large level is never repeatedly rewritten with tiny new ones
-    /// (write amplification). A no-op (returns `false`) with fewer than two levels, or
+    /// that run (reclaiming overwritten patches + shadowed tombstones and collapsing read
+    /// fan-out within the tier), leaving differently-sized levels alone so a large level is
+    /// never repeatedly rewritten with tiny new ones (write amplification). The merge runs
+    /// in the run's own format: **resident** levels fold in RAM via
+    /// [`Memtable::merge_levels`]; **off-heap** levels are merged by
+    /// [`merge_run`](slater_delta::l0_offheap::merge_run), a disk-native streaming k-way
+    /// merge over the sorted on-disk sections that never holds the merged payloads resident
+    /// (RSS bounded to a block window — see D54). A no-op (returns `false`) with fewer than
+    /// two levels, or
     /// when no two adjacent levels are same-tier (a healthy size ladder). This is
     /// self-balancing: equal-sized flushes form same-tier runs that merge, and the merged
     /// results are themselves same-tier and merge in turn, so fan-out stays bounded.
@@ -586,12 +606,6 @@ impl DeltaWriter {
         if self.consolidating.load(Ordering::Acquire) {
             return Ok(false);
         }
-        // Off-heap L0 does no L0→L0 compaction: `merge_levels` needs resident memtables,
-        // and an off-heap level is deliberately not held resident. The fraction-of-core
-        // consolidation bounds the level count instead. See D54.
-        if inner.off_heap {
-            return Ok(false);
-        }
         if inner.l0.len() < 2 {
             return Ok(false);
         }
@@ -602,38 +616,61 @@ impl DeltaWriter {
             return Ok(false); // a healthy size ladder — nothing same-tier to merge
         };
 
-        // Merge the run (newest-first) into one equivalent segment. Every level here is
-        // resident (off-heap returned early above).
-        let run: Vec<&Memtable> = inner.l0[start..end]
-            .iter()
-            .map(|s| s.resident_memtable().as_ref())
-            .collect();
-        let merged = Memtable::merge_levels(&run);
-
-        // Reuse the run's OLDEST file slot (`inner.l0[end - 1]`) — its number and born-id
-        // base are the run's minimum, matching the merged segment's base, so on-disk
-        // number order stays == age/base order without reconciling in `open`.
+        // Reuse the run's OLDEST slot (`inner.l0[end - 1]`): its number and born-id base are
+        // the run's minimum, matching the merged segment's base, so on-disk number order
+        // stays == age/base order without reconciling in `open`. The run's newer members are
+        // deleted after publishing.
         let oldest_path = inner.l0[end - 1].path().to_path_buf();
-        L0Segment::write(&merged, &oldest_path)
-            .with_context(|| format!("write compacted L0 segment {oldest_path:?}"))?;
-        let seg = L0Segment::open(&oldest_path)
-            .with_context(|| format!("reopen compacted L0 segment {oldest_path:?}"))?;
-
-        // The run's newer members (all but the oldest slot we overwrote) are now folded
-        // into the merged segment; delete them after publishing.
         let consumed: Vec<PathBuf> = inner.l0[start..end - 1]
             .iter()
             .map(|s| s.path().to_path_buf())
             .collect();
 
+        // Merge the run (newest-first) into one equivalent segment, in the run's own format:
+        // off-heap **streams** the sorted on-disk runs (RSS bounded to a block window, D54),
+        // resident folds in RAM via `merge_levels`.
+        let merged_level = if inner.off_heap {
+            let cache = inner
+                .block_cache
+                .clone()
+                .context("off-heap L0 compaction requires a block cache")?;
+            let Some(run) = inner.l0[start..end]
+                .iter()
+                .map(|s| s.offheap_reader())
+                .collect::<Option<Vec<Arc<L0Reader>>>>()
+            else {
+                return Ok(false); // a mixed stack (not expected in off-heap mode) — skip
+            };
+            merge_run(
+                &run,
+                &oldest_path,
+                new_segment_scope(),
+                OFFHEAP_L0_BLOCK_BYTES,
+                OFFHEAP_L0_ZSTD_LEVEL,
+            )
+            .with_context(|| format!("merge off-heap L0 run into {oldest_path:?}"))?;
+            open_l0_level(&oldest_path, Some(&cache))
+                .with_context(|| format!("reopen merged off-heap L0 segment {oldest_path:?}"))?
+        } else {
+            let run: Vec<&Memtable> = inner.l0[start..end]
+                .iter()
+                .map(|s| s.resident_memtable().as_ref())
+                .collect();
+            let merged = Memtable::merge_levels(&run);
+            L0Segment::write(&merged, &oldest_path)
+                .with_context(|| format!("write compacted L0 segment {oldest_path:?}"))?;
+            L0Level::Resident(
+                L0Segment::open(&oldest_path)
+                    .with_context(|| format!("reopen compacted L0 segment {oldest_path:?}"))?,
+            )
+        };
+
         // Splice the run out, in place, for the single merged segment (stack stays
         // newest-first + number-ordered).
-        inner
-            .l0
-            .splice(start..end, std::iter::once(L0Level::Resident(seg)));
+        inner.l0.splice(start..end, std::iter::once(merged_level));
 
         // Publish the collapsed stack, then delete the consumed files (durable in the
-        // merged file) — publish-before-delete so a reader never loses the data.
+        // merged segment) — publish-before-delete so a reader never loses the data.
         self.republish(&inner);
         for p in &consumed {
             remove_if_present(p)?;
@@ -820,8 +857,9 @@ fn open_l0_level(path: &Path, cache: Option<&Arc<GfBlockCache>>) -> Result<L0Lev
         let cache = cache
             .cloned()
             .context("off-heap L0 segment on disk but no block cache configured")?;
-        let scope = segment_scope(path);
-        let reader = Arc::new(L0Reader::open(path, scope, cache)?);
+        // The cache scope is read from the segment's meta (persisted, fresh per write), so
+        // a compaction that reuses a directory can't collide with stale cached blocks.
+        let reader = Arc::new(L0Reader::open(path, cache)?);
         let bytes = dir_size(path);
         Ok(L0Level::OffHeap {
             reader,
@@ -833,15 +871,11 @@ fn open_l0_level(path: &Path, cache: Option<&Arc<GfBlockCache>>) -> Result<L0Lev
     }
 }
 
-/// A stable, deterministic cache scope for an off-heap segment, derived from its path (a
-/// fixed-seed `DefaultHasher`, so it survives a reopen). Disjoint from the columnar keys
-/// (which scope on the random generation UUID); a retired segment's scope is never queried
-/// again, so its blocks age out of the shared LRU.
-fn segment_scope(path: &Path) -> u128 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut h);
-    h.finish() as u128
+/// A fresh, globally-unique cache scope for a newly written off-heap segment, persisted in
+/// its meta so a reopen reads it back. Fresh per write (even when a compaction reuses a
+/// directory), and disjoint from the columnar keys (which scope on the generation UUID).
+fn new_segment_scope() -> u128 {
+    uuid::Uuid::new_v4().as_u128()
 }
 
 /// Total on-disk size of a segment directory (sum of its file lengths).
@@ -1134,6 +1168,81 @@ mod tests {
                 .and_then(|d| d.patches.get("price").cloned()),
             Some(Value::Int(7)),
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Off-heap L0→L0 compaction (D54) streams the sealed on-disk segments through a merge
+    /// and collapses the same-tier run into one, preserving every read (cross-level core
+    /// patch fold + disjoint born nodes), durable across a reopen.
+    #[test]
+    fn offheap_compaction_streams_and_collapses_the_stack() {
+        let dir = tmp("offheap_compact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = gf_cache();
+        {
+            let w = open_offheap(&dir, cache.clone());
+            // Three same-tier flushes: each re-patches core 10 (folds newest-wins) and adds
+            // a distinct born node (disjoint synthetic ids 100, 101, 102).
+            for i in 0..3u64 {
+                w.write(
+                    upsert(
+                        "Company",
+                        "ticker",
+                        Value::Str("A".into()),
+                        &[("price", Value::Int(i as i64))],
+                    ),
+                    node(10),
+                )
+                .unwrap();
+                w.write(
+                    upsert(
+                        "Company",
+                        "ticker",
+                        Value::Str(format!("C{i}")),
+                        &[("n", Value::Int(i as i64))],
+                    ),
+                    OpResolution::Node(None),
+                )
+                .unwrap();
+                assert!(w.flush_to_l0().unwrap());
+            }
+            assert_eq!(w.l0_len(), 3);
+            let before_born = w.delta_snapshot().born_ids_with_label("Company");
+            assert_eq!(before_born, vec![100, 101, 102]);
+
+            // Compact the same-tier run → collapses the stack.
+            assert!(w.compact_l0().unwrap(), "same-tier run compacts");
+            assert!(w.l0_len() < 3, "compaction collapsed the stack");
+            let snap = w.delta_snapshot();
+            assert_eq!(
+                snap.node_patch(10)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                Some(Value::Int(2)),
+                "newest core-10 patch wins after the merge",
+            );
+            assert_eq!(
+                snap.born_ids_with_label("Company"),
+                before_born,
+                "born ids preserved",
+            );
+            assert_eq!(
+                snap.node_identity_by_dense(100),
+                Some((
+                    "Company".to_string(),
+                    "ticker".to_string(),
+                    Value::Str("C0".into()),
+                )),
+            );
+        }
+        // Reopen off-heap: the merged segment reloads and reads still hold.
+        let w2 = open_offheap(&dir, cache);
+        let snap = w2.delta_snapshot();
+        assert_eq!(
+            snap.node_patch(10)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(2)),
+        );
+        assert_eq!(snap.born_ids_with_label("Company"), vec![100, 101, 102]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

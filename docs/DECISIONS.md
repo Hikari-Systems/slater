@@ -1089,8 +1089,13 @@ per-segment cache scopes (a fixed-seed hash of the segment dir path) are disjoin
 columnar scopes, and a retired segment's blocks age out of the LRU. (2) **Blocking the secondary indexes**
 (`born_by_label`/`index`/`identity`, `core_patched`) — they stay resident (they re-hold born *values*, the
 only unbounded term left, and only for insert-heavy deltas); blocking them is a mechanical follow-up. (3)
-**L0→L0 compaction off-heap** — `merge_levels` needs resident memtables, so compaction is skipped in
-off-heap mode and the fraction-of-core consolidation bounds the level count instead. None is a correctness
-gap; the hot read path and every per-entity payload are fully off-heap. `#![forbid(unsafe_code)]` holds
+Naively **porting `merge_levels`** (fold the whole run into a resident memtable, then write it) for
+off-heap compaction — it would spike RSS to the merged-run size, defeating the point. Instead off-heap
+L0→L0 compaction is a **disk-native streaming merge** (`l0_offheap::merge_run`): the sorted on-disk runs
+are folded through a `DeltaSnapshot` (reusing the tested read/fold semantics) and streamed out through an
+incremental `OffheapSegmentWriter`, so peak RSS is a block window, not the merged result. A merge reuses
+the run's oldest segment directory, so a **fresh unique scope** (v4 UUID) is persisted in each segment's
+meta and read back at open — otherwise the reused path would serve the pre-merge segment's stale cached
+blocks. The hot read path and every per-entity payload are fully off-heap. `#![forbid(unsafe_code)]` holds
 throughout (`pread`, no mmap). No L0 back-compat obligation (segments are ephemeral between flush and
 consolidation). See `docs/WRITABLE-PROGRESS.md` §"Off-heap L0 reads" and `~/.claude/plans/offheap-l0.md`.
