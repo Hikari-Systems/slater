@@ -42,7 +42,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use graph_format::ids::{Generation as GenId, Value};
 use slater_delta::{
-    replay_dir, DeltaSnapshot, L0Segment, Memtable, OpResolution, Seq, WalOp, WalRecord, WalSink,
+    replay_dir, DeltaSnapshot, L0Segment, LevelRead, Memtable, OpResolution, Seq, WalOp, WalRecord,
+    WalSink,
 };
 
 /// A frozen delta handed to consolidation: an immutable snapshot of every
@@ -676,7 +677,10 @@ fn next_segment_number(dir: &Path) -> Result<u64> {
 /// segments' immutable memtable handles.
 fn published_snapshot(mem: &Memtable, l0: &[L0Segment]) -> DeltaSnapshot {
     let mem = Arc::new(mem.clone());
-    let levels: Vec<Arc<Memtable>> = l0.iter().map(|s| s.memtable().clone()).collect();
+    let levels: Vec<Arc<dyn LevelRead>> = l0
+        .iter()
+        .map(|s| s.memtable().clone() as Arc<dyn LevelRead>)
+        .collect();
     DeltaSnapshot::with_levels(mem, levels)
 }
 

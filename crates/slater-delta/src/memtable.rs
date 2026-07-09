@@ -1645,6 +1645,121 @@ fn value_in_range(
 /// beneath it: reads fold `memtable ⊕ L0*` (newest wins) over the core.
 ///
 /// # Multi-level fold (Phase 4c)
+/// The per-level read surface a [`DeltaSnapshot`] folds over. Each sealed delta level
+/// answers these — a resident [`Memtable`] today, an off-heap paged segment tomorrow —
+/// so the snapshot dispatches uniformly over `&dyn LevelRead` without caring where a
+/// level's bytes live.
+///
+/// **Every return is owned.** An off-heap level serves a read from a decompressed block
+/// that may be evicted the instant the call returns, so it can never hand back a borrow
+/// into its storage. The resident [`Memtable`] impl clones on the two hot value-returning
+/// accessors ([`node_patch_owned`](LevelRead::node_patch_owned),
+/// [`edge_delta_owned`](LevelRead::edge_delta_owned)); the tombstone-suppression hot path
+/// reads a single flag ([`node_tombstoned`](LevelRead::node_tombstoned)) and never clones a
+/// patch set. `Send + Sync` so a published [`DeltaSnapshot`] stays shareable across tasks.
+pub trait LevelRead: std::fmt::Debug + Send + Sync {
+    fn is_empty(&self) -> bool;
+    fn node_delta_count(&self) -> usize;
+    fn edge_delta_count(&self) -> usize;
+    fn synthetic_base(&self) -> u64;
+    fn edge_synthetic_base(&self) -> u64;
+    fn born_count(&self) -> u64;
+    fn born_edge_count(&self) -> u64;
+    /// Owned node delta by dense id (the snapshot merges owned deltas across levels).
+    fn node_patch_owned(&self, dense_id: u64) -> Option<NodeDelta>;
+    /// The tombstone flag alone for `dense_id`, or `None` if this level does not touch
+    /// it — the hot suppression-filter path, so it never clones the patch set.
+    fn node_tombstoned(&self, dense_id: u64) -> Option<bool>;
+    /// Owned `(label, key, key-value)` business identity by dense id.
+    fn node_identity_owned(&self, dense_id: u64) -> Option<(String, String, Value)>;
+    fn born_ids_with_label(&self, label: &str) -> Vec<u64>;
+    fn born_synthetic_for_identity(&self, label: &str, key: &str, value: &Value) -> Option<u64>;
+    fn born_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64>;
+    fn born_ids_in_index_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Vec<u64>;
+    fn core_ids_patched_on_index(&self, label: &str, prop: &str) -> Vec<u64>;
+    fn out_edges(&self, node: u64) -> Vec<DeltaEdge>;
+    fn in_edges(&self, node: u64) -> Vec<DeltaEdge>;
+    /// Owned edge delta by dense edge id.
+    fn edge_delta_owned(&self, edge_id: u64) -> Option<EdgeDelta>;
+}
+
+/// The resident level: a [`Memtable`] answers every accessor from its in-RAM maps,
+/// cloning only where the trait's owned contract requires it (the borrow-returning
+/// inherent methods stay for the same-memtable fast paths and tests).
+impl LevelRead for Memtable {
+    fn is_empty(&self) -> bool {
+        Memtable::is_empty(self)
+    }
+    fn node_delta_count(&self) -> usize {
+        Memtable::node_delta_count(self)
+    }
+    fn edge_delta_count(&self) -> usize {
+        Memtable::edge_delta_count(self)
+    }
+    fn synthetic_base(&self) -> u64 {
+        Memtable::synthetic_base(self)
+    }
+    fn edge_synthetic_base(&self) -> u64 {
+        Memtable::edge_synthetic_base(self)
+    }
+    fn born_count(&self) -> u64 {
+        Memtable::born_count(self)
+    }
+    fn born_edge_count(&self) -> u64 {
+        Memtable::born_edge_count(self)
+    }
+    fn node_patch_owned(&self, dense_id: u64) -> Option<NodeDelta> {
+        self.node_patch(dense_id).cloned()
+    }
+    fn node_tombstoned(&self, dense_id: u64) -> Option<bool> {
+        self.node_patch(dense_id).map(|nd| nd.tombstoned)
+    }
+    fn node_identity_owned(&self, dense_id: u64) -> Option<(String, String, Value)> {
+        self.node_identity_by_dense(dense_id)
+            .map(|(l, k, v)| (l.to_string(), k.to_string(), v.clone()))
+    }
+    fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
+        Memtable::born_ids_with_label(self, label)
+    }
+    fn born_synthetic_for_identity(&self, label: &str, key: &str, value: &Value) -> Option<u64> {
+        Memtable::born_synthetic_for_identity(self, label, key, value)
+    }
+    fn born_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64> {
+        Memtable::born_ids_in_index_eq(self, label, prop, key)
+    }
+    fn born_ids_in_index_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Vec<u64> {
+        Memtable::born_ids_in_index_range(self, label, prop, lo, lo_inclusive, hi, hi_inclusive)
+    }
+    fn core_ids_patched_on_index(&self, label: &str, prop: &str) -> Vec<u64> {
+        Memtable::core_ids_patched_on_index(self, label, prop)
+    }
+    fn out_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        Memtable::out_edges(self, node)
+    }
+    fn in_edges(&self, node: u64) -> Vec<DeltaEdge> {
+        Memtable::in_edges(self, node)
+    }
+    fn edge_delta_owned(&self, edge_id: u64) -> Option<EdgeDelta> {
+        self.edge_delta_by_id(edge_id).cloned()
+    }
+}
+
 /// The active [`mem`](Self::mem) is the newest level; [`l0`](Self::l0) holds the
 /// sealed segments **newest-first**. Precedence is **last-writer-wins across levels**:
 /// - **node patches** on a *core* dense id may split across levels (a node patched
@@ -1664,9 +1779,10 @@ fn value_in_range(
 pub struct DeltaSnapshot {
     /// The live (active) memtable — the newest level.
     mem: Arc<Memtable>,
-    /// Sealed, immutable L0 segments (as reloaded memtables), **newest first**. Empty
-    /// on the common no-flush path.
-    l0: Vec<Arc<Memtable>>,
+    /// Sealed, immutable L0 levels, **newest first**. Empty on the common no-flush path.
+    /// Each is a `dyn LevelRead` — a resident [`Memtable`] today, an off-heap paged
+    /// segment tomorrow — so the fold below dispatches without caring where its bytes live.
+    l0: Vec<Arc<dyn LevelRead>>,
 }
 
 impl DeltaSnapshot {
@@ -1689,7 +1805,7 @@ impl DeltaSnapshot {
     /// Stack sealed L0 segments (as reloaded memtables, **newest first**) beneath the
     /// active memtable (Phase 4c). The writer publishes the flushed segments here so a
     /// read folds `mem ⊕ L0*`.
-    pub fn with_levels(mem: Arc<Memtable>, l0: Vec<Arc<Memtable>>) -> Self {
+    pub fn with_levels(mem: Arc<Memtable>, l0: Vec<Arc<dyn LevelRead>>) -> Self {
         Self { mem, l0 }
     }
 
@@ -1703,27 +1819,28 @@ impl DeltaSnapshot {
     /// The sealed L0 segments beneath the active memtable, **newest first** (empty on
     /// the common no-flush path). The writer folds born-id resolution over these.
     #[inline]
-    pub fn l0_levels(&self) -> &[Arc<Memtable>] {
+    pub fn l0_levels(&self) -> &[Arc<dyn LevelRead>] {
         &self.l0
     }
 
     /// The delta levels in **newest-first** precedence order (active memtable, then the
     /// L0 segments newest→oldest) — first hit wins for tombstone/identity/edge-dedup
     /// precedence.
-    fn levels_newest_first(&self) -> impl Iterator<Item = &Memtable> {
-        std::iter::once(self.mem.as_ref()).chain(self.l0.iter().map(Arc::as_ref))
+    fn levels_newest_first(&self) -> impl Iterator<Item = &dyn LevelRead> {
+        std::iter::once(self.mem.as_ref() as &dyn LevelRead)
+            .chain(self.l0.iter().map(|a| a.as_ref()))
     }
 
     /// The delta levels in **oldest-first** order (oldest L0 segment … active memtable)
     /// — the fold order for [`node_patch`](Self::node_patch) (newer property writes
     /// overlay older ones) and the emission order for born-id unions (their stacked
     /// synthetic-id ranges then come out ascending, matching the core scan order).
-    fn levels_oldest_first(&self) -> impl Iterator<Item = &Memtable> {
+    fn levels_oldest_first(&self) -> impl Iterator<Item = &dyn LevelRead> {
         self.l0
             .iter()
             .rev()
-            .map(Arc::as_ref)
-            .chain(std::iter::once(self.mem.as_ref()))
+            .map(|a| a.as_ref())
+            .chain(std::iter::once(self.mem.as_ref() as &dyn LevelRead))
     }
 
     /// Whether this snapshot overlays nothing — the reader's fast-path predicate. With
@@ -1746,11 +1863,11 @@ impl DeltaSnapshot {
         }
         let mut acc: Option<NodeDelta> = None;
         for level in self.levels_oldest_first() {
-            let Some(nd) = level.node_patch(dense_id) else {
+            let Some(nd) = level.node_patch_owned(dense_id) else {
                 continue;
             };
             match &mut acc {
-                None => acc = Some(nd.clone()),
+                None => acc = Some(nd),
                 Some(a) => {
                     if nd.tombstoned {
                         // A newer delete removes the node and everything patched below
@@ -1762,8 +1879,8 @@ impl DeltaSnapshot {
                         // tombstone already cleared the accumulated patches) and its
                         // property patches win over any surviving older ones.
                         a.tombstoned = false;
-                        for (k, v) in &nd.patches {
-                            a.patches.insert(k.clone(), v.clone());
+                        for (k, v) in nd.patches {
+                            a.patches.insert(k, v);
                         }
                     }
                 }
@@ -1780,8 +1897,8 @@ impl DeltaSnapshot {
     #[inline]
     pub fn is_tombstoned(&self, dense_id: u64) -> bool {
         for level in self.levels_newest_first() {
-            if let Some(nd) = level.node_patch(dense_id) {
-                return nd.tombstoned;
+            if let Some(t) = level.node_tombstoned(dense_id) {
+                return t;
             }
         }
         false
@@ -1792,7 +1909,7 @@ impl DeltaSnapshot {
     /// which is fine for a planning bound.
     pub fn node_delta_count(&self) -> usize {
         self.levels_newest_first()
-            .map(Memtable::node_delta_count)
+            .map(LevelRead::node_delta_count)
             .sum()
     }
 
@@ -1801,7 +1918,7 @@ impl DeltaSnapshot {
     /// planning/threshold magnitude). Pairs with [`Self::node_delta_count`].
     pub fn edge_delta_count(&self) -> usize {
         self.levels_newest_first()
-            .map(Memtable::edge_delta_count)
+            .map(LevelRead::edge_delta_count)
             .sum()
     }
 
@@ -1812,7 +1929,7 @@ impl DeltaSnapshot {
     #[inline]
     pub fn synthetic_base(&self) -> u64 {
         self.levels_newest_first()
-            .map(Memtable::synthetic_base)
+            .map(LevelRead::synthetic_base)
             .min()
             .unwrap_or(0)
     }
@@ -1822,7 +1939,7 @@ impl DeltaSnapshot {
     /// disjoint and stacked past the core count).
     #[inline]
     pub fn born_count(&self) -> u64 {
-        self.levels_newest_first().map(Memtable::born_count).sum()
+        self.levels_newest_first().map(LevelRead::born_count).sum()
     }
 
     /// Recover a node's `(label, key, key-value)` business identity by dense id — the
@@ -1830,9 +1947,9 @@ impl DeltaSnapshot {
     /// newest level touching the id answers (a synthetic id lives in exactly one; a
     /// core id's identity is level-invariant).
     #[inline]
-    pub fn node_identity_by_dense(&self, dense_id: u64) -> Option<(&str, &str, &Value)> {
+    pub fn node_identity_by_dense(&self, dense_id: u64) -> Option<(String, String, Value)> {
         self.levels_newest_first()
-            .find_map(|m| m.node_identity_by_dense(dense_id))
+            .find_map(|m| m.node_identity_owned(dense_id))
     }
 
     /// The synthetic dense ids of delta-born nodes carrying `label`, appended to a
@@ -2009,7 +2126,7 @@ impl DeltaSnapshot {
     #[inline]
     pub fn edge_synthetic_base(&self) -> u64 {
         self.levels_newest_first()
-            .map(Memtable::edge_synthetic_base)
+            .map(LevelRead::edge_synthetic_base)
             .min()
             .unwrap_or(0)
     }
@@ -2019,7 +2136,7 @@ impl DeltaSnapshot {
     #[inline]
     pub fn born_edge_count(&self) -> u64 {
         self.levels_newest_first()
-            .map(Memtable::born_edge_count)
+            .map(LevelRead::born_edge_count)
             .sum()
     }
 
@@ -2044,7 +2161,7 @@ impl DeltaSnapshot {
     /// then suppresses it, never double-counting or resurrecting it. Output order is
     /// deterministic (newest level's edges first, in that level's own order).
     fn merge_edges(&self, node: u64, outgoing: bool) -> Vec<DeltaEdge> {
-        let read = |m: &Memtable| {
+        let read = |m: &dyn LevelRead| {
             if outgoing {
                 m.out_edges(node)
             } else {
@@ -2052,7 +2169,7 @@ impl DeltaSnapshot {
             }
         };
         if self.l0.is_empty() {
-            return read(&self.mem);
+            return read(self.mem.as_ref());
         }
         let mut seen: HashSet<(String, u64)> = HashSet::new();
         let mut out = Vec::new();
@@ -2086,7 +2203,7 @@ impl DeltaSnapshot {
     /// stops the search (the edge is deleted, so no older patch survives).
     pub fn edge_patch_value(&self, edge_id: u64, prop: &str) -> Option<Value> {
         for m in self.levels_newest_first() {
-            let Some(d) = m.edge_delta_by_id(edge_id) else {
+            let Some(d) = m.edge_delta_owned(edge_id) else {
                 continue;
             };
             if d.tombstoned {
@@ -2107,7 +2224,7 @@ impl DeltaSnapshot {
     pub fn edge_patches(&self, edge_id: u64) -> BTreeMap<String, Value> {
         let mut merged: BTreeMap<String, Value> = BTreeMap::new();
         for m in self.levels_oldest_first() {
-            let Some(d) = m.edge_delta_by_id(edge_id) else {
+            let Some(d) = m.edge_delta_owned(edge_id) else {
                 continue;
             };
             if d.tombstoned {
@@ -2769,7 +2886,12 @@ mod tests {
 
     /// Build a `DeltaSnapshot` from a live memtable and older L0 levels (newest first).
     fn snap(mem: Memtable, l0: Vec<Memtable>) -> DeltaSnapshot {
-        DeltaSnapshot::with_levels(Arc::new(mem), l0.into_iter().map(Arc::new).collect())
+        DeltaSnapshot::with_levels(
+            Arc::new(mem),
+            l0.into_iter()
+                .map(|m| Arc::new(m) as Arc<dyn LevelRead>)
+                .collect(),
+        )
     }
 
     #[test]
@@ -2893,11 +3015,19 @@ mod tests {
         // Each synthetic id resolves against its owning level only.
         assert_eq!(
             s.node_identity_by_dense(100),
-            Some(("Person", "name", &Value::Str("Ann".into())))
+            Some((
+                "Person".to_string(),
+                "name".to_string(),
+                Value::Str("Ann".into())
+            ))
         );
         assert_eq!(
             s.node_identity_by_dense(101),
-            Some(("Person", "name", &Value::Str("Bob".into())))
+            Some((
+                "Person".to_string(),
+                "name".to_string(),
+                Value::Str("Bob".into())
+            ))
         );
         assert_eq!(
             s.node_patch(100).unwrap().patches.get("age"),
@@ -3454,7 +3584,10 @@ mod tests {
 
         let stack = DeltaSnapshot::with_levels(
             Arc::new(run[0].clone()),
-            run[1..].iter().map(|m| Arc::new(m.clone())).collect(),
+            run[1..]
+                .iter()
+                .map(|m| Arc::new(m.clone()) as Arc<dyn LevelRead>)
+                .collect(),
         );
         let merged_snap = DeltaSnapshot::from_memtable(Arc::new(merged));
 

@@ -887,6 +887,40 @@ O(log n) regardless of block size; smaller leaves make the *cold* path cheap —
 more blocks. Only affects newly built generations (existing images unchanged until rebuilt);
 determinism goldens are invariant. `bench_range_block_size_point_lookups` (`isam.rs`, `#[ignore]`).
 
+## Off-heap L0 reads — the big deferred RSS item (🔨 IN PROGRESS)
+
+Plan: `~/.claude/plans/offheap-l0.md`. **Goal:** stop holding whole sealed L0 delta
+segments resident. Today `L0Segment::open` deserialises a whole segment into
+`Arc<Memtable>` and `DeltaSnapshot` holds `Vec<Arc<Memtable>>`, so the L0 stack's RSS grows
+with the delta byte budget. Make sealed levels read **off-heap**: resident sparse per-axis
+directory + `pread`'d blocks through the shared columnar `BlockCache` (**user decision: one
+shared cache/eviction domain, not a dedicated delta cache**). `#![forbid(unsafe_code)]` ⇒
+`pread`, no mmap. No L0 back-compat (segments are ephemeral). Pure-RSS refinement, **not a
+correctness concern**. Three green slices:
+
+- **Phase A — the `LevelRead` seam. ✅ DONE** (this commit). Extracted the per-level read
+  surface `DeltaSnapshot` folds over into a `trait LevelRead` (`slater-delta::memtable`,
+  re-exported), with **owned** returns so an off-heap level can never leak a borrow into an
+  evictable block; the hot tombstone-suppression path gets a dedicated `node_tombstoned(id)
+  -> Option<bool>` that reads a single flag and never clones a patch set. `impl LevelRead for
+  Memtable` (delegates to the inherent borrow-returning methods, cloning only on the two
+  value accessors). `DeltaSnapshot.l0` is now `Vec<Arc<dyn LevelRead>>` and the fold
+  iterators (`levels_newest_first`/`levels_oldest_first`) yield `&dyn LevelRead`;
+  `with_levels`/`l0_levels` take/return the trait object. `DeltaSnapshot::node_identity_by_dense`
+  now returns **owned** `Option<(String,String,Value)>` (3 `exec.rs` call sites adjusted:
+  `label_id(&label)`, `kname.as_str() == key`, `overlay_named(named, &kname, …)`). The active
+  memtable stays a concrete `Arc<Memtable>` (the writer mutates/clones it), so the empty-delta
+  fast path and the `if self.l0.is_empty()` single-memtable fast paths are untouched — the
+  read-path cost is unchanged by construction (a non-empty single-memtable delta pays at most
+  one extra virtual call on the count/base/identity accessors, all gated behind
+  `!delta.is_empty()`). No on-disk format change; L0 segments are still resident memtables
+  coerced to `Arc<dyn LevelRead>`. Whole slater (612) + slater-delta (61) + workspace green
+  (27 result groups, 0 failed, determinism goldens incl.); clippy `-D warnings` + fmt clean;
+  empty-delta bench baseline re-established (~326 µs/3.5 ms arms, fast path unchanged).
+- **Phase B — block-addressable `L0 v2` format + off-heap `L0Reader: LevelRead`** (next).
+- **Phase C — wire into writer/server + config knob; consolidation/compaction load-to-merge**
+  (records as D54).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In

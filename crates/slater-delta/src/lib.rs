@@ -41,5 +41,7 @@ pub mod wal;
 
 pub use identity::{EdgeIdentity, NodeIdentity};
 pub use l0::L0Segment;
-pub use memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, Memtable, NodeDelta, OpResolution};
+pub use memtable::{
+    DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta, OpResolution,
+};
 pub use wal::{replay_dir, replay_segment, Replay, SealedSegment, Seq, WalOp, WalRecord, WalSink};

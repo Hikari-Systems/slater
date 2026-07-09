@@ -565,7 +565,7 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
         return Ok(gen
             .delta()
             .node_identity_by_dense(id)
-            .and_then(|(label, _, _)| gen.label_id(label))
+            .and_then(|(label, _, _)| gen.label_id(&label))
             .into_iter()
             .collect());
     }
@@ -597,8 +597,8 @@ fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
         // for a synthetic id.
         if id >= gen.core_generation().node_count() {
             if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
-                if kname == key {
-                    return Ok(Val::from_value(kval.clone()));
+                if kname.as_str() == key {
+                    return Ok(Val::from_value(kval));
                 }
             }
             return Ok(Val::Null);
@@ -1670,7 +1670,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // folding the patches over it.
         if id >= self.gen.core_generation().node_count() {
             if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
-                overlay_named(named, kname, Val::from_value(kval.clone()));
+                overlay_named(named, &kname, Val::from_value(kval));
             }
         }
         let Some(nd) = delta.node_patch(id) else {

@@ -492,7 +492,14 @@ impl Graphs {
         let dump_res = (|| -> Result<()> {
             let view = MergedView::new(
                 core.as_ref(),
-                DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
+                DeltaSnapshot::with_levels(
+                    frozen.snapshot.clone(),
+                    frozen
+                        .l0
+                        .iter()
+                        .map(|m| m.clone() as std::sync::Arc<dyn slater_delta::LevelRead>)
+                        .collect(),
+                ),
             );
             let engine = Engine::new(&view, cache);
             let mut file = std::io::BufWriter::new(
