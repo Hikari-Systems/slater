@@ -987,16 +987,22 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`. Core-edge patching (`136f316`) + its ledger note (`8d5a8b0`)
-are **pushed** to `origin/writeable`; the smoke-test group-commit rerun (`04beb9e`) + this findings
-note are **local, not yet pushed**. **Phases 0–5 are ALL DONE**, and the optional **`slater dump`
-CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph dump; round-trip verified
-content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred follow-ups** are now being
-closed one small commit at a time (see the "Deferred follow-ups (post-Phase-5)" section above).
-**Open recommended next task:** the **batch-local ISAM resolve** in `execute_write_batch` (see the
-"Perf finding — bulk-delete resolve is ISAM-block-decompress bound" section above — the 30%-delete
-smoke is CPU-bound on uncached per-row ISAM block decompression; a merge-join resolve pass would take
-it from ~15 min to seconds). Latest commits:
+**Resume state:** on branch `writeable`, **local commits not yet pushed** to `origin/writeable`
+(last pushed: `bc12d82`). **Phases 0–5 + `slater dump` CLI are ALL DONE.** The **bulk-delete
+ISAM-resolve floor is RESOLVED** (D52 decoded-block cache + D53 smaller range-index blocks;
+875s→13.2s — the batch-local merge-join resolve is now unnecessary). **Off-heap L0 reads
+(the big deferred RSS item) are ✅ DONE — all three phases** (see the "Off-heap L0 reads"
+section above): A the `LevelRead` seam (`65d3aa5`), B the block-addressable format + `L0Reader`
+with proven read-for-read parity (`3194cb6`), C the writer/server wiring behind `delta.offHeapL0`
+(default off) sharing the columnar `BlockCache` (`016aff3`, D54). **Open follow-ups** (all
+optional, none blocking): block the resident **secondary indexes** for insert-heavy deltas;
+**L0→L0 compaction** in off-heap mode; and (independent) removing the now-dead `FileKind::Range`
+cache variant. Latest commits:
+- `016aff3` feat(delta): wire off-heap L0 into the writer/server (Phase C) — D54
+- `3194cb6` feat(delta): off-heap L0 segment format + reader (Phase B)
+- `65d3aa5` refactor(delta): LevelRead seam for off-heap L0 (Phase A)
+- `79e9a51` perf(build): give range (ISAM) indexes their own smaller leaf-block size (D53)
+- `549c276` perf(isam): cache decoded range-index blocks + binary-search them (D52)
 - `04beb9e` test(delta): drive the 30%-delete smoke via group-committed write-UNWIND (found the ISAM-resolve floor)
 - `136f316` feat(delta): in-place core-edge property patching (SET r.p on an existing core edge)
 - `bcb109d` feat(delta): write-UNWIND batched node writes (group-commit surface)
