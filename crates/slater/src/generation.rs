@@ -163,6 +163,24 @@ impl Generation {
         master_key: Option<&[u8]>,
         verify_integrity: bool,
     ) -> Result<Self> {
+        Self::open_with_store_opts_cached(store, graph, master_key, verify_integrity, None)
+    }
+
+    /// As [`open_with_store_opts`](Generation::open_with_store_opts), but with an
+    /// optional per-generation **range-index block-cache budget**. When `Some(n)` with
+    /// `n > 0`, one decompressed-leaf-block cache of `n` bytes is built and shared across
+    /// every range (ISAM) reader in this generation, so a repeated equality/range probe
+    /// (a write resolve or an indexed seek over a contiguous key run) decompresses each
+    /// leaf once rather than once per probe. `None`/`0` opens the readers uncached (the
+    /// behaviour every other open path keeps). The cache is owned by the generation, so
+    /// dropping it on swap frees the budget.
+    pub fn open_with_store_opts_cached(
+        store: &dyn ObjectStore,
+        graph: &str,
+        master_key: Option<&[u8]>,
+        verify_integrity: bool,
+        range_index_cache_bytes: Option<usize>,
+    ) -> Result<Self> {
         let uuid = GenId(Self::current_uuid_in(store, graph)?);
         // Backend-relative key prefix for this generation's files.
         let base = join_key(graph, &uuid.to_string());
@@ -254,6 +272,14 @@ impl Generation {
         let reltype_tgt_post = open_post("reltype_tgt.post")?;
         let vectors = VectorStoreReader::open_src(open_blk("vectors.f32.blk")?, cipher.clone())?;
 
+        // One decoded-leaf-block cache shared across this generation's range readers
+        // (built only when a positive budget is supplied — the server path; every other
+        // opener leaves the readers uncached). Keyed per reader by the index's ordinal,
+        // so `(ordinal, block)` is unique within the cache.
+        let range_cache = range_index_cache_bytes
+            .filter(|&n| n > 0)
+            .map(|n| Arc::new(graph_format::isam::DecodedBlockCache::new(n)));
+
         // Open every range index concurrently — each is an independent S3 footer
         // read, and large graphs carry 100+ of them, so a serial loop here is the
         // bulk of a cold start. rayon bounds the fan-out to the core count; the
@@ -261,10 +287,14 @@ impl Generation {
         let range_indexes = manifest
             .range_indexes
             .par_iter()
-            .map(|ri| -> Result<(String, IsamReader)> {
+            .enumerate()
+            .map(|(ordinal, ri)| -> Result<(String, IsamReader)> {
                 let key = join_key(&base, &format!("range/{}.isam", ri.name));
-                let reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
+                let mut reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
                     .with_context(|| format!("open range index {key}"))?;
+                if let Some(cache) = &range_cache {
+                    reader = reader.with_block_cache(cache.clone(), ordinal as u32);
+                }
                 Ok((ri.name.clone(), reader))
             })
             .collect::<Result<HashMap<_, _>>>()?;

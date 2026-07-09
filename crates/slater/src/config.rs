@@ -461,6 +461,18 @@ pub struct CacheConfig {
     /// before. Pinned PQ codes are never swept.
     #[serde(default = "default_cache_ttl_ms", deserialize_with = "de::i64")]
     pub cache_ttl_ms: i64,
+    /// Per-generation byte budget for the range-index (ISAM) decompressed-leaf-block
+    /// cache. A business-key write resolve and an indexed range seek both probe the
+    /// range index; without this cache each probe re-reads + re-decompresses its leaf
+    /// block, so a bulk write over a contiguous key range re-decompresses the same block
+    /// once per key. One budget is shared across all of a generation's range readers and
+    /// freed when the generation is dropped on swap. **0 disables it** (every probe reads
+    /// fresh, the pre-cache behaviour). Defaults to 16 MiB.
+    #[serde(
+        default = "default_range_index_cache",
+        deserialize_with = "de::usize_floor0"
+    )]
+    pub range_index_cache_bytes: usize,
 }
 
 impl CacheConfig {
@@ -678,6 +690,9 @@ fn default_vector_cache() -> usize {
 fn default_result_cache() -> usize {
     16 * 1024 * 1024
 }
+fn default_range_index_cache() -> usize {
+    16 * 1024 * 1024
+}
 fn default_cache_ttl_ms() -> i64 {
     30 * 60 * 1000
 }
@@ -746,6 +761,7 @@ impl Default for CacheConfig {
             vector_cache_bytes: default_vector_cache(),
             result_cache_bytes: default_result_cache(),
             cache_ttl_ms: default_cache_ttl_ms(),
+            range_index_cache_bytes: default_range_index_cache(),
         }
     }
 }

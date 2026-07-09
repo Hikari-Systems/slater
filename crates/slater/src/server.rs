@@ -126,6 +126,10 @@ pub struct Graphs {
     acl_path: Option<PathBuf>,
     /// Refuse to serve a generation whose manifest carries no ACL stamp.
     require_acl_stamp: bool,
+    /// Per-generation range-index block-cache budget (`config.cache.rangeIndexCacheBytes`),
+    /// applied when opening a generation here and on every hot-reload swap. `None` (the
+    /// non-server openers) leaves range readers uncached.
+    range_index_cache_bytes: Option<usize>,
     /// Per-graph writable-layer writers, populated only when the delta layer is
     /// enabled (`config.delta.enabled`). Empty otherwise — the read-only server is
     /// exactly what it was. Each writer is bound to the generation it resolved its
@@ -142,7 +146,7 @@ impl Graphs {
     /// [`open_all_with_store`]: Graphs::open_all_with_store
     pub fn open_all(data_dir: &Path, master_key: Option<&[u8]>) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(data_dir));
-        Self::open_all_with_store(store, master_key, true)
+        Self::open_all_with_store(store, master_key, true, None)
     }
 
     /// Discover and open every graph in `store`, deriving each generation's block
@@ -154,6 +158,7 @@ impl Graphs {
         store: Arc<dyn ObjectStore>,
         master_key: Option<&[u8]>,
         verify_integrity: bool,
+        range_index_cache_bytes: Option<usize>,
     ) -> Result<Self> {
         let names = store.list("").context("list graphs in data store")?;
         // Open every graph concurrently. Each open is dominated by serial S3
@@ -168,11 +173,12 @@ impl Graphs {
             // A graph is one with a published `current` pointer.
             .filter(|name| store.exists(&join_key(name, "current")).unwrap_or(false))
             .map(|name| -> Result<(String, RwLock<Arc<Generation>>)> {
-                let gen = Generation::open_with_store_opts(
+                let gen = Generation::open_with_store_opts_cached(
                     store.as_ref(),
                     &name,
                     master_key,
                     verify_integrity,
+                    range_index_cache_bytes,
                 )
                 .with_context(|| format!("open graph {name}"))?;
                 Ok((name, RwLock::new(Arc::new(gen))))
@@ -185,6 +191,7 @@ impl Graphs {
             graphs,
             acl_path: None,
             require_acl_stamp: false,
+            range_index_cache_bytes,
             writers: HashMap::new(),
         })
     }
@@ -387,11 +394,12 @@ impl Graphs {
         // Open + validate the new generation. A half-rsynced/truncated copy fails
         // its content-hash check here and the caller keeps the old one serving.
         let new_gen = Arc::new(
-            Generation::open_with_store_opts(
+            Generation::open_with_store_opts_cached(
                 self.store.as_ref(),
                 name,
                 self.master_key.as_deref(),
                 self.verify_integrity,
+                self.range_index_cache_bytes,
             )
             .with_context(|| format!("open swapped-in generation {on_disk} of graph '{name}'"))?,
         );
@@ -1618,7 +1626,12 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         .context("load at-rest encryption key")?;
     let store = build_store(&cfg)?;
     let verify_integrity = cfg.data_backend.verify_integrity_resolved();
-    let mut graphs = Graphs::open_all_with_store(store, master_key.as_deref(), verify_integrity)?;
+    let mut graphs = Graphs::open_all_with_store(
+        store,
+        master_key.as_deref(),
+        verify_integrity,
+        Some(cfg.cache.range_index_cache_bytes),
+    )?;
     graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
     graphs
         .verify_manifest_policy()
@@ -3766,6 +3779,70 @@ mod tests {
     use crate::acl::hash_password;
     use crate::testgen;
     use tokio::net::TcpStream;
+
+    /// Micro-benchmark isolating the write-resolve cost: time `resolve_business_key`
+    /// over the 30%-delete segment (`wikidata_id` in `0..=p30`, ascending), cached vs
+    /// uncached, against a real large core — no WAL/memtable/flush machinery. Answers
+    /// "is the ISAM resolve the bulk-delete bottleneck, and does the range cache fix it?".
+    /// Env-gated + `#[ignore]`; point it at a data dir:
+    /// `SLATER_SMOKE_DATADIR=/home/rickk/perf-gens/wiki1m SLATER_SMOKE_GRAPH=wiki1m \
+    ///   cargo test -p slater --lib bench_resolve_business_key -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a prebuilt generation; see SLATER_SMOKE_DATADIR"]
+    fn bench_resolve_business_key_over_the_segment() {
+        let data_dir = std::env::var("SLATER_SMOKE_DATADIR")
+            .expect("set SLATER_SMOKE_DATADIR to a slater data directory");
+        let graph = std::env::var("SLATER_SMOKE_GRAPH").unwrap_or_else(|_| "wiki1m".to_string());
+        let p30: i64 = std::env::var("SLATER_SMOKE_P30")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(332894);
+        // Sample size — a small ascending run reproduces the "re-probe the same block"
+        // pattern without a 10-minute loop. Default 5000.
+        let n: i64 = std::env::var("SLATER_SMOKE_BENCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(&data_dir));
+
+        let run = |label: &str, budget: Option<usize>| {
+            // verify_integrity = false: the copy-completeness re-hash of a 1M-node core
+            // would dwarf the loop we are timing (and the server pays it once at boot).
+            let t_open = std::time::Instant::now();
+            let gen = Generation::open_with_store_opts_cached(
+                store.as_ref(),
+                &graph,
+                None,
+                false,
+                budget,
+            )
+            .expect("open generation");
+            let open_elapsed = t_open.elapsed();
+            // Index geometry — few big blocks ⇒ decode-per-probe dominates.
+            if let Some(r) = gen.range_index("node_Entity_wikidata_id") {
+                println!("  index blocks = {}", r.num_blocks());
+            }
+            let lo = p30 - n + 1;
+            let t0 = std::time::Instant::now();
+            let mut hits = 0u64;
+            for k in lo..=p30 {
+                if let KeyResolution::Unique(_) =
+                    resolve_business_key(&gen, "Entity", "wikidata_id", &Value::Int(k))
+                {
+                    hits += 1;
+                }
+            }
+            let loop_elapsed = t0.elapsed();
+            println!(
+                "{label}: open {open_elapsed:?}; resolved {n} keys ({hits} hits) in \
+                 {loop_elapsed:?} ({:.1} µs/resolve)",
+                loop_elapsed.as_micros() as f64 / n as f64
+            );
+        };
+
+        run("uncached", None);
+        run("cached-16MiB", Some(16 * 1024 * 1024));
+    }
 
     /// Write a temp ACL granting `reporting`/`pw` read on `people`, return its path.
     fn write_acl(root: &Path) -> std::path::PathBuf {

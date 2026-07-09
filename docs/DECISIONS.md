@@ -1022,3 +1022,27 @@ reads `edge_props`, now overlay-aware, exactly like a patched core node). **Scop
 otherwise:** a delete of a core edge still resolves by identity (no id needed), and a
 patched-then-deleted-across-levels edge reads stale props *only via a path traversal never reaches*
 (the tombstone suppresses it in the adjacency overlay), so it is unobservable.
+
+### D52 — Range-index reads cache *decoded* leaf blocks (not raw bytes) and binary-search them
+`crates/graph-format/src/isam.rs`, wired per-generation in `crates/slater/src/generation.rs`
+(`cache.rangeIndexCacheBytes`, default 16 MiB). A business-key write resolve (`resolve_business_key`)
+and an indexed range seek both probe an ISAM range index, and `IsamReader::lookup_eq` previously
+**re-read + re-decompressed + fully decoded, then linearly scanned, a whole leaf block on every
+probe**. Measured on the 91M-shaped 1M-node Wikidata core: the `wikidata_id` index has **27 blocks of
+~37 000 entries each** (blocks are sized for range-scan compression, not point lookups), so a single
+resolve cost **~2.6 ms** and a 300K-key bulk delete spent ~800s *just resolving*, CPU-bound — the
+finding that surfaced once group-commit removed the fsync wait.
+
+**A raw-byte block cache is the wrong altitude here** (measured **~15%** only): with 37K-entry blocks
+the cost is the *decode + scan*, not the read + decompress, and a byte cache still re-decodes every
+probe. So the cache stores **decoded** blocks (`Arc<Vec<(Value, u64)>>`) — `DecodedBlockCache`, a
+byte-budgeted LRU keyed `(index-ordinal, block)`, one instance shared across a generation's range
+readers and freed when the generation drops on swap — and `lookup_eq`/`lookup_range` **binary-search**
+the cached sorted block (the block is ascending by `cmp_key`) instead of scanning it. A repeated probe
+into a warm block is then O(log n), and each block is decompressed+decoded at most once. Result:
+**~2.6 ms → ~1.5 µs per resolve (~1750×)**; the 30%-delete smoke **875s → 13.2s (~66×)**, now bound by
+the 30 batch fsyncs, not the resolve. Off for every non-server opener (`None` budget: tools, tests,
+consolidate) so their behaviour is unchanged; no change to `resolve_business_key`/`scan_candidates`
+call sites (the reader caches transparently). Rejected: a raw-byte cache (decode still dominates); a
+per-reader cache (memory multiplies across a generation's indexes — one shared budget is bounded).
+Complementary build-side lever (smaller range-index blocks) is D53.

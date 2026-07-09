@@ -16,10 +16,11 @@
 //! ```
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -235,12 +236,145 @@ struct TopEntry {
     nonce: Option<[u8; NONCE_LEN]>,
 }
 
+/// A decoded ISAM leaf block: `(key, id)` pairs, ascending by key. Shared read-only.
+type DecodedBlock = Arc<Vec<(Value, u64)>>;
+
+/// Rough resident-byte estimate of a decoded block, for LRU budgeting. Exact for
+/// fixed-width keys (Int/Float); a small under-count for `Str` heap, which the budget
+/// tolerates.
+fn decoded_bytes(entries: &[(Value, u64)]) -> usize {
+    std::mem::size_of_val(entries)
+}
+
+struct DbcEntry {
+    value: DecodedBlock,
+    bytes: usize,
+    tick: u64,
+}
+
+struct DbcInner {
+    map: HashMap<(u32, u32), DbcEntry>,
+    /// `tick → key`, ascending — the front is least-recently-used.
+    order: BTreeMap<u64, (u32, u32)>,
+    tick: u64,
+    bytes: usize,
+    budget: usize,
+}
+
+/// A byte-budgeted LRU of **decoded** ISAM leaf blocks, keyed by `(sub, block)` where
+/// `sub` is the index's per-generation ordinal. One instance is shared across a
+/// generation's range readers.
+///
+/// This caches decoded entries, not raw bytes: an ISAM leaf can hold tens of thousands
+/// of `(key, id)` pairs, so decoding it on *every* probe (as a raw-byte cache would
+/// still force) dominates a point lookup. Decoding once and holding the sorted `Vec`
+/// lets a repeated equality/range probe **binary-search** the cached block — O(log n)
+/// instead of O(n) — which is the bulk-write-resolve / indexed-seek hot path. Modelled
+/// on `blockcache::BlockCache` (same LRU shape); loads run outside the lock.
+pub struct DecodedBlockCache {
+    inner: Mutex<DbcInner>,
+}
+
+impl DecodedBlockCache {
+    /// Create a cache with the given byte budget (clamped to at least 1).
+    pub fn new(budget_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(DbcInner {
+                map: HashMap::new(),
+                order: BTreeMap::new(),
+                tick: 0,
+                bytes: 0,
+                budget: budget_bytes.max(1),
+            }),
+        }
+    }
+
+    /// Fetch decoded block `(sub, block)`, decoding it with `load` on a miss. `load`
+    /// runs **outside** the lock so a slow decompress+decode never serialises other
+    /// readers; a concurrent duplicate load deduplicates to the first insert's `Arc`.
+    fn get_or_load(
+        &self,
+        sub: u32,
+        block: u32,
+        load: impl FnOnce() -> Result<Vec<(Value, u64)>>,
+    ) -> Result<DecodedBlock> {
+        let key = (sub, block);
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(v) = g.touch_get(&key) {
+                return Ok(v);
+            }
+        }
+        let value: DecodedBlock = Arc::new(load()?);
+        let bytes = decoded_bytes(&value);
+        let mut g = self.inner.lock().unwrap();
+        Ok(g.insert(key, value, bytes))
+    }
+}
+
+impl DbcInner {
+    fn next_tick(&mut self) -> u64 {
+        let t = self.tick;
+        self.tick += 1;
+        t
+    }
+
+    fn touch_get(&mut self, key: &(u32, u32)) -> Option<DecodedBlock> {
+        let (value, old_tick) = {
+            let e = self.map.get(key)?;
+            (e.value.clone(), e.tick)
+        };
+        self.order.remove(&old_tick);
+        let new_tick = self.next_tick();
+        self.order.insert(new_tick, *key);
+        self.map.get_mut(key).unwrap().tick = new_tick;
+        Some(value)
+    }
+
+    /// Insert (or return an existing concurrent load), then evict LRU until within
+    /// budget, keeping at least one entry so a block larger than the budget is returnable.
+    fn insert(&mut self, key: (u32, u32), value: DecodedBlock, bytes: usize) -> DecodedBlock {
+        if let Some(existing) = self.touch_get(&key) {
+            return existing;
+        }
+        let tick = self.next_tick();
+        self.order.insert(tick, key);
+        self.map.insert(
+            key,
+            DbcEntry {
+                value: value.clone(),
+                bytes,
+                tick,
+            },
+        );
+        self.bytes += bytes;
+        while self.bytes > self.budget && self.order.len() > 1 {
+            let (&lru_tick, &lru_key) = self.order.iter().next().unwrap();
+            self.order.remove(&lru_tick);
+            if let Some(e) = self.map.remove(&lru_key) {
+                self.bytes -= e.bytes;
+            }
+        }
+        value
+    }
+}
+
 /// Reader holding the resident sparse top-level.
 pub struct IsamReader {
     src: Arc<dyn RandomReadAt>,
     top: Vec<TopEntry>,
     /// Per-generation cipher, set iff the index is encrypted.
     cipher: Option<Arc<BlockCipher>>,
+    /// Optional decoded-leaf-block cache (see [`Self::with_block_cache`]). When present,
+    /// a leaf is decompressed **and decoded** once and the sorted `(key, id)` `Vec` is
+    /// held, so a repeated equality/range probe into the same block (e.g. a bulk-write
+    /// resolve over a contiguous key range) binary-searches the cached block instead of
+    /// re-reading + re-decoding it. `None` = decode every block fresh (the plain default).
+    cache: Option<Arc<DecodedBlockCache>>,
+    /// The cache `sub`-key for this reader's blocks — the index's ordinal within its
+    /// generation. The cache is per-generation, so `(sub, block)` uniquely identifies a
+    /// leaf within it.
+    cache_sub: u32,
 }
 
 impl IsamReader {
@@ -333,14 +467,46 @@ impl IsamReader {
                 nonce,
             });
         }
-        Ok(Self { src, top, cipher })
+        Ok(Self {
+            src,
+            top,
+            cipher,
+            cache: None,
+            cache_sub: 0,
+        })
+    }
+
+    /// Attach a decoded-leaf-block cache to this reader, keyed under `sub` (the index's
+    /// per-generation ordinal). The `cache` is shared across all of a generation's range
+    /// readers, so one byte budget bounds them all and dropping the generation frees the
+    /// lot. Builder-style so a caller can `open_src(..).with_block_cache(..)`.
+    pub fn with_block_cache(mut self, cache: Arc<DecodedBlockCache>, sub: u32) -> Self {
+        self.cache = Some(cache);
+        self.cache_sub = sub;
+        self
     }
 
     pub fn num_blocks(&self) -> usize {
         self.top.len()
     }
 
-    fn read_block(&self, b: usize) -> Result<Vec<(Value, u64)>> {
+    /// A leaf block's decoded `(key, id)` pairs (ascending by key), served from the
+    /// decoded-block cache when one is attached — so a repeated probe into the same block
+    /// decompresses + decodes it once and then binary-searches the cached copy — and
+    /// decoded fresh into a one-off `Arc` otherwise.
+    fn block(&self, b: usize) -> Result<DecodedBlock> {
+        match &self.cache {
+            Some(cache) => cache.get_or_load(self.cache_sub, b as u32, || {
+                Self::decode_block(&self.decompress_block(b)?)
+            }),
+            None => Ok(Arc::new(Self::decode_block(&self.decompress_block(b)?)?)),
+        }
+    }
+
+    /// Read + decrypt + decompress leaf block `b` to its raw (decompressed) bytes. The
+    /// expensive part (a positional read and a zstd inflate) lives here, alongside the
+    /// decode the cache memoises.
+    fn decompress_block(&self, b: usize) -> Result<Vec<u8>> {
         let t = &self.top[b];
         let mut stored = vec![0u8; t.comp_len as usize];
         self.src.read_exact_at(&mut stored, t.offset)?;
@@ -348,8 +514,12 @@ impl IsamReader {
             (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
             _ => stored,
         };
-        let raw = codec::decompress(&comp, t.raw_len as usize)?;
-        let mut r = &raw[..];
+        codec::decompress(&comp, t.raw_len as usize)
+    }
+
+    /// Decode `(key, id)` pairs from a leaf block's decompressed bytes.
+    fn decode_block(raw: &[u8]) -> Result<Vec<(Value, u64)>> {
+        let mut r = raw;
         let count = read_uvarint(&mut r)? as usize;
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
@@ -377,16 +547,21 @@ impl IsamReader {
         let mut out = Vec::new();
         let mut b = le - 1;
         loop {
-            let entries = self.read_block(b)?;
+            let entries = self.block(b)?;
+            // The block is sorted by key: binary-search the first entry >= `key`, then
+            // collect the equal run — O(log n) + run-length, not a full O(n) block scan.
+            let start = entries.partition_point(|(k, _)| k.cmp_key(key) == Ordering::Less);
+            let mut i = start;
+            while i < entries.len() && entries[i].0.cmp_key(key) == Ordering::Equal {
+                out.push(entries[i].1);
+                i += 1;
+            }
+            // If the block's first key already equals `key`, an equal run may continue
+            // backwards into the previous block.
             let first_is_key = entries
                 .first()
                 .map(|(k, _)| k.cmp_key(key) == Ordering::Equal)
                 .unwrap_or(false);
-            for (k, id) in entries {
-                if k.cmp_key(key) == Ordering::Equal {
-                    out.push(id);
-                }
-            }
             if first_is_key && b > 0 {
                 b -= 1;
             } else {
@@ -421,14 +596,6 @@ impl IsamReader {
             }
         };
 
-        let in_lo = |k: &Value| match lo {
-            None => true,
-            Some(lo) => match k.cmp_key(lo) {
-                Ordering::Greater => true,
-                Ordering::Equal => lo_inclusive,
-                Ordering::Less => false,
-            },
-        };
         let past_hi = |k: &Value| match hi {
             None => false,
             Some(hi) => match k.cmp_key(hi) {
@@ -444,16 +611,25 @@ impl IsamReader {
             if past_hi(&self.top[b].first_key) {
                 break;
             }
-            for (k, id) in self.read_block(b)? {
-                if past_hi(&k) {
+            let entries = self.block(b)?;
+            // Binary-search past the leading entries below `lo` (only the first scanned
+            // block has any); from there every entry is `>= lo` (in_lo holds).
+            let begin = match lo {
+                None => 0,
+                Some(lo) => entries.partition_point(|(k, _)| match k.cmp_key(lo) {
+                    Ordering::Less => true,
+                    Ordering::Equal => !lo_inclusive,
+                    Ordering::Greater => false,
+                }),
+            };
+            for (k, id) in &entries[begin..] {
+                if past_hi(k) {
                     // entries are sorted; nothing later in this scan matches hi
                     out.sort_unstable();
                     out.dedup();
                     return Ok(out);
                 }
-                if in_lo(&k) {
-                    out.push(id);
-                }
+                out.push(*id);
             }
         }
         out.sort_unstable();
@@ -469,10 +645,10 @@ impl IsamReader {
     pub fn distinct_key_counts(&self) -> Result<Vec<(Value, u64)>> {
         let mut out: Vec<(Value, u64)> = Vec::new();
         for b in 0..self.top.len() {
-            for (k, _) in self.read_block(b)? {
+            for (k, _) in self.block(b)?.iter() {
                 match out.last_mut() {
-                    Some((prev, n)) if prev.cmp_key(&k) == Ordering::Equal => *n += 1,
-                    _ => out.push((k, 1)),
+                    Some((prev, n)) if prev.cmp_key(k) == Ordering::Equal => *n += 1,
+                    _ => out.push((k.clone(), 1)),
                 }
             }
         }
@@ -519,6 +695,62 @@ mod tests {
         }
         // Absent key.
         assert!(r.lookup_eq(&Value::Str("Nope".into())).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cached_reader_matches_uncached_and_reuses_blocks() {
+        let path = tmp("cache");
+        // Contiguous integer keys (the `wikidata_id` shape), tiny blocks so a key range
+        // spans many blocks — the bulk-write-resolve case that re-probes the same block.
+        let entries: Vec<(Value, u64)> = (0..600u64).map(|i| (Value::Int(i as i64), i)).collect();
+        write_isam(&path, entries.clone(), 64, 3).unwrap();
+
+        let plain = IsamReader::open(&path).unwrap();
+        assert!(plain.num_blocks() > 1);
+
+        let cache = Arc::new(DecodedBlockCache::new(1 << 20));
+        let cached = IsamReader::open(&path)
+            .unwrap()
+            .with_block_cache(cache.clone(), 7);
+
+        // A cached reader answers every lookup (eq + range) identically to the uncached
+        // one — the binary-search path must not change results.
+        for i in [0u64, 1, 250, 599] {
+            let k = Value::Int(i as i64);
+            assert_eq!(
+                cached.lookup_eq(&k).unwrap(),
+                plain.lookup_eq(&k).unwrap(),
+                "cached lookup diverges at {i}"
+            );
+        }
+        assert!(cached.lookup_eq(&Value::Int(10_000)).unwrap().is_empty());
+        assert_eq!(
+            cached
+                .lookup_range(Some(&Value::Int(100)), true, Some(&Value::Int(400)), false)
+                .unwrap(),
+            plain
+                .lookup_range(Some(&Value::Int(100)), true, Some(&Value::Int(400)), false)
+                .unwrap(),
+            "cached range diverges"
+        );
+
+        // A warm block is not re-decoded: sweeping every key once caches each block
+        // exactly once, so the cache holds precisely `num_blocks` decoded blocks (with a
+        // budget big enough to retain them all).
+        let fresh = Arc::new(DecodedBlockCache::new(1 << 20));
+        let r2 = IsamReader::open(&path)
+            .unwrap()
+            .with_block_cache(fresh.clone(), 0);
+        for i in 0..600u64 {
+            let _ = r2.lookup_eq(&Value::Int(i as i64)).unwrap();
+        }
+        assert_eq!(
+            fresh.inner.lock().unwrap().map.len(),
+            plain.num_blocks(),
+            "every block decoded exactly once and retained"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 

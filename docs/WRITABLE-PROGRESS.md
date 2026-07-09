@@ -866,6 +866,20 @@ query reads (a single shared reader across threads), so the batch-local pass is 
 `smoke_1m` deletes are **core-node** deletes (resolve to `Unique` core dense ids); the born-node /
 whole-delta fold path (`born_synthetic_in_delta`) is *not* on this hot path.
 
+**✅ RESOLVED (2026-07-09) — decoded-block cache + binary search (D52).** Profiling
+(a `#[ignore]` `bench_resolve_business_key` micro-bench, since WSL2 ptrace is locked) showed the real
+shape: the `wikidata_id` index is **27 blocks of ~37 000 entries**, so a resolve's cost is the
+**decode + linear scan** of a whole block, *not* the read+decompress — a raw-byte cache gave only
+**~15%**. Fixed by caching **decoded** blocks (`IsamReader` now holds a `DecodedBlockCache` —
+byte-budgeted LRU of `Arc<Vec<(Value,u64)>>`, one per generation, `cache.rangeIndexCacheBytes`
+default 16 MiB) and **binary-searching** the sorted cached block in `lookup_eq`/`lookup_range`.
+Measured: **~2.6 ms → ~1.5 µs/resolve (~1750×)**; the full 30%-delete smoke **875s → 13.2s (~66×)**,
+now bound by the 30 batch fsyncs, not the resolve. Transparent to `resolve_business_key`/
+`scan_candidates` (reader-internal); off (`None` budget) for every non-server opener. The
+**batch-local merge-join** idea above is now unnecessary for this workload (the cache handles the
+contiguous re-probe). Complementary build-side lever — **smaller range-index blocks** so *even
+uncached* point lookups are cheap — is the next item (D53).
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
