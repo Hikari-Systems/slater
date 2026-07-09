@@ -963,6 +963,112 @@ impl Memtable {
         })
     }
 
+    /// Gather this memtable's whole delta into the plain, owned [`SegmentData`] an
+    /// **off-heap** L0 segment is written from ([`crate::l0_offheap::write_segment`]).
+    /// Every axis is built through this memtable's own read methods (identity by dense id,
+    /// `out_edges`/`in_edges`, `edge_delta_by_id`, the born-index precedence), so the
+    /// off-heap segment answers reads identically to this resident level.
+    pub fn to_segment_data(&self) -> crate::l0_offheap::SegmentData {
+        use crate::l0_offheap::{identity_key_bytes, BornIndexEntry, SegmentData};
+        let mut data = SegmentData {
+            synthetic_base: self.synthetic_base,
+            edge_synthetic_base: self.edge_synthetic_base,
+            node_delta_count: self.node_delta_count() as u64,
+            edge_delta_count: self.edge_delta_count() as u64,
+            born_count: self.born_count(),
+            born_edge_count: self.born_edge_count(),
+            ..Default::default()
+        };
+        let name = |sym| self.interner.name(sym).unwrap_or("").to_string();
+
+        // Nodes, sorted by dense id.
+        let mut node_ids: Vec<u64> = self.by_dense.keys().copied().collect();
+        node_ids.sort_unstable();
+        for dense in node_ids {
+            let Some(ck) = self.by_dense.get(&dense) else {
+                continue;
+            };
+            let Some(e) = self.nodes.get(ck) else {
+                continue;
+            };
+            data.nodes.push((
+                dense,
+                name(e.identity.label),
+                name(e.identity.key),
+                e.identity.value.clone(),
+                e.delta.clone(),
+            ));
+        }
+
+        // Adjacency, sorted by endpoint (via the read methods, for reader parity).
+        let mut out_srcs: Vec<u64> = self.out_adj.keys().copied().collect();
+        out_srcs.sort_unstable();
+        for src in out_srcs {
+            data.adj_out.push((src, self.out_edges(src)));
+        }
+        let mut in_dsts: Vec<u64> = self.in_adj.keys().copied().collect();
+        in_dsts.sort_unstable();
+        for dst in in_dsts {
+            data.adj_in.push((dst, self.in_edges(dst)));
+        }
+
+        // Edges carrying a delta: born ids + core-patched ids.
+        let mut edge_ids: Vec<u64> = (0..self.born_edges.len() as u64)
+            .map(|i| self.edge_synthetic_base + i)
+            .collect();
+        edge_ids.extend(self.by_edge_id.keys().copied());
+        edge_ids.sort_unstable();
+        edge_ids.dedup();
+        for id in edge_ids {
+            if let Some(d) = self.edge_delta_by_id(id) {
+                data.edges.push((id, d.clone()));
+            }
+        }
+
+        // Secondary: born nodes → by-label / index / identity (born-allocation order).
+        let mut by_label: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for ck in &self.born {
+            let Some(e) = self.nodes.get(ck) else {
+                continue;
+            };
+            let Some(dense) = e.synthetic else { continue };
+            let label = name(e.identity.label);
+            let key = name(e.identity.key);
+            by_label.entry(label.clone()).or_default().push(dense);
+            let mut props: BTreeMap<String, Value> = BTreeMap::new();
+            if !key.is_empty() {
+                props.insert(key.clone(), e.identity.value.clone());
+            }
+            for (p, v) in &e.delta.patches {
+                props.insert(p.clone(), v.clone()); // a patch wins over the business key
+            }
+            data.born_by_identity
+                .push((identity_key_bytes(&label, &key, &e.identity.value), dense));
+            data.born_index.push(BornIndexEntry {
+                label,
+                id: dense,
+                props: props.into_iter().collect(),
+            });
+        }
+        data.born_by_label = by_label.into_iter().collect();
+
+        // Secondary: core dense ids patched on an indexed property.
+        for (&dense, ck) in &self.by_dense {
+            if dense >= self.synthetic_base {
+                continue;
+            }
+            let Some(e) = self.nodes.get(ck) else {
+                continue;
+            };
+            let label = name(e.identity.label);
+            for p in e.delta.patches.keys() {
+                data.core_patched.push((label.clone(), p.clone(), dense));
+            }
+        }
+
+        data
+    }
+
     /// Fold a **contiguous, stacked run** of L0 levels (newest-first) into one
     /// equivalent memtable — the L0→L0 compaction primitive (Phase 4d-i). The result
     /// answers every read identically to
@@ -1609,7 +1715,7 @@ fn value_size(v: &Value) -> usize {
 /// unbounded on that side), by [`Value::cmp_key`] — the ISAM total order used by
 /// `graph_format::isam`'s `lookup_range`. Shared by the delta-born and moved-core
 /// range-index overlays.
-fn value_in_range(
+pub(crate) fn value_in_range(
     v: &Value,
     lo: Option<&Value>,
     lo_inclusive: bool,

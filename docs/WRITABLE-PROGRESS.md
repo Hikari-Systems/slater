@@ -917,9 +917,32 @@ correctness concern**. Three green slices:
   coerced to `Arc<dyn LevelRead>`. Whole slater (612) + slater-delta (61) + workspace green
   (27 result groups, 0 failed, determinism goldens incl.); clippy `-D warnings` + fmt clean;
   empty-delta bench baseline re-established (~326 µs/3.5 ms arms, fast path unchanged).
-- **Phase B — block-addressable `L0 v2` format + off-heap `L0Reader: LevelRead`** (next).
+- **Phase B — block-addressable off-heap format + `L0Reader: LevelRead`. ✅ DONE** (this
+  commit; pure `slater-delta`, no server wiring yet). New `l0_offheap.rs`. **A segment is a
+  directory** of block files + a resident `meta.bin`: `node.blk`/`adj_out.blk`/`adj_in.blk`/
+  `edge.blk` are `graph_format::blockfile::BlockFile`s (one record per patched/born node,
+  per node-with-edges, per delta-carrying edge — record order = key order), read through the
+  **shared `graph_format::blockcache::BlockCache`** via `cache.record(reader, scope, sub, idx)`.
+  Each section has a **resident sorted `u64` key column** (dense/edge id → record index); a
+  point read binary-searches it — a **miss costs no I/O** (the hot tombstone/patch path), a
+  **hit pages+caches one block**. `meta.bin` (MAGIC ‖ crc32c ‖ body) holds the scalars, the
+  four key columns, and the secondary indexes. `write_segment` writes temp-dir-then-`rename`
+  (atomic); `L0Reader::open(dir, scope, cache)` verifies+loads meta and opens the four readers.
+  `Memtable::to_segment_data()` gathers the whole delta **through the memtable's own read
+  methods** (`out_edges`/`in_edges`/`edge_delta_by_id`/born-index precedence), so the off-heap
+  segment answers reads **identically** — proven by `offheap_reader_matches_resident_memtable`,
+  a read-for-read parity assertion over the full `LevelRead` surface (node patch/tombstone/
+  identity incl. misses, out/in edges, edge deltas, born-by-label, born-index eq+range,
+  core-ids-patched, born-synthetic-for-identity) on a fixture exercising core-patch +
+  moved-indexed-value + born nodes + tombstone + born edge w/ property + core-edge tombstone
+  + core-edge patch. Plus empty round-trip + crc-rejection tests. **Scope/deferred:** the
+  **secondary indexes stay resident** (born-by-label/index/identity, core-patched) — they back
+  scan-planning + `MERGE`-reuse, are proportionally smaller, and re-hold born *values* resident
+  (the only unbounded term left, insert-heavy only); blocking them too is a mechanical
+  follow-up. The **hot read path and every per-entity payload are fully off-heap**. 64
+  slater-delta tests green; clippy `-D warnings` + fmt clean.
 - **Phase C — wire into writer/server + config knob; consolidation/compaction load-to-merge**
-  (records as D54).
+  (next; records as D54).
 
 ## Recommended context-clear points
 

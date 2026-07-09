@@ -36,11 +36,13 @@
 pub mod identity;
 pub mod interner;
 pub mod l0;
+pub mod l0_offheap;
 pub mod memtable;
 pub mod wal;
 
 pub use identity::{EdgeIdentity, NodeIdentity};
 pub use l0::L0Segment;
+pub use l0_offheap::L0Reader;
 pub use memtable::{
     DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta, OpResolution,
 };
