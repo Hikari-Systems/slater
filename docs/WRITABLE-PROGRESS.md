@@ -832,6 +832,40 @@ The "Smaller follow-ups" listed further down, each closed one small commit at a 
   slater-delta (61) + workspace green; clippy `-D warnings` + fmt clean; empty-delta bench within
   noise (all overlay code is behind the `!is_empty` guard).
 
+## Perf finding — bulk-delete resolve is ISAM-block-decompress bound (2026-07-09)
+
+**Context:** reran the `smoke_1m.rs` `delete_thirty_percent_segment` stress on the **1M-node
+Wikidata core** (`SLATER_SMOKE_DATADIR=/home/rickk/perf-gens/wiki1m`, graph `wiki1m`), this time
+through the **group-committed write-`UNWIND`** path (commit `04beb9e`): the test's `BoltClient`
+gained `run_pull_params` (it previously could not send `$rows`, so it could not drive a batched
+write at all — the deferred "params-carrying Bolt client" gap), and the delete loop now issues
+`UNWIND $rows AS r MATCH (n:Entity {wikidata_id: r.id}) DELETE n` in 10 000-id batches
+(`SLATER_SMOKE_DELETE_CHUNK`).
+
+**Result:** ✅ PASSED — 300000/1000000 deleted in **30 group-committed batches** (30 fsyncs, not
+300K), range seek over the segment → 0 rows, whole-label count → exactly 700000. Post-delete reads
+stay fast (~1.5s each over the overlaid 1M core).
+
+**Timing / finding:** wall-clock **875s (~14.6 min)** for the deletes — ~**4× faster** than the
+per-statement ~1h, but now **CPU-bound at 100%, not fsync-bound**. Group commit collapsed the fsyncs
+and thereby *unmasked* a pre-existing per-row cost: `resolve_business_key` (`server.rs`) →
+`IsamReader::lookup_eq` → `read_block` (`crates/graph-format/src/isam.rs`) **decompresses a full
+zstd index block (and decodes every entry) on every probe, with no cache**. The victims are a
+contiguous `wikidata_id` range, so the *same* block is re-decompressed once per key in it — the
+~875s floor is ~300K block decompressions for only a few thousand distinct blocks. This is
+**orthogonal to group commit and to the core-edge / delta work**; it lives in the shared ISAM
+equality-probe path.
+
+**Recommended follow-up (well-scoped, not yet done):** a **batch-local resolve pass** in
+`execute_write_batch` (`server.rs`) — collect the batch's key `Value`s, sort them, and resolve them
+in **one indexed merge-join** that decompresses each ISAM block at most once, instead of an
+independent uncached `resolve_business_key` per row. Keeps the concurrent single-probe read path
+untouched (so no shared-cache thrash) and should bring the 30%-delete from ~15 min to seconds. A
+lighter alternative — a small last-block cache on `IsamReader` — risks thrashing under concurrent
+query reads (a single shared reader across threads), so the batch-local pass is preferred. NB the
+`smoke_1m` deletes are **core-node** deletes (resolve to `Unique` core dense ids); the born-node /
+whole-delta fold path (`born_synthetic_in_delta`) is *not* on this hot path.
+
 ## Recommended context-clear points
 
 Best stops are **right after a sub-milestone commit with all gates green**. In
@@ -846,11 +880,17 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **not yet** pushed to origin. **Phases 0–5 are ALL DONE**, and
-the optional **`slater dump` CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph
-dump; round-trip verified content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred
-follow-ups** are now being closed one small commit at a time (see the "Deferred follow-ups
-(post-Phase-5)" section above). Latest commits:
+**Resume state:** on branch `writeable`. Core-edge patching (`136f316`) + its ledger note (`8d5a8b0`)
+are **pushed** to `origin/writeable`; the smoke-test group-commit rerun (`04beb9e`) + this findings
+note are **local, not yet pushed**. **Phases 0–5 are ALL DONE**, and the optional **`slater dump`
+CLI** parallel workstream is now **✅ DONE** too (`--list` + full graph dump; round-trip verified
+content-hash-identical + a reproducible `#[ignore]` e2e). The **deferred follow-ups** are now being
+closed one small commit at a time (see the "Deferred follow-ups (post-Phase-5)" section above).
+**Open recommended next task:** the **batch-local ISAM resolve** in `execute_write_batch` (see the
+"Perf finding — bulk-delete resolve is ISAM-block-decompress bound" section above — the 30%-delete
+smoke is CPU-bound on uncached per-row ISAM block decompression; a merge-join resolve pass would take
+it from ~15 min to seconds). Latest commits:
+- `04beb9e` test(delta): drive the 30%-delete smoke via group-committed write-UNWIND (found the ISAM-resolve floor)
 - `136f316` feat(delta): in-place core-edge property patching (SET r.p on an existing core edge)
 - `bcb109d` feat(delta): write-UNWIND batched node writes (group-commit surface)
 - `6ed7bec` feat(delta): write_batch group-commit primitive
