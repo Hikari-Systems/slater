@@ -46,7 +46,7 @@ use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Level};
 
-use crate::acl::AclHandle;
+use crate::acl::{Acl, AclHandle};
 use crate::bolt::chunk;
 use crate::bolt::handshake;
 use crate::bolt::message;
@@ -2421,9 +2421,11 @@ async fn handle_request(
             let writer = ctx.graphs.writer(&graph);
             let (columns, rows) = match &writer {
                 Some(w) => {
-                    match parser::parse_statement(&query)
-                        .map_err(|e| Failure::from_query_error(&e))?
-                    {
+                    let stmt = parser::parse_statement(&query)
+                        .map_err(|e| Failure::from_query_error(&e))?;
+                    // A `read` grant selected the graph; mutating it needs `write` too.
+                    authorize_statement(&ctx.acl.snapshot(), &user, &graph, &stmt)?;
+                    match stmt {
                         parser::ast::Statement::Write(stmt) => {
                             let out = execute_write(w, gen.as_ref(), &stmt, &param_vals)?;
                             maybe_maintain_delta(ctx, &graph, w).await;
@@ -2693,6 +2695,43 @@ fn execute_write(
         .write(op, OpResolution::Node(resolved))
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
+}
+
+/// Does this statement mutate the graph, and so require a `write` grant?
+///
+/// Every arm of the write grammar must be listed here: node writes (`MERGE` /
+/// `MATCH … SET` / `MATCH … DELETE`, plain or under a write-`UNWIND`), relationship writes
+/// (`MERGE (a)-[r:R]->(b) [SET …]` / `MATCH (a)-[r:R]->(b) DELETE r`), and the
+/// `CALL slater.consolidate()` admin trigger, which rewrites the served generation.
+/// Matching on the enum rather than sniffing the query text means a new write statement
+/// cannot be added without the compiler forcing a decision here.
+fn statement_mutates(stmt: &parser::ast::Statement) -> bool {
+    match stmt {
+        parser::ast::Statement::Write(_)
+        | parser::ast::Statement::WriteEdge(_)
+        | parser::ast::Statement::Consolidate => true,
+        parser::ast::Statement::Read(_) => false,
+    }
+}
+
+/// Gate a parsed statement on the caller's grants for `graph`.
+///
+/// Reads are already gated at graph selection (`Acl::can_read`); this adds the write gate.
+/// A `read` grant does **not** imply the right to mutate, so switching on `delta.enabled`
+/// cannot silently promote every existing reader into a writer.
+fn authorize_statement(
+    acl: &Acl,
+    user: &str,
+    graph: &str,
+    stmt: &parser::ast::Statement,
+) -> std::result::Result<(), Failure> {
+    if statement_mutates(stmt) && !acl.can_write(user, graph) {
+        return Err(Failure::new(
+            CODE_FORBIDDEN,
+            format!("write access to graph '{graph}' is not granted to this user"),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a node write's business key to its dense-id context for the WAL op. `Unique`
@@ -5772,6 +5811,88 @@ mod tests {
             "the post-freeze write survived on the carried-forward delta"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every operation of the write grammar, so a new one cannot be added without being
+    /// listed here. Each must parse to a mutating statement.
+    fn every_write_statement() -> Vec<&'static str> {
+        vec![
+            // ── node writes (the grammar requires a SET or DELETE after the pattern,
+            //    so a bare `MERGE (n:L {k:v})` is not a valid statement) ───────────
+            "MERGE (n:Person {name:'Dave'}) SET n.age = 1",
+            "MATCH (n:Person {name:'Alice'}) SET n.age = 1",
+            "MATCH (n:Person {name:'Alice'}) SET n.age = 1, n.city = 'Oslo'",
+            "MATCH (n:Person {name:'Alice'}) DELETE n",
+            "MATCH (n:Person {name:'Alice'}) DETACH DELETE n",
+            // ── batched (write-`UNWIND`) node writes ─────────────────────────────
+            "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age",
+            "UNWIND $rows AS r MATCH (n:Person {name: r.name}) SET n.age = r.age",
+            "UNWIND $rows AS r MATCH (n:Person {name: r.name}) DELETE n",
+            // ── relationship writes ──────────────────────────────────────────────
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'})",
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) SET r.since = 2020",
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+            // ── admin: rewrites the served generation ────────────────────────────
+            "CALL slater.consolidate()",
+        ]
+    }
+
+    fn acl_json(grants: serde_json::Value) -> Acl {
+        let json = serde_json::json!({
+            "users": { "u": { "passwordArgon2id": hash_password("pw").unwrap(), "grants": grants } }
+        });
+        Acl::from_json_str(&json.to_string()).unwrap()
+    }
+
+    /// **A read grant must not authorise any write.** Before the writable layer landed the
+    /// ACL had only `can_read`, so switching on `delta.enabled` would silently have promoted
+    /// every reader into a writer. Every operation of the write grammar is checked.
+    #[test]
+    fn a_read_only_grant_forbids_every_write_operation() {
+        let read_only = acl_json(serde_json::json!({ "people": ["read"] }));
+        for q in every_write_statement() {
+            let stmt = parser::parse_statement(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            assert!(
+                statement_mutates(&stmt),
+                "{q} must be classified as a mutating statement"
+            );
+            let err = authorize_statement(&read_only, "u", "people", &stmt).expect_err(q);
+            assert_eq!(err.code, CODE_FORBIDDEN, "{q}");
+            assert!(err.message.contains("write access"), "{q}: {}", err.message);
+        }
+    }
+
+    /// The same statements are authorised once the user also holds `write`.
+    #[test]
+    fn a_read_write_grant_authorises_every_write_operation() {
+        let rw = acl_json(serde_json::json!({ "people": ["read", "write"] }));
+        for q in every_write_statement() {
+            let stmt = parser::parse_statement(q).unwrap();
+            authorize_statement(&rw, "u", "people", &stmt)
+                .unwrap_or_else(|e| panic!("read+write must authorise {q}: {}", e.message));
+        }
+    }
+
+    /// The write grant is **per graph**: holding it on one graph authorises nothing on
+    /// another, and reads never need it.
+    #[test]
+    fn the_write_grant_is_per_graph_and_reads_stay_allowed() {
+        let acl = acl_json(serde_json::json!({
+            "people": ["read"],
+            "scratch": ["read", "write"],
+        }));
+        let write =
+            parser::parse_statement("MERGE (n:Person {name:'Dave'}) SET n.age = 1").unwrap();
+        assert!(authorize_statement(&acl, "u", "scratch", &write).is_ok());
+        assert!(
+            authorize_statement(&acl, "u", "people", &write).is_err(),
+            "a write grant on `scratch` must not leak to `people`"
+        );
+
+        let read = parser::parse_statement("MATCH (n:Person) RETURN count(*)").unwrap();
+        assert!(!statement_mutates(&read));
+        assert!(authorize_statement(&acl, "u", "people", &read).is_ok());
+        assert!(authorize_statement(&acl, "u", "scratch", &read).is_ok());
     }
 
     /// `count(*)` over a **merged** view must net the delta's born rows in and its

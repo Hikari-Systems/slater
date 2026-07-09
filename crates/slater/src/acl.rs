@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Access control — argon2id authentication and per-graph read grants.
+//! Access control — argon2id authentication and per-graph `read` / `write` grants.
 //!
 //! The ACL is a plain-JSON file (it lives on shared storage alongside the
 //! data) mapping each user to an **argon2id password hash** and a set of
 //! per-graph grants. Cleartext passwords are never stored; hashes are minted with
 //! the `slater hash-password` subcommand ([`hash_password`]). At `LOGON` the
 //! server [`Acl::verify`]s the supplied credentials; before serving any query it
-//! checks [`Acl::can_read`] for the selected graph.
+//! checks [`Acl::can_read`] for the selected graph, and before executing any
+//! mutation it checks [`Acl::can_write`]. The two grants are **independent** — a
+//! reader is not implicitly a writer.
 //!
 //! The file is **hot-reloaded**: [`AclHandle::poll`] re-reads it when it changes,
 //! and a malformed file is rejected loudly while the last-good ACL keeps serving
 //! (a fat-fingered edit must never lock every user out).
 //
-// The server loop that calls poll()/verify()/can_read() lands with the Bolt
-// connection state machine; allow dead_code for the standalone ACL until then.
+// The server loop that calls poll()/verify()/can_read()/can_write() lands with the
+// Bolt connection state machine; allow dead_code for the standalone ACL until then.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -35,7 +37,10 @@ use tracing::{info, warn};
 pub struct UserEntry {
     /// PHC-string argon2id hash (`$argon2id$v=19$m=...$salt$hash`).
     pub password_argon2id: String,
-    /// Graph name → granted permissions (only `"read"` is meaningful today).
+    /// Graph name → granted permissions. Two are meaningful: `"read"` (serve queries on
+    /// the graph) and `"write"` (mutate it through the writable layer). They are
+    /// independent — a `"read"` grant confers no write access — so a writer is granted
+    /// `["read", "write"]`. Unrecognised permission strings are ignored.
     #[serde(default)]
     pub grants: HashMap<String, Vec<String>>,
 }
@@ -77,10 +82,26 @@ impl Acl {
 
     /// Does `user` hold a `read` grant on `graph`?
     pub fn can_read(&self, user: &str, graph: &str) -> bool {
+        self.has_grant(user, graph, "read")
+    }
+
+    /// Does `user` hold a `write` grant on `graph`?
+    ///
+    /// **A `read` grant never implies `write`.** The writable layer (`delta.enabled`) is
+    /// the only way a Bolt statement can mutate a graph, and every such statement is
+    /// checked against this predicate — so an existing read-only ACL keeps its meaning
+    /// when the writable layer is switched on, rather than silently gaining write access.
+    /// A writer needs both: `"grants": { "g": ["read", "write"] }` (the write path resolves
+    /// business keys, which is a read).
+    pub fn can_write(&self, user: &str, graph: &str) -> bool {
+        self.has_grant(user, graph, "write")
+    }
+
+    fn has_grant(&self, user: &str, graph: &str, perm: &str) -> bool {
         self.users.get(user).is_some_and(|u| {
             u.grants
                 .get(graph)
-                .is_some_and(|perms| perms.iter().any(|p| p == "read"))
+                .is_some_and(|perms| perms.iter().any(|p| p == perm))
         })
     }
 
@@ -397,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn grants_are_per_graph_and_read_only() {
+    fn grants_are_per_graph_and_permission_specific() {
         let acl = acl_with(
             "reporting",
             "pw",
@@ -411,6 +432,44 @@ mod tests {
             acl.readable_graphs("reporting"),
             vec!["eu_ai_act".to_string()]
         );
+    }
+
+    /// `read` and `write` are independent grants: reading never confers the right to
+    /// mutate, so enabling the writable layer cannot promote existing readers to writers.
+    #[test]
+    fn a_read_grant_never_implies_write() {
+        let acl = acl_with(
+            "reader",
+            "pw",
+            &[
+                ("g", &["read"]),
+                ("w_only", &["write"]),
+                ("both", &["read", "write"]),
+            ],
+        );
+        assert!(acl.can_read("reader", "g"));
+        assert!(!acl.can_write("reader", "g"), "read must not imply write");
+
+        // A write-only grant confers no read access (and so cannot even select the graph).
+        assert!(acl.can_write("reader", "w_only"));
+        assert!(!acl.can_read("reader", "w_only"));
+
+        // The writer's grant is both.
+        assert!(acl.can_read("reader", "both"));
+        assert!(acl.can_write("reader", "both"));
+
+        // Unknown user / ungranted graph deny both.
+        assert!(!acl.can_write("reader", "unlisted"));
+        assert!(!acl.can_write("ghost", "both"));
+    }
+
+    /// An unrecognised permission string is inert — it grants nothing, rather than being
+    /// silently treated as a wildcard.
+    #[test]
+    fn unknown_permission_strings_grant_nothing() {
+        let acl = acl_with("u", "pw", &[("g", &["admin", "ALL", "Read", "WRITE"])]);
+        assert!(!acl.can_read("u", "g"), "permissions are case-sensitive");
+        assert!(!acl.can_write("u", "g"));
     }
 
     #[test]

@@ -1,8 +1,11 @@
 # Slater threat model
 
 This document states what Slater's at-rest protections do and do not defend against.
-It is deliberately narrow: Slater serves **immutable, read-only** graph generations built
-offline by `slater-build` and published to a data directory the `slater` server opens.
+It is deliberately narrow: Slater serves graph generations built offline by `slater-build`
+and published to a data directory the `slater` server opens. The **core generation is
+immutable**; when the writable layer is enabled (`delta.enabled`, off by default) mutations
+accumulate in a separate delta (WAL + L0 segments) and never modify a published generation
+in place.
 
 ## Assets
 
@@ -11,7 +14,11 @@ offline by `slater-build` and published to a data directory the `slater` server 
 - **`MANIFEST.json`** — the per-generation inventory: file list, per-file BLAKE3 hashes,
   the `content_hash` over that inventory, the encryption header (KDF params + salt), and the
   new authentication fields (`aclBlake3`, `mac`).
-- **`acl.json`** — server-wide users → per-graph read grants + argon2id password hashes.
+- **`acl.json`** — server-wide users → per-graph `read` / `write` grants + argon2id password
+  hashes. The two grants are independent: `read` authorises queries, `write` authorises the
+  `MERGE` / `SET` / `DELETE` statements and `CALL slater.consolidate()`. **A `read` grant
+  confers no write access**, so enabling the writable layer on an existing deployment cannot
+  promote its readers into writers.
 - **The at-rest master key** — supplied to both `slater-build` and `slater` out of band (an
   env var or a mounted secret file). It is **never** written into the data directory.
 - **The server configuration** — `config.json`, the `/sandbox` overlay deep-merged over it,

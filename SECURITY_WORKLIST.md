@@ -10,6 +10,30 @@ Severity reflects impact assuming the documented trust model (read-only server; 
 dir and `acl.json` are protected by filesystem permissions; queries arrive from
 authenticated principals over Bolt).
 
+## Closed — write authorisation for the writable layer (2026-07-09)
+
+- [x] **✅ FIXED — a `read` grant authorised writes.** The writable layer (`delta.enabled`)
+  added `MERGE` / `SET` / `DELETE` and `CALL slater.consolidate()` to the Bolt surface, but the
+  ACL was never extended: `Acl` exposed only `can_read`, and the write dispatch in
+  `server.rs` was gated solely by the `can_read` check performed at graph selection. Any user
+  who could **read** a graph could **mutate** it — including triggering a consolidation, which
+  rewrites the served generation. The `"write"` string parsed (grants is an unvalidated
+  `Vec<String>`) but was never consulted; a `["write"]`-only grant conferred nothing at all.
+
+  **Fix:** `Acl::can_write` plus `authorize_statement`, which classifies a parsed statement via
+  `statement_mutates` (an exhaustive `match` on `Statement`, so a new write statement cannot be
+  added without a compile-time decision) and refuses it with `Neo.ClientError.Security.Forbidden`
+  unless the caller holds `write` on that graph. `read` does **not** imply `write`, so an
+  existing read-only `acl.json` keeps its meaning when the writable layer is switched on.
+
+  **Tests:** `a_read_only_grant_forbids_every_write_operation` iterates every operation of the
+  write grammar (node `MERGE`/`SET`/`DELETE`/`DETACH DELETE`, the write-`UNWIND` batch forms,
+  relationship `MERGE`/`MERGE … SET`/`DELETE`, and `CALL slater.consolidate()`) and asserts each
+  is refused under a read-only grant; `a_read_write_grant_authorises_every_write_operation` and
+  `the_write_grant_is_per_graph_and_reads_stay_allowed` cover the positive and per-graph cases,
+  and `acl::tests::a_read_grant_never_implies_write` pins the predicate. Verified end-to-end over
+  Bolt: a read-only user is refused all nine statements and the graph is provably unmutated.
+
 ## Status at a glance
 
 **5 done · 1 in progress · 3 open** (as of 2026-06-12)
