@@ -90,15 +90,24 @@ impl BlockKey {
 /// Thin wrapper over [`graph_format::blockcache::BlockCache`] (shared with
 /// `slater-build`'s sequential-scan use).
 pub struct BlockCache {
-    inner: GfBlockCache,
+    inner: Arc<GfBlockCache>,
 }
 
 impl BlockCache {
     /// Create a cache with the given byte budget (clamped to at least 1).
     pub fn new(budget_bytes: usize) -> Self {
         Self {
-            inner: GfBlockCache::new(budget_bytes),
+            inner: Arc::new(GfBlockCache::new(budget_bytes)),
         }
+    }
+
+    /// A handle to the underlying `graph_format` cache — so another reader (the
+    /// off-heap delta L0 segments, which page through `graph_format::blockcache`
+    /// directly) shares this one budget and eviction domain. Its `(scope, sub)` keys
+    /// are disjoint from the columnar keys (generation UUID vs a per-segment scope),
+    /// so the two never collide in the shared LRU.
+    pub fn gf(&self) -> Arc<GfBlockCache> {
+        self.inner.clone()
     }
 
     /// Fetch a block from the cache, loading it with `load` on a miss.

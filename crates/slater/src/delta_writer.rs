@@ -40,11 +40,83 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
+use graph_format::blockcache::BlockCache as GfBlockCache;
 use graph_format::ids::{Generation as GenId, Value};
+use slater_delta::l0_offheap::write_segment;
 use slater_delta::{
-    replay_dir, DeltaSnapshot, L0Segment, LevelRead, Memtable, OpResolution, Seq, WalOp, WalRecord,
-    WalSink,
+    replay_dir, DeltaSnapshot, L0Reader, L0Segment, LevelRead, Memtable, OpResolution, Seq, WalOp,
+    WalRecord, WalSink,
 };
+
+/// Block target size + zstd level for an off-heap L0 segment's payload sections. Small
+/// blocks (as for range indexes) keep a cold point read's one-time decode cheap; a delta
+/// is small relative to the core anyway.
+const OFFHEAP_L0_BLOCK_BYTES: usize = 16 * 1024;
+const OFFHEAP_L0_ZSTD_LEVEL: i32 = 3;
+
+/// A sealed L0 level held by the writer — either **resident** (the whole flushed memtable
+/// in RAM) or **off-heap** (a directory of block files whose payloads page through the
+/// shared [`BlockCache`](GfBlockCache); only a compact index is resident). The writer
+/// dispatches over this so reads, publish, freeze and retire are format-agnostic; the one
+/// consumer that needs a resident memtable — L0→L0 compaction — is skipped in the off-heap
+/// mode (consolidation bounds the level count instead). See D54.
+enum L0Level {
+    Resident(L0Segment),
+    OffHeap {
+        reader: Arc<L0Reader>,
+        /// The segment **directory** (retire deletes it; compaction is off here).
+        dir: PathBuf,
+        /// On-disk size — a conservative stand-in for the resident footprint in the
+        /// total-delta accounting (the off-heap resident share is far smaller).
+        bytes: u64,
+    },
+}
+
+impl L0Level {
+    /// This level as a `dyn LevelRead` for a transient read (bases, born-resolve) — a
+    /// borrow, so no `Arc` clone.
+    fn as_level(&self) -> &dyn LevelRead {
+        match self {
+            L0Level::Resident(s) => s.memtable().as_ref(),
+            L0Level::OffHeap { reader, .. } => reader.as_ref(),
+        }
+    }
+
+    /// An owned `Arc<dyn LevelRead>` for the published [`DeltaSnapshot`] / freeze.
+    fn level_arc(&self) -> Arc<dyn LevelRead> {
+        match self {
+            L0Level::Resident(s) => s.memtable().clone() as Arc<dyn LevelRead>,
+            L0Level::OffHeap { reader, .. } => reader.clone() as Arc<dyn LevelRead>,
+        }
+    }
+
+    /// The on-disk path retire deletes (a file for resident, a directory for off-heap).
+    fn path(&self) -> &Path {
+        match self {
+            L0Level::Resident(s) => s.path(),
+            L0Level::OffHeap { dir, .. } => dir,
+        }
+    }
+
+    /// Approximate resident/total-accounting size in bytes.
+    fn bytes(&self) -> u64 {
+        match self {
+            L0Level::Resident(s) => s.memtable().bytes() as u64,
+            L0Level::OffHeap { bytes, .. } => *bytes,
+        }
+    }
+
+    /// The resident memtable behind a [`L0Level::Resident`] — for L0→L0 compaction, which
+    /// runs only in the resident mode (the caller returns early for off-heap).
+    fn resident_memtable(&self) -> &Arc<Memtable> {
+        match self {
+            L0Level::Resident(s) => s.memtable(),
+            L0Level::OffHeap { .. } => {
+                unreachable!("L0→L0 compaction is disabled in off-heap mode")
+            }
+        }
+    }
+}
 
 /// A frozen delta handed to consolidation: an immutable snapshot of every
 /// committed write (the active memtable **and** every sealed L0 level), plus the
@@ -55,8 +127,9 @@ pub struct Frozen {
     /// The active memtable at freeze time — the newest delta level the dump folds in.
     pub snapshot: Arc<Memtable>,
     /// The sealed L0 levels at freeze time, **newest first** — the dump folds these
-    /// beneath the active memtable via [`DeltaSnapshot::with_levels`].
-    pub l0: Vec<Arc<Memtable>>,
+    /// beneath the active memtable via [`DeltaSnapshot::with_levels`]. Each is a
+    /// `dyn LevelRead` (resident or off-heap), read through the merged view.
+    pub l0: Vec<Arc<dyn LevelRead>>,
     /// Every committed WAL segment the frozen delta represents. `retire` removes
     /// exactly these; any segment opened after the freeze (post-freeze writes) is
     /// left untouched.
@@ -74,11 +147,19 @@ struct WriterInner {
     /// The authoritative active memtable; the published snapshot's newest level is a
     /// clone of it.
     mem: Memtable,
-    /// The sealed L0 segments beneath the active memtable, **newest first** (empty on
-    /// the common no-flush path). Each flush prepends one; consolidation clears them.
-    l0: Vec<L0Segment>,
+    /// The sealed L0 levels beneath the active memtable, **newest first** (empty on the
+    /// common no-flush path). Each flush prepends one; consolidation clears them. A level
+    /// is resident or off-heap per [`WriterInner::off_heap`].
+    l0: Vec<L0Level>,
     /// The last sequence number assigned (0 before the first write).
     seq: Seq,
+    /// Read (and write) sealed L0 levels off-heap through [`WriterInner::block_cache`]
+    /// (Phase C / D54). Set from `delta.offHeapL0` at open; when false everything is the
+    /// resident single-file path exactly as before.
+    off_heap: bool,
+    /// The server's shared block cache off-heap L0 segments page through. `None` on the
+    /// resident path and for non-server openers.
+    block_cache: Option<Arc<GfBlockCache>>,
 }
 
 /// The per-graph writable-layer writer. Cheap to clone-share behind an `Arc`.
@@ -122,6 +203,34 @@ impl DeltaWriter {
         core_edge_count: u64,
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<Self> {
+        Self::open_with_cache(
+            dir,
+            graph,
+            core_uuid,
+            core_node_count,
+            core_edge_count,
+            false,
+            None,
+            resolve,
+        )
+    }
+
+    /// [`Self::open`] with the off-heap-L0 knob and the shared block cache (Phase C /
+    /// D54). `off_heap` controls only what a *flush* writes; existing sealed segments are
+    /// reloaded in whichever format they were written (a directory = off-heap, a file =
+    /// resident), so the two never require the flag to agree with the disk. An off-heap
+    /// segment needs `cache`; finding one with `cache == None` is a clear error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_cache(
+        dir: impl AsRef<Path>,
+        graph: &str,
+        core_uuid: GenId,
+        core_node_count: u64,
+        core_edge_count: u64,
+        off_heap: bool,
+        cache: Option<Arc<GfBlockCache>>,
+        resolve: impl Fn(&WalOp) -> OpResolution,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
 
         // Reload the sealed L0 segments first (Phase 4c). They stack past the core: the
@@ -130,16 +239,16 @@ impl DeltaWriter {
         // first** (the read-stack order); the bases are the max over levels (= the
         // newest level's `base + born`, since bases stack monotonically).
         let l0_dir = dir.join("l0");
-        let mut l0: Vec<L0Segment> = Vec::new();
+        let mut l0: Vec<L0Level> = Vec::new();
         let mut node_base = core_node_count;
         let mut edge_base = core_edge_count;
         for (_, path) in l0_segment_paths_sorted(&l0_dir)? {
-            let seg =
-                L0Segment::open(&path).with_context(|| format!("reload L0 segment {path:?}"))?;
-            let m = seg.memtable();
-            node_base = node_base.max(m.synthetic_base() + m.born_count());
-            edge_base = edge_base.max(m.edge_synthetic_base() + m.born_edge_count());
-            l0.push(seg);
+            let level = open_l0_level(&path, cache.as_ref())
+                .with_context(|| format!("reload L0 segment {path:?}"))?;
+            let lv = level.as_level();
+            node_base = node_base.max(lv.synthetic_base() + lv.born_count());
+            edge_base = edge_base.max(lv.edge_synthetic_base() + lv.born_edge_count());
+            l0.push(level);
         }
         l0.reverse(); // ascending on disk (oldest→newest) → newest-first read order
 
@@ -168,6 +277,8 @@ impl DeltaWriter {
                 mem,
                 l0,
                 seq: replay.last_seq,
+                off_heap,
+                block_cache: cache,
             }),
             published: RwLock::new(published),
             epoch: AtomicU64::new(1),
@@ -359,7 +470,7 @@ impl DeltaWriter {
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at freeze")?;
         let snapshot = Arc::new(inner.mem.clone());
-        let l0: Vec<Arc<Memtable>> = inner.l0.iter().map(|s| s.memtable().clone()).collect();
+        let l0: Vec<Arc<dyn LevelRead>> = inner.l0.iter().map(|s| s.level_arc()).collect();
         Ok(Frozen {
             snapshot,
             l0,
@@ -389,15 +500,30 @@ impl DeltaWriter {
             return Ok(false);
         }
 
-        // 1. Seal the active memtable to a fresh, content-checked L0 file (fsync-durable).
+        // 1. Seal the active memtable to a fresh, content-checked L0 segment (fsync-durable) —
+        //    a resident single file, or (off-heap) a directory of block files.
         let l0_dir = inner.dir.join("l0");
         std::fs::create_dir_all(&l0_dir)
             .with_context(|| format!("create L0 directory {l0_dir:?}"))?;
         let n = next_l0_number(&l0_dir)?;
         let path = l0_dir.join(format!("{n:010}.l0"));
-        L0Segment::write(&inner.mem, &path)
-            .with_context(|| format!("write L0 segment {path:?}"))?;
-        let seg = L0Segment::open(&path).with_context(|| format!("reopen L0 segment {path:?}"))?;
+        let level = if inner.off_heap {
+            let cache = inner
+                .block_cache
+                .clone()
+                .context("off-heap L0 flush requires a block cache")?;
+            let data = inner.mem.to_segment_data();
+            write_segment(&data, &path, OFFHEAP_L0_BLOCK_BYTES, OFFHEAP_L0_ZSTD_LEVEL)
+                .with_context(|| format!("write off-heap L0 segment {path:?}"))?;
+            open_l0_level(&path, Some(&cache))
+                .with_context(|| format!("reopen off-heap L0 segment {path:?}"))?
+        } else {
+            L0Segment::write(&inner.mem, &path)
+                .with_context(|| format!("write L0 segment {path:?}"))?;
+            L0Level::Resident(
+                L0Segment::open(&path).with_context(|| format!("reopen L0 segment {path:?}"))?,
+            )
+        };
 
         // 2. Rebase the active memtable past every level (the flushed one is the newest
         //    L0, so the next born id starts at its base + its born count).
@@ -414,7 +540,7 @@ impl DeltaWriter {
         old.seal().context("seal WAL segment at flush")?;
 
         inner.mem = Memtable::with_bases(node_base, edge_base);
-        inner.l0.insert(0, seg); // newest-first
+        inner.l0.insert(0, level); // newest-first
 
         // 4. The flushed writes are durable in the L0 file (fsynced above), so the
         //    pre-flush WAL segments can go.
@@ -460,24 +586,27 @@ impl DeltaWriter {
         if self.consolidating.load(Ordering::Acquire) {
             return Ok(false);
         }
+        // Off-heap L0 does no L0→L0 compaction: `merge_levels` needs resident memtables,
+        // and an off-heap level is deliberately not held resident. The fraction-of-core
+        // consolidation bounds the level count instead. See D54.
+        if inner.off_heap {
+            return Ok(false);
+        }
         if inner.l0.len() < 2 {
             return Ok(false);
         }
 
         // Pick a contiguous run of similar-sized levels (over the newest-first stack).
-        let sizes: Vec<u64> = inner
-            .l0
-            .iter()
-            .map(|s| s.memtable().bytes() as u64)
-            .collect();
+        let sizes: Vec<u64> = inner.l0.iter().map(|s| s.bytes()).collect();
         let Some((start, end)) = select_compaction_run(&sizes) else {
             return Ok(false); // a healthy size ladder — nothing same-tier to merge
         };
 
-        // Merge the run (newest-first) into one equivalent segment.
+        // Merge the run (newest-first) into one equivalent segment. Every level here is
+        // resident (off-heap returned early above).
         let run: Vec<&Memtable> = inner.l0[start..end]
             .iter()
-            .map(|s| s.memtable().as_ref())
+            .map(|s| s.resident_memtable().as_ref())
             .collect();
         let merged = Memtable::merge_levels(&run);
 
@@ -499,7 +628,9 @@ impl DeltaWriter {
 
         // Splice the run out, in place, for the single merged segment (stack stays
         // newest-first + number-ordered).
-        inner.l0.splice(start..end, std::iter::once(seg));
+        inner
+            .l0
+            .splice(start..end, std::iter::once(L0Level::Resident(seg)));
 
         // Publish the collapsed stack, then delete the consumed files (durable in the
         // merged file) — publish-before-delete so a reader never loses the data.
@@ -600,7 +731,7 @@ impl DeltaWriter {
     /// level) — checked against the total-delta soft/hard caps (Phase 4d).
     pub fn total_bytes(&self) -> usize {
         let inner = self.inner.lock().expect("delta writer lock");
-        inner.mem.bytes() + inner.l0.iter().map(|s| s.memtable().bytes()).sum::<usize>()
+        inner.mem.bytes() + inner.l0.iter().map(|s| s.bytes() as usize).sum::<usize>()
     }
 
     /// The number of sealed L0 levels currently overlaid (diagnostics / tests).
@@ -675,13 +806,53 @@ fn next_segment_number(dir: &Path) -> Result<u64> {
 /// Build the atomic published [`DeltaSnapshot`] from the active memtable and the L0
 /// stack (newest-first): clone the memtable into a fresh level and gather the L0
 /// segments' immutable memtable handles.
-fn published_snapshot(mem: &Memtable, l0: &[L0Segment]) -> DeltaSnapshot {
+fn published_snapshot(mem: &Memtable, l0: &[L0Level]) -> DeltaSnapshot {
     let mem = Arc::new(mem.clone());
-    let levels: Vec<Arc<dyn LevelRead>> = l0
-        .iter()
-        .map(|s| s.memtable().clone() as Arc<dyn LevelRead>)
-        .collect();
+    let levels: Vec<Arc<dyn LevelRead>> = l0.iter().map(|s| s.level_arc()).collect();
     DeltaSnapshot::with_levels(mem, levels)
+}
+
+/// Open a sealed L0 segment at `path` in whichever format it was written: a **directory**
+/// is off-heap (its payloads page through the shared `cache`), a **file** is resident.
+/// Finding an off-heap segment with no `cache` is a clear configuration error.
+fn open_l0_level(path: &Path, cache: Option<&Arc<GfBlockCache>>) -> Result<L0Level> {
+    if path.is_dir() {
+        let cache = cache
+            .cloned()
+            .context("off-heap L0 segment on disk but no block cache configured")?;
+        let scope = segment_scope(path);
+        let reader = Arc::new(L0Reader::open(path, scope, cache)?);
+        let bytes = dir_size(path);
+        Ok(L0Level::OffHeap {
+            reader,
+            dir: path.to_path_buf(),
+            bytes,
+        })
+    } else {
+        Ok(L0Level::Resident(L0Segment::open(path)?))
+    }
+}
+
+/// A stable, deterministic cache scope for an off-heap segment, derived from its path (a
+/// fixed-seed `DefaultHasher`, so it survives a reopen). Disjoint from the columnar keys
+/// (which scope on the random generation UUID); a retired segment's scope is never queried
+/// again, so its blocks age out of the shared LRU.
+fn segment_scope(path: &Path) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut h);
+    h.finish() as u128
+}
+
+/// Total on-disk size of a segment directory (sum of its file lengths).
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// Refine a base (core-only) resolution against the sealed L0 levels: a node/endpoint
@@ -689,10 +860,10 @@ fn published_snapshot(mem: &Memtable, l0: &[L0Segment]) -> DeltaSnapshot {
 /// in an L0 level resolves to that born node's existing synthetic id, so a re-`MERGE`
 /// on the WAL-tail replay path reuses it rather than allocating a duplicate (Phase
 /// 4c-B). Mirrors the live write path's `DeltaWriter::born_synthetic_for_identity`.
-fn resolve_with_l0(op: &WalOp, base: OpResolution, l0: &[L0Segment]) -> OpResolution {
+fn resolve_with_l0(op: &WalOp, base: OpResolution, l0: &[L0Level]) -> OpResolution {
     let born = |(label, key, value): (&str, &str, &Value)| {
         l0.iter()
-            .find_map(|s| s.memtable().born_synthetic_for_identity(label, key, value))
+            .find_map(|s| s.as_level().born_synthetic_for_identity(label, key, value))
     };
     match base {
         OpResolution::Node(None) => OpResolution::Node(op.node_key().and_then(born)),
@@ -711,12 +882,18 @@ fn resolve_with_l0(op: &WalOp, base: OpResolution, l0: &[L0Segment]) -> OpResolu
     }
 }
 
-/// Remove `path`, tolerating an already-absent file (idempotent cleanup).
+/// Remove `path`, tolerating an already-absent path (idempotent cleanup). Handles both a
+/// resident segment **file** and an off-heap segment **directory**.
 fn remove_if_present(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
+    let res = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match res {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("remove file {path:?}")),
+        Err(e) => Err(e).with_context(|| format!("remove {path:?}")),
     }
 }
 
@@ -837,6 +1014,127 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("slater_dw_{tag}_{}", std::process::id()))
+    }
+
+    fn gf_cache() -> Arc<GfBlockCache> {
+        Arc::new(GfBlockCache::new(1 << 20))
+    }
+
+    fn open_offheap(dir: &Path, cache: Arc<GfBlockCache>) -> DeltaWriter {
+        DeltaWriter::open_with_cache(
+            dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            true,
+            Some(cache),
+            resolve_ticker,
+        )
+        .unwrap()
+    }
+
+    /// An off-heap flush writes a **directory** segment whose reads (core patch + a
+    /// delta-born node) survive a reopen and match the resident semantics; compaction is a
+    /// no-op in off-heap mode.
+    #[test]
+    fn offheap_flush_writes_a_directory_and_reads_survive_reopen() {
+        let dir = tmp("offheap_flush");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = gf_cache();
+        {
+            let w = open_offheap(&dir, cache.clone());
+            w.write(
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("A".into()),
+                    &[("price", Value::Int(10))],
+                ),
+                node(10),
+            )
+            .unwrap();
+            // A born node (resolver returns None for "C" → synthetic id 100).
+            w.write(
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("C".into()),
+                    &[("price", Value::Int(30))],
+                ),
+                OpResolution::Node(None),
+            )
+            .unwrap();
+
+            assert!(w.flush_to_l0().unwrap(), "memtable had writes to flush");
+            assert_eq!(w.l0_len(), 1);
+            // The on-disk segment is a directory (off-heap), not a file.
+            let seg = dir.join("l0").join("0000000000.l0");
+            assert!(seg.is_dir(), "off-heap flush writes a directory segment");
+            // Compaction is disabled in off-heap mode.
+            assert!(!w.compact_l0().unwrap(), "off-heap L0 does no compaction");
+
+            // Reads come from the off-heap level now (memtable was reset by the flush).
+            let snap = w.delta_snapshot();
+            assert_eq!(
+                snap.node_patch(10)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                Some(Value::Int(10)),
+            );
+            assert_eq!(snap.born_ids_with_label("Company"), vec![100]);
+            assert_eq!(
+                snap.node_identity_by_dense(100),
+                Some((
+                    "Company".to_string(),
+                    "ticker".to_string(),
+                    Value::Str("C".into())
+                )),
+            );
+        }
+        // Reopen off-heap: the directory segment reloads and the reads still hold.
+        let w2 = open_offheap(&dir, cache);
+        assert_eq!(w2.l0_len(), 1);
+        let snap = w2.delta_snapshot();
+        assert_eq!(
+            snap.node_patch(10)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(10)),
+        );
+        assert_eq!(snap.born_ids_with_label("Company"), vec![100]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Freezing an off-heap writer captures the sealed level as a `dyn LevelRead`, so the
+    /// consolidation dump reads its writes through the merged view (no resident memtable).
+    #[test]
+    fn offheap_freeze_captures_levels_for_the_dump() {
+        let dir = tmp("offheap_freeze");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = gf_cache();
+        let w = open_offheap(&dir, cache);
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(7))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        let frozen = w.freeze().unwrap();
+        assert_eq!(frozen.l0.len(), 1, "the sealed off-heap level is captured");
+        assert_eq!(frozen.consumed_l0.len(), 1);
+        // The captured level reads through LevelRead (as the dump's merged view would).
+        let stack = DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone());
+        assert_eq!(
+            stack
+                .node_patch(10)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(7)),
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -829,6 +829,15 @@ pub struct DeltaConfig {
     /// absolute path pins a specific binary. Defaults to `slater-build`.
     #[serde(default = "default_builder_bin")]
     pub builder_bin: String,
+    /// Read sealed L0 delta segments **off-heap** (Phase C): a flushed level spills to a
+    /// directory of block files whose per-entity payloads page through the server's shared
+    /// `BlockCache` on demand, rather than being reloaded whole into RAM — so the resident
+    /// footprint of the L0 stack is a compact index, not the full delta. Off by default;
+    /// when off, a flush writes the resident single-file L0 segment exactly as before.
+    /// While on, L0→L0 compaction is skipped (consolidation bounds the level count); see
+    /// `docs/WRITABLE-PROGRESS.md` and D54.
+    #[serde(default)]
+    pub off_heap_l0: bool,
 }
 
 impl Default for DeltaConfig {
@@ -842,6 +851,7 @@ impl Default for DeltaConfig {
             delta_hard_bytes: 0,
             consolidate_window: String::new(),
             builder_bin: default_builder_bin(),
+            off_heap_l0: false,
         }
     }
 }

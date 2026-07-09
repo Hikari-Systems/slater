@@ -941,37 +941,37 @@ correctness concern**. Three green slices:
   (the only unbounded term left, insert-heavy only); blocking them too is a mechanical
   follow-up. The **hot read path and every per-entity payload are fully off-heap**. 64
   slater-delta tests green; clippy `-D warnings` + fmt clean.
-- **Phase C — wire into writer/server (🔜 NEXT; records as D54).** The remaining
-  integration. Precise resume spec (delicate — this refactors the crash-safety-critical
-  writer lifecycle, so keep the default path byte-identical and gate off-heap behind a new
-  `delta.offHeapL0` config flag, default **off**):
-  - **Unify the L0 handle.** `WriterInner.l0: Vec<L0Segment>` → `Vec<L0Level>` where
-    `enum L0Level { Resident(L0Segment), OffHeap { reader: Arc<L0Reader>, dir: PathBuf, bytes: u64 } }`
-    with uniform accessors the writer needs: `level() -> Arc<dyn LevelRead>` (publish/read),
-    `path() -> &Path` (retire/compact bookkeeping — file for resident, dir for off-heap),
-    `to_memtable() -> Result<Memtable>` (merge/consolidation load; resident = clone, off-heap
-    = load the whole segment resident — acceptable, it's background maintenance),
-    `bytes() -> u64`, and `born_synthetic_for_identity(..)` via `LevelRead`.
-  - **Call sites** (`delta_writer.rs`): `open` reload loop (build `L0Level` per config; bases
-    via `LevelRead`), `freeze` (`Frozen.l0: Vec<Arc<Memtable>>` → `Vec<Arc<dyn LevelRead>>` via
-    `level()`; `consumed_l0` via `path()`), `flush_to_l0` (write off-heap `write_segment` vs
-    resident `L0Segment::write` per flag; the off-heap seal is a directory), `compact_l0`
-    (sizes via `bytes()`, merge via `to_memtable()`, write per flag; reuse-oldest-slot logic
-    unchanged), `total_bytes`/`resolve_with_l0`/`published_snapshot`. `retire` clears the
-    stack (unchanged).
-  - **Server/config.** New `DeltaConfig.off_heap_l0: bool` (camelCase `offHeapL0`, default
-    false) threaded through `ConnCtx`. Thread the **server's existing columnar `BlockCache`**
-    handle (user decision: shared cache/eviction domain) into the `DeltaWriter` so off-heap
-    segments page through it; assign each segment a unique cache **scope** id (e.g. a stable
-    hash of its dir path, or a monotonic per-writer counter persisted in the segment). A
-    retired segment's scope is never queried again, so its blocks age out of the LRU (matches
-    the columnar gen-swap orphaning).
-  - **`server.rs:495`** already coerces `frozen.l0` to `Arc<dyn LevelRead>`; once `Frozen.l0`
-    is `Vec<Arc<dyn LevelRead>>` that becomes a plain `.clone()`.
-  - **Tests:** the ~15 `delta_writer.rs` flush/compact/freeze tests keep passing on the
-    default (resident) path unchanged; add off-heap variants (flag on) asserting flush writes
-    a directory, reopen reloads off-heap, reads/compaction/consolidation still correct, and an
-    RSS-bound smoke. Then D54.
+- **Phase C — wire into writer/server. ✅ DONE** (this commit; **completes off-heap L0**).
+  Gated behind a new `delta.offHeapL0` config flag (**default off** → the resident path is
+  byte-identical to before). `DeltaWriter.WriterInner.l0` is now `Vec<L0Level>` where
+  `enum L0Level { Resident(L0Segment), OffHeap { reader: Arc<L0Reader>, dir, bytes } }`, with
+  `as_level()`/`level_arc()` (`&dyn`/`Arc<dyn LevelRead>` for bases/publish), `path()`
+  (file for resident, **directory** for off-heap), `bytes()`, `resident_memtable()`
+  (compaction only). Call sites: `open_with_cache` (new; `open` delegates with off/None — so
+  the ~12 existing `open` call sites are untouched) reloads each segment in **whichever
+  format it is on disk** (`open_l0_level`: a dir ⇒ off-heap via the cache + a path-derived
+  scope, a file ⇒ resident) so the flag need not agree with the disk; `flush_to_l0` writes
+  `l0_offheap::write_segment` (a directory) vs `L0Segment::write` per flag; `compact_l0` is a
+  **no-op in off-heap mode** (`merge_levels` needs resident memtables — consolidation bounds
+  the level count instead, so no L0→L0 compaction off-heap); `freeze` captures `Frozen.l0:
+  Vec<Arc<dyn LevelRead>>` (dump reads through the merged view, no resident memtable);
+  `retire`/`remove_if_present` now delete a **file or a directory**; `published_snapshot`/
+  `resolve_with_l0`/`total_bytes` go through `L0Level`. **Shared cache** (user decision):
+  `crate::cache::BlockCache` now holds `inner: Arc<GfBlockCache>` + a `gf()` accessor; the
+  server creates the columnar cache **before** `enable_writable_layer` and threads `cache.gf()`
+  in, so off-heap L0 blocks page through the **same budget + eviction domain** as columnar
+  blocks (per-segment cache scope = a fixed-seed hash of the segment dir path, disjoint from
+  the generation-UUID columnar scopes; a retired segment's scope is simply never queried again
+  → its blocks age out of the LRU). New `DeltaConfig.off_heap_l0` (camelCase `offHeapL0`).
+  Tests: all resident-path tests unchanged (614 slater + 64 slater-delta green);
+  `offheap_flush_writes_a_directory_and_reads_survive_reopen` (flush → directory segment,
+  core-patch + born-node reads via the off-heap level, compaction no-op, reopen-durable) +
+  `offheap_freeze_captures_levels_for_the_dump` (freeze captures the sealed level as a
+  `dyn LevelRead`, merged-view read). clippy `-D warnings` + fmt clean. See D54.
+
+  **Deferred (documented):** the secondary scan/write indexes remain resident (Phase B
+  note — insert-heavy born *values*); and off-heap mode skips L0→L0 compaction (relies on
+  consolidation to bound level count). Both are cleanly-scoped follow-ups, not correctness gaps.
 
 ## Recommended context-clear points
 

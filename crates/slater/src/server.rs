@@ -202,7 +202,12 @@ impl Graphs {
     /// `<wal_dir>/<graph>/`. Called once at boot only when `cfg.enabled`. Idempotent
     /// per graph — a graph that fails to open its writer aborts boot (a durable
     /// write layer that silently isn't there is worse than a hard failure).
-    pub fn enable_writable_layer(&mut self, cfg: &DeltaConfig, data_dir: &Path) -> Result<()> {
+    pub fn enable_writable_layer(
+        &mut self,
+        cfg: &DeltaConfig,
+        data_dir: &Path,
+        block_cache: Option<Arc<graph_format::blockcache::BlockCache>>,
+    ) -> Result<()> {
         let base = {
             let p = Path::new(&cfg.wal_dir);
             if p.is_absolute() {
@@ -214,12 +219,14 @@ impl Graphs {
         for (name, slot) in &self.graphs {
             let gen = slot.read().unwrap().clone();
             let dir = base.join(name);
-            let writer = DeltaWriter::open(
+            let writer = DeltaWriter::open_with_cache(
                 &dir,
                 name,
                 gen.uuid(),
                 gen.node_count(),
                 gen.edge_count(),
+                cfg.off_heap_l0,
+                block_cache.clone(),
                 |op| resolve_op(&gen, op),
             )
             .with_context(|| format!("open writable layer for graph '{name}'"))?;
@@ -492,14 +499,7 @@ impl Graphs {
         let dump_res = (|| -> Result<()> {
             let view = MergedView::new(
                 core.as_ref(),
-                DeltaSnapshot::with_levels(
-                    frozen.snapshot.clone(),
-                    frozen
-                        .l0
-                        .iter()
-                        .map(|m| m.clone() as std::sync::Arc<dyn slater_delta::LevelRead>)
-                        .collect(),
-                ),
+                DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
             );
             let engine = Engine::new(&view, cache);
             let mut file = std::io::BufWriter::new(
@@ -1643,17 +1643,19 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     graphs
         .verify_manifest_policy()
         .context("manifest authentication policy")?;
+    // The shared columnar block cache — created before the writable layer so off-heap L0
+    // delta segments page through this same budget + eviction domain (Phase C / D54).
+    let cache = Arc::new(BlockCache::new(cfg.cache.block_cache_bytes));
     if cfg.delta.enabled {
         graphs
-            .enable_writable_layer(&cfg.delta, Path::new(cfg.data_dir()))
+            .enable_writable_layer(&cfg.delta, Path::new(cfg.data_dir()), Some(cache.gf()))
             .context("enable writable layer")?;
-        info!(wal_dir = %cfg.delta.wal_dir, "writable layer enabled");
+        info!(wal_dir = %cfg.delta.wal_dir, off_heap_l0 = cfg.delta.off_heap_l0, "writable layer enabled");
     }
     let graphs = Arc::new(graphs);
     if graphs.is_empty() {
         warn!(data_dir = %cfg.data_dir(), "no graphs found to serve");
     }
-    let cache = Arc::new(BlockCache::new(cfg.cache.block_cache_bytes));
     let result_cache = Arc::new(ResultCache::new(cfg.cache.result_cache_bytes));
     // The vector-index pool, and pin every generation's resident PQ codes into it
     // so the disk-native ANN path navigates from memory (the milestone DESIGN).
@@ -4075,6 +4077,7 @@ mod tests {
             delta_hard_bytes: 0,
             consolidate_window: String::new(),
             builder_bin: "slater-build".to_string(),
+            off_heap_l0: false,
         }
     }
 
@@ -4088,7 +4091,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen = graphs.get("people").unwrap();
@@ -4168,7 +4171,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -4215,7 +4218,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen = graphs.get("people").unwrap();
@@ -4288,7 +4291,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen = graphs.get("people").unwrap();
@@ -4405,7 +4408,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen = graphs.get("people").unwrap();
@@ -4498,7 +4501,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -4624,7 +4627,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen = graphs.get("people").unwrap();
@@ -4704,7 +4707,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -4808,7 +4811,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -4921,7 +4924,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -4971,7 +4974,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -5060,7 +5063,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -5129,7 +5132,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -5292,7 +5295,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen0 = graphs.get("people").unwrap();
@@ -5454,7 +5457,7 @@ mod tests {
 
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         // MERGE-create Dave (born) and patch a core node (Alice.age = 99).
@@ -5517,7 +5520,7 @@ mod tests {
         drop(graphs);
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         assert_eq!(
             graphs.writer("people").unwrap().l0_len(),
@@ -5563,7 +5566,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen0 = graphs.get("people").unwrap();
@@ -5630,7 +5633,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
 
         let gen0 = graphs.get("people").unwrap();
@@ -5707,7 +5710,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let gen0 = graphs.get("people").unwrap();
         let writer = graphs.writer("people").unwrap();
@@ -5936,7 +5939,7 @@ mod tests {
         let wal = root.join("_wal");
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         graphs
-            .enable_writable_layer(&delta_cfg(&wal), &root)
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
         let graphs = Arc::new(graphs);
         // A minimal ACL (unused by consolidation, but ConnCtx requires one).

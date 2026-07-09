@@ -1065,3 +1065,32 @@ budget holds far more blocks. Costs are modest: more blocks ⇒ a slightly large
 (~426 vs 27 entries here — still tiny) and marginally worse compression / more range-scan seeks. Only
 affects **newly built** generations; existing images are unchanged until rebuilt. Determinism/golden
 tests are invariant (they build-twice-and-compare, not against a pinned old-block-size hash).
+
+### D54 — Off-heap L0 delta segments read through the shared block cache
+`crates/slater-delta/src/{memtable.rs,l0_offheap.rs}`, `crates/slater/src/{delta_writer.rs,cache.rs,config.rs,server.rs}`.
+A sealed L0 delta level was reloaded **whole** into RAM (`L0Segment` → `Arc<Memtable>`), so the
+resident footprint of the L0 stack grew with the delta byte budget — the deferred RSS item. Off-heap
+L0 (opt-in `delta.offHeapL0`, default off) instead spills a flushed level to a **directory** of
+`graph_format::blockfile` sections (`node`/`adj_out`/`adj_in`/`edge`) whose per-entity payloads page
+on demand through the server's **shared columnar `BlockCache`** (user decision: one budget + one
+eviction domain, not a dedicated delta cache), plus a resident `meta.bin` (scalars, per-section sorted
+`u64` key columns, secondary indexes). A point read binary-searches the resident key column: a **miss
+costs no I/O** (the hot tombstone/patch path), a **hit pages+caches one block**.
+
+Enabled by the `LevelRead` trait seam (Phase A): `DeltaSnapshot` folds over `Arc<dyn LevelRead>`, so a
+level is resident (`Memtable`) or off-heap (`L0Reader`) transparently. `Memtable::to_segment_data`
+gathers the delta through the memtable's own read methods and an `offheap_reader_matches_resident_memtable`
+parity test proves read-for-read equality, so the two formats are behaviourally identical. The writer
+holds `Vec<L0Level>` (resident|off-heap); reads/publish/freeze/consolidation go through `LevelRead`, and
+a segment is reloaded in whichever format it is on disk (a directory ⇒ off-heap).
+
+**Rejected / deferred, deliberately.** (1) A **dedicated** delta cache — the user chose the shared one;
+per-segment cache scopes (a fixed-seed hash of the segment dir path) are disjoint from the generation-UUID
+columnar scopes, and a retired segment's blocks age out of the LRU. (2) **Blocking the secondary indexes**
+(`born_by_label`/`index`/`identity`, `core_patched`) — they stay resident (they re-hold born *values*, the
+only unbounded term left, and only for insert-heavy deltas); blocking them is a mechanical follow-up. (3)
+**L0→L0 compaction off-heap** — `merge_levels` needs resident memtables, so compaction is skipped in
+off-heap mode and the fraction-of-core consolidation bounds the level count instead. None is a correctness
+gap; the hot read path and every per-entity payload are fully off-heap. `#![forbid(unsafe_code)]` holds
+throughout (`pread`, no mmap). No L0 back-compat obligation (segments are ephemeral between flush and
+consolidation). See `docs/WRITABLE-PROGRESS.md` §"Off-heap L0 reads" and `~/.claude/plans/offheap-l0.md`.
