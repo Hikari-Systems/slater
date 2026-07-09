@@ -3,7 +3,7 @@
 [![CI](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml/badge.svg)](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Hikari-Systems/slater?sort=semver)](https://github.com/Hikari-Systems/slater/releases/latest)
 
-> **In one line:** Slater serves a graph database the way SQLite serves a relational one — you bake the data into an immutable file, ship it anywhere, and serve it read-only with **memory cost that's flat no matter how big the graph gets**.
+> **In one line:** Slater serves a graph database the way SQLite serves a relational one — you bake the data into an immutable file, ship it anywhere, and serve it with **memory cost that's flat no matter how big the graph gets**. It is a **mostly-reads-some-writes** engine: reads are the design centre, and writes are layered on top without taxing them.
 
 ---
 
@@ -11,7 +11,7 @@
 
 |  |  |  |  |
 |:--|:--|:--|:--|
-| [Why Slater exists](#why-slater-exists) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
+| [Why Slater exists](#why-slater-exists) | [Mostly reads, some writes](#mostly-reads-some-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
 | [How it works](#how-it-works) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
 | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
 | [Performance](#performance) | [License](#license) |
@@ -21,7 +21,20 @@ A **graph database** stores data as *things* (nodes) and the *relationships betw
 
 The catch with most graph databases (neo4j, Memgraph, FalkorDB) is that they're built to *write* as much as read: transactional, clustered, and holding the whole graph resident in RAM. A 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill.
 
-Slater is built for the other half of the problem: graphs that are **mostly read and rebuilt in batches** — knowledge graphs for RAG, recommendation and identity graphs, dependency graphs. You build the graph once, offline, into an immutable on-disk image; then any number of Slater servers serve it read-only over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve.**
+Slater is built for the other half of the problem: graphs that are **mostly read, with a trickle of writes** — knowledge graphs for RAG, recommendation and identity graphs, dependency graphs. You build the graph once, offline, into an immutable on-disk image; then any number of Slater servers serve it over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve.**
+
+### Mostly reads, some writes
+
+Batch-rebuilding a whole graph to correct one property, add one node, or retract one edge is a blunt instrument. So Slater takes writes too — but it refuses to pay for them on the read path.
+
+Writes land in a **log-structured merge (LSM) layer over the immutable core**: a write-ahead log and an in-memory table, spilling to immutable delta segments, folded back into a fresh core by a periodic **consolidation**. The asymmetry is deliberate:
+
+- **Reads over an unwritten graph cost exactly what they did before.** An empty delta is a single predictable branch, not a merge — the read-only path is byte-identical.
+- **The read tax scales with the size of the delta, not the size of the graph.** Whole-graph answers — `count(*)`, the label and relationship-type marginals — stay *metadata reads* even with writes outstanding: the delta keeps its own counters, so a `count(*)` over a 91.6M-node core with half a million pending writes still answers in tens of milliseconds without touching a single block.
+- **Writes are durable, not fast.** A single writer drains the queue; `SUCCESS` is returned only after the `fsync` that covers the write, so *acknowledged ⇒ durable*. Batch them (a write-`UNWIND` group-commits one `fsync` per batch rather than per row) and they're cheap; issue them one at a time and you'll feel every `fsync`. That's the intended trade.
+- **The write grammar is small on purpose.** Business-key `MERGE` / `MATCH … SET` / `DELETE` over nodes and relationships — enough to correct, insert and retract. It is not general Cypher write semantics, and it isn't trying to be.
+
+The writable layer is **off by default** (`delta.enabled`). Leave it off and Slater is exactly the read-only engine it always was.
 
 > **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
 > who insists on going by a single name — "Just… Slater" — and one of my favourite
@@ -33,10 +46,11 @@ Slater is built for the other half of the problem: graphs that are **mostly read
 - **RAM set by your cache budget, not your graph size** — fan out as many read replicas as you like.
 - **A drop-in for the read path** — speaks Bolt, so any standard neo4j driver (JS, Python, Go…) works unchanged. It's the read subset of Cypher; nothing new to learn.
 - **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
+- **Durable writes when you need them** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE`, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Vector search built in** — disk-native approximate-nearest-neighbour (cosine KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline.
-- **Locked down by design** — read-only by construction, optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, read-only container rootfs.
+- **Locked down by design** — writes off by default, optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, read-only container rootfs.
 
-**When *not* to use it:** if you need live writes, transactional mutation, or full Cypher write semantics, Slater isn't your engine — it's deliberately the serving half. Pair it with whatever builds your graph upstream.
+**When *not* to use it:** if writes are the main event — high-throughput transactional mutation, multi-statement transactions with rollback, or full Cypher write semantics — Slater isn't your engine. It takes writes so you don't have to rebuild a graph to change one node, not so you can run an OLTP workload on it. The single writer is a durability floor, not a throughput story: read-heavy with a trickle of corrections is the shape it's built for.
 
 ## Features
 
@@ -47,7 +61,7 @@ Slater is built for the other half of the problem: graphs that are **mostly read
 | **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
 | **Tiny, dependency-light install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:latest-lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
 | **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
-| **Rugged under load** | The server and offline builder both compile with `#![forbid(unsafe_code)]` — the engine's only `unsafe` lives in the audited jemalloc allocator crate. Read-only means no write locks, no GC pauses, no data races. One bad query can't take the server down. |
+| **Rugged under load** | The server and offline builder both compile with `#![forbid(unsafe_code)]` — the engine's only `unsafe` lives in the audited jemalloc allocator crate. The core is immutable, so reads take no locks and never wait on a writer; a single writer serialises mutations behind the write path alone. No GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
 | **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
 | **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. |
@@ -96,7 +110,7 @@ docker run --rm -v slater-data:/data -v "$PWD/dumps:/dumps:ro" \
   --entrypoint /app/slater-build hikarisystems/slater:latest \
   --input /dumps/people.cypher --graph people --data-dir /data
 
-# Serve it (read-only) over Bolt on 7687:
+# Serve it over Bolt on 7687 (read-only unless `delta.enabled`):
 docker run -d --name slater -p 7687:7687 \
   -v slater-data:/data:ro -v "$PWD/acl.json:/config/acl.json:ro" \
   hikarisystems/slater:latest
@@ -434,8 +448,8 @@ where filesystem change events are unreliable). When it changes:
 
 ## ACL
 
-`acl.json` maps users to argon2id password hashes and per-graph **read** grants.
-Mint a hash (never store cleartext) with:
+`acl.json` maps users to argon2id password hashes and per-graph **`read`** / **`write`**
+grants. Mint a hash (never store cleartext) with:
 
 ```sh
 slater hash-password 's3cret'        # prints a $argon2id$… string for acl.json
@@ -450,7 +464,7 @@ A starter `acl.json` ships at the repo root; its shape is:
       "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>",
       "grants": {
         "people": ["read"],
-        "products": ["read"]
+        "products": ["read", "write"]
       }
     }
   }
@@ -460,9 +474,15 @@ A starter `acl.json` ships at the repo root; its shape is:
 * **`users`** — one entry per login, keyed by username.
 * **`passwordArgon2id`** — the `$argon2id$…` string from `slater hash-password`
   (never cleartext; the file itself is plain JSON and lives on shared storage).
-* **`grants`** — per-graph capability lists. Only **`read`** is meaningful (Slater
-  serves read-only); a user can query exactly the graphs listed and no others. A
-  graph absent from a user's grants is invisible to them.
+* **`grants`** — per-graph capability lists. Two permissions are meaningful:
+  * **`read`** — query the graph. A graph absent from a user's grants is invisible to them.
+  * **`write`** — mutate the graph through the writable layer (`delta.enabled`): the
+    `MERGE` / `SET` / `DELETE` statements and `CALL slater.consolidate()`.
+
+  They are **independent: a `read` grant confers no write access.** Turning the writable
+  layer on therefore cannot promote your existing readers into writers. A writer needs
+  both — `["read", "write"]` — because resolving a business key to write it is a read.
+  Unrecognised permission strings are ignored (they grant nothing).
 
 Mount it read-only at the path named by `aclPath` (default `/config/acl.json`).
 The server reloads it on each generation hot-swap, and the at-rest ACL stamp is
