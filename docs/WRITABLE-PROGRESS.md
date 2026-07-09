@@ -1007,8 +1007,7 @@ below are current, and that the latest commit hash is noted.
 
 ## Next action
 
-**Resume state:** on branch `writeable`, **local commits not yet pushed** to `origin/writeable`
-(last pushed: `bc12d82`). **Phases 0–5 + `slater dump` CLI are ALL DONE.** The **bulk-delete
+**Resume state:** on branch `writeable`, **all pushed** to `origin/writeable` (through `53c3a82`). **Phases 0–5 + `slater dump` CLI are ALL DONE.** The **bulk-delete
 ISAM-resolve floor is RESOLVED** (D52 decoded-block cache + D53 smaller range-index blocks;
 875s→13.2s — the batch-local merge-join resolve is now unnecessary). **Off-heap L0 reads
 (the big deferred RSS item) are ✅ DONE — all three phases** (see the "Off-heap L0 reads"
