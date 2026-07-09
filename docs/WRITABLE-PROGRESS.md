@@ -941,8 +941,37 @@ correctness concern**. Three green slices:
   (the only unbounded term left, insert-heavy only); blocking them too is a mechanical
   follow-up. The **hot read path and every per-entity payload are fully off-heap**. 64
   slater-delta tests green; clippy `-D warnings` + fmt clean.
-- **Phase C — wire into writer/server + config knob; consolidation/compaction load-to-merge**
-  (next; records as D54).
+- **Phase C — wire into writer/server (🔜 NEXT; records as D54).** The remaining
+  integration. Precise resume spec (delicate — this refactors the crash-safety-critical
+  writer lifecycle, so keep the default path byte-identical and gate off-heap behind a new
+  `delta.offHeapL0` config flag, default **off**):
+  - **Unify the L0 handle.** `WriterInner.l0: Vec<L0Segment>` → `Vec<L0Level>` where
+    `enum L0Level { Resident(L0Segment), OffHeap { reader: Arc<L0Reader>, dir: PathBuf, bytes: u64 } }`
+    with uniform accessors the writer needs: `level() -> Arc<dyn LevelRead>` (publish/read),
+    `path() -> &Path` (retire/compact bookkeeping — file for resident, dir for off-heap),
+    `to_memtable() -> Result<Memtable>` (merge/consolidation load; resident = clone, off-heap
+    = load the whole segment resident — acceptable, it's background maintenance),
+    `bytes() -> u64`, and `born_synthetic_for_identity(..)` via `LevelRead`.
+  - **Call sites** (`delta_writer.rs`): `open` reload loop (build `L0Level` per config; bases
+    via `LevelRead`), `freeze` (`Frozen.l0: Vec<Arc<Memtable>>` → `Vec<Arc<dyn LevelRead>>` via
+    `level()`; `consumed_l0` via `path()`), `flush_to_l0` (write off-heap `write_segment` vs
+    resident `L0Segment::write` per flag; the off-heap seal is a directory), `compact_l0`
+    (sizes via `bytes()`, merge via `to_memtable()`, write per flag; reuse-oldest-slot logic
+    unchanged), `total_bytes`/`resolve_with_l0`/`published_snapshot`. `retire` clears the
+    stack (unchanged).
+  - **Server/config.** New `DeltaConfig.off_heap_l0: bool` (camelCase `offHeapL0`, default
+    false) threaded through `ConnCtx`. Thread the **server's existing columnar `BlockCache`**
+    handle (user decision: shared cache/eviction domain) into the `DeltaWriter` so off-heap
+    segments page through it; assign each segment a unique cache **scope** id (e.g. a stable
+    hash of its dir path, or a monotonic per-writer counter persisted in the segment). A
+    retired segment's scope is never queried again, so its blocks age out of the LRU (matches
+    the columnar gen-swap orphaning).
+  - **`server.rs:495`** already coerces `frozen.l0` to `Arc<dyn LevelRead>`; once `Frozen.l0`
+    is `Vec<Arc<dyn LevelRead>>` that becomes a plain `.clone()`.
+  - **Tests:** the ~15 `delta_writer.rs` flush/compact/freeze tests keep passing on the
+    default (resident) path unchanged; add off-heap variants (flag on) asserting flush writes
+    a directory, reopen reloads off-heap, reads/compaction/consolidation still correct, and an
+    RSS-bound smoke. Then D54.
 
 ## Recommended context-clear points
 
