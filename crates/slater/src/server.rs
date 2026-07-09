@@ -2698,9 +2698,12 @@ fn execute_write(
 /// Resolve a node write's business key to its dense-id context for the WAL op. `Unique`
 /// → the core id; a MERGE-create (`is_set && upsert`) on an `Absent` key → a born
 /// synthetic id (reusing one already flushed to L0, else `None` to allocate); a DELETE
-/// of a born node → its synthetic id resolved across the whole delta; every other
-/// absent / ambiguous / unindexed case is a clear error. Shared by the single and
-/// batched (write-UNWIND) node write paths so their semantics cannot drift.
+/// or a `MATCH … SET` of a born node → its synthetic id resolved across the whole delta;
+/// every other absent / ambiguous / unindexed case is a clear error. Shared by the single
+/// and batched (write-UNWIND) node write paths so their semantics cannot drift.
+///
+/// Every `Absent` arm consults the delta, not just the core: a delta-born node is a real,
+/// readable node, so `MERGE`, `DELETE` and `SET` must all be able to name it.
 fn resolve_node_op(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
@@ -2732,16 +2735,22 @@ fn resolve_node_op(
                 }
             }
         }
-        // A `MATCH … SET` (update-only) whose key matches no core node.
-        KeyResolution::Absent => {
-            return Err(Failure::new(
-                CODE_EXECUTION,
-                format!(
-                    "no {label}({key} = …) node to update: the business key matches no existing \
-                     node (use MERGE to create it)"
-                ),
-            ))
-        }
+        // A `MATCH … SET` (update-only) whose key matches no core node may still name a
+        // **delta-born** node: it exists and reads back like any other, so an update has
+        // to resolve it across the whole delta exactly as the DELETE arm above does.
+        // Absent from the core *and* the delta → the key names nothing.
+        KeyResolution::Absent => match writer.born_synthetic_in_delta(label, key, value) {
+            Some(id) => Some(id),
+            None => {
+                return Err(Failure::new(
+                    CODE_EXECUTION,
+                    format!(
+                        "no {label}({key} = …) node to update: the business key matches no \
+                         existing node (use MERGE to create it)"
+                    ),
+                ))
+            }
+        },
         KeyResolution::Ambiguous => {
             return Err(Failure::new(
                 CODE_EXECUTION,
@@ -5763,6 +5772,294 @@ mod tests {
             "the post-freeze write survived on the carried-forward delta"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `count(*)` over a **merged** view must net the delta's born rows in and its
+    /// suppressed rows out — and must do so without scanning the core (the fast path
+    /// reads `live_node_count`). Checked against the executor's own materialising scan,
+    /// which is the definition of what a read sees.
+    #[tokio::test]
+    async fn merged_count_star_nets_born_and_suppressed_rows() {
+        let (_root, ctx) =
+            build_writable_ctx_caps("merged_count", "slater-build", 1 << 20, 0, 0, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let try_write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
+        };
+        let write = |q: &str| try_write(q).unwrap();
+        let count = |q: &str| -> i64 {
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            match rows[0][0] {
+                Val::Int(n) => n,
+                ref other => panic!("expected an int count, got {other:?}"),
+            }
+        };
+        // The materialising scan — the ground truth the fast path must agree with.
+        let scanned = || -> i64 {
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast = parser::parse("MATCH (n) RETURN n.name").unwrap();
+            let rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            rows.len() as i64
+        };
+        let check = |expected: i64| {
+            assert_eq!(
+                count("MATCH (n) RETURN count(*)"),
+                expected,
+                "whole-graph count"
+            );
+            assert_eq!(
+                count("MATCH (n:Person) RETURN count(*)"),
+                expected,
+                "labelled count"
+            );
+            assert_eq!(scanned(), expected, "the scan agrees with the fast path");
+        };
+
+        check(3); // Alice, Bob, Carol.
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 1"); // born
+        check(4);
+        write("MATCH (n:Person {name:'Alice'}) DELETE n"); // suppress a core row
+        check(3);
+        write("MATCH (n:Person {name:'Dave'}) DELETE n"); // suppress a born row
+        check(2);
+        // A delete of a key that exists nowhere is refused outright, so it can never
+        // enter the delta as an inert tombstone and wrongly decrement the count.
+        assert!(try_write("MATCH (n:Person {name:'Ghost'}) DELETE n").is_err());
+        check(2);
+        write("MERGE (n:Person {name:'Alice'}) SET n.age = 31"); // resurrect the core row
+        check(3);
+    }
+
+    /// The whole-graph metadata shapes — `labels(n)[0]`, `type(r)` and the bare edge
+    /// `count(*)` — must stay metadata reads over a delta and agree with the materialising
+    /// scan. Deleting a node also kills its incident edges, so the edge count drops by
+    /// that node's degree. Fixture: 3 `:Person`, one `Alice-[:KNOWS]->Bob`.
+    #[tokio::test]
+    async fn merged_metadata_and_edge_counts_track_the_delta() {
+        let (_root, ctx) = build_writable_ctx_caps("merged_meta", "slater-build", 1 << 20, 0, 0, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+        let rows = |q: &str| -> Vec<Vec<Val>> {
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let out = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            out
+        };
+        let one_int = |q: &str| -> i64 {
+            let r = rows(q);
+            match r[0][0] {
+                Val::Int(n) => n,
+                ref other => panic!("expected an int, got {other:?}"),
+            }
+        };
+        // The count column of the first group row (`Val` has no `PartialEq`).
+        let group_count = |q: &str| -> i64 {
+            let r = rows(q);
+            match r[0][1] {
+                Val::Int(n) => n,
+                ref other => panic!("expected an int count, got {other:?}"),
+            }
+        };
+        // The materialising scan — ground truth for the edge count.
+        let scanned_edges = || -> i64 { rows("MATCH ()-[r]->() RETURN r").len() as i64 };
+
+        // Baseline: 3 nodes, 1 edge. The bare edge count used to have no fast path at all.
+        assert_eq!(one_int("MATCH ()-[r]->() RETURN count(*)"), 1);
+        assert_eq!(scanned_edges(), 1);
+        assert_eq!(group_count("MATCH (n) RETURN labels(n)[0], count(*)"), 3);
+        assert_eq!(group_count("MATCH ()-[r]->() RETURN type(r), count(*)"), 1);
+
+        // A born node adds a label group but no edges.
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 1");
+        assert_eq!(
+            group_count("MATCH (n) RETURN labels(n)[0], count(*)"),
+            4,
+            "born node counted in the label group"
+        );
+        assert_eq!(
+            one_int("MATCH ()-[r]->() RETURN count(*)"),
+            1,
+            "born node adds no edges"
+        );
+        assert_eq!(scanned_edges(), 1);
+
+        // Deleting a core endpoint also removes the edge incident to it.
+        write("MATCH (n:Person {name:'Bob'}) DELETE n");
+        assert_eq!(
+            one_int("MATCH ()-[r]->() RETURN count(*)"),
+            0,
+            "Alice→Bob dies with its endpoint"
+        );
+        assert_eq!(scanned_edges(), 0, "the scan agrees");
+        assert_eq!(
+            group_count("MATCH (n) RETURN labels(n)[0], count(*)"),
+            3,
+            "label group drops the deleted node"
+        );
+        assert!(
+            rows("MATCH ()-[r]->() RETURN type(r), count(*)").is_empty(),
+            "an empty reltype group is not emitted"
+        );
+    }
+
+    /// An edge tombstone cannot be netted out of a counter (a deleted **core** edge carries
+    /// no edge id), so the edge fast paths must **decline** rather than report a wrong
+    /// number — the matcher then produces the right answer.
+    #[tokio::test]
+    async fn edge_tombstone_makes_the_edge_fast_path_decline_not_lie() {
+        let (_root, ctx) =
+            build_writable_ctx_caps("merged_edge_tomb", "slater-build", 1 << 20, 0, 0, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        assert!(
+            MergedView::new(gen.as_ref(), writer.delta_snapshot())
+                .live_edge_count()
+                .unwrap()
+                .is_some(),
+            "an empty delta is exactly countable"
+        );
+
+        let stmt = match parser::parse_statement(
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::WriteEdge(w) => w,
+            other => panic!("expected an edge delete, got {other:?}"),
+        };
+        execute_edge_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+        assert!(
+            view.live_edge_count().unwrap().is_none(),
+            "an edge tombstone makes the counter-derived count inexact ⇒ decline"
+        );
+        // The query still answers correctly, via full execution.
+        let ast = parser::parse("MATCH ()-[r]->() RETURN count(*)").unwrap();
+        let counted = match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+            Val::Int(n) => n,
+            ref other => panic!("expected an int, got {other:?}"),
+        };
+        assert_eq!(counted, 0, "the deleted edge is suppressed by the matcher");
+    }
+
+    /// A delta-born node is a real, readable node, so a plain `MATCH … SET` must be able
+    /// to update it — both while it is still in the active memtable and after it has been
+    /// flushed to an L0 segment. (It used to resolve the key against the core only, so
+    /// updating a node you had just created failed with "use MERGE to create it".)
+    #[tokio::test]
+    async fn match_set_updates_a_delta_born_node() {
+        let (_root, ctx) = build_writable_ctx_caps("set_born", "slater-build", 1 << 20, 0, 0, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let try_write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
+        };
+        let age_of = |name: &str| -> Option<i64> {
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast =
+                parser::parse(&format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.age")).unwrap();
+            let rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            rows.first().map(|r| match r[0] {
+                Val::Int(n) => n,
+                ref other => panic!("expected an int age, got {other:?}"),
+            })
+        };
+
+        // Born, still in the active memtable → SET must find it.
+        try_write("MERGE (n:Person {name:'Dave'}) SET n.age = 1").unwrap();
+        try_write("MATCH (n:Person {name:'Dave'}) SET n.age = 2").unwrap();
+        assert_eq!(
+            age_of("Dave"),
+            Some(2),
+            "SET on a born node in the memtable"
+        );
+
+        // Flush it to an L0 segment, then SET again → must resolve across the levels.
+        assert!(writer.flush_to_l0().unwrap(), "born row flushed to L0");
+        try_write("MATCH (n:Person {name:'Dave'}) SET n.age = 3").unwrap();
+        assert_eq!(age_of("Dave"), Some(3), "SET on a born node flushed to L0");
+
+        // A key that exists in neither the core nor the delta is still a clear error.
+        let e = try_write("MATCH (n:Person {name:'Nobody'}) SET n.age = 1").unwrap_err();
+        assert!(e.message.contains("node to update"), "got: {}", e.message);
+    }
+
+    /// The same invariants once the delta is spread across **sealed L0 levels**: a born
+    /// row, its tombstone, and its resurrection each land in a different level, so the
+    /// count summary must fold newest-wins across levels rather than sum them.
+    #[tokio::test]
+    async fn merged_count_star_folds_across_l0_levels() {
+        // memtable_bytes = 1 ⇒ every write flushes; trigger 0 ⇒ no compaction, so the
+        // levels stay distinct and the cross-level fold is what is under test.
+        let (_root, ctx) = build_writable_ctx_caps("merged_count_l0", "slater-build", 1, 0, 0, 0);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let gen = ctx.graphs.get("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let write = |q: &str| {
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+        let count = || -> i64 {
+            let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+            let ast = parser::parse("MATCH (n:Person) RETURN count(*)").unwrap();
+            let rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            match rows[0][0] {
+                Val::Int(n) => n,
+                ref other => panic!("expected an int count, got {other:?}"),
+            }
+        };
+
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 1");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(count(), 4, "born in L0");
+
+        write("MATCH (n:Person {name:'Dave'}) DELETE n");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(
+            count(),
+            3,
+            "tombstoned in a newer level than it was born in"
+        );
+
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 2");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(
+            count(),
+            4,
+            "a newer MERGE resurrects it: the older tombstone must not still subtract"
+        );
+        assert!(writer.l0_len() >= 2, "the levels really are distinct");
     }
 
     /// Phase 4d-ii-a: the write path auto-maintains the delta. With a 1-byte memtable

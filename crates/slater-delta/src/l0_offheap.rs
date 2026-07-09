@@ -45,7 +45,9 @@ use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta};
 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
-const OFFHEAP_VERSION: u64 = 1;
+/// v2 adds the resident `tombstoned` dense-id column, so a merged live `count(*)` can
+/// enumerate this segment's suppressed rows without paging `node.blk`.
+const OFFHEAP_VERSION: u64 = 2;
 
 /// Per-section cache discriminants (the `sub` in a [`BlockCache`] key). Distinct so the
 /// four sections of one segment never collide in the shared cache.
@@ -265,6 +267,15 @@ pub struct OffheapSegmentWriter {
     born_index: Vec<BornIndexEntry>,
     core_patched: Vec<(String, String, u64)>,
     born_by_identity: Vec<(Vec<u8>, u64)>,
+    /// Dense ids this segment tombstones, accumulated from the pushed node deltas (so
+    /// both the flush path and the streaming merge populate it for free) and kept
+    /// resident in `meta.bin`.
+    tombstoned: Vec<u64>,
+    /// Whether any pushed edge is a tombstone, and the per-reltype born-edge tally — both
+    /// derived from the outgoing adjacency records (every delta edge appears exactly once
+    /// as an out-edge of its source), so the flush and merge paths populate them alike.
+    edge_tombstones: bool,
+    born_edges_by_reltype: BTreeMap<String, u64>,
 }
 
 impl OffheapSegmentWriter {
@@ -305,6 +316,9 @@ impl OffheapSegmentWriter {
             born_index: Vec::new(),
             core_patched: Vec::new(),
             born_by_identity: Vec::new(),
+            tombstoned: Vec::new(),
+            edge_tombstones: false,
+            born_edges_by_reltype: BTreeMap::new(),
         })
     }
 
@@ -319,10 +333,27 @@ impl OffheapSegmentWriter {
         self.node
             .append_record(&encode_node(label, key, value, delta))?;
         self.node_keys.push(dense);
+        // Every pushed node carries a dense id (a no-op tombstone of a key that exists
+        // nowhere is never emitted), so this is exactly the segment's suppressed set.
+        if delta.tombstoned {
+            self.tombstoned.push(dense);
+        }
         Ok(())
     }
 
     pub fn push_adj_out(&mut self, node: u64, edges: &[DeltaEdge]) -> Result<()> {
+        // Every delta edge is the out-edge of exactly one source, so this pass sees each
+        // one once: enough to derive both resident edge columns without a second walk.
+        for e in edges {
+            if e.tombstoned {
+                self.edge_tombstones = true;
+            } else if e.edge_id.is_some() {
+                *self
+                    .born_edges_by_reltype
+                    .entry(e.reltype.clone())
+                    .or_default() += 1;
+            }
+        }
         self.adj_out.append_record(&encode_adj(edges))?;
         self.adj_out_keys.push(node);
         Ok(())
@@ -434,6 +465,16 @@ impl OffheapSegmentWriter {
             body.extend_from_slice(ck);
             write_uvarint(&mut body, *id);
         }
+        // v2: the resident live-count columns — the suppressed node ids (ascending, since
+        // `push_node` runs in dense-id order), the edge-tombstone flag, and the per-reltype
+        // born-edge tally — so a live count never pages a payload block.
+        w_u64s(&mut body, self.tombstoned.iter().copied());
+        body.push(u8::from(self.edge_tombstones));
+        write_uvarint(&mut body, self.born_edges_by_reltype.len() as u64);
+        for (reltype, n) in &self.born_edges_by_reltype {
+            w_str(&mut body, reltype);
+            write_uvarint(&mut body, *n);
+        }
 
         let crc = crc32c::crc32c(&body);
         let mut out = Vec::with_capacity(body.len() + 12);
@@ -529,6 +570,11 @@ pub struct L0Reader {
     born_index: Vec<BornIndexEntry>,
     core_patched: Vec<(String, String, u64)>,
     born_by_identity: HashMap<Vec<u8>, u64>,
+    /// Resident suppressed dense ids (v2 meta) — the live-count summary's candidate set.
+    tombstoned: Vec<u64>,
+    /// Resident edge live-count columns (v2 meta).
+    edge_tombstones: bool,
+    born_edges_by_reltype: HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for L0Reader {
@@ -621,6 +667,18 @@ impl L0Reader {
             r = &r[len..];
             born_by_identity.insert(ck, read_uvarint(&mut r)?);
         }
+        let tombstoned = r_u64s(&mut r)?;
+        if r.is_empty() {
+            bail!("L0 segment {dir:?}: short edge-tombstone flag");
+        }
+        let edge_tombstones = r[0] != 0;
+        r = &r[1..];
+        let n_ber = read_uvarint(&mut r)? as usize;
+        let mut born_edges_by_reltype = HashMap::with_capacity(n_ber);
+        for _ in 0..n_ber {
+            let reltype = r_str(&mut r)?;
+            born_edges_by_reltype.insert(reltype, read_uvarint(&mut r)?);
+        }
         if !r.is_empty() {
             bail!("L0 segment {dir:?} meta has {} trailing bytes", r.len());
         }
@@ -643,6 +701,9 @@ impl L0Reader {
             edge_delta_count,
             born_count,
             born_edge_count,
+            tombstoned,
+            edge_tombstones,
+            born_edges_by_reltype,
             born_by_label,
             born_index,
             core_patched,
@@ -717,6 +778,35 @@ impl LevelRead for L0Reader {
 
     fn edge_delta_count(&self) -> usize {
         self.edge_delta_count as usize
+    }
+
+    fn tombstoned_ids(&self) -> Vec<u64> {
+        self.tombstoned.clone()
+    }
+
+    fn born_count_with_label(&self, label: &str) -> u64 {
+        self.born_by_label
+            .get(label)
+            .map_or(0, |ids| ids.len() as u64)
+    }
+
+    fn has_edge_tombstones(&self) -> bool {
+        self.edge_tombstones
+    }
+
+    fn born_edge_count_with_reltype(&self, reltype: &str) -> u64 {
+        self.born_edges_by_reltype
+            .get(reltype)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn born_labels(&self) -> Vec<String> {
+        self.born_by_label.keys().cloned().collect()
+    }
+
+    fn born_edge_reltypes(&self) -> Vec<String> {
+        self.born_edges_by_reltype.keys().cloned().collect()
     }
 
     fn synthetic_base(&self) -> u64 {
@@ -1044,6 +1134,26 @@ mod tests {
                 edge_id: None,
             },
         );
+        // Born edge Alice(5) -> Newbie, whose destination endpoint does not exist yet and
+        // is therefore *created by the edge merge itself* (`endpoint_dense_or_create`) —
+        // a born node that must be tallied per label like any other.
+        m.apply(
+            &WalOp::UpsertEdge {
+                src_label: "Person".into(),
+                src_key: "name".into(),
+                src_value: Value::Str("Alice".into()),
+                reltype: "KNOWS".into(),
+                dst_label: "City".into(),
+                dst_key: "name".into(),
+                dst_value: Value::Str("Newbie".into()),
+                patches: Default::default(),
+            },
+            OpResolution::Edge {
+                src: Some(5),
+                dst: None,
+                edge_id: None,
+            },
+        );
         // Tombstone a core edge Alice(5) -> Carol(8).
         m.apply(
             &WalOp::DeleteEdge {
@@ -1105,6 +1215,31 @@ mod tests {
         assert_eq!(a.edge_synthetic_base(), b.edge_synthetic_base());
         assert_eq!(a.born_count(), b.born_count());
         assert_eq!(a.born_edge_count(), b.born_edge_count());
+        // The v2 resident live-count columns: the suppressed set (order-insensitive — the
+        // memtable's is a HashSet) and the per-label born tally.
+        let (mut ta, mut tb) = (a.tombstoned_ids(), b.tombstoned_ids());
+        ta.sort_unstable();
+        tb.sort_unstable();
+        assert_eq!(ta, tb, "tombstoned_ids");
+        for label in ["Person", "City", "Absent"] {
+            assert_eq!(
+                a.born_count_with_label(label),
+                b.born_count_with_label(label),
+                "born_count_with_label({label})"
+            );
+        }
+        assert_eq!(
+            a.has_edge_tombstones(),
+            b.has_edge_tombstones(),
+            "has_edge_tombstones"
+        );
+        for rt in ["KNOWS", "R", "Absent"] {
+            assert_eq!(
+                a.born_edge_count_with_reltype(rt),
+                b.born_edge_count_with_reltype(rt),
+                "born_edge_count_with_reltype({rt})"
+            );
+        }
         // Node patch / tombstone / identity over the whole dense range + some misses.
         for id in 0..a.synthetic_base() + a.born_count() + 3 {
             assert_eq!(

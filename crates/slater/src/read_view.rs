@@ -27,13 +27,14 @@
 
 use anyhow::Result;
 use graph_format::columns::PropsReader;
-use graph_format::ids::{Generation as GenId, Value};
+use graph_format::ids::{Generation as GenId, NodeId, Value};
 use graph_format::isam::IsamReader;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::topology::TopologyReader;
 use graph_format::vectors::VectorStoreReader;
 use slater_delta::DeltaSnapshot;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::generation::{Generation, RelEndpointSide, VamanaIndex};
@@ -49,6 +50,39 @@ pub trait ReadView: Send + Sync {
     fn manifest(&self) -> &Manifest;
     fn node_count(&self) -> u64;
     fn edge_count(&self) -> u64;
+
+    /// The number of nodes a read actually **sees**: the core's nodes, plus the delta's
+    /// born ones, minus every row the delta suppresses.
+    ///
+    /// Deliberately distinct from [`Self::node_count`], which is the dense-id **scan
+    /// bound** (`core + every born id`, tombstoned or not) and so over-counts a delta
+    /// with deletes. Answering `count(*)` from this keeps it a metadata read on both the
+    /// pure-core and the merged path — see [`MergedView::live_node_count`].
+    fn live_node_count(&self) -> u64;
+    /// As [`Self::live_node_count`], restricted to nodes carrying `label_id`. Fallible
+    /// because the merged path reads the labels of suppressed **core** rows (nodes may
+    /// carry several labels, while a delta identity records only the matched one).
+    fn live_label_node_count(&self, label_id: u32) -> Result<u64>;
+
+    /// Live `labels(n)[0]` groups — `(first-label name, count)`, with `None` naming the
+    /// zero-label bucket. Delta-born nodes carry exactly one label (their `MERGE` named
+    /// it), which may be a label the core never defined, so the merged groups are keyed
+    /// by name rather than by core label id.
+    fn live_first_label_groups(&self) -> Result<Vec<(Option<String>, u64)>>;
+
+    /// The live merged edge count, or `None` when the delta makes it uncomputable from
+    /// counters (see [`DeltaSnapshot::edge_counts_are_exact`]) and the caller must fall
+    /// back to full execution.
+    ///
+    /// Deleting a **node** silently kills its incident edges (the executor drops an edge
+    /// whose endpoint is suppressed), so the merged count subtracts the degree of every
+    /// tombstoned node. That is O(1) when nothing is deleted and O(Σ degree of the deleted
+    /// nodes) otherwise — proportional to the delta's blast radius, never to the graph.
+    fn live_edge_count(&self) -> Result<Option<u64>>;
+
+    /// Live `type(r)` groups — `(reltype name, count)` — or `None` when uncomputable, on
+    /// the same terms as [`Self::live_edge_count`].
+    fn live_reltype_edge_groups(&self) -> Result<Option<Vec<(String, u64)>>>;
 
     // ── Symbol-table lookups ───────────────────────────────────────────────
     fn label_id(&self, name: &str) -> Option<u32>;
@@ -125,6 +159,45 @@ impl ReadView for Generation {
     }
     fn edge_count(&self) -> u64 {
         Generation::edge_count(self)
+    }
+    /// A pure core has no delta: every node is live.
+    fn live_node_count(&self) -> u64 {
+        Generation::node_count(self)
+    }
+    fn live_label_node_count(&self, label_id: u32) -> Result<u64> {
+        Ok(Generation::label_node_count(self, label_id))
+    }
+    fn live_first_label_groups(&self) -> Result<Vec<(Option<String>, u64)>> {
+        let mut groups: Vec<(Option<String>, u64)> = Vec::new();
+        for lid in 0..Generation::manifest(self).labels.len() as u32 {
+            let c = Generation::first_label_count(self, lid);
+            if c > 0 {
+                let name = Generation::label_name(self, lid).unwrap_or("").to_string();
+                groups.push((Some(name), c));
+            }
+        }
+        let null_count = Generation::node_count(self)
+            .saturating_sub(Generation::first_labelled_node_count(self));
+        if null_count > 0 {
+            groups.push((None, null_count));
+        }
+        Ok(groups)
+    }
+    fn live_edge_count(&self) -> Result<Option<u64>> {
+        Ok(Some(Generation::edge_count(self)))
+    }
+    fn live_reltype_edge_groups(&self) -> Result<Option<Vec<(String, u64)>>> {
+        let mut groups = Vec::new();
+        for t in 0..Generation::manifest(self).reltypes.len() as u32 {
+            let c = Generation::reltype_edge_count(self, t);
+            if c > 0 {
+                groups.push((
+                    Generation::reltype_name(self, t).unwrap_or("").to_string(),
+                    c,
+                ));
+            }
+        }
+        Ok(Some(groups))
     }
     fn label_id(&self, name: &str) -> Option<u32> {
         Generation::label_id(self, name)
@@ -249,6 +322,64 @@ impl<'g> MergedView<'g> {
             delta: DeltaSnapshot::empty(),
         }
     }
+
+    /// Edges killed because an endpoint was deleted, bucketed by reltype name and split
+    /// into core edges and delta-born ones. A `DELETE n` tombstones only the node, but the
+    /// executor drops any edge whose endpoint fails the liveness check, so a live edge
+    /// count has to account for them.
+    ///
+    /// Each dead edge is counted **once**: the outgoing pass over a tombstoned node claims
+    /// every edge leaving it, and the incoming pass skips an edge whose source is itself
+    /// tombstoned (already claimed). That also makes a self-loop on a dead node count once.
+    ///
+    /// Cost is O(Σ degree of the tombstoned nodes) — nothing at all when the delta has no
+    /// deletes, and always proportional to the delta's blast radius rather than the graph.
+    fn edges_lost_to_node_tombstones(&self) -> Result<LostEdges> {
+        let mut lost = LostEdges::default();
+        let suppressed = self.delta.effective_tombstoned_ids();
+        if suppressed.is_empty() {
+            return Ok(lost);
+        }
+        let core_count = self.core.node_count();
+        let dead: HashSet<u64> = suppressed.iter().copied().collect();
+
+        for &dense in suppressed {
+            // Core adjacency exists only for core nodes.
+            if dense < core_count {
+                for a in self.core.topology().outgoing(NodeId(dense))? {
+                    let name = self.core.reltype_name(a.reltype).unwrap_or("").to_string();
+                    *lost.core.entry(name).or_default() += 1;
+                }
+                for a in self.core.topology().incoming(NodeId(dense))? {
+                    if dead.contains(&(a.neighbour.index() as u64)) {
+                        continue; // claimed by that source's outgoing pass
+                    }
+                    let name = self.core.reltype_name(a.reltype).unwrap_or("").to_string();
+                    *lost.core.entry(name).or_default() += 1;
+                }
+            }
+            // Delta-born edges incident to this dead node (either endpoint may be born).
+            for e in self.delta.out_edges(dense) {
+                if e.edge_id.is_some() && !e.tombstoned {
+                    *lost.born.entry(e.reltype).or_default() += 1;
+                }
+            }
+            for e in self.delta.in_edges(dense) {
+                if e.edge_id.is_some() && !e.tombstoned && !dead.contains(&e.other) {
+                    *lost.born.entry(e.reltype).or_default() += 1;
+                }
+            }
+        }
+        Ok(lost)
+    }
+}
+
+/// Per-reltype tallies of edges removed by node tombstones, kept apart because the core
+/// and born terms are added back from different counters.
+#[derive(Default)]
+struct LostEdges {
+    core: HashMap<String, u64>,
+    born: HashMap<String, u64>,
 }
 
 // The overlay view. Phase 0 forwards every accessor to the core; the delta is
@@ -271,6 +402,158 @@ impl ReadView for MergedView<'_> {
         // Delta-born edges (Phase 3) occupy synthetic dense edge ids past the core
         // count, so the merged count includes them (matching the node overlay above).
         self.core.edge_count() + self.delta.born_edge_count()
+    }
+    /// `core + born − suppressed`, all three terms O(1)-or-O(#tombstones):
+    /// `born_count` is a per-level counter and the suppressed set is the delta's
+    /// (small) tombstone set folded newest-wins. Never touches the core's node blocks,
+    /// so `count(*)` over a written graph stays a metadata read rather than the
+    /// 91.6M-row scan the pure-core fast path used to be traded for.
+    fn live_node_count(&self) -> u64 {
+        (self.core.node_count() + self.delta.born_count())
+            .saturating_sub(self.delta.effective_tombstoned_ids().len() as u64)
+    }
+
+    fn live_label_node_count(&self, label_id: u32) -> Result<u64> {
+        let Some(label) = self.core.label_name(label_id) else {
+            return Ok(0);
+        };
+        let core_count = self.core.node_count();
+        // Suppressed rows carrying this label. A **core** id's labels come from the core
+        // (a node may carry several, while the delta identity records only the label the
+        // write matched on); a **born** id carries exactly the one label its `MERGE`
+        // named, recoverable from its delta identity.
+        let mut suppressed = 0u64;
+        for &dense in self.delta.effective_tombstoned_ids() {
+            let carries = if dense < core_count {
+                self.core.node_labels().labels(dense)?.contains(&label_id)
+            } else {
+                self.delta
+                    .node_identity_by_dense(dense)
+                    .is_some_and(|(l, _, _)| l == label)
+            };
+            if carries {
+                suppressed += 1;
+            }
+        }
+        Ok(
+            (self.core.label_node_count(label_id) + self.delta.born_count_with_label(label))
+                .saturating_sub(suppressed),
+        )
+    }
+
+    fn live_first_label_groups(&self) -> Result<Vec<(Option<String>, u64)>> {
+        let core_count = self.core.node_count();
+        // Suppressed rows, bucketed by the first label they *had*. A core row's labels come
+        // from the core (it may carry several); a born row carries exactly the one its
+        // `MERGE` named.
+        let mut suppressed: HashMap<Option<String>, i64> = HashMap::new();
+        for &dense in self.delta.effective_tombstoned_ids() {
+            let first: Option<String> = if dense < core_count {
+                self.core
+                    .node_labels()
+                    .labels(dense)?
+                    .first()
+                    .and_then(|&lid| self.core.label_name(lid))
+                    .map(str::to_string)
+            } else {
+                self.delta.node_identity_by_dense(dense).map(|(l, _, _)| l)
+            };
+            *suppressed.entry(first).or_default() += 1;
+        }
+        let born: HashMap<String, u64> = self
+            .delta
+            .born_labels()
+            .into_iter()
+            .map(|l| {
+                let n = self.delta.born_count_with_label(&l);
+                (l, n)
+            })
+            .collect();
+
+        // Emit in core label-id order, then delta-only labels by name, then the null
+        // bucket — a deterministic order the metadata result builder can rely on.
+        let mut out: Vec<(Option<String>, u64)> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for lid in 0..self.core.manifest().labels.len() as u32 {
+            let name = self.core.label_name(lid).unwrap_or("").to_string();
+            let key = Some(name.clone());
+            let live = self.core.first_label_count(lid) as i64
+                + born.get(&name).copied().unwrap_or(0) as i64
+                - suppressed.get(&key).copied().unwrap_or(0);
+            seen.insert(self.core.label_name(lid).unwrap_or(""));
+            if live > 0 {
+                out.push((key, live as u64));
+            }
+        }
+        let mut extra: Vec<&String> = born.keys().filter(|l| !seen.contains(l.as_str())).collect();
+        extra.sort();
+        for name in extra {
+            let key = Some(name.clone());
+            let live = born[name] as i64 - suppressed.get(&key).copied().unwrap_or(0);
+            if live > 0 {
+                out.push((key, live as u64));
+            }
+        }
+        let null_live = core_count.saturating_sub(self.core.first_labelled_node_count()) as i64
+            - suppressed.get(&None).copied().unwrap_or(0);
+        if null_live > 0 {
+            out.push((None, null_live as u64));
+        }
+        Ok(out)
+    }
+
+    fn live_edge_count(&self) -> Result<Option<u64>> {
+        if !self.delta.edge_counts_are_exact() {
+            return Ok(None);
+        }
+        let lost = self.edges_lost_to_node_tombstones()?;
+        let dead: u64 = lost.core.values().chain(lost.born.values()).sum();
+        Ok(Some(
+            (self.core.edge_count() + self.delta.born_edge_count()).saturating_sub(dead),
+        ))
+    }
+
+    fn live_reltype_edge_groups(&self) -> Result<Option<Vec<(String, u64)>>> {
+        if !self.delta.edge_counts_are_exact() {
+            return Ok(None);
+        }
+        let lost = self.edges_lost_to_node_tombstones()?;
+        let dead = |name: &str| -> i64 {
+            (lost.core.get(name).copied().unwrap_or(0) + lost.born.get(name).copied().unwrap_or(0))
+                as i64
+        };
+        let born: HashMap<String, u64> = self
+            .delta
+            .born_edge_reltypes()
+            .into_iter()
+            .map(|t| {
+                let n = self.delta.born_edge_count_with_reltype(&t);
+                (t, n)
+            })
+            .collect();
+
+        // Core reltype-id order, then delta-only reltypes by name (see the label groups).
+        let mut out: Vec<(String, u64)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in 0..self.core.manifest().reltypes.len() as u32 {
+            let name = self.core.reltype_name(t).unwrap_or("").to_string();
+            let live = self.core.reltype_edge_count(t) as i64
+                + born.get(&name).copied().unwrap_or(0) as i64
+                - dead(&name);
+            seen.insert(name.clone());
+            if live > 0 {
+                out.push((name, live as u64));
+            }
+        }
+        let mut extra: Vec<&String> = born.keys().filter(|t| !seen.contains(*t)).collect();
+        extra.sort();
+        for name in extra {
+            let live = born[name] as i64 - dead(name);
+            if live > 0 {
+                out.push((name.clone(), live as u64));
+            }
+        }
+        Ok(Some(out))
     }
     fn label_id(&self, name: &str) -> Option<u32> {
         self.core.label_id(name)

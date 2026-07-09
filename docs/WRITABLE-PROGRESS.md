@@ -1005,6 +1005,82 @@ descending preference:
 When stopping: ensure this file's Phase status checkboxes + the "next action" line
 below are current, and that the latest commit hash is noted.
 
+## Live metadata fast paths over a delta (D55) — 2026-07-09
+
+**Symptom.** A `count(*)` on the 91.6M-node wikidata core with a 458K-node delta blew the
+box's RAM allowance. `exec.rs::run_single` gated **every** metadata fast path on
+`self.gen.delta().is_empty()`, so a single `MERGE` demoted whole-graph `count(*)` from a
+690µs manifest read to a full 91.6M-row scan — which then breached `maxIntermediate`.
+
+**Why it could not just be ungated.** `MergedView::node_count()` is deliberately the dense-id
+**scan bound** (`core + every born id`, tombstoned or not) and `label_node_count()` ignored the
+delta entirely. Both are correct for their callers; neither is a live count.
+
+**Fix.** New `ReadView` methods — `live_node_count`, `live_label_node_count`,
+`live_first_label_groups`, `live_edge_count`, `live_reltype_edge_groups` — computing
+`core + born − suppressed` from delta counters:
+
+- `born_count` / `born_count_with_label` are exact per level (a re-`MERGE` reuses the born
+  node's synthetic id, so a born node is allocated exactly once across the delta);
+- the only enumerated set is the **tombstone set** (`DeltaSnapshot::effective_tombstoned_ids`,
+  memoised per snapshot behind an `Arc<OnceLock>`), filtered through the existing newest-wins
+  `is_tombstoned` so a resurrect across levels correctly suppresses nothing;
+- a suppressed **core** row's labels are read from the core (nodes may be multi-label, while a
+  delta identity records only the matched label); a born row carries exactly one label.
+
+**Edge side.** Deleting a *node* silently kills its incident edges (the executor drops an edge
+whose endpoint fails the liveness check), so `live_edge_count` subtracts the degree of every
+tombstoned node — O(1) with no deletes, O(Σ degree of the deleted nodes) otherwise. Each dead
+edge is counted once (the outgoing pass claims it; the incoming pass skips an edge whose source
+is also dead, which also makes a self-loop count once).
+
+**Also fixed, found on the way:**
+
+- **Bare edge `count(*)` had no fast path at all, even on a pure core.** `MATCH ()-[r]->()
+  RETURN type(r), count(*)` answered from the manifest in 22ms, but dropping the group key
+  walked the adjacency: 96.9s and a `maxScan` breach on 1.49B edges. New
+  `try_edge_count_fast_path` (Stage E, before the Stage-B count walk) → 24.6ms.
+- **`MATCH … SET` could not update a delta-born node.** `resolve_node_op` resolved `MERGE` and
+  `DELETE` against the whole delta but `SET` against the core only, so updating a node you had
+  just created failed with *"use MERGE to create it"*. Now resolves via
+  `born_synthetic_in_delta` like `DELETE`.
+
+**Known limits (guarded, not silently wrong).** `DeltaSnapshot::edge_counts_are_exact()` returns
+false — and the edge fast paths decline to full execution — when:
+
+- the delta holds any **edge tombstone**: a deleted *core* edge carries no edge id (it is matched
+  against the core adjacency by identity), so it cannot be netted out of a counter; or
+- **born edges span more than one level**: unlike a born node, the writer does *not* reuse a born
+  edge's synthetic id from a lower level, so re-`MERGE`ing an edge across a flush allocates a
+  second id and `Σ born_edge_count` reaches 2 for one logical edge. `MergedView::edge_count()`
+  (the scan bound) inherits this over-count. **Follow-up:** give edges a
+  `born_edge_synthetic_for_identity` resolution across L0, mirroring nodes, then drop the guard.
+
+**Format.** Off-heap L0 `meta.bin` → **v2**: resident `tombstoned` dense-id column, an
+`edge_tombstones` flag, and a per-reltype born-edge tally, all derived in `push_node` /
+`push_adj_out` so the flush path and the streaming merge populate them alike (no back-compat:
+an L0 segment lives only between a flush and the next consolidation).
+
+**Verified on the real 91.6M core** (458K born, 229K core + 229K born edits, 50 core + 50 born
+deletes), with the **product-default 1M** intermediate budget:
+
+| query | pure core | with delta |
+|---|---|---|
+| `MATCH (n) RETURN count(*)` | 690µs–34ms | 24ms (`92,058,404`) |
+| `MATCH (n:Entity) RETURN count(*)` | 4.7ms | 23ms |
+| `MATCH ()-[r]->() RETURN count(*)` | **96.9s → maxScan breach** → 24.6ms | 58ms (`1,489,724,454`) |
+| `MATCH (n) RETURN labels(n)[0], count(*)` | 23ms | 46ms |
+| `MATCH ()-[r]->() RETURN type(r), count(*)` | 22ms | 57ms |
+
+The edge count drops by exactly **570** = `Σ outdeg(286) + Σ indeg(286) − both-deleted(2)` over
+the 50 deleted core nodes, cross-checked with 100 anchored per-node degree probes on a pure core.
+Peak server RSS across the whole cycle: **1.9 GB**. Whole workspace green (620 slater + 71
+slater-delta), clippy `-D warnings` and fmt clean.
+
+**Unrelated planner gaps observed (not fixed):** `WHERE n.prop IN [ … ]` on an indexed property
+does not plan as index seeks (it scans), and `MATCH ()-[]->(n {key})` does not anchor on `n`
+(the anchored `MATCH (n {key})<-[]-(m)` form does).
+
 ## Next action
 
 **Resume state:** on branch `writeable`, **all pushed** to `origin/writeable` (through `53c3a82`). **Phases 0–5 + `slater dump` CLI are ALL DONE.** The **bulk-delete

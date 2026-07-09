@@ -176,3 +176,67 @@ shapes; record per-budget completion rate + peak anon. Goal: a default that lets
 91.6M queries complete while still bounding unbounded growth. Expect two regimes — count
 shapes (flat RSS, knee is compute/time-bound, can sit high) vs row-materialising shapes
 (RSS scales with budget, knee set by acceptable RSS).
+
+---
+
+## Build diagnostics — full 91.6M wikidata on the `writeable` branch (2026-07-09)
+
+`slater-build --diagnostics --diagnostics-interval-ms 250` over the 133 GB business-key MERGE
+dump (`wikidata-full-merge.cypher`), 16 cores / `--threads 14`, `--max-memory 4 GiB`.
+**53m 46s wall**, 756% average CPU, 8.47 GB peak RSS, 91,600,504 nodes / 1,489,725,024 edges.
+
+**Determinism check.** 8 of the 9 emitted files are byte-identical to the v0.21.0 core
+(`c97cdb75…`); only `range/node_Entity_wikidata_id.isam` differs (659 MB → 632 MB), which is
+exactly the intended effect of **D53** (smaller leaf blocks for range ISAMs). Hence the new
+content-hash `5e8e7307…`. Nothing else drifted.
+
+| phase | wall | % | CPU-s | cpu/wall | read | write | peak RSS |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| pass1 (parse + metadata) | 11.1m | 21% | 9461 | **14.2×** | 133 G | 12 G | 1.95 G |
+| dedup keys | 1.9m | 4% | 183 | 1.6× | 3 G | 7 G | 0.62 G |
+| resolve edge endpoints | 11.3m | 21% | 7002 | **10.3×** | 95 G | 158 G | 2.42 G |
+| cluster (locality reorder) | 8.7m | 16% | 1534 | 2.9× | 51 G | 36 G | 1.60 G |
+| emit node stores | 2.8m | 5% | 232 | 1.4× | 3 G | 8 G | 1.27 G |
+| emit topology (CSR + edges) | 12.2m | 23% | 5585 | 7.7× | 75 G | 110 G | **8.06 G** |
+| emit.graph_summaries | 4.3m | 8% | 328 | 1.3× | 23 G | 6 G | 3.83 G |
+| emit range indexes | 0.3m | 1% | 18 | 1.0× | 1 G | 1 G | 2.50 G |
+| publish (hash + manifest) | 1.0m | 2% | 59 | 1.0× | 23 G | 0 G | 2.50 G |
+
+### Findings
+
+1. **Peak RSS is 2× the `--max-memory` budget.** 20.1% of all samples exceed 4 GiB, and every
+   one of them is in `emit.topology` (`emit forward CSR + edge_props per band`), peaking at
+   **8.06 GB** at t=41 min. `--max-memory` evidently bounds the external-sort budget, not the
+   phase's working set. On a memory-capped box this is the phase that OOMs.
+
+2. **~35% of wall clock (18.9 min) runs effectively single-threaded on 16 cores.** Median CPU
+   and the fraction of time below 1.5 cores:
+
+   | phase | median CPU | time under 1.5 cores |
+   |---|--:|--:|
+   | `cluster` | 100% | 67% |
+   | `emit.graph_summaries` | 100% | 75% |
+   | `emit.node_stores` | 100% | 69% |
+   | `dedup` | 103% | 60% |
+   | `publish` | 99% | **100%** |
+
+   `cluster` reports 14 active workers and bursts to 1336% at p90, but spends two-thirds of its
+   8.7 min on one core — the block-parallel LDG pass has a long serial tail. `publish` is a
+   fully serial BLAKE3 over the 23 GB image (411 MB/s). `emit.graph_summaries` is a serial
+   91.6M-node tally — the same marginals the query-side metadata fast paths read.
+
+3. **`emit.topology` is the only phase under real pressure** — PSI cpu 8.8 / io 11.5 (every
+   other phase is ≲4 io, ~0 cpu) at 917% CPU. It is simultaneously the wall-clock leader (23%),
+   the RSS peak, and the IO peak (110 GB written).
+
+4. **`pass1` and `resolve` scale well** (14.2× and 10.3× of wall in CPU-seconds), so the
+   parallel-extsort / parallel-pipeline work is doing its job; the remaining headroom is
+   entirely in the five near-serial phases above.
+
+5. **IO amplification: 3.1× read / 2.5× write** against the 133 GB input (406 GB read, 337 GB
+   written) — the cost of the spill-based external sort. `resolve` alone writes 158 GB.
+
+**Highest-leverage next steps**, in order: (a) bound `emit.topology`'s working set to
+`--max-memory` (it is the OOM surface and the RSS peak); (b) parallelise `emit.graph_summaries`
+(4.3 min, embarrassingly parallel tally); (c) parallelise the `publish` hash (1.0 min, one core
+over 23 GB); (d) chase `cluster`'s serial tail (8.7 min at 2.9×).

@@ -34,7 +34,7 @@
 //! aliasing of the same physical node is out of scope until a later phase).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use graph_format::ids::Value;
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
@@ -190,6 +190,17 @@ pub struct Memtable {
     /// from `edge_synthetic_base`); a tombstone-only entry is *not* pushed here (it
     /// allocates no synthetic edge id).
     born_edges: Vec<Vec<u8>>,
+    /// The node dense ids this level currently tombstones (core-resolved *or* born).
+    /// Maintained incrementally so a merged live count costs O(#tombstones) rather than
+    /// O(#deltas) — deletes are rare beside upserts. A **no-op tombstone** (a business
+    /// key absent from both the core and the delta) resolves to no dense id and never
+    /// lands here, so it can never wrongly decrement a count.
+    tombstoned: HashSet<u64>,
+    /// Per-label tally of the delta-born nodes *allocated* in this level (liveness is not
+    /// tracked here — a tombstoned born node stays counted, and the tombstone subtracts
+    /// it via [`Self::tombstoned_ids`]). Mirrors `born`, so a per-label live count needs
+    /// no walk of the born vector.
+    born_label_counts: HashMap<SymbolId, u64>,
     /// Running resident-size estimate (approximate, monotonically conservative),
     /// checked against the memtable byte budget.
     bytes: usize,
@@ -294,12 +305,21 @@ impl Memtable {
             synthetic: None,
         });
         // An upsert resurrects a tombstoned node (last-writer-wins at node level).
-        entry.delta.tombstoned = false;
+        let was_tombstoned = std::mem::replace(&mut entry.delta.tombstoned, false);
         for (name, val) in patches {
             self.bytes += name.len() + value_size(&val);
             entry.delta.patches.insert(name, val);
         }
         let already_synthetic = entry.synthetic;
+        let label_sym = entry.identity.label;
+        // A resurrect clears this level's tombstone. Only an entry that already had a
+        // dense id here can have been tombstoned, so `resolved.or(already_synthetic)`
+        // covers every case (a freshly created entry is never `was_tombstoned`).
+        if was_tombstoned {
+            if let Some(dense) = resolved.or(already_synthetic) {
+                self.tombstoned.remove(&dense);
+            }
+        }
         match resolved {
             Some(dense) => {
                 self.by_dense.insert(dense, ck);
@@ -315,6 +335,7 @@ impl Memtable {
                     .get_mut(&ck)
                     .expect("entry just inserted")
                     .synthetic = Some(dense);
+                *self.born_label_counts.entry(label_sym).or_default() += 1;
             }
             None => {}
         }
@@ -345,9 +366,94 @@ impl Memtable {
         });
         entry.delta.tombstoned = true;
         entry.delta.patches.clear();
+        let already_synthetic = entry.synthetic;
+        // Record the suppressed dense id. `resolved` is the core dense id, or a lower
+        // level's born synthetic id (the writer substitutes it); `already_synthetic`
+        // catches a node born in *this* level. A key that resolves to neither exists
+        // nowhere — an inert no-op tombstone that must not be counted.
         if let Some(dense) = resolved {
             self.by_dense.insert(dense, ck);
+            self.tombstoned.insert(dense);
+        } else if let Some(dense) = already_synthetic {
+            self.tombstoned.insert(dense);
         }
+    }
+
+    /// Recompute the derived tally maps (`tombstoned`, `born_label_counts`) from the
+    /// authoritative `nodes` / `by_dense` / `born` stores. The live write path maintains
+    /// them incrementally; this is for the paths that rebuild a memtable's fields
+    /// directly ([`Self::deserialise`]) and so bypass `upsert_node` / `delete_node`.
+    fn rebuild_derived(&mut self) {
+        self.tombstoned.clear();
+        self.born_label_counts.clear();
+        for (&dense, ck) in &self.by_dense {
+            if self.nodes.get(ck).is_some_and(|e| e.delta.tombstoned) {
+                self.tombstoned.insert(dense);
+            }
+        }
+        for ck in &self.born {
+            if let Some(e) = self.nodes.get(ck) {
+                *self.born_label_counts.entry(e.identity.label).or_default() += 1;
+            }
+        }
+    }
+
+    /// The node dense ids this level tombstones — the candidate set for the merged live
+    /// count. Bounded by the number of deletes, not by the delta's size.
+    pub fn tombstoned_ids(&self) -> Vec<u64> {
+        self.tombstoned.iter().copied().collect()
+    }
+
+    /// The number of delta-born nodes allocated in this level carrying `label` (ignoring
+    /// tombstones — the caller subtracts those via [`Self::tombstoned_ids`]).
+    pub fn born_count_with_label(&self, label: &str) -> u64 {
+        self.interner
+            .get(label)
+            .and_then(|sym| self.born_label_counts.get(&sym).copied())
+            .unwrap_or(0)
+    }
+
+    /// Whether this level suppresses any edge (a deleted core edge, or a deleted born
+    /// edge). A **core-edge** tombstone carries no edge id — it is matched against the
+    /// core adjacency by identity — so a live edge count cannot subtract it without
+    /// probing the core; callers therefore decline their fast path when this is true.
+    pub fn has_edge_tombstones(&self) -> bool {
+        self.edges.values().any(|e| e.delta.tombstoned)
+    }
+
+    /// The distinct labels carried by this level's delta-born nodes. A `MERGE` may
+    /// introduce a label the core never defined, so a merged label enumeration cannot be
+    /// driven from the core's symbol table alone.
+    pub fn born_labels(&self) -> Vec<String> {
+        self.born_label_counts
+            .keys()
+            .filter_map(|&sym| self.interner.name(sym).map(str::to_string))
+            .collect()
+    }
+
+    /// The distinct relationship types carried by this level's delta-born edges (which,
+    /// like labels, may be absent from the core's symbol table).
+    pub fn born_edge_reltypes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .edges
+            .values()
+            .filter(|e| e.synthetic_edge.is_some())
+            .filter_map(|e| self.interner.name(e.identity.reltype).map(str::to_string))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Delta-born edges allocated in this level carrying `reltype`.
+    pub fn born_edge_count_with_reltype(&self, reltype: &str) -> u64 {
+        let Some(sym) = self.interner.get(reltype) else {
+            return 0;
+        };
+        self.edges
+            .values()
+            .filter(|e| e.synthetic_edge.is_some() && e.identity.reltype == sym)
+            .count() as u64
     }
 
     /// Apply a decoded WAL operation, given the caller-resolved dense-id context
@@ -628,6 +734,10 @@ impl Memtable {
         self.bytes += ck.len() + std::mem::size_of::<NodeEntry>();
         self.born.push(ck.clone());
         self.by_dense.insert(dense, ck.clone());
+        // A node born here is born exactly as one born by `upsert_node`, so it must be
+        // tallied the same way — otherwise a per-label live count silently under-counts
+        // the endpoints an edge `MERGE` brought into existence.
+        *self.born_label_counts.entry(identity.label).or_default() += 1;
         self.nodes.insert(
             ck,
             NodeEntry {
@@ -1432,7 +1542,7 @@ impl Memtable {
         if !r.is_empty() {
             anyhow::bail!("L0 segment has {} trailing bytes", r.len());
         }
-        Ok(Self {
+        let mut m = Self {
             interner,
             nodes,
             edges,
@@ -1444,8 +1554,15 @@ impl Memtable {
             edge_synthetic_base,
             born,
             born_edges,
+            tombstoned: HashSet::new(),
+            born_label_counts: HashMap::new(),
             bytes: bytes_est,
-        })
+        };
+        // The tally maps are derived, not serialised: rebuild them from the restored
+        // stores so a reloaded segment answers live counts identically to the memtable
+        // it was flushed from.
+        m.rebuild_derived();
+        Ok(m)
     }
 }
 
@@ -1771,6 +1888,22 @@ pub trait LevelRead: std::fmt::Debug + Send + Sync {
     fn edge_synthetic_base(&self) -> u64;
     fn born_count(&self) -> u64;
     fn born_edge_count(&self) -> u64;
+    /// The node dense ids this level tombstones — the candidate set for a merged live
+    /// count. Must stay **resident** (bounded by the delete count, not the delta size).
+    fn tombstoned_ids(&self) -> Vec<u64>;
+    /// Delta-born nodes allocated in this level carrying `label`, tombstones included
+    /// (the caller nets them out against [`Self::tombstoned_ids`]).
+    fn born_count_with_label(&self, label: &str) -> u64;
+    /// Whether this level suppresses any edge — a live edge count declines when so (a
+    /// core-edge tombstone carries no edge id and cannot be netted out cheaply).
+    fn has_edge_tombstones(&self) -> bool;
+    /// Delta-born edges allocated in this level carrying `reltype`.
+    fn born_edge_count_with_reltype(&self, reltype: &str) -> u64;
+    /// Distinct labels of this level's born nodes (a `MERGE` may introduce a label the
+    /// core never defined, so an enumeration cannot use the core symbol table alone).
+    fn born_labels(&self) -> Vec<String>;
+    /// Distinct relationship types of this level's born edges.
+    fn born_edge_reltypes(&self) -> Vec<String>;
     /// Owned node delta by dense id (the snapshot merges owned deltas across levels).
     fn node_patch_owned(&self, dense_id: u64) -> Option<NodeDelta>;
     /// The tombstone flag alone for `dense_id`, or `None` if this level does not touch
@@ -1821,6 +1954,24 @@ impl LevelRead for Memtable {
     }
     fn born_edge_count(&self) -> u64 {
         Memtable::born_edge_count(self)
+    }
+    fn tombstoned_ids(&self) -> Vec<u64> {
+        Memtable::tombstoned_ids(self)
+    }
+    fn born_count_with_label(&self, label: &str) -> u64 {
+        Memtable::born_count_with_label(self, label)
+    }
+    fn has_edge_tombstones(&self) -> bool {
+        Memtable::has_edge_tombstones(self)
+    }
+    fn born_edge_count_with_reltype(&self, reltype: &str) -> u64 {
+        Memtable::born_edge_count_with_reltype(self, reltype)
+    }
+    fn born_labels(&self) -> Vec<String> {
+        Memtable::born_labels(self)
+    }
+    fn born_edge_reltypes(&self) -> Vec<String> {
+        Memtable::born_edge_reltypes(self)
     }
     fn node_patch_owned(&self, dense_id: u64) -> Option<NodeDelta> {
         self.node_patch(dense_id).cloned()
@@ -1889,6 +2040,10 @@ pub struct DeltaSnapshot {
     /// Each is a `dyn LevelRead` — a resident [`Memtable`] today, an off-heap paged
     /// segment tomorrow — so the fold below dispatches without caring where its bytes live.
     l0: Vec<Arc<dyn LevelRead>>,
+    /// Memoised [`Self::effective_tombstoned_ids`]. Behind an `Arc` so the clones a read
+    /// takes of this snapshot share one computation; a commit publishes a fresh snapshot
+    /// (and hence a fresh, empty cell).
+    tombstones: Arc<OnceLock<Vec<u64>>>,
 }
 
 impl DeltaSnapshot {
@@ -1897,6 +2052,7 @@ impl DeltaSnapshot {
         Self {
             mem: Arc::new(Memtable::new()),
             l0: Vec::new(),
+            tombstones: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1905,6 +2061,7 @@ impl DeltaSnapshot {
         Self {
             mem,
             l0: Vec::new(),
+            tombstones: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1912,7 +2069,11 @@ impl DeltaSnapshot {
     /// active memtable (Phase 4c). The writer publishes the flushed segments here so a
     /// read folds `mem ⊕ L0*`.
     pub fn with_levels(mem: Arc<Memtable>, l0: Vec<Arc<dyn LevelRead>>) -> Self {
-        Self { mem, l0 }
+        Self {
+            mem,
+            l0,
+            tombstones: Arc::new(OnceLock::new()),
+        }
     }
 
     /// The active (newest, writable) memtable level — the writer's `snapshot()` returns
@@ -2046,6 +2207,91 @@ impl DeltaSnapshot {
     #[inline]
     pub fn born_count(&self) -> u64 {
         self.levels_newest_first().map(LevelRead::born_count).sum()
+    }
+
+    /// Delta-born nodes carrying `label`, summed across levels (tombstones included —
+    /// [`Self::effective_tombstoned_ids`] nets them out). Born ids are disjoint across
+    /// levels, so the sum never double-counts: a re-`MERGE` of an already-born key
+    /// reuses its synthetic id rather than allocating a second one.
+    pub fn born_count_with_label(&self, label: &str) -> u64 {
+        self.levels_newest_first()
+            .map(|l| l.born_count_with_label(label))
+            .sum()
+    }
+
+    /// Delta-born edges carrying `reltype`, summed across levels. Only meaningful when
+    /// [`Self::edge_counts_are_exact`] holds (otherwise the sum may double-count).
+    pub fn born_edge_count_with_reltype(&self, reltype: &str) -> u64 {
+        self.levels_newest_first()
+            .map(|l| l.born_edge_count_with_reltype(reltype))
+            .sum()
+    }
+
+    /// The distinct labels of every delta-born node, across levels.
+    pub fn born_labels(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .levels_newest_first()
+            .flat_map(|l| l.born_labels())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The distinct relationship types of every delta-born edge, across levels.
+    pub fn born_edge_reltypes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .levels_newest_first()
+            .flat_map(|l| l.born_edge_reltypes())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether a **live edge count** can be derived from this delta's counters.
+    ///
+    /// Two things spoil it:
+    /// - an **edge tombstone**: a deleted core edge carries no edge id (it is matched
+    ///   against the core adjacency by identity), so it cannot be netted out cheaply;
+    /// - **born edges spanning more than one level**: unlike a born *node*, the writer
+    ///   does not reuse a born edge's synthetic id from a lower level, so re-`MERGE`ing
+    ///   an edge across a flush allocates a second id and `born_edge_count` sums to 2 for
+    ///   one logical edge. Until the writer resolves born edge ids across levels (as it
+    ///   already does for nodes), a delta whose born edges span levels is not countable
+    ///   from counters alone.
+    ///
+    /// Callers that get `false` must fall back to full execution rather than report a
+    /// number that could be wrong.
+    pub fn edge_counts_are_exact(&self) -> bool {
+        let levels_with_born_edges = self
+            .levels_newest_first()
+            .filter(|l| l.born_edge_count() > 0)
+            .count();
+        levels_with_born_edges <= 1 && !self.levels_newest_first().any(|l| l.has_edge_tombstones())
+    }
+
+    /// The node dense ids the delta **effectively** suppresses: every level's tombstones,
+    /// unioned, then filtered through the newest-wins fold — so a row deleted in an older
+    /// level but resurrected by a newer `MERGE` is correctly excluded. Ids below the core
+    /// node count are suppressed core rows; ids at or above it are tombstoned born nodes.
+    ///
+    /// Costs O(#tombstones × #levels) and is memoised per snapshot. This is what lets a
+    /// merged `count(*)` stay a metadata read: the born term is an O(1) per-level counter
+    /// and the only enumerated set is the (small) tombstone set — never the core.
+    pub fn effective_tombstoned_ids(&self) -> &[u64] {
+        self.tombstones.get_or_init(|| {
+            let mut candidates: HashSet<u64> = HashSet::new();
+            for level in self.levels_newest_first() {
+                candidates.extend(level.tombstoned_ids());
+            }
+            let mut ids: Vec<u64> = candidates
+                .into_iter()
+                .filter(|&dense| self.is_tombstoned(dense))
+                .collect();
+            ids.sort_unstable();
+            ids
+        })
     }
 
     /// Recover a node's `(label, key, key-value)` business identity by dense id — the
@@ -3090,6 +3336,135 @@ mod tests {
             !nd.patches.contains_key("age"),
             "the tombstone below the re-MERGE cleared the older patch"
         );
+    }
+
+    #[test]
+    fn noop_tombstone_of_an_absent_key_suppresses_nothing() {
+        // A delete of a business key present in neither the core nor the delta resolves
+        // to no dense id. It must never appear in the suppressed set, or a merged
+        // `count(*)` would decrement for a row that never existed.
+        let mut mem = Memtable::with_synthetic_base(100);
+        mem.delete_node("Person", "name", Value::Str("Ghost".into()), None);
+        assert!(
+            mem.tombstoned_ids().is_empty(),
+            "no dense id ⇒ no suppression"
+        );
+        let s = snap(mem, vec![]);
+        assert!(s.effective_tombstoned_ids().is_empty());
+        assert_eq!(s.born_count(), 0, "a no-op tombstone allocates no born id");
+    }
+
+    #[test]
+    fn deleting_a_born_node_suppresses_its_synthetic_id() {
+        // A born node keeps its synthetic id when tombstoned (ids must stay stable), so
+        // `born_count` still counts it and the tombstone nets it back out.
+        let mut mem = Memtable::with_synthetic_base(100);
+        mem.upsert_node("Person", "name", Value::Str("Ann".into()), None, []);
+        assert_eq!(mem.born_count(), 1);
+        assert_eq!(mem.born_count_with_label("Person"), 1);
+        mem.delete_node("Person", "name", Value::Str("Ann".into()), None);
+        assert_eq!(
+            mem.tombstoned_ids(),
+            vec![100],
+            "the born node's synthetic id is suppressed"
+        );
+        assert_eq!(mem.born_count(), 1, "born allocation is not rescinded");
+        let s = snap(mem, vec![]);
+        // live = core(100) + born(1) − suppressed(1) = 100.
+        assert_eq!(
+            s.born_count() as i64 - s.effective_tombstoned_ids().len() as i64,
+            0
+        );
+    }
+
+    #[test]
+    fn resurrect_across_levels_is_not_counted_as_suppressed() {
+        // L0 tombstones core node 5; the live level re-`MERGE`s it. The candidate set
+        // still contains 5 (L0 tombstones it), but the newest-wins fold clears it — so it
+        // must not decrement the merged count.
+        let mut old = Memtable::with_synthetic_base(100);
+        old.delete_node("Person", "name", Value::Str("Dave".into()), Some(5));
+        assert_eq!(old.tombstoned_ids(), vec![5]);
+        let mut mem = Memtable::with_synthetic_base(100);
+        mem.upsert_node("Person", "name", Value::Str("Dave".into()), Some(5), []);
+        let s = snap(mem, vec![old]);
+        assert!(
+            s.effective_tombstoned_ids().is_empty(),
+            "an older tombstone shadowed by a newer MERGE suppresses nothing"
+        );
+    }
+
+    #[test]
+    fn resurrect_then_redelete_in_the_same_level_suppresses_once() {
+        let mut mem = Memtable::with_synthetic_base(100);
+        mem.delete_node("Person", "name", Value::Str("Dave".into()), Some(5));
+        mem.upsert_node("Person", "name", Value::Str("Dave".into()), Some(5), []);
+        assert!(
+            mem.tombstoned_ids().is_empty(),
+            "the upsert cleared the tombstone"
+        );
+        mem.delete_node("Person", "name", Value::Str("Dave".into()), Some(5));
+        assert_eq!(mem.tombstoned_ids(), vec![5]);
+        let s = snap(mem, vec![]);
+        assert_eq!(s.effective_tombstoned_ids(), &[5]);
+    }
+
+    #[test]
+    fn an_edge_merge_tallies_the_endpoints_it_creates() {
+        // `MERGE (a)-[r:R]->(b)` creates absent endpoints as born nodes. They must be
+        // tallied per label exactly like a node `MERGE`'s, or a labelled `count(*)` would
+        // miss every node an edge write brought into existence.
+        let mut mem = Memtable::with_bases(100, 10);
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            Some(1), // Alice resolves to a core node
+            None,    // Carol is absent ⇒ born here
+            [],
+        );
+        assert_eq!(mem.born_count(), 1, "Carol was born");
+        assert_eq!(
+            mem.born_count_with_label("Person"),
+            1,
+            "the born endpoint is tallied under its label"
+        );
+        // And the two counters agree once both a node MERGE and an edge endpoint exist.
+        mem.upsert_node("Person", "name", Value::Str("Dave".into()), None, []);
+        assert_eq!(mem.born_count(), 2);
+        assert_eq!(mem.born_count_with_label("Person"), 2);
+    }
+
+    #[test]
+    fn born_counts_split_by_label_and_sum_across_levels() {
+        let mut old = Memtable::with_synthetic_base(100);
+        old.upsert_node("Person", "name", Value::Str("Ann".into()), None, []);
+        old.upsert_node("City", "name", Value::Str("Oslo".into()), None, []);
+        let mut mem = Memtable::with_synthetic_base(102);
+        mem.upsert_node("Person", "name", Value::Str("Bob".into()), None, []);
+        let s = snap(mem, vec![old]);
+        assert_eq!(s.born_count(), 3);
+        assert_eq!(s.born_count_with_label("Person"), 2);
+        assert_eq!(s.born_count_with_label("City"), 1);
+        assert_eq!(s.born_count_with_label("Absent"), 0);
+    }
+
+    #[test]
+    fn derived_tallies_survive_an_l0_serialise_round_trip() {
+        // `tombstoned` / `born_label_counts` are derived, not serialised — a reloaded
+        // segment must rebuild them or its live counts would silently drift.
+        let mut mem = Memtable::with_synthetic_base(100);
+        mem.upsert_node("Person", "name", Value::Str("Ann".into()), None, []);
+        mem.upsert_node("City", "name", Value::Str("Oslo".into()), None, []);
+        mem.delete_node("Person", "name", Value::Str("Zed".into()), Some(7));
+        let back = Memtable::deserialise(&mem.serialise()).unwrap();
+        assert_eq!(back.tombstoned_ids(), vec![7]);
+        assert_eq!(back.born_count_with_label("Person"), 1);
+        assert_eq!(back.born_count_with_label("City"), 1);
     }
 
     #[test]

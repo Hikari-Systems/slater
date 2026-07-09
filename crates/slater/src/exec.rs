@@ -1846,27 +1846,58 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn run_single(&self, sq: &SingleQuery) -> Result<QueryResult> {
-        // The count / whole-graph-metadata fast paths answer from the immutable
-        // core's resident marginals and range indexes without materialising rows —
-        // but a live delta can change those answers (a tombstone removes a node from
-        // a count/label enumeration; a property patch on an indexed key moves it in
-        // the index). So they run only against a pure core; with any delta present we
-        // fall through to full execution, where `scan_candidates` suppresses
-        // tombstones and the property overlay corrects patched values. The empty
-        // delta is the overwhelming common case, so read-only performance is intact.
+        // The count / whole-graph-metadata fast paths answer from the immutable core's
+        // resident marginals and range indexes without materialising rows — but a live
+        // delta can change those answers (a tombstone removes a node from a count/label
+        // enumeration; a property patch on an indexed key moves it in the index).
+        //
+        // The bare `count(*)` path is delta-aware and always runs: the delta carries an
+        // O(1) born tally per level and a small suppressed-id set, so the merged count is
+        // still a metadata read. The rest need a pure core; with any delta present they
+        // fall through to full execution, where `scan_candidates` suppresses tombstones
+        // and the property overlay corrects patched values. The empty delta is the
+        // overwhelming common case, so read-only performance is intact.
+        // Stage 3: a bare `MATCH (n[:L][{p: v}]) RETURN count(*)|count(n)` from
+        // resident metadata / a single index lookup, skipping materialisation.
+        // Only reachable here (top-level / UNION part), where the seed is the
+        // empty singleton — a `CALL { … }` subquery seeds outer rows via
+        // `run_single_seeded` and never takes this path, so the count is always
+        // over the whole match.
+        //
+        // This one is **delta-aware** (`live_node_count` / `live_label_node_count` net
+        // out the delta's born and suppressed rows), so it survives a non-empty delta —
+        // without it, a single `MERGE` would turn a whole-graph `count(*)` into a full
+        // scan of the core. The inline-property variant still needs a pure core (see
+        // the guard in `try_count_fast_path`).
+        if let Some((columns, row)) = self.try_count_fast_path(sq)? {
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
+        }
+        // Stage E: the bare whole-graph edge count `MATCH ()-[r]->() RETURN count(*)`,
+        // from resident counts rather than an expansion. Delta-aware; it must precede
+        // Stage B, which would otherwise walk every edge.
+        if let Some((columns, row)) = self.try_edge_count_fast_path(sq)? {
+            return Ok(QueryResult {
+                columns,
+                rows: vec![row],
+            });
+        }
+        // Stage M: a whole-graph label/reltype *metadata* enumeration or grouped count —
+        // `MATCH ()-[r]->() RETURN [DISTINCT] type(r) [, count(*)]` and `MATCH (n) RETURN
+        // [DISTINCT] labels(n)[0] [, count(*)]` (plus the labelled schema-marginal
+        // variants) — answered from resident metadata with zero block reads, instead of
+        // materialising every binding. Both are delta-aware: they net the delta's born
+        // rows in and its suppressed rows out, and decline the shapes they cannot answer
+        // exactly over a delta (the labelled endpoint cube, an undirected hop).
+        if let Some(res) = self.try_reltype_meta_fast_path(sq)? {
+            return Ok(res);
+        }
+        if let Some(res) = self.try_label_meta_fast_path(sq)? {
+            return Ok(res);
+        }
         if self.gen.delta().is_empty() {
-            // Stage 3: a bare `MATCH (n[:L][{p: v}]) RETURN count(*)|count(n)` from
-            // resident metadata / a single index lookup, skipping materialisation.
-            // Only reachable here (top-level / UNION part), where the seed is the
-            // empty singleton — a `CALL { … }` subquery seeds outer rows via
-            // `run_single_seeded` and never takes this path, so the count is always
-            // over the whole match.
-            if let Some((columns, row)) = self.try_count_fast_path(sq)? {
-                return Ok(QueryResult {
-                    columns,
-                    rows: vec![row],
-                });
-            }
             // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
             // and `RETURN count(DISTINCT n.p)` are answered from the range index over
             // (L, p) — one sequential index walk, no per-node property decode.
@@ -1877,17 +1908,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // multi-hop count walks but counts during expansion instead of
             // materialising the row set (the fanout RSS peak).
             if let Some(res) = self.try_count_walk_fast_path(sq)? {
-                return Ok(res);
-            }
-            // Stage M: a whole-graph label/reltype *metadata* enumeration or grouped
-            // count — `MATCH ()-[r]->() RETURN [DISTINCT] type(r) [, count(*)]` and
-            // `MATCH (n) RETURN [DISTINCT] labels(n)[0] [, count(*)]` (plus the
-            // labelled schema-marginal variants) — answered from resident metadata
-            // with zero block reads, instead of materialising every binding.
-            if let Some(res) = self.try_reltype_meta_fast_path(sq)? {
-                return Ok(res);
-            }
-            if let Some(res) = self.try_label_meta_fast_path(sq)? {
                 return Ok(res);
             }
         }
@@ -1954,21 +1974,30 @@ impl<'g, V: ReadView> Engine<'g, V> {
             return Ok(None);
         };
 
-        // Compute the match count.
+        // Compute the match count. The no-inline-prop shapes read the *live* counts, so
+        // they hold over a merged view too (born rows added, suppressed rows netted out).
         let count: i64 = if node.props.is_empty() {
             match &node.label_expr {
-                None => self.gen.node_count() as i64,
+                None => self.gen.live_node_count() as i64,
                 // A lone positive atom is a single label posting; any boolean /
                 // multi-label expression has no single-posting count — fall back.
                 Some(e) => match e.as_single_atom() {
-                    Some(l) => self
-                        .gen
-                        .label_id(l)
-                        .map(|lid| self.gen.label_node_count(lid) as i64)
-                        .unwrap_or(0),
+                    Some(l) => match self.gen.label_id(l) {
+                        Some(lid) => self.gen.live_label_node_count(lid)? as i64,
+                        // A label the core never defined can still have delta-born nodes
+                        // (a `MERGE` may introduce a brand-new label), and those have no
+                        // core label id to count against — fall back to full execution.
+                        None if !self.gen.delta().is_empty() => return Ok(None),
+                        None => 0,
+                    },
                     None => return Ok(None),
                 },
             }
+        } else if !self.gen.delta().is_empty() {
+            // Inline props over a delta: the index-length shortcut below ignores born
+            // rows, moved indexed values and tombstones. It is also cheap to execute
+            // normally (an indexed seek, not a scan), so just fall back.
+            return Ok(None);
         } else {
             // Inline props: only an exact single indexed-equality is safe (the scan
             // result then needs no residual filtering, so its length is the count).
@@ -2003,7 +2032,18 @@ impl<'g, V: ReadView> Engine<'g, V> {
             self.scan_candidates(&scan)?.len() as i64
         };
 
-        // Build the single output row: the count in its column, constants evaluated.
+        Ok(Some(self.count_row(sq, count_idx, count)?))
+    }
+
+    /// Build the single output row of a count fast path: `count` in its column, every
+    /// other (constant) projection evaluated against an empty scope.
+    fn count_row(
+        &self,
+        sq: &SingleQuery,
+        count_idx: usize,
+        count: i64,
+    ) -> Result<(Vec<String>, Vec<Val>)> {
+        let body = &sq.ret.body;
         let empty: HashMap<String, Val> = HashMap::new();
         let mut columns = Vec::with_capacity(body.items.len());
         let mut row = Vec::with_capacity(body.items.len());
@@ -2015,7 +2055,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 row.push(self.eval(&it.expr, &Scope::Map(&empty), None)?);
             }
         }
-        Ok(Some((columns, row)))
+        Ok((columns, row))
     }
 
     /// Recognise a whole-graph relationship-type metadata query and answer it from
@@ -2098,6 +2138,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // labelled with a known id.
         let left_id = left_label.map(|n| self.gen.label_id(&n));
         let right_id = right_label.map(|n| self.gen.label_id(&n));
+
+        // With a live delta the core's resident schema marginals no longer describe the
+        // graph. The whole-graph `type(r)` shape is still answerable from the delta's edge
+        // counters; the labelled-endpoint cube and the undirected doubling are not, so
+        // they decline and the matcher runs.
+        if !self.gen.delta().is_empty() {
+            if left_id.is_some() || right_id.is_some() || matches!(rel.dir, Direction::Undirected) {
+                return Ok(None);
+            }
+            let Some(live) = self.gen.live_reltype_edge_groups()? else {
+                return Ok(None);
+            };
+            let groups: Vec<(Val, u64)> = live.into_iter().map(|(n, c)| (Val::Str(n), c)).collect();
+            return Ok(Some(
+                self.build_meta_result(sq, key_idx, count_idx, groups)?,
+            ));
+        }
         // Edges of type `t` whose source satisfies `src` and target satisfies `tgt`,
         // read from the resident whole-graph counts / schema marginals / cube. `None`
         // ⇒ the required marginal is not present in this generation (⇒ decline).
@@ -2137,6 +2194,93 @@ impl<'g, V: ReadView> Engine<'g, V> {
         Ok(Some(
             self.build_meta_result(sq, key_idx, count_idx, groups)?,
         ))
+    }
+
+    /// Recognise a whole-graph edge count — `MATCH ()-[r]->() RETURN count(*)` — and
+    /// answer it from resident counts instead of walking the adjacency.
+    ///
+    /// Without this, the bare (ungrouped) edge count has no fast path at all: the grouped
+    /// `RETURN type(r), count(*)` form is answered from the manifest, but dropping the
+    /// group key sent the query to a full expansion — 96 s and a `maxScan` breach on a
+    /// 1.5B-edge core. Merged views answer from the delta's edge counters, declining when
+    /// those cannot be exact (see [`ReadView::live_edge_count`]).
+    ///
+    /// Declines on: a WHERE, a rel-type filter / rel property / variable length, any
+    /// endpoint label or property, a self-loop pattern `(a)-[r]->(a)`, an undirected
+    /// relationship (each edge would match in both orientations), extra pattern segments,
+    /// a non-constant extra projection, or DISTINCT / ORDER BY / SKIP / LIMIT.
+    fn try_edge_count_fast_path(
+        &self,
+        sq: &SingleQuery,
+    ) -> Result<Option<(Vec<String>, Vec<Val>)>> {
+        if sq.reading.len() != 1 {
+            return Ok(None);
+        }
+        let Clause::Match(m) = &sq.reading[0] else {
+            return Ok(None);
+        };
+        if m.optional || m.where_.is_some() || m.patterns.len() != 1 {
+            return Ok(None);
+        }
+        let pat = &m.patterns[0];
+        if pat.segments.is_some() || pat.selector.is_some() || pat.restrictor.is_some() {
+            return Ok(None);
+        }
+        if pat.rels.len() != 1 {
+            return Ok(None);
+        }
+        let (rel, right) = &pat.rels[0];
+        let left = &pat.start;
+        if rel.type_expr.is_some() || !rel.props.is_empty() || rel.var_length.is_some() {
+            return Ok(None);
+        }
+        // An undirected hop matches each edge in both orientations — not a plain count.
+        if matches!(rel.dir, Direction::Undirected) {
+            return Ok(None);
+        }
+        // Whole graph: both endpoints unconstrained, and not the same variable (which
+        // would restrict the match to self-loops).
+        if left.label_expr.is_some()
+            || right.label_expr.is_some()
+            || !left.props.is_empty()
+            || !right.props.is_empty()
+        {
+            return Ok(None);
+        }
+        if let (Some(lv), Some(rv)) = (left.var.as_deref(), right.var.as_deref()) {
+            if lv == rv {
+                return Ok(None);
+            }
+        }
+
+        let body = &sq.ret.body;
+        if sq.ret.distinct
+            || body.star
+            || body.items.is_empty()
+            || !body.order_by.is_empty()
+            || body.skip.is_some()
+            || body.limit.is_some()
+        {
+            return Ok(None);
+        }
+        let mut count_idx = None;
+        for (i, it) in body.items.iter().enumerate() {
+            if is_count_of(&it.expr, rel.var.as_deref()) {
+                if count_idx.is_some() {
+                    return Ok(None);
+                }
+                count_idx = Some(i);
+            } else if !matches!(it.expr, Expr::Param(_) | Expr::Literal(_)) {
+                return Ok(None);
+            }
+        }
+        let Some(count_idx) = count_idx else {
+            return Ok(None);
+        };
+        let Some(count) = self.gen.live_edge_count()? else {
+            return Ok(None); // the delta cannot answer it exactly — run the matcher
+        };
+        Ok(Some(self.count_row(sq, count_idx, count as i64)?))
     }
 
     /// Recognise a whole-graph `labels(n)[0]` metadata query and answer it from the
@@ -2180,23 +2324,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
             return Ok(None);
         };
 
-        let n = self.gen.manifest().labels.len();
-        let mut groups: Vec<(Val, u64)> = Vec::new();
-        for lid in 0..n as u32 {
-            let c = self.gen.first_label_count(lid);
-            if c > 0 {
-                let name = self.gen.label_name(lid).unwrap_or("").to_string();
-                groups.push((Val::Str(name), c));
-            }
-        }
-        // Zero-label nodes project `labels(n)[0] == null`.
-        let null_count = self
+        // Live groups: the core's first-label marginals, plus the delta's born nodes,
+        // minus its suppressed rows. Zero-label nodes project `labels(n)[0] == null`.
+        let groups: Vec<(Val, u64)> = self
             .gen
-            .node_count()
-            .saturating_sub(self.gen.first_labelled_node_count());
-        if null_count > 0 {
-            groups.push((Val::Null, null_count));
-        }
+            .live_first_label_groups()?
+            .into_iter()
+            .map(|(name, c)| (name.map_or(Val::Null, Val::Str), c))
+            .collect();
         Ok(Some(
             self.build_meta_result(sq, key_idx, count_idx, groups)?,
         ))
