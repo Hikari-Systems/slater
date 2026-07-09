@@ -1046,3 +1046,22 @@ consolidate) so their behaviour is unchanged; no change to `resolve_business_key
 call sites (the reader caches transparently). Rejected: a raw-byte cache (decode still dominates); a
 per-reader cache (memory multiplies across a generation's indexes — one shared budget is bounded).
 Complementary build-side lever (smaller range-index blocks) is D53.
+
+### D53 — Range (ISAM) indexes are built with smaller leaf blocks than the columnar files
+`crates/slater-build/src/{shared.rs,main.rs,build_external.rs}`. The builder sized every file —
+node/edge props, topology, **and range ISAMs** — with one `--block-size` (256 KiB), which is right for
+*columnar* files (scanned sequentially; big blocks compress well and amortise seeks) but wrong for a
+range index, which is probed by **point** lookups (business-key write resolve, indexed equality/range
+seeks). A point lookup decodes a whole leaf, so a 256 KiB leaf = ~37 000 entries decoded per probe
+(the D52 finding). So range ISAMs now take their own `--range-block-size`, default **16 KiB**, while
+columnar files keep 256 KiB (a `vector_block_size` split already set the precedent).
+
+Measured on 1M contiguous int keys: 256 KiB → 27 blocks (~37K entries), **~2836 µs/uncached lookup**;
+16 KiB → 426 blocks (~2.3K entries), **~182 µs (~15×)**. This is **complementary to D52, not a
+replacement**: D52's decoded-block cache makes a *warm* probe O(log n) (~1.5 µs) regardless of block
+size; D53 makes the *cold* path — a cache miss's one-time decode, an uncached tool, or a random-access
+workload whose working set exceeds the cache — ~15× cheaper, and shrinks each cache entry so the same
+budget holds far more blocks. Costs are modest: more blocks ⇒ a slightly larger resident top-level
+(~426 vs 27 entries here — still tiny) and marginally worse compression / more range-scan seeks. Only
+affects **newly built** generations; existing images are unchanged until rebuilt. Determinism/golden
+tests are invariant (they build-twice-and-compare, not against a pinned old-block-size hash).

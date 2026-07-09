@@ -755,6 +755,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf measurement — smaller leaf blocks make an uncached point lookup cheaper"]
+    fn bench_range_block_size_point_lookups() {
+        // 1M contiguous int keys (the wikidata_id shape) built at 256 KiB vs 16 KiB leaf
+        // blocks; time uncached equality probes over an ascending run.
+        let entries: Vec<(Value, u64)> = (0..1_000_000u64)
+            .map(|i| (Value::Int(i as i64), i))
+            .collect();
+        for bs in [256 * 1024usize, 16 * 1024] {
+            let path = tmp(&format!("bs_{bs}"));
+            write_isam(&path, entries.clone(), bs, 3).unwrap();
+            let r = IsamReader::open(&path).unwrap();
+            let n = 20_000u64;
+            let t = std::time::Instant::now();
+            for k in 0..n {
+                let _ = r.lookup_eq(&Value::Int(k as i64)).unwrap();
+            }
+            println!(
+                "block_size={bs}: {} blocks (~{} entries/block), {:.1} µs/uncached-lookup",
+                r.num_blocks(),
+                1_000_000 / r.num_blocks().max(1),
+                t.elapsed().as_micros() as f64 / n as f64
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn distinct_key_counts_matches_lookup_eq() {
         let path = tmp("distinct");
         // Repeated keys whose runs span block boundaries (tiny blocks below).

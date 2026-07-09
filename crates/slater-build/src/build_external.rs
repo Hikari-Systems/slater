@@ -1838,11 +1838,11 @@ fn build_inner(
         write_isam_sorted(
             tmp_dir.join(&rel_path),
             sorter.sorted()?.map(|r| r.map(|re| (re.key, re.id))),
-            opts.block_size,
+            opts.range_block_size,
             opts.zstd_level,
             cipher.clone(),
         )?;
-        block_sizes.insert(rel_path, opts.block_size as u32);
+        block_sizes.insert(rel_path, opts.range_block_size as u32);
         range_indexes.push(RangeIndexDesc {
             name: meta.name,
             entity: meta.entity,

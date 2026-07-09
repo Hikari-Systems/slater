@@ -92,9 +92,15 @@ struct Cli {
     #[arg(long)]
     pk: Option<String>,
 
-    /// Target block size (bytes) for prop/label/topology/range files.
+    /// Target block size (bytes) for prop/label/topology files.
     #[arg(long, default_value_t = 256 * 1024)]
     block_size: usize,
+
+    /// Target leaf-block size (bytes) for range (ISAM) indexes. Smaller than
+    /// `--block-size` on purpose: range indexes are probed by point lookups, and a
+    /// lookup decodes a whole leaf, so small leaves keep a probe cheap. See D53.
+    #[arg(long, default_value_t = 16 * 1024)]
+    range_block_size: usize,
 
     /// Target block size (bytes) for the vector store.
     #[arg(long, default_value_t = 256 * 1024)]
@@ -501,6 +507,7 @@ fn main() -> Result<()> {
     let opts = BuildOptions {
         pk: cli.pk.clone(),
         block_size: cli.block_size,
+        range_block_size: cli.range_block_size,
         vector_block_size: cli.vector_block_size,
         zstd_level,
         compression_profile,

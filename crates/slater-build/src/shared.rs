@@ -35,8 +35,15 @@ pub struct BuildOptions {
     /// edges reference endpoints by it, and `field` is stored as a queryable property.
     /// `Some("__dump_id__")` ingests legacy FalkorDB `GRAPH.DUMP` files.
     pub pk: Option<String>,
-    /// Target block size for prop/label/topology/range files, bytes.
+    /// Target block size for prop/label/topology files, bytes.
     pub block_size: usize,
+    /// Target block size for **range (ISAM) index** leaf blocks, bytes. Deliberately
+    /// smaller than `block_size`: a range index is probed by *point* lookups (business-key
+    /// write resolve, indexed equality/range seeks), and a lookup decodes a whole leaf, so
+    /// a large block makes every probe decode tens of thousands of entries. Smaller leaves
+    /// keep a point lookup cheap even on a cache miss, at a modest cost to compression and
+    /// range-scan seek count. See D53.
+    pub range_block_size: usize,
     /// Target block size for the vector store, bytes.
     pub vector_block_size: usize,
     /// Effective zstd level applied to all published `.blk`/index files. Resolved
@@ -102,6 +109,7 @@ impl Default for BuildOptions {
         Self {
             pk: None,
             block_size: 256 * 1024,
+            range_block_size: 16 * 1024,
             vector_block_size: 256 * 1024,
             zstd_level: 3,
             compression_profile: "manual".into(),

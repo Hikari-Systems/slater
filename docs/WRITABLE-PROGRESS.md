@@ -877,8 +877,15 @@ Measured: **~2.6 ms → ~1.5 µs/resolve (~1750×)**; the full 30%-delete smoke 
 now bound by the 30 batch fsyncs, not the resolve. Transparent to `resolve_business_key`/
 `scan_candidates` (reader-internal); off (`None` budget) for every non-server opener. The
 **batch-local merge-join** idea above is now unnecessary for this workload (the cache handles the
-contiguous re-probe). Complementary build-side lever — **smaller range-index blocks** so *even
-uncached* point lookups are cheap — is the next item (D53).
+contiguous re-probe).
+
+**✅ Also done (D53) — smaller range-index leaf blocks.** The builder sized range ISAMs with the same
+256 KiB `--block-size` as columnar files (→ ~37K entries/leaf); range indexes now take their own
+`--range-block-size` (default **16 KiB**). Complementary to D52: the decoded cache makes a *warm* probe
+O(log n) regardless of block size; smaller leaves make the *cold* path cheap — 1M int keys: 256 KiB →
+~2836 µs/uncached lookup, 16 KiB → **~182 µs (~15×)** — and shrink each cache entry so the budget holds
+more blocks. Only affects newly built generations (existing images unchanged until rebuilt);
+determinism goldens are invariant. `bench_range_block_size_point_lookups` (`isam.rs`, `#[ignore]`).
 
 ## Recommended context-clear points
 
