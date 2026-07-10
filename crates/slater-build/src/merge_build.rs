@@ -1211,21 +1211,9 @@ impl SortRecord for EdgeFinal {
     fn size_hint(&self) -> usize {
         40 + self.props_blob.len()
     }
-    fn resident_hint(&self) -> usize {
-        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
-    }
 }
 
 /// An edge's reltype + props, keyed by `edge_seq`. Sorted by `edge_seq` so it
-/// Bytes a [`Blob`] owns on the heap: zero while it fits inline.
-fn heap_of(b: &Blob) -> usize {
-    if b.spilled() {
-        b.len()
-    } else {
-        0
-    }
-}
-
 /// merge-joins in lockstep with the resolved endpoints within an edge-partition.
 struct Payload {
     edge_seq: u64,
@@ -1254,10 +1242,6 @@ impl SortRecord for Payload {
     }
     fn size_hint(&self) -> usize {
         16 + self.props_blob.len()
-    }
-    fn resident_hint(&self) -> usize {
-        // An inline blob costs nothing beyond the record; only a spilled one is heap.
-        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
     }
 }
 

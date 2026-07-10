@@ -30,11 +30,17 @@ use crate::wire::{read_uvarint, write_uvarint};
 /// the record into the store at emit) go through this so the two can never drift.
 pub fn encode_labels_record(label_ids: &[u32]) -> Vec<u8> {
     let mut rec = Vec::new();
-    write_uvarint(&mut rec, label_ids.len() as u64);
-    for l in label_ids {
-        write_uvarint(&mut rec, *l as u64);
-    }
+    encode_labels_record_into(&mut rec, label_ids);
     rec
+}
+
+/// [`encode_labels_record`] appending into a caller-owned buffer — see
+/// [`encode_props_record_into`](crate::columns::encode_props_record_into).
+pub fn encode_labels_record_into(rec: &mut Vec<u8>, label_ids: &[u32]) {
+    write_uvarint(rec, label_ids.len() as u64);
+    for l in label_ids {
+        write_uvarint(rec, *l as u64);
+    }
 }
 
 /// Writer for `node_labels.blk`. Append nodes strictly in dense-id order.

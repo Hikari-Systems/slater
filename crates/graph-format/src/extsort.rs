@@ -200,8 +200,19 @@ pub trait SortRecord: Sized {
     /// buffer with `size_hint` and the sorter holds several times the bytes it thinks it
     /// does — invisibly, until the budget gets big enough for the multiple to matter.
     ///
-    /// The default double-counts a record's inline scalars (they appear in both terms),
-    /// which is the safe direction: over-estimating spills sooner.
+    /// The default deliberately double-counts a record's inline scalars — they appear in
+    /// both terms — and **do not "fix" that**. The margin is load-bearing. `ExtSorter`
+    /// budgets `buf.capacity() * size_of::<R>() + heap`, but a `Vec` grows by *doubling*,
+    /// and the `realloc` that crosses the spill threshold holds the old array and the new
+    /// one at once. A sorter granted `B` bytes therefore touches ~1.5·B at its peak, and
+    /// nothing accounts for the k-way merge's per-run block, the band batchers, or the
+    /// block writers' partial blocks either.
+    ///
+    /// Measured: overriding this to the exact resident size for `resolve`'s records —
+    /// which is *correct* per record, since their blobs sit inline — let each buffer pack
+    /// ~1.7× more of them and pushed the phase from 4.31 GB to 6.04 GB against a 4 GiB
+    /// cap, for no gain in wall clock. Override only if you have also removed the growth
+    /// transient (pre-sized buffers) and accounted the merge.
     fn resident_hint(&self) -> usize {
         std::mem::size_of::<Self>() + self.size_hint()
     }

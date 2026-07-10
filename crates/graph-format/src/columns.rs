@@ -30,12 +30,20 @@ use crate::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_val
 /// store at emit) go through this, so the two encodings can never drift.
 pub fn encode_props_record(props: &[(u32, Value)]) -> Vec<u8> {
     let mut rec = Vec::new();
-    write_uvarint(&mut rec, props.len() as u64);
-    for (key_id, value) in props {
-        write_uvarint(&mut rec, *key_id as u64);
-        write_value(&mut rec, value);
-    }
+    encode_props_record_into(&mut rec, props);
     rec
+}
+
+/// [`encode_props_record`] appending into a caller-owned buffer, so a hot loop can
+/// reuse one allocation instead of making a fresh `Vec` per record. The builder encodes
+/// one property record per node *and per edge*; at 1.49B edges the throwaway `Vec` is
+/// the allocation, not the bytes.
+pub fn encode_props_record_into(rec: &mut Vec<u8>, props: &[(u32, Value)]) {
+    write_uvarint(rec, props.len() as u64);
+    for (key_id, value) in props {
+        write_uvarint(rec, *key_id as u64);
+        write_value(rec, value);
+    }
 }
 
 /// Writer for a property `.blk` file. Append entities strictly in dense-id order

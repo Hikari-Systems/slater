@@ -2052,15 +2052,6 @@ struct NodeEmit {
     labels_blob: Blob,
     props_blob: Blob,
 }
-/// Bytes a [`Blob`] owns on the heap: zero while it fits inline.
-fn heap_of(b: &Blob) -> usize {
-    if b.spilled() {
-        b.len()
-    } else {
-        0
-    }
-}
-
 impl SortRecord for NodeEmit {
     fn encode(&self, buf: &mut Vec<u8>) {
         write_uvarint(buf, self.final_id);
@@ -2082,9 +2073,6 @@ impl SortRecord for NodeEmit {
     }
     fn size_hint(&self) -> usize {
         16 + self.labels_blob.len() + self.props_blob.len()
-    }
-    fn resident_hint(&self) -> usize {
-        std::mem::size_of::<Self>() + heap_of(&self.labels_blob) + heap_of(&self.props_blob)
     }
 }
 
@@ -2126,11 +2114,6 @@ impl SortRecord for EdgeFwd {
     }
     fn size_hint(&self) -> usize {
         40 + self.props_blob.len()
-    }
-    fn resident_hint(&self) -> usize {
-        // An inline blob costs nothing beyond the record itself; only a spilled one
-        // touches the heap. The default would charge `props_blob.len()` twice over.
-        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
     }
 }
 

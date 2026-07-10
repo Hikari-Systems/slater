@@ -13,14 +13,15 @@
 //! container (reused so we get streaming + compression for free), deleted once the
 //! generation is published.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
-use graph_format::columns::{decode_props, encode_props_record};
-use graph_format::nodelabels::{decode_labels, encode_labels_record};
+use graph_format::columns::{decode_props, encode_props_record, encode_props_record_into};
+use graph_format::nodelabels::{decode_labels, encode_labels_record_into};
 use graph_format::wire::{read_uvarint, write_uvarint};
 
 #[inline]
@@ -59,14 +60,43 @@ pub(crate) fn read_blob<'a>(r: &mut &'a [u8]) -> Result<&'a [u8]> {
 /// `SmallVec<[u8; 16]>` is exactly `Vec<u8>`'s 24 bytes, so nothing grows.
 pub type Blob = smallvec::SmallVec<[u8; 16]>;
 
-/// [`encode_labels_record`] straight into a [`Blob`].
-pub fn labels_blob(labels: &[u32]) -> Blob {
-    Blob::from_slice(&encode_labels_record(labels))
+thread_local! {
+    /// Reused encode buffer. Building a record through `encode_props_record`'s own
+    /// `Vec` allocates once *per record*; the builder encodes one per node and one per
+    /// edge, and at 1.49B edges that is the cost, not the bytes.
+    static ENCODE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// [`encode_props_record`] straight into a [`Blob`].
+/// [`encode_labels_record`] straight into a [`Blob`], reusing a per-thread buffer.
+pub fn labels_blob(labels: &[u32]) -> Blob {
+    ENCODE_SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        buf.clear();
+        encode_labels_record_into(&mut buf, labels);
+        Blob::from_slice(&buf)
+    })
+}
+
+/// [`encode_props_record`] straight into a [`Blob`], reusing a per-thread buffer.
+///
+/// The empty case gets its own path because it is *the* case at graph scale: no Wikidata
+/// edge carries properties, so its record is the single byte `uvarint(0)`. That byte fits
+/// inline in the [`Blob`], and this path reaches no heap and no scratch — where
+/// `Blob::from_slice(&encode_props_record(&[]))` would allocate a one-byte `Vec`, copy it
+/// inline, and drop it, 1.49B times over.
 pub fn props_blob(props: &[(u32, graph_format::ids::Value)]) -> Blob {
-    Blob::from_slice(&encode_props_record(props))
+    if props.is_empty() {
+        let mut b = Blob::new();
+        b.push(0); // uvarint(0) — zero properties
+        debug_assert_eq!(b.as_slice(), encode_props_record(&[]).as_slice());
+        return b;
+    }
+    ENCODE_SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        buf.clear();
+        encode_props_record_into(&mut buf, props);
+        Blob::from_slice(&buf)
+    })
 }
 
 pub struct NodeRec {
@@ -434,7 +464,7 @@ impl ShardRemap {
 pub fn remap_labels_blob(blob: &[u8], remap: &ShardRemap) -> Result<Blob> {
     let ids = decode_labels(blob)?;
     let mapped: Vec<u32> = ids.into_iter().map(|l| remap.map_label(l)).collect();
-    Ok(Blob::from_slice(&encode_labels_record(&mapped)))
+    Ok(labels_blob(&mapped))
 }
 
 /// Re-encode a `node_props.blk`/`edge_props.blk` blob, translating local key ids to
@@ -445,7 +475,7 @@ pub fn remap_props_blob(blob: &[u8], remap: &ShardRemap) -> Result<Blob> {
         .into_iter()
         .map(|(k, v)| (remap.map_key(k), v))
         .collect();
-    Ok(Blob::from_slice(&encode_props_record(&mapped)))
+    Ok(props_blob(&mapped))
 }
 
 /// Fold the shards' local symbol tables (in shard order = input order) into the

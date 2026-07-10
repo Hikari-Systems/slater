@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -38,7 +38,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use rayon::prelude::*;
 
 use crate::codec;
 use crate::crypto::{BlockCipher, NONCE_LEN};
@@ -53,8 +52,6 @@ const BLOCKFILE_MAGIC_ENC: &[u8; 8] = b"SLBLKE01";
 const FOOTER_LEN: u64 = 24; // dir_offset(8) + dir_len(8) + block_count(8)
 const DIR_ENTRY_LEN: usize = 20; // offset(8) + comp_len(4) + raw_len(4) + rec_count(4)
 const DIR_ENTRY_LEN_ENC: usize = DIR_ENTRY_LEN + NONCE_LEN; // + per-block nonce
-/// Bytes each `concat_block_files` worker copies per read/write pair.
-const CONCAT_CHUNK: usize = 8 << 20;
 
 /// Location of a record: which block, and which slot within that block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,12 +518,15 @@ impl BlockFileWriter {
 /// each worker writes a disjoint, contiguous slice of an output store, and this
 /// stitches the slices without a serial re-encode.
 ///
-/// Each input's block region lands at an offset that depends only on the *sizes* of
-/// the regions before it, and every input carries its own footer. So the layout is
-/// known before a single byte moves: read the footers, prefix-sum the region sizes,
-/// then copy the regions concurrently with positional writes. At 91.6M nodes this step
-/// concatenates 176 band files into 20.4 GB and was 35% of `emit.topology` at 85% CPU —
-/// one thread pushing every byte through a `BufWriter`.
+/// The copy goes through [`std::io::copy`], which on Linux dispatches a file-to-file
+/// copy to `copy_file_range(2)`: the bytes never enter user space, so this costs no
+/// memcpy and no second set of page-cache pages.
+///
+/// It is **not** parallelised, and that is deliberate. At 91.6M nodes this concatenates
+/// 176 band files into 20.4 GB and the step is bounded by write bandwidth, not CPU —
+/// it sat at 85% of one core. Copying the regions concurrently with positional writes
+/// (measured) scattered the write stream across the output and *raised* CPU to 110% for
+/// no wall-clock gain. One sequential stream is what the disk wants.
 pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Result<u64> {
     if inputs.is_empty() {
         bail!("concat_block_files: no inputs");
@@ -540,18 +540,16 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
     };
     let magic_len = magic.len() as u64;
 
-    // ---- pass 1: read every footer, lay the output out ----
-    struct Part {
-        dir_offset: u64,
-        dir_len: u64,
-        blocks: u64,
-        /// Where this input's block region begins in the output.
-        out_base: u64,
-    }
-    let mut parts: Vec<Part> = Vec::with_capacity(inputs.len());
+    let mut out = File::create(out_path.as_ref())
+        .with_context(|| format!("create {}", out_path.as_ref().display()))?;
+    out.write_all(&magic)?;
     let mut out_pos = magic_len;
+    let mut dir_bytes: Vec<u8> = Vec::new();
+    let mut block_count: u64 = 0;
+    let mut total_records: u64 = 0;
+
     for inp in inputs {
-        let f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
+        let mut f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
         let mut m = [0u8; 8];
         f.read_exact_at(&mut m, 0)?;
         if m != magic {
@@ -567,86 +565,51 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
         let dir_offset = fr.read_u64::<LittleEndian>()?;
         let dir_len = fr.read_u64::<LittleEndian>()?;
         let blocks = fr.read_u64::<LittleEndian>()?;
-        parts.push(Part {
-            dir_offset,
-            dir_len,
-            blocks,
-            out_base: out_pos,
-        });
-        out_pos += dir_offset - magic_len;
+
+        // Copy the block region [8, dir_offset) verbatim, tracking where it lands.
+        let blocks_base_out = out_pos;
+        let region = dir_offset - magic_len;
+        f.seek(SeekFrom::Start(magic_len))?;
+        let copied = std::io::copy(&mut (&f).take(region), &mut out)
+            .with_context(|| format!("copy blocks of {}", inp.display()))?;
+        if copied != region {
+            bail!(
+                "concat_block_files: short copy of {} ({copied} of {region})",
+                inp.display()
+            );
+        }
+        out_pos += region;
+
+        // Rewrite each directory entry's offset into the output's coordinate space.
+        let mut db = vec![0u8; dir_len as usize];
+        f.read_exact_at(&mut db, dir_offset)?;
+        let mut dr = &db[..];
+        for _ in 0..blocks {
+            let offset = dr.read_u64::<LittleEndian>()?;
+            let comp_len = dr.read_u32::<LittleEndian>()?;
+            let raw_len = dr.read_u32::<LittleEndian>()?;
+            let rec_count = dr.read_u32::<LittleEndian>()?;
+            dir_bytes.write_u64::<LittleEndian>(blocks_base_out + (offset - magic_len))?;
+            dir_bytes.write_u32::<LittleEndian>(comp_len)?;
+            dir_bytes.write_u32::<LittleEndian>(raw_len)?;
+            dir_bytes.write_u32::<LittleEndian>(rec_count)?;
+            if encrypted {
+                let mut nonce = [0u8; NONCE_LEN];
+                dr.read_exact(&mut nonce)?;
+                dir_bytes.write_all(&nonce)?;
+            }
+            block_count += 1;
+            total_records += rec_count as u64;
+        }
     }
+
     let dir_offset_out = out_pos;
-
-    let out = File::create(out_path.as_ref())
-        .with_context(|| format!("create {}", out_path.as_ref().display()))?;
-    out.write_all_at(&magic, 0)?;
-
-    // ---- pass 2: copy the block regions concurrently; rebuild each directory chunk ----
-    // Positional writes to disjoint ranges of one file need no coordination, and each
-    // input's directory rewrite is a pure function of its own bytes and its `out_base`.
-    let entry_len = if encrypted {
-        DIR_ENTRY_LEN_ENC
-    } else {
-        DIR_ENTRY_LEN
-    };
-    let dir_chunks: Vec<Vec<u8>> = inputs
-        .par_iter()
-        .zip(parts.par_iter())
-        .map(|(inp, part)| -> Result<Vec<u8>> {
-            let f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
-            let mut copy_buf = vec![0u8; CONCAT_CHUNK];
-            let mut pos = magic_len;
-            while pos < part.dir_offset {
-                let n = ((part.dir_offset - pos) as usize).min(copy_buf.len());
-                f.read_exact_at(&mut copy_buf[..n], pos)?;
-                out.write_all_at(&copy_buf[..n], part.out_base + (pos - magic_len))?;
-                pos += n as u64;
-            }
-
-            // Rewrite each directory entry's offset into the output's coordinate space.
-            let mut db = vec![0u8; part.dir_len as usize];
-            f.read_exact_at(&mut db, part.dir_offset)?;
-            let mut dr = &db[..];
-            let mut chunk = Vec::with_capacity(part.blocks as usize * entry_len);
-            for _ in 0..part.blocks {
-                let offset = dr.read_u64::<LittleEndian>()?;
-                let comp_len = dr.read_u32::<LittleEndian>()?;
-                let raw_len = dr.read_u32::<LittleEndian>()?;
-                let rec_count = dr.read_u32::<LittleEndian>()?;
-                chunk.write_u64::<LittleEndian>(part.out_base + (offset - magic_len))?;
-                chunk.write_u32::<LittleEndian>(comp_len)?;
-                chunk.write_u32::<LittleEndian>(raw_len)?;
-                chunk.write_u32::<LittleEndian>(rec_count)?;
-                if encrypted {
-                    let mut nonce = [0u8; NONCE_LEN];
-                    dr.read_exact(&mut nonce)?;
-                    chunk.write_all(&nonce)?;
-                }
-            }
-            Ok(chunk)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // ---- pass 3: directory + footer, in input order ----
-    let mut dir_bytes: Vec<u8> = Vec::with_capacity(dir_chunks.iter().map(Vec::len).sum());
-    for c in &dir_chunks {
-        dir_bytes.extend_from_slice(c);
-    }
-    let block_count: u64 = parts.iter().map(|p| p.blocks).sum();
-    // Record counts live in the rebuilt directory; sum them from it rather than
-    // re-reading the inputs.
-    let mut total_records: u64 = 0;
-    for i in 0..block_count as usize {
-        let at = i * entry_len + 16; // offset(8) + comp_len(4) + raw_len(4)
-        total_records += (&dir_bytes[at..at + 4]).read_u32::<LittleEndian>()? as u64;
-    }
-
-    out.write_all_at(&dir_bytes, dir_offset_out)?;
+    out.write_all(&dir_bytes)?;
     let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
     footer.write_u64::<LittleEndian>(dir_offset_out)?;
     footer.write_u64::<LittleEndian>(dir_bytes.len() as u64)?;
     footer.write_u64::<LittleEndian>(block_count)?;
-    out.write_all_at(&footer, dir_offset_out + dir_bytes.len() as u64)?;
+    out.write_all(&footer)?;
     out.sync_all().context("fsync concat block file")?;
     Ok(total_records)
 }
