@@ -591,6 +591,17 @@ fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
             if let Some(v) = nd.patches.get(key) {
                 return Ok(Val::from_value(v.clone()));
             }
+            // Under a replace-all, or when this property was `REMOVE`d, the core value is
+            // gone. The anchor business key is the exception — it survives, seeded from
+            // the delta identity — so never read a core block for a dropped property.
+            if nd.replaced || nd.removed.contains(key) {
+                if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
+                    if kname.as_str() == key {
+                        return Ok(Val::from_value(kval));
+                    }
+                }
+                return Ok(Val::Null);
+            }
         }
         // A delta-born node (Phase 2c) has no core row: its only non-patch property is
         // the business key, recovered from the delta identity. Never read a core block
@@ -1665,17 +1676,29 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if delta.is_empty() {
             return;
         }
-        // A delta-born node (Phase 2c) starts from empty core props: seed its
-        // business-key property from the identity (it is not stored as a patch) before
-        // folding the patches over it.
-        if id >= self.gen.core_generation().node_count() {
+        let nd = delta.node_patch(id);
+        let replaced = nd.as_ref().is_some_and(|d| d.replaced);
+        let born = id >= self.gen.core_generation().node_count();
+        // A `SET n = {map}` replace-all discards every core-derived property.
+        if replaced {
+            named.clear();
+        }
+        // Seed the anchor business-key property from the delta identity (it is never
+        // stored as a patch) when the core props are not its source of truth: a
+        // delta-born node has no core row, and a replaced node just dropped it.
+        if born || replaced {
             if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
                 overlay_named(named, &kname, Val::from_value(kval));
             }
         }
-        let Some(nd) = delta.node_patch(id) else {
+        let Some(nd) = nd else {
             return;
         };
+        // Fold out removed properties (a no-op after a replace-all, which already
+        // cleared them). The anchor key is never in `removed` (the writer forbids it).
+        for name in &nd.removed {
+            named.retain(|(k, _)| k.as_str() != name.as_str());
+        }
         for (name, value) in &nd.patches {
             overlay_named(named, name, Val::from_value(value.clone()));
         }

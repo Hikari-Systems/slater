@@ -144,13 +144,20 @@ fn r_patches(r: &mut &[u8]) -> Result<(std::collections::BTreeMap<String, Value>
     Ok((patches, tombstoned))
 }
 
-/// Encode a node record body: `label ‖ key ‖ key-value ‖ delta`.
+/// Encode a node record body: `label ‖ key ‖ key-value ‖ delta`. The delta carries the
+/// shared `(tombstoned, patches)` image plus the `replaced` flag and `removed`
+/// property-name set (per-property removal + replace-all).
 fn encode_node(label: &str, key: &str, value: &Value, delta: &NodeDelta) -> Vec<u8> {
     let mut buf = Vec::new();
     w_str(&mut buf, label);
     w_str(&mut buf, key);
     write_value(&mut buf, value);
     w_patches(&mut buf, &delta.patches, delta.tombstoned);
+    buf.push(u8::from(delta.replaced));
+    write_uvarint(&mut buf, delta.removed.len() as u64);
+    for name in &delta.removed {
+        w_str(&mut buf, name);
+    }
     buf
 }
 
@@ -159,12 +166,24 @@ fn decode_node(mut r: &[u8]) -> Result<(String, String, Value, NodeDelta)> {
     let key = r_str(&mut r)?;
     let value = read_value(&mut r)?;
     let (patches, tombstoned) = r_patches(&mut r)?;
+    if r.is_empty() {
+        bail!("l0 offheap: short delta (missing replaced flag)");
+    }
+    let replaced = r[0] != 0;
+    r = &r[1..];
+    let n = read_uvarint(&mut r)? as usize;
+    let mut removed = std::collections::BTreeSet::new();
+    for _ in 0..n {
+        removed.insert(r_str(&mut r)?);
+    }
     Ok((
         label,
         key,
         value,
         NodeDelta {
             patches,
+            removed,
+            replaced,
             tombstoned,
         },
     ))

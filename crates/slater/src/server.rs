@@ -2664,7 +2664,7 @@ fn set_prop_items(
             SetItem::ReplaceMap(_) => {
                 return Err(Failure::new(
                     CODE_REQUEST,
-                    "SET n = {…} (replace all properties) is not yet supported".into(),
+                    "SET n = {…} (replace all) cannot be combined with other SET items".into(),
                 ))
             }
             SetItem::MergeMap(_) => {
@@ -2684,13 +2684,111 @@ fn set_prop_items(
     Ok(out)
 }
 
-/// `REMOVE` parses (Stage 1) but its durable primitives (property tombstone, label
-/// drop) land in Stages 3 and 5. Reject it with a clear message until then.
-fn unsupported_remove() -> Failure {
-    Failure::new(
-        CODE_REQUEST,
-        "REMOVE (drop a property or label) is not yet supported".into(),
-    )
+/// Build the durable node WAL op for a write statement, evaluating each value through
+/// `eval` (constant/parameter for a plain write, per-row for a write-`UNWIND`). Shared
+/// by the plain and batch paths so they cannot diverge. Stage 3 wires `SET n = {map}`
+/// to [`WalOp::ReplaceNode`] and `REMOVE n.p` to [`WalOp::RemoveNodeProps`]; the
+/// still-unimplemented `SET n += {map}` (Stage 4) and label mutations (Stage 5) are
+/// rejected with clear messages via [`set_prop_items`] / this function's REMOVE arm.
+fn build_node_wal_op(
+    stmt: &parser::ast::WriteStmt,
+    key_value: &Value,
+    eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
+) -> std::result::Result<WalOp, Failure> {
+    use parser::ast::{RemoveItem, SetItem, WriteOp};
+    let label = stmt.label.clone();
+    let key = stmt.key.clone();
+    let value = key_value.clone();
+    match &stmt.op {
+        // `SET n = {map}` — a single replace-all item lowers to `ReplaceNode`.
+        WriteOp::Set(items) if matches!(items.as_slice(), [SetItem::ReplaceMap(_)]) => {
+            let SetItem::ReplaceMap(map) = &items[0] else {
+                unreachable!("matched a single ReplaceMap item")
+            };
+            let patches = replace_map_patches(stmt, key_value, map, &eval)?;
+            Ok(WalOp::ReplaceNode {
+                label,
+                key,
+                value,
+                patches,
+            })
+        }
+        WriteOp::Set(items) => {
+            let props = set_prop_items(items)?;
+            let mut patches = Vec::with_capacity(props.len());
+            for (prop, expr) in props {
+                patches.push((prop.clone(), eval(expr, "a SET value")?));
+            }
+            Ok(WalOp::UpsertNode {
+                label,
+                key,
+                value,
+                patches,
+            })
+        }
+        WriteOp::Remove(items) => {
+            let mut props = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    RemoveItem::Prop(p) => {
+                        if p == &stmt.key {
+                            return Err(Failure::new(
+                                CODE_REQUEST,
+                                format!(
+                                    "cannot REMOVE the business-key property '{p}' — it is the \
+                                     node's identity"
+                                ),
+                            ));
+                        }
+                        props.push(p.clone());
+                    }
+                    RemoveItem::Labels(_) => {
+                        return Err(Failure::new(
+                            CODE_REQUEST,
+                            "REMOVE n:Label (drop a label) is not yet supported".into(),
+                        ))
+                    }
+                }
+            }
+            Ok(WalOp::RemoveNodeProps {
+                label,
+                key,
+                value,
+                props,
+            })
+        }
+        // A node DELETE tombstones the node; the topology overlay then suppresses its
+        // incident edges. DELETE conformance (Stage 2) — a plain DELETE of a connected
+        // node — is enforced by the caller after resolution.
+        WriteOp::Delete { .. } => Ok(WalOp::DeleteNode { label, key, value }),
+    }
+}
+
+/// Evaluate a `SET n = {map}` replace map into storable patches, enforcing that it does
+/// not touch the anchor business key: the key is the node's identity, re-seeded on read,
+/// so re-stating it with the same value is redundant (skipped) and a different value is
+/// rejected (an anchored write cannot change identity).
+fn replace_map_patches(
+    stmt: &parser::ast::WriteStmt,
+    key_value: &Value,
+    map: &[(String, parser::ast::Expr)],
+    eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
+) -> std::result::Result<Vec<(String, Value)>, Failure> {
+    let mut patches = Vec::with_capacity(map.len());
+    for (k, expr) in map {
+        let v = eval(expr, "a replace-map value")?;
+        if k == &stmt.key {
+            if v.cmp_key(key_value) != std::cmp::Ordering::Equal {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    format!("a replace map cannot change the business-key property '{k}'"),
+                ));
+            }
+            continue;
+        }
+        patches.push((k.clone(), v));
+    }
+    Ok(patches)
 }
 
 /// Whether node `id` still has any relationship over the merged view (core + the
@@ -2754,31 +2852,10 @@ fn execute_write(
         return execute_write_batch(writer, gen, stmt, params);
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
-    let op = match &stmt.op {
-        WriteOp::Set(items) => {
-            let props = set_prop_items(items)?;
-            let mut patches = Vec::with_capacity(props.len());
-            for (prop, expr) in props {
-                patches.push((prop.clone(), write_value(expr, params, "a SET value")?));
-            }
-            WalOp::UpsertNode {
-                label: stmt.label.clone(),
-                key: stmt.key.clone(),
-                value: key_value,
-                patches,
-            }
-        }
-        WriteOp::Remove(_) => return Err(unsupported_remove()),
-        // A node DELETE tombstones the node; the topology overlay then suppresses its
-        // incident edges. DELETE conformance (Stage 2): a *plain* DELETE of a node that
-        // still has relationships is rejected below — only DETACH DELETE removes them.
-        WriteOp::Delete { detach: _, .. } => WalOp::DeleteNode {
-            label: stmt.label.clone(),
-            key: stmt.key.clone(),
-            value: key_value,
-        },
-    };
-    let is_set = matches!(op, WalOp::UpsertNode { .. });
+    let op = build_node_wal_op(stmt, &key_value, |e, what| write_value(e, params, what))?;
+    // Every non-DELETE node op is "set-like": it addresses an existing node (or, under
+    // MERGE, creates one), never tombstones. That distinction routes `resolve_node_op`.
+    let is_set = !matches!(op, WalOp::DeleteNode { .. });
     let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
     // DELETE conformance: a plain (non-DETACH) DELETE errors if the node still has any
     // relationship. `resolved` is the node's dense id (a delete never returns `None`).
@@ -3009,7 +3086,6 @@ fn execute_write_batch(
             ))
         }
     };
-    let is_set = matches!(stmt.op, WriteOp::Set(_));
     let mut ops: Vec<(WalOp, OpResolution)> = Vec::with_capacity(rows.len());
     for row in &rows {
         let key_value = eval_row_value(
@@ -3019,30 +3095,10 @@ fn execute_write_batch(
             params,
             "the anchor business-key value",
         )?;
-        let op = match &stmt.op {
-            WriteOp::Set(items) => {
-                let props = set_prop_items(items)?;
-                let mut patches = Vec::with_capacity(props.len());
-                for (prop, expr) in props {
-                    patches.push((
-                        prop.clone(),
-                        eval_row_value(expr, var, row, params, "a SET value")?,
-                    ));
-                }
-                WalOp::UpsertNode {
-                    label: stmt.label.clone(),
-                    key: stmt.key.clone(),
-                    value: key_value,
-                    patches,
-                }
-            }
-            WriteOp::Remove(_) => return Err(unsupported_remove()),
-            WriteOp::Delete { detach: _, .. } => WalOp::DeleteNode {
-                label: stmt.label.clone(),
-                key: stmt.key.clone(),
-                value: key_value,
-            },
-        };
+        let op = build_node_wal_op(stmt, &key_value, |e, what| {
+            eval_row_value(e, var, row, params, what)
+        })?;
+        let is_set = !matches!(op, WalOp::DeleteNode { .. });
         let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
         // DELETE conformance, per row: a plain DELETE errors if the row's node still
         // has a relationship (the batch is all-DELETE or all-SET, so no edge this batch
@@ -5191,6 +5247,84 @@ mod tests {
             !present("Bob"),
             "Bob had no remaining edges, so plain DELETE worked"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Stage 3: `REMOVE n.p` drops a property, `SET n = {map}` replaces all
+    /// of them (the anchor business key survives), and touching the anchor key is
+    /// rejected — all read back through the live overlay.
+    #[test]
+    fn remove_and_replace_read_back_through_the_overlay() {
+        let (root, _g) = testgen::write_indexed_people("remove_replace_s3");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected a node write for {q:?}, got {other:?}"),
+            }
+        };
+        // A single property, read through the live overlay, rendered to a comparable
+        // string (`Val` has no `PartialEq`): `null` / `int:N` / `str:S`.
+        let prop = |name: &str, p: &str| -> String {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let q = format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.{p}");
+            let ast = parser::parse(&q).unwrap();
+            let mut rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            match rows.pop().map(|mut r| r.remove(0)).unwrap_or(Val::Null) {
+                Val::Null => "null".to_string(),
+                Val::Int(n) => format!("int:{n}"),
+                Val::Str(s) => format!("str:{s}"),
+                other => format!("other:{other:?}"),
+            }
+        };
+
+        // Seed Alice with a new property, then REMOVE it: the property reads back Null
+        // while an untouched core property (age) is unaffected.
+        run("MATCH (n:Person {name:'Alice'}) SET n.city = 'NYC'").unwrap();
+        assert_eq!(prop("Alice", "city"), "str:NYC");
+        run("MATCH (n:Person {name:'Alice'}) REMOVE n.city").unwrap();
+        assert_eq!(prop("Alice", "city"), "null", "REMOVE drops the property");
+        assert_eq!(
+            prop("Alice", "age"),
+            "int:30",
+            "an untouched core prop stands"
+        );
+
+        // Replace-all on Bob: a prior property (city) is wiped, `age` is replaced, and the
+        // anchor business key (name) survives even though the map omits it.
+        run("MATCH (n:Person {name:'Bob'}) SET n.city = 'LA'").unwrap();
+        run("MATCH (n:Person {name:'Bob'}) SET n = {age: 99}").unwrap();
+        assert_eq!(prop("Bob", "age"), "int:99", "replace-all set the new age");
+        assert_eq!(
+            prop("Bob", "city"),
+            "null",
+            "replace-all wiped the old city"
+        );
+        assert_eq!(
+            prop("Bob", "name"),
+            "str:Bob",
+            "the anchor business key survives a replace-all"
+        );
+
+        // The anchor key cannot be removed or changed by a write.
+        let e = run("MATCH (n:Person {name:'Carol'}) REMOVE n.name").unwrap_err();
+        assert!(e.message.contains("business-key"), "got: {}", e.message);
+        let e = run("MATCH (n:Person {name:'Carol'}) SET n = {name: 'X'}").unwrap_err();
+        assert!(e.message.contains("business-key"), "got: {}", e.message);
 
         std::fs::remove_dir_all(&root).ok();
     }

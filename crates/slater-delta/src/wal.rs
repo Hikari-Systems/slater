@@ -85,6 +85,8 @@ const OP_UPSERT_NODE: u8 = 1;
 const OP_DELETE_NODE: u8 = 2;
 const OP_UPSERT_EDGE: u8 = 3;
 const OP_DELETE_EDGE: u8 = 4;
+const OP_REMOVE_NODE_PROPS: u8 = 5;
+const OP_REPLACE_NODE: u8 = 6;
 
 /// A monotonic per-graph WAL sequence number.
 ///
@@ -128,6 +130,25 @@ pub enum WalOp {
         key: String,
         value: Value,
     },
+    /// Drop properties from the node identified by `(label, key, value)` (`REMOVE n.p`):
+    /// each named property is folded out of the core row on read and dropped at
+    /// consolidation. Last-writer-wins with [`WalOp::UpsertNode`] on the same key.
+    RemoveNodeProps {
+        label: String,
+        key: String,
+        value: Value,
+        /// The property names to remove, in source order.
+        props: Vec<String>,
+    },
+    /// Replace *all* properties of the node identified by `(label, key, value)`
+    /// (`SET n = {map}`): the core properties are ignored on read and the node carries
+    /// only `patches` afterwards (the anchor business key is re-seeded from identity).
+    ReplaceNode {
+        label: String,
+        key: String,
+        value: Value,
+        patches: Vec<(String, Value)>,
+    },
     /// Create (or, once edge properties land, patch) the relationship identified by
     /// `(src business key) -[reltype]-> (dst business key)` (Phase 3). A `MERGE`
     /// create; idempotent by edge identity. `patches` is reserved for edge-property
@@ -163,7 +184,13 @@ impl WalOp {
             WalOp::UpsertNode {
                 label, key, value, ..
             }
-            | WalOp::DeleteNode { label, key, value } => Some((label, key, value)),
+            | WalOp::DeleteNode { label, key, value }
+            | WalOp::RemoveNodeProps {
+                label, key, value, ..
+            }
+            | WalOp::ReplaceNode {
+                label, key, value, ..
+            } => Some((label, key, value)),
             WalOp::UpsertEdge { .. } | WalOp::DeleteEdge { .. } => None,
         }
     }
@@ -194,7 +221,10 @@ impl WalOp {
                 reltype,
                 (dst_label, dst_key, dst_value),
             )),
-            WalOp::UpsertNode { .. } | WalOp::DeleteNode { .. } => None,
+            WalOp::UpsertNode { .. }
+            | WalOp::DeleteNode { .. }
+            | WalOp::RemoveNodeProps { .. }
+            | WalOp::ReplaceNode { .. } => None,
         }
     }
 }
@@ -232,6 +262,37 @@ impl WalRecord {
                 write_str(buf, label);
                 write_str(buf, key);
                 write_value(buf, value);
+            }
+            WalOp::RemoveNodeProps {
+                label,
+                key,
+                value,
+                props,
+            } => {
+                buf.push(OP_REMOVE_NODE_PROPS);
+                write_str(buf, label);
+                write_str(buf, key);
+                write_value(buf, value);
+                write_uvarint(buf, props.len() as u64);
+                for p in props {
+                    write_str(buf, p);
+                }
+            }
+            WalOp::ReplaceNode {
+                label,
+                key,
+                value,
+                patches,
+            } => {
+                buf.push(OP_REPLACE_NODE);
+                write_str(buf, label);
+                write_str(buf, key);
+                write_value(buf, value);
+                write_uvarint(buf, patches.len() as u64);
+                for (prop, val) in patches {
+                    write_str(buf, prop);
+                    write_value(buf, val);
+                }
             }
             WalOp::UpsertEdge {
                 src_label,
@@ -311,6 +372,46 @@ impl WalRecord {
                 Ok(WalRecord {
                     seq,
                     op: WalOp::DeleteNode { label, key, value },
+                })
+            }
+            OP_REMOVE_NODE_PROPS => {
+                let label = read_str(r)?;
+                let key = read_str(r)?;
+                let value = read_value(r)?;
+                let n = read_uvarint(r)? as usize;
+                let mut props = Vec::with_capacity(n);
+                for _ in 0..n {
+                    props.push(read_str(r)?);
+                }
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::RemoveNodeProps {
+                        label,
+                        key,
+                        value,
+                        props,
+                    },
+                })
+            }
+            OP_REPLACE_NODE => {
+                let label = read_str(r)?;
+                let key = read_str(r)?;
+                let value = read_value(r)?;
+                let n = read_uvarint(r)? as usize;
+                let mut patches = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let prop = read_str(r)?;
+                    let val = read_value(r)?;
+                    patches.push((prop, val));
+                }
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::ReplaceNode {
+                        label,
+                        key,
+                        value,
+                        patches,
+                    },
                 })
             }
             OP_UPSERT_EDGE => {
@@ -651,6 +752,45 @@ mod tests {
             del.op.node_key(),
             Some(("Company", "ticker", &Value::Str("A".into())))
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_and_replace_node_ops_round_trip_through_a_segment() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_remrep_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let remove = WalRecord {
+            seq: Seq(1),
+            op: WalOp::RemoveNodeProps {
+                label: "Company".into(),
+                key: "ticker".into(),
+                value: Value::Str("A".into()),
+                props: vec!["price".into(), "sector".into()],
+            },
+        };
+        let replace = WalRecord {
+            seq: Seq(2),
+            op: WalOp::ReplaceNode {
+                label: "Company".into(),
+                key: "ticker".into(),
+                value: Value::Str("A".into()),
+                patches: vec![("name".into(), Value::Str("Acme".into()))],
+            },
+        };
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            sink.append(&remove).unwrap();
+            sink.append(&replace).unwrap();
+            sink.commit(Seq(2)).unwrap();
+        }
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![remove.clone(), replace.clone()]);
+        // Both are node ops — they expose the node business key, not edge keys.
+        assert_eq!(
+            remove.op.node_key(),
+            Some(("Company", "ticker", &Value::Str("A".into())))
+        );
+        assert!(replace.op.edge_keys().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 

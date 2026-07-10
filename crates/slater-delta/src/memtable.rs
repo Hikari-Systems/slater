@@ -33,7 +33,7 @@
 //! retires the delta). Phase 1 assumes one business identity per node (multi-key
 //! aliasing of the same physical node is out of scope until a later phase).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use graph_format::ids::Value;
@@ -44,14 +44,39 @@ use crate::interner::Interner;
 use crate::wal::WalOp;
 
 /// Per-node delta: property patches to fold last-writer-wins over the core row,
-/// plus a tombstone flag that suppresses the core row entirely on read.
+/// property removals, an optional replace-all, plus a tombstone flag that suppresses
+/// the core row entirely on read.
+///
+/// Effective properties on read = `(replaced ? {} : core) − removed + patches`.
+/// Invariant: a property name is in `patches` **xor** `removed` (a `SET` un-removes it,
+/// a `REMOVE` un-patches it). Under `replaced`, `removed` is redundant (the core is
+/// already ignored) but kept disjoint for the invariant.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NodeDelta {
     /// Property patches keyed by property **name**, last value wins.
     pub patches: BTreeMap<String, Value>,
+    /// Property names dropped by `REMOVE n.p`: folded out of the core row on read.
+    pub removed: BTreeSet<String>,
+    /// `SET n = {map}` — ignore *all* core properties; the effective set is `patches`
+    /// alone (plus the anchor business key, which the reader re-seeds from identity).
+    pub replaced: bool,
     /// If set, the node is deleted: the core row is suppressed on read and dropped
     /// at consolidation. (Wired in Phase 2.)
     pub tombstoned: bool,
+}
+
+/// The effective state of a core node's indexed property under the delta — the input
+/// to the range-index membership overlay ([`DeltaSnapshot::core_hit_survives_eq`] and
+/// friends). The core ISAM lists a node at its *original* value; this says whether that
+/// membership still holds, moved, or is gone.
+enum IndexState {
+    /// Unchanged by the delta — the core ISAM value stands.
+    Core,
+    /// A new patched value; the core ISAM membership must be recomputed against it.
+    Patched(Value),
+    /// The property is gone in the delta view (removed, or dropped by a replace-all
+    /// that did not re-set it) — the node no longer carries this indexed value.
+    Absent,
 }
 
 /// Per-edge delta, mirroring [`NodeDelta`] for relationship records (Phase 3):
@@ -125,7 +150,43 @@ impl NodeDelta {
     /// Whether this delta carries any information (a bare, empty, un-tombstoned
     /// delta is meaningless and should never be stored).
     pub fn is_meaningful(&self) -> bool {
-        self.tombstoned || !self.patches.is_empty()
+        self.tombstoned || self.replaced || !self.patches.is_empty() || !self.removed.is_empty()
+    }
+
+    /// Fold a *newer* level's delta onto `self` (the older, accumulated state),
+    /// newest-wins — the single source of truth for both the cross-level read fold
+    /// ([`DeltaSnapshot::node_patch`]) and L0 compaction ([`Memtable::merge_levels`]),
+    /// so the two can never disagree.
+    fn fold_newer(&mut self, newer: &NodeDelta) {
+        if newer.tombstoned {
+            // A newer delete removes the node and everything patched below it.
+            self.patches.clear();
+            self.removed.clear();
+            self.replaced = false;
+            self.tombstoned = true;
+            return;
+        }
+        self.tombstoned = false;
+        if newer.replaced {
+            // A newer replace-all wipes the below-level state; its patches are the base.
+            self.patches = newer.patches.clone();
+            self.removed.clear();
+            self.replaced = true;
+            return;
+        }
+        // Newer removes then patches, on top of the accumulated state. Under an already
+        // in-force `replaced`, dropping from `patches` suffices (the core is ignored);
+        // otherwise the drop is recorded in `removed` too.
+        for k in &newer.removed {
+            self.patches.remove(k);
+            if !self.replaced {
+                self.removed.insert(k.clone());
+            }
+        }
+        for (k, v) in &newer.patches {
+            self.removed.remove(k);
+            self.patches.insert(k.clone(), v.clone());
+        }
     }
 }
 
@@ -281,14 +342,19 @@ impl Memtable {
     /// patches the existing core node, an absent key creates a new one.
     ///
     /// Shared by live writes and WAL replay so the two paths cannot diverge.
-    pub fn upsert_node(
+    /// Get-or-create the entry for `(label, key, value)`, resurrecting a tombstone and
+    /// registering its dense id — the caller's `resolved` core id, or a freshly
+    /// allocated born synthetic id when the key is absent from the core. Returns the
+    /// canonical key so the caller can mutate `self.nodes[&ck].delta`. The shared
+    /// bookkeeping behind every node property mutator (`upsert_node`, `remove_node_props`,
+    /// `replace_node`), so they cannot drift on born-id allocation or tombstone counting.
+    fn touch_node_entry(
         &mut self,
         label: &str,
         key: &str,
         value: Value,
         resolved: Option<u64>,
-        patches: impl IntoIterator<Item = (String, Value)>,
-    ) {
+    ) -> Vec<u8> {
         let identity = NodeIdentity::new(
             self.interner.intern(label),
             self.interner.intern(key),
@@ -304,12 +370,8 @@ impl Memtable {
             delta: NodeDelta::default(),
             synthetic: None,
         });
-        // An upsert resurrects a tombstoned node (last-writer-wins at node level).
+        // A property write resurrects a tombstoned node (last-writer-wins at node level).
         let was_tombstoned = std::mem::replace(&mut entry.delta.tombstoned, false);
-        for (name, val) in patches {
-            self.bytes += name.len() + value_size(&val);
-            entry.delta.patches.insert(name, val);
-        }
         let already_synthetic = entry.synthetic;
         let label_sym = entry.identity.label;
         // A resurrect clears this level's tombstone. Only an entry that already had a
@@ -322,11 +384,11 @@ impl Memtable {
         }
         match resolved {
             Some(dense) => {
-                self.by_dense.insert(dense, ck);
+                self.by_dense.insert(dense, ck.clone());
             }
             // Delta-born: allocate one synthetic dense id per identity, once. A later
-            // upsert of the same key reuses it (and never re-pushes into `born`), so
-            // the synthetic id is stable for the delta's whole life.
+            // write of the same key reuses it (and never re-pushes into `born`), so the
+            // synthetic id is stable for the delta's whole life.
             None if already_synthetic.is_none() => {
                 let dense = self.synthetic_base + self.born.len() as u64;
                 self.born.push(ck.clone());
@@ -338,6 +400,81 @@ impl Memtable {
                 *self.born_label_counts.entry(label_sym).or_default() += 1;
             }
             None => {}
+        }
+        ck
+    }
+
+    pub fn upsert_node(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+        patches: impl IntoIterator<Item = (String, Value)>,
+    ) {
+        let ck = self.touch_node_entry(label, key, value, resolved);
+        let entry = self
+            .nodes
+            .get_mut(&ck)
+            .expect("touch_node_entry inserted it");
+        for (name, val) in patches {
+            self.bytes += name.len() + value_size(&val);
+            // A `SET x = v` overrides a prior `REMOVE x` (invariant: patches xor removed).
+            entry.delta.removed.remove(&name);
+            entry.delta.patches.insert(name, val);
+        }
+    }
+
+    /// Drop properties from the node identified by `(label, key, value)` (`REMOVE n.p`).
+    /// Each name is folded out of the core row on read and never emitted at
+    /// consolidation. `resolved` is the node's dense id (core, or a born synthetic id);
+    /// an absent key is a harmless no-op entry. Shared by live writes and WAL replay.
+    pub fn remove_node_props(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+        props: impl IntoIterator<Item = String>,
+    ) {
+        let ck = self.touch_node_entry(label, key, value, resolved);
+        let entry = self
+            .nodes
+            .get_mut(&ck)
+            .expect("touch_node_entry inserted it");
+        for name in props {
+            entry.delta.patches.remove(&name);
+            // Under an in-force replace-all the core is already ignored, so dropping from
+            // `patches` suffices; otherwise record the removal so the core prop is folded out.
+            if !entry.delta.replaced {
+                self.bytes += name.len();
+                entry.delta.removed.insert(name);
+            }
+        }
+    }
+
+    /// Replace *all* of a node's properties with `patches` (`SET n = {map}`): the core
+    /// properties are ignored on read and dropped at consolidation. `resolved` is the
+    /// node's dense id. Shared by live writes and WAL replay.
+    pub fn replace_node(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+        patches: impl IntoIterator<Item = (String, Value)>,
+    ) {
+        let ck = self.touch_node_entry(label, key, value, resolved);
+        let entry = self
+            .nodes
+            .get_mut(&ck)
+            .expect("touch_node_entry inserted it");
+        entry.delta.replaced = true;
+        entry.delta.removed.clear();
+        entry.delta.patches.clear();
+        for (name, val) in patches {
+            self.bytes += name.len() + value_size(&val);
+            entry.delta.patches.insert(name, val);
         }
     }
 
@@ -366,6 +503,8 @@ impl Memtable {
         });
         entry.delta.tombstoned = true;
         entry.delta.patches.clear();
+        entry.delta.removed.clear();
+        entry.delta.replaced = false;
         let already_synthetic = entry.synthetic;
         // Record the suppressed dense id. `resolved` is the core dense id, or a lower
         // level's born synthetic id (the writer substitutes it); `already_synthetic`
@@ -474,6 +613,24 @@ impl Memtable {
             (WalOp::DeleteNode { label, key, value }, OpResolution::Node(resolved)) => {
                 self.delete_node(label, key, value.clone(), resolved)
             }
+            (
+                WalOp::RemoveNodeProps {
+                    label,
+                    key,
+                    value,
+                    props,
+                },
+                OpResolution::Node(resolved),
+            ) => self.remove_node_props(label, key, value.clone(), resolved, props.iter().cloned()),
+            (
+                WalOp::ReplaceNode {
+                    label,
+                    key,
+                    value,
+                    patches,
+                },
+                OpResolution::Node(resolved),
+            ) => self.replace_node(label, key, value.clone(), resolved, patches.iter().cloned()),
             (
                 WalOp::UpsertEdge {
                     src_label,
@@ -1224,12 +1381,11 @@ impl Memtable {
                     label: label.to_string(),
                     key: key.to_string(),
                     value: entry.identity.value.clone(),
-                    patches: BTreeMap::new(),
-                    tombstoned: false,
+                    delta: NodeDelta::default(),
                     dense,
                 });
                 f.dense = dense;
-                fold_delta(&mut f.patches, &mut f.tombstoned, &entry.delta);
+                f.delta.fold_newer(&entry.delta);
             }
             for entry in seg.edges.values() {
                 let sl = seg.interner.name(entry.identity.src.label).unwrap_or("");
@@ -1285,27 +1441,18 @@ impl Memtable {
                 base_node + i as u64,
                 "born node ids must tile [base, base+n) — run not contiguous?"
             );
-            m.upsert_node(&f.label, &f.key, f.value.clone(), None, f.patches.clone());
-            if f.tombstoned {
-                m.delete_node(&f.label, &f.key, f.value.clone(), None);
-            }
+            // Allocate the synthetic id in order first (an empty upsert), then replay the
+            // full folded delta over it. A tombstoned born node still needs the id
+            // allocated (`delete_node` alone would not push it into `born`).
+            m.upsert_node(&f.label, &f.key, f.value.clone(), None, std::iter::empty());
+            replay_folded_node(&mut m, f, None);
         }
         // Core-resolved nodes (patched / tombstoned existing core rows), in dense-id
         // order so the merged memtable is deterministic (dense is unique per core node).
         let mut core: Vec<&FoldedNode> = fnodes.values().filter(|f| f.dense < base_node).collect();
         core.sort_by_key(|f| f.dense);
         for f in core {
-            if f.tombstoned {
-                m.delete_node(&f.label, &f.key, f.value.clone(), Some(f.dense));
-            } else {
-                m.upsert_node(
-                    &f.label,
-                    &f.key,
-                    f.value.clone(),
-                    Some(f.dense),
-                    f.patches.clone(),
-                );
-            }
+            replay_folded_node(&mut m, f, Some(f.dense));
         }
 
         // Born edges in ascending synthetic-edge-id order (endpoints resolved so none is
@@ -1428,7 +1575,7 @@ impl Memtable {
         for (ck, e) in nodes {
             w_bytes(&mut buf, ck);
             w_node_identity(&mut buf, &e.identity);
-            w_delta(&mut buf, &e.delta.patches, e.delta.tombstoned);
+            w_node_delta(&mut buf, &e.delta);
             w_opt_u64(&mut buf, e.synthetic);
         }
 
@@ -1483,16 +1630,13 @@ impl Memtable {
         for _ in 0..n_nodes {
             let ck = r_bytes(r)?;
             let identity = r_node_identity(r)?;
-            let (patches, tombstoned) = r_delta(r)?;
+            let delta = r_node_delta(r)?;
             let synthetic = r_opt_u64(r)?;
             nodes.insert(
                 ck,
                 NodeEntry {
                     identity,
-                    delta: NodeDelta {
-                        patches,
-                        tombstoned,
-                    },
+                    delta,
                     synthetic,
                 },
             );
@@ -1573,8 +1717,7 @@ struct FoldedNode {
     label: String,
     key: String,
     value: Value,
-    patches: BTreeMap<String, Value>,
-    tombstoned: bool,
+    delta: NodeDelta,
     dense: u64,
 }
 
@@ -1598,23 +1741,45 @@ struct FoldedEdge {
     core_edge_id: Option<u64>,
 }
 
-/// Fold one level's node/edge delta onto an accumulator newest-wins (the accumulator
-/// is the *older* state, `src` the newer): a newer tombstone clears the patches and
-/// tombstones; a newer upsert resurrects and its properties win per key. Matches
-/// [`DeltaSnapshot::node_patch`]'s across-levels merge.
-fn fold_delta(patches: &mut BTreeMap<String, Value>, tombstoned: &mut bool, src: &NodeDelta) {
-    if src.tombstoned {
-        patches.clear();
-        *tombstoned = true;
+/// Replay a folded node's net delta into the rebuilt memtable `m` at `resolved`
+/// (`Some(core dense)` for a core row, `None` for a born node whose id is already
+/// allocated). The inverse of [`NodeDelta::fold_newer`]: it reissues the mutator calls
+/// that reproduce the folded state (tombstone, replace-all, or upsert + removals).
+fn replay_folded_node(m: &mut Memtable, f: &FoldedNode, resolved: Option<u64>) {
+    let d = &f.delta;
+    if d.tombstoned {
+        m.delete_node(&f.label, &f.key, f.value.clone(), resolved);
+    } else if d.replaced {
+        m.replace_node(
+            &f.label,
+            &f.key,
+            f.value.clone(),
+            resolved,
+            d.patches.clone(),
+        );
     } else {
-        *tombstoned = false;
-        for (k, v) in &src.patches {
-            patches.insert(k.clone(), v.clone());
+        m.upsert_node(
+            &f.label,
+            &f.key,
+            f.value.clone(),
+            resolved,
+            d.patches.clone(),
+        );
+        if !d.removed.is_empty() {
+            m.remove_node_props(
+                &f.label,
+                &f.key,
+                f.value.clone(),
+                resolved,
+                d.removed.iter().cloned(),
+            );
         }
     }
 }
 
-/// Overload of [`fold_delta`] for an [`EdgeDelta`] (identical LWW semantics).
+/// Fold one level's edge delta onto an accumulator newest-wins (the accumulator is the
+/// *older* state, `src` the newer): a newer tombstone clears the patches and tombstones;
+/// a newer upsert resurrects and its properties win per key.
 fn fold_delta_edge(patches: &mut BTreeMap<String, Value>, tombstoned: &mut bool, src: &EdgeDelta) {
     if src.tombstoned {
         patches.clear();
@@ -1659,8 +1824,9 @@ fn edge_name_key(
     b
 }
 
-/// L0 segment body format version (see [`Memtable::serialise`]).
-const L0_FORMAT_VERSION: u64 = 1;
+/// L0 segment body format version (see [`Memtable::serialise`]). Bumped to 2 when the
+/// node delta gained per-property removals and the replace-all flag.
+const L0_FORMAT_VERSION: u64 = 2;
 
 fn w_str(buf: &mut Vec<u8>, s: &str) {
     write_uvarint(buf, s.len() as u64);
@@ -1750,6 +1916,33 @@ fn r_delta(r: &mut &[u8]) -> anyhow::Result<(BTreeMap<String, Value>, bool)> {
         patches.insert(k, v);
     }
     Ok((patches, tombstoned))
+}
+
+/// A node delta carries the shared `(tombstoned, patches)` image plus the L0-v2
+/// additions — the `replaced` flag and the `removed` property-name set.
+fn w_node_delta(buf: &mut Vec<u8>, d: &NodeDelta) {
+    w_delta(buf, &d.patches, d.tombstoned);
+    buf.push(d.replaced as u8);
+    write_uvarint(buf, d.removed.len() as u64);
+    for name in &d.removed {
+        w_str(buf, name);
+    }
+}
+
+fn r_node_delta(r: &mut &[u8]) -> anyhow::Result<NodeDelta> {
+    let (patches, tombstoned) = r_delta(r)?;
+    let replaced = read_u8(r)? != 0;
+    let n = read_uvarint(r)? as usize;
+    let mut removed = BTreeSet::new();
+    for _ in 0..n {
+        removed.insert(r_str(r)?);
+    }
+    Ok(NodeDelta {
+        patches,
+        removed,
+        replaced,
+        tombstoned,
+    })
 }
 
 fn w_dense_index(buf: &mut Vec<u8>, idx: &HashMap<u64, Vec<u8>>) {
@@ -2135,22 +2328,8 @@ impl DeltaSnapshot {
             };
             match &mut acc {
                 None => acc = Some(nd),
-                Some(a) => {
-                    if nd.tombstoned {
-                        // A newer delete removes the node and everything patched below
-                        // it (a tombstone carries no properties of its own).
-                        a.patches.clear();
-                        a.tombstoned = true;
-                    } else {
-                        // A newer upsert resurrects (if a tombstone sat below it, that
-                        // tombstone already cleared the accumulated patches) and its
-                        // property patches win over any surviving older ones.
-                        a.tombstoned = false;
-                        for (k, v) in nd.patches {
-                            a.patches.insert(k, v);
-                        }
-                    }
-                }
+                // Newest-wins fold across levels — the same logic L0 compaction uses.
+                Some(a) => a.fold_newer(&nd),
             }
         }
         acc
@@ -2391,27 +2570,45 @@ impl DeltaSnapshot {
     // only index *membership*. Born nodes are covered by `born_ids_in_index_*`; these
     // deal exclusively with core dense ids (`< synthetic_base`).
 
-    /// The **merged** patched value a core node presents for the indexed property
-    /// `prop` (newest level wins per property), or `None` if it is not patched on
-    /// `prop` (its core ISAM value stands) or is tombstoned (suppressed separately).
-    fn patched_index_value(&self, dense: u64, prop: &str) -> Option<Value> {
-        self.node_patch(dense)
-            .filter(|nd| !nd.tombstoned)
-            .and_then(|nd| nd.patches.get(prop).cloned())
+    /// The effective indexed value a core node presents for `prop` under the delta —
+    /// the three states the ISAM overlay must distinguish. The core ISAM lists the node
+    /// at its *original* value; this decides how the overlay corrects that membership.
+    fn effective_index_state(&self, dense: u64, prop: &str) -> IndexState {
+        let Some(nd) = self.node_patch(dense).filter(|nd| !nd.tombstoned) else {
+            return IndexState::Core;
+        };
+        if let Some(v) = nd.patches.get(prop) {
+            return IndexState::Patched(v.clone());
+        }
+        if nd.replaced || nd.removed.contains(prop) {
+            // The anchor business key survives a replace/remove: its core ISAM value —
+            // the immutable identity value — is still correct, so the core hit stands.
+            if self
+                .node_identity_by_dense(dense)
+                .is_some_and(|(_, kname, _)| kname == prop)
+            {
+                return IndexState::Core;
+            }
+            return IndexState::Absent;
+        }
+        IndexState::Core
     }
 
     /// Whether a core ISAM hit at an **equality** seek on `prop` survives the overlay.
-    /// A node whose patched value for `prop` moved *away* from `key` is dropped (the
-    /// ISAM still lists it at its stale original value); an unpatched hit always survives.
+    /// A node whose patched value for `prop` moved *away* from `key` is dropped, as is
+    /// one whose `prop` was removed or dropped by a replace-all (the ISAM still lists it
+    /// at its stale original value); an unpatched hit always survives.
     pub fn core_hit_survives_eq(&self, dense: u64, prop: &str, key: &Value) -> bool {
-        match self.patched_index_value(dense, prop) {
-            Some(v) => v.cmp_key(key) == std::cmp::Ordering::Equal,
-            None => true,
+        match self.effective_index_state(dense, prop) {
+            IndexState::Core => true,
+            IndexState::Patched(v) => v.cmp_key(key) == std::cmp::Ordering::Equal,
+            IndexState::Absent => false,
         }
     }
 
     /// Whether a core ISAM hit at a **range** seek on `prop` survives the overlay — its
-    /// patched value stays within `[lo, hi]`. An unpatched hit always survives.
+    /// effective value stays within `[lo, hi]`. A removed / replaced-away value drops the
+    /// hit; an unpatched hit always survives.
     #[allow(clippy::too_many_arguments)]
     pub fn core_hit_survives_range(
         &self,
@@ -2422,9 +2619,10 @@ impl DeltaSnapshot {
         hi: Option<&Value>,
         hi_inclusive: bool,
     ) -> bool {
-        match self.patched_index_value(dense, prop) {
-            Some(v) => value_in_range(&v, lo, lo_inclusive, hi, hi_inclusive),
-            None => true,
+        match self.effective_index_state(dense, prop) {
+            IndexState::Core => true,
+            IndexState::Patched(v) => value_in_range(&v, lo, lo_inclusive, hi, hi_inclusive),
+            IndexState::Absent => false,
         }
     }
 
@@ -2432,7 +2630,9 @@ impl DeltaSnapshot {
     /// nodes relocated *into* a range seek by a property patch (the core ISAM lists them
     /// at their old value). Candidates are unioned across levels (patched on `prop`,
     /// carrying `label`) and each is judged by its *merged* (newest-wins) value, so a
-    /// node patched across levels is decided once. Ascending (`BTreeSet`).
+    /// node patched across levels is decided once. A removed / replaced-away value never
+    /// moves *into* a seek (its effective state is `Absent`), so it is filtered out.
+    /// Ascending (`BTreeSet`).
     fn moved_core_ids_in_index(
         &self,
         label: &str,
@@ -2444,7 +2644,9 @@ impl DeltaSnapshot {
             cand.extend(level.core_ids_patched_on_index(label, prop));
         }
         cand.into_iter()
-            .filter(|&d| self.patched_index_value(d, prop).is_some_and(|v| pred(&v)))
+            .filter(
+                |&d| matches!(self.effective_index_state(d, prop), IndexState::Patched(v) if pred(&v)),
+            )
             .collect()
     }
 
@@ -2619,8 +2821,18 @@ mod tests {
         let t = NodeDelta {
             patches: BTreeMap::new(),
             tombstoned: true,
+            ..NodeDelta::default()
         };
         assert!(t.is_meaningful());
+        // Removal-only and replace-only deltas are meaningful too.
+        let mut rem = NodeDelta::default();
+        rem.removed.insert("x".into());
+        assert!(rem.is_meaningful());
+        let repl = NodeDelta {
+            replaced: true,
+            ..NodeDelta::default()
+        };
+        assert!(repl.is_meaningful());
     }
 
     #[test]
@@ -2698,6 +2910,185 @@ mod tests {
         direct.delete_node("L", "k", Value::Int(3), Some(9));
         assert_eq!(viae.node_patch(9), direct.node_patch(9));
         assert!(viae.node_patch(9).unwrap().tombstoned);
+    }
+
+    #[test]
+    fn apply_remove_and_replace_match_direct_calls() {
+        // WAL-replay (`apply`) and the direct mutators must not diverge — REMOVE.
+        let mut viae = Memtable::new();
+        viae.apply(
+            &WalOp::RemoveNodeProps {
+                label: "L".into(),
+                key: "k".into(),
+                value: Value::Int(3),
+                props: vec!["a".into(), "b".into()],
+            },
+            OpResolution::Node(Some(9)),
+        );
+        let mut direct = Memtable::new();
+        direct.remove_node_props(
+            "L",
+            "k",
+            Value::Int(3),
+            Some(9),
+            ["a".to_string(), "b".into()],
+        );
+        assert_eq!(viae.node_patch(9), direct.node_patch(9));
+        let d = viae.node_patch(9).unwrap();
+        assert!(d.removed.contains("a") && d.removed.contains("b"));
+        assert!(!d.replaced && !d.tombstoned);
+
+        // …and REPLACE.
+        let mut viae = Memtable::new();
+        viae.apply(
+            &WalOp::ReplaceNode {
+                label: "L".into(),
+                key: "k".into(),
+                value: Value::Int(3),
+                patches: vec![("name".into(), Value::Str("x".into()))],
+            },
+            OpResolution::Node(Some(9)),
+        );
+        let mut direct = Memtable::new();
+        direct.replace_node(
+            "L",
+            "k",
+            Value::Int(3),
+            Some(9),
+            [("name".to_string(), Value::Str("x".into()))],
+        );
+        assert_eq!(viae.node_patch(9), direct.node_patch(9));
+        let d = viae.node_patch(9).unwrap();
+        assert!(d.replaced);
+        assert_eq!(d.patches.get("name"), Some(&Value::Str("x".into())));
+    }
+
+    #[test]
+    fn set_and_remove_maintain_the_patches_xor_removed_invariant() {
+        let mut m = Memtable::new();
+        m.upsert_node(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            [("p".to_string(), Value::Int(7))],
+        );
+        // REMOVE p: it leaves `patches` and enters `removed`.
+        m.remove_node_props("L", "k", Value::Int(1), Some(0), ["p".to_string()]);
+        let d = m.node_patch(0).unwrap();
+        assert!(!d.patches.contains_key("p") && d.removed.contains("p"));
+        // SET p again: it leaves `removed` and re-enters `patches`.
+        m.upsert_node(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            [("p".to_string(), Value::Int(9))],
+        );
+        let d = m.node_patch(0).unwrap();
+        assert_eq!(d.patches.get("p"), Some(&Value::Int(9)));
+        assert!(!d.removed.contains("p"));
+    }
+
+    #[test]
+    fn replace_then_remove_folds_across_levels() {
+        // Level 0 (oldest): patch a core node with two props.
+        let mut l0 = Memtable::new();
+        l0.upsert_node(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            [
+                ("a".to_string(), Value::Int(1)),
+                ("b".to_string(), Value::Int(2)),
+            ],
+        );
+        // Level 1: replace-all with {c}. Below-level props (a, b) are wiped.
+        let mut l1 = Memtable::new();
+        l1.replace_node(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            [("c".to_string(), Value::Int(3))],
+        );
+        // Level 2 (newest): remove c.
+        let mut l2 = Memtable::new();
+        l2.remove_node_props("L", "k", Value::Int(1), Some(0), ["c".to_string()]);
+
+        // Fold through the read snapshot: active memtable = l2 (newest), L0 = [l1, l0]
+        // newest-first.
+        let snap = DeltaSnapshot::with_levels(
+            Arc::new(l2.clone()),
+            vec![
+                Arc::new(l1.clone()) as Arc<dyn LevelRead>,
+                Arc::new(l0.clone()) as Arc<dyn LevelRead>,
+            ],
+        );
+        let d = snap.node_patch(0).expect("core node has a folded delta");
+        assert!(
+            d.replaced,
+            "the replace-all is still in force below the removal"
+        );
+        assert!(
+            d.patches.is_empty(),
+            "c was removed; a/b were wiped by the replace"
+        );
+
+        // L0 compaction must reproduce the identical folded state (newest-first input),
+        // and it must survive an L0 v2 serialise round-trip.
+        let merged = Memtable::merge_levels(&[&l2, &l1, &l0]);
+        let restored = Memtable::deserialise(&merged.serialise()).unwrap();
+        let dm = restored.node_patch(0).unwrap();
+        assert!(dm.replaced && dm.patches.is_empty());
+    }
+
+    #[test]
+    fn core_isam_hit_survival_reflects_remove_and_replace() {
+        let a = || Value::Str("A".into());
+        let tech = Value::Str("Tech".into());
+
+        // Unpatched core node → its core ISAM value stands (survives).
+        let snap = DeltaSnapshot::from_memtable(Arc::new(Memtable::new()));
+        assert!(snap.core_hit_survives_eq(0, "sector", &tech));
+
+        // REMOVE sector → the stale core ISAM hit at "Tech" is dropped.
+        let mut m = Memtable::new();
+        m.remove_node_props("Company", "ticker", a(), Some(0), ["sector".to_string()]);
+        let snap = DeltaSnapshot::from_memtable(Arc::new(m));
+        assert!(
+            !snap.core_hit_survives_eq(0, "sector", &tech),
+            "a removed indexed property drops the core ISAM hit"
+        );
+
+        // SET n = {name: 'Acme'} (replace-all, sector not re-set) → sector hit dropped,
+        // the patched `name` relocates, and the anchor business key still survives.
+        let mut m = Memtable::new();
+        m.replace_node(
+            "Company",
+            "ticker",
+            a(),
+            Some(0),
+            [("name".to_string(), Value::Str("Acme".into()))],
+        );
+        let snap = DeltaSnapshot::from_memtable(Arc::new(m));
+        assert!(
+            !snap.core_hit_survives_eq(0, "sector", &tech),
+            "replace-all drops an indexed property it did not re-set"
+        );
+        assert!(
+            snap.core_hit_survives_eq(0, "name", &Value::Str("Acme".into())),
+            "a replace-set indexed property relocates to its new value"
+        );
+        assert!(
+            !snap.core_hit_survives_eq(0, "name", &Value::Str("Other".into())),
+            "…and is missed at any other value"
+        );
+        assert!(
+            snap.core_hit_survives_eq(0, "ticker", &a()),
+            "the anchor business key survives a replace-all"
+        );
     }
 
     #[test]
