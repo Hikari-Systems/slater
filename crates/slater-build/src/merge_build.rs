@@ -28,6 +28,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,6 +37,7 @@ use graph_format::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use graph_format::columns::{decode_props, encode_props_record};
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{BlockId, Value};
+use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
 use graph_format::nodelabels::encode_labels_record;
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
@@ -970,16 +972,28 @@ impl KeyProv {
 /// partition file is itself sorted by that key — exactly the "one" side the parallel
 /// per-partition merge-join in [`resolve_edges`] consumes. Returns the distinct-node
 /// count. (prov ids are still assigned in global identity order, so deterministic.)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dedup_nodes(
     node_merge_bkt: &Path,
     remaps: &[ShardRemap],
     nodes_out: &Path,
     node_keys_out: &Path,
     scratch_dir: &Path,
-    sort_budget: usize,
+    mem: &Arc<MemoryBudget>,
     zstd_level: i32,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<u64> {
-    let mut sorter = ExtSorter::<NodeMergeRec>::new(scratch_dir, sort_budget, zstd_level)?;
+    // Two sub-steps with very different shapes; label them so `--diagnostics` can
+    // attribute this phase's serial time to one or the other.
+    diag.set_op("scan + sort node MERGEs", "merges", 0);
+    diag.set_active_workers(1);
+    // The one sorter live in this phase, so it takes the whole budget: a big buffer
+    // forms few runs, and the k-way merge holds one decompressed block per run.
+    let mut sorter = ExtSorter::<NodeMergeRec>::new(
+        scratch_dir,
+        mem.reserve_now("dedup node sorter", mem.available(), MIN_SORT_BYTES)?,
+        zstd_level,
+    )?;
     let mut seq = 0u64;
     for (si, seg) in segments(node_merge_bkt).into_iter().enumerate() {
         let rm = remaps.get(si);
@@ -999,10 +1013,13 @@ pub(crate) fn dedup_nodes(
             }
             nm.seq = seq;
             seq += 1;
+            diag.tick(seq);
             sorter.push(nm)
         })?;
     }
 
+    diag.set_op("fold props, write node bucket + key stream", "nodes", 0);
+    diag.set_active_workers(1);
     let mut nodes_w = BucketWriter::create(nodes_out, BUCKET_BLOCK, zstd_level)?;
     // One key-stream file per hash partition; each ends up sorted by (label,key,value)
     // because the drain visits identities in that global order.
@@ -1046,6 +1063,7 @@ pub(crate) fn dedup_nodes(
 
     for r in sorter.sorted()? {
         let nm = r?;
+        diag.tick(prov);
         let same = matches!(&cur, Some((l, k, v))
             if *l == nm.label && *k == nm.key && value_cmp_exact(v, &nm.value) == Ordering::Equal);
         if !same {
@@ -1323,21 +1341,28 @@ pub(crate) fn resolve_edges(
     node_keys: &Path,
     edge_out: &Path,
     scratch_dir: &Path,
-    sort_budget: usize,
+    mem: &Arc<MemoryBudget>,
     threads: usize,
     zstd_level: i32,
 ) -> Result<u64> {
     let nthreads = threads.max(1);
-    // Per-partition sort budget: at most `nthreads` partitions hold an ExtSorter live at
-    // once, so divide to keep total resident ≈ sort_budget (as emit.topology does).
+    // Re-lend the whole budget to this phase's partition workers, who then contend for
+    // slices of it among themselves. Each worker holds its slice for one partition and
+    // returns it, so a worker that cannot be funded parks on a peer rather than
+    // over-committing — and if not even one can be funded, `reserve` says so and the
+    // build fails instead of hanging.
+    //
     // These sorters use `new_inline` (spill on the partition worker, not the shared
     // pool): they already run `nthreads`-wide, so parallel spill buys no cores here and
     // would only multiply each sorter's run count — and hence the k-way merge's
     // `#runs × RUN_BLOCK_BYTES` resident footprint — by `spill_threads()+1`, which is
     // what drove the resolve phase far past its budget at graph scale.
-    let part_budget = (sort_budget / nthreads).max(8 << 20);
+    let pool = mem
+        .reserve_now("resolve partition pool", mem.available(), MIN_SORT_BYTES)?
+        .into_sub_budget();
+    let part_want = (pool.total() / nthreads).max(MIN_SORT_BYTES);
     let batch_threshold =
-        (sort_budget / 64 / (RESOLVE_PARTS * nthreads).max(1)).clamp(16 << 10, 1 << 20);
+        (mem.total() / 64 / (RESOLVE_PARTS * nthreads).max(1)).clamp(16 << 10, 1 << 20);
     let ep_base = scratch_dir.join("ep_part.bkt");
     let pay_base = scratch_dir.join("pay_part.bkt");
     let res_base = scratch_dir.join("res_part.bkt");
@@ -1449,8 +1474,11 @@ pub(crate) fn resolve_edges(
     // ── stage 1: resolve each value-partition by merge-join, repartition by edge_seq ─
     let res_spill = PartSpill::new(&res_base, zstd_level)?;
     par_partitions(nthreads, |p| {
-        let mut sorter =
-            ExtSorter::<EndpointRef>::new_inline(scratch_dir, part_budget, zstd_level)?;
+        let mut sorter = ExtSorter::<EndpointRef>::new_inline(
+            scratch_dir,
+            pool.reserve("endpoint-ref sorter", part_want, MIN_SORT_BYTES)?,
+            zstd_level,
+        )?;
         let rdr = BlockFileReader::open(seg_path(&ep_base, p as u64))?;
         rdr.for_each_record(|_, rec| {
             let mut s = rec;
@@ -1498,14 +1526,18 @@ pub(crate) fn resolve_edges(
     // ── stage 2: reassemble each edge-partition (pair src/dst + payload), repart by triple ─
     let ef_spill = PartSpill::new(&ef_base, zstd_level)?;
     par_partitions(nthreads, |q| {
+        // Both sorters are drained together below, so both are resident at once.
+        // Take ONE slice of the pool and split it, rather than reserving twice —
+        // see `Reservation::split_off`.
+        let mut res_grant = pool.reserve("reassembly sorters", part_want, MIN_SORT_BYTES)?;
+        let pay_grant = res_grant.split_off(res_grant.bytes() / 2);
         let mut res_sorter =
-            ExtSorter::<ResolvedEndpoint>::new_inline(scratch_dir, part_budget, zstd_level)?;
+            ExtSorter::<ResolvedEndpoint>::new_inline(scratch_dir, res_grant, zstd_level)?;
         BlockFileReader::open(seg_path(&res_base, q as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             res_sorter.push(ResolvedEndpoint::decode(&mut s)?)
         })?;
-        let mut pay_sorter =
-            ExtSorter::<Payload>::new_inline(scratch_dir, part_budget, zstd_level)?;
+        let mut pay_sorter = ExtSorter::<Payload>::new_inline(scratch_dir, pay_grant, zstd_level)?;
         BlockFileReader::open(seg_path(&pay_base, q as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             pay_sorter.push(Payload::decode(&mut s)?)
@@ -1552,7 +1584,11 @@ pub(crate) fn resolve_edges(
     let counts: Vec<AtomicU64> = (0..RESOLVE_PARTS).map(|_| AtomicU64::new(0)).collect();
     let counts_r = &counts;
     par_partitions(nthreads, |t| {
-        let mut sorter = ExtSorter::<EdgeFinal>::new_inline(scratch_dir, part_budget, zstd_level)?;
+        let mut sorter = ExtSorter::<EdgeFinal>::new_inline(
+            scratch_dir,
+            pool.reserve("edge-dedup sorter", part_want, MIN_SORT_BYTES)?,
+            zstd_level,
+        )?;
         BlockFileReader::open(seg_path(&ef_base, t as u64))?.for_each_record(|_, rec| {
             let mut s = rec;
             sorter.push(EdgeFinal::decode(&mut s)?)

@@ -1099,3 +1099,114 @@ meta and read back at open — otherwise the reused path would serve the pre-mer
 blocks. The hot read path and every per-entity payload are fully off-heap. `#![forbid(unsafe_code)]` holds
 throughout (`pread`, no mmap). No L0 back-compat obligation (segments are ephemeral between flush and
 consolidation). See `docs/WRITABLE-PROGRESS.md` §"Off-heap L0 reads" and `~/.claude/plans/offheap-l0.md`.
+
+### D56 — A filesystem-only generation records BLAKE3 only; SHA-256/CRC32C are for object stores
+`crates/graph-format/src/integrity.rs`, `crates/slater-build/src/common.rs`, `crates/slater-build/src/main.rs`.
+The MANIFEST recorded three digests per file — BLAKE3 (canonical content hash), base64 SHA-256 (S3's
+`x-amz-checksum-sha256`) and base64 CRC32C (GCS's `crc32c`) — for **every** build. The two object
+checksums exist for exactly one purpose: so a generation *served from an object store* can be verified
+against the store's server-computed checksum from a metadata `HEAD`, with no body read. A generation
+that lives on a filesystem is verified by re-hashing its bytes with BLAKE3 and has no use for either.
+
+They are not free. SHA-256 has no tree structure, so it cannot be parallelised within a file and runs
+at roughly one core's throughput; at 91.6M nodes it *was* the `publish` phase — 1.0 min at 99% CPU for
+100% of its samples, reading 23.4 GB at 411 MB/s, which is about where a single SHA-256 core saturates.
+So SHA-256 and CRC32C are now computed only when `--store` is set (the build publishes to an object
+store) or `--object-checksums` is passed (the generation is bound for one by other means, e.g. `aws s3
+cp`). `FileEntry::sha256` / `::crc32c` were already `Option` and `skip_serializing_if = "Option::is_none"`,
+so a filesystem MANIFEST simply omits both keys.
+
+**This changes `MANIFEST.json` for filesystem builds but *not* the content hash** — which
+`docs/BUILD-PERF-PLAN.md` predicted it would, wrongly. `content_hash` is a digest over the inventory's
+`(name, blake3)` pairs only (`integrity::content_hash`, `Manifest::verify_content_hash`), and the BLAKE3
+values are unchanged; `MANIFEST.json` is not itself in the inventory. So the omitted `sha256`/`crc32c`
+keys are invisible to it. Verified: a 1M Wikidata build before and after this change both hash to
+`6cbc6508cfb33d9e70bb1e7ca7c7a88073c5f18b55a9b9b87037eaee007ea638`. **No re-baseline was needed**, and
+the 91.6M fixed point `5e8e7307…` still stands. `emit_determinism.rs` (build-twice, compare bytes) is
+invariant either way.
+
+The cost of the trade is bounded and known: a generation built without `--object-checksums`, then
+hand-copied to S3/GCS, falls back to that backend's size-only completeness check (`Content-Length`
+vs the manifest's byte count) instead of a content-grade checksum comparison — an S3 PUT is atomic, so
+a present, right-sized object is a complete one. `--object-checksums` restores the strong check for
+anyone who wants it, at the old price. BLAKE3 itself is unaffected and still covers every file; the
+`rayon` feature plus an 8 MiB read buffer (was 64 KiB) let `Hasher::update_rayon` fan a single large
+file across the pool, which matters because `topology.csr.blk` alone is ~71% of a generation's bytes.
+
+### D57 — Block sealing (zstd + AEAD) runs on a shared pool, bounded globally, drained in block order
+`crates/graph-format/src/blockfile.rs`.
+`BlockFileWriter::flush_block` compressed — and, for an encrypted generation, AEAD-sealed — each full
+block **inline, on whichever thread appended the record that filled it**. Every `.blk` file in a
+generation goes through this writer, so a build phase whose shape is "read a sorted stream on one
+thread, write it back out" was really measuring *one core's zstd throughput*. Per-op diagnostics at 1M
+nodes named four of them: `cluster`'s `route adjacency into stripes` (2.7s at 116% CPU), `dedup`'s
+drain (84%), `emit.node_stores`' drain (99%), and `emit.topology`'s stitch (79%).
+
+Sealing now goes to a shared, bounded worker pool (`SLATER_BLOCKFILE_SEAL_THREADS`, default
+`--threads`; `1` restores the inline path as an escape hatch). The appending thread hands off a full raw
+block and keeps filling the next; workers seal concurrently; the appending thread drains the
+**contiguous completed prefix** in block order and writes it. Blocks that finish early wait their turn,
+so block boundaries, block contents, directory order and file bytes are all independent of the order
+workers finish in. zstd is deterministic for a given `(input, level)`, so an unencrypted file is
+byte-identical to the serial path — verified: a 1M Wikidata build hashes to `6cbc6508…` before and
+after. (An encrypted file was never byte-reproducible: each block takes a fresh random nonce.)
+
+The in-flight cap is **global, not per-writer**, which is the load-bearing choice. A single thread can
+hold many writers open at once — `cluster` routes into 1,398 stripe files, one `BlockFileWriter` each —
+so a per-writer allowance would multiply by 1,398. One counted semaphore over `seal_threads × 2` blocks
+bounds the pipeline's resident bytes to ~16 MB at the default 256 KiB block regardless of how many
+writers are live. `BlockId`s are handed out from a `next_block` counter rather than `dir.len()`, since
+the directory now lags the submission point by whatever is in flight.
+
+Measured at 1M nodes / 12.2M edges (16 cores, `--threads 14`): total build **30.6s → 24.4s**, with
+`emit.node_stores`' drain 0.9s@99% → 0.5s@243%, `cluster`'s route 2.7s@116% → 2.0s@164%, and
+`emit.topology`'s forward band pass 5.6s → 3.8s. The residual serial time in `cluster`'s route is the
+k-way merge *decompressing* run blocks on the consuming thread — the read side, not the write side.
+
+### D58 — `--max-memory` is arbitrated by one accountant, and sorters budget *resident* bytes
+`crates/graph-format/src/membudget.rs`, `crates/graph-format/src/extsort.rs`, `crates/slater-build/src/*`.
+`--max-memory` was a number every consumer helped itself to a fraction of: two posting sorters took
+`/16` each, every range index another `/16`, each band worker `/16/threads`. Nothing held the whole
+number, so nothing noticed when the fractions summed past it — a 4 GiB cap peaked at 8.06 GB, with 20.1%
+of all diagnostic samples above the cap.
+
+`MemoryBudget` is the missing arbiter: a counted semaphore over the cap handing out RAII `Reservation`s,
+granting `min(want, free)`. Two grant modes, and the difference is a liveness argument. `reserve_now`
+never blocks and fails when less than `floor` is free — for long-lived reservations taken on one thread,
+where a blocking wait could only deadlock against the caller's own earlier grants. `reserve` blocks, and
+is sound only where another holder is guaranteed to release: a worker pool drawing from
+`Reservation::into_sub_budget()`, each worker holding one slice per work item. A `floor` above the whole
+cap can never be satisfied, so it fails loudly rather than parking. `Reservation::split_off` exists
+because `resolve`'s stage 2 holds two sorters at once, and reserving twice inside a pool would let every
+worker take its first slice and then wait forever for a second.
+
+**The subtle half.** An accountant is only as honest as the estimates it is handed. `ExtSorter` sized its
+buffer with `SortRecord::size_hint()`, whose contract is *"an estimate of the **encoded** size"* — the
+run-file cost. `EndpointRef` reports 24 bytes and occupies 56 resident (its `Value` alone is 32); a `Vec`
+holds up to twice the elements it has. The old `/16/threads` fractions were small enough (~18 MB per
+sorter) that the 3-4× under-count never mattered. Granting the real budget multiplied it: the first
+full-scale run of this change put `resolve` at **15.11 GB against 4.29 GB reserved**. So `SortRecord`
+grew `resident_hint()` (`size_of::<Self>() + size_hint()`), and `push` budgets
+`buf.capacity() * size_of::<R>() + heap_bytes`. `resolve`'s peak fell to 5.62 GB and `dedup`'s from
+4.89 GB to 1.53 GB. The bug was *found* by the `budget_reserved_bytes` counter this decision added
+alongside `rss_bytes` — divergence between the two is exactly the bug it exists to show.
+
+A pool sorter's spill mode is a property of the data, not the code: `ExtSorter::new_for_pool(…,
+saturated)`. At 91.6M nodes `emit.topology` runs 88 bands over 14 workers, so the shared spill pool can
+hand a band no extra cores and splitting its reservation across in-flight buffers would only multiply its
+run count (the merge holds one decompressed block per run) — inline is right. At 1M nodes there is
+exactly **one** band, and inline left 13 cores idle (`emit.topology` 6.5s → 9.95s). The caller passes
+`nbands >= threads`.
+
+**Measured, full 91.6M / 1.49B rebuild, 4 GiB cap, `--threads 14`.** Peak **reserved** is 4.29 GB =
+**1.00× the cap** — the accountant provably never overcommits. Samples above 2× the cap: **0.0%** (was
+20.1% above the cap outright). Content hash unchanged at `5e8e7307…`.
+
+**What is still not bounded, and why.** Peak *RSS* is 8.29 GB = 1.93× the cap, so the plan's "≤1.25×"
+target is **not** met. The gap is not live memory. `emit.topology`'s `stitch` step holds **6.25 GB
+resident against 0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files —
+it allocates almost nothing. `emit reverse CSR per band` sits 4.7 GB above its reservation, and `EdgeRev`
+owns no heap at all. What remains is glibc arena retention: 14 worker threads that churned ~1.5B small
+`props_blob` allocations, freed into per-thread arenas that are never returned to the OS. The fix is
+`malloc_trim` at phase boundaries and/or `mallopt(M_ARENA_MAX)` — the server already ships an idle-gated
+`malloc_trim` (v0.9.0) for the same reason. Deliberately deferred, not forgotten.

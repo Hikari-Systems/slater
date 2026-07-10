@@ -177,6 +177,17 @@ struct Cli {
     #[arg(long, default_value = "4g", value_parser = parse_size)]
     max_memory: u64,
 
+    /// Also record each file's SHA-256 and CRC32C in the MANIFEST. These let a
+    /// generation served from S3/GCS be verified against the store's own object
+    /// checksum without reading the bodies, and are computed automatically whenever
+    /// the build publishes to an object store. Pass this when the generation will be
+    /// copied to a store by other means (`aws s3 cp`, rsync-then-upload): without
+    /// them, the store backend falls back to a size-only completeness check. Costs
+    /// wall clock — SHA-256 is the slowest digest of the three and cannot be
+    /// parallelised within a file.
+    #[arg(long)]
+    object_checksums: bool,
+
     /// Scratch directory for the external build's spill files. Defaults to a
     /// `.slater-scratch-<gen>` under the graph directory; removed on success.
     #[arg(long)]
@@ -521,6 +532,7 @@ fn main() -> Result<()> {
         pq_subspaces: cli.pq_subspaces,
         pq_bits: cli.pq_bits,
         max_memory_bytes: cli.max_memory as usize,
+        object_checksums: cli.object_checksums,
         temp_dir: cli.temp_dir.clone(),
         cluster: cli.cluster,
         cluster_passes: cli.cluster_passes,
@@ -535,6 +547,7 @@ fn main() -> Result<()> {
         .num_threads(threads)
         .build_global();
     graph_format::extsort::configure_spill_threads(threads);
+    graph_format::blockfile::configure_seal_threads(threads);
 
     let data_dir = PathBuf::from(&cli.data_dir);
     let mut diag = make_diag(&cli, &data_dir)?;

@@ -27,13 +27,16 @@
 //! touches the file — only the nonces do (D28). Reading is decrypt-then-
 //! decompress on a cache miss; the cache therefore holds plaintext bytes.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::codec;
@@ -67,6 +70,175 @@ struct DirEntry {
     nonce: Option<[u8; NONCE_LEN]>,
 }
 
+// ── parallel block sealing ───────────────────────────────────────────────────
+//
+// Sealing a block — zstd-compress it, then AEAD-encrypt it when the generation is
+// encrypted — is pure CPU, and it ran inline on whichever thread appended the
+// record that filled the block. That made a single-threaded producer the ceiling
+// for several build phases that are otherwise cheap: `cluster`'s stripe routing,
+// `dedup`'s drain, `emit.node_stores`' drain. All three read a sorted stream on one
+// thread and write it back out, so all three were really measuring one core's zstd
+// throughput (measured: 84–116% CPU across the whole phase).
+//
+// So the seal moves to a shared, bounded pool. The appending thread hands off a full
+// raw block and keeps filling the next; workers seal blocks concurrently; the
+// appending thread then drains *in block order* and writes whatever contiguous
+// prefix has completed. Block boundaries, block contents and directory order are all
+// unchanged, and zstd is deterministic for a given (input, level) — so the emitted
+// file is byte-identical to the serial path. (An encrypted file was never
+// byte-reproducible anyway: each block takes a fresh random nonce.)
+//
+// Memory is bounded by a *global* in-flight cap rather than a per-writer one,
+// because a single thread can hold many writers open at once — `cluster` routes into
+// 1,398 stripe files — and a per-writer allowance would multiply by that.
+
+/// One queued seal: compress (+encrypt) a raw block, executed on a pool worker.
+type SealJob = Box<dyn FnOnce() + Send + 'static>;
+
+static SEAL_POOL: OnceLock<Sender<SealJob>> = OnceLock::new();
+
+/// Blocks submitted-but-not-yet-written across every live writer. Caps the raw +
+/// sealed bytes the seal pipeline can hold: `cap × target_block_bytes × 2`, so ~16 MB
+/// at the default 256 KiB block and 32 permits.
+static INFLIGHT: OnceLock<Inflight> = OnceLock::new();
+
+/// Caller-configured seal-worker cap (`0` = unset), set once from `--threads`.
+static CONFIGURED_SEAL_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the block-seal worker cap. Must be called before the first `BlockFileWriter`;
+/// later calls are ignored once the pool has started. `SLATER_BLOCKFILE_SEAL_THREADS`
+/// overrides it; `1` restores the original inline-seal behaviour.
+pub fn configure_seal_threads(n: usize) {
+    CONFIGURED_SEAL_THREADS.store(n.max(1), AtomicOrdering::Relaxed);
+}
+
+fn seal_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SLATER_BLOCKFILE_SEAL_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or_else(
+                || match CONFIGURED_SEAL_THREADS.load(AtomicOrdering::Relaxed) {
+                    0 => std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4),
+                    n => n,
+                },
+            )
+            .clamp(1, 64)
+    })
+}
+
+/// A counted semaphore over in-flight blocks.
+struct Inflight {
+    held: Mutex<usize>,
+    cv: Condvar,
+    cap: usize,
+}
+
+impl Inflight {
+    fn acquire(&self) {
+        let mut h = self.held.lock().unwrap();
+        while *h >= self.cap {
+            h = self.cv.wait(h).unwrap();
+        }
+        *h += 1;
+    }
+    fn release(&self) {
+        *self.held.lock().unwrap() -= 1;
+        self.cv.notify_one();
+    }
+}
+
+fn inflight() -> &'static Inflight {
+    INFLIGHT.get_or_init(|| Inflight {
+        held: Mutex::new(0),
+        cv: Condvar::new(),
+        cap: (seal_threads() * 2).max(2),
+    })
+}
+
+fn seal_pool() -> &'static Sender<SealJob> {
+    SEAL_POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<SealJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..seal_threads() {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name("slater-blockfile-seal".into())
+                .spawn(move || loop {
+                    // Hold the lock only to dequeue; run the job unlocked.
+                    let job = { rx.lock().unwrap().recv() };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break, // sender dropped (never, in practice)
+                    }
+                })
+                .expect("spawn blockfile seal worker");
+        }
+        tx
+    })
+}
+
+/// A block that has been sealed but not yet written, awaiting its turn in block order.
+struct Sealed {
+    stored: Vec<u8>,
+    raw_len: u32,
+    rec_count: u32,
+    nonce: Option<[u8; NONCE_LEN]>,
+}
+
+/// One writer's in-flight seals. Workers insert by block index; the appending thread
+/// pops the contiguous prefix and writes it.
+struct SealState {
+    done: Mutex<BTreeMap<usize, Sealed>>,
+    cv: Condvar,
+    pending: Mutex<usize>,
+    pending_cv: Condvar,
+    err: Mutex<Option<anyhow::Error>>,
+}
+
+impl SealState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            done: Mutex::new(BTreeMap::new()),
+            cv: Condvar::new(),
+            pending: Mutex::new(0),
+            pending_cv: Condvar::new(),
+            err: Mutex::new(None),
+        })
+    }
+    fn drain(&self) {
+        let mut p = self.pending.lock().unwrap();
+        while *p > 0 {
+            p = self.pending_cv.wait(p).unwrap();
+        }
+    }
+    fn take_err(&self) -> Option<anyhow::Error> {
+        self.err.lock().unwrap().take()
+    }
+}
+
+/// Compress and (optionally) seal one raw block. The unit of pool work.
+fn seal_block(
+    raw: &[u8],
+    level: i32,
+    cipher: Option<&BlockCipher>,
+) -> Result<(Vec<u8>, Option<[u8; NONCE_LEN]>)> {
+    let comp = codec::compress(raw, level)?;
+    // On-disk bytes are the compressed block, sealed with the AEAD when a cipher is
+    // configured. `comp_len` then counts ciphertext (+16 tag).
+    match cipher {
+        Some(cipher) => {
+            let nonce = BlockCipher::random_nonce();
+            let sealed = cipher.encrypt(&nonce, &comp)?;
+            Ok((sealed, Some(nonce)))
+        }
+        None => Ok((comp, None)),
+    }
+}
+
 /// Streaming writer that packs records into compressed blocks.
 pub struct BlockFileWriter {
     file: BufWriter<File>,
@@ -79,6 +251,13 @@ pub struct BlockFileWriter {
     /// When set, each compressed block is sealed with this cipher under a fresh
     /// per-block nonce before it is written.
     cipher: Option<Arc<BlockCipher>>,
+    /// Index of the next block to *submit* for sealing. Not `dir.len()`: blocks are
+    /// sealed out of order, so `dir` lags behind by whatever is in flight.
+    next_block: usize,
+    /// Index of the next block to *write*. `dir.len()` always equals this.
+    next_write: usize,
+    /// In-flight seals, or `None` when sealing runs inline (a single seal worker).
+    seal: Option<Arc<SealState>>,
 }
 
 impl BlockFileWriter {
@@ -128,13 +307,16 @@ impl BlockFileWriter {
             cur_offsets: vec![0],
             cur_data: Vec::new(),
             cipher,
+            next_block: 0,
+            next_write: 0,
+            seal: (seal_threads() > 1).then(SealState::new),
         })
     }
 
     /// Append a record and return its location. Records are packed into the
     /// current block until it reaches the target size, then the block is flushed.
     pub fn append_record(&mut self, record: &[u8]) -> Result<RecordLoc> {
-        let block = BlockId(self.dir.len() as u32);
+        let block = BlockId(self.next_block as u32);
         let slot = (self.cur_offsets.len() - 1) as u32;
         self.cur_data.extend_from_slice(record);
         self.cur_offsets.push(self.cur_data.len() as u32);
@@ -144,9 +326,11 @@ impl BlockFileWriter {
         Ok(RecordLoc { block, slot })
     }
 
-    fn flush_block(&mut self) -> Result<()> {
+    /// Serialise the current block's records into one raw buffer and reset the
+    /// accumulators. Returns `None` when there is nothing pending.
+    fn take_raw_block(&mut self) -> Result<Option<(Vec<u8>, u32)>> {
         if self.cur_data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let count = (self.cur_offsets.len() - 1) as u32;
         let mut raw = Vec::with_capacity(4 + self.cur_offsets.len() * 4 + self.cur_data.len());
@@ -155,37 +339,125 @@ impl BlockFileWriter {
             raw.write_u32::<LittleEndian>(*off)?;
         }
         raw.extend_from_slice(&self.cur_data);
-
-        let comp = codec::compress(&raw, self.level)?;
-        // On-disk bytes are the compressed block, sealed with the AEAD when a
-        // cipher is configured. `comp_len` then counts ciphertext (+16 tag).
-        let (stored, nonce) = match &self.cipher {
-            Some(cipher) => {
-                let nonce = BlockCipher::random_nonce();
-                let sealed = cipher.encrypt(&nonce, &comp)?;
-                (sealed, Some(nonce))
-            }
-            None => (comp, None),
-        };
-        self.file.write_all(&stored)?;
-        self.dir.push(DirEntry {
-            offset: self.offset,
-            comp_len: stored.len() as u32,
-            raw_len: raw.len() as u32,
-            rec_count: count,
-            nonce,
-        });
-        self.offset += stored.len() as u64;
         self.cur_offsets.clear();
         self.cur_offsets.push(0);
         self.cur_data.clear();
+        Ok(Some((raw, count)))
+    }
+
+    /// Write one sealed block at the current offset and record its directory entry.
+    fn write_sealed(&mut self, b: Sealed) -> Result<()> {
+        self.file.write_all(&b.stored)?;
+        self.dir.push(DirEntry {
+            offset: self.offset,
+            comp_len: b.stored.len() as u32,
+            raw_len: b.raw_len,
+            rec_count: b.rec_count,
+            nonce: b.nonce,
+        });
+        self.offset += b.stored.len() as u64;
+        self.next_write += 1;
         Ok(())
+    }
+
+    /// Write every sealed block that is now contiguous with `next_write`. Blocks that
+    /// finished early sit in `done` until their predecessors land, so the file's block
+    /// order — and therefore its bytes — never depends on the order workers finish in.
+    fn drain_ready(&mut self) -> Result<()> {
+        let state = match &self.seal {
+            Some(s) => Arc::clone(s),
+            None => return Ok(()),
+        };
+        loop {
+            let next = {
+                let mut done = state.done.lock().unwrap();
+                match done.remove(&self.next_write) {
+                    Some(b) => b,
+                    None => break,
+                }
+            };
+            self.write_sealed(next)?;
+        }
+        if let Some(e) = state.take_err() {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> Result<()> {
+        let Some((raw, count)) = self.take_raw_block()? else {
+            return Ok(());
+        };
+        let idx = self.next_block;
+        self.next_block += 1;
+
+        let Some(state) = self.seal.as_ref().map(Arc::clone) else {
+            // Inline: the original single-threaded behaviour.
+            let (stored, nonce) = seal_block(&raw, self.level, self.cipher.as_deref())?;
+            return self.write_sealed(Sealed {
+                stored,
+                raw_len: raw.len() as u32,
+                rec_count: count,
+                nonce,
+            });
+        };
+
+        // Bound the pipeline before submitting: at most `cap` blocks across every live
+        // writer are un-written at once, so 1,398 concurrently-open stripe writers cost
+        // the same as one.
+        inflight().acquire();
+        *state.pending.lock().unwrap() += 1;
+        let level = self.level;
+        let cipher = self.cipher.clone();
+        let st = Arc::clone(&state);
+        let submitted = seal_pool().send(Box::new(move || {
+            let raw_len = raw.len() as u32;
+            match seal_block(&raw, level, cipher.as_deref()) {
+                Ok((stored, nonce)) => {
+                    st.done.lock().unwrap().insert(
+                        idx,
+                        Sealed {
+                            stored,
+                            raw_len,
+                            rec_count: count,
+                            nonce,
+                        },
+                    );
+                }
+                Err(e) => {
+                    let mut slot = st.err.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(e);
+                    }
+                }
+            }
+            inflight().release();
+            let mut p = st.pending.lock().unwrap();
+            *p -= 1;
+            st.pending_cv.notify_all();
+            st.cv.notify_all();
+        }));
+        if submitted.is_err() {
+            inflight().release();
+            *state.pending.lock().unwrap() -= 1;
+            return Err(anyhow!("blockfile seal pool unavailable"));
+        }
+        self.drain_ready()
     }
 
     /// Flush the final block, write the directory and footer, and return the
     /// number of blocks written.
     pub fn finish(mut self) -> Result<u64> {
         self.flush_block()?;
+        // Every block is submitted; wait for the stragglers and write the tail in order.
+        if let Some(state) = self.seal.as_ref().map(Arc::clone) {
+            state.drain();
+            if let Some(e) = state.take_err() {
+                return Err(e);
+            }
+            self.drain_ready()?;
+            debug_assert!(state.done.lock().unwrap().is_empty());
+        }
         let entry_len = if self.cipher.is_some() {
             DIR_ENTRY_LEN_ENC
         } else {
@@ -504,9 +776,21 @@ impl BlockFileReader {
     /// Visit every block once, in ascending order, decompressed exactly once,
     /// using a bounded concurrent read-ahead so a remote backend overlaps its
     /// fetch round-trips. `f` receives `(block_index, raw_block_bytes)`.
-    pub fn for_each_block(&self, mut f: impl FnMut(usize, &[u8]) -> Result<()>) -> Result<()> {
-        let n = self.dir.len();
-        let mut bi = 0;
+    pub fn for_each_block(&self, f: impl FnMut(usize, &[u8]) -> Result<()>) -> Result<()> {
+        self.for_each_block_in(0, self.dir.len(), f)
+    }
+
+    /// [`for_each_block`](BlockFileReader::for_each_block) restricted to blocks
+    /// `[b_lo, b_hi)`. Disjoint block ranges share no state, so callers may drive
+    /// several concurrently over one reader.
+    pub fn for_each_block_in(
+        &self,
+        b_lo: usize,
+        b_hi: usize,
+        mut f: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let n = b_hi.min(self.dir.len());
+        let mut bi = b_lo;
         while bi < n {
             let hi = (bi + Self::SCAN_READAHEAD).min(n);
             // Fetch this window's stored bytes — concurrently on a remote backend
@@ -538,13 +822,47 @@ impl BlockFileReader {
     /// remote backend overlaps its fetch round-trips.
     ///
     /// [`for_each_block`]: BlockFileReader::for_each_block
-    pub fn for_each_record(&self, mut f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
-        self.for_each_block(|bi, raw| {
+    pub fn for_each_record(&self, f: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        self.for_each_record_in(0, self.total_records(), f)
+    }
+
+    /// [`for_each_record`](BlockFileReader::for_each_record) restricted to global
+    /// record indices `[lo, hi)`, decompressing only the blocks that hold them.
+    ///
+    /// This is the primitive a *parallel* whole-file sweep is built from: shard the
+    /// record space into contiguous ranges and give each worker one. Blocks straddling
+    /// a range boundary are decompressed by both neighbours (at most one block of
+    /// duplicated work per boundary); everything else is decompressed exactly once, so
+    /// the total zstd work is the same as the serial scan. Records outside `[lo, hi)`
+    /// are skipped without being handed to `f`, so each record is visited by exactly
+    /// one worker.
+    pub fn for_each_record_in(
+        &self,
+        lo: u64,
+        hi: u64,
+        mut f: impl FnMut(u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let total = self.total_records();
+        let (lo, hi) = (lo.min(total), hi.min(total));
+        if lo >= hi {
+            return Ok(());
+        }
+        let b_lo = self.locate(lo)?.block.index();
+        // `hi` is exclusive, so the last block we need is the one holding `hi - 1`.
+        let b_hi = self.locate(hi - 1)?.block.index() + 1;
+        self.for_each_block_in(b_lo, b_hi, |bi, raw| {
             let (offsets, data) = parse_block(raw)?;
             let start = self.block_start[bi];
             for slot in 0..self.dir[bi].rec_count {
+                let global = start + slot as u64;
+                if global < lo {
+                    continue;
+                }
+                if global >= hi {
+                    break;
+                }
                 let rec = record_from_block(&offsets, data, slot)?;
-                f(start + slot as u64, rec)?;
+                f(global, rec)?;
             }
             Ok(())
         })
@@ -806,6 +1124,85 @@ mod tests {
         let r = BlockFileReader::open_with_cipher(&path, Some(wrong)).unwrap();
         let err = r.read_record_global(0).unwrap_err();
         assert!(err.to_string().contains("wrong key"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `for_each_record_in` is what makes a parallel whole-file sweep possible, so
+    /// the contract it has to keep is: partition the record space into contiguous
+    /// ranges, and every record is visited by exactly one range, in ascending order.
+    /// Boundaries deliberately fall inside blocks here (records per block ≫ 1).
+    #[test]
+    fn ranged_record_scan_partitions_the_file_exactly_once() {
+        let path = tmp("range_scan");
+        let n = 500u64;
+        let mut w = BlockFileWriter::create(&path, 256, 3).unwrap();
+        for i in 0..n {
+            w.append_record(format!("rec{i:04}").as_bytes()).unwrap();
+        }
+        let blocks = w.finish().unwrap();
+        assert!(blocks > 4, "want a multi-block file, got {blocks}");
+
+        let r = BlockFileReader::open(&path).unwrap();
+        assert_eq!(r.total_records(), n);
+
+        // Four contiguous ranges whose bounds do not align to block starts.
+        let bounds = [0u64, 137, 250, 401, n];
+        let mut seen: Vec<u64> = Vec::new();
+        for w in bounds.windows(2) {
+            let (lo, hi) = (w[0], w[1]);
+            let mut local = Vec::new();
+            r.for_each_record_in(lo, hi, |g, rec| {
+                assert_eq!(rec, format!("rec{g:04}").as_bytes(), "wrong record at {g}");
+                local.push(g);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(local, (lo..hi).collect::<Vec<_>>(), "range [{lo},{hi})");
+            seen.extend(local);
+        }
+        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "not an exact partition");
+
+        // Degenerate and clamped ranges are silent no-ops, not errors.
+        let mut hits = 0;
+        r.for_each_record_in(10, 10, |_, _| {
+            hits += 1;
+            Ok(())
+        })
+        .unwrap();
+        r.for_each_record_in(n, n + 50, |_, _| {
+            hits += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(hits, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The parallel seal pipeline drains in block order, so a file written through it
+    /// must read back with its records in append order and its blocks intact — even
+    /// when workers finish out of order (many small blocks make that likely).
+    #[test]
+    fn parallel_sealing_preserves_record_order() {
+        let path = tmp("seal_order");
+        let n = 5_000u64;
+        let mut w = BlockFileWriter::create(&path, 512, 3).unwrap();
+        for i in 0..n {
+            w.append_record(format!("{i:08}").as_bytes()).unwrap();
+        }
+        let blocks = w.finish().unwrap();
+        assert!(blocks > 50, "want many blocks so seals race, got {blocks}");
+
+        let r = BlockFileReader::open(&path).unwrap();
+        assert_eq!(r.total_records(), n);
+        let mut next = 0u64;
+        r.for_each_record(|g, rec| {
+            assert_eq!(g, next);
+            assert_eq!(rec, format!("{g:08}").as_bytes());
+            next += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(next, n);
         let _ = std::fs::remove_file(&path);
     }
 

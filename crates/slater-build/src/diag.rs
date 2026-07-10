@@ -594,6 +594,7 @@ fn collect_sample(inner: &Inner, prev: &mut Option<(Instant, f64, IoCounters)>) 
         progress_pct: (total > 0).then(|| done as f64 / total as f64 * 100.0),
         active_workers: inner.memo.active_workers.load(Ordering::Relaxed),
         rss_bytes: rss,
+        budget_reserved_bytes: graph_format::membudget::global_reserved_bytes(),
         cgroup_mem_current_bytes: cgroup_mem_current(),
         cgroup_mem_limit_bytes: cgroup_mem_limit(),
         cpu_seconds_total: cpu,
@@ -627,6 +628,11 @@ struct Sample {
     active_workers: u64,
     // memory
     rss_bytes: Option<u64>,
+    /// Bytes the [`MemoryBudget`](graph_format::membudget::MemoryBudget) has lent
+    /// out right now. Read this beside `rss_bytes`: the budget is what the build
+    /// *believes* it is spending, RSS is what it actually holds. A phase where RSS
+    /// climbs while this stays flat is spending memory nobody reserved.
+    budget_reserved_bytes: u64,
     cgroup_mem_current_bytes: Option<u64>,
     cgroup_mem_limit_bytes: Option<u64>,
     // cpu

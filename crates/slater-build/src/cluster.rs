@@ -18,11 +18,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use anyhow::{bail, Result};
 use rayon::prelude::*;
 
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::extsort::{ExtSorter, SortRecord};
+use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
 use graph_format::wire::{read_uvarint, write_uvarint};
 
 const UNASSIGNED: u32 = u32::MAX;
@@ -50,8 +53,9 @@ pub struct ClusterParams {
     pub passes: u32,
     /// Target node records per partition (≈ one output block's worth).
     pub block_capacity: u32,
-    /// Memory budget for the adjacency external sort.
-    pub mem_budget: usize,
+    /// The build's memory accountant. The adjacency external sort and the O(N)
+    /// partition maps both reserve from it.
+    pub budget: Arc<MemoryBudget>,
     pub temp_dir: PathBuf,
     pub zstd_level: i32,
     /// Worker cap for the parallel restreaming passes (does not affect the result).
@@ -120,6 +124,7 @@ pub fn build_permutation<E>(
     node_count: u64,
     params: &ClusterParams,
     scan_edges: E,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<Permutation>
 where
     E: Fn(&mut dyn FnMut(u64, u64) -> Result<()>) -> Result<()>,
@@ -142,7 +147,7 @@ where
     // Budget guard: the two node→partition maps (double-buffered for the parallel
     // restreaming passes) are the large residents.
     let part_bytes = (n as u128) * 8;
-    if part_bytes > params.mem_budget as u128 {
+    if part_bytes > params.budget.total() as u128 {
         bail!(
             "ldg node→partition maps need {} MiB which exceeds the build memory budget; \
              use --cluster=none or raise --max-memory",
@@ -164,43 +169,68 @@ where
         ))
     };
     {
-        // Give the adjacency sort the full `mem_budget`. This is a *single*,
+        // Give the adjacency sort the whole budget. This is a *single*,
         // non-concurrent `ExtSorter`, and its run-formation buffers never coexist with
         // the O(n) permutation maps — this block scope closes (dropping the sorter)
         // before `part_prev`/`part_next` are allocated below. So the phase peak is
-        // max(sort, maps), not their sum, and the sort may safely use the whole budget.
+        // max(sort, maps), not their sum, and the sort may safely take everything.
         //
-        // The `/16` `sort_budget` convention in build_external.rs exists for phases that
+        // The `/16` `sort_budget` convention this once followed exists for phases that
         // run *many* concurrent `ExtSorter`s (per band / per partition / per thread) and
         // must share one budget between them. Applying it here was a misdiagnosis: it
         // shrank the run-formation buffer ~16×, which multiplied the run count by the
         // same factor, and the k-way merge holds one decompressed block per run — so a
         // starved budget *raised* both peak RSS and wall time. Full budget ⇒ few runs ⇒
         // a cheap single-pass merge.
-        let mut sorter =
-            ExtSorter::<AdjPair>::new(&params.temp_dir, params.mem_budget, params.zstd_level)?;
+        diag.set_op("build undirected adjacency (external sort)", "edges", 0);
+        diag.set_active_workers(1);
+        let mut sorter = ExtSorter::<AdjPair>::new(
+            &params.temp_dir,
+            params.budget.reserve_now(
+                "ldg adjacency sort",
+                params.budget.available(),
+                MIN_SORT_BYTES,
+            )?,
+            params.zstd_level,
+        )?;
+        let mut pushed = 0u64;
         scan_edges(&mut |s, d| {
             if s != d {
                 sorter.push(AdjPair { node: s, nbr: d })?;
                 sorter.push(AdjPair { node: d, nbr: s })?;
+                pushed += 1;
+                diag.tick(pushed);
             }
             Ok(())
         })?;
+        diag.set_op("route adjacency into stripes", "adjacencies", pushed * 2);
+        diag.set_active_workers(1);
         let mut writers: Vec<BlockFileWriter> = (0..nstripes)
             .map(|s| BlockFileWriter::create(stripe_adj(s), ADJ_BLOCK_BYTES, params.zstd_level))
             .collect::<Result<_>>()?;
         let mut buf = Vec::new();
+        let mut routed = 0u64;
         for rec in sorter.sorted()? {
             let a = rec?;
             let s = (a.node / STRIPE_NODES) as usize;
             buf.clear();
             a.encode(&mut buf);
             writers[s].append_record(&buf)?;
+            routed += 1;
+            diag.tick(routed);
         }
         for w in writers {
             w.finish()?;
         }
     }
+
+    // The permutation maps are the phase's other large resident. Reserve them so the
+    // accountant's total tracks what is actually held, not just what the sorters took.
+    let _maps = params.budget.reserve_now(
+        "ldg partition maps",
+        part_bytes as usize,
+        part_bytes as usize,
+    )?;
 
     // 2) Block-parallel restreaming LDG. Double-buffer the partition map: each pass
     //    reads the frozen previous assignment (so stripes are independent) and writes
@@ -223,7 +253,9 @@ where
         .num_threads(params.threads.max(1))
         .build()?;
     let run = (|| -> Result<()> {
-        for _ in 0..params.passes.max(1) {
+        for pass in 0..params.passes.max(1) {
+            diag.set_op(&format!("ldg pass {pass}"), "nodes", node_count);
+            diag.set_active_workers(params.threads.max(1) as u64);
             let mut load_prev = vec![0u32; p];
             for &pp in &part_prev {
                 if pp != UNASSIGNED {
@@ -260,6 +292,8 @@ where
 
     // Final assignment is in `part_prev` (post-swap). Place any still-unassigned
     // (edge-less) node round-robin for balance, then lay partitions out consecutively.
+    diag.set_op("build final permutation", "nodes", node_count);
+    diag.set_active_workers(1);
     let mut load = vec![0u32; p];
     let mut rr = 0usize;
     for slot in part_prev.iter_mut() {
@@ -373,7 +407,7 @@ mod tests {
             mode,
             passes: 4,
             block_capacity: cap,
-            mem_budget: 1 << 28,
+            budget: MemoryBudget::new(1 << 28),
             temp_dir: dir.to_path_buf(),
             zstd_level: 1,
             threads: 4,
@@ -429,8 +463,20 @@ mod tests {
             }
             Ok(())
         };
-        let p1 = build_permutation(n, &params(ClusterMode::Ldg, 50, &dir), scan).unwrap();
-        let p2 = build_permutation(n, &params(ClusterMode::Ldg, 50, &dir), scan).unwrap();
+        let p1 = build_permutation(
+            n,
+            &params(ClusterMode::Ldg, 50, &dir),
+            scan,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
+        let p2 = build_permutation(
+            n,
+            &params(ClusterMode::Ldg, 50, &dir),
+            scan,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
 
         // Bijection on 0..n.
         let mut seen = vec![false; n as usize];
@@ -460,9 +506,20 @@ mod tests {
             Ok(())
         };
         let cap = 50u64;
-        let none =
-            build_permutation(n, &params(ClusterMode::None, cap as u32, &dir), scan).unwrap();
-        let ldg = build_permutation(n, &params(ClusterMode::Ldg, cap as u32, &dir), scan).unwrap();
+        let none = build_permutation(
+            n,
+            &params(ClusterMode::None, cap as u32, &dir),
+            scan,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
+        let ldg = build_permutation(
+            n,
+            &params(ClusterMode::Ldg, cap as u32, &dir),
+            scan,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
 
         let none_cut = cut(&edges, &none, cap);
         let ldg_cut = cut(&edges, &ldg, cap);
@@ -480,7 +537,13 @@ mod tests {
     fn none_mode_is_identity() {
         let dir = tmp("none");
         let scan = |_: &mut dyn FnMut(u64, u64) -> Result<()>| Ok(());
-        let p = build_permutation(10, &params(ClusterMode::None, 4, &dir), scan).unwrap();
+        let p = build_permutation(
+            10,
+            &params(ClusterMode::None, 4, &dir),
+            scan,
+            &crate::diag::BuildDiag::disabled(),
+        )
+        .unwrap();
         assert!(p.is_identity());
         for i in 0..10 {
             assert_eq!(p.final_of(i), i);

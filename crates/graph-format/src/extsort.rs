@@ -5,8 +5,8 @@
 //! order range-index `(value, id)` pairs (for streaming ISAM), none of which fit
 //! in RAM at graph scale.
 //!
-//! A caller pushes records; whenever the in-RAM buffer reaches the budget it is
-//! sorted and spilled to a **run file** (a plain [`crate::blockfile`] block
+//! A caller pushes records; whenever the in-RAM buffer reaches its reservation it
+//! is sorted and spilled to a **run file** (a plain [`crate::blockfile`] block
 //! container — already streaming, compressed and self-describing, so no new
 //! on-disk format is needed). `sorted()` then returns an iterator that merges all
 //! runs with a min-heap, holding one decoded record + one decompressed block per
@@ -15,6 +15,10 @@
 //!
 //! Run files are transient and **never encrypted** — they live under a build-local
 //! temp dir and are unlinked when the sort is done (or the sorter is dropped).
+//!
+//! A sorter's working bytes come from a [`MemoryBudget`](crate::membudget::MemoryBudget)
+//! reservation, not from a number the caller made up: several sorters are live at
+//! once in most build phases, and only an arbiter can keep their sum under the cap.
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use crate::ids::BlockId;
+use crate::membudget::Reservation;
 
 /// Target raw block size for spilled run files. Independent of the generation's
 /// block size — runs are transient scratch, not part of the published image.
@@ -46,9 +51,9 @@ static SORTER_SEQ: AtomicU64 = AtomicU64::new(0);
 // a total order, so the merged output is identical regardless of the order runs
 // complete in.
 //
-// Memory faithfulness: each sorter splits its byte budget across (max_inflight + 1)
-// smaller buffers, so peak resident bytes per sorter stay ≈ `budget_bytes` — just
-// more, smaller runs (a slightly larger but still single-pass merge heap).
+// Memory faithfulness: each sorter splits its reservation across (max_inflight + 1)
+// smaller buffers, so peak resident bytes per sorter stay ≈ what it was granted —
+// just more, smaller runs (a slightly larger but still single-pass merge heap).
 
 /// One queued spill: sort + write, executed on a pool worker.
 type SpillJob = Box<dyn FnOnce() + Send + 'static>;
@@ -173,14 +178,39 @@ pub trait SortRecord: Sized {
     fn decode(r: &mut &[u8]) -> Result<Self>;
     /// Total ordering key.
     fn cmp_key(&self, other: &Self) -> Ordering;
-    /// Cheap upper-ish estimate of the encoded size, for budgeting. An
-    /// over-estimate only spills a little sooner; it never affects correctness.
+    /// Cheap upper-ish estimate of the **encoded** size — what this record costs in a
+    /// run file. Used as a proxy for the heap this record owns; see
+    /// [`SortRecord::resident_hint`], which is what the memory budget actually counts.
+    /// An over-estimate only spills a little sooner; it never affects correctness.
     fn size_hint(&self) -> usize;
+
+    /// Upper-ish estimate of the bytes this record occupies **resident in the sort
+    /// buffer**: its own footprint as a `Vec<R>` element, plus whatever it owns on the
+    /// heap.
+    ///
+    /// This is not `size_hint`, and conflating the two is a memory bug with teeth.
+    /// `size_hint` measures a record's *encoded* form: `EndpointRef` reports 24 bytes
+    /// while occupying 56 in the buffer (its `Value` alone is 32), and a record whose
+    /// scalars pack into varints can encode to a third of what it resides in. Budget the
+    /// buffer with `size_hint` and the sorter holds several times the bytes it thinks it
+    /// does — invisibly, until the budget gets big enough for the multiple to matter.
+    ///
+    /// The default double-counts a record's inline scalars (they appear in both terms),
+    /// which is the safe direction: over-estimating spills sooner.
+    fn resident_hint(&self) -> usize {
+        std::mem::size_of::<Self>() + self.size_hint()
+    }
 }
 
 /// External sorter: feed records with [`ExtSorter::push`], then [`ExtSorter::sorted`].
 pub struct ExtSorter<R: SortRecord + Send + 'static> {
     temp_dir: PathBuf,
+    /// The bytes this sorter was granted. `buf_threshold` below is derived from what
+    /// the accountant actually lent, not from a fraction of a number nobody tracks.
+    /// Handed on to the [`SortedIter`] by `sorted()` — the merge holds one
+    /// decompressed block per run, so releasing here would give the bytes back
+    /// exactly when the sort is still spending them.
+    reservation: Option<Reservation>,
     /// Per-buffer spill threshold (the budget split across in-flight buffers).
     buf_threshold: usize,
     /// Max spills outstanding at once (`1` ⇒ inline, original behaviour).
@@ -188,7 +218,8 @@ pub struct ExtSorter<R: SortRecord + Send + 'static> {
     level: i32,
     seq: u64,
     buf: Vec<R>,
-    buf_bytes: usize,
+    /// Heap owned by the buffered records (the array itself is `buf.capacity()`).
+    heap_bytes: usize,
     /// Monotonic run index for unique run-file names (workers complete out of order).
     next_run: u64,
     state: Arc<SpillState>,
@@ -197,16 +228,22 @@ pub struct ExtSorter<R: SortRecord + Send + 'static> {
 }
 
 impl<R: SortRecord + Send + 'static> ExtSorter<R> {
-    /// Create a sorter spilling under `temp_dir`, holding at most `budget_bytes` of
-    /// records resident. `zstd_level` compresses the run files. Run formation
-    /// (sort + compress + write) runs on the shared spill pool; the budget is split
-    /// across the in-flight buffers so peak resident bytes stay ≈ `budget_bytes`.
-    pub fn new(temp_dir: &Path, budget_bytes: usize, zstd_level: i32) -> Result<Self> {
-        Self::with_inflight(temp_dir, budget_bytes, zstd_level, spill_threads())
+    /// Create a sorter spilling under `temp_dir`, holding at most `reservation`'s
+    /// bytes of records resident. `zstd_level` compresses the run files. Run
+    /// formation (sort + compress + write) runs on the shared spill pool; the
+    /// reservation is split across the in-flight buffers so peak resident bytes stay
+    /// ≈ what was granted.
+    ///
+    /// The sorter owns the reservation for its whole life, so the bytes return to
+    /// the [`MemoryBudget`] only once the runs are merged (or the sorter is dropped)
+    /// — the merge holds one decompressed block per run, so releasing at `sorted()`
+    /// would under-account exactly when the phase is at its peak.
+    pub fn new(temp_dir: &Path, reservation: Reservation, zstd_level: i32) -> Result<Self> {
+        Self::with_inflight(temp_dir, reservation, zstd_level, spill_threads())
     }
 
     /// Like [`ExtSorter::new`] but spills **inline** on the pushing thread (no parallel
-    /// spill pool) and sizes the run-formation buffer to the *whole* budget.
+    /// spill pool) and sizes the run-formation buffer to the *whole* reservation.
     ///
     /// Use this for a sorter that already runs inside a saturated worker pool — e.g.
     /// one `ExtSorter` per partition inside a `par_partitions` stage. There the shared
@@ -217,21 +254,43 @@ impl<R: SortRecord + Send + 'static> ExtSorter<R> {
     /// (`par_partitions` × the sorters each worker holds) that `#runs × RUN_BLOCK_BYTES`
     /// merge footprint is what dominates peak RSS. Inline spilling keeps a single
     /// budget-sized buffer resident and forms the fewest possible runs, so N concurrent
-    /// inline sorters stay within ≈ N × budget instead of blowing past it.
-    pub fn new_inline(temp_dir: &Path, budget_bytes: usize, zstd_level: i32) -> Result<Self> {
-        Self::with_inflight(temp_dir, budget_bytes, zstd_level, 1)
+    /// inline sorters stay within ≈ N × their reservations instead of blowing past them.
+    pub fn new_inline(temp_dir: &Path, reservation: Reservation, zstd_level: i32) -> Result<Self> {
+        Self::with_inflight(temp_dir, reservation, zstd_level, 1)
+    }
+
+    /// [`ExtSorter::new_inline`] when `saturated`, else [`ExtSorter::new`].
+    ///
+    /// For a sorter created per work-item inside a worker pool, which of the two is
+    /// right depends on whether that pool actually fills the machine — and that is a
+    /// property of the *data*, not of the code. `emit.topology` runs one sorter per
+    /// node band: at 91.6M nodes there are 88 bands over 14 workers, so every core is
+    /// busy and inline spilling is correct. At 1M nodes there is exactly **one** band,
+    /// so an inline sorter leaves 13 cores idle — there, handing run formation to the
+    /// shared spill pool is what uses the machine. The caller knows which it has.
+    pub fn new_for_pool(
+        temp_dir: &Path,
+        reservation: Reservation,
+        zstd_level: i32,
+        saturated: bool,
+    ) -> Result<Self> {
+        if saturated {
+            Self::new_inline(temp_dir, reservation, zstd_level)
+        } else {
+            Self::new(temp_dir, reservation, zstd_level)
+        }
     }
 
     fn with_inflight(
         temp_dir: &Path,
-        budget_bytes: usize,
+        reservation: Reservation,
         zstd_level: i32,
         max_inflight: usize,
     ) -> Result<Self> {
         std::fs::create_dir_all(temp_dir)
             .with_context(|| format!("create extsort temp dir {}", temp_dir.display()))?;
         let max_inflight = max_inflight.max(1);
-        let budget = budget_bytes.max(1);
+        let budget = reservation.bytes().max(1);
         // Size the run-formation buffer. Inline spilling (max_inflight == 1) is
         // synchronous, so only one buffer is ever resident — it can use the whole
         // budget, which minimises the run count (and thus the merge's resident memory).
@@ -244,26 +303,38 @@ impl<R: SortRecord + Send + 'static> ExtSorter<R> {
         };
         Ok(Self {
             temp_dir: temp_dir.to_path_buf(),
+            reservation: Some(reservation),
             buf_threshold,
             max_inflight,
             level: zstd_level,
             seq: SORTER_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
             buf: Vec::new(),
-            buf_bytes: 0,
+            heap_bytes: 0,
             next_run: 0,
             state: SpillState::new(),
             consumed: false,
         })
     }
 
-    /// Push one record; spills a sorted run when the buffer reaches its threshold.
+    /// Push one record; spills a sorted run when the buffer's **resident** bytes reach
+    /// its threshold.
+    ///
+    /// Resident cost is the backing array's *capacity* — a `Vec` doubles, so it can hold
+    /// twice the elements it has — plus the heap each record owns. Counting `len` rather
+    /// than `capacity` would understate the array by up to 2× on top of whatever the
+    /// per-record estimate misses.
     pub fn push(&mut self, rec: R) -> Result<()> {
-        self.buf_bytes += rec.size_hint();
+        self.heap_bytes += rec.resident_hint().saturating_sub(std::mem::size_of::<R>());
         self.buf.push(rec);
-        if self.buf_bytes >= self.buf_threshold {
+        if self.resident_bytes() >= self.buf_threshold {
             self.spill_run()?;
         }
         Ok(())
+    }
+
+    /// Bytes the in-RAM buffer currently holds.
+    fn resident_bytes(&self) -> usize {
+        self.buf.capacity() * std::mem::size_of::<R>() + self.heap_bytes
     }
 
     fn run_path(&mut self) -> (u64, PathBuf) {
@@ -290,7 +361,7 @@ impl<R: SortRecord + Send + 'static> ExtSorter<R> {
         }
         let (idx, path) = self.run_path();
         let buf = std::mem::take(&mut self.buf);
-        self.buf_bytes = 0;
+        self.heap_bytes = 0;
 
         if self.max_inflight <= 1 {
             // Inline: original single-threaded behaviour.
@@ -341,7 +412,10 @@ impl<R: SortRecord + Send + 'static> ExtSorter<R> {
         let mut runs = std::mem::take(&mut *self.state.runs.lock().unwrap());
         // Restore dispatch order so the merge is deterministic for equal keys.
         runs.sort_by_key(|(idx, _)| *idx);
-        SortedIter::open(runs.into_iter().map(|(_, p)| p).collect())
+        SortedIter::open(
+            runs.into_iter().map(|(_, p)| p).collect(),
+            self.reservation.take(),
+        )
     }
 }
 
@@ -454,10 +528,14 @@ pub struct SortedIter<R: SortRecord> {
     cursors: Vec<RunCursor<R>>,
     heap: std::collections::BinaryHeap<HeapItem<R>>,
     runs: Vec<PathBuf>,
+    /// Inherited from the [`ExtSorter`]: the merge is still spending memory (one
+    /// decompressed block per run), so the reservation is only returned to the
+    /// budget once the caller has finished draining this iterator.
+    _reservation: Option<Reservation>,
 }
 
 impl<R: SortRecord> SortedIter<R> {
-    fn open(runs: Vec<PathBuf>) -> Result<Self> {
+    fn open(runs: Vec<PathBuf>, reservation: Option<Reservation>) -> Result<Self> {
         let mut cursors = Vec::with_capacity(runs.len());
         let mut heap = std::collections::BinaryHeap::new();
         for (i, path) in runs.iter().enumerate() {
@@ -472,6 +550,7 @@ impl<R: SortRecord> SortedIter<R> {
             cursors,
             heap,
             runs,
+            _reservation: reservation,
         })
     }
 }
@@ -503,7 +582,16 @@ impl<R: SortRecord> Drop for SortedIter<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::membudget::MemoryBudget;
     use crate::wire::{read_uvarint, write_uvarint};
+
+    /// A standalone reservation of exactly `bytes` — each test sorter gets its own
+    /// budget, so the tests exercise the sizing maths, not the accountant.
+    fn res(bytes: usize) -> Reservation {
+        MemoryBudget::new(bytes)
+            .reserve_now("test", bytes, 1)
+            .unwrap()
+    }
 
     /// A (key,payload) record; cmp_key is a total order on (key, payload).
     struct KV {
@@ -552,7 +640,7 @@ mod tests {
         };
         let n = 50_000u64;
         // Tiny budget (~a few KB of records) forces many runs.
-        let mut s = ExtSorter::<KV>::new(&dir, 4096, 1).unwrap();
+        let mut s = ExtSorter::<KV>::new(&dir, res(4096), 1).unwrap();
         let mut input = Vec::new();
         for i in 0..n {
             let key = next() % 1000; // many duplicate keys
@@ -581,7 +669,7 @@ mod tests {
     fn run_files_are_deleted_when_iterator_drops() {
         let dir = tmp("cleanup");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut s = ExtSorter::<KV>::new(&dir, 256, 1).unwrap();
+        let mut s = ExtSorter::<KV>::new(&dir, res(256), 1).unwrap();
         for i in 0..2000u64 {
             s.push(KV {
                 key: 2000 - i,
@@ -621,7 +709,7 @@ mod tests {
     fn empty_sorter_yields_nothing() {
         let dir = tmp("empty");
         let _ = std::fs::remove_dir_all(&dir);
-        let s = ExtSorter::<KV>::new(&dir, 4096, 1).unwrap();
+        let s = ExtSorter::<KV>::new(&dir, res(4096), 1).unwrap();
         let mut it = s.sorted().unwrap();
         assert!(it.next().is_none());
         let _ = std::fs::remove_dir_all(&dir);

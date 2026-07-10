@@ -27,6 +27,7 @@ use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
+use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
 use graph_format::nodelabels::{encode_labels_record, NodeLabelsReader, NodeLabelsWriter};
 use graph_format::postings::write_endpoint_postings_from_sorted;
 use graph_format::topology::{Adj, CsrHalfWriter, TopologyReader};
@@ -834,6 +835,12 @@ fn build_inner(
     diag: &crate::diag::BuildDiag,
 ) -> Result<BuildOutcome> {
     let (cipher, encryption_header) = common::derive_cipher(&opts.encryption_key);
+    // The single arbiter of `--max-memory`. Every sorter below reserves from it and
+    // hands the bytes back when it drops, so the live reservations can never sum
+    // past the cap — which is what the old per-consumer `/16` fractions did. The
+    // diagnostics sampler reports the live total as `budget_reserved_bytes`, so a
+    // run shows reserved-against-resident and any divergence is a visible bug.
+    let mem = MemoryBudget::new(opts.max_memory_bytes);
     // No `--pk` ⇒ merge style (business-key MERGE engine). `--pk FIELD` ⇒ the legacy
     // dense-id pipeline keyed on FIELD (the configurable, stored `__dump_id__`).
     let merge_mode = opts.pk.is_none();
@@ -1018,16 +1025,16 @@ fn build_inner(
     if merge_mode {
         let dedup_g = diag.phase("dedup");
         if resume_phase < Phase::Deduped {
-            diag.set_op("dedup business-key nodes (external sort)", "nodes", 0);
-            let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
+            // `dedup_nodes` labels its own sub-steps (scan+sort, then the drain).
             node_count = merge_build::dedup_nodes(
                 &node_merge_bkt,
                 &remaps,
                 &node_bkt,
                 &node_keys_bkt,
                 scratch_dir,
-                sort_budget,
+                &mem,
                 SCRATCH_ZSTD,
+                diag,
             )?;
             checkpoint(
                 scratch_dir,
@@ -1061,14 +1068,13 @@ fn build_inner(
         // stream (sort-merge-join), collapse identical (src, reltype, dst) edges, and
         // write the final edge bucket — the same `EdgeRec` shape cluster/emit consume.
         diag.set_op("resolve business keys (merge-join)", "edges", 0);
-        let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
         edge_count = merge_build::resolve_edges(
             &edge_merge_bkt,
             &remaps,
             &node_keys_bkt,
             &edge_bkt,
             scratch_dir,
-            sort_budget,
+            &mem,
             opts.threads,
             SCRATCH_ZSTD,
         )?;
@@ -1260,8 +1266,9 @@ fn build_inner(
             load_perm(&perm_path, node_count)?
         }
     } else {
-        diag.set_op("block-parallel LDG cluster", "nodes", node_count);
-        diag.set_active_workers(opts.threads.max(1) as u64);
+        // `build_permutation` labels its own sub-steps (adjacency sort, stripe
+        // routing, each LDG pass, final permutation) so a --diagnostics run can
+        // attribute this phase's serial stretches to a named step.
         let block_capacity = (opts.block_size / 48).max(1) as u32;
         let perm = cluster::build_permutation(
             node_count,
@@ -1269,12 +1276,13 @@ fn build_inner(
                 mode: opts.cluster,
                 passes: opts.cluster_passes,
                 block_capacity,
-                mem_budget: opts.max_memory_bytes,
+                budget: Arc::clone(&mem),
                 temp_dir: scratch_dir.to_path_buf(),
                 zstd_level: SCRATCH_ZSTD,
                 threads: opts.threads,
             },
             |visit| buckets::for_each_edge(&edge_bkt, |e| visit(e.src_prov, e.dst_prov)),
+            diag,
         )?;
         save_perm(&perm, &perm_path)?;
         checkpoint(
@@ -1299,7 +1307,6 @@ fn build_inner(
 
     // ---- emit (always redone on resume) --------------------------------------
     let mut block_sizes: BTreeMap<String, u32> = BTreeMap::new();
-    let sort_budget = (opts.max_memory_bytes / 16).max(16 * 1024 * 1024);
     // In `merge` mode the deduped node bucket already holds GLOBAL symbol ids (the
     // pass-1 remaps applied during dedup), so the node scan must NOT remap again —
     // an empty slice makes `for_each_node_remapped` byte-copy each blob unchanged.
@@ -1318,6 +1325,22 @@ fn build_inner(
         label_id: Option<u32>,
         key_id: Option<u32>,
     }
+    // Emit-phase memory split. During `emit.topology` three sets of sorters are live
+    // at once — the range indexes, the two endpoint-posting sinks, and the band-worker
+    // pool — so each takes a *named share of one budget* rather than helping itself to
+    // `max_memory / 16` of a number nobody was tracking. The pool gets whatever is
+    // left, which is the bulk of it: the pool is the set that scales with `--threads`,
+    // and it is where the resident bytes actually went (peak RSS was reached inside
+    // "emit forward CSR + edge_props per band").
+    //
+    // The range sorters are the longest-lived of the three — created here, drained in
+    // `emit.range_isam` well after topology — so they are reserved first and hold
+    // their bytes across everything below.
+    let range_want = if range_stmts.is_empty() {
+        0
+    } else {
+        (mem.total() / 8 / range_stmts.len()).max(RANGE_SORT_FLOOR)
+    };
     let mut range_metas: Vec<RangeMeta> = Vec::new();
     let mut range_sorters: Vec<ExtSorter<RangeEntry>> = Vec::new();
     let mut node_range: Vec<NodeRangeSpec> = Vec::new();
@@ -1355,7 +1378,7 @@ fn build_inner(
         }
         range_sorters.push(ExtSorter::<RangeEntry>::new(
             scratch_dir,
-            sort_budget,
+            mem.reserve_now("range-index sorter", range_want, RANGE_SORT_FLOOR)?,
             opts.zstd_level,
         )?);
     }
@@ -1461,7 +1484,14 @@ fn build_inner(
             }
         }
     } else {
-        let mut node_sorter = ExtSorter::<NodeEmit>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
+        // The only sorter live in this phase besides the (small) range sinks, and it
+        // is consumed before `emit.topology` starts — so it may take everything the
+        // range sorters left. A big buffer means few runs means a cheap merge.
+        let mut node_sorter = ExtSorter::<NodeEmit>::new(
+            scratch_dir,
+            mem.reserve_now("node-store sorter", mem.available(), MIN_SORT_BYTES)?,
+            SCRATCH_ZSTD,
+        )?;
         buckets::for_each_node_remapped(&node_bkt, emit_remaps, |prov, node| {
             diag.tick(prov);
             let node = fold_node(node, prov)?;
@@ -1598,19 +1628,37 @@ fn build_inner(
     // global externally-sorted sinks (push order is irrelevant — they sort) behind a
     // mutex; the reverse records are range-routed by `final_dst` into per-dst-band
     // files for the parallel reverse phase.
+    let post_want = (mem.total() / 16).max(MIN_SORT_BYTES);
     let src_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
         scratch_dir,
-        sort_budget,
+        mem.reserve_now("src endpoint postings", post_want, MIN_SORT_BYTES)?,
         SCRATCH_ZSTD,
     )?);
     let tgt_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
         scratch_dir,
-        sort_budget,
+        mem.reserve_now("tgt endpoint postings", post_want, MIN_SORT_BYTES)?,
         SCRATCH_ZSTD,
     )?);
     let range_mx = Mutex::new(range_sorters);
     let rev_spill = BandSpill::new(nbands, |b| band_path(scratch_dir, pid, "rev_route", b))?;
-    let worker_budget = (opts.max_memory_bytes / 16 / threads).max(8 << 20);
+
+    // Everything the long-lived sinks left goes to the band workers, re-lent as a
+    // budget of their own. A worker reserves one slice per band and returns it when
+    // the band is done, so `reserve` inside a worker is a wait on a *peer*, never on
+    // the caller — the one shape in which blocking for memory cannot deadlock.
+    //
+    // The consequence the plan asked for: when the cap is tight, `threads` workers
+    // cannot all hold a slice, so the surplus ones park until a band finishes.
+    // Parallelism is then throttled by memory rather than by core count, instead of
+    // every worker over-committing and the phase peaking at 2× the cap. If not even
+    // one worker can be funded, `reserve` fails loudly rather than parking forever.
+    let worker_pool = mem
+        .reserve_now("band-worker pool", mem.available(), MIN_SORT_BYTES)?
+        .into_sub_budget();
+    let worker_want = (worker_pool.total() / threads).max(MIN_SORT_BYTES);
+    // Are there enough bands to keep every worker busy? If so each band sorter spills
+    // inline (see `emit_forward_band`); if not, they lean on the shared spill pool.
+    let bands_saturate_pool = nbands >= threads;
 
     // 2) Forward: each band sorts its edges by (final_src, final_dst, prov_edge_id),
     //    assigns final_edge_id = base_b + i, writes its forward CSR half + edge_props
@@ -1632,6 +1680,7 @@ fn build_inner(
             tgt_post_r,
             range_r,
             rev_spill_r,
+            worker_pool_r,
             cipher_r,
             next_r,
             err_r,
@@ -1643,6 +1692,7 @@ fn build_inner(
             &tgt_post_mx,
             &range_mx,
             &rev_spill,
+            &worker_pool,
             &cipher,
             &next,
             &err,
@@ -1674,7 +1724,9 @@ fn build_inner(
                         rev_spill_r,
                         batch_threshold,
                         scratch_dir,
-                        worker_budget,
+                        worker_pool_r,
+                        worker_want,
+                        bands_saturate_pool,
                         opts.block_size,
                         opts.zstd_level,
                         cipher_r.clone(),
@@ -1706,7 +1758,8 @@ fn build_inner(
     {
         let next = AtomicU64::new(0);
         let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let (rev_route_paths_r, cipher_r, next_r, err_r) = (&rev_route_paths, &cipher, &next, &err);
+        let (rev_route_paths_r, worker_pool_r, cipher_r, next_r, err_r) =
+            (&rev_route_paths, &worker_pool, &cipher, &next, &err);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(move || loop {
@@ -1725,7 +1778,9 @@ fn build_inner(
                         &rev_route_paths_r[b],
                         &band_path(scratch_dir, pid, "csr_rev", b),
                         scratch_dir,
-                        worker_budget,
+                        worker_pool_r,
+                        worker_want,
+                        bands_saturate_pool,
                         opts.block_size,
                         opts.zstd_level,
                         cipher_r.clone(),
@@ -1748,6 +1803,9 @@ fn build_inner(
     for p in &rev_route_paths {
         let _ = std::fs::remove_file(p);
     }
+    // The band workers are done: hand their share back so the phases below (the
+    // postings drain, `emit.graph_summaries`) can reserve against a full budget.
+    drop(worker_pool);
 
     // 4) Stitch: concat the per-band block files (forward halves then reverse halves
     //    for the CSR; band order for edge_props), then drain the postings sinks.
@@ -1803,7 +1861,6 @@ fn build_inner(
     // topology + node labels, persisted so `open` need not rescan and the
     // label/reltype fast paths answer from resident metadata.
     let emit_summary_g = diag.phase("emit.graph_summaries");
-    diag.set_op("tally label/reltype summaries", "nodes", node_count);
     let summaries = compute_graph_summaries(
         &tmp_dir.join("topology.csr.blk"),
         &tmp_dir.join("node_labels.blk"),
@@ -1812,7 +1869,9 @@ fn build_inner(
         labels.names().len(),
         cipher.clone(),
         scratch_dir,
-        (opts.max_memory_bytes / 16).max(16 << 20),
+        &mem,
+        opts.threads,
+        diag,
     )?;
     drop(emit_summary_g);
 
@@ -1906,6 +1965,7 @@ fn build_inner(
         acl_blake3: opts.acl_blake3.clone(),
         extra_files: vector_files,
         store: opts.publish_store.clone(),
+        force_object_checksums: opts.object_checksums,
     })
 }
 
@@ -2288,6 +2348,12 @@ fn band_path(dir: &Path, pid: u32, kind: &str, b: usize) -> PathBuf {
 /// sink lock — small enough that the lock is held only briefly.
 const FWD_SINK_BATCH: usize = 8192;
 
+/// Smallest reservation a range-index sorter is given. Range sorters are the
+/// longest-lived of the emit-phase sorters but among the smallest consumers, so
+/// they take a modest floor rather than [`MIN_SORT_BYTES`]: a graph declaring many
+/// indexes must not starve the band workers, which is where the bytes actually go.
+const RANGE_SORT_FLOOR: usize = 1 << 20;
+
 /// Emit one forward node band `[lo, hi)`: sort the band's edges, assign
 /// `final_edge_id = base + i`, write the band's forward CSR half and `edge_props`
 /// slice, feed the global postings/edge-range sinks, and route each edge's reverse
@@ -2308,14 +2374,31 @@ fn emit_forward_band(
     rev_spill: &BandSpill,
     batch_threshold: usize,
     scratch_dir: &Path,
-    budget: usize,
+    pool: &Arc<MemoryBudget>,
+    want: usize,
+    saturated: bool,
     block_size: usize,
     zstd_level: i32,
     cipher: Option<Arc<BlockCipher>>,
     diag: &crate::diag::BuildDiag,
 ) -> Result<()> {
-    // Load + sort this band's edges by (final_src, final_dst, prov_edge_id).
-    let mut sorter = ExtSorter::<EdgeFwd>::new(scratch_dir, budget, SCRATCH_ZSTD)?;
+    // Load + sort this band's edges by (final_src, final_dst, prov_edge_id). Blocks
+    // here if every slice of the pool is already out on another band.
+    //
+    // When the band pool is saturated (more bands than workers, the graph-scale case)
+    // this sorter spills inline: the shared spill pool can hand it no extra cores, and
+    // splitting its reservation across `spill_threads()+1` in-flight buffers would
+    // multiply its run count by that factor — the k-way merge holds one decompressed
+    // block per run, and with 14 bands live that `#runs × RUN_BLOCK_BYTES` is what
+    // dominates peak RSS. Run *compression* stays parallel either way: `BlockFileWriter`
+    // seals on its own pool. On a small graph with fewer bands than workers, inline
+    // spilling would instead leave most cores idle — hence `saturated`.
+    let mut sorter = ExtSorter::<EdgeFwd>::new_for_pool(
+        scratch_dir,
+        pool.reserve("forward band sorter", want, MIN_SORT_BYTES)?,
+        SCRATCH_ZSTD,
+        saturated,
+    )?;
     {
         let r = BlockFileReader::open(band_file)?;
         r.for_each_record(|_, rec| {
@@ -2421,13 +2504,21 @@ fn emit_reverse_band(
     route_file: &Path,
     csr_out: &Path,
     scratch_dir: &Path,
-    budget: usize,
+    pool: &Arc<MemoryBudget>,
+    want: usize,
+    saturated: bool,
     block_size: usize,
     zstd_level: i32,
     cipher: Option<Arc<BlockCipher>>,
     diag: &crate::diag::BuildDiag,
 ) -> Result<()> {
-    let mut sorter = ExtSorter::<EdgeRev>::new(scratch_dir, budget, SCRATCH_ZSTD)?;
+    // Inline vs pooled spill for the same reason as the forward band above.
+    let mut sorter = ExtSorter::<EdgeRev>::new_for_pool(
+        scratch_dir,
+        pool.reserve("reverse band sorter", want, MIN_SORT_BYTES)?,
+        SCRATCH_ZSTD,
+        saturated,
+    )?;
     {
         let r = BlockFileReader::open(route_file)?;
         r.for_each_record(|_, rec| {
@@ -2471,22 +2562,33 @@ struct GraphSummaries {
 }
 
 /// Compute [`GraphSummaries`] over the finished stores with **no resident node→label
-/// map** — labels are read one node at a time. The forward pass treats each node as
-/// the **source** of its outgoing edges (per-reltype edge + self-loop counts, the
-/// `(src_label, reltype)` marginal, per-label first/occurrence tallies) and spills a
-/// `(dst, src_label, reltype)` record per edge×source-label; the reverse pass treats
-/// each node as the **target** of its incoming edges (the `(reltype, tgt_label)`
-/// marginal). The full `(src_label, reltype, tgt_label)` cube then falls out of a
-/// linear merge of the `dst`-sorted spill with a node-id-ordered walk of
-/// `node_labels` (which supplies each edge's target labels) — a bounded external
-/// sort-merge join rather than a resident map.
+/// map** — labels are read block-sequentially, never a whole-graph table.
 ///
-/// FOLLOW-UP (build perf at scale): the marginal/node passes read each store with
-/// per-node `read_record_global`, which re-decompresses a node's whole block on every
-/// call — the same inefficiency `Generation::build_label_counts` was written to avoid.
-/// It is negligible at a few hundred k nodes but O(records-per-block) redundant zstd
-/// work at Wikidata (91M) scale; drive both stores block-sequentially via
-/// `for_each_record` before rebuilding the giant generations.
+/// Every accumulator here is a sum over nodes, so the whole computation is a
+/// map-reduce over disjoint, contiguous node ranges. Contiguity is what makes it
+/// cheap: each worker's ranges of `topology.csr.blk` and `node_labels.blk` are
+/// ascending, so a two-block cache always hits and each block is decompressed
+/// exactly once (see [`BlockFileReader::for_each_record_in`]).
+///
+/// **Map (over source-node ranges).** The forward half treats each node as the
+/// *source* of its outgoing edges (per-reltype edge + self-loop counts, the
+/// `(src_label, reltype)` marginal, per-label first/occurrence tallies) and routes a
+/// `(dst, src_label, reltype)` record per edge×source-label into the dst-range it
+/// belongs to. The reverse half treats each node as the *target* of its incoming
+/// edges (the `(reltype, tgt_label)` marginal).
+///
+/// **Join (over target-node ranges).** The full `(src_label, reltype, tgt_label)`
+/// cube needs both endpoints' labels on each edge, and the map half only ever held
+/// the source's. Routing by `dst` means every record a range needs is in that
+/// range's one spill file: worker `j` sorts its file by `dst` and merge-joins it
+/// against an ascending walk of `node_labels[lo_j..hi_j]`, which supplies the target
+/// labels. A bounded external sort-merge join, and one per range rather than one
+/// globally — so the join parallelises with the tally instead of serialising after it.
+///
+/// **Reduce.** Addition over `u64` is commutative and associative, and the per-range
+/// cubes are disjoint in `dst` but not in the triple key, so they are summed. The
+/// emitted vectors are index-aligned and the marginals are sorted, so the output does
+/// not depend on the worker count. `emit_determinism.rs` is the gate on that.
 #[allow(clippy::too_many_arguments)]
 fn compute_graph_summaries(
     topo_path: &Path,
@@ -2496,11 +2598,152 @@ fn compute_graph_summaries(
     n_labels: usize,
     cipher: Option<Arc<BlockCipher>>,
     scratch_dir: &Path,
-    sort_budget: usize,
+    mem: &Arc<MemoryBudget>,
+    threads: usize,
+    diag: &crate::diag::BuildDiag,
 ) -> Result<GraphSummaries> {
     use std::collections::HashMap;
+
+    /// The `(src_label, reltype, tgt_label)` cube one dst-range worker tallied.
+    type Cube = HashMap<(u32, u32, u32), u64>;
+
+    let empty = GraphSummaries {
+        reltype_edge_counts: vec![0; n_reltypes],
+        reltype_self_loop_counts: vec![0; n_reltypes],
+        label_node_counts: vec![0; n_labels],
+        first_label_counts: vec![0; n_labels],
+        src_label_reltype_counts: Vec::new(),
+        reltype_tgt_label_counts: Vec::new(),
+        schema_triple_counts: Vec::new(),
+    };
+    if node_count == 0 {
+        return Ok(empty);
+    }
+
     let topo = TopologyReader::open_with_cipher(topo_path, cipher.clone())?;
     let labels = NodeLabelsReader::open_with_cipher(labels_path, cipher)?;
+
+    // Contiguous node ranges, one per worker. `chunk` also defines the dst-routing
+    // bands, so a triple's band is `dst / chunk` and range `j` owns exactly the
+    // triples whose target labels it will read.
+    let nthreads = threads.max(1);
+    let chunk = node_count.div_ceil(nthreads as u64).max(1);
+    let nranges = node_count.div_ceil(chunk) as usize;
+    let range_of = |j: usize| -> (u64, u64) {
+        let lo = (j as u64) * chunk;
+        (lo, (lo + chunk).min(node_count))
+    };
+
+    // A tiny windowed block cache per worker, rather than a per-node
+    // `labels.labels(id)` call (which re-decompresses a node's whole block on *every*
+    // call — at 91.6M nodes, empirically ~30% of the phase's instructions, confirmed
+    // via callgrind on a 1M-node sample, for barely 1% of the work done) or a full
+    // flat table materialising every node's labels up front (O(node_count) resident —
+    // unbounded as the schema grows wider). Each worker visits node ids strictly
+    // ascending within its own range, matching `node_labels.blk`'s on-disk order, so a
+    // cache sized for a couple of blocks always hits until the scan crosses into the
+    // next one.
+    const LABEL_CACHE_BYTES: usize = 4 << 20;
+
+    let pid = std::process::id();
+    let triple_spill = BandSpill::new(nranges, |j| band_path(scratch_dir, pid, "summary_dst", j))?;
+    let batch_threshold = (mem.total() / 32 / (nranges * nranges).max(1)).clamp(16 << 10, 1 << 20);
+
+    // ---- map: tally over source-node ranges, route triples by dst ----
+    diag.set_op("tally label/reltype summaries", "nodes", node_count);
+    diag.set_active_workers(nranges as u64);
+    struct Tally {
+        reltype_edge: Vec<u64>,
+        reltype_self: Vec<u64>,
+        label_node: Vec<u64>,
+        first_label: Vec<u64>,
+        src_marg: HashMap<(u32, u32), u64>,
+        tgt_marg: HashMap<(u32, u32), u64>,
+    }
+
+    let tallies: Vec<Result<Tally>> = {
+        let (topo_r, labels_r, spill_r) = (&topo, &labels, &triple_spill);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nranges)
+                .map(|j| {
+                    scope.spawn(move || -> Result<Tally> {
+                        let (lo, hi) = range_of(j);
+                        let mut t = Tally {
+                            reltype_edge: vec![0u64; n_reltypes],
+                            reltype_self: vec![0u64; n_reltypes],
+                            label_node: vec![0u64; n_labels],
+                            first_label: vec![0u64; n_labels],
+                            src_marg: HashMap::new(),
+                            tgt_marg: HashMap::new(),
+                        };
+                        let cache = graph_format::blockcache::BlockCache::new(LABEL_CACHE_BYTES);
+                        let labels_of = |id: u64| -> Result<Vec<u32>> {
+                            let rec = cache.record(labels_r.inner(), 0, 0, id)?;
+                            graph_format::nodelabels::decode_labels(&rec)
+                        };
+                        let mut batcher = BandBatcher::new(spill_r, batch_threshold);
+
+                        // Forward: `global` is the source of each outgoing edge. Every
+                        // node id in the graph falls in exactly one range's forward
+                        // half, so the label tallies below count each node once.
+                        topo_r.inner().for_each_record_in(lo, hi, |id, rec| {
+                            let adjs = graph_format::topology::decode_adj(rec)?;
+                            let labs = labels_of(id)?;
+                            if let Some(&f) = labs.first() {
+                                t.first_label[f as usize] += 1;
+                            }
+                            for &l in &labs {
+                                t.label_node[l as usize] += 1;
+                            }
+                            for adj in &adjs {
+                                let r = adj.reltype;
+                                t.reltype_edge[r as usize] += 1;
+                                if adj.neighbour.0 == id {
+                                    t.reltype_self[r as usize] += 1;
+                                }
+                                for &a in &labs {
+                                    *t.src_marg.entry((a, r)).or_insert(0) += 1;
+                                    batcher.push(
+                                        (adj.neighbour.0 / chunk) as usize,
+                                        &TripleSpill {
+                                            dst: adj.neighbour.0,
+                                            src_label: a,
+                                            reltype: r,
+                                        },
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        })?;
+
+                        // Reverse: the reverse adjacency shares the topology file at
+                        // `node_count + id` (see `topology.rs`), so the same node range
+                        // is a second contiguous record range. `id` is the target of
+                        // each incoming edge.
+                        topo_r.inner().for_each_record_in(
+                            node_count + lo,
+                            node_count + hi,
+                            |g, rec| {
+                                let adjs = graph_format::topology::decode_adj(rec)?;
+                                let labs = labels_of(g - node_count)?;
+                                for adj in &adjs {
+                                    for &b in &labs {
+                                        *t.tgt_marg.entry((adj.reltype, b)).or_insert(0) += 1;
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )?;
+
+                        batcher.flush_all()?;
+                        diag.progress_add(hi - lo);
+                        Ok(t)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
 
     let mut reltype_edge = vec![0u64; n_reltypes];
     let mut reltype_self = vec![0u64; n_reltypes];
@@ -2508,99 +2751,105 @@ fn compute_graph_summaries(
     let mut first_label = vec![0u64; n_labels];
     let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
     let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
-    // The full triple needs both endpoints' labels joined to each edge. The forward
-    // pass has the source's labels in hand but the target is an arbitrary node, so we
-    // spill `(dst, src_label, reltype)` keyed by `dst` and resolve the target labels
-    // in a sorted merge below — no resident node→label map.
-    let mut triple_spill = ExtSorter::<TripleSpill>::new(scratch_dir, sort_budget, SCRATCH_ZSTD)?;
+    for t in tallies {
+        let t = t?;
+        for (acc, v) in reltype_edge.iter_mut().zip(&t.reltype_edge) {
+            *acc += v;
+        }
+        for (acc, v) in reltype_self.iter_mut().zip(&t.reltype_self) {
+            *acc += v;
+        }
+        for (acc, v) in label_node.iter_mut().zip(&t.label_node) {
+            *acc += v;
+        }
+        for (acc, v) in first_label.iter_mut().zip(&t.first_label) {
+            *acc += v;
+        }
+        for (k, v) in t.src_marg {
+            *src_marg.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in t.tgt_marg {
+            *tgt_marg.entry(k).or_insert(0) += v;
+        }
+    }
+    let (spill_paths, _counts) = triple_spill.finish()?;
 
-    // Node→labels, looked up through a tiny windowed block cache rather than a
-    // per-node `labels.labels(id)` call (which re-decompresses a node's whole
-    // block on *every* call — at 91.6M nodes, empirically ~30% of the phase's
-    // instructions, confirmed via callgrind on a 1M-node sample, for barely 1% of
-    // the work done) or a full flat table materialising every node's labels
-    // up front (O(node_count) resident memory — unbounded as the schema grows
-    // wider). Both passes below visit node ids strictly ascending, matching
-    // `node_labels.blk`'s own on-disk order, so a cache sized for only a couple of
-    // blocks always hits until the scan crosses into the next one: each block
-    // still decompresses exactly once per pass, with O(block size) memory instead
-    // of O(node_count). `label_node`/`first_label` are tallied on first sight of
-    // each node's labels (the forward pass, which visits every id exactly once).
-    const LABEL_CACHE_BYTES: usize = 4 << 20; // a couple of blocks, any configured block size
-    let label_cache = graph_format::blockcache::BlockCache::new(LABEL_CACHE_BYTES);
-    let labels_of = |id: u64| -> Result<Vec<u32>> {
-        let rec = label_cache.record(labels.inner(), 0, 0, id)?;
-        graph_format::nodelabels::decode_labels(&rec)
+    // ---- join: resolve each dst range's target labels, tally the cube ----
+    diag.set_op("join schema cube by target label", "nodes", node_count);
+    diag.set_active_workers(nranges as u64);
+    let pool = mem
+        .reserve_now("summary cube pool", mem.available(), MIN_SORT_BYTES)?
+        .into_sub_budget();
+    let want = (pool.total() / nranges).max(MIN_SORT_BYTES);
+
+    let cubes: Vec<Result<Cube>> = {
+        let (labels_r, pool_r, paths_r) = (&labels, &pool, &spill_paths);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nranges)
+                .map(|j| {
+                    scope.spawn(move || -> Result<Cube> {
+                        let (lo, hi) = range_of(j);
+                        let mut sorter = ExtSorter::<TripleSpill>::new_inline(
+                            scratch_dir,
+                            pool_r.reserve("summary triple sorter", want, MIN_SORT_BYTES)?,
+                            SCRATCH_ZSTD,
+                        )?;
+                        BlockFileReader::open(&paths_r[j])?.for_each_record(|_, rec| {
+                            let mut s = rec;
+                            sorter.push(TripleSpill::decode(&mut s)?)
+                        })?;
+
+                        // Both sides ascend in `dst` / node id, so one linear pass
+                        // resolves every record's target labels; each label block is
+                        // decompressed once. Every routed `dst` lies in `[lo, hi)`, so
+                        // the walk reaches it.
+                        let mut cube: Cube = HashMap::new();
+                        let mut sorted = sorter.sorted()?;
+                        let mut pending: Option<TripleSpill> = sorted.next().transpose()?;
+                        labels_r
+                            .inner()
+                            .for_each_record_in(lo, hi, |node_id, rec| {
+                                if pending.as_ref().is_some_and(|p| p.dst == node_id) {
+                                    let tgt_labs = graph_format::nodelabels::decode_labels(rec)?;
+                                    while let Some(p) = pending.as_ref() {
+                                        if p.dst != node_id {
+                                            break;
+                                        }
+                                        for &b in &tgt_labs {
+                                            *cube
+                                                .entry((p.src_label, p.reltype, b))
+                                                .or_insert(0) += 1;
+                                        }
+                                        pending = sorted.next().transpose()?;
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                        if let Some(p) = pending {
+                            bail!(
+                                "internal: summary triple for dst {} was routed to the \
+                                 node range [{lo}, {hi}) that does not contain it",
+                                p.dst
+                            );
+                        }
+                        diag.progress_add(hi - lo);
+                        Ok(cube)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
     };
+    for p in &spill_paths {
+        let _ = std::fs::remove_file(p);
+    }
 
-    // Forward (`0..node_count`) and reverse (`node_count..2*node_count`) adjacency
-    // share one file (see `topology.rs`), so one block-sequential scan over the
-    // whole thing — branching on which half a record falls in — decompresses each
-    // topology block exactly once instead of the forward/reverse loops each
-    // re-scanning (and an index-based `outgoing`/`incoming` call each
-    // re-decompressing per node).
-    topo.inner().for_each_record(|global, rec| {
-        let adjs = graph_format::topology::decode_adj(rec)?;
-        if global < node_count {
-            // Forward: `global` is the source of each outgoing edge.
-            let id = global;
-            let labs = labels_of(id)?;
-            if let Some(&f) = labs.first() {
-                first_label[f as usize] += 1;
-            }
-            for &l in &labs {
-                label_node[l as usize] += 1;
-            }
-            for adj in &adjs {
-                let t = adj.reltype;
-                reltype_edge[t as usize] += 1;
-                if adj.neighbour.0 == id {
-                    reltype_self[t as usize] += 1;
-                }
-                for &a in &labs {
-                    *src_marg.entry((a, t)).or_insert(0) += 1;
-                    triple_spill.push(TripleSpill {
-                        dst: adj.neighbour.0,
-                        src_label: a,
-                        reltype: t,
-                    })?;
-                }
-            }
-        } else {
-            // Reverse: `global - node_count` is the target of each incoming edge.
-            let id = global - node_count;
-            let labs = labels_of(id)?;
-            for adj in &adjs {
-                for &b in &labs {
-                    *tgt_marg.entry((adj.reltype, b)).or_insert(0) += 1;
-                }
-            }
+    let mut cube: Cube = HashMap::new();
+    for c in cubes {
+        for (k, v) in c? {
+            *cube.entry(k).or_insert(0) += v;
         }
-        Ok(())
-    })?;
-
-    // Merge the `dst`-sorted spill with a node-id-ordered sequential walk of
-    // `node_labels`: both ascend, so each spill record's target labels are resolved
-    // in one linear pass (each label block decompressed once). Every spilled `dst`
-    // is a valid node id, so it is reached by the walk.
-    let mut cube: HashMap<(u32, u32, u32), u64> = HashMap::new();
-    let mut sorted = triple_spill.sorted()?;
-    let mut pending: Option<TripleSpill> = sorted.next().transpose()?;
-    labels.inner().for_each_record(|node_id, rec| {
-        if pending.as_ref().is_some_and(|p| p.dst == node_id) {
-            let tgt_labs = graph_format::nodelabels::decode_labels(rec)?;
-            while let Some(p) = pending.as_ref() {
-                if p.dst != node_id {
-                    break;
-                }
-                for &b in &tgt_labs {
-                    *cube.entry((p.src_label, p.reltype, b)).or_insert(0) += 1;
-                }
-                pending = sorted.next().transpose()?;
-            }
-        }
-        Ok(())
-    })?;
+    }
 
     let mut src_label_reltype_counts: Vec<(u32, u32, u64)> =
         src_marg.into_iter().map(|((a, t), c)| (a, t, c)).collect();

@@ -102,6 +102,11 @@ pub struct BuildOptions {
     /// area, every file is uploaded, then the remote `current` pointer is written
     /// last. `None` ⇒ filesystem-only publish (the default).
     pub publish_store: Option<Arc<dyn graph_format::store::ObjectStore>>,
+    /// Compute the per-file SHA-256 / CRC32C object checksums even for a
+    /// filesystem-only build. Implied when `publish_store` is set. Set this when the
+    /// generation will be copied to S3/GCS by other means and must keep its
+    /// content-grade integrity check there rather than falling back to a size check.
+    pub object_checksums: bool,
 }
 
 impl Default for BuildOptions {
@@ -129,6 +134,7 @@ impl Default for BuildOptions {
             keep_temp: false,
             resume: false,
             publish_store: None,
+            object_checksums: false,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(2).max(1))
                 .unwrap_or(1),

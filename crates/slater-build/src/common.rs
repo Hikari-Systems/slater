@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
 use graph_format::crypto::{self, BlockCipher};
 use graph_format::histogram::{
@@ -115,6 +116,11 @@ pub struct PublishInputs<'a> {
     /// the local atomic publish (upload every file, then write the remote
     /// `current` pointer last). `None` ⇒ filesystem-only publish.
     pub store: Option<Arc<dyn ObjectStore>>,
+    /// Compute the per-file SHA-256 and CRC32C object checksums even when this build
+    /// does not itself publish to an object store — for a generation that will be
+    /// copied to S3/GCS by some other means and must keep its content-grade
+    /// integrity check there. See [`write_manifest_and_publish`].
+    pub force_object_checksums: bool,
 }
 
 /// Inventory every file (size + BLAKE3), assemble + (optionally) MAC-seal the
@@ -138,26 +144,42 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
     file_names.extend(inp.extra_files.iter().cloned());
     file_names.sort();
 
-    let mut files = Vec::new();
-    for name in &file_names {
-        let path = inp.tmp_dir.join(name);
-        let bytes = fs::metadata(&path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        // One read pass yields the canonical BLAKE3 and both server-comparable
-        // object checksums — SHA-256 (S3) and CRC32C (GCS) — so a generation served
-        // from either object store can be integrity-checked from its object-checksum
-        // metadata without a body read.
-        let (blake3, sha256, crc32c) =
-            graph_format::integrity::hash_file_blake3_sha256_crc32c(&path)?;
-        files.push(graph_format::manifest::FileEntry {
-            name: name.clone(),
-            bytes,
-            blake3,
-            sha256: Some(sha256),
-            crc32c: Some(crc32c),
-        });
-    }
+    // SHA-256 (S3) and CRC32C (GCS) exist so a generation *served from an object
+    // store* can be integrity-checked against the store's server-computed object
+    // checksum from a metadata request, with no body read. A filesystem-only
+    // generation is verified by re-hashing its bytes with BLAKE3, so it needs
+    // neither — and SHA-256 is the slowest of the three by a wide margin (no tree
+    // structure, so it cannot be parallelised within a file). Compute them only
+    // when this build publishes to a store, or when the caller says the generation
+    // is bound for one (D56). The content hash is unaffected: it folds only the
+    // inventory's `(name, blake3)` pairs, and MANIFEST.json is not in the inventory.
+    let object_checksums = inp.store.is_some() || inp.force_object_checksums;
+
+    // Each file is an independent read+hash. BLAKE3 already fans out *within* a file
+    // via `update_rayon` — which matters because `topology.csr.blk` alone is ~71% of
+    // the bytes — and this fans out across the rest.
+    let mut files: Vec<graph_format::manifest::FileEntry> = file_names
+        .par_iter()
+        .map(|name| -> Result<graph_format::manifest::FileEntry> {
+            let path = inp.tmp_dir.join(name);
+            let bytes = fs::metadata(&path)
+                .with_context(|| format!("stat {}", path.display()))?
+                .len();
+            let (blake3, sha256, crc32c) =
+                graph_format::integrity::hash_file_checksums(&path, object_checksums)?;
+            Ok(graph_format::manifest::FileEntry {
+                name: name.clone(),
+                bytes,
+                blake3,
+                sha256,
+                crc32c,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // `par_iter` preserves order, but the inventory's order is load-bearing (it is
+    // folded into the content hash), so pin it to the sorted names rather than to a
+    // property of the iterator.
+    files.sort_by(|a, b| a.name.cmp(&b.name));
     let inventory: Vec<(String, String)> = files
         .iter()
         .map(|f| (f.name.clone(), f.blake3.clone()))

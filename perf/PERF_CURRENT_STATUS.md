@@ -240,3 +240,69 @@ content-hash `5e8e7307…`. Nothing else drifted.
 `--max-memory` (it is the OOM surface and the RSS peak); (b) parallelise `emit.graph_summaries`
 (4.3 min, embarrassingly parallel tally); (c) parallelise the `publish` hash (1.0 min, one core
 over 23 GB); (d) chase `cluster`'s serial tail (8.7 min at 2.9×).
+
+## Build diagnostics — full 91.6M wikidata after B1–B4 (2026-07-10)
+
+Same box, same command as the 2026-07-09 run above (16 cores, `--threads 14`, `--max-memory 4 GiB`
+default, `--diagnostics-interval-ms 250`), on the `writeable` branch with **B1** (memory accountant,
+D58), **B2** (parallel `emit.graph_summaries`), **B3** (publish hashing, D56) and **B4** (per-sub-step
+instrumentation + parallel block sealing, D57) landed.
+
+**Content hash `5e8e7307…` — unchanged.** Every item is byte-preserving at full scale, including B3
+part 1, which `docs/BUILD-PERF-PLAN.md` had wrongly predicted would force a re-baseline.
+
+**48.1 min wall** (was 53.8 min, **−10.6%**), 968% average CPU, **8.13 GB peak RSS** (was 8.47 GB).
+
+| phase | wall | cpu/wall | peak RSS | vs 2026-07-09 |
+|---|--:|--:|--:|---|
+| pass1 (parse + metadata) | 10.77m | 14.1× | 2.14 G | −3% wall |
+| dedup keys | 1.61m | 2.0× | 1.53 G | −15% wall, RSS 0.62→1.53 G |
+| resolve edge endpoints | 11.61m | **11.8×** | 5.62 G | +3% wall, 10.3→11.8× |
+| cluster (locality reorder) | 8.53m | 2.9× | 4.25 G | −2% wall, unchanged |
+| emit node stores | **1.68m** | **3.4×** | 2.86 G | **−40% wall**, 1.4→3.4× |
+| emit topology (CSR + edges) | 11.93m | **9.4×** | 8.29 G | −2% wall, 7.7→9.4× |
+| emit.graph_summaries | **1.36m** | **9.6×** | 5.73 G | **−68% wall**, 1.3→9.6× |
+| emit range indexes | 0.34m | 0.9× | 3.30 G | unchanged |
+| publish (hash + manifest) | **0.19m** | 2.2× | 3.32 G | **−81% wall**, 1.0→2.2× |
+
+### Memory: the accountant holds, the allocator does not
+
+| metric | 2026-07-09 | 2026-07-10 |
+|---|--:|--:|
+| peak **reserved** | *(not tracked)* | **4.29 G = 1.00× cap** |
+| peak RSS | 8.47 G = 2.08× cap | 8.29 G = 1.93× cap |
+| samples above the cap | 20.1% | 13.3% above 1.25× |
+| samples above **2×** the cap | (peak was 2.08×) | **0.0%** |
+
+`MemoryBudget` provably never overcommits: peak reserved is exactly the cap. The residual RSS overshoot
+is **not live memory**. Inside `emit.topology`, the `stitch` step holds **6.25 GB resident against
+0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files, and
+`emit reverse CSR per band` sits 4.7 GB above its reservation even though `EdgeRev` owns no heap. That
+is glibc arena retention from 14 worker threads that churned ~1.5B small `props_blob` allocations. See
+**D58**; the fix is `malloc_trim` at phase boundaries / `mallopt(M_ARENA_MAX)`, not more budgeting.
+
+### Where the remaining serial time is (per-sub-step, from B4 stage 1)
+
+| phase | sub-op | wall | cpu%avg |
+|---|---|--:|--:|
+| cluster | build undirected adjacency (external sort) | 115.5s | 281% |
+| cluster | **route adjacency into stripes** | **272.8s (54%)** | **120%** |
+| cluster | ldg pass 0 / 1 / 2 | 27.5 / 40.5 / 43.8s | 812 / 743 / 714% |
+| emit.topology | emit forward CSR + edge_props per band | 282.2s | 1436% |
+| emit.topology | emit reverse CSR per band | 123.8s | 1453% |
+| emit.topology | **stitch CSR + edge_props + postings** | **247.8s (35%)** | **85%** |
+
+Two named, still-serial steps remain, and D57's parallel sealing did not touch either — both are bounded
+by *reads*, not by compression:
+
+1. **`cluster` / route adjacency into stripes** — one thread drains the adjacency sorter's k-way merge
+   (decompressing run blocks) and scatters into 1,398 stripe files. The fix is to invert the phase:
+   route unsorted `(node, nbr)` pairs into per-stripe files in parallel, then sort each stripe in
+   parallel — `ldg_stripe_pass` only ever needs *its own* stripe ordered by node, so the stripe files
+   come out byte-identical and the permutation cannot move.
+2. **`emit.topology` / stitch** — a verbatim block-concat of 176 band files into `topology.csr.blk` +
+   `edge_props.blk` (20.4 GB), at 85% CPU and IO-bound. Now 35% of the phase, because the band passes
+   themselves got 1.6× faster.
+
+`emit.graph_summaries` and `publish`, the two phases the 2026-07-09 findings called out as serial, are
+now 9.6× and 2.2× and together cost 1.55 min (was 5.3 min).

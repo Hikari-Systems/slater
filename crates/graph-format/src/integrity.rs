@@ -34,49 +34,79 @@ pub fn crc32c_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(bytes).to_be_bytes())
 }
 
-/// Stream a file through BLAKE3, SHA-256, AND CRC32C in a single read pass,
-/// returning `(blake3_hex, sha256_base64, crc32c_base64)`. The builder uses this
-/// for the inventory so each file is read once for the canonical content digest
-/// (BLAKE3) and both server-comparable object checksums: SHA-256 (S3) and CRC32C
-/// (GCS). The CRC32C is base64 of the digest as a big-endian `u32` — GCS's wire
-/// form (see [`crc32c_base64`]).
-pub fn hash_file_blake3_sha256_crc32c(path: impl AsRef<Path>) -> Result<(String, String, String)> {
-    let f = File::open(path.as_ref())
-        .with_context(|| format!("open for hashing {}", path.as_ref().display()))?;
-    let mut reader = BufReader::new(f);
+/// Bytes read per hashing pass iteration.
+///
+/// The old value was 64 KiB, which is too small twice over: it costs a syscall
+/// every 64 KiB across a 16 GB file, and `blake3::Hasher::update_rayon` has nothing
+/// to fan out across below a few hundred KiB, so a big-buffer read is what makes
+/// the tree hash parallel at all.
+const HASH_CHUNK: usize = 8 << 20;
+
+/// Stream a file through BLAKE3 and, when `object_checksums` is set, SHA-256 and
+/// CRC32C too — all in a single read pass. Returns `(blake3_hex, sha256_base64,
+/// crc32c_base64)`.
+///
+/// BLAKE3 is the canonical content digest and is always computed. The other two
+/// exist so a generation served from an object store can be verified against the
+/// store's *server-computed* object checksum from a metadata request, with no body
+/// read: SHA-256 is S3's `x-amz-checksum-sha256`, CRC32C is GCS's `crc32c`. A build
+/// that never reaches an object store has no use for either, and SHA-256 is by far
+/// the slowest of the three — it has no tree structure, so it is a hard serial floor
+/// at roughly one core's throughput. Skipping it is most of this function's cost.
+///
+/// When they *are* wanted, the three run concurrently over one chunk rather than one
+/// after another, so the wall time per chunk is `max(blake3, sha256+crc32c)` instead
+/// of their sum.
+pub fn hash_file_checksums(
+    path: impl AsRef<Path>,
+    object_checksums: bool,
+) -> Result<(String, Option<String>, Option<String>)> {
+    let path = path.as_ref();
+    let f = File::open(path).with_context(|| format!("open for hashing {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(HASH_CHUNK, f);
     let mut b3 = blake3::Hasher::new();
     let mut sha = Sha256::new();
     let mut crc: u32 = 0;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; HASH_CHUNK];
     loop {
-        let n = reader.read(&mut buf)?;
+        // `BufReader::read` returns at most one buffer's worth, but a short read is
+        // legal; fill the chunk so `update_rayon` always sees a splittable buffer.
+        let mut n = 0;
+        while n < buf.len() {
+            match reader.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
         if n == 0 {
             break;
         }
-        b3.update(&buf[..n]);
-        sha.update(&buf[..n]);
-        crc = crc32c::crc32c_append(crc, &buf[..n]);
+        let chunk = &buf[..n];
+        if object_checksums {
+            let (_, c) = rayon::join(
+                || b3.update_rayon(chunk),
+                || {
+                    sha.update(chunk);
+                    crc32c::crc32c_append(crc, chunk)
+                },
+            );
+            crc = c;
+        } else {
+            b3.update_rayon(chunk);
+        }
+    }
+    let b3_hex = b3.finalize().to_hex().to_string();
+    if !object_checksums {
+        return Ok((b3_hex, None, None));
     }
     let sha_b64 = base64::engine::general_purpose::STANDARD.encode(sha.finalize());
     let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-    Ok((b3.finalize().to_hex().to_string(), sha_b64, crc_b64))
+    Ok((b3_hex, Some(sha_b64), Some(crc_b64)))
 }
 
 /// Stream a file through BLAKE3 and return the lowercase hex digest.
 pub fn hash_file(path: impl AsRef<Path>) -> Result<String> {
-    let f = File::open(path.as_ref())
-        .with_context(|| format!("open for hashing {}", path.as_ref().display()))?;
-    let mut reader = BufReader::new(f);
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(hash_file_checksums(path, false)?.0)
 }
 
 /// Stream an object through BLAKE3 via positional reads and return the
@@ -152,13 +182,34 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.len(), 4);
         assert_eq!(u32::from_be_bytes(decoded.try_into().unwrap()), raw);
-        // Single-pass file hasher agrees with the in-memory helper.
+        // Single-pass file hasher agrees with the in-memory helpers.
         let dir = std::env::temp_dir().join(format!("slater_crc_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("c.blk");
         std::fs::write(&p, bytes).unwrap();
-        let (_b3, _sha, crc_b64) = hash_file_blake3_sha256_crc32c(&p).unwrap();
-        assert_eq!(crc_b64, b64);
+        let (b3, sha, crc) = hash_file_checksums(&p, true).unwrap();
+        assert_eq!(crc.unwrap(), b64);
+        assert_eq!(sha.unwrap(), sha256_base64(bytes));
+        assert_eq!(b3, hash_bytes(bytes));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skipping the object checksums must not perturb the canonical digest — that
+    /// is the whole premise of gating them on an object-store publish.
+    #[test]
+    fn skipping_object_checksums_leaves_blake3_unchanged() {
+        let dir = std::env::temp_dir().join(format!("slater_skip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big.blk");
+        // Larger than one HASH_CHUNK, so the multi-chunk `update_rayon` path runs.
+        let bytes: Vec<u8> = (0..(HASH_CHUNK + 12345)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &bytes).unwrap();
+        let (with, sha, crc) = hash_file_checksums(&p, true).unwrap();
+        let (without, none_sha, none_crc) = hash_file_checksums(&p, false).unwrap();
+        assert_eq!(with, without);
+        assert_eq!(with, hash_bytes(&bytes));
+        assert!(sha.is_some() && crc.is_some());
+        assert!(none_sha.is_none() && none_crc.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -713,6 +713,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -1521,6 +1522,7 @@ dependencies = [
  "criterion",
  "gcloud-storage",
  "lz4_flex",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -43,7 +43,11 @@ rustls-pemfile = "2"
 
 # Storage codec (graph-format).
 zstd = "0.13"
-blake3 = "1"
+# `rayon` gives `Hasher::update_rayon`, which hashes one buffer across the pool.
+# BLAKE3 is a Merkle tree, so a single large file parallelises internally — which is
+# what the publish phase needs: `topology.csr.blk` alone is 71% of a generation's
+# bytes, so fanning out across *files* would leave it on one core.
+blake3 = { version = "1", features = ["rayon"] }
 byteorder = "1"
 # Per-frame WAL checksum (slater-delta) — detects a torn crash tail on replay.
 crc32c = "0.6"
