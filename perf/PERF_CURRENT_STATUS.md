@@ -332,29 +332,41 @@ Same box and command as above. Adds **D60** (`cluster` sorts each stripe rather 
 adjacency), the per-edge blob inlining, and inline sealing for pool-owned writers — on top of
 B1–B4 (D56–D58) and jemalloc (D59).
 
-**Content hash `5e8e7307…` — unchanged across all five verification rebuilds, including D61's.**
+**Content hash `5e8e7307…` — unchanged across all six verification rebuilds, including D61's two.**
 
-**40.94 min wall** (was 53.8, **−24%**), **5.66 GB peak RSS**. B1's memory acceptance — peak ≤ ~1.25×
-cap, zero samples above 2× — passes on the reserved-bytes accounting; note that *measured* peak RSS
-swings **4.28 → 5.97 GB across three runs of identical code**, so any single figure here (the old
-headline "4.95 GB" included) is one draw from that spread, not a property of the build.
+**Read this table as draws, not constants.** Wall and peak RSS on this build are not repeatable to
+better than ±6% and ±1.7 GB respectively: `f`/`g`/`h` are three runs of *identical* code, and the
+"rest of build" (every phase outside `emit.topology`) spans 1858–2075s across all five runs below.
+The only figures here that mean anything on their own are **bytes written** and the **content hash**.
 
-| phase | 2026-07-09 | jemalloc (D59) | B1–B4 | **D61** | peak RSS |
+| phase | 2026-07-09 | jemalloc (D59) | B1–B4 (`g`) | **D61 #1** | **D61 #2** |
 |---|--:|--:|--:|--:|--:|
-| pass1 | 11.1m | 11.11m | 11.17m | 11.74m | 2.11 G |
-| dedup keys | 1.9m | 1.13m | **1.12m** | 1.14m | 1.03 G |
-| resolve edge endpoints | 11.3m | 11.31m | **11.20m** | 12.59m | 4.17 G |
-| **cluster** | **8.7m** | 8.52m | **4.55m** | 4.65m | 2.81 G |
-| emit node stores | 2.8m | 0.98m | **0.97m** | 1.03m | 1.20 G |
-| **emit topology** | 12.2m | 12.03m | 12.51m | **7.86m** | 5.16 G |
-| emit.graph_summaries | 4.3m | 1.34m | **1.44m** | 1.37m | 3.10 G |
-| emit range indexes | 0.3m | 0.33m | 0.33m | 0.35m | 0.54 G |
-| publish | 1.0m | 0.21m | **0.20m** | 0.21m | 0.52 G |
-| **total** | **53.8m** | 47.0m | 43.5m | **40.9m** | **5.66 G** |
+| pass1 | 11.1m | 11.11m | 11.17m | 11.74m | 12.00m |
+| dedup keys | 1.9m | 1.13m | **1.12m** | 1.14m | 1.11m |
+| resolve edge endpoints | 11.3m | 11.31m | **11.20m** | 12.59m | 12.84m |
+| **cluster** | **8.7m** | 8.52m | **4.55m** | 4.65m | 5.12m |
+| emit node stores | 2.8m | 0.98m | **0.97m** | 1.03m | 1.16m |
+| **emit topology** | 12.2m | 12.03m | 12.51m | **7.86m** | **10.32m** |
+| emit.graph_summaries | 4.3m | 1.34m | **1.44m** | 1.37m | 1.55m |
+| emit range indexes | 0.3m | 0.33m | 0.33m | 0.35m | 0.52m |
+| publish | 1.0m | 0.21m | **0.20m** | 0.21m | 0.31m |
+| **total** | **53.8m** | 47.0m | 43.5m | **40.9m** | **44.9m** |
+| peak RSS (`getrusage`) | 8.47 G | 5.66 G | 4.95 G | 5.66 G | 5.01 G |
 
 D61 deletes the two endpoint-posting drains (231.6s of single-threaded k-way merge) and, with them,
-11.9 GB of spill writes from `emit forward CSR per band` (54.24 → 42.34 GB). Everything outside
-`emit.topology` is run-to-run noise.
+11.9 GB of spill writes from `emit forward CSR per band` (**54.24 → 42.34 GB**, reproduced to 0.1% in
+both runs). D61 #2 was a slow-disk draw — *every* phase in it is slower, including ones the change
+never touches (`emit range indexes` +46%, `publish` +46%) — which is exactly why the claim below is
+stated the way it is.
+
+**The defensible statement:** `emit.topology` was 750.6 / 892.6 / 902.1s across three old runs and is
+471.7 / 619.4s across two new ones. **The worst new run beats the best old run by 131s.** Normalising
+each run's `emit.topology` by its own "rest of build" to cancel machine conditions: old 750.6 / 884.9 /
+850.6s → new **441.7 / 554.6s**.
+
+**Peak RSS is not a regression and never was a constant.** 4.28 / 4.95 / 5.97 GB on identical code
+before; 5.01 / 5.66 GB after. The two posting sinks used to hold `2 × --max-memory/16` for the whole
+forward pass; that 512 MB now funds larger band sort buffers instead, so the net is ~zero.
 
 ### What is serial now, and why
 

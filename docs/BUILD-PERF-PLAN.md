@@ -284,11 +284,17 @@ content hash `5e8e7307…` unchanged throughout.** Per-phase table in `perf/PERF
 > closed. Splitting its single `stitch` diagnostics label into its four real operations showed the
 > cost was **not** the block-concat this plan assumed but the two endpoint-posting drains, which a
 > per-reltype bit plane deletes outright (they were computing a *set*, via a 2.98 B-record external
-> sort). Verified by a fifth 91.6M rebuild: **40.9 min wall (−24% from 53.8), `emit.topology` 12.5 →
-> 7.9 min, `5e8e7307…` still unchanged** — the bitmap emits the same bytes, so no re-baseline. Peak
-> RSS is 5.66 GB, but note that three runs of *identical* code measured 4.28 / 4.95 / 5.97 GB, so the
-> "4.95 GB" headline above is one draw from that spread. The concat is left serial on purpose: it has
-> ~1.5× of headroom worth ~20s, ~1% of the build. See D61.
+> sort). Verified by two more 91.6M rebuilds, **`5e8e7307…` unchanged in both** — the bitmap emits the
+> same bytes, so no re-baseline.
+>
+> Quote the repeatable quantities: the two drains (231.6s of single-threaded k-way merge) are gone,
+> and `emit forward CSR per band` writes **54.24 → 42.34 GB** (reproduced to 0.1% across both runs).
+> `emit.topology` was 750.6 / 892.6 / 902.1s across three old runs and is 471.7 / 619.4s across two
+> new ones — **the worst new run beats the best old run by 131s.** Total wall (40.9 / 44.9m vs 43.5 /
+> 46.1 / 47.9m) and peak RSS (5.01 / 5.66 GB vs 4.28 / 4.95 / 5.97 GB) are not repeatable to better
+> than ±6% and ±1.7 GB on this box, so the "43.5 min / 4.95 GB / 1.15× cap" headline above is one draw
+> from that spread rather than a property of the build. The concat is left serial on purpose: ~1.5× of
+> measured headroom, worth ~20s, ~1% of the build. See D61.
 
 - **B1 — `MemoryBudget` accountant.** Done, and **partially met** (see acceptance below). Shipped as
   **D58**. New `graph-format/src/membudget.rs`: a counted semaphore over `--max-memory` handing out RAII

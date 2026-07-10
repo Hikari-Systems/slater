@@ -1388,24 +1388,41 @@ only if the format changes for an independent reason, or on a reflink filesystem
 `copy_file_range` makes the concat O(1) outright.
 
 **Verification.** The bitmap and the sorter emit the same bytes, so **no content hash moves** — a
-stronger check than any re-baseline would have been. Full 91.6M rebuild, `5e8e7307…` unchanged, and
-every published file's BLAKE3 matches the baseline generation's inventory exactly.
+stronger check than any re-baseline would have been. Two full 91.6M rebuilds, `5e8e7307…` unchanged in
+both, and every published file's BLAKE3 matches the baseline generation's inventory exactly.
 
-| | before (`g`) | after |
+**Quote the noise-free quantities, not a wall-clock draw.** This box's `rest of build` — every phase
+this change does not touch — spans **1858–2075s across the five runs**, a ±6% machine-condition band,
+so any single wall or peak-RSS figure is one sample from it. What does not move run to run:
+
+| | before (3 runs) | after (2 runs) |
 |---|--:|--:|
-| `drain reltype_{src,tgt}.post` | 231.6s @ 0.91 cores | **gone** (bit-plane write: ~1s) |
-| `emit forward CSR per band` | 278.2s, **54.24 GB** written | 228.8s, **42.34 GB** written |
-| `concat` (both) | 55.8s | 55.8s (untouched) |
-| `emit.topology` | 750.6s (f/h: 892.6 / 902.1) | **471.7s** |
-| build wall (phase sum) | 43.48m | **40.94m** |
-| peak RSS | 4.95 GB | 5.66 GB — *within the 4.28–5.97 GB spread of three same-code runs* |
+| content hash | `5e8e7307…` | **`5e8e7307…`** |
+| `drain reltype_{src,tgt}.post` | 231.6s @ 0.91 cores | **gone** — bit-plane write 1.0s @ 0.9 cores |
+| `emit forward CSR per band`, **bytes written** | **54.24 GB** | **42.34 / 42.39 GB** (−22%) |
+| `concat` (both), wall | 55.5 / 55.8s | 55.8 / 56.4s (untouched) |
+| RSS − reserved, worst op | +2.43 GB (`drain … tgt`) | **+0.87 GB** (band `resident_hint` margin) |
 | Monarch-KG peak RSS | 2.03 GB | **1.39 GB** |
 
-Peak RSS is unchanged in substance: the two posting sinks used to reserve `2 × --max-memory/16` for
-the whole forward pass, and that 512 MB now goes to the band-worker pool instead, which spends it on
-larger band sort buffers. The headline "4.95 GB" was one run; `f` and `h` on identical code measured
-5.97 and 4.28 GB.
+And what does move, quoted as a range rather than a best draw:
 
-Cross-checked at other scales: 1M Wikidata hashes `6cbc6508…` on **both** paths; Monarch-KG (63
-reltypes — the only real dataset exercising `reltype_count > 3`) hashes `89d2e818…` on both paths,
-with all 63 per-reltype source and target counts matching the pre-change manifest.
+| | before: f / g / h | after: #1 / #2 |
+|---|--:|--:|
+| `emit.topology` | 892.6 / 750.6 / 902.1s | **471.7 / 619.4s** |
+| …normalised to `g`'s control | 884.9 / 750.6 / 850.6s | **441.7 / 554.6s** |
+| build wall (phase sum) | 46.12 / 43.48 / 47.88m | **40.94 / 44.91m** |
+| peak RSS (`getrusage`) | 5.97 / 4.95 / 4.28 GB | 5.66 / 5.01 GB |
+
+**The worst new run's `emit.topology` (619.4s) beats the best old run's (750.6s) by 131s.** That is the
+claim to make; "12.5 → 7.9 min" is true of one pair of draws and would be cherry-picked.
+
+**Peak RSS is unchanged in substance, and its old headline was a cherry-pick.** The two posting sinks
+used to reserve `2 × --max-memory/16` for the whole forward pass; that 512 MB now goes to the
+band-worker pool, which spends it on larger band sort buffers, so the net is ~zero. The documented
+"4.95 GB = 1.15× cap" was the `g` run; `f` and `h`, on *identical* code, measured 5.97 and 4.28 GB.
+Do not compare a single RSS number across two runs of this build.
+
+Cross-checked at other scales, where the answer *is* deterministic: 1M Wikidata hashes `6cbc6508…` on
+**both** paths; Monarch-KG (63 reltypes — the only real dataset exercising `reltype_count > 3`) hashes
+`89d2e818…` on both paths, with all 63 per-reltype source and target counts matching the pre-change
+manifest.
