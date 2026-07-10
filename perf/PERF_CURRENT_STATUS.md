@@ -316,3 +316,56 @@ by *reads*, not by compression:
 
 `emit.graph_summaries` and `publish`, the two phases the 2026-07-09 findings called out as serial, are
 now 9.6× and 2.2× and together cost 1.55 min (was 5.3 min).
+
+## Build diagnostics — full 91.6M wikidata, final (2026-07-10, `wd91m-g-diag.jsonl`)
+
+Same box and command as above. Adds **D60** (`cluster` sorts each stripe rather than the whole
+adjacency), the per-edge blob inlining, and inline sealing for pool-owned writers — on top of
+B1–B4 (D56–D58) and jemalloc (D59).
+
+**Content hash `5e8e7307…` — unchanged across all four verification rebuilds.**
+
+**43.48 min wall** (was 53.8, **−19%**), 1082% average CPU, **4.95 GB peak RSS = 1.15× the 4 GiB
+cap** (was 8.47 GB = 2.08×). B1's memory acceptance — peak ≤ ~1.25× cap, zero samples above 2× —
+**passes**.
+
+| phase | 2026-07-09 | jemalloc (D59) | final | cpu/wall | peak RSS |
+|---|--:|--:|--:|--:|--:|
+| pass1 | 11.1m | 11.11m | 11.17m | 13.7× | 2.11 G |
+| dedup keys | 1.9m | 1.13m | **1.12m** | 2.0× | 1.20 G |
+| resolve edge endpoints | 11.3m | 11.31m | **11.20m** | 12.0× | 4.23 G |
+| **cluster** | **8.7m** | 8.52m | **4.55m** | **8.3×** | 2.98 G |
+| emit node stores | 2.8m | 0.98m | **0.97m** | 5.5× | 1.10 G |
+| emit topology | 12.2m | 12.03m | 12.51m | 8.0× | 5.04 G |
+| emit.graph_summaries | 4.3m | 1.34m | **1.44m** | 9.3× | 3.85 G |
+| emit range indexes | 0.3m | 0.33m | 0.33m | 0.9× | 0.52 G |
+| publish | 1.0m | 0.21m | **0.20m** | 2.2× | 0.52 G |
+| **total** | **53.8m** | 47.0m | **43.5m** | | **4.95 G** |
+
+### What is serial now, and why
+
+| phase | sub-op | wall | cpu%avg |
+|---|---|--:|--:|
+| cluster | route adjacency into stripes | 51.2s | 796% |
+| cluster | sort adjacency stripes | 100.5s | 989% |
+| cluster | ldg pass 0 / 1 / 2 | 26.5 / 42.8 / 41.8s | ~740% |
+| emit.topology | partition edges by src band | 49.2s | 1125% |
+| emit.topology | emit forward CSR + edge_props per band | 271.8s | 1250% |
+| emit.topology | emit reverse CSR per band | 135.2s | 1278% |
+| emit.topology | **stitch CSR + edge_props + postings** | **272.5s** | **79%** |
+
+Only one near-serial step is left, and it is **not CPU-starved — it is write-bandwidth-bound**.
+`stitch` concatenates 176 band files into 20.4 GB. Three implementations measured within ±10% of
+each other: serial `BufWriter` 247.8s @85%, parallel `pwrite` 255.8s @110%, sequential
+`std::io::copy` (→ `copy_file_range(2)`; the bytes never enter user space) 272.5s @79%. The last
+ships because it costs the least CPU, not because it is faster. **Beating it means writing fewer
+bytes, not writing them differently.** See D60.
+
+### The two measurements that overturned an intuition
+
+1. **A *more accurate* memory estimate made the build worse.** With blobs inlined,
+   `SortRecord::resident_hint` can report `resolve`'s records exactly. Doing so let each buffer pack
+   ~1.7× more records — and `Vec` grows by doubling, so the `realloc` crossing the spill threshold
+   holds both arrays. `resolve` 4.31 → **6.04 GB** against a 4 GiB cap; `emit.topology`'s reverse
+   band 123.8 → 243.8s; no wall-clock gain. The default's double-count is a load-bearing margin.
+2. **85% CPU on `stitch` did not mean it needed threads.** See the table above.

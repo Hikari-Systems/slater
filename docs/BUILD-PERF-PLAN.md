@@ -275,10 +275,10 @@ redirected from `cluster` into `BlockFileWriter`). `dedup + node_stores` was str
 
 ## Progress ledger
 
-Written 2026-07-09 from the `wd91m-writeable-build-diag.jsonl` run. Landed 2026-07-10 and verified by two
-full 91.6M rebuilds (`wd91m-b1v2-diag.jsonl` on glibc, `wd91m-jem-diag.jsonl` on jemalloc):
-**47.0 min wall (was 53.8), peak RSS 5.66 GB (was 8.47), content hash `5e8e7307…` unchanged.**
-New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
+Written 2026-07-09 from the `wd91m-writeable-build-diag.jsonl` run. Landed 2026-07-10 and verified by
+four full 91.6M rebuilds (glibc, jemalloc, F1–F4, and the final `wd91m-g-diag.jsonl`):
+**43.5 min wall (was 53.8, −19%), peak RSS 4.95 GB = 1.15× the 4 GiB cap (was 8.47 GB = 2.08×),
+content hash `5e8e7307…` unchanged throughout.** Per-phase table in `perf/PERF_CURRENT_STATUS.md`.
 
 - **B1 — `MemoryBudget` accountant.** Done, and **partially met** (see acceptance below). Shipped as
   **D58**. New `graph-format/src/membudget.rs`: a counted semaphore over `--max-memory` handing out RAII
@@ -331,17 +331,20 @@ New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
   7.7× → 9.4×.
 - **`dedup` + `emit.node_stores` map-reduce.** Struck; the premise was measured false (see above).
 
-### Follow-ups, named and measured, not attempted
+### Follow-ups
 
-1. **`cluster` / `route adjacency into stripes`** — 272.8s of the phase's 512s (54%) at **120% CPU**, and
-   D57 did *not* help it: at scale the step is bounded by the k-way merge **decompressing** run blocks on
-   the consuming thread, not by compression. Invert the phase: route unsorted `(node, nbr)` pairs into
-   per-stripe files in parallel, then sort each stripe in parallel. `ldg_stripe_pass` only ever needs its
-   own stripe ordered by node, so the stripe files come out byte-identical and the permutation cannot
-   move. The 1M content hash (`6cbc6508…`) is the tripwire.
-2. **`emit.topology` / `stitch`** — now 247.8s (35% of the phase) at 85% CPU, a verbatim block-concat of
-   176 band files into 20.4 GB. IO-bound; it became the phase's largest serial step only because the band
-   passes got 1.6× faster.
+1. ~~**`cluster` / `route adjacency into stripes`**~~ **Done (D60).** The global adjacency sort never
+   needed to exist: stripes partition on `node`, the primary sort key, so a stripe is a *contiguous
+   slice* of the global order and can be sorted independently, byte-identically. Parallel route →
+   parallel per-stripe sort. **`cluster` 8.52 min @ 2.9× → 4.55 min @ 8.3×**; route+sort 388s → 152s;
+   content hash `5e8e7307…` unchanged (the tripwire, since `cluster` decides dense-id assignment).
+2. **`emit.topology` / `stitch`** — **272.5s at 79% CPU, now 36% of the phase and the build's largest
+   serial step.** Not a parallelism problem: it is bounded by **write bandwidth**. Three variants measured
+   within ±10% of each other — serial `BufWriter` 247.8s @85%, parallel `pwrite` 255.8s @110%, sequential
+   `std::io::copy` (→ `copy_file_range(2)`, bytes never enter user space) 272.5s @79%. The last ships,
+   for costing the least CPU. **Beating this means writing fewer bytes, not writing them differently** —
+   e.g. having band workers emit into the final file directly, which needs their compressed sizes up
+   front.
 3. ~~**Allocator retention** — the last 2× of peak RSS.~~ **Done (D59).** `slater-build` took
    `tikv-jemallocator` as its `#[global_allocator]` on Linux. Peak RSS 8.13 → 5.66 GB, `emit.topology`
    8.29 → 4.60 G, `stitch` 6.25 → 2.53 G against the same 0.81 G reserved, and `emit.node_stores` got
@@ -354,14 +357,27 @@ New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
    `max_distinct` cap and discarding them. On near-unique `node_Entity_wikidata_id` that was one 5.78 GB
    sample — the whole build's peak. Now `distinct_key_counts_bounded` abandons mid-scan (D59).
 
-   Still open: jemalloc treats the *symptom*. The churn is ~1.5B small `props_blob` `Vec<u8>`
-   allocations, one per edge. A per-band bump arena, or inlining short blobs into the record, would remove
-   them and cut CPU as well as RSS.
+   ~~Still open: jemalloc treats the *symptom*.~~ **Done.** `Blob` is `SmallVec<[u8; 16]>` — exactly
+   `Vec<u8>`'s 24 bytes, so nothing grew — which inlines the `uvarint(0)` an edge with no properties
+   encodes to, removing the allocation from every decode. Construction followed: an empty-props fast path
+   writes the byte straight into the inline blob, and `encode_*_record_into` lets the rest reuse a
+   thread-local buffer. (An `Option<Blob>` would have been *worse*: `SmallVec` has no niche, so it costs
+   32 bytes.)
+
+   But do **not** then "correct" `SortRecord::resident_hint` to the exact resident size — see D60. The
+   default's double-count pays for `Vec`'s doubling `realloc` transient; removing it put `resolve` at
+   1.41× the cap.
 4. **Unbudgeted resident consumers.** `emit.prop_hist` was one (now fixed). The k-way merge's
    `#runs × 256 KiB` of decompressed blocks is another, and `cluster`'s O(n) partition maps are reserved
    but the stripe readers are not. None currently drives the peak; `budget_reserved_bytes` vs `rss_bytes`
    in a `--diagnostics` run is how you find the next one.
-5. **`pass1` writers** — `BlockFileWriter` hands every block to D57's seal pool, which is pure overhead
+5. ~~**`pass1` writers**~~ **Done, partly.** Writers owned by one worker of an already-saturated pool now
+   seal inline (`BlockFileWriter::create_inline`): pass 1's shard writers, `resolve`'s per-worker edge
+   writer, merge stage 3. **Not** `ExtSorter`'s run files, which is the tempting case and the wrong one:
+   for an inline sorter, `write_run` executes on the worker that owns the sorter — the one already doing
+   the sort — so handing its blocks to the seal pool is real parallelism. Inline-sealing there cost
+   `resolve` 7.1s → 8.6s at 1M.
+6. **`pass1` writers (original note)** — `BlockFileWriter` hands every block to D57's seal pool, which is pure overhead
    for a phase already at 14.1× cpu/wall. An inline-seal constructor for writers driven from inside a
    saturated pool would remove it, mirroring `ExtSorter::new_for_pool`. (Measured within noise at 91.6M:
    11.1m → 10.77m, so this is speculative.)

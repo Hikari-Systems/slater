@@ -1255,3 +1255,56 @@ the build's peak was already 4.60 GB = **1.07× the cap**, with **zero** samples
 Remaining, and deliberately not done: jemalloc treats the symptom. The churn is ~1.5B small
 `props_blob` `Vec<u8>` allocations, one per edge; a per-band bump arena (or inlining short blobs into the
 record) would remove them and cut CPU as well as RSS.
+
+### D60 — `cluster` sorts each stripe, never the whole adjacency
+`crates/slater-build/src/cluster.rs`.
+LDG clustering needs, for each **stripe** of 65,536 node ids, that stripe's undirected
+adjacency ordered by node. It was getting that from a *global* sort: one `ExtSorter` over every
+half-edge, after which a single thread drained the k-way merge — decompressing every run — and
+scattered records into 1,398 stripe writers. At 91.6M nodes that drain was **54% of the whole
+`cluster` phase at 120% CPU**, and D57's parallel block sealing did nothing for it because the
+bottleneck is *de*compression on the consuming thread, not compression.
+
+The global sort never needed to exist. Stripes partition on `node`, which is the primary sort
+key, so a stripe's adjacency is a **contiguous slice** of the global `(node, nbr)` order —
+sorting each stripe independently yields byte-for-byte the file the global merge would have
+scattered into it. Now: pass A routes each half-edge to the stripe owning its `node`, parallel
+over the edge bucket's shards; pass B sorts each stripe, parallel over stripes. Nothing is
+globally ordered, so nothing is globally serial. `build_permutation` takes a shard-parallel scan
+(`buckets::for_each_edge` had no callers left and is now test-only).
+
+Full 91.6M rebuild, content hash `5e8e7307…` unchanged — which is the load-bearing check, since
+`cluster` decides dense-id assignment and any change to iteration order would move every emitted
+file:
+
+| | before | after |
+|---|--:|--:|
+| `cluster` phase | 8.52 min @ 2.9× | **4.55 min @ 8.3×** |
+| build adjacency + route | 115.5s + 272.8s | — |
+| route into stripes | — | **51.2s @ 796%** |
+| sort stripes | — | **100.5s @ 989%** |
+
+Total build 47.04 → 43.48 min. The LDG passes themselves (111s at ~740%) were always parallel and
+were never the problem; B4 stage 1's per-sub-step instrumentation is what made that visible.
+
+**Two changes measured and reverted, recorded so they are not retried.**
+
+1. *Exact `resident_hint` for inline blobs.* With `props_blob` inlined into the record
+   (`SmallVec<[u8; 16]>`), the resident size of `resolve`'s records is knowable exactly, and
+   overriding `SortRecord::resident_hint` to report it is correct *per record*. In aggregate it is
+   wrong: buffers then pack ~1.7× more records, and a `Vec` grows by **doubling** — the `realloc`
+   that crosses the spill threshold holds the old array and the new one at once. `resolve` went
+   4.31 GB → **6.04 GB against a 4 GiB cap** (1.41×, past B1's acceptance) and `emit.topology`'s
+   reverse band 123.8s → 243.8s, for zero wall-clock gain. The default's apparent double-count is a
+   load-bearing margin that also silently covers the k-way merge's per-run block, the band
+   batchers, and the block writers' partial blocks. Documented on the trait.
+
+2. *Parallel `stitch`.* `emit.topology`'s block-concat sat at 85% of one core, which reads like a
+   parallelism problem and is not: it is bounded by **write bandwidth**. Copying the 176 band
+   regions concurrently with positional writes scattered the write stream and raised CPU to 110%
+   for no gain. Measured, all ±10% of each other: serial `BufWriter` 247.8s @85%, parallel `pwrite`
+   255.8s @110%, sequential `std::io::copy` 272.5s @**79%**. The last is what ships — on Linux it
+   dispatches file-to-file to `copy_file_range(2)`, so the bytes never enter user space (no memcpy,
+   no second set of page-cache pages) — chosen for costing the least CPU, not for being faster.
+   `stitch` is now 36% of `emit.topology` and the build's largest serial step. Beating it means
+   writing fewer bytes, not writing them differently.
