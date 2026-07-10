@@ -27,9 +27,11 @@ use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
-use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
+use graph_format::membudget::{MemoryBudget, Reservation, MIN_SORT_BYTES};
 use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
-use graph_format::postings::write_endpoint_postings_from_sorted;
+use graph_format::postings::{
+    write_endpoint_postings_from_planes, write_endpoint_postings_from_sorted, EndpointPlanes,
+};
 use graph_format::topology::{Adj, CsrHalfWriter, TopologyReader};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
@@ -73,6 +75,16 @@ fn band_nodes() -> u64 {
             .unwrap_or(BAND_NODES_DEFAULT)
     })
 }
+
+/// Force the external-sort endpoint-postings path even when the bit planes would
+/// fit. No graph we build is large *and* richly typed enough to spill naturally
+/// (Wikidata needs 22.9 MB of planes, Monarch-KG 23.0 MB), so without this the
+/// fallback would never be exercised. Tests set it and assert the build still
+/// publishes the same content hash. Mirrors `SLATER_EMIT_BAND_NODES`.
+fn force_sorter_postings() -> bool {
+    std::env::var_os("SLATER_POSTINGS_FORCE_SORTER").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Checkpoint file (in scratch) recording how far a build got, for `--resume`.
 const STATE_FILE: &str = "BUILD-STATE.json";
 
@@ -1639,21 +1651,47 @@ fn build_inner(
         base[b + 1] = base[b] + band_counts[b];
     }
 
-    // Shared sinks for the forward phase. Postings and edge-range entries are fed into
-    // global externally-sorted sinks (push order is irrelevant — they sort) behind a
-    // mutex; the reverse records are range-routed by `final_dst` into per-dst-band
-    // files for the parallel reverse phase.
-    let post_want = (mem.total() / 16).max(MIN_SORT_BYTES);
-    let src_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
-        scratch_dir,
-        mem.reserve_now("src endpoint postings", post_want, MIN_SORT_BYTES)?,
-        SCRATCH_ZSTD,
-    )?);
-    let tgt_post_mx = Mutex::new(ExtSorter::<RelEndpoint>::new(
-        scratch_dir,
-        mem.reserve_now("tgt endpoint postings", post_want, MIN_SORT_BYTES)?,
-        SCRATCH_ZSTD,
-    )?);
+    // Shared sinks for the forward phase. Edge-range entries are fed into global
+    // externally-sorted sinks (push order is irrelevant — they sort) behind a mutex;
+    // the reverse records are range-routed by `final_dst` into per-dst-band files
+    // for the parallel reverse phase.
+    //
+    // Endpoint postings want only a per-reltype *set* of node ids, so bit planes
+    // answer them outright: no sort, no spill, and nothing held away from the band
+    // workers but the planes themselves. `reltype_count` and `node_count` are both
+    // final long before this phase (pass 1 interns the reltypes; the band layout
+    // above already needs `node_count`), so the planes can be sized up front.
+    let reltype_count = reltypes.names().len() as u32;
+    let planes_bytes = 2 * EndpointPlanes::bytes_for(reltype_count, node_count);
+    let plane_cap = (mem.total() / 8) as u64;
+    let posting_sinks = if planes_bytes <= plane_cap && !force_sorter_postings() {
+        let res = mem.reserve_now(
+            "endpoint posting planes",
+            planes_bytes as usize,
+            planes_bytes as usize,
+        )?;
+        PostingSinks::Planes {
+            src: EndpointPlanes::new(reltype_count, node_count),
+            tgt: EndpointPlanes::new(reltype_count, node_count),
+            _res: res,
+        }
+    } else {
+        // A graph both large and richly typed enough to blow the plane budget, or a
+        // test forcing this path. Costs 2 records per edge through an external sort.
+        let post_want = (mem.total() / 16).max(MIN_SORT_BYTES);
+        PostingSinks::Sorters {
+            src: Mutex::new(ExtSorter::<RelEndpoint>::new(
+                scratch_dir,
+                mem.reserve_now("src endpoint postings", post_want, MIN_SORT_BYTES)?,
+                SCRATCH_ZSTD,
+            )?),
+            tgt: Mutex::new(ExtSorter::<RelEndpoint>::new(
+                scratch_dir,
+                mem.reserve_now("tgt endpoint postings", post_want, MIN_SORT_BYTES)?,
+                SCRATCH_ZSTD,
+            )?),
+        }
+    };
     let range_mx = Mutex::new(range_sorters);
     let rev_spill = BandSpill::new(nbands, |b| band_path(scratch_dir, pid, "rev_route", b))?;
 
@@ -1691,8 +1729,7 @@ fn build_inner(
             base_r,
             fwd_band_paths_r,
             edge_range_r,
-            src_post_r,
-            tgt_post_r,
+            posts_r,
             range_r,
             rev_spill_r,
             worker_pool_r,
@@ -1703,8 +1740,7 @@ fn build_inner(
             &base,
             &fwd_band_paths,
             &edge_range,
-            &src_post_mx,
-            &tgt_post_mx,
+            &posting_sinks,
             &range_mx,
             &rev_spill,
             &worker_pool,
@@ -1733,8 +1769,7 @@ fn build_inner(
                         &band_path(scratch_dir, pid, "csr_fwd", b),
                         &band_path(scratch_dir, pid, "eprops", b),
                         edge_range_r,
-                        src_post_r,
-                        tgt_post_r,
+                        posts_r,
                         range_r,
                         rev_spill_r,
                         batch_threshold,
@@ -1846,37 +1881,73 @@ fn build_inner(
     block_sizes.insert("edge_props.blk".into(), opts.block_size as u32);
     block_sizes.insert("topology.csr.blk".into(), opts.block_size as u32);
 
-    // Each drain is a k-way merge over an `ExtSorter` holding one `RelEndpoint` per
-    // edge — 1.49B of them at Wikidata scale — decompressing every run block on this
-    // one thread, then writing the posting file. Not a file copy; do not read its cost
-    // as the concat's.
-    let reltype_count = reltypes.names().len() as u32;
-    diag.set_op("drain reltype_src.post (k-way merge)", "edges", edge_count);
-    let reltype_source_counts = write_endpoint_postings_from_sorted(
-        tmp_dir.join("reltype_src.post"),
-        reltype_count,
-        src_post_mx
-            .into_inner()
-            .unwrap()
-            .sorted()?
-            .map(|r| r.map(|e| (e.reltype, e.node))),
-        opts.block_size,
-        opts.zstd_level,
-        cipher.clone(),
-    )?;
-    diag.set_op("drain reltype_tgt.post (k-way merge)", "edges", edge_count);
-    let reltype_target_counts = write_endpoint_postings_from_sorted(
-        tmp_dir.join("reltype_tgt.post"),
-        reltype_count,
-        tgt_post_mx
-            .into_inner()
-            .unwrap()
-            .sorted()?
-            .map(|r| r.map(|e| (e.reltype, e.node))),
-        opts.block_size,
-        opts.zstd_level,
-        cipher.clone(),
-    )?;
+    // Write the endpoint postings. From bit planes this is a linear scan of
+    // `reltype_count × node_count` bits per side. From the sorter fallback it is a
+    // k-way merge over one `RelEndpoint` per edge — 1.49B of them at Wikidata scale
+    // — decompressing every run block on this one thread. Not a file copy; do not
+    // read the merge's cost as the concat's.
+    let (reltype_source_counts, reltype_target_counts) = match posting_sinks {
+        PostingSinks::Planes { src, tgt, _res } => {
+            // `BlockFileWriter` copies an over-target record into `cur_data` and
+            // again into the raw block, so the peak is ~3× the largest record. The
+            // sorter path never reserved its equivalent (`bucket: Vec<u64>` plus
+            // both copies) — that was the gap `budget_reserved_bytes` reported.
+            let rec = src.max_record_bytes().max(tgt.max_record_bytes());
+            let _rec = mem.reserve_now("endpoint posting record", rec * 3, rec * 3)?;
+            diag.set_op(
+                "write reltype_src.post (bit planes)",
+                "reltypes",
+                reltype_count as u64,
+            );
+            let sc = write_endpoint_postings_from_planes(
+                tmp_dir.join("reltype_src.post"),
+                &src,
+                opts.block_size,
+                opts.zstd_level,
+                cipher.clone(),
+            )?;
+            diag.set_op(
+                "write reltype_tgt.post (bit planes)",
+                "reltypes",
+                reltype_count as u64,
+            );
+            let tc = write_endpoint_postings_from_planes(
+                tmp_dir.join("reltype_tgt.post"),
+                &tgt,
+                opts.block_size,
+                opts.zstd_level,
+                cipher.clone(),
+            )?;
+            (sc, tc)
+        }
+        PostingSinks::Sorters { src, tgt } => {
+            diag.set_op("drain reltype_src.post (k-way merge)", "edges", edge_count);
+            let sc = write_endpoint_postings_from_sorted(
+                tmp_dir.join("reltype_src.post"),
+                reltype_count,
+                src.into_inner()
+                    .unwrap()
+                    .sorted()?
+                    .map(|r| r.map(|e| (e.reltype, e.node))),
+                opts.block_size,
+                opts.zstd_level,
+                cipher.clone(),
+            )?;
+            diag.set_op("drain reltype_tgt.post (k-way merge)", "edges", edge_count);
+            let tc = write_endpoint_postings_from_sorted(
+                tmp_dir.join("reltype_tgt.post"),
+                reltype_count,
+                tgt.into_inner()
+                    .unwrap()
+                    .sorted()?
+                    .map(|r| r.map(|e| (e.reltype, e.node))),
+                opts.block_size,
+                opts.zstd_level,
+                cipher.clone(),
+            )?;
+            (sc, tc)
+        }
+    };
     block_sizes.insert("reltype_src.post".into(), opts.block_size as u32);
     block_sizes.insert("reltype_tgt.post".into(), opts.block_size as u32);
     // Recover the range sorters (now carrying the edge-range entries) for the range
@@ -2198,6 +2269,27 @@ impl SortRecord for TripleSpill {
     }
 }
 
+/// Where the forward pass records "node `n` is an endpoint of a reltype-`t` edge".
+///
+/// Both variants produce byte-identical `reltype_{src,tgt}.post` files; the
+/// builder picks `Planes` unless they would not fit the memory budget. `Planes`
+/// needs no sort, no spill and no mutex — a band owns a disjoint slice of the
+/// source plane, and target bits are set with an atomic `fetch_or`. `Sorters` is
+/// the bounded-memory fallback: one `RelEndpoint` per edge per side into an
+/// external sort, drained as a k-way merge.
+enum PostingSinks {
+    Planes {
+        src: EndpointPlanes,
+        tgt: EndpointPlanes,
+        /// Holds the planes' bytes against the budget for as long as they exist.
+        _res: Reservation,
+    },
+    Sorters {
+        src: Mutex<ExtSorter<RelEndpoint>>,
+        tgt: Mutex<ExtSorter<RelEndpoint>>,
+    },
+}
+
 /// A `(reltype, node)` endpoint posting entry, sorted by reltype then node so the
 /// drain can write one ascending-distinct record per reltype. Used for both the
 /// source posting (node = edge source) and the target posting (node = edge dest).
@@ -2406,8 +2498,7 @@ fn emit_forward_band(
     csr_out: &Path,
     eprops_out: &Path,
     edge_range: &[EdgeRangeSpec],
-    src_post: &Mutex<ExtSorter<RelEndpoint>>,
-    tgt_post: &Mutex<ExtSorter<RelEndpoint>>,
+    posts: &PostingSinks,
     range_sorters: &Mutex<Vec<ExtSorter<RangeEntry>>>,
     rev_spill: &BandSpill,
     batch_threshold: usize,
@@ -2450,19 +2541,27 @@ fn emit_forward_band(
     let mut eprops =
         BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, cipher)?;
     let mut rev_batch = BandBatcher::new(rev_spill, batch_threshold);
-    let mut src_batch: Vec<RelEndpoint> = Vec::with_capacity(FWD_SINK_BATCH);
-    let mut tgt_batch: Vec<RelEndpoint> = Vec::with_capacity(FWD_SINK_BATCH);
+    // Only the sorter sink batches; the plane sink writes a bit per edge in place.
+    let batch_cap = match posts {
+        PostingSinks::Sorters { .. } => FWD_SINK_BATCH,
+        PostingSinks::Planes { .. } => 0,
+    };
+    let mut src_batch: Vec<RelEndpoint> = Vec::with_capacity(batch_cap);
+    let mut tgt_batch: Vec<RelEndpoint> = Vec::with_capacity(batch_cap);
     let mut range_batch: Vec<(usize, RangeEntry)> = Vec::new();
 
     let flush_posts =
         |src_batch: &mut Vec<RelEndpoint>, tgt_batch: &mut Vec<RelEndpoint>| -> Result<()> {
+            let PostingSinks::Sorters { src, tgt } = posts else {
+                return Ok(());
+            };
             {
-                let mut g = src_post.lock().unwrap();
+                let mut g = src.lock().unwrap();
                 for r in src_batch.drain(..) {
                     g.push(r)?;
                 }
             }
-            let mut g = tgt_post.lock().unwrap();
+            let mut g = tgt.lock().unwrap();
             for r in tgt_batch.drain(..) {
                 g.push(r)?;
             }
@@ -2483,14 +2582,24 @@ fn emit_forward_band(
             },
         )?;
         eprops.append_record(&ef.props_blob)?;
-        src_batch.push(RelEndpoint {
-            reltype: ef.reltype,
-            node: ef.final_src,
-        });
-        tgt_batch.push(RelEndpoint {
-            reltype: ef.reltype,
-            node: ef.final_dst,
-        });
+        match posts {
+            // `final_src` is inside this band, so the source plane's words are ours
+            // alone; `final_dst` can land in any band, hence the atomic in `set`.
+            PostingSinks::Planes { src, tgt, .. } => {
+                src.set(ef.reltype, ef.final_src);
+                tgt.set(ef.reltype, ef.final_dst);
+            }
+            PostingSinks::Sorters { .. } => {
+                src_batch.push(RelEndpoint {
+                    reltype: ef.reltype,
+                    node: ef.final_src,
+                });
+                tgt_batch.push(RelEndpoint {
+                    reltype: ef.reltype,
+                    node: ef.final_dst,
+                });
+            }
+        }
         for spec in edge_range {
             if let (Some(rid), Some(kid)) = (spec.reltype_id, spec.key_id) {
                 if ef.reltype == rid {

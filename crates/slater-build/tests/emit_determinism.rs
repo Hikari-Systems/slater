@@ -50,11 +50,20 @@ fn make_dump(n: usize) -> String {
 }
 
 fn build(work: &Path, tag: &str, cluster: &str) -> BTreeMap<String, String> {
+    build_with_env(work, tag, cluster, &[])
+}
+
+fn build_with_env(
+    work: &Path,
+    tag: &str,
+    cluster: &str,
+    env: &[(&str, &str)],
+) -> BTreeMap<String, String> {
     let data_dir = work.join(format!("data_{tag}"));
     let input = work.join(format!("dump_{tag}.cypher"));
     std::fs::write(&input, make_dump(64)).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
-        .args(["--pk", "__dump_id__"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slater-build"));
+    cmd.args(["--pk", "__dump_id__"])
         .args([
             "--input",
             input.to_str().unwrap(),
@@ -66,9 +75,11 @@ fn build(work: &Path, tag: &str, cluster: &str) -> BTreeMap<String, String> {
             cluster,
         ])
         // Force one band per node so the multi-band partition/concat path is exercised.
-        .env("SLATER_EMIT_BAND_NODES", "1")
-        .output()
-        .expect("run slater-build");
+        .env("SLATER_EMIT_BAND_NODES", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run slater-build");
     assert!(
         out.status.success(),
         "build {tag} failed: {}",
@@ -123,4 +134,44 @@ fn parallel_emit_is_deterministic_ldg() {
 #[test]
 fn parallel_emit_is_deterministic_none() {
     assert_identical("none");
+}
+
+/// The endpoint postings have two writers: bit planes (default) and the external
+/// sort (the fallback when the planes would not fit the memory budget). They must
+/// publish the *same generation*, not merely equivalent postings — the content
+/// hash folds `reltype_{src,tgt}.post` in, so a build that spills has to be
+/// indistinguishable from one that does not.
+///
+/// No real dataset takes the fallback (Wikidata's planes are 22.9 MB, Monarch-KG's
+/// 23.0 MB, against a cap of `--max-memory / 8`), so nothing else would cover it.
+#[test]
+fn both_posting_paths_publish_the_same_generation() {
+    let work = std::env::temp_dir().join(format!("slater_postpaths_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+
+    let planes = build_with_env(&work, "planes", "ldg", &[]);
+    let sorter = build_with_env(
+        &work,
+        "sorter",
+        "ldg",
+        &[("SLATER_POSTINGS_FORCE_SORTER", "1")],
+    );
+
+    // The fixture has two reltypes (NEXT, FAR), so plane indexing is exercised.
+    assert_eq!(
+        planes.get("reltype_src.post"),
+        sorter.get("reltype_src.post"),
+        "bit-plane and external-sort src postings differ"
+    );
+    assert_eq!(
+        planes.get("reltype_tgt.post"),
+        sorter.get("reltype_tgt.post"),
+        "bit-plane and external-sort tgt postings differ"
+    );
+    assert_eq!(
+        planes, sorter,
+        "the two posting paths published different generations"
+    );
+    let _ = std::fs::remove_dir_all(&work);
 }

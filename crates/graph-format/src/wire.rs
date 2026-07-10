@@ -39,6 +39,13 @@ pub fn write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
+/// Bytes [`write_uvarint`] would append for `v`, without encoding it. Lets a
+/// caller size a record buffer exactly before filling it.
+pub fn uvarint_len(v: u64) -> usize {
+    let bits = (u64::BITS - v.leading_zeros()).max(1) as usize;
+    bits.div_ceil(7)
+}
+
 /// Read an unsigned LEB128 varint, advancing the slice.
 pub fn read_uvarint(r: &mut &[u8]) -> Result<u64> {
     let mut result = 0u64;
@@ -219,6 +226,22 @@ mod tests {
             let mut r = &buf[..];
             assert_eq!(read_uvarint(&mut r).unwrap(), v);
             assert!(r.is_empty());
+        }
+    }
+
+    /// `uvarint_len` sizes a buffer that `write_uvarint` then fills exactly, so it
+    /// has to agree with the encoder on every boundary, not approximately.
+    #[test]
+    fn uvarint_len_agrees_with_encoder() {
+        let mut cases: Vec<u64> = vec![0, 1, u64::MAX];
+        for shift in 0..64u32 {
+            let b = 1u64 << shift;
+            cases.extend([b.wrapping_sub(1), b, b.wrapping_add(1)]);
+        }
+        for v in cases {
+            let mut buf = Vec::new();
+            write_uvarint(&mut buf, v);
+            assert_eq!(uvarint_len(v), buf.len(), "uvarint_len({v})");
         }
     }
 
