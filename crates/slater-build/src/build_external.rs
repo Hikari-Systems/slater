@@ -1824,23 +1824,34 @@ fn build_inner(
 
     // 4) Stitch: concat the per-band block files (forward halves then reverse halves
     //    for the CSR; band order for edge_props), then drain the postings sinks.
-    diag.set_op("stitch CSR + edge_props + postings", "", 0);
+    //
+    // Four serial operations, labelled separately: one `stitch` label over all of them
+    // hid which was costing what, and led to the whole 272.5s being attributed to the
+    // concat — see the note on the postings drain below.
     diag.set_active_workers(1);
+    diag.set_op("concat topology.csr.blk", "", 0);
     let mut csr_parts: Vec<PathBuf> = Vec::with_capacity(nbands * 2);
     csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_fwd", b)));
     csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_rev", b)));
     concat_block_files(tmp_dir.join("topology.csr.blk"), &csr_parts)?;
+    diag.set_op("concat edge_props.blk", "", 0);
     let eprops_parts: Vec<PathBuf> = (0..nbands)
         .map(|b| band_path(scratch_dir, pid, "eprops", b))
         .collect();
     concat_block_files(tmp_dir.join("edge_props.blk"), &eprops_parts)?;
+    diag.set_op("remove band scratch files", "", 0);
     for p in csr_parts.iter().chain(eprops_parts.iter()) {
         let _ = std::fs::remove_file(p);
     }
     block_sizes.insert("edge_props.blk".into(), opts.block_size as u32);
     block_sizes.insert("topology.csr.blk".into(), opts.block_size as u32);
 
+    // Each drain is a k-way merge over an `ExtSorter` holding one `RelEndpoint` per
+    // edge — 1.49B of them at Wikidata scale — decompressing every run block on this
+    // one thread, then writing the posting file. Not a file copy; do not read its cost
+    // as the concat's.
     let reltype_count = reltypes.names().len() as u32;
+    diag.set_op("drain reltype_src.post (k-way merge)", "edges", edge_count);
     let reltype_source_counts = write_endpoint_postings_from_sorted(
         tmp_dir.join("reltype_src.post"),
         reltype_count,
@@ -1853,6 +1864,7 @@ fn build_inner(
         opts.zstd_level,
         cipher.clone(),
     )?;
+    diag.set_op("drain reltype_tgt.post (k-way merge)", "edges", edge_count);
     let reltype_target_counts = write_endpoint_postings_from_sorted(
         tmp_dir.join("reltype_tgt.post"),
         reltype_count,
