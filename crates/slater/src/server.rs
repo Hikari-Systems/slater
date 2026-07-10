@@ -2674,6 +2674,7 @@ fn build_node_wal_ops(
             // later items accumulate afresh (a following patch overlays the replace).
             let mut ops: Vec<WalOp> = Vec::new();
             let mut pending: Vec<(String, Value)> = Vec::new();
+            let mut added_labels: Vec<String> = Vec::new();
             for item in items {
                 match item {
                     // Patching the anchor key's value is allowed — it relocates the node
@@ -2697,16 +2698,22 @@ fn build_node_wal_ops(
                             patches,
                         });
                     }
-                    SetItem::AddLabels(_) => {
-                        return Err(Failure::new(
-                            CODE_REQUEST,
-                            "SET n:Label (add a label) is not yet supported".into(),
-                        ))
-                    }
+                    // Label additions are independent of the property patches; collect
+                    // them into a single SetNodeLabels op emitted after the patch flush.
+                    SetItem::AddLabels(labels) => added_labels.extend(labels.iter().cloned()),
                 }
             }
             if !pending.is_empty() {
                 ops.push(upsert(pending));
+            }
+            if !added_labels.is_empty() {
+                ops.push(WalOp::SetNodeLabels {
+                    label: label.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    added: added_labels,
+                    removed: Vec::new(),
+                });
             }
             // A statement that produced no ops (an empty replace map with nothing after
             // it cannot happen — a replace already pushed) still needs one so a MERGE
@@ -2717,7 +2724,8 @@ fn build_node_wal_ops(
             Ok(ops)
         }
         WriteOp::Remove(items) => {
-            let mut props = Vec::with_capacity(items.len());
+            let mut props = Vec::new();
+            let mut removed_labels = Vec::new();
             for item in items {
                 match item {
                     RemoveItem::Prop(p) => {
@@ -2732,26 +2740,80 @@ fn build_node_wal_ops(
                         }
                         props.push(p.clone());
                     }
-                    RemoveItem::Labels(_) => {
-                        return Err(Failure::new(
-                            CODE_REQUEST,
-                            "REMOVE n:Label (drop a label) is not yet supported".into(),
-                        ))
-                    }
+                    RemoveItem::Labels(labels) => removed_labels.extend(labels.iter().cloned()),
                 }
             }
-            Ok(vec![WalOp::RemoveNodeProps {
-                label,
-                key,
-                value,
-                props,
-            }])
+            let mut ops = Vec::new();
+            if !props.is_empty() {
+                ops.push(WalOp::RemoveNodeProps {
+                    label: label.clone(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    props,
+                });
+            }
+            if !removed_labels.is_empty() {
+                ops.push(WalOp::SetNodeLabels {
+                    label,
+                    key,
+                    value,
+                    added: Vec::new(),
+                    removed: removed_labels,
+                });
+            }
+            debug_assert!(!ops.is_empty(), "REMOVE names at least one prop or label");
+            Ok(ops)
         }
         // A node DELETE tombstones the node; the topology overlay then suppresses its
         // incident edges. DELETE conformance (Stage 2) — a plain DELETE of a connected
         // node — is enforced by the caller after resolution.
         WriteOp::Delete { .. } => Ok(vec![WalOp::DeleteNode { label, key, value }]),
     }
+}
+
+/// Validate the label mutations in a write's op sequence against the graph and the
+/// resolved node:
+///  - a `SET n:Label` naming a label absent from the core symbol table is rejected (a
+///    brand-new label has no core id, so the read overlay could not honour it — the
+///    pre-existing-label subset ships first);
+///  - `REMOVE n:<identity-label>` on a **delta-born** node is rejected (Decision C): its
+///    label comes from its identity, so dropping it would leave the node label-less. On
+///    an existing **core** node the drop is allowed (it still resolves by dense id).
+///
+/// `resolved` is the node's dense id; a born id is at or above the core node count.
+fn validate_label_ops(
+    ops: &[WalOp],
+    resolved: Option<u64>,
+    gen: &Generation,
+    stmt: &parser::ast::WriteStmt,
+) -> std::result::Result<(), Failure> {
+    let is_born = resolved.is_some_and(|id| id >= gen.node_count());
+    for op in ops {
+        let WalOp::SetNodeLabels { added, removed, .. } = op else {
+            continue;
+        };
+        for l in added {
+            if gen.label_id(l).is_none() {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    format!(
+                        "cannot add label ':{l}' — it is not defined in the graph (only \
+                         pre-existing labels can be set)"
+                    ),
+                ));
+            }
+        }
+        if is_born && removed.iter().any(|l| l == &stmt.label) {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                format!(
+                    "cannot REMOVE the identity label ':{}' from a newly-created node",
+                    stmt.label
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Evaluate a `SET n = {map}` replace map into storable patches. The map may re-set the
@@ -2841,6 +2903,7 @@ fn execute_write(
     let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
     let first = ops.first().expect("a node write yields at least one op");
     let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
+    validate_label_ops(&ops, resolved, gen, stmt)?;
     // DELETE conformance: a plain (non-DETACH) DELETE errors if the node still has any
     // relationship. `resolved` is the node's dense id (a delete never returns `None`).
     if let WriteOp::Delete { detach: false, .. } = &stmt.op {
@@ -3091,6 +3154,7 @@ fn execute_write_batch(
             .first()
             .expect("a node write yields at least one op");
         let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
+        validate_label_ops(&row_ops, resolved, gen, stmt)?;
         // DELETE conformance, per row: a plain DELETE errors if the row's node still
         // has a relationship (the batch is all-DELETE or all-SET, so no edge this batch
         // creates precedes the check).
@@ -5400,6 +5464,126 @@ mod tests {
             "null",
             "the replace wiped the earlier property"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Stage 5: `SET n:Label` / `REMOVE n:Label` change what a node matches and
+    /// scans as, the label counts stay **exact** under the overlay (no fall-back scan),
+    /// the first-label grouping re-buckets, and the guards (brand-new label, born identity
+    /// label) fire.
+    #[test]
+    fn label_mutation_matches_scans_counts_and_validates() {
+        let (root, _g, _) = testgen::write_basic("label_mut_s5");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected a node write for {q:?}, got {other:?}"),
+            }
+        };
+        let view = || {
+            MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            )
+        };
+        let names = |q: &str| -> Vec<String> {
+            let v = view();
+            let ast = parser::parse(q).unwrap();
+            let mut out: Vec<String> = Engine::new(&v, &cache)
+                .run(&ast)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Val::Str(s) => s.clone(),
+                    other => panic!("expected str, got {other:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        let count = |q: &str| -> i64 {
+            let v = view();
+            let ast = parser::parse(q).unwrap();
+            let n = match Engine::new(&v, &cache).run(&ast).unwrap().rows[0][0] {
+                Val::Int(n) => n,
+                ref other => panic!("count not int: {other:?}"),
+            };
+            n
+        };
+
+        let base_person = count("MATCH (n:Person) RETURN count(*)");
+        let base_company = count("MATCH (n:Company) RETURN count(*)");
+
+        // SET n:Company on a Person → it now matches and scans as :Company, and the exact
+        // label count grows by one; it still matches :Person.
+        run("MATCH (n:Person {name:'Alice'}) SET n:Company").unwrap();
+        assert!(names("MATCH (n:Company) RETURN n.name").contains(&"Alice".to_string()));
+        assert_eq!(
+            count("MATCH (n:Company) RETURN count(*)"),
+            base_company + 1,
+            "exact label count reflects the added label under the overlay"
+        );
+        assert!(names("MATCH (n:Person) RETURN n.name").contains(&"Alice".to_string()));
+        assert_eq!(
+            count("MATCH (n:Person) RETURN count(*)"),
+            base_person,
+            "Person count is unchanged (Alice kept :Person)"
+        );
+
+        // REMOVE it → back to the baseline.
+        run("MATCH (n:Person {name:'Alice'}) REMOVE n:Company").unwrap();
+        assert!(!names("MATCH (n:Company) RETURN n.name").contains(&"Alice".to_string()));
+        assert_eq!(count("MATCH (n:Company) RETURN count(*)"), base_company);
+
+        // Removing the identity label of an existing **core** node is allowed; the exact
+        // Person count drops, and the node re-buckets to the null first-label group.
+        run("MATCH (n:Person {name:'Bob'}) REMOVE n:Person").unwrap();
+        assert!(!names("MATCH (n:Person) RETURN n.name").contains(&"Bob".to_string()));
+        assert_eq!(
+            count("MATCH (n:Person) RETURN count(*)"),
+            base_person - 1,
+            "exact label count reflects the dropped label"
+        );
+        // First-label grouping re-buckets Bob from Person to null.
+        let group = |first: &str| -> i64 {
+            let v = view();
+            let q = format!(
+                "MATCH (n) WITH labels(n)[0] AS l, count(*) AS c WHERE l = '{first}' RETURN c"
+            );
+            let ast = parser::parse(&q).unwrap();
+            let rows = Engine::new(&v, &cache).run(&ast).unwrap().rows;
+            match rows.first().map(|r| &r[0]) {
+                Some(Val::Int(n)) => *n,
+                _ => 0,
+            }
+        };
+        assert_eq!(
+            group("Person"),
+            base_person - 1,
+            "the first-label Person group loses Bob"
+        );
+
+        // A brand-new label (absent from the core symbol table) is rejected by name.
+        let e = run("MATCH (n:Person {name:'Carol'}) SET n:Ghost").unwrap_err();
+        assert!(e.message.contains("not defined"), "got: {}", e.message);
+
+        // A delta-born node's identity label cannot be removed.
+        run("MERGE (n:Person {name:'Zoe'}) SET n.age = 1").unwrap();
+        let e = run("MATCH (n:Person {name:'Zoe'}) REMOVE n:Person").unwrap_err();
+        assert!(e.message.contains("identity label"), "got: {}", e.message);
 
         std::fs::remove_dir_all(&root).ok();
     }

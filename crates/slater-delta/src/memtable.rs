@@ -60,6 +60,12 @@ pub struct NodeDelta {
     /// `SET n = {map}` — ignore *all* core properties; the effective set is `patches`
     /// alone (plus the anchor business key, which the reader re-seeds from identity).
     pub replaced: bool,
+    /// Labels added by `SET n:Label` — unioned with the node's core/identity labels on
+    /// read. Held by **name** (like patches), mapped to core ids by the reader.
+    pub labels_added: BTreeSet<String>,
+    /// Labels dropped by `REMOVE n:Label` — folded out of the node's labels on read.
+    /// Invariant: a name is in `labels_added` xor `labels_removed`.
+    pub labels_removed: BTreeSet<String>,
     /// If set, the node is deleted: the core row is suppressed on read and dropped
     /// at consolidation. (Wired in Phase 2.)
     pub tombstoned: bool,
@@ -150,7 +156,12 @@ impl NodeDelta {
     /// Whether this delta carries any information (a bare, empty, un-tombstoned
     /// delta is meaningless and should never be stored).
     pub fn is_meaningful(&self) -> bool {
-        self.tombstoned || self.replaced || !self.patches.is_empty() || !self.removed.is_empty()
+        self.tombstoned
+            || self.replaced
+            || !self.patches.is_empty()
+            || !self.removed.is_empty()
+            || !self.labels_added.is_empty()
+            || !self.labels_removed.is_empty()
     }
 
     /// Fold a *newer* level's delta onto `self` (the older, accumulated state),
@@ -163,12 +174,24 @@ impl NodeDelta {
             self.patches.clear();
             self.removed.clear();
             self.replaced = false;
+            self.labels_added.clear();
+            self.labels_removed.clear();
             self.tombstoned = true;
             return;
         }
         self.tombstoned = false;
+        // Label mutations are independent of the property replace/remove above.
+        for l in &newer.labels_added {
+            self.labels_removed.remove(l);
+            self.labels_added.insert(l.clone());
+        }
+        for l in &newer.labels_removed {
+            self.labels_added.remove(l);
+            self.labels_removed.insert(l.clone());
+        }
         if newer.replaced {
-            // A newer replace-all wipes the below-level state; its patches are the base.
+            // A newer replace-all wipes the below-level property state; its patches are
+            // the base. (Labels are unaffected — handled above.)
             self.patches = newer.patches.clone();
             self.removed.clear();
             self.replaced = true;
@@ -478,6 +501,37 @@ impl Memtable {
         }
     }
 
+    /// Add and/or drop labels on the node identified by `(label, key, value)`
+    /// (`SET n:Label` / `REMOVE n:Label`). Labels are held by name and unioned with (or
+    /// folded out of) the node's core/identity labels on read. `resolved` is the node's
+    /// dense id. Shared by live writes and WAL replay. The caller (`slater`) forbids
+    /// removing a delta-born node's identity label (it would leave the node label-less).
+    pub fn set_node_labels(
+        &mut self,
+        label: &str,
+        key: &str,
+        value: Value,
+        resolved: Option<u64>,
+        added: impl IntoIterator<Item = String>,
+        removed: impl IntoIterator<Item = String>,
+    ) {
+        let ck = self.touch_node_entry(label, key, value, resolved);
+        let entry = self
+            .nodes
+            .get_mut(&ck)
+            .expect("touch_node_entry inserted it");
+        for l in added {
+            self.bytes += l.len();
+            entry.delta.labels_removed.remove(&l);
+            entry.delta.labels_added.insert(l);
+        }
+        for l in removed {
+            self.bytes += l.len();
+            entry.delta.labels_added.remove(&l);
+            entry.delta.labels_removed.insert(l);
+        }
+    }
+
     /// Tombstone the node identified by `(label, key, value)`: reads suppress the
     /// core row and it is dropped at consolidation. `resolved` is the node's
     /// current-core dense id (an ISAM probe on the `slater` side); `None` for a
@@ -505,6 +559,8 @@ impl Memtable {
         entry.delta.patches.clear();
         entry.delta.removed.clear();
         entry.delta.replaced = false;
+        entry.delta.labels_added.clear();
+        entry.delta.labels_removed.clear();
         let already_synthetic = entry.synthetic;
         // Record the suppressed dense id. `resolved` is the core dense id, or a lower
         // level's born synthetic id (the writer substitutes it); `already_synthetic`
@@ -631,6 +687,23 @@ impl Memtable {
                 },
                 OpResolution::Node(resolved),
             ) => self.replace_node(label, key, value.clone(), resolved, patches.iter().cloned()),
+            (
+                WalOp::SetNodeLabels {
+                    label,
+                    key,
+                    value,
+                    added,
+                    removed,
+                },
+                OpResolution::Node(resolved),
+            ) => self.set_node_labels(
+                label,
+                key,
+                value.clone(),
+                resolved,
+                added.iter().cloned(),
+                removed.iter().cloned(),
+            ),
             (
                 WalOp::UpsertEdge {
                     src_label,
@@ -763,6 +836,62 @@ impl Memtable {
             }
         }
         out
+    }
+
+    /// Dense ids (core or born) that **gained** `label` via `SET n:Label` — the label
+    /// scan appends these so a node that acquired the label shows up. Removal is handled
+    /// by the label-read overlay re-checking scanned candidates, not here.
+    pub fn ids_with_added_label(&self, label: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (&dense, ck) in &self.by_dense {
+            if self
+                .nodes
+                .get(ck)
+                .is_some_and(|e| e.delta.labels_added.contains(label))
+            {
+                out.push(dense);
+            }
+        }
+        out
+    }
+
+    /// Dense ids (core or born) that **dropped** `label` via `REMOVE n:Label` in this
+    /// level — the counterpart of [`Self::ids_with_added_label`] for the exact live count.
+    pub fn ids_with_removed_label(&self, label: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (&dense, ck) in &self.by_dense {
+            if self
+                .nodes
+                .get(ck)
+                .is_some_and(|e| e.delta.labels_removed.contains(label))
+            {
+                out.push(dense);
+            }
+        }
+        out
+    }
+
+    /// Dense ids carrying any label mutation in this level — the bounded candidate set for
+    /// the exact live first-label grouping (the caller reads each node's folded labels).
+    pub fn label_overlay_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (&dense, ck) in &self.by_dense {
+            if self.nodes.get(ck).is_some_and(|e| {
+                !e.delta.labels_added.is_empty() || !e.delta.labels_removed.is_empty()
+            }) {
+                out.push(dense);
+            }
+        }
+        out
+    }
+
+    /// Whether any node in this level carries a label mutation (`SET`/`REMOVE n:Label`).
+    /// When true a label scan can no longer be trusted to prove its label — the reader
+    /// re-checks each candidate against the overlay.
+    pub fn has_label_overlay(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|e| !e.delta.labels_added.is_empty() || !e.delta.labels_removed.is_empty())
     }
 
     /// The value a delta-born node's entry `e` presents for the indexed property
@@ -1749,7 +1878,9 @@ fn replay_folded_node(m: &mut Memtable, f: &FoldedNode, resolved: Option<u64>) {
     let d = &f.delta;
     if d.tombstoned {
         m.delete_node(&f.label, &f.key, f.value.clone(), resolved);
-    } else if d.replaced {
+        return;
+    }
+    if d.replaced {
         m.replace_node(
             &f.label,
             &f.key,
@@ -1774,6 +1905,17 @@ fn replay_folded_node(m: &mut Memtable, f: &FoldedNode, resolved: Option<u64>) {
                 d.removed.iter().cloned(),
             );
         }
+    }
+    // Label mutations replay independently of the property state above.
+    if !d.labels_added.is_empty() || !d.labels_removed.is_empty() {
+        m.set_node_labels(
+            &f.label,
+            &f.key,
+            f.value.clone(),
+            resolved,
+            d.labels_added.iter().cloned(),
+            d.labels_removed.iter().cloned(),
+        );
     }
 }
 
@@ -1824,9 +1966,9 @@ fn edge_name_key(
     b
 }
 
-/// L0 segment body format version (see [`Memtable::serialise`]). Bumped to 2 when the
-/// node delta gained per-property removals and the replace-all flag.
-const L0_FORMAT_VERSION: u64 = 2;
+/// L0 segment body format version (see [`Memtable::serialise`]). v2 added per-property
+/// removals + the replace-all flag; v3 added the added/removed label-name sets.
+const L0_FORMAT_VERSION: u64 = 3;
 
 fn w_str(buf: &mut Vec<u8>, s: &str) {
     write_uvarint(buf, s.len() as u64);
@@ -1918,31 +2060,47 @@ fn r_delta(r: &mut &[u8]) -> anyhow::Result<(BTreeMap<String, Value>, bool)> {
     Ok((patches, tombstoned))
 }
 
-/// A node delta carries the shared `(tombstoned, patches)` image plus the L0-v2
-/// additions — the `replaced` flag and the `removed` property-name set.
+/// A node delta carries the shared `(tombstoned, patches)` image plus the `replaced`
+/// flag, the `removed` property-name set (L0 v2), and the added/removed label-name sets
+/// (L0 v3).
 fn w_node_delta(buf: &mut Vec<u8>, d: &NodeDelta) {
     w_delta(buf, &d.patches, d.tombstoned);
     buf.push(d.replaced as u8);
-    write_uvarint(buf, d.removed.len() as u64);
-    for name in &d.removed {
-        w_str(buf, name);
-    }
+    w_name_set(buf, &d.removed);
+    w_name_set(buf, &d.labels_added);
+    w_name_set(buf, &d.labels_removed);
 }
 
 fn r_node_delta(r: &mut &[u8]) -> anyhow::Result<NodeDelta> {
     let (patches, tombstoned) = r_delta(r)?;
     let replaced = read_u8(r)? != 0;
-    let n = read_uvarint(r)? as usize;
-    let mut removed = BTreeSet::new();
-    for _ in 0..n {
-        removed.insert(r_str(r)?);
-    }
+    let removed = r_name_set(r)?;
+    let labels_added = r_name_set(r)?;
+    let labels_removed = r_name_set(r)?;
     Ok(NodeDelta {
         patches,
         removed,
         replaced,
+        labels_added,
+        labels_removed,
         tombstoned,
     })
+}
+
+fn w_name_set(buf: &mut Vec<u8>, set: &BTreeSet<String>) {
+    write_uvarint(buf, set.len() as u64);
+    for name in set {
+        w_str(buf, name);
+    }
+}
+
+fn r_name_set(r: &mut &[u8]) -> anyhow::Result<BTreeSet<String>> {
+    let n = read_uvarint(r)? as usize;
+    let mut set = BTreeSet::new();
+    for _ in 0..n {
+        set.insert(r_str(r)?);
+    }
+    Ok(set)
 }
 
 fn w_dense_index(buf: &mut Vec<u8>, idx: &HashMap<u64, Vec<u8>>) {
@@ -2105,6 +2263,14 @@ pub trait LevelRead: std::fmt::Debug + Send + Sync {
     /// Owned `(label, key, key-value)` business identity by dense id.
     fn node_identity_owned(&self, dense_id: u64) -> Option<(String, String, Value)>;
     fn born_ids_with_label(&self, label: &str) -> Vec<u64>;
+    /// Dense ids (core or born) that gained `label` via `SET n:Label` in this level.
+    fn ids_with_added_label(&self, label: &str) -> Vec<u64>;
+    /// Dense ids (core or born) that dropped `label` via `REMOVE n:Label` in this level.
+    fn ids_with_removed_label(&self, label: &str) -> Vec<u64>;
+    /// Dense ids carrying any label mutation in this level.
+    fn label_overlay_ids(&self) -> Vec<u64>;
+    /// Whether this level carries any label mutation (`SET`/`REMOVE n:Label`).
+    fn has_label_overlay(&self) -> bool;
     fn born_synthetic_for_identity(&self, label: &str, key: &str, value: &Value) -> Option<u64>;
     fn born_ids_in_index_eq(&self, label: &str, prop: &str, key: &Value) -> Vec<u64>;
     fn born_ids_in_index_range(
@@ -2178,6 +2344,18 @@ impl LevelRead for Memtable {
     }
     fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
         Memtable::born_ids_with_label(self, label)
+    }
+    fn ids_with_added_label(&self, label: &str) -> Vec<u64> {
+        Memtable::ids_with_added_label(self, label)
+    }
+    fn ids_with_removed_label(&self, label: &str) -> Vec<u64> {
+        Memtable::ids_with_removed_label(self, label)
+    }
+    fn label_overlay_ids(&self) -> Vec<u64> {
+        Memtable::label_overlay_ids(self)
+    }
+    fn has_label_overlay(&self) -> bool {
+        Memtable::has_label_overlay(self)
     }
     fn born_synthetic_for_identity(&self, label: &str, key: &str, value: &Value) -> Option<u64> {
         Memtable::born_synthetic_for_identity(self, label, key, value)
@@ -2494,6 +2672,50 @@ impl DeltaSnapshot {
         self.levels_oldest_first()
             .flat_map(|m| m.born_ids_with_label(label))
             .collect()
+    }
+
+    /// Dense ids (core or born) that gained `label` via `SET n:Label`, across levels —
+    /// appended to a core label scan so a node that acquired the label shows up.
+    pub fn ids_with_added_label(&self, label: &str) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .levels_newest_first()
+            .flat_map(|m| m.ids_with_added_label(label))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Dense ids (core or born) that dropped `label` via `REMOVE n:Label`, across levels.
+    /// De-duplicated: the newest level's decision for a node stands, but membership here
+    /// is a set test the caller resolves against the merged view, so a plain union is safe.
+    pub fn ids_with_removed_label(&self, label: &str) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .levels_newest_first()
+            .flat_map(|m| m.ids_with_removed_label(label))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Dense ids carrying any label mutation, across levels (deduped) — the bounded
+    /// candidate set for the exact live first-label grouping.
+    pub fn label_overlay_ids(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .levels_newest_first()
+            .flat_map(|m| m.label_overlay_ids())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether any level carries a label mutation. When true a label scan can no longer
+    /// be *trusted* to prove its label — the reader must re-check each scanned candidate
+    /// against the label overlay (which folds in additions and out removals).
+    pub fn has_label_overlay(&self) -> bool {
+        self.levels_newest_first().any(|m| m.has_label_overlay())
     }
 
     /// The synthetic dense id of a delta-born node with this business identity, resolved
@@ -3089,6 +3311,60 @@ mod tests {
             snap.core_hit_survives_eq(0, "ticker", &a()),
             "the anchor business key survives a replace-all"
         );
+    }
+
+    #[test]
+    fn label_overlay_applies_folds_and_survives_l0_round_trip() {
+        // apply(WAL) == direct call for SetNodeLabels.
+        let mut viae = Memtable::new();
+        viae.apply(
+            &WalOp::SetNodeLabels {
+                label: "L".into(),
+                key: "k".into(),
+                value: Value::Int(1),
+                added: vec!["A".into(), "B".into()],
+                removed: vec!["C".into()],
+            },
+            OpResolution::Node(Some(0)),
+        );
+        let mut direct = Memtable::new();
+        direct.set_node_labels(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            ["A".to_string(), "B".into()],
+            ["C".to_string()],
+        );
+        assert_eq!(viae.node_patch(0), direct.node_patch(0));
+        assert!(viae.has_label_overlay());
+        assert_eq!(viae.ids_with_added_label("A"), vec![0]);
+
+        // Cross-level fold: level 0 adds A; level 1 removes A and adds B.
+        let mut l0 = Memtable::new();
+        l0.set_node_labels("L", "k", Value::Int(1), Some(0), ["A".to_string()], []);
+        let mut l1 = Memtable::new();
+        l1.set_node_labels(
+            "L",
+            "k",
+            Value::Int(1),
+            Some(0),
+            ["B".to_string()],
+            ["A".to_string()],
+        );
+        let snap = DeltaSnapshot::with_levels(
+            Arc::new(l1.clone()),
+            vec![Arc::new(l0.clone()) as Arc<dyn LevelRead>],
+        );
+        let d = snap.node_patch(0).unwrap();
+        assert!(d.labels_added.contains("B") && !d.labels_added.contains("A"));
+        assert!(d.labels_removed.contains("A"));
+
+        // L0 compaction + v3 serialise round-trip preserves the folded labels.
+        let merged = Memtable::merge_levels(&[&l1, &l0]);
+        let restored = Memtable::deserialise(&merged.serialise()).unwrap();
+        let dm = restored.node_patch(0).unwrap();
+        assert!(dm.labels_added.contains("B") && dm.labels_removed.contains("A"));
     }
 
     #[test]

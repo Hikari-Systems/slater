@@ -47,7 +47,7 @@ use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 /// v2 adds the resident `tombstoned` dense-id column, so a merged live `count(*)` can
 /// enumerate this segment's suppressed rows without paging `node.blk`.
-const OFFHEAP_VERSION: u64 = 2;
+const OFFHEAP_VERSION: u64 = 3;
 
 /// Per-section cache discriminants (the `sub` in a [`BlockCache`] key). Distinct so the
 /// four sections of one segment never collide in the shared cache.
@@ -154,11 +154,26 @@ fn encode_node(label: &str, key: &str, value: &Value, delta: &NodeDelta) -> Vec<
     write_value(&mut buf, value);
     w_patches(&mut buf, &delta.patches, delta.tombstoned);
     buf.push(u8::from(delta.replaced));
-    write_uvarint(&mut buf, delta.removed.len() as u64);
-    for name in &delta.removed {
-        w_str(&mut buf, name);
-    }
+    w_name_set(&mut buf, &delta.removed);
+    w_name_set(&mut buf, &delta.labels_added);
+    w_name_set(&mut buf, &delta.labels_removed);
     buf
+}
+
+fn w_name_set(buf: &mut Vec<u8>, set: &std::collections::BTreeSet<String>) {
+    write_uvarint(buf, set.len() as u64);
+    for name in set {
+        w_str(buf, name);
+    }
+}
+
+fn r_name_set(r: &mut &[u8]) -> Result<std::collections::BTreeSet<String>> {
+    let n = read_uvarint(r)? as usize;
+    let mut set = std::collections::BTreeSet::new();
+    for _ in 0..n {
+        set.insert(r_str(r)?);
+    }
+    Ok(set)
 }
 
 fn decode_node(mut r: &[u8]) -> Result<(String, String, Value, NodeDelta)> {
@@ -171,11 +186,9 @@ fn decode_node(mut r: &[u8]) -> Result<(String, String, Value, NodeDelta)> {
     }
     let replaced = r[0] != 0;
     r = &r[1..];
-    let n = read_uvarint(&mut r)? as usize;
-    let mut removed = std::collections::BTreeSet::new();
-    for _ in 0..n {
-        removed.insert(r_str(&mut r)?);
-    }
+    let removed = r_name_set(&mut r)?;
+    let labels_added = r_name_set(&mut r)?;
+    let labels_removed = r_name_set(&mut r)?;
     Ok((
         label,
         key,
@@ -184,6 +197,8 @@ fn decode_node(mut r: &[u8]) -> Result<(String, String, Value, NodeDelta)> {
             patches,
             removed,
             replaced,
+            labels_added,
+            labels_removed,
             tombstoned,
         },
     ))
@@ -295,6 +310,14 @@ pub struct OffheapSegmentWriter {
     /// as an out-edge of its source), so the flush and merge paths populate them alike.
     edge_tombstones: bool,
     born_edges_by_reltype: BTreeMap<String, u64>,
+    /// Dense ids that gained / dropped each label via `SET`/`REMOVE n:Label`, the full set
+    /// of label-mutated ids, and whether any node carries a label mutation at all — all
+    /// accumulated from the pushed node deltas (so the flush and streaming-merge paths
+    /// populate them for free) and kept resident for the exact live-count overlay.
+    added_label_ids: BTreeMap<String, Vec<u64>>,
+    removed_label_ids: BTreeMap<String, Vec<u64>>,
+    label_overlay_ids: Vec<u64>,
+    has_label_overlay: bool,
 }
 
 impl OffheapSegmentWriter {
@@ -338,6 +361,10 @@ impl OffheapSegmentWriter {
             tombstoned: Vec::new(),
             edge_tombstones: false,
             born_edges_by_reltype: BTreeMap::new(),
+            added_label_ids: BTreeMap::new(),
+            removed_label_ids: BTreeMap::new(),
+            label_overlay_ids: Vec::new(),
+            has_label_overlay: false,
         })
     }
 
@@ -356,6 +383,24 @@ impl OffheapSegmentWriter {
         // nowhere is never emitted), so this is exactly the segment's suppressed set.
         if delta.tombstoned {
             self.tombstoned.push(dense);
+        }
+        // Label overlay: index each gained/dropped label → dense (ascending, since push
+        // order is dense order), record the label-mutated id, and flag the segment.
+        if !delta.labels_added.is_empty() || !delta.labels_removed.is_empty() {
+            self.has_label_overlay = true;
+            self.label_overlay_ids.push(dense);
+            for l in &delta.labels_added {
+                self.added_label_ids
+                    .entry(l.clone())
+                    .or_default()
+                    .push(dense);
+            }
+            for l in &delta.labels_removed {
+                self.removed_label_ids
+                    .entry(l.clone())
+                    .or_default()
+                    .push(dense);
+            }
         }
         Ok(())
     }
@@ -494,6 +539,20 @@ impl OffheapSegmentWriter {
             w_str(&mut body, reltype);
             write_uvarint(&mut body, *n);
         }
+        // v3: the label-overlay index — dense ids that gained / dropped each label, the
+        // full label-mutated id set (for the exact live first-label grouping), and a flag
+        // set when any node carries a label mutation (so a scan re-checks candidates).
+        body.push(u8::from(self.has_label_overlay));
+        let w_label_ids = |body: &mut Vec<u8>, m: &BTreeMap<String, Vec<u64>>| {
+            write_uvarint(body, m.len() as u64);
+            for (label, ids) in m {
+                w_str(body, label);
+                w_u64s(body, ids.iter().copied());
+            }
+        };
+        w_label_ids(&mut body, &self.added_label_ids);
+        w_label_ids(&mut body, &self.removed_label_ids);
+        w_u64s(&mut body, self.label_overlay_ids.iter().copied());
 
         let crc = crc32c::crc32c(&body);
         let mut out = Vec::with_capacity(body.len() + 12);
@@ -594,6 +653,12 @@ pub struct L0Reader {
     /// Resident edge live-count columns (v2 meta).
     edge_tombstones: bool,
     born_edges_by_reltype: HashMap<String, u64>,
+    /// Resident label-overlay index (v3 meta): dense ids that gained / dropped each label,
+    /// the full label-mutated id set, and a flag set when any node carries a label mutation.
+    added_label_ids: HashMap<String, Vec<u64>>,
+    removed_label_ids: HashMap<String, Vec<u64>>,
+    label_overlay_ids: Vec<u64>,
+    has_label_overlay: bool,
 }
 
 impl std::fmt::Debug for L0Reader {
@@ -698,6 +763,24 @@ impl L0Reader {
             let reltype = r_str(&mut r)?;
             born_edges_by_reltype.insert(reltype, read_uvarint(&mut r)?);
         }
+        // v3: the label-overlay index.
+        if r.is_empty() {
+            bail!("L0 segment {dir:?}: short label-overlay flag");
+        }
+        let has_label_overlay = r[0] != 0;
+        r = &r[1..];
+        let r_label_ids = |r: &mut &[u8]| -> Result<HashMap<String, Vec<u64>>> {
+            let n = read_uvarint(r)? as usize;
+            let mut m = HashMap::with_capacity(n);
+            for _ in 0..n {
+                let label = r_str(r)?;
+                m.insert(label, r_u64s(r)?);
+            }
+            Ok(m)
+        };
+        let added_label_ids = r_label_ids(&mut r)?;
+        let removed_label_ids = r_label_ids(&mut r)?;
+        let label_overlay_ids = r_u64s(&mut r)?;
         if !r.is_empty() {
             bail!("L0 segment {dir:?} meta has {} trailing bytes", r.len());
         }
@@ -727,6 +810,10 @@ impl L0Reader {
             born_index,
             core_patched,
             born_by_identity,
+            added_label_ids,
+            removed_label_ids,
+            label_overlay_ids,
+            has_label_overlay,
         })
     }
 
@@ -859,6 +946,25 @@ impl LevelRead for L0Reader {
 
     fn born_ids_with_label(&self, label: &str) -> Vec<u64> {
         self.born_by_label.get(label).cloned().unwrap_or_default()
+    }
+
+    fn ids_with_added_label(&self, label: &str) -> Vec<u64> {
+        self.added_label_ids.get(label).cloned().unwrap_or_default()
+    }
+
+    fn ids_with_removed_label(&self, label: &str) -> Vec<u64> {
+        self.removed_label_ids
+            .get(label)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn label_overlay_ids(&self) -> Vec<u64> {
+        self.label_overlay_ids.clone()
+    }
+
+    fn has_label_overlay(&self) -> bool {
+        self.has_label_overlay
     }
 
     fn born_synthetic_for_identity(&self, label: &str, key: &str, value: &Value) -> Option<u64> {

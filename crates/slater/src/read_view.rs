@@ -417,28 +417,43 @@ impl ReadView for MergedView<'_> {
         let Some(label) = self.core.label_name(label_id) else {
             return Ok(0);
         };
+        let label = label.to_string();
         let core_count = self.core.node_count();
-        // Suppressed rows carrying this label. A **core** id's labels come from the core
-        // (a node may carry several, while the delta identity records only the label the
-        // write matched on); a **born** id carries exactly the one label its `MERGE`
-        // named, recoverable from its delta identity.
-        let mut suppressed = 0u64;
-        for &dense in self.delta.effective_tombstoned_ids() {
-            let carries = if dense < core_count {
+        // Whether a node carries this label *before* the label overlay: a **core** id's
+        // labels come from the core (it may carry several); a **born** id carries exactly
+        // the one label its `MERGE` named, recoverable from its delta identity.
+        let had_label = |dense: u64| -> Result<bool> {
+            Ok(if dense < core_count {
                 self.core.node_labels().labels(dense)?.contains(&label_id)
             } else {
                 self.delta
                     .node_identity_by_dense(dense)
                     .is_some_and(|(l, _, _)| l == label)
-            };
-            if carries {
-                suppressed += 1;
+            })
+        };
+        let mut count = self.core.label_node_count(label_id) as i64
+            + self.delta.born_count_with_label(&label) as i64;
+        // Label-mutation adjustments (Stage 5), bounded by the label-overlay set: a node
+        // that gained this label and did not already carry it is added; one that dropped a
+        // label it had is subtracted. Exact, so no fall-back-to-scan is needed.
+        for dense in self.delta.ids_with_added_label(&label) {
+            if !had_label(dense)? {
+                count += 1;
             }
         }
-        Ok(
-            (self.core.label_node_count(label_id) + self.delta.born_count_with_label(label))
-                .saturating_sub(suppressed),
-        )
+        for dense in self.delta.ids_with_removed_label(&label) {
+            if had_label(dense)? {
+                count -= 1;
+            }
+        }
+        // Suppressed rows carrying this label. A tombstone clears any label mutation, so a
+        // suppressed node's membership is its core/identity one.
+        for &dense in self.delta.effective_tombstoned_ids() {
+            if had_label(dense)? {
+                count -= 1;
+            }
+        }
+        Ok(count.max(0) as u64)
     }
 
     fn live_first_label_groups(&self) -> Result<Vec<(Option<String>, u64)>> {
@@ -470,6 +485,41 @@ impl ReadView for MergedView<'_> {
             })
             .collect();
 
+        // First-label re-bucketing under a label overlay (Stage 5), bounded by the
+        // label-mutation set. Only a **core** node can change its first-label bucket: a
+        // born node keeps its identity as first (identity removal is rejected), and the
+        // added labels append *after* the surviving core labels, so the new first label is
+        // the first surviving core label — else, if all core labels were dropped, the
+        // alphabetically-first added label — else none. A tombstoned node is handled by
+        // `suppressed`.
+        let mut moved: HashMap<Option<String>, i64> = HashMap::new();
+        for dense in self.delta.label_overlay_ids() {
+            if dense >= core_count {
+                continue;
+            }
+            let Some(nd) = self.delta.node_patch(dense) else {
+                continue;
+            };
+            if nd.tombstoned {
+                continue;
+            }
+            let core_labels = self.core.node_labels().labels(dense)?;
+            let old_first = core_labels
+                .first()
+                .and_then(|&lid| self.core.label_name(lid))
+                .map(str::to_string);
+            let new_first = core_labels
+                .iter()
+                .filter_map(|&lid| self.core.label_name(lid))
+                .find(|name| !nd.labels_removed.contains(*name))
+                .map(str::to_string)
+                .or_else(|| nd.labels_added.iter().next().cloned());
+            if old_first != new_first {
+                *moved.entry(old_first).or_default() -= 1;
+                *moved.entry(new_first).or_default() += 1;
+            }
+        }
+
         // Emit in core label-id order, then delta-only labels by name, then the null
         // bucket — a deterministic order the metadata result builder can rely on.
         let mut out: Vec<(Option<String>, u64)> = Vec::new();
@@ -479,7 +529,8 @@ impl ReadView for MergedView<'_> {
             let key = Some(name.clone());
             let live = self.core.first_label_count(lid) as i64
                 + born.get(&name).copied().unwrap_or(0) as i64
-                - suppressed.get(&key).copied().unwrap_or(0);
+                - suppressed.get(&key).copied().unwrap_or(0)
+                + moved.get(&key).copied().unwrap_or(0);
             seen.insert(self.core.label_name(lid).unwrap_or(""));
             if live > 0 {
                 out.push((key, live as u64));
@@ -495,7 +546,8 @@ impl ReadView for MergedView<'_> {
             }
         }
         let null_live = core_count.saturating_sub(self.core.first_labelled_node_count()) as i64
-            - suppressed.get(&None).copied().unwrap_or(0);
+            - suppressed.get(&None).copied().unwrap_or(0)
+            + moved.get(&None).copied().unwrap_or(0);
         if null_live > 0 {
             out.push((None, null_live as u64));
         }

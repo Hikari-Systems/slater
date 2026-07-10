@@ -559,23 +559,47 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
     // A delta-born node (Phase 2c) carries the single label of its business identity
     // and has no core label record — resolve the label name from the delta and map it
     // through the core symbol table (the write path requires the label to pre-exist).
-    // The id-threshold compare gates the delta probe, so the read-only/empty-delta
-    // path (every id is a core id) never even consults the delta here.
-    if id >= gen.core_generation().node_count() {
-        return Ok(gen
-            .delta()
+    // The id-threshold compare gates the core block read; the label overlay below still
+    // applies to a born node's identity label.
+    let mut ids: Vec<u32> = if id >= gen.core_generation().node_count() {
+        gen.delta()
             .node_identity_by_dense(id)
             .and_then(|(label, _, _)| gen.label_id(&label))
             .into_iter()
-            .collect());
+            .collect()
+    } else {
+        let rec = cache.record(
+            gen.node_labels().inner(),
+            gen.uuid(),
+            FileKind::NodeLabels,
+            id,
+        )?;
+        nodelabels::decode_labels(&rec)?
+    };
+    // Label mutation overlay (Stage 5): fold out `REMOVE n:Label` drops and union in
+    // `SET n:Label` additions. Labels are held by name; map through the core symbol
+    // table. The empty-delta fast path skips this entirely.
+    let delta = gen.delta();
+    if !delta.is_empty() {
+        if let Some(nd) = delta.node_patch(id) {
+            if !nd.labels_removed.is_empty() {
+                let removed: Vec<u32> = nd
+                    .labels_removed
+                    .iter()
+                    .filter_map(|l| gen.label_id(l))
+                    .collect();
+                ids.retain(|x| !removed.contains(x));
+            }
+            for l in &nd.labels_added {
+                if let Some(lid) = gen.label_id(l) {
+                    if !ids.contains(&lid) {
+                        ids.push(lid);
+                    }
+                }
+            }
+        }
     }
-    let rec = cache.record(
-        gen.node_labels().inner(),
-        gen.uuid(),
-        FileKind::NodeLabels,
-        id,
-    )?;
-    nodelabels::decode_labels(&rec)
+    Ok(ids)
 }
 
 /// Thread-safe read of node `id`'s value for property `key` (or `Null` if absent),
@@ -2015,6 +2039,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 // multi-label expression has no single-posting count — fall back.
                 Some(e) => match e.as_single_atom() {
                     Some(l) => match self.gen.label_id(l) {
+                        // `live_label_node_count` is exact under a label overlay (Stage 5),
+                        // so no fall-back-to-scan is needed here.
                         Some(lid) => self.gen.live_label_node_count(lid)? as i64,
                         // A label the core never defined can still have delta-born nodes
                         // (a `MERGE` may introduce a brand-new label), and those have no
@@ -5373,12 +5399,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let mut ids = self.gen.collect_nodes_with_label(*label_id)?;
                 // Delta-born nodes (Phase 2c) are not in the core label postings —
                 // append the synthetic ids carrying this label so a created node shows
-                // up in a label scan. Tombstoned ids are dropped by the suppression
-                // below. The empty-delta fast path skips the lookup entirely.
+                // up in a label scan. Stage 5 also appends core/born ids that *gained*
+                // this label via `SET n:Label`; a core node that *dropped* it stays in
+                // the postings but is re-checked and rejected by `node_ok` (the scan is
+                // no longer trusted to prove the label — see `scan_guaranteed_labels`).
+                // Tombstoned ids are dropped by the suppression below. The empty-delta
+                // fast path skips the lookup entirely.
                 let delta = self.gen.delta();
                 if !delta.is_empty() {
                     if let Some(label) = self.gen.label_name(*label_id) {
                         ids.extend(delta.born_ids_with_label(label));
+                        ids.extend(delta.ids_with_added_label(label));
+                        ids.sort_unstable();
+                        ids.dedup();
                     }
                 }
                 ids
@@ -5429,7 +5462,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// Id seeks and full scans prove nothing.
     fn scan_guaranteed_labels(&self, scan: &NodeScan) -> Vec<u32> {
         match scan {
-            NodeScan::LabelScan { label_id } => vec![*label_id],
+            // A label scan proves its label — unless a label mutation is present, in
+            // which case a scanned candidate may have dropped it (Stage 5); force
+            // `node_ok` to re-check by proving nothing.
+            NodeScan::LabelScan { label_id } => {
+                if self.gen.delta().has_label_overlay() {
+                    Vec::new()
+                } else {
+                    vec![*label_id]
+                }
+            }
             NodeScan::RangeEq { index, .. } | NodeScan::RangeRange { index, .. } => self
                 .gen
                 .manifest()

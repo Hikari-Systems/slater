@@ -87,6 +87,7 @@ const OP_UPSERT_EDGE: u8 = 3;
 const OP_DELETE_EDGE: u8 = 4;
 const OP_REMOVE_NODE_PROPS: u8 = 5;
 const OP_REPLACE_NODE: u8 = 6;
+const OP_SET_NODE_LABELS: u8 = 7;
 
 /// A monotonic per-graph WAL sequence number.
 ///
@@ -149,6 +150,16 @@ pub enum WalOp {
         value: Value,
         patches: Vec<(String, Value)>,
     },
+    /// Add and/or drop labels on the node identified by `(label, key, value)`
+    /// (`SET n:Label` / `REMOVE n:Label`). The labels are unioned with (or folded out
+    /// of) the node's core/identity labels on read. Last-writer-wins per label name.
+    SetNodeLabels {
+        label: String,
+        key: String,
+        value: Value,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
     /// Create (or, once edge properties land, patch) the relationship identified by
     /// `(src business key) -[reltype]-> (dst business key)` (Phase 3). A `MERGE`
     /// create; idempotent by edge identity. `patches` is reserved for edge-property
@@ -190,6 +201,9 @@ impl WalOp {
             }
             | WalOp::ReplaceNode {
                 label, key, value, ..
+            }
+            | WalOp::SetNodeLabels {
+                label, key, value, ..
             } => Some((label, key, value)),
             WalOp::UpsertEdge { .. } | WalOp::DeleteEdge { .. } => None,
         }
@@ -224,7 +238,8 @@ impl WalOp {
             WalOp::UpsertNode { .. }
             | WalOp::DeleteNode { .. }
             | WalOp::RemoveNodeProps { .. }
-            | WalOp::ReplaceNode { .. } => None,
+            | WalOp::ReplaceNode { .. }
+            | WalOp::SetNodeLabels { .. } => None,
         }
     }
 }
@@ -292,6 +307,26 @@ impl WalRecord {
                 for (prop, val) in patches {
                     write_str(buf, prop);
                     write_value(buf, val);
+                }
+            }
+            WalOp::SetNodeLabels {
+                label,
+                key,
+                value,
+                added,
+                removed,
+            } => {
+                buf.push(OP_SET_NODE_LABELS);
+                write_str(buf, label);
+                write_str(buf, key);
+                write_value(buf, value);
+                write_uvarint(buf, added.len() as u64);
+                for l in added {
+                    write_str(buf, l);
+                }
+                write_uvarint(buf, removed.len() as u64);
+                for l in removed {
+                    write_str(buf, l);
                 }
             }
             WalOp::UpsertEdge {
@@ -411,6 +446,31 @@ impl WalRecord {
                         key,
                         value,
                         patches,
+                    },
+                })
+            }
+            OP_SET_NODE_LABELS => {
+                let label = read_str(r)?;
+                let key = read_str(r)?;
+                let value = read_value(r)?;
+                let na = read_uvarint(r)? as usize;
+                let mut added = Vec::with_capacity(na);
+                for _ in 0..na {
+                    added.push(read_str(r)?);
+                }
+                let nr = read_uvarint(r)? as usize;
+                let mut removed = Vec::with_capacity(nr);
+                for _ in 0..nr {
+                    removed.push(read_str(r)?);
+                }
+                Ok(WalRecord {
+                    seq,
+                    op: WalOp::SetNodeLabels {
+                        label,
+                        key,
+                        value,
+                        added,
+                        removed,
                     },
                 })
             }
