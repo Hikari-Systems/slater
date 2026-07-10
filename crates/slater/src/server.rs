@@ -2693,6 +2693,47 @@ fn unsupported_remove() -> Failure {
     )
 }
 
+/// Whether node `id` still has any relationship over the merged view (core + the
+/// writer's current delta). Used to enforce openCypher DELETE conformance: a plain
+/// `DELETE` of a node that still has relationships is an error — only `DETACH DELETE`
+/// removes them. Both `outgoing_adj` and `incoming_adj` are overlay-aware, so an edge
+/// a prior write already tombstoned (or an edge to an already-deleted node) is not
+/// counted; the check therefore sees the *live* incident set at write time.
+fn node_has_relationships(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    id: u64,
+) -> std::result::Result<bool, Failure> {
+    let delta = DeltaSnapshot::from_memtable(writer.snapshot());
+    let view = MergedView::new(gen, delta);
+    let cache = BlockCache::new(1 << 16);
+    let engine = crate::exec::Engine::new(&view, &cache);
+    let map_err = |e: anyhow::Error| {
+        Failure::new(
+            CODE_EXECUTION,
+            format!("check the node's incident relationships: {e:#}"),
+        )
+    };
+    if !engine.outgoing_adj(id).map_err(map_err)?.is_empty() {
+        return Ok(true);
+    }
+    if !engine.incoming_adj(id).map_err(map_err)?.is_empty() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The error a plain (non-`DETACH`) `DELETE` raises when its node still has
+/// relationships — openCypher requires the edges be removed first.
+fn delete_has_relationships_error() -> Failure {
+    Failure::new(
+        CODE_EXECUTION,
+        "Cannot delete node, because it still has relationships. To delete it and its \
+         relationships, use DETACH DELETE."
+            .into(),
+    )
+}
+
 fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
@@ -2728,8 +2769,9 @@ fn execute_write(
             }
         }
         WriteOp::Remove(_) => return Err(unsupported_remove()),
-        // DETACH is accepted but a no-op until the Phase 3 topology overlay removes
-        // incident edges; the node is tombstoned either way.
+        // A node DELETE tombstones the node; the topology overlay then suppresses its
+        // incident edges. DELETE conformance (Stage 2): a *plain* DELETE of a node that
+        // still has relationships is rejected below — only DETACH DELETE removes them.
         WriteOp::Delete { detach: _, .. } => WalOp::DeleteNode {
             label: stmt.label.clone(),
             key: stmt.key.clone(),
@@ -2738,6 +2780,15 @@ fn execute_write(
     };
     let is_set = matches!(op, WalOp::UpsertNode { .. });
     let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+    // DELETE conformance: a plain (non-DETACH) DELETE errors if the node still has any
+    // relationship. `resolved` is the node's dense id (a delete never returns `None`).
+    if let WriteOp::Delete { detach: false, .. } = &stmt.op {
+        if let Some(id) = resolved {
+            if node_has_relationships(writer, gen, id)? {
+                return Err(delete_has_relationships_error());
+            }
+        }
+    }
     writer
         .write(op, OpResolution::Node(resolved))
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
@@ -2993,6 +3044,16 @@ fn execute_write_batch(
             },
         };
         let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+        // DELETE conformance, per row: a plain DELETE errors if the row's node still
+        // has a relationship (the batch is all-DELETE or all-SET, so no edge this batch
+        // creates precedes the check).
+        if let WriteOp::Delete { detach: false, .. } = &stmt.op {
+            if let Some(id) = resolved {
+                if node_has_relationships(writer, gen, id)? {
+                    return Err(delete_has_relationships_error());
+                }
+            }
+        }
         ops.push((op, OpResolution::Node(resolved)));
     }
     writer
@@ -4344,11 +4405,14 @@ mod tests {
         assert_eq!(person_count(&writer), 3);
 
         // Delete Alice.
-        let stmt =
-            match parser::parse_statement("MATCH (n:Person {name:'Alice'}) DELETE n").unwrap() {
-                parser::ast::Statement::Write(w) => w,
-                _ => panic!("expected a write"),
-            };
+        // DETACH: Alice still has outgoing :KNOWS edges, so a plain DELETE would be
+        // rejected (DELETE conformance); DETACH removes the node and detaches its edges.
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) DETACH DELETE n")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a write"),
+        };
         execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
 
         // Read-your-deletes: the anchor scan no longer yields Alice, the count drops,
@@ -4766,7 +4830,8 @@ mod tests {
             execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
         };
         write("MERGE (n:Person {name:'Dave'}) SET n.age = 50");
-        write("MATCH (n:Person {name:'Bob'}) DELETE n");
+        // DETACH: Bob has an incident :KNOWS edge, so a plain DELETE would be rejected.
+        write("MATCH (n:Person {name:'Bob'}) DETACH DELETE n");
 
         // RangeEq finds the born node — the headline 2d gap (a label scan already
         // found it in 2c; an *indexed key seek* did not until now).
@@ -5046,8 +5111,10 @@ mod tests {
 
         assert_eq!(hop(), vec!["Bob".to_string()], "core edge reaches Bob");
 
-        // Delete Bob (the edge's destination) through the write path.
-        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) DELETE n").unwrap()
+        // Delete Bob (the edge's destination) through the write path. DETACH because Bob
+        // still has the incident :KNOWS edge — a plain DELETE would be rejected.
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) DETACH DELETE n")
+            .unwrap()
         {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write"),
@@ -5058,6 +5125,73 @@ mod tests {
             hop().is_empty(),
             "the core edge to the now-tombstoned Bob is suppressed"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// DELETE conformance (Stage 2): a plain `DELETE` of a node that still has
+    /// relationships is rejected — in either edge direction — and leaves the node in
+    /// place; `DETACH DELETE` removes the node and its edges.
+    #[test]
+    fn plain_delete_rejects_node_with_relationships_detach_allows() {
+        let (root, _g) = testgen::write_indexed_people("delete_conformance_s2");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected a node write for {q:?}, got {other:?}"),
+            }
+        };
+        let present = |name: &str| -> bool {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let q = format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.name");
+            let ast = parser::parse(&q).unwrap();
+            let rows = Engine::new(&view, &cache).run(&ast).unwrap().rows.len();
+            rows > 0
+        };
+
+        // Alice has an outgoing :KNOWS edge to Bob → a plain DELETE is rejected, and
+        // Alice is untouched.
+        let e = run("MATCH (n:Person {name:'Alice'}) DELETE n").unwrap_err();
+        assert!(
+            e.message.contains("still has relationships"),
+            "got: {}",
+            e.message
+        );
+        assert!(present("Alice"), "the rejected DELETE left Alice in place");
+
+        // Bob has an *incoming* :KNOWS edge from Alice → a plain DELETE is rejected too
+        // (the check sees both directions).
+        let e = run("MATCH (n:Person {name:'Bob'}) DELETE n").unwrap_err();
+        assert!(
+            e.message.contains("still has relationships"),
+            "got: {}",
+            e.message
+        );
+        assert!(present("Bob"), "the rejected DELETE left Bob in place");
+
+        // DETACH DELETE removes Alice and her edges; a subsequent plain DELETE of Bob
+        // now succeeds (his only relationship was the edge from Alice, now gone).
+        run("MATCH (n:Person {name:'Alice'}) DETACH DELETE n").unwrap();
+        assert!(!present("Alice"), "DETACH DELETE removed Alice");
+        run("MATCH (n:Person {name:'Bob'}) DELETE n").unwrap();
+        assert!(
+            !present("Bob"),
+            "Bob had no remaining edges, so plain DELETE worked"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5997,9 +6131,9 @@ mod tests {
         check(3); // Alice, Bob, Carol.
         write("MERGE (n:Person {name:'Dave'}) SET n.age = 1"); // born
         check(4);
-        write("MATCH (n:Person {name:'Alice'}) DELETE n"); // suppress a core row
+        write("MATCH (n:Person {name:'Alice'}) DETACH DELETE n"); // suppress a core row (Alice has edges)
         check(3);
-        write("MATCH (n:Person {name:'Dave'}) DELETE n"); // suppress a born row
+        write("MATCH (n:Person {name:'Dave'}) DELETE n"); // suppress a born row (no edges)
         check(2);
         // A delete of a key that exists nowhere is refused outright, so it can never
         // enter the delta as an inert tombstone and wrongly decrement the count.
@@ -6071,8 +6205,9 @@ mod tests {
         );
         assert_eq!(scanned_edges(), 1);
 
-        // Deleting a core endpoint also removes the edge incident to it.
-        write("MATCH (n:Person {name:'Bob'}) DELETE n");
+        // DETACH-deleting a core endpoint also removes the edge incident to it (a plain
+        // DELETE would be rejected while the edge is still there).
+        write("MATCH (n:Person {name:'Bob'}) DETACH DELETE n");
         assert_eq!(
             one_int("MATCH ()-[r]->() RETURN count(*)"),
             0,

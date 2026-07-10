@@ -1690,6 +1690,15 @@ impl<'g, V: ReadView> Engine<'g, V> {
         self.outgoing(id)
     }
 
+    /// The incoming adjacency of node `id` (the mirror of [`Self::outgoing_adj`]) —
+    /// the edges whose destination is `id`. Overlay-aware in the same way: a
+    /// delta-born in-edge is included, an edge the delta tombstones (or an edge from a
+    /// tombstoned node) is dropped. Used by the DELETE-conformance incident-degree
+    /// check, which must see relationships in *both* directions.
+    pub fn incoming_adj(&self, id: u64) -> Result<Vec<topology::Adj>> {
+        self.incoming(id)
+    }
+
     /// Resolve a relationship's type name and named properties — the material a
     /// Bolt `Relationship` structure carries.
     pub fn rel_record(&self, id: u64, reltype: u32) -> Result<(String, NamedProps)> {

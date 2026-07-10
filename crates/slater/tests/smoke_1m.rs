@@ -69,8 +69,10 @@ fn delete_in_batches(c: &mut BoltClient, graph: &str, ids: &[i64], chunk: usize)
                 .map(|id| PsValue::Map(vec![("id".into(), PsValue::Int(*id))]))
                 .collect(),
         );
+        // DETACH: a segment delete removes connected entities, and DELETE conformance
+        // rejects a plain DELETE of a node that still has relationships.
         c.run_pull_params(
-            "UNWIND $rows AS r MATCH (n:Entity {wikidata_id: r.id}) DELETE n",
+            "UNWIND $rows AS r MATCH (n:Entity {wikidata_id: r.id}) DETACH DELETE n",
             vec![("rows".into(), rows)],
             Some(graph),
         )
