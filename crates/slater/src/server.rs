@@ -2643,88 +2643,78 @@ fn write_value(
     })
 }
 
-/// Execute one durable write: build the WAL op from the parsed statement +
-/// parameters, resolve the anchor's business key to a current-core dense id, and
-/// hand it to the writer (WAL append + fsync commit + memtable apply + publish).
-/// Returns an empty result — read-back is a separate `MATCH … RETURN` over the
-/// overlaid view. A `RETURN` after a write is not yet supported.
-/// Reduce a widened `SET` item list to the `(prop, value)` pairs the Stage-1 executor
-/// can honour — plain `SET var.prop = value` writes. The map-replace, map-merge, and
-/// label-set items parse (Stage 1) but need durable primitives that land in Stages 3–5,
-/// so they are rejected here with a clear "not yet supported" message rather than
-/// silently dropped.
-fn set_prop_items(
-    items: &[parser::ast::SetItem],
-) -> std::result::Result<Vec<(&String, &parser::ast::Expr)>, Failure> {
-    use parser::ast::SetItem;
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            SetItem::Prop { prop, value } => out.push((prop, value)),
-            SetItem::ReplaceMap(_) => {
-                return Err(Failure::new(
-                    CODE_REQUEST,
-                    "SET n = {…} (replace all) cannot be combined with other SET items".into(),
-                ))
-            }
-            SetItem::MergeMap(_) => {
-                return Err(Failure::new(
-                    CODE_REQUEST,
-                    "SET n += {…} (merge properties) is not yet supported".into(),
-                ))
-            }
-            SetItem::AddLabels(_) => {
-                return Err(Failure::new(
-                    CODE_REQUEST,
-                    "SET n:Label (add a label) is not yet supported".into(),
-                ))
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Build the durable node WAL op for a write statement, evaluating each value through
-/// `eval` (constant/parameter for a plain write, per-row for a write-`UNWIND`). Shared
-/// by the plain and batch paths so they cannot diverge. Stage 3 wires `SET n = {map}`
-/// to [`WalOp::ReplaceNode`] and `REMOVE n.p` to [`WalOp::RemoveNodeProps`]; the
-/// still-unimplemented `SET n += {map}` (Stage 4) and label mutations (Stage 5) are
-/// rejected with clear messages via [`set_prop_items`] / this function's REMOVE arm.
-fn build_node_wal_op(
+/// Build the durable node WAL op sequence for a write statement, evaluating each value
+/// through `eval` (constant/parameter for a plain write, per-row for a write-`UNWIND`).
+/// Shared by the plain and batch paths so they cannot diverge. `SET n.p = v` /
+/// `SET n += {map}` fold into `UpsertNode` patches (source order, LWW); `SET n = {map}`
+/// emits a `ReplaceNode`; `REMOVE n.p` a `RemoveNodeProps`; `DELETE` a `DeleteNode`.
+/// A statement that mixes a replace with further items yields several ops that
+/// group-commit atomically. Label mutations (Stage 5) are still rejected by name.
+fn build_node_wal_ops(
     stmt: &parser::ast::WriteStmt,
     key_value: &Value,
     eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
-) -> std::result::Result<WalOp, Failure> {
+) -> std::result::Result<Vec<WalOp>, Failure> {
     use parser::ast::{RemoveItem, SetItem, WriteOp};
     let label = stmt.label.clone();
     let key = stmt.key.clone();
     let value = key_value.clone();
+    let upsert = |patches: Vec<(String, Value)>| WalOp::UpsertNode {
+        label: label.clone(),
+        key: key.clone(),
+        value: value.clone(),
+        patches,
+    };
     match &stmt.op {
-        // `SET n = {map}` — a single replace-all item lowers to `ReplaceNode`.
-        WriteOp::Set(items) if matches!(items.as_slice(), [SetItem::ReplaceMap(_)]) => {
-            let SetItem::ReplaceMap(map) = &items[0] else {
-                unreachable!("matched a single ReplaceMap item")
-            };
-            let patches = replace_map_patches(stmt, key_value, map, &eval)?;
-            Ok(WalOp::ReplaceNode {
-                label,
-                key,
-                value,
-                patches,
-            })
-        }
         WriteOp::Set(items) => {
-            let props = set_prop_items(items)?;
-            let mut patches = Vec::with_capacity(props.len());
-            for (prop, expr) in props {
-                patches.push((prop.clone(), eval(expr, "a SET value")?));
+            // Fold SET items in source order into a sequence of ops that group-commits.
+            // `var.prop = v` and `var += {map}` items accumulate into a pending patch
+            // list (last-writer-wins applied by the memtable); a `var = {map}`
+            // replace-all wipes the prior state and emits a `ReplaceNode`, after which
+            // later items accumulate afresh (a following patch overlays the replace).
+            let mut ops: Vec<WalOp> = Vec::new();
+            let mut pending: Vec<(String, Value)> = Vec::new();
+            for item in items {
+                match item {
+                    // Patching the anchor key's value is allowed — it relocates the node
+                    // in the index (the "moved indexed value" overlay); the delta identity
+                    // that resolves the node stays fixed.
+                    SetItem::Prop { prop, value: expr } => {
+                        pending.push((prop.clone(), eval(expr, "a SET value")?));
+                    }
+                    SetItem::MergeMap(map) => {
+                        for (k, expr) in map {
+                            pending.push((k.clone(), eval(expr, "a merge-map value")?));
+                        }
+                    }
+                    SetItem::ReplaceMap(map) => {
+                        let patches = replace_map_patches(map, &eval)?;
+                        pending.clear();
+                        ops.push(WalOp::ReplaceNode {
+                            label: label.clone(),
+                            key: key.clone(),
+                            value: value.clone(),
+                            patches,
+                        });
+                    }
+                    SetItem::AddLabels(_) => {
+                        return Err(Failure::new(
+                            CODE_REQUEST,
+                            "SET n:Label (add a label) is not yet supported".into(),
+                        ))
+                    }
+                }
             }
-            Ok(WalOp::UpsertNode {
-                label,
-                key,
-                value,
-                patches,
-            })
+            if !pending.is_empty() {
+                ops.push(upsert(pending));
+            }
+            // A statement that produced no ops (an empty replace map with nothing after
+            // it cannot happen — a replace already pushed) still needs one so a MERGE
+            // create-if-absent's its node and the write acks.
+            if ops.is_empty() {
+                ops.push(upsert(Vec::new()));
+            }
+            Ok(ops)
         }
         WriteOp::Remove(items) => {
             let mut props = Vec::with_capacity(items.len());
@@ -2750,43 +2740,30 @@ fn build_node_wal_op(
                     }
                 }
             }
-            Ok(WalOp::RemoveNodeProps {
+            Ok(vec![WalOp::RemoveNodeProps {
                 label,
                 key,
                 value,
                 props,
-            })
+            }])
         }
         // A node DELETE tombstones the node; the topology overlay then suppresses its
         // incident edges. DELETE conformance (Stage 2) — a plain DELETE of a connected
         // node — is enforced by the caller after resolution.
-        WriteOp::Delete { .. } => Ok(WalOp::DeleteNode { label, key, value }),
+        WriteOp::Delete { .. } => Ok(vec![WalOp::DeleteNode { label, key, value }]),
     }
 }
 
-/// Evaluate a `SET n = {map}` replace map into storable patches, enforcing that it does
-/// not touch the anchor business key: the key is the node's identity, re-seeded on read,
-/// so re-stating it with the same value is redundant (skipped) and a different value is
-/// rejected (an anchored write cannot change identity).
+/// Evaluate a `SET n = {map}` replace map into storable patches. The map may re-set the
+/// anchor key (which relocates the node in the index, like any indexed-value patch); a
+/// map that omits the key keeps it — the reader re-seeds it from the delta identity.
 fn replace_map_patches(
-    stmt: &parser::ast::WriteStmt,
-    key_value: &Value,
     map: &[(String, parser::ast::Expr)],
     eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
 ) -> std::result::Result<Vec<(String, Value)>, Failure> {
     let mut patches = Vec::with_capacity(map.len());
     for (k, expr) in map {
-        let v = eval(expr, "a replace-map value")?;
-        if k == &stmt.key {
-            if v.cmp_key(key_value) != std::cmp::Ordering::Equal {
-                return Err(Failure::new(
-                    CODE_REQUEST,
-                    format!("a replace map cannot change the business-key property '{k}'"),
-                ));
-            }
-            continue;
-        }
-        patches.push((k.clone(), v));
+        patches.push((k.clone(), eval(expr, "a replace-map value")?));
     }
     Ok(patches)
 }
@@ -2832,6 +2809,12 @@ fn delete_has_relationships_error() -> Failure {
     )
 }
 
+/// Execute one durable write: build the WAL op sequence from the parsed statement +
+/// parameters, resolve the anchor's business key to a current-core dense id, and hand
+/// the ops to the writer (WAL append + fsync commit + memtable apply + publish) as one
+/// group commit. A statement lowers to several ops only when it mixes a replace-all with
+/// further SET items; they commit atomically. Returns an empty result — read-back is a
+/// separate `MATCH … RETURN` over the overlaid view.
 fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
@@ -2852,11 +2835,12 @@ fn execute_write(
         return execute_write_batch(writer, gen, stmt, params);
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
-    let op = build_node_wal_op(stmt, &key_value, |e, what| write_value(e, params, what))?;
-    // Every non-DELETE node op is "set-like": it addresses an existing node (or, under
-    // MERGE, creates one), never tombstones. That distinction routes `resolve_node_op`.
-    let is_set = !matches!(op, WalOp::DeleteNode { .. });
-    let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+    let ops = build_node_wal_ops(stmt, &key_value, |e, what| write_value(e, params, what))?;
+    // Every op in a statement shares the anchor key, so one resolution serves them all.
+    // A non-DELETE op is "set-like" (addresses an existing node, or MERGE-creates one).
+    let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
+    let first = ops.first().expect("a node write yields at least one op");
+    let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
     // DELETE conformance: a plain (non-DETACH) DELETE errors if the node still has any
     // relationship. `resolved` is the node's dense id (a delete never returns `None`).
     if let WriteOp::Delete { detach: false, .. } = &stmt.op {
@@ -2866,8 +2850,12 @@ fn execute_write(
             }
         }
     }
+    let batch: Vec<(WalOp, OpResolution)> = ops
+        .into_iter()
+        .map(|op| (op, OpResolution::Node(resolved)))
+        .collect();
     writer
-        .write(op, OpResolution::Node(resolved))
+        .write_batch(&batch)
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
 }
@@ -3095,11 +3083,14 @@ fn execute_write_batch(
             params,
             "the anchor business-key value",
         )?;
-        let op = build_node_wal_op(stmt, &key_value, |e, what| {
+        let row_ops = build_node_wal_ops(stmt, &key_value, |e, what| {
             eval_row_value(e, var, row, params, what)
         })?;
-        let is_set = !matches!(op, WalOp::DeleteNode { .. });
-        let resolved = resolve_node_op(writer, gen, &op, is_set, stmt.upsert)?;
+        let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
+        let first = row_ops
+            .first()
+            .expect("a node write yields at least one op");
+        let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
         // DELETE conformance, per row: a plain DELETE errors if the row's node still
         // has a relationship (the batch is all-DELETE or all-SET, so no edge this batch
         // creates precedes the check).
@@ -3110,7 +3101,9 @@ fn execute_write_batch(
                 }
             }
         }
-        ops.push((op, OpResolution::Node(resolved)));
+        for op in row_ops {
+            ops.push((op, OpResolution::Node(resolved)));
+        }
     }
     writer
         .write_batch(&ops)
@@ -5320,11 +5313,93 @@ mod tests {
             "the anchor business key survives a replace-all"
         );
 
-        // The anchor key cannot be removed or changed by a write.
+        // The anchor key cannot be REMOVEd — it is the node's identity.
         let e = run("MATCH (n:Person {name:'Carol'}) REMOVE n.name").unwrap_err();
         assert!(e.message.contains("business-key"), "got: {}", e.message);
-        let e = run("MATCH (n:Person {name:'Carol'}) SET n = {name: 'X'}").unwrap_err();
-        assert!(e.message.contains("business-key"), "got: {}", e.message);
+        // …but it may be re-set (here via replace-all), which relocates the node in the
+        // index — it is then found at its new key value.
+        run("MATCH (n:Person {name:'Carol'}) SET n = {name: 'Xavier'}").unwrap();
+        assert_eq!(
+            prop("Xavier", "name"),
+            "str:Xavier",
+            "replace-all relocated the node to its new key value"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Stage 4: `SET n += {map}` merges, multiple SET items fold in source
+    /// order (last-writer-wins), and a replace-all mixed with a following SET
+    /// group-commits (the post-replace patch lands on top of the replaced base).
+    #[test]
+    fn multi_item_and_merge_map_set_fold_in_source_order() {
+        let (root, _g) = testgen::write_indexed_people("multi_set_s4");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run = |q: &str| {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                other => panic!("expected a node write for {q:?}, got {other:?}"),
+            };
+        };
+        let prop = |name: &str, p: &str| -> String {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let q = format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.{p}");
+            let ast = parser::parse(&q).unwrap();
+            let mut rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            match rows.pop().map(|mut r| r.remove(0)).unwrap_or(Val::Null) {
+                Val::Null => "null".to_string(),
+                Val::Int(n) => format!("int:{n}"),
+                Val::Str(s) => format!("str:{s}"),
+                other => format!("other:{other:?}"),
+            }
+        };
+
+        // `SET n += {map}` adds every entry.
+        run("MATCH (n:Person {name:'Alice'}) SET n += {city: 'NYC', role: 'eng'}");
+        assert_eq!(prop("Alice", "city"), "str:NYC");
+        assert_eq!(prop("Alice", "role"), "str:eng");
+
+        // Mixed items fold in source order, last-writer-wins across Prop and merge-map.
+        run("MATCH (n:Person {name:'Bob'}) SET n.score = 1, n += {score: 2, tier: 'A'}, n.tier = 'B'");
+        assert_eq!(
+            prop("Bob", "score"),
+            "int:2",
+            "the later merge-map value wins over the earlier prop"
+        );
+        assert_eq!(
+            prop("Bob", "tier"),
+            "str:B",
+            "the later prop wins over the merge-map"
+        );
+
+        // A replace-all mixed with a following SET group-commits: the replace wipes the
+        // earlier property, then the post-replace patch lands on top.
+        run("MATCH (n:Person {name:'Carol'}) SET n.old = 'x'");
+        run("MATCH (n:Person {name:'Carol'}) SET n = {age: 50}, n.city = 'LA'");
+        assert_eq!(prop("Carol", "age"), "int:50", "replace set the new age");
+        assert_eq!(
+            prop("Carol", "city"),
+            "str:LA",
+            "the post-replace SET applied on top"
+        );
+        assert_eq!(
+            prop("Carol", "old"),
+            "null",
+            "the replace wiped the earlier property"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
