@@ -155,6 +155,11 @@ impl SpillState {
 /// Sort a buffer by key and write it as one run file. The unit of pool work.
 fn write_run<R: SortRecord>(mut buf: Vec<R>, path: &Path, level: i32) -> Result<()> {
     buf.sort_by(|a, b| a.cmp_key(b));
+    // Run blocks go to the shared seal pool, not inline. It is tempting to reason that
+    // this already runs on a pool worker so the seal pool can add nothing — but for an
+    // *inline* sorter (`new_inline`) `write_run` executes on the worker that owns the
+    // sorter, and that worker is doing the sort too. Handing its blocks off is real
+    // parallelism. Measured at 1M: inline-sealing here cost `resolve` 7.1s → 8.6s.
     let mut w = BlockFileWriter::create(path, RUN_BLOCK_BYTES, level)?;
     let mut enc = Vec::new();
     for rec in &buf {

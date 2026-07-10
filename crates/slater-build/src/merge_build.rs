@@ -34,15 +34,14 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Context, Result};
 
 use graph_format::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
-use graph_format::columns::{decode_props, encode_props_record};
+use graph_format::columns::decode_props;
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{BlockId, Value};
 use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
-use graph_format::nodelabels::encode_labels_record;
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
 use crate::buckets::{
-    read_blob, seg_path, segments, write_blob, BucketWriter, EdgeRec, NodeRec, ShardRemap,
+    read_blob, seg_path, segments, write_blob, Blob, BucketWriter, EdgeRec, NodeRec, ShardRemap,
 };
 use crate::model::SetExpr;
 use crate::set_eval::validate_set_expr;
@@ -842,10 +841,12 @@ pub(crate) struct MergeShardWriters {
 }
 
 impl MergeShardWriters {
+    /// Inline seal: pass 1 runs one of these per shard across every core, so the shared
+    /// block-seal pool can lend it no cores — see [`BlockFileWriter::create_inline`].
     pub(crate) fn create(node_seg: &Path, edge_seg: &Path, zstd_level: i32) -> Result<Self> {
         Ok(Self {
-            node: BlockFileWriter::create(node_seg, BUCKET_BLOCK, zstd_level)?,
-            edge: BlockFileWriter::create(edge_seg, BUCKET_BLOCK, zstd_level)?,
+            node: BlockFileWriter::create_inline(node_seg, BUCKET_BLOCK, zstd_level)?,
+            edge: BlockFileWriter::create_inline(edge_seg, BUCKET_BLOCK, zstd_level)?,
             scratch: Vec::new(),
         })
     }
@@ -1042,8 +1043,8 @@ pub(crate) fn dedup_nodes(
         if let Some((label, key, value)) = cur.take() {
             nodes_w.append_node(&NodeRec {
                 dump_id: None,
-                labels_blob: encode_labels_record(&[label]),
-                props_blob: encode_props_record(props),
+                labels_blob: crate::buckets::labels_blob(&[label]),
+                props_blob: crate::buckets::props_blob(props),
                 vec_props: Vec::new(),
             })?;
             scratch.clear();
@@ -1174,7 +1175,7 @@ struct EdgeFinal {
     src: u64,
     dst: u64,
     reltype: u32,
-    props_blob: Vec<u8>,
+    props_blob: Blob,
     edge_seq: u64,
 }
 
@@ -1191,7 +1192,7 @@ impl SortRecord for EdgeFinal {
         let dst = read_uvarint(r)?;
         let reltype = read_uvarint(r)? as u32;
         let edge_seq = read_uvarint(r)?;
-        let props_blob = read_blob(r)?.to_vec();
+        let props_blob = Blob::from_slice(read_blob(r)?);
         Ok(EdgeFinal {
             src,
             dst,
@@ -1210,14 +1211,26 @@ impl SortRecord for EdgeFinal {
     fn size_hint(&self) -> usize {
         40 + self.props_blob.len()
     }
+    fn resident_hint(&self) -> usize {
+        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
+    }
 }
 
 /// An edge's reltype + props, keyed by `edge_seq`. Sorted by `edge_seq` so it
+/// Bytes a [`Blob`] owns on the heap: zero while it fits inline.
+fn heap_of(b: &Blob) -> usize {
+    if b.spilled() {
+        b.len()
+    } else {
+        0
+    }
+}
+
 /// merge-joins in lockstep with the resolved endpoints within an edge-partition.
 struct Payload {
     edge_seq: u64,
     reltype: u32,
-    props_blob: Vec<u8>,
+    props_blob: Blob,
 }
 
 impl SortRecord for Payload {
@@ -1229,7 +1242,7 @@ impl SortRecord for Payload {
     fn decode(r: &mut &[u8]) -> Result<Self> {
         let edge_seq = read_uvarint(r)?;
         let reltype = read_uvarint(r)? as u32;
-        let props_blob = read_blob(r)?.to_vec();
+        let props_blob = Blob::from_slice(read_blob(r)?);
         Ok(Payload {
             edge_seq,
             reltype,
@@ -1241,6 +1254,10 @@ impl SortRecord for Payload {
     }
     fn size_hint(&self) -> usize {
         16 + self.props_blob.len()
+    }
+    fn resident_hint(&self) -> usize {
+        // An inline blob costs nothing beyond the record; only a spilled one is heap.
+        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
     }
 }
 
@@ -1443,7 +1460,7 @@ pub(crate) fn resolve_edges(
                                     &Payload {
                                         edge_seq,
                                         reltype: em.reltype,
-                                        props_blob: encode_props_record(&em.set_props),
+                                        props_blob: crate::buckets::props_blob(&em.set_props),
                                     },
                                 )?;
                                 edge_seq += 1;
@@ -1593,8 +1610,9 @@ pub(crate) fn resolve_edges(
             let mut s = rec;
             sorter.push(EdgeFinal::decode(&mut s)?)
         })?;
+        // One writer per partition worker; that pool is already saturated.
         let mut edge_w =
-            BucketWriter::create(seg_path(edge_out, t as u64), BUCKET_BLOCK, zstd_level)?;
+            BucketWriter::create_inline(seg_path(edge_out, t as u64), BUCKET_BLOCK, zstd_level)?;
         let mut local = 0u64;
         let mut cur: Option<(u64, u32, u64)> = None;
         let mut props: Vec<(u32, Value)> = Vec::new();
@@ -1611,7 +1629,7 @@ pub(crate) fn resolve_edges(
                     src_prov: src,
                     dst_prov: dst,
                     reltype,
-                    props_blob: encode_props_record(props),
+                    props_blob: crate::buckets::props_blob(props),
                 })?;
                 *local += 1;
             }

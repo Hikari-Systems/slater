@@ -38,6 +38,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use rayon::prelude::*;
 
 use crate::codec;
 use crate::crypto::{BlockCipher, NONCE_LEN};
@@ -52,6 +53,8 @@ const BLOCKFILE_MAGIC_ENC: &[u8; 8] = b"SLBLKE01";
 const FOOTER_LEN: u64 = 24; // dir_offset(8) + dir_len(8) + block_count(8)
 const DIR_ENTRY_LEN: usize = 20; // offset(8) + comp_len(4) + raw_len(4) + rec_count(4)
 const DIR_ENTRY_LEN_ENC: usize = DIR_ENTRY_LEN + NONCE_LEN; // + per-block nonce
+/// Bytes each `concat_block_files` worker copies per read/write pair.
+const CONCAT_CHUNK: usize = 8 << 20;
 
 /// Location of a record: which block, and which slot within that block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +286,25 @@ impl BlockFileWriter {
         Self::create_inner(path, target_block_bytes, zstd_level, cipher)
     }
 
+    /// [`BlockFileWriter::create`] that seals its blocks **inline**, on the appending
+    /// thread, instead of handing them to the shared seal pool.
+    ///
+    /// Use it for a writer driven from inside an already-saturated worker pool — pass 1's
+    /// shard writers, or `ExtSorter`'s run files, which are written by the spill pool.
+    /// There the seal pool can hand the writer no extra cores; all it adds is a channel
+    /// hop, a `BTreeMap` insert and contention on the global in-flight semaphore, and it
+    /// oversubscribes the machine with a second pool's worth of threads. Mirrors
+    /// [`ExtSorter::new_for_pool`](crate::extsort::ExtSorter::new_for_pool).
+    pub fn create_inline(
+        path: impl AsRef<Path>,
+        target_block_bytes: usize,
+        zstd_level: i32,
+    ) -> Result<Self> {
+        let mut w = Self::create_inner(path, target_block_bytes, zstd_level, None)?;
+        w.seal = None;
+        Ok(w)
+    }
+
     fn create_inner(
         path: impl AsRef<Path>,
         target_block_bytes: usize,
@@ -498,6 +520,13 @@ impl BlockFileWriter {
 /// count. This is the "cursor assembly" step for range-partitioned parallel emit:
 /// each worker writes a disjoint, contiguous slice of an output store, and this
 /// stitches the slices without a serial re-encode.
+///
+/// Each input's block region lands at an offset that depends only on the *sizes* of
+/// the regions before it, and every input carries its own footer. So the layout is
+/// known before a single byte moves: read the footers, prefix-sum the region sizes,
+/// then copy the regions concurrently with positional writes. At 91.6M nodes this step
+/// concatenates 176 band files into 20.4 GB and was 35% of `emit.topology` at 85% CPU —
+/// one thread pushing every byte through a `BufWriter`.
 pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Result<u64> {
     if inputs.is_empty() {
         bail!("concat_block_files: no inputs");
@@ -509,17 +538,18 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
         m if m == BLOCKFILE_MAGIC_ENC => true,
         _ => bail!("concat_block_files: bad magic in {}", inputs[0].display()),
     };
+    let magic_len = magic.len() as u64;
 
-    let out = File::create(out_path.as_ref())
-        .with_context(|| format!("create {}", out_path.as_ref().display()))?;
-    let mut out = BufWriter::new(out);
-    out.write_all(&magic)?;
-    let mut out_pos = magic.len() as u64;
-    let mut dir_bytes: Vec<u8> = Vec::new();
-    let mut block_count: u64 = 0;
-    let mut total_records: u64 = 0;
-    let mut copy_buf = vec![0u8; 1 << 20];
-
+    // ---- pass 1: read every footer, lay the output out ----
+    struct Part {
+        dir_offset: u64,
+        dir_len: u64,
+        blocks: u64,
+        /// Where this input's block region begins in the output.
+        out_base: u64,
+    }
+    let mut parts: Vec<Part> = Vec::with_capacity(inputs.len());
+    let mut out_pos = magic_len;
     for inp in inputs {
         let f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
         let mut m = [0u8; 8];
@@ -537,51 +567,86 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
         let dir_offset = fr.read_u64::<LittleEndian>()?;
         let dir_len = fr.read_u64::<LittleEndian>()?;
         let blocks = fr.read_u64::<LittleEndian>()?;
+        parts.push(Part {
+            dir_offset,
+            dir_len,
+            blocks,
+            out_base: out_pos,
+        });
+        out_pos += dir_offset - magic_len;
+    }
+    let dir_offset_out = out_pos;
 
-        // Copy the block region [8, dir_offset) verbatim, tracking where it lands.
-        let blocks_base_out = out_pos;
-        let mut pos = magic.len() as u64;
-        while pos < dir_offset {
-            let n = ((dir_offset - pos) as usize).min(copy_buf.len());
-            f.read_exact_at(&mut copy_buf[..n], pos)?;
-            out.write_all(&copy_buf[..n])?;
-            pos += n as u64;
-        }
-        out_pos += dir_offset - magic.len() as u64;
+    let out = File::create(out_path.as_ref())
+        .with_context(|| format!("create {}", out_path.as_ref().display()))?;
+    out.write_all_at(&magic, 0)?;
 
-        // Rewrite each directory entry's offset into the output's coordinate space.
-        let mut db = vec![0u8; dir_len as usize];
-        f.read_exact_at(&mut db, dir_offset)?;
-        let mut dr = &db[..];
-        for _ in 0..blocks {
-            let offset = dr.read_u64::<LittleEndian>()?;
-            let comp_len = dr.read_u32::<LittleEndian>()?;
-            let raw_len = dr.read_u32::<LittleEndian>()?;
-            let rec_count = dr.read_u32::<LittleEndian>()?;
-            let new_offset = blocks_base_out + (offset - magic.len() as u64);
-            dir_bytes.write_u64::<LittleEndian>(new_offset)?;
-            dir_bytes.write_u32::<LittleEndian>(comp_len)?;
-            dir_bytes.write_u32::<LittleEndian>(raw_len)?;
-            dir_bytes.write_u32::<LittleEndian>(rec_count)?;
-            if encrypted {
-                let mut nonce = [0u8; NONCE_LEN];
-                dr.read_exact(&mut nonce)?;
-                dir_bytes.write_all(&nonce)?;
+    // ---- pass 2: copy the block regions concurrently; rebuild each directory chunk ----
+    // Positional writes to disjoint ranges of one file need no coordination, and each
+    // input's directory rewrite is a pure function of its own bytes and its `out_base`.
+    let entry_len = if encrypted {
+        DIR_ENTRY_LEN_ENC
+    } else {
+        DIR_ENTRY_LEN
+    };
+    let dir_chunks: Vec<Vec<u8>> = inputs
+        .par_iter()
+        .zip(parts.par_iter())
+        .map(|(inp, part)| -> Result<Vec<u8>> {
+            let f = File::open(inp).with_context(|| format!("open {}", inp.display()))?;
+            let mut copy_buf = vec![0u8; CONCAT_CHUNK];
+            let mut pos = magic_len;
+            while pos < part.dir_offset {
+                let n = ((part.dir_offset - pos) as usize).min(copy_buf.len());
+                f.read_exact_at(&mut copy_buf[..n], pos)?;
+                out.write_all_at(&copy_buf[..n], part.out_base + (pos - magic_len))?;
+                pos += n as u64;
             }
-            block_count += 1;
-            total_records += rec_count as u64;
-        }
+
+            // Rewrite each directory entry's offset into the output's coordinate space.
+            let mut db = vec![0u8; part.dir_len as usize];
+            f.read_exact_at(&mut db, part.dir_offset)?;
+            let mut dr = &db[..];
+            let mut chunk = Vec::with_capacity(part.blocks as usize * entry_len);
+            for _ in 0..part.blocks {
+                let offset = dr.read_u64::<LittleEndian>()?;
+                let comp_len = dr.read_u32::<LittleEndian>()?;
+                let raw_len = dr.read_u32::<LittleEndian>()?;
+                let rec_count = dr.read_u32::<LittleEndian>()?;
+                chunk.write_u64::<LittleEndian>(part.out_base + (offset - magic_len))?;
+                chunk.write_u32::<LittleEndian>(comp_len)?;
+                chunk.write_u32::<LittleEndian>(raw_len)?;
+                chunk.write_u32::<LittleEndian>(rec_count)?;
+                if encrypted {
+                    let mut nonce = [0u8; NONCE_LEN];
+                    dr.read_exact(&mut nonce)?;
+                    chunk.write_all(&nonce)?;
+                }
+            }
+            Ok(chunk)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // ---- pass 3: directory + footer, in input order ----
+    let mut dir_bytes: Vec<u8> = Vec::with_capacity(dir_chunks.iter().map(Vec::len).sum());
+    for c in &dir_chunks {
+        dir_bytes.extend_from_slice(c);
+    }
+    let block_count: u64 = parts.iter().map(|p| p.blocks).sum();
+    // Record counts live in the rebuilt directory; sum them from it rather than
+    // re-reading the inputs.
+    let mut total_records: u64 = 0;
+    for i in 0..block_count as usize {
+        let at = i * entry_len + 16; // offset(8) + comp_len(4) + raw_len(4)
+        total_records += (&dir_bytes[at..at + 4]).read_u32::<LittleEndian>()? as u64;
     }
 
-    let dir_offset_out = out_pos;
-    out.write_all(&dir_bytes)?;
+    out.write_all_at(&dir_bytes, dir_offset_out)?;
     let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
     footer.write_u64::<LittleEndian>(dir_offset_out)?;
     footer.write_u64::<LittleEndian>(dir_bytes.len() as u64)?;
     footer.write_u64::<LittleEndian>(block_count)?;
-    out.write_all(&footer)?;
-    let mut out = out.into_inner().context("flush concat block file")?;
-    out.flush()?;
+    out.write_all_at(&footer, dir_offset_out + dir_bytes.len() as u64)?;
     out.sync_all().context("fsync concat block file")?;
     Ok(total_records)
 }
@@ -1204,6 +1269,42 @@ mod tests {
         .unwrap();
         assert_eq!(next, n);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The parallel concat rebuilds each directory entry, and an encrypted entry is
+    /// wider by a 24-byte per-block nonce. Get that stride wrong and every block after
+    /// the first decrypts to garbage — so the encrypted path gets its own round-trip.
+    #[test]
+    fn concat_preserves_encrypted_records_and_their_nonces() {
+        use crate::crypto::BlockCipher;
+        let cipher = Arc::new(BlockCipher::from_master(b"concat key", &[7u8; 32]));
+        let mut parts = Vec::new();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        for pi in 0..3u32 {
+            let p = tmp(&format!("enc_part{pi}"));
+            let mut w =
+                BlockFileWriter::create_with_cipher(&p, 512, 3, Some(cipher.clone())).unwrap();
+            for i in 0..150u32 {
+                let rec = format!("e{pi}-{i}-{}", "y".repeat((i % 40) as usize)).into_bytes();
+                w.append_record(&rec).unwrap();
+                expected.push(rec);
+            }
+            w.finish().unwrap();
+            parts.push(p);
+        }
+        let out = tmp("enc_concat");
+        let total = concat_block_files(&out, &parts).unwrap();
+        assert_eq!(total, expected.len() as u64);
+
+        let r = BlockFileReader::open_with_cipher(&out, Some(cipher)).unwrap();
+        assert_eq!(r.total_records(), expected.len() as u64);
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(&r.read_record_global(i as u64).unwrap(), want, "record {i}");
+        }
+        for p in &parts {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

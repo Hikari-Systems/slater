@@ -50,14 +50,33 @@ pub(crate) fn read_blob<'a>(r: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 /// One node as spilled in pass 1. Holds the pre-encoded label/property record
 /// bytes plus any routed vector properties (kept for the vector store).
+/// A pre-encoded property / label record, carried through the build's sort records.
+///
+/// Inline up to 16 bytes, which is the overwhelmingly common case: a node's label record
+/// is a handful of varints, and an edge with no properties encodes to the single byte
+/// `uvarint(0)`. Wikidata has 1.49B such edges, and each `Vec<u8>` for that one byte was a
+/// heap allocation — several per edge, once for each sort record it passes through.
+/// `SmallVec<[u8; 16]>` is exactly `Vec<u8>`'s 24 bytes, so nothing grows.
+pub type Blob = smallvec::SmallVec<[u8; 16]>;
+
+/// [`encode_labels_record`] straight into a [`Blob`].
+pub fn labels_blob(labels: &[u32]) -> Blob {
+    Blob::from_slice(&encode_labels_record(labels))
+}
+
+/// [`encode_props_record`] straight into a [`Blob`].
+pub fn props_blob(props: &[(u32, graph_format::ids::Value)]) -> Blob {
+    Blob::from_slice(&encode_props_record(props))
+}
+
 pub struct NodeRec {
     /// The node's `__dump_id__`, used to resolve edge endpoints. `None` if the
     /// node carried none (then no edge can reference it).
     pub dump_id: Option<i64>,
     /// Pre-encoded `node_labels.blk` record (see [`graph_format::nodelabels::encode_labels_record`]).
-    pub labels_blob: Vec<u8>,
+    pub labels_blob: Blob,
     /// Pre-encoded `node_props.blk` record (see [`graph_format::columns::encode_props_record`]).
-    pub props_blob: Vec<u8>,
+    pub props_blob: Blob,
     /// Routed vector properties `(key, vector)` for the vector store (usually empty).
     pub vec_props: Vec<(String, Vec<f32>)>,
 }
@@ -86,8 +105,8 @@ impl NodeRec {
     pub fn decode(mut r: &[u8]) -> Result<Self> {
         let view = NodeRecView::parse(r)?;
         let dump_id = view.dump_id;
-        let labels_blob = view.labels_blob.to_vec();
-        let props_blob = view.props_blob.to_vec();
+        let labels_blob = Blob::from_slice(view.labels_blob);
+        let props_blob = Blob::from_slice(view.props_blob);
         // Re-parse the vector tail into owned form.
         r = view.vec_tail;
         let n = read_uvarint(&mut r)? as usize;
@@ -170,7 +189,7 @@ pub struct EdgeRec {
     pub src_prov: u64,
     pub dst_prov: u64,
     pub reltype: u32,
-    pub props_blob: Vec<u8>,
+    pub props_blob: Blob,
 }
 
 impl EdgeRec {
@@ -187,7 +206,7 @@ impl EdgeRec {
         let src_prov = read_uvarint(&mut r)?;
         let dst_prov = read_uvarint(&mut r)?;
         let reltype = read_uvarint(&mut r)? as u32;
-        let props_blob = read_blob(&mut r)?.to_vec();
+        let props_blob = Blob::from_slice(read_blob(&mut r)?);
         Ok(EdgeRec {
             prov_edge_id,
             src_prov,
@@ -206,7 +225,7 @@ pub struct UnresolvedEdge {
     pub src_dump: i64,
     pub dst_dump: i64,
     pub reltype: u32,
-    pub props_blob: Vec<u8>,
+    pub props_blob: Blob,
 }
 
 impl UnresolvedEdge {
@@ -221,7 +240,7 @@ impl UnresolvedEdge {
         let src_dump = unzigzag(read_uvarint(&mut r)?);
         let dst_dump = unzigzag(read_uvarint(&mut r)?);
         let reltype = read_uvarint(&mut r)? as u32;
-        let props_blob = read_blob(&mut r)?.to_vec();
+        let props_blob = Blob::from_slice(read_blob(&mut r)?);
         Ok(UnresolvedEdge {
             src_dump,
             dst_dump,
@@ -245,6 +264,20 @@ impl BucketWriter {
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create(path, target_block_bytes, zstd_level)?,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// [`BucketWriter::create`] sealing its blocks inline. For a writer owned by one
+    /// worker of an already-saturated pool, where the shared seal pool can add no cores
+    /// — see [`BlockFileWriter::create_inline`].
+    pub fn create_inline(
+        path: impl AsRef<Path>,
+        target_block_bytes: usize,
+        zstd_level: i32,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: BlockFileWriter::create_inline(path, target_block_bytes, zstd_level)?,
             scratch: Vec::new(),
         })
     }
@@ -398,21 +431,21 @@ impl ShardRemap {
 }
 
 /// Re-encode a `node_labels.blk` blob, translating local label ids to global.
-pub fn remap_labels_blob(blob: &[u8], remap: &ShardRemap) -> Result<Vec<u8>> {
+pub fn remap_labels_blob(blob: &[u8], remap: &ShardRemap) -> Result<Blob> {
     let ids = decode_labels(blob)?;
     let mapped: Vec<u32> = ids.into_iter().map(|l| remap.map_label(l)).collect();
-    Ok(encode_labels_record(&mapped))
+    Ok(Blob::from_slice(&encode_labels_record(&mapped)))
 }
 
 /// Re-encode a `node_props.blk`/`edge_props.blk` blob, translating local key ids to
 /// global (values are unchanged).
-pub fn remap_props_blob(blob: &[u8], remap: &ShardRemap) -> Result<Vec<u8>> {
+pub fn remap_props_blob(blob: &[u8], remap: &ShardRemap) -> Result<Blob> {
     let props = decode_props(blob)?;
     let mapped: Vec<(u32, graph_format::ids::Value)> = props
         .into_iter()
         .map(|(k, v)| (remap.map_key(k), v))
         .collect();
-    Ok(encode_props_record(&mapped))
+    Ok(Blob::from_slice(&encode_props_record(&mapped)))
 }
 
 /// Fold the shards' local symbol tables (in shard order = input order) into the
@@ -564,10 +597,12 @@ pub fn for_each_node_dump_id(
 }
 
 /// Scan an edge bucket (all segments) in append order, decoding each record.
-pub fn for_each_edge(
-    base: impl AsRef<Path>,
-    mut f: impl FnMut(EdgeRec) -> Result<()>,
-) -> Result<()> {
+///
+/// Test-only: the build reads edge shards concurrently (`cluster` routes the undirected
+/// adjacency shard-parallel; `emit.topology` partitions them into bands), so nothing in
+/// the pipeline wants a single sequential pass any more. The bucket round-trip test does.
+#[cfg(test)]
+fn for_each_edge(base: impl AsRef<Path>, mut f: impl FnMut(EdgeRec) -> Result<()>) -> Result<()> {
     for seg in segments(base.as_ref()) {
         let r = BlockFileReader::open(&seg)?;
         r.for_each_record(|_, rec| {
@@ -612,8 +647,8 @@ mod tests {
             };
             w.append_node(&NodeRec {
                 dump_id: dump,
-                labels_blob: labels.clone(),
-                props_blob: props.clone(),
+                labels_blob: Blob::from_slice(&labels),
+                props_blob: Blob::from_slice(&props),
                 vec_props: vecs.clone(),
             })
             .unwrap();
@@ -632,8 +667,8 @@ mod tests {
         assert_eq!(got.len(), expected.len());
         for (g, e) in got.iter().zip(&expected) {
             assert_eq!(g.0, e.0);
-            assert_eq!(&g.1, &e.1);
-            assert_eq!(&g.2, &e.2);
+            assert_eq!(g.1.as_slice(), e.1.as_slice());
+            assert_eq!(g.2.as_slice(), e.2.as_slice());
             assert_eq!(g.3.len(), e.3.len());
         }
 
@@ -664,7 +699,7 @@ mod tests {
                 src_prov: i % 50,
                 dst_prov: (i * 3) % 50,
                 reltype: (i % 4) as u32,
-                props_blob: props,
+                props_blob: Blob::from_slice(&props),
             };
             w.append_edge(&e).unwrap();
             expected.push((

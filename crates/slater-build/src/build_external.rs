@@ -21,19 +21,21 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use graph_format::blockfile::{concat_block_files, BlockFileReader, BlockFileWriter};
-use graph_format::columns::{encode_props_record, PropsWriter};
+use graph_format::columns::PropsWriter;
 use graph_format::crypto::BlockCipher;
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, RangeIndexDesc};
 use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
-use graph_format::nodelabels::{encode_labels_record, NodeLabelsReader, NodeLabelsWriter};
+use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
 use graph_format::postings::write_endpoint_postings_from_sorted;
 use graph_format::topology::{Adj, CsrHalfWriter, TopologyReader};
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
-use crate::buckets::{self, read_blob, write_blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge};
+use crate::buckets::{
+    self, read_blob, write_blob, Blob, BucketWriter, EdgeRec, NodeRec, UnresolvedEdge,
+};
 use crate::cluster::{self, ClusterParams, Permutation};
 use crate::common::{self, BuildOutcome, PublishInputs};
 use crate::merge_build;
@@ -265,12 +267,14 @@ fn process_shard(
     let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
     let mut node_ovr: Vec<crate::model::NodeOverwriteStmt> = Vec::new();
     let mut edge_ovr: Vec<crate::model::EdgeOverwriteStmt> = Vec::new();
-    let mut node_w = BucketWriter::create(
+    // Inline seal: pass 1 already runs one of these per shard across every core, so the
+    // block-seal pool can lend it nothing and would only add a hop per block.
+    let mut node_w = BucketWriter::create_inline(
         buckets::seg_path(node_bkt, chunk.shard),
         BUCKET_BLOCK,
         SCRATCH_ZSTD,
     )?;
-    let mut uedge_w = BucketWriter::create(
+    let mut uedge_w = BucketWriter::create_inline(
         buckets::seg_path(uedge_bkt, chunk.shard),
         BUCKET_BLOCK,
         SCRATCH_ZSTD,
@@ -321,8 +325,8 @@ fn process_shard(
                         }
                     }
                 }
-                let labels_blob = encode_labels_record(&label_ids);
-                let props_blob = encode_props_record(&scalar_props);
+                let labels_blob = buckets::labels_blob(&label_ids);
+                let props_blob = buckets::props_blob(&scalar_props);
                 node_w.append_node(&NodeRec {
                     dump_id: if dump_id == NO_DUMP {
                         None
@@ -342,7 +346,7 @@ fn process_shard(
                     let kid = keys.intern(&k);
                     scalar_props.push((kid, v));
                 }
-                let props_blob = encode_props_record(&scalar_props);
+                let props_blob = buckets::props_blob(&scalar_props);
                 uedge_w.append_unresolved_edge(&UnresolvedEdge {
                     src_dump: e.src_dump_id,
                     dst_dump: e.dst_dump_id,
@@ -1152,7 +1156,8 @@ fn build_inner(
                     let rm = &remaps_r[i as usize];
                     let res = (|| -> Result<()> {
                         let mut id = bases_r[i as usize];
-                        let mut edge_w = BucketWriter::create(
+                        // One writer per resolve worker; the pool is already saturated.
+                        let mut edge_w = BucketWriter::create_inline(
                             buckets::seg_path(edge_r, i),
                             BUCKET_BLOCK,
                             SCRATCH_ZSTD,
@@ -1183,6 +1188,7 @@ fn build_inner(
                             let props_blob = match overlay_r {
                                 Some(ov) if ov.has_edge_patches() => ov
                                     .fold_edge(src, dst, reltype, &props_blob)?
+                                    .map(|v| Blob::from_slice(&v))
                                     .unwrap_or(props_blob),
                                 _ => props_blob,
                             };
@@ -1266,9 +1272,12 @@ fn build_inner(
             load_perm(&perm_path, node_count)?
         }
     } else {
-        // `build_permutation` labels its own sub-steps (adjacency sort, stripe
-        // routing, each LDG pass, final permutation) so a --diagnostics run can
-        // attribute this phase's serial stretches to a named step.
+        // `build_permutation` labels its own sub-steps (stripe routing, stripe sort,
+        // each LDG pass, final permutation) so a --diagnostics run can attribute this
+        // phase's serial stretches to a named step. It routes and sorts the undirected
+        // adjacency shard-parallel, so it wants the edge bucket's segments, not one
+        // sequential scan of it.
+        let edge_segs = buckets::segments(&edge_bkt);
         let block_capacity = (opts.block_size / 48).max(1) as u32;
         let perm = cluster::build_permutation(
             node_count,
@@ -1281,7 +1290,13 @@ fn build_inner(
                 zstd_level: SCRATCH_ZSTD,
                 threads: opts.threads,
             },
-            |visit| buckets::for_each_edge(&edge_bkt, |e| visit(e.src_prov, e.dst_prov)),
+            edge_segs.len(),
+            |shard, visit| {
+                BlockFileReader::open(&edge_segs[shard])?.for_each_record(|_, rec| {
+                    let e = EdgeRec::decode(rec)?;
+                    visit(e.src_prov, e.dst_prov)
+                })
+            },
             diag,
         )?;
         save_perm(&perm, &perm_path)?;
@@ -1450,7 +1465,7 @@ fn build_inner(
             if ov.has_node_patches() {
                 if let Some(folded) = ov.fold_node(prov, &node.props_blob)? {
                     return Ok(NodeRec {
-                        props_blob: folded,
+                        props_blob: Blob::from_slice(&folded),
                         ..node
                     });
                 }
@@ -2034,9 +2049,18 @@ fn truncate(s: &str, n: usize) -> String {
 /// Node payload sorted by final id for the emit reorder.
 struct NodeEmit {
     final_id: u64,
-    labels_blob: Vec<u8>,
-    props_blob: Vec<u8>,
+    labels_blob: Blob,
+    props_blob: Blob,
 }
+/// Bytes a [`Blob`] owns on the heap: zero while it fits inline.
+fn heap_of(b: &Blob) -> usize {
+    if b.spilled() {
+        b.len()
+    } else {
+        0
+    }
+}
+
 impl SortRecord for NodeEmit {
     fn encode(&self, buf: &mut Vec<u8>) {
         write_uvarint(buf, self.final_id);
@@ -2045,8 +2069,8 @@ impl SortRecord for NodeEmit {
     }
     fn decode(r: &mut &[u8]) -> Result<Self> {
         let final_id = read_uvarint(r)?;
-        let labels_blob = read_blob(r)?.to_vec();
-        let props_blob = read_blob(r)?.to_vec();
+        let labels_blob = Blob::from_slice(read_blob(r)?);
+        let props_blob = Blob::from_slice(read_blob(r)?);
         Ok(NodeEmit {
             final_id,
             labels_blob,
@@ -2059,6 +2083,9 @@ impl SortRecord for NodeEmit {
     fn size_hint(&self) -> usize {
         16 + self.labels_blob.len() + self.props_blob.len()
     }
+    fn resident_hint(&self) -> usize {
+        std::mem::size_of::<Self>() + heap_of(&self.labels_blob) + heap_of(&self.props_blob)
+    }
 }
 
 /// Edge sorted by source for the forward CSR half (and to assign final edge ids).
@@ -2067,7 +2094,7 @@ struct EdgeFwd {
     final_dst: u64,
     prov_edge_id: u64,
     reltype: u32,
-    props_blob: Vec<u8>,
+    props_blob: Blob,
 }
 impl SortRecord for EdgeFwd {
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -2082,7 +2109,7 @@ impl SortRecord for EdgeFwd {
         let final_dst = read_uvarint(r)?;
         let prov_edge_id = read_uvarint(r)?;
         let reltype = read_uvarint(r)? as u32;
-        let props_blob = read_blob(r)?.to_vec();
+        let props_blob = Blob::from_slice(read_blob(r)?);
         Ok(EdgeFwd {
             final_src,
             final_dst,
@@ -2099,6 +2126,11 @@ impl SortRecord for EdgeFwd {
     }
     fn size_hint(&self) -> usize {
         40 + self.props_blob.len()
+    }
+    fn resident_hint(&self) -> usize {
+        // An inline blob costs nothing beyond the record itself; only a spilled one
+        // touches the heap. The default would charge `props_blob.len()` twice over.
+        std::mem::size_of::<Self>() + heap_of(&self.props_blob)
     }
 }
 
@@ -2232,7 +2264,7 @@ impl SortRecord for RangeEntry {
 /// Used to range-partition the edge stream by node id — forward edges by `final_src`,
 /// reverse records by `final_dst` — into the per-band files the parallel emit drains.
 /// The files are transient scratch (plaintext, [`SCRATCH_ZSTD`]); never published.
-struct BandSpill {
+pub(crate) struct BandSpill {
     writers: Vec<Mutex<BandWriter>>,
     paths: Vec<PathBuf>,
 }
@@ -2243,12 +2275,23 @@ struct BandWriter {
 }
 
 impl BandSpill {
-    fn new(nbands: usize, mut path_for: impl FnMut(usize) -> PathBuf) -> Result<Self> {
+    fn new(nbands: usize, path_for: impl FnMut(usize) -> PathBuf) -> Result<Self> {
+        Self::with_block(nbands, BUCKET_BLOCK, path_for)
+    }
+
+    /// [`BandSpill::new`] with an explicit block size. Every band holds one partially
+    /// filled block resident, so `nbands × block_bytes` is a floor on the spill's
+    /// footprint: `cluster` routes into 1,398 stripes and must not pay 1 MiB apiece.
+    pub(crate) fn with_block(
+        nbands: usize,
+        block_bytes: usize,
+        mut path_for: impl FnMut(usize) -> PathBuf,
+    ) -> Result<Self> {
         let mut writers = Vec::with_capacity(nbands);
         let mut paths = Vec::with_capacity(nbands);
         for b in 0..nbands {
             let p = path_for(b);
-            let w = BlockFileWriter::create(&p, BUCKET_BLOCK, SCRATCH_ZSTD)?;
+            let w = BlockFileWriter::create(&p, block_bytes, SCRATCH_ZSTD)?;
             writers.push(Mutex::new(BandWriter { w, count: 0 }));
             paths.push(p);
         }
@@ -2256,7 +2299,7 @@ impl BandSpill {
     }
 
     /// Finalize every band writer; returns `(paths, per-band record counts)`.
-    fn finish(self) -> Result<(Vec<PathBuf>, Vec<u64>)> {
+    pub(crate) fn finish(self) -> Result<(Vec<PathBuf>, Vec<u64>)> {
         let mut counts = Vec::with_capacity(self.writers.len());
         for m in self.writers {
             let bw = m.into_inner().unwrap();
@@ -2270,7 +2313,7 @@ impl BandSpill {
 /// Per-worker local batcher over a shared [`BandSpill`]. Accumulates each band's
 /// records (length-prefixed in one contiguous buffer to avoid per-record allocation)
 /// and flushes a band under its lock once its buffer crosses `threshold` bytes.
-struct BandBatcher<'a> {
+pub(crate) struct BandBatcher<'a> {
     set: &'a BandSpill,
     bufs: Vec<Vec<u8>>,
     threshold: usize,
@@ -2278,7 +2321,7 @@ struct BandBatcher<'a> {
 }
 
 impl<'a> BandBatcher<'a> {
-    fn new(set: &'a BandSpill, threshold: usize) -> Self {
+    pub(crate) fn new(set: &'a BandSpill, threshold: usize) -> Self {
         let n = set.writers.len();
         Self {
             set,
@@ -2288,7 +2331,7 @@ impl<'a> BandBatcher<'a> {
         }
     }
 
-    fn push<R: SortRecord>(&mut self, band: usize, rec: &R) -> Result<()> {
+    pub(crate) fn push<R: SortRecord>(&mut self, band: usize, rec: &R) -> Result<()> {
         self.scratch.clear();
         rec.encode(&mut self.scratch);
         let buf = &mut self.bufs[band];
@@ -2320,7 +2363,7 @@ impl<'a> BandBatcher<'a> {
         Ok(())
     }
 
-    fn flush_all(&mut self) -> Result<()> {
+    pub(crate) fn flush_all(&mut self) -> Result<()> {
         for b in 0..self.bufs.len() {
             self.flush_band(b)?;
         }

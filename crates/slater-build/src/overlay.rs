@@ -29,7 +29,7 @@ use anyhow::{bail, Result};
 
 use graph_format::columns::{decode_props, encode_props_record};
 use graph_format::ids::Value;
-use graph_format::nodelabels::{decode_labels, encode_labels_record};
+use graph_format::nodelabels::decode_labels;
 use graph_format::wire::{read_uvarint, read_value, skip_value, write_value};
 
 use crate::buckets::{self, NodeRec, ShardMeta, ShardRemap};
@@ -346,8 +346,8 @@ fn make_node(
     }
     NodeRec {
         dump_id: None,
-        labels_blob: encode_labels_record(&[label_gid]),
-        props_blob: encode_props_record(&props),
+        labels_blob: buckets::labels_blob(&[label_gid]),
+        props_blob: buckets::props_blob(&props),
         vec_props: Vec::new(),
     }
 }

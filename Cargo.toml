@@ -64,6 +64,12 @@ clap = { version = "4", features = ["derive"] }
 # Parallel query execution (slater).
 rayon = "1"
 
+# Inline storage for the per-entity property/label blobs the build shuttles through its
+# sort records. `SmallVec<[u8; 16]>` is exactly `Vec<u8>`'s 24 bytes, so it is a drop-in
+# that removes a heap allocation per record: a Wikidata edge carries no properties, and
+# its encoded props record is the single byte `uvarint(0)`.
+smallvec = { version = "1", features = ["union", "const_generics"] }
+
 # Portable explicit SIMD for the brute-force vector-kNN dot kernel (slater). Gives
 # guaranteed vectorization independent of the optimizer's autovectorizer (which the
 # `opt-level = "s"` release profile largely suppresses): SSE2/NEON at each arch's

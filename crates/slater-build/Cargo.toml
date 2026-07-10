@@ -52,6 +52,7 @@ pest.workspace = true
 pest_derive.workspace = true
 tracing.workspace = true
 rayon.workspace = true
+smallvec.workspace = true
 dhat = { version = "0.3", optional = true }
 # Global allocator on Linux (wired in main.rs). The band workers free ~1.5B small
 # `props_blob` allocations into per-thread arenas that glibc never returns to the OS;

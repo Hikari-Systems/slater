@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -27,6 +27,8 @@ use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::membudget::{MemoryBudget, MIN_SORT_BYTES};
 use graph_format::wire::{read_uvarint, write_uvarint};
+
+use crate::build_external::{BandBatcher, BandSpill};
 
 const UNASSIGNED: u32 = u32::MAX;
 const ADJ_BLOCK_BYTES: usize = 256 * 1024;
@@ -117,17 +119,18 @@ impl SortRecord for AdjPair {
     }
 }
 
-/// Compute the node-id permutation. `scan_edges` streams every directed edge as a
-/// `(src_prov, dst_prov)` pair; it is invoked once (to build the undirected
-/// adjacency). The graph itself is never held resident.
+/// Compute the node-id permutation. `scan_shard(i, visit)` streams every directed edge
+/// of shard `i` as a `(src_prov, dst_prov)` pair; the `edge_shards` shards are scanned
+/// concurrently. The graph itself is never held resident.
 pub fn build_permutation<E>(
     node_count: u64,
     params: &ClusterParams,
-    scan_edges: E,
+    edge_shards: usize,
+    scan_shard: E,
     diag: &crate::diag::BuildDiag,
 ) -> Result<Permutation>
 where
-    E: Fn(&mut dyn FnMut(u64, u64) -> Result<()>) -> Result<()>,
+    E: Fn(usize, &mut dyn FnMut(u64, u64) -> Result<()>) -> Result<()> + Sync,
 {
     match params.mode {
         ClusterMode::None => return Ok(Permutation::Identity),
@@ -168,59 +171,151 @@ where
             s
         ))
     };
+    // A stripe's adjacency is a *contiguous slice* of the global `(node, nbr)` order,
+    // because stripes partition on `node` — the primary sort key. Sorting each stripe
+    // independently therefore produces exactly the file a global sort would have
+    // scattered into it, byte for byte, and there is no reason to do the global sort.
+    //
+    // The old shape did: one `ExtSorter` over every half-edge, then a single thread
+    // drained its k-way merge (decompressing every run) and scattered records into 1,398
+    // stripe writers. At 91.6M nodes that drain was **54% of the whole `cluster` phase at
+    // 120% CPU** — bounded by decompression on the consuming thread, which is why moving
+    // block *sealing* onto a pool (D57) did nothing for it.
+    //
+    // Now: pass A routes each half-edge to the stripe owning its `node`, parallel over the
+    // edge bucket's shards. Pass B sorts each stripe independently, parallel over stripes.
+    // Nothing is globally ordered, so nothing is globally serial.
+    let route_path = |s: usize| -> PathBuf {
+        params.temp_dir.join(format!(
+            "slater_cluster_route_{}_{}.blk",
+            std::process::id(),
+            s
+        ))
+    };
+    let threads = params.threads.max(1);
     {
-        // Give the adjacency sort the whole budget. This is a *single*,
-        // non-concurrent `ExtSorter`, and its run-formation buffers never coexist with
-        // the O(n) permutation maps — this block scope closes (dropping the sorter)
-        // before `part_prev`/`part_next` are allocated below. So the phase peak is
-        // max(sort, maps), not their sum, and the sort may safely take everything.
-        //
-        // The `/16` `sort_budget` convention this once followed exists for phases that
-        // run *many* concurrent `ExtSorter`s (per band / per partition / per thread) and
-        // must share one budget between them. Applying it here was a misdiagnosis: it
-        // shrank the run-formation buffer ~16×, which multiplied the run count by the
-        // same factor, and the k-way merge holds one decompressed block per run — so a
-        // starved budget *raised* both peak RSS and wall time. Full budget ⇒ few runs ⇒
-        // a cheap single-pass merge.
-        diag.set_op("build undirected adjacency (external sort)", "edges", 0);
-        diag.set_active_workers(1);
-        let mut sorter = ExtSorter::<AdjPair>::new(
-            &params.temp_dir,
-            params.budget.reserve_now(
-                "ldg adjacency sort",
+        // ---- pass A: route half-edges into per-stripe files (parallel over shards) ----
+        diag.set_op("route adjacency into stripes", "shards", edge_shards as u64);
+        diag.set_active_workers(threads as u64);
+        // Each stripe holds one partially filled block resident, so the *block* size sets
+        // this pass's floor: 1,398 stripes × 256 KiB ≈ 358 MB. (The default 1 MiB bucket
+        // block would be 1.4 GB.)
+        let spill = BandSpill::with_block(nstripes, ADJ_BLOCK_BYTES, route_path)?;
+        let batch =
+            (params.budget.total() / 64 / (nstripes * threads).max(1)).clamp(8 << 10, 1 << 18);
+        let next = AtomicUsize::new(0);
+        let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let (spill_r, next_r, err_r, scan_r) = (&spill, &next, &err, &scan_shard);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || {
+                    let mut batcher = BandBatcher::new(spill_r, batch);
+                    loop {
+                        if err_r.lock().unwrap().is_some() {
+                            break;
+                        }
+                        let sh = next_r.fetch_add(1, AtomicOrdering::Relaxed);
+                        if sh >= edge_shards {
+                            break;
+                        }
+                        let res = (|| -> Result<()> {
+                            scan_r(sh, &mut |s, d| {
+                                // Self-loops carry no proximity signal.
+                                if s != d {
+                                    let stripe = |v: u64| (v / STRIPE_NODES) as usize;
+                                    batcher.push(stripe(s), &AdjPair { node: s, nbr: d })?;
+                                    batcher.push(stripe(d), &AdjPair { node: d, nbr: s })?;
+                                }
+                                Ok(())
+                            })?;
+                            batcher.flush_all()?;
+                            diag.progress_add(1);
+                            Ok(())
+                        })();
+                        if let Err(e) = res {
+                            let mut g = err_r.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
+        }
+        spill.finish()?;
+    }
+    {
+        // ---- pass B: sort each stripe independently (parallel over stripes) ----
+        diag.set_op("sort adjacency stripes", "stripes", nstripes as u64);
+        diag.set_active_workers(threads as u64);
+        // Stripes outnumber workers by ~100×, so each sorter spills inline: the shared
+        // spill pool can hand it no cores, and splitting its reservation would only
+        // multiply its run count. Run *compression* is still parallel (D57).
+        let pool = params
+            .budget
+            .reserve_now(
+                "ldg stripe sort pool",
                 params.budget.available(),
                 MIN_SORT_BYTES,
-            )?,
-            params.zstd_level,
-        )?;
-        let mut pushed = 0u64;
-        scan_edges(&mut |s, d| {
-            if s != d {
-                sorter.push(AdjPair { node: s, nbr: d })?;
-                sorter.push(AdjPair { node: d, nbr: s })?;
-                pushed += 1;
-                diag.tick(pushed);
+            )?
+            .into_sub_budget();
+        let want = (pool.total() / threads).max(MIN_SORT_BYTES);
+        let next = AtomicUsize::new(0);
+        let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let (pool_r, next_r, err_r) = (&pool, &next, &err);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(move || loop {
+                    if err_r.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let st = next_r.fetch_add(1, AtomicOrdering::Relaxed);
+                    if st >= nstripes {
+                        break;
+                    }
+                    let res = (|| -> Result<()> {
+                        let mut sorter = ExtSorter::<AdjPair>::new_inline(
+                            &params.temp_dir,
+                            pool_r.reserve("ldg stripe sorter", want, MIN_SORT_BYTES)?,
+                            params.zstd_level,
+                        )?;
+                        let src = route_path(st);
+                        BlockFileReader::open(&src)?.for_each_record(|_, rec| {
+                            let mut r = rec;
+                            sorter.push(AdjPair::decode(&mut r)?)
+                        })?;
+                        let mut w = BlockFileWriter::create(
+                            stripe_adj(st),
+                            ADJ_BLOCK_BYTES,
+                            params.zstd_level,
+                        )?;
+                        let mut buf = Vec::new();
+                        for rec in sorter.sorted()? {
+                            buf.clear();
+                            rec?.encode(&mut buf);
+                            w.append_record(&buf)?;
+                        }
+                        w.finish()?;
+                        let _ = std::fs::remove_file(&src);
+                        diag.progress_add(1);
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        let mut g = err_r.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        break;
+                    }
+                });
             }
-            Ok(())
-        })?;
-        diag.set_op("route adjacency into stripes", "adjacencies", pushed * 2);
-        diag.set_active_workers(1);
-        let mut writers: Vec<BlockFileWriter> = (0..nstripes)
-            .map(|s| BlockFileWriter::create(stripe_adj(s), ADJ_BLOCK_BYTES, params.zstd_level))
-            .collect::<Result<_>>()?;
-        let mut buf = Vec::new();
-        let mut routed = 0u64;
-        for rec in sorter.sorted()? {
-            let a = rec?;
-            let s = (a.node / STRIPE_NODES) as usize;
-            buf.clear();
-            a.encode(&mut buf);
-            writers[s].append_record(&buf)?;
-            routed += 1;
-            diag.tick(routed);
-        }
-        for w in writers {
-            w.finish()?;
+        });
+        if let Some(e) = err.into_inner().unwrap() {
+            return Err(e);
         }
     }
 
@@ -457,7 +552,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (n, edges) = community_graph();
-        let scan = |visit: &mut dyn FnMut(u64, u64) -> Result<()>| {
+        // One shard holding every edge — the tests exercise the ordering, not the fan-out.
+        let scan = |_shard: usize, visit: &mut dyn FnMut(u64, u64) -> Result<()>| {
             for &(a, b) in &edges {
                 visit(a, b)?;
             }
@@ -466,6 +562,7 @@ mod tests {
         let p1 = build_permutation(
             n,
             &params(ClusterMode::Ldg, 50, &dir),
+            1,
             scan,
             &crate::diag::BuildDiag::disabled(),
         )
@@ -473,6 +570,7 @@ mod tests {
         let p2 = build_permutation(
             n,
             &params(ClusterMode::Ldg, 50, &dir),
+            1,
             scan,
             &crate::diag::BuildDiag::disabled(),
         )
@@ -499,7 +597,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (n, edges) = community_graph();
-        let scan = |visit: &mut dyn FnMut(u64, u64) -> Result<()>| {
+        // One shard holding every edge — the tests exercise the ordering, not the fan-out.
+        let scan = |_shard: usize, visit: &mut dyn FnMut(u64, u64) -> Result<()>| {
             for &(a, b) in &edges {
                 visit(a, b)?;
             }
@@ -509,6 +608,7 @@ mod tests {
         let none = build_permutation(
             n,
             &params(ClusterMode::None, cap as u32, &dir),
+            1,
             scan,
             &crate::diag::BuildDiag::disabled(),
         )
@@ -516,6 +616,7 @@ mod tests {
         let ldg = build_permutation(
             n,
             &params(ClusterMode::Ldg, cap as u32, &dir),
+            1,
             scan,
             &crate::diag::BuildDiag::disabled(),
         )
@@ -536,10 +637,11 @@ mod tests {
     #[test]
     fn none_mode_is_identity() {
         let dir = tmp("none");
-        let scan = |_: &mut dyn FnMut(u64, u64) -> Result<()>| Ok(());
+        let scan = |_shard: usize, _: &mut dyn FnMut(u64, u64) -> Result<()>| Ok(());
         let p = build_permutation(
             10,
             &params(ClusterMode::None, 4, &dir),
+            1,
             scan,
             &crate::diag::BuildDiag::disabled(),
         )
