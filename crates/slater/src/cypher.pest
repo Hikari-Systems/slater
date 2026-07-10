@@ -241,7 +241,12 @@ where_clause = { kw_where ~ expr }
 
 // ── Patterns ─────────────────────────────────────────────────────────────────
 
-pattern = { (path_var ~ "=")? ~ node_pattern ~ (rel_pattern ~ node_pattern)* }
+// `PatternElement` may be wrapped in redundant parentheses — `MATCH ((a)-[:R]->(b))`
+// and `MATCH ((n))` are both legal. The parenthesised arm is tried second: a
+// `node_pattern` only accepts `( var? labels? properties? )`, so it fails fast on a
+// leading `(` and backtracks cleanly. `lower_pattern_element` flattens the nesting.
+pattern = { (path_var ~ "=")? ~ pattern_element }
+pattern_element = { (node_pattern ~ (rel_pattern ~ node_pattern)*) | ("(" ~ pattern_element ~ ")") }
 path_var = { identifier }
 
 // `match_pattern` is `pattern` plus GQL quantified path patterns. It is used ONLY
@@ -250,7 +255,9 @@ path_var = { identifier }
 // segment they can't execute. The leading `shortest_call` alternative accepts the
 // openCypher `MATCH p = shortestPath((a)-[:R*]->(b))` spelling (Neo4j/Memgraph
 // compatibility), desugaring to the `ANY SHORTEST` / `ALL SHORTEST` selector.
-match_pattern = { shortest_call | (path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)*) }
+match_pattern = { shortest_call | (path_selector? ~ path_restrictor? ~ (path_var ~ "=")? ~ match_element) }
+// `pattern_element` widened with GQL quantified groups, and likewise parenthesisable.
+match_element = { (node_pattern ~ ((quantified_path | rel_pattern) ~ node_pattern)*) | ("(" ~ match_element ~ ")") }
 
 // openCypher `shortestPath(...)` / `allShortestPaths(...)` in MATCH position, with an
 // optional bound path variable. The inner `pattern` is a single (var-length)
@@ -292,12 +299,27 @@ quant_hi = { integer }
 plus_bound = { "+" }
 star_bound = { "*" }
 
-node_pattern = { "(" ~ var? ~ labels? ~ prop_map? ~ ")" }
+node_pattern = { "(" ~ var? ~ labels? ~ properties? ~ ")" }
 
-rel_pattern = { left_arrow? ~ "-" ~ rel_detail? ~ "-" ~ right_arrow? }
-left_arrow = { "<" }
-right_arrow = { ">" }
-rel_detail = { "[" ~ var? ~ rel_types? ~ var_length? ~ prop_map? ~ "]" }
+// `Properties = MapLiteral | Parameter`. The parameter spelling (`MATCH (n $p)`)
+// parses, but the executor cannot yet turn a runtime map into a pattern
+// predicate, so `lower_properties` rejects it with a clear message rather than a
+// syntax error.
+properties = { prop_map | parameter }
+
+rel_pattern = { left_arrow? ~ dash ~ rel_detail? ~ dash ~ right_arrow? }
+// openCypher's `LeftArrowHead` / `RightArrowHead` / `Dash` admit the Unicode
+// look-alikes an editor or a word processor silently substitutes — the en/em
+// dash, the minus sign, the soft hyphen, the fullwidth and small-form variants.
+// They are spelled out only here: `SUBTRACT`, `add_op` and `sign` stay ASCII `-`,
+// exactly as the reference keeps `Dash` out of its arithmetic productions.
+// `dash` is silent so `lower_rel_pattern` still sees only the arrow-head pairs.
+left_arrow = { "<" | "⟨" | "〈" | "﹤" | "＜" }
+right_arrow = { ">" | "⟩" | "〉" | "﹥" | "＞" }
+dash = _{
+    "-" | "\u{00AD}" | "‐" | "‑" | "‒" | "–" | "—" | "―" | "−" | "﹘" | "﹣" | "－"
+}
+rel_detail = { "[" ~ var? ~ rel_types? ~ var_length? ~ properties? ~ "]" }
 var_length = { "*" ~ range_spec? }
 range_spec = { integer? ~ (".." ~ integer?)? }
 
@@ -326,9 +348,12 @@ property_key = { identifier }
 // ── Expressions (precedence climbing via nested rules) ───────────────────────
 
 expr = { or_expr }
-or_expr = { and_expr ~ (kw_or ~ and_expr)* }
-and_expr = { xor_expr ~ (kw_and ~ xor_expr)* }
-xor_expr = { not_expr ~ (kw_xor ~ not_expr)* }
+// openCypher nests these `Or > Xor > And > Not`, so `AND` binds tightest of the
+// three and `a XOR b AND c` is `a XOR (b AND c)`. Slater used to nest
+// `Or > And > Xor`, which silently flipped that grouping.
+or_expr = { xor_expr ~ (kw_or ~ xor_expr)* }
+xor_expr = { and_expr ~ (kw_xor ~ and_expr)* }
+and_expr = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr = { not_op* ~ comparison }
 not_op = { kw_not }
 
@@ -392,10 +417,11 @@ primary = {
 
 parens = { "(" ~ expr ~ ")" }
 variable = { identifier }
-// A parameter name may be a reserved word (e.g. `$limit`), so it is not
-// reserved-checked the way a bare identifier is.
+// `Parameter = "$" ~ (SymbolicName | DecimalInteger)` — positional parameters
+// (`$0`, `$1`) are as legal as named ones. The digit arm is tried last because
+// `ident_start` never matches a digit.
 parameter = { "$" ~ param_name }
-param_name = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" | ident_start ~ ident_cont* }
+param_name = @{ quoted_name | (ident_start ~ ident_cont*) | decimal_int }
 
 // n{.name, .age, alias: expr, .*}
 map_projection = { identifier ~ "{" ~ (map_proj_item ~ ("," ~ map_proj_item)*)? ~ "}" }
@@ -469,7 +495,21 @@ shortest_path_kw = @{ ^"shortestPath" ~ !ident_cont }
 // the inner pattern (seeded by the outer row's bindings) has ≥1 match. Only the
 // single-clause read form is supported; a RETURN-bearing or multi-clause inner
 // body is deferred to the CALL{} machinery (Phase 12).
-exists_subquery = { exists_kw ~ "{" ~ kw_match? ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ "}" }
+// `ExistentialSubquery = EXISTS ~ "{" ~ (RegularQuery | Pattern ~ Where?) ~ "}"`.
+// The pattern arm is tried first (it is the only one the executor supports); a
+// RETURN-bearing or multi-clause body falls through to `subquery`, which parses
+// so `lower_exists` can reject it by name instead of as a syntax error.
+// The `&"}"` is load-bearing. Without it the pattern arm succeeds on the `MATCH (a)`
+// prefix of `EXISTS { MATCH (a) RETURN a }`, the following `"}"` then fails, and an
+// ordered choice never retries the arm it already committed to — so the RegularQuery
+// arm would be unreachable. The lookahead makes the pattern arm claim the body only
+// when it has consumed all of it.
+exists_subquery = {
+    exists_kw ~ "{" ~ (
+        (kw_match? ~ pattern ~ ("," ~ pattern)* ~ where_clause? ~ &"}")
+      | subquery
+    ) ~ "}"
+}
 exists_kw = @{ ^"exists" ~ !ident_cont }
 
 // Pattern comprehension `[(a)-[:R]->(b) WHERE pred | expr]`: a relationship
@@ -487,7 +527,18 @@ map_lit_entry = { property_key ~ ":" ~ expr }
 literal = { float | integer | boolean | null | string }
 null = { kw_null }
 boolean = { kw_true | kw_false }
-integer = @{ ("-")? ~ ASCII_DIGIT+ }
+// openCypher `IntegerLiteral = HexInteger | OctalInteger | DecimalInteger`. The
+// three radices are ordered so the longest prefix wins: `0x…` is hex, a leading
+// `0` followed by octal digits is OCTAL (`017` is 15, not 17), and everything
+// else is decimal. Because `DecimalInteger` is `0 | (1-9) digit*`, a leading zero
+// followed by a non-octal digit (`08`, `09`) is not an integer at all — the `0`
+// matches and the stray digit fails the enclosing rule, exactly as the reference
+// grammar does. The optional `-` is Slater's own (the reference spells negation
+// as a separate unary operator); it costs nothing and keeps `-1` a single token.
+integer = @{ "-"? ~ (hex_int | octal_int | decimal_int) }
+hex_int = _{ ^"0x" ~ ASCII_HEX_DIGIT+ }
+octal_int = _{ "0" ~ ASCII_OCT_DIGIT+ }
+decimal_int = _{ "0" | (ASCII_NONZERO_DIGIT ~ ASCII_DIGIT*) }
 // A double literal, tried before `integer` in `literal` so a fractional/exponent
 // form wins. Two shapes, matching the openCypher reference `DoubleLiteral`:
 //   * a decimal point with a fractional part — `1.5`, `.5` (no integer part), each
@@ -506,19 +557,28 @@ sq_inner = @{ (escape | (!"'" ~ !"\\" ~ ANY))* }
 dq_inner = @{ (escape | (!"\"" ~ !"\\" ~ ANY))* }
 escape = @{ "\\" ~ ANY }
 
-// Identifiers: backtick-quoted or a plain ident that is not a reserved word.
-identifier = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" | (!reserved ~ ident_start ~ ident_cont*) }
-ident_start = _{ ASCII_ALPHA | "_" }
-ident_cont = _{ ASCII_ALPHANUMERIC | "_" }
+// Identifiers: backtick-quoted or a bare name.
+//
+// openCypher's `SymbolicName` is `UnescapedSymbolicName | EscapedSymbolicName |
+// …`, and `UnescapedSymbolicName = IdentifierStart ~ IdentifierPart*` — which
+// matches every reserved word too. Its `ReservedWord` production is referenced
+// only from `SchemaName = SymbolicName | ReservedWord`, so in the reference
+// grammar `SchemaName` and `SymbolicName` accept exactly the same strings and no
+// bare name is ever excluded. Slater used to carry a `!reserved` guard here,
+// which rejected the legal `MATCH (n:Order)`, `RETURN n.end` and `{limit: 1}`.
+// The guard is gone; a keyword only wins where the grammar asks for a `kw_*`
+// terminal, and those still assert a trailing `!ident_cont` word boundary, so
+// `RETURNS` is not `RETURN`, and `n.order` is a property lookup, not an ORDER BY.
+identifier = @{ quoted_name | (ident_start ~ ident_cont*) }
 
-// Reserved words may not be bare identifiers (so `RETURN return` etc. fail). The
-// trailing !ident_cont guard stops `count` matching the prefix of `countries`.
-reserved = _{
-    (^"match" | ^"optional" | ^"where" | ^"return" | ^"with" | ^"order" | ^"by"
-      | ^"skip" | ^"limit" | ^"distinct" | ^"as" | ^"and" | ^"or" | ^"xor"
-      | ^"not" | ^"in" | ^"is" | ^"null" | ^"true" | ^"false" | ^"case"
-      | ^"when" | ^"then" | ^"else" | ^"end" | ^"contains" | ^"starts"
-      | ^"ends" | ^"union" | ^"ascending" | ^"asc" | ^"descending" | ^"desc"
-      | ^"call" | ^"yield" | ^"unwind" | ^"for")
-    ~ !ident_cont
-}
+// `EscapedSymbolicName = ("`" ~ (!"`" ~ ANY)* ~ "`")+` — the `+` is how a literal
+// backtick is escaped inside a quoted name (`` `a``b` `` is the single name
+// ``a`b``), and the `*` lets `` `` `` name the empty string.
+quoted_name = _{ ("`" ~ (!"`" ~ ANY)* ~ "`")+ }
+
+// `IdentifierStart = ID_Start | Pc`, `IdentifierPart = ID_Continue | Sc`. Unicode,
+// not ASCII: `café` and `π` are names, and `_` arrives via connector punctuation.
+// These also back every keyword's `!ident_cont` boundary guard, so a keyword
+// followed by a non-ASCII letter (`ORDERé`) is correctly read as one name.
+ident_start = _{ ID_START | CONNECTOR_PUNCTUATION }
+ident_cont = _{ ID_CONTINUE | CURRENCY_SYMBOL }

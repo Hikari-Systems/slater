@@ -23,6 +23,12 @@ use graph_format::ids::Value;
 #[grammar = "cypher.pest"]
 struct CypherParser;
 
+/// Production-by-production conformance of `cypher.pest` against the openCypher
+/// reference grammar. Kept in its own file: it is a specification, not a unit test.
+#[cfg(test)]
+#[path = "parser_conformance_tests.rs"]
+mod conformance;
+
 pub mod ast {
     //! The read-Cypher abstract syntax tree.
     use graph_format::ids::Value;
@@ -1517,6 +1523,39 @@ fn lower_sort_item(pair: Pair<Rule>) -> Result<(Expr, SortDir)> {
 
 // ── Pattern lowering ─────────────────────────────────────────────────────────
 
+/// Flatten a (possibly parenthesised) `pattern_element` / `match_element` into its
+/// ordered leaves. openCypher lets a pattern element be wrapped in redundant
+/// parentheses to any depth (`MATCH (((a)-[:R]->(b)))`); the nesting groups but
+/// carries no meaning, so the leaves are all the lowering needs. `wrapper` names
+/// the self-recursive rule, which is the only structural difference between the
+/// plain and the quantifier-bearing spellings.
+fn flatten_pattern_element(pair: Pair<Rule>, wrapper: Rule) -> Result<Vec<Pair<Rule>>> {
+    let mut out = Vec::new();
+    push_pattern_leaves(pair, wrapper, &mut out)?;
+    Ok(out)
+}
+
+fn push_pattern_leaves<'i>(
+    pair: Pair<'i, Rule>,
+    wrapper: Rule,
+    out: &mut Vec<Pair<'i, Rule>>,
+) -> Result<()> {
+    for child in pair.into_inner() {
+        let rule = child.as_rule();
+        if rule == wrapper {
+            push_pattern_leaves(child, wrapper, out)?;
+        } else if matches!(
+            rule,
+            Rule::node_pattern | Rule::rel_pattern | Rule::quantified_path
+        ) {
+            out.push(child);
+        } else {
+            bail!("internal: unexpected pattern element child {rule:?}");
+        }
+    }
+    Ok(())
+}
+
 fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     let mut path_var = None;
     let mut nodes = Vec::new();
@@ -1524,8 +1563,15 @@ fn lower_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::path_var => path_var = Some(ident_text(child)?),
-            Rule::node_pattern => nodes.push(lower_node_pattern(child)?),
-            Rule::rel_pattern => rels.push(lower_rel_pattern(child)?),
+            Rule::pattern_element => {
+                for elem in flatten_pattern_element(child, Rule::pattern_element)? {
+                    match elem.as_rule() {
+                        Rule::node_pattern => nodes.push(lower_node_pattern(elem)?),
+                        Rule::rel_pattern => rels.push(lower_rel_pattern(elem)?),
+                        other => bail!("internal: unexpected pattern element {other:?}"),
+                    }
+                }
+            }
             other => bail!("internal: unexpected pattern child {other:?}"),
         }
     }
@@ -1563,6 +1609,7 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
     let mut restrictor: Option<PathRestrictor> = None;
     let mut selector: Option<PathSelector> = None;
 
+    let mut elems: Vec<Pair<Rule>> = Vec::new();
     for child in pair.into_inner() {
         match child.as_rule() {
             // `MATCH p = shortestPath((a)-[:R*]->(b))` — desugar the openCypher
@@ -1571,6 +1618,13 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
             Rule::path_selector => selector = Some(lower_path_selector(child)?),
             Rule::path_restrictor => restrictor = Some(lower_path_restrictor(child)?),
             Rule::path_var => path_var = Some(ident_text(child)?),
+            Rule::match_element => elems = flatten_pattern_element(child, Rule::match_element)?,
+            other => bail!("internal: unexpected match_pattern child {other:?}"),
+        }
+    }
+
+    for child in elems {
+        match child.as_rule() {
             Rule::node_pattern => {
                 let node = lower_node_pattern(child)?;
                 if start.is_none() {
@@ -1592,7 +1646,7 @@ fn lower_match_pattern(pair: Pair<Rule>) -> Result<Pattern> {
                 has_quant = true;
                 pending_quant = Some(lower_quantified_path(child)?);
             }
-            other => bail!("internal: unexpected match_pattern child {other:?}"),
+            other => bail!("internal: unexpected match element {other:?}"),
         }
     }
 
@@ -1807,12 +1861,37 @@ fn lower_quantifier_bounds(pair: Pair<Rule>) -> Result<VarLength> {
     }
 }
 
-/// Parse a non-negative `integer` token used as a quantifier bound.
+/// Parse an `integer` token, honouring openCypher's three radices: `0x…` is hex,
+/// a leading `0` before further octal digits is octal (`017` is 15, not 17), and
+/// anything else is decimal. The sign is carried into `from_str_radix` rather
+/// than negated afterwards, so `i64::MIN` round-trips.
+fn parse_int_literal(s: &str) -> Result<i64> {
+    let neg = s.starts_with('-');
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    let (radix, body) = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => (16, hex),
+        None if digits.len() > 1 && digits.starts_with('0') => (8, &digits[1..]),
+        None => (10, digits),
+    };
+    let signed = if neg {
+        format!("-{body}")
+    } else {
+        body.to_string()
+    };
+    i64::from_str_radix(&signed, radix).map_err(|e| anyhow::anyhow!("bad integer {s:?}: {e}"))
+}
+
+/// Parse a non-negative `integer` token used as a quantifier bound. Shares
+/// [`parse_int_literal`]'s radix rules, so `*{017}` means 15 hops, not 17.
 fn parse_u32(pair: Pair<Rule>) -> Result<u32> {
-    pair.as_str()
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("invalid quantifier bound '{}'", pair.as_str()))
+    let s = pair.as_str().trim();
+    parse_int_literal(s)
+        .ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid quantifier bound '{s}'"))
 }
 
 fn lower_node_pattern(pair: Pair<Rule>) -> Result<NodePat> {
@@ -1823,7 +1902,7 @@ fn lower_node_pattern(pair: Pair<Rule>) -> Result<NodePat> {
         match child.as_rule() {
             Rule::var => var = Some(ident_text(only_child(child)?)?),
             Rule::labels => label_expr = Some(lower_labels(child)?),
-            Rule::prop_map => props = lower_prop_map(child)?,
+            Rule::properties => props = lower_properties(child)?,
             other => bail!("internal: unexpected node child {other:?}"),
         }
     }
@@ -1852,7 +1931,7 @@ fn lower_rel_pattern(pair: Pair<Rule>) -> Result<RelPat> {
                         // `rel_types` and node `labels` share the `label_expr` grammar.
                         Rule::rel_types => type_expr = Some(lower_labels(d)?),
                         Rule::var_length => var_length = Some(lower_var_length(d)?),
-                        Rule::prop_map => props = lower_prop_map(d)?,
+                        Rule::properties => props = lower_properties(d)?,
                         other => bail!("internal: unexpected rel_detail child {other:?}"),
                     }
                 }
@@ -1889,9 +1968,10 @@ fn lower_var_length(pair: Pair<Rule>) -> Result<VarLength> {
         .filter(|p| p.as_rule() == Rule::integer)
         .collect();
     let parse_u32 = |p: &Pair<Rule>| -> Result<u32> {
-        p.as_str()
-            .parse::<u32>()
-            .map_err(|e| anyhow::anyhow!("bad var-length bound {:?}: {e}", p.as_str()))
+        parse_int_literal(p.as_str())
+            .ok()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow::anyhow!("bad var-length bound {:?}", p.as_str()))
     };
     if !text.contains("..") {
         // `*3` — exact length.
@@ -1978,6 +2058,21 @@ fn lower_le_atom(pair: Pair<Rule>) -> Result<LabelExpr> {
         Rule::le_name => Ok(LabelExpr::Atom(ident_text(child)?)),
         Rule::label_expr => lower_label_expr(child),
         other => bail!("internal: unexpected le_atom child {other:?}"),
+    }
+}
+
+/// `Properties = MapLiteral | Parameter`. Both spellings parse; only the inline
+/// map lowers, because matching a pattern against a map supplied at runtime needs
+/// the executor to build the predicate per row, which it cannot yet do.
+fn lower_properties(pair: Pair<Rule>) -> Result<Vec<(String, Expr)>> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::prop_map => lower_prop_map(inner),
+        Rule::parameter => bail!(
+            "a parameter property map in a pattern is not supported; \
+             write the properties inline, e.g. (n:Label {{key: $value}})"
+        ),
+        other => bail!("internal: unexpected properties child {other:?}"),
     }
 }
 
@@ -2472,6 +2567,12 @@ fn lower_exists(pair: Pair<Rule>) -> Result<Expr> {
         match child.as_rule() {
             Rule::pattern => patterns.push(lower_pattern(child)?),
             Rule::where_clause => predicate = Some(Box::new(lower_expr(only_child(child)?)?)),
+            // `EXISTS { RegularQuery }` — the reference grammar's other arm. It
+            // parses so we can name the limitation instead of emitting a syntax error.
+            Rule::subquery => bail!(
+                "only the pattern form of EXISTS {{ … }} is supported; \
+                 a RETURN-bearing subquery must be spelled CALL {{ … }}"
+            ),
             other => bail!("internal: unexpected exists child {other:?}"),
         }
     }
@@ -2496,12 +2597,7 @@ fn lower_shortest_path(pair: Pair<Rule>) -> Result<Expr> {
 fn lower_literal(pair: Pair<Rule>) -> Result<Expr> {
     let inner = only_child(pair)?;
     let v = match inner.as_rule() {
-        Rule::integer => Value::Int(
-            inner
-                .as_str()
-                .parse::<i64>()
-                .map_err(|e| anyhow::anyhow!("bad integer {:?}: {e}", inner.as_str()))?,
-        ),
+        Rule::integer => Value::Int(parse_int_literal(inner.as_str())?),
         Rule::float => Value::Float(
             inner
                 .as_str()
@@ -2586,7 +2682,7 @@ fn has_keyword(pair: &Pair<Rule>, kw: &str) -> bool {
         .any(|w| w.eq_ignore_ascii_case(kw))
 }
 
-/// Extract an identifier's text, stripping surrounding backticks if quoted.
+/// Extract an identifier's text, unquoting a backtick-escaped name if present.
 fn ident_text(pair: Pair<Rule>) -> Result<String> {
     // `var`/`label_name`/`alias` wrap an `identifier`; unwrap one layer if present.
     let p = if pair.as_rule() == Rule::identifier {
@@ -2597,11 +2693,17 @@ fn ident_text(pair: Pair<Rule>) -> Result<String> {
             _ => pair,
         }
     };
-    let s = p.as_str();
-    Ok(s.strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .unwrap_or(s)
-        .to_string())
+    Ok(unquote_name(p.as_str()))
+}
+
+/// Strip the outer backticks of an `EscapedSymbolicName` and collapse each
+/// doubled backtick to one, so `` `a``b` `` names the single identifier ``a`b``.
+/// A bare (unquoted) name is returned verbatim — it can never start with a backtick.
+fn unquote_name(s: &str) -> String {
+    match s.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        Some(inner) => inner.replace("``", "`"),
+        None => s.to_string(),
+    }
 }
 
 fn unescape_string(pair: Pair<Rule>) -> Result<String> {
