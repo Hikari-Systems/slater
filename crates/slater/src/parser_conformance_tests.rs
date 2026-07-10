@@ -371,7 +371,7 @@ fn range_literal_every_shape() {
 
     // RangeLiteral bounds are IntegerLiteral, so they share its radices.
     let vl = |q: &str| match &ok(q).head.reading[0] {
-        Clause::Match(m) => m.patterns[0].rels[0].0.var_length.clone().unwrap(),
+        Clause::Match(m) => m.patterns[0].rels[0].0.var_length.unwrap(),
         other => panic!("expected a MATCH, got {other:?}"),
     };
     let v = vl("MATCH (a)-[:R*017]->(b) RETURN a");
