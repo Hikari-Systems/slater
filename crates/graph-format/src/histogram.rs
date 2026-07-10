@@ -81,11 +81,11 @@ pub fn derive_histogram_from_isam(
         return Ok(None);
     }
     let reader = IsamReader::open_with_cipher(isam_path, cipher)?;
-    let pairs = reader.distinct_key_counts()?;
-    if pairs.len() as u64 > max_distinct {
-        return Ok(None);
-    }
-    Ok(Some(pairs))
+    // Abandon *during* the scan, not after it. Counting every distinct key and then
+    // checking the length costs O(distinct) resident memory for an index we are about
+    // to decline: on 91.6M Wikidata nodes, `node_Entity_wikidata_id` is near-unique, and
+    // the discarded `Vec` was the peak RSS of the whole build.
+    reader.distinct_key_counts_bounded(max_distinct)
 }
 
 /// Write `prop_hist.blk`: one record per encoded histogram, in `records` order
@@ -169,6 +169,17 @@ mod tests {
         assert!(derive_histogram_from_isam(&path, None, 0)
             .unwrap()
             .is_none());
+
+        // The bounded scan abandons rather than counting everything and checking the
+        // length afterwards: `None` the moment a (max_distinct + 1)-th key appears, so
+        // a near-unique index never materialises the `Vec` it is about to discard.
+        assert_eq!(
+            reader.distinct_key_counts_bounded(4).unwrap(),
+            Some(want.clone())
+        );
+        assert_eq!(reader.distinct_key_counts_bounded(3).unwrap(), None);
+        assert_eq!(reader.distinct_key_counts_bounded(1).unwrap(), None);
+        assert_eq!(reader.distinct_key_counts_bounded(0).unwrap(), None);
         let _ = std::fs::remove_file(&path);
     }
 

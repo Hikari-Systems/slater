@@ -3261,6 +3261,7 @@ dependencies = [
  "serde_json",
  "slater-scalar",
  "thiserror",
+ "tikv-jemallocator",
  "tracing",
  "uuid",
 ]

@@ -643,16 +643,39 @@ impl IsamReader {
     /// adjacent (see `write_isam`), so a run-length count over the concatenated
     /// blocks is exact; an open run is carried across the block boundary.
     pub fn distinct_key_counts(&self) -> Result<Vec<(Value, u64)>> {
+        Ok(self
+            .distinct_key_counts_bounded(u64::MAX)?
+            .expect("an unbounded count never abandons"))
+    }
+
+    /// [`distinct_key_counts`](IsamReader::distinct_key_counts), abandoning as soon
+    /// as more than `max_distinct` distinct keys have been seen and returning `None`.
+    ///
+    /// The caller that wants a *bounded* histogram must say so here rather than
+    /// counting everything and checking the length afterwards. On a near-unique index
+    /// the two differ by gigabytes: `node_Entity_wikidata_id` over 91.6M Wikidata nodes
+    /// has ~91.6M distinct keys, and materialising all of them only to discard the
+    /// `Vec` was — measured — the peak RSS of the entire build (5.78 GB, in a phase
+    /// that runs for five seconds and keeps none of it).
+    pub fn distinct_key_counts_bounded(
+        &self,
+        max_distinct: u64,
+    ) -> Result<Option<Vec<(Value, u64)>>> {
         let mut out: Vec<(Value, u64)> = Vec::new();
         for b in 0..self.top.len() {
             for (k, _) in self.block(b)?.iter() {
                 match out.last_mut() {
                     Some((prev, n)) if prev.cmp_key(k) == Ordering::Equal => *n += 1,
-                    _ => out.push((k.clone(), 1)),
+                    _ => {
+                        if out.len() as u64 >= max_distinct {
+                            return Ok(None);
+                        }
+                        out.push((k.clone(), 1));
+                    }
                 }
             }
         }
-        Ok(out)
+        Ok(Some(out))
     }
 }
 

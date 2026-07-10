@@ -251,38 +251,47 @@ instrumentation + parallel block sealing, D57) landed.
 **Content hash `5e8e7307…` — unchanged.** Every item is byte-preserving at full scale, including B3
 part 1, which `docs/BUILD-PERF-PLAN.md` had wrongly predicted would force a re-baseline.
 
-**48.1 min wall** (was 53.8 min, **−10.6%**), 968% average CPU, **8.13 GB peak RSS** (was 8.47 GB).
+Also with **D59**: `slater-build` on jemalloc, and the property-histogram scan bounded.
+
+**47.0 min wall** (was 53.8 min, **−12.5%**), 984% average CPU, **5.66 GB peak RSS** (was 8.47 GB, **−33%**).
 
 | phase | wall | cpu/wall | peak RSS | vs 2026-07-09 |
 |---|--:|--:|--:|---|
-| pass1 (parse + metadata) | 10.77m | 14.1× | 2.14 G | −3% wall |
-| dedup keys | 1.61m | 2.0× | 1.53 G | −15% wall, RSS 0.62→1.53 G |
-| resolve edge endpoints | 11.61m | **11.8×** | 5.62 G | +3% wall, 10.3→11.8× |
-| cluster (locality reorder) | 8.53m | 2.9× | 4.25 G | −2% wall, unchanged |
-| emit node stores | **1.68m** | **3.4×** | 2.86 G | **−40% wall**, 1.4→3.4× |
-| emit topology (CSR + edges) | 11.93m | **9.4×** | 8.29 G | −2% wall, 7.7→9.4× |
-| emit.graph_summaries | **1.36m** | **9.6×** | 5.73 G | **−68% wall**, 1.3→9.6× |
-| emit range indexes | 0.34m | 0.9× | 3.30 G | unchanged |
-| publish (hash + manifest) | **0.19m** | 2.2× | 3.32 G | **−81% wall**, 1.0→2.2× |
+| pass1 (parse + metadata) | 11.11m | 14.0× | 2.15 G | unchanged |
+| dedup keys | **1.13m** | 2.0× | 1.01 G | **−41% wall** |
+| resolve edge endpoints | 11.31m | **12.2×** | 4.31 G | level, 10.3→12.2× |
+| cluster (locality reorder) | 8.52m | 3.0× | 2.08 G | −2% wall, RSS 1.60→2.08 G |
+| emit node stores | **0.98m** | **5.4×** | 1.24 G | **−65% wall**, 1.4→5.4× |
+| emit topology (CSR + edges) | 12.03m | **8.6×** | 4.60 G | level, RSS **8.06→4.60 G** |
+| emit.graph_summaries | **1.34m** | **9.6×** | 3.71 G | **−69% wall**, 1.3→9.6× |
+| emit range indexes | 0.33m | 0.9× | 0.49 G | unchanged |
+| emit property histograms | 0.09m | 1.0× | 5.78 G → *see below* | new peak, then fixed |
+| publish (hash + manifest) | **0.21m** | 2.2× | 0.44 G | **−79% wall**, 1.0→2.2× |
 
-### Memory: the accountant holds, the allocator does not
+### Memory: the accountant holds, and now the allocator returns
 
-| metric | 2026-07-09 | 2026-07-10 |
-|---|--:|--:|
-| peak **reserved** | *(not tracked)* | **4.29 G = 1.00× cap** |
-| peak RSS | 8.47 G = 2.08× cap | 8.29 G = 1.93× cap |
-| samples above the cap | 20.1% | 13.3% above 1.25× |
-| samples above **2×** the cap | (peak was 2.08×) | **0.0%** |
+| metric | 2026-07-09 | glibc (B1–B4) | **jemalloc (D59)** |
+|---|--:|--:|--:|
+| peak **reserved** | *(not tracked)* | 4.29 G = 1.00× cap | **4.29 G = 1.00× cap** |
+| peak RSS | 8.47 G = 2.08× cap | 8.29 G = 1.93× cap | **5.66 G = 1.34× cap †** |
+| `emit.topology` peak RSS | 8.06 G | 8.29 G | **4.60 G = 1.07× cap** |
+| `stitch` RSS vs reserved | — | 6.25 G vs 0.81 G | **2.53 G vs 0.81 G** |
+| samples above 1.25× cap | 20.1% (above 1.0×) | 13.3% | **0.01% (1 of 11,059)** |
+| samples above 2× cap | (peak 2.08×) | 0.0% | **0.0%** |
 
-`MemoryBudget` provably never overcommits: peak reserved is exactly the cap. The residual RSS overshoot
-is **not live memory**. Inside `emit.topology`, the `stitch` step holds **6.25 GB resident against
-0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files, and
-`emit reverse CSR per band` sits 4.7 GB above its reservation even though `EdgeRev` owns no heap. That
-is glibc arena retention from 14 worker threads that churned ~1.5B small `props_blob` allocations. See
-**D58**; the fix is to put `slater-build` on jemalloc (as `slater` already is), not more budgeting.
-`malloc_trim` is not an option here — the crate sets `unsafe_code = "forbid"`.
+† The single 5.78 GB sample is `emit.prop_hist`, a five-second phase that reserves nothing:
+`derive_histogram_from_isam` materialised **every** distinct `(Value, count)` pair before checking the
+`--histogram-max-distinct` cap and discarding them, and `node_Entity_wikidata_id` is near-unique over
+91.6M nodes. Fixed in D59 (`distinct_key_counts_bounded` abandons mid-scan). **Excluding it, the build's
+peak is 4.60 GB = 1.07× the cap.**
 
-### Where the remaining serial time is (per-sub-step, from B4 stage 1)
+`MemoryBudget` (D58) provably never overcommits — peak reserved is exactly the cap. What it could not see
+was glibc arena retention: `stitch` held 6.25 GB resident against 0.81 GB reserved while doing nothing but
+a verbatim block-concat of finished files. jemalloc's `background_threads` purge threads return that heap
+(D59), and also service the ~1.5B small `props_blob` allocations faster — which is why `emit.node_stores`
+went 2.8m@1.4× (2026-07-09) → 1.68m@3.4× (glibc) → **0.98m@5.4×** (jemalloc).
+
+### Where the remaining serial time is (per-sub-step, from B4 stage 1; glibc run)
 
 | phase | sub-op | wall | cpu%avg |
 |---|---|--:|--:|

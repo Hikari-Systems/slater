@@ -1202,18 +1202,56 @@ exactly **one** band, and inline left 13 cores idle (`emit.topology` 6.5s → 9.
 **1.00× the cap** — the accountant provably never overcommits. Samples above 2× the cap: **0.0%** (was
 20.1% above the cap outright). Content hash unchanged at `5e8e7307…`.
 
-**What is still not bounded, and why.** Peak *RSS* is 8.29 GB = 1.93× the cap, so the plan's "≤1.25×"
-target is **not** met. The gap is not live memory. `emit.topology`'s `stitch` step holds **6.25 GB
-resident against 0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files —
-it allocates almost nothing. `emit reverse CSR per band` sits 4.7 GB above its reservation, and `EdgeRev`
-owns no heap at all. What remains is glibc arena retention: 14 worker threads that churned ~1.5B small
-`props_blob` allocations, freed into per-thread arenas that are never returned to the OS.
+**What the accountant could not bound, and why.** On glibc, peak *RSS* was 8.29 GB = 1.93× the cap even
+though peak reserved was exactly 1.00×. The gap was never live memory: `emit.topology`'s `stitch` step
+held **6.25 GB resident against 0.81 GB reserved** while doing nothing but a verbatim block-concat of
+finished files, and `emit reverse CSR per band` sat 4.7 GB above its reservation despite `EdgeRev` owning
+no heap at all. That was glibc arena retention — 14 worker threads churning ~1.5B small `props_blob`
+allocations, freed into per-thread arenas that are never returned to the OS. Fixed by **D59** (jemalloc);
+`emit.topology` now peaks at 4.60 GB = **1.07× the cap** and `stitch` at 2.53 GB against the same
+0.81 GB reserved. B1's acceptance is met.
 
-The fix is **jemalloc, not `malloc_trim`** — `slater-build` sets `unsafe_code = "forbid"`, so a libc
-`malloc_trim` FFI cannot be added to it at all, and the server crate already made precisely this
-migration for precisely this reason: `tikv-jemallocator`'s `background_threads` purge threads return
-freed heap on a decay timer, which "moves the last `unsafe` out of this crate and into the audited
-allocator" (`slater/src/main.rs`). `slater-build` is a separate binary, so a `#[global_allocator]` there
-is scoped to it. Deliberately deferred, not forgotten. Note this treats the symptom: the churn itself is
-~1.5B small `props_blob` `Vec<u8>` allocations, and eliminating those (a per-band bump arena, or inlining
-short blobs) would cut CPU as well as RSS.
+### D59 — `slater-build` runs on jemalloc, and the histogram scan abandons instead of counting
+`crates/slater-build/src/main.rs`, `crates/slater-build/Cargo.toml`, `crates/graph-format/src/{isam,histogram}.rs`.
+D58's accountant bounds what the build's sorters *reserve* — at 91.6M nodes, peak reserved is exactly the
+`--max-memory` cap. Peak *RSS* stayed at 1.93× that, and the excess was not live: `emit.topology`'s
+`stitch` step held 6.25 GB resident against 0.81 GB reserved while only concatenating finished files, and
+the reverse-band sorter sat 4.7 GB above its reservation though `EdgeRev` owns no heap. Fourteen band
+workers free ~1.5B small `props_blob` allocations into per-thread glibc arenas, which glibc never returns
+to the OS.
+
+So `slater-build` takes `tikv-jemallocator` as its `#[global_allocator]` on Linux, as `slater` already
+does. Its `background_threads` purge threads return freed heap on a decay timer without the process
+making `free()` calls. **Not `malloc_trim`**: this crate sets `unsafe_code = "forbid"`, so the libc FFI
+is unavailable to it — and the server migrated *away* from an idle-gated `malloc_trim` for exactly that
+reason, "moving the last `unsafe` out of this crate and into the audited allocator". The allocator is
+`cfg`-exclusive with the `profiling` feature's dhat allocator (only one `#[global_allocator]` may exist),
+and `slater-build` is its own binary, so nothing about the server changes.
+
+**Measured, full 91.6M / 1.49B rebuild, 4 GiB cap, `--threads 14`, against the same build on glibc.**
+Content hash unchanged (`5e8e7307…`). Wall **48.08 → 47.04 min**; peak RSS **8.13 → 5.66 GB**.
+
+| phase | glibc wall / peak RSS | jemalloc wall / peak RSS |
+|---|--:|--:|
+| dedup | 1.61m / 1.53 G | **1.13m / 1.01 G** |
+| resolve | 11.61m / 5.62 G | **11.31m / 4.31 G** |
+| cluster | 8.53m / 4.25 G | 8.52m / **2.08 G** |
+| emit.node_stores | 1.68m / 2.86 G | **0.98m / 1.24 G** |
+| emit.topology | 11.93m / **8.29 G** | 12.03m / **4.60 G** |
+| emit.topology → `stitch` | 6.25 G resident / 0.81 G reserved | **2.53 G** / 0.81 G reserved |
+
+jemalloc is not only returning pages, it services the small-allocation churn faster: `emit.node_stores`
+went 1.68 → 0.98 min (**2.9× faster than the 2.8 min pre-B1 baseline**, at 5.4× cpu/wall vs 1.4×).
+
+**The last peak was somewhere else entirely.** With retention gone, the build's peak RSS became a *single
+sample* — 5.78 GB, 1.34× the cap, 1 of 11,059 samples — inside `emit.prop_hist`, a five-second phase that
+reserves nothing. `derive_histogram_from_isam` called `distinct_key_counts()`, which materialises **every**
+distinct `(Value, count)` pair, and only then checked `pairs.len() > max_distinct` and discarded the lot.
+`node_Entity_wikidata_id` is near-unique over 91.6M nodes. Replaced by `distinct_key_counts_bounded`,
+which abandons the moment a `max_distinct + 1`-th key appears; boundary semantics are unchanged (a
+histogram with exactly `max_distinct` keys is still stored) and pinned by test. Excluding that transient,
+the build's peak was already 4.60 GB = **1.07× the cap**, with **zero** samples above 1.25×.
+
+Remaining, and deliberately not done: jemalloc treats the symptom. The churn is ~1.5B small
+`props_blob` `Vec<u8>` allocations, one per edge; a per-band bump arena (or inlining short blobs into the
+record) would remove them and cut CPU as well as RSS.

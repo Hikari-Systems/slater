@@ -275,9 +275,10 @@ redirected from `cluster` into `BlockFileWriter`). `dedup + node_stores` was str
 
 ## Progress ledger
 
-Written 2026-07-09 from the `wd91m-writeable-build-diag.jsonl` run. Landed 2026-07-10 and verified by a
-full 91.6M rebuild (`wd91m-b1v2-diag.jsonl`): **48.1 min wall (was 53.8), content hash `5e8e7307…`
-unchanged.** New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
+Written 2026-07-09 from the `wd91m-writeable-build-diag.jsonl` run. Landed 2026-07-10 and verified by two
+full 91.6M rebuilds (`wd91m-b1v2-diag.jsonl` on glibc, `wd91m-jem-diag.jsonl` on jemalloc):
+**47.0 min wall (was 53.8), peak RSS 5.66 GB (was 8.47), content hash `5e8e7307…` unchanged.**
+New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
 
 - **B1 — `MemoryBudget` accountant.** Done, and **partially met** (see acceptance below). Shipped as
   **D58**. New `graph-format/src/membudget.rs`: a counted semaphore over `--max-memory` handing out RAII
@@ -303,13 +304,15 @@ unchanged.** New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
      at 91.6M (88 bands / 14 workers) but wrong at 1M, where there is **one** band and inline left 13
      cores idle (`emit.topology` 6.5s → 9.95s). Now `ExtSorter::new_for_pool(…, nbands >= threads)`.
 
-  **Acceptance.** Peak **reserved** = 4.29 GB = **1.00× the cap**; **zero** samples above 2× the cap (was
-  20.1% above the cap). Wall clock improved, not within-5%-of-baseline. But peak **RSS** is 8.29 GB =
-  1.93× cap, so *"≤ ~1.25× the cap"* is **not met**. The residual is not live memory: `stitch` holds
-  6.25 GB resident against 0.81 GB reserved while only concatenating finished files, and the reverse-band
-  sorter sits 4.7 GB above its reservation despite `EdgeRev` owning no heap. It is glibc arena retention
-  across 14 workers that churned ~1.5B small `props_blob` allocations. Fix is **jemalloc**, not more
-  budgeting — see **Follow-ups**.
+  **Acceptance: met.** Peak **reserved** = 4.29 GB = **1.00× the cap**; **zero** samples above 2× the cap
+  (was 20.1% above the cap outright). Peak **RSS** 4.60 GB = **1.07× the cap** in every budgeted phase,
+  once **D59** (jemalloc) removed the glibc arena retention that the accountant cannot see. Wall clock
+  improved rather than merely staying within 5%. Content hash `5e8e7307…` unchanged.
+
+  On glibc the peak had stayed at 1.93× cap despite reserved being exactly 1.00×, and the gap was never
+  live memory — `stitch` held 6.25 GB resident against 0.81 GB reserved while only concatenating finished
+  files. That was ~1.5B small `props_blob` allocations freed into per-thread arenas glibc never returns.
+  See **D59**.
 - **B2 — `emit.graph_summaries` map-reduce.** Done. Tally sharded over contiguous node ranges; triples
   routed by `dst`-range so the target-label join *also* parallelises (one sort-merge join per range)
   rather than staying a single serial pass after the tally, as the plan proposed. Needed a new
@@ -339,22 +342,26 @@ unchanged.** New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
 2. **`emit.topology` / `stitch`** — now 247.8s (35% of the phase) at 85% CPU, a verbatim block-concat of
    176 band files into 20.4 GB. IO-bound; it became the phase's largest serial step only because the band
    passes got 1.6× faster.
-3. **Allocator retention** — the last 2× of peak RSS (see B1's acceptance). Swap `slater-build` onto
-   **jemalloc**: `#[global_allocator] static: tikv_jemallocator::Jemalloc`, Linux-only, gated
-   `not(feature = "profiling")` so it does not collide with dhat's allocator. `tikv-jemallocator` with
-   `background_threads` is already a workspace dependency, and `slater-build` is its own binary, so the
-   change is scoped to it and leaves the server untouched.
+3. ~~**Allocator retention** — the last 2× of peak RSS.~~ **Done (D59).** `slater-build` took
+   `tikv-jemallocator` as its `#[global_allocator]` on Linux. Peak RSS 8.13 → 5.66 GB, `emit.topology`
+   8.29 → 4.60 G, `stitch` 6.25 → 2.53 G against the same 0.81 G reserved, and `emit.node_stores` got
+   *faster* (1.68 → 0.98 min) because jemalloc also services the churn better. Wall 48.08 → 47.04 min,
+   hash unchanged. Not `malloc_trim` — this crate forbids `unsafe`, and `slater` had already migrated off
+   it for that reason.
 
-   Not `malloc_trim`: `slater-build` sets `unsafe_code = "forbid"`, so the libc FFI cannot be added
-   without dropping that lint — and the server crate already migrated *away* from an idle-gated
-   `malloc_trim` to jemalloc for exactly that reason (`slater/src/main.rs`). jemalloc's decay-based purge
-   threads return freed heap without the process making `free()` calls.
+   It exposed the real last peak: `emit.prop_hist`, a five-second phase reserving nothing, whose
+   `derive_histogram_from_isam` materialised **every** distinct `(Value, count)` pair before checking the
+   `max_distinct` cap and discarding them. On near-unique `node_Entity_wikidata_id` that was one 5.78 GB
+   sample — the whole build's peak. Now `distinct_key_counts_bounded` abandons mid-scan (D59).
 
-   Caveat: this treats the symptom. The churn is ~1.5B small `props_blob` `Vec<u8>` allocations; a
-   per-band bump arena (or inlining short blobs) would cut CPU as well as RSS. And decay purging runs on
-   a ~10s timer, so it should collapse the retained 5.5 GB visible during `stitch` while the in-phase
-   peak of the forward-band pass may persist — ≤1.25× is not guaranteed by this alone.
-4. **`pass1` writers** — `BlockFileWriter` hands every block to D57's seal pool, which is pure overhead
+   Still open: jemalloc treats the *symptom*. The churn is ~1.5B small `props_blob` `Vec<u8>`
+   allocations, one per edge. A per-band bump arena, or inlining short blobs into the record, would remove
+   them and cut CPU as well as RSS.
+4. **Unbudgeted resident consumers.** `emit.prop_hist` was one (now fixed). The k-way merge's
+   `#runs × 256 KiB` of decompressed blocks is another, and `cluster`'s O(n) partition maps are reserved
+   but the stripe readers are not. None currently drives the peak; `budget_reserved_bytes` vs `rss_bytes`
+   in a `--diagnostics` run is how you find the next one.
+5. **`pass1` writers** — `BlockFileWriter` hands every block to D57's seal pool, which is pure overhead
    for a phase already at 14.1× cpu/wall. An inline-seal constructor for writers driven from inside a
    saturated pool would remove it, mirroring `ExtSorter::new_for_pool`. (Measured within noise at 91.6M:
    11.1m → 10.77m, so this is speculative.)

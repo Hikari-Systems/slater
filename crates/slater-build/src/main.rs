@@ -19,12 +19,30 @@ mod resolve;
 mod set_eval;
 mod shared;
 
+// On Linux, jemalloc is the global allocator, as it is for the server.
+//
+// The build's memory accountant (D58) bounds what its sorters *reserve* — at 91.6M
+// nodes, peak reserved is exactly the `--max-memory` cap. Peak RSS was still 1.93×
+// that, and the excess is not live memory: `emit.topology`'s stitch step held 6.25 GB
+// resident against 0.81 GB reserved while doing nothing but concatenating finished
+// files. Fourteen band workers churn ~1.5B small `props_blob` allocations and free
+// them into per-thread glibc arenas, which are never returned to the OS. jemalloc's
+// `background_threads` purge threads return that heap on a decay timer without the
+// process making `free()` calls.
+//
+// Not `malloc_trim`: this crate sets `unsafe_code = "forbid"`, so the libc FFI is not
+// available to it — and `slater` migrated away from an idle-gated `malloc_trim` for
+// exactly that reason, moving the last `unsafe` into the audited allocator. Non-Linux
+// targets keep the system allocator unchanged.
+#[cfg(all(target_os = "linux", not(feature = "profiling")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // Heap-profiling build only (`--features profiling`, off by default): dhat's
 // counting allocator attributes live bytes at peak RSS to allocation call
-// stacks, for phases (resolve/cluster at Wikidata scale) whose observed RSS
-// exceeds their nominal `--max-memory` budget by more than the sort/spill
-// accounting alone explains. Mirrors how `slater`'s main.rs swaps in jemalloc,
-// but scoped to this one feature rather than always-on.
+// stacks. Displaces jemalloc above (only one `#[global_allocator]` may exist),
+// which is why the two are mutually exclusive by `cfg`. Use it to attribute the
+// residual RSS to allocation sites rather than to guess at it.
 #[cfg(feature = "profiling")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
