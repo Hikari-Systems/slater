@@ -235,15 +235,14 @@ fn parse_edge_create(pair: Pair<Rule>, id_field: &str) -> Result<Statement> {
     }))
 }
 
-/// Extract a single-node match (`label` + one `{key: value}`) from a matched
-/// pattern. v1 requires exactly one label and exactly one match property.
+/// Extract a node match (identity `label` + any additional labels + one `{key: value}`)
+/// from a matched pattern. At least one label and exactly one match property are
+/// required; the first label is the identity (it locates/creates the node), the rest are
+/// written alongside it (`MERGE (n:Ident:Other {k:v})`).
 fn node_match_from_pattern(pair: Pair<Rule>) -> Result<NodeMatch> {
     let (_var, labels, props) = parse_node_pattern(pair)?;
-    if labels.len() != 1 {
-        bail!(
-            "overwrite match pattern must have exactly one label, got {}",
-            labels.len()
-        );
+    if labels.is_empty() {
+        bail!("overwrite match pattern must have at least one label");
     }
     if props.len() != 1 {
         bail!(
@@ -251,9 +250,16 @@ fn node_match_from_pattern(pair: Pair<Rule>) -> Result<NodeMatch> {
             props.len()
         );
     }
-    let label = labels.into_iter().next().unwrap();
+    let mut labels = labels.into_iter();
+    let label = labels.next().unwrap();
+    let extra_labels: Vec<String> = labels.collect();
     let (key, value) = props.into_iter().next().unwrap();
-    Ok(NodeMatch { label, key, value })
+    Ok(NodeMatch {
+        label,
+        extra_labels,
+        key,
+        value,
+    })
 }
 
 /// Parse a `set_clause` (`SET v.k = rhs, …`) into `(key, expr)` assignments, where

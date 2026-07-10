@@ -25,9 +25,10 @@
 //! A generation does not record which property is a node's identity. We infer it
 //! from the range indexes (`plan::index_for`) — the same signal the write path uses
 //! — and **refuse** (a clear error, no silent data loss) when a node has no
-//! range-indexed property or carries more than one label. Phase 1 assumes one
-//! business identity per node; multi-key aliasing and unindexed labels are out of
-//! scope until a later phase.
+//! range-indexed property. A multi-label node round-trips as
+//! `MERGE (n:Ident:Other {key: v})`: the range-indexed label is the identity (it
+//! leads the list) and every label is written back, so a `SET n:Label` survives a
+//! consolidation. Multi-key aliasing of one node is still out of scope.
 //!
 //! # Determinism
 //! Nodes and edges iterate in ascending dense-id order; a node's `SET` assignments
@@ -84,36 +85,58 @@ fn emit_index_ddl<V: ReadView>(view: &V, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// The recovered `(label, key-property, key-value)` business identity of a node, or
-/// an error naming why it is unrecoverable (no range-indexed property present, or a
-/// multi-label node) — consolidation refuses rather than emit an unidentifiable node.
+/// The recovered business identity of a node: its labels **ordered with the identity
+/// label first** (the label carrying the range index on the present business key; the
+/// remaining labels sorted by core label id for determinism), plus the key property and
+/// value. A multi-label node round-trips as `MERGE (n:Ident:Other {key: v})`. Errors when
+/// no label has a range-indexed property present — consolidation refuses rather than emit
+/// an unidentifiable node.
 fn node_identity(
     view: &impl ReadView,
     id: u64,
     labels: &[String],
     props: &NamedProps,
-) -> Result<(String, String, Value)> {
-    let [label] = labels else {
-        bail!("cannot consolidate node {id}: Phase 1 requires exactly one label, found {labels:?}");
-    };
-    for ri in &view.manifest().range_indexes {
-        if ri.entity != EntityKind::Node || &ri.label_or_type != label {
-            continue;
-        }
-        if let Some((_, val)) = props.iter().find(|(k, _)| k == &ri.property) {
-            let value = val_to_value(val).with_context(|| {
-                format!(
-                    "node {id} business key {}.{} is not a scalar",
-                    label, ri.property
-                )
-            })?;
-            return Ok((label.clone(), ri.property.clone(), value));
+) -> Result<(Vec<String>, String, Value)> {
+    // The identity label is the one with a range index on a property this node carries;
+    // when several qualify, the lowest core label id wins (a deterministic tie-break).
+    let mut best: Option<(u32, String, String, Value)> = None; // (label_id, label, key, value)
+    for label in labels {
+        for ri in &view.manifest().range_indexes {
+            if ri.entity != EntityKind::Node || &ri.label_or_type != label {
+                continue;
+            }
+            if let Some((_, val)) = props.iter().find(|(k, _)| k == &ri.property) {
+                let value = val_to_value(val).with_context(|| {
+                    format!(
+                        "node {id} business key {}.{} is not a scalar",
+                        label, ri.property
+                    )
+                })?;
+                let lid = view.label_id(label).unwrap_or(u32::MAX);
+                if best.as_ref().map_or(true, |(bid, ..)| lid < *bid) {
+                    best = Some((lid, label.clone(), ri.property.clone(), value));
+                }
+            }
         }
     }
-    bail!(
-        "cannot consolidate node {id} (:{label}): no range-indexed business-key property is set — \
-         add a range index on its identity property (Phase 1 identifies nodes by an indexed key)"
-    )
+    let Some((_, ident_label, key, key_value)) = best else {
+        bail!(
+            "cannot consolidate node {id} (labels {labels:?}): no range-indexed business-key \
+             property is set — add a range index on an identity property (nodes are identified \
+             by an indexed key)"
+        );
+    };
+    // Identity label first, then the rest ordered by core label id.
+    let mut rest: Vec<(u32, &String)> = labels
+        .iter()
+        .filter(|l| **l != ident_label)
+        .map(|l| (view.label_id(l).unwrap_or(u32::MAX), l))
+        .collect();
+    rest.sort();
+    let mut ordered = Vec::with_capacity(labels.len());
+    ordered.push(ident_label.clone());
+    ordered.extend(rest.into_iter().map(|(_, l)| l.clone()));
+    Ok((ordered, key, key_value))
 }
 
 /// `MERGE (n:Label {key: v}) SET n.p = v, …;` for one node — the key property
@@ -129,8 +152,15 @@ fn emit_node<V: ReadView>(
         return Ok(());
     }
     let (labels, props) = engine.node_record(id)?;
-    let (label, key, key_value) = node_identity(view, id, &labels, &props)?;
-    write!(out, "MERGE (n:{label} {{{key}: {}}})", literal(&key_value))?;
+    let (ident_labels, key, key_value) = node_identity(view, id, &labels, &props)?;
+    // `MERGE (n:Ident:Other {key: v})` — all labels, identity first. The build MERGE
+    // dialect matches on the leading (identity) label and writes the whole list.
+    let label_str = ident_labels.join(":");
+    write!(
+        out,
+        "MERGE (n:{label_str} {{{key}: {}}})",
+        literal(&key_value)
+    )?;
     emit_set(&props, "n", Some(&key), out)?;
     writeln!(out, ";")?;
     Ok(())
@@ -151,7 +181,12 @@ fn emit_edges_from<V: ReadView>(
         return Ok(());
     }
     let (slabels, sprops) = engine.node_record(src)?;
-    let (sl, sk, sv) = node_identity(view, src, &slabels, &sprops)?;
+    // An edge endpoint is addressed by its identity label + key alone; the node's full
+    // label set is written by its own node MERGE.
+    let (sl, sk, sv) = {
+        let (labels, k, v) = node_identity(view, src, &slabels, &sprops)?;
+        (labels.into_iter().next().expect("identity label"), k, v)
+    };
     for adj in engine.outgoing_adj(src)? {
         let dst = adj.neighbour.0;
         // Belt-and-braces: `outgoing_adj` already drops an edge to a tombstoned node,
@@ -160,7 +195,10 @@ fn emit_edges_from<V: ReadView>(
             continue;
         }
         let (dlabels, dprops) = engine.node_record(dst)?;
-        let (dl, dk, dv) = node_identity(view, dst, &dlabels, &dprops)?;
+        let (dl, dk, dv) = {
+            let (labels, k, v) = node_identity(view, dst, &dlabels, &dprops)?;
+            (labels.into_iter().next().expect("identity label"), k, v)
+        };
         let (rtype, eprops) = engine.rel_record(adj.edge.0, adj.reltype)?;
         write!(
             out,
@@ -298,6 +336,26 @@ mod tests {
             msg.contains("Company"),
             "expected a Company refusal, got: {msg}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn node_identity_selects_indexed_label_and_orders_it_first() {
+        // A multi-label node's identity is the range-indexed label, and it leads the
+        // emitted label list regardless of the order the labels are presented in.
+        let (root, graph) = testgen::write_indexed_people("node_ident_multi");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let view = MergedView::read_only(&gen);
+        let props: NamedProps = vec![("name".to_string(), crate::exec::Val::Str("Alice".into()))];
+        let (labels, key, value) =
+            node_identity(&view, 0, &["VIP".to_string(), "Person".to_string()], &props).unwrap();
+        assert_eq!(
+            labels,
+            vec!["Person".to_string(), "VIP".to_string()],
+            "the indexed label (Person) is the identity and leads the list"
+        );
+        assert_eq!(key, "name");
+        assert_eq!(value, Value::Str("Alice".into()));
         std::fs::remove_dir_all(&root).ok();
     }
 

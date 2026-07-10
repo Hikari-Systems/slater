@@ -727,6 +727,9 @@ fn fold_node_props(into: &mut Vec<(u32, Value)>, add: &[(u32, SetExprI)]) -> Res
 /// so last-writer-wins is well defined and the sort total.
 pub(crate) struct NodeMergeRec {
     pub label: u32,
+    /// Labels beyond the identity `label` (local ids), written alongside it. Empty for a
+    /// single-label node. Not part of the sort key — the identity `label` locates the node.
+    pub extra_labels: Vec<u32>,
     pub key: u32,
     pub value: Value,
     pub set_props: Vec<(u32, SetExprI)>,
@@ -755,6 +758,10 @@ fn decode_props_pairs(r: &mut &[u8]) -> Result<Vec<(u32, Value)>> {
 impl SortRecord for NodeMergeRec {
     fn encode(&self, buf: &mut Vec<u8>) {
         write_uvarint(buf, self.label as u64);
+        write_uvarint(buf, self.extra_labels.len() as u64);
+        for l in &self.extra_labels {
+            write_uvarint(buf, *l as u64);
+        }
         write_uvarint(buf, self.key as u64);
         write_value(buf, &self.value);
         encode_node_set_props(buf, &self.set_props);
@@ -762,12 +769,18 @@ impl SortRecord for NodeMergeRec {
     }
     fn decode(r: &mut &[u8]) -> Result<Self> {
         let label = read_uvarint(r)? as u32;
+        let n_extra = read_uvarint(r)? as usize;
+        let mut extra_labels = Vec::with_capacity(n_extra);
+        for _ in 0..n_extra {
+            extra_labels.push(read_uvarint(r)? as u32);
+        }
         let key = read_uvarint(r)? as u32;
         let value = read_value(r)?;
         let set_props = decode_node_set_props(r)?;
         let seq = read_uvarint(r)?;
         Ok(NodeMergeRec {
             label,
+            extra_labels,
             key,
             value,
             set_props,
@@ -887,6 +900,12 @@ pub(crate) fn build_node_merge_rec(
 ) -> Result<NodeMergeRec> {
     reject_vector(&o.match_.value, "node MERGE business key")?;
     let label = labels.intern(&o.match_.label);
+    let extra_labels: Vec<u32> = o
+        .match_
+        .extra_labels
+        .iter()
+        .map(|l| labels.intern(l))
+        .collect();
     let key = keys.intern(&o.match_.key);
     let mut set_props = Vec::with_capacity(o.set_props.len());
     for (k, e) in &o.set_props {
@@ -895,6 +914,7 @@ pub(crate) fn build_node_merge_rec(
     }
     Ok(NodeMergeRec {
         label,
+        extra_labels,
         key,
         value: o.match_.value.clone(),
         set_props,
@@ -1005,6 +1025,9 @@ pub(crate) fn dedup_nodes(
             if let Some(rm) = rm {
                 if !rm.identity {
                     nm.label = rm.map_label(nm.label);
+                    for l in nm.extra_labels.iter_mut() {
+                        *l = rm.map_label(*l);
+                    }
                     nm.key = rm.map_key(nm.key);
                     for (k, e) in nm.set_props.iter_mut() {
                         *k = rm.map_key(*k);
@@ -1033,17 +1056,25 @@ pub(crate) fn dedup_nodes(
     let mut prov = 0u64;
     let mut cur: Option<(u32, u32, Value)> = None;
     let mut props: Vec<(u32, Value)> = Vec::new();
+    // Labels beyond the identity `label`, unioned across the records that fold into one
+    // node identity (a node's full label set — the identity plus any `SET n:Extra`).
+    let mut extra: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
 
     let mut flush = |cur: &mut Option<(u32, u32, Value)>,
                      props: &mut Vec<(u32, Value)>,
+                     extra: &mut std::collections::BTreeSet<u32>,
                      nodes_w: &mut BucketWriter,
                      keys_w: &mut [BlockFileWriter],
                      prov: &mut u64|
      -> Result<()> {
         if let Some((label, key, value)) = cur.take() {
+            let mut all_labels = Vec::with_capacity(1 + extra.len());
+            all_labels.push(label);
+            all_labels.extend(extra.iter().copied());
+            extra.clear();
             nodes_w.append_node(&NodeRec {
                 dump_id: None,
-                labels_blob: crate::buckets::labels_blob(&[label]),
+                labels_blob: crate::buckets::labels_blob(&all_labels),
                 props_blob: crate::buckets::props_blob(props),
                 vec_props: Vec::new(),
             })?;
@@ -1068,14 +1099,29 @@ pub(crate) fn dedup_nodes(
         let same = matches!(&cur, Some((l, k, v))
             if *l == nm.label && *k == nm.key && value_cmp_exact(v, &nm.value) == Ordering::Equal);
         if !same {
-            flush(&mut cur, &mut props, &mut nodes_w, &mut keys_w, &mut prov)?;
+            flush(
+                &mut cur,
+                &mut props,
+                &mut extra,
+                &mut nodes_w,
+                &mut keys_w,
+                &mut prov,
+            )?;
             cur = Some((nm.label, nm.key, nm.value.clone()));
             // Identity prop first; SET props then fold over it last-wins.
             props = vec![(nm.key, nm.value.clone())];
         }
+        extra.extend(nm.extra_labels.iter().copied());
         fold_node_props(&mut props, &nm.set_props)?;
     }
-    flush(&mut cur, &mut props, &mut nodes_w, &mut keys_w, &mut prov)?;
+    flush(
+        &mut cur,
+        &mut props,
+        &mut extra,
+        &mut nodes_w,
+        &mut keys_w,
+        &mut prov,
+    )?;
     nodes_w.finish()?;
     for w in keys_w {
         w.finish()?;

@@ -99,11 +99,18 @@ pub enum SetExpr {
     },
 }
 
-/// One half of an edge-overwrite endpoint match: locate a node by `label` having
-/// property `key == value`.
+/// One half of an edge-overwrite endpoint match: locate a node by `label` (its identity
+/// label) having property `key == value`. A node MERGE may name **additional** labels
+/// (`MERGE (n:Ident:Other {k:v})`) — the identity label matches/creates the node and the
+/// extra labels are written alongside it. Edge endpoints stay single-label (`extra_labels`
+/// empty).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeMatch {
     pub label: String,
+    /// Labels beyond the identity `label`, in the order named. Empty for the single-label
+    /// case and for edge endpoints.
+    #[serde(default)]
+    pub extra_labels: Vec<String>,
     pub key: String,
     pub value: Value,
 }

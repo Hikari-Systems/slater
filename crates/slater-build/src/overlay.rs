@@ -335,6 +335,11 @@ fn make_node(
     keys: &mut Interner,
 ) -> NodeRec {
     let label_gid = labels.intern(&m.label);
+    let mut label_gids = Vec::with_capacity(1 + m.extra_labels.len());
+    label_gids.push(label_gid);
+    for l in &m.extra_labels {
+        label_gids.push(labels.intern(l));
+    }
     let key_gid = keys.intern(&m.key);
     let mut props: Vec<(u32, Value)> = vec![(key_gid, m.value.clone())];
     for (k, v) in set_props {
@@ -346,7 +351,7 @@ fn make_node(
     }
     NodeRec {
         dump_id: None,
-        labels_blob: buckets::labels_blob(&[label_gid]),
+        labels_blob: buckets::labels_blob(&label_gids),
         props_blob: buckets::props_blob(&props),
         vec_props: Vec::new(),
     }

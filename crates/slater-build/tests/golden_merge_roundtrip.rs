@@ -164,6 +164,64 @@ fn run_merge(cluster: &str) {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+// A multi-label node MERGE (`MERGE (n:Ident:Extra {k:v})`) — the shape the consolidation
+// dump emits for a node that gained a label via `SET n:Label`. The identity (leading)
+// label locates the node and carries the range index; every named label is written to the
+// node-label store, so the extra label survives the rebuild.
+const MULTI_LABEL_DUMP: &str = r#"CREATE INDEX FOR (n:Source) ON (n.sourceId);
+MERGE (n:Source:Company {sourceId: 's1'}) SET n.formType = '10-K';
+MERGE (n:Source:Company {sourceId: 's1'}) SET n.formType = '8-K';
+"#;
+
+#[test]
+fn multi_label_node_merge_writes_every_label() {
+    use graph_format::nodelabels::NodeLabelsReader;
+
+    let work = unique_dir("multilabel");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, MULTI_LABEL_DUMP).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "multilabel",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+        ])
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("multilabel");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+    // The two MERGEs of the same business key collapse to one node.
+    assert_eq!(m.node_count, 1, "same business key collapses to one node");
+
+    // That node carries BOTH labels; the identity label (Source) is present, and the
+    // extra label (Company) survived the rebuild.
+    let nl = NodeLabelsReader::open(gen_dir.join("node_labels.blk")).unwrap();
+    let ids = nl.labels(0).unwrap();
+    let names: Vec<&str> = ids.iter().map(|&l| m.labels[l as usize].as_str()).collect();
+    assert!(
+        names.contains(&"Source") && names.contains(&"Company"),
+        "node should carry both labels, got {names:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
 #[test]
 fn merge_dump_cluster_none_roundtrips() {
     run_merge("none");
