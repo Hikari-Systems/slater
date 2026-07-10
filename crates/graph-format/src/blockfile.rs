@@ -522,11 +522,26 @@ impl BlockFileWriter {
 /// copy to `copy_file_range(2)`: the bytes never enter user space, so this costs no
 /// memcpy and no second set of page-cache pages.
 ///
-/// It is **not** parallelised, and that is deliberate. At 91.6M nodes this concatenates
-/// 176 band files into 20.4 GB and the step is bounded by write bandwidth, not CPU —
-/// it sat at 85% of one core. Copying the regions concurrently with positional writes
-/// (measured) scattered the write stream across the output and *raised* CPU to 110% for
-/// no wall-clock gain. One sequential stream is what the disk wants.
+/// It is **not** parallelised. The reason is economic, not physical — the earlier
+/// claim that this step "is bounded by write bandwidth" was wrong, so do not lean on
+/// it. At 91.6M nodes it copies 18.0 GB in 50.7 s: 356 MB/s read + 356 MB/s write, at
+/// 0.31 of a core, with `psi_io` 48.7. That `psi_io` looks like a saturated disk but
+/// is not: PSI counts the fraction of time a *runnable task is stalled on I/O*, and
+/// with exactly one thread that degenerates to "the one thread is waiting", which a
+/// queue-depth-1 copy loop always is. In the same build on the same device, `publish`
+/// reads 25.1 GB at 2,099 MB/s (`psi_io` 3.5) because it hashes the inventory with
+/// `par_iter` and keeps the queue full.
+///
+/// So there *is* headroom — measured with concurrent `copy_file_range` on this ext4
+/// volume, 4-6 streams reach ~1.6 GB/s aggregate against ~1.1 GB/s for one, i.e. about
+/// 1.5x. But 1.5x on 59 s of a 43.5-min build is ~20 s, ~1%, which is inside the
+/// build's ±10% run-to-run noise and could never be verified. (An older attempt fared
+/// worse still by copying the regions with *user-space* positional writes, memcpying
+/// every byte through user space and raising CPU to 110% for no gain — that measured
+/// the cost of abandoning `copy_file_range`, not the cost of parallelism.)
+///
+/// Revisit only if the concat stops being 1% of the build, or lands on a filesystem
+/// with reflink (XFS/btrfs), where `copy_file_range` would make it O(1) outright.
 pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Result<u64> {
     if inputs.is_empty() {
         bail!("concat_block_files: no inputs");
