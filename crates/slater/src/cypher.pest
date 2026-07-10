@@ -58,6 +58,8 @@ kw_set = @{ ^"set" ~ !ident_cont }
 kw_delete = @{ ^"delete" ~ !ident_cont }
 kw_detach = @{ ^"detach" ~ !ident_cont }
 kw_remove = @{ ^"remove" ~ !ident_cont }
+kw_create = @{ ^"create" ~ !ident_cont }
+kw_on = @{ ^"on" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
@@ -114,10 +116,21 @@ union = { kw_union ~ kw_all? }
 write_statement = {
     SOI ~ (
         edge_write
-      | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ update_clause ~ return_clause?)
-      | ((kw_match | kw_merge) ~ node_pattern ~ update_clause ~ return_clause?)
+      | create_stmt
+      | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ write_actions ~ return_clause?)
+      | ((kw_match | kw_merge) ~ node_pattern ~ write_actions ~ return_clause?)
     ) ~ ";"? ~ EOI
 }
+// `CREATE (n:Label {props})` — create a node unconditionally (Stage 7). All properties
+// are inline; the server designates the range-indexed one as the business key.
+create_stmt = { kw_create ~ node_pattern ~ return_clause? }
+
+// The action(s) applied to a MATCH/MERGE-anchored node: an unconditional updating clause,
+// and/or (only for MERGE) `ON CREATE SET …` / `ON MATCH SET …` conditional blocks. At
+// least one merge action or an updating clause must be present.
+write_actions = { (merge_action+ ~ update_clause?) | update_clause }
+merge_action = { kw_on ~ (kw_create | kw_match) ~ set_clause }
+
 // One updating clause applied to the anchored node. openCypher's full `UpdatingClause`
 // set is `SET` / `REMOVE` / `[DETACH] DELETE` (plus `CREATE`/`MERGE`, which anchor a
 // node rather than mutate one). Each item is validated at lowering to target the anchor

@@ -68,8 +68,15 @@ pub mod ast {
         /// the business key is absent, else patch it); `false` for `MATCH` (address an
         /// existing node only — an absent key is an error). Always `false` for DELETE.
         pub upsert: bool,
-        /// The mutation applied to the anchored node.
+        /// The unconditional mutation applied to the anchored node (an empty `Set` when a
+        /// MERGE carries only `ON CREATE`/`ON MATCH` blocks).
         pub op: WriteOp,
+        /// `MERGE … ON CREATE SET …` — items applied only when the MERGE **creates** the
+        /// node. Empty unless present; only valid on a MERGE (rejected on MATCH).
+        pub on_create: Vec<SetItem>,
+        /// `MERGE … ON MATCH SET …` — items applied only when the MERGE **matches** an
+        /// existing node. Empty unless present; only valid on a MERGE.
+        pub on_match: Vec<SetItem>,
         /// An optional `RETURN` projecting the (post-write) anchor node.
         pub ret: Option<ReturnClause>,
         /// A leading `UNWIND <list> AS <var>` (write-UNWIND): `Some((list_expr, var))`
@@ -150,12 +157,28 @@ pub mod ast {
         Delete,
     }
 
+    /// `CREATE (n:Label {props})` — create a node unconditionally (Stage 7). Unlike a
+    /// MATCH/MERGE anchor there is no single inline business key: every property is inline,
+    /// and the server designates the range-indexed one as the business key.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct CreateStmt {
+        pub var: String,
+        pub label: String,
+        /// All inline properties (the business key is identified by the server).
+        pub props: Vec<(String, Expr)>,
+        pub ret: Option<ReturnClause>,
+    }
+
     /// A parsed statement: a read query, or a writable-layer write. The server
     /// dispatches on this — see [`super::parse_statement`].
+    // An AST enum: variant sizes vary (a full read `Query` vs a small write). Boxing every
+    // variant to equalise them is noise for a short-lived parse result.
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug, Clone, PartialEq)]
     pub enum Statement {
         Read(Query),
         Write(WriteStmt),
+        Create(CreateStmt),
         WriteEdge(EdgeWriteStmt),
         /// `CALL slater.consolidate()` — fold the writable delta into a fresh
         /// generation and swap it in (Phase 5). Takes no arguments and targets the
@@ -659,10 +682,13 @@ pub fn parse_statement(input: &str) -> Result<ast::Statement> {
     }
     if let Ok(mut pairs) = CypherParser::parse(Rule::write_statement, input) {
         let stmt = pairs.next().expect("write_statement rule yields one pair");
-        // A relationship write (Phase 3c) parses to a single `edge_write` child; the
-        // node write's tokens are inline. Dispatch on which is present.
+        // A relationship write (Phase 3c) parses to a single `edge_write` child; a CREATE
+        // to a single `create_stmt`; the node write's tokens are inline. Dispatch on which.
         if let Some(edge) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::edge_write) {
             return Ok(ast::Statement::WriteEdge(lower_edge_write(edge)?));
+        }
+        if let Some(create) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::create_stmt) {
+            return Ok(ast::Statement::Create(lower_create_stmt(create)?));
         }
         return Ok(ast::Statement::Write(lower_write_statement(stmt)?));
     }
@@ -894,6 +920,112 @@ fn lower_remove_item(pair: Pair<Rule>) -> Result<(String, RemoveItem)> {
     }
 }
 
+/// Lower one `update_clause` (`set_clause` | `remove_clause` | `delete_clause`) into the
+/// caller's accumulators.
+fn lower_update_clause(
+    clause: Pair<Rule>,
+    set_items: &mut Vec<(String, SetItem)>,
+    remove_items: &mut Vec<(String, RemoveItem)>,
+    delete: &mut Option<(bool, Vec<String>)>,
+) -> Result<()> {
+    let uc = only_child(clause)?;
+    match uc.as_rule() {
+        Rule::set_clause => {
+            for item in kids(uc) {
+                debug_assert_eq!(item.as_rule(), Rule::set_item);
+                set_items.push(lower_set_item(item)?);
+            }
+        }
+        Rule::remove_clause => {
+            for item in kids(uc) {
+                debug_assert_eq!(item.as_rule(), Rule::remove_item);
+                remove_items.push(lower_remove_item(item)?);
+            }
+        }
+        Rule::delete_clause => {
+            let mut detach = false;
+            let mut targets = Vec::new();
+            for c in kids(uc) {
+                match c.as_rule() {
+                    Rule::kw_detach => detach = true,
+                    Rule::kw_delete => {}
+                    Rule::var => targets.push(ident_text(only_child(c)?)?),
+                    other => bail!("internal: unexpected delete_clause child {other:?}"),
+                }
+            }
+            debug_assert!(!targets.is_empty(), "delete_clause names a variable");
+            *delete = Some((detach, targets));
+        }
+        other => bail!("internal: unexpected update_clause child {other:?}"),
+    }
+    Ok(())
+}
+
+/// Lower a `merge_action` (`ON CREATE SET …` / `ON MATCH SET …`) into `(is_create, items)`.
+/// The `ON` and the branch keyword are read from the unfiltered inner (the branch keyword
+/// distinguishes create from match).
+fn lower_merge_action(pair: Pair<Rule>) -> Result<(bool, Vec<(String, SetItem)>)> {
+    let mut is_create = false;
+    let mut items = Vec::new();
+    for c in pair.into_inner() {
+        match c.as_rule() {
+            Rule::kw_on | Rule::kw_match => {}
+            Rule::kw_create => is_create = true,
+            Rule::set_clause => {
+                for item in kids(c) {
+                    items.push(lower_set_item(item)?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((is_create, items))
+}
+
+/// Lower a `create_stmt` (`CREATE (n:Label {props})`) into a [`CreateStmt`]. The node must
+/// be named and single-labelled with at least one inline property (the business key is
+/// designated by the server, which knows the range index); property values must be
+/// constants (literal or parameter).
+fn lower_create_stmt(pair: Pair<Rule>) -> Result<CreateStmt> {
+    let mut node: Option<NodePat> = None;
+    let mut ret: Option<ReturnClause> = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::kw_create => {}
+            Rule::node_pattern => node = Some(lower_node_pattern(child)?),
+            Rule::return_clause => ret = Some(lower_return_clause(child)?),
+            Rule::EOI => {}
+            other => bail!("internal: unexpected create_stmt child {other:?}"),
+        }
+    }
+    let node = node.expect("create_stmt always has a node pattern");
+    let var = node.var.ok_or_else(|| {
+        anyhow::anyhow!("a CREATE node must be named, e.g. CREATE (n:Label {{…}})")
+    })?;
+    let label = node
+        .label_expr
+        .as_ref()
+        .and_then(LabelExpr::as_single_atom)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "a CREATE node must carry exactly one label, e.g. CREATE (n:Label {{…}})"
+            )
+        })?
+        .clone();
+    if node.props.is_empty() {
+        bail!("a CREATE node must carry at least one inline property (its business key), e.g. CREATE (n:Label {{key: value}})");
+    }
+    for (name, value) in &node.props {
+        ensure_constant(value, &format!("the value of {var}.{name}"))?;
+    }
+    Ok(CreateStmt {
+        var,
+        label,
+        props: node.props,
+        ret,
+    })
+}
+
 /// Lower a `write_statement` into a [`WriteStmt`], enforcing the Phase 1c shape:
 /// a single labelled anchor node with exactly one inline business-key property
 /// (a literal or parameter), and SET assignments that all target that anchor
@@ -904,6 +1036,8 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let mut set_items: Vec<(String, SetItem)> = Vec::new();
     let mut remove_items: Vec<(String, RemoveItem)> = Vec::new();
     let mut delete: Option<(bool, Vec<String>)> = None; // (detach, target vars)
+    let mut on_create_items: Vec<(String, SetItem)> = Vec::new();
+    let mut on_match_items: Vec<(String, SetItem)> = Vec::new();
     let mut ret: Option<ReturnClause> = None;
     let mut upsert = false; // MERGE anchor (create-if-absent) vs MATCH (update only)
     let mut unwind: Option<(Expr, String)> = None; // write-UNWIND source + alias
@@ -916,38 +1050,25 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
             Rule::kw_match => {}
             Rule::kw_merge => upsert = true,
             Rule::node_pattern => node = Some(lower_node_pattern(child)?),
-            Rule::update_clause => {
-                let uc = only_child(child)?;
-                match uc.as_rule() {
-                    Rule::set_clause => {
-                        for item in kids(uc) {
-                            debug_assert_eq!(item.as_rule(), Rule::set_item);
-                            set_items.push(lower_set_item(item)?);
-                        }
-                    }
-                    Rule::remove_clause => {
-                        for item in kids(uc) {
-                            debug_assert_eq!(item.as_rule(), Rule::remove_item);
-                            remove_items.push(lower_remove_item(item)?);
-                        }
-                    }
-                    Rule::delete_clause => {
-                        let mut detach = false;
-                        let mut targets = Vec::new();
-                        for c in kids(uc) {
-                            match c.as_rule() {
-                                Rule::kw_detach => detach = true,
-                                Rule::kw_delete => {}
-                                Rule::var => targets.push(ident_text(only_child(c)?)?),
-                                other => {
-                                    bail!("internal: unexpected delete_clause child {other:?}")
-                                }
+            Rule::write_actions => {
+                for act in kids(child) {
+                    match act.as_rule() {
+                        Rule::merge_action => {
+                            let (is_create, items) = lower_merge_action(act)?;
+                            if is_create {
+                                on_create_items.extend(items);
+                            } else {
+                                on_match_items.extend(items);
                             }
                         }
-                        debug_assert!(!targets.is_empty(), "delete_clause names a variable");
-                        delete = Some((detach, targets));
+                        Rule::update_clause => lower_update_clause(
+                            act,
+                            &mut set_items,
+                            &mut remove_items,
+                            &mut delete,
+                        )?,
+                        other => bail!("internal: unexpected write_actions child {other:?}"),
                     }
-                    other => bail!("internal: unexpected update_clause child {other:?}"),
                 }
             }
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
@@ -1005,7 +1126,8 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         }
         WriteOp::Remove(out)
     } else {
-        if set_items.is_empty() {
+        // A bare MERGE with only ON CREATE/ON MATCH blocks has no unconditional SET.
+        if set_items.is_empty() && on_create_items.is_empty() && on_match_items.is_empty() {
             bail!("a write must SET or REMOVE at least one property or label");
         }
         let mut out = Vec::with_capacity(set_items.len());
@@ -1025,6 +1147,10 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         WriteOp::Set(out)
     };
 
+    let is_unwind = unwind.is_some();
+    let on_create = validate_conditional_sets(on_create_items, &var, upsert, is_unwind, "CREATE")?;
+    let on_match = validate_conditional_sets(on_match_items, &var, upsert, is_unwind, "MATCH")?;
+
     Ok(WriteStmt {
         var,
         label,
@@ -1032,9 +1158,40 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         key_value,
         upsert,
         op,
+        on_create,
+        on_match,
         ret,
         unwind,
     })
+}
+
+/// Validate a MERGE's `ON CREATE`/`ON MATCH` SET items: only valid on a MERGE, each must
+/// target the anchor variable, and (for a non-UNWIND write) carry constant values. Returns
+/// the bare [`SetItem`]s in source order.
+fn validate_conditional_sets(
+    items: Vec<(String, SetItem)>,
+    var: &str,
+    upsert: bool,
+    is_unwind: bool,
+    which: &str,
+) -> Result<Vec<SetItem>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !upsert {
+        bail!("ON {which} SET is only valid on MERGE, not MATCH");
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (svar, item) in items {
+        if svar != var {
+            bail!("ON {which} SET must target the anchor variable '{var}', not '{svar}'");
+        }
+        if !is_unwind {
+            ensure_set_item_constant(&item, var)?;
+        }
+        out.push(item);
+    }
+    Ok(out)
 }
 
 /// A plain (non-UNWIND) write's SET right-hand sides must be values known without
@@ -2939,7 +3096,12 @@ mod tests {
 
     fn write_err(q: &str) -> String {
         match parse_statement(q) {
-            Ok(Statement::Write(_) | Statement::WriteEdge(_) | Statement::Consolidate) => {
+            Ok(
+                Statement::Write(_)
+                | Statement::Create(_)
+                | Statement::WriteEdge(_)
+                | Statement::Consolidate,
+            ) => {
                 panic!("expected reject for {q:?}")
             }
             // An unsupported write shape falls through to the read parser, which
@@ -3197,6 +3359,86 @@ mod tests {
         // A non-UNWIND replace/merge map may not carry a computed right-hand side.
         assert!(
             write_err("MATCH (n:Company {ticker: 'A'}) SET n += {x: n.y + 1}").contains("literal")
+        );
+    }
+
+    // ── Stage 7: CREATE, MERGE ON CREATE / ON MATCH SET ─────────────────────────
+
+    #[test]
+    fn create_lowers_with_all_inline_props() {
+        let c = match parse_statement("CREATE (n:Person {name: 'Zoe', age: 1})").unwrap() {
+            Statement::Create(c) => c,
+            other => panic!("expected a Create, got {other:?}"),
+        };
+        assert_eq!(c.var, "n");
+        assert_eq!(c.label, "Person");
+        assert_eq!(
+            c.props,
+            vec![
+                ("name".to_string(), Expr::Literal(Value::Str("Zoe".into()))),
+                ("age".to_string(), Expr::Literal(Value::Int(1))),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_requires_a_name_a_label_and_a_prop() {
+        assert!(write_err("CREATE (:Person {name: 'Zoe'})").contains("named"));
+        assert!(write_err("CREATE (n {name: 'Zoe'})").contains("one label"));
+        assert!(write_err("CREATE (n:Person)").contains("at least one inline property"));
+    }
+
+    #[test]
+    fn merge_on_create_and_on_match_lower() {
+        let w = write(
+            "MERGE (n:Person {name: 'Zoe'}) ON CREATE SET n.created = true ON MATCH SET n.seen = true",
+        );
+        assert!(w.upsert, "ON CREATE/ON MATCH imply a MERGE");
+        assert_eq!(
+            w.on_create,
+            vec![SetItem::Prop {
+                prop: "created".to_string(),
+                value: Expr::Literal(Value::Bool(true)),
+            }]
+        );
+        assert_eq!(
+            w.on_match,
+            vec![SetItem::Prop {
+                prop: "seen".to_string(),
+                value: Expr::Literal(Value::Bool(true)),
+            }]
+        );
+        assert_eq!(w.op, WriteOp::Set(vec![]), "no unconditional mutation");
+    }
+
+    #[test]
+    fn merge_conditional_and_unconditional_set_coexist() {
+        let w = write("MERGE (n:Person {name: 'Zoe'}) ON CREATE SET n.a = 1 SET n.b = 2");
+        assert_eq!(
+            w.on_create,
+            vec![SetItem::Prop {
+                prop: "a".to_string(),
+                value: Expr::Literal(Value::Int(1)),
+            }]
+        );
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::Prop {
+                prop: "b".to_string(),
+                value: Expr::Literal(Value::Int(2)),
+            }])
+        );
+    }
+
+    #[test]
+    fn on_create_on_match_rejected_on_match_anchor() {
+        assert!(
+            write_err("MATCH (n:Person {name: 'Zoe'}) ON CREATE SET n.x = 1")
+                .contains("only valid on MERGE")
+        );
+        assert!(
+            write_err("MATCH (n:Person {name: 'Zoe'}) ON MATCH SET n.x = 1")
+                .contains("only valid on MERGE")
         );
     }
 

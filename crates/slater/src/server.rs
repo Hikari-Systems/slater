@@ -2431,6 +2431,11 @@ async fn handle_request(
                             maybe_maintain_delta(ctx, &graph, w).await;
                             out
                         }
+                        parser::ast::Statement::Create(stmt) => {
+                            let out = execute_create(w, gen.as_ref(), &stmt, &param_vals)?;
+                            maybe_maintain_delta(ctx, &graph, w).await;
+                            out
+                        }
                         parser::ast::Statement::WriteEdge(stmt) => {
                             let out = execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?;
                             maybe_maintain_delta(ctx, &graph, w).await;
@@ -2650,79 +2655,88 @@ fn write_value(
 /// emits a `ReplaceNode`; `REMOVE n.p` a `RemoveNodeProps`; `DELETE` a `DeleteNode`.
 /// A statement that mixes a replace with further items yields several ops that
 /// group-commit atomically. Label mutations (Stage 5) are still rejected by name.
+/// Fold a list of `SET` items (identity `label`/`key`/`value` fixed) into a WAL op
+/// sequence: `var.prop = v` / `var += {map}` accumulate into `UpsertNode` patches (source
+/// order, LWW); `var = {map}` emits a `ReplaceNode`; `var:Label` a `SetNodeLabels`. When
+/// `ensure_nonempty` and the items produce nothing, a no-op upsert is emitted (so a MERGE
+/// still create-if-absent's its node). Shared by the main `SET`, the `ON CREATE`/`ON MATCH`
+/// blocks, and `CREATE`.
+fn fold_set_items(
+    items: &[parser::ast::SetItem],
+    label: &str,
+    key: &str,
+    value: &Value,
+    ensure_nonempty: bool,
+    eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
+) -> std::result::Result<Vec<WalOp>, Failure> {
+    use parser::ast::SetItem;
+    let upsert = |patches: Vec<(String, Value)>| WalOp::UpsertNode {
+        label: label.to_string(),
+        key: key.to_string(),
+        value: value.clone(),
+        patches,
+    };
+    let mut ops: Vec<WalOp> = Vec::new();
+    let mut pending: Vec<(String, Value)> = Vec::new();
+    let mut added_labels: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            // Patching the anchor key's value is allowed — it relocates the node in the
+            // index (the "moved indexed value" overlay); the delta identity stays fixed.
+            SetItem::Prop { prop, value: expr } => {
+                pending.push((prop.clone(), eval(expr, "a SET value")?));
+            }
+            SetItem::MergeMap(map) => {
+                for (k, expr) in map {
+                    pending.push((k.clone(), eval(expr, "a merge-map value")?));
+                }
+            }
+            SetItem::ReplaceMap(map) => {
+                let patches = replace_map_patches(map, &eval)?;
+                pending.clear();
+                ops.push(WalOp::ReplaceNode {
+                    label: label.to_string(),
+                    key: key.to_string(),
+                    value: value.clone(),
+                    patches,
+                });
+            }
+            // Label additions are independent of the property patches; collect them into
+            // one SetNodeLabels op emitted after the patch flush.
+            SetItem::AddLabels(labels) => added_labels.extend(labels.iter().cloned()),
+        }
+    }
+    if !pending.is_empty() {
+        ops.push(upsert(pending));
+    }
+    if !added_labels.is_empty() {
+        ops.push(WalOp::SetNodeLabels {
+            label: label.to_string(),
+            key: key.to_string(),
+            value: value.clone(),
+            added: added_labels,
+            removed: Vec::new(),
+        });
+    }
+    if ops.is_empty() && ensure_nonempty {
+        ops.push(upsert(Vec::new()));
+    }
+    Ok(ops)
+}
+
 fn build_node_wal_ops(
     stmt: &parser::ast::WriteStmt,
     key_value: &Value,
     eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
 ) -> std::result::Result<Vec<WalOp>, Failure> {
-    use parser::ast::{RemoveItem, SetItem, WriteOp};
+    use parser::ast::{RemoveItem, WriteOp};
     let label = stmt.label.clone();
     let key = stmt.key.clone();
     let value = key_value.clone();
-    let upsert = |patches: Vec<(String, Value)>| WalOp::UpsertNode {
-        label: label.clone(),
-        key: key.clone(),
-        value: value.clone(),
-        patches,
-    };
     match &stmt.op {
-        WriteOp::Set(items) => {
-            // Fold SET items in source order into a sequence of ops that group-commits.
-            // `var.prop = v` and `var += {map}` items accumulate into a pending patch
-            // list (last-writer-wins applied by the memtable); a `var = {map}`
-            // replace-all wipes the prior state and emits a `ReplaceNode`, after which
-            // later items accumulate afresh (a following patch overlays the replace).
-            let mut ops: Vec<WalOp> = Vec::new();
-            let mut pending: Vec<(String, Value)> = Vec::new();
-            let mut added_labels: Vec<String> = Vec::new();
-            for item in items {
-                match item {
-                    // Patching the anchor key's value is allowed — it relocates the node
-                    // in the index (the "moved indexed value" overlay); the delta identity
-                    // that resolves the node stays fixed.
-                    SetItem::Prop { prop, value: expr } => {
-                        pending.push((prop.clone(), eval(expr, "a SET value")?));
-                    }
-                    SetItem::MergeMap(map) => {
-                        for (k, expr) in map {
-                            pending.push((k.clone(), eval(expr, "a merge-map value")?));
-                        }
-                    }
-                    SetItem::ReplaceMap(map) => {
-                        let patches = replace_map_patches(map, &eval)?;
-                        pending.clear();
-                        ops.push(WalOp::ReplaceNode {
-                            label: label.clone(),
-                            key: key.clone(),
-                            value: value.clone(),
-                            patches,
-                        });
-                    }
-                    // Label additions are independent of the property patches; collect
-                    // them into a single SetNodeLabels op emitted after the patch flush.
-                    SetItem::AddLabels(labels) => added_labels.extend(labels.iter().cloned()),
-                }
-            }
-            if !pending.is_empty() {
-                ops.push(upsert(pending));
-            }
-            if !added_labels.is_empty() {
-                ops.push(WalOp::SetNodeLabels {
-                    label: label.clone(),
-                    key: key.clone(),
-                    value: value.clone(),
-                    added: added_labels,
-                    removed: Vec::new(),
-                });
-            }
-            // A statement that produced no ops (an empty replace map with nothing after
-            // it cannot happen — a replace already pushed) still needs one so a MERGE
-            // create-if-absent's its node and the write acks.
-            if ops.is_empty() {
-                ops.push(upsert(Vec::new()));
-            }
-            Ok(ops)
-        }
+        // The main SET fold emits at least one op (a no-op upsert when empty) so a MERGE
+        // create-if-absent's its node and the write acks.
+        WriteOp::Set(items) => fold_set_items(items, &label, &key, &value, true, eval),
         WriteOp::Remove(items) => {
             let mut props = Vec::new();
             let mut removed_labels = Vec::new();
@@ -2900,6 +2914,25 @@ fn execute_write(
     let ops = build_node_wal_ops(stmt, &key_value, |e, what| write_value(e, params, what))?;
     // Every op in a statement shares the anchor key, so one resolution serves them all.
     // A non-DELETE op is "set-like" (addresses an existing node, or MERGE-creates one).
+    let mut ops = ops;
+    // MERGE `ON CREATE SET` / `ON MATCH SET`: whether the MERGE creates or matches is
+    // decided by the pre-write state, so compute it before appending the conditional ops.
+    if stmt.upsert && (!stmt.on_create.is_empty() || !stmt.on_match.is_empty()) {
+        let created = merge_creates_node(writer, gen, &stmt.label, &stmt.key, &key_value);
+        let items = if created {
+            &stmt.on_create
+        } else {
+            &stmt.on_match
+        };
+        ops.extend(fold_set_items(
+            items,
+            &stmt.label,
+            &stmt.key,
+            &key_value,
+            false,
+            |e, what| write_value(e, params, what),
+        )?);
+    }
     let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
     let first = ops.first().expect("a node write yields at least one op");
     let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
@@ -2923,6 +2956,88 @@ fn execute_write(
     Ok((Vec::new(), Vec::new()))
 }
 
+/// Whether a MERGE on `(label, key, value)` **creates** a new node (vs matching an
+/// existing one). The node exists if the current core carries the key uniquely, or a
+/// prior write already made it a delta-born node; otherwise this MERGE creates it.
+/// Computed against the pre-write state (so it must be called before the op is applied).
+fn merge_creates_node(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    label: &str,
+    key: &str,
+    value: &Value,
+) -> bool {
+    match resolve_business_key(gen, label, key, value) {
+        KeyResolution::Unique(_) => false, // an existing core node — matched
+        KeyResolution::Absent => writer.born_synthetic_in_delta(label, key, value).is_none(),
+        // Ambiguous / unindexed will error at `resolve_node_op`; treat as "not created".
+        _ => false,
+    }
+}
+
+/// Execute a `CREATE (n:Label {props})`: designate the range-indexed property as the
+/// business key and unconditionally create (born-upsert) the node with the remaining
+/// properties. Errors if no inline property is the label's range-indexed identity.
+fn execute_create(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    stmt: &parser::ast::CreateStmt,
+    params: &HashMap<String, Val>,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    if stmt.ret.is_some() {
+        return Err(Failure::new(
+            CODE_REQUEST,
+            "RETURN after a write is not yet supported; issue a separate MATCH … RETURN".into(),
+        ));
+    }
+    // Evaluate every inline property, then pick the business key: the label's
+    // range-indexed property (lowest core label id breaks a tie among indexes).
+    let mut props: Vec<(String, Value)> = Vec::with_capacity(stmt.props.len());
+    for (name, expr) in &stmt.props {
+        props.push((
+            name.clone(),
+            write_value(expr, params, "a CREATE property")?,
+        ));
+    }
+    let key = gen
+        .manifest()
+        .range_indexes
+        .iter()
+        .find(|ri| {
+            ri.entity == graph_format::manifest::EntityKind::Node
+                && ri.label_or_type == stmt.label
+                && props.iter().any(|(p, _)| p == &ri.property)
+        })
+        .map(|ri| ri.property.clone())
+        .ok_or_else(|| {
+            Failure::new(
+                CODE_REQUEST,
+                format!(
+                    "cannot CREATE (:{}): none of its properties is the label's range-indexed \
+                     business key — add a range index, or use MERGE with an inline key",
+                    stmt.label
+                ),
+            )
+        })?;
+    let key_pos = props
+        .iter()
+        .position(|(p, _)| p == &key)
+        .expect("key present");
+    let (_, key_value) = props.remove(key_pos);
+    let op = WalOp::UpsertNode {
+        label: stmt.label.clone(),
+        key: key.clone(),
+        value: key_value,
+        patches: props,
+    };
+    // Born-create (upsert semantics): resolve as a set-like op with create-on-absent.
+    let resolved = resolve_node_op(writer, gen, &op, true, true)?;
+    writer
+        .write(op, OpResolution::Node(resolved))
+        .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable CREATE failed: {e:#}")))?;
+    Ok((Vec::new(), Vec::new()))
+}
+
 /// Does this statement mutate the graph, and so require a `write` grant?
 ///
 /// Every arm of the write grammar must be listed here: node writes (`MERGE` /
@@ -2934,6 +3049,7 @@ fn execute_write(
 fn statement_mutates(stmt: &parser::ast::Statement) -> bool {
     match stmt {
         parser::ast::Statement::Write(_)
+        | parser::ast::Statement::Create(_)
         | parser::ast::Statement::WriteEdge(_)
         | parser::ast::Statement::Consolidate => true,
         parser::ast::Statement::Read(_) => false,
@@ -3146,9 +3262,26 @@ fn execute_write_batch(
             params,
             "the anchor business-key value",
         )?;
-        let row_ops = build_node_wal_ops(stmt, &key_value, |e, what| {
+        let mut row_ops = build_node_wal_ops(stmt, &key_value, |e, what| {
             eval_row_value(e, var, row, params, what)
         })?;
+        // MERGE ON CREATE / ON MATCH, per row (create-vs-match against the pre-batch state).
+        if stmt.upsert && (!stmt.on_create.is_empty() || !stmt.on_match.is_empty()) {
+            let created = merge_creates_node(writer, gen, &stmt.label, &stmt.key, &key_value);
+            let items = if created {
+                &stmt.on_create
+            } else {
+                &stmt.on_match
+            };
+            row_ops.extend(fold_set_items(
+                items,
+                &stmt.label,
+                &stmt.key,
+                &key_value,
+                false,
+                |e, what| eval_row_value(e, var, row, params, what),
+            )?);
+        }
         let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
         let first = row_ops
             .first()
@@ -5584,6 +5717,91 @@ mod tests {
         run("MERGE (n:Person {name:'Zoe'}) SET n.age = 1").unwrap();
         let e = run("MATCH (n:Person {name:'Zoe'}) REMOVE n:Person").unwrap_err();
         assert!(e.message.contains("identity label"), "got: {}", e.message);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// End-to-end Stage 7: `CREATE` makes a node from its inline props (business key = the
+    /// range-indexed one); `MERGE … ON CREATE / ON MATCH SET` fire the right branch by
+    /// whether the node was created or matched.
+    #[test]
+    fn create_and_merge_conditional_sets_end_to_end() {
+        let (root, _g) = testgen::write_indexed_people("stage7");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let run = |q: &str| -> std::result::Result<(), Failure> {
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
+                }
+                parser::ast::Statement::Create(c) => {
+                    execute_create(&writer, gen.as_ref(), &c, &HashMap::new()).map(|_| ())
+                }
+                other => panic!("expected a write/create for {q:?}, got {other:?}"),
+            }
+        };
+        let prop = |name: &str, p: &str| -> String {
+            let view = MergedView::new(
+                gen.as_ref(),
+                DeltaSnapshot::from_memtable(writer.snapshot()),
+            );
+            let q = format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.{p}");
+            let ast = parser::parse(&q).unwrap();
+            let mut rows = Engine::new(&view, &cache).run(&ast).unwrap().rows;
+            match rows.pop().map(|mut r| r.remove(0)).unwrap_or(Val::Null) {
+                Val::Null => "null".to_string(),
+                Val::Int(n) => format!("int:{n}"),
+                Val::Str(s) => format!("str:{s}"),
+                other => format!("other:{other:?}"),
+            }
+        };
+
+        // CREATE makes a node with its inline properties (name is the range-indexed key).
+        run("CREATE (n:Person {name: 'Zoe', age: 20})").unwrap();
+        assert_eq!(
+            prop("Zoe", "age"),
+            "int:20",
+            "CREATE made the node with its props"
+        );
+
+        // MERGE on an absent key → ON CREATE fires.
+        run("MERGE (n:Person {name: 'Yan'}) ON CREATE SET n.origin = 'created' ON MATCH SET n.origin = 'matched'").unwrap();
+        assert_eq!(
+            prop("Yan", "origin"),
+            "str:created",
+            "ON CREATE fired for a new node"
+        );
+
+        // MERGE on an existing core key (Alice) → ON MATCH fires.
+        run("MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.origin = 'created' ON MATCH SET n.origin = 'matched'").unwrap();
+        assert_eq!(
+            prop("Alice", "origin"),
+            "str:matched",
+            "ON MATCH fired for an existing node"
+        );
+
+        // Re-MERGE Yan → it now matches the delta-born node created above.
+        run("MERGE (n:Person {name: 'Yan'}) ON CREATE SET n.origin = 'c2' ON MATCH SET n.origin = 'm2'").unwrap();
+        assert_eq!(
+            prop("Yan", "origin"),
+            "str:m2",
+            "the second MERGE matched the born node"
+        );
+
+        // CREATE with no range-indexed property among its props is rejected.
+        let e = run("CREATE (n:Person {city: 'X'})").unwrap_err();
+        assert!(
+            e.message.contains("range-indexed business key"),
+            "got: {}",
+            e.message
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
