@@ -279,7 +279,8 @@ is **not live memory**. Inside `emit.topology`, the `stitch` step holds **6.25 G
 0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files, and
 `emit reverse CSR per band` sits 4.7 GB above its reservation even though `EdgeRev` owns no heap. That
 is glibc arena retention from 14 worker threads that churned ~1.5B small `props_blob` allocations. See
-**D58**; the fix is `malloc_trim` at phase boundaries / `mallopt(M_ARENA_MAX)`, not more budgeting.
+**D58**; the fix is to put `slater-build` on jemalloc (as `slater` already is), not more budgeting.
+`malloc_trim` is not an option here — the crate sets `unsafe_code = "forbid"`.
 
 ### Where the remaining serial time is (per-sub-step, from B4 stage 1)
 

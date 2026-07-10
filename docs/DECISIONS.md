@@ -1207,6 +1207,13 @@ target is **not** met. The gap is not live memory. `emit.topology`'s `stitch` st
 resident against 0.81 GB reserved** while doing nothing but a verbatim block-concat of finished files —
 it allocates almost nothing. `emit reverse CSR per band` sits 4.7 GB above its reservation, and `EdgeRev`
 owns no heap at all. What remains is glibc arena retention: 14 worker threads that churned ~1.5B small
-`props_blob` allocations, freed into per-thread arenas that are never returned to the OS. The fix is
-`malloc_trim` at phase boundaries and/or `mallopt(M_ARENA_MAX)` — the server already ships an idle-gated
-`malloc_trim` (v0.9.0) for the same reason. Deliberately deferred, not forgotten.
+`props_blob` allocations, freed into per-thread arenas that are never returned to the OS.
+
+The fix is **jemalloc, not `malloc_trim`** — `slater-build` sets `unsafe_code = "forbid"`, so a libc
+`malloc_trim` FFI cannot be added to it at all, and the server crate already made precisely this
+migration for precisely this reason: `tikv-jemallocator`'s `background_threads` purge threads return
+freed heap on a decay timer, which "moves the last `unsafe` out of this crate and into the audited
+allocator" (`slater/src/main.rs`). `slater-build` is a separate binary, so a `#[global_allocator]` there
+is scoped to it. Deliberately deferred, not forgotten. Note this treats the symptom: the churn itself is
+~1.5B small `props_blob` `Vec<u8>` allocations, and eliminating those (a per-band bump arena, or inlining
+short blobs) would cut CPU as well as RSS.

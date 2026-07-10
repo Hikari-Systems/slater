@@ -308,8 +308,8 @@ unchanged.** New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
   1.93× cap, so *"≤ ~1.25× the cap"* is **not met**. The residual is not live memory: `stitch` holds
   6.25 GB resident against 0.81 GB reserved while only concatenating finished files, and the reverse-band
   sorter sits 4.7 GB above its reservation despite `EdgeRev` owning no heap. It is glibc arena retention
-  across 14 workers that churned ~1.5B small `props_blob` allocations. Fix is `malloc_trim` at phase
-  boundaries / `mallopt(M_ARENA_MAX)`, not more budgeting — see **Follow-ups**.
+  across 14 workers that churned ~1.5B small `props_blob` allocations. Fix is **jemalloc**, not more
+  budgeting — see **Follow-ups**.
 - **B2 — `emit.graph_summaries` map-reduce.** Done. Tally sharded over contiguous node ranges; triples
   routed by `dst`-range so the target-label join *also* parallelises (one sort-merge join per range)
   rather than staying a single serial pass after the tally, as the plan proposed. Needed a new
@@ -339,9 +339,21 @@ unchanged.** New per-phase table in `perf/PERF_CURRENT_STATUS.md`.
 2. **`emit.topology` / `stitch`** — now 247.8s (35% of the phase) at 85% CPU, a verbatim block-concat of
    176 band files into 20.4 GB. IO-bound; it became the phase's largest serial step only because the band
    passes got 1.6× faster.
-3. **Allocator retention** — the last 2× of peak RSS (see B1's acceptance). `malloc_trim(0)` in
-   `PhaseGuard::drop` and/or `mallopt(M_ARENA_MAX, …)` at startup. The server already ships an idle-gated
-   `malloc_trim` (v0.9.0) for the same reason.
+3. **Allocator retention** — the last 2× of peak RSS (see B1's acceptance). Swap `slater-build` onto
+   **jemalloc**: `#[global_allocator] static: tikv_jemallocator::Jemalloc`, Linux-only, gated
+   `not(feature = "profiling")` so it does not collide with dhat's allocator. `tikv-jemallocator` with
+   `background_threads` is already a workspace dependency, and `slater-build` is its own binary, so the
+   change is scoped to it and leaves the server untouched.
+
+   Not `malloc_trim`: `slater-build` sets `unsafe_code = "forbid"`, so the libc FFI cannot be added
+   without dropping that lint — and the server crate already migrated *away* from an idle-gated
+   `malloc_trim` to jemalloc for exactly that reason (`slater/src/main.rs`). jemalloc's decay-based purge
+   threads return freed heap without the process making `free()` calls.
+
+   Caveat: this treats the symptom. The churn is ~1.5B small `props_blob` `Vec<u8>` allocations; a
+   per-band bump arena (or inlining short blobs) would cut CPU as well as RSS. And decay purging runs on
+   a ~10s timer, so it should collapse the retained 5.5 GB visible during `stitch` while the in-phase
+   peak of the forward-band pass may persist — ≤1.25× is not guaranteed by this alone.
 4. **`pass1` writers** — `BlockFileWriter` hands every block to D57's seal pool, which is pure overhead
    for a phase already at 14.1× cpu/wall. An inline-seal constructor for writers driven from inside a
    saturated pool would remove it, mirroring `ExtSorter::new_for_pool`. (Measured within noise at 91.6M:
