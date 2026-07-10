@@ -1308,3 +1308,104 @@ were never the problem; B4 stage 1's per-sub-step instrumentation is what made t
    no second set of page-cache pages) — chosen for costing the least CPU, not for being faster.
    `stitch` is now 36% of `emit.topology` and the build's largest serial step. Beating it means
    writing fewer bytes, not writing them differently.
+
+### D61 — Endpoint postings are a set, so compute them as a bitmap; and `psi_io` on a one-thread op measures queue depth, not the disk
+`crates/graph-format/src/postings.rs`, `crates/slater-build/src/build_external.rs`.
+
+`emit.topology`'s tail ran four serial single-threaded operations under one diagnostics label,
+`stitch CSR + edge_props + postings`. D60 benchmarked three implementations of the *concat* under
+that label — serial `BufWriter` 247.8s, parallel `pwrite` 255.8s, sequential `std::io::copy` 272.5s
+— and, landing within noise of each other, read them as proof that the step is write-bandwidth-bound
+and unimprovable. The label was hiding the cost. **Each of those three numbers was ~220s of posting
+drain plus a ~55s concat**, so all three measured mostly the same thing. `7fd8949` split the label,
+and both halves of the old conclusion then failed. Split out on the 91.6M build:
+
+| sub-op | wall | cores | dev read | dev write | psi_io | RSS − reserved |
+|---|--:|--:|--:|--:|--:|--:|
+| `concat topology.csr.blk` | 50.7s | 0.31 | 18.0 GB @ 356 MB/s | 18.0 GB @ 355 MB/s | 48.7 | −0.57 GB |
+| `concat edge_props.blk` | 8.4s | 0.38 | 3.9 GB @ 470 MB/s | 3.9 GB @ 469 MB/s | 43.9 | −0.68 GB |
+| `drain reltype_src.post` | 88.8s | 0.91 | 4.5 GB @ 50 MB/s | 0 | 9.1 | **+1.98 GB** |
+| `drain reltype_tgt.post` | 142.8s | 0.92 | 7.4 GB @ 52 MB/s | 0 | 2.9 | **+2.43 GB** |
+
+**1. The sort never needed to exist.** `reltype_src.post` record `t` is the ascending distinct set of
+node ids that are a source of a reltype-`t` edge. The builder reached that by pushing one
+`RelEndpoint {reltype, node}` per edge per side into an `ExtSorter` — 2.98 B records — sorting by
+`(reltype, node)`, and run-length-collapsing the drain. **A bit plane per reltype computes the same
+set with no sort.** Bits only go 0→1, so the dedup is free and the answer is independent of the order
+edges arrive in. Forward bands own disjoint, word-aligned slices of the source plane; targets scatter
+across every band, so the planes are `AtomicU64` and workers `fetch_or` into them (`Relaxed` — the
+band join is the happens-before edge). A plain `load` before the `fetch_or` elides most of the atomics,
+because edges arrive grouped by source node.
+
+Cost is `n_reltypes × ceil(node_count/8)` bytes per side. Checked against every dataset we build, the
+product `n_reltypes × node_count` is bounded by ~92M bits — the richly typed graphs are the small ones:
+
+| dataset | nodes | reltypes | planes, both sides |
+|---|--:|--:|--:|
+| Wikidata-full | 91,600,504 | 1 | 22.9 MB |
+| Monarch-KG | 1,462,594 | 63 | 23.0 MB |
+| MeSH | 340,839 | 3 | 256 KB |
+| EU-AI-Act | 21,817 | 60 | 327 KB |
+| POLE | 61,521 | 17 | 261 KB |
+| Camelid-vet | 5,377 | 85 | 114 KB |
+
+A graph both large *and* richly typed would not fit, so `write_endpoint_postings_from_sorted` stays as
+the fallback, gated on `2 × bytes_for(…) ≤ --max-memory / 8`. Nothing real takes that branch, so
+`SLATER_POSTINGS_FORCE_SORTER=1` exists to make CI take it.
+
+**2. `budget_reserved_bytes` found its fourth bug.** The drains held 2.0–2.4 GB nobody reserved:
+`write_endpoint_postings_from_sorted` accumulates `bucket: Vec<u64>` — every distinct node id of the
+current reltype — before flushing. Wikidata has one reltype and 91,306,368 distinct sources, so that
+is **730 MB**, plus the two copies `BlockFileWriter` makes of an over-target record. D59 had already
+halved this gap (6.25 → 2.53 GB) by moving to jemalloc and attributed *all* of it to glibc arena
+retention. The residual was not retention; it was an allocation nobody counted. The bitmap path
+reserves its planes and its record buffer, and the gap is gone.
+
+**3. `psi_io` on a one-thread op is not a saturation signal.** PSI counts the fraction of time a
+*runnable task is stalled on I/O*. With exactly one thread that degenerates to "the one thread is
+waiting", which a queue-depth-1 `copy_file_range` loop always is. The concat's `psi_io` 48.7 at
+711 MB/s therefore says nothing about the device. In the same build, `publish` reads 25.1 GB at
+**2,099 MB/s at `psi_io` 3.5** — it BLAKE3s the inventory under `par_iter` and keeps the queue full —
+and `partition edges by src band` sustains 636 MB/s at `psi_io` 3.9 across 14 workers. Measured
+directly (concurrent `copy_file_range`, 6 GiB, page cache evicted between runs): ~1.1 GB/s aggregate
+at one stream, ~1.6 GB/s at 4–6. So the concat has ~1.5× of headroom, worth ~20s — **~1% of the
+build, inside its own ±10% run-to-run noise.** Not taken, but the reason is economic, not physical.
+Documented on `concat_block_files`. (D60's "parallel `pwrite` raised CPU to 110% for no gain" measured
+the cost of abandoning `copy_file_range` and memcpying every byte through user space, not the cost of
+parallelism.)
+
+**4. Segmented generations were evaluated and rejected.** Publishing the per-band files as segments
+(an `fs::rename` each) instead of concatenating them would delete the concat outright. But
+`BAND_NODES = 1<<20`, so `bands = ceil(nodes / 1,048,576)` is **1** for EU-AI-Act, camelid, MeSH, POLE,
+bioalphaengine, Wikidata-1M and Wikidata-100k, and **2** for Monarch-KG. Only full Wikidata has more
+(88). A segment-per-band *is* today's single file for 11 of the 13 graphs we build, and on the one
+that differs it is worth 55.8s of 2,610s — 2.1% — against a format change, a second binary search on
+every `read_record_global`, a content-hash re-baseline, 264 files (≈2,862 at 1B nodes), and per-object
+overhead on the S3/GCS upload and disk-cache tiers. The stronger form — band workers writing straight
+into the published generation, "also removing 20.4 GB of scratch writes" — does not remove them: those
+bytes are written either way, only to a different directory. Both forms buy the same ~56s. Revisit
+only if the format changes for an independent reason, or on a reflink filesystem (XFS/btrfs), where
+`copy_file_range` makes the concat O(1) outright.
+
+**Verification.** The bitmap and the sorter emit the same bytes, so **no content hash moves** — a
+stronger check than any re-baseline would have been. Full 91.6M rebuild, `5e8e7307…` unchanged, and
+every published file's BLAKE3 matches the baseline generation's inventory exactly.
+
+| | before (`g`) | after |
+|---|--:|--:|
+| `drain reltype_{src,tgt}.post` | 231.6s @ 0.91 cores | **gone** (bit-plane write: ~1s) |
+| `emit forward CSR per band` | 278.2s, **54.24 GB** written | 228.8s, **42.34 GB** written |
+| `concat` (both) | 55.8s | 55.8s (untouched) |
+| `emit.topology` | 750.6s (f/h: 892.6 / 902.1) | **471.7s** |
+| build wall (phase sum) | 43.48m | **40.94m** |
+| peak RSS | 4.95 GB | 5.66 GB — *within the 4.28–5.97 GB spread of three same-code runs* |
+| Monarch-KG peak RSS | 2.03 GB | **1.39 GB** |
+
+Peak RSS is unchanged in substance: the two posting sinks used to reserve `2 × --max-memory/16` for
+the whole forward pass, and that 512 MB now goes to the band-worker pool instead, which spends it on
+larger band sort buffers. The headline "4.95 GB" was one run; `f` and `h` on identical code measured
+5.97 and 4.28 GB.
+
+Cross-checked at other scales: 1M Wikidata hashes `6cbc6508…` on **both** paths; Monarch-KG (63
+reltypes — the only real dataset exercising `reltype_count > 3`) hashes `89d2e818…` on both paths,
+with all 63 per-reltype source and target counts matching the pre-change manifest.

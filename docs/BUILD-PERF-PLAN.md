@@ -280,6 +280,16 @@ four full 91.6M rebuilds (glibc, jemalloc, F1–F4, and the final `wd91m-g-diag.
 **43.5 min wall (was 53.8, −19%), peak RSS 4.95 GB = 1.15× the 4 GiB cap (was 8.47 GB = 2.08×),
 content hash `5e8e7307…` unchanged throughout.** Per-phase table in `perf/PERF_CURRENT_STATUS.md`.
 
+> **Follow-up, 2026-07-10 (D61):** the one item this plan left open — `emit.topology`'s tail — is
+> closed. Splitting its single `stitch` diagnostics label into its four real operations showed the
+> cost was **not** the block-concat this plan assumed but the two endpoint-posting drains, which a
+> per-reltype bit plane deletes outright (they were computing a *set*, via a 2.98 B-record external
+> sort). Verified by a fifth 91.6M rebuild: **40.9 min wall (−24% from 53.8), `emit.topology` 12.5 →
+> 7.9 min, `5e8e7307…` still unchanged** — the bitmap emits the same bytes, so no re-baseline. Peak
+> RSS is 5.66 GB, but note that three runs of *identical* code measured 4.28 / 4.95 / 5.97 GB, so the
+> "4.95 GB" headline above is one draw from that spread. The concat is left serial on purpose: it has
+> ~1.5× of headroom worth ~20s, ~1% of the build. See D61.
+
 - **B1 — `MemoryBudget` accountant.** Done, and **partially met** (see acceptance below). Shipped as
   **D58**. New `graph-format/src/membudget.rs`: a counted semaphore over `--max-memory` handing out RAII
   `Reservation`s. `ExtSorter::new`/`new_inline` take a `Reservation` instead of a bare byte count and

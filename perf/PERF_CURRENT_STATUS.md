@@ -291,6 +291,15 @@ a verbatim block-concat of finished files. jemalloc's `background_threads` purge
 (D59), and also service the ~1.5B small `props_blob` allocations faster — which is why `emit.node_stores`
 went 2.8m@1.4× (2026-07-09) → 1.68m@3.4× (glibc) → **0.98m@5.4×** (jemalloc).
 
+> **Half of that attribution was wrong (D61).** `stitch` was not "doing nothing but a verbatim
+> block-concat" — 220s of it was two posting drains. jemalloc did return the glibc arenas (6.25 →
+> 2.53 GB), but the **residual 2.53 GB against 0.81 GB reserved was not retention**: it was
+> `write_endpoint_postings_from_sorted`'s `bucket: Vec<u64>`, holding all 91,306,368 distinct source
+> node ids (730 MB) plus the two copies `BlockFileWriter` makes of an over-target record — an
+> allocation nobody had counted. D61's bit planes remove it and reserve what they do use; the largest
+> unreserved gap anywhere in `emit.topology` is now 0.87 GB, which is the `resident_hint` margin the
+> band sorters deliberately carry. That counter has now found four distinct bugs.
+
 ### Where the remaining serial time is (per-sub-step, from B4 stage 1; glibc run)
 
 | phase | sub-op | wall | cpu%avg |
@@ -323,24 +332,29 @@ Same box and command as above. Adds **D60** (`cluster` sorts each stripe rather 
 adjacency), the per-edge blob inlining, and inline sealing for pool-owned writers — on top of
 B1–B4 (D56–D58) and jemalloc (D59).
 
-**Content hash `5e8e7307…` — unchanged across all four verification rebuilds.**
+**Content hash `5e8e7307…` — unchanged across all five verification rebuilds, including D61's.**
 
-**43.48 min wall** (was 53.8, **−19%**), 1082% average CPU, **4.95 GB peak RSS = 1.15× the 4 GiB
-cap** (was 8.47 GB = 2.08×). B1's memory acceptance — peak ≤ ~1.25× cap, zero samples above 2× —
-**passes**.
+**40.94 min wall** (was 53.8, **−24%**), **5.66 GB peak RSS**. B1's memory acceptance — peak ≤ ~1.25×
+cap, zero samples above 2× — passes on the reserved-bytes accounting; note that *measured* peak RSS
+swings **4.28 → 5.97 GB across three runs of identical code**, so any single figure here (the old
+headline "4.95 GB" included) is one draw from that spread, not a property of the build.
 
-| phase | 2026-07-09 | jemalloc (D59) | final | cpu/wall | peak RSS |
+| phase | 2026-07-09 | jemalloc (D59) | B1–B4 | **D61** | peak RSS |
 |---|--:|--:|--:|--:|--:|
-| pass1 | 11.1m | 11.11m | 11.17m | 13.7× | 2.11 G |
-| dedup keys | 1.9m | 1.13m | **1.12m** | 2.0× | 1.20 G |
-| resolve edge endpoints | 11.3m | 11.31m | **11.20m** | 12.0× | 4.23 G |
-| **cluster** | **8.7m** | 8.52m | **4.55m** | **8.3×** | 2.98 G |
-| emit node stores | 2.8m | 0.98m | **0.97m** | 5.5× | 1.10 G |
-| emit topology | 12.2m | 12.03m | 12.51m | 8.0× | 5.04 G |
-| emit.graph_summaries | 4.3m | 1.34m | **1.44m** | 9.3× | 3.85 G |
-| emit range indexes | 0.3m | 0.33m | 0.33m | 0.9× | 0.52 G |
-| publish | 1.0m | 0.21m | **0.20m** | 2.2× | 0.52 G |
-| **total** | **53.8m** | 47.0m | **43.5m** | | **4.95 G** |
+| pass1 | 11.1m | 11.11m | 11.17m | 11.74m | 2.11 G |
+| dedup keys | 1.9m | 1.13m | **1.12m** | 1.14m | 1.03 G |
+| resolve edge endpoints | 11.3m | 11.31m | **11.20m** | 12.59m | 4.17 G |
+| **cluster** | **8.7m** | 8.52m | **4.55m** | 4.65m | 2.81 G |
+| emit node stores | 2.8m | 0.98m | **0.97m** | 1.03m | 1.20 G |
+| **emit topology** | 12.2m | 12.03m | 12.51m | **7.86m** | 5.16 G |
+| emit.graph_summaries | 4.3m | 1.34m | **1.44m** | 1.37m | 3.10 G |
+| emit range indexes | 0.3m | 0.33m | 0.33m | 0.35m | 0.54 G |
+| publish | 1.0m | 0.21m | **0.20m** | 0.21m | 0.52 G |
+| **total** | **53.8m** | 47.0m | 43.5m | **40.9m** | **5.66 G** |
+
+D61 deletes the two endpoint-posting drains (231.6s of single-threaded k-way merge) and, with them,
+11.9 GB of spill writes from `emit forward CSR per band` (54.24 → 42.34 GB). Everything outside
+`emit.topology` is run-to-run noise.
 
 ### What is serial now, and why
 
@@ -349,23 +363,34 @@ cap** (was 8.47 GB = 2.08×). B1's memory acceptance — peak ≤ ~1.25× cap, z
 | cluster | route adjacency into stripes | 51.2s | 796% |
 | cluster | sort adjacency stripes | 100.5s | 989% |
 | cluster | ldg pass 0 / 1 / 2 | 26.5 / 42.8 / 41.8s | ~740% |
-| emit.topology | partition edges by src band | 49.2s | 1125% |
-| emit.topology | emit forward CSR + edge_props per band | 271.8s | 1250% |
-| emit.topology | emit reverse CSR per band | 135.2s | 1278% |
-| emit.topology | **stitch CSR + edge_props + postings** | **272.5s** | **79%** |
+| emit.topology | partition edges by src band | 53.9s | 1173% |
+| emit.topology | emit forward CSR + edge_props per band | 228.8s | 1335% |
+| emit.topology | emit reverse CSR per band | 131.6s | 1399% |
+| emit.topology | concat topology.csr.blk + edge_props.blk | 55.8s | ~35% |
+| emit.topology | write reltype_{src,tgt}.post (bit planes) | ~1s | 89% |
 
-Only one near-serial step is left, and it is **not CPU-starved — it is write-bandwidth-bound**.
-`stitch` concatenates 176 band files into 20.4 GB. Three implementations measured within ±10% of
-each other: serial `BufWriter` 247.8s @85%, parallel `pwrite` 255.8s @110%, sequential
-`std::io::copy` (→ `copy_file_range(2)`; the bytes never enter user space) 272.5s @79%. The last
-ships because it costs the least CPU, not because it is faster. **Beating it means writing fewer
-bytes, not writing them differently.** See D60.
+> **Superseded (D61).** The rows above are the post-D61 build. The `stitch CSR + edge_props +
+> postings` row this table used to carry (**272.5s @79%**) was *one label over four operations*, and
+> the conclusion drawn from it — "not CPU-starved, it is write-bandwidth-bound" — was wrong twice
+> over. 220s of that 272.5s was the two posting drains (single-threaded k-way merges over 2.98 B
+> records), not the concat; and the concat's 79–85% CPU with `psi_io` ≈ 49 reflects **queue depth 1**,
+> not a saturated disk — `publish` reads 25.1 GB at 2,099 MB/s on the same device in the same run.
+> The drains are now gone (bit planes), and the concat is left serial because its remaining ~1.5× of
+> headroom is worth ~20s: ~1% of the build, inside its own run-to-run noise. See D61.
 
-### The two measurements that overturned an intuition
+Post-D61 the largest serial steps are the two `cluster` stripe passes and the concat.
+
+### The three measurements that overturned an intuition
 
 1. **A *more accurate* memory estimate made the build worse.** With blobs inlined,
    `SortRecord::resident_hint` can report `resolve`'s records exactly. Doing so let each buffer pack
    ~1.7× more records — and `Vec` grows by doubling, so the `realloc` crossing the spill threshold
    holds both arrays. `resolve` 4.31 → **6.04 GB** against a 4 GiB cap; `emit.topology`'s reverse
    band 123.8 → 243.8s; no wall-clock gain. The default's double-count is a load-bearing margin.
-2. **85% CPU on `stitch` did not mean it needed threads.** See the table above.
+2. **85% CPU on `stitch` did not mean it needed threads** — but not for the reason recorded. It was
+   four operations under one label, and the expensive two were CPU-bound single-threaded sorts that a
+   bitmap deleted outright. Benchmarking three variants of the *cheap* operation under a label
+   dominated by the *expensive* ones produced three numbers within noise and one wrong conclusion.
+3. **`psi_io` is not a device-saturation signal on a single-threaded op.** It counts the fraction of
+   time a runnable task is stalled on I/O; with one thread that is just "the thread is waiting". See
+   D61.
