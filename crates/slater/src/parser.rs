@@ -83,12 +83,37 @@ pub mod ast {
     /// The mutation a [`WriteStmt`] applies to its business-key-anchored node.
     #[derive(Debug, Clone, PartialEq)]
     pub enum WriteOp {
-        /// Overwrite properties (Phase 1c): `(prop, value)` pairs in source order
-        /// (later wins), each right-hand side a literal or parameter.
-        Set(Vec<(String, Expr)>),
-        /// Tombstone the node (Phase 2). `detach` records a `DETACH DELETE` — a no-op
-        /// distinction until the Phase 3 topology overlay removes incident edges.
-        Delete { detach: bool },
+        /// `SET` items in source order (later wins). Each targets the anchor variable.
+        Set(Vec<SetItem>),
+        /// `REMOVE` items in source order — property drops and label drops.
+        Remove(Vec<RemoveItem>),
+        /// Tombstone the node(s). `detach` records a `DETACH DELETE` (also removes
+        /// incident edges). `targets` are the named variables to delete; in the
+        /// anchored write model every target is the anchor variable.
+        Delete { detach: bool, targets: Vec<String> },
+    }
+
+    /// One `SET` assignment on the anchor node. openCypher's four item shapes.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum SetItem {
+        /// `SET var.prop = value` — write one property (value a literal or parameter,
+        /// or a row-field reference under a write-`UNWIND`).
+        Prop { prop: String, value: Expr },
+        /// `SET var = {map}` — replace *all* of the node's properties with the map.
+        ReplaceMap(Vec<(String, Expr)>),
+        /// `SET var += {map}` — merge the map into the node's existing properties.
+        MergeMap(Vec<(String, Expr)>),
+        /// `SET var:Label[:Label…]` — add labels to the node.
+        AddLabels(Vec<String>),
+    }
+
+    /// One `REMOVE` item on the anchor node.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum RemoveItem {
+        /// `REMOVE var.prop` — drop a property.
+        Prop(String),
+        /// `REMOVE var:Label[:Label…]` — drop labels.
+        Labels(Vec<String>),
     }
 
     /// One endpoint of a relationship write: a single-label node addressed by one
@@ -672,29 +697,33 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
             Rule::set_clause => {
                 for item in kids(c) {
                     debug_assert_eq!(item.as_rule(), Rule::set_item);
-                    let mut it = kids(item);
-                    let var = ident_text(only_child(
-                        it.next().expect("set_item has a target variable"),
-                    )?)?;
-                    let prop = ident_text(only_child(
-                        it.next().expect("set_item has a property access"),
-                    )?)?;
-                    let value = lower_expr(it.next().expect("set_item has a value expression"))?;
-                    sets.push((var, prop, value));
+                    let (svar, si) = lower_set_item(item)?;
+                    match si {
+                        SetItem::Prop { prop, value } => sets.push((svar, prop, value)),
+                        SetItem::ReplaceMap(_) | SetItem::MergeMap(_) => bail!(
+                            "a relationship write supports only `SET r.prop = value`, not whole-map assignment"
+                        ),
+                        SetItem::AddLabels(_) => {
+                            bail!("relationships have a type, not labels; use `SET r.prop = value`")
+                        }
+                    }
                 }
             }
             Rule::delete_clause => {
                 let mut detach = false;
-                let mut target = None;
+                let mut targets: Vec<String> = Vec::new();
                 for d in kids(c) {
                     match d.as_rule() {
                         Rule::kw_detach => detach = true,
                         Rule::kw_delete => {}
-                        Rule::var => target = Some(ident_text(only_child(d)?)?),
+                        Rule::var => targets.push(ident_text(only_child(d)?)?),
                         other => bail!("internal: unexpected delete_clause child {other:?}"),
                     }
                 }
-                delete = Some((detach, target.expect("delete_clause names a variable")));
+                if targets.len() != 1 {
+                    bail!("a relationship DELETE removes exactly one edge: MATCH (a)-[r:R]->(b) DELETE r");
+                }
+                delete = Some((detach, targets.into_iter().next().unwrap()));
             }
             other => bail!("internal: unexpected edge_write child {other:?}"),
         }
@@ -796,6 +825,75 @@ fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
     })
 }
 
+/// Lower a `node_labels` (`:A:B`) to the plain list of label names it carries.
+fn lower_node_labels(pair: Pair<Rule>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for c in kids(pair) {
+        debug_assert_eq!(c.as_rule(), Rule::label_name);
+        out.push(ident_text(c)?);
+    }
+    debug_assert!(!out.is_empty(), "node_labels matches at least one `:label`");
+    Ok(out)
+}
+
+/// Lower one `set_item` to its `(target_var, SetItem)`. The target variable is
+/// returned separately so the caller can check it against the anchor.
+fn lower_set_item(pair: Pair<Rule>) -> Result<(String, SetItem)> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::set_prop => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("set_prop has a target variable"))?;
+            let prop = ident_text(only_child(
+                it.next().expect("set_prop has a property access"),
+            )?)?;
+            let value = lower_expr(it.next().expect("set_prop has a value expression"))?;
+            Ok((var, SetItem::Prop { prop, value }))
+        }
+        Rule::set_merge_map => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("set_merge_map has a target variable"))?;
+            let map = lower_prop_map(it.next().expect("set_merge_map has a map literal"))?;
+            Ok((var, SetItem::MergeMap(map)))
+        }
+        Rule::set_replace_map => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("set_replace_map has a target variable"))?;
+            let map = lower_prop_map(it.next().expect("set_replace_map has a map literal"))?;
+            Ok((var, SetItem::ReplaceMap(map)))
+        }
+        Rule::set_labels => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("set_labels has a target variable"))?;
+            let labels = lower_node_labels(it.next().expect("set_labels has a label list"))?;
+            Ok((var, SetItem::AddLabels(labels)))
+        }
+        other => bail!("internal: unexpected set_item child {other:?}"),
+    }
+}
+
+/// Lower one `remove_item` to its `(target_var, RemoveItem)`.
+fn lower_remove_item(pair: Pair<Rule>) -> Result<(String, RemoveItem)> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::remove_prop => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("remove_prop has a target variable"))?;
+            let prop = ident_text(only_child(
+                it.next().expect("remove_prop has a property access"),
+            )?)?;
+            Ok((var, RemoveItem::Prop(prop)))
+        }
+        Rule::remove_labels => {
+            let mut it = kids(inner);
+            let var = ident_text(it.next().expect("remove_labels has a target variable"))?;
+            let labels = lower_node_labels(it.next().expect("remove_labels has a label list"))?;
+            Ok((var, RemoveItem::Labels(labels)))
+        }
+        other => bail!("internal: unexpected remove_item child {other:?}"),
+    }
+}
+
 /// Lower a `write_statement` into a [`WriteStmt`], enforcing the Phase 1c shape:
 /// a single labelled anchor node with exactly one inline business-key property
 /// (a literal or parameter), and SET assignments that all target that anchor
@@ -803,8 +901,9 @@ fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
 /// is a clear error rather than a silent mis-parse.
 fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
     let mut node: Option<NodePat> = None;
-    let mut sets: Vec<(String, String, Expr)> = Vec::new();
-    let mut delete: Option<(bool, String)> = None; // (detach, target var)
+    let mut set_items: Vec<(String, SetItem)> = Vec::new();
+    let mut remove_items: Vec<(String, RemoveItem)> = Vec::new();
+    let mut delete: Option<(bool, Vec<String>)> = None; // (detach, target vars)
     let mut ret: Option<ReturnClause> = None;
     let mut upsert = false; // MERGE anchor (create-if-absent) vs MATCH (update only)
     let mut unwind: Option<(Expr, String)> = None; // write-UNWIND source + alias
@@ -817,31 +916,39 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
             Rule::kw_match => {}
             Rule::kw_merge => upsert = true,
             Rule::node_pattern => node = Some(lower_node_pattern(child)?),
-            Rule::set_clause => {
-                for item in kids(child) {
-                    debug_assert_eq!(item.as_rule(), Rule::set_item);
-                    let mut it = kids(item);
-                    let var = ident_text(only_child(
-                        it.next().expect("set_item has a target variable"),
-                    )?)?;
-                    let prop_access = it.next().expect("set_item has a property access");
-                    let prop = ident_text(only_child(prop_access)?)?;
-                    let value = lower_expr(it.next().expect("set_item has a value expression"))?;
-                    sets.push((var, prop, value));
-                }
-            }
-            Rule::delete_clause => {
-                let mut detach = false;
-                let mut target = None;
-                for c in kids(child) {
-                    match c.as_rule() {
-                        Rule::kw_detach => detach = true,
-                        Rule::kw_delete => {}
-                        Rule::var => target = Some(ident_text(only_child(c)?)?),
-                        other => bail!("internal: unexpected delete_clause child {other:?}"),
+            Rule::update_clause => {
+                let uc = only_child(child)?;
+                match uc.as_rule() {
+                    Rule::set_clause => {
+                        for item in kids(uc) {
+                            debug_assert_eq!(item.as_rule(), Rule::set_item);
+                            set_items.push(lower_set_item(item)?);
+                        }
                     }
+                    Rule::remove_clause => {
+                        for item in kids(uc) {
+                            debug_assert_eq!(item.as_rule(), Rule::remove_item);
+                            remove_items.push(lower_remove_item(item)?);
+                        }
+                    }
+                    Rule::delete_clause => {
+                        let mut detach = false;
+                        let mut targets = Vec::new();
+                        for c in kids(uc) {
+                            match c.as_rule() {
+                                Rule::kw_detach => detach = true,
+                                Rule::kw_delete => {}
+                                Rule::var => targets.push(ident_text(only_child(c)?)?),
+                                other => {
+                                    bail!("internal: unexpected delete_clause child {other:?}")
+                                }
+                            }
+                        }
+                        debug_assert!(!targets.is_empty(), "delete_clause names a variable");
+                        delete = Some((detach, targets));
+                    }
+                    other => bail!("internal: unexpected update_clause child {other:?}"),
                 }
-                delete = Some((detach, target.expect("delete_clause names a variable")));
             }
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
             Rule::EOI => {}
@@ -873,32 +980,49 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         ensure_constant(&key_value, "the anchor business-key value")?;
     }
 
-    // Exactly one of SET / DELETE fired (the grammar alternates them).
-    let op = if let Some((detach, target)) = delete {
+    // Exactly one update clause fired (the grammar alternates SET / REMOVE / DELETE).
+    let op = if let Some((detach, targets)) = delete {
         if upsert {
             bail!("MERGE cannot be combined with DELETE — use MATCH … DELETE to remove a node");
         }
-        if target != var {
-            bail!("DELETE must target the anchor variable '{var}', not '{target}'");
-        }
-        WriteOp::Delete { detach }
-    } else {
-        if sets.is_empty() {
-            bail!("a write must SET at least one property");
-        }
-        let mut out_sets = Vec::with_capacity(sets.len());
-        for (set_var, prop, value) in sets {
-            if set_var != var {
+        for target in &targets {
+            if target != &var {
                 bail!(
-                    "SET must target the anchor variable '{var}', not '{set_var}' (a write mutates one node)"
+                    "DELETE must target the anchor variable '{var}', not '{target}' (a write anchors one node)"
                 );
             }
-            if unwind.is_none() {
-                ensure_constant(&value, &format!("the value assigned to {var}.{prop}"))?;
-            }
-            out_sets.push((prop, value));
         }
-        WriteOp::Set(out_sets)
+        WriteOp::Delete { detach, targets }
+    } else if !remove_items.is_empty() {
+        let mut out = Vec::with_capacity(remove_items.len());
+        for (rvar, item) in remove_items {
+            if rvar != var {
+                bail!(
+                    "REMOVE must target the anchor variable '{var}', not '{rvar}' (a write mutates one node)"
+                );
+            }
+            out.push(item);
+        }
+        WriteOp::Remove(out)
+    } else {
+        if set_items.is_empty() {
+            bail!("a write must SET or REMOVE at least one property or label");
+        }
+        let mut out = Vec::with_capacity(set_items.len());
+        for (svar, item) in set_items {
+            if svar != var {
+                bail!(
+                    "SET must target the anchor variable '{var}', not '{svar}' (a write mutates one node)"
+                );
+            }
+            // A plain write's values must be constants; a write-UNWIND's may reference
+            // the alias's fields (validated per-row at execution).
+            if unwind.is_none() {
+                ensure_set_item_constant(&item, &var)?;
+            }
+            out.push(item);
+        }
+        WriteOp::Set(out)
     };
 
     Ok(WriteStmt {
@@ -911,6 +1035,24 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         ret,
         unwind,
     })
+}
+
+/// A plain (non-UNWIND) write's SET right-hand sides must be values known without
+/// reading the graph — a literal or a parameter (or such inside a replace/merge map).
+/// Label-set items carry no expression, so they always pass.
+fn ensure_set_item_constant(item: &SetItem, var: &str) -> Result<()> {
+    match item {
+        SetItem::Prop { prop, value } => {
+            ensure_constant(value, &format!("the value assigned to {var}.{prop}"))
+        }
+        SetItem::ReplaceMap(map) | SetItem::MergeMap(map) => {
+            for (k, v) in map {
+                ensure_constant(v, &format!("the value assigned to {var}.{k}"))?;
+            }
+            Ok(())
+        }
+        SetItem::AddLabels(_) => Ok(()),
+    }
 }
 
 /// A Phase 1c write's business-key value and every SET right-hand side must be a
@@ -2653,6 +2795,7 @@ fn is_kw(r: Rule) -> bool {
             | Rule::kw_else
             | Rule::kw_end
             | Rule::kw_set
+            | Rule::kw_remove
             | Rule::kw_call
             | Rule::kw_yield
             | Rule::kw_unwind
@@ -2816,11 +2959,14 @@ mod tests {
         assert_eq!(
             w.op,
             WriteOp::Set(vec![
-                ("price".to_string(), Expr::Literal(Value::Int(10))),
-                (
-                    "sector".to_string(),
-                    Expr::Literal(Value::Str("Tech".into()))
-                ),
+                SetItem::Prop {
+                    prop: "price".to_string(),
+                    value: Expr::Literal(Value::Int(10)),
+                },
+                SetItem::Prop {
+                    prop: "sector".to_string(),
+                    value: Expr::Literal(Value::Str("Tech".into())),
+                },
             ])
         );
         assert!(w.ret.is_none());
@@ -2844,7 +2990,10 @@ mod tests {
         );
         assert_eq!(
             w.op,
-            WriteOp::Set(vec![("age".to_string(), r("age"))]),
+            WriteOp::Set(vec![SetItem::Prop {
+                prop: "age".to_string(),
+                value: r("age"),
+            }]),
             "SET values read row fields"
         );
 
@@ -2852,7 +3001,13 @@ mod tests {
         let d = write("UNWIND $rows AS r MATCH (n:Person {name: r.name}) DELETE n");
         assert!(d.unwind.is_some());
         assert!(!d.upsert);
-        assert_eq!(d.op, WriteOp::Delete { detach: false });
+        assert_eq!(
+            d.op,
+            WriteOp::Delete {
+                detach: false,
+                targets: vec!["n".to_string()]
+            }
+        );
 
         // A plain (non-UNWIND) write carries no unwind, and still rejects non-constants.
         assert!(write("MERGE (n:Person {name: 'Zoe'}) SET n.age = 1")
@@ -2871,7 +3026,10 @@ mod tests {
         assert_eq!(w.key_value, Expr::Param("t".into()));
         assert_eq!(
             w.op,
-            WriteOp::Set(vec![("price".to_string(), Expr::Param("p".into()))])
+            WriteOp::Set(vec![SetItem::Prop {
+                prop: "price".to_string(),
+                value: Expr::Param("p".into()),
+            }])
         );
         assert!(w.ret.is_some());
     }
@@ -2882,17 +3040,163 @@ mod tests {
         assert_eq!(w.var, "n");
         assert_eq!(w.label, "Company");
         assert_eq!(w.key, "ticker");
-        assert_eq!(w.op, WriteOp::Delete { detach: false });
+        assert_eq!(
+            w.op,
+            WriteOp::Delete {
+                detach: false,
+                targets: vec!["n".to_string()]
+            }
+        );
         assert!(w.ret.is_none());
 
         let d = write("MATCH (n:Company {ticker: 'ABC'}) DETACH DELETE n");
-        assert_eq!(d.op, WriteOp::Delete { detach: true });
+        assert_eq!(
+            d.op,
+            WriteOp::Delete {
+                detach: true,
+                targets: vec!["n".to_string()]
+            }
+        );
 
         // DELETE must name the anchor variable.
         let e = write_err("MATCH (n:Company {ticker: 'ABC'}) DELETE m");
         assert!(
             e.contains("DELETE must target") || e == "read-only",
             "got: {e}"
+        );
+    }
+
+    // ── Stage 1: widened SET / REMOVE / DELETE (parse-only) ─────────────────────
+
+    #[test]
+    fn set_replace_map_lowers() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) SET n = {price: 10, sector: 'Tech'}");
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::ReplaceMap(vec![
+                ("price".to_string(), Expr::Literal(Value::Int(10))),
+                (
+                    "sector".to_string(),
+                    Expr::Literal(Value::Str("Tech".into()))
+                ),
+            ])])
+        );
+    }
+
+    #[test]
+    fn set_merge_map_lowers() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) SET n += {price: 10}");
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::MergeMap(vec![(
+                "price".to_string(),
+                Expr::Literal(Value::Int(10))
+            )])])
+        );
+    }
+
+    #[test]
+    fn set_labels_lowers() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) SET n:Listed:Tech");
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::AddLabels(vec![
+                "Listed".to_string(),
+                "Tech".to_string()
+            ])])
+        );
+    }
+
+    #[test]
+    fn set_items_mix_shapes_in_source_order() {
+        let w = write(
+            "MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10, n += {sector: 'Tech'}, n:Listed",
+        );
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![
+                SetItem::Prop {
+                    prop: "price".to_string(),
+                    value: Expr::Literal(Value::Int(10)),
+                },
+                SetItem::MergeMap(vec![(
+                    "sector".to_string(),
+                    Expr::Literal(Value::Str("Tech".into()))
+                )]),
+                SetItem::AddLabels(vec!["Listed".to_string()]),
+            ])
+        );
+    }
+
+    #[test]
+    fn remove_prop_lowers() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) REMOVE n.price");
+        assert_eq!(
+            w.op,
+            WriteOp::Remove(vec![RemoveItem::Prop("price".to_string())])
+        );
+    }
+
+    #[test]
+    fn remove_labels_lowers() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) REMOVE n:Listed:Tech");
+        assert_eq!(
+            w.op,
+            WriteOp::Remove(vec![RemoveItem::Labels(vec![
+                "Listed".to_string(),
+                "Tech".to_string()
+            ])])
+        );
+    }
+
+    #[test]
+    fn remove_items_mix_prop_and_labels() {
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) REMOVE n.price, n:Listed");
+        assert_eq!(
+            w.op,
+            WriteOp::Remove(vec![
+                RemoveItem::Prop("price".to_string()),
+                RemoveItem::Labels(vec!["Listed".to_string()]),
+            ])
+        );
+    }
+
+    #[test]
+    fn multi_target_delete_lowers() {
+        // In the anchored model every target is the anchor variable; the grammar
+        // still parses the comma-separated form.
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) DELETE n, n");
+        assert_eq!(
+            w.op,
+            WriteOp::Delete {
+                detach: false,
+                targets: vec!["n".to_string(), "n".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn widened_write_items_target_the_anchor() {
+        // SET / REMOVE items pointing at a non-anchor variable are rejected by name.
+        assert!(write_err("MATCH (n:Company {ticker: 'A'}) SET m += {x: 1}")
+            .contains("anchor variable"));
+        assert!(
+            write_err("MATCH (n:Company {ticker: 'A'}) SET m:Listed").contains("anchor variable")
+        );
+        assert!(write_err("MATCH (n:Company {ticker: 'A'}) REMOVE m.x").contains("anchor variable"));
+        assert!(write_err("MATCH (n:Company {ticker: 'A'}) REMOVE m:Listed")
+            .contains("anchor variable"));
+        // A DELETE naming a non-anchor variable is rejected too.
+        assert!(
+            write_err("MATCH (n:Company {ticker: 'A'}) DELETE n, m").contains("DELETE must target")
+        );
+    }
+
+    #[test]
+    fn plain_write_forbids_computed_map_values() {
+        // A non-UNWIND replace/merge map may not carry a computed right-hand side.
+        assert!(
+            write_err("MATCH (n:Company {ticker: 'A'}) SET n += {x: n.y + 1}").contains("literal")
         );
     }
 
@@ -2906,7 +3210,10 @@ mod tests {
         assert_eq!(w.key_value, Expr::Literal(Value::Str("ABC".into())));
         assert_eq!(
             w.op,
-            WriteOp::Set(vec![("price".to_string(), Expr::Literal(Value::Int(10)))])
+            WriteOp::Set(vec![SetItem::Prop {
+                prop: "price".to_string(),
+                value: Expr::Literal(Value::Int(10)),
+            }])
         );
 
         // MATCH is update-only (no create).

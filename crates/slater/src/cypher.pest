@@ -57,6 +57,7 @@ kw_end = @{ ^"end" ~ !ident_cont }
 kw_set = @{ ^"set" ~ !ident_cont }
 kw_delete = @{ ^"delete" ~ !ident_cont }
 kw_detach = @{ ^"detach" ~ !ident_cont }
+kw_remove = @{ ^"remove" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
 kw_unwind = @{ ^"unwind" ~ !ident_cont }
@@ -113,15 +114,45 @@ union = { kw_union ~ kw_all? }
 write_statement = {
     SOI ~ (
         edge_write
-      | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause?)
-      | ((kw_match | kw_merge) ~ node_pattern ~ (set_clause | delete_clause) ~ return_clause?)
+      | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ update_clause ~ return_clause?)
+      | ((kw_match | kw_merge) ~ node_pattern ~ update_clause ~ return_clause?)
     ) ~ ";"? ~ EOI
 }
+// One updating clause applied to the anchored node. openCypher's full `UpdatingClause`
+// set is `SET` / `REMOVE` / `[DETACH] DELETE` (plus `CREATE`/`MERGE`, which anchor a
+// node rather than mutate one). Each item is validated at lowering to target the anchor
+// variable; shapes the executor cannot yet honour are rejected there by name.
+update_clause = { set_clause | remove_clause | delete_clause }
+
+// `SET` widened to the four openCypher item shapes: `var.prop = expr` (property write),
+// `var += {map}` (merge properties), `var = {map}` (replace all properties), and
+// `var:Label[:Label…]` (add labels). `set_prop` is tried first (only it carries a
+// `.prop`); `set_merge_map` before `set_replace_map` so `+=` is not mis-read as `=`.
 set_clause = { kw_set ~ set_item ~ ("," ~ set_item)* }
-set_item = { var ~ property_access ~ "=" ~ expr }
-// `[DETACH] DELETE var` tombstones the anchored node (Phase 2). DETACH is accepted
-// but a no-op until the Phase 3 topology overlay removes incident edges.
-delete_clause = { kw_detach? ~ kw_delete ~ var }
+set_item = { set_prop | set_merge_map | set_replace_map | set_labels }
+set_prop = { var ~ property_access ~ "=" ~ expr }
+set_merge_map = { var ~ "+=" ~ prop_map }
+set_replace_map = { var ~ "=" ~ prop_map }
+set_labels = { var ~ node_labels }
+
+// `REMOVE var.prop` (drop a property) or `REMOVE var:Label[:Label…]` (drop labels).
+// `remove_labels` is tried first: a bare `var` followed by `:` is a label list, not a
+// property access (which needs a `.`).
+remove_clause = { kw_remove ~ remove_item ~ ("," ~ remove_item)* }
+remove_item = { remove_labels | remove_prop }
+remove_prop = { var ~ property_access }
+remove_labels = { var ~ node_labels }
+
+// A plain colon-separated label list (openCypher `NodeLabels`), distinct from the
+// GQL boolean `label_expr` a pattern carries — a SET/REMOVE names concrete labels to
+// add or drop, never a boolean predicate.
+node_labels = { (":" ~ label_name)+ }
+
+// `[DETACH] DELETE var[, var…]` tombstones the anchored node(s). DETACH additionally
+// detaches incident edges; plain DELETE errors at execution if the node still has any
+// (DELETE conformance, Stage 2). Multi-target delete parses here; the anchored write
+// model binds a single variable, so extra targets are validated at lowering.
+delete_clause = { kw_detach? ~ kw_delete ~ var ~ ("," ~ var)* }
 
 // ── Relationship write (Phase 3c) ─────────────────────────────────────────────
 // `MERGE (a:L {k:v})-[:R]->(b:M {j:w})` creates a relationship (create-if-absent by

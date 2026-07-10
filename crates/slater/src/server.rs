@@ -2648,6 +2648,51 @@ fn write_value(
 /// hand it to the writer (WAL append + fsync commit + memtable apply + publish).
 /// Returns an empty result — read-back is a separate `MATCH … RETURN` over the
 /// overlaid view. A `RETURN` after a write is not yet supported.
+/// Reduce a widened `SET` item list to the `(prop, value)` pairs the Stage-1 executor
+/// can honour — plain `SET var.prop = value` writes. The map-replace, map-merge, and
+/// label-set items parse (Stage 1) but need durable primitives that land in Stages 3–5,
+/// so they are rejected here with a clear "not yet supported" message rather than
+/// silently dropped.
+fn set_prop_items(
+    items: &[parser::ast::SetItem],
+) -> std::result::Result<Vec<(&String, &parser::ast::Expr)>, Failure> {
+    use parser::ast::SetItem;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SetItem::Prop { prop, value } => out.push((prop, value)),
+            SetItem::ReplaceMap(_) => {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    "SET n = {…} (replace all properties) is not yet supported".into(),
+                ))
+            }
+            SetItem::MergeMap(_) => {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    "SET n += {…} (merge properties) is not yet supported".into(),
+                ))
+            }
+            SetItem::AddLabels(_) => {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    "SET n:Label (add a label) is not yet supported".into(),
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `REMOVE` parses (Stage 1) but its durable primitives (property tombstone, label
+/// drop) land in Stages 3 and 5. Reject it with a clear message until then.
+fn unsupported_remove() -> Failure {
+    Failure::new(
+        CODE_REQUEST,
+        "REMOVE (drop a property or label) is not yet supported".into(),
+    )
+}
+
 fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
@@ -2669,9 +2714,10 @@ fn execute_write(
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
     let op = match &stmt.op {
-        WriteOp::Set(sets) => {
-            let mut patches = Vec::with_capacity(sets.len());
-            for (prop, expr) in sets {
+        WriteOp::Set(items) => {
+            let props = set_prop_items(items)?;
+            let mut patches = Vec::with_capacity(props.len());
+            for (prop, expr) in props {
                 patches.push((prop.clone(), write_value(expr, params, "a SET value")?));
             }
             WalOp::UpsertNode {
@@ -2681,9 +2727,10 @@ fn execute_write(
                 patches,
             }
         }
+        WriteOp::Remove(_) => return Err(unsupported_remove()),
         // DETACH is accepted but a no-op until the Phase 3 topology overlay removes
         // incident edges; the node is tombstoned either way.
-        WriteOp::Delete { detach: _ } => WalOp::DeleteNode {
+        WriteOp::Delete { detach: _, .. } => WalOp::DeleteNode {
             label: stmt.label.clone(),
             key: stmt.key.clone(),
             value: key_value,
@@ -2922,9 +2969,10 @@ fn execute_write_batch(
             "the anchor business-key value",
         )?;
         let op = match &stmt.op {
-            WriteOp::Set(sets) => {
-                let mut patches = Vec::with_capacity(sets.len());
-                for (prop, expr) in sets {
+            WriteOp::Set(items) => {
+                let props = set_prop_items(items)?;
+                let mut patches = Vec::with_capacity(props.len());
+                for (prop, expr) in props {
                     patches.push((
                         prop.clone(),
                         eval_row_value(expr, var, row, params, "a SET value")?,
@@ -2937,7 +2985,8 @@ fn execute_write_batch(
                     patches,
                 }
             }
-            WriteOp::Delete { detach: _ } => WalOp::DeleteNode {
+            WriteOp::Remove(_) => return Err(unsupported_remove()),
+            WriteOp::Delete { detach: _, .. } => WalOp::DeleteNode {
                 label: stmt.label.clone(),
                 key: stmt.key.clone(),
                 value: key_value,
