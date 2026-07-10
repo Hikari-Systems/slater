@@ -69,6 +69,14 @@ harness = false
 name = "dump_roundtrip"
 required-features = ["testkit"]
 
+# The full-write-clauses live Bolt round-trip drives every write clause over a real
+# server + real `slater-build` consolidation off the `testgen` fixture (testkit-gated);
+# `#[ignore]` besides. Run: `SLATER_BUILD_BIN=$CARGO_TARGET_DIR/debug/slater-build
+# cargo test -p slater --features testkit --test writable_bolt_roundtrip -- --ignored`.
+[[test]]
+name = "writable_bolt_roundtrip"
+required-features = ["testkit"]
+
 # Proves the writable layer's empty-delta read path is a zero-cost pass-through:
 # A/Bs a node-materialisation loop over a bare `Generation` vs a `MergedView` with
 # an empty delta. Run: `cargo bench -p slater --features testkit --bench delta_overlay`.

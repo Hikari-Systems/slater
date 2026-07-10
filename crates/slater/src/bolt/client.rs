@@ -152,6 +152,14 @@ impl BoltClient {
         Ok((columns, rows))
     }
 
+    /// Send `RESET` to clear a FAILED/streaming state (after a query FAILURE the server
+    /// answers every message but `RESET` with `IGNORED`, so a client that means to
+    /// continue on the same connection must reset first). Expects `SUCCESS`.
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        self.request(crate::bolt::message::tag::RESET, Vec::new())
+            .map(|_| ())
+    }
+
     /// Encode and send one Bolt message (chunked + terminated by `to_wire`).
     pub fn send(&mut self, tag: u8, fields: Vec<PsValue>) -> std::io::Result<()> {
         let msg = PsValue::Struct { tag, fields };
