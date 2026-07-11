@@ -4282,12 +4282,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// otherwise only edges of a listed type. An edge is kept only when both
     /// endpoints are in the selected node set.
     fn build_view(&self, labels: Option<&[u32]>, rels: Option<&[u32]>) -> Result<GraphView> {
+        // Route the node selection through `scan_candidates` so the view is built over the
+        // *effective* estate: segment-born and delta-born nodes carrying a selected label are
+        // included, tombstoned (segment or delta) ids are dropped, and a segment override that
+        // changed a node's labels re-decides its membership. (This also folds the write-delta,
+        // which the pre-segmented-core `build_view` ignored.)
         let nodes: Vec<u64> = match labels {
-            None => (0..self.gen.node_count()).collect(),
+            None => self.scan_candidates(&NodeScan::AllNodes)?,
             Some(lbls) => {
                 let mut set = std::collections::BTreeSet::new();
                 for &l in lbls {
-                    for nid in self.gen.collect_nodes_with_label(l)? {
+                    for nid in self.scan_candidates(&NodeScan::LabelScan { label_id: l })? {
                         set.insert(nid);
                     }
                 }
@@ -4340,6 +4345,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// (`label_node_count`, `reltype_edge_count`) — no graph scan.
     fn meta_stats(&self) -> (Vec<String>, Vec<Vec<Val>>) {
         let m = self.gen.manifest();
+        // Live (delta- and stack-aware) counts. `live_label_node_count` / `live_node_count`
+        // always sum; the edge/reltype live counts decline (→ base) when a segment's
+        // marginals are not exact. All equal the base marginals for a singleton + empty
+        // delta, so a pure-core `db.meta.stats()` is unchanged.
         let labels: Vec<(String, Val)> = m
             .labels
             .iter()
@@ -4347,23 +4356,39 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let cnt = self
                     .gen
                     .label_id(l)
-                    .map(|id| self.gen.label_node_count(id) as usize)
+                    .map(|id| self.gen.live_label_node_count(id).unwrap_or(0))
                     .unwrap_or(0);
                 (l.clone(), Val::Int(cnt as i64))
             })
             .collect();
+        let live_rt: Option<HashMap<String, u64>> = self
+            .gen
+            .live_reltype_edge_groups()
+            .ok()
+            .flatten()
+            .map(|g| g.into_iter().collect());
         let reltypes: Vec<(String, Val)> = m
             .reltypes
             .iter()
             .map(|t| {
-                let cnt = self
-                    .gen
-                    .reltype_id(t)
-                    .map(|id| self.gen.reltype_edge_count(id) as usize)
-                    .unwrap_or(0);
+                let cnt = match &live_rt {
+                    Some(map) => map.get(t).copied().unwrap_or(0),
+                    None => self
+                        .gen
+                        .reltype_id(t)
+                        .map(|id| self.gen.reltype_edge_count(id))
+                        .unwrap_or(0),
+                };
                 (t.clone(), Val::Int(cnt as i64))
             })
             .collect();
+        let node_count = self.gen.live_node_count();
+        let edge_count = self
+            .gen
+            .live_edge_count()
+            .ok()
+            .flatten()
+            .unwrap_or(m.edge_count);
         let cols = [
             "labels",
             "relTypes",
@@ -4379,8 +4404,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let row = vec![
             Val::Map(labels),
             Val::Map(reltypes),
-            Val::Int(m.edge_count as i64),
-            Val::Int(m.node_count as i64),
+            Val::Int(edge_count as i64),
+            Val::Int(node_count as i64),
             Val::Int(m.labels.len() as i64),
             Val::Int(m.reltypes.len() as i64),
             Val::Int(m.property_keys.len() as i64),
@@ -9902,6 +9927,100 @@ mod tests {
             vec![0, 1, 6],
             "base T sources {{0,1}} ∪ segment {{6}}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `algo.*` procedures build their subgraph view over the *effective* estate: the
+    /// label-filtered node set now includes a segment-born node carrying the label (it went
+    /// through the base label postings only before slice 3.6's fix). Regression guard for the
+    /// adversarial-review finding.
+    #[test]
+    fn algo_view_includes_segment_born_labelled_node() {
+        use crate::read_view::MergedView;
+        let (root, graph, _) = write_basic_with_born_segment("seg_algo_view");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+
+        // Base :Person = {Alice, Bob, Carol}; the segment births Zed (:Person). The WCC view
+        // over :Person must span all four, so the row count is 4, not the base-only 3.
+        let res = engine
+            .run(
+                &parser::parse(
+                    "CALL algo.WCC({nodeLabels: ['Person']}) YIELD node, componentId \
+                     RETURN count(*)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(4)),
+            "{:?}",
+            res.rows[0][0]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A stacked set opens and answers queries identically through a non-filesystem backend
+    /// (mem store), exercising the store-native segment reader path end-to-end (the segments
+    /// live on the same object store as the base). Conformance for slice 3.6.
+    #[test]
+    fn stacked_set_opens_and_reads_over_mem_store() {
+        use crate::read_view::MergedView;
+        use graph_format::store::mem::MemObjectStore;
+        use graph_format::store::ObjectStore;
+
+        fn load_tree(store: &MemObjectStore, root: &std::path::Path, dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    load_tree(store, root, &path);
+                } else {
+                    let key = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    store
+                        .put(&key, &std::fs::read(&path).unwrap(), None)
+                        .unwrap();
+                }
+            }
+        }
+
+        let (root, graph, _) = write_basic_with_born_segment("seg_mem_store");
+        let mem = MemObjectStore::new();
+        load_tree(&mem, &root, &root);
+
+        let gen = Generation::open_with_store(&mem, &graph, None).unwrap();
+        assert_eq!(
+            gen.stack().segments().len(),
+            1,
+            "segment loaded via the mem store"
+        );
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+
+        // Born node 5 reads its full row through the store; whole-graph count is marginal-summed.
+        let (labels, props) = engine.node_record(5).unwrap();
+        assert_eq!(labels, vec!["Person".to_string()]);
+        assert!(matches!(prop(&props, "name"), Some(Val::Str(s)) if s == "Zed"));
+        let res = engine
+            .run(&parser::parse("MATCH (n) RETURN count(*)").unwrap())
+            .unwrap();
+        assert!(matches!(res.rows[0][0], Val::Int(6)));
+        // Its born adjacency resolves too.
+        let knows = gen.reltype_id("KNOWS").unwrap();
+        assert!(engine
+            .incoming(5)
+            .unwrap()
+            .iter()
+            .any(|a| a.neighbour.0 == 0 && a.reltype == knows));
+
         std::fs::remove_dir_all(&root).ok();
     }
 
