@@ -118,9 +118,10 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 2 slice 2 (`segment.rs` section
-format). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–2
-done, next is slice 3 (ISAM fragment + removal sidecar; posting fragments).
+**Branch:** `writeable`. **Committed through:** Phase 2 slice 3 (index + posting
+fragments). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–3
+done, next is slice 4 (`SEGMENT.json` signed marginals + per-index dirty bits + bands +
+inventory/hashes + `meta.bin` self-MAC parity with `manifest.rs`).
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
 - HP0 — Phase 0.5 committed (`a6e4d34`).
@@ -154,7 +155,12 @@ done, next is slice 3 (ISAM fragment + removal sidecar; posting fragments).
      delta-varint removal sidecar in `idx.meta` (MAGIC+crc+version); `lookup_eq`/
      `lookup_range`/`removals`/`indexed`, `open_if_present` for the no-index case,
      plaintext + encrypted (absent-key refusal). 6 tests green, clippy clean.
-     **3b TODO** — posting fragments (per-reltype born src/tgt endpoint id lists).
+     **3b DONE** — `graph-format/src/segpostings.rs`: `write_posting_fragments` +
+     `SegmentPostingsReader`, resident `post.meta` (MAGIC+crc+version) of per-reltype
+     ascending-distinct born src/tgt endpoint ids (reuses `encode/decode_endpoint_posting`);
+     `src_ids`/`tgt_ids`/`reltypes`, `open_if_present`. Removals NOT tracked (a driving-set
+     superset stays correct; edge removal handled by the adjacency fold). 5 tests green,
+     clippy clean. **Slice 3 COMPLETE.**
   4. `SEGMENT.json` (signed marginal deltas as i64, per-index dirty bits, bands,
      inventory+hashes, encryption/MAC parity with `manifest.rs`).
   5. Populate `SegmentRef` in the set manifest (already forward-shaped) + codec goldens

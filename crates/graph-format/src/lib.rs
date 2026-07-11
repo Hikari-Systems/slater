@@ -42,6 +42,7 @@ pub mod postings;
 pub mod pq;
 pub mod segindex;
 pub mod segment;
+pub mod segpostings;
 pub mod setmanifest;
 pub mod store;
 pub mod topology;
