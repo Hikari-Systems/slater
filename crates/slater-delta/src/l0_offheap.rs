@@ -47,7 +47,7 @@ use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 /// v2 adds the resident `tombstoned` dense-id column, so a merged live `count(*)` can
 /// enumerate this segment's suppressed rows without paging `node.blk`.
-const OFFHEAP_VERSION: u64 = 3;
+const OFFHEAP_VERSION: u64 = 4;
 
 /// Per-section cache discriminants (the `sub` in a [`BlockCache`] key). Distinct so the
 /// four sections of one segment never collide in the shared cache.
@@ -309,6 +309,10 @@ pub struct OffheapSegmentWriter {
     born_index: Vec<BornIndexEntry>,
     core_patched: Vec<(String, String, u64)>,
     born_by_identity: Vec<(Vec<u8>, u64)>,
+    /// `(core edge id, src dense, dst dense, reltype)` for every in-place core-edge property
+    /// patch (v4). Persisted so a T2 flush over an off-heap L0 level can recover a patched
+    /// edge's endpoints — absent from the adjacency, they would otherwise be lost.
+    core_patched_edges: Vec<(u64, u64, u64, String)>,
     /// Dense ids this segment tombstones, accumulated from the pushed node deltas (so
     /// both the flush path and the streaming merge populate it for free) and kept
     /// resident in `meta.bin`.
@@ -366,6 +370,7 @@ impl OffheapSegmentWriter {
             born_index: Vec::new(),
             core_patched: Vec::new(),
             born_by_identity: Vec::new(),
+            core_patched_edges: Vec::new(),
             tombstoned: Vec::new(),
             edge_tombstones: false,
             born_edges_by_reltype: BTreeMap::new(),
@@ -459,6 +464,12 @@ impl OffheapSegmentWriter {
         self.edge_delta_count = edge_delta_count;
         self.born_count = born_count;
         self.born_edge_count = born_edge_count;
+    }
+
+    /// Record the core-edge patch endpoints (v4) — the flush needs them to rebuild a
+    /// patched edge's replace row from an off-heap level.
+    pub fn set_core_patched_edges(&mut self, core_patched_edges: Vec<(u64, u64, u64, String)>) {
+        self.core_patched_edges = core_patched_edges;
     }
 
     pub fn set_secondaries(
@@ -561,6 +572,14 @@ impl OffheapSegmentWriter {
         w_label_ids(&mut body, &self.added_label_ids);
         w_label_ids(&mut body, &self.removed_label_ids);
         w_u64s(&mut body, self.label_overlay_ids.iter().copied());
+        // v4: core-edge patch endpoints, so a T2 flush can rebuild a patched edge's replace row.
+        write_uvarint(&mut body, self.core_patched_edges.len() as u64);
+        for (eid, src, dst, reltype) in &self.core_patched_edges {
+            write_uvarint(&mut body, *eid);
+            write_uvarint(&mut body, *src);
+            write_uvarint(&mut body, *dst);
+            w_str(&mut body, reltype);
+        }
 
         let crc = crc32c::crc32c(&body);
         let mut out = Vec::with_capacity(body.len() + 12);
@@ -608,6 +627,7 @@ pub fn write_segment(
         data.core_patched.clone(),
         data.born_by_identity.clone(),
     );
+    w.set_core_patched_edges(data.core_patched_edges.clone());
     w.finish()
 }
 
@@ -656,6 +676,8 @@ pub struct L0Reader {
     born_index: Vec<BornIndexEntry>,
     core_patched: Vec<(String, String, u64)>,
     born_by_identity: HashMap<Vec<u8>, u64>,
+    /// Resident core-edge patch endpoints (v4 meta) — `(edge id, src, dst, reltype)`.
+    core_patched_edges: Vec<(u64, u64, u64, String)>,
     /// Resident suppressed dense ids (v2 meta) — the live-count summary's candidate set.
     tombstoned: Vec<u64>,
     /// Resident edge live-count columns (v2 meta).
@@ -789,6 +811,16 @@ impl L0Reader {
         let added_label_ids = r_label_ids(&mut r)?;
         let removed_label_ids = r_label_ids(&mut r)?;
         let label_overlay_ids = r_u64s(&mut r)?;
+        // v4: core-edge patch endpoints.
+        let n_cpe = read_uvarint(&mut r)? as usize;
+        let mut core_patched_edges = Vec::with_capacity(n_cpe);
+        for _ in 0..n_cpe {
+            let eid = read_uvarint(&mut r)?;
+            let src = read_uvarint(&mut r)?;
+            let dst = read_uvarint(&mut r)?;
+            let reltype = r_str(&mut r)?;
+            core_patched_edges.push((eid, src, dst, reltype));
+        }
         if !r.is_empty() {
             bail!("L0 segment {dir:?} meta has {} trailing bytes", r.len());
         }
@@ -818,6 +850,7 @@ impl L0Reader {
             born_index,
             core_patched,
             born_by_identity,
+            core_patched_edges,
             added_label_ids,
             removed_label_ids,
             label_overlay_ids,
@@ -1034,6 +1067,18 @@ impl LevelRead for L0Reader {
             .expect("l0 edge record");
         Some(decode_edge(&bytes).expect("decode l0 edge"))
     }
+    fn node_dense_ids(&self) -> Vec<u64> {
+        self.node_keys.clone()
+    }
+    fn adj_out_nodes(&self) -> Vec<u64> {
+        self.adj_out_keys.clone()
+    }
+    fn edge_ids(&self) -> Vec<u64> {
+        self.edge_keys.clone()
+    }
+    fn core_patched_edges(&self) -> Vec<(u64, u64, u64, String)> {
+        self.core_patched_edges.clone()
+    }
 }
 
 impl L0Reader {
@@ -1162,6 +1207,9 @@ pub fn merge_run(
     let mut born_index: Vec<BornIndexEntry> = Vec::new();
     let mut core_patched: Vec<(String, String, u64)> = Vec::new();
     let mut born_by_identity: Vec<(Vec<u8>, u64)> = Vec::new();
+    // Core-edge patch endpoints, newest-wins by edge id (endpoints are stable, so the fold
+    // only matters if a newer level re-patched the same edge — either way the endpoints agree).
+    let mut cpe: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new();
     for r in run.iter().rev() {
         for (label, ids) in r.born_by_label_ref() {
             by_label
@@ -1174,12 +1222,20 @@ pub fn merge_run(
         for (ck, id) in r.born_by_identity_ref() {
             born_by_identity.push((ck.clone(), *id));
         }
+        for (eid, src, dst, reltype) in r.core_patched_edges() {
+            cpe.insert(eid, (src, dst, reltype));
+        }
     }
     w.set_secondaries(
         by_label.into_iter().collect(),
         born_index,
         core_patched,
         born_by_identity,
+    );
+    w.set_core_patched_edges(
+        cpe.into_iter()
+            .map(|(eid, (src, dst, rt))| (eid, src, dst, rt))
+            .collect(),
     );
     w.finish()
 }

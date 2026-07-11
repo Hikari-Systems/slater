@@ -2334,6 +2334,19 @@ pub trait LevelRead: std::fmt::Debug + Send + Sync {
     fn as_memtable(&self) -> Option<&Memtable> {
         None
     }
+
+    /// Every dense node id this level carries a delta for (core-resolved or born) — the
+    /// enumeration a T2 flush unions across levels to fold them into one segment's node
+    /// section. Unordered; the caller sorts + dedups the union.
+    fn node_dense_ids(&self) -> Vec<u64>;
+    /// Every source node with outgoing delta edges (born edges + core-edge-delete tombstones).
+    fn adj_out_nodes(&self) -> Vec<u64>;
+    /// Every edge id this level carries a delta for (born ids + patched core edge ids).
+    fn edge_ids(&self) -> Vec<u64>;
+    /// `(core edge id, src dense, dst dense, reltype)` for every in-place core-edge property
+    /// patch — the endpoints a T2 flush needs to materialise the edge's full replace row (a
+    /// patch is absent from the adjacency, so the edge section alone would drop them).
+    fn core_patched_edges(&self) -> Vec<(u64, u64, u64, String)>;
 }
 
 /// The resident level: a [`Memtable`] answers every accessor from its in-RAM maps,
@@ -2435,6 +2448,35 @@ impl LevelRead for Memtable {
     }
     fn edge_delta_owned(&self, edge_id: u64) -> Option<EdgeDelta> {
         self.edge_delta_by_id(edge_id).cloned()
+    }
+    fn node_dense_ids(&self) -> Vec<u64> {
+        self.by_dense.keys().copied().collect()
+    }
+    fn adj_out_nodes(&self) -> Vec<u64> {
+        self.out_adj.keys().copied().collect()
+    }
+    fn edge_ids(&self) -> Vec<u64> {
+        (0..self.born_edges.len() as u64)
+            .map(|i| self.edge_synthetic_base + i)
+            .chain(self.by_edge_id.keys().copied())
+            .collect()
+    }
+    fn core_patched_edges(&self) -> Vec<(u64, u64, u64, String)> {
+        self.by_edge_id
+            .iter()
+            .filter_map(|(&cid, eck)| {
+                let e = self.edges.get(eck)?;
+                Some((
+                    cid,
+                    e.src_dense,
+                    e.dst_dense,
+                    self.interner
+                        .name(e.identity.reltype)
+                        .unwrap_or("")
+                        .to_string(),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -3070,6 +3112,111 @@ impl Default for DeltaSnapshot {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Fold a frozen delta — the active memtable (newest) over its sealed L0 levels (resident or
+/// **off-heap**) — into the [`SegmentData`](crate::l0_offheap::SegmentData) a **T2 segment
+/// flush** consumes, folded newest-wins across levels via a [`DeltaSnapshot`]. Produces only
+/// the fields `write_flush_segment` reads: the scalars, node rows, outgoing adjacency, edge
+/// rows and core-edge patch endpoints.
+///
+/// This is the off-heap-capable analogue of `Memtable::merge_levels(...).to_segment_data()`:
+/// it never reconstructs a `Memtable` (an off-heap level's block image drops the edge endpoint
+/// identities a memtable needs), working entirely in dense-id space. The resident-only flush
+/// path still uses `merge_levels`; this is reached when any level is off-heap.
+pub fn flush_segment_data(
+    active: &Arc<Memtable>,
+    l0: &[Arc<dyn LevelRead>],
+) -> crate::l0_offheap::SegmentData {
+    use crate::l0_offheap::SegmentData;
+    let snap = DeltaSnapshot::with_levels(active.clone(), l0.to_vec());
+    let base_node = snap.synthetic_base();
+    let base_edge = snap.edge_synthetic_base();
+
+    // Ascending, deduped union of an id column across the active memtable and every L0 level.
+    let union = |ids: &dyn Fn(&dyn LevelRead) -> Vec<u64>| -> Vec<u64> {
+        let mut v = ids(active.as_ref() as &dyn LevelRead);
+        for lvl in l0 {
+            v.extend(ids(lvl.as_ref()));
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    // The newest level that owns edge `id` (active first) — its tombstone flag decides.
+    let newest_edge = |id: u64| -> Option<EdgeDelta> {
+        std::iter::once(active.as_ref() as &dyn LevelRead)
+            .chain(l0.iter().map(|a| a.as_ref()))
+            .find_map(|l| l.edge_delta_owned(id))
+    };
+
+    let mut data = SegmentData {
+        synthetic_base: base_node,
+        edge_synthetic_base: base_edge,
+        born_count: snap.born_count(),
+        born_edge_count: snap.born_edge_count(),
+        ..Default::default()
+    };
+
+    // Node rows: folded delta + identity, ascending dense id. An inert no-op tombstone (a
+    // delete of a key never resolved to a dense id) has no id here, so it is dropped — exactly
+    // as `merge_levels` drops entries absent from `by_dense`.
+    for id in union(&|l| l.node_dense_ids()) {
+        if let (Some(delta), Some((label, key, value))) =
+            (snap.node_patch(id), snap.node_identity_by_dense(id))
+        {
+            data.nodes.push((id, label, key, value, delta));
+        }
+    }
+    // Outgoing adjacency: folded born edges + core-edge-delete tombstones, ascending src.
+    for node in union(&|l| l.adj_out_nodes()) {
+        let edges = snap.out_edges(node);
+        if !edges.is_empty() {
+            data.adj_out.push((node, edges));
+        }
+    }
+    // Edge rows, ascending edge id (core ids < base before born ids). A tombstoned CORE edge is
+    // suppressed via the adjacency removal above, never an edge row (matching `to_segment_data`,
+    // whose `by_edge_id` index drops on delete); a tombstoned BORN edge is kept (harmless — the
+    // flush's born-edge loop skips it).
+    for id in union(&|l| l.edge_ids()) {
+        let Some(newest) = newest_edge(id) else {
+            continue;
+        };
+        if id < base_edge && newest.tombstoned {
+            continue;
+        }
+        data.edges.push((
+            id,
+            EdgeDelta {
+                patches: snap.edge_patches(id),
+                tombstoned: newest.tombstoned,
+            },
+        ));
+    }
+    // Core-edge patch endpoints (newest-wins by id), dropping any whose merged edge is a
+    // tombstone (a patch-then-delete across levels is a delete, not a patched row).
+    let mut cpe: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new();
+    for (eid, src, dst, rt) in active.core_patched_edges() {
+        cpe.insert(eid, (src, dst, rt));
+    }
+    for lvl in l0 {
+        for (eid, src, dst, rt) in lvl.core_patched_edges() {
+            cpe.entry(eid).or_insert((src, dst, rt));
+        }
+    }
+    let live_patch: std::collections::HashSet<u64> = data
+        .edges
+        .iter()
+        .filter(|(_, d)| !d.tombstoned)
+        .map(|(id, _)| *id)
+        .collect();
+    data.core_patched_edges = cpe
+        .into_iter()
+        .filter(|(eid, _)| live_patch.contains(eid))
+        .map(|(eid, (src, dst, rt))| (eid, src, dst, rt))
+        .collect();
+    data
 }
 
 #[cfg(test)]

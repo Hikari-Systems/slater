@@ -806,9 +806,8 @@ pub struct DeltaConfig {
     /// stack exceeds `maxUpperSegments` (T3), and consolidation (`deltaCorePercent`) stays
     /// rare. **Off by default (0)** — like `deltaCorePercent`, folding the delta into the core
     /// is a durable heavyweight operation operators opt into; the explicit
-    /// `flush_graph_to_segment` path is unaffected. When a graph reads its L0 **off-heap**
-    /// (`offHeapL0`) the auto-flush is suppressed (an off-heap flush is not yet supported —
-    /// it still bails), so leave this 0 there.
+    /// `flush_graph_to_segment` path is unaffected. Fires for a resident **or** an off-heap
+    /// (`offHeapL0`) L0 stack — the off-heap fold lands at the `SegmentData` level (Phase 7.5).
     #[serde(default, deserialize_with = "de::usize")]
     pub segment_flush_bytes: usize,
     /// Maximum number of upper **core segments** a served set may carry before a T3

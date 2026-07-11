@@ -44,6 +44,7 @@ pub use identity::{EdgeIdentity, NodeIdentity};
 pub use l0::L0Segment;
 pub use l0_offheap::L0Reader;
 pub use memtable::{
-    DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta, OpResolution,
+    flush_segment_data, DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta,
+    OpResolution,
 };
 pub use wal::{replay_dir, replay_segment, Replay, SealedSegment, Seq, WalOp, WalRecord, WalSink};

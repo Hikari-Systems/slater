@@ -613,33 +613,27 @@ impl Graphs {
             return Ok(None); // nothing to flush; freeze's fresh WAL segment keeps taking writes
         }
 
-        // Fold the frozen snapshot with any spilled L0 levels into ONE newest-wins memtable
-        // (Phase 4c). The active memtable is newest; `frozen.l0` is newest-first — so the
-        // `merge_levels` order is `[snapshot, l0[0]…l0[n]]`. Every level was resolved against
-        // the same served core, so they share a `synthetic_base`; the merged memtable inherits
-        // it (= `prior_node_total`), keeping the writer's Phase-3.2 band assertion true. The
-        // no-L0 fast path flushes the snapshot directly (unchanged), so the merge — and its
-        // clone of the folded state — is only paid when levels actually stacked.
-        let merged: Option<Memtable> = if frozen.l0.is_empty() {
-            None
-        } else {
+        // Fold the frozen snapshot with any spilled L0 levels into ONE newest-wins
+        // `SegmentData` — the flush writer's input (Phase 4c). The active memtable is newest;
+        // `frozen.l0` is newest-first. Every level was resolved against the same served core, so
+        // they share a `synthetic_base`; the fold keeps it (= `prior_node_total`), holding the
+        // writer's Phase-3.2 band assertion. Three cases: **no L0** flushes the snapshot
+        // directly; **resident L0** folds in RAM via `merge_levels` (the tested path); **off-heap
+        // L0** (a block image, not a memtable) folds at the `SegmentData` level via
+        // `flush_segment_data` — working in dense-id space without reconstructing a memtable (an
+        // off-heap image drops the edge endpoint identities a memtable rebuild would need).
+        let flush_data: slater_delta::l0_offheap::SegmentData = if frozen.l0.is_empty() {
+            frozen.snapshot.to_segment_data()
+        } else if frozen.l0.iter().all(|l| l.as_memtable().is_some()) {
             let mut levels: Vec<&Memtable> = Vec::with_capacity(1 + frozen.l0.len());
             levels.push(frozen.snapshot.as_ref());
             for lvl in &frozen.l0 {
-                match lvl.as_memtable() {
-                    Some(m) => levels.push(m),
-                    // Off-heap L0 stores a block image, not a memtable, so `merge_levels`
-                    // cannot fold it (the `LevelRead` trait is lossy for a full rebuild).
-                    // Resident L0 (the default) folds; off-heap flush is a later slice.
-                    None => bail!(
-                        "flush_to_segment over an off-heap L0 level is not yet supported \
-                         (resident L0 folds; off-heap needs a memtable rebuild)"
-                    ),
-                }
+                levels.push(lvl.as_memtable().expect("all levels checked resident"));
             }
-            Some(Memtable::merge_levels(&levels))
+            Memtable::merge_levels(&levels).to_segment_data()
+        } else {
+            slater_delta::flush_segment_data(&frozen.snapshot, &frozen.l0)
         };
-        let flush_mem: &Memtable = merged.as_ref().unwrap_or_else(|| frozen.snapshot.as_ref());
 
         // The appended band starts at the current stack top (base + every existing segment).
         let prior_node_total = core.stack().extents().nodes.total();
@@ -688,7 +682,7 @@ impl Graphs {
                 encryption_header,
                 created_unix,
             };
-            match crate::flush_segment::write_flush_segment(flush_mem, &inp) {
+            match crate::flush_segment::write_flush_segment(&flush_data, &inp) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&seg_dir);
@@ -1585,14 +1579,11 @@ struct ConnCtx {
     /// Whole-delta byte budget (active memtable + every L0 level) that triggers a T2
     /// delta→segment flush after a write (`config.delta.segment_flush_bytes`; 0 disables
     /// — Phase 6). Distinct from `memtable_bytes` (memtable→L0); this folds the entire
-    /// delta into a core segment. Suppressed when `off_heap_l0` (that flush still bails).
+    /// delta into a core segment, resident or off-heap L0 alike (Phase 7.5).
     segment_flush_bytes: usize,
     /// Upper core-segment count that admits a T3 segment→segment compaction after a write
     /// (`config.delta.max_upper_segments`; 0 disables — Phase 5.3 policy, Phase 6 auto-fire).
     max_upper_segments: usize,
-    /// Whether this server reads L0 off-heap (`config.delta.off_heap_l0`). Consulted only
-    /// to suppress the T2 auto-flush (an off-heap flush is not yet supported — it bails).
-    off_heap_l0: bool,
     /// Grace (seconds) before the orphan segment/set GC sweep reclaims a dir the served set no
     /// longer references (`config.delta.segment_gc_grace_secs`; 0 disables — Phase 7 slice 7.2).
     /// The sweep fires after the orphan-creating events (a T3 compaction, a consolidation).
@@ -2479,7 +2470,6 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
         segment_flush_bytes: cfg.delta.segment_flush_bytes,
         max_upper_segments: cfg.delta.max_upper_segments,
-        off_heap_l0: cfg.delta.off_heap_l0,
         segment_gc_grace_secs: cfg.delta.segment_gc_grace_secs,
         delta_core_percent: cfg.delta.delta_core_percent,
         delta_hard_bytes: cfg.delta.delta_hard_bytes,
@@ -4438,13 +4428,9 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
 
         // T2: once the WHOLE delta (memtable + every L0 level) reaches `segmentFlushBytes`,
         // fold it into one durable core segment — the O(delta) drain that keeps the delta
-        // small without an O(core) consolidation. Off by default (0); suppressed under
-        // off-heap L0 (that flush still bails — an unsupported-path warn every write is not
-        // worth spawning).
-        if ctx.segment_flush_bytes > 0
-            && !ctx.off_heap_l0
-            && writer.total_bytes() >= ctx.segment_flush_bytes
-        {
+        // small without an O(core) consolidation. Off by default (0). Fires for a resident or
+        // an off-heap L0 stack alike (the off-heap fold is `flush_segment_data`, Phase 7.5).
+        if ctx.segment_flush_bytes > 0 && writer.total_bytes() >= ctx.segment_flush_bytes {
             let (g, c) = (graph.to_string(), ctx.clone());
             match tokio::task::spawn_blocking(move || {
                 c.graphs
@@ -5547,6 +5533,15 @@ mod tests {
             builder_bin: "slater-build".to_string(),
             off_heap_l0: false,
             segment_gc_grace_secs: 0,
+        }
+    }
+
+    /// [`delta_cfg`] reading sealed L0 levels **off-heap** (a block image paged through the
+    /// shared cache, not a resident memtable) — the config a T2 flush over off-heap L0 exercises.
+    fn delta_cfg_offheap(wal_dir: &Path) -> DeltaConfig {
+        DeltaConfig {
+            off_heap_l0: true,
+            ..delta_cfg(wal_dir)
         }
     }
 
@@ -8637,6 +8632,171 @@ mod tests {
             "newest-wins fold survives reopen: {:?}",
             alice2.rows[0][0]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A flush over an **off-heap** L0 stack (the previously-deferred case). With `offHeapL0`
+    /// every `flush_to_l0` seals a *block image* rather than a resident memtable, so the T2
+    /// flush folds it at the `SegmentData` level (`flush_segment_data`) instead of rebuilding a
+    /// memtable. Exercises every fold kind — a core-node patch re-applied across levels
+    /// (newest-wins), born nodes from different levels, a born edge, a **core-edge property
+    /// patch** (the v4 `core_patched_edges` that off-heap now persists), and a core-node delete —
+    /// all read back through an empty delta and survive a from-disk reopen.
+    #[test]
+    fn flush_to_segment_folds_an_off_heap_l0_stack() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_offheap_l0");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        // Off-heap L0 needs a resident block cache to page its sealed levels.
+        let wcache = Arc::new(graph_format::blockcache::BlockCache::new(1 << 20));
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg_offheap(&wal), &root, Some(wcache))
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+
+        // L0-oldest (off-heap): patch a core node, born Dave, a born edge, and a core-edge patch
+        // on the base Alice-KNOWS->Bob edge — the endpoints off-heap must now persist (v4).
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Alice'})-[:KNOWS]->(b:Person {name:'Dave'})",
+        );
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) SET r.since = 2099",
+        );
+        assert!(graphs.writer("people").unwrap().flush_to_l0().unwrap());
+
+        // Active memtable (newest): re-patch Alice (55 wins over 99), born Eve, delete Carol.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 55");
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+        assert_eq!(
+            graphs.writer("people").unwrap().l0_len(),
+            1,
+            "one off-heap L0 level"
+        );
+
+        // The flush folds [active ⊕ off-heap L0] into one segment — no longer a bail.
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("an off-heap-stacked delta flushes");
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.base_uuid(), base_uuid, "base preserved");
+        assert_eq!(gen1.stack().segments().len(), 1, "one folded upper segment");
+        let writer = graphs.writer("people").unwrap();
+        assert!(writer.snapshot().is_empty(), "delta retired empty");
+        assert_eq!(writer.l0_len(), 0, "the off-heap L0 level was consumed");
+
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+        let check = |graphs: &Graphs, tag: &str| {
+            // Newest-wins core patch (55 over 99).
+            assert!(
+                matches!(
+                    q(graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.age").rows[0][0],
+                    Val::Int(55)
+                ),
+                "{tag}: Alice's newest patch wins"
+            );
+            // Born nodes from both levels.
+            assert!(
+                matches!(
+                    q(graphs, "MATCH (n:Person {name:'Dave'}) RETURN n.age").rows[0][0],
+                    Val::Int(50)
+                ),
+                "{tag}: Dave (off-heap L0 born) present"
+            );
+            assert!(
+                matches!(
+                    q(graphs, "MATCH (n:Person {name:'Eve'}) RETURN n.age").rows[0][0],
+                    Val::Int(60)
+                ),
+                "{tag}: Eve (active born) present"
+            );
+            // Carol deleted; 3 base − 1 + 2 born = 4.
+            assert_eq!(
+                q(graphs, "MATCH (n:Person {name:'Carol'}) RETURN n")
+                    .rows
+                    .len(),
+                0,
+                "{tag}: Carol deleted through the off-heap fold"
+            );
+            assert!(
+                matches!(
+                    q(graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                    Val::Int(4)
+                ),
+                "{tag}: 3 base − Carol + Dave + Eve = 4"
+            );
+            // The core-edge patch (endpoints recovered from the persisted v4 field).
+            assert!(
+                matches!(
+                    q(graphs, "MATCH (:Person {name:'Alice'})-[r:KNOWS]->(:Person {name:'Bob'}) RETURN r.since").rows[0][0],
+                    Val::Int(2099)
+                ),
+                "{tag}: the off-heap core-edge patch folded into the segment"
+            );
+            // The born edge traverses.
+            let targets: Vec<String> = q(
+                graphs,
+                "MATCH (:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name",
+            )
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+            assert!(
+                targets.contains(&"Dave".to_string()),
+                "{tag}: born edge Alice->Dave traverses: {targets:?}"
+            );
+        };
+        check(&graphs, "post-flush");
+
+        // Reopen from disk (no writable layer): the folded segment serves everything.
+        drop(writer);
+        drop(gen1);
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the flushed set"
+        );
+        check(&graphs, "post-reopen");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -11854,7 +12014,6 @@ mod tests {
             l0_compaction_trigger,
             segment_flush_bytes,
             max_upper_segments,
-            off_heap_l0: false,
             segment_gc_grace_secs,
             delta_core_percent,
             delta_hard_bytes,
@@ -12021,7 +12180,6 @@ mod tests {
             l0_compaction_trigger: 4,
             segment_flush_bytes: 0,
             max_upper_segments: 8,
-            off_heap_l0: false,
             segment_gc_grace_secs: 0,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
@@ -12109,7 +12267,6 @@ mod tests {
             l0_compaction_trigger: 4,
             segment_flush_bytes: 0,
             max_upper_segments: 8,
-            off_heap_l0: false,
             segment_gc_grace_secs: 0,
             delta_core_percent: 0,
             delta_hard_bytes: 0,

@@ -128,9 +128,11 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.4 (HP27). **Phases 1–7 DONE.**
-Next is **Phase 8** — bench harness + hardening + docs: a read-amp harness (point lookup, 2-hop,
-label scan, counts) over fs and S3 at 0/2/4/8 segments, cold + warm.
+**Branch:** `writeable`. **Committed through:** Phase 7 (HP27) + flush-writer hardening (HP28/HP29 —
+both deferred flush `bail!`s closed: patch-then-delete of a core edge, and off-heap-L0 flush). **Phases
+1–7 DONE; every write op now flushes, resident or off-heap.** Next is **Phase 8** — bench harness +
+hardening + docs: a read-amp harness (point lookup, 2-hop, label scan, counts) over fs and S3 at
+0/2/4/8 segments, cold + warm.
 
 Phase 7 (T4 retarget + GC) is complete: (7.1) `serialise_binary_dump` folds the core stack so
 `consolidate_graph` collapses a stacked set to a correct singleton via the Phase-0 direct path;
@@ -138,10 +140,12 @@ Phase 7 (T4 retarget + GC) is complete: (7.1) `serialise_binary_dump` folds the 
 artifacts under a `.gc/`-marker grace, single-flight via `begin_consolidation`, never touching a
 generation dir; (7.3) `deltaConfig.segmentGcGraceSecs` (0 disables) wires the sweep into
 `maybe_maintain_delta` (post-compaction) and `execute_consolidate` (post-retarget); (7.4)
-`ObjectStore::delete` makes the sweep reclaim a remote store's objects too. Deferred `bail!`s still
-open in the *flush* writer (each benign, Phase-6-independent): patch-then-delete of the same core
-edge in one delta, and a flush over an off-heap L0 level (the T2 auto-trigger is gated off under
-`offHeapL0` for exactly that reason).
+`ObjectStore::delete` makes the sweep reclaim a remote store's objects too. **Both flush-writer
+deferrals are now closed** (HP28/HP29): a **patch-then-delete of the same core edge in one delta**
+(was a latent live-read bug — the memtable left the tombstone out of the adjacency overlay; fixed in
+`delete_edge`), and a **flush over an off-heap L0 level** (folds at the `SegmentData` level via
+`slater_delta::flush_segment_data`; off-heap format bumped to v4 to persist `core_patched_edges`; the
+`offHeapL0` T2-auto-flush suppression is removed).
 
 **Phase 7 (T4 retarget + GC) — slice 7.1 DONE (segment-aware consolidation dump — the retarget
 correctness gate).** `consolidate_graph` already freezes the delta, dumps `MergedView(core, delta)`
@@ -988,8 +992,32 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   (`seg-<uuid>`/`set-<uuid>`) so a store-backed instance that never staged a segment still
   grace-tracks it. One e2e (`gc_reclaims_orphans_from_an_object_store`, over a `MemObjectStore`).
   **747 slater lib** (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy (incl.
-  `s3,gcs`) + fmt clean. ← current baseline; **Phase 7 COMPLETE** (7.1–7.4). Next: **Phase 8** (bench
-  harness + hardening + docs).
+  `s3,gcs`) + fmt clean. **Phase 7 COMPLETE** (7.1–7.4).
+- HP28 — flush-writer hardening: **patch-then-delete of a core edge in one delta**. A `SET r.p`
+  (`patch_core_edge`) then `DELETE r` (`delete_edge`) on the same core edge left the tombstone out of
+  the adjacency overlay — the patch keyed the entry by core edge id (a patch changes no topology, so
+  it never touched `out_adj`/`in_adj`) and `delete_edge`'s existing-entry branch only set
+  `tombstoned` + cleared patches. So the **read overlay never suppressed the edge** (a latent live
+  bug) and the flush `bail!`ed. Fixed: `delete_edge`, when it tombstones an already-patched core edge,
+  drops the by-id index and registers the tombstone in `out_adj`/`in_adj` — matched by adjacency
+  identity like a plain delete. One e2e
+  (`flush_to_segment_materialises_a_patch_then_delete_of_a_core_edge`). 748 slater lib (+1) + 78
+  slater-delta.
+- HP29 — flush-writer hardening: **flush over an off-heap L0 stack** (the last deferred `bail!`).
+  `write_flush_segment` now consumes a `SegmentData` (it only ever used `to_segment_data()`), so the
+  caller folds by kind: no L0 → the snapshot's `to_segment_data`; **resident** L0 → `merge_levels`
+  (unchanged tested path); **off-heap** L0 → new `slater_delta::flush_segment_data`, which folds the
+  frozen delta at the `SegmentData` level via a `DeltaSnapshot` (dense-id space, no memtable rebuild —
+  an off-heap image drops the edge endpoint identities a rebuild needs). Needs the patched-edge
+  endpoints, so the off-heap format is **bumped to v4** to persist `core_patched_edges` (new
+  `LevelRead::{node_dense_ids,adj_out_nodes,edge_ids,core_patched_edges}` enumerators; `merge_run`
+  carries it forward). The `offHeapL0` T2-auto-flush suppression + the now-dead `ConnCtx.off_heap_l0`
+  are removed. One e2e (`flush_to_segment_folds_an_off_heap_l0_stack`: cross-level newest-wins core
+  patch, born nodes from both levels, a born edge, a **core-edge patch**, and a core-node delete —
+  folded, read back, and durable across a reopen). **749 slater lib** (+1) + 78 slater-delta + 141
+  graph-format + full workspace green (28 suites), clippy (incl. `s3,gcs`) + fmt clean. ← current
+  baseline. **Every write op now flushes, resident or off-heap — no per-op `bail!` remains.** Next:
+  **Phase 8** (bench harness + hardening + docs).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

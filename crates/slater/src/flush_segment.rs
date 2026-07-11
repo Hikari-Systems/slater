@@ -42,6 +42,12 @@
 //! so it flows through `suppressed` as an ordinary core-edge delete — the writer needs no
 //! special case (the edge-row loop's tombstoned-core-edge branch is now an invariant guard).
 //!
+//! A **stacked L0** flush folds every level newest-wins into one segment: a **resident** stack
+//! folds in RAM (`Memtable::merge_levels`), an **off-heap** stack (a block image, not a
+//! memtable) folds at the `SegmentData` level (`slater_delta::flush_segment_data`), so the flush
+//! writer consumes a `SegmentData` and no longer cares which. Every write op now flushes,
+//! resident or off-heap — no per-op `bail!` remains.
+//!
 //! # Full rows, replace semantics
 //! Segments hold *full* rows, not patches: the newest segment carrying an id wins in a
 //! single read (no cross-segment fold). For a **born** node the effective row is
@@ -70,7 +76,8 @@ use graph_format::segmanifest::{
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
-use slater_delta::{Memtable, NodeDelta};
+use slater_delta::l0_offheap::SegmentData;
+use slater_delta::NodeDelta;
 
 use crate::generation::Generation;
 
@@ -114,11 +121,11 @@ pub struct FlushInputs<'a> {
 /// node patches** — into a core segment at `inp.seg_dir`, writing every section
 /// (`node/adj_out/adj_in/edge.blk`), the index and posting fragments, and a sealed
 /// `SEGMENT.json`. Returns the sealed manifest, from which the caller derives a
-/// [`SegmentRef`](graph_format::setmanifest::SegmentRef) for the new set. Refuses a delta
-/// carrying a core node/edge tombstone, a core-edge patch, or a stacked L0 level — later
-/// slices (see the module scope note).
-pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentManifest> {
-    let data = mem.to_segment_data();
+/// [`SegmentRef`](graph_format::setmanifest::SegmentRef) for the new set. `data` is the folded
+/// delta (a single memtable's `to_segment_data`, a resident-L0 `merge_levels` fold, or an
+/// off-heap-L0 `flush_segment_data` fold — the caller picks), so every write op flushes,
+/// stacked or not, resident or off-heap.
+pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<SegmentManifest> {
     let synthetic_base = data.synthetic_base;
     let edge_synthetic_base = data.edge_synthetic_base;
 
