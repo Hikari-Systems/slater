@@ -118,9 +118,29 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.5 (`6e2c3a7`). **Phases
-1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.6 (hardening + conformance; histogram
-decline already landed in 3.5).**
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.6 (`85d68ff`). **Phases
+1–3 DONE.** Next: **Phase 4 — the T2 flush (`DeltaWriter::flush_to_segment`)**, the first
+*writer* of a core segment. Everything below Phase 3 is the read side; nothing produces a
+segment yet, so all of Phase 3 is exercised only by hand-built fixtures.
+
+### Phase 4 entry notes (obligations Phase 3 recorded — the flush writer MUST honour these)
+- **Synthetic id allocation:** the write-delta must allocate born ids above the *stack top*
+  (`core_stack().extents().nodes.total()` / `.edges.total()`), NOT merely above the base
+  count — else a delta-born id collides with a segment's band and `resolve_node_row` returns
+  the wrong row. (Today the delta's `synthetic_base` == base count; a flush over a stacked
+  set must lift it.)
+- **Removal sidecars are cross-layer:** a segment's `idx.meta` `removals` must list every id
+  whose indexed value it supersedes — base *or an older segment's* fragment entry — so the
+  oldest→newest `fold_index_*` retain gives newest-wins.
+- **Node-delete → incident-edge removals:** deleting a node must write `removed` adjacency
+  fragments for *every* incident edge on the neighbour's side (the read path drops a dead
+  edge via the removal fragment, NOT via a per-neighbour segment-tombstone check), and the
+  `edge_count_delta` / `reltype_edge_deltas` marginals must net those out. (See the
+  `write_basic_with_segment` vs `write_basic_with_born_segment` test fixtures: the former is
+  adjacency/scan-shaped and deliberately NOT edge-count-consistent; the latter is a clean
+  births-only segment used for the count oracle.)
+- **`marginals_exact`:** set it only when the flush can prove every marginal; the read path
+  declines all count fast paths to full execution when any segment is inexact.
 
 ### Phase 3 design (decided)
 
@@ -167,10 +187,14 @@ fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs 
   `try_count_fast_path` (declines inexact), `try_reltype_meta_fast_path` (routes stacked
   sets through `live_reltype_edge_groups`), `try_label_meta_fast_path` + grouped-index/
   count-walk (decline over a stacked set — **histogram decline landed here, not 3.6**).
-- **3.6** hardening: full suite + conformance fs+mem; clippy across the workspace; run the
-  fuzz target; sweep for any other fast path that reads base marginals directly without a
-  stack check (audit `try_*_fast_path` + `plan.rs` cost model `choose_node_scan` selectivity
-  which reads `label_node_count`/`node_count`); Phase 3 exit + doc.
+- **3.6 DONE** (`85d68ff`): full workspace suite + clippy + fuzz build green; mem-store
+  conformance (a stacked set opens + queries end-to-end store-natively). An adversarial
+  review of the merge seams verified all five invariants and the singleton/delta-only
+  byte-identity; it surfaced two ungated base-marginal *result* reads (both also pre-existing
+  delta-unaware), now fixed: `Engine::build_view` (algo.* subgraph) selects nodes via
+  `scan_candidates`, and `meta_stats` reports `live_*` counts. `plan.rs` `choose_node_scan`
+  reads base counts for **cost only** (the executor re-filters) — correct, left as-is.
+  **Phase 3 COMPLETE.**
 
 **Reference — the delta-overlay mirror targets** (Phase 3 seams mimic these for segments):
 `MergedView` in `read_view.rs` (`live_*` signed marginals); `exec.rs` `overlay_node_props`
@@ -199,11 +223,12 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
 - HP7 — Phase 3 slice 3.4: index-probe union + segment-aware scans (`1851b49`); 707 slater
   lib tests green (3 scan oracle tests), clippy clean. ✓
 - HP8 — Phase 3 slice 3.5: count summation via signed marginals + histogram decline
-  (`6e2c3a7`); 708 slater lib tests green (count oracle + decline), clippy clean. ✓ ←
-  current baseline.
+  (`6e2c3a7`); 708 slater lib tests green (count oracle + decline), clippy clean. ✓
+- HP9 — Phase 3 slice 3.6: hardening + conformance + review fixes (`85d68ff`); full
+  workspace suite green (710 slater lib), clippy clean, fuzz builds; mem-store conformance.
+  ✓ **Phase 3 COMPLETE.** ← current baseline; next track is Phase 4 (T2 flush writer).
 
-**Immediate next step — start Phase 2 (core-segment format).** Build
-`graph-format/src/segment.rs` incrementally, each slice its own green commit:
+**Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
      node & edge id → segment, binary-searched; unit tests. (isolated, safe first slice)
      **DONE** — `ExtentTable`/`Extents`/`SegmentOrd`, `partition_point` routing, tiling
@@ -258,14 +283,15 @@ Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core track for slater (branch `writeable`). Read
-> `docs/SEGMENTED-CORE-PLAN.md`, especially "RESUME HERE", and the task list. Phase 1
-> is done; continue from the next handoff point (Phase 2, core-segment format —
-> `graph-format/src/segment.rs`, template `slater-delta/src/l0_offheap.rs`). Build/test
-> with `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` and
-> `dangerouslyDisableSandbox`. Commit at each safe handoff point and update
-> "RESUME HERE" as you go.
+> `docs/SEGMENTED-CORE-PLAN.md`, especially "RESUME HERE", and the task list. Phases 1–3
+> are done (read path over a stacked set); continue from the next handoff point (Phase 4 —
+> the T2 flush, `DeltaWriter::flush_to_segment`, the first *writer* of a core segment).
+> Honour the "Phase 4 entry notes" obligations. Build/test with
+> `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` and `dangerouslyDisableSandbox`.
+> Commit at each safe handoff point and update "RESUME HERE" as you go.
 
-**Key files:** `graph-format/src/{segment.rs(new),extents.rs(new),setmanifest.rs,
-manifest.rs,isam.rs,blockfile.rs,ids.rs}`, `slater-delta/src/l0_offheap.rs` (template),
-`slater/src/{generation.rs,read_view.rs,exec.rs,server.rs,cache.rs}`,
-`slater-build/src/common.rs`.
+**Key files for Phase 4:** `slater/src/{delta_writer.rs,segstack.rs,generation.rs,
+server.rs,consolidate.rs}`, `slater-delta/src/memtable.rs` (delta level → segment
+materialisation; `synthetic_base`), `graph-format/src/{segment.rs,segindex.rs,
+segpostings.rs,segmanifest.rs,setmanifest.rs}` (the writers), the read-side fold in
+`slater/src/{read_view.rs,exec.rs}` (the merge Phase 4's output must satisfy).
