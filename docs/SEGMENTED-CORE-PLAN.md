@@ -102,7 +102,9 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
 - **Phase 7 — T4 retarget + GC.** IN PROGRESS. `consolidate_graph` collapses a set to a
   singleton via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
   Slice 7.1 DONE (`HP24`): segment-aware consolidation dump (the retarget correctness gate —
-  `serialise_binary_dump` folds the core stack). Slice 7.2: orphan segment/set GC.
+  `serialise_binary_dump` folds the core stack). Slice 7.2 DONE (`HP25`): orphan segment/set GC
+  core (`Graphs::gc_orphan_segments`, local-fs, marker-based grace). Slice 7.3: GC config +
+  write-path wiring. Slice 7.4 (optional): remote-store GC parity.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
   2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm.
 
@@ -125,8 +127,12 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.1 (HP24). **Phases 1–6
-DONE; Phase 7 IN PROGRESS.** Next is **Phase 7 slice 7.2** (orphan segment/set GC).
+**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.2 (HP25). **Phases 1–6
+DONE; Phase 7 IN PROGRESS** (7.1 retarget gate + 7.2 GC core done). Next is **Phase 7 slice
+7.3** (GC config knob `deltaConfig.segmentGcGraceSecs` + wiring the sweep after a T3 compaction
+and a consolidation/retarget). `Graphs::gc_orphan_segments(name, data_dir, grace_secs)` is the
+core (local-fs, marker-based grace, single-flight via `begin_consolidation`, never touches a gen
+dir); 7.4 (optional) adds `ObjectStore::delete` for remote-store parity.
 
 **Phase 7 (T4 retarget + GC) — slice 7.1 DONE (segment-aware consolidation dump — the retarget
 correctness gate).** `consolidate_graph` already freezes the delta, dumps `MergedView(core, delta)`
@@ -423,13 +429,32 @@ Two slices:
   _to_a_singleton`: the retarget folds a stacked core back to a singleton via the direct dump path,
   re-binds the writer, carries a post-freeze write forward). **742 slater lib** (+2) + 141
   graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
-- **7.2 — orphan segment/set GC (grace-period sweep).** Flush (4.4-d) and compaction (5.1)
-  intentionally leave the superseded `segments/<uuid>/` dirs and `sets/<uuid>.json` files on disk for
-  a later sweep; a retarget to a singleton orphans the whole prior set + all its segments. A
-  `Graphs` GC pass computes the live reference set from `current` (→ set → base + segment uuids, or a
-  singleton gen) and removes unreferenced segment dirs + stale set files older than a **grace period**
-  (a reader may still hold a just-swapped-out `Generation`). Config `deltaConfig.segmentGcGraceSecs`;
-  crash-safe (never deletes a referenced or too-recent dir), local-fs first then object-store parity.
+- **7.2 DONE** (HP25) — **orphan segment/set GC core (grace-period sweep).** Flush (4.4-d) and
+  compaction (5.1) intentionally leave the superseded `segments/<uuid>/` dirs and `sets/<uuid>.json`
+  files on disk for a later sweep; a retarget (7.1) to a singleton orphans the whole prior set + all
+  its segments. New `Graphs::gc_orphan_segments(name, data_dir, grace_secs) -> SegmentGcReport`
+  computes the live reference set from `current` (→ set → its segment uuids; a bare-gen `current`
+  after a retarget has no set file ⇒ nothing live ⇒ every set/segment is an orphan) and reclaims the
+  unreferenced `segments/` dirs + `sets/*.json` files. **Reader safety** via a grace measured from the
+  *retirement observation*, not file creation: the first sweep drops a `.gcmark` marker (its mtime is
+  the observation), a later sweep deletes once the marker ages past `grace_secs` (`0` = immediate).
+  Local-fs readers hold the segment files open, so `remove_dir_all` is safe under an in-flight reader
+  (the inode outlives the unlink); the grace covers a reader mid-open and a future remote backend.
+  **Single-flight**: takes the `begin_consolidation` claim (when a writable layer exists) so it never
+  races a flush/compaction/consolidation — with the claim held, no in-flight op is publishing a
+  segment `current` does not yet name, so even immediate mode is safe. Never touches a **generation**
+  directory (base or the retargeted singleton) — only `segments/` and `sets/`. **Local-fs only** for
+  now (deletion is `std::fs` under `data_dir`; the `ObjectStore` trait has no delete — a remote sweep
+  is slice 7.4). Three e2e oracles (`gc_reclaims_stale_sets_and_compacted_segments`,
+  `gc_respects_the_grace_before_reclaiming`, `gc_after_retarget_reclaims_the_prior_set`). **745 slater
+  lib** (+3) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
+- **7.3 — GC config + write-path wiring (NEXT).** A `deltaConfig.segmentGcGraceSecs` knob (`0`
+  disables) plumbed onto `ConnCtx`, and the sweep wired to fire after the orphan-creating events — a
+  T3 compaction (in `maybe_maintain_delta`) and a consolidation/retarget (in the consolidate path) —
+  rather than every write, guarded by the knob and treating a lost single-flight race as benign (debug).
+- **7.4 — remote-store GC parity (optional).** Add an `ObjectStore::delete` and reclaim a remote
+  set/segment's objects (with the grace covering lazy block re-fetch, where the fd-persistence
+  argument does not hold).
 
 ### Phase 6 slice log
 - **6.4 DONE** (HP23): **T2/T3 auto-trigger wire-up** — Phase 6 CLOSED. `maybe_maintain_delta`
@@ -901,8 +926,22 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   byte-for-byte unchanged (`!stacked` short-circuit). Two e2e oracles
   (`consolidation_dump_folds_the_segment_stack`,
   `consolidate_over_a_stacked_set_collapses_to_a_singleton`). **742 slater lib** (+2) + 141
-  graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next
-  is Phase 7 slice 7.2 (orphan segment/set GC).
+  graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
+- HP25 — Phase 7 slice 7.2: **orphan segment/set GC core**. New
+  `Graphs::gc_orphan_segments(name, data_dir, grace_secs) -> SegmentGcReport` (`server.rs`) reclaims
+  the `segments/<uuid>/` dirs + `sets/<uuid>.json` files the current served set no longer references —
+  the disk the flush (4.4-d) and compaction (5.1) slices leave behind, plus everything a retarget
+  (7.1) orphans when it collapses a stacked set to a singleton (a bare-gen `current` ⇒ nothing live).
+  **Reader-safe grace** measured from the retirement *observation*, not file creation: sweep 1 stamps
+  a `.gcmark` marker, a later sweep deletes once it ages past `grace_secs` (`0` = immediate; safe here
+  because the sweep holds the `begin_consolidation` claim, so no in-flight flush/compaction is
+  publishing a segment `current` does not yet name; local-fs readers hold the files open so a delete
+  under them is safe via inode persistence). Never touches a **generation** dir — only `segments/` and
+  `sets/`. **Local-fs only** (deletion is `std::fs`; the `ObjectStore` trait has no delete — remote is
+  slice 7.4). Three e2e oracles (`gc_reclaims_stale_sets_and_compacted_segments`,
+  `gc_respects_the_grace_before_reclaiming`, `gc_after_retarget_reclaims_the_prior_set`). **745 slater
+  lib** (+3) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ←
+  current baseline; next is Phase 7 slice 7.3 (GC config + write-path wiring).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

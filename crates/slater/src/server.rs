@@ -972,6 +972,173 @@ impl Graphs {
         self.compact_graph_segments(name, vector_cache, data_dir, start, end)
             .map(Some)
     }
+
+    /// **T4 GC** (Phase 7 slice 7.2): reclaim the orphaned `segments/<uuid>/` directories and
+    /// stale `sets/<uuid>.json` files under `<data_dir>/<name>/` that the **currently served
+    /// set** no longer references — the disk-reclamation the flush (4.4-d) and compaction (5.1)
+    /// slices deferred, plus everything a retarget (7.1) orphans when it collapses a stacked set
+    /// to a singleton (the whole prior set + all its segments).
+    ///
+    /// # Grace period (reader safety)
+    /// A just-swapped-out set/segment may still be held by an in-flight reader that opened its
+    /// `Generation` before the swap. On the local filesystem that reader holds the segment's
+    /// files open, so `remove_dir_all` is safe for it (the inode outlives the unlink until the
+    /// reader drops) — but a reader mid-open, or a future remote backend that re-fetches blocks
+    /// lazily, is not. So an orphan is deleted only after it has been **observed unreferenced for
+    /// at least `grace_secs`**: the first sweep drops a `.gcmark` marker (its mtime is the
+    /// retirement observation), and a later sweep deletes once the marker has aged past the
+    /// grace. `grace_secs == 0` deletes on first sight (immediate mode — safe here because the
+    /// sweep holds the single-flight claim below, so no in-flight flush/compaction is publishing
+    /// a segment `current` does not yet name).
+    ///
+    /// # Single-flight
+    /// Takes the [`DeltaWriter::begin_consolidation`] claim (when a writable layer exists) so it
+    /// never races a flush / compaction / consolidation mutating the set/stack — a lost race
+    /// bails "already in progress" (benign; the caller retries on a later write). A read-only
+    /// graph has no writer and nothing mutates its stack, so the claim is skipped.
+    ///
+    /// Local-filesystem only for now: deletion is `std::fs` under `data_dir`. A remote store
+    /// (which needs an `ObjectStore` delete) is a later sub-slice, so this is a no-op there.
+    pub fn gc_orphan_segments(
+        &self,
+        name: &str,
+        data_dir: &Path,
+        grace_secs: u64,
+    ) -> Result<SegmentGcReport> {
+        // Remote/in-memory backends serve segments through the store, not `data_dir`, and the
+        // trait has no delete — reclaiming their objects is a later sub-slice.
+        if !self.store.is_local_fs() {
+            return Ok(SegmentGcReport::default());
+        }
+        // Never race a stack mutation (flush / compaction / consolidation). A read-only graph
+        // has no writable layer, so nothing mutates its stack and the claim is unnecessary.
+        let _guard = match self.writer(name) {
+            Some(w) => {
+                if !w.begin_consolidation() {
+                    bail!("a consolidation or flush for '{name}' is already in progress");
+                }
+                Some(ConsolidationGuard(w))
+            }
+            None => None,
+        };
+
+        // The live reference set: the set `current` names, plus its segments. A `current` that
+        // names a bare generation uuid (a singleton — e.g. just after a retarget) has no set
+        // file, so nothing under `sets/` or `segments/` is live and every entry is an orphan.
+        let current = GenId(Generation::current_uuid_in(self.store.as_ref(), name)?);
+        let (live_set, live_segments): (Option<GenId>, std::collections::HashSet<GenId>) =
+            if graph_format::setmanifest::SetManifest::exists_via(
+                self.store.as_ref(),
+                name,
+                current,
+            ) {
+                let set = graph_format::setmanifest::SetManifest::read_via(
+                    self.store.as_ref(),
+                    name,
+                    current,
+                )
+                .with_context(|| format!("read current set for GC of '{name}'"))?;
+                let segs = set.segments.iter().map(|s| s.uuid).collect();
+                (Some(current), segs)
+            } else {
+                (None, std::collections::HashSet::new())
+            };
+
+        let graph_dir = data_dir.join(name);
+        let now = now_unix();
+        let mut report = SegmentGcReport::default();
+
+        // Whether an orphan marked at `marker` has aged past the grace; on the first sighting
+        // (no marker) it stamps one and reports "not yet". `grace_secs == 0` is immediate.
+        let eligible = |marker: &Path| -> Result<bool> {
+            if grace_secs == 0 {
+                return Ok(true);
+            }
+            match std::fs::metadata(marker) {
+                Ok(md) => {
+                    let mtime = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    Ok(now - mtime >= grace_secs as i64)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::File::create(marker)
+                        .with_context(|| format!("stamp gc marker {}", marker.display()))?;
+                    Ok(false)
+                }
+                Err(e) => Err(e).with_context(|| format!("stat gc marker {}", marker.display())),
+            }
+        };
+
+        // Orphaned segment directories. `segments/<uuid>/` the current set does not reference.
+        let segments_dir = graph_dir.join("segments");
+        for child in self.store.list(&join_key(name, "segments"))? {
+            let Ok(uuid) = uuid::Uuid::parse_str(&child) else {
+                continue; // skip markers / tmp / anything not a bare uuid dir
+            };
+            if live_segments.contains(&GenId(uuid)) {
+                continue;
+            }
+            let seg_dir = segments_dir.join(&child);
+            let marker = seg_dir.join(".gcmark");
+            if eligible(&marker)? {
+                std::fs::remove_dir_all(&seg_dir)
+                    .with_context(|| format!("gc segment dir {}", seg_dir.display()))?;
+                report.deleted_segments.push(GenId(uuid));
+            } else {
+                report.marked += 1;
+            }
+        }
+
+        // Stale set manifests. `sets/<uuid>.json` other than the current set (the marker for a
+        // set is a `.<uuid>.gcmark` sidecar, so it never collides with a `<uuid>.json`).
+        let sets_dir = graph_dir.join("sets");
+        for child in self.store.list(&join_key(name, "sets"))? {
+            let Some(stem) = child.strip_suffix(".json") else {
+                continue; // skip markers (.<uuid>.gcmark) and *.tmp
+            };
+            let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+            if live_set == Some(GenId(uuid)) {
+                continue;
+            }
+            let set_path = sets_dir.join(&child);
+            let marker = sets_dir.join(format!(".{uuid}.gcmark"));
+            if eligible(&marker)? {
+                std::fs::remove_file(&set_path)
+                    .with_context(|| format!("gc set manifest {}", set_path.display()))?;
+                let _ = std::fs::remove_file(&marker); // idempotent
+                report.deleted_sets.push(GenId(uuid));
+            } else {
+                report.marked += 1;
+            }
+        }
+
+        if !report.deleted_segments.is_empty() || !report.deleted_sets.is_empty() {
+            info!(
+                graph = %name,
+                segments = report.deleted_segments.len(),
+                sets = report.deleted_sets.len(),
+                "reclaimed orphaned segment/set artifacts"
+            );
+        }
+        Ok(report)
+    }
+}
+
+/// What a [`Graphs::gc_orphan_segments`] sweep reclaimed (or newly observed).
+#[derive(Debug, Default, Clone)]
+pub struct SegmentGcReport {
+    /// Segment directories deleted this sweep (aged past the grace).
+    pub deleted_segments: Vec<GenId>,
+    /// Set manifest files deleted this sweep.
+    pub deleted_sets: Vec<GenId>,
+    /// Orphans newly observed this sweep — marked, awaiting the grace before deletion.
+    pub marked: usize,
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it — never in practice).
@@ -7341,6 +7508,272 @@ mod tests {
             "post-freeze write carried forward"
         );
         assert!(!root.join("people").join(".consolidate.dump").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Phase 7 slice 7.2: orphan segment/set GC ─────────────────────────────────
+
+    /// The segment directory names (uuid dirs, skipping dot-files) under `<root>/people/`.
+    fn seg_dirs(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root.join("people").join("segments"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `<uuid>.json` set manifest file names under `<root>/people/sets/`.
+    fn set_files(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root.join("people").join("sets"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Phase 7 slice 7.2: the GC sweep reclaims the disk the flush and compaction slices
+    /// intentionally leave behind. Two flushes stack two segments and orphan the first set;
+    /// GC reclaims the stale set while both (live) segments survive. Compacting the two
+    /// segments into one then orphans the run's two dirs + the pre-compaction set; GC reclaims
+    /// exactly those, keeping the merged segment and the current set — and never touching the
+    /// base generation directory. Reads stay consistent across the whole sweep.
+    #[test]
+    fn gc_reclaims_stale_sets_and_compacted_segments() {
+        let (root, _g) = testgen::write_indexed_people("gc_reclaim_72");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().base_uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+
+        // Two flushes → two segments; `current` names set2 (base + seg1 + seg2), set1 is stale.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(graphs.get("people").unwrap().stack().segments().len(), 2);
+        assert_eq!(set_files(&root).len(), 2, "set1 (stale) + set2 (current)");
+        assert_eq!(seg_dirs(&root).len(), 2, "two live segments");
+
+        // Immediate GC reclaims the stale set1.json; both segments are live under set2.
+        let rep = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(rep.deleted_sets.len(), 1, "the stale set is reclaimed");
+        assert!(
+            rep.deleted_segments.is_empty(),
+            "both segments live under set2"
+        );
+        assert_eq!(set_files(&root).len(), 1, "only the current set remains");
+        assert_eq!(seg_dirs(&root).len(), 2, "segments untouched");
+
+        // Compact the two segments into one → set3 (base + merged); seg1, seg2 and set2 orphan.
+        graphs
+            .compact_graph_segments("people", &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(graphs.get("people").unwrap().stack().segments().len(), 1);
+        assert_eq!(
+            seg_dirs(&root).len(),
+            3,
+            "2 compacted + 1 merged on disk pre-GC"
+        );
+
+        let rep = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(
+            rep.deleted_segments.len(),
+            2,
+            "the compacted run's dirs reclaimed"
+        );
+        assert_eq!(
+            rep.deleted_sets.len(),
+            1,
+            "the pre-compaction set reclaimed"
+        );
+        assert_eq!(seg_dirs(&root).len(), 1, "only the merged segment remains");
+        assert_eq!(set_files(&root).len(), 1, "only the current set remains");
+        assert!(
+            root.join("people").join(base_uuid.0.to_string()).exists(),
+            "GC never touches the base generation directory"
+        );
+
+        // Reads are consistent after the sweep: 3 base + Dave + Eve.
+        let gen = graphs.get("people").unwrap();
+        let w = graphs.writer("people").unwrap();
+        let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+        let n = Engine::new(&view, &cache)
+            .run(&parser::parse("MATCH (n:Person) RETURN count(*)").unwrap())
+            .unwrap();
+        assert!(matches!(n.rows[0][0], Val::Int(5)), "count intact after GC");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 7 slice 7.2: an orphan is not deleted until it has been observed unreferenced for
+    /// the grace period. A stale set is marked (not deleted) by sweeps within the grace, and
+    /// only an eligible (here: immediate) sweep reclaims it — the reader-safety guarantee.
+    #[test]
+    fn gc_respects_the_grace_before_reclaiming() {
+        let (root, _g) = testgen::write_indexed_people("gc_grace_72");
+        let wal = root.join("_wal");
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        // Two flushes orphan set1.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(set_files(&root).len(), 2, "set1 stale + set2 current");
+
+        // A large grace: the first sweep only *marks* the stale set — nothing is deleted.
+        let rep = graphs.gc_orphan_segments("people", &root, 3600).unwrap();
+        assert!(
+            rep.deleted_sets.is_empty() && rep.deleted_segments.is_empty(),
+            "nothing deleted within the grace"
+        );
+        assert!(
+            rep.marked >= 1,
+            "the stale set was marked for a later sweep"
+        );
+        assert_eq!(
+            set_files(&root).len(),
+            2,
+            "stale set still present within grace"
+        );
+        // A second sweep, still within the grace, keeps waiting.
+        let rep2 = graphs.gc_orphan_segments("people", &root, 3600).unwrap();
+        assert!(rep2.deleted_sets.is_empty(), "still waiting out the grace");
+        assert_eq!(set_files(&root).len(), 2);
+        // Once eligible (immediate), the stale set is reclaimed.
+        let rep3 = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(rep3.deleted_sets.len(), 1, "eligible orphan reclaimed");
+        assert_eq!(set_files(&root).len(), 1, "only the current set remains");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 7 slice 7.2: after a retarget collapses a stacked set to a singleton (slice 7.1),
+    /// `current` names a bare generation with no set file — so the *whole* prior set and every
+    /// one of its segments is orphaned. GC reclaims them all, leaving the base generation and
+    /// the freshly built singleton generation directories intact and the graph readable.
+    #[test]
+    fn gc_after_retarget_reclaims_the_prior_set() {
+        let (root, _g) = testgen::write_indexed_people("gc_retarget_72");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().base_uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        // Flush a segment so the core is stacked (set1 over base + seg).
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seg_dirs(&root).len(), 1);
+        assert_eq!(set_files(&root).len(), 1);
+
+        // Retarget to a singleton via an injected builder that publishes a fresh generation.
+        let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0072);
+        let build = |_dump: &Path, g: &str, dd: &Path| -> Result<()> {
+            assert_eq!(g, "people");
+            testgen::write_indexed_people_at(dd, new_uuid, [30, 25, 40]);
+            Ok(())
+        };
+        graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+        let gen1 = graphs.get("people").unwrap();
+        assert!(gen1.stack().is_singleton(), "retarget collapsed the stack");
+        assert_eq!(gen1.uuid().0, new_uuid);
+        // The prior set + segment linger on disk until GC (the deferred reclamation).
+        assert_eq!(seg_dirs(&root).len(), 1, "prior segment lingers pre-GC");
+        assert_eq!(set_files(&root).len(), 1, "prior set lingers pre-GC");
+
+        // GC reclaims the whole prior set + its segment (current is a bare singleton gen).
+        let rep = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(rep.deleted_segments.len(), 1, "prior segment reclaimed");
+        assert_eq!(rep.deleted_sets.len(), 1, "prior set reclaimed");
+        assert_eq!(seg_dirs(&root).len(), 0);
+        assert_eq!(set_files(&root).len(), 0);
+        // Both generation directories survive — GC only touches segments/ and sets/.
+        assert!(
+            root.join("people").join(base_uuid.0.to_string()).exists(),
+            "base generation survives"
+        );
+        assert!(
+            root.join("people").join(new_uuid.to_string()).exists(),
+            "the retargeted singleton generation survives"
+        );
+
+        // The singleton still serves.
+        let gen = graphs.get("people").unwrap();
+        let w = graphs.writer("people").unwrap();
+        let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+        let alice = Engine::new(&view, &cache)
+            .run(&parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap())
+            .unwrap();
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(30)),
+            "singleton readable after GC"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
