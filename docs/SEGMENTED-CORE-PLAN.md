@@ -118,9 +118,8 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.1 (`1cc6b55`). **Phases
-1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.2 (full-row node/edge resolution over
-the stack).**
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.2 (`ad005a8`). **Phases
+1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.3 (adjacency fan-out gating).**
 
 ### Phase 3 design (decided)
 
@@ -144,11 +143,12 @@ resolver needs only `&CoreStack` + the id.
 fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs set):**
 - **3.1 DONE** (`057fec2` store-native segment opens; `1cc6b55` `CoreStack` load+route+
   `core_stack()`, wired into `Generation::open`, INERT — no read consults it yet).
-- **3.2** node/edge full-row resolution: add `CoreStack::resolve_node_row(id)->Option<NodeRow>`
-  (newest→oldest full-row-wins, `None`=miss→base) + `resolve_edge_row`; wire `exec.rs`
-  `node_props`/`node_label_ids`(`node_label_ids_par`)/`edge_props` to consult the stack
-  before the delta overlay. Map segment name-space rows → id-space (names absent from core
-  symbols drop from the id-keyed view, readable by name — mirrors born-edge props).
+- **3.2 DONE** (`ad005a8`): `CoreStack::resolve_node_row/resolve_edge_row`; seams
+  `node_label_ids_par`, `node_prop_par`, `edge_prop_par` resolve segment full-row over base
+  before the delta; name-space `core_named_props`/`core_named_edge_props` (used by
+  `node_record`/`rel_record`/`all_properties`) preserve non-core-symbol keys. Precedence
+  delta>segment>base. **Invariant for Phase 4: the delta must allocate synthetic ids above
+  the *stack top*, not just above the base** (else a born id collides with a segment band).
 - **3.3** adjacency: merge base `outgoing/incoming` with each segment's `out_adj/in_adj`
   fragments (`removed` suppresses, `may_hold_node` gates the fan-out) in
   `read_adj_overlaid`/`overlay_adj`, then delta on top.
@@ -180,7 +180,9 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
 - HP3 — Phase 2 segment format, 5 slices, committed through `35f0c0d`. ✓ **Phase 2 complete.**
 - HP4 — Phase 3 slice 3.1: store-native segment opens (`057fec2`) + `CoreStack`
   load/route/`core_stack()` wired into `Generation::open`, INERT (`1cc6b55`); 140
-  graph-format + 702 slater lib tests green, clippy clean. ✓ ← current baseline.
+  graph-format + 702 slater lib tests green, clippy clean. ✓
+- HP5 — Phase 3 slice 3.2: node/edge full-row resolution seam (`ad005a8`); 704 slater lib
+  tests green (2 stacked-set oracle tests), clippy clean. ✓ ← current baseline.
 
 **Immediate next step — start Phase 2 (core-segment format).** Build
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
