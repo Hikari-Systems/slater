@@ -38,6 +38,7 @@ use anyhow::{bail, Result};
 
 use crate::algo;
 use crate::cache::{BlockCache, FileKind, VectorIndexCache};
+use crate::generation::RelEndpointSide;
 use crate::parser::ast::*;
 use crate::plan::{choose_node_scan, index_for, is_id_anchored, maybe_rel_type_scan, NodeScan};
 use crate::read_view::ReadView;
@@ -5506,6 +5507,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     .range_index(index)
                     .expect("planner only picks open indexes")
                     .lookup_eq(key)?;
+                // Core stack (below the delta): suppress base hits the segments supersede,
+                // union the segments' matching born/patched ids, then restore ascending
+                // order for the delta overlay below.
+                let stack = self.gen.core_stack();
+                if !stack.is_singleton() {
+                    if let Some((label, prop)) = self.node_index_label_prop(index) {
+                        stack.fold_index_eq(&mut ids, label, prop, key)?;
+                        ids.sort_unstable();
+                        ids.dedup();
+                    }
+                }
                 let delta = self.gen.delta();
                 if !delta.is_empty() {
                     if let Some((label, prop)) = self.node_index_label_prop(index) {
@@ -5541,6 +5553,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         hi.as_ref().map(|(v, _)| v),
                         hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
                     )?;
+                // Core stack index fragments (below the delta), mirroring `RangeEq`.
+                let stack = self.gen.core_stack();
+                if !stack.is_singleton() {
+                    if let Some((label, prop)) = self.node_index_label_prop(index) {
+                        stack.fold_index_range(
+                            &mut ids,
+                            label,
+                            prop,
+                            lo.as_ref().map(|(v, _)| v),
+                            lo.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                            hi.as_ref().map(|(v, _)| v),
+                            hi.as_ref().map(|(_, i)| *i).unwrap_or(true),
+                        )?;
+                        ids.sort_unstable();
+                        ids.dedup();
+                    }
+                }
                 // Mirrors the `RangeEq` overlay above: relocate patched core nodes in
                 // the range index, then append matching delta-born nodes (Phase 2d).
                 let delta = self.gen.delta();
@@ -5569,6 +5598,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
             NodeScan::LabelScan { label_id } => {
                 let mut ids = self.gen.collect_nodes_with_label(*label_id)?;
+                // Core stack: a segment full row can add or drop a label (or tombstone the
+                // node), so every stack-touched id's membership is recomputed from its
+                // effective row, and born ids carrying the label are added.
+                let stack = self.gen.core_stack();
+                let label = self.gen.label_name(*label_id).map(str::to_string);
+                if !stack.is_singleton() {
+                    if let Some(label) = label.as_deref() {
+                        stack.fold_label_scan(&mut ids, label)?;
+                    }
+                }
                 // Delta-born nodes (Phase 2c) are not in the core label postings —
                 // append the synthetic ids carrying this label so a created node shows
                 // up in a label scan. Stage 5 also appends core/born ids that *gained*
@@ -5579,12 +5618,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 // fast path skips the lookup entirely.
                 let delta = self.gen.delta();
                 if !delta.is_empty() {
-                    if let Some(label) = self.gen.label_name(*label_id) {
+                    if let Some(label) = label.as_deref() {
                         ids.extend(delta.born_ids_with_label(label));
                         ids.extend(delta.ids_with_added_label(label));
-                        ids.sort_unstable();
-                        ids.dedup();
                     }
+                }
+                if !stack.is_singleton() || !delta.is_empty() {
+                    ids.sort_unstable();
+                    ids.dedup();
                 }
                 ids
             }
@@ -5594,24 +5635,59 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // scan; the first hop re-filters by reltype so this only narrows.
             NodeScan::RelTypeScan {
                 reltype_ids, side, ..
-            } => self
-                .gen
-                .collect_endpoint_nodes_for_reltypes(reltype_ids, *side)?,
+            } => {
+                let mut ids = self
+                    .gen
+                    .collect_endpoint_nodes_for_reltypes(reltype_ids, *side)?;
+                // Union each segment's endpoint driving set for these reltypes. Postings
+                // carry no removals — a superset stays correct because the first hop
+                // re-filters by reltype (and `suppress_tombstoned` drops deleted nodes).
+                let stack = self.gen.core_stack();
+                if !stack.is_singleton() {
+                    for seg in stack.segments() {
+                        let Some(post) = &seg.postings else { continue };
+                        for &rt in reltype_ids {
+                            let Some(name) = self.gen.reltype_name(rt) else {
+                                continue;
+                            };
+                            if matches!(side, RelEndpointSide::Source | RelEndpointSide::Either) {
+                                ids.extend_from_slice(post.src_ids(name));
+                            }
+                            if matches!(side, RelEndpointSide::Target | RelEndpointSide::Either) {
+                                ids.extend_from_slice(post.tgt_ids(name));
+                            }
+                        }
+                    }
+                    ids.sort_unstable();
+                    ids.dedup();
+                }
+                ids
+            }
         };
-        Ok(self.suppress_tombstoned(ids))
+        self.suppress_tombstoned(ids)
     }
 
-    /// Drop candidate dense ids the live delta has tombstoned (Phase 2): a deleted
-    /// node must never bind as an anchor. The empty-delta fast path returns the input
-    /// untouched, so the read-only path pays nothing.
-    fn suppress_tombstoned(&self, ids: Vec<u64>) -> Vec<u64> {
+    /// Drop candidate dense ids a deletion has tombstoned — the delta's (Phase 2) *and* the
+    /// core stack's (a flush that deleted a node): a deleted node must never bind as an
+    /// anchor. The pure-core singleton with an empty delta returns the input untouched, so
+    /// the read-only path pays nothing.
+    fn suppress_tombstoned(&self, ids: Vec<u64>) -> Result<Vec<u64>> {
         let delta = self.gen.delta();
-        if delta.is_empty() {
-            return ids;
+        let stack = self.gen.core_stack();
+        if delta.is_empty() && stack.is_singleton() {
+            return Ok(ids);
         }
-        ids.into_iter()
-            .filter(|&id| !delta.is_tombstoned(id))
-            .collect()
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if delta.is_tombstoned(id) {
+                continue;
+            }
+            if !stack.is_singleton() && stack.is_node_tombstoned(id)? {
+                continue;
+            }
+            out.push(id);
+        }
+        Ok(out)
     }
 
     /// The `(label, property)` a node range index is defined on, for the delta-born
@@ -9118,8 +9194,12 @@ mod tests {
     /// (`(0)-[:KNOWS {since:2099}]->(5)`). Returns `(root, graph, set_uuid)`.
     fn write_basic_with_segment(tag: &str) -> (std::path::PathBuf, String, uuid::Uuid) {
         use graph_format::manifest::FileEntry;
-        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segindex::{write_index_fragments, IndexSpec};
+        use graph_format::segmanifest::{
+            DirtyIndex, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
+        };
         use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
+        use graph_format::segpostings::{write_posting_fragments, PostingSpec};
         use graph_format::setmanifest::{SegmentRef, SetManifest};
 
         let (root, graph, base_uuid) = testgen::write_basic(tag);
@@ -9202,6 +9282,41 @@ mod tests {
         .unwrap();
         w.finish().unwrap();
 
+        // Index fragments: the born/patched (value, id) pairs this segment carries, plus the
+        // removal sidecar of base ids whose indexed value it supersedes (node 0's age moved
+        // 30→99, node 2 tombstoned). name: node 0 keeps "Alice", so only Carol(2) is removed.
+        write_index_fragments(
+            &seg_dir,
+            &[
+                IndexSpec {
+                    label: "Person".into(),
+                    prop: "age".into(),
+                    entries: vec![(Value::Int(99), 0), (Value::Int(50), 5)],
+                    removals: vec![0, 2],
+                },
+                IndexSpec {
+                    label: "Person".into(),
+                    prop: "name".into(),
+                    entries: vec![(Value::Str("Zed".into()), 5)],
+                    removals: vec![2],
+                },
+            ],
+            4096,
+            3,
+            None,
+        )
+        .unwrap();
+        // Endpoint driving sets: the born edge 0-[:KNOWS]->5.
+        write_posting_fragments(
+            &seg_dir,
+            &[PostingSpec {
+                reltype: "KNOWS".into(),
+                src_ids: vec![0],
+                tgt_ids: vec![5],
+            }],
+        )
+        .unwrap();
+
         let mut m = SegmentManifest {
             magic: SEGMENT_MAGIC.into(),
             version: SEGMENT_MANIFEST_VERSION,
@@ -9217,7 +9332,18 @@ mod tests {
             reltype_edge_deltas: vec![("KNOWS".into(), 0)], // KNOWS: +e5 -e4
             label_node_deltas: vec![("Person".into(), 0)],
             marginals_exact: true,
-            dirty_indexes: vec![],
+            dirty_indexes: vec![
+                DirtyIndex {
+                    label: "Person".into(),
+                    property: "age".into(),
+                    fragment: "idx_0.isam".into(),
+                },
+                DirtyIndex {
+                    label: "Person".into(),
+                    property: "name".into(),
+                    fragment: "idx_1.isam".into(),
+                },
+            ],
             mac: None,
             files: vec![FileEntry {
                 name: "node.blk".into(),
@@ -9420,6 +9546,170 @@ mod tests {
             "removed edge stays gone under a delta"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The scan_candidates seam merges segment index fragments (base hits minus removals ∪
+    /// the segments' matching born/patched ids), recomputes label membership over segment
+    /// full rows, and unions endpoint postings — with tombstoned nodes suppressed. The read
+    /// oracle for slice 3.4.
+    #[test]
+    fn segment_index_label_and_reltype_scans_merge() {
+        use crate::plan::NodeScan;
+        use crate::read_view::MergedView;
+        let (root, graph, _) = write_basic_with_segment("seg_scans");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+
+        let eq = |age: i64| -> Vec<u64> {
+            let mut v = engine
+                .scan_candidates(&NodeScan::RangeEq {
+                    index: "node_Person_age".into(),
+                    key: Value::Int(age),
+                })
+                .unwrap();
+            v.sort_unstable();
+            v
+        };
+        // Node 0's age moved 30→99 (found at 99, gone at 30); node 5 born at 50; node 2
+        // (age 40) tombstoned, so its stale base entry is suppressed by the removal sidecar.
+        assert_eq!(eq(99), vec![0]);
+        assert_eq!(eq(30), Vec::<u64>::new());
+        assert_eq!(eq(50), vec![5]);
+        assert_eq!(eq(40), Vec::<u64>::new());
+        assert_eq!(eq(25), vec![1]); // untouched base node Bob
+
+        // Range: age >= 45 → the moved node 0 (99) and born node 5 (50); base 30/25/40 excluded.
+        let mut rng = engine
+            .scan_candidates(&NodeScan::RangeRange {
+                index: "node_Person_age".into(),
+                lo: Some((Value::Int(45), true)),
+                hi: None,
+            })
+            .unwrap();
+        rng.sort_unstable();
+        assert_eq!(rng, vec![0, 5]);
+
+        // Label scan: Person = {Alice(0, overridden, still Person), Bob(1), Zed(5, born)};
+        // Carol(2) tombstoned and dropped.
+        let person = gen.label_id("Person").unwrap();
+        let mut labs = engine
+            .scan_candidates(&NodeScan::LabelScan { label_id: person })
+            .unwrap();
+        labs.sort_unstable();
+        assert_eq!(labs, vec![0, 1, 5]);
+        // (RelTypeScan's segment-posting union is exercised in
+        // `segment_reltype_scan_unions_postings`, which uses a base fixture carrying the
+        // endpoint postings a `RelTypeScan` requires.)
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `RelTypeScan` unions each segment's endpoint driving set over the base postings
+    /// (over-inclusion is safe — the first hop re-filters by reltype). Uses a base fixture
+    /// that carries the endpoint postings a `RelTypeScan` needs.
+    #[test]
+    fn segment_reltype_scan_unions_postings() {
+        use crate::plan::NodeScan;
+        use crate::read_view::MergedView;
+        use graph_format::manifest::FileEntry;
+        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segment::{NodeRow, SegmentWriter};
+        use graph_format::segpostings::{write_posting_fragments, PostingSpec};
+        use graph_format::setmanifest::{SegmentRef, SetManifest};
+
+        let (root, graph) = testgen::write_rel_sparse("seg_reltype_scan");
+        let base_uuid = Generation::current_uuid(&root, &graph).unwrap();
+        let seg_uuid = uuid::Uuid::from_u128(0x5_5e60_0000_0000_0000_0000_0000_0009);
+        let set_uuid = uuid::Uuid::from_u128(0x5_5e70_0000_0000_0000_0000_0000_0009);
+
+        // A segment that births node 6 (:N) with a new outgoing T-edge, so its endpoint
+        // posting adds node 6 to T's source driving set (base T sources are {0,1}).
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        std::fs::create_dir_all(seg_dir.parent().unwrap()).unwrap();
+        let mut w = SegmentWriter::create(&seg_dir, 0x33, 4096, 3).unwrap();
+        w.push_node(
+            6,
+            &NodeRow {
+                labels: vec!["N".into()],
+                props: vec![("name".into(), Value::Str("g".into()))],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.finish().unwrap();
+        write_posting_fragments(
+            &seg_dir,
+            &[PostingSpec {
+                reltype: "T".into(),
+                src_ids: vec![6],
+                tgt_ids: vec![],
+            }],
+        )
+        .unwrap();
+
+        let mut m = SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: SEGMENT_MANIFEST_VERSION,
+            segment_uuid: GenId(seg_uuid),
+            base: GenId(base_uuid),
+            created_unix: 0,
+            node_band: (6, 7),
+            edge_band: (3, 3),
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 1,
+            edge_count_delta: 0,
+            reltype_edge_deltas: vec![],
+            label_node_deltas: vec![("N".into(), 1)],
+            marginals_exact: true,
+            dirty_indexes: vec![],
+            mac: None,
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 0,
+                blake3: "aa".into(),
+                sha256: None,
+                crc32c: None,
+            }],
+        };
+        m.set_content_hash();
+        m.write_to_dir(&seg_dir).unwrap();
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = SetManifest::singleton(GenId(base_uuid), 0);
+        set.set_uuid = GenId(set_uuid);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        std::fs::write(
+            sets.join(format!("{set_uuid}.json")),
+            set.to_bytes().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(&graph).join("current"), set_uuid.to_string()).unwrap();
+
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+        let t = gen.reltype_id("T").unwrap();
+        let mut srcs = engine
+            .scan_candidates(&NodeScan::RelTypeScan {
+                reltype_ids: vec![t],
+                side: RelEndpointSide::Source,
+                guaranteed_label: None,
+            })
+            .unwrap();
+        srcs.sort_unstable();
+        assert_eq!(
+            srcs,
+            vec![0, 1, 6],
+            "base T sources {{0,1}} ∪ segment {{6}}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

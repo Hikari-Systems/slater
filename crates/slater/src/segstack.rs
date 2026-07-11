@@ -28,7 +28,7 @@ use anyhow::{bail, Context, Result};
 use graph_format::blockcache::BlockCache as GfBlockCache;
 use graph_format::crypto::{self, BlockCipher};
 use graph_format::extents::Extents;
-use graph_format::ids::Generation as GenId;
+use graph_format::ids::{Generation as GenId, Value};
 use graph_format::segindex::SegmentIndexReader;
 use graph_format::segmanifest::SegmentManifest;
 use graph_format::segment::{EdgeRow, NodeRow, SegmentReader};
@@ -231,6 +231,89 @@ impl CoreStack {
             }
         }
         Ok(None)
+    }
+
+    /// Whether node `id` is effectively deleted by the stack: the newest segment carrying it
+    /// is a tombstone. `false` for a live override, a born row, or a base-only id.
+    pub fn is_node_tombstoned(&self, id: u64) -> Result<bool> {
+        Ok(self.resolve_node_row(id)?.is_some_and(|r| r.tombstoned))
+    }
+
+    /// Fold the stack's index fragments into a base equality-probe result `ids`, oldest→
+    /// newest: each segment first **suppresses** the base/older ids it supersedes (its
+    /// `removals` sidecar), then **unions** its own matching fragment ids. Processing oldest
+    /// →newest makes a newer flush's value win over an older flush's.
+    ///
+    /// Correctness rests on a Phase-4 writer obligation: a segment's `removals` must list
+    /// every id whose indexed value it supersedes (base *or* an older segment's), not only
+    /// base ids — so the `retain` drops any stale earlier contribution. `ids` need not be
+    /// sorted on entry; the caller re-sorts after (the delta overlay relies on it).
+    pub fn fold_index_eq(
+        &self,
+        ids: &mut Vec<u64>,
+        label: &str,
+        prop: &str,
+        key: &Value,
+    ) -> Result<()> {
+        for seg in &self.segments {
+            let Some(idx) = &seg.index else { continue };
+            let removals = idx.removals(label, prop);
+            if !removals.is_empty() {
+                ids.retain(|id| removals.binary_search(id).is_err());
+            }
+            ids.extend(idx.lookup_eq(label, prop, key)?);
+        }
+        Ok(())
+    }
+
+    /// Range-probe counterpart of [`fold_index_eq`](Self::fold_index_eq).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_index_range(
+        &self,
+        ids: &mut Vec<u64>,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> Result<()> {
+        for seg in &self.segments {
+            let Some(idx) = &seg.index else { continue };
+            let removals = idx.removals(label, prop);
+            if !removals.is_empty() {
+                ids.retain(|id| removals.binary_search(id).is_err());
+            }
+            ids.extend(idx.lookup_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)?);
+        }
+        Ok(())
+    }
+
+    /// Fold the stack's effect on a base **label scan** into `ids`: every id the stack
+    /// carries a row for has its base membership dropped and re-decided by its *effective*
+    /// row (segments hold full label sets, so an override can add or drop a label, and a
+    /// tombstone drops it entirely); born ids carrying the label are added. `ids` is not
+    /// re-sorted here (the caller sorts/dedups after the delta overlay).
+    pub fn fold_label_scan(&self, ids: &mut Vec<u64>, label: &str) -> Result<()> {
+        if self.segments.is_empty() {
+            return Ok(());
+        }
+        let mut touched: Vec<u64> = Vec::new();
+        for seg in &self.segments {
+            touched.extend_from_slice(seg.reader.node_ids());
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        let touched_set: std::collections::HashSet<u64> = touched.iter().copied().collect();
+        ids.retain(|id| !touched_set.contains(id));
+        for id in touched {
+            if let Some(row) = self.resolve_node_row(id)? {
+                if !row.tombstoned && row.labels.iter().any(|l| l == label) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
