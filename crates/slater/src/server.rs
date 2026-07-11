@@ -550,6 +550,205 @@ impl Graphs {
         info!(graph = %name, generation = %new_uuid, "consolidated writable delta into a fresh generation");
         Ok(new_uuid)
     }
+
+    /// **T2 flush** (`docs/SEGMENTED-CORE-PLAN.md`, Phase 4): fold `name`'s writable delta
+    /// into a single immutable **upper core segment** stacked over the unchanged base —
+    /// the O(delta) alternative to [`consolidate_graph`](Self::consolidate_graph), which
+    /// reads the whole core back out and rebuilds. The base is *preserved*: no id moves and
+    /// no business key is re-resolved against a new core (only the surviving post-freeze WAL
+    /// tail is re-resolved by retire, exactly as consolidation does).
+    ///
+    /// Skeleton mirrors consolidation — freeze → publish → swap → retire — with the segment
+    /// write standing in for the dump+rebuild:
+    /// 1. Freeze the delta (seal its WAL, capture an immutable snapshot).
+    /// 2. Materialise the snapshot into a new `segments/<uuid>/` core segment.
+    /// 3. Publish a fresh **set** (same base, one more segment) and flip `current` — the
+    ///    crash barrier: `current` only ever names a set whose segment + manifest are fully
+    ///    written, and a crash before the flip leaves an orphan segment (no `current`
+    ///    change), harmless until GC.
+    /// 4. Swap the served generation to the new set (its stack now carries the segment).
+    /// 5. Retire: drop the consumed WAL, rebase the memtable past the new stack top, re-bind
+    ///    the writer to the new set uuid.
+    ///
+    /// Returns `Ok(Some(set_uuid))` on a flush, `Ok(None)` when the delta is empty.
+    ///
+    /// # Scope (slice 4.1)
+    /// Births-only, plaintext, fs-backed, no prior L0 level. A delta carrying a core patch
+    /// or tombstone, a stacked L0 level, or an encrypted-at-rest core is refused (later
+    /// slices). Not yet wired to an auto-trigger — invoked explicitly.
+    pub fn flush_graph_to_segment(
+        &self,
+        name: &str,
+        vector_cache: &VectorIndexCache,
+        data_dir: &Path,
+    ) -> Result<Option<GenId>> {
+        let writer = self
+            .writer(name)
+            .ok_or_else(|| anyhow!("graph '{name}' has no writable layer to flush"))?;
+        // A flush and a consolidation both mutate the set/stack — share the exclusive claim
+        // (and suppress auto flush/compaction over the freeze→retire window). RAII release.
+        if !writer.begin_consolidation() {
+            bail!("a consolidation or flush for '{name}' is already in progress");
+        }
+        let _guard = ConsolidationGuard(writer.clone());
+
+        // Encryption parity is a later slice: refuse rather than write delta data to a
+        // plaintext segment beside an encrypted core.
+        if self.master_key.is_some() {
+            bail!("flush_to_segment under encryption at rest is not yet supported");
+        }
+
+        let core = self
+            .get(name)
+            .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
+        if writer.core_uuid() != core.uuid() {
+            bail!(
+                "cannot flush '{name}': the writable delta was resolved against generation {} \
+                 but the served core is {} — the delta is orphaned",
+                writer.core_uuid(),
+                core.uuid()
+            );
+        }
+
+        // Freeze: seal the WAL, capture the immutable snapshot. Non-destructive — a failure
+        // before the `current` flip leaves the old set serving and the delta live.
+        let frozen = writer
+            .freeze()
+            .with_context(|| format!("freeze writable delta for '{name}'"))?;
+        if !frozen.l0.is_empty() {
+            bail!("flush_to_segment over a stacked L0 level is not yet supported");
+        }
+        if frozen.snapshot.is_empty() {
+            return Ok(None); // nothing to flush; freeze's fresh WAL segment keeps taking writes
+        }
+
+        // The appended band starts at the current stack top (base + every existing segment).
+        let prior_node_total = core.stack().extents().nodes.total();
+        let prior_edge_total = core.stack().extents().edges.total();
+
+        let seg_uuid = GenId(uuid::Uuid::new_v4());
+        let set_uuid = GenId(uuid::Uuid::new_v4());
+        let created_unix = now_unix();
+        let seg_dir = data_dir
+            .join(name)
+            .join("segments")
+            .join(seg_uuid.0.to_string());
+
+        let manifest = {
+            let inp = crate::flush_segment::FlushInputs {
+                seg_dir: &seg_dir,
+                seg_uuid,
+                base_uuid: core.base_uuid(),
+                prior_node_total,
+                prior_edge_total,
+                cipher: None,
+                master_key: None,
+                created_unix,
+            };
+            match crate::flush_segment::write_births_segment(frozen.snapshot.as_ref(), &inp) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&seg_dir);
+                    return Err(e)
+                        .with_context(|| format!("materialise flush segment for '{name}'"));
+                }
+            }
+        };
+
+        // Publish a fresh set (same base, existing segments + the new one), then flip
+        // `current` — set before pointer so `current` only ever names a complete set.
+        let mut set =
+            graph_format::setmanifest::SetManifest::singleton(core.base_uuid(), created_unix);
+        set.set_uuid = set_uuid;
+        set.segments = core
+            .stack()
+            .segments()
+            .iter()
+            .map(|s| graph_format::setmanifest::SegmentRef::from_manifest(&s.manifest))
+            .chain(std::iter::once(
+                graph_format::setmanifest::SegmentRef::from_manifest(&manifest),
+            ))
+            .collect();
+        publish_set_and_current(data_dir, name, set_uuid, &set)
+            .with_context(|| format!("publish flush set for '{name}'"))?;
+
+        // Swap the served generation to the new set (its stack now carries the segment).
+        let new_uuid = self
+            .swap_if_changed(name, vector_cache)
+            .with_context(|| format!("swap in flushed set for '{name}'"))?
+            .ok_or_else(|| {
+                anyhow!("flush for '{name}' published a set but `current` was unchanged")
+            })?;
+        debug_assert_eq!(new_uuid, set_uuid);
+        let new_gen = self
+            .get(name)
+            .ok_or_else(|| anyhow!("flushed set for '{name}' vanished before retire"))?;
+
+        // Retire: the flushed writes now live in the segment. Drop the consumed WAL and
+        // rebase the memtable past the new stack top (base + every segment band, incl. the
+        // new one). resolve_op is bound to the new generation, so a post-freeze re-MERGE of
+        // a flushed born key re-resolves through the segment's index.
+        writer
+            .retire(
+                &frozen.consumed,
+                &frozen.consumed_l0,
+                set_uuid,
+                new_gen.stack().extents().nodes.total(),
+                new_gen.stack().extents().edges.total(),
+                |op| resolve_op(new_gen.as_ref(), op),
+            )
+            .with_context(|| format!("retire flushed delta for '{name}'"))?;
+
+        info!(graph = %name, set = %set_uuid, segment = %seg_uuid, "flushed writable delta into a core segment");
+        Ok(Some(set_uuid))
+    }
+}
+
+/// Seconds since the Unix epoch (0 if the clock is before it — never in practice).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Publish a flush's set manifest then flip `current`, both via a local tmp-then-rename so a
+/// crash never exposes a half-written set or a pointer to one. Mirrors the builder's
+/// local-publish barrier (`slater-build::common`): `sets/<uuid>.json` (fsynced) *before*
+/// `current` (fsynced). Local-fs only for now (the object-store upload path is a later
+/// slice); the segment directory is already durable when this is called.
+fn publish_set_and_current(
+    data_dir: &Path,
+    graph: &str,
+    set_uuid: GenId,
+    set: &graph_format::setmanifest::SetManifest,
+) -> Result<()> {
+    let graph_dir = data_dir.join(graph);
+    let sets_dir = graph_dir.join("sets");
+    std::fs::create_dir_all(&sets_dir).with_context(|| format!("create {}", sets_dir.display()))?;
+    let set_path = sets_dir.join(format!("{}.json", set_uuid.0));
+    let set_tmp = sets_dir.join(format!(".{}.json.tmp", set_uuid.0));
+    std::fs::write(&set_tmp, set.to_bytes()?)
+        .with_context(|| format!("write {}", set_tmp.display()))?;
+    std::fs::rename(&set_tmp, &set_path)
+        .with_context(|| format!("publish {}", set_path.display()))?;
+    fsync_dir(&sets_dir)?;
+
+    let current = graph_dir.join("current");
+    let current_tmp = graph_dir.join(".current.tmp");
+    std::fs::write(&current_tmp, format!("{}\n", set_uuid.0))
+        .with_context(|| format!("write {}", current_tmp.display()))?;
+    std::fs::rename(&current_tmp, &current)
+        .with_context(|| format!("swap {}", current.display()))?;
+    fsync_dir(&graph_dir)?;
+    Ok(())
+}
+
+/// fsync a directory so a rename into it is durable before the next publish step.
+fn fsync_dir(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("fsync {}", dir.display()))
 }
 
 /// Spawn the configured `slater-build` binary to rebuild `graph` from the binary
@@ -6273,6 +6472,117 @@ mod tests {
             wal_count(&wal_dir),
             1,
             "only the post-freeze segment remains"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
+    /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
+    /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.
+    #[test]
+    fn flush_to_segment_folds_births_into_a_core_segment() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(b:Person {name:'Eve'})",
+        );
+
+        // Flush the delta into an upper core segment.
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+
+        // The served generation is a new set over the *same* base, carrying one segment.
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.uuid(), set_uuid, "identity is the new set uuid");
+        assert_eq!(gen1.base_uuid(), base_uuid, "base preserved by the flush");
+        assert_eq!(gen1.stack().segments().len(), 1, "one upper segment");
+
+        // The delta is retired: the active memtable is empty, the writer is re-bound.
+        let writer = graphs.writer("people").unwrap();
+        assert!(writer.snapshot().is_empty(), "delta retired empty");
+        assert_eq!(writer.core_uuid(), set_uuid, "writer re-bound to the set");
+
+        // Read back with an empty delta — every born entity is served from the segment.
+        let q = |graphs: &Graphs, q: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+        // Index seek (name is indexed in the base) finds the flushed born node's props.
+        let dave = q(
+            &graphs,
+            "MATCH (n:Person {name:'Dave'}) RETURN n.name, n.age",
+        );
+        assert_eq!(dave.rows.len(), 1, "index seek finds Dave in the segment");
+        assert!(
+            matches!(dave.rows[0][1], Val::Int(50)),
+            "Dave age from segment"
+        );
+        // Count over the merged marginals: 3 base + 2 born.
+        let n = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n.rows[0][0], Val::Int(5)),
+            "3 base + 2 born from the segment: {:?}",
+            n.rows[0][0]
+        );
+        // The born edge traverses from the segment adjacency.
+        let knows = q(
+            &graphs,
+            "MATCH (a:Person {name:'Dave'})-[:KNOWS]->(b) RETURN b.name",
+        );
+        assert_eq!(knows.rows.len(), 1, "the born KNOWS edge traverses");
+        assert!(
+            matches!(&knows.rows[0][0], Val::Str(s) if s == "Eve"),
+            "KNOWS target from segment: {:?}",
+            knows.rows[0][0]
+        );
+
+        // Reopen from disk: the set + segment reload, and the data survives.
+        drop(writer);
+        drop(gen1);
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        let gen2 = graphs.get("people").unwrap();
+        assert_eq!(gen2.uuid(), set_uuid, "reopen names the flushed set");
+        assert_eq!(gen2.stack().segments().len(), 1, "segment reloaded");
+        let view = MergedView::new(gen2.as_ref(), DeltaSnapshot::empty());
+        let ast = parser::parse("MATCH (n:Person {name:'Eve'}) RETURN n.age").unwrap();
+        let eve = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(eve.rows[0][0], Val::Int(60)),
+            "Eve reloaded from the segment: {:?}",
+            eve.rows[0][0]
         );
 
         std::fs::remove_dir_all(&root).ok();

@@ -118,10 +118,42 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.6 (`85d68ff`). **Phases
-1–3 DONE.** Next: **Phase 4 — the T2 flush (`DeltaWriter::flush_to_segment`)**, the first
-*writer* of a core segment. Everything below Phase 3 is the read side; nothing produces a
-segment yet, so all of Phase 3 is exercised only by hand-built fixtures.
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.1 (HP10). **Phases 1–3
+DONE; Phase 4 IN PROGRESS.** The first *writer* of a core segment now exists and is proven
+end-to-end (`Graphs::flush_graph_to_segment` + `crate::flush_segment::write_births_segment`):
+a births-only delta folds into an upper core segment, publishes a new set, swaps, and
+retires — every born entity reads back from the segment (index seek, count marginals,
+traversal) and survives a reopen. Next: **slice 4.2 — core-resolved patches** (full
+override rows read from the base via the merged view + removal sidecars), then 4.3 (deletes
++ node-delete→incident-edge removals), then 4.4 (L0 fold, encryption parity, s3 upload,
+auto-trigger wiring).
+
+### Phase 4 slice log
+- **4.1 DONE** (HP10): `flush_segment.rs` materialiser (`write_births_segment`) — born
+  nodes/edges → full rows, adjacency fragments, ISAM index fragments (shared prop derivation
+  with the node row so they can't diverge), posting fragments, and *exact* births-only
+  marginals. `Graphs::flush_graph_to_segment` orchestrates freeze → write segment → publish
+  set + flip `current` (crash barrier, mirrors the builder's local publish) → `swap_if_changed`
+  → **reuses `DeltaWriter::retire`** (base preserved, so retire's re-base/re-resolve is passed
+  the *set* total via `extents().total()`, not the base-only `node_count()`). Refuses (bails)
+  a core patch/tombstone, a stacked L0 level, or an encrypted core — all later slices. **Not
+  wired to an auto-trigger** (invoked explicitly, like Phase 2's "don't wire reads yet").
+  - **Follow-ups the slice deferred (each a later slice):** (a) core-patch/-delete full-row
+    materialisation needs the merged-view base read + removal sidecars; (b) L0-level fold (a
+    flush over a prior `flush_to_l0` stack) needs a cross-level `DeltaSnapshot` walk (no
+    unified `iter_nodes` on `DeltaSnapshot` — drive `l0_levels()` + the born-* folded
+    helpers); (c) encryption parity (write the segment under the core's cipher + seal the
+    MAC — currently refused when `master_key.is_some()`); (d) s3/object-store upload of the
+    segment + set (currently local-fs publish only, like the builder before its upload step);
+    (e) **write-path resolve is not yet segment-aware** — a *concurrent* re-`MERGE` of a
+    just-flushed born key during the freeze→retire window would not find it in the segment
+    (resolve folds only L0, not segments), risking a duplicate; the 4.1 test is synchronous so
+    it does not hit this, but the auto-trigger MUST NOT ship before Phase 6's segment-aware
+    resolve (or a flush-time write barrier).
+
+**(historical)** Phase 4 was the first *writer* of a core segment. Everything below Phase 3
+is the read side; before slice 4.1 nothing produced a segment, so all of Phase 3 was
+exercised only by hand-built fixtures.
 
 ### Phase 4 entry notes (obligations Phase 3 recorded — the flush writer MUST honour these)
 - **Synthetic id allocation:** the write-delta must allocate born ids above the *stack top*
@@ -226,7 +258,12 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   (`6e2c3a7`); 708 slater lib tests green (count oracle + decline), clippy clean. ✓
 - HP9 — Phase 3 slice 3.6: hardening + conformance + review fixes (`85d68ff`); full
   workspace suite green (710 slater lib), clippy clean, fuzz builds; mem-store conformance.
-  ✓ **Phase 3 COMPLETE.** ← current baseline; next track is Phase 4 (T2 flush writer).
+  ✓ **Phase 3 COMPLETE.**
+- HP10 — Phase 4 slice 4.1: births-only T2 flush writer end-to-end. New
+  `slater/src/flush_segment.rs` (`write_births_segment`) + `Graphs::flush_graph_to_segment`
+  (freeze → segment → publish set/current → swap → reuse `retire`); one new e2e oracle test
+  (`flush_to_segment_folds_births_into_a_core_segment`). 711 slater lib tests green, clippy
+  clean. ← current baseline; next is slice 4.2 (core-patch full-row materialisation).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

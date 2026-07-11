@@ -25,6 +25,7 @@ pub mod delta_writer;
 pub mod diag;
 pub mod dump;
 pub mod exec;
+pub mod flush_segment;
 pub mod generation;
 pub mod health;
 pub mod help;
