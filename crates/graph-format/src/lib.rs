@@ -29,6 +29,7 @@ pub mod codec;
 pub mod columns;
 pub mod consolidate_dump;
 pub mod crypto;
+pub mod extents;
 pub mod extsort;
 pub mod histogram;
 pub mod ids;

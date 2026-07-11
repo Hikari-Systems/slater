@@ -118,8 +118,9 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** HP2 (Phase 1 plumbing). **Phase 1 is
-DONE.** Next: Phase 2 (core-segment format).
+**Branch:** `writeable`. **Committed through:** Phase 2 slice 1 (`extents.rs` routing
+table). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slice 1 done,
+next is slice 2 (segment writer/reader sections).
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
 - HP0 — Phase 0.5 committed (`a6e4d34`).
@@ -133,6 +134,8 @@ DONE.** Next: Phase 2 (core-segment format).
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
      node & edge id → segment, binary-searched; unit tests. (isolated, safe first slice)
+     **DONE** — `ExtentTable`/`Extents`/`SegmentOrd`, `partition_point` routing, tiling
+     invariant validated at construction, `Extents::from_set`; 11 tests green, clippy clean.
   2. Segment writer/reader: sections `node.blk`/`adj_out.blk`/`adj_in.blk`/`edge.blk`
      as off-heap-L0-style resident sorted key columns over BlockCache-paged payloads
      (template: `slater-delta/src/l0_offheap.rs`); full-row node/edge records +
