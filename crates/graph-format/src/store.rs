@@ -134,6 +134,15 @@ pub trait ObjectStore: Send + Sync {
     fn put(&self, key: &str, _bytes: &[u8], _sha256_b64: Option<&str>) -> Result<()> {
         anyhow::bail!("storage backend is read-only; cannot write {key}")
     }
+
+    /// Whether this store is the plain local filesystem rooted at the data directory. A
+    /// flush/build that writes objects directly under `data_dir` via `std::fs` has already
+    /// published them through such a store, so no explicit `put` upload is required. Remote
+    /// and in-memory backends return `false`, so a publisher must upload each object with
+    /// [`put`](Self::put). Default `false` (assume an explicit upload is needed).
+    fn is_local_fs(&self) -> bool {
+        false
+    }
 }
 
 /// What the manifest asserts about one generation file, passed to

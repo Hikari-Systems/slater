@@ -118,7 +118,7 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-c (HP15). **Phases 1–3
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-d (HP16). **Phases 1–3
 DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
 `crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges, core-resolved
 node patches, deletes, AND core-edge patches** — **every write op can now flush** (the last
@@ -143,14 +143,38 @@ bail is gone). **A flush over a stacked L0 now folds** — when the freeze captu
 levels beneath the active memtable, they merge newest-wins into one segment via
 `Memtable::merge_levels([snapshot, l0…])` (the active memtable is newest, `frozen.l0` is
 newest-first); born ids tile contiguously above the shared base and the merged `synthetic_base`
-stays `== prior_node_total`. Next: **slice 4.4-d** (s3 upload); then auto-trigger wiring
-(Phase-6-gated). Still deferred and `bail!`ed: patch-**then-delete** of the same core edge in
-one delta (an adjacency-removal concern the patch materialiser doesn't own), and a flush over an
-**off-heap** L0 level (resident L0 folds via `LevelRead::as_memtable`; off-heap stores a block
-image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
-`server.rs` `as_memtable()` returns `None`).
+stays `== prior_node_total`. **A flush against a remote store now uploads through it** — the
+segment is staged locally, then (when `self.store` is not the local fs — `ObjectStore::is_local_fs`)
+`upload_flush_to_store` publishes every segment file (with its SHA-256), `SEGMENT.json`, the set
+manifest, then `current` **last** (the copy-completeness barrier), mirroring the builder's
+`upload_generation`; this precedes the swap, which reads `current` from `self.store`. **Slice
+4.4 is COMPLETE — the whole deployment bundle is in.** Next: **auto-trigger wiring**
+(Phase-6-gated — needs segment-aware write-path resolve; do NOT wire before then). Still
+deferred and `bail!`ed: patch-**then-delete** of the same core edge in one delta (an
+adjacency-removal concern the patch materialiser doesn't own), and a flush over an **off-heap**
+L0 level (resident L0 folds via `LevelRead::as_memtable`; off-heap stores a block image, not a
+memtable, so it needs a memtable rebuild the lossy trait can't give — `as_memtable()` returns
+`None`).
 
 ### Phase 4 slice log
+- **4.4-d DONE** (HP16): **object-store upload** — the last of the deployment bundle. A flush
+  against a store that is not the local filesystem (S3/GCS/in-memory) now publishes through it
+  instead of only writing local fs. The segment is staged locally by `write_flush_segment` as
+  before; then, gated on a new `ObjectStore::is_local_fs()` (default `false`, `true` only for
+  `FsObjectStore` — for which the direct `std::fs` writes already *are* the store), a new
+  `upload_flush_to_store` uploads every segment file (with its SHA-256, so S3 validates the body
+  and stores the object checksum) under `<graph>/segments/<uuid>/`, then `SEGMENT.json`, then the
+  set manifest, then `current` **last** — the copy-completeness barrier, mirroring the builder's
+  `upload_generation`. The upload runs **before** `swap_if_changed`, because the swap reads
+  `current` from `self.store`; a remote store must see the new pointer for the swap to observe a
+  change (else it bails "current was unchanged"). Local atomic publish (`publish_set_and_current`,
+  tmp-then-rename + fsync) is kept — it stages the local copy and is the fs-backend's crash-safe
+  publish (`FsObjectStore::put` is a plain non-atomic `std::fs::write`). One new e2e oracle
+  (`flush_to_segment_uploads_to_an_object_store`): seed a `MemObjectStore` from a local base
+  fixture, open the served graph through it, flush a born node + core patch, assert the store now
+  holds the set manifest + updated `current` + the segment's `SEGMENT.json`, then reopen reading
+  **only** through the mem store (no local fs) and serve the flushed data. 719 slater lib + 140
+  graph-format + full workspace green, clippy + fmt clean.
 - **4.4-c DONE** (HP15): **stacked L0 fold**. A flush over a freeze that captured sealed L0
   levels (active memtable + `frozen.l0`, previously `bail!`ed) now folds them into one segment.
   When `frozen.l0` is non-empty, `flush_graph_to_segment` builds `[snapshot, l0[0]…l0[n]]`
@@ -469,27 +493,23 @@ Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core work on branch `writeable`. Read `docs/SEGMENTED-CORE-PLAN.md`
-> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP15 (slice 4.4-c,
-> stacked L0 fold).** Phases 1–3 DONE; Phase 4 IN PROGRESS. **Every write op materialises
-> into a flush segment**, **a flush over an encrypted core writes an encrypted segment**, and
-> **a flush over a stacked L0 folds all levels newest-wins into one segment.** Baseline:
-> **718 slater lib tests** (140 graph-format, 78 slater-delta), clippy clean.
+> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP16 (slice 4.4-d,
+> object-store upload) — slice 4.4 and the whole T2-flush deployment bundle are COMPLETE.**
+> Phases 1–3 DONE; Phase 4's flush writer is feature-complete: **every write op materialises
+> into a flush segment**, over an **encrypted** core it writes an encrypted segment, over a
+> **stacked L0** it folds all levels newest-wins, and against a **remote store** it uploads
+> segment+set+`current` (current last). Baseline: **719 slater lib tests** (140 graph-format,
+> 78 slater-delta), clippy clean.
 >
-> NEXT: **slice 4.4-d — the last of the deployment bundle** (one limitation site left in
-> `Graphs::flush_graph_to_segment`). Do NOT wire the auto-trigger — Phase-6-gated (needs
-> segment-aware write-path resolve; see 4.1 deferral note (e)). (4.4-b encryption parity and
-> 4.4-c stacked L0 fold are DONE — see the slice log. Two orthogonal sub-deferrals remain,
-> both `bail!`ed: patch-then-delete of the same core edge in one delta, and a flush over an
-> **off-heap** L0 level — `LevelRead::as_memtable()` returns `None` for it, needing a
-> memtable rebuild the lossy trait can't give.)
->
-> **4.4-d — S3 / OBJECT-STORE UPLOAD**: `publish_set_and_current` (`server.rs:763`) is
-> local-fs only (comment at `server.rs:758`). Upload segment dir (all sections + fragments
-> + `SEGMENT.json`) + set manifest to the configured `ObjectStore`, mirroring the builder's
-> upload (memory `s3-storage-backend`/`gcs-storage-backend`); durable before `current`
-> flips. Confirm `SegmentReader::open_via(store, ...)` (`segstack.rs:169`) reads it back.
-> Test against a mem-store, reopen store-natively (never bench S3 off EC2 — memory
-> `s3-benchmark-methodology`).
+> NEXT: **auto-trigger wiring is the remaining Phase-4 item, but it is Phase-6-GATED** — it
+> needs segment-aware write-path resolve (a post-freeze re-MERGE of a flushed born key must
+> re-resolve through the segment index), so do NOT wire it before Phase 6 (see 4.1 deferral
+> note (e)). Until then the flush is invoked explicitly (`Graphs::flush_graph_to_segment`);
+> there is no automatic freeze→flush trigger. If starting fresh Phase-4 work is not intended,
+> the natural next move is **Phase 5** (per the plan's phase list) or picking up the two
+> deferred `bail!`ed sub-cases: patch-then-delete of the same core edge in one delta, and a
+> flush over an **off-heap** L0 level (`LevelRead::as_memtable()` returns `None` for it,
+> needing a memtable rebuild the lossy trait can't give).
 >
 > DISCIPLINE: `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` +
 > `dangerouslyDisableSandbox`. Full workspace + clippy green; `cargo fmt --all` before

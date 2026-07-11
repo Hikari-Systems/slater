@@ -715,6 +715,22 @@ impl Graphs {
         publish_set_and_current(data_dir, name, set_uuid, &set)
             .with_context(|| format!("publish flush set for '{name}'"))?;
 
+        // When the served store is not the local filesystem the segment was staged to
+        // (S3/GCS/in-memory), publish the segment + set + `current` through it so a reader
+        // that opens via the store finds them — `current` last, the copy-completeness
+        // barrier. This must precede the swap below, which reads `current` from `self.store`.
+        if !self.store.is_local_fs() {
+            upload_flush_to_store(
+                self.store.as_ref(),
+                name,
+                &seg_dir,
+                &manifest,
+                set_uuid,
+                &set,
+            )
+            .with_context(|| format!("upload flush segment for '{name}' to the object store"))?;
+        }
+
         // Swap the served generation to the new set (its stack now carries the segment).
         let new_uuid = self
             .swap_if_changed(name, vector_cache)
@@ -784,6 +800,60 @@ fn publish_set_and_current(
     std::fs::rename(&current_tmp, &current)
         .with_context(|| format!("swap {}", current.display()))?;
     fsync_dir(&graph_dir)?;
+    Ok(())
+}
+
+/// Upload a locally-staged flush to a remote object store: every segment file (with its
+/// SHA-256 so S3 validates the body and stores the object checksum), then `SEGMENT.json`,
+/// then the set manifest, then the `current` pointer **last** — the copy-completeness
+/// barrier (`current` only ever names a fully-uploaded set, which only names fully-uploaded
+/// segments). Mirrors the builder's `upload_generation` (`slater-build::common`).
+fn upload_flush_to_store(
+    store: &dyn ObjectStore,
+    graph: &str,
+    seg_dir: &Path,
+    seg_manifest: &graph_format::segmanifest::SegmentManifest,
+    set_uuid: GenId,
+    set: &graph_format::setmanifest::SetManifest,
+) -> Result<()> {
+    let seg_prefix = crate::segstack::segment_prefix(graph, seg_manifest.segment_uuid);
+    for fe in &seg_manifest.files {
+        let bytes = std::fs::read(seg_dir.join(&fe.name))
+            .with_context(|| format!("read {} for upload", fe.name))?;
+        store
+            .put(
+                &join_key(&seg_prefix, &fe.name),
+                &bytes,
+                fe.sha256.as_deref(),
+            )
+            .with_context(|| format!("upload segment file {}", fe.name))?;
+    }
+    // SEGMENT.json (authenticated by its own MAC, no inventory checksum) after its sections,
+    // so a lister never sees a manifest before the files it names.
+    let seg_json =
+        std::fs::read(seg_dir.join("SEGMENT.json")).context("read SEGMENT.json for upload")?;
+    store
+        .put(
+            &graph_format::segmanifest::SegmentManifest::key(graph, seg_manifest.segment_uuid),
+            &seg_json,
+            None,
+        )
+        .context("upload SEGMENT.json")?;
+    // The set manifest, then the `current` pointer last.
+    store
+        .put(
+            &graph_format::setmanifest::SetManifest::key(graph, set_uuid),
+            &set.to_bytes()?,
+            None,
+        )
+        .context("upload flush set manifest")?;
+    store
+        .put(
+            &join_key(graph, "current"),
+            format!("{}\n", set_uuid.0).as_bytes(),
+            None,
+        )
+        .context("write remote current pointer")?;
     Ok(())
 }
 
@@ -6874,6 +6944,132 @@ mod tests {
             matches!(alice2.rows[0][0], Val::Int(55)),
             "newest-wins fold survives reopen: {:?}",
             alice2.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Recursively load every file under `root` into a `MemObjectStore`, keyed by its
+    /// `/`-joined path relative to `root` — the same keys the store abstraction builds.
+    fn load_dir_into_mem(
+        store: &graph_format::store::mem::MemObjectStore,
+        root: &Path,
+        dir: &Path,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                load_dir_into_mem(store, root, &path);
+            } else {
+                let key = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                store
+                    .put(&key, &std::fs::read(&path).unwrap(), None)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Phase 4 slice 4.4-d: a flush against a **non-filesystem** store uploads the segment,
+    /// set manifest and `current` pointer through the `ObjectStore` abstraction (the segment
+    /// is staged locally, then published to the store). A fresh open that reads *only* through
+    /// the in-memory store — no local filesystem — serves the flushed born node, proving the
+    /// upload round-trips store-natively.
+    #[test]
+    fn flush_to_segment_uploads_to_an_object_store() {
+        use graph_format::store::mem::MemObjectStore;
+        use graph_format::store::ObjectStore as _;
+
+        // Build the base generation locally, then seed a mem store from it — the mem store is
+        // the served backend; the local dir is only the WAL + segment staging area.
+        let (root, _g) = testgen::write_indexed_people("flush_seg_memstore");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mem = Arc::new(MemObjectStore::new());
+        load_dir_into_mem(&mem, &root, &root);
+
+        let mut graphs =
+            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
+                .unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a node write: {q}"),
+            }
+        };
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+
+        // The store now holds the set, an updated `current`, and the segment's SEGMENT.json.
+        assert_eq!(
+            String::from_utf8(mem.read_all("people/current").unwrap())
+                .unwrap()
+                .trim(),
+            set_uuid.0.to_string(),
+            "remote current names the flushed set"
+        );
+        assert!(
+            mem.exists(&graph_format::setmanifest::SetManifest::key(
+                "people", set_uuid
+            ))
+            .unwrap(),
+            "the set manifest was uploaded"
+        );
+        let seg_json_keys: Vec<String> = mem
+            .list("people/segments")
+            .unwrap()
+            .iter()
+            .map(|u| format!("people/segments/{u}/SEGMENT.json"))
+            .collect();
+        assert_eq!(seg_json_keys.len(), 1, "one segment dir uploaded");
+        assert!(
+            mem.exists(&seg_json_keys[0]).unwrap(),
+            "SEGMENT.json uploaded to the store"
+        );
+
+        // Reopen reading ONLY through the mem store (no local fs): the flushed data is served.
+        drop(graphs);
+        let graphs =
+            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
+                .unwrap();
+        let gen = graphs.get("people").unwrap();
+        assert_eq!(gen.uuid(), set_uuid, "store reopen names the flushed set");
+        assert_eq!(gen.base_uuid(), base_uuid, "base preserved");
+        assert_eq!(gen.stack().segments().len(), 1, "segment loaded from store");
+        let view = MergedView::new(gen.as_ref(), DeltaSnapshot::empty());
+        let ast = parser::parse("MATCH (n:Person {name:'Dave'}) RETURN n.age").unwrap();
+        let dave = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(dave.rows[0][0], Val::Int(50)),
+            "born Dave served from the store-native segment: {:?}",
+            dave.rows.first()
+        );
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let alice = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(99)),
+            "Alice's flushed patch served from the store: {:?}",
+            alice.rows.first()
         );
 
         std::fs::remove_dir_all(&root).ok();

@@ -68,6 +68,10 @@ impl FsObjectStore {
 }
 
 impl ObjectStore for FsObjectStore {
+    fn is_local_fs(&self) -> bool {
+        true
+    }
+
     fn open(&self, key: &str) -> Result<Arc<dyn RandomReadAt>> {
         Ok(Arc::new(FileObject::open(self.path_for(key))?))
     }
