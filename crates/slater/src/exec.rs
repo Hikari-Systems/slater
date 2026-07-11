@@ -2126,7 +2126,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if let Some(res) = self.try_label_meta_fast_path(sq)? {
             return Ok(res);
         }
-        if self.gen.delta().is_empty() {
+        // The grouped-index fast path walks the base range index / histograms directly, which
+        // are not segment-aware, so it is only sound over a singleton set; a stacked set falls
+        // through to full execution (segment-aware via the scan / adjacency seams).
+        if self.gen.delta().is_empty() && self.gen.core_stack().is_singleton() {
             // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
             // and `RETURN count(DISTINCT n.p)` are answered from the range index over
             // (L, p) — one sequential index walk, no per-node property decode.
@@ -2161,6 +2164,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// `lookup_eq` length. Anything else (multi-label, residual props, non-index
     /// props, a non-constant extra projection) falls back.
     fn try_count_fast_path(&self, sq: &SingleQuery) -> Result<Option<(Vec<String>, Vec<Val>)>> {
+        // A stacked set answers `count(*)` / `count(n:L)` from the summed segment marginals
+        // (`live_node_count` / `live_label_node_count`); decline to full execution when any
+        // segment's marginals are not provably exact.
+        if !self.gen.core_stack().marginals_exact() {
+            return Ok(None);
+        }
         if sq.reading.len() != 1 {
             return Ok(None);
         }
@@ -2370,11 +2379,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let left_id = left_label.map(|n| self.gen.label_id(&n));
         let right_id = right_label.map(|n| self.gen.label_id(&n));
 
-        // With a live delta the core's resident schema marginals no longer describe the
-        // graph. The whole-graph `type(r)` shape is still answerable from the delta's edge
-        // counters; the labelled-endpoint cube and the undirected doubling are not, so
-        // they decline and the matcher runs.
-        if !self.gen.delta().is_empty() {
+        // With a live delta *or* a core segment stack, the base's resident schema marginals
+        // no longer describe the graph. The whole-graph `type(r)` shape is still answerable
+        // from the summed edge counters (`live_reltype_edge_groups`); the labelled-endpoint
+        // cube and the undirected doubling are not, so they decline and the matcher runs.
+        if !self.gen.delta().is_empty() || !self.gen.core_stack().is_singleton() {
             if left_id.is_some() || right_id.is_some() || matches!(rel.dir, Direction::Undirected) {
                 return Ok(None);
             }
@@ -2546,6 +2555,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // Requires exact first-label counts — otherwise first-label semantics can't
         // be reproduced from per-label occurrence counts under multi-label nodes.
         if !self.gen.has_first_label_counts() {
+            return Ok(None);
+        }
+        // A core segment carries per-label *occurrence* deltas, not first-label deltas, so a
+        // stacked set cannot reproduce `labels(n)[0]` groups from marginals — decline to full
+        // execution (which reads the effective rows and is segment-aware).
+        if !self.gen.core_stack().is_singleton() {
             return Ok(None);
         }
 
@@ -9603,6 +9618,183 @@ mod tests {
         // (RelTypeScan's segment-posting union is exercised in
         // `segment_reltype_scan_unions_postings`, which uses a base fixture carrying the
         // endpoint postings a `RelTypeScan` requires.)
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Stack a **births-only** segment (no tombstones/removals, so its marginals are trivially
+    /// self-consistent) over a `write_basic` base: born node 5 (`:Person {name:'Zed'}`) and
+    /// born edge 5 (`(0)-[:KNOWS]->(5)`) with adjacency. Returns `(root, graph, seg_uuid)`.
+    fn write_basic_with_born_segment(tag: &str) -> (std::path::PathBuf, String, uuid::Uuid) {
+        use graph_format::manifest::FileEntry;
+        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
+        use graph_format::setmanifest::{SegmentRef, SetManifest};
+
+        let (root, graph, base_uuid) = testgen::write_basic(tag);
+        let seg_uuid = uuid::Uuid::from_u128(0x5_5eb0_0000_0000_0000_0000_0000_0001);
+        let set_uuid = uuid::Uuid::from_u128(0x5_5eb1_0000_0000_0000_0000_0000_0001);
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        std::fs::create_dir_all(seg_dir.parent().unwrap()).unwrap();
+        let mut w = SegmentWriter::create(&seg_dir, 0x44, 4096, 3).unwrap();
+        w.push_node(
+            5,
+            &NodeRow {
+                labels: vec!["Person".into()],
+                props: vec![("name".into(), Value::Str("Zed".into()))],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.push_adj_out(
+            0,
+            &[AdjEdge {
+                other: 5,
+                reltype: "KNOWS".into(),
+                edge_id: 5,
+                removed: false,
+            }],
+        )
+        .unwrap();
+        w.push_adj_in(
+            5,
+            &[AdjEdge {
+                other: 0,
+                reltype: "KNOWS".into(),
+                edge_id: 5,
+                removed: false,
+            }],
+        )
+        .unwrap();
+        w.push_edge(
+            5,
+            &EdgeRow {
+                src: 0,
+                dst: 5,
+                reltype: "KNOWS".into(),
+                props: vec![],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let mut m = SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: SEGMENT_MANIFEST_VERSION,
+            segment_uuid: GenId(seg_uuid),
+            base: GenId(base_uuid),
+            created_unix: 0,
+            node_band: (5, 6),
+            edge_band: (5, 6),
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 1,
+            edge_count_delta: 1,
+            reltype_edge_deltas: vec![("KNOWS".into(), 1)],
+            label_node_deltas: vec![("Person".into(), 1)],
+            marginals_exact: true,
+            dirty_indexes: vec![],
+            mac: None,
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 0,
+                blake3: "aa".into(),
+                sha256: None,
+                crc32c: None,
+            }],
+        };
+        m.set_content_hash();
+        m.write_to_dir(&seg_dir).unwrap();
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = SetManifest::singleton(GenId(base_uuid), 0);
+        set.set_uuid = GenId(set_uuid);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        std::fs::write(
+            sets.join(format!("{set_uuid}.json")),
+            set.to_bytes().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(&graph).join("current"), set_uuid.to_string()).unwrap();
+        (root, graph, seg_uuid)
+    }
+
+    /// Whole-graph counts are answered from the summed segment marginals (node/label/edge/
+    /// reltype), and a segment whose marginals are not exact declines to full execution —
+    /// which is segment-aware and yields the same answer. The read oracle for slice 3.5.
+    #[test]
+    fn segment_marginals_answer_counts_and_decline_when_inexact() {
+        use crate::read_view::MergedView;
+        use graph_format::segmanifest::SegmentManifest;
+        let (root, graph, seg_uuid) = write_basic_with_born_segment("seg_counts");
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        let cache = BlockCache::new(1 << 20);
+
+        let count = |view: &MergedView, q: &str| -> i64 {
+            let res = Engine::new(view, &cache)
+                .run(&parser::parse(q).unwrap())
+                .unwrap();
+            match res.rows[0][0] {
+                Val::Int(n) => n,
+                ref v => panic!("expected Int, got {v:?}"),
+            }
+        };
+        let reltype_groups = |view: &MergedView| -> Vec<(String, i64)> {
+            let res = Engine::new(view, &cache)
+                .run(&parser::parse("MATCH ()-[r]->() RETURN type(r), count(*)").unwrap())
+                .unwrap();
+            let mut g: Vec<(String, i64)> = res
+                .rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    (Val::Str(s), Val::Int(c)) => (s.clone(), *c),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            g.sort();
+            g
+        };
+
+        // Live estate = base 5 nodes + Zed(5); base 5 edges + e5. Answered from marginals.
+        let gen = Generation::open(&root, &graph).unwrap();
+        {
+            let view = MergedView::read_only(&gen);
+            assert_eq!(count(&view, "MATCH (n) RETURN count(*)"), 6);
+            assert_eq!(count(&view, "MATCH (n:Person) RETURN count(*)"), 4); // + Zed
+            assert_eq!(count(&view, "MATCH (n:Company) RETURN count(*)"), 2); // untouched
+            assert_eq!(count(&view, "MATCH ()-[r]->() RETURN count(*)"), 6);
+            // KNOWS = e0,e1,e4,e5 = 4; WORKS_AT = e2,e3 = 2.
+            assert_eq!(
+                reltype_groups(&view),
+                vec![("KNOWS".to_string(), 4), ("WORKS_AT".to_string(), 2)]
+            );
+        }
+
+        // Flip the segment's marginals to inexact: the count fast paths must decline and full
+        // execution (segment-aware) must still return the same answers.
+        let mut m = SegmentManifest::read_from_dir(&seg_dir).unwrap();
+        m.marginals_exact = false;
+        m.write_to_dir(&seg_dir).unwrap();
+        let gen2 = Generation::open(&root, &graph).unwrap();
+        let view2 = MergedView::read_only(&gen2);
+        assert_eq!(
+            count(&view2, "MATCH (n) RETURN count(*)"),
+            6,
+            "decline → full exec"
+        );
+        assert_eq!(count(&view2, "MATCH (n:Person) RETURN count(*)"), 4);
+        assert_eq!(count(&view2, "MATCH ()-[r]->() RETURN count(*)"), 6);
+        assert_eq!(
+            reltype_groups(&view2),
+            vec![("KNOWS".to_string(), 4), ("WORKS_AT".to_string(), 2)]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

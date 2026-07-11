@@ -162,17 +162,23 @@ impl ReadView for Generation {
         Generation::manifest(self)
     }
     fn node_count(&self) -> u64 {
-        Generation::node_count(self)
+        // The full stacked id space (base + segment born bands). Equals the base count for a
+        // singleton set; used as the `AllNodes` scan bound.
+        self.stack().extents().nodes.total()
     }
     fn edge_count(&self) -> u64 {
-        Generation::edge_count(self)
+        self.stack().extents().edges.total()
     }
-    /// A pure core has no delta: every node is live.
+    /// No delta, but the base may carry a segment stack: net the stack's node marginals in.
     fn live_node_count(&self) -> u64 {
-        Generation::node_count(self)
+        (Generation::node_count(self) as i64 + self.stack().node_count_delta()).max(0) as u64
     }
     fn live_label_node_count(&self, label_id: u32) -> Result<u64> {
-        Ok(Generation::label_node_count(self, label_id))
+        let base = Generation::label_node_count(self, label_id) as i64;
+        let seg = Generation::label_name(self, label_id)
+            .map(|n| self.stack().label_node_delta(n))
+            .unwrap_or(0);
+        Ok((base + seg).max(0) as u64)
     }
     fn live_first_label_groups(&self) -> Result<Vec<(Option<String>, u64)>> {
         let mut groups: Vec<(Option<String>, u64)> = Vec::new();
@@ -191,17 +197,41 @@ impl ReadView for Generation {
         Ok(groups)
     }
     fn live_edge_count(&self) -> Result<Option<u64>> {
-        Ok(Some(Generation::edge_count(self)))
+        if !self.stack().marginals_exact() {
+            return Ok(None);
+        }
+        Ok(Some(
+            (Generation::edge_count(self) as i64 + self.stack().edge_count_delta()).max(0) as u64,
+        ))
     }
     fn live_reltype_edge_groups(&self) -> Result<Option<Vec<(String, u64)>>> {
+        if !self.stack().marginals_exact() {
+            return Ok(None);
+        }
         let mut groups = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for t in 0..Generation::manifest(self).reltypes.len() as u32 {
-            let c = Generation::reltype_edge_count(self, t);
+            let name = Generation::reltype_name(self, t).unwrap_or("").to_string();
+            let c = (Generation::reltype_edge_count(self, t) as i64
+                + self.stack().reltype_edge_delta(&name))
+            .max(0) as u64;
+            seen.insert(name.clone());
             if c > 0 {
-                groups.push((
-                    Generation::reltype_name(self, t).unwrap_or("").to_string(),
-                    c,
-                ));
+                groups.push((name, c));
+            }
+        }
+        // A reltype a flush introduced that the base never had.
+        let mut extra: Vec<String> = self
+            .stack()
+            .segment_reltype_names()
+            .into_iter()
+            .filter(|t| !seen.contains(t))
+            .collect();
+        extra.sort();
+        for name in extra {
+            let c = self.stack().reltype_edge_delta(&name).max(0) as u64;
+            if c > 0 {
+                groups.push((name, c));
             }
         }
         Ok(Some(groups))
@@ -399,16 +429,15 @@ impl ReadView for MergedView<'_> {
         self.core.manifest()
     }
     fn node_count(&self) -> u64 {
-        // Delta-born nodes (Phase 2c) occupy synthetic dense ids past the core count,
-        // so the merged count includes them. A full scan (`0..node_count`) therefore
-        // yields the core ids then the synthetic ones; tombstone suppression drops any
-        // deleted id (core or born) at the scan boundary.
-        self.core.node_count() + self.delta.born_count()
+        // The dense-id scan bound: the whole stacked id space (base + every segment's born
+        // band, via the extents' total) plus the delta's synthetic born ids. A full scan
+        // (`0..node_count`) yields base ids, then segment-born ids, then delta-born ones;
+        // tombstone suppression drops any deleted id at the scan boundary. Equals
+        // `core.node_count() + born` for a singleton set.
+        self.core.stack().extents().nodes.total() + self.delta.born_count()
     }
     fn edge_count(&self) -> u64 {
-        // Delta-born edges (Phase 3) occupy synthetic dense edge ids past the core
-        // count, so the merged count includes them (matching the node overlay above).
-        self.core.edge_count() + self.delta.born_edge_count()
+        self.core.stack().extents().edges.total() + self.delta.born_edge_count()
     }
     /// `core + born − suppressed`, all three terms O(1)-or-O(#tombstones):
     /// `born_count` is a per-level counter and the suppressed set is the delta's
@@ -416,8 +445,12 @@ impl ReadView for MergedView<'_> {
     /// so `count(*)` over a written graph stays a metadata read rather than the
     /// 91.6M-row scan the pure-core fast path used to be traded for.
     fn live_node_count(&self) -> u64 {
-        (self.core.node_count() + self.delta.born_count())
-            .saturating_sub(self.delta.effective_tombstoned_ids().len() as u64)
+        // `base + Σ segment node deltas + born − suppressed`. The stack's per-segment delta
+        // already nets each flush's births and tombstones, so this stays a metadata read.
+        // The caller gates on `core_stack().marginals_exact()` before trusting it.
+        let base_born = (self.core.node_count() + self.delta.born_count()) as i64
+            + self.core.stack().node_count_delta();
+        (base_born - self.delta.effective_tombstoned_ids().len() as i64).max(0) as u64
     }
 
     fn live_label_node_count(&self, label_id: u32) -> Result<u64> {
@@ -439,6 +472,7 @@ impl ReadView for MergedView<'_> {
             })
         };
         let mut count = self.core.label_node_count(label_id) as i64
+            + self.core.stack().label_node_delta(&label)
             + self.delta.born_count_with_label(&label) as i64;
         // Label-mutation adjustments (Stage 5), bounded by the label-overlay set: a node
         // that gained this label and did not already carry it is added; one that dropped a
@@ -562,20 +596,23 @@ impl ReadView for MergedView<'_> {
     }
 
     fn live_edge_count(&self) -> Result<Option<u64>> {
-        if !self.delta.edge_counts_are_exact() {
+        if !self.delta.edge_counts_are_exact() || !self.core.stack().marginals_exact() {
             return Ok(None);
         }
         let lost = self.edges_lost_to_node_tombstones()?;
-        let dead: u64 = lost.core.values().chain(lost.born.values()).sum();
-        Ok(Some(
-            (self.core.edge_count() + self.delta.born_edge_count()).saturating_sub(dead),
-        ))
+        let dead: i64 = lost.core.values().chain(lost.born.values()).sum::<u64>() as i64;
+        let live = self.core.edge_count() as i64
+            + self.core.stack().edge_count_delta()
+            + self.delta.born_edge_count() as i64
+            - dead;
+        Ok(Some(live.max(0) as u64))
     }
 
     fn live_reltype_edge_groups(&self) -> Result<Option<Vec<(String, u64)>>> {
-        if !self.delta.edge_counts_are_exact() {
+        if !self.delta.edge_counts_are_exact() || !self.core.stack().marginals_exact() {
             return Ok(None);
         }
+        let stack = self.core.stack();
         let lost = self.edges_lost_to_node_tombstones()?;
         let dead = |name: &str| -> i64 {
             (lost.core.get(name).copied().unwrap_or(0) + lost.born.get(name).copied().unwrap_or(0))
@@ -591,12 +628,13 @@ impl ReadView for MergedView<'_> {
             })
             .collect();
 
-        // Core reltype-id order, then delta-only reltypes by name (see the label groups).
+        // Core reltype-id order, then reltypes seen only in the stack or the delta, by name.
         let mut out: Vec<(String, u64)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for t in 0..self.core.manifest().reltypes.len() as u32 {
             let name = self.core.reltype_name(t).unwrap_or("").to_string();
             let live = self.core.reltype_edge_count(t) as i64
+                + stack.reltype_edge_delta(&name)
                 + born.get(&name).copied().unwrap_or(0) as i64
                 - dead(&name);
             seen.insert(name.clone());
@@ -604,12 +642,21 @@ impl ReadView for MergedView<'_> {
                 out.push((name, live as u64));
             }
         }
-        let mut extra: Vec<&String> = born.keys().filter(|t| !seen.contains(*t)).collect();
+        // A reltype a flush or the delta introduced that the core never had.
+        let mut extra: Vec<String> = born
+            .keys()
+            .cloned()
+            .chain(stack.segment_reltype_names())
+            .filter(|t| !seen.contains(t))
+            .collect();
         extra.sort();
+        extra.dedup();
         for name in extra {
-            let live = born[name] as i64 - dead(name);
+            let live = stack.reltype_edge_delta(&name)
+                + born.get(&name).copied().unwrap_or(0) as i64
+                - dead(&name);
             if live > 0 {
-                out.push((name.clone(), live as u64));
+                out.push((name, live as u64));
             }
         }
         Ok(Some(out))

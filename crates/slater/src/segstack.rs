@@ -239,6 +239,70 @@ impl CoreStack {
         Ok(self.resolve_node_row(id)?.is_some_and(|r| r.tombstoned))
     }
 
+    // ── signed marginals (summed across the stack, for the count fast paths) ────────────
+
+    /// Whether every segment's `SEGMENT.json` marginals are provably exact. A count fast
+    /// path may sum the stack's marginals only when this holds; otherwise it declines and
+    /// falls back to full execution (the "empty ⇒ decline, never wrong" discipline). Vacuously
+    /// `true` for a singleton set.
+    pub fn marginals_exact(&self) -> bool {
+        self.segments.iter().all(|s| s.manifest.marginals_exact)
+    }
+
+    /// Net change in node count across the stack (Σ each segment's born − tombstoned).
+    pub fn node_count_delta(&self) -> i64 {
+        self.segments
+            .iter()
+            .map(|s| s.manifest.node_count_delta)
+            .sum()
+    }
+
+    /// Net change in edge count across the stack.
+    pub fn edge_count_delta(&self) -> i64 {
+        self.segments
+            .iter()
+            .map(|s| s.manifest.edge_count_delta)
+            .sum()
+    }
+
+    /// Net change in the occurrence count of `label` across the stack.
+    pub fn label_node_delta(&self, label: &str) -> i64 {
+        self.segments
+            .iter()
+            .flat_map(|s| &s.manifest.label_node_deltas)
+            .filter(|(l, _)| l == label)
+            .map(|(_, d)| *d)
+            .sum()
+    }
+
+    /// Net change in `reltype`'s edge count across the stack.
+    pub fn reltype_edge_delta(&self, reltype: &str) -> i64 {
+        self.segments
+            .iter()
+            .flat_map(|s| &s.manifest.reltype_edge_deltas)
+            .filter(|(t, _)| t == reltype)
+            .map(|(_, d)| *d)
+            .sum()
+    }
+
+    /// The distinct reltype names carrying a delta anywhere in the stack — so a group-by /
+    /// enumeration can surface a reltype a flush introduced that the base never had.
+    pub fn segment_reltype_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .segments
+            .iter()
+            .flat_map(|s| {
+                s.manifest
+                    .reltype_edge_deltas
+                    .iter()
+                    .map(|(t, _)| t.clone())
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Fold the stack's index fragments into a base equality-probe result `ids`, oldest→
     /// newest: each segment first **suppresses** the base/older ids it supersedes (its
     /// `removals` sidecar), then **unions** its own matching fragment ids. Processing oldest
