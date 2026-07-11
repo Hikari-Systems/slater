@@ -118,14 +118,53 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 2 slice 5 — **Phase 2 COMPLETE**.
-**Phases 1–2 DONE.** Next: **Phase 3 (read path over a stacked set).** `LevelRead`
-extensions + at-rest adapter; `MergedView` routing (full-row short-circuit via `segment.rs`
-`node_row`/`edge_row` + `extents.rs` routing; adjacency fan-out gating via
-`may_hold_node` fences; index-probe union via `segindex` base-minus-removals ∪ fragment +
-`segpostings` driving-set union; count summation via `segmanifest` signed marginals with
-`marginals_exact` decline; histogram decline). Four exec.rs seams: `node_record`,
-`read_adj_overlaid`/`overlay_adj`, `scan_candidates`, count fast paths.
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.1 (`1cc6b55`). **Phases
+1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.2 (full-row node/edge resolution over
+the stack).**
+
+### Phase 3 design (decided)
+
+Segments are **immutable-core-shaped** (full rows, *replace* semantics), not delta-shaped
+(patch-fold). So they form a **core stack** *between* the base `Generation` and the
+write-delta — NOT a `LevelRead` level. Effective read precedence, newest-wins:
+1. **delta** (`MergedView.delta`) — patches / tombstones / born rows (top).
+2. **upper segments newest→oldest** — first segment whose `may_hold_node(id)` fence passes
+   and `node_row(id)`/`edge_row(id)` returns `Some` wins as a *full row* (its `tombstoned`
+   flag = deleted); no cross-segment fold.
+3. **base** generation readers (bottom).
+
+The merge lives at the **four exec.rs seams** (the trait methods like `node_props()` return
+single readers, so the fold can't live in `ReadView`). Each seam resolves the base row from
+the stack *before* applying the existing delta overlay. The stack + routing are reached via
+`ReadView::core_stack()` → `crate::segstack::CoreStack` (`segments()` oldest→newest,
+`extents()` id→`SegmentOrd`). Segment readers page through their own held `BlockCache`, so a
+resolver needs only `&CoreStack` + the id.
+
+**Slices (each its own green commit; test every slice against a hand-built stacked-set
+fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs set):**
+- **3.1 DONE** (`057fec2` store-native segment opens; `1cc6b55` `CoreStack` load+route+
+  `core_stack()`, wired into `Generation::open`, INERT — no read consults it yet).
+- **3.2** node/edge full-row resolution: add `CoreStack::resolve_node_row(id)->Option<NodeRow>`
+  (newest→oldest full-row-wins, `None`=miss→base) + `resolve_edge_row`; wire `exec.rs`
+  `node_props`/`node_label_ids`(`node_label_ids_par`)/`edge_props` to consult the stack
+  before the delta overlay. Map segment name-space rows → id-space (names absent from core
+  symbols drop from the id-keyed view, readable by name — mirrors born-edge props).
+- **3.3** adjacency: merge base `outgoing/incoming` with each segment's `out_adj/in_adj`
+  fragments (`removed` suppresses, `may_hold_node` gates the fan-out) in
+  `read_adj_overlaid`/`overlay_adj`, then delta on top.
+- **3.4** `scan_candidates`: RangeEq/RangeRange = base ISAM − per-segment `removals` ∪
+  segment `lookup_eq/range`; LabelScan unions segment-carried label rows; RelTypeScan
+  unions segment `postings` driving sets; then existing delta union.
+- **3.5** counts: extend `MergedView` `live_*` marginal folds to sum base + Σ segment
+  `SegmentManifest` deltas (+ delta), declining (→ None / full exec) when any segment's
+  `marginals_exact` is false.
+- **3.6** histogram/grouped-index decline over a stacked set; full suite + conformance
+  fs+mem; clippy; Phase 3 exit.
+
+**Reference — the delta-overlay mirror targets** (Phase 3 seams mimic these for segments):
+`MergedView` in `read_view.rs` (`live_*` signed marginals); `exec.rs` `overlay_node_props`
+(:1698), `overlay_adj` (:342)/`read_adj_overlaid` (:388), `scan_candidates` (:5362) with
+`born_ids_in_index_eq/range`; `DeltaSnapshot` fold in `slater-delta/memtable.rs`.
 
 **Phase 2 artifacts (all in `graph-format/src/`, format only — NOT wired to reads):**
 `extents.rs` (id→segment routing), `segment.rs` (node/adj/edge sections + fences +
@@ -138,8 +177,10 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
 - HP1 — `SetManifest` type + graph-format tests, committed (`4c80c6b`). ✓
 - HP2 — builder writes singleton set + reader opens through it (implicit-singleton
   fallback), 698 slater lib + slater-build suites green, clippy clean, committed. ✓
-  ← current baseline; **Phase 1 complete.**
-- HP3 (next track) — Phase 2 segment format landing in slices (see below).
+- HP3 — Phase 2 segment format, 5 slices, committed through `35f0c0d`. ✓ **Phase 2 complete.**
+- HP4 — Phase 3 slice 3.1: store-native segment opens (`057fec2`) + `CoreStack`
+  load/route/`core_stack()` wired into `Generation::open`, INERT (`1cc6b55`); 140
+  graph-format + 702 slater lib tests green, clippy clean. ✓ ← current baseline.
 
 **Immediate next step — start Phase 2 (core-segment format).** Build
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
