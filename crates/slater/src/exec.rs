@@ -561,7 +561,17 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
     // through the core symbol table (the write path requires the label to pre-exist).
     // The id-threshold compare gates the core block read; the label overlay below still
     // applies to a born node's identity label.
-    let mut ids: Vec<u32> = if id >= gen.core_generation().node_count() {
+    let mut ids: Vec<u32> = if let Some(row) = gen.core_stack().resolve_node_row(id)? {
+        // A segment carries a full row for `id` (an override of a base node, or a
+        // segment-born node): its label set replaces the base's, mapped through the core
+        // symbol table (labels must pre-exist, as for a delta-born identity label). A
+        // tombstone row contributes no labels.
+        if row.tombstoned {
+            Vec::new()
+        } else {
+            row.labels.iter().filter_map(|l| gen.label_id(l)).collect()
+        }
+    } else if id >= gen.core_generation().node_count() {
         gen.delta()
             .node_identity_by_dense(id)
             .and_then(|(label, _, _)| gen.label_id(&label))
@@ -627,17 +637,31 @@ fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
                 return Ok(Val::Null);
             }
         }
-        // A delta-born node (Phase 2c) has no core row: its only non-patch property is
-        // the business key, recovered from the delta identity. Never read a core block
-        // for a synthetic id.
-        if id >= gen.core_generation().node_count() {
-            if let Some((_, kname, kval)) = delta.node_identity_by_dense(id) {
-                if kname.as_str() == key {
-                    return Ok(Val::from_value(kval));
-                }
-            }
+    }
+    // Core stack (below the delta, above the base): a segment full row wins over the base.
+    // The delta patch/replace/remove above already took precedence, so reaching here means
+    // the delta did not decide this key.
+    if let Some(row) = gen.core_stack().resolve_node_row(id)? {
+        if row.tombstoned {
             return Ok(Val::Null);
         }
+        return Ok(row
+            .props
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| Val::from_value(v.clone()))
+            .unwrap_or(Val::Null));
+    }
+    // A delta-born node (Phase 2c) with no segment row has no core row: its only non-patch
+    // property is the business key, recovered from the delta identity. Never read a core
+    // block for a synthetic id.
+    if !gen.delta().is_empty() && id >= gen.core_generation().node_count() {
+        if let Some((_, kname, kval)) = gen.delta().node_identity_by_dense(id) {
+            if kname.as_str() == key {
+                return Ok(Val::from_value(kval));
+            }
+        }
+        return Ok(Val::Null);
     }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
@@ -720,20 +744,28 @@ fn node_ok_par(
 /// stay byte-for-byte identical.
 fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
     if !gen.delta().is_empty() {
-        // A delta-born edge (Phase 3, `id >= core edge_count`) has no core edge-props
-        // record — its property lives only in the delta.
-        if id >= gen.core_generation().edge_count() {
-            return Ok(gen
-                .delta()
-                .edge_patch_value(id, key)
-                .map(Val::from_value)
-                .unwrap_or(Val::Null));
-        }
-        // A **core** edge patched in place (`SET r.p` on an existing edge): the delta
-        // patch wins over the core value; absent, fall through to the core read.
+        // A delta patch on this key wins over any core/segment value (`SET r.p`, or a
+        // delta-born edge whose properties live only in the delta).
         if let Some(v) = gen.delta().edge_patch_value(id, key) {
             return Ok(Val::from_value(v));
         }
+    }
+    // Core stack: a segment full row for the edge wins over the base.
+    if let Some(row) = gen.core_stack().resolve_edge_row(id)? {
+        if row.tombstoned {
+            return Ok(Val::Null);
+        }
+        return Ok(row
+            .props
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| Val::from_value(v.clone()))
+            .unwrap_or(Val::Null));
+    }
+    // A delta-born edge with no segment row has no core record — only the delta (already
+    // consulted above) holds its properties, so any other key is absent.
+    if !gen.delta().is_empty() && id >= gen.core_generation().edge_count() {
+        return Ok(Val::Null);
     }
     let Some(key_id) = gen.property_key_id(key) else {
         return Ok(Val::Null);
@@ -1681,13 +1713,61 @@ impl<'g, V: ReadView> Engine<'g, V> {
             .into_iter()
             .filter_map(|l| self.gen.label_name(l).map(|s| s.to_string()))
             .collect();
-        let mut props: NamedProps = self
+        let mut props = self.core_named_props(id)?;
+        self.overlay_node_props(id, &mut props);
+        Ok((labels, props))
+    }
+
+    /// Node `id`'s **core-stack** properties in name space (below the delta): the winning
+    /// segment full row when one carries the id, else the base record mapped to names.
+    /// Resolving in name space (rather than through the id-keyed [`Self::node_props`])
+    /// preserves a segment property whose key is not in the base symbol table. The caller
+    /// folds the delta overlay on top ([`Self::overlay_node_props`]).
+    fn core_named_props(&self, id: u64) -> Result<NamedProps> {
+        if let Some(row) = self.gen.core_stack().resolve_node_row(id)? {
+            if row.tombstoned {
+                return Ok(Vec::new());
+            }
+            return Ok(row
+                .props
+                .into_iter()
+                .map(|(k, v)| (k, Val::from_value(v)))
+                .collect());
+        }
+        Ok(self
             .node_props(id)?
             .into_iter()
             .map(|(kid, v)| (self.key_name(kid), Val::from_value(v)))
-            .collect();
-        self.overlay_node_props(id, &mut props);
-        Ok((labels, props))
+            .collect())
+    }
+
+    /// Edge `id`'s effective properties in name space: the winning segment full row folded
+    /// under the delta's edge patches, else the base record (via [`Self::edge_props`], which
+    /// already folds patches). The edge analogue of [`Self::core_named_props`].
+    fn core_named_edge_props(&self, id: u64) -> Result<NamedProps> {
+        if let Some(row) = self.gen.core_stack().resolve_edge_row(id)? {
+            if row.tombstoned {
+                return Ok(Vec::new());
+            }
+            let mut out: NamedProps = row
+                .props
+                .into_iter()
+                .map(|(k, v)| (k, Val::from_value(v)))
+                .collect();
+            // A delta patch on a segment-carried edge wins last-writer-wins.
+            let delta = self.gen.delta();
+            if !delta.is_empty() {
+                for (name, value) in delta.edge_patches(id) {
+                    overlay_named(&mut out, &name, Val::from_value(value));
+                }
+            }
+            return Ok(out);
+        }
+        Ok(self
+            .edge_props(id)?
+            .into_iter()
+            .map(|(kid, v)| (self.key_name(kid), Val::from_value(v)))
+            .collect())
     }
 
     /// Fold the live delta's property patches for node `id` onto `named` (the core
@@ -1750,11 +1830,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// Bolt `Relationship` structure carries.
     pub fn rel_record(&self, id: u64, reltype: u32) -> Result<(String, NamedProps)> {
         let type_name = self.gen.reltype_name(reltype).unwrap_or("").to_string();
-        let props = self
-            .edge_props(id)?
-            .into_iter()
-            .map(|(kid, v)| (self.key_name(kid), Val::from_value(v)))
-            .collect();
+        let props = self.core_named_edge_props(id)?;
         Ok((type_name, props))
     }
 
@@ -6373,24 +6449,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
     }
 
     fn all_properties(&self, base: &Val) -> Result<Vec<(String, Val)>> {
-        let raw = match base {
-            Val::Node(id) => self.node_props(*id)?,
-            Val::Rel { id, .. } => self.edge_props(*id)?,
-            Val::Map(m) => return Ok(m.clone()),
-            Val::Null => return Ok(Vec::new()),
+        match base {
+            Val::Node(id) => {
+                // Core-stack row (segment or base) in name space, then the delta overlay.
+                let mut out = self.core_named_props(*id)?;
+                self.overlay_node_props(*id, &mut out);
+                Ok(out)
+            }
+            // `core_named_edge_props` already folds the segment row and the delta patches.
+            Val::Rel { id, .. } => self.core_named_edge_props(*id),
+            Val::Map(m) => Ok(m.clone()),
+            Val::Null => Ok(Vec::new()),
             other => bail!("type {} has no properties", other.to_display()),
-        };
-        let mut out = Vec::with_capacity(raw.len());
-        for (kid, v) in raw {
-            let name = self.gen.property_key_name(kid).unwrap_or("?").to_string();
-            out.push((name, Val::from_value(v)));
         }
-        // Writable-layer overlay: fold delta patches for a node in name-space, LWW.
-        // (Edges have no delta in Phase 1c.) No-op on the empty-delta fast path.
-        if let Val::Node(id) = base {
-            self.overlay_node_props(*id, &mut out);
-        }
-        Ok(out)
     }
 
     fn eval_list_predicate(
@@ -8916,6 +8987,7 @@ mod tests {
     use crate::generation::Generation;
     use crate::parser;
     use crate::testgen;
+    use graph_format::ids::Generation as GenId;
 
     /// The writable-layer read overlay (Phase 1c): a delta patch on an existing
     /// node's property overrides the core value last-writer-wins, a delta patch on
@@ -8976,6 +9048,217 @@ mod tests {
             matches!(&res.rows[0][1], Val::Str(s) if s == "AAA"),
             "n.rating via overlay"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Stack a single upper core segment over a `write_basic` base and repoint `current`
+    /// at a set that lists it. The segment overrides base node 0 (full-row replace: keeps
+    /// `name`, changes `age` 30→99, adds a non-core-symbol prop `mood`, drops `city`/`team`),
+    /// tombstones base node 2, births node 5 (`:Person {name:'Zed', age:50}`) and edge 5
+    /// (`(0)-[:KNOWS {since:2099}]->(5)`). Returns `(root, graph, set_uuid)`.
+    fn write_basic_with_segment(tag: &str) -> (std::path::PathBuf, String, uuid::Uuid) {
+        use graph_format::manifest::FileEntry;
+        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segment::{EdgeRow, NodeRow, SegmentWriter};
+        use graph_format::setmanifest::{SegmentRef, SetManifest};
+
+        let (root, graph, base_uuid) = testgen::write_basic(tag);
+        let seg_uuid = uuid::Uuid::from_u128(0x5_5e60_0000_0000_0000_0000_0000_0001);
+        let set_uuid = uuid::Uuid::from_u128(0x5_5e70_0000_0000_0000_0000_0000_0001);
+
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        std::fs::create_dir_all(seg_dir.parent().unwrap()).unwrap();
+        let mut w = SegmentWriter::create(&seg_dir, 0x22, 4096, 3).unwrap();
+        // Nodes pushed in ascending dense-id order: override(0), tombstone(2), born(5).
+        w.push_node(
+            0,
+            &NodeRow {
+                labels: vec!["Person".into()],
+                props: vec![
+                    ("name".into(), Value::Str("Alice".into())),
+                    ("age".into(), Value::Int(99)),
+                    ("mood".into(), Value::Str("calm".into())),
+                ],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.push_node(2, &NodeRow::tombstone()).unwrap();
+        w.push_node(
+            5,
+            &NodeRow {
+                labels: vec!["Person".into()],
+                props: vec![
+                    ("name".into(), Value::Str("Zed".into())),
+                    ("age".into(), Value::Int(50)),
+                ],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.push_edge(
+            5,
+            &EdgeRow {
+                src: 0,
+                dst: 5,
+                reltype: "KNOWS".into(),
+                props: vec![("since".into(), Value::Int(2099))],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        let mut m = SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: SEGMENT_MANIFEST_VERSION,
+            segment_uuid: GenId(seg_uuid),
+            base: GenId(base_uuid),
+            created_unix: 0,
+            node_band: (5, 6), // one born node id
+            edge_band: (5, 6), // one born edge id
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 0, // +1 born, -1 tombstoned
+            edge_count_delta: 1,
+            reltype_edge_deltas: vec![("KNOWS".into(), 1)],
+            label_node_deltas: vec![("Person".into(), 0)],
+            marginals_exact: true,
+            dirty_indexes: vec![],
+            mac: None,
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 0,
+                blake3: "aa".into(),
+                sha256: None,
+                crc32c: None,
+            }],
+        };
+        m.set_content_hash();
+        m.write_to_dir(&seg_dir).unwrap();
+
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = SetManifest::singleton(GenId(base_uuid), 0);
+        set.set_uuid = GenId(set_uuid);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        std::fs::write(
+            sets.join(format!("{set_uuid}.json")),
+            set.to_bytes().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(&graph).join("current"), set_uuid.to_string()).unwrap();
+        (root, graph, set_uuid)
+    }
+
+    fn prop<'a>(props: &'a NamedProps, key: &str) -> Option<&'a Val> {
+        props.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// A segment full row overrides/extends the base node reads it carries, births new
+    /// entities, and tombstones nodes — through both `node_record` (all-props) and the
+    /// single-property path. This is the read oracle for slice 3.2.
+    #[test]
+    fn segment_full_row_overrides_and_extends_reads() {
+        use crate::read_view::MergedView;
+        let (root, graph, set_uuid) = write_basic_with_segment("seg_full_row_reads");
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(gen.uuid(), GenId(set_uuid));
+        assert_eq!(gen.stack().segments().len(), 1);
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+
+        // Overridden node 0: full-row replace — age 30→99, new `mood`, and `city`/`team` gone.
+        let (labels0, p0) = engine.node_record(0).unwrap();
+        assert_eq!(labels0, vec!["Person".to_string()]);
+        assert!(matches!(prop(&p0, "name"), Some(Val::Str(s)) if s == "Alice"));
+        assert!(matches!(prop(&p0, "age"), Some(Val::Int(99))), "{p0:?}");
+        assert!(matches!(prop(&p0, "mood"), Some(Val::Str(s)) if s == "calm"));
+        assert!(
+            prop(&p0, "city").is_none(),
+            "full-row replace drops base props: {p0:?}"
+        );
+        assert!(prop(&p0, "team").is_none(), "{p0:?}");
+        // Single-property path agrees, including the non-core-symbol key `mood`.
+        assert!(matches!(engine.node_prop(0, "age").unwrap(), Val::Int(99)));
+        assert!(matches!(engine.node_prop(0, "mood").unwrap(), Val::Str(s) if s == "calm"));
+        assert!(matches!(engine.node_prop(0, "city").unwrap(), Val::Null));
+
+        // Born node 5.
+        let (labels5, p5) = engine.node_record(5).unwrap();
+        assert_eq!(labels5, vec!["Person".to_string()]);
+        assert!(matches!(prop(&p5, "name"), Some(Val::Str(s)) if s == "Zed"));
+        assert!(matches!(engine.node_prop(5, "age").unwrap(), Val::Int(50)));
+
+        // Tombstoned node 2: no labels, no props.
+        let (labels2, p2) = engine.node_record(2).unwrap();
+        assert!(
+            labels2.is_empty() && p2.is_empty(),
+            "tombstoned: {labels2:?} {p2:?}"
+        );
+
+        // Untouched base node 1 reads straight from the base.
+        let (_l1, p1) = engine.node_record(1).unwrap();
+        assert!(matches!(prop(&p1, "age"), Some(Val::Int(25))));
+        assert!(matches!(prop(&p1, "city"), Some(Val::Str(s)) if s == "London"));
+
+        // Born edge 5 resolves its full row; base edge 0 is untouched.
+        let knows = gen.reltype_id("KNOWS").unwrap();
+        let (t5, ep5) = engine.rel_record(5, knows).unwrap();
+        assert_eq!(t5, "KNOWS");
+        assert!(
+            matches!(prop(&ep5, "since"), Some(Val::Int(2099))),
+            "{ep5:?}"
+        );
+        assert!(matches!(
+            engine.edge_prop(5, "since").unwrap(),
+            Val::Int(2099)
+        ));
+        let (_t0, ep0) = engine.rel_record(0, knows).unwrap();
+        assert!(
+            matches!(prop(&ep0, "since"), Some(Val::Int(2020))),
+            "{ep0:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The write-delta sits above the segment stack: a delta patch wins over a segment full
+    /// row (delta > segment > base), for both the all-props and single-property paths.
+    #[test]
+    fn delta_wins_over_segment_full_row() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph, _) = write_basic_with_segment("seg_delta_precedence");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Patch node 0 (already segment-overridden to age 99): the delta sets age 7.
+        let mut mem = Memtable::new();
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(0),
+            [("age".to_string(), Value::Int(7))],
+        );
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let engine = Engine::new(&view, &cache);
+
+        let (_l0, p0) = engine.node_record(0).unwrap();
+        assert!(
+            matches!(prop(&p0, "age"), Some(Val::Int(7))),
+            "delta wins: {p0:?}"
+        );
+        // The segment's other props still show through where the delta is silent.
+        assert!(matches!(prop(&p0, "mood"), Some(Val::Str(s)) if s == "calm"));
+        assert!(matches!(engine.node_prop(0, "age").unwrap(), Val::Int(7)));
         std::fs::remove_dir_all(&root).ok();
     }
 

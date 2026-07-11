@@ -31,7 +31,7 @@ use graph_format::extents::Extents;
 use graph_format::ids::Generation as GenId;
 use graph_format::segindex::SegmentIndexReader;
 use graph_format::segmanifest::SegmentManifest;
-use graph_format::segment::SegmentReader;
+use graph_format::segment::{EdgeRow, NodeRow, SegmentReader};
 use graph_format::segpostings::SegmentPostingsReader;
 use graph_format::setmanifest::SetManifest;
 use graph_format::store::{join_key, ObjectStore};
@@ -198,6 +198,39 @@ impl CoreStack {
     /// The id → owning-member routing tables (node and edge id spaces).
     pub fn extents(&self) -> &Extents {
         &self.extents
+    }
+
+    /// Resolve node `id`'s **full effective row** as the core stack sees it (below the
+    /// write-delta): the newest segment that carries the id wins in a single record read —
+    /// segments hold full rows, so there is no cross-segment fold. Returns:
+    /// - `Some(row)` — a segment carries `id` (`row.tombstoned` = the flush deleted it);
+    /// - `None` — no segment touches `id`, so the caller reads the base generation.
+    ///
+    /// A binary-search miss inside a segment costs no I/O (the `may_hold_node` fence + the
+    /// resident key column gate it), so an untouched id skips the whole stack in
+    /// O(#segments) resident checks. Instant `None` for a singleton set.
+    pub fn resolve_node_row(&self, id: u64) -> Result<Option<NodeRow>> {
+        for seg in self.segments.iter().rev() {
+            if seg.reader.may_hold_node(id) {
+                if let Some(row) = seg.reader.node_row(id)? {
+                    return Ok(Some(row));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve edge `id`'s full effective row over the stack — the edge mirror of
+    /// [`resolve_node_row`](Self::resolve_node_row).
+    pub fn resolve_edge_row(&self, id: u64) -> Result<Option<EdgeRow>> {
+        for seg in self.segments.iter().rev() {
+            if seg.reader.may_hold_edge(id) {
+                if let Some(row) = seg.reader.edge_row(id)? {
+                    return Ok(Some(row));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
