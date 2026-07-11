@@ -118,8 +118,26 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.1 (HP17). **Phases 1–4
+**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.2 (HP18). **Phases 1–4
 DONE; Phase 5 IN PROGRESS.**
+
+**Phase 5 (T3 segment compaction) — slice 5.2 DONE (merge hardening).** Five new e2e oracle
+tests exercise the cases 5.1's single test did not — and **the 5.1 merge writer + orchestrator
+handled all five with no code change** (a hardening slice that confirmed, not patched, the
+design): a **base-node delete folded across the run** (a below-run tombstone + its incident-edge
+`removed` fragments are *carried*, not reclaimed — Bob and his two KNOWS edges stay gone, summed
+marginals net the delete); a **partial run `[1,3)`** with a segment below (seg 0) and above (seg
+3) — Carol is patched in every segment (11→22→33→44) and still resolves to seg 3's 44 (above wins)
+while seg 0's below-run 11 stays superseded via the merged segment's carried index removal, and
+below/within/above-run born nodes all survive (the splice `segments[..start] + merged +
+segments[end..]` preserves precedence and the bands still tile); a **zero-width band** in the run
+(seg 0 is a patch-only flush ⇒ empty node/edge bands — the contiguity check accepts the zero-width
+tile, the patched row + carried removal survive); an **encrypted** merge (fresh per-segment cipher
++ KDF header, sealed MAC, decrypts on read, reopens only WITH the key); and a **remote-store**
+merge (the merged segment + spliced set + `current` upload through the `ObjectStore`; the run's two
+pre-merge dirs remain for a later GC, so the store holds three segment dirs; a store-native reopen
+serves the fold). **725 slater lib** (+5) + 140 graph-format + 78 slater-delta + full workspace
+green, clippy + fmt clean.
 
 **Phase 5 (T3 segment compaction) — slice 5.1 DONE.** A new merge writer
 (`crate::merge_segment::write_merge_segment`) folds a **contiguous run** of upper segments
@@ -177,17 +195,31 @@ delta (an adjacency-removal concern the patch materialiser doesn't own), and a f
 image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
 `as_memtable()` returns `None`).
 
-**Phase 5 NEXT after 5.1:** **5.2** — hardening the merge over the cases 5.1's test doesn't
-exercise (a base-node **delete** folded across the run; a **partial** run `[i,j)` with segments
-above/below it; an **encrypted** merge; a **remote-store** merge; a merge whose inputs include a
-zero-width band). **5.3** — the **admission policy**: `maxUpperSegments`, size-tiered run
-selection, scheduling, and (Phase-6-gated) an auto-compaction trigger; DECISIONS.md D50 → the
-four-rung ladder. Deferred leanness (each benign, matching the flush writer's noted follow-ups):
-a born-then-deleted **edge** leaves an orphan edge row in the merged segment (its adjacency is
-suppressed by the fold, so it is never read); postings are a union (a stale driving hit is
-filtered by adjacency).
+**Phase 5 NEXT after 5.2:** **5.3** — the **admission policy**: `maxUpperSegments`, size-tiered
+run selection, scheduling, and (Phase-6-gated) an auto-compaction trigger; DECISIONS.md D50 → the
+four-rung ladder. (5.2's merge hardening is DONE — see below.) Deferred leanness (each benign,
+matching the flush writer's noted follow-ups): a born-then-deleted **edge** leaves an orphan edge
+row in the merged segment (its adjacency is suppressed by the fold, so it is never read); postings
+are a union (a stale driving hit is filtered by adjacency).
 
 ### Phase 5 slice log
+- **5.2 DONE** (HP18): **merge hardening** — five new e2e oracle tests over the cases 5.1's test
+  did not exercise, all passing against the **unchanged** 5.1 writer/orchestrator (a hardening
+  slice that confirmed the design rather than patching it):
+  `compact_folds_a_base_delete_across_the_run` (a below-run node tombstone + incident-edge
+  `removed` fragments are carried through the fold, summed marginals net the delete),
+  `compact_a_partial_run_preserves_precedence` (4 segments, compact the middle `[1,3)`; Carol
+  patched in all four 11→22→33→44 resolves to seg 3's 44 — above the run — while seg 0's below-run
+  11 stays superseded, and below/within/above-run born nodes all survive the splice),
+  `compact_folds_a_zero_width_band` (a patch-only seg 0 ⇒ empty node/edge bands folds with a
+  births-carrying seg 1; the contiguity check accepts the zero-width tile),
+  `compact_encrypts_the_merged_segment` (fresh per-segment cipher + KDF header + sealed MAC;
+  decrypts on read; reopens only WITH the key; without → refused), and
+  `compact_uploads_to_an_object_store` (merged segment + spliced set + `current` upload through a
+  `MemObjectStore`; the two pre-merge dirs stay for a later GC ⇒ three segment dirs; store-native
+  reopen serves the fold). Each read-probe battery is identical before the compaction, after it,
+  and after a reopen. **725 slater lib** (+5) + 140 graph-format + 78 slater-delta + full
+  workspace green, clippy + fmt clean.
 - **5.1 DONE** (HP17): the **T3 merge writer** + orchestrator + rebind, end-to-end. New
   `crate::merge_segment::write_merge_segment(inputs, &MergeInputs)` folds a contiguous run of
   `&LoadedSegment`s (oldest→newest) into one segment — enumerating each reader's key columns
@@ -498,8 +530,14 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   spliced set → upload → swap → `rebind_core_uuid`), `DeltaWriter::rebind_core_uuid` (lightweight
   id-space-invariant rebind). One e2e oracle (`compact_segments_folds_a_run_into_one`): a 10-probe
   battery reads identically before/after a 2→1 compaction and survives a reopen. 720 slater lib +
-  full workspace green, clippy + fmt clean. ← current baseline; next is slice 5.2 (merge
-  hardening: delete-across-run, partial run, encrypted/remote, zero-width band).
+  full workspace green, clippy + fmt clean.
+- HP18 — Phase 5 slice 5.2: **merge hardening**. Five new e2e oracle tests
+  (`compact_folds_a_base_delete_across_the_run`, `compact_a_partial_run_preserves_precedence`,
+  `compact_folds_a_zero_width_band`, `compact_encrypts_the_merged_segment`,
+  `compact_uploads_to_an_object_store`), all green against the **unchanged** 5.1 writer +
+  orchestrator. 725 slater lib + full workspace green, clippy + fmt clean. ← current baseline;
+  next is slice 5.3 (admission policy: `maxUpperSegments`, size-tiered run selection, scheduling;
+  DECISIONS.md D50 → four-rung ladder; an auto-compaction trigger stays Phase-6-gated).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
@@ -556,23 +594,23 @@ Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core work on branch `writeable`. Read `docs/SEGMENTED-CORE-PLAN.md`
-> "RESUME HERE" + the Phase 5 slice log first. **Committed through HP17 (Phase 5 slice 5.1, T3
-> segment compaction).** Phases 1–4 DONE (the T2-flush writer is feature-complete). **Phase 5
+> "RESUME HERE" + the Phase 5 slice log first. **Committed through HP18 (Phase 5 slice 5.2, T3
+> merge hardening).** Phases 1–4 DONE (the T2-flush writer is feature-complete). **Phase 5
 > (T3 segment↔segment merge) IN PROGRESS.** Slice 5.1 shipped the **merge writer**
 > (`crate::merge_segment::write_merge_segment` — folds a contiguous run of upper segments
 > newest-wins into one, summed marginals), the **orchestrator**
 > (`Graphs::compact_graph_segments` — pick run → merge → publish spliced set → upload → swap →
 > rebind), and a lightweight **delta rebind** (`DeltaWriter::rebind_core_uuid` — compaction
-> preserves `extents().total()`, so no freeze/replay/rebase). Run selection is explicit.
-> Baseline: **720 slater lib tests** (140 graph-format, 78 slater-delta), clippy + fmt clean.
+> preserves `extents().total()`, so no freeze/replay/rebase). Slice 5.2 added **five e2e merge
+> hardening tests** (base-delete-across-run, partial run `[1,3)`, zero-width band, encrypted,
+> remote-store) — all green against the **unchanged** 5.1 writer + orchestrator (no code change).
+> Run selection is explicit. Baseline: **725 slater lib tests** (140 graph-format, 78
+> slater-delta), clippy + fmt clean.
 >
-> NEXT: **slice 5.2** — harden the merge over the cases 5.1's test doesn't exercise (a base-node
-> **delete** folded across the run; a **partial** run `[i,j)`; an **encrypted** merge; a
-> **remote-store** merge; a zero-width band). Then **slice 5.3** — the **admission policy**
-> (`maxUpperSegments`, size-tiered run selection, scheduling; DECISIONS.md D50 → four-rung
-> ladder). An auto-compaction trigger, like the flush auto-trigger, is Phase-6-gated. Deferred
-> leanness (benign): a born-then-deleted edge leaves an orphan edge row (adjacency-suppressed,
-> never read); postings are a union.
+> NEXT: **slice 5.3** — the **admission policy** (`maxUpperSegments`, size-tiered run selection,
+> scheduling; DECISIONS.md D50 → four-rung ladder). An auto-compaction trigger, like the flush
+> auto-trigger, is Phase-6-gated. Deferred leanness (benign): a born-then-deleted edge leaves an
+> orphan edge row (adjacency-suppressed, never read); postings are a union.
 >
 > DISCIPLINE: `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` +
 > `dangerouslyDisableSandbox`. Full workspace + clippy green; `cargo fmt --all` before
