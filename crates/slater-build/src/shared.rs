@@ -23,7 +23,21 @@ use graph_format::vectors::VectorStoreWriter;
 use crate::model::VectorIndexStmt;
 
 /// Tunables for one build (all have sensible defaults in the CLI).
+/// Format of the build `--input`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum InputFormat {
+    /// A primitive-Cypher creation script (the default; parsed in pass 1).
+    Cypher,
+    /// A binary consolidation dump directory ([`graph_format::consolidate_dump`]),
+    /// ingested directly (parse / dedup / resolve skipped) — see
+    /// [`crate::direct_ingest`].
+    SlaterDump,
+}
+
 pub struct BuildOptions {
+    /// Format of the input (`--input-format`). `SlaterDump` selects the direct
+    /// binary-dump ingest path; `Cypher` (default) parses the input script.
+    pub input_format: InputFormat,
     /// Identity model of the input dump.
     ///
     /// `None` (default) ⇒ **merge** style: nodes/edges are business-key `MERGE`
@@ -113,6 +127,7 @@ impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             pk: None,
+            input_format: InputFormat::Cypher,
             block_size: 256 * 1024,
             range_block_size: 16 * 1024,
             vector_block_size: 256 * 1024,

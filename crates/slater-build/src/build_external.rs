@@ -876,187 +876,217 @@ fn build_inner(
     let range_stmts: Vec<RangeIndexStmt>;
     let vector_stmts: Vec<VectorIndexStmt>;
 
-    // Per-shard local→global symbol remaps, used by resolve (reltype/key ids) and
-    // emit (label/key ids) to translate the buckets' local ids to global.
+    // The post-resolve inputs the clustering + emit phases consume. Produced either by
+    // the Cypher front-half (pass 1 → dedup → resolve, below) or, for a
+    // `--input-format=slater-dump` build, directly from the binary dump — both leave
+    // `node_bkt`/`edge_bkt` in the same shape and these values set.
+    let mut node_count: u64;
+    let edge_count: u64;
+    let mut labels: Interner;
+    let reltypes: Interner;
+    let mut keys: Interner;
+    // `remaps`/`overlay`/`base_node_count` are Cypher-front-half machinery; a dump has
+    // no per-shard symbol remap (its ids are already global), no overlay patch pass,
+    // and no MERGE-created overlay nodes, so they are empty/None/`node_count` there.
+    let remaps: Vec<buckets::ShardRemap>;
+    let overlay: Option<crate::overlay::Overlay>;
+    let base_node_count: u64;
 
-    // ---- pass 1: shard-parallel parse into node + unresolved-edge buckets -------
-    let pass1_g = diag.phase("pass1");
-    if resume_phase < Phase::Pass1 {
-        // Vector-index routing set: which `(label, property)` vecf32 values go to the
-        // vector store. The parallel workers see shards out of order, so they need
-        // this up front. The dump format puts ALL index DDL before any node data, so
-        // a cheap pre-scan of the header (stops at the first node) plus the optional
-        // sidecar gives the complete set.
-        let mut vec_index_set: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        if let Some(path) = &opts.vector_index_json {
-            for v in crate::shared::load_vector_sidecar(path)? {
-                vec_index_set.insert((v.label.clone(), v.property.clone()));
-            }
-        }
-        {
-            let mut sr = StatementReader::new(open_input(input_path, 0)?);
-            while let Some(raw) = sr.next_statement()? {
-                match parse_statement(&raw)
-                    .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
-                {
-                    Statement::VectorIndex(v) => {
-                        vec_index_set.insert((v.label, v.property));
-                    }
-                    // DDL header ends at the first data statement — a CREATE node in a
-                    // `dump-id` dump, or a business-key MERGE in a `merge` dump.
-                    Statement::Node(_)
-                    | Statement::NodeOverwrite(_)
-                    | Statement::EdgeOverwrite(_) => break,
-                    _ => {}
-                }
-            }
-        }
-        // Mark the scratch resumable *before* the long parallel pass: a mid-pass-1
-        // crash then leaves this `Phase::Start` state + the finalized shard sidecars,
-        // and `--resume` re-enters pass 1, skipping shards whose sidecar exists.
-        checkpoint(
-            scratch_dir,
-            &BuildState {
-                generation: generation.0.to_string(),
-                phase: Phase::Start,
-                node_count: 0,
-                edge_count: 0,
-                labels: Vec::new(),
-                reltypes: Vec::new(),
-                property_keys: Vec::new(),
-                range_stmts: Vec::new(),
-                vector_stmts: Vec::new(),
-                cluster_identity: false,
-            },
-        )?;
-        run_pass1_sharded(
-            input_path,
-            &node_bkt,
-            &uedge_bkt,
-            merge_mode,
-            &node_merge_bkt,
-            &edge_merge_bkt,
-            pk_field,
-            vec_index_set,
-            opts.threads,
-            diag,
-        )?;
-    }
-
-    // Merge the shards' local symbol tables (in shard = input order) into the global
-    // tables + per-shard remaps. Done fresh or on resume (the node sidecars persist
-    // until publish), so the global ids reproduce the historical first-seen order.
-    diag.set_op("merge shard symbol tables", "shards", 0);
-    let metas = {
-        let mut v = Vec::new();
-        let mut n = 0u64;
-        while let Some(m) = buckets::read_shard_meta(&node_bkt, n)? {
-            v.push(m);
-            n += 1;
-        }
-        if v.is_empty() {
-            bail!("pass 1 produced no shards");
-        }
-        v
-    };
-    let (g_labels, g_reltypes, g_keys, rmaps) = buckets::merge_shard_symbols(&metas);
-    let remaps: Vec<buckets::ShardRemap> = rmaps;
-    let mut labels: Interner = Interner::from_names(g_labels);
-    let reltypes: Interner = Interner::from_names(g_reltypes);
-    let mut keys: Interner = Interner::from_names(g_keys);
-    let mut node_count: u64 = metas.iter().map(|m| m.node_count).sum();
-    // Provisional ids `[0, base_node_count)` are the parsed (CREATEd) nodes; any
-    // MERGE-created overlay nodes follow at `base_node_count + i`.
-    let base_node_count = node_count;
-    // Union the index DDL across shards (it lives in shard 0; dedup defensively).
-    {
-        let mut rs: Vec<RangeIndexStmt> = Vec::new();
-        let mut vs: Vec<VectorIndexStmt> = Vec::new();
-        for m in &metas {
-            for r in &m.range_stmts {
-                if !rs.contains(r) {
-                    rs.push(r.clone());
-                }
-            }
-            for v in &m.vector_stmts {
-                if !vs
-                    .iter()
-                    .any(|e| e.label == v.label && e.property == v.property)
-                {
-                    vs.push(v.clone());
-                }
-            }
-        }
-        range_stmts = rs;
-        vector_stmts = vs;
-    }
-
-    // ---- pass 1.9: resolve overlay overwrites (MERGE|MATCH … SET …) -----------
-    // Re-derived every run (incl. resume) from the persisted shard sidecars + node
-    // buckets — deterministic, so no separate checkpoint is needed. Extends the
-    // global label/key tables with SET targets and MERGE-created labels, and grows
-    // `node_count` by the MERGE-created nodes so clustering covers them. `None` ⇒ a
-    // plain CREATE-only dump, which pays nothing here.
-    let overlay = if merge_mode {
-        None
-    } else {
-        crate::overlay::Overlay::build(
-            &node_bkt,
-            &remaps,
-            &metas,
-            &mut labels,
-            &mut keys,
-            &reltypes,
-        )?
-    };
-    if let Some(ov) = &overlay {
-        node_count += ov.created.len() as u64;
-    }
-
-    if resume_phase < Phase::Pass1 {
-        checkpoint(
-            scratch_dir,
-            &BuildState {
-                generation: generation.0.to_string(),
-                phase: Phase::Pass1,
-                node_count,
-                edge_count: 0,
-                labels: labels.names().to_vec(),
-                reltypes: reltypes.names().to_vec(),
-                property_keys: keys.names().to_vec(),
-                range_stmts: range_stmts.clone(),
-                vector_stmts: vector_stmts.clone(),
-                cluster_identity: false,
-            },
-        )?;
-        fault_after("pass1");
-    }
-    drop(pass1_g);
-
-    // ---- pass 1.5 (merge dumps): dedup business-key node MERGEs ----------------
-    // Collapse same-identity node MERGEs into one node each (SET props last-wins) via an
-    // external sort, writing the deduped node bucket + the `(identity → prov)` key stream
-    // the edge resolve below joins against. `node_count` becomes the distinct-node count.
-    if merge_mode {
-        let dedup_g = diag.phase("dedup");
-        if resume_phase < Phase::Deduped {
-            // `dedup_nodes` labels its own sub-steps (scan+sort, then the drain).
-            node_count = merge_build::dedup_nodes(
-                &node_merge_bkt,
-                &remaps,
+    // ── direct binary-dump ingest (skips parse / dedup / resolve) ──────────────
+    if matches!(opts.input_format, crate::shared::InputFormat::SlaterDump) {
+        let _dump_g = diag.phase("ingest");
+        if resume_phase < Phase::Resolved {
+            let ing = crate::direct_ingest::ingest_dump(
+                Path::new(input_path),
                 &node_bkt,
-                &node_keys_bkt,
-                scratch_dir,
-                &mem,
+                &edge_bkt,
+                BUCKET_BLOCK,
                 SCRATCH_ZSTD,
                 diag,
             )?;
+            node_count = ing.node_count;
+            edge_count = ing.edge_count;
+            labels = Interner::from_names(ing.labels);
+            reltypes = Interner::from_names(ing.reltypes);
+            keys = Interner::from_names(ing.keys);
+            range_stmts = ing.range_stmts;
+            vector_stmts = Vec::new();
             checkpoint(
                 scratch_dir,
                 &BuildState {
                     generation: generation.0.to_string(),
-                    phase: Phase::Deduped,
+                    phase: Phase::Resolved,
+                    node_count,
+                    edge_count,
+                    labels: labels.names().to_vec(),
+                    reltypes: reltypes.names().to_vec(),
+                    property_keys: keys.names().to_vec(),
+                    range_stmts: range_stmts.clone(),
+                    vector_stmts: vector_stmts.clone(),
+                    cluster_identity: false,
+                },
+            )?;
+            fault_after("resolve");
+        } else {
+            // Resume past a completed ingest: the buckets survive in scratch; recover
+            // counts/symbols/DDL from the checkpoint.
+            let s = resume.as_ref().unwrap();
+            node_count = s.node_count;
+            edge_count = s.edge_count;
+            labels = Interner::from_names(s.labels.clone());
+            reltypes = Interner::from_names(s.reltypes.clone());
+            keys = Interner::from_names(s.property_keys.clone());
+            range_stmts = s.range_stmts.clone();
+            vector_stmts = s.vector_stmts.clone();
+        }
+        remaps = Vec::new();
+        overlay = None;
+        base_node_count = node_count;
+    } else {
+        // Per-shard local→global symbol remaps, used by resolve (reltype/key ids) and
+        // emit (label/key ids) to translate the buckets' local ids to global.
+
+        // ---- pass 1: shard-parallel parse into node + unresolved-edge buckets -------
+        let pass1_g = diag.phase("pass1");
+        if resume_phase < Phase::Pass1 {
+            // Vector-index routing set: which `(label, property)` vecf32 values go to the
+            // vector store. The parallel workers see shards out of order, so they need
+            // this up front. The dump format puts ALL index DDL before any node data, so
+            // a cheap pre-scan of the header (stops at the first node) plus the optional
+            // sidecar gives the complete set.
+            let mut vec_index_set: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            if let Some(path) = &opts.vector_index_json {
+                for v in crate::shared::load_vector_sidecar(path)? {
+                    vec_index_set.insert((v.label.clone(), v.property.clone()));
+                }
+            }
+            {
+                let mut sr = StatementReader::new(open_input(input_path, 0)?);
+                while let Some(raw) = sr.next_statement()? {
+                    match parse_statement(&raw)
+                        .with_context(|| format!("in statement: {}", truncate(&raw, 120)))?
+                    {
+                        Statement::VectorIndex(v) => {
+                            vec_index_set.insert((v.label, v.property));
+                        }
+                        // DDL header ends at the first data statement — a CREATE node in a
+                        // `dump-id` dump, or a business-key MERGE in a `merge` dump.
+                        Statement::Node(_)
+                        | Statement::NodeOverwrite(_)
+                        | Statement::EdgeOverwrite(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            // Mark the scratch resumable *before* the long parallel pass: a mid-pass-1
+            // crash then leaves this `Phase::Start` state + the finalized shard sidecars,
+            // and `--resume` re-enters pass 1, skipping shards whose sidecar exists.
+            checkpoint(
+                scratch_dir,
+                &BuildState {
+                    generation: generation.0.to_string(),
+                    phase: Phase::Start,
+                    node_count: 0,
+                    edge_count: 0,
+                    labels: Vec::new(),
+                    reltypes: Vec::new(),
+                    property_keys: Vec::new(),
+                    range_stmts: Vec::new(),
+                    vector_stmts: Vec::new(),
+                    cluster_identity: false,
+                },
+            )?;
+            run_pass1_sharded(
+                input_path,
+                &node_bkt,
+                &uedge_bkt,
+                merge_mode,
+                &node_merge_bkt,
+                &edge_merge_bkt,
+                pk_field,
+                vec_index_set,
+                opts.threads,
+                diag,
+            )?;
+        }
+
+        // Merge the shards' local symbol tables (in shard = input order) into the global
+        // tables + per-shard remaps. Done fresh or on resume (the node sidecars persist
+        // until publish), so the global ids reproduce the historical first-seen order.
+        diag.set_op("merge shard symbol tables", "shards", 0);
+        let metas = {
+            let mut v = Vec::new();
+            let mut n = 0u64;
+            while let Some(m) = buckets::read_shard_meta(&node_bkt, n)? {
+                v.push(m);
+                n += 1;
+            }
+            if v.is_empty() {
+                bail!("pass 1 produced no shards");
+            }
+            v
+        };
+        let (g_labels, g_reltypes, g_keys, rmaps) = buckets::merge_shard_symbols(&metas);
+        remaps = rmaps;
+        labels = Interner::from_names(g_labels);
+        reltypes = Interner::from_names(g_reltypes);
+        keys = Interner::from_names(g_keys);
+        node_count = metas.iter().map(|m| m.node_count).sum();
+        // Provisional ids `[0, base_node_count)` are the parsed (CREATEd) nodes; any
+        // MERGE-created overlay nodes follow at `base_node_count + i`.
+        base_node_count = node_count;
+        // Union the index DDL across shards (it lives in shard 0; dedup defensively).
+        {
+            let mut rs: Vec<RangeIndexStmt> = Vec::new();
+            let mut vs: Vec<VectorIndexStmt> = Vec::new();
+            for m in &metas {
+                for r in &m.range_stmts {
+                    if !rs.contains(r) {
+                        rs.push(r.clone());
+                    }
+                }
+                for v in &m.vector_stmts {
+                    if !vs
+                        .iter()
+                        .any(|e| e.label == v.label && e.property == v.property)
+                    {
+                        vs.push(v.clone());
+                    }
+                }
+            }
+            range_stmts = rs;
+            vector_stmts = vs;
+        }
+
+        // ---- pass 1.9: resolve overlay overwrites (MERGE|MATCH … SET …) -----------
+        // Re-derived every run (incl. resume) from the persisted shard sidecars + node
+        // buckets — deterministic, so no separate checkpoint is needed. Extends the
+        // global label/key tables with SET targets and MERGE-created labels, and grows
+        // `node_count` by the MERGE-created nodes so clustering covers them. `None` ⇒ a
+        // plain CREATE-only dump, which pays nothing here.
+        overlay = if merge_mode {
+            None
+        } else {
+            crate::overlay::Overlay::build(
+                &node_bkt,
+                &remaps,
+                &metas,
+                &mut labels,
+                &mut keys,
+                &reltypes,
+            )?
+        };
+        if let Some(ov) = &overlay {
+            node_count += ov.created.len() as u64;
+        }
+
+        if resume_phase < Phase::Pass1 {
+            checkpoint(
+                scratch_dir,
+                &BuildState {
+                    generation: generation.0.to_string(),
+                    phase: Phase::Pass1,
                     node_count,
                     edge_count: 0,
                     labels: labels.names().to_vec(),
@@ -1067,212 +1097,249 @@ fn build_inner(
                     cluster_identity: false,
                 },
             )?;
-            fault_after("deduped");
+            fault_after("pass1");
+        }
+        drop(pass1_g);
+
+        // ---- pass 1.5 (merge dumps): dedup business-key node MERGEs ----------------
+        // Collapse same-identity node MERGEs into one node each (SET props last-wins) via an
+        // external sort, writing the deduped node bucket + the `(identity → prov)` key stream
+        // the edge resolve below joins against. `node_count` becomes the distinct-node count.
+        if merge_mode {
+            let dedup_g = diag.phase("dedup");
+            if resume_phase < Phase::Deduped {
+                // `dedup_nodes` labels its own sub-steps (scan+sort, then the drain).
+                node_count = merge_build::dedup_nodes(
+                    &node_merge_bkt,
+                    &remaps,
+                    &node_bkt,
+                    &node_keys_bkt,
+                    scratch_dir,
+                    &mem,
+                    SCRATCH_ZSTD,
+                    diag,
+                )?;
+                checkpoint(
+                    scratch_dir,
+                    &BuildState {
+                        generation: generation.0.to_string(),
+                        phase: Phase::Deduped,
+                        node_count,
+                        edge_count: 0,
+                        labels: labels.names().to_vec(),
+                        reltypes: reltypes.names().to_vec(),
+                        property_keys: keys.names().to_vec(),
+                        range_stmts: range_stmts.clone(),
+                        vector_stmts: vector_stmts.clone(),
+                        cluster_identity: false,
+                    },
+                )?;
+                fault_after("deduped");
+            } else {
+                node_count = resume.as_ref().unwrap().node_count;
+            }
+            drop(dedup_g);
+        }
+
+        // ---- resolve dump ids → provisional node ids, write the edge bucket -------
+        let resolve_g = diag.phase("resolve");
+        if resume_phase >= Phase::Resolved {
+            edge_count = resume.as_ref().unwrap().edge_count;
+        } else if merge_mode {
+            // Resolve each edge MERGE's endpoints by business key against the node-key
+            // stream (sort-merge-join), collapse identical (src, reltype, dst) edges, and
+            // write the final edge bucket — the same `EdgeRec` shape cluster/emit consume.
+            diag.set_op("resolve business keys (merge-join)", "edges", 0);
+            edge_count = merge_build::resolve_edges(
+                &edge_merge_bkt,
+                &remaps,
+                &node_keys_bkt,
+                &edge_bkt,
+                scratch_dir,
+                &mem,
+                opts.threads,
+                SCRATCH_ZSTD,
+            )?;
+            checkpoint(
+                scratch_dir,
+                &BuildState {
+                    generation: generation.0.to_string(),
+                    phase: Phase::Resolved,
+                    node_count,
+                    edge_count,
+                    labels: labels.names().to_vec(),
+                    reltypes: reltypes.names().to_vec(),
+                    property_keys: keys.names().to_vec(),
+                    range_stmts: range_stmts.clone(),
+                    vector_stmts: vector_stmts.clone(),
+                    cluster_identity: false,
+                },
+            )?;
+            fault_after("resolve");
         } else {
-            node_count = resume.as_ref().unwrap().node_count;
-        }
-        drop(dedup_g);
-    }
+            diag.set_op("resolve dump_id → node_id (parallel)", "edges", 0);
+            diag.set_active_workers(opts.threads.max(1) as u64);
+            // Rebuild the resolver by scanning the node bucket's dump ids (read-only once
+            // built, so it is shared across resolve workers behind an `Arc`).
+            let mut dump_ids: Vec<i64> = Vec::with_capacity(node_count as usize);
+            buckets::for_each_node_dump_id(&node_bkt, |_, d| {
+                dump_ids.push(d.unwrap_or(NO_DUMP));
+                Ok(())
+            })?;
+            let resolver =
+                std::sync::Arc::new(DumpResolver::build_dense(&dump_ids, opts.max_memory_bytes)?);
+            drop(dump_ids);
 
-    // ---- resolve dump ids → provisional node ids, write the edge bucket -------
-    let resolve_g = diag.phase("resolve");
-    let edge_count: u64;
-    if resume_phase >= Phase::Resolved {
-        edge_count = resume.as_ref().unwrap().edge_count;
-    } else if merge_mode {
-        // Resolve each edge MERGE's endpoints by business key against the node-key
-        // stream (sort-merge-join), collapse identical (src, reltype, dst) edges, and
-        // write the final edge bucket — the same `EdgeRec` shape cluster/emit consume.
-        diag.set_op("resolve business keys (merge-join)", "edges", 0);
-        edge_count = merge_build::resolve_edges(
-            &edge_merge_bkt,
-            &remaps,
-            &node_keys_bkt,
-            &edge_bkt,
-            scratch_dir,
-            &mem,
-            opts.threads,
-            SCRATCH_ZSTD,
-        )?;
-        checkpoint(
-            scratch_dir,
-            &BuildState {
-                generation: generation.0.to_string(),
-                phase: Phase::Resolved,
-                node_count,
-                edge_count,
-                labels: labels.names().to_vec(),
-                reltypes: reltypes.names().to_vec(),
-                property_keys: keys.names().to_vec(),
-                range_stmts: range_stmts.clone(),
-                vector_stmts: vector_stmts.clone(),
-                cluster_identity: false,
-            },
-        )?;
-        fault_after("resolve");
-    } else {
-        diag.set_op("resolve dump_id → node_id (parallel)", "edges", 0);
-        diag.set_active_workers(opts.threads.max(1) as u64);
-        // Rebuild the resolver by scanning the node bucket's dump ids (read-only once
-        // built, so it is shared across resolve workers behind an `Arc`).
-        let mut dump_ids: Vec<i64> = Vec::with_capacity(node_count as usize);
-        buckets::for_each_node_dump_id(&node_bkt, |_, d| {
-            dump_ids.push(d.unwrap_or(NO_DUMP));
-            Ok(())
-        })?;
-        let resolver =
-            std::sync::Arc::new(DumpResolver::build_dense(&dump_ids, opts.max_memory_bytes)?);
-        drop(dump_ids);
+            // Per-shard base prov_edge_id (prefix sum of uedge counts) → contiguous,
+            // input-ordered edge ids identical to the old single-threaded resolve.
+            let counts: Vec<u64> = metas.iter().map(|m| m.uedge_count).collect();
+            let mut bases: Vec<u64> = Vec::with_capacity(counts.len());
+            let mut acc = 0u64;
+            for &c in &counts {
+                bases.push(acc);
+                acc += c;
+            }
+            let total_edges = acc;
+            diag.set_op("resolve dump_id → node_id (parallel)", "edges", total_edges);
 
-        // Per-shard base prov_edge_id (prefix sum of uedge counts) → contiguous,
-        // input-ordered edge ids identical to the old single-threaded resolve.
-        let counts: Vec<u64> = metas.iter().map(|m| m.uedge_count).collect();
-        let mut bases: Vec<u64> = Vec::with_capacity(counts.len());
-        let mut acc = 0u64;
-        for &c in &counts {
-            bases.push(acc);
-            acc += c;
-        }
-        let total_edges = acc;
-        diag.set_op("resolve dump_id → node_id (parallel)", "edges", total_edges);
-
-        // Each worker resolves one unresolved-edge shard into edge_bkt.<shard> with
-        // global symbol ids (via the shard remap) and its deterministic id range.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let next = std::sync::Arc::new(AtomicU64::new(0));
-        let err: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let nshards = metas.len() as u64;
-        let bases_r = &bases;
-        let counts_r = &counts;
-        let remaps_r = &remaps;
-        let uedge_r = &uedge_bkt;
-        let edge_r = &edge_bkt;
-        // Overlay edge patches are folded here (this pass already holds the resolved
-        // src/dst provs + global reltype). `Option<&Overlay>` is `Copy` + `Sync`, so
-        // each worker shares it read-only; matched patches mark themselves hit.
-        let overlay_r = overlay.as_ref();
-        std::thread::scope(|scope| {
-            for _ in 0..opts.threads.max(1) {
-                let next = std::sync::Arc::clone(&next);
-                let err = std::sync::Arc::clone(&err);
-                let resolver = std::sync::Arc::clone(&resolver);
-                scope.spawn(move || loop {
-                    if err.lock().unwrap().is_some() {
-                        break;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= nshards {
-                        break;
-                    }
-                    let rm = &remaps_r[i as usize];
-                    let res = (|| -> Result<()> {
-                        let mut id = bases_r[i as usize];
-                        // One writer per resolve worker; the pool is already saturated.
-                        let mut edge_w = BucketWriter::create_inline(
-                            buckets::seg_path(edge_r, i),
-                            BUCKET_BLOCK,
-                            SCRATCH_ZSTD,
-                        )?;
-                        let rdr = graph_format::blockfile::BlockFileReader::open(
-                            buckets::seg_path(uedge_r, i),
-                        )?;
-                        rdr.for_each_record(|_, rec| {
-                            let ue = buckets::UnresolvedEdge::decode(rec)?;
-                            let src = resolver.get(ue.src_dump).with_context(|| {
-                                format!(
-                                    "edge references unknown source __dump_id__ {}",
-                                    ue.src_dump
-                                )
-                            })?;
-                            let dst = resolver.get(ue.dst_dump).with_context(|| {
-                                format!(
-                                    "edge references unknown target __dump_id__ {}",
-                                    ue.dst_dump
-                                )
-                            })?;
-                            let props_blob = if rm.identity {
-                                ue.props_blob
-                            } else {
-                                buckets::remap_props_blob(&ue.props_blob, rm)?
-                            };
-                            let reltype = rm.map_reltype(ue.reltype);
-                            let props_blob = match overlay_r {
-                                Some(ov) if ov.has_edge_patches() => ov
-                                    .fold_edge(src, dst, reltype, &props_blob)?
-                                    .map(|v| Blob::from_slice(&v))
-                                    .unwrap_or(props_blob),
-                                _ => props_blob,
-                            };
-                            edge_w.append_edge(&EdgeRec {
-                                prov_edge_id: id,
-                                src_prov: src,
-                                dst_prov: dst,
-                                reltype,
-                                props_blob,
-                            })?;
-                            id += 1;
-                            Ok(())
-                        })?;
-                        edge_w.finish()?;
-                        Ok(())
-                    })();
-                    match res {
-                        Ok(()) => diag.progress_add(counts_r[i as usize]),
-                        Err(e) => {
-                            let mut s = err.lock().unwrap();
-                            if s.is_none() {
-                                *s = Some(e);
-                            }
+            // Each worker resolves one unresolved-edge shard into edge_bkt.<shard> with
+            // global symbol ids (via the shard remap) and its deterministic id range.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let next = std::sync::Arc::new(AtomicU64::new(0));
+            let err: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let nshards = metas.len() as u64;
+            let bases_r = &bases;
+            let counts_r = &counts;
+            let remaps_r = &remaps;
+            let uedge_r = &uedge_bkt;
+            let edge_r = &edge_bkt;
+            // Overlay edge patches are folded here (this pass already holds the resolved
+            // src/dst provs + global reltype). `Option<&Overlay>` is `Copy` + `Sync`, so
+            // each worker shares it read-only; matched patches mark themselves hit.
+            let overlay_r = overlay.as_ref();
+            std::thread::scope(|scope| {
+                for _ in 0..opts.threads.max(1) {
+                    let next = std::sync::Arc::clone(&next);
+                    let err = std::sync::Arc::clone(&err);
+                    let resolver = std::sync::Arc::clone(&resolver);
+                    scope.spawn(move || loop {
+                        if err.lock().unwrap().is_some() {
                             break;
                         }
-                    }
-                });
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= nshards {
+                            break;
+                        }
+                        let rm = &remaps_r[i as usize];
+                        let res = (|| -> Result<()> {
+                            let mut id = bases_r[i as usize];
+                            // One writer per resolve worker; the pool is already saturated.
+                            let mut edge_w = BucketWriter::create_inline(
+                                buckets::seg_path(edge_r, i),
+                                BUCKET_BLOCK,
+                                SCRATCH_ZSTD,
+                            )?;
+                            let rdr = graph_format::blockfile::BlockFileReader::open(
+                                buckets::seg_path(uedge_r, i),
+                            )?;
+                            rdr.for_each_record(|_, rec| {
+                                let ue = buckets::UnresolvedEdge::decode(rec)?;
+                                let src = resolver.get(ue.src_dump).with_context(|| {
+                                    format!(
+                                        "edge references unknown source __dump_id__ {}",
+                                        ue.src_dump
+                                    )
+                                })?;
+                                let dst = resolver.get(ue.dst_dump).with_context(|| {
+                                    format!(
+                                        "edge references unknown target __dump_id__ {}",
+                                        ue.dst_dump
+                                    )
+                                })?;
+                                let props_blob = if rm.identity {
+                                    ue.props_blob
+                                } else {
+                                    buckets::remap_props_blob(&ue.props_blob, rm)?
+                                };
+                                let reltype = rm.map_reltype(ue.reltype);
+                                let props_blob = match overlay_r {
+                                    Some(ov) if ov.has_edge_patches() => ov
+                                        .fold_edge(src, dst, reltype, &props_blob)?
+                                        .map(|v| Blob::from_slice(&v))
+                                        .unwrap_or(props_blob),
+                                    _ => props_blob,
+                                };
+                                edge_w.append_edge(&EdgeRec {
+                                    prov_edge_id: id,
+                                    src_prov: src,
+                                    dst_prov: dst,
+                                    reltype,
+                                    props_blob,
+                                })?;
+                                id += 1;
+                                Ok(())
+                            })?;
+                            edge_w.finish()?;
+                            Ok(())
+                        })();
+                        match res {
+                            Ok(()) => diag.progress_add(counts_r[i as usize]),
+                            Err(e) => {
+                                let mut s = err.lock().unwrap();
+                                if s.is_none() {
+                                    *s = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(e) = std::sync::Arc::try_unwrap(err)
+                .ok()
+                .and_then(|m| m.into_inner().ok())
+                .flatten()
+            {
+                return Err(e);
             }
-        });
-        if let Some(e) = std::sync::Arc::try_unwrap(err)
-            .ok()
-            .and_then(|m| m.into_inner().ok())
-            .flatten()
-        {
-            return Err(e);
-        }
-        // An overlay edge patch that matched no resolved edge means the targeted
-        // relationship does not exist — and edge create-on-absent is not a v1 feature.
-        if let Some(ov) = overlay.as_ref() {
-            let unmatched = ov.unmatched_edges();
-            if let Some(&(s, d, rt)) = unmatched.first() {
-                bail!(
-                    "{} overlay edge overwrite(s) matched no existing relationship \
+            // An overlay edge patch that matched no resolved edge means the targeted
+            // relationship does not exist — and edge create-on-absent is not a v1 feature.
+            if let Some(ov) = overlay.as_ref() {
+                let unmatched = ov.unmatched_edges();
+                if let Some(&(s, d, rt)) = unmatched.first() {
+                    bail!(
+                        "{} overlay edge overwrite(s) matched no existing relationship \
                      (e.g. src node {s} → dst node {d}, reltype id {rt}); edge \
                      create-on-absent is not supported",
-                    unmatched.len()
-                );
+                        unmatched.len()
+                    );
+                }
             }
+            // Unresolved-edge shards consumed; reclaim their scratch.
+            for i in 0..nshards {
+                let _ = std::fs::remove_file(buckets::seg_path(&uedge_bkt, i));
+            }
+            edge_count = total_edges;
+            checkpoint(
+                scratch_dir,
+                &BuildState {
+                    generation: generation.0.to_string(),
+                    phase: Phase::Resolved,
+                    node_count,
+                    edge_count,
+                    labels: labels.names().to_vec(),
+                    reltypes: reltypes.names().to_vec(),
+                    property_keys: keys.names().to_vec(),
+                    range_stmts: range_stmts.clone(),
+                    vector_stmts: vector_stmts.clone(),
+                    cluster_identity: false,
+                },
+            )?;
+            fault_after("resolve");
         }
-        // Unresolved-edge shards consumed; reclaim their scratch.
-        for i in 0..nshards {
-            let _ = std::fs::remove_file(buckets::seg_path(&uedge_bkt, i));
-        }
-        edge_count = total_edges;
-        checkpoint(
-            scratch_dir,
-            &BuildState {
-                generation: generation.0.to_string(),
-                phase: Phase::Resolved,
-                node_count,
-                edge_count,
-                labels: labels.names().to_vec(),
-                reltypes: reltypes.names().to_vec(),
-                property_keys: keys.names().to_vec(),
-                range_stmts: range_stmts.clone(),
-                vector_stmts: vector_stmts.clone(),
-                cluster_identity: false,
-            },
-        )?;
-        fault_after("resolve");
-    }
-    drop(resolve_g);
+        drop(resolve_g);
+    } // end Cypher front-half
 
     // ---- pass 2: clustering → node-id permutation -----------------------------
     let cluster_g = diag.phase("cluster");

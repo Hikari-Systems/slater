@@ -37,9 +37,12 @@
 //! serialises byte-identically — the property the consolidation golden gate rests
 //! on.
 
+use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use graph_format::consolidate_dump::{DumpRangeIndex, DumpWriter};
 use graph_format::ids::Value;
 use graph_format::manifest::EntityKind;
 
@@ -62,6 +65,155 @@ pub fn serialise_merge_dump<V: ReadView>(
     for src in 0..n {
         emit_edges_from(engine, view, src, out)?;
     }
+    Ok(())
+}
+
+/// A first-seen symbol interner. Ids are assigned in interning order, so the dump's
+/// symbol tables reproduce deterministically (the range-index DDL is interned first,
+/// then nodes, then edges — mirroring the text path's DDL-before-data ordering) and
+/// dead symbols left by deletions are dropped.
+#[derive(Default)]
+struct Interner {
+    names: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl Interner {
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.index.get(name) {
+            return id;
+        }
+        let id = self.names.len() as u32;
+        self.names.push(name.to_string());
+        self.index.insert(name.to_string(), id);
+        id
+    }
+
+    fn into_names(self) -> Vec<String> {
+        self.names
+    }
+}
+
+/// The new dense id of a surviving node after tombstoned ids are elided: `old`
+/// minus how many tombstoned ids sort below it. `tombs` is the sorted effective
+/// tombstone set ([`DeltaSnapshot::effective_tombstoned_ids`]), so this renumbers
+/// the surviving `0..node_count` span gaplessly in O(log #tombstones).
+fn compact_id(tombs: &[u64], old: u64) -> u64 {
+    old - tombs.partition_point(|&t| t < old) as u64
+}
+
+/// Fold a node/edge's named props into `(key_id, Value)` pairs against `keys`,
+/// dropping vector-valued props (a consolidation-dump non-goal, exactly as the text
+/// path renders them away) and refusing a non-scalar value (a bug, never silent).
+fn intern_props(
+    props: &NamedProps,
+    keys: &mut Interner,
+    var: &str,
+    out: &mut Vec<(u32, Value)>,
+) -> Result<()> {
+    out.clear();
+    for (name, val) in props {
+        match val_to_value(val) {
+            // Vectors do not ride a consolidation dump; the text path emits them as a
+            // `null` literal, which removes the property — dropping it here is the same.
+            Some(Value::Vector(_)) => continue,
+            Some(v) => out.push((keys.intern(name), v)),
+            None => bail!("property {var}.{name} is not a scalar value"),
+        }
+    }
+    Ok(())
+}
+
+/// Serialise `engine`'s merged view to a **binary** consolidation dump directory
+/// ([`graph_format::consolidate_dump`]) — the fast path `slater-build` ingests
+/// directly (skipping parse, node dedup, and endpoint resolution). The engine must
+/// wrap the [`ReadView`] being dumped (a `MergedView` to capture the delta).
+///
+/// Unlike [`serialise_merge_dump`], node identity is not recovered from a business
+/// key: dense ids are carried directly (compacted to elide tombstones), so a node
+/// needs no range-indexed property. Endpoints are emitted as compacted ids, so no
+/// per-edge business-key lookup happens — the dump side is O(nodes + edges) with no
+/// endpoint reads, the source of the ~2× consolidation win.
+pub fn serialise_binary_dump<V: ReadView>(
+    engine: &Engine<'_, V>,
+    view: &V,
+    dir: &Path,
+) -> Result<()> {
+    let mut labels = Interner::default();
+    let mut reltypes = Interner::default();
+    let mut keys = Interner::default();
+
+    // Range-index DDL first: intern the indexed names before any data so their symbol
+    // ids are lowest and stable (mirrors the text path emitting `CREATE INDEX` first),
+    // and record the DDL for the dump's `meta.json`.
+    let mut range_indexes: Vec<DumpRangeIndex> = Vec::new();
+    for ri in &view.manifest().range_indexes {
+        match ri.entity {
+            EntityKind::Node => {
+                labels.intern(&ri.label_or_type);
+            }
+            EntityKind::Edge => {
+                reltypes.intern(&ri.label_or_type);
+            }
+        }
+        keys.intern(&ri.property);
+        range_indexes.push(DumpRangeIndex {
+            entity: ri.entity,
+            label_or_type: ri.label_or_type.clone(),
+            property: ri.property.clone(),
+        });
+    }
+
+    let tombs = view.delta().effective_tombstoned_ids();
+    let n = view.node_count();
+    let mut w = DumpWriter::create(dir)?;
+
+    // Nodes in ascending compacted-id order (tombstoned ids elided). The append
+    // position is the new dense id, matching `compact_id`.
+    let mut label_ids: Vec<u32> = Vec::new();
+    let mut prop_kv: Vec<(u32, Value)> = Vec::new();
+    for old in 0..n {
+        if view.delta().is_tombstoned(old) {
+            continue;
+        }
+        let (lnames, props) = engine.node_record(old)?;
+        label_ids.clear();
+        for l in &lnames {
+            label_ids.push(labels.intern(l));
+        }
+        intern_props(&props, &mut keys, "n", &mut prop_kv)?;
+        w.append_node(&label_ids, &prop_kv)?;
+    }
+
+    // Edges, walked from each surviving source (so every edge is emitted once).
+    // `outgoing_adj` is overlay-aware: it already drops tombstoned edges and edges to
+    // tombstoned nodes and appends delta-born edges.
+    for old_src in 0..n {
+        if view.delta().is_tombstoned(old_src) {
+            continue;
+        }
+        let new_src = compact_id(tombs, old_src);
+        for adj in engine.outgoing_adj(old_src)? {
+            let old_dst = adj.neighbour.0;
+            // Belt-and-braces: a node tombstone must never leak an edge into the rebuild.
+            if view.delta().is_tombstoned(old_dst) {
+                continue;
+            }
+            let new_dst = compact_id(tombs, old_dst);
+            let (rtype_name, eprops) = engine.rel_record(adj.edge.0, adj.reltype)?;
+            let rt = reltypes.intern(&rtype_name);
+            intern_props(&eprops, &mut keys, "r", &mut prop_kv)?;
+            w.append_edge(new_src, new_dst, rt, &prop_kv)?;
+        }
+    }
+
+    w.finish(
+        labels.into_names(),
+        reltypes.into_names(),
+        keys.into_names(),
+        range_indexes,
+    )
+    .context("finish binary consolidation dump")?;
     Ok(())
 }
 
@@ -299,8 +451,60 @@ mod tests {
     use crate::generation::Generation;
     use crate::read_view::MergedView;
     use crate::testgen;
+    use graph_format::columns::decode_props;
+    use graph_format::consolidate_dump::DumpReader;
+    use graph_format::nodelabels::decode_labels;
     use slater_delta::{DeltaSnapshot, Memtable};
     use std::sync::Arc;
+
+    /// Read a binary dump back into name-space: `(labels, props)` per node and
+    /// `(src_idx, dst_idx, reltype, props)` per edge, resolving symbol ids through
+    /// the dump's meta tables. Lets the tests assert on the merged, compacted graph.
+    #[allow(clippy::type_complexity)]
+    fn read_dump(
+        dir: &Path,
+    ) -> (
+        Vec<(Vec<String>, Vec<(String, Value)>)>,
+        Vec<(u64, u64, String, Vec<(String, Value)>)>,
+    ) {
+        let r = DumpReader::open(dir).unwrap();
+        let m = r.meta();
+        let (labels, reltypes, keys) = (
+            m.labels.clone(),
+            m.reltypes.clone(),
+            m.property_keys.clone(),
+        );
+        let name_props = |pb: &[u8]| -> Vec<(String, Value)> {
+            decode_props(pb)
+                .unwrap()
+                .into_iter()
+                .map(|(k, v)| (keys[k as usize].clone(), v))
+                .collect()
+        };
+        let mut nodes = Vec::new();
+        r.for_each_node(|_, lb, pb| {
+            let ls = decode_labels(lb)
+                .unwrap()
+                .into_iter()
+                .map(|l| labels[l as usize].clone())
+                .collect();
+            nodes.push((ls, name_props(pb)));
+            Ok(())
+        })
+        .unwrap();
+        let mut edges = Vec::new();
+        r.for_each_edge(|_, s, d, t, pb| {
+            edges.push((s, d, reltypes[t as usize].clone(), name_props(pb)));
+            Ok(())
+        })
+        .unwrap();
+        (nodes, edges)
+    }
+
+    /// The property value of `name` in a node/edge's decoded props, if present.
+    fn prop<'a>(props: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+        props.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
 
     #[test]
     fn literals_round_trip_and_escape() {
@@ -698,5 +902,160 @@ mod tests {
             "dump:\n{out}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── binary dump (direct consolidation) ────────────────────────────────────
+
+    fn dump_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("slater_bindump_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn binary_dump_folds_delta_and_carries_edges() {
+        // The merged state (a core patch on Alice's age, a born node Dave, a born edge
+        // Bob-KNOWS->Carol) must all appear in the binary dump.
+        let (root, graph) = testgen::write_indexed_people("bindump_fold");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        // Patch a core node.
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(0),
+            [("age".to_string(), Value::Int(99))],
+        );
+        // Born node.
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Dave".into()),
+            None,
+            [("age".to_string(), Value::Int(50))],
+        );
+        // Born edge between two core nodes.
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            Some(1),
+            Some(2),
+            [],
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let dir = dump_dir("fold");
+        let _ = std::fs::remove_dir_all(&dir);
+        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+
+        let (nodes, edges) = read_dump(&dir);
+        // Core Alice(0), Bob(1), Carol(2) + born Dave(3), all in id order.
+        assert_eq!(nodes.len(), 4);
+        let by_name = |name: &str| {
+            nodes
+                .iter()
+                .find(|(_, p)| prop(p, "name") == Some(&Value::Str(name.into())))
+                .unwrap_or_else(|| panic!("node {name} missing from dump"))
+        };
+        assert_eq!(prop(&by_name("Alice").1, "age"), Some(&Value::Int(99)));
+        assert_eq!(prop(&by_name("Dave").1, "age"), Some(&Value::Int(50)));
+        assert!(by_name("Alice").0.iter().any(|l| l == "Person"));
+
+        // The core edge Alice->Bob and the born edge Bob->Carol both present.
+        let name_of = |idx: u64| {
+            prop(&nodes[idx as usize].1, "name")
+                .and_then(|v| match v {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let edge_pairs: Vec<(String, String)> = edges
+            .iter()
+            .map(|(s, d, _, _)| (name_of(*s), name_of(*d)))
+            .collect();
+        assert!(edge_pairs.contains(&("Alice".into(), "Bob".into())));
+        assert!(edge_pairs.contains(&("Bob".into(), "Carol".into())));
+        assert_eq!(edges.len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_dump_compacts_over_a_tombstone() {
+        // Deleting Alice (core id 0) must drop her node and her edge, and renumber the
+        // survivors gaplessly — Bob and Carol occupy compacted ids 0 and 1, and the
+        // surviving edge (if any) references the new ids.
+        let (root, graph) = testgen::write_indexed_people("bindump_tombstone");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let mut mem = Memtable::new();
+        mem.delete_node("Person", "name", Value::Str("Alice".into()), Some(0));
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let dir = dump_dir("tombstone");
+        let _ = std::fs::remove_dir_all(&dir);
+        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+
+        let (nodes, edges) = read_dump(&dir);
+        // Alice gone; Bob and Carol remain, at compacted ids 0 and 1.
+        assert_eq!(nodes.len(), 2);
+        let names: Vec<Value> = nodes
+            .iter()
+            .map(|(_, p)| prop(p, "name").unwrap().clone())
+            .collect();
+        assert!(!names.contains(&Value::Str("Alice".into())));
+        assert!(names.contains(&Value::Str("Bob".into())));
+        assert!(names.contains(&Value::Str("Carol".into())));
+        // The only core edge (Alice->Bob) is gone with Alice.
+        assert!(edges.is_empty());
+        // Every surviving edge endpoint (none here) would be a valid compacted id.
+        for (s, d, _, _) in &edges {
+            assert!(*s < 2 && *d < 2);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fixed `(core, delta)` dumps byte-identically — the consolidation golden.
+    #[test]
+    fn binary_dump_is_byte_deterministic() {
+        let (root, graph) = testgen::write_indexed_people("bindump_determinism");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let run = |dir: &Path| {
+            let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+            mem.upsert_node(
+                "Person",
+                "name",
+                Value::Str("Dave".into()),
+                None,
+                [("age".to_string(), Value::Int(50))],
+            );
+            let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let _ = std::fs::remove_dir_all(dir);
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, dir).unwrap();
+        };
+        let a = dump_dir("det_a");
+        let b = dump_dir("det_b");
+        run(&a);
+        run(&b);
+        for f in ["nodes.blk", "edges.blk", "meta.json"] {
+            assert_eq!(
+                std::fs::read(a.join(f)).unwrap(),
+                std::fs::read(b.join(f)).unwrap(),
+                "dump file {f} differs across runs"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

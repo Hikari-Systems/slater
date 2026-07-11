@@ -11,6 +11,7 @@ mod build_external;
 mod cluster;
 mod common;
 mod diag;
+mod direct_ingest;
 mod merge_build;
 mod model;
 mod overlay;
@@ -58,7 +59,7 @@ use serde_json::json;
 use crate::build_external::build_external;
 use crate::cluster::ClusterMode;
 use crate::diag::BuildDiag;
-use crate::shared::BuildOptions;
+use crate::shared::{BuildOptions, InputFormat};
 
 // Candidate zstd levels per backend-aware profile. zstd decode speed is ~level
 // independent, so a higher build level shrinks on-disk/on-wire bytes (and thus read
@@ -109,6 +110,15 @@ struct Cli {
     /// identity and edges resolve endpoints by it; such dumps must be self-contained.
     #[arg(long)]
     pk: Option<String>,
+
+    /// Format of `--input`. `cypher` (default) parses a primitive-Cypher creation
+    /// script. `slater-dump` ingests a **binary consolidation dump** directory
+    /// (produced by the server during a direct consolidation): dense ids and global
+    /// symbol ids are carried in the dump, so parse, node dedup, and endpoint
+    /// resolution are skipped and the build enters at clustering. `--pk` must not be
+    /// combined with `slater-dump` (a dump has no business-key resolution).
+    #[arg(long, value_enum, default_value_t = InputFormat::Cypher)]
+    input_format: InputFormat,
 
     /// Target block size (bytes) for prop/label/topology files.
     #[arg(long, default_value_t = 256 * 1024)]
@@ -533,8 +543,12 @@ fn main() -> Result<()> {
     let threads = resolve_threads(&cli);
     let publish_store = resolve_publish_store(&cli)?;
     let (zstd_level, compression_profile) = resolve_compression(&cli, publish_store.is_some());
+    if cli.pk.is_some() && matches!(cli.input_format, InputFormat::SlaterDump) {
+        anyhow::bail!("--pk cannot be combined with --input-format=slater-dump");
+    }
     let opts = BuildOptions {
         pk: cli.pk.clone(),
+        input_format: cli.input_format,
         block_size: cli.block_size,
         range_block_size: cli.range_block_size,
         vector_block_size: cli.vector_block_size,

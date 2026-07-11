@@ -27,6 +27,7 @@ pub mod blockcache;
 pub mod blockfile;
 pub mod codec;
 pub mod columns;
+pub mod consolidate_dump;
 pub mod crypto;
 pub mod extsort;
 pub mod histogram;

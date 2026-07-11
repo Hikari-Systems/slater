@@ -1,0 +1,461 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The binary consolidation dump — the intermediate `slater` hands `slater-build`
+//! for a *direct* consolidation rebuild (BUILD-PERF Phase 0 / the segmented-core
+//! plan's quick win).
+//!
+//! Consolidation is dump-and-rebuild: the server serialises the merged
+//! `core ⊕ delta` view, then `slater-build` rebuilds a fresh generation from it.
+//! Historically that intermediate was business-key `MERGE` **Cypher text**
+//! ([`crate::…`] — actually `slater/src/consolidate.rs`): ~150 s to write and ~58 s
+//! to re-parse at 10 M nodes, because the builder must re-parse every statement and
+//! re-resolve every business key it just took apart. This module is the binary
+//! replacement: the dump already carries dense ids and global symbol ids, so the
+//! builder skips parse, node dedup, and endpoint resolution entirely, entering its
+//! pipeline at the post-resolve `EdgeRec`/`NodeRec` shape.
+//!
+//! # Layout — a directory of three files
+//! - `meta.json` — [`DumpMeta`]: magic/version, node & edge counts, the global
+//!   `labels` / `reltypes` / `property_keys` symbol tables (so record ids are
+//!   self-describing), and the range-index DDL to recreate.
+//! - `nodes.blk` — a [`BlockFileWriter`] container, one record per surviving node in
+//!   ascending **compacted** dense-id order (record index *is* the new node id).
+//!   A record is `blob(labels_record) ‖ blob(props_record)` where the two inner
+//!   records use the canonical [`encode_labels_record`] / [`encode_props_record`]
+//!   layouts with **global** symbol ids — so the builder byte-copies each blob
+//!   straight into its node store with no re-encode.
+//! - `edges.blk` — a [`BlockFileWriter`] container, one record per edge in emit
+//!   order: `uvarint(src) ‖ uvarint(dst) ‖ uvarint(reltype) ‖ blob(props_record)`,
+//!   endpoints already resolved to compacted node ids.
+//!
+//! # Why binary, not the text dialect
+//! The text dump reads *both endpoints' node records per edge* to recover their
+//! business keys; the binary dump carries the endpoint ids directly, so the whole
+//! dump side is O(nodes + edges) block copies with no per-edge lookups. Parallel
+//! edges are preserved verbatim (the text `MERGE` dialect silently collapsed
+//! `(a)-[:T]->(b)` duplicates; the binary path does not).
+//!
+//! # Determinism
+//! Nodes are emitted in ascending compacted-id order; edges in adjacency-walk order
+//! over compacted sources; symbol tables in manifest order followed by first-seen
+//! delta additions. A fixed `(core, delta)` therefore dumps byte-identically — the
+//! property the consolidation golden gate rests on.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::blockfile::{BlockFileReader, BlockFileWriter};
+use crate::columns::encode_props_record_into;
+use crate::ids::Value;
+use crate::manifest::EntityKind;
+use crate::nodelabels::encode_labels_record_into;
+use crate::wire::{read_uvarint, write_uvarint};
+
+/// Magic at the head of `meta.json`, distinguishing a consolidation dump from a
+/// generation image (`SLATER01`).
+pub const DUMP_MAGIC: &str = "SLDUMP01";
+
+/// Dump-format version. Bumped on any incompatible change to the record or meta
+/// layout; the builder refuses a dump whose version it does not understand.
+pub const DUMP_VERSION: u32 = 1;
+
+/// zstd level for the transient dump files. Low: the dump is written once and read
+/// once, so build/parse CPU dominates any saved bytes.
+pub const DUMP_ZSTD: i32 = 3;
+
+/// Target block size (bytes) for the dump's `.blk` files, matching the builder's
+/// transient-bucket block size (`build_external::BUCKET_BLOCK`).
+pub const DUMP_BLOCK: usize = 1 << 20;
+
+const META_FILE: &str = "meta.json";
+const NODES_FILE: &str = "nodes.blk";
+const EDGES_FILE: &str = "edges.blk";
+
+/// A range index to recreate on the rebuilt generation. Mirrors the text dump's
+/// `CREATE INDEX FOR (n:Label) ON (n.prop)` DDL — only the entity, label/type and
+/// property matter; the builder assigns its own on-disk index stem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpRangeIndex {
+    pub entity: EntityKind,
+    pub label_or_type: String,
+    pub property: String,
+}
+
+/// The dump's `meta.json`: everything the builder needs that is not in the two
+/// `.blk` streams. Symbol tables make the record ids self-describing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DumpMeta {
+    pub magic: String,
+    pub version: u32,
+    pub node_count: u64,
+    pub edge_count: u64,
+    /// Global label symbol table: a node record's label ids index this.
+    pub labels: Vec<String>,
+    /// Global relationship-type symbol table: an edge record's `reltype` indexes this.
+    pub reltypes: Vec<String>,
+    /// Global property-key symbol table: a props record's `key_id`s index this.
+    pub property_keys: Vec<String>,
+    /// Range indexes to recreate on the rebuilt generation.
+    pub range_indexes: Vec<DumpRangeIndex>,
+}
+
+/// Append `blob(rec) = uvarint(len) ‖ rec`, so a reader can split concatenated
+/// self-delimiting records without a separator.
+fn write_blob(buf: &mut Vec<u8>, rec: &[u8]) {
+    write_uvarint(buf, rec.len() as u64);
+    buf.extend_from_slice(rec);
+}
+
+/// Split one `blob` off the front of `r`, returning its bytes and advancing `r`.
+fn read_blob<'a>(r: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let len = read_uvarint(r)? as usize;
+    if r.len() < len {
+        bail!("dump blob truncated: want {len}, have {}", r.len());
+    }
+    let (blob, rest) = r.split_at(len);
+    *r = rest;
+    Ok(blob)
+}
+
+/// Streaming writer for a consolidation dump directory. Append nodes in ascending
+/// compacted-id order, then edges in emit order, then [`finish`](DumpWriter::finish)
+/// with the symbol tables and index DDL.
+pub struct DumpWriter {
+    dir: PathBuf,
+    nodes: BlockFileWriter,
+    edges: BlockFileWriter,
+    node_count: u64,
+    edge_count: u64,
+    node_scratch: Vec<u8>,
+    edge_scratch: Vec<u8>,
+    props_scratch: Vec<u8>,
+}
+
+impl DumpWriter {
+    /// Create the dump directory and its two block files. `dir` is created (and its
+    /// parents) if absent; existing `nodes.blk`/`edges.blk` are overwritten.
+    pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create dump dir {}", dir.display()))?;
+        let nodes = BlockFileWriter::create(dir.join(NODES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
+        let edges = BlockFileWriter::create(dir.join(EDGES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
+        Ok(Self {
+            dir,
+            nodes,
+            edges,
+            node_count: 0,
+            edge_count: 0,
+            node_scratch: Vec::new(),
+            edge_scratch: Vec::new(),
+            props_scratch: Vec::new(),
+        })
+    }
+
+    /// Append one node's `(labels, props)` in **global** symbol ids. The append
+    /// position is the node's compacted dense id, so nodes must be appended in
+    /// ascending id order with no gaps (tombstoned ids elided, ids renumbered).
+    pub fn append_node(&mut self, labels: &[u32], props: &[(u32, Value)]) -> Result<()> {
+        self.node_scratch.clear();
+        self.props_scratch.clear();
+        encode_labels_record_into(&mut self.props_scratch, labels);
+        write_blob(&mut self.node_scratch, &self.props_scratch);
+        self.props_scratch.clear();
+        encode_props_record_into(&mut self.props_scratch, props);
+        write_blob(&mut self.node_scratch, &self.props_scratch);
+        self.nodes.append_record(&self.node_scratch)?;
+        self.node_count += 1;
+        Ok(())
+    }
+
+    /// Append one edge with endpoints already resolved to compacted node ids and a
+    /// **global** reltype id. `props` are in global key ids.
+    pub fn append_edge(
+        &mut self,
+        src: u64,
+        dst: u64,
+        reltype: u32,
+        props: &[(u32, Value)],
+    ) -> Result<()> {
+        self.edge_scratch.clear();
+        write_uvarint(&mut self.edge_scratch, src);
+        write_uvarint(&mut self.edge_scratch, dst);
+        write_uvarint(&mut self.edge_scratch, reltype as u64);
+        self.props_scratch.clear();
+        encode_props_record_into(&mut self.props_scratch, props);
+        write_blob(&mut self.edge_scratch, &self.props_scratch);
+        self.edges.append_record(&self.edge_scratch)?;
+        self.edge_count += 1;
+        Ok(())
+    }
+
+    /// Number of nodes / edges appended so far.
+    pub fn node_count(&self) -> u64 {
+        self.node_count
+    }
+    pub fn edge_count(&self) -> u64 {
+        self.edge_count
+    }
+
+    /// Flush the block files and write `meta.json`. Consumes the writer.
+    pub fn finish(
+        self,
+        labels: Vec<String>,
+        reltypes: Vec<String>,
+        property_keys: Vec<String>,
+        range_indexes: Vec<DumpRangeIndex>,
+    ) -> Result<()> {
+        let node_count = self.node_count;
+        let edge_count = self.edge_count;
+        self.nodes.finish().context("finish dump nodes.blk")?;
+        self.edges.finish().context("finish dump edges.blk")?;
+        let meta = DumpMeta {
+            magic: DUMP_MAGIC.to_string(),
+            version: DUMP_VERSION,
+            node_count,
+            edge_count,
+            labels,
+            reltypes,
+            property_keys,
+            range_indexes,
+        };
+        let json = serde_json::to_vec_pretty(&meta).context("serialise dump meta")?;
+        let meta_path = self.dir.join(META_FILE);
+        std::fs::write(&meta_path, &json)
+            .with_context(|| format!("write dump meta {}", meta_path.display()))?;
+        Ok(())
+    }
+}
+
+/// Reader over a consolidation dump directory. Opens the metadata eagerly (small)
+/// and streams the node / edge block files on demand.
+pub struct DumpReader {
+    meta: DumpMeta,
+    nodes: BlockFileReader,
+    edges: BlockFileReader,
+}
+
+impl DumpReader {
+    /// Open a dump directory: parse and validate `meta.json`, open the two block
+    /// files. Errors if the magic/version is not understood or a file is missing.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let meta_path = dir.join(META_FILE);
+        let json = std::fs::read(&meta_path)
+            .with_context(|| format!("read dump meta {}", meta_path.display()))?;
+        let meta: DumpMeta = serde_json::from_slice(&json)
+            .with_context(|| format!("parse dump meta {}", meta_path.display()))?;
+        if meta.magic != DUMP_MAGIC {
+            bail!(
+                "not a consolidation dump: magic {:?} != {DUMP_MAGIC:?}",
+                meta.magic
+            );
+        }
+        if meta.version != DUMP_VERSION {
+            bail!(
+                "unsupported consolidation dump version {} (this build understands {DUMP_VERSION})",
+                meta.version
+            );
+        }
+        let nodes = BlockFileReader::open(dir.join(NODES_FILE))?;
+        let edges = BlockFileReader::open(dir.join(EDGES_FILE))?;
+        if nodes.total_records() != meta.node_count {
+            bail!(
+                "dump nodes.blk has {} records but meta declares {}",
+                nodes.total_records(),
+                meta.node_count
+            );
+        }
+        if edges.total_records() != meta.edge_count {
+            bail!(
+                "dump edges.blk has {} records but meta declares {}",
+                edges.total_records(),
+                meta.edge_count
+            );
+        }
+        Ok(Self { meta, nodes, edges })
+    }
+
+    pub fn meta(&self) -> &DumpMeta {
+        &self.meta
+    }
+
+    /// Stream every node record in id order, handing the callback the raw
+    /// (labels_record, props_record) blob slices — pre-encoded in the canonical
+    /// [`encode_labels_record`](crate::nodelabels::encode_labels_record) /
+    /// [`encode_props_record`](crate::columns::encode_props_record) layouts, so the
+    /// builder byte-copies each straight into its stores.
+    pub fn for_each_node(&self, mut f: impl FnMut(u64, &[u8], &[u8]) -> Result<()>) -> Result<()> {
+        self.nodes.for_each_record(|id, rec| {
+            let mut r = rec;
+            let labels_blob = read_blob(&mut r)?;
+            let props_blob = read_blob(&mut r)?;
+            f(id, labels_blob, props_blob)
+        })
+    }
+
+    /// Stream every edge record in emit order: `(edge_id, src, dst, reltype,
+    /// props_record_blob)`, endpoints already compacted node ids.
+    pub fn for_each_edge(
+        &self,
+        mut f: impl FnMut(u64, u64, u64, u32, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.edges.for_each_record(|id, rec| {
+            let mut r = rec;
+            let src = read_uvarint(&mut r)?;
+            let dst = read_uvarint(&mut r)?;
+            let reltype = read_uvarint(&mut r)? as u32;
+            let props_blob = read_blob(&mut r)?;
+            f(id, src, dst, reltype, props_blob)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::columns::decode_props;
+    use crate::nodelabels::decode_labels;
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("slater_dump_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn write_read_roundtrip() {
+        let dir = tmp("roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let nodes: Vec<(Vec<u32>, Vec<(u32, Value)>)> = vec![
+            (
+                vec![0, 2],
+                vec![(0, Value::Str("Alice".into())), (1, Value::Int(30))],
+            ),
+            (vec![], vec![]), // a node with no labels or props
+            (
+                vec![1],
+                vec![(2, Value::List(vec![Value::Int(1), Value::Str("x".into())]))],
+            ),
+        ];
+        let edges: Vec<(u64, u64, u32, Vec<(u32, Value)>)> = vec![
+            (0, 2, 0, vec![(3, Value::Int(2020))]),
+            (2, 0, 1, vec![]),
+            (0, 2, 0, vec![]), // a parallel edge — must survive verbatim
+        ];
+
+        let mut w = DumpWriter::create(&dir).unwrap();
+        for (ls, ps) in &nodes {
+            w.append_node(ls, ps).unwrap();
+        }
+        for (s, d, t, ps) in &edges {
+            w.append_edge(*s, *d, *t, ps).unwrap();
+        }
+        assert_eq!(w.node_count(), 3);
+        assert_eq!(w.edge_count(), 3);
+        w.finish(
+            vec!["Person".into(), "VIP".into(), "Company".into()],
+            vec!["KNOWS".into(), "OWNS".into()],
+            vec!["name".into(), "age".into(), "tags".into(), "since".into()],
+            vec![DumpRangeIndex {
+                entity: EntityKind::Node,
+                label_or_type: "Person".into(),
+                property: "name".into(),
+            }],
+        )
+        .unwrap();
+
+        let r = DumpReader::open(&dir).unwrap();
+        assert_eq!(r.meta().node_count, 3);
+        assert_eq!(r.meta().edge_count, 3);
+        assert_eq!(r.meta().labels, vec!["Person", "VIP", "Company"]);
+        assert_eq!(r.meta().range_indexes.len(), 1);
+
+        let mut got_nodes = Vec::new();
+        r.for_each_node(|id, lb, pb| {
+            got_nodes.push((id, decode_labels(lb).unwrap(), decode_props(pb).unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got_nodes.len(), 3);
+        for (i, (ls, ps)) in nodes.iter().enumerate() {
+            assert_eq!(got_nodes[i].0, i as u64);
+            assert_eq!(&got_nodes[i].1, ls);
+            assert_eq!(&got_nodes[i].2, ps);
+        }
+
+        let mut got_edges = Vec::new();
+        r.for_each_edge(|id, s, d, t, pb| {
+            got_edges.push((id, s, d, t, decode_props(pb).unwrap()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got_edges.len(), 3);
+        for (i, (s, d, t, ps)) in edges.iter().enumerate() {
+            assert_eq!(got_edges[i].0, i as u64);
+            assert_eq!(got_edges[i].1, *s);
+            assert_eq!(got_edges[i].2, *d);
+            assert_eq!(got_edges[i].3, *t);
+            assert_eq!(&got_edges[i].4, ps);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_foreign_magic() {
+        let dir = tmp("foreign");
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = DumpWriter::create(&dir).unwrap();
+        w.finish(vec![], vec![], vec![], vec![]).unwrap();
+        // Corrupt the magic.
+        let meta_path = dir.join(META_FILE);
+        let mut meta: DumpMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta.magic = "NOTADUMP".into();
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let err = match DumpReader::open(&dir) {
+            Ok(_) => panic!("expected a foreign-magic refusal"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("not a consolidation dump"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fixed (node, edge) input dumps byte-identically across runs — the golden
+    /// property the consolidation gate rests on. Compares the raw `.blk` bytes.
+    #[test]
+    fn dump_is_byte_deterministic() {
+        let mk = |dir: &Path| {
+            let mut w = DumpWriter::create(dir).unwrap();
+            w.append_node(&[0], &[(0, Value::Str("Alice".into()))])
+                .unwrap();
+            w.append_node(&[0], &[(0, Value::Str("Bob".into()))])
+                .unwrap();
+            w.append_edge(0, 1, 0, &[(1, Value::Int(2020))]).unwrap();
+            w.finish(
+                vec!["Person".into()],
+                vec!["KNOWS".into()],
+                vec!["name".into(), "since".into()],
+                vec![],
+            )
+            .unwrap();
+        };
+        let a = tmp("det_a");
+        let b = tmp("det_b");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+        mk(&a);
+        mk(&b);
+        for f in [NODES_FILE, EDGES_FILE, META_FILE] {
+            assert_eq!(
+                std::fs::read(a.join(f)).unwrap(),
+                std::fs::read(b.join(f)).unwrap(),
+                "dump file {f} not byte-identical across runs"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+}

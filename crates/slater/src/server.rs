@@ -494,34 +494,29 @@ impl Graphs {
             .freeze()
             .with_context(|| format!("freeze writable delta for '{name}'"))?;
 
-        // Dump the merged (core ⊕ delta) view to a scratch script beside the graph.
-        let dump_path = data_dir.join(name).join(".consolidate.cypher");
-        let dump_res = (|| -> Result<()> {
+        // Dump the merged (core ⊕ delta) view to a scratch *binary* dump directory
+        // beside the graph. The builder ingests it directly (no re-parse / re-resolve).
+        let dump_path = data_dir.join(name).join(".consolidate.dump");
+        let dump_res: Result<()> = {
             let view = MergedView::new(
                 core.as_ref(),
                 DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
             );
             let engine = Engine::new(&view, cache);
-            let mut file = std::io::BufWriter::new(
-                std::fs::File::create(&dump_path)
-                    .with_context(|| format!("create consolidation dump {dump_path:?}"))?,
-            );
-            crate::consolidate::serialise_merge_dump(&engine, &view, &mut file)?;
-            std::io::Write::flush(&mut file).context("flush consolidation dump")?;
-            Ok(())
-        })();
+            crate::consolidate::serialise_binary_dump(&engine, &view, &dump_path)
+        };
         if let Err(e) = dump_res {
-            let _ = std::fs::remove_file(&dump_path);
+            let _ = std::fs::remove_dir_all(&dump_path);
             return Err(e).with_context(|| format!("serialise consolidation dump for '{name}'"));
         }
 
         // Rebuild. A builder failure leaves the delta live (no retire) and the old
         // core serving; propagate the error after removing the scratch dump.
         if let Err(e) = build(&dump_path, name, data_dir) {
-            let _ = std::fs::remove_file(&dump_path);
+            let _ = std::fs::remove_dir_all(&dump_path);
             return Err(e).with_context(|| format!("rebuild consolidated generation for '{name}'"));
         }
-        let _ = std::fs::remove_file(&dump_path);
+        let _ = std::fs::remove_dir_all(&dump_path);
 
         // Publish: pick up the freshly built generation (validated + PQ-pinned) and
         // swap the served slot to it.
@@ -557,15 +552,19 @@ impl Graphs {
     }
 }
 
-/// Spawn the configured `slater-build` binary to rebuild `graph` from the `dump`
-/// script into `data_dir`, publishing a fresh generation — the production `build`
-/// seam for [`Graphs::consolidate_graph`]. A bare `builder_bin` resolves on `PATH`.
-/// A non-zero exit is an error, so the caller keeps the old core serving. The
-/// invocation mirrors a normal business-key `MERGE` import (no `--pk`).
+/// Spawn the configured `slater-build` binary to rebuild `graph` from the binary
+/// consolidation `dump` directory into `data_dir`, publishing a fresh generation —
+/// the production `build` seam for [`Graphs::consolidate_graph`]. A bare
+/// `builder_bin` resolves on `PATH`. A non-zero exit is an error, so the caller
+/// keeps the old core serving. The dump carries dense ids and global symbol ids, so
+/// the builder ingests it directly (`--input-format slater-dump`), skipping parse,
+/// node dedup, and endpoint resolution.
 pub fn run_builder(builder_bin: &str, dump: &Path, graph: &str, data_dir: &Path) -> Result<()> {
     let status = std::process::Command::new(builder_bin)
         .arg("--input")
         .arg(dump)
+        .arg("--input-format")
+        .arg("slater-dump")
         .arg("--graph")
         .arg(graph)
         .arg("--data-dir")
@@ -6125,6 +6124,46 @@ mod tests {
             .count()
     }
 
+    /// Read a binary consolidation dump into a `{ node name → node props }` map, for
+    /// tests that assert the serialiser saw the merged state. Nodes are keyed by their
+    /// `name` property (the fixtures' business key).
+    fn dump_nodes(
+        dump: &Path,
+    ) -> std::collections::HashMap<String, Vec<(String, graph_format::ids::Value)>> {
+        use graph_format::consolidate_dump::DumpReader;
+        let r = DumpReader::open(dump).unwrap();
+        let keys = r.meta().property_keys.clone();
+        let mut out = std::collections::HashMap::new();
+        r.for_each_node(|_, _lb, pb| {
+            let props: Vec<(String, graph_format::ids::Value)> =
+                graph_format::columns::decode_props(pb)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, v)| (keys[k as usize].clone(), v))
+                    .collect();
+            if let Some((_, graph_format::ids::Value::Str(name))) =
+                props.iter().find(|(k, _)| k == "name")
+            {
+                out.insert(name.clone(), props);
+            }
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// The integer `age` of node `name` in a binary dump, if present.
+    fn dump_age(dump: &Path, name: &str) -> Option<i64> {
+        dump_nodes(dump).get(name).and_then(|p| {
+            p.iter()
+                .find(|(k, _)| k == "age")
+                .and_then(|(_, v)| match v {
+                    graph_format::ids::Value::Int(i) => Some(*i),
+                    _ => None,
+                })
+        })
+    }
+
     /// End-to-end Phase 1d-B: a durable delta is folded into a fresh generation by
     /// consolidation. The injected builder inspects the dump (proving the serialiser
     /// saw the *merged* state) and independently publishes the known-correct
@@ -6169,14 +6208,15 @@ mod tests {
         let writer_mid = writer.clone();
         let gen_mid = gen0.clone();
         let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
-            let text = std::fs::read_to_string(dump)?;
-            assert!(
-                text.contains("MERGE (n:Person {name: 'Alice'}) SET n.age = 99;"),
-                "dump should carry the merged age:\n{text}"
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "dump should carry the merged age"
             );
-            assert!(
-                !text.contains("age = 77"),
-                "the post-freeze write must not be in the frozen dump:\n{text}"
+            assert_ne!(
+                dump_age(dump, "Bob"),
+                Some(77),
+                "the post-freeze write (Bob age 77) must not be in the frozen dump"
             );
             assert_eq!(g, "people");
             let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
@@ -6228,7 +6268,7 @@ mod tests {
             gen1.uuid(),
             "writer re-bound to new core"
         );
-        assert!(!root.join("people").join(".consolidate.cypher").exists());
+        assert!(!root.join("people").join(".consolidate.dump").exists());
         assert_eq!(
             wal_count(&wal_dir),
             1,
@@ -6437,14 +6477,16 @@ mod tests {
         let cache = BlockCache::new(1 << 20);
         let vc = VectorIndexCache::new(1 << 20);
         let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
-            let text = std::fs::read_to_string(dump)?;
+            let nodes = dump_nodes(dump);
             assert!(
-                text.contains("MERGE (n:Person {name: 'Dave'})"),
-                "the flushed born node must be in the dump:\n{text}"
+                nodes.contains_key("Dave"),
+                "the flushed born node must be in the dump: {:?}",
+                nodes.keys().collect::<Vec<_>>()
             );
-            assert!(
-                text.contains("SET n.age = 99"),
-                "the flushed core patch must be in the dump:\n{text}"
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "the flushed core patch must be in the dump"
             );
             assert_eq!(g, "people");
             testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
@@ -6459,7 +6501,7 @@ mod tests {
         let writer = graphs.writer("people").unwrap();
         assert_eq!(writer.l0_len(), 0, "L0 stack cleared by retire");
         assert_eq!(l0_count(&wal_dir), 0, "L0 file deleted by retire");
-        assert!(!root.join("people").join(".consolidate.cypher").exists());
+        assert!(!root.join("people").join(".consolidate.dump").exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -6510,7 +6552,7 @@ mod tests {
             writer.snapshot().node_patch(0).unwrap().patches.get("age"),
             Some(&Value::Int(99))
         );
-        assert!(!root.join("people").join(".consolidate.cypher").exists());
+        assert!(!root.join("people").join(".consolidate.dump").exists());
 
         // Durability: a fresh writer over the WAL replays the write.
         let reopened = DeltaWriter::open(
