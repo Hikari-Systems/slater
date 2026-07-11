@@ -325,7 +325,11 @@ impl CoreStack {
             if !removals.is_empty() {
                 ids.retain(|id| removals.binary_search(id).is_err());
             }
-            ids.extend(idx.lookup_eq(label, prop, key)?);
+            // The fence skips the leaf-block decompress when `key` can't be in this fragment;
+            // it never gates the removal suppress above (which is by id, not value).
+            if idx.may_hold_eq(label, prop, key) {
+                ids.extend(idx.lookup_eq(label, prop, key)?);
+            }
         }
         Ok(())
     }
@@ -348,7 +352,9 @@ impl CoreStack {
             if !removals.is_empty() {
                 ids.retain(|id| removals.binary_search(id).is_err());
             }
-            ids.extend(idx.lookup_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)?);
+            if idx.may_hold_range(label, prop, lo, lo_inclusive, hi, hi_inclusive) {
+                ids.extend(idx.lookup_range(label, prop, lo, lo_inclusive, hi, hi_inclusive)?);
+            }
         }
         Ok(())
     }
@@ -544,6 +550,85 @@ mod tests {
         );
         assert!(stack.segments()[0].reader.node_row(0).unwrap().is_none());
         assert_eq!(stack.segments()[0].manifest.node_count_delta, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A one-node segment (born id 3) that also carries an index fragment over
+    /// `(Person, name)`: entries `{"New"→1, "Zed"→3}` (fence `["New","Zed"]`) and a removal
+    /// of base id 1 (its stale `"Old"` value is superseded by the flush). Lets a `fold_index_eq`
+    /// test exercise the fence gate and the removal suppress together.
+    fn write_indexed_segment(
+        root: &std::path::Path,
+        graph: &str,
+        seg: GenId,
+        base: GenId,
+    ) -> SegmentManifest {
+        use graph_format::segindex::{write_index_fragments, IndexSpec};
+        let m = write_segment(root, graph, seg, base, (3, 4), (2, 3));
+        let seg_dir = root.join(graph).join("segments").join(seg.to_string());
+        write_index_fragments(
+            &seg_dir,
+            &[IndexSpec {
+                label: "Person".into(),
+                prop: "name".into(),
+                entries: vec![(Value::Str("New".into()), 1), (Value::Str("Zed".into()), 3)],
+                removals: vec![1],
+            }],
+            4096,
+            3,
+            None,
+        )
+        .unwrap();
+        m
+    }
+
+    #[test]
+    fn fold_index_eq_gates_on_the_fence_and_suppresses_removals() {
+        let (root, graph) = (tmp("foldfence"), "g");
+        let (base, seg) = (gid(1), gid(2));
+        let m = write_indexed_segment(&root, graph, seg, base);
+        let mut set = SetManifest::singleton(base, 0);
+        set.set_uuid = gid(3);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        let store = FsObjectStore::new(&root);
+        let stack = CoreStack::load(&store, graph, &set, 3, 2, None, true, None).unwrap();
+
+        // A base hit on the superseded value: removal drops it, fence admits "Old" (inside
+        // ["New","Zed"]) but the fragment has no "Old" entry ⇒ the flushed node is gone.
+        let mut ids = vec![1];
+        stack
+            .fold_index_eq(&mut ids, "Person", "name", &Value::Str("Old".into()))
+            .unwrap();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids,
+            Vec::<u64>::new(),
+            "the moved-away value must not resolve"
+        );
+
+        // The new value now resolves to the patched id.
+        let mut ids = vec![];
+        stack
+            .fold_index_eq(&mut ids, "Person", "name", &Value::Str("New".into()))
+            .unwrap();
+        assert_eq!(ids, vec![1]);
+
+        // A born id resolves under its own value.
+        let mut ids = vec![];
+        stack
+            .fold_index_eq(&mut ids, "Person", "name", &Value::Str("Zed".into()))
+            .unwrap();
+        assert_eq!(ids, vec![3]);
+
+        // A key below the fence ("Aaa" < "New") is a certain miss — the fold skips the
+        // fragment's ISAM read and returns the (empty) base result unchanged.
+        let mut ids = vec![];
+        stack
+            .fold_index_eq(&mut ids, "Person", "name", &Value::Str("Aaa".into()))
+            .unwrap();
+        assert_eq!(ids, Vec::<u64>::new());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -94,8 +94,8 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   update to the four-rung ladder.
 - **Phase 6 — Batch resolve + fences on the write path.** IN PROGRESS. Slice 6.1 DONE
   (`HP20`): segment-aware `resolve_business_key` (folds the core stack — the note-(e) closure /
-  T2·T3 auto-trigger gate). Remaining: merge-join batch resolve; fences/blooms on resolve; then
-  the T2/T3 auto-trigger wire-up.
+  T2·T3 auto-trigger gate). Slice 6.2 DONE (`HP21`): per-fragment value fence (idx.meta v2) on
+  the resolve fold. Remaining: merge-join batch resolve; then the T2/T3 auto-trigger wire-up.
 - **Phase 7 — T4 retarget + GC.** `consolidate_graph` collapses a set to a singleton
   via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
@@ -120,8 +120,32 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.1 (HP20). **Phases 1–5
+**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.2 (HP21). **Phases 1–5
 DONE; Phase 6 IN PROGRESS.**
+
+**Phase 6 (write-path resolve) — slice 6.2 DONE (per-fragment value fence on the resolve
+fold).** The resolve fold (`CoreStack::fold_index_eq` / `fold_index_range`, shared by the write
+path and every read-path index probe) probed *every* segment's ISAM fragment for `(label, prop)`,
+each an uncached leaf-block decompress — the ISAM floor (memory `bulk-delete-isam-resolve-floor`).
+Now each fragment carries a **resident value fence**: the `cmp_key` min/max of its entries, written
+into `idx.meta` (bumped to **v2**: `… ‖ removals ‖ fence`, `fence = 0 | 1 ‖ min ‖ max`) by
+`write_index_fragments` (derived from `entries`, `None` for a removal-only fragment). The fold now
+gates the fragment lookup on `SegmentIndexReader::may_hold_eq` / `may_hold_range` — a probe whose
+key/range falls outside the fence is a **provable miss** and skips the leaf-block read entirely, at
+no I/O. The fence gates **only** the fragment `lookup_*`, never the removal sidecar (removals
+suppress base ids by *id*, independent of the probed value, so they are always applied). Results
+are byte-identical to the un-fenced fold — the whole slater lib + graph-format suites are unchanged
+(the fence can only skip a lookup that would have returned empty). Fence min/max and eq/range
+overlap (inclusivity + unbounded sides + cross-type `cmp_key`) are unit-tested in the three
+`segindex` round-trips (plaintext / object-store / encrypted, so the fence survives every backend
+and the cipher); a `CoreStack`-level oracle (`fold_index_eq_gates_on_the_fence_and_suppresses_
+removals`) drives a real stacked segment through the gated fold (moved-away value → gone, new value
+→ patched id, born id → born value, below-fence key → skipped-and-empty). **737 slater lib** (+1) +
+**140 graph-format** (fence assertions folded into the existing round-trips) + 78 slater-delta +
+full workspace green, clippy + fmt clean. **NEXT in Phase 6:** the merge-join **batch** resolve
+(sort the write batch's keys once, stream-merge against the sorted base + each segment fragment in
+one pass — kills the per-row ISAM decompress), then the small slice that wires the T2/T3
+auto-triggers now that the gate (6.1) is met.
 
 **Phase 6 (write-path resolve) — slice 6.1 DONE (segment-aware `resolve_business_key`).**
 The single write-path resolver — `server::resolve_business_key`, the choke point for *every*
@@ -277,6 +301,19 @@ suppressed by the fold, so it is never read); postings are a union (a stale driv
 filtered by adjacency).
 
 ### Phase 6 slice log
+- **6.2 DONE** (HP21): **per-fragment value fence on the resolve fold**. `idx.meta` → **v2**
+  (`… ‖ removals ‖ fence`, `fence = 0 | 1 ‖ min ‖ max`); `write_index_fragments` derives each
+  fragment's `cmp_key` min/max from its entries (`None` for a removal-only fragment).
+  `SegmentIndexReader::may_hold_eq` / `may_hold_range` gate the fold's fragment `lookup_*`
+  (`CoreStack::fold_index_eq` / `fold_index_range`) — a key/range outside the fence is a provable
+  miss and skips the leaf-block decompress (the ISAM floor) at no I/O. The fence gates only the
+  fragment lookup, never the removal suppress (removals are by id, not value). Byte-identical
+  results (a skipped lookup would have returned empty). Fence + eq/range overlap unit-tested in the
+  three `segindex` round-trips; a `CoreStack` oracle
+  (`fold_index_eq_gates_on_the_fence_and_suppresses_removals`) drives a real segment through the
+  gated fold. **737 slater lib** (+1) + **140 graph-format** + 78 slater-delta + full workspace
+  green, clippy + fmt clean. ← current baseline; next is the merge-join batch resolve, then the
+  T2/T3 auto-trigger wire-up.
 - **6.1 DONE** (HP20): **segment-aware `resolve_business_key`** — the note-(e) closure and the
   T2/T3 auto-trigger gate. The write path's single business-key resolver now folds the core stack
   over the base equality probe (`CoreStack::fold_index_eq`, the read path's oldest→newest
@@ -287,8 +324,7 @@ filtered by adjacency).
   probe was the gap. Two e2e oracles
   (`resolve_through_the_stack_reuses_a_flushed_key_no_duplicate`,
   `resolve_reborns_a_key_deleted_into_a_segment`). **736 slater lib** (+2) + 140 graph-format + 78
-  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next is fences on
-  the fold, then the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
+  slater-delta + full workspace green, clippy + fmt clean.
 
 ### Phase 5 slice log
 - **5.3 DONE** (HP19): **admission policy** — the fourth D50 rung. New pure predicate
@@ -651,8 +687,16 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   singleton set is unchanged. Two e2e oracles
   (`resolve_through_the_stack_reuses_a_flushed_key_no_duplicate`,
   `resolve_reborns_a_key_deleted_into_a_segment`). 736 slater lib + 140 graph-format + 78
-  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next in Phase 6 is
-  fences on the fold, then the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
+  slater-delta + full workspace green, clippy + fmt clean.
+- HP21 — Phase 6 slice 6.2: **per-fragment value fence on the resolve fold**. `idx.meta` → v2
+  (`… ‖ removals ‖ fence`); `write_index_fragments` derives each fragment's `cmp_key` min/max;
+  `SegmentIndexReader::may_hold_eq` / `may_hold_range` gate the fold's fragment `lookup_*`
+  (`CoreStack::fold_index_eq` / `fold_index_range`) so a probe outside the fence skips the
+  leaf-block decompress (the ISAM floor) — the removal suppress is never gated. Byte-identical
+  results. Fence + overlap unit-tested in the three `segindex` round-trips; a `CoreStack` oracle
+  (`fold_index_eq_gates_on_the_fence_and_suppresses_removals`). 737 slater lib + 140 graph-format +
+  78 slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next in Phase 6
+  is the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

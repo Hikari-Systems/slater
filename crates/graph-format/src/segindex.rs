@@ -22,12 +22,22 @@
 //! # `idx.meta`
 //! ```text
 //! MAGIC(8) ‖ crc32c(body)(4) ‖ body
-//! body = version:uvarint ‖ count:uvarint ‖ count × ( label:str ‖ prop:str ‖ removals:u64-list )
+//! body = version:uvarint ‖ count:uvarint ‖ count × ( label:str ‖ prop:str ‖ removals:u64-list ‖ fence )
+//! fence = 0:u8                        (no fragment values — a removal-only fragment)
+//!       | 1:u8 ‖ min:value ‖ max:value   (the cmp_key min/max of this fragment's entries)
 //! ```
 //! The `k`-th descriptor owns `idx_<k>.isam`. Absent `idx.meta` ⇒ a segment with no index
 //! fragments (a flush that touched no indexed property); [`SegmentIndexReader::open_if_present`]
 //! returns `None`.
+//!
+//! The **fence** is a resident per-fragment value range (min/max under [`Value::cmp_key`], the
+//! ISAM order). A probe whose key/range cannot fall inside the fence provably has no hit in this
+//! fragment, so the fold skips the fragment's ISAM `lookup_*` — and with it the leaf-block
+//! decompress that is the write-path resolve floor — without an I/O. It gates only the *fragment*
+//! lookup, never the removal sidecar: removals suppress base ids by *id* regardless of the probed
+//! value, so they are always applied.
 
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,12 +47,12 @@ use crate::crypto::BlockCipher;
 use crate::ids::Value;
 use crate::isam::{write_isam_with_cipher, IsamReader};
 use crate::store::{join_key, ObjectStore};
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
 /// Magic at the head of `idx.meta`.
 const IDX_MAGIC: &[u8; 8] = b"SLSEGIX1";
-/// Index-fragment format version.
-const IDX_VERSION: u64 = 1;
+/// Index-fragment format version. v2 adds the per-fragment value fence.
+const IDX_VERSION: u64 = 2;
 
 /// One `(label, prop)` index fragment a segment contributes: the born/patched
 /// `(value, node_id)` pairs (need not be pre-sorted — the ISAM writer sorts) and the
@@ -98,6 +108,50 @@ fn isam_name(k: usize) -> String {
     format!("idx_{k}.isam")
 }
 
+/// The `cmp_key` min/max of a fragment's entry values — its value fence. `None` for an
+/// entry-less (removal-only) fragment, which holds no value at all.
+fn fence_of(entries: &[(Value, u64)]) -> Option<(Value, Value)> {
+    let mut it = entries.iter().map(|(v, _)| v);
+    let first = it.next()?;
+    let (mut min, mut max) = (first.clone(), first.clone());
+    for v in it {
+        if v.cmp_key(&min) == Ordering::Less {
+            min = v.clone();
+        }
+        if v.cmp_key(&max) == Ordering::Greater {
+            max = v.clone();
+        }
+    }
+    Some((min, max))
+}
+
+fn w_fence(buf: &mut Vec<u8>, fence: &Option<(Value, Value)>) {
+    match fence {
+        Some((min, max)) => {
+            buf.push(1);
+            write_value(buf, min);
+            write_value(buf, max);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn r_fence(r: &mut &[u8]) -> Result<Option<(Value, Value)>> {
+    let Some((&tag, rest)) = r.split_first() else {
+        bail!("segindex: short fence");
+    };
+    *r = rest;
+    match tag {
+        0 => Ok(None),
+        1 => {
+            let min = read_value(r)?;
+            let max = read_value(r)?;
+            Ok(Some((min, max)))
+        }
+        b => bail!("segindex: bad fence tag {b}"),
+    }
+}
+
 /// Write a segment's index fragments into `dir` (which must already exist — it is the
 /// segment directory): one ISAM file per spec plus the resident `idx.meta`. `cipher`
 /// seals the ISAM blocks and top-levels (and is mirrored by the reader). Removal lists
@@ -135,6 +189,7 @@ pub fn write_index_fragments(
         w_str(&mut body, &spec.label);
         w_str(&mut body, &spec.prop);
         w_ids(&mut body, &spec.removals);
+        w_fence(&mut body, &fence_of(&spec.entries));
     }
     let crc = crc32c::crc32c(&body);
     let mut out = Vec::with_capacity(body.len() + 12);
@@ -152,12 +207,16 @@ struct Fragment {
     prop: String,
     isam: IsamReader,
     removals: Vec<u64>,
+    /// `cmp_key` min/max of the fragment's entry values; `None` for a removal-only fragment.
+    fence: Option<(Value, Value)>,
 }
 
 /// Parse and validate an `idx.meta` body (magic ‖ crc32c ‖ uvarint body) into the per-
 /// fragment `(label, prop, removals)` descriptors. The ISAM files are opened separately by
 /// the caller (differently for fs vs store), but the magic/crc/version checks are shared.
-fn decode_idx_meta(meta: &[u8]) -> Result<Vec<(String, String, Vec<u64>)>> {
+type IdxDescriptor = (String, String, Vec<u64>, Option<(Value, Value)>);
+
+fn decode_idx_meta(meta: &[u8]) -> Result<Vec<IdxDescriptor>> {
     if meta.len() < 12 || &meta[..8] != IDX_MAGIC {
         bail!("segment idx.meta has bad magic");
     }
@@ -177,7 +236,8 @@ fn decode_idx_meta(meta: &[u8]) -> Result<Vec<(String, String, Vec<u64>)>> {
         let label = r_str(&mut r)?;
         let prop = r_str(&mut r)?;
         let removals = r_ids(&mut r)?;
-        out.push((label, prop, removals));
+        let fence = r_fence(&mut r)?;
+        out.push((label, prop, removals, fence));
     }
     if !r.is_empty() {
         bail!("segment idx.meta has {} trailing bytes", r.len());
@@ -220,7 +280,7 @@ impl SegmentIndexReader {
             Err(e) => return Err(e).with_context(|| format!("read {meta_path:?}")),
         };
         let mut fragments = Vec::new();
-        for (k, (label, prop, removals)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
+        for (k, (label, prop, removals, fence)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
             let isam = IsamReader::open_with_cipher(dir.join(isam_name(k)), cipher.clone())
                 .with_context(|| format!("open index fragment {k} ({label}, {prop})"))?;
             fragments.push(Fragment {
@@ -228,6 +288,7 @@ impl SegmentIndexReader {
                 prop,
                 isam,
                 removals,
+                fence,
             });
         }
         Ok(Some(Self { fragments }))
@@ -249,7 +310,7 @@ impl SegmentIndexReader {
             .read_all(&meta_key)
             .with_context(|| format!("read {meta_key}"))?;
         let mut fragments = Vec::new();
-        for (k, (label, prop, removals)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
+        for (k, (label, prop, removals, fence)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
             let isam = IsamReader::open_src(
                 store.open(&join_key(prefix, &isam_name(k)))?,
                 cipher.clone(),
@@ -260,6 +321,7 @@ impl SegmentIndexReader {
                 prop,
                 isam,
                 removals,
+                fence,
             });
         }
         Ok(Some(Self { fragments }))
@@ -308,6 +370,52 @@ impl SegmentIndexReader {
     /// removal sidecar a base probe must merge-subtract. Empty if none.
     pub fn removals(&self, label: &str, prop: &str) -> &[u64] {
         self.find(label, prop).map_or(&[], |f| &f.removals)
+    }
+
+    /// Fence check for an **equality** probe: `true` when `key` could fall inside this
+    /// fragment's value range, so [`lookup_eq`](Self::lookup_eq) must actually be run.
+    /// `false` — a certain miss — when there is no fragment for `(label, prop)` (nothing to
+    /// look up) or `key` lies outside the resident `cmp_key` fence (no leaf-block read needed).
+    /// A `false` here yields exactly the empty result `lookup_eq` would have, at no I/O.
+    pub fn may_hold_eq(&self, label: &str, prop: &str, key: &Value) -> bool {
+        match self.find(label, prop).and_then(|f| f.fence.as_ref()) {
+            None => false,
+            Some((min, max)) => {
+                key.cmp_key(min) != Ordering::Less && key.cmp_key(max) != Ordering::Greater
+            }
+        }
+    }
+
+    /// Fence check for a **range** probe: `true` when the fragment's value range overlaps the
+    /// half-open/closed probe range `[lo, hi]` (an unbounded side never bounds the overlap),
+    /// so [`lookup_range`](Self::lookup_range) must run; `false` — a certain miss — otherwise.
+    pub fn may_hold_range(
+        &self,
+        label: &str,
+        prop: &str,
+        lo: Option<&Value>,
+        lo_inclusive: bool,
+        hi: Option<&Value>,
+        hi_inclusive: bool,
+    ) -> bool {
+        let Some((min, max)) = self.find(label, prop).and_then(|f| f.fence.as_ref()) else {
+            return false;
+        };
+        if let Some(lo) = lo {
+            match max.cmp_key(lo) {
+                Ordering::Less => return false,
+                Ordering::Equal if !lo_inclusive => return false,
+                _ => {}
+            }
+        }
+        if let Some(hi) = hi {
+            match min.cmp_key(hi) {
+                Ordering::Greater => return false,
+                Ordering::Equal if !hi_inclusive => return false,
+                _ => {}
+            }
+        }
+        true
     }
 }
 
@@ -403,6 +511,25 @@ mod tests {
         let mut idx = r.indexed();
         idx.sort();
         assert_eq!(idx, vec![("Person", "age"), ("Person", "name")]);
+
+        // Value fence: age spans [9, 30], name spans ["Al", "Zoe"] under cmp_key. A probe
+        // inside the fence must run; one outside is a certain miss the fold can skip.
+        assert!(r.may_hold_eq("Person", "age", &Value::Int(30)));
+        assert!(r.may_hold_eq("Person", "age", &Value::Int(9)));
+        assert!(!r.may_hold_eq("Person", "age", &Value::Int(8))); // below min
+        assert!(!r.may_hold_eq("Person", "age", &Value::Int(31))); // above max
+        assert!(!r.may_hold_eq("Person", "age", &Value::Str("30".into()))); // wrong type, above
+        assert!(!r.may_hold_eq("Ghost", "x", &Value::Int(1))); // no fragment
+        assert!(r.may_hold_eq("Person", "name", &Value::Str("Bo".into()))); // "Al" < "Bo" < "Zoe"
+        assert!(!r.may_hold_eq("Person", "name", &Value::Str("Zz".into()))); // above "Zoe"
+
+        // Range fence overlap, respecting inclusivity and unbounded sides.
+        assert!(!r.may_hold_range("Person", "age", Some(&Value::Int(31)), true, None, true));
+        assert!(r.may_hold_range("Person", "age", Some(&Value::Int(30)), true, None, true)); // touches max
+        assert!(!r.may_hold_range("Person", "age", Some(&Value::Int(30)), false, None, true)); // (30,∞) misses
+        assert!(!r.may_hold_range("Person", "age", None, true, Some(&Value::Int(9)), false)); // (-∞,9) misses
+        assert!(r.may_hold_range("Person", "age", None, true, Some(&Value::Int(9)), true)); // (-∞,9] touches min
+        assert!(r.may_hold_range("Person", "age", None, true, None, true)); // fully unbounded
     }
 
     #[test]
