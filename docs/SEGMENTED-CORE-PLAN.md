@@ -131,7 +131,8 @@ never correctness.
 ## RESUME HERE
 
 **Branch:** `writeable`. **Committed through:** Phase 8 slices 8.1 (HP30 — read-amp harness) + 8.2
-(HP31 — object-store read-amp parity) + 8.3 (HP32 — label-scan membership gate) atop Phase 7 (HP27) +
+(HP31 — object-store read-amp parity) + 8.3 (HP32 — label-scan membership gate) + 8.4 (HP33 —
+read-amp parity verified live over MinIO/S3 + fake-gcs-server/GCS) atop Phase 7 (HP27) +
 flush-writer hardening (HP28/HP29). **Phases 1–7 DONE; every write op now flushes, resident or
 off-heap. Phase 8 IN PROGRESS.** Slice 8.1 shipped the **fs read-amp harness** (point lookup, 2-hop,
 label scan, count at 0/2/4/8 segments, cold-miss read-amp + warm latency); 8.2 the **object-store
@@ -450,6 +451,19 @@ merged segment (its adjacency is suppressed by the fold, so it is never read); p
 
 ### Phase 8 slice log (bench harness + hardening + docs — IN PROGRESS)
 
+- **8.4 DONE** (HP33) — **read-amp parity over real object stores (MinIO/S3 + fake-gcs-server/GCS).**
+  Confirms the object-store read path (8.2) is genuinely generic — **no per-backend code exists**: a new
+  `benchkit::mirror_fs_into_store(&dyn ObjectStore, root)` + integration test
+  `tests/object_store_readamp.rs` build a depth-4 stacked set on fs, mirror it into a real network store,
+  and assert the base+segment block-miss counts match fs shape-for-shape. Two arms — S3 (`s3` feature,
+  MinIO, gated on `SLATER_S3_TEST_ENDPOINT`) and GCS (`gcs` feature, `fake-gcs-server`, gated on
+  `SLATER_GCS_TEST_ENDPOINT`) — share one store-agnostic assertion; the file builds inert under plain
+  `testkit` (both arms cfg'd out), so an ordinary `cargo test` is unaffected. **Verified live against
+  both backends**: `point_lookup 1+0`, `two_hop 2+0`, `label_scan 2+4`, `count 0+0` identical over fs,
+  MinIO, and the GCS emulator (the segment fold is served over the network, not short-circuited). This
+  answers "does GCS need its own path" — **no**, the same `Reader::open_store`/`read_amp_cold_store`
+  serve it (MinIO/emulator are correctness-only per `s3-benchmark-methodology`; real latency stays on
+  EC2). Clippy (incl. `--tests --features testkit,s3,gcs`) + fmt clean; full workspace green.
 - **8.3 DONE** (HP32) — **label-scan membership gate.** A whole-graph label scan's membership
   fold (`CoreStack::fold_label_scan`) decoded a node block per segment (`resolve_node_row` on every
   stack-touched id) to re-check labels. New resident manifest field `SegmentManifest.label_membership_

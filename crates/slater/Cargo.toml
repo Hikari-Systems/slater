@@ -101,3 +101,10 @@ required-features = ["testkit"]
 name = "segment_read_amp"
 harness = false
 required-features = ["testkit"]
+
+# Read-amp correctness parity over a real object store (MinIO/S3, fake-gcs-server/GCS). Both
+# arms skip unless their endpoint env var is set. The S3 arm needs `s3`, the GCS arm `gcs`; the
+# file builds with just `testkit` (store arms cfg'd out). See the file header for run commands.
+[[test]]
+name = "object_store_readamp"
+required-features = ["testkit"]

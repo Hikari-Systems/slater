@@ -92,6 +92,16 @@ block counts by the per-GET cost. The presence-fence result therefore matters *m
 untouched point lookup that stays at 1 block is one GET regardless of stack depth, whereas a
 naïve per-segment fan-out would be one GET per segment.
 
+The read path is generic over `ObjectStore`, so **no per-backend code exists** — S3 and GCS
+serve the fold through the identical `Reader::open_store` / `read_amp_cold_store`, only the
+store constructor differs. The `tests/object_store_readamp.rs` integration test proves this
+against real network backends (MinIO for S3, `fake-gcs-server` for GCS — both correctness-only):
+it builds a depth-4 stacked set on fs, mirrors it into the store, and asserts the base+segment
+block-miss counts match fs shape-for-shape. Both arms are verified — e.g. `label_scan` reads
+`2+4` blocks over fs, MinIO, and the GCS emulator alike; the segment fold is genuinely served
+over the network, not short-circuited. The arms skip unless `SLATER_S3_TEST_ENDPOINT` /
+`SLATER_GCS_TEST_ENDPOINT` are set, so an ordinary `cargo test` is unaffected.
+
 ## The label-scan membership gate
 
 The harness surfaced that a whole-graph label scan's *membership fold* (`CoreStack::

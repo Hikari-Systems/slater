@@ -397,6 +397,15 @@ fn load_dir_into_store(store: &dyn ObjectStore, root: &Path, dir: &Path) {
     }
 }
 
+/// Mirror an fs-built stacked set (see [`build_stacked`]) into an arbitrary [`ObjectStore`]
+/// under store-relative keys — the store-agnostic path used by the S3/MinIO and GCS-emulator
+/// correctness tests. The read path is generic over the store, so once mirrored the set serves
+/// through [`Reader::open_store`] / [`read_amp_cold_store`] identically to fs or the in-memory
+/// store; only the per-block latency differs on a real backend.
+pub fn mirror_fs_into_store(store: &dyn ObjectStore, root: &Path) {
+    load_dir_into_store(store, root, root);
+}
+
 /// Build [`build_stacked`] on the local fs, mirror the whole stacked set (base + segments +
 /// set manifests + `current`) into a fresh in-memory [`ObjectStore`], tear the fs copy down,
 /// and return the store. Reading it back through [`Reader::open_store`] exercises the
