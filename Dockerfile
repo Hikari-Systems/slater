@@ -46,20 +46,29 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
 COPY crates/slater-scalar/Cargo.toml crates/slater-scalar/Cargo.toml
+COPY crates/slater-delta/Cargo.toml crates/slater-delta/Cargo.toml
 COPY crates/slater-build/Cargo.toml crates/slater-build/Cargo.toml
 COPY crates/slater/Cargo.toml crates/slater/Cargo.toml
 RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
        crates/slater-scalar/src \
+       crates/slater-delta/src \
        crates/slater-build/src crates/slater-build/src/bin crates/slater/src \
-       crates/slater/benches \
+       crates/slater/benches crates/slater/tests \
     && echo '' > crates/graph-format/src/lib.rs \
     && echo 'fn main() {}' > crates/graph-format/benches/codec.rs \
     && echo '' > crates/slater-scalar/src/lib.rs \
+    && echo '' > crates/slater-delta/src/lib.rs \
     && echo 'fn main() {}' > crates/slater-build/src/main.rs \
     && echo 'fn main() {}' > crates/slater-build/src/bin/bench_codec.rs \
     && echo '' > crates/slater/src/lib.rs \
     && echo 'fn main() {}' > crates/slater/src/main.rs \
     && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
+    && echo 'fn main() {}' > crates/slater/benches/delta_overlay.rs \
+    && echo 'fn main() {}' > crates/slater/benches/segment_read_amp.rs \
+    && echo '' > crates/slater/tests/dump_roundtrip.rs \
+    && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
+    && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
+    && echo '' > crates/slater/tests/object_store_readamp.rs \
     && cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
     && rm -rf crates/*/src \
        target/release/slater target/release/slater-build target/release/bench-codec \
