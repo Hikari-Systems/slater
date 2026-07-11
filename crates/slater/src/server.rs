@@ -592,12 +592,6 @@ impl Graphs {
         }
         let _guard = ConsolidationGuard(writer.clone());
 
-        // Encryption parity is a later slice: refuse rather than write delta data to a
-        // plaintext segment beside an encrypted core.
-        if self.master_key.is_some() {
-            bail!("flush_to_segment under encryption at rest is not yet supported");
-        }
-
         let core = self
             .get(name)
             .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
@@ -634,6 +628,28 @@ impl Graphs {
             .join("segments")
             .join(seg_uuid.0.to_string());
 
+        // Encryption parity: when the served core is encrypted at rest, the flush segment must
+        // be too. Derive a *fresh* per-segment cipher + manifest header (KDF salt only, never
+        // the key) mirroring the builder's `derive_cipher`; the read side re-derives the same
+        // cipher from `manifest.encryption` + the master key (`segstack::derive_segment_cipher`).
+        let (cipher, encryption_header): (
+            Option<std::sync::Arc<graph_format::crypto::BlockCipher>>,
+            Option<graph_format::manifest::EncryptionHeader>,
+        ) = match self.master_key.as_deref() {
+            Some(key) => {
+                let salt = graph_format::crypto::random_salt();
+                let header = graph_format::manifest::EncryptionHeader {
+                    aead: graph_format::crypto::AEAD_NAME.to_string(),
+                    kdf: graph_format::crypto::KDF_NAME.to_string(),
+                    salt_hex: graph_format::crypto::hex_encode(&salt),
+                };
+                let cipher =
+                    std::sync::Arc::new(graph_format::crypto::BlockCipher::from_master(key, &salt));
+                (Some(cipher), Some(header))
+            }
+            None => (None, None),
+        };
+
         let manifest = {
             let inp = crate::flush_segment::FlushInputs {
                 seg_dir: &seg_dir,
@@ -642,8 +658,9 @@ impl Graphs {
                 core: core.as_ref(),
                 prior_node_total,
                 prior_edge_total,
-                cipher: None,
-                master_key: None,
+                cipher,
+                master_key: self.master_key.as_deref(),
+                encryption_header,
                 created_unix,
             };
             match crate::flush_segment::write_flush_segment(frozen.snapshot.as_ref(), &inp) {
@@ -6584,6 +6601,106 @@ mod tests {
             matches!(eve.rows[0][0], Val::Int(60)),
             "Eve reloaded from the segment: {:?}",
             eve.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.4-b: **encryption parity**. When the served core is encrypted at rest,
+    /// a flush must write an encrypted segment — the writer derives a fresh per-segment cipher
+    /// and KDF header, stamps `manifest.encryption`, and seals the MAC. The segment reopens
+    /// (MAC-verified, sections decrypted) *with* the key and its born data reads back through
+    /// an empty delta; reopening the same data directory *without* the key is refused.
+    #[test]
+    fn flush_to_segment_encrypts_the_segment_under_a_master_key() {
+        let key: &[u8] = b"an-at-rest-master-key-32byteslong";
+        let (root, _g) = testgen::write_indexed_people_keyed("flush_seg_keyed_e2e", Some(key));
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, Some(key)).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(b:Person {name:'Alice'})",
+        );
+
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+
+        // The new segment carries its own encryption header (salt only) — proof the flush
+        // wrote ciphertext, not plaintext beside the encrypted core.
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.base_uuid(), base_uuid, "base preserved by the flush");
+        let seg = &gen1.stack().segments()[0];
+        let header = seg
+            .manifest
+            .encryption
+            .as_ref()
+            .expect("flushed segment manifest carries an encryption header");
+        assert_eq!(header.aead, graph_format::crypto::AEAD_NAME);
+        assert!(
+            seg.manifest.mac.is_some(),
+            "flushed segment manifest is MAC-sealed"
+        );
+
+        // Read back with an empty delta (still keyed): the born, encrypted node decrypts.
+        let dave = {
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen1.as_ref(), w.delta_snapshot());
+            let ast = parser::parse("MATCH (n:Person {name:'Dave'}) RETURN n.age").unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+        assert!(
+            matches!(dave.rows[0][0], Val::Int(50)),
+            "Dave decrypts from the keyed segment: {:?}",
+            dave.rows[0][0]
+        );
+        drop(gen1);
+
+        // Reopen the whole data dir WITH the key — set + encrypted segment reload and verify.
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, Some(key)).unwrap();
+        let gen2 = graphs.get("people").unwrap();
+        assert_eq!(gen2.uuid(), set_uuid, "reopen names the flushed set");
+        let view = MergedView::new(gen2.as_ref(), DeltaSnapshot::empty());
+        let ast =
+            parser::parse("MATCH (a:Person {name:'Dave'})-[:KNOWS]->(b) RETURN b.name").unwrap();
+        let knows = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(&knows.rows[0][0], Val::Str(s) if s == "Alice"),
+            "the born encrypted edge traverses after reopen: {:?}",
+            knows.rows.first()
+        );
+        drop(gen2);
+        drop(graphs);
+
+        // Reopen WITHOUT the key — the encrypted base + segment are refused (no plaintext leak).
+        assert!(
+            Graphs::open_all(&root, None).is_err(),
+            "an encrypted data dir must not open without the key"
         );
 
         std::fs::remove_dir_all(&root).ok();

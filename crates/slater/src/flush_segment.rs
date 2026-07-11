@@ -63,7 +63,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
 use graph_format::ids::{Generation as GenId, NodeId, Value};
-use graph_format::manifest::FileEntry;
+use graph_format::manifest::{EncryptionHeader, FileEntry};
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
     DirtyIndex, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
@@ -101,6 +101,10 @@ pub struct FlushInputs<'a> {
     /// runtime master key used to seal the manifest MAC (`None` = no MAC).
     pub cipher: Option<Arc<BlockCipher>>,
     pub master_key: Option<&'a [u8]>,
+    /// The manifest encryption header (AEAD/KDF names + this segment's fresh KDF salt, never
+    /// the key) recorded so [`crate::segstack`] can re-derive the same cipher on reopen.
+    /// `Some` iff `cipher` is — the read side keys off it.
+    pub encryption_header: Option<EncryptionHeader>,
     /// Wall-clock stamp for the manifest (the caller supplies it — the workflow/runtime is
     /// clock-free by construction).
     pub created_unix: i64,
@@ -585,7 +589,7 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
         node_band,
         edge_band,
         content_hash: String::new(),
-        encryption: None,
+        encryption: inp.encryption_header.clone(),
         node_count_delta,
         edge_count_delta,
         reltype_edge_deltas: reltype_edge_deltas.into_iter().collect(),

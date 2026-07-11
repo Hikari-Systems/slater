@@ -118,7 +118,7 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-a (HP13). **Phases 1–3
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-b (HP14). **Phases 1–3
 DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
 `crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges, core-resolved
 node patches, deletes, AND core-edge patches** — **every write op can now flush** (the last
@@ -135,12 +135,38 @@ removed on both live endpoints. A **core-edge patch** (`SET r.p = v` on an exist
 folds into the upper segment as a full **replace** edge row — the edge's base props (a lower
 segment's winning `resolve_edge_row`, else the base generation's `edge_props`) overlaid by the
 patch — that `resolve_edge_row` serves over the base, with **no marginal change** (topology is
-untouched). Publishes/swaps/retires and reads back identically — surviving a reopen. Next:
-**slice 4.4** (stacked L0 fold, encryption parity, s3 upload, auto-trigger wiring). Still
-deferred and `bail!`ed: patch-**then-delete** of the same core edge in one delta (an
-adjacency-removal concern the patch materialiser doesn't own), stacked L0 folds, encryption.
+untouched). Publishes/swaps/retires and reads back identically — surviving a reopen. **A
+flush over an encrypted core now writes an encrypted segment** — a fresh per-segment cipher +
+KDF header is derived from the runtime `master_key`, `manifest.encryption` is stamped and the
+MAC sealed, and the read side re-derives the same cipher on reopen (the `master_key.is_some()`
+bail is gone). Next: **slice 4.4-c** (stacked L0 fold), then **4.4-d** (s3 upload); then
+auto-trigger wiring (Phase-6-gated). Still deferred and `bail!`ed: patch-**then-delete** of the
+same core edge in one delta (an adjacency-removal concern the patch materialiser doesn't own),
+and stacked L0 folds (`server.rs:612` `if !frozen.l0.is_empty()`).
 
 ### Phase 4 slice log
+- **4.4-b DONE** (HP14): **encryption parity**. A flush over a core that is encrypted at rest
+  now writes an encrypted segment instead of bailing. The caller
+  (`Graphs::flush_graph_to_segment`) derives a **fresh per-segment** `BlockCipher` + manifest
+  `EncryptionHeader` (KDF salt only, never the key) from `self.master_key` — mirroring the
+  builder's `slater-build::common::derive_cipher` and `generation.rs:derive_cipher`, each
+  segment gets its own salt — and threads `cipher`/`master_key` into `FlushInputs` alongside a
+  new `encryption_header` field. The writer already routed every section through
+  `SegmentWriter::create_with_cipher` and sealed the MAC via `seal_mac(inp.master_key)`; the
+  **only writer gap was the manifest stamp** — `flush_segment.rs` hard-coded
+  `manifest.encryption = None`, now set from `inp.encryption_header`. The **read side needed no
+  change** (`segstack::load` → `derive_segment_cipher` already reads
+  `manifest.encryption.{aead,kdf,salt_hex}` + `master_key`, MAC-verifies). The
+  `master_key.is_some()` bail at the top of `flush_graph_to_segment` is removed. Fixture work:
+  `testgen::write_indexed_people_at` refactored to thread an optional key (new
+  `write_indexed_people_at_keyed` / `write_indexed_people_keyed`) so a keyed core fixture exists
+  — every section written through the cipher, manifest sealed — plaintext path unchanged
+  (`None` reduces to the old fixture). One new e2e oracle
+  (`flush_to_segment_encrypts_the_segment_under_a_master_key`): keyed core, born node + edge
+  flushed, assert the segment manifest carries an encryption header + MAC, read the born node
+  back decrypted through an empty delta, reopen the whole data dir WITH the key (born edge
+  traverses), and assert reopening WITHOUT the key is refused. 717 slater lib + full workspace
+  green, clippy clean.
 - **4.4-a DONE** (HP13): **core-edge patches** — closes the last per-op `bail!` in
   `write_flush_segment`'s edge-row loop, so every write op can now flush. A `SET r.p = v` on a
   core edge (id below the edge synthetic base, in the memtable's `by_edge_id`) is materialised
@@ -416,13 +442,43 @@ open/refuse parity with generation fixtures. Do NOT wire the read path yet — t
 Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
-> Resume the segmented-core track for slater (branch `writeable`). Read
-> `docs/SEGMENTED-CORE-PLAN.md`, especially "RESUME HERE", and the task list. Phases 1–3
-> are done (read path over a stacked set); continue from the next handoff point (Phase 4 —
-> the T2 flush, `DeltaWriter::flush_to_segment`, the first *writer* of a core segment).
-> Honour the "Phase 4 entry notes" obligations. Build/test with
-> `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` and `dangerouslyDisableSandbox`.
-> Commit at each safe handoff point and update "RESUME HERE" as you go.
+> Resume the segmented-core work on branch `writeable`. Read `docs/SEGMENTED-CORE-PLAN.md`
+> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP14 (slice 4.4-b,
+> encryption parity).** Phases 1–3 DONE; Phase 4 IN PROGRESS. **Every write op now
+> materialises into a flush segment** (`write_flush_segment` has no remaining per-op
+> `bail!`), **and a flush over an encrypted core writes an encrypted segment.** Baseline:
+> **717 slater lib tests** (140 graph-format, 78 slater-delta), clippy clean.
+>
+> NEXT: **slice 4.4-c then 4.4-d — the rest of the deployment bundle.** Two limitation sites
+> remain in `Graphs::flush_graph_to_segment` (`crates/slater/src/server.rs`); each is its own
+> green commit + HP. Do NOT wire the auto-trigger — Phase-6-gated (needs segment-aware
+> write-path resolve; see 4.1 deferral note (e)). (4.4-b encryption parity is DONE:
+> per-segment cipher + header derived from `master_key`, `manifest.encryption` stamped,
+> MAC sealed, read side re-derives on reopen — see the slice log.)
+>
+> **4.4-c — STACKED L0 FOLD** (the real work): bail at `server.rs:612`
+> `if !frozen.l0.is_empty()`. Fold `snapshot ⊕ l0` into ONE newest-wins `SegmentData`.
+> Hard part: an L0 level is `OffheapSegment: LevelRead`, not a `Memtable`, but
+> `merge_levels` (`memtable.rs:1503`) needs concrete `Memtable`s. Route (a) deserialise each
+> L0 back to a `Memtable` (`from_segment_data` path, `memtable.rs` ~1500-1660) then
+> `merge_levels` — verify core-edge patches survive
+> (`merge_levels_preserves_a_core_edge_patch`, `memtable.rs:4501`); or (b) build
+> `SegmentData` from a `DeltaSnapshot::with_levels(snapshot, l0)` walk. Verify merged
+> `synthetic_base == prior_node_total` (`server.rs:620`). Test: spill ≥2 L0 levels, flush,
+> read back through empty delta + reopen; assert newest-wins across levels.
+>
+> **4.4-d — S3 / OBJECT-STORE UPLOAD**: `publish_set_and_current` (`server.rs:738`) is
+> local-fs only (comment at `server.rs:733`). Upload segment dir (all sections + fragments
+> + `SEGMENT.json`) + set manifest to the configured `ObjectStore`, mirroring the builder's
+> upload (memory `s3-storage-backend`/`gcs-storage-backend`); durable before `current`
+> flips. Confirm `SegmentReader::open_via(store, ...)` (`segstack.rs:169`) reads it back.
+> Test against a mem-store, reopen store-natively (never bench S3 off EC2 — memory
+> `s3-benchmark-methodology`).
+>
+> DISCIPLINE: `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` +
+> `dangerouslyDisableSandbox`. Full workspace + clippy green; `cargo fmt --all` before
+> commit. Commit to `writeable` (no PRs). Update this "RESUME HERE" + slice log + add an HP
+> per sub-slice.
 
 **Key files for Phase 4:** `slater/src/{delta_writer.rs,segstack.rs,generation.rs,
 server.rs,consolidate.rs}`, `slater-delta/src/memtable.rs` (delta level → segment

@@ -30,21 +30,24 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use graph_format::columns::PropsWriter;
+use graph_format::crypto::{self, BlockCipher};
 use graph_format::histogram::{
     derive_histogram_from_isam, encode_histogram, write_property_histograms,
 };
 use graph_format::ids::{EdgeId, Generation as GenId, NodeId, Value};
 use graph_format::integrity::hash_file;
 use graph_format::isam::write_isam;
+use graph_format::isam::write_isam_with_cipher;
 use graph_format::manifest::{
-    AnnMode, EntityKind, FileEntry, Manifest, Metric, PropertyHistogramDesc, RangeIndexDesc,
-    VectorIndexDesc,
+    AnnMode, EncryptionHeader, EntityKind, FileEntry, Manifest, Metric, PropertyHistogramDesc,
+    RangeIndexDesc, VectorIndexDesc,
 };
 use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
-use graph_format::topology::{write_csr, Edge, TopologyReader};
+use graph_format::topology::{write_csr, write_csr_with_cipher, Edge, TopologyReader};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::{FORMAT_VERSION, MAGIC};
@@ -359,18 +362,62 @@ pub fn write_indexed_people(tag: &str) -> (PathBuf, String) {
     (root, graph)
 }
 
+/// [`write_indexed_people`] built **encrypted at rest** under `master_key`: every
+/// section is written through the block cipher, and the manifest carries the KDF
+/// encryption header + a sealed MAC (so a keyed [`crate::server::Graphs`] accepts it).
+/// The stand-in for a real encrypted core a T2 flush must extend with an encrypted
+/// segment. `master_key: None` reduces to the plaintext fixture.
+pub fn write_indexed_people_keyed(tag: &str, master_key: Option<&[u8]>) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0007);
+    let root = std::env::temp_dir().join(format!("slater_idxfixk_{}_{tag}", std::process::id()));
+    let graph = write_indexed_people_at_keyed(&root, uuid, [30, 25, 40], master_key);
+    (root, graph)
+}
+
 /// Write the `people` generation of [`write_indexed_people`] into `root/people/<uuid>/`
 /// with the given Alice/Bob/Carol ages, updating `root/people/current` to name it.
 /// Parameterised so a consolidation test can publish a fresh, independently-known
 /// generation (a new `uuid`, patched ages) into an existing data directory — the
 /// stand-in for what the real builder produces. Returns the graph name (`people`).
 pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) -> String {
+    write_indexed_people_at_keyed(root, uuid, ages, None)
+}
+
+/// The body of [`write_indexed_people_at`], additionally routing every section
+/// through a per-generation block cipher derived from `master_key` (and sealing the
+/// manifest MAC) when a key is supplied. `None` writes the plaintext fixture.
+pub fn write_indexed_people_at_keyed(
+    root: &Path,
+    uuid: uuid::Uuid,
+    ages: [i64; 3],
+    master_key: Option<&[u8]>,
+) -> String {
     let graph = "people".to_string();
     let dir = root.join(&graph).join(uuid.to_string());
     std::fs::create_dir_all(dir.join("range")).unwrap();
 
+    // Derive the block cipher + MANIFEST encryption header (salt only, never the key).
+    let (cipher, encryption): (Option<Arc<BlockCipher>>, Option<EncryptionHeader>) =
+        match master_key {
+            Some(key) => {
+                let salt = crypto::random_salt();
+                let header = EncryptionHeader {
+                    aead: crypto::AEAD_NAME.to_string(),
+                    kdf: crypto::KDF_NAME.to_string(),
+                    salt_hex: crypto::hex_encode(&salt),
+                };
+                (
+                    Some(Arc::new(BlockCipher::from_master(key, &salt))),
+                    Some(header),
+                )
+            }
+            None => (None, None),
+        };
+
     // node_props.blk — name(0) + age(1) on every node.
-    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    let mut np =
+        PropsWriter::create_with_cipher(dir.join("node_props.blk"), BLOCK, LEVEL, cipher.clone())
+            .unwrap();
     for (name, age) in [("Alice", ages[0]), ("Bob", ages[1]), ("Carol", ages[2])] {
         np.append(&[(0, Value::Str(name.into())), (1, Value::Int(age))])
             .unwrap();
@@ -378,14 +425,22 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
     np.finish().unwrap();
 
     // node_labels.blk — all :Person(0).
-    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    let mut nl = NodeLabelsWriter::create_with_cipher(
+        dir.join("node_labels.blk"),
+        BLOCK,
+        LEVEL,
+        cipher.clone(),
+    )
+    .unwrap();
     for _ in 0..3 {
         nl.append(&[0]).unwrap();
     }
     nl.finish().unwrap();
 
     // edge_props.blk — e0 carries since(2).
-    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    let mut ep =
+        PropsWriter::create_with_cipher(dir.join("edge_props.blk"), BLOCK, LEVEL, cipher.clone())
+            .unwrap();
     ep.append(&[(2, Value::Int(2020))]).unwrap();
     ep.finish().unwrap();
 
@@ -396,16 +451,29 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
         reltype: 0,
         edge: EdgeId(0),
     }];
-    write_csr(dir.join("topology.csr.blk"), 3, &edges, BLOCK, LEVEL).unwrap();
+    write_csr_with_cipher(
+        dir.join("topology.csr.blk"),
+        3,
+        &edges,
+        BLOCK,
+        LEVEL,
+        cipher.clone(),
+    )
+    .unwrap();
 
     // vectors.f32.blk — empty (no vector index), but the reader always opens it.
-    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
-        .unwrap()
-        .finish()
-        .unwrap();
+    VectorStoreWriter::create_with_cipher(
+        dir.join("vectors.f32.blk"),
+        BLOCK,
+        LEVEL,
+        cipher.clone(),
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
 
     // range index on (Person, name).
-    write_isam(
+    write_isam_with_cipher(
         dir.join("range").join("node_Person_name.isam"),
         vec![
             (Value::Str("Alice".into()), 0),
@@ -414,6 +482,7 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
         ],
         BLOCK,
         LEVEL,
+        cipher.clone(),
     )
     .unwrap();
 
@@ -449,7 +518,7 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
         .collect();
     let content_hash = graph_format::integrity::content_hash(&inv);
 
-    let manifest = Manifest {
+    let mut manifest = Manifest {
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -460,7 +529,7 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
         codec: "zstd".into(),
         zstd_level: LEVEL,
         compression_profile: String::new(),
-        encryption: None,
+        encryption,
         node_count: 3,
         edge_count: 1,
         labels: vec!["Person".into()],
@@ -487,6 +556,9 @@ pub fn write_indexed_people_at(root: &Path, uuid: uuid::Uuid, ages: [i64; 3]) ->
         mac: None,
         files,
     };
+    if let Some(key) = master_key {
+        manifest.seal_mac(key).unwrap();
+    }
     manifest.write_to_dir(&dir).unwrap();
 
     std::fs::write(
