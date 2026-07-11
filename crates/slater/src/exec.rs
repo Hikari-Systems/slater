@@ -403,10 +403,70 @@ fn read_adj_overlaid(
         let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
         topology::decode_adj(&rec)?
     };
+    // Fold the core segment stack's adjacency fragments (below the delta), then the delta.
+    let core = overlay_segment_adj(gen, node, outgoing, core)?;
     if gen.delta().is_empty() {
         return Ok(core);
     }
     Ok(overlay_adj(gen, node, outgoing, core))
+}
+
+/// Fold every upper core segment's adjacency **fragment** for `node` into its base
+/// adjacency, oldest→newest (so a newer flush's removal wins over an older flush's born
+/// edge). A fragment carries only the edges a flush *added* or *removed*, never rewriting
+/// the whole neighbour list: a `removed` entry suppresses the matching `edge_id` from the
+/// list so far, a born entry appends (mapping its reltype **name** to the core id — a
+/// reltype absent from the core cannot be an `Adj`, so it is skipped, as for the delta).
+///
+/// Each segment is gated by its O(1) adjacency fence ([`SegmentReader::may_hold_out_adj`] /
+/// `may_hold_in_adj`) so an untouched node skips the segment without a binary search — the
+/// mechanism that keeps a stacked adjacency read close to the single base block read.
+/// Returns `core` unchanged for a singleton set.
+fn overlay_segment_adj(
+    gen: &dyn ReadView,
+    node: u64,
+    outgoing: bool,
+    mut core: Vec<topology::Adj>,
+) -> Result<Vec<topology::Adj>> {
+    let stack = gen.core_stack();
+    if stack.is_singleton() {
+        return Ok(core);
+    }
+    for seg in stack.segments() {
+        let r = &seg.reader;
+        let frag = if outgoing {
+            if !r.may_hold_out_adj(node) {
+                continue;
+            }
+            r.out_adj(node)?
+        } else {
+            if !r.may_hold_in_adj(node) {
+                continue;
+            }
+            r.in_adj(node)?
+        };
+        if frag.is_empty() {
+            continue;
+        }
+        let mut removed: HashSet<u64> = HashSet::new();
+        let mut born: Vec<topology::Adj> = Vec::new();
+        for e in frag {
+            if e.removed {
+                removed.insert(e.edge_id);
+            } else if let Some(rt) = gen.reltype_id(&e.reltype) {
+                born.push(topology::Adj {
+                    reltype: rt,
+                    neighbour: NodeId(e.other),
+                    edge: EdgeId(e.edge_id),
+                });
+            }
+        }
+        if !removed.is_empty() {
+            core.retain(|a| !removed.contains(&a.edge.0));
+        }
+        core.extend(born);
+    }
+    Ok(core)
 }
 
 /// Thread-safe single-node neighbour read for the parallel `shortestPath()` BFS:
@@ -9059,7 +9119,7 @@ mod tests {
     fn write_basic_with_segment(tag: &str) -> (std::path::PathBuf, String, uuid::Uuid) {
         use graph_format::manifest::FileEntry;
         use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
-        use graph_format::segment::{EdgeRow, NodeRow, SegmentWriter};
+        use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
         use graph_format::setmanifest::{SegmentRef, SetManifest};
 
         let (root, graph, base_uuid) = testgen::write_basic(tag);
@@ -9110,6 +9170,36 @@ mod tests {
             },
         )
         .unwrap();
+        // Adjacency fragments: born edge 5 (0→5 KNOWS) on both endpoints, and a removal of
+        // base edge 4 (0→2 KNOWS) from node 0's outgoing list.
+        w.push_adj_out(
+            0,
+            &[
+                AdjEdge {
+                    other: 2,
+                    reltype: "KNOWS".into(),
+                    edge_id: 4,
+                    removed: true,
+                },
+                AdjEdge {
+                    other: 5,
+                    reltype: "KNOWS".into(),
+                    edge_id: 5,
+                    removed: false,
+                },
+            ],
+        )
+        .unwrap();
+        w.push_adj_in(
+            5,
+            &[AdjEdge {
+                other: 0,
+                reltype: "KNOWS".into(),
+                edge_id: 5,
+                removed: false,
+            }],
+        )
+        .unwrap();
         w.finish().unwrap();
 
         let mut m = SegmentManifest {
@@ -9122,9 +9212,9 @@ mod tests {
             edge_band: (5, 6), // one born edge id
             content_hash: String::new(),
             encryption: None,
-            node_count_delta: 0, // +1 born, -1 tombstoned
-            edge_count_delta: 1,
-            reltype_edge_deltas: vec![("KNOWS".into(), 1)],
+            node_count_delta: 0, // +1 born (5), -1 tombstoned (2)
+            edge_count_delta: 0, // +1 born (e5), -1 removed (e4)
+            reltype_edge_deltas: vec![("KNOWS".into(), 0)], // KNOWS: +e5 -e4
             label_node_deltas: vec![("Person".into(), 0)],
             marginals_exact: true,
             dirty_indexes: vec![],
@@ -9259,6 +9349,77 @@ mod tests {
         // The segment's other props still show through where the delta is silent.
         assert!(matches!(prop(&p0, "mood"), Some(Val::Str(s)) if s == "calm"));
         assert!(matches!(engine.node_prop(0, "age").unwrap(), Val::Int(7)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A segment's adjacency fragments fold over the base neighbour list: a `removed` entry
+    /// suppresses a base edge, a born entry appends one, and an untouched node reads its base
+    /// adjacency unchanged (its fence skips the segment). The read oracle for slice 3.3.
+    #[test]
+    fn segment_adjacency_fragments_merge_over_base() {
+        use crate::read_view::MergedView;
+        let (root, graph, _) = write_basic_with_segment("seg_adjacency");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+        let knows = gen.reltype_id("KNOWS").unwrap();
+        let works = gen.reltype_id("WORKS_AT").unwrap();
+
+        let triples = |adj: &[topology::Adj]| -> Vec<(u64, u32, u64)> {
+            let mut v: Vec<_> = adj
+                .iter()
+                .map(|a| (a.neighbour.0, a.reltype, a.edge.0))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Base node 0 out-edges: →1 (KNOWS e0), →3 (WORKS_AT e2), →2 (KNOWS e4). The segment
+        // removes e4 and adds e5 (→5 KNOWS).
+        assert_eq!(
+            triples(&engine.outgoing(0).unwrap()),
+            vec![(1, knows, 0), (3, works, 2), (5, knows, 5)],
+        );
+        // Incoming to born node 5 is the born edge alone (no base row for a synthetic id).
+        assert_eq!(triples(&engine.incoming(5).unwrap()), vec![(0, knows, 5)]);
+        // A node with no fragment in the segment reads its base adjacency unchanged.
+        assert_eq!(
+            triples(&engine.outgoing(1).unwrap()),
+            vec![(2, knows, 1)], // base edge e1: 1→2 KNOWS
+        );
+
+        // Under a delta that adds one more out-edge from node 0, all three layers compose.
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+        let mut mem = Memtable::new();
+        mem.upsert_node("Person", "name", Value::Str("Alice".into()), Some(0), []);
+        // A second, delta-born out-edge from node 0: 0→3 (Acme) KNOWS.
+        mem.upsert_edge(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            "KNOWS",
+            "Company",
+            "name",
+            Value::Str("Acme".into()),
+            Some(0),
+            Some(3),
+            [],
+        );
+        let dview = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let deng = Engine::new(&dview, &cache);
+        let out0 = deng.outgoing(0).unwrap();
+        // base e0(→1), base e2(→3 WORKS_AT), segment e5(→5), delta born(→3 KNOWS); e4 gone.
+        assert_eq!(out0.len(), 4, "{:?}", triples(&out0));
+        assert!(out0
+            .iter()
+            .any(|a| a.neighbour.0 == 5 && a.reltype == knows));
+        assert!(
+            !out0.iter().any(|a| a.edge.0 == 4),
+            "removed edge stays gone under a delta"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 

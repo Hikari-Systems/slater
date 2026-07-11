@@ -651,6 +651,30 @@ impl SegmentReader {
     pub fn may_hold_edge(&self, edge_id: u64) -> bool {
         matches!(self.edge_fence(), Some((lo, hi)) if lo <= edge_id && edge_id <= hi)
     }
+    /// `[min, max]` node ids carrying an **outgoing** adjacency fragment, or `None`. Distinct
+    /// from [`node_fence`](Self::node_fence): a node whose only change is a new incident edge
+    /// carries an adjacency fragment but *no* node row, so the node fence would wrongly skip
+    /// it. Adjacency gating must use this fence.
+    pub fn out_adj_fence(&self) -> Option<(u64, u64)> {
+        Self::fence(&self.adj_out_keys)
+    }
+    /// `[min, max]` node ids carrying an **incoming** adjacency fragment, or `None`.
+    pub fn in_adj_fence(&self) -> Option<(u64, u64)> {
+        Self::fence(&self.adj_in_keys)
+    }
+    /// Whether `node` *could* carry an outgoing fragment (inside [`out_adj_fence`]). A `false`
+    /// skips the segment for this node's out-adjacency with no binary search.
+    ///
+    /// [`out_adj_fence`]: SegmentReader::out_adj_fence
+    pub fn may_hold_out_adj(&self, node: u64) -> bool {
+        matches!(self.out_adj_fence(), Some((lo, hi)) if lo <= node && node <= hi)
+    }
+    /// Whether `node` *could* carry an incoming fragment (inside [`in_adj_fence`]).
+    ///
+    /// [`in_adj_fence`]: SegmentReader::in_adj_fence
+    pub fn may_hold_in_adj(&self, node: u64) -> bool {
+        matches!(self.in_adj_fence(), Some((lo, hi)) if lo <= node && node <= hi)
+    }
 
     fn record_bytes(&self, reader: &BlockFileReader, sub: u32, idx: usize) -> Result<Vec<u8>> {
         let rec = self.cache.record(reader, self.scope, sub, idx as u64)?;
@@ -841,6 +865,12 @@ mod tests {
         assert!(r.may_hold_edge(100));
         assert_eq!(r.node_ids(), &[10, 12, 15]);
         assert_eq!(r.edge_ids(), &[100, 101]);
+        // Adjacency fences are separate from the node fence: node 10 carries the only
+        // outgoing fragment, node 15 the only incoming one.
+        assert_eq!(r.out_adj_fence(), Some((10, 10)));
+        assert_eq!(r.in_adj_fence(), Some((15, 15)));
+        assert!(r.may_hold_out_adj(10) && !r.may_hold_out_adj(15));
+        assert!(r.may_hold_in_adj(15) && !r.may_hold_in_adj(10));
     }
 
     #[test]
