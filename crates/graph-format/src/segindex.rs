@@ -366,6 +366,45 @@ impl SegmentIndexReader {
         }
     }
 
+    /// Fence-gated **batch** equality lookup: `out[i]` is the born/patched node ids whose
+    /// `(label, prop)` value equals `keys[i]`, aligned to the input. `keys` must be sorted
+    /// ascending by `cmp_key` and distinct — the batch counterpart of
+    /// [`lookup_eq`](Self::lookup_eq), driven by [`IsamReader::lookup_eq_sorted`] so the
+    /// whole batch costs one decompress per touched fragment block (the bulk-write ISAM
+    /// floor). The **fence** gates it exactly as [`may_hold_eq`](Self::may_hold_eq) gates a
+    /// point lookup: a key outside the fragment's resident `cmp_key` range (or every key,
+    /// for an absent / removal-only fragment) is a provable miss and is swept-over — its
+    /// slot stays empty at no I/O. So `out[i]` equals `may_hold_eq(k) ? lookup_eq(k) : []`
+    /// for each key, byte-identical to the point path.
+    pub fn lookup_eq_sorted(
+        &self,
+        label: &str,
+        prop: &str,
+        keys: &[&Value],
+    ) -> Result<Vec<Vec<u64>>> {
+        let mut out = vec![Vec::new(); keys.len()];
+        let Some(fr) = self.find(label, prop) else {
+            return Ok(out); // no fragment ⇒ every key misses
+        };
+        // A removal-only fragment carries no fence (and no entries); a key outside the fence
+        // cannot be in the ISAM. Sweep only the in-fence keys, then scatter back by slot.
+        let Some((min, max)) = fr.fence.as_ref() else {
+            return Ok(out);
+        };
+        let mut slots = Vec::new();
+        let mut in_fence = Vec::new();
+        for (i, &k) in keys.iter().enumerate() {
+            if k.cmp_key(min) != Ordering::Less && k.cmp_key(max) != Ordering::Greater {
+                slots.push(i);
+                in_fence.push(k);
+            }
+        }
+        for (slot, ids) in slots.into_iter().zip(fr.isam.lookup_eq_sorted(&in_fence)?) {
+            out[slot] = ids;
+        }
+        Ok(out)
+    }
+
     /// The sorted base-index node ids this segment suppresses for `(label, prop)` — the
     /// removal sidecar a base probe must merge-subtract. Empty if none.
     pub fn removals(&self, label: &str, prop: &str) -> &[u64] {
@@ -522,6 +561,31 @@ mod tests {
         assert!(!r.may_hold_eq("Ghost", "x", &Value::Int(1))); // no fragment
         assert!(r.may_hold_eq("Person", "name", &Value::Str("Bo".into()))); // "Al" < "Bo" < "Zoe"
         assert!(!r.may_hold_eq("Person", "name", &Value::Str("Zz".into()))); // above "Zoe"
+
+        // Batch equality sweep == the per-key point path, with the fence gating each key:
+        // 8 (below min) and 31 (above max) are provable misses ⇒ empty slots; 9 and 30 hit.
+        let keys = [Value::Int(8), Value::Int(9), Value::Int(30), Value::Int(31)];
+        let refs: Vec<&Value> = keys.iter().collect();
+        let swept = r.lookup_eq_sorted("Person", "age", &refs).unwrap();
+        assert_eq!(swept.len(), keys.len());
+        for (k, got) in keys.iter().zip(&swept) {
+            let want = if r.may_hold_eq("Person", "age", k) {
+                let mut v = r.lookup_eq("Person", "age", k).unwrap();
+                v.sort_unstable();
+                v
+            } else {
+                Vec::new()
+            };
+            let mut got = got.clone();
+            got.sort_unstable();
+            assert_eq!(got, want, "batch sweep diverges at {k:?}");
+        }
+        // An absent fragment sweeps to all-empty; an empty key list is a no-op.
+        assert_eq!(
+            r.lookup_eq_sorted("Ghost", "x", &refs).unwrap(),
+            vec![Vec::<u64>::new(); keys.len()]
+        );
+        assert!(r.lookup_eq_sorted("Person", "age", &[]).unwrap().is_empty());
 
         // Range fence overlap, respecting inclusivity and unbounded sides.
         assert!(!r.may_hold_range("Person", "age", Some(&Value::Int(31)), true, None, true));

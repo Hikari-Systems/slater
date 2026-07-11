@@ -95,7 +95,8 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
 - **Phase 6 — Batch resolve + fences on the write path.** IN PROGRESS. Slice 6.1 DONE
   (`HP20`): segment-aware `resolve_business_key` (folds the core stack — the note-(e) closure /
   T2·T3 auto-trigger gate). Slice 6.2 DONE (`HP21`): per-fragment value fence (idx.meta v2) on
-  the resolve fold. Remaining: merge-join batch resolve; then the T2/T3 auto-trigger wire-up.
+  the resolve fold. Slice 6.3 DONE (`HP22`): merge-join batch resolve (one block decompress per
+  touched block for a whole write batch). Remaining: the T2/T3 auto-trigger wire-up.
 - **Phase 7 — T4 retarget + GC.** `consolidate_graph` collapses a set to a singleton
   via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
@@ -120,8 +121,41 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.2 (HP21). **Phases 1–5
+**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.3 (HP22). **Phases 1–5
 DONE; Phase 6 IN PROGRESS.**
+
+**Phase 6 (write-path resolve) — slice 6.3 DONE (merge-join batch resolve).** The batched
+write path (`execute_write_batch`) resolved each `UNWIND` row's business key one-at-a-time,
+re-decompressing the same ISAM leaf blocks per row — the bulk-write floor (memory
+`bulk-delete-isam-resolve-floor`); the 6.2 fence only skips a *segment* that cannot hold a given
+key, so a batch of many distinct keys still touches many blocks. Now the batch's keys resolve in
+**one merge-join sweep**. `(label, key)` is **fixed across a batch** (only the value varies), so
+the values are deduped + sorted once and streamed against the sorted base ISAM and each segment
+fragment: `IsamReader::lookup_eq_sorted(&[&Value])` walks the leaf blocks in one forward pass —
+each touched block decoded once, a decoded-block memo carrying it across the ascending keys;
+`SegmentIndexReader::lookup_eq_sorted` fence-prunes the keys then sweeps the in-fence set;
+`CoreStack::fold_index_eq_batch` folds the stack oldest→newest (per-segment removal suppress on
+every key's id vec — by id, value-independent — then the fence-gated fragment sweep unioned in),
+carrying **exactly** the 6.1/6.2 suppress-then-union + fence semantics. `resolve_business_keys_batch`
+(server) drives it: base sweep → batch fold → sort/dedup → per-value `Absent`/`Unique`/`Ambiguous`
+verdict, byte-identical to N `resolve_business_key` calls (the singleton set short-circuits to the
+base sweep, an unindexed pair or any read failure collapses **all** values to `Unindexed` — never
+`Absent`, so a read failure can't manufacture a duplicate). `resolve_node_op` /
+`merge_creates_node` were split into `_from(resolution)` variants so the batch path resolves the
+core **once** per distinct key and still shares the born-id / create-vs-match / delete decisions
+with the single path (they can't drift); `KeyResolution` is now `Copy`. The core probe reads `gen`
+only (never the accumulating delta), so hoisting every row's resolution to the top of the batch is
+sound. **NEXT (closing Phase 6 slice):** wire the T2/T3 auto-triggers into `maybe_maintain_delta`
+(`server.rs`) — the 6.1 correctness gate is met; see the note below on its design load. Tested: an
+`isam` sweep-vs-point-lookup equivalence over the int + string shapes (present/absent/boundary-
+spanning keys); the fence-gated batch sweep folded into the three `segindex` round-trips; a
+`CoreStack` oracle (`fold_index_eq_batch_matches_point_folds`, batch == N point folds); an e2e
+oracle (`batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate`: one `UNWIND … MERGE …
+SET` batch over a flushed segment reuses a segment-born key, patches a base key, borns an absent
+key, honours a within-batch duplicate — duplicate-free across a second flush + reopen + re-batch);
+`bench_resolve_business_key_over_the_segment` extended with a batch-vs-per-row timing (same
+verdicts). **739 slater lib** (+2) + **141 graph-format** (+1) + 78 slater-delta + full workspace
+green (28 suites), clippy + fmt clean.
 
 **Phase 6 (write-path resolve) — slice 6.2 DONE (per-fragment value fence on the resolve
 fold).** The resolve fold (`CoreStack::fold_index_eq` / `fold_index_range`, shared by the write
@@ -283,24 +317,45 @@ delta (an adjacency-removal concern the patch materialiser doesn't own), and a f
 image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
 `as_memtable()` returns `None`).
 
-**Phase 6 NEXT after 6.1:** the **note-(e) gate is now met** — `resolve_business_key` folds the
-stack, so the write path resolves a born/flushed key against a segment. What remains in Phase 6:
-(1) **fences/blooms on the resolve fold** — `fold_index_eq` probes every segment's index fragment;
-a per-fragment value-range fence (min/max, or a bloom) lets the fold skip a segment that can't
-hold the probed value; (2) the **merge-join batch resolve** — resolving each row's business key
-one-at-a-time does an uncached per-row ISAM block decompress (the bulk-write floor, memory
-`bulk-delete-isam-resolve-floor`); sort the batch's keys once and stream-merge them against the
-sorted index (base + each segment fragment) in one pass. Then the closing slice **wires the T2/T3
-auto-triggers** — `maybe_maintain_delta`-style hooks that fire `flush_graph_to_segment` at
-`memtableBytes`/segment-count thresholds and `compact_graph_segments_auto` at `maxUpperSegments`
-(the L0-internal memtable→L0/L0→L0 auto-maintenance already exists — this adds the two
-segment-tier rungs, safe now the resolve gate is met). **Phase 5 stays functionally complete**
+**Phase 6 NEXT after 6.3:** the **note-(e) gate is met** (6.1) and both resolve-fold performance
+floors are closed — the **per-fragment value fence** (6.2, skip a segment that can't hold the key)
+and the **merge-join batch resolve** (6.3, one block decompress per touched block for a whole write
+batch instead of per row). What remains in Phase 6 is the **closing slice: wire the T2/T3
+auto-triggers** — `maybe_maintain_delta`-style hooks (`server.rs:~4036`) that fire
+`flush_graph_to_segment` at a **distinct delta→segment flush threshold** (separate from
+`memtableBytes`, which already drives L0 flush) and `compact_graph_segments_auto` at
+`maxUpperSegments` (the L0-internal memtable→L0/L0→L0 auto-maintenance already exists — this adds
+the two segment-tier rungs, safe now the resolve gate is met). It is **design-laden**: it needs
+that new flush threshold **plus** `vector_cache`/`data_dir` plumbing into `maybe_maintain_delta` —
+scope it deliberately. **Phase 5 stays functionally complete**
 (writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carried from 5.1 (each benign): a
 born-then-deleted **edge** leaves an orphan edge row in the merged segment (its adjacency is
 suppressed by the fold, so it is never read); postings are a union (a stale driving hit is
 filtered by adjacency).
 
 ### Phase 6 slice log
+- **6.3 DONE** (HP22): **merge-join batch resolve** — the bulk-write ISAM floor (memory
+  `bulk-delete-isam-resolve-floor`). `execute_write_batch` resolved each `UNWIND` row's key with a
+  per-row ISAM point probe (re-decompressing the same blocks; the 6.2 fence only skips a segment,
+  not a block). Now, because `(label, key)` is fixed across a batch, the values are deduped +
+  sorted once and streamed against the sorted index in one pass: new
+  `IsamReader::lookup_eq_sorted(&[&Value])` (one forward block-walk, each touched block decoded
+  once via a sweep-local memo), `SegmentIndexReader::lookup_eq_sorted` (fence-prune the keys, sweep
+  the in-fence set, scatter back), `CoreStack::fold_index_eq_batch` (oldest→newest per-segment
+  removal-suppress on every key's id vec + fence-gated fragment sweep union — carries 6.1/6.2
+  semantics exactly), and `resolve_business_keys_batch` (server: base sweep → batch fold →
+  sort/dedup → per-value verdict, byte-identical to N `resolve_business_key`; unindexed/read-fail
+  ⇒ all `Unindexed`, never `Absent`). `resolve_node_op` / `merge_creates_node` split into
+  `_from(resolution)` variants (batch resolves the core once per distinct key, shares the born-id /
+  create / delete decisions with the single path); `KeyResolution` is now `Copy`. The core probe
+  reads `gen` only, so hoisting every row's resolution up front is sound. Tested: `isam`
+  sweep-vs-point equivalence (int + string, present/absent/boundary-spanning); the fence-gated
+  batch sweep in the three `segindex` round-trips; a `CoreStack` oracle
+  (`fold_index_eq_batch_matches_point_folds`); an e2e oracle
+  (`batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate`); the resolve bench extended
+  with a batch-vs-per-row timing. **739 slater lib** (+2) + **141 graph-format** (+1) + 78
+  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next is the closing
+  Phase-6 slice — the T2/T3 auto-trigger wire-up.
 - **6.2 DONE** (HP21): **per-fragment value fence on the resolve fold**. `idx.meta` → **v2**
   (`… ‖ removals ‖ fence`, `fence = 0 | 1 ‖ min ‖ max`); `write_index_fragments` derives each
   fragment's `cmp_key` min/max from its entries (`None` for a removal-only fragment).
@@ -312,8 +367,7 @@ filtered by adjacency).
   three `segindex` round-trips; a `CoreStack` oracle
   (`fold_index_eq_gates_on_the_fence_and_suppresses_removals`) drives a real segment through the
   gated fold. **737 slater lib** (+1) + **140 graph-format** + 78 slater-delta + full workspace
-  green, clippy + fmt clean. ← current baseline; next is the merge-join batch resolve, then the
-  T2/T3 auto-trigger wire-up.
+  green, clippy + fmt clean.
 - **6.1 DONE** (HP20): **segment-aware `resolve_business_key`** — the note-(e) closure and the
   T2/T3 auto-trigger gate. The write path's single business-key resolver now folds the core stack
   over the base equality probe (`CoreStack::fold_index_eq`, the read path's oldest→newest
@@ -695,8 +749,19 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   leaf-block decompress (the ISAM floor) — the removal suppress is never gated. Byte-identical
   results. Fence + overlap unit-tested in the three `segindex` round-trips; a `CoreStack` oracle
   (`fold_index_eq_gates_on_the_fence_and_suppresses_removals`). 737 slater lib + 140 graph-format +
-  78 slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next in Phase 6
-  is the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
+  78 slater-delta + full workspace green, clippy + fmt clean.
+- HP22 — Phase 6 slice 6.3: **merge-join batch resolve** — the bulk-write ISAM floor (memory
+  `bulk-delete-isam-resolve-floor`). `execute_write_batch` now resolves the whole batch's keys in
+  one merge-join sweep instead of a per-row point probe: `IsamReader::lookup_eq_sorted` (forward
+  block-walk, each touched block decoded once), `SegmentIndexReader::lookup_eq_sorted` (fence-prune
+  + sweep), `CoreStack::fold_index_eq_batch` (oldest→newest suppress-then-union, fence-gated), and
+  `resolve_business_keys_batch` (server; byte-identical verdicts to N `resolve_business_key`).
+  `resolve_node_op` / `merge_creates_node` split into `_from(resolution)` variants; `KeyResolution`
+  is `Copy`. Tests: `isam` sweep-vs-point equivalence; the fence-gated batch sweep in the three
+  `segindex` round-trips; `fold_index_eq_batch_matches_point_folds`;
+  `batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate`; the resolve bench extended
+  with a batch-vs-per-row timing. 739 slater lib + 141 graph-format + 78 slater-delta + full
+  workspace green, clippy + fmt clean. ← current baseline; next is the T2/T3 auto-trigger wire-up.
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

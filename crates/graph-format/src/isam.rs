@@ -572,6 +572,68 @@ impl IsamReader {
         Ok(out)
     }
 
+    /// Batch equality lookup: `out[i]` is the ids whose index key equals `keys[i]`,
+    /// each inner `Vec` sorted ascending — exactly what `keys.len()` calls to
+    /// [`lookup_eq`](Self::lookup_eq) would return, aligned to the input.
+    ///
+    /// `keys` **must be sorted ascending by `cmp_key` and distinct** (the write-batch
+    /// resolver dedups + sorts its business-key values before calling). A single forward
+    /// merge-join pass over the leaf blocks then decodes each **touched** block once and
+    /// binary-searches every key that falls in it — so a whole batch of `m` keys costs
+    /// O(blocks touched) block decompresses instead of O(m) (the bulk-write ISAM floor).
+    /// Because `keys` is ascending, the anchor block index is non-decreasing across the
+    /// sweep, so a block shared by several consecutive keys is decoded once; a decoded-block
+    /// memo carries it forward (and the reader's own decoded-block cache, when attached,
+    /// backs the equal-run backward walk that a high-cardinality key can trigger).
+    pub fn lookup_eq_sorted(&self, keys: &[&Value]) -> Result<Vec<Vec<u64>>> {
+        let mut out: Vec<Vec<u64>> = (0..keys.len()).map(|_| Vec::new()).collect();
+        if self.top.is_empty() {
+            return Ok(out);
+        }
+        // Decoded-block memo for this sweep: the anchor block is non-decreasing across the
+        // ascending keys, so a block serving several consecutive keys decodes once here.
+        let mut memo_b: usize = usize::MAX;
+        let mut memo: Option<DecodedBlock> = None;
+        for (i, &key) in keys.iter().enumerate() {
+            // The equal run for `key` ends in the last block whose first key is <= `key`
+            // (mirrors `lookup_eq`); it may extend backwards when that block starts on `key`.
+            let le = self
+                .top
+                .partition_point(|t| t.first_key.cmp_key(key) != Ordering::Greater);
+            if le == 0 {
+                continue;
+            }
+            let mut b = le - 1;
+            loop {
+                let entries = if b == memo_b {
+                    memo.as_ref().expect("memo set when memo_b valid").clone()
+                } else {
+                    let e = self.block(b)?;
+                    memo_b = b;
+                    memo = Some(e.clone());
+                    e
+                };
+                let start = entries.partition_point(|(k, _)| k.cmp_key(key) == Ordering::Less);
+                let mut j = start;
+                while j < entries.len() && entries[j].0.cmp_key(key) == Ordering::Equal {
+                    out[i].push(entries[j].1);
+                    j += 1;
+                }
+                let first_is_key = entries
+                    .first()
+                    .map(|(k, _)| k.cmp_key(key) == Ordering::Equal)
+                    .unwrap_or(false);
+                if first_is_key && b > 0 {
+                    b -= 1;
+                } else {
+                    break;
+                }
+            }
+            out[i].sort_unstable();
+        }
+        Ok(out)
+    }
+
     /// Range lookup over `[lo, hi]` with per-bound inclusivity. A `None` bound is
     /// unbounded on that side. Returns matching ids, sorted ascending.
     pub fn lookup_range(
@@ -775,6 +837,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lookup_eq_sorted_matches_point_lookups() {
+        // Two shapes that stress the merge-join sweep: contiguous ints (each key one id,
+        // keys span many tiny blocks) and repeated strings (many ids per key, equal runs
+        // span block boundaries). The sweep must be byte-identical to N point lookups, and
+        // its absent-key gaps must be empty.
+        for shape in ["ints", "strings"] {
+            let path = tmp(&format!("sweep_{shape}"));
+            let entries: Vec<(Value, u64)> = if shape == "ints" {
+                (0..600u64).map(|i| (Value::Int(i as i64), i)).collect()
+            } else {
+                let sources = ["Fowler-2010", "Whitehead-2024", "Smith-1999"];
+                (0..600u64)
+                    .map(|id| (Value::Str(sources[(id % 3) as usize].to_string()), id))
+                    .collect()
+            };
+            write_isam(&path, entries.clone(), 64, 3).unwrap();
+            let r = IsamReader::open(&path).unwrap();
+            assert!(r.num_blocks() > 1);
+
+            // A sorted, distinct probe list mixing present and absent keys.
+            let mut keys: Vec<Value> = if shape == "ints" {
+                (0..600i64).step_by(1).map(Value::Int).collect()
+            } else {
+                vec![
+                    Value::Str("Aaa".into()),
+                    Value::Str("Fowler-2010".into()),
+                    Value::Str("Smith-1999".into()),
+                    Value::Str("Whitehead-2024".into()),
+                    Value::Str("Zzz".into()),
+                ]
+            };
+            if shape == "ints" {
+                keys.push(Value::Int(10_000)); // an absent tail key
+            }
+            keys.sort_by(|a, b| a.cmp_key(b));
+            let refs: Vec<&Value> = keys.iter().collect();
+
+            let swept = r.lookup_eq_sorted(&refs).unwrap();
+            assert_eq!(swept.len(), keys.len());
+            for (k, got) in keys.iter().zip(&swept) {
+                assert_eq!(got, &r.lookup_eq(k).unwrap(), "sweep diverges at {k:?}");
+            }
+            // An empty probe list is a well-formed no-op.
+            assert!(r.lookup_eq_sorted(&[]).unwrap().is_empty());
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

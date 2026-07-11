@@ -3096,6 +3096,7 @@ fn resolve_op(gen: &Generation, op: &WalOp) -> OpResolution {
 /// The outcome of probing a write's business key against the current-core range
 /// index. Distinguishing *absent* from *ambiguous*/*unindexed* is what lets a
 /// `MERGE` create a delta-born node only when the key is genuinely new (Phase 2c).
+#[derive(Clone, Copy)]
 enum KeyResolution {
     /// Exactly one existing core node — its dense id.
     Unique(u64),
@@ -3150,6 +3151,65 @@ fn resolve_business_key(gen: &Generation, label: &str, key: &str, value: &Value)
         [only] => KeyResolution::Unique(*only),
         _ => KeyResolution::Ambiguous,
     }
+}
+
+/// Resolve a whole batch of business-key `values` for a **fixed** `(label, key)` in one
+/// merge-join sweep, returning a `KeyResolution` per input value (aligned to `values`). This
+/// is the bulk-write floor from memory `bulk-delete-isam-resolve-floor`: resolving each of a
+/// write batch's rows one-at-a-time re-decompresses the same ISAM leaf blocks per row (the
+/// fence only skips a *segment* that cannot hold a given key — a batch of many distinct keys
+/// still touches many blocks). Here the distinct values are sorted once and streamed against
+/// the sorted base ISAM ([`IsamReader::lookup_eq_sorted`]) and each segment fragment
+/// ([`CoreStack::fold_index_eq_batch`], carrying the oldest→newest suppress-then-union
+/// semantics and the fence), so each touched block decompresses once for the whole batch.
+///
+/// Each value's verdict is **byte-identical** to [`resolve_business_key`] for that value: the
+/// per-value base sweep equals its point `lookup_eq`, the batch fold equals the point fold,
+/// and the singleton set short-circuits to the base sweep exactly as the single path does. A
+/// probe of the same `(label, key)` that is unindexed, or any read failure in the sweep,
+/// collapses every value to `Unindexed` (never `Absent`, so a read failure cannot manufacture
+/// a duplicate born node — matching the single path).
+fn resolve_business_keys_batch(
+    gen: &Generation,
+    label: &str,
+    key: &str,
+    values: &[&Value],
+) -> Vec<KeyResolution> {
+    let unindexed = || vec![KeyResolution::Unindexed; values.len()];
+    let labels = [label.to_string()];
+    let Some(idx) = crate::plan::index_for(gen, &labels, key) else {
+        return unindexed();
+    };
+    let Some(reader) = gen.range_index(&idx) else {
+        return unindexed();
+    };
+    // Base equality sweep: `ids[i]` is the base ids whose value equals `values[i]` (sorted,
+    // unique — one entry per (value, id) in the base ISAM).
+    let Ok(mut ids) = reader.lookup_eq_sorted(values) else {
+        return unindexed();
+    };
+    let stack = gen.stack();
+    if !stack.is_singleton() {
+        if stack
+            .fold_index_eq_batch(&mut ids, label, key, values)
+            .is_err()
+        {
+            return unindexed();
+        }
+        // The fold unions base ids + per-segment fragment ids, so a value carried by both the
+        // base and a fragment can appear twice — sort+dedup before the verdict.
+        for v in &mut ids {
+            v.sort_unstable();
+            v.dedup();
+        }
+    }
+    ids.iter()
+        .map(|v| match v.as_slice() {
+            [] => KeyResolution::Absent,
+            [only] => KeyResolution::Unique(*only),
+            _ => KeyResolution::Ambiguous,
+        })
+        .collect()
 }
 
 /// The delta snapshot + epoch to overlay when reading `gen`. The writer's delta
@@ -3514,7 +3574,26 @@ fn merge_creates_node(
     key: &str,
     value: &Value,
 ) -> bool {
-    match resolve_business_key(gen, label, key, value) {
+    merge_creates_node_from(
+        writer,
+        resolve_business_key(gen, label, key, value),
+        label,
+        key,
+        value,
+    )
+}
+
+/// The core half of [`merge_creates_node`] over an already-resolved `KeyResolution` — so the
+/// batch path can resolve every row's key in one merge-join sweep and decide create-vs-match
+/// per row without a second per-row core probe.
+fn merge_creates_node_from(
+    writer: &Arc<DeltaWriter>,
+    resolution: KeyResolution,
+    label: &str,
+    key: &str,
+    value: &Value,
+) -> bool {
+    match resolution {
         KeyResolution::Unique(_) => false, // an existing core node — matched
         KeyResolution::Absent => writer.born_synthetic_in_delta(label, key, value).is_none(),
         // Ambiguous / unindexed will error at `resolve_node_op`; treat as "not created".
@@ -3640,7 +3719,32 @@ fn resolve_node_op(
     upsert: bool,
 ) -> std::result::Result<Option<u64>, Failure> {
     let (label, key, value) = op.node_key().expect("resolve_node_op is for node ops only");
-    Ok(match resolve_business_key(gen, label, key, value) {
+    resolve_node_op_from(
+        writer,
+        resolve_business_key(gen, label, key, value),
+        label,
+        key,
+        value,
+        is_set,
+        upsert,
+    )
+}
+
+/// The core half of [`resolve_node_op`] over an already-resolved `KeyResolution` — the
+/// delta/born-id decision that does not touch the ISAM. The batch path resolves every row's
+/// business key in one merge-join sweep (the bulk-write floor) and then routes each row's
+/// `KeyResolution` through here, so the batched and single write paths still share one set of
+/// create/update/delete semantics (they cannot drift).
+fn resolve_node_op_from(
+    writer: &Arc<DeltaWriter>,
+    resolution: KeyResolution,
+    label: &str,
+    key: &str,
+    value: &Value,
+    is_set: bool,
+    upsert: bool,
+) -> std::result::Result<Option<u64>, Failure> {
+    Ok(match resolution {
         KeyResolution::Unique(id) => Some(id),
         // MERGE create: a key absent from the core is a delta-born node — reuse an id
         // already flushed to L0, else `None` allocates a fresh one.
@@ -3800,21 +3904,57 @@ fn execute_write_batch(
             ))
         }
     };
+    // Evaluate every row's anchor business-key value up front, then resolve the whole batch's
+    // keys against the core in **one merge-join sweep** (`resolve_business_keys_batch`) rather
+    // than a per-row ISAM point probe — the bulk-write floor (memory
+    // `bulk-delete-isam-resolve-floor`). The `(label, key)` is fixed across the batch, so only
+    // the value varies: dedup the values, sweep the distinct set once, then fan each row's
+    // resolution back out. The per-row `KeyResolution` is byte-identical to what the single
+    // path would compute (the core probe reads `gen` only — the accumulating delta cannot
+    // change it), so the born-id / create-vs-match decisions below are unchanged.
+    let key_values: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            eval_row_value(
+                &stmt.key_value,
+                var,
+                row,
+                params,
+                "the anchor business-key value",
+            )
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let row_res: Vec<KeyResolution> = {
+        // Distinct values in `cmp_key` order (the ISAM order the sweep needs), with each row
+        // mapped to its distinct slot.
+        let mut order: Vec<usize> = (0..key_values.len()).collect();
+        order.sort_by(|&a, &b| key_values[a].cmp_key(&key_values[b]));
+        let mut distinct: Vec<&Value> = Vec::new();
+        let mut row_to_distinct = vec![0usize; key_values.len()];
+        for &ri in &order {
+            if distinct
+                .last()
+                .map_or(true, |last| !last.cmp_key(&key_values[ri]).is_eq())
+            {
+                distinct.push(&key_values[ri]);
+            }
+            row_to_distinct[ri] = distinct.len() - 1;
+        }
+        let resolved = resolve_business_keys_batch(gen, &stmt.label, &stmt.key, &distinct);
+        row_to_distinct.iter().map(|&d| resolved[d]).collect()
+    };
+
     let mut ops: Vec<(WalOp, OpResolution)> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let key_value = eval_row_value(
-            &stmt.key_value,
-            var,
-            row,
-            params,
-            "the anchor business-key value",
-        )?;
-        let mut row_ops = build_node_wal_ops(stmt, &key_value, |e, what| {
+    for (i, row) in rows.iter().enumerate() {
+        let key_value = &key_values[i];
+        let resolution = row_res[i];
+        let mut row_ops = build_node_wal_ops(stmt, key_value, |e, what| {
             eval_row_value(e, var, row, params, what)
         })?;
         // MERGE ON CREATE / ON MATCH, per row (create-vs-match against the pre-batch state).
         if stmt.upsert && (!stmt.on_create.is_empty() || !stmt.on_match.is_empty()) {
-            let created = merge_creates_node(writer, gen, &stmt.label, &stmt.key, &key_value);
+            let created =
+                merge_creates_node_from(writer, resolution, &stmt.label, &stmt.key, key_value);
             let items = if created {
                 &stmt.on_create
             } else {
@@ -3824,16 +3964,22 @@ fn execute_write_batch(
                 items,
                 &stmt.label,
                 &stmt.key,
-                &key_value,
+                key_value,
                 false,
                 |e, what| eval_row_value(e, var, row, params, what),
             )?);
         }
         let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
-        let first = row_ops
-            .first()
-            .expect("a node write yields at least one op");
-        let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
+        debug_assert!(!row_ops.is_empty(), "a node write yields at least one op");
+        let resolved = resolve_node_op_from(
+            writer,
+            resolution,
+            &stmt.label,
+            &stmt.key,
+            key_value,
+            is_set,
+            stmt.upsert,
+        )?;
         validate_label_ops(&row_ops, resolved, gen, stmt)?;
         // DELETE conformance, per row: a plain DELETE errors if the row's node still
         // has a relationship (the batch is all-DELETE or all-SET, so no edge this batch
@@ -4794,9 +4940,29 @@ mod tests {
             }
             let loop_elapsed = t0.elapsed();
             println!(
-                "{label}: open {open_elapsed:?}; resolved {n} keys ({hits} hits) in \
+                "{label}: open {open_elapsed:?}; per-row resolved {n} keys ({hits} hits) in \
                  {loop_elapsed:?} ({:.1} µs/resolve)",
                 loop_elapsed.as_micros() as f64 / n as f64
+            );
+
+            // The batch merge-join resolve (slice 6.3): sweep the same ascending run once
+            // instead of one point probe per key. Same verdicts, one decompress per touched
+            // block for the whole batch — the bulk-write floor fix.
+            let values: Vec<Value> = (lo..=p30).map(Value::Int).collect();
+            let refs: Vec<&Value> = values.iter().collect();
+            let t1 = std::time::Instant::now();
+            let batch = resolve_business_keys_batch(&gen, "Entity", "wikidata_id", &refs);
+            let batch_elapsed = t1.elapsed();
+            let batch_hits = batch
+                .iter()
+                .filter(|r| matches!(r, KeyResolution::Unique(_)))
+                .count();
+            assert_eq!(batch_hits as u64, hits, "batch verdicts match per-row");
+            println!(
+                "{label}: batch-resolved {n} keys ({batch_hits} hits) in {batch_elapsed:?} \
+                 ({:.1} µs/resolve, {:.1}× per-row)",
+                batch_elapsed.as_micros() as f64 / n as f64,
+                loop_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
             );
         };
 
@@ -7099,6 +7265,164 @@ mod tests {
             matches!(dave3.rows[0][0], Val::Int(77)),
             "Dave re-patched to 77 post-reopen"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 6 slice 6.3: the **batched** write path (`execute_write_batch`) resolves the whole
+    /// batch's business keys through the core stack in one merge-join sweep
+    /// (`resolve_business_keys_batch`) — byte-identically to the per-row single path, but at one
+    /// block decompress per touched fragment block instead of per row (the bulk-write ISAM
+    /// floor, memory `bulk-delete-isam-resolve-floor`). A single `UNWIND … MERGE … SET` batch
+    /// over a flushed segment must: reuse a *segment-born* key (patch, no duplicate), patch a
+    /// *base* key, born an *absent* key, and honour a *within-batch duplicate* key (both rows
+    /// resolve to the same id, group-commit LWW) — leaving the graph duplicate-free.
+    #[test]
+    fn batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate() {
+        let (root, _g) = testgen::write_indexed_people("batch_resolve_stack_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let batch = |graphs: &Graphs, q: &str, params: &HashMap<String, Val>| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, params).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let ages = |graphs: &Graphs, nm: &str| -> Vec<i64> {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let qy = format!("MATCH (n:Person {{name:'{nm}'}}) RETURN n.age");
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse(&qy).unwrap())
+                .unwrap();
+            res.rows
+                .iter()
+                .filter_map(|r| match &r[0] {
+                    Val::Int(n) => Some(*n),
+                    _ => None,
+                })
+                .collect()
+        };
+        let count = |graphs: &Graphs| -> i64 {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let res = Engine::new(&view, &cache)
+                .run(&parser::parse("MATCH (n:Person) RETURN count(*)").unwrap())
+                .unwrap();
+            match res.rows[0][0] {
+                Val::Int(n) => n,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+
+        // Flush two born nodes into an upper segment (Dave, Eve).
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+        assert_eq!(count(&graphs), 5, "3 base + 2 flushed born");
+
+        // One batch: Dave (segment-born → patch), Alice (base → patch), Frank (absent → born),
+        // Dave again (within-batch duplicate → same id, group-commit LWW). The merge-join
+        // resolve must fold the stack for every distinct key in the sweep.
+        let rows = Val::List(vec![
+            Val::Map(vec![
+                ("name".into(), Val::Str("Dave".into())),
+                ("age".into(), Val::Int(99)),
+            ]),
+            Val::Map(vec![
+                ("name".into(), Val::Str("Alice".into())),
+                ("age".into(), Val::Int(31)),
+            ]),
+            Val::Map(vec![
+                ("name".into(), Val::Str("Frank".into())),
+                ("age".into(), Val::Int(40)),
+            ]),
+            Val::Map(vec![
+                ("name".into(), Val::Str("Dave".into())),
+                ("age".into(), Val::Int(88)),
+            ]),
+        ]);
+        let mut params = HashMap::new();
+        params.insert("rows".to_string(), rows);
+        batch(
+            &graphs,
+            "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age",
+            &params,
+        );
+
+        // Duplicate-free: one Dave (LWW → 88), one Alice (patched → 31), one born Frank (40).
+        assert_eq!(ages(&graphs, "Dave"), vec![88], "one Dave, last write wins");
+        assert_eq!(ages(&graphs, "Alice"), vec![31], "base Alice patched once");
+        assert_eq!(ages(&graphs, "Frank"), vec![40], "absent Frank born once");
+        assert_eq!(count(&graphs), 6, "5 + 1 born Frank, no duplicates");
+
+        // Flush + reopen: the batch resolve still de-duplicates against the reloaded 2-seg set.
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the second delta flushes");
+        drop(graphs);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        assert_eq!(count(&graphs), 6, "6 after reopen");
+
+        // A second batch re-touching the now-flushed Dave/Frank keys reuses them (no dup).
+        let rows2 = Val::List(vec![
+            Val::Map(vec![
+                ("name".into(), Val::Str("Dave".into())),
+                ("age".into(), Val::Int(77)),
+            ]),
+            Val::Map(vec![
+                ("name".into(), Val::Str("Frank".into())),
+                ("age".into(), Val::Int(41)),
+            ]),
+        ]);
+        let mut params2 = HashMap::new();
+        params2.insert("rows".to_string(), rows2);
+        batch(
+            &graphs,
+            "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age",
+            &params2,
+        );
+        assert_eq!(
+            ages(&graphs, "Dave"),
+            vec![77],
+            "Dave re-patched post-reopen"
+        );
+        assert_eq!(
+            ages(&graphs, "Frank"),
+            vec![41],
+            "Frank re-patched post-reopen"
+        );
+        assert_eq!(count(&graphs), 6, "still 6 — batch reuse, no duplicate");
 
         std::fs::remove_dir_all(&root).ok();
     }

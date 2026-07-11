@@ -334,6 +334,41 @@ impl CoreStack {
         Ok(())
     }
 
+    /// Batch counterpart of [`fold_index_eq`](Self::fold_index_eq): fold the stack over a
+    /// whole **sorted, distinct** key list in one merge-join sweep per fragment, instead of
+    /// a point probe per key. `ids[i]` enters carrying the base equality-probe result for
+    /// `keys[i]` (from [`IsamReader::lookup_eq_sorted`]); on return each has the stack folded
+    /// in oldest→newest — every id vec has the segment's `removals` suppressed (by id, value-
+    /// independent, so the same removal set applies to every key), then its fence-gated
+    /// fragment sweep unioned. The result is **exactly** what `keys.len()` calls to
+    /// `fold_index_eq` leave (removal-then-union in the same order), but at one block
+    /// decompress per touched fragment block for the whole batch — the bulk-write ISAM floor
+    /// (memory `bulk-delete-isam-resolve-floor`). The caller re-sorts/dedups each `ids[i]`.
+    pub fn fold_index_eq_batch(
+        &self,
+        ids: &mut [Vec<u64>],
+        label: &str,
+        prop: &str,
+        keys: &[&Value],
+    ) -> Result<()> {
+        debug_assert_eq!(ids.len(), keys.len(), "ids must align with keys");
+        for seg in &self.segments {
+            let Some(idx) = &seg.index else { continue };
+            let removals = idx.removals(label, prop);
+            if !removals.is_empty() {
+                for v in ids.iter_mut() {
+                    v.retain(|id| removals.binary_search(id).is_err());
+                }
+            }
+            // One fence-gated sweep for the whole batch (each out-of-fence key skips its
+            // leaf-block read); union each key's hits into its accumulator.
+            for (v, hits) in ids.iter_mut().zip(idx.lookup_eq_sorted(label, prop, keys)?) {
+                v.extend(hits);
+            }
+        }
+        Ok(())
+    }
+
     /// Range-probe counterpart of [`fold_index_eq`](Self::fold_index_eq).
     #[allow(clippy::too_many_arguments)]
     pub fn fold_index_range(
@@ -629,6 +664,69 @@ mod tests {
             .unwrap();
         assert_eq!(ids, Vec::<u64>::new());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fold_index_eq_batch_matches_point_folds() {
+        // The batch fold over a stacked segment must be byte-identical to N point folds —
+        // same removal suppress, same fence gating, same union — for every probed key.
+        let (root, graph) = (tmp("foldbatch"), "g");
+        let (base, seg) = (gid(1), gid(2));
+        let m = write_indexed_segment(&root, graph, seg, base);
+        let mut set = SetManifest::singleton(base, 0);
+        set.set_uuid = gid(3);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        let store = FsObjectStore::new(&root);
+        let stack = CoreStack::load(&store, graph, &set, 3, 2, None, true, None).unwrap();
+
+        // A sorted, distinct key list: below-fence miss, the superseded value (base id 1 in
+        // `removals`, no fragment entry ⇒ gone), the patched value, and the born value.
+        let keys = [
+            Value::Str("Aaa".into()),
+            Value::Str("New".into()),
+            Value::Str("Old".into()),
+            Value::Str("Zed".into()),
+        ];
+        // Per-key base probe result (base id 1 carries the stale "Old" value pre-flush).
+        let base_ids = |k: &Value| -> Vec<u64> {
+            if *k == Value::Str("Old".into()) {
+                vec![1]
+            } else {
+                vec![]
+            }
+        };
+        let refs: Vec<&Value> = keys.iter().collect();
+
+        // Batch fold.
+        let mut batch: Vec<Vec<u64>> = keys.iter().map(base_ids).collect();
+        stack
+            .fold_index_eq_batch(&mut batch, "Person", "name", &refs)
+            .unwrap();
+        for v in &mut batch {
+            v.sort_unstable();
+            v.dedup();
+        }
+
+        // N point folds.
+        let single: Vec<Vec<u64>> = keys
+            .iter()
+            .map(|k| {
+                let mut ids = base_ids(k);
+                stack.fold_index_eq(&mut ids, "Person", "name", k).unwrap();
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            })
+            .collect();
+
+        assert_eq!(batch, single, "batch fold diverges from point folds");
+        // And the fold is what we expect: Old gone, New→1, Zed→3, Aaa empty.
+        assert_eq!(
+            batch,
+            vec![vec![], vec![1u64], vec![], vec![3u64]],
+            "batch fold verdict"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
