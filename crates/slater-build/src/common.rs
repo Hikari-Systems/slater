@@ -236,6 +236,20 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         .with_context(|| format!("publish {}", inp.final_dir.display()))?;
     fsync_dir(inp.graph_dir)?;
 
+    // Publish the singleton set manifest (`sets/<uuid>.json`) *before* the `current`
+    // pointer, so `current` only ever names a set whose manifest is fully written.
+    // Set uuid == generation uuid in a singleton, so `current` keeps naming the
+    // generation directory (nothing that reads `current` changes).
+    let set = graph_format::setmanifest::SetManifest::singleton(inp.generation, now_unix());
+    let sets_dir = inp.graph_dir.join("sets");
+    fs::create_dir_all(&sets_dir).with_context(|| format!("create {}", sets_dir.display()))?;
+    let set_path = sets_dir.join(format!("{}.json", inp.generation.0));
+    let set_tmp = sets_dir.join(format!(".{}.json.tmp", inp.generation.0));
+    fs::write(&set_tmp, set.to_bytes()?).with_context(|| format!("write {}", set_tmp.display()))?;
+    fs::rename(&set_tmp, &set_path).with_context(|| format!("publish {}", set_path.display()))?;
+    fsync_dir(&sets_dir)?;
+    fsync_dir(inp.graph_dir)?;
+
     let current = inp.graph_dir.join("current");
     let current_tmp = inp.graph_dir.join(".current.tmp");
     fs::write(&current_tmp, format!("{}\n", inp.generation.0))
@@ -293,6 +307,16 @@ fn upload_generation(
     store
         .put(&join_key(&base, "MANIFEST.json"), &manifest, None)
         .context("upload MANIFEST.json")?;
+    // The singleton set manifest, then the `current` pointer last — the same
+    // publish barrier as the local path (`current` only names a fully-uploaded set).
+    let set = graph_format::setmanifest::SetManifest::singleton(generation, now_unix());
+    store
+        .put(
+            &graph_format::setmanifest::SetManifest::key(graph, generation),
+            &set.to_bytes()?,
+            None,
+        )
+        .context("upload set manifest")?;
     store
         .put(
             &join_key(graph, "current"),

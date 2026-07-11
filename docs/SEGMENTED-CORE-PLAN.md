@@ -63,7 +63,13 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   tables seeded from the base manifest; untouched entities byte-copy their raw
   records (no decode/String-alloc/re-encode). `Engine::raw_node_labels/raw_node_props/
   raw_edge_props` + `DumpWriter::append_node_raw/append_edge_raw`.
-- **Phase 1 — Set manifest + plumbing (no data-file format change).** IN PROGRESS.
+- **Phase 1 — Set manifest + plumbing (no data-file format change).** DONE, committed
+  `4c80c6b` (HP1: type) + HP2 (reader/builder). `slater-build` publishes
+  `sets/<uuid>.json` (local + remote, before `current`); `Generation` resolves
+  `current`→set→base with an implicit-singleton fallback, carries a `base_uuid` field
+  (== `uuid()` in a singleton), `base_uuid()` accessor. Server/ResultKey unchanged
+  (set uuid == gen uuid). graph-format + slater (698 lib) + slater-build suites green,
+  clippy clean; real-builder consolidation round-trips through the set manifest.
   Introduce `<graph>/sets/<set-uuid>.json` and open the core through it, always a
   singleton (1 base, 0 segments) so behaviour is identical. **Design decision: in a
   singleton `set_uuid == base_uuid == gen_uuid`, so `current` stays a gen uuid and
@@ -112,38 +118,44 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** `a6e4d34` (Phase 0.5). Phase 1 in
-progress.
+**Branch:** `writeable`. **Committed through:** HP2 (Phase 1 plumbing). **Phase 1 is
+DONE.** Next: Phase 2 (core-segment format).
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
-- HP0 — Phase 0.5 committed (`a6e4d34`). ← current baseline
-- HP1 — `SetManifest` type + graph-format tests green, committed. *(next)*
-- HP2 — builder writes singleton set + reader opens through it, full slater +
-  slater-build suites green, committed.
-- HP3 — Phase 1 exit criteria met (conformance over fs/mem, bench within noise),
-  committed; Phase 1 done.
+- HP0 — Phase 0.5 committed (`a6e4d34`).
+- HP1 — `SetManifest` type + graph-format tests, committed (`4c80c6b`). ✓
+- HP2 — builder writes singleton set + reader opens through it (implicit-singleton
+  fallback), 698 slater lib + slater-build suites green, clippy clean, committed. ✓
+  ← current baseline; **Phase 1 complete.**
+- HP3 (next track) — Phase 2 segment format landing in slices (see below).
 
-**Immediate next step:** implement `graph-format/src/setmanifest.rs` (`SetManifest`
-{magic `SLSET01`, version, set_uuid, base gen uuid, `segments: Vec<SegmentRef>` empty,
-created_unix, optional mac}, `singleton()` ctor, `to_json`/`write_to_dir`/`read_via`/
-`exists_via`, magic+version validation) using `graph_format::ids::Generation` as the
-uuid newtype; mirror `manifest.rs` style. Path: `<graph>/sets/<set-uuid>.json`
-(`join_key(graph, &format!("sets/{uuid}.json"))`). Then HP2: builder publish
-(`slater-build/common.rs::write_manifest_and_publish` + `upload_generation` for remote
-parity) writes the singleton set; reader (`slater/generation.rs::
-open_with_store_opts_cached`) resolves `current`→uuid, opens `sets/<uuid>.json` if
-present (base = its `base`) else implicit singleton (base = uuid), adds a `base_uuid`
-field so file paths use the base while `uuid()` returns the set uuid. Server (task #8)
-is expected to need no change in the singleton case (uuid()==gen uuid), verify only.
+**Immediate next step — start Phase 2 (core-segment format).** Build
+`graph-format/src/segment.rs` incrementally, each slice its own green commit:
+  1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
+     node & edge id → segment, binary-searched; unit tests. (isolated, safe first slice)
+  2. Segment writer/reader: sections `node.blk`/`adj_out.blk`/`adj_in.blk`/`edge.blk`
+     as off-heap-L0-style resident sorted key columns over BlockCache-paged payloads
+     (template: `slater-delta/src/l0_offheap.rs`); full-row node/edge records +
+     tombstone flags; min/max id fences.
+  3. ISAM fragment + removal sidecar (reuse `write_isam_sorted`); posting fragments.
+  4. `SEGMENT.json` (signed marginal deltas as i64, per-index dirty bits, bands,
+     inventory+hashes, encryption/MAC parity with `manifest.rs`).
+  5. Populate `SegmentRef` in the set manifest (already forward-shaped) + codec goldens
+     + fuzz targets.
+Exit: round-trip + hand-computed codec goldens + fuzz green; encrypted segment
+open/refuse parity with generation fixtures. Do NOT wire the read path yet — that's
+Phase 3.
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core track for slater (branch `writeable`). Read
-> `docs/SEGMENTED-CORE-PLAN.md`, especially "RESUME HERE", and the task list. Continue
-> Phase 1 from the next unchecked handoff point. Build/test with
-> `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo … ` and
-> `dangerouslyDisableSandbox`. Commit at each safe handoff point and update the
-> "RESUME HERE" section as you go.
+> `docs/SEGMENTED-CORE-PLAN.md`, especially "RESUME HERE", and the task list. Phase 1
+> is done; continue from the next handoff point (Phase 2, core-segment format —
+> `graph-format/src/segment.rs`, template `slater-delta/src/l0_offheap.rs`). Build/test
+> with `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` and
+> `dangerouslyDisableSandbox`. Commit at each safe handoff point and update
+> "RESUME HERE" as you go.
 
-**Key files:** `graph-format/src/{setmanifest.rs(new),manifest.rs,ids.rs,store.rs}`,
-`slater/src/{generation.rs,server.rs,cache.rs}`, `slater-build/src/common.rs`,
-`slater/src/testgen.rs` (fixtures — should keep working via the fallback).
+**Key files:** `graph-format/src/{segment.rs(new),extents.rs(new),setmanifest.rs,
+manifest.rs,isam.rs,blockfile.rs,ids.rs}`, `slater-delta/src/l0_offheap.rs` (template),
+`slater/src/{generation.rs,read_view.rs,exec.rs,server.rs,cache.rs}`,
+`slater-build/src/common.rs`.

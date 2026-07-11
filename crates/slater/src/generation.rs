@@ -57,7 +57,15 @@ pub enum RelEndpointSide {
 
 pub struct Generation {
     graph: String,
+    /// The **set** uuid (== `<graph>/current`) — this served image's identity, used
+    /// as the block-cache / result-cache scope so a swap orphans stale entries. In a
+    /// Phase-1 singleton it equals `base_uuid`; a later flush gives a set a fresh uuid
+    /// over the same base.
     uuid: GenId,
+    /// The **base generation** uuid — the directory `<graph>/<base_uuid>/` whose
+    /// `.blk` files this image reads. Distinct from `uuid` once a set stacks segments
+    /// over a shared base.
+    base_uuid: GenId,
     dir: PathBuf,
     manifest: Manifest,
 
@@ -181,9 +189,19 @@ impl Generation {
         verify_integrity: bool,
         range_index_cache_bytes: Option<usize>,
     ) -> Result<Self> {
+        // `current` names a *set* uuid. Resolve it to the base generation: read the
+        // set manifest if one exists, else treat the uuid as an implicit singleton
+        // (base = the uuid itself) — the fallback for fixtures and pre-set images.
         let uuid = GenId(Self::current_uuid_in(store, graph)?);
-        // Backend-relative key prefix for this generation's files.
-        let base = join_key(graph, &uuid.to_string());
+        let base_uuid = if graph_format::setmanifest::SetManifest::exists_via(store, graph, uuid) {
+            let set = graph_format::setmanifest::SetManifest::read_via(store, graph, uuid)
+                .with_context(|| format!("read set manifest for {uuid} of graph {graph}"))?;
+            set.base
+        } else {
+            uuid
+        };
+        // Backend-relative key prefix for the base generation's files.
+        let base = join_key(graph, &base_uuid.to_string());
         let dir = PathBuf::from(&base);
 
         let manifest = Manifest::read_via(store, &base)
@@ -383,6 +401,7 @@ impl Generation {
         Ok(Self {
             graph: graph.to_string(),
             uuid,
+            base_uuid,
             dir,
             manifest,
             node_props,
@@ -427,6 +446,12 @@ impl Generation {
     }
     pub fn uuid(&self) -> GenId {
         self.uuid
+    }
+    /// The base generation uuid (the directory this image reads). Equal to
+    /// [`uuid`](Self::uuid) for a singleton set; distinct once segments stack over a
+    /// shared base.
+    pub fn base_uuid(&self) -> GenId {
+        self.base_uuid
     }
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -1199,6 +1224,41 @@ mod tests {
             .lookup_eq(&Value::Str("Bob".into()))
             .unwrap();
         assert_eq!(hits, vec![1]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opens_through_an_explicit_set_manifest() {
+        use graph_format::setmanifest::SetManifest;
+        let (root, graph, uuid) = write_fixture("opens_through_a_set_manifest");
+        // Write a singleton set manifest alongside the generation (set == base == gen).
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let set = SetManifest::singleton(GenId(uuid), 0);
+        std::fs::write(sets.join(format!("{uuid}.json")), set.to_bytes().unwrap()).unwrap();
+
+        // The reader resolves `current` → set manifest → base, and serves identically.
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(gen.uuid(), GenId(uuid), "identity is the set uuid");
+        assert_eq!(gen.base_uuid(), GenId(uuid), "base == set in a singleton");
+        assert_eq!(gen.node_count(), 3);
+        assert_eq!(
+            gen.node_props().props(0).unwrap(),
+            vec![(0, Value::Str("Alice".into())), (1, Value::Int(30))]
+        );
+
+        // A set manifest with an unknown magic must fail cleanly (not open garbage).
+        let mut bad: SetManifest =
+            serde_json::from_slice(&std::fs::read(sets.join(format!("{uuid}.json"))).unwrap())
+                .unwrap();
+        bad.magic = "NOTASET".into();
+        std::fs::write(sets.join(format!("{uuid}.json")), bad.to_bytes().unwrap()).unwrap();
+        let err = match Generation::open(&root, &graph) {
+            Ok(_) => panic!("expected a clean failure on a bad set manifest"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("not a set manifest"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
