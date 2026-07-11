@@ -9567,6 +9567,137 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A **patch-then-delete** of the same core edge in one delta: `SET r.p` then `DELETE r` on
+    /// the base Alice-KNOWS->Bob edge. The memtable resolves this to a pure adjacency tombstone
+    /// (dropping the by-id patch index), so the edge is suppressed **on read** (the live-delta
+    /// bug the flush writer previously refused) and the flush materialises it as an ordinary
+    /// core-edge delete — the edge is gone, the edge count nets down, and it stays gone across a
+    /// reopen. The endpoints and node count are untouched.
+    #[test]
+    fn flush_to_segment_materialises_a_patch_then_delete_of_a_core_edge() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_patch_del_edge_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(qy).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {qy}"),
+            }
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+        let edge_count = |graphs: &Graphs| -> i64 {
+            match q(graphs, "MATCH ()-[:KNOWS]->() RETURN count(*)").rows[0][0] {
+                Val::Int(n) => n,
+                ref v => panic!("count not an int: {v:?}"),
+            }
+        };
+
+        // Patch the base edge, then delete it — both in one (pre-flush) delta.
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) \
+             SET r.since = 2099, r.note = 'hi'",
+        );
+        write(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+        );
+
+        // The live read overlay already suppresses the edge — the patch does not resurrect it.
+        assert_eq!(
+            edge_count(&graphs),
+            0,
+            "patch-then-delete is gone on read (pre-flush)"
+        );
+        assert_eq!(
+            q(
+                &graphs,
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"
+            )
+            .rows
+            .len(),
+            0,
+            "the deleted edge does not traverse pre-flush"
+        );
+
+        // Flush: it materialises as a core-edge delete (adjacency removal), not an edge row.
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the delete flushes a non-empty delta");
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            1,
+            "one upper segment"
+        );
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired empty"
+        );
+
+        // Still gone after the flush, with the edge count netted down and the nodes intact.
+        assert_eq!(
+            edge_count(&graphs),
+            0,
+            "the edge stays deleted after the flush"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(3)
+            ),
+            "the endpoints survive — only the edge was deleted"
+        );
+
+        // Reopen from disk: the adjacency removal reloads and the edge is still gone.
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the set"
+        );
+        assert_eq!(
+            edge_count(&graphs),
+            0,
+            "the delete is durable across a reopen"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(3)
+            ),
+            "the endpoints reload intact"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 5 slice 5.1: **T3 segment compaction**. Two flushes stack two upper segments;
     /// `compact_graph_segments` folds them into one merged segment that reads **identically** to
     /// the run it replaces — a births-only pair, a base-node indexed patch (index-removal carry),

@@ -1187,9 +1187,31 @@ impl Memtable {
                 },
             );
         } else {
-            let entry = self.edges.get_mut(&eck).expect("edge present");
-            entry.delta.tombstoned = true;
-            entry.delta.patches.clear();
+            // The edge identity already has an entry. Tombstone it, clearing any prior property
+            // patch (a delete supersedes a `SET`). If that entry came from `patch_core_edge`
+            // (a patch-**then-delete** of the same core edge in one delta), the patch indexed it
+            // by core edge id and left it out of the adjacency overlay — a patch changes no
+            // topology. A delete DOES: drop the by-id index and register the tombstone in the
+            // adjacency indexes, so the read overlay and the segment flush suppress the core edge
+            // exactly as they would for a delete with no prior patch (matched by adjacency
+            // identity with no edge id, not by a tombstoned edge row).
+            let core_edge = {
+                let entry = self.edges.get_mut(&eck).expect("edge present");
+                entry.delta.tombstoned = true;
+                entry.delta.patches.clear();
+                entry.core_edge.take()
+            };
+            if let Some(cid) = core_edge {
+                self.by_edge_id.remove(&cid);
+                let out = self.out_adj.entry(src_dense).or_default();
+                if !out.contains(&eck) {
+                    out.push(eck.clone());
+                }
+                let inv = self.in_adj.entry(dst_dense).or_default();
+                if !inv.contains(&eck) {
+                    inv.push(eck);
+                }
+            }
         }
     }
 

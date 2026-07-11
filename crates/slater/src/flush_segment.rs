@@ -37,10 +37,10 @@
 //! relationship range index consulted at query time, so — unlike a node patch — an edge patch
 //! needs no index removal sidecar.
 //!
-//! Still deferred (each `bail!`ed, and the auto-trigger stays unwired so the orchestration
-//! never fires them): a patch-**then-delete** of the same core edge in one delta (an
-//! adjacency-removal concern this patch materialiser does not own), and a **stacked L0 level**
-//! fold (needs a cross-level walk — 4.4).
+//! A patch-**then-delete** of the same core edge in one delta is handled: the memtable's
+//! `delete_edge` resolves it into a pure adjacency tombstone (dropping the by-id patch index),
+//! so it flows through `suppressed` as an ordinary core-edge delete — the writer needs no
+//! special case (the edge-row loop's tombstoned-core-edge branch is now an invariant guard).
 //!
 //! # Full rows, replace semantics
 //! Segments hold *full* rows, not patches: the newest segment carrying an id wins in a
@@ -358,14 +358,16 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
     // to include them.
     for (eid, edelta) in &data.edges {
         if *eid < edge_synthetic_base {
-            // A core-edge patch. A tombstoned entry here is a patch-then-delete of the *same*
-            // core edge in one delta — the removal is an adjacency concern (the read path
-            // drops an edge by a `removed` fragment, not an edge-row tombstone) that this
-            // patch materialiser does not own; refuse it rather than half-apply.
+            // A core-edge patch. A patch-**then-delete** of the same core edge in one delta is
+            // resolved by the memtable into a pure adjacency tombstone (`delete_edge` drops the
+            // by-id patch index and registers the removal in the adjacency overlay), so it flows
+            // through `suppressed` as an ordinary core-edge delete and never reaches here as a
+            // tombstoned edge row. This guards that invariant.
             if edelta.tombstoned {
                 bail!(
-                    "flush_to_segment: core edge {eid} is both patched and tombstoned in one \
-                     delta — patch-then-delete of a core edge is not supported in this slice"
+                    "flush_to_segment: core edge {eid} appears as a tombstoned edge row — a \
+                     patch-then-delete should have been resolved to an adjacency removal by the \
+                     memtable (invariant violation)"
                 );
             }
             let Some((src, dst, reltype)) = core_patched_edges.get(eid).cloned() else {
