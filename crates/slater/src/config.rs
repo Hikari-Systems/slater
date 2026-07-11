@@ -797,6 +797,17 @@ pub struct DeltaConfig {
         deserialize_with = "de::usize"
     )]
     pub l0_compaction_trigger: usize,
+    /// Maximum number of upper **core segments** a served set may carry before a T3
+    /// segment→segment compaction is admissible (Phase 5 slice 5.3 — the fourth rung of the
+    /// D50 ladder). A point read may consult every upper segment, so once the stack exceeds
+    /// this the size-tiered run selector ([`crate::merge_segment::select_compaction_run`])
+    /// picks a contiguous run to fold, bounding read fan-out. Cheap (O(segments), no core
+    /// rebuild), like L0→L0 compaction. Defaults to 8; 0 disables admission (the explicit
+    /// `compact_graph_segments(start, end)` path is unaffected). **Auto-firing this from the
+    /// write path is Phase-6-gated** — it needs a segment-aware write resolve — so today the
+    /// threshold is consulted only by the explicit `compact_graph_segments_auto` entry point.
+    #[serde(default = "default_max_upper_segments", deserialize_with = "de::usize")]
+    pub max_upper_segments: usize,
     /// Auto-consolidation threshold as a **percent of the core's size** (Phase 4d-ii-b):
     /// once the delta's changed-entity count reaches `deltaCorePercent`% of the served
     /// generation's entity count, a background consolidation folds it into a fresh core.
@@ -847,6 +858,7 @@ impl Default for DeltaConfig {
             wal_dir: default_wal_dir(),
             memtable_bytes: default_memtable_bytes(),
             l0_compaction_trigger: default_l0_compaction_trigger(),
+            max_upper_segments: default_max_upper_segments(),
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: String::new(),
@@ -858,6 +870,10 @@ impl Default for DeltaConfig {
 
 fn default_l0_compaction_trigger() -> usize {
     4
+}
+
+fn default_max_upper_segments() -> usize {
+    8
 }
 
 fn default_wal_dir() -> String {

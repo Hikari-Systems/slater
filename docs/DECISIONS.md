@@ -985,6 +985,34 @@ intermediate tier absorbing the churn. So compaction is **two-tier**:
   safe. A `deltaHardBytes` hard cap is the OOM backstop — a write past it throttles (ensure a drain,
   await headroom, bounded so a wedged rebuild can't hang a writer forever); also off by default.
 
+**Update (segmented core, `docs/SEGMENTED-CORE-PLAN.md` Phases 4–5): the two tiers become a
+four-rung ladder.** The segmented core inserts two O(delta)/O(segments) rungs *between* the L0 tier
+and the O(core) rebuild, so a fill climbs progressively larger but still-sub-core folds before it
+ever needs a rebuild — each rung defers work to the next, rarer, coarser one, and the rebuild stays
+the terminal escape rather than the routine consolidation:
+
+1. **memtable → L0 flush** at `memtableBytes` — bound resident memtable RAM.
+2. **L0 → L0 compaction** at `l0CompactionTrigger` levels — bound L0 read fan-out (reclaim
+   overwrites/tombstones).
+3. **L0 → core segment (T2 flush)** — fold the sealed delta into one immutable upper *core* segment
+   over the base (`Graphs::flush_graph_to_segment`, Phase 4), draining the delta to near-empty
+   without a core rebuild. The segment reads newest-wins over the base; ids are preserved (no
+   re-resolution).
+4. **core segment → core segment (T3 compaction)** at **`maxUpperSegments`** — merge a contiguous
+   run of upper segments into one (`Graphs::compact_graph_segments`, Phase 5), bounding the *segment*
+   fan-out a point read crosses. Admission is by segment count; run selection is **size-tiered**
+   (`select_compaction_run`, slice 5.3): the longest contiguous run within a `SIZE_TIER_RATIO`× size
+   band, so each byte is rewritten at most once per tier climbed — the size-tiered-compaction
+   invariant, adapted to the contiguity constraint (only adjacent segments fold, their id bands must
+   tile). Cheap, on by default (`maxUpperSegments = 8`), like rung 2.
+
+Rungs 3–4 are O(delta)/O(segments) and preserve the id space, so — unlike the rebuild — they need no
+re-resolution or rebase, only a lightweight delta rebind. **Auto-firing rungs 3 and 4 from the write
+path is Phase-6-gated** (both need a segment-aware write resolve): until then they run explicitly
+(`flush_graph_to_segment` / `compact_graph_segments_auto`), exactly as the tier-2 rebuild runs from
+`CALL slater.consolidate()`. The tier-2 rebuild (the rung-5 terminal) is unchanged — it now folds a
+whole *stacked* set, not just base + delta.
+
 The reframe that makes this sound: because the delta is already durable, read-correct and
 RAM-bounded (WAL + on-disk L0 + tier-1 compaction), tier-2 consolidation is a **background
 read-locality optimisation, not a correctness requirement** — so it can be rare, opt-in, and

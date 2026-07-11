@@ -935,6 +935,43 @@ impl Graphs {
         info!(graph = %name, set = %set_uuid, segment = %seg_uuid, run_start = start, run_end = end, "compacted a run of upper segments into one");
         Ok(set_uuid)
     }
+
+    /// Size-tiered auto-compaction (Phase 5 slice 5.3): consult the admission policy
+    /// ([`crate::merge_segment::select_compaction_run`]) against the served stack's segment
+    /// sizes and, when a run is admissible, fold it via [`Self::compact_graph_segments`].
+    /// Returns the new set id, or `None` when the stack is within its `max_upper_segments`
+    /// fan-out budget (a no-op — nothing is published or swapped).
+    ///
+    /// This is the *policy* entry point; **auto-firing it from the write path is Phase-6-gated**
+    /// (it needs a segment-aware write resolve), exactly as the flush auto-trigger is. Until
+    /// then it is driven explicitly (a future `CALL slater.compact()`, a schedule, or a test),
+    /// mirroring how [`Self::compact_graph_segments`] takes an explicit run.
+    pub fn compact_graph_segments_auto(
+        &self,
+        name: &str,
+        vector_cache: &VectorIndexCache,
+        data_dir: &Path,
+        max_upper_segments: usize,
+    ) -> Result<Option<GenId>> {
+        // Per-segment on-disk size (the write-amplification proxy the selector tiers on).
+        let sizes: Vec<u64> = {
+            let core = self
+                .get(name)
+                .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
+            core.stack()
+                .segments()
+                .iter()
+                .map(|s| s.manifest.files.iter().map(|f| f.bytes).sum())
+                .collect()
+        };
+        let Some((start, end)) =
+            crate::merge_segment::select_compaction_run(&sizes, max_upper_segments)
+        else {
+            return Ok(None);
+        };
+        self.compact_graph_segments(name, vector_cache, data_dir, start, end)
+            .map(Some)
+    }
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it — never in practice).
@@ -4962,6 +4999,7 @@ mod tests {
             wal_dir: wal_dir.to_string_lossy().into_owned(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            max_upper_segments: 8,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: String::new(),
@@ -8105,6 +8143,148 @@ mod tests {
             probe(&graphs),
             before,
             "reopened compaction preserves every read"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 5 slice 5.3 (admission policy): the size-tiered auto entry point
+    /// [`Graphs::compact_graph_segments_auto`] admits a compaction only when the stack exceeds
+    /// `max_upper_segments`, and then folds the selected run through the same T3 writer. Three
+    /// similarly-sized flushes stack three segments; `auto` with a threshold ≥ 3 (or 0) is a
+    /// no-op, while a threshold of 2 admits and — the three being one tier — folds the whole run
+    /// into one. Every read is identical across the no-ops, the fold, and a reopen.
+    #[test]
+    fn auto_compaction_admits_only_when_over_budget() {
+        let (root, _g, _u) = testgen::write_basic("compact_auto_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a node write: {q}"),
+            }
+        };
+        let q = |graphs: &Graphs, query: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(query).unwrap())
+                .unwrap();
+            r
+        };
+
+        // Three flushes, one born indexed node each ⇒ three similarly-sized upper segments.
+        for (name, age) in [("Dave", 50), ("Frank", 60), ("Gina", 70)] {
+            write(
+                &graphs,
+                &format!("MERGE (n:Person {{name:'{name}'}}) SET n.age = {age}"),
+            );
+            graphs
+                .flush_graph_to_segment("people", &vc, &root)
+                .unwrap()
+                .expect("flush is non-empty");
+        }
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            3,
+            "three upper segments stacked"
+        );
+
+        let probe = |graphs: &Graphs| -> Vec<String> {
+            let s = |r: QueryResult| format!("{:?}", r.rows[0][0]);
+            vec![
+                s(q(graphs, "MATCH (n:Person {age:50}) RETURN n.name")),
+                s(q(graphs, "MATCH (n:Person {age:60}) RETURN n.name")),
+                s(q(graphs, "MATCH (n:Person {age:70}) RETURN n.name")),
+                s(q(graphs, "MATCH (n:Person) RETURN count(*)")),
+            ]
+        };
+        let before = probe(&graphs);
+        assert_eq!(before[0], "Str(\"Dave\")");
+        assert_eq!(before[3], "Int(6)", "3 base Person + 3 born");
+
+        // Within budget (threshold ≥ segment count) and disabled (0) are both no-ops.
+        assert_eq!(
+            graphs
+                .compact_graph_segments_auto("people", &vc, &root, 3)
+                .unwrap(),
+            None,
+            "3 segments, threshold 3 ⇒ within budget"
+        );
+        assert_eq!(
+            graphs
+                .compact_graph_segments_auto("people", &vc, &root, 0)
+                .unwrap(),
+            None,
+            "threshold 0 ⇒ admission disabled"
+        );
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            3,
+            "no-op auto calls left the stack untouched"
+        );
+
+        // Over budget (threshold 2 < 3): admit and fold. The three are one tier ⇒ whole run.
+        let set_uuid = graphs
+            .compact_graph_segments_auto("people", &vc, &root, 2)
+            .unwrap()
+            .expect("threshold 2 admits a compaction");
+        let post = graphs.get("people").unwrap();
+        assert_eq!(post.uuid(), set_uuid, "served the compacted set");
+        assert_eq!(
+            post.stack().segments().len(),
+            1,
+            "the one-tier run folded into a single segment"
+        );
+        drop(post);
+        assert_eq!(
+            graphs.writer("people").unwrap().core_uuid(),
+            set_uuid,
+            "delta rebound to the compacted set"
+        );
+        assert_eq!(
+            probe(&graphs),
+            before,
+            "auto-compaction preserves every read"
+        );
+
+        // Now within budget again (1 segment) ⇒ auto is a no-op.
+        assert_eq!(
+            graphs
+                .compact_graph_segments_auto("people", &vc, &root, 2)
+                .unwrap(),
+            None,
+            "1 segment, threshold 2 ⇒ nothing left to admit"
+        );
+
+        // Reopen: the compacted set reloads and every read survives.
+        drop(graphs);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            1,
+            "merged segment reloaded"
+        );
+        assert_eq!(
+            probe(&graphs),
+            before,
+            "reopened auto-compaction preserves every read"
         );
 
         std::fs::remove_dir_all(&root).ok();

@@ -413,6 +413,95 @@ fn fold_index(
 /// Union the run's posting driving sets per reltype (ascending, distinct). A superset is
 /// always correct: a stale driving hit for a removed edge is filtered by the folded
 /// adjacency at read time, so postings need no removal tracking.
+/// The size ratio within which two segments count as the **same tier** for size-tiered run
+/// selection: a run is same-tier when its largest member is no more than [`SIZE_TIER_RATIO`]×
+/// its smallest. Folding within a tier bounds write amplification — each byte is rewritten at
+/// most once per tier climbed, never repeatedly against a much larger segment (the
+/// size-tiered-compaction invariant, adapted to a stacked core's contiguity constraint: only
+/// *adjacent* segments may fold, because their id bands must stay contiguous).
+pub const SIZE_TIER_RATIO: u64 = 4;
+
+/// The minimum run length a compaction folds: two segments (folding one is a no-op).
+pub const MIN_COMPACTION_RUN: usize = 2;
+
+/// Size-tiered run selection (Phase 5 slice 5.3, the fourth rung of the D50 ladder).
+///
+/// Given the upper segments' on-disk `sizes` (oldest → newest, one entry per segment) and the
+/// admission threshold `max_upper_segments`, choose the contiguous run `[start, end)` to fold,
+/// or `None` when no compaction is admissible.
+///
+/// **Admission** is by segment *count* — the read-fan-out cost, since a point read may consult
+/// every segment: the stack is compacted only once it exceeds `max_upper_segments`
+/// (`0` disables admission entirely; the explicit [`Graphs::compact_graph_segments`](crate::server::Graphs::compact_graph_segments)
+/// path is unaffected). **Selection** is *size-tiered*: among the contiguous runs of ≥
+/// [`MIN_COMPACTION_RUN`] same-tier segments (largest ≤ [`SIZE_TIER_RATIO`]× smallest), pick the
+/// **longest** (it reduces fan-out most while rewriting each byte exactly once), tie-breaking by
+/// the **smallest** total bytes (prefer the cheaper, smaller tier). If no two adjacent segments
+/// share a tier (sizes escalate by more than the ratio at every step), fall back to the adjacent
+/// **pair** with the smallest combined bytes — the cheapest merge that still reduces the count,
+/// so the policy always makes progress while over budget.
+///
+/// The returned run is always a valid input to `write_merge_segment` — contiguous and of length
+/// ≥ [`MIN_COMPACTION_RUN`].
+pub fn select_compaction_run(sizes: &[u64], max_upper_segments: usize) -> Option<(usize, usize)> {
+    // Admission: disabled, or the stack is within its fan-out budget (and so short it can't fold).
+    if max_upper_segments == 0
+        || sizes.len() <= max_upper_segments
+        || sizes.len() < MIN_COMPACTION_RUN
+    {
+        return None;
+    }
+
+    // A zero-size run (only a defensive case — a segment always carries at least a meta file)
+    // is same-tier with anything; otherwise the largest must be within the ratio of the smallest.
+    let same_tier = |lo: u64, hi: u64| lo == 0 || hi <= lo.saturating_mul(SIZE_TIER_RATIO);
+
+    // Longest contiguous same-tier run, tie-broken by smallest total bytes. Runs from each start
+    // are considered independently (O(n²) over the segment count, which is tens at most) because
+    // dropping a run's smallest member can *raise* the floor and admit a longer run to its right.
+    let mut best: Option<(usize, usize, u64)> = None; // (start, end, total_bytes)
+    for i in 0..sizes.len() {
+        let (mut lo, mut hi, mut total) = (sizes[i], sizes[i], sizes[i]);
+        let mut j = i + 1;
+        while j < sizes.len() {
+            let (nlo, nhi) = (lo.min(sizes[j]), hi.max(sizes[j]));
+            if !same_tier(nlo, nhi) {
+                break;
+            }
+            lo = nlo;
+            hi = nhi;
+            total = total.saturating_add(sizes[j]);
+            j += 1;
+        }
+        let len = j - i;
+        if len < MIN_COMPACTION_RUN {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bs, be, bt)) => len > be - bs || (len == be - bs && total < bt),
+        };
+        if better {
+            best = Some((i, j, total));
+        }
+    }
+    if let Some((start, end, _)) = best {
+        return Some((start, end));
+    }
+
+    // No two adjacent segments share a tier: fall back to the cheapest adjacent pair so the
+    // count still drops. `sizes.len() >= MIN_COMPACTION_RUN` here, so the loop is non-empty.
+    let (mut best_start, mut best_bytes) = (0usize, u64::MAX);
+    for k in 0..sizes.len() - 1 {
+        let combined = sizes[k].saturating_add(sizes[k + 1]);
+        if combined < best_bytes {
+            best_bytes = combined;
+            best_start = k;
+        }
+    }
+    Some((best_start, best_start + 2))
+}
+
 fn fold_postings(inputs: &[&LoadedSegment]) -> Vec<PostingSpec> {
     let mut post: BTreeMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = BTreeMap::new();
     for seg in inputs {
@@ -430,4 +519,67 @@ fn fold_postings(inputs: &[&LoadedSegment]) -> Vec<PostingSpec> {
             tgt_ids: tgt.into_iter().collect(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_compaction_run;
+
+    #[test]
+    fn admission_is_disabled_when_threshold_is_zero() {
+        // `0` never admits, regardless of how tall the stack is.
+        assert_eq!(select_compaction_run(&[10, 10, 10, 10], 0), None);
+    }
+
+    #[test]
+    fn a_stack_within_budget_is_not_compacted() {
+        // len <= max_upper_segments ⇒ within the fan-out budget ⇒ no-op.
+        assert_eq!(select_compaction_run(&[10, 10, 10], 3), None);
+        assert_eq!(select_compaction_run(&[10, 10, 10], 4), None);
+        // Too short to fold at all.
+        assert_eq!(select_compaction_run(&[10], 1), None);
+        assert_eq!(select_compaction_run(&[], 1), None);
+    }
+
+    #[test]
+    fn uniform_over_budget_folds_the_whole_stack() {
+        // All same-tier ⇒ the longest run is the entire stack.
+        assert_eq!(select_compaction_run(&[10, 10, 10, 10], 2), Some((0, 4)));
+    }
+
+    #[test]
+    fn longest_same_tier_run_wins_over_a_shorter_one() {
+        // [0,3) are within a 4× band (10..=30); seg 3 (1000) is its own tier. The length-3 run
+        // beats any length-2, and the lone big segment is left above.
+        assert_eq!(select_compaction_run(&[10, 20, 30, 1000], 2), Some((0, 3)));
+    }
+
+    #[test]
+    fn ties_break_toward_the_smaller_tier() {
+        // Two disjoint same-tier runs of equal length: the cheaper (smaller-byte) one is chosen.
+        // [10,20] (tier ~10, total 30) vs [400,500] (tier ~400, total 900) ⇒ the small tier.
+        assert_eq!(select_compaction_run(&[10, 20, 400, 500], 2), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_dropped_floor_can_admit_a_longer_run_to_the_right() {
+        // From seg 0 the run stops at seg 2 (10*4 = 40 < 100). But starting at seg 1 raises the
+        // floor to 40, and 100,120 <= 40*4 = 160 ⇒ [1,4) is a length-3 run the greedy-from-0 scan
+        // would miss. The independent per-start scan finds it.
+        assert_eq!(select_compaction_run(&[10, 40, 100, 120], 2), Some((1, 4)));
+    }
+
+    #[test]
+    fn strictly_escalating_sizes_fall_back_to_the_cheapest_pair() {
+        // Every adjacent pair is 100× apart — well beyond SIZE_TIER_RATIO — so no same-tier run
+        // exists; the policy still reduces the count by folding the two cheapest adjacent segments.
+        let sizes = [1u64, 100, 10_000, 1_000_000];
+        assert_eq!(select_compaction_run(&sizes, 2), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_zero_width_segment_joins_its_neighbours() {
+        // A defensive case: a 0-byte segment is same-tier with anything, so it folds in.
+        assert_eq!(select_compaction_run(&[0, 10, 20], 2), Some((0, 3)));
+    }
 }

@@ -118,8 +118,39 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.2 (HP18). **Phases 1–4
+**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.3 (HP19). **Phases 1–4
 DONE; Phase 5 IN PROGRESS.**
+
+**Phase 5 (T3 segment compaction) — slice 5.3 DONE (admission policy).** The fourth rung of
+the D50 ladder is in: a **size-tiered run selector** and a policy entry point that drives the
+5.1 writer. `crate::merge_segment::select_compaction_run(sizes, max_upper_segments) ->
+Option<(start, end)>` is the **pure** admission+selection predicate — admission is by *segment
+count* (a point read may consult every upper segment, so the stack is compacted only once it
+exceeds `maxUpperSegments`; `0` disables — the explicit `compact_graph_segments(start,end)`
+path is untouched), and selection is **size-tiered**: the *longest* contiguous run of same-tier
+segments (largest ≤ `SIZE_TIER_RATIO=4`× smallest) — it reduces fan-out most while rewriting
+each byte once — tie-broken by the *smallest* total bytes (prefer the cheaper, smaller tier);
+if no two adjacent segments share a tier (sizes escalate by >4× at every step) it falls back to
+the *cheapest adjacent pair* so the count still drops (progress guaranteed while over budget).
+Per-start scan is O(n²) over the segment count (tens at most) *because dropping a run's smallest
+member can raise its floor and admit a longer run to its right* — a greedy-from-each-index scan
+would miss it (a unit test pins this). `Graphs::compact_graph_segments_auto(name, vc, data_dir,
+max_upper_segments)` reads the served stack's per-segment on-disk sizes (`Σ manifest.files.bytes`
+— the write-amplification proxy), calls the selector, and folds the chosen run via 5.1's
+`compact_graph_segments` (or returns `Ok(None)` — a true no-op, nothing published/swapped). New
+config knob `deltaConfig.maxUpperSegments` (default **8**, on like `l0CompactionTrigger`); D50 in
+DECISIONS.md is rewritten from two tiers to the **four-rung ladder** (memtable→L0, L0→L0,
+L0→segment T2 flush, segment→segment T3 compaction) above the terminal O(core) rebuild. **Both T3
+rungs' auto-firing from the write path stays Phase-6-gated** (needs a segment-aware write
+resolve) — `compact_graph_segments_auto` is the explicit driver until then, exactly as
+`flush_graph_to_segment` is for T2. Eight new pure-selector unit tests
+(`merge_segment::tests`: disabled, within-budget, uniform-whole-stack, longest-wins,
+tie-to-smaller-tier, dropped-floor-admits-a-longer-run, escalating-fallback-pair,
+zero-width-joins) + one e2e (`auto_compaction_admits_only_when_over_budget`: 3 flushes ⇒ 3
+segments; `auto` at threshold ≥3 and at 0 are no-ops; at 2 admits and folds the one-tier run into
+one; 1-segment re-check is a no-op; every read identical across the no-ops, the fold, and a
+reopen). **734 slater lib** (+9) + 140 graph-format + 78 slater-delta + full workspace green,
+clippy + fmt clean.
 
 **Phase 5 (T3 segment compaction) — slice 5.2 DONE (merge hardening).** Five new e2e oracle
 tests exercise the cases 5.1's single test did not — and **the 5.1 merge writer + orchestrator
@@ -195,14 +226,31 @@ delta (an adjacency-removal concern the patch materialiser doesn't own), and a f
 image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
 `as_memtable()` returns `None`).
 
-**Phase 5 NEXT after 5.2:** **5.3** — the **admission policy**: `maxUpperSegments`, size-tiered
-run selection, scheduling, and (Phase-6-gated) an auto-compaction trigger; DECISIONS.md D50 → the
-four-rung ladder. (5.2's merge hardening is DONE — see below.) Deferred leanness (each benign,
-matching the flush writer's noted follow-ups): a born-then-deleted **edge** leaves an orphan edge
-row in the merged segment (its adjacency is suppressed by the fold, so it is never read); postings
-are a union (a stale driving hit is filtered by adjacency).
+**Phase 5 NEXT after 5.3:** **Phase 5 is functionally complete** (writer 5.1 + hardening 5.2 +
+admission 5.3). What remains before calling the phase closed is only the **auto-firing wire-up**,
+which is **Phase-6-gated**: the write path must be able to resolve a *born* key against a segment
+(the 4.1 note (e) limitation) before either `flush_graph_to_segment` or
+`compact_graph_segments_auto` can safely be called from inside a write. So the next actual work is
+**Phase 6** (batch resolve + fences on the write path), after which a small slice wires both T2 and
+T3 auto-triggers (like the existing memtable→L0/L0→L0 auto-triggers) reading `memtableBytes` /
+`maxUpperSegments`. Deferred leanness carried from 5.1 (each benign, matching the flush writer's
+noted follow-ups): a born-then-deleted **edge** leaves an orphan edge row in the merged segment (its
+adjacency is suppressed by the fold, so it is never read); postings are a union (a stale driving hit
+is filtered by adjacency).
 
 ### Phase 5 slice log
+- **5.3 DONE** (HP19): **admission policy** — the fourth D50 rung. New pure predicate
+  `merge_segment::select_compaction_run(sizes, max_upper_segments) -> Option<(start,end)>`
+  (admission by segment count vs `maxUpperSegments`, `0` disables; size-tiered selection: longest
+  same-tier run within `SIZE_TIER_RATIO=4`×, tie → smallest total bytes; escalating-sizes fallback
+  to the cheapest adjacent pair; O(n²) per-start scan because a dropped floor can admit a longer
+  run to the right). New orchestrator `Graphs::compact_graph_segments_auto` (reads
+  `Σ manifest.files.bytes` per segment, selects, folds via 5.1's `compact_graph_segments`, or
+  `Ok(None)` no-op). New config `deltaConfig.maxUpperSegments` (default 8). DECISIONS.md D50
+  rewritten two-tier → four-rung ladder. Auto-firing both T3 rungs from the write path stays
+  Phase-6-gated. 8 selector unit tests + 1 e2e (`auto_compaction_admits_only_when_over_budget`).
+  **734 slater lib** (+9) + 140 graph-format + 78 slater-delta + full workspace green, clippy + fmt
+  clean. ← current baseline; next real work is Phase 6, then a small T2/T3 auto-trigger wire-up.
 - **5.2 DONE** (HP18): **merge hardening** — five new e2e oracle tests over the cases 5.1's test
   did not exercise, all passing against the **unchanged** 5.1 writer/orchestrator (a hardening
   slice that confirmed the design rather than patching it):
@@ -535,9 +583,16 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   (`compact_folds_a_base_delete_across_the_run`, `compact_a_partial_run_preserves_precedence`,
   `compact_folds_a_zero_width_band`, `compact_encrypts_the_merged_segment`,
   `compact_uploads_to_an_object_store`), all green against the **unchanged** 5.1 writer +
-  orchestrator. 725 slater lib + full workspace green, clippy + fmt clean. ← current baseline;
-  next is slice 5.3 (admission policy: `maxUpperSegments`, size-tiered run selection, scheduling;
-  DECISIONS.md D50 → four-rung ladder; an auto-compaction trigger stays Phase-6-gated).
+  orchestrator. 725 slater lib + full workspace green, clippy + fmt clean.
+- HP19 — Phase 5 slice 5.3: **admission policy**. Pure size-tiered run selector
+  `merge_segment::select_compaction_run` (count-based admission vs `maxUpperSegments`;
+  longest-same-tier-run selection, `SIZE_TIER_RATIO=4`×, cheapest-tie, escalating fallback pair;
+  O(n²) per-start scan) + orchestrator `Graphs::compact_graph_segments_auto` (size-driven, folds
+  via 5.1 or `Ok(None)`) + config `deltaConfig.maxUpperSegments` (default 8). DECISIONS.md D50
+  rewritten to the four-rung ladder; both T3 auto-firings stay Phase-6-gated. 8 selector unit tests
+  + 1 e2e (`auto_compaction_admits_only_when_over_budget`). 734 slater lib + 140 graph-format + 78
+  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next real work is
+  Phase 6 (batch resolve), then a small T2/T3 auto-trigger wire-up.
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
