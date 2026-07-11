@@ -76,8 +76,8 @@ use crate::generation::Generation;
 
 /// Block target size + zstd level for a core segment's payload sections. A flush is small
 /// relative to the core; small blocks keep a cold point read's one-time decode cheap.
-const SEG_BLOCK_BYTES: usize = 16 * 1024;
-const SEG_ZSTD_LEVEL: i32 = 3;
+pub(crate) const SEG_BLOCK_BYTES: usize = 16 * 1024;
+pub(crate) const SEG_ZSTD_LEVEL: i32 = 3;
 
 /// Open-time context for materialising a flush segment.
 pub struct FlushInputs<'a> {
@@ -813,8 +813,10 @@ fn effective_adj(core: &Generation, node: u64, outgoing: bool) -> Result<Vec<(u6
 
 /// Build the sealed manifest's file inventory: every file in the segment dir (all sections
 /// and fragments; `SEGMENT.json` is written *after* and is never in its own inventory),
-/// each with its BLAKE3 hash, name-sorted so the content hash is deterministic.
-fn inventory(seg_dir: &Path) -> Result<Vec<FileEntry>> {
+/// each with its BLAKE3 hash, name-sorted so the content hash is deterministic. Shared with
+/// the T3 merge writer ([`crate::merge_segment`]) so the two produce byte-consistent
+/// manifests.
+pub(crate) fn inventory(seg_dir: &Path) -> Result<Vec<FileEntry>> {
     let mut files: Vec<FileEntry> = Vec::new();
     for entry in std::fs::read_dir(seg_dir)
         .with_context(|| format!("list segment dir {}", seg_dir.display()))?

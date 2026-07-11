@@ -761,6 +761,180 @@ impl Graphs {
         info!(graph = %name, set = %set_uuid, segment = %seg_uuid, "flushed writable delta into a core segment");
         Ok(Some(set_uuid))
     }
+
+    /// **T3 segment compaction** (Phase 5): fold the contiguous run of upper segments at
+    /// ordinal `[start, end)` (oldest→newest) into a single merged segment, publish a new set
+    /// that splices it in place of the run, and swap the served generation onto it.
+    ///
+    /// Unlike a flush, compaction touches **only** the immutable segment stack — it reads the
+    /// run's segments, never the base or the delta, and writes an O(inputs) merged segment
+    /// that reads identically to the run. The merged band is the union of the run's bands, so
+    /// the dense id space (`extents().total()`) is invariant: the write-delta's resolved ids
+    /// stay valid and the writer is simply **rebound** to the new set (no freeze, no WAL
+    /// replay, no rebase — see [`DeltaWriter::rebind_core_uuid`]). The run's old segment
+    /// directories are left on disk for a later GC pass (Phase 7); the new set no longer
+    /// references them.
+    ///
+    /// Shares the [`DeltaWriter::begin_consolidation`] exclusion with flush/consolidation so
+    /// no two stack mutations overlap. Returns the new set uuid, or an error if the run is not
+    /// a valid contiguous run of ≥ 2 segments.
+    pub fn compact_graph_segments(
+        &self,
+        name: &str,
+        vector_cache: &VectorIndexCache,
+        data_dir: &Path,
+        start: usize,
+        end: usize,
+    ) -> Result<GenId> {
+        let writer = self
+            .writer(name)
+            .ok_or_else(|| anyhow!("graph '{name}' has no writable layer to compact"))?;
+        if !writer.begin_consolidation() {
+            bail!("a consolidation or flush for '{name}' is already in progress");
+        }
+        let _guard = ConsolidationGuard(writer.clone());
+
+        let core = self
+            .get(name)
+            .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
+        if writer.core_uuid() != core.uuid() {
+            bail!(
+                "cannot compact '{name}': the writable delta was resolved against generation \
+                 {} but the served core is {} — the delta is orphaned",
+                writer.core_uuid(),
+                core.uuid()
+            );
+        }
+
+        let segments = core.stack().segments();
+        if start >= end || end > segments.len() || end - start < 2 {
+            bail!(
+                "compact '{name}': invalid run [{start}, {end}) over {} segment(s) — need a \
+                 contiguous run of at least two",
+                segments.len()
+            );
+        }
+        let run: Vec<&crate::segstack::LoadedSegment> = segments[start..end].iter().collect();
+
+        // The id-space totals must be preserved by the merge (the merged band unions the
+        // run's), else the delta's resolved ids would no longer line up — assert it below.
+        let old_node_total = core.stack().extents().nodes.total();
+        let old_edge_total = core.stack().extents().edges.total();
+
+        let seg_uuid = GenId(uuid::Uuid::new_v4());
+        let set_uuid = GenId(uuid::Uuid::new_v4());
+        let created_unix = now_unix();
+        let seg_dir = data_dir
+            .join(name)
+            .join("segments")
+            .join(seg_uuid.0.to_string());
+
+        // Encryption parity: a merge over an encrypted stack writes a fresh per-segment cipher
+        // + header (KDF salt only) — mirroring the flush path.
+        let (cipher, encryption_header): (
+            Option<std::sync::Arc<graph_format::crypto::BlockCipher>>,
+            Option<graph_format::manifest::EncryptionHeader>,
+        ) = match self.master_key.as_deref() {
+            Some(key) => {
+                let salt = graph_format::crypto::random_salt();
+                let header = graph_format::manifest::EncryptionHeader {
+                    aead: graph_format::crypto::AEAD_NAME.to_string(),
+                    kdf: graph_format::crypto::KDF_NAME.to_string(),
+                    salt_hex: graph_format::crypto::hex_encode(&salt),
+                };
+                let cipher =
+                    std::sync::Arc::new(graph_format::crypto::BlockCipher::from_master(key, &salt));
+                (Some(cipher), Some(header))
+            }
+            None => (None, None),
+        };
+
+        let manifest = {
+            let inp = crate::merge_segment::MergeInputs {
+                seg_dir: &seg_dir,
+                seg_uuid,
+                base_uuid: core.base_uuid(),
+                cipher,
+                master_key: self.master_key.as_deref(),
+                encryption_header,
+                created_unix,
+            };
+            match crate::merge_segment::write_merge_segment(&run, &inp) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&seg_dir);
+                    return Err(e)
+                        .with_context(|| format!("materialise merged segment for '{name}'"));
+                }
+            }
+        };
+
+        // Publish a fresh set: the segments below the run, the merged segment in the run's
+        // ordinal slot, then the segments above the run — precedence preserved.
+        let mut set =
+            graph_format::setmanifest::SetManifest::singleton(core.base_uuid(), created_unix);
+        set.set_uuid = set_uuid;
+        let mut refs: Vec<graph_format::setmanifest::SegmentRef> =
+            Vec::with_capacity(segments.len() - (end - start) + 1);
+        for s in &segments[..start] {
+            refs.push(graph_format::setmanifest::SegmentRef::from_manifest(
+                &s.manifest,
+            ));
+        }
+        refs.push(graph_format::setmanifest::SegmentRef::from_manifest(
+            &manifest,
+        ));
+        for s in &segments[end..] {
+            refs.push(graph_format::setmanifest::SegmentRef::from_manifest(
+                &s.manifest,
+            ));
+        }
+        set.segments = refs;
+        publish_set_and_current(data_dir, name, set_uuid, &set)
+            .with_context(|| format!("publish compacted set for '{name}'"))?;
+
+        // Upload the merged segment + set + `current` (current last) when the store is remote;
+        // the run's old segments stay in the store for a later GC. Shares the flush uploader.
+        if !self.store.is_local_fs() {
+            upload_flush_to_store(
+                self.store.as_ref(),
+                name,
+                &seg_dir,
+                &manifest,
+                set_uuid,
+                &set,
+            )
+            .with_context(|| format!("upload merged segment for '{name}' to the object store"))?;
+        }
+
+        let new_uuid = self
+            .swap_if_changed(name, vector_cache)
+            .with_context(|| format!("swap in compacted set for '{name}'"))?
+            .ok_or_else(|| {
+                anyhow!("compaction for '{name}' published a set but `current` was unchanged")
+            })?;
+        debug_assert_eq!(new_uuid, set_uuid);
+        let new_gen = self
+            .get(name)
+            .ok_or_else(|| anyhow!("compacted set for '{name}' vanished before rebind"))?;
+
+        // The merged band unions the run's, so the id space is unchanged — the delta's ids
+        // stay valid. Verify before rebinding (fail safe rather than corrupt the overlay).
+        let new_node_total = new_gen.stack().extents().nodes.total();
+        let new_edge_total = new_gen.stack().extents().edges.total();
+        if new_node_total != old_node_total || new_edge_total != old_edge_total {
+            bail!(
+                "compaction for '{name}' changed the id space (nodes {old_node_total}→\
+                 {new_node_total}, edges {old_edge_total}→{new_edge_total}) — refusing to \
+                 rebind the delta"
+            );
+        }
+        // Rebind the delta to the new set: ids unchanged, so no re-resolution or rebase.
+        writer.rebind_core_uuid(set_uuid);
+
+        info!(graph = %name, set = %set_uuid, segment = %seg_uuid, run_start = start, run_end = end, "compacted a run of upper segments into one");
+        Ok(set_uuid)
+    }
 }
 
 /// Seconds since the Unix epoch (0 if the clock is before it — never in practice).
@@ -7739,6 +7913,198 @@ mod tests {
             matches!(since.rows[0][0], Val::Int(2099)),
             "the patched edge prop reloaded from the segment: {:?}",
             since.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 5 slice 5.1: **T3 segment compaction**. Two flushes stack two upper segments;
+    /// `compact_graph_segments` folds them into one merged segment that reads **identically** to
+    /// the run it replaces — a births-only pair, a base-node indexed patch (index-removal carry),
+    /// and a cross-segment node-row override (newest-wins) all resolve the same before and after,
+    /// the stack shrinks to one segment, the id space is preserved, the delta is rebound, and the
+    /// merged data survives a reopen.
+    #[test]
+    fn compact_segments_folds_a_run_into_one() {
+        // `write_basic`: Alice/Bob/Carol :Person (name+age indexed, ages 30/25/40),
+        // Acme/Globex :Company, base edge Alice-KNOWS->Bob among others.
+        let (root, _g, _u) = testgen::write_basic("compact_seg_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let q = |graphs: &Graphs, query: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse(query).unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+
+        // Flush 1: a born node (Dave, indexed name+age), a born edge (Dave-KNOWS->Alice), and a
+        // base-node **indexed** patch (Carol's age 40→99 — a below-run index removal + entry).
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) SET n.age = 99");
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(b:Person {name:'Alice'})",
+        );
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("flush 1 is non-empty");
+
+        // Flush 2: another born node (Frank) and a **cross-segment override** of the same base
+        // node's indexed age (Carol 99→77). Carol is a base node, so the write path re-resolves
+        // her by key in both flushes; the merge must newest-wins her row (77) and suppress both
+        // the base value (40) and segment 1's intermediate value (99) in the index. (Note that a
+        // just-flushed *born* key like Dave cannot be re-patched by the write path until Phase 6
+        // makes resolve segment-aware — see the plan's 4.1 note (e) — so the override targets the
+        // base node Carol, which resolves in both flushes.)
+        write(&graphs, "MERGE (n:Person {name:'Frank'}) SET n.age = 70");
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) SET n.age = 77");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("flush 2 is non-empty");
+
+        let pre = graphs.get("people").unwrap();
+        assert_eq!(
+            pre.stack().segments().len(),
+            2,
+            "two upper segments stacked"
+        );
+        let old_node_total = pre.stack().extents().nodes.total();
+        let old_edge_total = pre.stack().extents().edges.total();
+        drop(pre);
+
+        // The battery of probes that must read identically before and after the compaction.
+        // `Val` has no `PartialEq`, so each probe result is captured as its debug string.
+        let probe = |graphs: &Graphs| -> Vec<String> {
+            let s = |v: &Val| format!("{v:?}");
+            // A one-row scalar, or a marker for the row count when the seek should be empty.
+            let scalar = |r: &QueryResult| r.rows.first().map_or("∅".into(), |row| s(&row[0]));
+            // The reverse-adjacency probe onto the base node Alice (its row count matters too).
+            let rev = q(
+                graphs,
+                "MATCH (b:Person {name:'Alice'})<-[:KNOWS]-(a) RETURN a.name",
+            );
+            vec![
+                // 1. cross-segment override of a base node: Carol seeks by her newest age (77);
+                //    the base value (40) and segment 1's intermediate value (99) are suppressed.
+                scalar(&q(graphs, "MATCH (n:Person {age:77}) RETURN n.name")),
+                scalar(&q(graphs, "MATCH (n:Person {age:99}) RETURN n.name")),
+                scalar(&q(graphs, "MATCH (n:Person {age:40}) RETURN n.name")),
+                s(&q(graphs, "MATCH (n:Person {name:'Carol'}) RETURN n.age").rows[0][0]),
+                // 2. born nodes, each by its born age index.
+                scalar(&q(graphs, "MATCH (n:Person {age:50}) RETURN n.name")),
+                scalar(&q(graphs, "MATCH (n:Person {age:70}) RETURN n.name")),
+                // 3. node count over summed marginals (3 base Person + Dave + Frank).
+                s(&q(graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0]),
+                // 4. born edge traverses to its base target (forward) …
+                s(&q(
+                    graphs,
+                    "MATCH (a:Person {name:'Dave'})-[:KNOWS]->(b) RETURN b.name",
+                )
+                .rows[0][0]),
+                // 5. … and reverse (incoming KNOWS onto Alice — only the born edge).
+                format!("rev_rows={}", rev.rows.len()),
+                scalar(&rev),
+            ]
+        };
+        let before = probe(&graphs);
+        // Sanity-check the ground truth so a bug can't make before==after both wrong.
+        assert_eq!(
+            before[0], "Str(\"Carol\")",
+            "Carol by newest indexed age 77"
+        );
+        assert_eq!(before[1], "∅", "segment-1 intermediate age 99 suppressed");
+        assert_eq!(before[2], "∅", "base age 40 suppressed");
+        assert_eq!(before[3], "Int(77)", "Carol newest age");
+        assert_eq!(before[4], "Str(\"Dave\")", "Dave by born age 50");
+        assert_eq!(before[5], "Str(\"Frank\")", "Frank by born age 70");
+        assert_eq!(before[6], "Int(5)", "3 base Person + 2 born");
+        assert_eq!(before[7], "Str(\"Alice\")", "forward edge target");
+        assert_eq!(before[8], "rev_rows=1", "one incoming KNOWS on Alice");
+        assert_eq!(before[9], "Str(\"Dave\")", "reverse edge source");
+
+        // Compact the run [0, 2) into one segment.
+        let set_uuid = graphs
+            .compact_graph_segments("people", &vc, &root, 0, 2)
+            .unwrap();
+
+        let post = graphs.get("people").unwrap();
+        assert_eq!(post.uuid(), set_uuid, "served the compacted set");
+        assert_eq!(post.base_uuid(), base_uuid, "base preserved by compaction");
+        assert_eq!(
+            post.stack().segments().len(),
+            1,
+            "run folded into one segment"
+        );
+        assert_eq!(
+            post.stack().extents().nodes.total(),
+            old_node_total,
+            "node id space invariant under compaction"
+        );
+        assert_eq!(
+            post.stack().extents().edges.total(),
+            old_edge_total,
+            "edge id space invariant under compaction"
+        );
+        drop(post);
+
+        // The writer is rebound to the new set (ids unchanged, delta preserved).
+        assert_eq!(
+            graphs.writer("people").unwrap().core_uuid(),
+            set_uuid,
+            "delta rebound to the compacted set"
+        );
+
+        // Every probe reads identically through the merged segment.
+        assert_eq!(probe(&graphs), before, "compaction preserves every read");
+
+        // Reopen from disk: the compacted set + merged segment reload and survive. Re-enable
+        // the writable layer so the shared probe closure has a writer (the delta was retired by
+        // the flushes and rebound by the compaction, so it reloads empty).
+        drop(graphs);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the compacted set"
+        );
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            1,
+            "merged segment reloaded"
+        );
+        assert_eq!(
+            probe(&graphs),
+            before,
+            "reopened compaction preserves every read"
         );
 
         std::fs::remove_dir_all(&root).ok();

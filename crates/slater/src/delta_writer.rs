@@ -753,6 +753,23 @@ impl DeltaWriter {
         Ok(())
     }
 
+    /// Re-bind the writer to a new core generation whose **dense id space is identical** to
+    /// the current one — a T3 segment compaction (Phase 5) merges a contiguous run of
+    /// immutable upper segments into one, reorganising the stack without renumbering any id,
+    /// touching the base, or folding the delta. So — unlike [`Self::retire`] — the memtable,
+    /// WAL and L0 levels are preserved untouched (no WAL replay, no synthetic-id rebase, no
+    /// L0 clear); only the served set uuid the delta records changes. The caller MUST hold
+    /// the consolidation guard and MUST have verified the new core preserves
+    /// `extents().total()` for both id spaces (the resolved dense ids stay valid only under
+    /// that invariant). The lock order (`inner` → `core_uuid`) mirrors [`Self::retire`], and
+    /// the epoch bump invalidates any delta-overlaid result-cache entry keyed on the old set.
+    pub fn rebind_core_uuid(&self, new_core_uuid: GenId) {
+        // Serialise against an in-flight write so a mutation never straddles the rebind.
+        let _inner = self.inner.lock().expect("delta writer lock");
+        *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Number of distinct node identities currently carrying a delta (diagnostics).
     pub fn node_delta_count(&self) -> usize {
         self.snapshot().node_delta_count()

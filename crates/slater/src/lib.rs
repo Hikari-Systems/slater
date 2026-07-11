@@ -30,6 +30,7 @@ pub mod generation;
 pub mod health;
 pub mod help;
 pub mod introspect;
+pub mod merge_segment;
 pub mod parser;
 pub mod plan;
 pub mod query;

@@ -118,8 +118,29 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-d (HP16). **Phases 1–3
-DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
+**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.1 (HP17). **Phases 1–4
+DONE; Phase 5 IN PROGRESS.**
+
+**Phase 5 (T3 segment compaction) — slice 5.1 DONE.** A new merge writer
+(`crate::merge_segment::write_merge_segment`) folds a **contiguous run** of upper segments
+(oldest→newest) into one merged segment that reads *identically* to the run — newest-wins per
+dimension: node/edge rows (newest input's full row; a **within-run** born tombstone is
+reclaimed, a **below-run** tombstone kept), adjacency fragments (per node, `removed` cancels a
+within-run born append else is carried), index fragments (per `(label,prop)`, entry id-sets +
+removal sidecars fold newest-wins; each live id's value is read from the merged full-row node —
+segments have no `(value,id)` iterator — and a below-run removal is carried), postings (union).
+**Marginals are the *sum* of the inputs'** (`marginals_exact` = AND) — the merged segment must
+contribute the same Δcounts as the run it replaces, and born-then-deleted ids net to zero.
+`Graphs::compact_graph_segments(name, vc, data_dir, start, end)` picks the run, writes the
+merged segment, publishes a new set (segments below the run + merged + segments above), uploads
+(remote store), swaps, and **rebinds** the delta (`DeltaWriter::rebind_core_uuid`) — compaction
+touches neither base nor delta and the merged band unions the run's, so `extents().total()` is
+invariant and the delta's resolved ids stay valid (no freeze/replay/rebase, unlike `retire`,
+which also clears L0). The run's old segment dirs are left for a later GC (Phase 7). Run
+selection is explicit (`start..end`); **admission policy — `maxUpperSegments`, size-tiered
+selection, scheduling — is slice 5.3.** An auto-trigger is still Phase-6-gated (as for flush).
+
+**(Phase 4 — flush writer, all slices DONE.)** The flush writer (`Graphs::flush_graph_to_segment` +
 `crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges, core-resolved
 node patches, deletes, AND core-edge patches** — **every write op can now flush** (the last
 per-op `bail!` in the edge-row loop is closed). A `SET`/`REMOVE` on a base node folds into the
@@ -148,13 +169,45 @@ segment is staged locally, then (when `self.store` is not the local fs — `Obje
 `upload_flush_to_store` publishes every segment file (with its SHA-256), `SEGMENT.json`, the set
 manifest, then `current` **last** (the copy-completeness barrier), mirroring the builder's
 `upload_generation`; this precedes the swap, which reads `current` from `self.store`. **Slice
-4.4 is COMPLETE — the whole deployment bundle is in.** Next: **auto-trigger wiring**
-(Phase-6-gated — needs segment-aware write-path resolve; do NOT wire before then). Still
-deferred and `bail!`ed: patch-**then-delete** of the same core edge in one delta (an
-adjacency-removal concern the patch materialiser doesn't own), and a flush over an **off-heap**
-L0 level (resident L0 folds via `LevelRead::as_memtable`; off-heap stores a block image, not a
-memtable, so it needs a memtable rebuild the lossy trait can't give — `as_memtable()` returns
-`None`).
+4.4 is COMPLETE — the whole deployment bundle is in.** (Flush auto-trigger wiring is
+Phase-6-gated — needs segment-aware write-path resolve; do NOT wire before then.) Still
+deferred and `bail!`ed in the *flush* writer: patch-**then-delete** of the same core edge in one
+delta (an adjacency-removal concern the patch materialiser doesn't own), and a flush over an
+**off-heap** L0 level (resident L0 folds via `LevelRead::as_memtable`; off-heap stores a block
+image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
+`as_memtable()` returns `None`).
+
+**Phase 5 NEXT after 5.1:** **5.2** — hardening the merge over the cases 5.1's test doesn't
+exercise (a base-node **delete** folded across the run; a **partial** run `[i,j)` with segments
+above/below it; an **encrypted** merge; a **remote-store** merge; a merge whose inputs include a
+zero-width band). **5.3** — the **admission policy**: `maxUpperSegments`, size-tiered run
+selection, scheduling, and (Phase-6-gated) an auto-compaction trigger; DECISIONS.md D50 → the
+four-rung ladder. Deferred leanness (each benign, matching the flush writer's noted follow-ups):
+a born-then-deleted **edge** leaves an orphan edge row in the merged segment (its adjacency is
+suppressed by the fold, so it is never read); postings are a union (a stale driving hit is
+filtered by adjacency).
+
+### Phase 5 slice log
+- **5.1 DONE** (HP17): the **T3 merge writer** + orchestrator + rebind, end-to-end. New
+  `crate::merge_segment::write_merge_segment(inputs, &MergeInputs)` folds a contiguous run of
+  `&LoadedSegment`s (oldest→newest) into one segment — enumerating each reader's key columns
+  (`node_ids`/`edge_ids`/`adj_out_ids`/`adj_in_ids`, `reltypes`, `indexed`) and point-reading
+  the rows, newest-wins with within-run reclamation per the module scope. Marginals **sum** the
+  inputs' manifests (`marginals_exact` = AND). `Graphs::compact_graph_segments` picks the run,
+  writes the merged segment, publishes the spliced set, uploads (remote), `swap_if_changed`,
+  asserts `extents().total()` is invariant, and `DeltaWriter::rebind_core_uuid`s the delta (a
+  new lightweight rebind: `inner`-locked `core_uuid` set + epoch bump, no replay/rebase/L0-clear
+  — unlike `retire`). Shared with the flush writer: `flush_segment::{inventory, SEG_BLOCK_BYTES,
+  SEG_ZSTD_LEVEL}` (now `pub(crate)`) and `upload_flush_to_store`. One e2e oracle
+  (`compact_segments_folds_a_run_into_one`, `write_basic` fixture): two flushes stack two
+  segments (born Dave+edge, base Carol age 40→99; born Frank, base Carol 99→77); a 10-probe
+  battery — cross-segment base override (Carol 77; base 40 + intermediate 99 both suppressed),
+  born-age index seeks, summed count, forward+reverse born edge — reads **identically** before
+  and after the compaction, the stack shrinks 2→1, the id space is invariant, the delta is
+  rebound, and every probe survives a reopen. NB the override targets a **base** node (Carol),
+  not a flushed born node (Dave) — a born key can't be re-resolved by the write path until
+  Phase 6 (the 4.1 note (e) limitation). 720 slater lib + 140 graph-format + 78 slater-delta +
+  full workspace green, clippy + fmt clean.
 
 ### Phase 4 slice log
 - **4.4-d DONE** (HP16): **object-store upload** — the last of the deployment bundle. A flush
@@ -435,8 +488,18 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   `resolve_edge_row`), no marginal change, no index sidecar (no live rel index). `SegmentData`
   gained `core_patched_edges` (endpoints a patch omits from `adj_out`). One new e2e oracle test
   (`flush_to_segment_materialises_a_core_edge_patch`). 716 slater lib + full workspace green,
-  clippy clean. ← current baseline; next is slice 4.4 (stacked L0 fold, encryption parity, s3
-  upload, auto-trigger wiring).
+  clippy clean.
+- HP14/HP15/HP16 — Phase 4 slices 4.4-b/-c/-d (encryption parity, stacked-L0 fold, object-store
+  upload); see the Phase 4 slice log above. Slice 4.4 COMPLETE; the flush writer is
+  feature-complete (717→719 slater lib).
+- HP17 — Phase 5 slice 5.1: **T3 segment compaction** writer + orchestrator + delta rebind.
+  New `crate::merge_segment::write_merge_segment` (newest-wins fold of a contiguous run into one
+  segment, summed marginals), `Graphs::compact_graph_segments` (pick run → merge → publish
+  spliced set → upload → swap → `rebind_core_uuid`), `DeltaWriter::rebind_core_uuid` (lightweight
+  id-space-invariant rebind). One e2e oracle (`compact_segments_folds_a_run_into_one`): a 10-probe
+  battery reads identically before/after a 2→1 compaction and survives a reopen. 720 slater lib +
+  full workspace green, clippy + fmt clean. ← current baseline; next is slice 5.2 (merge
+  hardening: delete-across-run, partial run, encrypted/remote, zero-width band).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
@@ -493,31 +556,32 @@ Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core work on branch `writeable`. Read `docs/SEGMENTED-CORE-PLAN.md`
-> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP16 (slice 4.4-d,
-> object-store upload) — slice 4.4 and the whole T2-flush deployment bundle are COMPLETE.**
-> Phases 1–3 DONE; Phase 4's flush writer is feature-complete: **every write op materialises
-> into a flush segment**, over an **encrypted** core it writes an encrypted segment, over a
-> **stacked L0** it folds all levels newest-wins, and against a **remote store** it uploads
-> segment+set+`current` (current last). Baseline: **719 slater lib tests** (140 graph-format,
-> 78 slater-delta), clippy clean.
+> "RESUME HERE" + the Phase 5 slice log first. **Committed through HP17 (Phase 5 slice 5.1, T3
+> segment compaction).** Phases 1–4 DONE (the T2-flush writer is feature-complete). **Phase 5
+> (T3 segment↔segment merge) IN PROGRESS.** Slice 5.1 shipped the **merge writer**
+> (`crate::merge_segment::write_merge_segment` — folds a contiguous run of upper segments
+> newest-wins into one, summed marginals), the **orchestrator**
+> (`Graphs::compact_graph_segments` — pick run → merge → publish spliced set → upload → swap →
+> rebind), and a lightweight **delta rebind** (`DeltaWriter::rebind_core_uuid` — compaction
+> preserves `extents().total()`, so no freeze/replay/rebase). Run selection is explicit.
+> Baseline: **720 slater lib tests** (140 graph-format, 78 slater-delta), clippy + fmt clean.
 >
-> NEXT: **auto-trigger wiring is the remaining Phase-4 item, but it is Phase-6-GATED** — it
-> needs segment-aware write-path resolve (a post-freeze re-MERGE of a flushed born key must
-> re-resolve through the segment index), so do NOT wire it before Phase 6 (see 4.1 deferral
-> note (e)). Until then the flush is invoked explicitly (`Graphs::flush_graph_to_segment`);
-> there is no automatic freeze→flush trigger. If starting fresh Phase-4 work is not intended,
-> the natural next move is **Phase 5** (per the plan's phase list) or picking up the two
-> deferred `bail!`ed sub-cases: patch-then-delete of the same core edge in one delta, and a
-> flush over an **off-heap** L0 level (`LevelRead::as_memtable()` returns `None` for it,
-> needing a memtable rebuild the lossy trait can't give).
+> NEXT: **slice 5.2** — harden the merge over the cases 5.1's test doesn't exercise (a base-node
+> **delete** folded across the run; a **partial** run `[i,j)`; an **encrypted** merge; a
+> **remote-store** merge; a zero-width band). Then **slice 5.3** — the **admission policy**
+> (`maxUpperSegments`, size-tiered run selection, scheduling; DECISIONS.md D50 → four-rung
+> ladder). An auto-compaction trigger, like the flush auto-trigger, is Phase-6-gated. Deferred
+> leanness (benign): a born-then-deleted edge leaves an orphan edge row (adjacency-suppressed,
+> never read); postings are a union.
 >
 > DISCIPLINE: `CARGO_TARGET_DIR=/home/rickk/.cache/slater-target cargo …` +
 > `dangerouslyDisableSandbox`. Full workspace + clippy green; `cargo fmt --all` before
 > commit. Commit to `writeable` (no PRs). Update this "RESUME HERE" + slice log + add an HP
 > per sub-slice.
 
-**Key files for Phase 4:** `slater/src/{delta_writer.rs,segstack.rs,generation.rs,
-server.rs,consolidate.rs}`, `slater-delta/src/memtable.rs` (delta level → segment
-materialisation; `synthetic_base`), `graph-format/src/{segment.rs,segindex.rs,
-segpostings.rs,segmanifest.rs,setmanifest.rs}` (the writers), the read-side fold in
-`slater/src/{read_view.rs,exec.rs}` (the merge Phase 4's output must satisfy).
+**Key files for Phase 5:** `slater/src/{merge_segment.rs (the merge writer), server.rs
+(compact_graph_segments + upload_flush_to_store + publish_set_and_current), delta_writer.rs
+(rebind_core_uuid, freeze, retire), segstack.rs (LoadedSegment readers, extents), flush_segment.rs
+(shared inventory + block consts)}`, `graph-format/src/{segment.rs,segindex.rs,segpostings.rs
+(reader enumeration APIs the fold walks), segmanifest.rs,setmanifest.rs (the manifests spliced)}`,
+the read-side fold in `slater/src/{read_view.rs,exec.rs}` (the merge's output must satisfy it).
