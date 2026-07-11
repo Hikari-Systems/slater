@@ -40,6 +40,7 @@ pub mod membudget;
 pub mod nodelabels;
 pub mod postings;
 pub mod pq;
+pub mod segment;
 pub mod setmanifest;
 pub mod store;
 pub mod topology;

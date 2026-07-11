@@ -118,9 +118,9 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 2 slice 1 (`extents.rs` routing
-table). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slice 1 done,
-next is slice 2 (segment writer/reader sections).
+**Branch:** `writeable`. **Committed through:** Phase 2 slice 2 (`segment.rs` section
+format). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–2
+done, next is slice 3 (ISAM fragment + removal sidecar; posting fragments).
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
 - HP0 — Phase 0.5 committed (`a6e4d34`).
@@ -140,6 +140,13 @@ next is slice 2 (segment writer/reader sections).
      as off-heap-L0-style resident sorted key columns over BlockCache-paged payloads
      (template: `slater-delta/src/l0_offheap.rs`); full-row node/edge records +
      tombstone flags; min/max id fences.
+     **DONE** — `graph-format/src/segment.rs`: `SegmentWriter`/`SegmentReader`,
+     `NodeRow`/`EdgeRow`/`AdjEdge`, four block sections + resident sorted key columns,
+     `may_hold_node`/`node_fence` id-band fences, plaintext + AEAD (block-section
+     encryption via `create_with_cipher`/`open_with_cipher`, absent-key refusal),
+     `meta.bin` MAGIC+crc32c+version. 8 tests (round-trip, tiny-block multi-page,
+     encrypted, empty, corrupt/foreign-magic reject) green, clippy clean.
+     NOTE: `meta.bin` self-MAC + `SEGMENT.json` marginals are slice 4, not here.
   3. ISAM fragment + removal sidecar (reuse `write_isam_sorted`); posting fragments.
   4. `SEGMENT.json` (signed marginal deltas as i64, per-index dirty bits, bands,
      inventory+hashes, encryption/MAC parity with `manifest.rs`).
