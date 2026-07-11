@@ -36,6 +36,7 @@ use anyhow::{bail, Context, Result};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
 use crate::isam::{write_isam_with_cipher, IsamReader};
+use crate::store::{join_key, ObjectStore};
 use crate::wire::{read_uvarint, write_uvarint};
 
 /// Magic at the head of `idx.meta`.
@@ -154,6 +155,37 @@ struct Fragment {
 }
 
 /// The opened index fragments of one core segment.
+/// Parse and validate an `idx.meta` body (magic ‖ crc32c ‖ uvarint body) into the per-
+/// fragment `(label, prop, removals)` descriptors. The ISAM files are opened separately by
+/// the caller (differently for fs vs store), but the magic/crc/version checks are shared.
+fn decode_idx_meta(meta: &[u8]) -> Result<Vec<(String, String, Vec<u64>)>> {
+    if meta.len() < 12 || &meta[..8] != IDX_MAGIC {
+        bail!("segment idx.meta has bad magic");
+    }
+    let crc = u32::from_le_bytes([meta[8], meta[9], meta[10], meta[11]]);
+    let body = &meta[12..];
+    if crc32c::crc32c(body) != crc {
+        bail!("segment idx.meta failed checksum");
+    }
+    let mut r = body;
+    let version = read_uvarint(&mut r)?;
+    if version != IDX_VERSION {
+        bail!("unsupported segindex version {version} (this build understands {IDX_VERSION})");
+    }
+    let count = read_uvarint(&mut r)? as usize;
+    let mut out = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let label = r_str(&mut r)?;
+        let prop = r_str(&mut r)?;
+        let removals = r_ids(&mut r)?;
+        out.push((label, prop, removals));
+    }
+    if !r.is_empty() {
+        bail!("segment idx.meta has {} trailing bytes", r.len());
+    }
+    Ok(out)
+}
+
 pub struct SegmentIndexReader {
     fragments: Vec<Fragment>,
 }
@@ -187,25 +219,8 @@ impl SegmentIndexReader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {meta_path:?}")),
         };
-        if meta.len() < 12 || &meta[..8] != IDX_MAGIC {
-            bail!("segment idx.meta {dir:?} has bad magic");
-        }
-        let crc = u32::from_le_bytes([meta[8], meta[9], meta[10], meta[11]]);
-        let body = &meta[12..];
-        if crc32c::crc32c(body) != crc {
-            bail!("segment idx.meta {dir:?} failed checksum");
-        }
-        let mut r = body;
-        let version = read_uvarint(&mut r)?;
-        if version != IDX_VERSION {
-            bail!("unsupported segindex version {version} (this build understands {IDX_VERSION})");
-        }
-        let count = read_uvarint(&mut r)? as usize;
-        let mut fragments = Vec::with_capacity(count);
-        for k in 0..count {
-            let label = r_str(&mut r)?;
-            let prop = r_str(&mut r)?;
-            let removals = r_ids(&mut r)?;
+        let mut fragments = Vec::new();
+        for (k, (label, prop, removals)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
             let isam = IsamReader::open_with_cipher(dir.join(isam_name(k)), cipher.clone())
                 .with_context(|| format!("open index fragment {k} ({label}, {prop})"))?;
             fragments.push(Fragment {
@@ -215,8 +230,37 @@ impl SegmentIndexReader {
                 removals,
             });
         }
-        if !r.is_empty() {
-            bail!("segment idx.meta {dir:?} has {} trailing bytes", r.len());
+        Ok(Some(Self { fragments }))
+    }
+
+    /// Store-native counterpart of [`open_if_present`](SegmentIndexReader::open_if_present) —
+    /// reads `<prefix>/idx.meta` and each ISAM fragment through `store`, so a segment on any
+    /// backend opens like the base generation's range indexes. `None` if `idx.meta` is absent.
+    pub fn open_if_present_via(
+        store: &dyn ObjectStore,
+        prefix: &str,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Option<Self>> {
+        let meta_key = join_key(prefix, "idx.meta");
+        if !store.exists(&meta_key)? {
+            return Ok(None);
+        }
+        let meta = store
+            .read_all(&meta_key)
+            .with_context(|| format!("read {meta_key}"))?;
+        let mut fragments = Vec::new();
+        for (k, (label, prop, removals)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
+            let isam = IsamReader::open_src(
+                store.open(&join_key(prefix, &isam_name(k)))?,
+                cipher.clone(),
+            )
+            .with_context(|| format!("open index fragment {k} ({label}, {prop})"))?;
+            fragments.push(Fragment {
+                label,
+                prop,
+                isam,
+                removals,
+            });
         }
         Ok(Some(Self { fragments }))
     }
@@ -277,6 +321,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Copy every file in a written segment directory into `store` under `prefix`, so the
+    /// store-native open path reads the same bytes the fs writer produced.
+    fn stage_dir(dir: &std::path::Path, prefix: &str, store: &dyn ObjectStore) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let name = entry.file_name().into_string().unwrap();
+                let bytes = std::fs::read(entry.path()).unwrap();
+                store
+                    .put(&format!("{prefix}/{name}"), &bytes, None)
+                    .unwrap();
+            }
+        }
     }
 
     fn specs() -> Vec<IndexSpec> {
@@ -352,6 +411,26 @@ mod tests {
         write_index_fragments(&dir, &specs(), 64, 3, None).unwrap();
         let r = SegmentIndexReader::open(&dir, None).unwrap();
         assert_reads(&r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trips_via_object_store() {
+        use crate::store::mem::MemObjectStore;
+        let dir = tmp("via");
+        write_index_fragments(&dir, &specs(), 64, 3, None).unwrap();
+        let store = MemObjectStore::new();
+        stage_dir(&dir, "seg", &store);
+        let r = SegmentIndexReader::open_if_present_via(&store, "seg", None)
+            .unwrap()
+            .unwrap();
+        assert_reads(&r);
+        // Absent prefix ⇒ None, matching the fs `open_if_present`.
+        assert!(
+            SegmentIndexReader::open_if_present_via(&store, "nope", None)
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

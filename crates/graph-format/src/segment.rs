@@ -56,6 +56,7 @@ use crate::blockcache::BlockCache;
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
+use crate::store::{join_key, ObjectStore};
 use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
 /// Magic at the head of a segment's `meta.bin`, distinct from a generation MANIFEST
@@ -564,6 +565,46 @@ impl SegmentReader {
         })
     }
 
+    /// Store-native counterpart of [`open_with_cipher`](SegmentReader::open_with_cipher) —
+    /// reads `meta.bin` and pages the four block sections through `store` under key prefix
+    /// `prefix`, so a segment on any backend (fs / mem / S3) opens exactly like the base
+    /// generation's `.blk` files. Verifies `meta.bin` magic/version/crc.
+    pub fn open_via(
+        store: &dyn ObjectStore,
+        prefix: &str,
+        cache: Arc<BlockCache>,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        let meta_key = join_key(prefix, "meta.bin");
+        let meta_bytes = store
+            .read_all(&meta_key)
+            .with_context(|| format!("read segment meta {meta_key}"))?;
+        let SegmentMeta {
+            scope,
+            node_keys,
+            adj_out_keys,
+            adj_in_keys,
+            edge_keys,
+        } = decode_segment_meta(&meta_bytes).with_context(|| format!("segment {prefix} meta"))?;
+        let open = |name: &str| -> Result<BlockFileReader> {
+            BlockFileReader::open_src(store.open(&join_key(prefix, name))?, cipher.clone())
+                .with_context(|| format!("open {prefix}/{name}"))
+        };
+        Ok(Self {
+            node_rdr: open("node.blk")?,
+            adj_out_rdr: open("adj_out.blk")?,
+            adj_in_rdr: open("adj_in.blk")?,
+            edge_rdr: open("edge.blk")?,
+            dir: PathBuf::from(prefix),
+            scope,
+            cache,
+            node_keys,
+            adj_out_keys,
+            adj_in_keys,
+            edge_keys,
+        })
+    }
+
     /// The segment directory.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -820,6 +861,30 @@ mod tests {
         write_sample(&dir, 16, None);
         let cache = Arc::new(BlockCache::new(1 << 20));
         let r = SegmentReader::open(&dir, cache).unwrap();
+        assert_sample(&r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trips_via_object_store() {
+        // The store-native open path must read byte-identically to the fs open path — this
+        // is what lets a stacked set's segments live on mem / S3 like the base generation.
+        use crate::store::mem::MemObjectStore;
+        let dir = tmp("via");
+        write_sample(&dir, 64, None);
+        let store = MemObjectStore::new();
+        for name in [
+            "meta.bin",
+            "node.blk",
+            "adj_out.blk",
+            "adj_in.blk",
+            "edge.blk",
+        ] {
+            let bytes = std::fs::read(dir.join(name)).unwrap();
+            store.put(&format!("seg/{name}"), &bytes, None).unwrap();
+        }
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let r = SegmentReader::open_via(&store, "seg", cache, None).unwrap();
         assert_sample(&r);
         std::fs::remove_dir_all(&dir).ok();
     }

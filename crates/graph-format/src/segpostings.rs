@@ -33,6 +33,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use crate::postings::{decode_endpoint_posting, encode_endpoint_posting};
+use crate::store::{join_key, ObjectStore};
 use crate::wire::{read_uvarint, write_uvarint};
 
 /// Magic at the head of `post.meta`.
@@ -115,6 +116,40 @@ pub fn write_posting_fragments(dir: impl AsRef<Path>, specs: &[PostingSpec]) -> 
     Ok(())
 }
 
+/// Parse and validate a `post.meta` body (magic ‖ crc32c ‖ uvarint body). Shared by the
+/// fs and store-native open paths so both enforce identical magic/crc/version checks.
+fn decode_post_meta(bytes: &[u8]) -> Result<Vec<PostingSpec>> {
+    if bytes.len() < 12 || &bytes[..8] != POST_MAGIC {
+        bail!("segment post.meta has bad magic");
+    }
+    let crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let body = &bytes[12..];
+    if crc32c::crc32c(body) != crc {
+        bail!("segment post.meta failed checksum");
+    }
+    let mut r = body;
+    let version = read_uvarint(&mut r)?;
+    if version != POST_VERSION {
+        bail!("unsupported segpostings version {version} (this build understands {POST_VERSION})");
+    }
+    let count = read_uvarint(&mut r)? as usize;
+    let mut specs = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let reltype = r_str(&mut r)?;
+        let src_ids = r_posting(&mut r)?;
+        let tgt_ids = r_posting(&mut r)?;
+        specs.push(PostingSpec {
+            reltype,
+            src_ids,
+            tgt_ids,
+        });
+    }
+    if !r.is_empty() {
+        bail!("segment post.meta has {} trailing bytes", r.len());
+    }
+    Ok(specs)
+}
+
 /// The opened posting fragments of one core segment (all resident).
 #[derive(Debug)]
 pub struct SegmentPostingsReader {
@@ -136,37 +171,25 @@ impl SegmentPostingsReader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {path:?}")),
         };
-        if bytes.len() < 12 || &bytes[..8] != POST_MAGIC {
-            bail!("segment post.meta {path:?} has bad magic");
+        Ok(Some(Self {
+            specs: decode_post_meta(&bytes)?,
+        }))
+    }
+
+    /// Store-native counterpart of [`open`](SegmentPostingsReader::open_if_present) — reads
+    /// `<prefix>/post.meta` through `store`, so a segment on any backend (fs / mem / S3)
+    /// opens the same way the base generation's files do. `None` if the object is absent.
+    pub fn open_if_present_via(store: &dyn ObjectStore, prefix: &str) -> Result<Option<Self>> {
+        let key = join_key(prefix, "post.meta");
+        if !store.exists(&key)? {
+            return Ok(None);
         }
-        let crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let body = &bytes[12..];
-        if crc32c::crc32c(body) != crc {
-            bail!("segment post.meta {path:?} failed checksum");
-        }
-        let mut r = body;
-        let version = read_uvarint(&mut r)?;
-        if version != POST_VERSION {
-            bail!(
-                "unsupported segpostings version {version} (this build understands {POST_VERSION})"
-            );
-        }
-        let count = read_uvarint(&mut r)? as usize;
-        let mut specs = Vec::with_capacity(count);
-        for _ in 0..count {
-            let reltype = r_str(&mut r)?;
-            let src_ids = r_posting(&mut r)?;
-            let tgt_ids = r_posting(&mut r)?;
-            specs.push(PostingSpec {
-                reltype,
-                src_ids,
-                tgt_ids,
-            });
-        }
-        if !r.is_empty() {
-            bail!("segment post.meta {path:?} has {} trailing bytes", r.len());
-        }
-        Ok(Some(Self { specs }))
+        let bytes = store
+            .read_all(&key)
+            .with_context(|| format!("read {key}"))?;
+        Ok(Some(Self {
+            specs: decode_post_meta(&bytes)?,
+        }))
     }
 
     fn find(&self, reltype: &str) -> Option<&PostingSpec> {
@@ -233,6 +256,26 @@ mod tests {
         let mut rts = r.reltypes();
         rts.sort();
         assert_eq!(rts, vec!["IN", "KNOWS"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn round_trips_via_object_store() {
+        use crate::store::mem::MemObjectStore;
+        let dir = tmp("via");
+        write_posting_fragments(&dir, &specs()).unwrap();
+        let store = MemObjectStore::new();
+        let bytes = std::fs::read(dir.join("post.meta")).unwrap();
+        store.put("seg/post.meta", &bytes, None).unwrap();
+        let r = SegmentPostingsReader::open_if_present_via(&store, "seg")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.src_ids("KNOWS"), &[5, 10, 100]);
+        assert_eq!(r.tgt_ids("KNOWS"), &[12, 15]);
+        // Absent prefix ⇒ None, matching fs `open_if_present`.
+        assert!(SegmentPostingsReader::open_if_present_via(&store, "nope")
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
