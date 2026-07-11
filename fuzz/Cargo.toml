@@ -18,6 +18,9 @@ libfuzzer-sys = "0.4"
 [dependencies.slater]
 path = "../crates/slater"
 
+[dependencies.graph-format]
+path = "../crates/graph-format"
+
 [workspace]
 
 [[bin]]
@@ -37,6 +40,13 @@ bench = false
 [[bin]]
 name = "chunk_decode"
 path = "fuzz_targets/chunk_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_decode"
+path = "fuzz_targets/segment_decode.rs"
 test = false
 doc = false
 bench = false

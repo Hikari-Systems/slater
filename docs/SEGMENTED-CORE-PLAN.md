@@ -118,10 +118,20 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 2 slice 4 (`SEGMENT.json`
-manifest). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–4
-done, next is slice 5 (populate `SegmentRef` in the set manifest — already forward-shaped
-— + codec goldens + fuzz targets). Slice 5 CLOSES Phase 2.
+**Branch:** `writeable`. **Committed through:** Phase 2 slice 5 — **Phase 2 COMPLETE**.
+**Phases 1–2 DONE.** Next: **Phase 3 (read path over a stacked set).** `LevelRead`
+extensions + at-rest adapter; `MergedView` routing (full-row short-circuit via `segment.rs`
+`node_row`/`edge_row` + `extents.rs` routing; adjacency fan-out gating via
+`may_hold_node` fences; index-probe union via `segindex` base-minus-removals ∪ fragment +
+`segpostings` driving-set union; count summation via `segmanifest` signed marginals with
+`marginals_exact` decline; histogram decline). Four exec.rs seams: `node_record`,
+`read_adj_overlaid`/`overlay_adj`, `scan_candidates`, count fast paths.
+
+**Phase 2 artifacts (all in `graph-format/src/`, format only — NOT wired to reads):**
+`extents.rs` (id→segment routing), `segment.rs` (node/adj/edge sections + fences +
+public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.rs`
+(endpoint driving-set fragments), `segmanifest.rs` (`SEGMENT.json`), plus
+`SegmentRef::from_manifest` in `setmanifest.rs`. Fuzz: `fuzz/fuzz_targets/segment_decode.rs`.
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
 - HP0 — Phase 0.5 committed (`a6e4d34`).
@@ -174,9 +184,16 @@ done, next is slice 5 (populate `SegmentRef` in the set manifest — already for
      deltas, defaults, store I/O) green, clippy clean.
   5. Populate `SegmentRef` in the set manifest (already forward-shaped) + codec goldens
      + fuzz targets.
+     **DONE** — `SegmentRef::from_manifest(&SegmentManifest)` (uuid/bands/content_hash
+     bridge; a set built from it tiles via `Extents::from_set`); public panic-safe codec
+     surface `NodeRow/EdgeRow::encode/decode`, `encode/decode_adj_fragment`,
+     `decode_segment_meta` (decoders no longer pre-size from untrusted counts); hand-
+     computed byte goldens for node/edge/adj records + a meta round-trip; new fuzz target
+     `fuzz/fuzz_targets/segment_decode.rs` (+ graph-format fuzz dep), type-checks.
+     137 graph-format lib tests green, clippy clean, whole workspace builds.
 Exit: round-trip + hand-computed codec goldens + fuzz green; encrypted segment
 open/refuse parity with generation fixtures. Do NOT wire the read path yet — that's
-Phase 3.
+Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core track for slater (branch `writeable`). Read

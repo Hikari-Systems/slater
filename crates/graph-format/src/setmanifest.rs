@@ -57,6 +57,21 @@ pub struct SegmentRef {
     pub content_hash: String,
 }
 
+impl SegmentRef {
+    /// Build the set-level reference to a segment from its own `SEGMENT.json` — copying
+    /// the uuid, id bands and content hash the set needs to route and integrity-check it.
+    /// This is the bridge that lets a flush append a `SegmentRef` to the set from the
+    /// segment manifest it just sealed (Phase 4).
+    pub fn from_manifest(m: &crate::segmanifest::SegmentManifest) -> Self {
+        Self {
+            uuid: m.segment_uuid,
+            node_band: m.node_band,
+            edge_band: m.edge_band,
+            content_hash: m.content_hash.clone(),
+        }
+    }
+}
+
 /// The `<graph>/sets/<set-uuid>.json` manifest: the base generation plus the ordered
 /// upper-segment stack.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +175,55 @@ mod tests {
         assert_eq!(s.base, base);
         assert!(s.segments.is_empty());
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn segment_ref_from_manifest_and_tiles() {
+        use crate::extents::{Extents, SegmentOrd};
+        use crate::segmanifest::SegmentManifest;
+
+        // Two flushes over a base of 50 nodes / 200 edges, appending contiguous bands.
+        let base = uuid(1);
+        let mut seg1 = SegmentManifest {
+            magic: crate::segmanifest::SEGMENT_MAGIC.into(),
+            version: crate::segmanifest::SEGMENT_MANIFEST_VERSION,
+            segment_uuid: uuid(2),
+            base,
+            created_unix: 0,
+            node_band: (50, 60),
+            edge_band: (200, 205),
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 10,
+            edge_count_delta: 5,
+            reltype_edge_deltas: vec![],
+            label_node_deltas: vec![],
+            marginals_exact: false,
+            dirty_indexes: vec![],
+            mac: None,
+            files: vec![],
+        };
+        seg1.set_content_hash();
+        let mut seg2 = seg1.clone();
+        seg2.segment_uuid = uuid(3);
+        seg2.node_band = (60, 63);
+        seg2.edge_band = (205, 205);
+        seg2.set_content_hash();
+
+        let mut set = SetManifest::singleton(base, 0);
+        set.segments.push(SegmentRef::from_manifest(&seg1));
+        set.segments.push(SegmentRef::from_manifest(&seg2));
+
+        assert_eq!(set.segments[0].uuid, uuid(2));
+        assert_eq!(set.segments[0].node_band, (50, 60));
+        assert_eq!(set.segments[0].content_hash, seg1.content_hash);
+
+        // The populated refs must build a valid, tiling routing table.
+        let e = Extents::from_set(&set, 50, 200).unwrap();
+        assert_eq!(e.nodes.route(55), Some(SegmentOrd::Upper(0)));
+        assert_eq!(e.nodes.route(62), Some(SegmentOrd::Upper(1)));
+        assert_eq!(e.nodes.total(), 63);
+        assert_eq!(e.edges.route(204), Some(SegmentOrd::Upper(0)));
     }
 
     #[test]

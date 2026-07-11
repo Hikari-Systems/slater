@@ -148,7 +148,10 @@ fn w_props(buf: &mut Vec<u8>, props: &[(String, Value)]) {
 
 fn r_props(r: &mut &[u8]) -> Result<Vec<(String, Value)>> {
     let n = read_uvarint(r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    // Do not pre-size from the untrusted count: each pair consumes ≥1 byte, so a bogus
+    // huge `n` simply runs `r` dry and errors rather than aborting on a giant allocation
+    // (these decoders are a fuzz target).
+    let mut out = Vec::new();
     for _ in 0..n {
         let k = r_str(r)?;
         let v = read_value(r)?;
@@ -175,7 +178,7 @@ fn decode_node(mut r: &[u8]) -> Result<NodeRow> {
     let tombstoned = r[0] != 0;
     r = &r[1..];
     let nl = read_uvarint(&mut r)? as usize;
-    let mut labels = Vec::with_capacity(nl);
+    let mut labels = Vec::new(); // not pre-sized: fuzz-safe against a bogus count
     for _ in 0..nl {
         labels.push(r_str(&mut r)?);
     }
@@ -230,7 +233,7 @@ fn encode_adj(edges: &[AdjEdge]) -> Vec<u8> {
 
 fn decode_adj(mut r: &[u8]) -> Result<Vec<AdjEdge>> {
     let n = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::new(); // not pre-sized: fuzz-safe against a bogus count
     for _ in 0..n {
         let other = read_uvarint(&mut r)?;
         let reltype = r_str(&mut r)?;
@@ -259,11 +262,94 @@ fn w_u64s(buf: &mut Vec<u8>, keys: &[u64]) {
 
 fn r_u64s(r: &mut &[u8]) -> Result<Vec<u64>> {
     let n = read_uvarint(r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::new(); // not pre-sized: fuzz-safe against a bogus count
     for _ in 0..n {
         out.push(read_uvarint(r)?);
     }
     Ok(out)
+}
+
+// ── public codec surface (goldens + fuzz) ──────────────────────────────────────────────
+
+impl NodeRow {
+    /// Encode this node full-row record to its on-disk body bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_node(self)
+    }
+    /// Decode a node full-row record body. Never panics on arbitrary bytes — it returns
+    /// `Err` on any truncation or bad count (a fuzz invariant).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        decode_node(bytes)
+    }
+}
+
+impl EdgeRow {
+    /// Encode this edge full-row record to its on-disk body bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_edge(self)
+    }
+    /// Decode an edge full-row record body. Never panics on arbitrary bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        decode_edge(bytes)
+    }
+}
+
+/// Encode an adjacency fragment (list of born/removed incident edges) to its body bytes.
+pub fn encode_adj_fragment(edges: &[AdjEdge]) -> Vec<u8> {
+    encode_adj(edges)
+}
+
+/// Decode an adjacency fragment body. Never panics on arbitrary bytes.
+pub fn decode_adj_fragment(bytes: &[u8]) -> Result<Vec<AdjEdge>> {
+    decode_adj(bytes)
+}
+
+/// The resident material a segment's `meta.bin` carries: the cache scope and the four
+/// per-section sorted key columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentMeta {
+    pub scope: u128,
+    pub node_keys: Vec<u64>,
+    pub adj_out_keys: Vec<u64>,
+    pub adj_in_keys: Vec<u64>,
+    pub edge_keys: Vec<u64>,
+}
+
+/// Parse and verify a segment `meta.bin` byte image (magic ‖ crc32c ‖ body). Never panics
+/// on arbitrary bytes — magic/crc/version/trailing-byte mismatches all return `Err`.
+pub fn decode_segment_meta(meta: &[u8]) -> Result<SegmentMeta> {
+    if meta.len() < 12 || &meta[..8] != META_MAGIC {
+        bail!("segment meta: bad magic");
+    }
+    let crc = u32::from_le_bytes([meta[8], meta[9], meta[10], meta[11]]);
+    let body = &meta[12..];
+    if crc32c::crc32c(body) != crc {
+        bail!("segment meta: failed checksum");
+    }
+    let mut r = body;
+    let version = read_uvarint(&mut r)?;
+    if version != SEGMENT_VERSION {
+        bail!("unsupported segment version {version} (this build understands {SEGMENT_VERSION})");
+    }
+    if r.len() < 16 {
+        bail!("segment meta: short (scope)");
+    }
+    let scope = u128::from_le_bytes(r[..16].try_into().unwrap());
+    r = &r[16..];
+    let node_keys = r_u64s(&mut r)?;
+    let adj_out_keys = r_u64s(&mut r)?;
+    let adj_in_keys = r_u64s(&mut r)?;
+    let edge_keys = r_u64s(&mut r)?;
+    if !r.is_empty() {
+        bail!("segment meta: {} trailing bytes", r.len());
+    }
+    Ok(SegmentMeta {
+        scope,
+        node_keys,
+        adj_out_keys,
+        adj_in_keys,
+        edge_keys,
+    })
 }
 
 // ── writer ─────────────────────────────────────────────────────────────────────────────
@@ -450,35 +536,15 @@ impl SegmentReader {
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let meta = std::fs::read(dir.join("meta.bin"))
+        let meta_bytes = std::fs::read(dir.join("meta.bin"))
             .with_context(|| format!("read segment meta {dir:?}/meta.bin"))?;
-        if meta.len() < 12 || &meta[..8] != META_MAGIC {
-            bail!("segment {dir:?} has bad meta magic");
-        }
-        let crc = u32::from_le_bytes([meta[8], meta[9], meta[10], meta[11]]);
-        let body = &meta[12..];
-        if crc32c::crc32c(body) != crc {
-            bail!("segment {dir:?} meta failed checksum");
-        }
-        let mut r = body;
-        let version = read_uvarint(&mut r)?;
-        if version != SEGMENT_VERSION {
-            bail!(
-                "unsupported segment version {version} (this build understands {SEGMENT_VERSION})"
-            );
-        }
-        if r.len() < 16 {
-            bail!("segment {dir:?}: short meta (scope)");
-        }
-        let scope = u128::from_le_bytes(r[..16].try_into().unwrap());
-        r = &r[16..];
-        let node_keys = r_u64s(&mut r)?;
-        let adj_out_keys = r_u64s(&mut r)?;
-        let adj_in_keys = r_u64s(&mut r)?;
-        let edge_keys = r_u64s(&mut r)?;
-        if !r.is_empty() {
-            bail!("segment {dir:?} meta has {} trailing bytes", r.len());
-        }
+        let SegmentMeta {
+            scope,
+            node_keys,
+            adj_out_keys,
+            adj_in_keys,
+            edge_keys,
+        } = decode_segment_meta(&meta_bytes).with_context(|| format!("segment {dir:?} meta"))?;
         let open = |name: &str| -> Result<BlockFileReader> {
             BlockFileReader::open_with_cipher(dir.join(name), cipher.clone())
                 .with_context(|| format!("open {name}"))
@@ -812,6 +878,99 @@ mod tests {
         std::fs::write(dir.join("meta.bin"), &meta).unwrap();
         let cache = Arc::new(BlockCache::new(1 << 20));
         assert!(SegmentReader::open(&dir, cache).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── hand-computed codec goldens ────────────────────────────────────────────────────
+    // Exact byte images for known records, so an accidental codec change is caught even if
+    // encode/decode stay mutually consistent. See the module codec section for the layout.
+
+    #[test]
+    fn node_record_golden() {
+        // labels ["A"], props [("k", Int 1)], live:
+        //   00            tombstoned=false
+        //   01            labels len = 1
+        //   01 41         w_str "A"
+        //   01            props len = 1
+        //   01 6B         w_str "k"
+        //   02 02         Int: TAG_INT(2), zigzag(1)=2
+        let row = NodeRow {
+            labels: vec!["A".into()],
+            props: vec![("k".into(), Value::Int(1))],
+            tombstoned: false,
+        };
+        assert_eq!(
+            row.encode(),
+            vec![0x00, 0x01, 0x01, 0x41, 0x01, 0x01, 0x6B, 0x02, 0x02]
+        );
+        assert_eq!(NodeRow::decode(&row.encode()).unwrap(), row);
+        // Tombstone: 01 (flag) 00 (no labels) 00 (no props).
+        assert_eq!(NodeRow::tombstone().encode(), vec![0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn edge_record_golden() {
+        // src 10, dst 15, reltype "R", no props, live:
+        //   00  0A  0F  01 52  00
+        let row = EdgeRow {
+            src: 10,
+            dst: 15,
+            reltype: "R".into(),
+            props: vec![],
+            tombstoned: false,
+        };
+        assert_eq!(row.encode(), vec![0x00, 0x0A, 0x0F, 0x01, 0x52, 0x00]);
+        assert_eq!(EdgeRow::decode(&row.encode()).unwrap(), row);
+    }
+
+    #[test]
+    fn adj_fragment_golden() {
+        // one entry: other 3, reltype "T", edge_id 7, removed:
+        //   01  03  01 54  07  01
+        let edges = vec![AdjEdge {
+            other: 3,
+            reltype: "T".into(),
+            edge_id: 7,
+            removed: true,
+        }];
+        assert_eq!(
+            encode_adj_fragment(&edges),
+            vec![0x01, 0x03, 0x01, 0x54, 0x07, 0x01]
+        );
+        assert_eq!(
+            decode_adj_fragment(&encode_adj_fragment(&edges)).unwrap(),
+            edges
+        );
+    }
+
+    #[test]
+    fn decoders_never_panic_on_arbitrary_bytes() {
+        // The property the fuzz targets assert, exercised over a spread of inputs including
+        // bogus counts that must error (not abort on a giant allocation) rather than panic.
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let _ = NodeRow::decode(&bytes);
+            let _ = EdgeRow::decode(&bytes);
+            let _ = decode_adj_fragment(&bytes);
+            let _ = decode_segment_meta(&bytes);
+        }
+        // A record whose count varints claim a huge length must Err, not OOM-abort.
+        assert!(NodeRow::decode(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F]).is_err());
+        assert!(decode_adj_fragment(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]).is_err());
+    }
+
+    #[test]
+    fn meta_decode_matches_written_segment() {
+        // The public `decode_segment_meta` reproduces exactly what a writer put in meta.bin.
+        let dir = tmp("meta");
+        write_sample(&dir, 4096, None);
+        let bytes = std::fs::read(dir.join("meta.bin")).unwrap();
+        let m = decode_segment_meta(&bytes).unwrap();
+        assert_eq!(m.scope, 0xABCD);
+        assert_eq!(m.node_keys, vec![10, 12, 15]);
+        assert_eq!(m.adj_out_keys, vec![10]);
+        assert_eq!(m.adj_in_keys, vec![15]);
+        assert_eq!(m.edge_keys, vec![100, 101]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
