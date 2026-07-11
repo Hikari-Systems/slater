@@ -100,6 +100,43 @@ fn print_read_amp_matrix(fixtures: &[(usize, PathBuf, String)], shapes: &[Shape]
     eprintln!();
 }
 
+/// Print the same read-amp matrix served through an in-memory `ObjectStore` — the
+/// backend-agnostic read path. The block-miss read-amp is backend-invariant, so this matrix
+/// matches the fs one cell-for-cell (the `read_amp_parity_fs_vs_object_store` unit test pins
+/// it); a real-S3 run (EC2, in-region) reproduces these counts and adds only per-block latency.
+fn print_store_read_amp_matrix(shapes: &[Shape]) {
+    eprintln!("=== object-store (in-memory) read amplification — parity with fs above ===");
+    eprintln!("(real S3 read-amp/latency is an EC2 in-region exercise; block counts are these)\n");
+    let stores: Vec<(usize, _, String)> = DEPTHS
+        .iter()
+        .map(|&d| {
+            let (store, graph) =
+                benchkit::build_stacked_store(&format!("readamp_store_d{d}"), N, d);
+            (d, store, graph)
+        })
+        .collect();
+    eprint!("{:<14}", "shape");
+    for (d, _, _) in &stores {
+        eprint!("  seg={d:<18}", d = d);
+    }
+    eprintln!();
+    for shape in shapes {
+        eprint!("{:<14}", shape.name);
+        for (_, store, graph) in &stores {
+            let amp = benchkit::read_amp_cold_store(store.as_ref(), graph, &shape.query);
+            let cell = format!(
+                "{}+{}={}",
+                amp.base_blocks,
+                amp.segment_blocks,
+                amp.total_blocks()
+            );
+            eprint!("  {cell:<20}");
+        }
+        eprintln!();
+    }
+    eprintln!();
+}
+
 /// Warm-latency benchmark: one criterion group per read shape, one point per stack depth. The
 /// reader (and its caches) is opened once per depth and reused across iterations, so the
 /// caches are warm and the measurement is steady-state read latency over the folded stack.
@@ -135,10 +172,13 @@ fn main() {
 
     let shapes = shapes(N);
 
-    // 1) The deterministic read-amp matrix (the headline result).
+    // 1) The deterministic read-amp matrix over fs (the headline result).
     print_read_amp_matrix(&fixtures, &shapes);
 
-    // 2) Warm latency via criterion.
+    // 2) The same matrix over an in-memory object store — proves backend-invariance.
+    print_store_read_amp_matrix(&shapes);
+
+    // 3) Warm latency via criterion.
     let mut c = Criterion::default().configure_from_args();
     bench_latency(&mut c, &fixtures, &shapes);
     c.final_summary();

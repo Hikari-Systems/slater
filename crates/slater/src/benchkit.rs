@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use graph_format::columns::PropsWriter;
@@ -25,6 +26,8 @@ use graph_format::integrity::hash_file;
 use graph_format::isam::write_isam;
 use graph_format::manifest::{EntityKind, FileEntry, Manifest, RangeIndexDesc};
 use graph_format::nodelabels::NodeLabelsWriter;
+use graph_format::store::mem::MemObjectStore;
+use graph_format::store::ObjectStore;
 use graph_format::topology::{write_csr, Edge};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::{FORMAT_VERSION, MAGIC};
@@ -335,6 +338,18 @@ impl Reader {
         self.cache.metrics().misses
     }
 
+    /// Cold-open `graph` over an arbitrary `ObjectStore` (S3/GCS/in-memory) with a base block
+    /// cache of `cache_bytes`. The read path is backend-agnostic: a base or segment block miss
+    /// fetches through the store, so the miss counts are identical to the fs reader's — only
+    /// the per-block latency differs (see [`read_amp_cold_store`]).
+    pub fn open_store(store: &dyn ObjectStore, graph: &str, cache_bytes: usize) -> Self {
+        let gen = Generation::open_with_store(store, graph, None).unwrap();
+        Self {
+            gen,
+            cache: BlockCache::new(cache_bytes),
+        }
+    }
+
     /// Cumulative segment-stack block misses so far.
     pub fn segment_misses(&self) -> u64 {
         self.gen.stack().cache_metrics().misses
@@ -348,6 +363,62 @@ pub fn read_amp_cold(root: &Path, graph: &str, query: &str) -> ReadAmp {
     let r = Reader::open(root, graph, 256 << 20);
     // Snapshot after open so the resident-column loads a segment open performs are excluded —
     // we measure only what the query itself pulls.
+    let (b0, s0) = (r.base_misses(), r.segment_misses());
+    let t = Instant::now();
+    let _ = r.run(query);
+    let elapsed = t.elapsed();
+    ReadAmp {
+        base_blocks: r.base_misses() - b0,
+        segment_blocks: r.segment_misses() - s0,
+        elapsed,
+    }
+}
+
+/// Recursively mirror an on-disk data directory into `store` under store-relative keys — the
+/// benchkit analogue of the server's test loader, so a fs-built stacked set can be served
+/// through an [`ObjectStore`] byte-for-byte.
+fn load_dir_into_store(store: &dyn ObjectStore, root: &Path, dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            load_dir_into_store(store, root, &path);
+        } else {
+            let key = path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            store
+                .put(&key, &std::fs::read(&path).unwrap(), None)
+                .unwrap();
+        }
+    }
+}
+
+/// Build [`build_stacked`] on the local fs, mirror the whole stacked set (base + segments +
+/// set manifests + `current`) into a fresh in-memory [`ObjectStore`], tear the fs copy down,
+/// and return the store. Reading it back through [`Reader::open_store`] exercises the
+/// backend-agnostic read path; because the store image is byte-identical to the fs one, its
+/// read-amp block-miss counts match the fs reader's exactly (asserted in the tests).
+///
+/// A real-S3 read-amp/latency run (the EC2, in-region exercise — never the laptop, never
+/// MinIO) points the same [`Reader::open_store`] at an S3-backed `ObjectStore`; the block-miss
+/// read-amp is backend-invariant, so this in-memory parity is what a laptop can verify, and
+/// only the per-block wall-clock changes on real S3.
+pub fn build_stacked_store(tag: &str, n: u64, segments: usize) -> (Arc<MemObjectStore>, String) {
+    let (root, graph) = build_stacked(tag, n, segments);
+    let store = Arc::new(MemObjectStore::new());
+    load_dir_into_store(store.as_ref(), &root, &root);
+    std::fs::remove_dir_all(&root).ok();
+    (store, graph)
+}
+
+/// [`read_amp_cold`] over an [`ObjectStore`]-backed graph — the S3/in-memory read path. Same
+/// metric (base + segment block misses across one cold run), served through the store.
+pub fn read_amp_cold_store(store: &dyn ObjectStore, graph: &str, query: &str) -> ReadAmp {
+    let r = Reader::open_store(store, graph, 256 << 20);
     let (b0, s0) = (r.base_misses(), r.segment_misses());
     let t = Instant::now();
     let _ = r.run(query);
@@ -425,5 +496,53 @@ mod tests {
 
         std::fs::remove_dir_all(&root0).ok();
         std::fs::remove_dir_all(&root4).ok();
+    }
+
+    /// Read amplification is **backend-invariant**: serving the same stacked set through an
+    /// in-memory `ObjectStore` pulls the identical base + segment block counts as the fs
+    /// reader for every read shape. This is the parity a laptop can verify; a real-S3 run adds
+    /// only per-block latency (EC2, in-region) — the block counts are these.
+    #[test]
+    fn read_amp_parity_fs_vs_object_store() {
+        let n = 4_000;
+        let anchor = n / 3;
+        let queries = [
+            format!("MATCH (p:Person {{name:'p{anchor:07}'}}) RETURN p.age"),
+            format!(
+                "MATCH (p:Person {{name:'p{anchor:07}'}})-[:KNOWS]->()-[:KNOWS]->(q) RETURN q.name"
+            ),
+            "MATCH (p:Person) RETURN p.name LIMIT 500".to_string(),
+            "MATCH (p:Person) RETURN count(p)".to_string(),
+        ];
+
+        // fs reader over a depth-4 stack.
+        let (root, graph) = build_stacked("bk_parity_fs", n, 4);
+        let fs_amp: Vec<ReadAmp> = queries
+            .iter()
+            .map(|q| read_amp_cold(&root, &graph, q))
+            .collect();
+
+        // The identical stacked set served through an in-memory object store.
+        let store = Arc::new(MemObjectStore::new());
+        load_dir_into_store(store.as_ref(), &root, &root);
+        let store_amp: Vec<ReadAmp> = queries
+            .iter()
+            .map(|q| read_amp_cold_store(store.as_ref(), &graph, q))
+            .collect();
+
+        for (i, (fs, st)) in fs_amp.iter().zip(store_amp.iter()).enumerate() {
+            assert_eq!(
+                (fs.base_blocks, fs.segment_blocks),
+                (st.base_blocks, st.segment_blocks),
+                "shape {i}: object-store read-amp must equal fs read-amp \
+                 (fs base+seg {}+{}, store {}+{})",
+                fs.base_blocks,
+                fs.segment_blocks,
+                st.base_blocks,
+                st.segment_blocks
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

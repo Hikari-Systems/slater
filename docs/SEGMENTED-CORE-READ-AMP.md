@@ -74,6 +74,23 @@ flat across all four depths.
   bounded by `maxUpperSegments` (~8) by construction, so it never runs away, but tightening it
   is the obvious next optimization.
 
+## Backend invariance (fs vs object store)
+
+Read amplification is the **number of blocks** a read pulls, which is a property of the format
+and the read path, not the backend — a base or segment block miss fetches through whatever
+`ObjectStore` serves the graph (local fs, S3, GCS, in-memory). So the matrix above is
+**identical** served through an object store; `benchkit::build_stacked_store` mirrors an
+fs-built stacked set into an in-memory store and `read_amp_cold_store` reads it back, and the
+`read_amp_parity_fs_vs_object_store` unit test pins the two miss counts equal for every shape.
+The bench prints both matrices side by side.
+
+What changes on a **real S3** backend is only the per-block *latency* (a cold miss is a network
+GET, ~tens of ms, versus a local page fault). That is an EC2, in-region measurement — never the
+laptop, never MinIO (see the `s3-benchmark-methodology` note) — and it multiplies these same
+block counts by the per-GET cost. The presence-fence result therefore matters *most* on S3: an
+untouched point lookup that stays at 1 block is one GET regardless of stack depth, whereas a
+naïve per-segment fan-out would be one GET per segment.
+
 ## Follow-up (bounded, correctness-neutral)
 
 **Range-gate the label-scan stack fold.** The label scan reads one block per upper segment even
