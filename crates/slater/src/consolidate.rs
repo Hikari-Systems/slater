@@ -180,29 +180,54 @@ pub fn serialise_binary_dump<V: ReadView>(
         .collect();
 
     let delta = view.delta();
-    let tombs = delta.effective_tombstoned_ids();
+    // The core stack (base + upper segments). A retarget consolidation runs over a *stacked*
+    // set: the byte-copy fast paths below gate on the write-delta alone, but a segment can
+    // patch or tombstone a base id too, and `raw_node_labels`/`raw_edge_props` read the base
+    // block store — so a segment-touched base id must take the decode-through-stack slow path
+    // (`node_record`/`rel_record` are already segment-aware). Only probed when `stacked`; a
+    // singleton short-circuits to `None` with zero stack work, keeping a non-flushed
+    // consolidation byte-for-byte unchanged.
+    let stack = view.core_stack();
+    let stacked = !stack.is_singleton();
     let core_nodes = view.core_generation().node_count();
     let core_edges = view.core_generation().edge_count();
     let n = view.node_count();
     let mut w = DumpWriter::create(dir)?;
+
+    // The dense ids elided from the rebuild: every id the *delta* tombstones plus every id a
+    // *segment* tombstones (a base row deleted into a segment, or a segment-born-then-deleted
+    // id). Built in one pass as the node loop skips ids, so it stays ascending and
+    // `compact_id` renumbers the survivors gaplessly — reclaiming born-then-deleted rows at the
+    // dense-id level (the leanness Phase 5 deferred). For a singleton this is exactly
+    // `delta.effective_tombstoned_ids()` (the stack contributes nothing).
+    let mut combined_tombs: Vec<u64> = Vec::new();
 
     // Nodes in ascending compacted-id order (tombstoned ids elided). The append
     // position is the new dense id, matching `compact_id`.
     let mut label_ids: Vec<u32> = Vec::new();
     let mut prop_kv: Vec<(u32, Value)> = Vec::new();
     for old in 0..n {
-        if delta.is_tombstoned(old) {
+        // A segment full row for this id, if any (an override of a base node, a segment-born
+        // node, or a tombstone). Resolved once and reused by the fast-path gate below.
+        let seg_row = if stacked {
+            stack.resolve_node_row(old)?
+        } else {
+            None
+        };
+        if delta.is_tombstoned(old) || seg_row.as_ref().is_some_and(|r| r.tombstoned) {
+            combined_tombs.push(old);
             continue;
         }
-        // Fast path: a base node the delta does not touch (no patch, no label change,
-        // not born) — byte-copy its raw label + property records.
-        if old < core_nodes && delta.node_patch(old).is_none() {
+        // Fast path: a base node neither the delta NOR a segment touches — byte-copy its raw
+        // label + property records straight from the base store.
+        if old < core_nodes && delta.node_patch(old).is_none() && seg_row.is_none() {
             let lb = engine.raw_node_labels(old)?;
             let pb = engine.raw_node_props(old)?;
             w.append_node_raw(&lb, &pb)?;
             continue;
         }
-        // Slow path: born or patched — decode, overlay, and re-intern.
+        // Slow path: born, delta-patched, or segment-overridden — decode through the stack,
+        // overlay the delta, and re-intern.
         let (lnames, props) = engine.node_record(old)?;
         label_ids.clear();
         for l in &lnames {
@@ -214,28 +239,36 @@ pub fn serialise_binary_dump<V: ReadView>(
 
     // Edges, walked from each surviving source (so every edge is emitted once).
     // `outgoing_adj` is overlay-aware: it already drops tombstoned edges and edges to
-    // tombstoned nodes and appends delta-born edges.
+    // tombstoned nodes and appends delta-born edges. `combined_tombs` is the exact set the
+    // node loop skipped, so `compact_id` over it matches the node append positions.
     for old_src in 0..n {
-        if delta.is_tombstoned(old_src) {
+        if combined_tombs.binary_search(&old_src).is_ok() {
             continue;
         }
-        let new_src = compact_id(tombs, old_src);
+        let new_src = compact_id(&combined_tombs, old_src);
         for adj in engine.outgoing_adj(old_src)? {
             let old_dst = adj.neighbour.0;
-            // Belt-and-braces: a node tombstone must never leak an edge into the rebuild.
-            if delta.is_tombstoned(old_dst) {
+            // Belt-and-braces: a node tombstone (delta or segment) must never leak an edge.
+            if combined_tombs.binary_search(&old_dst).is_ok() {
                 continue;
             }
-            let new_dst = compact_id(tombs, old_dst);
+            let new_dst = compact_id(&combined_tombs, old_dst);
             let eid = adj.edge.0;
-            // Fast path: a base edge the delta does not patch — byte-copy its raw
-            // property record. `adj.reltype` is a base reltype id = dump id (seeded).
-            if eid < core_edges && delta.edge_patches(eid).is_empty() {
+            // A segment full row for this edge, if any (a flushed core-edge patch).
+            let seg_edge = if stacked {
+                stack.resolve_edge_row(eid)?
+            } else {
+                None
+            };
+            // Fast path: a base edge neither the delta NOR a segment patches — byte-copy its
+            // raw property record. `adj.reltype` is a base reltype id = dump id (seeded).
+            if eid < core_edges && delta.edge_patches(eid).is_empty() && seg_edge.is_none() {
                 let pb = engine.raw_edge_props(eid)?;
                 w.append_edge_raw(new_src, new_dst, adj.reltype, &pb)?;
                 continue;
             }
-            // Slow path: born or patched edge — decode, overlay, re-intern.
+            // Slow path: born, delta-patched, or segment-patched edge — decode, overlay,
+            // re-intern.
             let (rtype_name, eprops) = engine.rel_record(eid, adj.reltype)?;
             let rt = reltypes.intern(&rtype_name);
             intern_props(&eprops, &mut keys, "r", &mut prop_kv)?;

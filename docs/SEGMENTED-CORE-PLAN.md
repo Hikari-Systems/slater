@@ -99,8 +99,10 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   touched block for a whole write batch). Slice 6.4 DONE (`HP23`): T2/T3 auto-trigger wire-up in
   `maybe_maintain_delta` (`segmentFlushBytes` flushes the delta into a core segment; the served
   stack over `maxUpperSegments` folds a run — beside the L0-internal rungs).
-- **Phase 7 — T4 retarget + GC.** `consolidate_graph` collapses a set to a singleton
-  via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
+- **Phase 7 — T4 retarget + GC.** IN PROGRESS. `consolidate_graph` collapses a set to a
+  singleton via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
+  Slice 7.1 DONE (`HP24`): segment-aware consolidation dump (the retarget correctness gate —
+  `serialise_binary_dump` folds the core stack). Slice 7.2: orphan segment/set GC.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
   2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm.
 
@@ -123,8 +125,35 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.4 (HP23). **Phases 1–6
-DONE.** Next real work is **Phase 7** (T4 retarget + GC).
+**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.1 (HP24). **Phases 1–6
+DONE; Phase 7 IN PROGRESS.** Next is **Phase 7 slice 7.2** (orphan segment/set GC).
+
+**Phase 7 (T4 retarget + GC) — slice 7.1 DONE (segment-aware consolidation dump — the retarget
+correctness gate).** `consolidate_graph` already freezes the delta, dumps `MergedView(core, delta)`
+to a scratch binary dump, rebuilds via the Phase-0 direct-ingest builder, swaps, and retires — so it
+*structurally* collapses a set to a singleton. But `serialise_binary_dump` was **not stack-aware**:
+its Phase-0.5 byte-copy fast paths gated only on the write-delta (`node_patch` / `is_tombstoned` /
+`edge_patches`), and `raw_node_labels`/`raw_edge_props` read the **base** block store keyed on the
+base uuid — so over a stacked set a base id patched/tombstoned **only in a segment** would byte-copy
+stale base bytes (losing the segment write) and a segment tombstone would not elide the id from the
+dense renumbering. Fixed by folding the stack into the serialiser: a **combined tombstone set**
+(delta ∪ segment, built single-pass as the node loop skips ids — so `compact_id` still matches the
+node append positions and born-then-deleted rows are reclaimed at the dense-id level, the leanness
+Phase 5 deferred), the node byte-copy fast path additionally gated on
+`stack.resolve_node_row(id).is_none()` (a segment-overridden base id takes the decode-through-stack
+slow path, already segment-aware via `node_record`/`node_label_ids_par`/`core_named_props`), and the
+edge fast path gated on `stack.resolve_edge_row(id).is_none()` with the dst skip + `compact_id` over
+the combined set. The **singleton set is byte-for-byte unchanged** (`resolve_node_row` is an instant
+`None` on an empty segment list, gated further behind a `!stacked` check so a non-flushed
+consolidation pays nothing). Tested: `consolidation_dump_folds_the_segment_stack` (dump of a stacked
+gen carries the segment-patched age not stale base, reclaims the tombstoned node with gapless
+renumbering, carries the born node/edge with compacted endpoints) +
+`consolidate_over_a_stacked_set_collapses_to_a_singleton` (the retarget folds a stacked core back to
+a singleton, re-binds the writer, carries a post-freeze write forward). **742 slater lib** (+2) + 141
+graph-format + 78 slater-delta + full workspace green (28 suites), clippy + fmt clean. **NEXT: slice
+7.2** — orphan segment/set GC: flush (4.4-d) and compaction (5.1) leave superseded `segments/<uuid>/`
+dirs + `sets/<uuid>.json` on disk, and a retarget orphans the whole prior set; a grace-period sweep
+reclaims the unreferenced ones (live set computed from `current` → set → base + segment uuids).
 
 **Phase 6 (write-path resolve) — slice 6.4 DONE (T2/T3 auto-trigger wire-up — Phase 6
 CLOSED).** The two segment-tier rungs of the D50 ladder now auto-fire from the write path,
@@ -364,6 +393,43 @@ complete** (writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carri
 benign, reclaimable in Phase 7): a born-then-deleted **edge** leaves an orphan edge row in the
 merged segment (its adjacency is suppressed by the fold, so it is never read); postings are a union
 (a stale driving hit is filtered by adjacency).
+
+### Phase 7 slice log (T4 retarget + GC — IN PROGRESS)
+
+**Scope (decided).** The terminal D50 rung + the disk-reclamation the earlier phases deferred.
+Two slices:
+- **7.1 DONE** (HP24) — **segment-aware consolidation dump (the retarget correctness gate).**
+  `consolidate_graph`
+  already folds `MergedView(core, delta)` to a scratch binary dump → builder → swap → retire, so it
+  *structurally* collapses a set to a singleton via the Phase-0 direct path. But
+  `serialise_binary_dump` is **not stack-aware**: its Phase-0.5 byte-copy fast paths gate only on the
+  *write-delta* (`delta.node_patch`/`is_tombstoned`/`edge_patches`), never on the segment stack, and
+  `raw_node_labels`/`raw_edge_props` read the **base** block store keyed on the base uuid. So over a
+  stacked set a base id **patched or tombstoned only in a segment** would byte-copy stale base bytes
+  (losing the segment write), and a segment tombstone would not elide the id from the dense
+  renumbering. The fix folds the stack into the serialiser: a **combined tombstone set** (delta ∪
+  segment, built single-pass as the node loop skips ids — so `compact_id` still matches node append
+  positions and born-then-deleted rows are reclaimed at the dense-id level), the node byte-copy fast
+  path additionally gated on `stack.resolve_node_row(id).is_none()` (a segment-overridden base id
+  takes the decode-through-stack slow path, which is already segment-aware via `node_record` /
+  `node_label_ids_par` / `core_named_props`), and the edge fast path gated on
+  `stack.resolve_edge_row(id).is_none()` with the dst skip + `compact_id` over the combined set. The
+  singleton set is byte-for-byte unchanged (`resolve_node_row` is an instant `None` on an empty
+  segment list, gated further behind a `!stacked` check so a non-flushed consolidation pays nothing).
+  Two new e2e oracles (`consolidation_dump_folds_the_segment_stack`: flush a base patch + base
+  delete + born node + born edge into one segment, then the dump of the stacked gen shows the
+  segment-patched age — not the stale base — reclaims the tombstoned node with gapless renumbering,
+  and carries the born node/edge with compacted endpoints; `consolidate_over_a_stacked_set_collapses
+  _to_a_singleton`: the retarget folds a stacked core back to a singleton via the direct dump path,
+  re-binds the writer, carries a post-freeze write forward). **742 slater lib** (+2) + 141
+  graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
+- **7.2 — orphan segment/set GC (grace-period sweep).** Flush (4.4-d) and compaction (5.1)
+  intentionally leave the superseded `segments/<uuid>/` dirs and `sets/<uuid>.json` files on disk for
+  a later sweep; a retarget to a singleton orphans the whole prior set + all its segments. A
+  `Graphs` GC pass computes the live reference set from `current` (→ set → base + segment uuids, or a
+  singleton gen) and removes unreferenced segment dirs + stale set files older than a **grace period**
+  (a reader may still hold a just-swapped-out `Generation`). Config `deltaConfig.segmentGcGraceSecs`;
+  crash-safe (never deletes a referenced or too-recent dir), local-fs first then object-store parity.
 
 ### Phase 6 slice log
 - **6.4 DONE** (HP23): **T2/T3 auto-trigger wire-up** — Phase 6 CLOSED. `maybe_maintain_delta`
@@ -820,8 +886,23 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   `is_already_in_progress` (debug). New `ConnCtx` fields `segment_flush_bytes` / `max_upper_segments`
   / `off_heap_l0`; `maxUpperSegments` doc + D50 rung-3/4 lose their Phase-6-gated caveats. One e2e
   oracle (`write_path_auto_flushes_and_compacts_segments`). 740 slater lib + 141 graph-format + 78
-  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next is Phase 7 (T4
-  retarget + GC).
+  slater-delta + full workspace green, clippy + fmt clean.
+- HP24 — Phase 7 slice 7.1: **segment-aware consolidation dump** — the T4 retarget correctness gate.
+  `serialise_binary_dump` (`consolidate.rs`) now folds the core stack so `consolidate_graph` over a
+  *stacked* set collapses it to a correct singleton via the Phase-0 direct dump path. The Phase-0.5
+  byte-copy fast paths gated only on the write-delta, and `raw_node_labels`/`raw_edge_props` read the
+  base block store — so a base id patched/tombstoned **only in a segment** would byte-copy stale base
+  bytes and a segment tombstone would not elide the id from the dense renumbering. Fix: a **combined
+  tombstone set** (delta ∪ segment, built single-pass as the node loop skips ids, so `compact_id`
+  matches the node append positions and born-then-deleted rows reclaim); the node fast path also
+  gated on `stack.resolve_node_row(id).is_none()` (a segment-overridden base id takes the
+  already-segment-aware `node_record` slow path); the edge fast path gated on
+  `resolve_edge_row(id).is_none()` with the dst skip + `compact_id` over the combined set. Singleton
+  byte-for-byte unchanged (`!stacked` short-circuit). Two e2e oracles
+  (`consolidation_dump_folds_the_segment_stack`,
+  `consolidate_over_a_stacked_set_collapses_to_a_singleton`). **742 slater lib** (+2) + 141
+  graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next
+  is Phase 7 slice 7.2 (orphan segment/set GC).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

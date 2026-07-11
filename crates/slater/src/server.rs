@@ -7085,6 +7085,266 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 7 slice 7.1: the consolidation dump serialiser folds the **core stack**, so a
+    /// retarget over a stacked set collapses it to a *correct* singleton. After a flush moves a
+    /// base-node patch (Alice→99), a base-node delete (Carol), a born node (Dave) and a born
+    /// edge (Dave→Bob) into one segment, dumping the served stacked generation with an empty
+    /// delta must reflect the **segment** state — not the stale base bytes the Phase-0.5
+    /// byte-copy fast path would emit. Concretely: Alice carries the segment's patched age
+    /// (proving the fast path yields to the decode-through-stack slow path for a
+    /// segment-overridden base id), Carol is elided and the survivors renumbered gaplessly
+    /// (proving the segment tombstone joins the combined tombstone set that drives `compact_id`),
+    /// and Dave + his born edge appear with compacted endpoints.
+    #[test]
+    fn consolidation_dump_folds_the_segment_stack() {
+        let (root, _g) = testgen::write_indexed_people("retarget_dump_71");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        // A base-node patch, a base-node delete, a born node, and a born edge from the born
+        // node to a surviving base node — every stack override kind in one flush.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(b:Person {name:'Bob'})",
+        );
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+        let gen = graphs.get("people").unwrap();
+        assert_eq!(gen.stack().segments().len(), 1, "one upper segment");
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired empty — the dump reads the stack alone"
+        );
+
+        // Dump the served *stacked* generation with an empty delta.
+        let dir = root.join(".retarget71.dump");
+        let _ = std::fs::remove_dir_all(&dir);
+        let view = MergedView::new(gen.as_ref(), DeltaSnapshot::empty());
+        crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dir)
+            .unwrap();
+
+        // Read it back: id → name / age, and the edges as (src-name, dst-name, reltype).
+        use graph_format::consolidate_dump::DumpReader;
+        let r = DumpReader::open(&dir).unwrap();
+        let keys = r.meta().property_keys.clone();
+        let reltypes = r.meta().reltypes.clone();
+        let mut id_name: HashMap<u64, String> = HashMap::new();
+        let mut id_age: HashMap<u64, i64> = HashMap::new();
+        r.for_each_node(|id, _lb, pb| {
+            for (k, v) in graph_format::columns::decode_props(pb).unwrap() {
+                match keys[k as usize].as_str() {
+                    "name" => {
+                        if let graph_format::ids::Value::Str(s) = v {
+                            id_name.insert(id, s);
+                        }
+                    }
+                    "age" => {
+                        if let graph_format::ids::Value::Int(i) = v {
+                            id_age.insert(id, i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut edges: Vec<(String, String, String)> = Vec::new();
+        r.for_each_edge(|_id, s, d, t, _pb| {
+            edges.push((
+                id_name[&s].clone(),
+                id_name[&d].clone(),
+                reltypes[t as usize].clone(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        // Three survivors — Carol is gone, and the dense ids are gapless [0,1,2].
+        assert_eq!(id_name.len(), 3, "Carol elided: Alice, Bob, Dave survive");
+        let mut ids: Vec<u64> = id_name.keys().copied().collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2], "survivors renumbered gaplessly");
+        let name_set: std::collections::HashSet<&str> =
+            id_name.values().map(String::as_str).collect();
+        assert!(
+            !name_set.contains("Carol"),
+            "the segment tombstone reclaimed Carol"
+        );
+        for expect in ["Alice", "Bob", "Dave"] {
+            assert!(name_set.contains(expect), "{expect} present in the dump");
+        }
+        // The segment patch wins over the stale base bytes — THE fix under test.
+        let age_of = |who: &str| -> i64 {
+            let id = *id_name.iter().find(|(_, n)| n.as_str() == who).unwrap().0;
+            id_age[&id]
+        };
+        assert_eq!(
+            age_of("Alice"),
+            99,
+            "Alice carries the SEGMENT-patched age, not base 30"
+        );
+        assert_eq!(
+            age_of("Bob"),
+            25,
+            "untouched base node keeps its byte-copied age"
+        );
+        assert_eq!(age_of("Dave"), 50, "segment-born node carried");
+
+        // The surviving base edge and the born edge, both with compacted endpoints.
+        assert_eq!(
+            edges.len(),
+            2,
+            "Alice→Bob (base) + Dave→Bob (born): {edges:?}"
+        );
+        assert!(edges.contains(&("Alice".into(), "Bob".into(), "KNOWS".into())));
+        assert!(edges.contains(&("Dave".into(), "Bob".into(), "KNOWS".into())));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 7 slice 7.1 (orchestration): `consolidate_graph` over a **stacked** set folds it
+    /// back to a singleton via the Phase-0 direct dump path — the terminal D50 rung. The
+    /// injected builder asserts the dump it is handed reflects the folded segment state (proving
+    /// the retarget reads through the stack, not the stale base), then publishes an
+    /// independently-correct singleton; afterwards the served core is a singleton (the stack
+    /// collapsed), the writer is re-bound, and a post-freeze write is carried forward.
+    #[test]
+    fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
+        let (root, _g) = testgen::write_indexed_people("retarget_e2e_71");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        // Flush a patch + delete + born into a segment, so the core we consolidate is stacked.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+        let gen0 = graphs.get("people").unwrap();
+        assert_eq!(
+            gen0.stack().segments().len(),
+            1,
+            "core is stacked before the retarget"
+        );
+
+        // Builder stand-in: assert the dump carries the folded segment state (Alice patched,
+        // Carol gone, Dave born), apply a post-freeze write (Bob→77) modelling a client writing
+        // during the rebuild, then publish an independently-correct singleton.
+        let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0071);
+        let writer = graphs.writer("people").unwrap();
+        let writer_mid = writer.clone();
+        let gen_mid = gen0.clone();
+        let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+            let nodes = dump_nodes(dump);
+            assert_eq!(
+                dump_age(dump, "Alice"),
+                Some(99),
+                "dump carries the segment patch"
+            );
+            assert!(
+                !nodes.contains_key("Carol"),
+                "dump reclaimed the segment tombstone"
+            );
+            assert_eq!(
+                dump_age(dump, "Dave"),
+                Some(50),
+                "dump carries the segment-born node"
+            );
+            assert_eq!(g, "people");
+            let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
+                .unwrap()
+            {
+                parser::ast::Statement::Write(w) => w,
+                _ => unreachable!(),
+            };
+            execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            Ok(())
+        };
+        let published = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+        assert_eq!(
+            published.0, new_uuid,
+            "swapped to the consolidated singleton"
+        );
+
+        // The stack collapsed: the served core is now a singleton, the writer re-bound.
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.uuid().0, new_uuid);
+        assert!(
+            gen1.stack().is_singleton(),
+            "the retarget folded the segment stack into a singleton base"
+        );
+        assert_eq!(
+            writer.core_uuid(),
+            gen1.uuid(),
+            "writer re-bound to the new core"
+        );
+        // The post-freeze write survived as a delta re-resolved onto the new core.
+        let read_age = |name: &str| -> Val {
+            let view = MergedView::new(gen1.as_ref(), writer.delta_snapshot());
+            let ast =
+                parser::parse(&format!("MATCH (n:Person {{name:'{name}'}}) RETURN n.age")).unwrap();
+            let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+            age
+        };
+        assert!(
+            matches!(read_age("Bob"), Val::Int(77)),
+            "post-freeze write carried forward"
+        );
+        assert!(!root.join("people").join(".consolidate.dump").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.
