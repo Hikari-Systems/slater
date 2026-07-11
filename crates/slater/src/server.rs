@@ -639,13 +639,14 @@ impl Graphs {
                 seg_dir: &seg_dir,
                 seg_uuid,
                 base_uuid: core.base_uuid(),
+                core: core.as_ref(),
                 prior_node_total,
                 prior_edge_total,
                 cipher: None,
                 master_key: None,
                 created_unix,
             };
-            match crate::flush_segment::write_births_segment(frozen.snapshot.as_ref(), &inp) {
+            match crate::flush_segment::write_flush_segment(frozen.snapshot.as_ref(), &inp) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&seg_dir);
@@ -6583,6 +6584,280 @@ mod tests {
             matches!(eve.rows[0][0], Val::Int(60)),
             "Eve reloaded from the segment: {:?}",
             eve.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.2: a delta of **core-resolved node patches** (a `SET`/`REMOVE` on a
+    /// node the base already carries) flushes into an upper segment as full replace-rows.
+    /// Every kind is exercised end-to-end through the query overlay with an empty delta:
+    /// a moved indexed value (base index entry superseded via the removal sidecar + the new
+    /// value re-added), a removed indexed value, a fresh non-indexed property (base props
+    /// preserved in the full row), an added label, and a mixed-in born node — all surviving
+    /// a reopen.
+    #[test]
+    fn flush_to_segment_materialises_core_node_patches() {
+        // `write_basic` gives Alice/Bob/Carol :Person (name+age indexed, ages 30/25/40) and
+        // Acme/Globex :Company, with both labels defined so a label-add is accepted.
+        let (root, _g, _u) = testgen::write_basic("flush_seg_patch_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        // Alice(30) → 99 and gains the pre-existing :Company label; Bob gains a fresh
+        // non-indexed city; Carol loses her indexed age; Zoe is a mixed-in birth.
+        write(
+            &graphs,
+            "MATCH (n:Person {name:'Alice'}) SET n.age = 99, n:Company",
+        );
+        write(
+            &graphs,
+            "MATCH (n:Person {name:'Bob'}) SET n.city = 'Berlin'",
+        );
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) REMOVE n.age");
+        write(&graphs, "MERGE (n:Person {name:'Zoe'}) SET n.age = 7");
+
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.stack().segments().len(), 1, "one upper segment");
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired empty"
+        );
+
+        // Query the flushed set with an empty delta — everything is served by the segment.
+        let q = |graphs: &Graphs, q: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(q).unwrap())
+                .unwrap();
+            r
+        };
+        let names = |r: &QueryResult| -> Vec<String> {
+            let mut ns: Vec<String> = r
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Val::Str(s) => s.clone(),
+                    v => panic!("expected a name string, got {v:?}"),
+                })
+                .collect();
+            ns.sort();
+            ns
+        };
+
+        // Moved indexed value: the old value is gone (removal sidecar suppressed the base
+        // hit), the new value finds Alice, an untouched value still finds Bob.
+        assert!(
+            q(&graphs, "MATCH (n:Person) WHERE n.age = 30 RETURN n.name")
+                .rows
+                .is_empty(),
+            "Alice's old indexed age (30) is superseded"
+        );
+        assert_eq!(
+            names(&q(
+                &graphs,
+                "MATCH (n:Person) WHERE n.age = 99 RETURN n.name"
+            )),
+            vec!["Alice"],
+            "the moved indexed value finds Alice at 99"
+        );
+        assert_eq!(
+            names(&q(
+                &graphs,
+                "MATCH (n:Person) WHERE n.age = 25 RETURN n.name"
+            )),
+            vec!["Bob"],
+            "an untouched base index entry still stands"
+        );
+        // Removed indexed value: Carol's age index entry is gone, and her property reads Null
+        // while her preserved base name survives in the full row.
+        assert!(
+            q(&graphs, "MATCH (n:Person) WHERE n.age = 40 RETURN n.name")
+                .rows
+                .is_empty(),
+            "Carol's removed indexed age is superseded with no replacement"
+        );
+        let carol = q(&graphs, "MATCH (n:Person {name:'Carol'}) RETURN n.age");
+        assert!(
+            matches!(carol.rows[0][0], Val::Null),
+            "Carol's age is removed: {:?}",
+            carol.rows[0][0]
+        );
+        // Fresh non-indexed property with base props preserved.
+        let bob = q(
+            &graphs,
+            "MATCH (n:Person {name:'Bob'}) RETURN n.city, n.age",
+        );
+        assert!(
+            matches!(&bob.rows[0][0], Val::Str(s) if s == "Berlin"),
+            "Bob's new city: {:?}",
+            bob.rows[0][0]
+        );
+        assert!(
+            matches!(bob.rows[0][1], Val::Int(25)),
+            "Bob's base age preserved in the full row: {:?}",
+            bob.rows[0][1]
+        );
+        // Added label surfaces in a label scan (Alice joins the base Companies); she is still
+        // a Person too (the base label is preserved in the full row).
+        assert_eq!(
+            names(&q(&graphs, "MATCH (n:Company) RETURN n.name")),
+            vec!["Acme", "Alice", "Globex"],
+            "the added :Company label is served by the segment beside the base companies"
+        );
+        assert_eq!(
+            names(&q(&graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.name")),
+            vec!["Alice"],
+            "Alice keeps her base :Person label"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(4)
+            ),
+            "3 base Persons + born Zoe; patches do not change the node count"
+        );
+        // The mixed-in born node reads back through its index entry.
+        assert_eq!(
+            names(&q(
+                &graphs,
+                "MATCH (n:Person) WHERE n.age = 7 RETURN n.name"
+            )),
+            vec!["Zoe"],
+            "the born node is found by its index entry"
+        );
+
+        // Reopen from disk: the patch full-rows and removal sidecars reload.
+        drop(gen1);
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        let gen2 = graphs.get("people").unwrap();
+        assert_eq!(gen2.uuid(), set_uuid, "reopen names the flushed set");
+        let view = MergedView::new(gen2.as_ref(), DeltaSnapshot::empty());
+        let alice = Engine::new(&view, &cache)
+            .run(&parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap())
+            .unwrap();
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(99)),
+            "Alice's patched age reloaded from the segment: {:?}",
+            alice.rows[0][0]
+        );
+        assert!(
+            Engine::new(&view, &cache)
+                .run(&parser::parse("MATCH (n:Person) WHERE n.age = 30 RETURN n.name").unwrap())
+                .unwrap()
+                .rows
+                .is_empty(),
+            "the removal sidecar survives the reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.2, cross-layer removal obligation: a second flush that re-patches a
+    /// node already carried by the *first* flush's segment must supersede the value that
+    /// lives in the **lower segment** (not just the base). The writer reads the base-below
+    /// row through the stack, so it lists the lower segment's id in its removal sidecar, and
+    /// the oldest→newest `fold_index_eq` yields newest-wins across two stacked segments.
+    #[test]
+    fn flush_to_segment_supersedes_a_lower_segment_value() {
+        let (root, _g, _u) = testgen::write_basic("flush_seg_restack_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            let parser::ast::Statement::Write(w) = parser::parse_statement(qy).unwrap() else {
+                panic!("expected a write: {qy}");
+            };
+            execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+
+        // First flush: Alice 30 → 99 lands in segment #1.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("first flush");
+        // Second flush: Alice 99 → 7. The base-below value (99) lives in segment #1.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 7");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("second flush");
+
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            2,
+            "two stacked segments"
+        );
+        // Newest value wins; both older values (the base's 30 and segment #1's 99) are gone.
+        assert_eq!(
+            q(&graphs, "MATCH (n:Person) WHERE n.age = 7 RETURN n.name")
+                .rows
+                .len(),
+            1,
+            "the newest flush's value wins across two segments"
+        );
+        assert!(
+            q(&graphs, "MATCH (n:Person) WHERE n.age = 99 RETURN n.name")
+                .rows
+                .is_empty(),
+            "segment #1's superseded value is dropped by segment #2's removal"
+        );
+        assert!(
+            q(&graphs, "MATCH (n:Person) WHERE n.age = 30 RETURN n.name")
+                .rows
+                .is_empty(),
+            "the original base value stays superseded"
+        );
+        let alice = q(&graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.age");
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(7)),
+            "Alice's twice-patched age: {:?}",
+            alice.rows[0][0]
         );
 
         std::fs::remove_dir_all(&root).ok();

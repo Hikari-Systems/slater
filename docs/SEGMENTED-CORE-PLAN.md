@@ -118,17 +118,37 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.1 (HP10). **Phases 1–3
-DONE; Phase 4 IN PROGRESS.** The first *writer* of a core segment now exists and is proven
-end-to-end (`Graphs::flush_graph_to_segment` + `crate::flush_segment::write_births_segment`):
-a births-only delta folds into an upper core segment, publishes a new set, swaps, and
-retires — every born entity reads back from the segment (index seek, count marginals,
-traversal) and survives a reopen. Next: **slice 4.2 — core-resolved patches** (full
-override rows read from the base via the merged view + removal sidecars), then 4.3 (deletes
-+ node-delete→incident-edge removals), then 4.4 (L0 fold, encryption parity, s3 upload,
-auto-trigger wiring).
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.2 (HP11). **Phases 1–3
+DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
+`crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges AND
+core-resolved node patches**: a `SET`/`REMOVE` on a base node folds into the upper segment as
+a full replace-row (base-below row read through the stack, delta overlaid) with the index
+**removal sidecars** that supersede its stale base/lower-segment values, publishes/swaps/
+retires, and reads back identically (moved/removed indexed value, fresh prop, added label,
+count marginal) — surviving a reopen and stacking across two segments. Next: **slice 4.3 —
+deletes** (node/edge tombstones + node-delete→incident-edge removal fragments + netted
+marginals), then 4.4 (L0 fold, encryption parity, s3 upload, auto-trigger wiring). Still
+deferred and `bail!`ed: **core-edge patches** (the base exposes no by-id endpoint reader to
+fill a full edge row — needs an adjacency-sourced endpoint lookup), core node/edge deletes,
+stacked L0 folds, encryption.
 
 ### Phase 4 slice log
+- **4.2 DONE** (HP11): `write_flush_segment` (renamed from `write_births_segment`) now also
+  materialises **core-resolved node patches**. `FlushInputs` carries `core: &Generation`;
+  each patched node (id below the synthetic base, non-tombstoned) has its base-below-delta
+  row read via `read_base_node_row` (`CoreStack::resolve_node_row` winning row, else the base
+  `node_props`/`node_labels` record), the delta overlaid into a full row by `core_patch_props`
+  / `core_patch_labels` (line-for-line mirrors of `overlay_node_props` + `node_label_ids_par`),
+  and a **minimal index diff** emitted: a `removal` for every base-indexed prop the effective
+  row changed/dropped (grouped under the identity label — cross-layer, so it supersedes a
+  *lower segment's* entry too), a fresh entry for every changed/added prop. Node-count delta
+  is births-only; label deltas net each patch's effective-vs-base label set (dropped when
+  zero); `marginals_exact` stays true. Two new oracle tests
+  (`flush_to_segment_materialises_core_node_patches`,
+  `flush_to_segment_supersedes_a_lower_segment_value`). 713 slater lib tests + full workspace
+  green, clippy clean.
+  - **Follow-ups deferred:** core-edge patch materialisation (no by-id base endpoint reader);
+    a patch-only flush writes a zero-width node band (supported by `Extents::from_lengths`).
 - **4.1 DONE** (HP10): `flush_segment.rs` materialiser (`write_births_segment`) — born
   nodes/edges → full rows, adjacency fragments, ISAM index fragments (shared prop derivation
   with the node row so they can't diverge), posting fragments, and *exact* births-only
@@ -263,7 +283,14 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   `slater/src/flush_segment.rs` (`write_births_segment`) + `Graphs::flush_graph_to_segment`
   (freeze → segment → publish set/current → swap → reuse `retire`); one new e2e oracle test
   (`flush_to_segment_folds_births_into_a_core_segment`). 711 slater lib tests green, clippy
-  clean. ← current baseline; next is slice 4.2 (core-patch full-row materialisation).
+  clean.
+- HP11 — Phase 4 slice 4.2: core-resolved **node**-patch full-row materialisation.
+  `write_flush_segment` reads each patched node's base-below row through the stack, overlays
+  the delta into a full replace-row, and emits cross-layer index removal sidecars + a fresh
+  entry per changed prop; label marginals net effective-vs-base. `FlushInputs.core` added;
+  `read_base_node_row`/`core_patch_props`/`core_patch_labels` helpers. Two new oracle tests
+  (base-layer patches; second flush superseding a lower segment's value). 713 slater lib
+  tests + full workspace green, clippy clean. ← current baseline; next is slice 4.3 (deletes).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

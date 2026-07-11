@@ -8,22 +8,36 @@
 //! preserved — no re-resolution, no id renumbering). The read path already merges such a
 //! segment (Phase 3); this module is its first writer.
 //!
-//! # Scope (slice 4.1 — births-only)
-//! This slice materialises a delta consisting solely of **born** nodes/edges (a `MERGE` of
-//! entities absent from the core), with their adjacency, index and posting fragments and
-//! *exact* marginals. A core-resolved patch or tombstone needs the base row to fill a full
-//! replace-row, and folding a stacked L0 level needs a cross-level walk; both are deferred
-//! to later slices, so this writer **refuses** (`bail!`) a delta carrying either — the
-//! orchestration never fires it in that shape yet (the auto-trigger is unwired).
+//! # Scope (slices 4.1 births-only + 4.2 node core-patches)
+//! 4.1 materialised a delta of solely **born** nodes/edges (a `MERGE` of entities absent
+//! from the core), with their adjacency, index and posting fragments and *exact* marginals.
+//! 4.2 adds **core-resolved node patches** (a `SET`/`REMOVE` on a node the core already
+//! carries, id below the delta's synthetic base): the writer reads the node's *base row*
+//! (the core stack's effective row below the delta — a lower segment's full row, else the
+//! base generation record), overlays the delta into a **full replace-row**, and records the
+//! index **removal sidecars** that supersede the base's now-stale indexed values.
+//!
+//! Still deferred (each `bail!`ed, and the auto-trigger stays unwired so the orchestration
+//! never fires them): a **core-edge patch** (the base exposes no by-id endpoint reader to
+//! fill a full edge row — later slice), a **tombstone/delete** of a core node or edge (4.3,
+//! which also writes the incident-edge removal fragments), and a **stacked L0 level** fold
+//! (needs a cross-level walk — 4.4).
 //!
 //! # Full rows, replace semantics
 //! Segments hold *full* rows, not patches: the newest segment carrying an id wins in a
-//! single read. For a born node the effective row is `{business key} ∪ patches` (a patch
-//! wins over the key) plus its `{identity label} ∪ labels_added ∖ labels_removed` — matching
-//! [`Memtable::to_segment_data`]'s `born_index` derivation so the segment's node row and its
-//! index fragment can never disagree.
+//! single read (no cross-segment fold). For a **born** node the effective row is
+//! `{business key} ∪ patches` (a patch wins over the key) plus its
+//! `{identity label} ∪ labels_added ∖ labels_removed` — matching
+//! [`Memtable::to_segment_data`]'s `born_index` derivation. For a **core-patched** node the
+//! effective row is its base-below-delta row overlaid by the delta exactly as the read path
+//! folds it ([`Executor::overlay_node_props`](crate::exec) / `node_label_ids_par`): a
+//! replace-all clears the base props (re-seeding the anchor business key), `removed` names
+//! drop, `patches` overwrite, and labels are `base ∖ labels_removed ∪ labels_added`. Because
+//! the node row *replaces* the base row wholesale, every base index entry the effective row
+//! no longer matches is listed in the segment's `removals` sidecar (Phase-3 obligation), so
+//! the oldest→newest `fold_index_*` retain yields newest-wins.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,7 +51,9 @@ use graph_format::segmanifest::{
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
-use slater_delta::Memtable;
+use slater_delta::{Memtable, NodeDelta};
+
+use crate::generation::Generation;
 
 /// Block target size + zstd level for a core segment's payload sections. A flush is small
 /// relative to the core; small blocks keep a cold point read's one-time decode cheap.
@@ -52,6 +68,11 @@ pub struct FlushInputs<'a> {
     pub seg_uuid: GenId,
     /// The base generation this segment deltas over (unchanged by the flush).
     pub base_uuid: GenId,
+    /// The currently-served core (the base generation + any existing upper segments) the
+    /// delta was resolved against. A core-resolved node patch reads its base-below-delta row
+    /// from here — the winning lower segment's full row ([`CoreStack::resolve_node_row`]),
+    /// else the base generation's node record — before overlaying the delta.
+    pub core: &'a Generation,
     /// The stack top *before* this flush: base node/edge count + every existing segment
     /// band. This segment's appended band starts here. For a first flush over a singleton
     /// set this equals the base count and the memtable's synthetic base.
@@ -66,13 +87,14 @@ pub struct FlushInputs<'a> {
     pub created_unix: i64,
 }
 
-/// Materialise `mem` — a **births-only** frozen memtable — into a core segment at
-/// `inp.seg_dir`, writing every section (`node/adj_out/adj_in/edge.blk`), the index and
-/// posting fragments, and a sealed `SEGMENT.json`. Returns the sealed manifest, from which
-/// the caller derives a [`SegmentRef`](graph_format::setmanifest::SegmentRef) for the new
-/// set. Refuses a delta carrying any core-resolved patch/tombstone (id below the synthetic
-/// base) — that is a later slice.
-pub fn write_births_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentManifest> {
+/// Materialise `mem` — a frozen memtable of **born** nodes/edges and/or **core-resolved
+/// node patches** — into a core segment at `inp.seg_dir`, writing every section
+/// (`node/adj_out/adj_in/edge.blk`), the index and posting fragments, and a sealed
+/// `SEGMENT.json`. Returns the sealed manifest, from which the caller derives a
+/// [`SegmentRef`](graph_format::setmanifest::SegmentRef) for the new set. Refuses a delta
+/// carrying a core node/edge tombstone, a core-edge patch, or a stacked L0 level — later
+/// slices (see the module scope note).
+pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentManifest> {
     let data = mem.to_segment_data();
     let synthetic_base = data.synthetic_base;
     let edge_synthetic_base = data.edge_synthetic_base;
@@ -95,32 +117,56 @@ pub fn write_births_segment(mem: &Memtable, inp: &FlushInputs) -> Result<Segment
     std::fs::create_dir_all(inp.seg_dir)
         .with_context(|| format!("create segment dir {}", inp.seg_dir.display()))?;
 
-    // ── nodes: full born rows, sorted by dense id (data.nodes is already sorted) ─────────
-    // Effective props/labels per born node, computed once and shared with the index below
-    // so the node row and its index fragment cannot diverge.
-    struct BornNode {
+    // ── nodes: full rows, sorted by dense id (data.nodes is already sorted) ───────────────
+    // Every touched node — born (id ≥ synthetic base) or core-patched (id below it) —
+    // becomes a full replace-row. Its effective props/labels are computed once and shared
+    // with the index fragments below so a node row and its index entry cannot diverge. For a
+    // core patch `base_props` holds the base-below-delta props keyed by name, so the index
+    // step can suppress exactly the base entries the effective row supersedes.
+    struct SegNode {
         id: u64,
+        /// Identity label — the key the base secondary index is grouped under.
         label: String,
         props: Vec<(String, Value)>,
         labels: Vec<String>,
         tombstoned: bool,
+        /// `None` for a born node; `Some((base props, base labels))` for a core patch — the
+        /// node's effective row *below* this delta (a lower segment's full row, else the base
+        /// generation record), the input to the index removal + label-marginal diff.
+        base: Option<(BTreeMap<String, Value>, Vec<String>)>,
     }
-    let mut born_nodes: Vec<BornNode> = Vec::with_capacity(data.nodes.len());
+    let mut seg_nodes: Vec<SegNode> = Vec::with_capacity(data.nodes.len());
     for (id, label, key, keyval, delta) in &data.nodes {
-        if *id < synthetic_base {
+        if *id >= synthetic_base {
+            // Born node: effective row is the business key overlaid by patches.
+            seg_nodes.push(SegNode {
+                id: *id,
+                label: label.clone(),
+                props: born_props(key, keyval, delta),
+                labels: effective_labels(label, delta),
+                tombstoned: delta.tombstoned,
+                base: None,
+            });
+            continue;
+        }
+        // Core-resolved node: a tombstone (delete) is slice 4.3 — refuse it here so the
+        // full-row/removal machinery below only ever sees a live patch.
+        if delta.tombstoned {
             bail!(
-                "flush_to_segment: node {id} is a core-resolved patch/tombstone \
-                 (below synthetic base {synthetic_base}) — not supported in this slice"
+                "flush_to_segment: node {id} is a core-resolved tombstone (delete) — deferred \
+                 to slice 4.3"
             );
         }
-        let props = born_props(key, keyval, delta);
-        let labels = effective_labels(label, delta);
-        born_nodes.push(BornNode {
+        let (base_props, base_labels) = read_base_node_row(inp.core, *id)?;
+        let props = core_patch_props(&base_props, key, keyval, delta);
+        let labels = core_patch_labels(&base_labels, delta);
+        seg_nodes.push(SegNode {
             id: *id,
             label: label.clone(),
             props,
             labels,
-            tombstoned: delta.tombstoned,
+            tombstoned: false,
+            base: Some((base_props, base_labels)),
         });
     }
 
@@ -149,7 +195,7 @@ pub fn write_births_segment(mem: &Memtable, inp: &FlushInputs) -> Result<Segment
     )
     .with_context(|| format!("create segment writer at {}", inp.seg_dir.display()))?;
 
-    for n in &born_nodes {
+    for n in &seg_nodes {
         w.push_node(
             n.id,
             &NodeRow {
@@ -204,27 +250,66 @@ pub fn write_births_segment(mem: &Memtable, inp: &FlushInputs) -> Result<Segment
     w.finish()
         .with_context(|| format!("finish segment sections at {}", inp.seg_dir.display()))?;
 
-    // ── index fragments: one ISAM per (label, prop) over born (value, id) pairs ───────────
-    // Group the born nodes' effective props by (label, prop). No removals (births-only).
+    // ── index fragments: one ISAM per (label, prop) over (value, id) pairs, plus the
+    // removal sidecar. A born node contributes an entry per effective prop (no removals). A
+    // core-patched node's full row *replaces* its base row, so for every base-indexed prop
+    // whose value the effective row changed or dropped it lists a `removal` (superseding the
+    // stale base entry), and for every prop the effective row changed or added it lists a
+    // fresh entry — the minimal diff that yields newest-wins under the oldest→newest fold.
+    // Grouping is under the identity label, matching the base secondary index and the
+    // memtable's `born_index` / `core_patched` derivations. ────────────────────────────────
     let mut spec_index: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut specs: Vec<IndexSpec> = Vec::new();
-    for n in &born_nodes {
-        if n.tombstoned {
-            continue; // a born-then-deleted node indexes nothing
-        }
-        for (prop, val) in &n.props {
-            let k = (n.label.clone(), prop.clone());
-            let idx = *spec_index.entry(k.clone()).or_insert_with(|| {
+    let mut spec_slot = |specs: &mut Vec<IndexSpec>, label: &str, prop: &str| -> usize {
+        *spec_index
+            .entry((label.to_string(), prop.to_string()))
+            .or_insert_with(|| {
                 specs.push(IndexSpec {
-                    label: k.0.clone(),
-                    prop: k.1.clone(),
+                    label: label.to_string(),
+                    prop: prop.to_string(),
                     entries: Vec::new(),
                     removals: Vec::new(),
                 });
                 specs.len() - 1
-            });
-            specs[idx].entries.push((val.clone(), n.id));
+            })
+    };
+    for n in &seg_nodes {
+        match &n.base {
+            None => {
+                if n.tombstoned {
+                    continue; // a born-then-deleted node indexes nothing
+                }
+                for (prop, val) in &n.props {
+                    let slot = spec_slot(&mut specs, &n.label, prop);
+                    specs[slot].entries.push((val.clone(), n.id));
+                }
+            }
+            Some((base_props, _)) => {
+                let eff: BTreeMap<&str, &Value> =
+                    n.props.iter().map(|(p, v)| (p.as_str(), v)).collect();
+                // Suppress every base entry the effective row no longer matches (changed or
+                // removed value).
+                for (prop, bval) in base_props {
+                    if eff.get(prop.as_str()) != Some(&bval) {
+                        let slot = spec_slot(&mut specs, &n.label, prop);
+                        specs[slot].removals.push(n.id);
+                    }
+                }
+                // Re-add every entry the effective row changed or introduced.
+                for (prop, val) in &n.props {
+                    if base_props.get(prop) != Some(val) {
+                        let slot = spec_slot(&mut specs, &n.label, prop);
+                        specs[slot].entries.push((val.clone(), n.id));
+                    }
+                }
+            }
         }
+    }
+    // A single node id can be superseded once per (label, prop); the fold + the writer both
+    // require ascending, de-duplicated removals.
+    for s in &mut specs {
+        s.removals.sort_unstable();
+        s.removals.dedup();
     }
     if !specs.is_empty() {
         write_index_fragments(
@@ -273,15 +358,37 @@ pub fn write_births_segment(mem: &Memtable, inp: &FlushInputs) -> Result<Segment
             .with_context(|| format!("write posting fragments at {}", inp.seg_dir.display()))?;
     }
 
-    // ── marginals (births-only ⇒ exact) ─────────────────────────────────────────────────
-    let live_nodes: Vec<&BornNode> = born_nodes.iter().filter(|n| !n.tombstoned).collect();
-    let node_count_delta = live_nodes.len() as i64;
+    // ── marginals (exact — every contribution is provable) ───────────────────────────────
+    // A born (live) node adds one to the node count and to each of its labels. A core patch
+    // leaves the node count unchanged (the base already counts it) and moves a label count
+    // only where the effective row's label set differs from its base-below-delta set.
+    let mut node_count_delta: i64 = 0;
     let mut label_node_deltas: BTreeMap<String, i64> = BTreeMap::new();
-    for n in &live_nodes {
-        for l in &n.labels {
-            *label_node_deltas.entry(l.clone()).or_insert(0) += 1;
+    for n in &seg_nodes {
+        match &n.base {
+            None => {
+                if n.tombstoned {
+                    continue; // born-then-deleted: nets to nothing
+                }
+                node_count_delta += 1;
+                for l in &n.labels {
+                    *label_node_deltas.entry(l.clone()).or_insert(0) += 1;
+                }
+            }
+            Some((_, base_labels)) => {
+                let before: BTreeSet<&str> = base_labels.iter().map(String::as_str).collect();
+                let after: BTreeSet<&str> = n.labels.iter().map(String::as_str).collect();
+                for l in after.difference(&before) {
+                    *label_node_deltas.entry((*l).to_string()).or_insert(0) += 1;
+                }
+                for l in before.difference(&after) {
+                    *label_node_deltas.entry((*l).to_string()).or_insert(0) -= 1;
+                }
+            }
         }
     }
+    // Drop labels whose net change cancels to zero so the sparse manifest stays minimal.
+    label_node_deltas.retain(|_, d| *d != 0);
     let mut reltype_edge_deltas: BTreeMap<String, i64> = BTreeMap::new();
     let mut edge_count_delta: i64 = 0;
     for (eid, delta) in &data.edges {
@@ -382,6 +489,83 @@ fn effective_labels(label: &str, delta: &slater_delta::NodeDelta) -> Vec<String>
     }
     for l in &delta.labels_removed {
         set.remove(l);
+    }
+    set.into_iter().collect()
+}
+
+/// Read node `id`'s **base-below-delta** row (props keyed by name, plus labels) as the core
+/// stack sees it under this flush's delta: a lower segment's winning full row, else the base
+/// generation's record. Mirrors [`Executor::core_named_props`](crate::exec) +
+/// `node_label_ids_par`, so the overlaid full row equals what a pre-flush query returned. A
+/// base row that is already a tombstone can only arise from a delete the write path never
+/// produces for a `SET`/`REMOVE`, so it is refused rather than silently resurrected.
+fn read_base_node_row(
+    core: &Generation,
+    id: u64,
+) -> Result<(BTreeMap<String, Value>, Vec<String>)> {
+    if let Some(row) = core.stack().resolve_node_row(id)? {
+        if row.tombstoned {
+            bail!(
+                "flush_to_segment: node {id} patches a base-tombstoned node — unexpected (a \
+                 delete is slice 4.3)"
+            );
+        }
+        return Ok((row.props.into_iter().collect(), row.labels));
+    }
+    let props = core
+        .node_props()
+        .props(id)
+        .with_context(|| format!("read base props for core-patched node {id}"))?
+        .into_iter()
+        .map(|(kid, v)| (core.property_key_name(kid).unwrap_or("?").to_string(), v))
+        .collect();
+    let labels = core
+        .node_labels()
+        .labels(id)
+        .with_context(|| format!("read base labels for core-patched node {id}"))?
+        .into_iter()
+        .filter_map(|lid| core.label_name(lid).map(str::to_string))
+        .collect();
+    Ok((props, labels))
+}
+
+/// Overlay a core node's delta onto its `base` props into the effective full-row property
+/// list, mirroring [`Executor::overlay_node_props`](crate::exec) for a non-born node: a
+/// replace-all clears the base props and re-seeds the anchor business key, `removed` names
+/// drop, then `patches` overwrite (last-writer-wins, and a patch on the anchor key wins).
+fn core_patch_props(
+    base: &BTreeMap<String, Value>,
+    key: &str,
+    keyval: &Value,
+    delta: &NodeDelta,
+) -> Vec<(String, Value)> {
+    let mut props = base.clone();
+    if delta.replaced {
+        props.clear();
+        if !key.is_empty() {
+            props.insert(key.to_string(), keyval.clone());
+        }
+    }
+    for r in &delta.removed {
+        props.remove(r);
+    }
+    for (p, v) in &delta.patches {
+        props.insert(p.clone(), v.clone());
+    }
+    props.into_iter().collect()
+}
+
+/// The effective label set of a core-patched node: its base labels with `labels_removed`
+/// folded out then `labels_added` unioned in — the same order `node_label_ids_par` applies
+/// (the [`NodeDelta`] invariant keeps a name out of both sets, so the order only documents
+/// the mirror).
+fn core_patch_labels(base_labels: &[String], delta: &NodeDelta) -> Vec<String> {
+    let mut set: BTreeSet<String> = base_labels.iter().cloned().collect();
+    for l in &delta.labels_removed {
+        set.remove(l);
+    }
+    for l in &delta.labels_added {
+        set.insert(l.clone());
     }
     set.into_iter().collect()
 }
