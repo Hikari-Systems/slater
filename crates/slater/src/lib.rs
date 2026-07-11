@@ -48,3 +48,9 @@ pub mod vector;
 // the fixture code in a normal `slater` build.
 #[cfg(any(test, feature = "testkit"))]
 pub mod testgen;
+
+// Phase 8 read-amp harness support (scaled fixture + stacked-set builder + cold-cache
+// reader). Gated `pub` under `testkit` like `testgen` so the `segment_read_amp` bench can
+// build stacked fixtures without shipping the code in a normal build.
+#[cfg(any(test, feature = "testkit"))]
+pub mod benchkit;

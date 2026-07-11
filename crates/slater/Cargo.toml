@@ -92,3 +92,12 @@ required-features = ["testkit"]
 name = "delta_overlay"
 harness = false
 required-features = ["testkit"]
+
+# Phase 8 read-amp harness: measures point-lookup / 2-hop / label-scan / count read
+# amplification (cold-cache block misses, base + segment) and warm latency over the same
+# graph folded to 0/2/4/8 upper segments. Proves an untouched read stays flat as the stack
+# grows. Run: `cargo bench -p slater --features testkit --bench segment_read_amp`.
+[[bench]]
+name = "segment_read_amp"
+harness = false
+required-features = ["testkit"]

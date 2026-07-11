@@ -241,7 +241,7 @@ impl Graphs {
 
     /// The writable-layer writer for `name`, or `None` when the layer is disabled
     /// or the graph has none.
-    fn writer(&self, name: &str) -> Option<Arc<DeltaWriter>> {
+    pub(crate) fn writer(&self, name: &str) -> Option<Arc<DeltaWriter>> {
         self.writers.get(name).cloned()
     }
 
@@ -342,7 +342,7 @@ impl Graphs {
     /// A snapshot of the live generation for `name`. A query holds this `Arc` for
     /// its whole life, so a concurrent swap (which only replaces the slot's `Arc`)
     /// never changes the generation a running query sees.
-    fn get(&self, name: &str) -> Option<Arc<Generation>> {
+    pub(crate) fn get(&self, name: &str) -> Option<Arc<Generation>> {
         self.graphs
             .get(name)
             .map(|slot| slot.read().unwrap().clone())
@@ -2069,7 +2069,7 @@ fn is_memgraph_dialect_query(q: &str) -> bool {
 
 /// A Bolt `FAILURE` to send: a status code and a human message.
 #[derive(Debug)]
-struct Failure {
+pub(crate) struct Failure {
     code: &'static str,
     message: String,
 }
@@ -3712,7 +3712,7 @@ fn delete_has_relationships_error() -> Failure {
 /// group commit. A statement lowers to several ops only when it mixes a replace-all with
 /// further SET items; they commit atomically. Returns an empty result — read-back is a
 /// separate `MATCH … RETURN` over the overlaid view.
-fn execute_write(
+pub(crate) fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
     stmt: &parser::ast::WriteStmt,
@@ -4278,7 +4278,7 @@ fn find_core_edge_id(
 /// the WAL edge op, and hand it to the writer. A `MERGE` of an edge that already
 /// exists in the core is an idempotent no-op; the relationship type must already
 /// exist (the traversal overlay maps it to a core reltype id).
-fn execute_edge_write(
+pub(crate) fn execute_edge_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
     stmt: &parser::ast::EdgeWriteStmt,

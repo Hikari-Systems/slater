@@ -72,12 +72,26 @@ impl std::fmt::Debug for LoadedSegment {
 /// The immutable core stack of a served set: the ordered upper segments and the id→member
 /// routing table. The base generation's readers are held by [`Generation`] itself; this
 /// carries only what stacks *over* the base.
-#[derive(Debug)]
 pub struct CoreStack {
     /// Oldest → newest; index `i` corresponds to [`SegmentOrd::Upper(i)`].
     segments: Vec<LoadedSegment>,
     /// Node- and edge-id → owning member routing tables (base band + one band per segment).
     extents: Extents,
+    /// The shared block cache that pages every segment's sections (see [`CoreStack::load`]).
+    /// `None` on a singleton stack (no segments ⇒ no segment I/O). Retained so the read-amp
+    /// harness can read the segment-side block-miss count (Phase 8).
+    cache: Option<Arc<GfBlockCache>>,
+}
+
+impl std::fmt::Debug for CoreStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `GfBlockCache` is not `Debug`; report its resident metrics instead of the map.
+        f.debug_struct("CoreStack")
+            .field("segments", &self.segments)
+            .field("extents", &self.extents)
+            .field("cache_metrics", &self.cache.as_ref().map(|c| c.metrics()))
+            .finish()
+    }
 }
 
 impl CoreStack {
@@ -88,6 +102,7 @@ impl CoreStack {
         Self {
             segments: Vec::new(),
             extents: Extents::singleton(base_node_count, base_edge_count),
+            cache: None,
         }
     }
 
@@ -181,12 +196,32 @@ impl CoreStack {
             });
         }
 
-        Ok(Self { segments, extents })
+        Ok(Self {
+            segments,
+            extents,
+            cache: Some(cache),
+        })
     }
 
     /// `true` when the set carries no upper segments (every graph until the Phase 4 flush).
     pub fn is_singleton(&self) -> bool {
         self.segments.is_empty()
+    }
+
+    /// Block-cache metrics for the stack's shared segment-paging cache — the running
+    /// hit/miss/eviction counters of the segment sections this stack has served. `misses`
+    /// is the number of segment blocks decompressed from the store; a query's segment-side
+    /// **read amplification** is the miss delta across it. A singleton stack does no segment
+    /// I/O and reports zeros. Consumed by the Phase-8 read-amp harness (`benchkit`).
+    pub fn cache_metrics(&self) -> graph_format::blockcache::CacheMetrics {
+        self.cache
+            .as_ref()
+            .map(|c| c.metrics())
+            .unwrap_or(graph_format::blockcache::CacheMetrics {
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+            })
     }
 
     /// The loaded upper segments, **oldest → newest**. Iterate in reverse for a newest-wins

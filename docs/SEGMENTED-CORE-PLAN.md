@@ -106,8 +106,10 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   core (`Graphs::gc_orphan_segments`, marker-based grace). Slice 7.3 DONE (`HP26`): GC config
   (`deltaConfig.segmentGcGraceSecs`) + write-path wiring (post-compaction, post-retarget). Slice
   7.4 DONE (`HP27`): remote-store GC parity (`ObjectStore::delete`).
-- **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
-  2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm.
+- **Phase 8 — Bench harness + hardening + docs.** IN PROGRESS. Read-amp harness (point lookup,
+  2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm. **Slice 8.1 DONE** (fs
+  harness + `slater::benchkit` + `docs/SEGMENTED-CORE-READ-AMP.md`); slice 8.2 = S3 variant + the
+  label-scan range-gate follow-up.
 
 ## Correctness discipline
 
@@ -128,11 +130,38 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 7 (HP27) + flush-writer hardening (HP28/HP29 —
-both deferred flush `bail!`s closed: patch-then-delete of a core edge, and off-heap-L0 flush). **Phases
-1–7 DONE; every write op now flushes, resident or off-heap.** Next is **Phase 8** — bench harness +
-hardening + docs: a read-amp harness (point lookup, 2-hop, label scan, counts) over fs and S3 at
-0/2/4/8 segments, cold + warm.
+**Branch:** `writeable`. **Committed through:** Phase 8 slice 8.1 (HP30 — the read-amp harness) atop
+Phase 7 (HP27) + flush-writer hardening (HP28/HP29 — both deferred flush `bail!`s closed:
+patch-then-delete of a core edge, and off-heap-L0 flush). **Phases 1–7 DONE; every write op now
+flushes, resident or off-heap. Phase 8 IN PROGRESS.** Slice 8.1 shipped the **fs read-amp harness**
+(point lookup, 2-hop, label scan, count at 0/2/4/8 segments, cold-miss read-amp + warm latency);
+still open in Phase 8: an **S3/object-store variant** of the harness and the **label-scan range-gate**
+follow-up the harness surfaced.
+
+**Phase 8 (bench harness + hardening + docs) — slice 8.1 DONE (HP30): the read-amp harness.**
+`slater::benchkit` (new testkit-gated module, gated `pub` like `testgen`) provides a scaled base
+fixture (`write_scale` — `n` `:Person` nodes, `name`/`age` props, a `(Person,name)` range index, a
+`:KNOWS` ring; all summary vectors re-derived via `fixture_summaries` so the resident count fast
+paths are exact), a stacked-set builder (`build_stacked(tag, n, segments)` — folds exactly
+`segments` upper segments, each patching one small **disjoint** ~16-node band near the top of the id
+space so the base bulk stays untouched), and a cold-cache `Reader` reporting **read amplification =
+cold-cache block misses** split base vs segment (via the new `CoreStack::cache_metrics()` accessor +
+`BlockCache::metrics()`). The bench `crates/slater/benches/segment_read_amp.rs` prints a read-amp
+matrix and warm criterion latency for four shapes × {0,2,4,8} segments. **Result (N=50k, cold-cache
+`base+seg=total`): point_lookup `1+0=1` and two_hop `2+0=2` stay _flat_ across all depths (the
+presence fence skips every segment for an untouched id at no I/O); count is `0+0=0` at every depth
+(resident marginals — patches net Δ=0); label_scan grows `4 → 6 → 8 → 12` (+1 segment block/segment,
+bounded by `maxUpperSegments`).** Warm point_lookup ≈31.5µs, flat across depth. The one bounded
+read-amp inefficiency the harness surfaced — label_scan reads a block per segment even for a scan
+range disjoint from every segment's node band — is documented as a range-gate follow-up.
+Supporting changes: `CoreStack` grew a retained `cache: Option<Arc<GfBlockCache>>` + `cache_metrics()`
+(manual `Debug` since `GfBlockCache` isn't `Debug`); `execute_write`/`execute_edge_write`/`Failure`
+and `Graphs::{get,writer}` widened `pub(crate)` so the in-crate `benchkit` can drive the write+flush
+path. Two benchkit unit tests (`write_scale_answers_the_four_shapes`,
+`untouched_read_amp_is_flat_across_stack_depth`). Full docs: `docs/SEGMENTED-CORE-READ-AMP.md`. **751
+slater lib** (+2) + 141 graph-format + 78 slater-delta green, clippy (incl. `--benches --features
+testkit`) + fmt clean. **NEXT: slice 8.2** — the S3/object-store read-amp variant (same shapes over a
+remote store, cold + warm), then the label-scan range-gate.
 
 Phase 7 (T4 retarget + GC) is complete: (7.1) `serialise_binary_dump` folds the core stack so
 `consolidate_graph` collapses a stacked set to a correct singleton via the Phase-0 direct path;
@@ -412,6 +441,22 @@ complete** (writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carri
 benign, reclaimable in Phase 7): a born-then-deleted **edge** leaves an orphan edge row in the
 merged segment (its adjacency is suppressed by the fold, so it is never read); postings are a union
 (a stale driving hit is filtered by adjacency).
+
+### Phase 8 slice log (bench harness + hardening + docs — IN PROGRESS)
+
+- **8.1 DONE** (HP30) — **fs read-amp harness.** New testkit-gated `slater::benchkit`
+  (scaled `write_scale` fixture + `build_stacked(tag, n, segments)` that folds N disjoint-top-band
+  segments + a cold-cache `Reader`) and bench `crates/slater/benches/segment_read_amp.rs`, measuring
+  **read amplification = cold-cache block misses** (base + segment split, via the new
+  `CoreStack::cache_metrics()` + `BlockCache::metrics()`) for four shapes at 0/2/4/8 segments, plus
+  warm criterion latency. Result (N=50k, `base+seg=total`): **point_lookup `1+0=1` / two_hop `2+0=2`
+  flat across depth** (presence fence skips untouched ids at no I/O), **count `0+0=0`** (resident
+  marginals), **label_scan `4→6→8→12`** (+1 seg block/segment, bounded by `maxUpperSegments`).
+  Supporting `pub(crate)` widenings (`execute_write`/`execute_edge_write`/`Failure`,
+  `Graphs::{get,writer}`) for the in-crate harness; manual `CoreStack` `Debug` (the retained
+  `GfBlockCache` isn't `Debug`). Docs: `docs/SEGMENTED-CORE-READ-AMP.md`. Two benchkit unit tests.
+  **751 slater lib** (+2) + 141 graph-format + 78 slater-delta green, clippy (incl. benches/testkit) +
+  fmt clean. **NEXT: 8.2** — S3/object-store read-amp variant + the label-scan range-gate follow-up.
 
 ### Phase 7 slice log (T4 retarget + GC — IN PROGRESS)
 
