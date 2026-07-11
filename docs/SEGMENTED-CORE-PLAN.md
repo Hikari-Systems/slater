@@ -118,8 +118,8 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.3 (`a8057f2`). **Phases
-1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.4 (index-probe union + scans).**
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.4 (`1851b49`). **Phases
+1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.5 (count summation via signed marginals).**
 
 ### Phase 3 design (decided)
 
@@ -154,9 +154,12 @@ fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs 
   appends) in `read_adj_overlaid`, then the delta. Gated by NEW adjacency fences
   `may_hold_out_adj/in_adj` (the node fence is wrong — an adjacency-only-touched node has
   no node row). Merge order base→segments→delta.
-- **3.4** `scan_candidates`: RangeEq/RangeRange = base ISAM − per-segment `removals` ∪
-  segment `lookup_eq/range`; LabelScan unions segment-carried label rows; RelTypeScan
-  unions segment `postings` driving sets; then existing delta union.
+- **3.4 DONE** (`1851b49`): `CoreStack::fold_index_eq/fold_index_range` (oldest→newest,
+  removals-suppress then lookup-union = newest-wins), `fold_label_scan` (membership
+  recomputed from effective rows), `is_node_tombstoned`; `scan_candidates` folds all four
+  variants + re-sorts for the delta overlay; `suppress_tombstoned` drops segment tombstones
+  (now `Result`). **Phase-4 obligation: a segment's `removals` must cover every id whose
+  indexed value it supersedes (base OR older segment), not just base ids.**
 - **3.5** counts: extend `MergedView` `live_*` marginal folds to sum base + Σ segment
   `SegmentManifest` deltas (+ delta), declining (→ None / full exec) when any segment's
   `marginals_exact` is false.
@@ -186,7 +189,9 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
 - HP5 — Phase 3 slice 3.2: node/edge full-row resolution seam (`ad005a8`); 704 slater lib
   tests green (2 stacked-set oracle tests), clippy clean. ✓
 - HP6 — Phase 3 slice 3.3: adjacency fan-out gating (`a8057f2`); 705 slater lib +
-  graph-format segment tests green, clippy clean. ✓ ← current baseline.
+  graph-format segment tests green, clippy clean. ✓
+- HP7 — Phase 3 slice 3.4: index-probe union + segment-aware scans (`1851b49`); 707 slater
+  lib tests green (3 scan oracle tests), clippy clean. ✓ ← current baseline.
 
 **Immediate next step — start Phase 2 (core-segment format).** Build
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
