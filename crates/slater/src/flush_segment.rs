@@ -8,7 +8,7 @@
 //! preserved — no re-resolution, no id renumbering). The read path already merges such a
 //! segment (Phase 3); this module is its first writer.
 //!
-//! # Scope (slices 4.1 births-only + 4.2 node core-patches)
+//! # Scope (slices 4.1 births-only + 4.2 node core-patches + 4.3 deletes)
 //! 4.1 materialised a delta of solely **born** nodes/edges (a `MERGE` of entities absent
 //! from the core), with their adjacency, index and posting fragments and *exact* marginals.
 //! 4.2 adds **core-resolved node patches** (a `SET`/`REMOVE` on a node the core already
@@ -16,12 +16,23 @@
 //! (the core stack's effective row below the delta — a lower segment's full row, else the
 //! base generation record), overlays the delta into a **full replace-row**, and records the
 //! index **removal sidecars** that supersede the base's now-stale indexed values.
+//! 4.3 adds **deletes**. A core-node delete is materialised as a full-row **tombstone**
+//! (the effective-row-empty case of a core patch: every base-indexed value moves to the
+//! `removals` sidecar, the node count and its labels net down by one) *and* the removal of
+//! its incident edges: the writer reads the deleted node's **effective adjacency** (base
+//! folded with every lower segment, mirroring [`overlay_segment_adj`](crate::exec)) and
+//! writes a `removed` adjacency fragment for each incident edge on the *surviving
+//! neighbour's* side (the read path drops a dead edge by that fragment's `edge_id`, never by
+//! a per-neighbour segment-tombstone check), netting each out of the edge/reltype marginals.
+//! An explicit **edge delete** (`DELETE r` on a core edge — carried in the delta as an
+//! adjacency tombstone with no edge id, matched by identity) is resolved to its core edge
+//! id(s) the same way and removed on *both* live endpoints' sides. A born edge incident to a
+//! node deleted in the same delta is dropped wholesale (it never reaches a lower layer).
 //!
 //! Still deferred (each `bail!`ed, and the auto-trigger stays unwired so the orchestration
 //! never fires them): a **core-edge patch** (the base exposes no by-id endpoint reader to
-//! fill a full edge row — later slice), a **tombstone/delete** of a core node or edge (4.3,
-//! which also writes the incident-edge removal fragments), and a **stacked L0 level** fold
-//! (needs a cross-level walk — 4.4).
+//! fill a full edge row — later slice), and a **stacked L0 level** fold (needs a cross-level
+//! walk — 4.4).
 //!
 //! # Full rows, replace semantics
 //! Segments hold *full* rows, not patches: the newest segment carrying an id wins in a
@@ -43,7 +54,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
-use graph_format::ids::{Generation as GenId, Value};
+use graph_format::ids::{Generation as GenId, NodeId, Value};
 use graph_format::manifest::FileEntry;
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
@@ -149,15 +160,25 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
             });
             continue;
         }
-        // Core-resolved node: a tombstone (delete) is slice 4.3 — refuse it here so the
-        // full-row/removal machinery below only ever sees a live patch.
-        if delta.tombstoned {
-            bail!(
-                "flush_to_segment: node {id} is a core-resolved tombstone (delete) — deferred \
-                 to slice 4.3"
-            );
-        }
         let (base_props, base_labels) = read_base_node_row(inp.core, *id)?;
+        // Core-resolved node delete: a full-row tombstone. Its effective row is empty, so
+        // this is the degenerate case of a core patch — every base-indexed value moves to
+        // the `removals` sidecar (the index step below reads `base` for exactly that), the
+        // node count and each base label net down by one (the marginal step), and the node
+        // section carries a tombstone row that `resolve_node_row` returns to supersede the
+        // live base/lower-segment row. The incident-edge removal fragments are written from
+        // the deleted node's *effective adjacency* further below.
+        if delta.tombstoned {
+            seg_nodes.push(SegNode {
+                id: *id,
+                label: label.clone(),
+                props: Vec::new(),
+                labels: Vec::new(),
+                tombstoned: true,
+                base: Some((base_props, base_labels)),
+            });
+            continue;
+        }
         let props = core_patch_props(&base_props, key, keyval, delta);
         let labels = core_patch_labels(&base_labels, delta);
         seg_nodes.push(SegNode {
@@ -170,18 +191,70 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
         });
     }
 
-    // ── edges: reconstruct full born rows from adjacency (endpoints/reltype) + edge delta
-    // (props). A born edge appears once in adj_out (at its src) carrying dst/reltype/id. ──
-    let mut edge_meta: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new(); // edge_id → (src,dst,reltype)
+    // ── edges + deletes: assemble the segment's edge topology from the delta's born edges
+    // and, for deletes, from the deleted nodes' effective adjacency below this flush. ───────
+    //
+    // `tombstoned_all` is every node this delta drops — a core delete or a born-then-deleted
+    // node. An edge incident to such a node does not survive, so a born edge touching one is
+    // discarded and a suppressed edge's removal fragment is written only on the *other*,
+    // surviving side (a dropped node cannot bind as an anchor, so its own adjacency is never
+    // read).
+    let tombstoned_all: BTreeSet<u64> = data
+        .nodes
+        .iter()
+        .filter(|(_, _, _, _, d)| d.tombstoned)
+        .map(|(id, _, _, _, _)| *id)
+        .collect();
+
+    // Live born edges (`edge_id → (src, dst, reltype)`): a delta-born relationship whose
+    // endpoints both survive. A born-then-deleted edge (its adjacency entry tombstoned) or
+    // one incident to a dropped node never reaches a lower layer, so it is materialised
+    // nowhere — no row, no adjacency, no posting, no marginal.
+    let mut live_born_edges: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new();
     for (src, edges) in &data.adj_out {
         for e in edges {
             let Some(eid) = e.edge_id else {
-                bail!(
-                    "flush_to_segment: an out-adjacency entry at node {src} has no edge id \
-                     (a core-edge tombstone) — not supported in this slice"
-                );
+                continue; // a core-edge delete (no id) — resolved into `suppressed` below
             };
-            edge_meta.insert(eid, (*src, e.other, e.reltype.clone()));
+            if e.tombstoned || tombstoned_all.contains(src) || tombstoned_all.contains(&e.other) {
+                continue;
+            }
+            live_born_edges.insert(eid, (*src, e.other, e.reltype.clone()));
+        }
+    }
+
+    // Suppressed core edges (`edge_id → (src, dst, reltype)`): every base/lower-segment edge
+    // this delta removes — implicitly as an incident edge of a deleted node, or explicitly as
+    // a `DELETE r` on a core edge (carried as an adjacency tombstone with no edge id, matched
+    // by identity). Both are resolved to concrete core edge ids against the deleted / aliased
+    // node's *effective* adjacency (base folded with every lower segment).
+    let mut suppressed: BTreeMap<u64, (u64, u64, String)> = BTreeMap::new();
+    // (a) every incident edge of a deleted core node, both directions (deduped by edge id so
+    //     a self-loop, seen on both sides, is counted once).
+    for (id, _label, _key, _keyval, delta) in &data.nodes {
+        if *id >= synthetic_base || !delta.tombstoned {
+            continue; // a born-then-deleted node has no core adjacency; a live patch none.
+        }
+        for (eid, other, reltype) in effective_adj(inp.core, *id, /*outgoing=*/ true)? {
+            suppressed.entry(eid).or_insert((*id, other, reltype));
+        }
+        for (eid, other, reltype) in effective_adj(inp.core, *id, /*outgoing=*/ false)? {
+            suppressed.entry(eid).or_insert((other, *id, reltype));
+        }
+    }
+    // (b) explicit core-edge deletes. Each is carried once in `adj_out` at its source with no
+    //     edge id; identity semantics remove *every* parallel edge of that reltype to the
+    //     neighbour, mirroring the delta's `(reltype, neighbour)` suppression in `overlay_adj`.
+    for (src, edges) in &data.adj_out {
+        for e in edges {
+            if e.edge_id.is_some() {
+                continue;
+            }
+            for (eid, other, reltype) in effective_adj(inp.core, *src, /*outgoing=*/ true)? {
+                if other == e.other && reltype == e.reltype {
+                    suppressed.insert(eid, (*src, e.other, reltype));
+                }
+            }
         }
     }
 
@@ -207,41 +280,79 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
         .with_context(|| format!("push node {}", n.id))?;
     }
 
-    // Adjacency fragments (data.adj_out/adj_in are sorted by endpoint; push in that order).
-    for (src, edges) in &data.adj_out {
-        let frag = born_adj_fragment(edges, *src, /*is_out=*/ true)?;
-        w.push_adj_out(*src, &frag)
+    // Adjacency fragments: each touched node's list of born edges (`removed = false`, both
+    // endpoints) plus a removal entry for every suppressed edge on each *surviving* endpoint's
+    // side. Built into per-node maps (a node can both gain a born edge and lose a core one, as
+    // node 0 does when its neighbour is deleted) and pushed in ascending id order.
+    let mut out_frags: BTreeMap<u64, Vec<AdjEdge>> = BTreeMap::new();
+    let mut in_frags: BTreeMap<u64, Vec<AdjEdge>> = BTreeMap::new();
+    for (eid, (src, dst, reltype)) in &live_born_edges {
+        out_frags.entry(*src).or_default().push(AdjEdge {
+            other: *dst,
+            reltype: reltype.clone(),
+            edge_id: *eid,
+            removed: false,
+        });
+        in_frags.entry(*dst).or_default().push(AdjEdge {
+            other: *src,
+            reltype: reltype.clone(),
+            edge_id: *eid,
+            removed: false,
+        });
+    }
+    for (eid, (src, dst, reltype)) in &suppressed {
+        if !tombstoned_all.contains(src) {
+            out_frags.entry(*src).or_default().push(AdjEdge {
+                other: *dst,
+                reltype: reltype.clone(),
+                edge_id: *eid,
+                removed: true,
+            });
+        }
+        if !tombstoned_all.contains(dst) {
+            in_frags.entry(*dst).or_default().push(AdjEdge {
+                other: *src,
+                reltype: reltype.clone(),
+                edge_id: *eid,
+                removed: true,
+            });
+        }
+    }
+    for (src, frag) in &out_frags {
+        w.push_adj_out(*src, frag)
             .with_context(|| format!("push out-adjacency for {src}"))?;
     }
-    for (dst, edges) in &data.adj_in {
-        let frag = born_adj_fragment(edges, *dst, /*is_out=*/ false)?;
-        w.push_adj_in(*dst, &frag)
+    for (dst, frag) in &in_frags {
+        w.push_adj_in(*dst, frag)
             .with_context(|| format!("push in-adjacency for {dst}"))?;
     }
 
-    // Edge rows, ascending edge id (data.edges is sorted).
-    for (eid, delta) in &data.edges {
+    // Edge rows, ascending edge id (data.edges is sorted). Only a live born edge carries a
+    // row; a core-edge patch (below the synthetic base, in `by_edge_id`) is still deferred, a
+    // core-edge delete carries no row (it is a pure adjacency removal), and a born edge that
+    // did not survive (tombstoned or incident to a dropped node) is materialised nowhere.
+    for (eid, edelta) in &data.edges {
         if *eid < edge_synthetic_base {
             bail!(
-                "flush_to_segment: edge {eid} is a core-edge patch/tombstone \
+                "flush_to_segment: edge {eid} is a core-edge patch \
                  (below edge synthetic base {edge_synthetic_base}) — not supported in this slice"
             );
         }
-        let (src, dst, reltype) = edge_meta.get(eid).cloned().ok_or_else(|| {
-            anyhow::anyhow!("flush_to_segment: born edge {eid} has no adjacency entry")
-        })?;
+        let Some((src, dst, reltype)) = live_born_edges.get(eid).cloned() else {
+            continue;
+        };
         w.push_edge(
             *eid,
             &EdgeRow {
                 src,
                 dst,
                 reltype,
-                props: delta
+                props: edelta
                     .patches
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                tombstoned: delta.tombstoned,
+                tombstoned: false,
             },
         )
         .with_context(|| format!("push edge {eid}"))?;
@@ -322,19 +433,11 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
         .with_context(|| format!("write index fragments at {}", inp.seg_dir.display()))?;
     }
 
-    // ── posting fragments: per reltype, ascending-distinct born src/tgt endpoint ids ──────
+    // ── posting fragments: per reltype, ascending-distinct born src/tgt endpoint ids. Only a
+    // live born edge drives a scan; a delete removes nothing from the (additive) base postings
+    // — a stale driving hit is filtered by the adjacency removal above at read time. ─────────
     let mut post: BTreeMap<String, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
-    for (eid, (src, dst, reltype)) in &edge_meta {
-        // A born edge that is also tombstoned (born-then-deleted) drives nothing.
-        if data
-            .edges
-            .binary_search_by_key(eid, |(id, _)| *id)
-            .ok()
-            .map(|i| data.edges[i].1.tombstoned)
-            .unwrap_or(false)
-        {
-            continue;
-        }
+    for (src, dst, reltype) in live_born_edges.values() {
         let e = post.entry(reltype.clone()).or_default();
         e.0.push(*src);
         e.1.push(*dst);
@@ -361,7 +464,9 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
     // ── marginals (exact — every contribution is provable) ───────────────────────────────
     // A born (live) node adds one to the node count and to each of its labels. A core patch
     // leaves the node count unchanged (the base already counts it) and moves a label count
-    // only where the effective row's label set differs from its base-below-delta set.
+    // only where the effective row's label set differs from its base-below-delta set. A core
+    // delete is the degenerate patch to the empty row: the node count nets down by one and
+    // every base label with it (the empty `after` differs from every `before` label).
     let mut node_count_delta: i64 = 0;
     let mut label_node_deltas: BTreeMap<String, i64> = BTreeMap::new();
     for n in &seg_nodes {
@@ -376,6 +481,9 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
                 }
             }
             Some((_, base_labels)) => {
+                if n.tombstoned {
+                    node_count_delta -= 1; // a core delete drops the node the base still counts
+                }
                 let before: BTreeSet<&str> = base_labels.iter().map(String::as_str).collect();
                 let after: BTreeSet<&str> = n.labels.iter().map(String::as_str).collect();
                 for l in after.difference(&before) {
@@ -389,18 +497,20 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
     }
     // Drop labels whose net change cancels to zero so the sparse manifest stays minimal.
     label_node_deltas.retain(|_, d| *d != 0);
+    // Edge marginals: a live born edge adds one to its reltype; a suppressed core edge (a
+    // deleted node's incident edge, or an explicit `DELETE r`) subtracts one. The two sets are
+    // disjoint by construction (a born edge is not in the base to be suppressed).
     let mut reltype_edge_deltas: BTreeMap<String, i64> = BTreeMap::new();
     let mut edge_count_delta: i64 = 0;
-    for (eid, delta) in &data.edges {
-        if delta.tombstoned {
-            continue;
-        }
-        let (_, _, reltype) = edge_meta
-            .get(eid)
-            .ok_or_else(|| anyhow::anyhow!("born edge {eid} missing adjacency"))?;
+    for (_src, _dst, reltype) in live_born_edges.values() {
         *reltype_edge_deltas.entry(reltype.clone()).or_insert(0) += 1;
         edge_count_delta += 1;
     }
+    for (_src, _dst, reltype) in suppressed.values() {
+        *reltype_edge_deltas.entry(reltype.clone()).or_insert(0) -= 1;
+        edge_count_delta -= 1;
+    }
+    reltype_edge_deltas.retain(|_, d| *d != 0);
 
     let node_band = (synthetic_base, synthetic_base + data.born_count);
     let edge_band = (
@@ -570,31 +680,62 @@ fn core_patch_labels(base_labels: &[String], delta: &NodeDelta) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Map a node's born delta edges into segment adjacency fragment entries. `is_out` selects
-/// the label direction for error messages only (the `other` endpoint is already the correct
-/// neighbour for each side). Refuses a core-edge tombstone (no edge id) — a later slice.
-fn born_adj_fragment(
-    edges: &[slater_delta::DeltaEdge],
-    node: u64,
-    is_out: bool,
-) -> Result<Vec<AdjEdge>> {
-    let mut frag = Vec::with_capacity(edges.len());
-    for e in edges {
-        let Some(edge_id) = e.edge_id else {
-            let side = if is_out { "out" } else { "in" };
-            bail!(
-                "flush_to_segment: an {side}-adjacency entry at node {node} has no edge id \
-                 (a core-edge tombstone) — not supported in this slice"
-            );
+/// Read node `node`'s **effective adjacency** below this flush in direction `outgoing`: the
+/// base CSR folded with every lower core segment's fragment, mirroring
+/// [`overlay_segment_adj`](crate::exec) (oldest→newest — a `removed` fragment suppresses by
+/// edge id, a born fragment appends). Returns `(edge_id, neighbour, reltype-name)` for each
+/// surviving incident edge — the input to a delete's removal fragments and netted marginals.
+/// A born endpoint id (≥ the base node count) has no base CSR record; its edges come wholly
+/// from the segment fragments.
+fn effective_adj(core: &Generation, node: u64, outgoing: bool) -> Result<Vec<(u64, u64, String)>> {
+    let base_nodes = core.topology().node_count();
+    let mut list: Vec<(u64, u64, String)> = if node < base_nodes {
+        let adjs = if outgoing {
+            core.topology().outgoing(NodeId(node))
+        } else {
+            core.topology().incoming(NodeId(node))
+        }
+        .with_context(|| format!("read base adjacency for node {node}"))?;
+        adjs.into_iter()
+            .map(|a| {
+                let rt = core.reltype_name(a.reltype).unwrap_or("").to_string();
+                (a.edge.0, a.neighbour.0, rt)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for seg in core.stack().segments() {
+        let r = &seg.reader;
+        let frag = if outgoing {
+            if !r.may_hold_out_adj(node) {
+                continue;
+            }
+            r.out_adj(node)?
+        } else {
+            if !r.may_hold_in_adj(node) {
+                continue;
+            }
+            r.in_adj(node)?
         };
-        frag.push(AdjEdge {
-            other: e.other,
-            reltype: e.reltype.clone(),
-            edge_id,
-            removed: e.tombstoned,
-        });
+        if frag.is_empty() {
+            continue;
+        }
+        let mut removed: BTreeSet<u64> = BTreeSet::new();
+        let mut born: Vec<(u64, u64, String)> = Vec::new();
+        for e in frag {
+            if e.removed {
+                removed.insert(e.edge_id);
+            } else {
+                born.push((e.edge_id, e.other, e.reltype));
+            }
+        }
+        if !removed.is_empty() {
+            list.retain(|(eid, _, _)| !removed.contains(eid));
+        }
+        list.extend(born);
     }
-    Ok(frag)
+    Ok(list)
 }
 
 /// Build the sealed manifest's file inventory: every file in the segment dir (all sections

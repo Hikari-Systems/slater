@@ -6807,8 +6807,12 @@ mod tests {
         };
         let q = |graphs: &Graphs, qy: &str| -> QueryResult {
             let gen = graphs.get("people").unwrap();
-            let w = graphs.writer("people").unwrap();
-            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            // A reopened graph (post-drop) has no writable layer; fall back to an empty delta.
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
             let r = Engine::new(&view, &cache)
                 .run(&parser::parse(qy).unwrap())
                 .unwrap();
@@ -6858,6 +6862,263 @@ mod tests {
             matches!(alice.rows[0][0], Val::Int(7)),
             "Alice's twice-patched age: {:?}",
             alice.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.3: a **node delete** flushes into an upper segment as a full-row
+    /// tombstone plus incident-edge removal fragments. `DETACH DELETE` of Bob (the target of
+    /// the base's one Alice-KNOWS->Bob edge) must, once flushed with an empty delta: drop Bob
+    /// from an index seek and the label count (its base-indexed values superseded via the
+    /// `removals` sidecar, the node/label marginals netted down), and drop the incident edge
+    /// from Alice's outgoing traversal and the reltype count (a `removed` adjacency fragment
+    /// on Alice's surviving side, the edge marginal netted down) — all surviving a reopen.
+    #[test]
+    fn flush_to_segment_materialises_a_node_delete() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_del_node_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(qy).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {qy}"),
+            }
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            // A reopened graph (post-drop) has no writable layer; fall back to an empty delta.
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+
+        // DETACH DELETE Bob (dst of the Alice-KNOWS->Bob base edge), then flush.
+        write(&graphs, "MATCH (n:Person {name:'Bob'}) DETACH DELETE n");
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a delete flushes a non-empty delta");
+
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.base_uuid(), base_uuid, "base preserved by the flush");
+        assert_eq!(gen1.stack().segments().len(), 1, "one upper segment");
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired"
+        );
+
+        // Bob is gone from the index seek, the label count, and Alice's traversal — read
+        // through the (now empty) delta, so the segment alone must answer.
+        assert!(
+            q(&graphs, "MATCH (n:Person {name:'Bob'}) RETURN n.name")
+                .rows
+                .is_empty(),
+            "deleted Bob is superseded in the name index"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(2)
+            ),
+            "2 survivors (Alice, Carol) after the delete"
+        );
+        assert!(
+            q(
+                &graphs,
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"
+            )
+            .rows
+            .is_empty(),
+            "the incident edge is removed on Alice's surviving side"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH ()-[:KNOWS]->() RETURN count(*)").rows[0][0],
+                Val::Int(0)
+            ),
+            "the reltype edge count nets the removed edge to zero"
+        );
+        // Alice and Carol still read normally.
+        assert_eq!(
+            q(&graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.name")
+                .rows
+                .len(),
+            1,
+            "Alice untouched by Bob's delete"
+        );
+
+        // Reopen from disk: the tombstone + removals reload and still hide Bob and his edge.
+        drop(gen1);
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the set"
+        );
+        assert!(
+            q(&graphs, "MATCH (n:Person {name:'Bob'}) RETURN n.name")
+                .rows
+                .is_empty(),
+            "Bob stays deleted across a reopen"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(2)
+            ),
+            "survivor count stable across a reopen"
+        );
+        assert!(
+            q(
+                &graphs,
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"
+            )
+            .rows
+            .is_empty(),
+            "the removed edge stays gone across a reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.3: an explicit **edge delete** (`DELETE r` on a core edge, both
+    /// endpoints surviving) flushes into an upper segment as a pure adjacency removal on
+    /// *both* endpoints' sides (no node tombstone, no edge row) with the edge/reltype
+    /// marginals netted down. The edge stops traversing from either direction while both
+    /// nodes remain, surviving a reopen.
+    #[test]
+    fn flush_to_segment_materialises_an_edge_delete() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_del_edge_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(qy).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {qy}"),
+            }
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            // A reopened graph (post-drop) has no writable layer; fall back to an empty delta.
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+
+        write(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+        );
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("an edge delete flushes a non-empty delta");
+
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            1,
+            "one upper segment"
+        );
+        // Both nodes remain; only the edge is gone, from both traversal directions.
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(3)
+            ),
+            "an edge delete leaves every node"
+        );
+        assert!(
+            q(
+                &graphs,
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"
+            )
+            .rows
+            .is_empty(),
+            "removed on Alice's outgoing side"
+        );
+        assert!(
+            q(
+                &graphs,
+                "MATCH (a)-[:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name"
+            )
+            .rows
+            .is_empty(),
+            "removed on Bob's incoming side"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH ()-[:KNOWS]->() RETURN count(*)").rows[0][0],
+                Val::Int(0)
+            ),
+            "the reltype edge count nets to zero"
+        );
+
+        // Reopen: the removal fragments reload and the edge stays gone.
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the set"
+        );
+        assert!(
+            q(
+                &graphs,
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name"
+            )
+            .rows
+            .is_empty(),
+            "the removed edge stays gone across a reopen"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(3)
+            ),
+            "node count stable across a reopen"
         );
 
         std::fs::remove_dir_all(&root).ok();

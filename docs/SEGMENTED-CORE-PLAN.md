@@ -118,21 +118,51 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.2 (HP11). **Phases 1–3
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.3 (HP12). **Phases 1–3
 DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
-`crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges AND
-core-resolved node patches**: a `SET`/`REMOVE` on a base node folds into the upper segment as
-a full replace-row (base-below row read through the stack, delta overlaid) with the index
-**removal sidecars** that supersede its stale base/lower-segment values, publishes/swaps/
-retires, and reads back identically (moved/removed indexed value, fresh prop, added label,
-count marginal) — surviving a reopen and stacking across two segments. Next: **slice 4.3 —
-deletes** (node/edge tombstones + node-delete→incident-edge removal fragments + netted
-marginals), then 4.4 (L0 fold, encryption parity, s3 upload, auto-trigger wiring). Still
-deferred and `bail!`ed: **core-edge patches** (the base exposes no by-id endpoint reader to
-fill a full edge row — needs an adjacency-sourced endpoint lookup), core node/edge deletes,
+`crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges, core-resolved
+node patches AND deletes**. A `SET`/`REMOVE` on a base node folds into the upper segment as a
+full replace-row (base-below row read through the stack, delta overlaid) with the index
+**removal sidecars** that supersede its stale base/lower-segment values. A **delete** is a
+full-row **tombstone** (the effective-row-empty case of a patch: node/label marginals net
+down, every base-indexed value moves to `removals`) plus incident-edge **removal fragments**:
+the writer reads the deleted node's *effective adjacency* (base folded with every lower
+segment, via `flush_segment::effective_adj`, mirroring `overlay_segment_adj`) and writes a
+`removed` fragment by edge id on each *surviving* neighbour's side, netting the edge/reltype
+marginals; an explicit `DELETE r` on a core edge is resolved to its id(s) the same way and
+removed on both live endpoints. Publishes/swaps/retires and reads back identically (deleted
+node gone from index/label/count, incident edge gone from traversal + reltype count) —
+surviving a reopen. Next: **slice 4.4** (stacked L0 fold, encryption parity, s3 upload,
+auto-trigger wiring). Still deferred and `bail!`ed: **core-edge patches** (the base exposes no
+by-id endpoint reader to fill a full edge row — needs an adjacency-sourced endpoint lookup),
 stacked L0 folds, encryption.
 
 ### Phase 4 slice log
+- **4.3 DONE** (HP12): **deletes**. `write_flush_segment` lifts the node/edge-tombstone
+  `bail!`s. A core-node delete is materialised as the effective-row-empty case of a core
+  patch — a `NodeRow` tombstone, `removals` for every base-indexed value (grouped under the
+  identity label, cross-layer), node-count −1, each base label −1 — reusing the 4.2 base=Some
+  index/label-marginal path (the only add is a `node_count_delta -= 1` for a tombstoned base
+  node). Incident edges are found by reading the deleted node's **effective adjacency** (new
+  `effective_adj` helper: base CSR `topology().outgoing/incoming` folded with every lower
+  segment's `out_adj/in_adj` fragment, oldest→newest — the write-time mirror of
+  `overlay_segment_adj`, recovering the concrete core edge id the delta's node tombstone never
+  carried), and a `removed` adjacency fragment is emitted by edge id on each **surviving**
+  endpoint's side (a dropped node's own side is never read); the edge/reltype marginals net
+  each out. An explicit `DELETE r` on a core edge (carried in `adj_out` as an adjacency
+  tombstone with no edge id) is resolved to its id(s) against the source's effective adjacency
+  — **all** parallel `(reltype, neighbour)` matches, mirroring `overlay_adj`'s suppression —
+  and removed on *both* live endpoints. A born edge incident to a node deleted in the same
+  delta is dropped wholesale (never reaches a lower layer). Born edges + suppressed removals
+  are merged per node into `out_frags/in_frags` and pushed together (node 0 both gains a born
+  edge and loses a core one in the same fragment). Two new e2e oracle tests
+  (`flush_to_segment_materialises_a_node_delete`, `…_an_edge_delete`) drive real read paths
+  (index seek, label/reltype count, both traversal directions) through an empty delta and a
+  reopen. 715 slater lib tests + full workspace green, clippy clean.
+  - **Follow-ups deferred:** a delete emits `removals` for *every* base prop, including
+    non-indexed ones (spurious idx fragments — benign, never consulted since the planner only
+    picks base-existing indexes; mirrors 4.2, leanness TODO); core-edge patch materialisation
+    still `bail!`ed (no by-id base endpoint reader).
 - **4.2 DONE** (HP11): `write_flush_segment` (renamed from `write_births_segment`) now also
   materialises **core-resolved node patches**. `FlushInputs` carries `core: &Generation`;
   each patched node (id below the synthetic base, non-tombstoned) has its base-below-delta
@@ -290,7 +320,14 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   entry per changed prop; label marginals net effective-vs-base. `FlushInputs.core` added;
   `read_base_node_row`/`core_patch_props`/`core_patch_labels` helpers. Two new oracle tests
   (base-layer patches; second flush superseding a lower segment's value). 713 slater lib
-  tests + full workspace green, clippy clean. ← current baseline; next is slice 4.3 (deletes).
+  tests + full workspace green, clippy clean.
+- HP12 — Phase 4 slice 4.3: **deletes** end-to-end. `write_flush_segment` materialises core
+  node/edge tombstones as full-row tombstones + incident-edge removal fragments (new
+  `effective_adj` helper recovers the incident edge ids from base+segment adjacency) with
+  netted node/edge/label/reltype marginals; born edges + suppressed removals merged per node.
+  Two new e2e oracle tests (node delete, edge delete) through an empty delta + reopen. 715
+  slater lib tests + full workspace green, clippy clean. ← current baseline; next is slice 4.4
+  (stacked L0 fold, encryption parity, s3 upload, auto-trigger wiring).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for
