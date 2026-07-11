@@ -994,10 +994,12 @@ the terminal escape rather than the routine consolidation:
 1. **memtable → L0 flush** at `memtableBytes` — bound resident memtable RAM.
 2. **L0 → L0 compaction** at `l0CompactionTrigger` levels — bound L0 read fan-out (reclaim
    overwrites/tombstones).
-3. **L0 → core segment (T2 flush)** — fold the sealed delta into one immutable upper *core* segment
-   over the base (`Graphs::flush_graph_to_segment`, Phase 4), draining the delta to near-empty
-   without a core rebuild. The segment reads newest-wins over the base; ids are preserved (no
-   re-resolution).
+3. **L0 → core segment (T2 flush)** at **`segmentFlushBytes`** (whole-delta bytes = memtable +
+   every L0 level) — fold the sealed delta into one immutable upper *core* segment over the base
+   (`Graphs::flush_graph_to_segment`, Phase 4), draining the delta to near-empty without a core
+   rebuild. The segment reads newest-wins over the base; ids are preserved (no re-resolution).
+   **Off by default (0)** — like the rung-5 rebuild, folding into the core is a durable heavyweight
+   op operators opt into; suppressed under off-heap L0 (that flush is not yet supported).
 4. **core segment → core segment (T3 compaction)** at **`maxUpperSegments`** — merge a contiguous
    run of upper segments into one (`Graphs::compact_graph_segments`, Phase 5), bounding the *segment*
    fan-out a point read crosses. Admission is by segment count; run selection is **size-tiered**
@@ -1007,10 +1009,14 @@ the terminal escape rather than the routine consolidation:
    tile). Cheap, on by default (`maxUpperSegments = 8`), like rung 2.
 
 Rungs 3–4 are O(delta)/O(segments) and preserve the id space, so — unlike the rebuild — they need no
-re-resolution or rebase, only a lightweight delta rebind. **Auto-firing rungs 3 and 4 from the write
-path is Phase-6-gated** (both need a segment-aware write resolve): until then they run explicitly
-(`flush_graph_to_segment` / `compact_graph_segments_auto`), exactly as the tier-2 rebuild runs from
-`CALL slater.consolidate()`. The tier-2 rebuild (the rung-5 terminal) is unchanged — it now folds a
+re-resolution or rebase, only a lightweight delta rebind. **Rungs 3 and 4 now auto-fire from the
+write path** (`maybe_maintain_delta`, Phase 6 closing slice — the segment-aware write resolve gate
+[rung's precondition] is met): a write that pushes the whole delta past `segmentFlushBytes` flushes
+it into a segment (rung 3), and one that leaves the served stack carrying more than `maxUpperSegments`
+upper segments folds a run (rung 4) — beside the explicit `flush_graph_to_segment` /
+`compact_graph_segments_auto` entry points, and alongside the L0-internal rungs 1–2. Both take the
+`begin_consolidation` single-flight claim, so they never overlap each other or a consolidation (a
+lost race bails benignly). The tier-2 rebuild (the rung-5 terminal) is unchanged — it now folds a
 whole *stacked* set, not just base + delta.
 
 The reframe that makes this sound: because the delta is already durable, read-correct and

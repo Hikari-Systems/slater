@@ -797,15 +797,30 @@ pub struct DeltaConfig {
         deserialize_with = "de::usize"
     )]
     pub l0_compaction_trigger: usize,
+    /// Byte budget for the **whole** delta (active memtable + every L0 level) before it is
+    /// flushed into a durable core **segment** — the T2 rung of the D50 ladder (Phase 4
+    /// writer, Phase 6 auto-trigger). Distinct from `memtableBytes`, which drains only the
+    /// *active memtable* into an L0 level: this folds the *entire* delta into an upper core
+    /// segment, the cheap O(delta) intermediate that keeps the delta small without an O(core)
+    /// consolidation rebuild. A flushed segment is then compacted with its peers once the
+    /// stack exceeds `maxUpperSegments` (T3), and consolidation (`deltaCorePercent`) stays
+    /// rare. **Off by default (0)** — like `deltaCorePercent`, folding the delta into the core
+    /// is a durable heavyweight operation operators opt into; the explicit
+    /// `flush_graph_to_segment` path is unaffected. When a graph reads its L0 **off-heap**
+    /// (`offHeapL0`) the auto-flush is suppressed (an off-heap flush is not yet supported —
+    /// it still bails), so leave this 0 there.
+    #[serde(default, deserialize_with = "de::usize")]
+    pub segment_flush_bytes: usize,
     /// Maximum number of upper **core segments** a served set may carry before a T3
     /// segment→segment compaction is admissible (Phase 5 slice 5.3 — the fourth rung of the
     /// D50 ladder). A point read may consult every upper segment, so once the stack exceeds
     /// this the size-tiered run selector ([`crate::merge_segment::select_compaction_run`])
     /// picks a contiguous run to fold, bounding read fan-out. Cheap (O(segments), no core
     /// rebuild), like L0→L0 compaction. Defaults to 8; 0 disables admission (the explicit
-    /// `compact_graph_segments(start, end)` path is unaffected). **Auto-firing this from the
-    /// write path is Phase-6-gated** — it needs a segment-aware write resolve — so today the
-    /// threshold is consulted only by the explicit `compact_graph_segments_auto` entry point.
+    /// `compact_graph_segments(start, end)` path is unaffected). The write path auto-fires this
+    /// from `maybe_maintain_delta` once the served stack exceeds it (Phase 6 closing slice —
+    /// the segment-aware write resolve gate is met), beside the explicit
+    /// `compact_graph_segments_auto` entry point.
     #[serde(default = "default_max_upper_segments", deserialize_with = "de::usize")]
     pub max_upper_segments: usize,
     /// Auto-consolidation threshold as a **percent of the core's size** (Phase 4d-ii-b):
@@ -858,6 +873,7 @@ impl Default for DeltaConfig {
             wal_dir: default_wal_dir(),
             memtable_bytes: default_memtable_bytes(),
             l0_compaction_trigger: default_l0_compaction_trigger(),
+            segment_flush_bytes: 0,
             max_upper_segments: default_max_upper_segments(),
             delta_core_percent: 0,
             delta_hard_bytes: 0,

@@ -92,11 +92,13 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
 - **Phase 5 — T3 segment compaction + admission.** Size-tiered merges, tombstone
   reclamation, adjacency collapse, `maxUpperSegments`, scheduling; DECISIONS.md D50
   update to the four-rung ladder.
-- **Phase 6 — Batch resolve + fences on the write path.** IN PROGRESS. Slice 6.1 DONE
+- **Phase 6 — Batch resolve + fences on the write path.** DONE. Slice 6.1 DONE
   (`HP20`): segment-aware `resolve_business_key` (folds the core stack — the note-(e) closure /
   T2·T3 auto-trigger gate). Slice 6.2 DONE (`HP21`): per-fragment value fence (idx.meta v2) on
   the resolve fold. Slice 6.3 DONE (`HP22`): merge-join batch resolve (one block decompress per
-  touched block for a whole write batch). Remaining: the T2/T3 auto-trigger wire-up.
+  touched block for a whole write batch). Slice 6.4 DONE (`HP23`): T2/T3 auto-trigger wire-up in
+  `maybe_maintain_delta` (`segmentFlushBytes` flushes the delta into a core segment; the served
+  stack over `maxUpperSegments` folds a run — beside the L0-internal rungs).
 - **Phase 7 — T4 retarget + GC.** `consolidate_graph` collapses a set to a singleton
   via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
@@ -121,8 +123,41 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.3 (HP22). **Phases 1–5
-DONE; Phase 6 IN PROGRESS.**
+**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.4 (HP23). **Phases 1–6
+DONE.** Next real work is **Phase 7** (T4 retarget + GC).
+
+**Phase 6 (write-path resolve) — slice 6.4 DONE (T2/T3 auto-trigger wire-up — Phase 6
+CLOSED).** The two segment-tier rungs of the D50 ladder now auto-fire from the write path,
+beside the existing L0-internal rungs, safe because the 6.1 segment-aware resolve gate is met (a
+concurrent re-`MERGE` of a just-flushed key resolves through the new segment instead of
+duplicating). In `maybe_maintain_delta` (`server.rs`), under the same `!is_consolidating()` guard
+and after the memtable→L0 / L0→L0 rungs: **T2** — when the *whole* delta (`writer.total_bytes()` =
+memtable + every L0 level) reaches the new **`deltaConfig.segmentFlushBytes`** (distinct from
+`memtableBytes`, which drains only the active memtable → an L0 level), `flush_graph_to_segment`
+folds the entire delta into one durable core segment (the cheap O(delta) drain that keeps the delta
+small without an O(core) consolidation); **off by default (0)** like `deltaCorePercent`, and
+suppressed under `offHeapL0` (that flush still bails — no warn-spam). **T3** — when the served set
+carries **more than `maxUpperSegments`** upper segments (pre-checked cheaply on the resident
+`stack().segments().len()`, the selector's own admission predicate — so no blocking task spawns per
+write), `compact_graph_segments_auto` folds a size-tiered run; runs *after* the T2 flush so a
+freshly appended segment that tips the stack over budget folds in the same pass. Both run on the
+blocking pool and take the `begin_consolidation` single-flight claim inside `Graphs` (so they never
+overlap each other or a consolidation); a lost race bails "already in progress" (new helper
+`is_already_in_progress`, logged at **debug** not warn). The L0 rungs still run regardless, so the
+memtable always drains even if a flush bails — the T2 flush's redundant L0 write before it folds the
+whole delta is the cheap price. New `ConnCtx` fields `segment_flush_bytes` / `max_upper_segments` /
+`off_heap_l0` (plumbed from `deltaConfig`); `maxUpperSegments`'s config doc + D50 rung-3/4 text
+lose their "Phase-6-gated" caveats. Tested: one new e2e oracle
+(`write_path_auto_flushes_and_compacts_segments`: `segmentFlushBytes=1` ⇒ every write folds the
+delta into a segment [stack 1→2→3], `maxUpperSegments=2` ⇒ the third write's pass compacts the run
+back within budget; every born row reads through the compacted stack **and** survives a from-disk
+reopen with no delta). **740 slater lib** (+1) + 141 graph-format + 78 slater-delta + full workspace
+green (28 suites), clippy + fmt clean. **NEXT: Phase 7** (T4 retarget: collapse a set to a singleton
+via the Phase-0 direct path; GC retired sets/segments after a grace period — the born-then-deleted
+orphan edge row + union postings noted in Phase 5 are the reclaimable leanness). Deferred `bail!`s
+still open in the *flush* writer (each Phase-6-independent): patch-then-delete of the same core edge
+in one delta, and a flush over an off-heap L0 level (the T2 auto-trigger is gated off under
+`offHeapL0` for exactly this reason).
 
 **Phase 6 (write-path resolve) — slice 6.3 DONE (merge-join batch resolve).** The batched
 write path (`execute_write_batch`) resolved each `UNWIND` row's business key one-at-a-time,
@@ -317,23 +352,36 @@ delta (an adjacency-removal concern the patch materialiser doesn't own), and a f
 image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
 `as_memtable()` returns `None`).
 
-**Phase 6 NEXT after 6.3:** the **note-(e) gate is met** (6.1) and both resolve-fold performance
-floors are closed — the **per-fragment value fence** (6.2, skip a segment that can't hold the key)
-and the **merge-join batch resolve** (6.3, one block decompress per touched block for a whole write
-batch instead of per row). What remains in Phase 6 is the **closing slice: wire the T2/T3
-auto-triggers** — `maybe_maintain_delta`-style hooks (`server.rs:~4036`) that fire
-`flush_graph_to_segment` at a **distinct delta→segment flush threshold** (separate from
-`memtableBytes`, which already drives L0 flush) and `compact_graph_segments_auto` at
-`maxUpperSegments` (the L0-internal memtable→L0/L0→L0 auto-maintenance already exists — this adds
-the two segment-tier rungs, safe now the resolve gate is met). It is **design-laden**: it needs
-that new flush threshold **plus** `vector_cache`/`data_dir` plumbing into `maybe_maintain_delta` —
-scope it deliberately. **Phase 5 stays functionally complete**
-(writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carried from 5.1 (each benign): a
-born-then-deleted **edge** leaves an orphan edge row in the merged segment (its adjacency is
-suppressed by the fold, so it is never read); postings are a union (a stale driving hit is
-filtered by adjacency).
+**Phase 6 CLOSED (after 6.4):** the **note-(e) gate is met** (6.1), both resolve-fold performance
+floors are closed — the **per-fragment value fence** (6.2) and the **merge-join batch resolve**
+(6.3) — and the **T2/T3 auto-triggers are wired** (6.4): `maybe_maintain_delta` fires
+`flush_graph_to_segment` once the whole delta reaches `segmentFlushBytes` (a threshold distinct from
+`memtableBytes`, which drains only the active memtable → L0) and `compact_graph_segments_auto` once
+the served stack exceeds `maxUpperSegments`, beside the pre-existing L0-internal
+memtable→L0/L0→L0 rungs. `vector_cache`/`data_dir` were already on `ConnCtx`; the slice added
+`segment_flush_bytes` / `max_upper_segments` / `off_heap_l0`. **Phase 5 stays functionally
+complete** (writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carried from 5.1 (each
+benign, reclaimable in Phase 7): a born-then-deleted **edge** leaves an orphan edge row in the
+merged segment (its adjacency is suppressed by the fold, so it is never read); postings are a union
+(a stale driving hit is filtered by adjacency).
 
 ### Phase 6 slice log
+- **6.4 DONE** (HP23): **T2/T3 auto-trigger wire-up** — Phase 6 CLOSED. `maybe_maintain_delta`
+  (`server.rs`) now fires the two segment-tier rungs beside the L0-internal ones, under the same
+  `!is_consolidating()` guard, safe because the 6.1 segment-aware resolve gate is met. **T2**: whole
+  delta (`total_bytes()` = memtable + every L0 level) ≥ new `deltaConfig.segmentFlushBytes` ⇒
+  `flush_graph_to_segment` folds it into a core segment; off by default (0, like `deltaCorePercent`),
+  suppressed under `offHeapL0` (that flush bails). **T3**: served `stack().segments().len()` >
+  `maxUpperSegments` (cheap resident pre-check = the selector's admission predicate) ⇒
+  `compact_graph_segments_auto` folds a run, *after* the T2 flush so a fresh segment tips-and-folds
+  in one pass. Both on the blocking pool + the `begin_consolidation` single-flight claim; a lost
+  race bails via new `is_already_in_progress` (debug, not warn). L0 rungs still run regardless (the
+  memtable always drains even if a flush bails). New `ConnCtx` fields `segment_flush_bytes` /
+  `max_upper_segments` / `off_heap_l0`; `maxUpperSegments` config doc + D50 rung-3/4 shed their
+  "Phase-6-gated" caveats. One e2e oracle (`write_path_auto_flushes_and_compacts_segments`: stack
+  1→2→3 then compacts within budget; born rows survive the fold + a from-disk reopen). **740 slater
+  lib** (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ←
+  current baseline; next is Phase 7 (T4 retarget + GC).
 - **6.3 DONE** (HP22): **merge-join batch resolve** — the bulk-write ISAM floor (memory
   `bulk-delete-isam-resolve-floor`). `execute_write_batch` resolved each `UNWIND` row's key with a
   per-row ISAM point probe (re-decompressing the same blocks; the 6.2 fence only skips a segment,
@@ -761,7 +809,19 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   `segindex` round-trips; `fold_index_eq_batch_matches_point_folds`;
   `batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate`; the resolve bench extended
   with a batch-vs-per-row timing. 739 slater lib + 141 graph-format + 78 slater-delta + full
-  workspace green, clippy + fmt clean. ← current baseline; next is the T2/T3 auto-trigger wire-up.
+  workspace green, clippy + fmt clean.
+- HP23 — Phase 6 slice 6.4: **T2/T3 auto-trigger wire-up** — Phase 6 CLOSED. `maybe_maintain_delta`
+  (`server.rs`) fires the two segment-tier rungs beside the L0-internal ones (same
+  `!is_consolidating()` guard): **T2** `flush_graph_to_segment` when the whole delta
+  (`total_bytes()`) ≥ new `deltaConfig.segmentFlushBytes` (off by default, suppressed under
+  `offHeapL0`); **T3** `compact_graph_segments_auto` when served `stack().segments().len()` >
+  `maxUpperSegments` (cheap resident pre-check), after the T2 flush so a fresh segment folds in the
+  same pass. Both on the blocking pool + `begin_consolidation` claim; a lost race bails via new
+  `is_already_in_progress` (debug). New `ConnCtx` fields `segment_flush_bytes` / `max_upper_segments`
+  / `off_heap_l0`; `maxUpperSegments` doc + D50 rung-3/4 lose their Phase-6-gated caveats. One e2e
+  oracle (`write_path_auto_flushes_and_compacts_segments`). 740 slater lib + 141 graph-format + 78
+  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next is Phase 7 (T4
+  retarget + GC).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

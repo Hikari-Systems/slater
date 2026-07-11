@@ -1377,6 +1377,17 @@ struct ConnCtx {
     /// L0 segment count that triggers an L0→L0 compaction after a write
     /// (`config.delta.l0_compaction_trigger`; 0 disables — Phase 4d-ii).
     l0_compaction_trigger: usize,
+    /// Whole-delta byte budget (active memtable + every L0 level) that triggers a T2
+    /// delta→segment flush after a write (`config.delta.segment_flush_bytes`; 0 disables
+    /// — Phase 6). Distinct from `memtable_bytes` (memtable→L0); this folds the entire
+    /// delta into a core segment. Suppressed when `off_heap_l0` (that flush still bails).
+    segment_flush_bytes: usize,
+    /// Upper core-segment count that admits a T3 segment→segment compaction after a write
+    /// (`config.delta.max_upper_segments`; 0 disables — Phase 5.3 policy, Phase 6 auto-fire).
+    max_upper_segments: usize,
+    /// Whether this server reads L0 off-heap (`config.delta.off_heap_l0`). Consulted only
+    /// to suppress the T2 auto-flush (an off-heap flush is not yet supported — it bails).
+    off_heap_l0: bool,
     /// Auto-consolidation threshold as a percent of the served core's entity count
     /// (`config.delta.delta_core_percent`; 0 disables — Phase 4d-ii-b).
     delta_core_percent: usize,
@@ -2257,6 +2268,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         builder_bin: cfg.delta.builder_bin.clone(),
         memtable_bytes: cfg.delta.memtable_bytes,
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
+        segment_flush_bytes: cfg.delta.segment_flush_bytes,
+        max_upper_segments: cfg.delta.max_upper_segments,
+        off_heap_l0: cfg.delta.off_heap_l0,
         delta_core_percent: cfg.delta.delta_core_percent,
         delta_hard_bytes: cfg.delta.delta_hard_bytes,
         consolidate_window,
@@ -4201,6 +4215,75 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
                 Err(e) => warn!(graph = %graph, error = %e, "delta compaction task panicked"),
             }
         }
+
+        // ── Segment-tier maintenance (Phase 6 closing slice): the two upper rungs of
+        // the D50 ladder, beside the L0-internal rungs above. Safe to auto-fire now the
+        // 6.1 segment-aware write resolve is in — a concurrent re-MERGE of a just-flushed
+        // key resolves through the new segment instead of duplicating. Both take the
+        // `begin_consolidation` claim inside `Graphs` (so they never overlap each other or
+        // a consolidation) and run on a blocking pool; a lost single-flight race bails as
+        // "already in progress" (logged at debug, not warn). The L0 rungs above still run
+        // regardless, so the memtable always drains even if a flush bails — the T2 flush's
+        // extra L0 write before it folds the whole delta is the cheap price of that.
+
+        // T2: once the WHOLE delta (memtable + every L0 level) reaches `segmentFlushBytes`,
+        // fold it into one durable core segment — the O(delta) drain that keeps the delta
+        // small without an O(core) consolidation. Off by default (0); suppressed under
+        // off-heap L0 (that flush still bails — an unsupported-path warn every write is not
+        // worth spawning).
+        if ctx.segment_flush_bytes > 0
+            && !ctx.off_heap_l0
+            && writer.total_bytes() >= ctx.segment_flush_bytes
+        {
+            let (g, c) = (graph.to_string(), ctx.clone());
+            match tokio::task::spawn_blocking(move || {
+                c.graphs
+                    .flush_graph_to_segment(&g, &c.vector_cache, &c.data_dir)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if is_already_in_progress(&e) => {
+                    debug!(graph = %graph, "segment flush skipped: a flush/consolidation is already running")
+                }
+                Ok(Err(e)) => {
+                    warn!(graph = %graph, error = %format!("{e:#}"), "delta flush_to_segment failed")
+                }
+                Err(e) => warn!(graph = %graph, error = %e, "delta flush_to_segment task panicked"),
+            }
+        }
+
+        // T3: once the served set carries more than `maxUpperSegments` upper segments,
+        // fold a contiguous run (the size-tiered selector picks it — self-gating, so the
+        // auto entry point is a true no-op when within budget). Pre-checked on the resident
+        // segment count (the selector's own admission predicate) so no blocking task is
+        // spawned per write. Runs after the T2 flush so a freshly appended segment that
+        // tips the stack over budget folds in the same pass.
+        let over_segment_budget = ctx.max_upper_segments > 0
+            && ctx
+                .graphs
+                .get(graph)
+                .map(|gen| gen.stack().segments().len() > ctx.max_upper_segments)
+                .unwrap_or(false);
+        if over_segment_budget {
+            let (g, c) = (graph.to_string(), ctx.clone());
+            let max_upper = ctx.max_upper_segments;
+            match tokio::task::spawn_blocking(move || {
+                c.graphs
+                    .compact_graph_segments_auto(&g, &c.vector_cache, &c.data_dir, max_upper)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if is_already_in_progress(&e) => {
+                    debug!(graph = %graph, "segment compaction skipped: a flush/consolidation is already running")
+                }
+                Ok(Err(e)) => {
+                    warn!(graph = %graph, error = %format!("{e:#}"), "segment compaction failed")
+                }
+                Err(e) => warn!(graph = %graph, error = %e, "segment compaction task panicked"),
+            }
+        }
     }
 
     // Background consolidation at a fraction of the core's size (4d-ii-b). Spawned
@@ -4262,6 +4345,14 @@ fn window_permits(
         None => true,
         Some(w) => w.contains(hour, dom, month, dow),
     }
+}
+
+/// Whether an error is a lost `begin_consolidation` single-flight race — a flush or a
+/// compaction that found another flush/consolidation already holding the exclusive claim
+/// (`bail!("… is already in progress")`). Benign: the other op is doing the work, so the
+/// segment-tier auto-triggers log this at debug rather than warn.
+fn is_already_in_progress(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("already in progress")
 }
 
 /// Fire a background consolidation for `graph`, detached from the write that triggered
@@ -5190,6 +5281,7 @@ mod tests {
             wal_dir: wal_dir.to_string_lossy().into_owned(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            segment_flush_bytes: 0,
             max_upper_segments: 8,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
@@ -10011,7 +10103,7 @@ mod tests {
     #[tokio::test]
     async fn merged_count_star_nets_born_and_suppressed_rows() {
         let (_root, ctx) =
-            build_writable_ctx_caps("merged_count", "slater-build", 1 << 20, 0, 0, 0);
+            build_writable_ctx_caps("merged_count", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10075,7 +10167,8 @@ mod tests {
     /// that node's degree. Fixture: 3 `:Person`, one `Alice-[:KNOWS]->Bob`.
     #[tokio::test]
     async fn merged_metadata_and_edge_counts_track_the_delta() {
-        let (_root, ctx) = build_writable_ctx_caps("merged_meta", "slater-build", 1 << 20, 0, 0, 0);
+        let (_root, ctx) =
+            build_writable_ctx_caps("merged_meta", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10157,7 +10250,7 @@ mod tests {
     #[tokio::test]
     async fn edge_tombstone_makes_the_edge_fast_path_decline_not_lie() {
         let (_root, ctx) =
-            build_writable_ctx_caps("merged_edge_tomb", "slater-build", 1 << 20, 0, 0, 0);
+            build_writable_ctx_caps("merged_edge_tomb", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10200,7 +10293,8 @@ mod tests {
     /// updating a node you had just created failed with "use MERGE to create it".)
     #[tokio::test]
     async fn match_set_updates_a_delta_born_node() {
-        let (_root, ctx) = build_writable_ctx_caps("set_born", "slater-build", 1 << 20, 0, 0, 0);
+        let (_root, ctx) =
+            build_writable_ctx_caps("set_born", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10249,7 +10343,8 @@ mod tests {
     async fn merged_count_star_folds_across_l0_levels() {
         // memtable_bytes = 1 ⇒ every write flushes; trigger 0 ⇒ no compaction, so the
         // levels stay distinct and the cross-level fold is what is under test.
-        let (_root, ctx) = build_writable_ctx_caps("merged_count_l0", "slater-build", 1, 0, 0, 0);
+        let (_root, ctx) =
+            build_writable_ctx_caps("merged_count_l0", "slater-build", 1, 0, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10299,7 +10394,7 @@ mod tests {
     /// exactly as the RUN handler does, and confirms the born rows survive.
     #[tokio::test]
     async fn write_path_auto_flushes_and_compacts() {
-        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3, 0, 0);
+        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3, 0, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
 
@@ -10346,6 +10441,108 @@ mod tests {
             assert!(
                 names.contains(n),
                 "born {n} survives flush+compaction: {names:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 6 closing slice: the write path auto-fires the two **segment-tier** rungs.
+    /// With a 1-byte `segmentFlushBytes` every write folds the whole delta into a core
+    /// segment (T2); with a 2-segment `maxUpperSegments` the third flush tips the stack
+    /// over budget and the same `maybe_maintain_delta` pass compacts a run (T3). Drives
+    /// `execute_write` + `maybe_maintain_delta` exactly as the RUN handler does, confirms
+    /// the stack grows then collapses, and that every born row survives — including a
+    /// reopen from disk (the segments are durable, the delta empty after each flush).
+    #[tokio::test]
+    async fn write_path_auto_flushes_and_compacts_segments() {
+        // memtable_bytes 1 (L0 rungs also fire, harmlessly — the whole delta flushes
+        // anyway), l0 trigger 0, no consolidation; segment_flush_bytes 1, max_upper 2.
+        let (root, ctx) = build_writable_ctx_caps("auto_seg", "slater-build", 1, 0, 0, 0, 1, 2);
+        let writer = ctx.graphs.writer("people").unwrap();
+
+        let write = |q: &str| {
+            let gen = ctx.graphs.get("people").unwrap();
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a node write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+        let segment_count = || ctx.graphs.get("people").unwrap().stack().segments().len();
+
+        write("MERGE (n:Person {name:'Dave'}) SET n.age = 1");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(
+            segment_count(),
+            1,
+            "first write flushed the delta into a segment"
+        );
+        assert_eq!(writer.total_bytes(), 0, "delta retired by the flush");
+
+        write("MERGE (n:Person {name:'Erin'}) SET n.age = 2");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        assert_eq!(segment_count(), 2, "second write appended a second segment");
+
+        write("MERGE (n:Person {name:'Fay'}) SET n.age = 3");
+        maybe_maintain_delta(&ctx, "people", &writer).await;
+        let after = segment_count();
+        assert!(
+            after < 3,
+            "third flush tipped the stack past maxUpperSegments and T3 folded a run: {after} segments"
+        );
+        assert!(
+            after <= 2,
+            "the stack is back within the 2-segment budget after compaction: {after}"
+        );
+
+        // Every born row reads back through the compacted segment stack.
+        let names_through = |gen: &Generation, w: &Arc<DeltaWriter>| -> HashSet<String> {
+            let cache = BlockCache::new(1 << 20);
+            let view = MergedView::new(gen, w.delta_snapshot());
+            let ast = parser::parse("MATCH (n:Person) RETURN n.name").unwrap();
+            let out: HashSet<String> = Engine::new(&view, &cache)
+                .run(&ast)
+                .unwrap()
+                .rows
+                .iter()
+                .filter_map(|r| match &r[0] {
+                    Val::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            out
+        };
+        let served = ctx.graphs.get("people").unwrap();
+        let names = names_through(served.as_ref(), &writer);
+        for n in ["Dave", "Erin", "Fay"] {
+            assert!(
+                names.contains(n),
+                "born {n} survives the segment fold: {names:?}"
+            );
+        }
+
+        // Reopen the graph from disk with no writable layer: the born rows live in the
+        // durable segments (the delta was empty after the last flush), so a fresh read
+        // still serves them.
+        let reopened = Graphs::open_all(&root, None).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let gen = reopened.get("people").unwrap();
+        let view = MergedView::new(gen.as_ref(), DeltaSnapshot::empty());
+        let ast = parser::parse("MATCH (n:Person) RETURN n.name").unwrap();
+        let reopened_names: HashSet<String> = Engine::new(&view, &cache)
+            .run(&ast)
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for n in ["Dave", "Erin", "Fay"] {
+            assert!(
+                reopened_names.contains(n),
+                "born {n} is durable across a reopen: {reopened_names:?}"
             );
         }
         std::fs::remove_dir_all(&root).ok();
@@ -10401,7 +10598,7 @@ mod tests {
         let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
         // The `people` fixture is 3 nodes + 1 edge = 4 entities; 25% = a threshold of 1,
         // so a single write is due. (Flush/compaction left at defaults; hard cap off.)
-        let (root, ctx) = build_writable_ctx_caps("auto_consol", &bin, 64 << 20, 4, 25, 0);
+        let (root, ctx) = build_writable_ctx_caps("auto_consol", &bin, 64 << 20, 4, 25, 0, 0, 8);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen0 = ctx.graphs.get("people").unwrap();
 
@@ -10450,11 +10647,12 @@ mod tests {
     /// pointed at the given binary — the harness for the `CALL slater.consolidate()`
     /// trigger (`execute_consolidate`).
     fn build_writable_ctx(tag: &str, builder_bin: &str) -> (PathBuf, Arc<ConnCtx>) {
-        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4, 0, 0)
+        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4, 0, 0, 0, 8)
     }
 
     /// [`build_writable_ctx`] with explicit delta caps, so a test can drive the auto
-    /// flush/compaction/consolidation thresholds (Phase 4d-ii).
+    /// flush/compaction/consolidation thresholds (Phase 4d-ii, Phase 6 segment tiers).
+    #[allow(clippy::too_many_arguments)]
     fn build_writable_ctx_caps(
         tag: &str,
         builder_bin: &str,
@@ -10462,6 +10660,8 @@ mod tests {
         l0_compaction_trigger: usize,
         delta_core_percent: usize,
         delta_hard_bytes: usize,
+        segment_flush_bytes: usize,
+        max_upper_segments: usize,
     ) -> (PathBuf, Arc<ConnCtx>) {
         let (root, _graph) = testgen::write_indexed_people(tag);
         let wal = root.join("_wal");
@@ -10513,6 +10713,9 @@ mod tests {
             builder_bin: builder_bin.to_string(),
             memtable_bytes,
             l0_compaction_trigger,
+            segment_flush_bytes,
+            max_upper_segments,
+            off_heap_l0: false,
             delta_core_percent,
             delta_hard_bytes,
             consolidate_window: None,
@@ -10676,6 +10879,9 @@ mod tests {
             builder_bin: "slater-build".to_string(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            segment_flush_bytes: 0,
+            max_upper_segments: 8,
+            off_heap_l0: false,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: None,
@@ -10760,6 +10966,9 @@ mod tests {
             builder_bin: "slater-build".to_string(),
             memtable_bytes: 64 << 20,
             l0_compaction_trigger: 4,
+            segment_flush_bytes: 0,
+            max_upper_segments: 8,
+            off_heap_l0: false,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: None,
