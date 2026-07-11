@@ -118,8 +118,9 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.4 (`1851b49`). **Phases
-1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.5 (count summation via signed marginals).**
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.5 (`6e2c3a7`). **Phases
+1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.6 (hardening + conformance; histogram
+decline already landed in 3.5).**
 
 ### Phase 3 design (decided)
 
@@ -160,11 +161,16 @@ fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs 
   variants + re-sorts for the delta overlay; `suppress_tombstoned` drops segment tombstones
   (now `Result`). **Phase-4 obligation: a segment's `removals` must cover every id whose
   indexed value it supersedes (base OR older segment), not just base ids.**
-- **3.5** counts: extend `MergedView` `live_*` marginal folds to sum base + Σ segment
-  `SegmentManifest` deltas (+ delta), declining (→ None / full exec) when any segment's
-  `marginals_exact` is false.
-- **3.6** histogram/grouped-index decline over a stacked set; full suite + conformance
-  fs+mem; clippy; Phase 3 exit.
+- **3.5 DONE** (`6e2c3a7`): `MergedView`/identity `live_*` sum the stack's `SegmentManifest`
+  deltas (node/label/edge/reltype), decline (→ None) on inexact marginals; `node_count()`/
+  `edge_count()` use `extents().total()` so `AllNodes` covers born bands. Gates:
+  `try_count_fast_path` (declines inexact), `try_reltype_meta_fast_path` (routes stacked
+  sets through `live_reltype_edge_groups`), `try_label_meta_fast_path` + grouped-index/
+  count-walk (decline over a stacked set — **histogram decline landed here, not 3.6**).
+- **3.6** hardening: full suite + conformance fs+mem; clippy across the workspace; run the
+  fuzz target; sweep for any other fast path that reads base marginals directly without a
+  stack check (audit `try_*_fast_path` + `plan.rs` cost model `choose_node_scan` selectivity
+  which reads `label_node_count`/`node_count`); Phase 3 exit + doc.
 
 **Reference — the delta-overlay mirror targets** (Phase 3 seams mimic these for segments):
 `MergedView` in `read_view.rs` (`live_*` signed marginals); `exec.rs` `overlay_node_props`
@@ -191,7 +197,10 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
 - HP6 — Phase 3 slice 3.3: adjacency fan-out gating (`a8057f2`); 705 slater lib +
   graph-format segment tests green, clippy clean. ✓
 - HP7 — Phase 3 slice 3.4: index-probe union + segment-aware scans (`1851b49`); 707 slater
-  lib tests green (3 scan oracle tests), clippy clean. ✓ ← current baseline.
+  lib tests green (3 scan oracle tests), clippy clean. ✓
+- HP8 — Phase 3 slice 3.5: count summation via signed marginals + histogram decline
+  (`6e2c3a7`); 708 slater lib tests green (count oracle + decline), clippy clean. ✓ ←
+  current baseline.
 
 **Immediate next step — start Phase 2 (core-segment format).** Build
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
