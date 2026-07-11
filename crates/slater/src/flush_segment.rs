@@ -8,7 +8,7 @@
 //! preserved — no re-resolution, no id renumbering). The read path already merges such a
 //! segment (Phase 3); this module is its first writer.
 //!
-//! # Scope (slices 4.1 births-only + 4.2 node core-patches + 4.3 deletes)
+//! # Scope (slices 4.1 births-only + 4.2 node core-patches + 4.3 deletes + 4.4-a edge patches)
 //! 4.1 materialised a delta of solely **born** nodes/edges (a `MERGE` of entities absent
 //! from the core), with their adjacency, index and posting fragments and *exact* marginals.
 //! 4.2 adds **core-resolved node patches** (a `SET`/`REMOVE` on a node the core already
@@ -28,11 +28,19 @@
 //! adjacency tombstone with no edge id, matched by identity) is resolved to its core edge
 //! id(s) the same way and removed on *both* live endpoints' sides. A born edge incident to a
 //! node deleted in the same delta is dropped wholesale (it never reaches a lower layer).
+//! 4.4-a adds **core-edge patches** (a `SET r.p = v` on an edge the core already carries):
+//! the writer reads the edge's *base props* (a lower segment's winning full row via
+//! [`CoreStack::resolve_edge_row`], else the base generation's edge props), overlays the
+//! patch into a **full replace-row** the segment serves over the base, and changes no
+//! marginal (topology is untouched). The endpoints + reltype a patch omits from adjacency are
+//! surfaced by [`Memtable::to_segment_data`] in `core_patched_edges`. slater carries no
+//! relationship range index consulted at query time, so — unlike a node patch — an edge patch
+//! needs no index removal sidecar.
 //!
 //! Still deferred (each `bail!`ed, and the auto-trigger stays unwired so the orchestration
-//! never fires them): a **core-edge patch** (the base exposes no by-id endpoint reader to
-//! fill a full edge row — later slice), and a **stacked L0 level** fold (needs a cross-level
-//! walk — 4.4).
+//! never fires them): a patch-**then-delete** of the same core edge in one delta (an
+//! adjacency-removal concern this patch materialiser does not own), and a **stacked L0 level**
+//! fold (needs a cross-level walk — 4.4).
 //!
 //! # Full rows, replace semantics
 //! Segments hold *full* rows, not patches: the newest segment carrying an id wins in a
@@ -327,16 +335,54 @@ pub fn write_flush_segment(mem: &Memtable, inp: &FlushInputs) -> Result<SegmentM
             .with_context(|| format!("push in-adjacency for {dst}"))?;
     }
 
-    // Edge rows, ascending edge id (data.edges is sorted). Only a live born edge carries a
-    // row; a core-edge patch (below the synthetic base, in `by_edge_id`) is still deferred, a
-    // core-edge delete carries no row (it is a pure adjacency removal), and a born edge that
-    // did not survive (tombstoned or incident to a dropped node) is materialised nowhere.
+    // Core-edge patch endpoints (`edge_id → (src, dst, reltype)`): a `SET r.p` on an existing
+    // core edge below the synthetic base. A patch leaves topology alone, so the endpoints are
+    // absent from `data.adj_out`; the memtable surfaces them here so the row can carry them.
+    let core_patched_edges: BTreeMap<u64, (u64, u64, String)> = data
+        .core_patched_edges
+        .iter()
+        .map(|(eid, src, dst, rt)| (*eid, (*src, *dst, rt.clone())))
+        .collect();
+
+    // Edge rows, ascending edge id (data.edges is sorted, core ids before born ids). A live
+    // born edge carries a full row; a core-edge patch below the synthetic base is a full
+    // *replace* row — the base edge props (a lower segment's winning row, else the base
+    // generation's) overlaid by the patch, `resolve_edge_row` serving it over the base with
+    // no marginal change (topology is untouched). A core-edge delete carries no row (a pure
+    // adjacency removal), and a born edge that did not survive is materialised nowhere. Pushed
+    // ascending, so core-patch ids (below the band) precede born ids and the id fence widens
+    // to include them.
     for (eid, edelta) in &data.edges {
         if *eid < edge_synthetic_base {
-            bail!(
-                "flush_to_segment: edge {eid} is a core-edge patch \
-                 (below edge synthetic base {edge_synthetic_base}) — not supported in this slice"
-            );
+            // A core-edge patch. A tombstoned entry here is a patch-then-delete of the *same*
+            // core edge in one delta — the removal is an adjacency concern (the read path
+            // drops an edge by a `removed` fragment, not an edge-row tombstone) that this
+            // patch materialiser does not own; refuse it rather than half-apply.
+            if edelta.tombstoned {
+                bail!(
+                    "flush_to_segment: core edge {eid} is both patched and tombstoned in one \
+                     delta — patch-then-delete of a core edge is not supported in this slice"
+                );
+            }
+            let Some((src, dst, reltype)) = core_patched_edges.get(eid).cloned() else {
+                bail!("flush_to_segment: core-patched edge {eid} has no recorded endpoints");
+            };
+            let mut props = read_base_edge_row(inp.core, *eid)?;
+            for (k, v) in &edelta.patches {
+                props.insert(k.clone(), v.clone()); // a patch wins over the base value
+            }
+            w.push_edge(
+                *eid,
+                &EdgeRow {
+                    src,
+                    dst,
+                    reltype,
+                    props: props.into_iter().collect(),
+                    tombstoned: false,
+                },
+            )
+            .with_context(|| format!("push core-patched edge {eid}"))?;
+            continue;
         }
         let Some((src, dst, reltype)) = live_born_edges.get(eid).cloned() else {
             continue;
@@ -637,6 +683,29 @@ fn read_base_node_row(
         .filter_map(|lid| core.label_name(lid).map(str::to_string))
         .collect();
     Ok((props, labels))
+}
+
+/// Read edge `id`'s **base-below-delta** property map (keyed by name) as the core stack sees
+/// it under this flush's delta: a lower segment's winning full row, else the base
+/// generation's edge props. The edge mirror of [`read_base_node_row`], matching
+/// [`Executor::core_named_edge_props`](crate::exec) so the overlaid full row equals what a
+/// pre-flush `RETURN r.p` returned. A base row that is already a tombstone would mean a patch
+/// on a deleted edge — the write path never produces that, so it is refused.
+fn read_base_edge_row(core: &Generation, id: u64) -> Result<BTreeMap<String, Value>> {
+    if let Some(row) = core.stack().resolve_edge_row(id)? {
+        if row.tombstoned {
+            bail!("flush_to_segment: edge {id} patches a base-tombstoned edge — unexpected");
+        }
+        return Ok(row.props.into_iter().collect());
+    }
+    let props = core
+        .edge_props()
+        .props(id)
+        .with_context(|| format!("read base props for core-patched edge {id}"))?
+        .into_iter()
+        .map(|(kid, v)| (core.property_key_name(kid).unwrap_or("?").to_string(), v))
+        .collect();
+    Ok(props)
 }
 
 /// Overlay a core node's delta onto its `base` props into the effective full-row property

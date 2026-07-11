@@ -7124,6 +7124,140 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 4 slice 4.4-a: a **core-edge patch** (`SET r.p = v` on an edge the core already
+    /// carries) flushes into an upper segment as a full **replace** edge row — the base props
+    /// overlaid by the patch — that `resolve_edge_row` serves over the base, with no marginal
+    /// change (topology untouched). The base fixture's one edge `Alice-KNOWS->Bob` carries
+    /// `since = 2020`; after patching `since → 2099` and adding a fresh `note`, an empty-delta
+    /// read serves both from the segment, the base `since` is gone, the endpoints/counts are
+    /// unchanged, and it all survives a reopen.
+    #[test]
+    fn flush_to_segment_materialises_a_core_edge_patch() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_patch_edge_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(qy).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {qy}"),
+            }
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            // A reopened graph (post-drop) has no writable layer; fall back to an empty delta.
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+
+        // Base edge Alice-KNOWS->Bob carries since=2020; the existing-edge MERGE resolves it
+        // and routes the SET to `patch_core_edge` (in-place patch, no duplicate born edge).
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) \
+             SET r.since = 2099, r.note = 'hi'",
+        );
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("an edge patch flushes a non-empty delta");
+
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            1,
+            "one upper segment"
+        );
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired empty"
+        );
+
+        // The overlaid prop is served from the segment; the fresh prop too; the base value gone.
+        let since = q(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b) RETURN r.since",
+        );
+        assert!(
+            matches!(since.rows[0][0], Val::Int(2099)),
+            "patched edge prop served from the segment: {:?}",
+            since.rows[0][0]
+        );
+        let note = q(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b) RETURN r.note",
+        );
+        assert!(
+            matches!(&note.rows[0][0], Val::Str(s) if s == "hi"),
+            "fresh edge prop served from the segment: {:?}",
+            note.rows[0][0]
+        );
+        // Topology + counts unchanged: both endpoints remain, the edge still traverses, and the
+        // node/edge marginals are untouched by a patch.
+        let bob = q(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name",
+        );
+        assert!(
+            matches!(&bob.rows[0][0], Val::Str(s) if s == "Bob"),
+            "the patched edge still traverses to Bob: {:?}",
+            bob.rows[0][0]
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH (n:Person) RETURN count(*)").rows[0][0],
+                Val::Int(3)
+            ),
+            "an edge patch changes no node count"
+        );
+        assert!(
+            matches!(
+                q(&graphs, "MATCH ()-[:KNOWS]->() RETURN count(*)").rows[0][0],
+                Val::Int(1)
+            ),
+            "an edge patch changes no edge count"
+        );
+
+        // Reopen from disk: the replace row reloads and still serves the patched value.
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        assert_eq!(
+            graphs.get("people").unwrap().uuid(),
+            set_uuid,
+            "reopen names the set"
+        );
+        let since = q(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b) RETURN r.since",
+        );
+        assert!(
+            matches!(since.rows[0][0], Val::Int(2099)),
+            "the patched edge prop reloaded from the segment: {:?}",
+            since.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Number of `*.l0` segment files under `<wal>/<graph>/l0/`.
     fn l0_count(wal_dir: &Path) -> usize {
         let l0 = wal_dir.join("l0");

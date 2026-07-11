@@ -1421,6 +1421,23 @@ impl Memtable {
             }
         }
 
+        // Core-edge property patches: the endpoints + reltype the core-segment flush needs
+        // to materialise a full replace row (a patch is not in `adj_out`, so `data.edges`
+        // alone would drop them). Keyed off `by_edge_id`, which holds only genuine patched
+        // core edge ids, in ascending id order.
+        let mut cp_ids: Vec<u64> = self.by_edge_id.keys().copied().collect();
+        cp_ids.sort_unstable();
+        for cid in cp_ids {
+            let Some(eck) = self.by_edge_id.get(&cid) else {
+                continue;
+            };
+            let Some(e) = self.edges.get(eck) else {
+                continue;
+            };
+            data.core_patched_edges
+                .push((cid, e.src_dense, e.dst_dense, name(e.identity.reltype)));
+        }
+
         // Secondary: born nodes → by-label / index / identity (born-allocation order).
         let mut by_label: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for ck in &self.born {

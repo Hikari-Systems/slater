@@ -86,6 +86,14 @@ pub struct SegmentData {
     pub adj_in: Vec<(u64, Vec<DeltaEdge>)>,
     /// `(edge id, delta)` — **sorted by edge id**.
     pub edges: Vec<(u64, EdgeDelta)>,
+    /// `(core edge id, src dense, dst dense, reltype name)` for every in-place property
+    /// patch of an existing **core** edge (a `SET r.p = v`). A patch leaves topology
+    /// alone, so — unlike a born edge — the endpoints are absent from `adj_out`/`adj_in`;
+    /// the core-segment flush writer needs them to materialise the edge's full replace
+    /// row (base props ⊕ patch). The off-heap L0 writer ignores this field (a delta-shaped
+    /// level reads a patched edge's value through `edge_delta_by_id`, never its endpoints).
+    /// **sorted by core edge id.**
+    pub core_patched_edges: Vec<(u64, u64, u64, String)>,
     /// `label → born dense ids` in born-allocation (ascending) order.
     pub born_by_label: Vec<(String, Vec<u64>)>,
     /// One entry per born node, in born-allocation order.
