@@ -1555,6 +1555,10 @@ struct ConnCtx {
     /// Whether this server reads L0 off-heap (`config.delta.off_heap_l0`). Consulted only
     /// to suppress the T2 auto-flush (an off-heap flush is not yet supported — it bails).
     off_heap_l0: bool,
+    /// Grace (seconds) before the orphan segment/set GC sweep reclaims a dir the served set no
+    /// longer references (`config.delta.segment_gc_grace_secs`; 0 disables — Phase 7 slice 7.2).
+    /// The sweep fires after the orphan-creating events (a T3 compaction, a consolidation).
+    segment_gc_grace_secs: u64,
     /// Auto-consolidation threshold as a percent of the served core's entity count
     /// (`config.delta.delta_core_percent`; 0 disables — Phase 4d-ii-b).
     delta_core_percent: usize,
@@ -2438,6 +2442,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         segment_flush_bytes: cfg.delta.segment_flush_bytes,
         max_upper_segments: cfg.delta.max_upper_segments,
         off_heap_l0: cfg.delta.off_heap_l0,
+        segment_gc_grace_secs: cfg.delta.segment_gc_grace_secs,
         delta_core_percent: cfg.delta.delta_core_percent,
         delta_hard_bytes: cfg.delta.delta_hard_bytes,
         consolidate_window,
@@ -4432,6 +4437,7 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
                 .get(graph)
                 .map(|gen| gen.stack().segments().len() > ctx.max_upper_segments)
                 .unwrap_or(false);
+        let mut compacted = false;
         if over_segment_budget {
             let (g, c) = (graph.to_string(), ctx.clone());
             let max_upper = ctx.max_upper_segments;
@@ -4441,7 +4447,9 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
             })
             .await
             {
-                Ok(Ok(_)) => {}
+                // `Some` means a run actually folded — its old segment dirs + the superseded
+                // set are now orphaned, so a GC sweep below has something to reclaim.
+                Ok(Ok(folded)) => compacted = folded.is_some(),
                 Ok(Err(e)) if is_already_in_progress(&e) => {
                     debug!(graph = %graph, "segment compaction skipped: a flush/consolidation is already running")
                 }
@@ -4449,6 +4457,30 @@ async fn maybe_maintain_delta(ctx: &Arc<ConnCtx>, graph: &str, writer: &Arc<Delt
                     warn!(graph = %graph, error = %format!("{e:#}"), "segment compaction failed")
                 }
                 Err(e) => warn!(graph = %graph, error = %e, "segment compaction task panicked"),
+            }
+        }
+
+        // T4 GC (Phase 7 slice 7.2): after a compaction folds a run, reclaim its now-orphaned
+        // segment dirs + the superseded set — only when a fold happened (so it is not paid per
+        // write) and GC is enabled (`segmentGcGraceSecs > 0`). The sweep takes its own
+        // `begin_consolidation` claim (the compaction already released it); a lost race is
+        // benign (another op holds it — it will re-observe the orphans on a later write).
+        if compacted && ctx.segment_gc_grace_secs > 0 {
+            let (g, c) = (graph.to_string(), ctx.clone());
+            let grace = ctx.segment_gc_grace_secs;
+            match tokio::task::spawn_blocking(move || {
+                c.graphs.gc_orphan_segments(&g, &c.data_dir, grace)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if is_already_in_progress(&e) => {
+                    debug!(graph = %graph, "segment GC skipped: a flush/consolidation is already running")
+                }
+                Ok(Err(e)) => {
+                    warn!(graph = %graph, error = %format!("{e:#}"), "segment GC after compaction failed")
+                }
+                Err(e) => warn!(graph = %graph, error = %e, "segment GC task panicked"),
             }
         }
     }
@@ -4587,6 +4619,7 @@ async fn execute_consolidate(
     let data_dir = ctx.data_dir.clone();
     let builder_bin = ctx.builder_bin.clone();
     let graph = graph.to_string();
+    let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
     let new_uuid = tokio::task::spawn_blocking(move || {
         graphs.consolidate_graph(&graph, &cache, &vector_cache, &data_dir, |dump, g, dd| {
             run_builder(&builder_bin, dump, g, dd)
@@ -4595,6 +4628,26 @@ async fn execute_consolidate(
     .await
     .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation task failed: {e}")))?
     .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation failed: {e:#}")))?;
+
+    // T4 GC (Phase 7 slice 7.2): a retarget collapses the served set to a singleton, orphaning
+    // the whole prior set + every one of its segments. Reclaim them when GC is enabled — a
+    // best-effort sweep whose failure never fails the (already-published) consolidation.
+    if ctx.segment_gc_grace_secs > 0 {
+        let (g, graphs, data_dir) = (gc_graph.clone(), ctx.graphs.clone(), ctx.data_dir.clone());
+        let grace = ctx.segment_gc_grace_secs;
+        match tokio::task::spawn_blocking(move || graphs.gc_orphan_segments(&g, &data_dir, grace))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if is_already_in_progress(&e) => {
+                debug!(graph = %gc_graph, "segment GC skipped: a flush/consolidation is already running")
+            }
+            Ok(Err(e)) => {
+                warn!(graph = %gc_graph, error = %format!("{e:#}"), "segment GC after consolidation failed")
+            }
+            Err(e) => warn!(graph = %gc_graph, error = %e, "segment GC task panicked"),
+        }
+    }
     Ok((
         vec!["generation".to_string()],
         vec![vec![PsValue::String(new_uuid.to_string())]],
@@ -5455,6 +5508,7 @@ mod tests {
             consolidate_window: String::new(),
             builder_bin: "slater-build".to_string(),
             off_heap_l0: false,
+            segment_gc_grace_secs: 0,
         }
     }
 
@@ -10796,7 +10850,7 @@ mod tests {
     #[tokio::test]
     async fn merged_count_star_nets_born_and_suppressed_rows() {
         let (_root, ctx) =
-            build_writable_ctx_caps("merged_count", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
+            build_writable_ctx_caps("merged_count", "slater-build", 1 << 20, 0, 0, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10861,7 +10915,7 @@ mod tests {
     #[tokio::test]
     async fn merged_metadata_and_edge_counts_track_the_delta() {
         let (_root, ctx) =
-            build_writable_ctx_caps("merged_meta", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
+            build_writable_ctx_caps("merged_meta", "slater-build", 1 << 20, 0, 0, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10942,8 +10996,17 @@ mod tests {
     /// number — the matcher then produces the right answer.
     #[tokio::test]
     async fn edge_tombstone_makes_the_edge_fast_path_decline_not_lie() {
-        let (_root, ctx) =
-            build_writable_ctx_caps("merged_edge_tomb", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
+        let (_root, ctx) = build_writable_ctx_caps(
+            "merged_edge_tomb",
+            "slater-build",
+            1 << 20,
+            0,
+            0,
+            0,
+            0,
+            8,
+            0,
+        );
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -10987,7 +11050,7 @@ mod tests {
     #[tokio::test]
     async fn match_set_updates_a_delta_born_node() {
         let (_root, ctx) =
-            build_writable_ctx_caps("set_born", "slater-build", 1 << 20, 0, 0, 0, 0, 8);
+            build_writable_ctx_caps("set_born", "slater-build", 1 << 20, 0, 0, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -11037,7 +11100,7 @@ mod tests {
         // memtable_bytes = 1 ⇒ every write flushes; trigger 0 ⇒ no compaction, so the
         // levels stay distinct and the cross-level fold is what is under test.
         let (_root, ctx) =
-            build_writable_ctx_caps("merged_count_l0", "slater-build", 1, 0, 0, 0, 0, 8);
+            build_writable_ctx_caps("merged_count_l0", "slater-build", 1, 0, 0, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -11087,7 +11150,8 @@ mod tests {
     /// exactly as the RUN handler does, and confirms the born rows survive.
     #[tokio::test]
     async fn write_path_auto_flushes_and_compacts() {
-        let (root, ctx) = build_writable_ctx_caps("auto_maint", "slater-build", 1, 3, 0, 0, 0, 8);
+        let (root, ctx) =
+            build_writable_ctx_caps("auto_maint", "slater-build", 1, 3, 0, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen = ctx.graphs.get("people").unwrap();
 
@@ -11150,7 +11214,7 @@ mod tests {
     async fn write_path_auto_flushes_and_compacts_segments() {
         // memtable_bytes 1 (L0 rungs also fire, harmlessly — the whole delta flushes
         // anyway), l0 trigger 0, no consolidation; segment_flush_bytes 1, max_upper 2.
-        let (root, ctx) = build_writable_ctx_caps("auto_seg", "slater-build", 1, 0, 0, 0, 1, 2);
+        let (root, ctx) = build_writable_ctx_caps("auto_seg", "slater-build", 1, 0, 0, 0, 1, 2, 0);
         let writer = ctx.graphs.writer("people").unwrap();
 
         let write = |q: &str| {
@@ -11241,6 +11305,88 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 7 slice 7.3: the write path auto-fires the T4 **GC** sweep after a T3 compaction.
+    /// With `segmentGcGraceSecs > 0` the sweep that `maybe_maintain_delta` runs after a
+    /// compaction folds a run *marks* the run's now-orphaned segment dirs (a `.gcmark` per dir)
+    /// but waits out the grace before deleting — so the marker's presence proves the wiring
+    /// fired GC without a fold-then-sleep. An explicit immediate sweep then reclaims them.
+    #[tokio::test]
+    async fn write_path_auto_gc_marks_orphans_after_compaction() {
+        // segment_flush_bytes 1 (flush each write), max_upper 2 (compact when >2), grace 3600
+        // (the auto-GC marks the orphans but holds them through the grace).
+        let (root, ctx) =
+            build_writable_ctx_caps("auto_gc", "slater-build", 1, 0, 0, 0, 1, 2, 3600);
+        let writer = ctx.graphs.writer("people").unwrap();
+        let write = |q: &str| {
+            let gen = ctx.graphs.get("people").unwrap();
+            let stmt = match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => w,
+                _ => panic!("expected a node write: {q}"),
+            };
+            execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        };
+        let gcmark_count = |root: &Path| -> usize {
+            seg_dirs(root)
+                .iter()
+                .filter(|d| {
+                    root.join("people")
+                        .join("segments")
+                        .join(d)
+                        .join(".gcmark")
+                        .exists()
+                })
+                .count()
+        };
+
+        // Four flushes tip the stack past maxUpperSegments and drive at least one compaction,
+        // whose orphaned run dirs the wiring's GC sweep marks.
+        for (i, name) in ["Dave", "Erin", "Fay", "Gina"].iter().enumerate() {
+            write(&format!(
+                "MERGE (n:Person {{name:'{name}'}}) SET n.age = {i}"
+            ));
+            maybe_maintain_delta(&ctx, "people", &writer).await;
+        }
+        assert!(
+            ctx.graphs.get("people").unwrap().stack().segments().len() <= 2,
+            "the stack stayed within the compaction budget"
+        );
+        let marked = gcmark_count(&root);
+        assert!(
+            marked >= 1,
+            "the auto-GC sweep marked the compacted run's orphaned dirs: {marked}"
+        );
+
+        // An immediate explicit sweep reclaims the marked orphans end-to-end.
+        let rep = ctx.graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert!(
+            !rep.deleted_segments.is_empty(),
+            "the marked orphans are reclaimed: {rep:?}"
+        );
+        // Only live segments remain, and every born row still reads back.
+        let cache = BlockCache::new(1 << 20);
+        let served = ctx.graphs.get("people").unwrap();
+        assert_eq!(
+            seg_dirs(&root).len(),
+            served.stack().segments().len(),
+            "no orphan dirs linger after the sweep"
+        );
+        let view = MergedView::new(served.as_ref(), writer.delta_snapshot());
+        let names: HashSet<String> = Engine::new(&view, &cache)
+            .run(&parser::parse("MATCH (n:Person) RETURN n.name").unwrap())
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for n in ["Dave", "Erin", "Fay", "Gina"] {
+            assert!(names.contains(n), "born {n} survives GC: {names:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn consolidation_due_is_a_fraction_of_core() {
         // Disabled / degenerate cases.
@@ -11291,7 +11437,7 @@ mod tests {
         let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
         // The `people` fixture is 3 nodes + 1 edge = 4 entities; 25% = a threshold of 1,
         // so a single write is due. (Flush/compaction left at defaults; hard cap off.)
-        let (root, ctx) = build_writable_ctx_caps("auto_consol", &bin, 64 << 20, 4, 25, 0, 0, 8);
+        let (root, ctx) = build_writable_ctx_caps("auto_consol", &bin, 64 << 20, 4, 25, 0, 0, 8, 0);
         let writer = ctx.graphs.writer("people").unwrap();
         let gen0 = ctx.graphs.get("people").unwrap();
 
@@ -11340,7 +11486,7 @@ mod tests {
     /// pointed at the given binary — the harness for the `CALL slater.consolidate()`
     /// trigger (`execute_consolidate`).
     fn build_writable_ctx(tag: &str, builder_bin: &str) -> (PathBuf, Arc<ConnCtx>) {
-        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4, 0, 0, 0, 8)
+        build_writable_ctx_caps(tag, builder_bin, 64 << 20, 4, 0, 0, 0, 8, 0)
     }
 
     /// [`build_writable_ctx`] with explicit delta caps, so a test can drive the auto
@@ -11355,6 +11501,7 @@ mod tests {
         delta_hard_bytes: usize,
         segment_flush_bytes: usize,
         max_upper_segments: usize,
+        segment_gc_grace_secs: u64,
     ) -> (PathBuf, Arc<ConnCtx>) {
         let (root, _graph) = testgen::write_indexed_people(tag);
         let wal = root.join("_wal");
@@ -11409,6 +11556,7 @@ mod tests {
             segment_flush_bytes,
             max_upper_segments,
             off_heap_l0: false,
+            segment_gc_grace_secs,
             delta_core_percent,
             delta_hard_bytes,
             consolidate_window: None,
@@ -11575,6 +11723,7 @@ mod tests {
             segment_flush_bytes: 0,
             max_upper_segments: 8,
             off_heap_l0: false,
+            segment_gc_grace_secs: 0,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: None,
@@ -11662,6 +11811,7 @@ mod tests {
             segment_flush_bytes: 0,
             max_upper_segments: 8,
             off_heap_l0: false,
+            segment_gc_grace_secs: 0,
             delta_core_percent: 0,
             delta_hard_bytes: 0,
             consolidate_window: None,

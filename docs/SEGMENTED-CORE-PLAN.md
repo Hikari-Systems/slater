@@ -99,12 +99,13 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   touched block for a whole write batch). Slice 6.4 DONE (`HP23`): T2/T3 auto-trigger wire-up in
   `maybe_maintain_delta` (`segmentFlushBytes` flushes the delta into a core segment; the served
   stack over `maxUpperSegments` folds a run — beside the L0-internal rungs).
-- **Phase 7 — T4 retarget + GC.** IN PROGRESS. `consolidate_graph` collapses a set to a
-  singleton via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
+- **Phase 7 — T4 retarget + GC.** Functionally complete. `consolidate_graph` collapses a set to
+  a singleton via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
   Slice 7.1 DONE (`HP24`): segment-aware consolidation dump (the retarget correctness gate —
   `serialise_binary_dump` folds the core stack). Slice 7.2 DONE (`HP25`): orphan segment/set GC
-  core (`Graphs::gc_orphan_segments`, local-fs, marker-based grace). Slice 7.3: GC config +
-  write-path wiring. Slice 7.4 (optional): remote-store GC parity.
+  core (`Graphs::gc_orphan_segments`, local-fs, marker-based grace). Slice 7.3 DONE (`HP26`): GC
+  config (`deltaConfig.segmentGcGraceSecs`) + write-path wiring (post-compaction, post-retarget).
+  Slice 7.4 (optional): remote-store GC parity (`ObjectStore::delete`).
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
   2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm.
 
@@ -127,12 +128,16 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.2 (HP25). **Phases 1–6
-DONE; Phase 7 IN PROGRESS** (7.1 retarget gate + 7.2 GC core done). Next is **Phase 7 slice
-7.3** (GC config knob `deltaConfig.segmentGcGraceSecs` + wiring the sweep after a T3 compaction
-and a consolidation/retarget). `Graphs::gc_orphan_segments(name, data_dir, grace_secs)` is the
-core (local-fs, marker-based grace, single-flight via `begin_consolidation`, never touches a gen
-dir); 7.4 (optional) adds `ObjectStore::delete` for remote-store parity.
+**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.3 (HP26). **Phases 1–6 DONE;
+Phase 7 functionally complete** (7.1 retarget gate + 7.2 GC core + 7.3 config/wiring). The only
+work left is the **optional slice 7.4** — remote-store GC parity: add an `ObjectStore::delete`
+and have `gc_orphan_segments` reclaim a remote set/segment's objects (today it is a no-op on a
+non-local-fs store), with the grace covering lazy block re-fetch (the local-fs fd-persistence
+argument does not hold on a remote backend). If 7.4 is not pursued, **Phase 8** (bench harness +
+hardening + docs) is next. The retarget path is `consolidate_graph` (already segment-aware after
+7.1); the GC entry point is `Graphs::gc_orphan_segments(name, data_dir, grace_secs)`, wired into
+`maybe_maintain_delta` (post-compaction) and `execute_consolidate` (post-retarget) under
+`deltaConfig.segmentGcGraceSecs > 0`.
 
 **Phase 7 (T4 retarget + GC) — slice 7.1 DONE (segment-aware consolidation dump — the retarget
 correctness gate).** `consolidate_graph` already freezes the delta, dumps `MergedView(core, delta)`
@@ -448,10 +453,16 @@ Two slices:
   is slice 7.4). Three e2e oracles (`gc_reclaims_stale_sets_and_compacted_segments`,
   `gc_respects_the_grace_before_reclaiming`, `gc_after_retarget_reclaims_the_prior_set`). **745 slater
   lib** (+3) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
-- **7.3 — GC config + write-path wiring (NEXT).** A `deltaConfig.segmentGcGraceSecs` knob (`0`
-  disables) plumbed onto `ConnCtx`, and the sweep wired to fire after the orphan-creating events — a
-  T3 compaction (in `maybe_maintain_delta`) and a consolidation/retarget (in the consolidate path) —
-  rather than every write, guarded by the knob and treating a lost single-flight race as benign (debug).
+- **7.3 DONE** (HP26) — **GC config + write-path wiring.** New `deltaConfig.segmentGcGraceSecs`
+  knob (`u64` seconds; **`0` disables**, off by default) plumbed onto `ConnCtx`, and the sweep wired to
+  fire after the orphan-creating events — a **T3 compaction** (in `maybe_maintain_delta`, only when a
+  run actually folded, so it is not paid per write) and a **consolidation/retarget** (at the end of
+  `execute_consolidate`). Both run on the blocking pool, are guarded by the knob, and treat a lost
+  single-flight race / transient error as benign (debug/warn — never fails the compaction or the
+  already-published consolidation). One e2e (`write_path_auto_gc_marks_orphans_after_compaction`:
+  four auto-flushes drive a compaction whose orphaned run dirs the wired sweep marks with `.gcmark`
+  within the grace, then an immediate explicit sweep reclaims them; every born row survives). **746
+  slater lib** (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
 - **7.4 — remote-store GC parity (optional).** Add an `ObjectStore::delete` and reclaim a remote
   set/segment's objects (with the grace covering lazy block re-fetch, where the fd-persistence
   argument does not hold).
@@ -940,8 +951,18 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   `sets/`. **Local-fs only** (deletion is `std::fs`; the `ObjectStore` trait has no delete — remote is
   slice 7.4). Three e2e oracles (`gc_reclaims_stale_sets_and_compacted_segments`,
   `gc_respects_the_grace_before_reclaiming`, `gc_after_retarget_reclaims_the_prior_set`). **745 slater
-  lib** (+3) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ←
-  current baseline; next is Phase 7 slice 7.3 (GC config + write-path wiring).
+  lib** (+3) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
+- HP26 — Phase 7 slice 7.3: **GC config + write-path wiring**. New `deltaConfig.segmentGcGraceSecs`
+  (`u64` seconds; `0` disables, off by default) on `DeltaConfig` + `ConnCtx`, and
+  `gc_orphan_segments` wired to fire after the orphan-creating events: a **T3 compaction** (in
+  `maybe_maintain_delta`, only when a run actually folded — captured via the `compact_auto` `Some`
+  result, so GC is not paid per write) and a **consolidation/retarget** (end of `execute_consolidate`).
+  Both on the blocking pool, guarded by the knob, a lost single-flight race / transient error benign
+  (debug/warn — never fails the fold or the already-published consolidation). `build_writable_ctx_caps`
+  gained a grace arg. One e2e (`write_path_auto_gc_marks_orphans_after_compaction`). **746 slater lib**
+  (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ← current
+  baseline; Phase 7 functionally complete (7.1 retarget gate + 7.2 GC core + 7.3 wiring); only the
+  optional 7.4 (remote-store `ObjectStore::delete` parity) remains.
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

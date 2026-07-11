@@ -864,6 +864,17 @@ pub struct DeltaConfig {
     /// `docs/WRITABLE-PROGRESS.md` and D54.
     #[serde(default)]
     pub off_heap_l0: bool,
+    /// Grace period, in **seconds**, before the segment/set GC sweep (Phase 7 slice 7.2 —
+    /// [`crate::server::Graphs::gc_orphan_segments`]) reclaims an orphaned `segments/<uuid>/`
+    /// directory or stale `sets/<uuid>.json` that the served set no longer references (a
+    /// compaction supersedes the run's dirs, a retarget the whole prior set). The grace runs
+    /// from the sweep's *first observation* of the orphan (not its file mtime), so an in-flight
+    /// reader that opened its `Generation` before the swap finishes reading before the delete —
+    /// the reader-safety margin. **0 disables the auto sweep** (off by default, like
+    /// `segmentFlushBytes`); a positive value both enables it and sets the grace. When enabled,
+    /// the sweep fires after the orphan-creating events (a T3 compaction, a consolidation).
+    #[serde(default, deserialize_with = "de::u64")]
+    pub segment_gc_grace_secs: u64,
 }
 
 impl Default for DeltaConfig {
@@ -880,6 +891,7 @@ impl Default for DeltaConfig {
             consolidate_window: String::new(),
             builder_bin: default_builder_bin(),
             off_heap_l0: false,
+            segment_gc_grace_secs: 0,
         }
     }
 }
