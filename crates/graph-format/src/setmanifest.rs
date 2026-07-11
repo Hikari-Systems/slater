@@ -200,6 +200,7 @@ mod tests {
             label_node_deltas: vec![],
             marginals_exact: false,
             dirty_indexes: vec![],
+            label_membership_touch: None,
             mac: None,
             files: vec![],
         };

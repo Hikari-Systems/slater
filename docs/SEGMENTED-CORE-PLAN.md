@@ -107,9 +107,9 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   (`deltaConfig.segmentGcGraceSecs`) + write-path wiring (post-compaction, post-retarget). Slice
   7.4 DONE (`HP27`): remote-store GC parity (`ObjectStore::delete`).
 - **Phase 8 — Bench harness + hardening + docs.** IN PROGRESS. Read-amp harness (point lookup,
-  2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm. **Slices 8.1 + 8.2 DONE**
-  (fs harness + object-store parity variant + `slater::benchkit` + `docs/SEGMENTED-CORE-READ-AMP.md`);
-  next = the label-scan membership gate.
+  2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm. **Slices 8.1 + 8.2 + 8.3
+  DONE** (fs harness + object-store parity variant + label-scan membership gate + `slater::benchkit` +
+  `docs/SEGMENTED-CORE-READ-AMP.md`); remaining is optional (EC2 real-S3 latency capture / docs polish).
 
 ## Correctness discipline
 
@@ -131,16 +131,18 @@ never correctness.
 ## RESUME HERE
 
 **Branch:** `writeable`. **Committed through:** Phase 8 slices 8.1 (HP30 — read-amp harness) + 8.2
-(HP31 — object-store read-amp parity) atop Phase 7 (HP27) + flush-writer hardening (HP28/HP29 — both
-deferred flush `bail!`s closed). **Phases 1–7 DONE; every write op now flushes, resident or off-heap.
-Phase 8 IN PROGRESS.** Slice 8.1 shipped the **fs read-amp harness** (point lookup, 2-hop, label
-scan, count at 0/2/4/8 segments, cold-miss read-amp + warm latency); slice 8.2 added the
-**object-store variant** (`build_stacked_store`/`read_amp_cold_store` over a `MemObjectStore`, proving
-read-amp is **backend-invariant** — block-miss counts identical to fs — with real-S3 latency an EC2
-exercise). Still open in Phase 8: the **label-scan gate** — a correct one needs a resident
-per-segment "labels whose membership this segment mutates" manifest field (the naïve range/fence gate
-is unsound under a label swap), so `fold_label_scan` can skip a segment that changes no membership for
-the scanned label; that turns label-scan read-amp flat for the common property-only-patch workload.
+(HP31 — object-store read-amp parity) + 8.3 (HP32 — label-scan membership gate) atop Phase 7 (HP27) +
+flush-writer hardening (HP28/HP29). **Phases 1–7 DONE; every write op now flushes, resident or
+off-heap. Phase 8 IN PROGRESS.** Slice 8.1 shipped the **fs read-amp harness** (point lookup, 2-hop,
+label scan, count at 0/2/4/8 segments, cold-miss read-amp + warm latency); 8.2 the **object-store
+variant** (`build_stacked_store`/`read_amp_cold_store`, read-amp **backend-invariant**, real-S3 latency
+an EC2 exercise); 8.3 the **label-scan membership gate** — a new `SegmentManifest.label_membership_
+touch: Option<Vec<String>>` (labels whose node membership the segment changes; `None`=unknown⇒never
+skip; the flush computes it exactly, the T3 merge unions it) lets `fold_label_scan` **skip the whole
+stack** when no segment touches the scanned label, so the membership fold reads **zero** segment blocks
+for the common property-only-patch workload (the naïve id-band/fence gate is unsound — a label *swap*
+preserves counts/fences yet moves membership). **Phase 8 remaining (optional): docs polish / an EC2
+real-S3 latency capture** — the harness + gate are otherwise complete.
 
 **Phase 8 (bench harness + hardening + docs) — slice 8.1 DONE (HP30): the read-amp harness.**
 `slater::benchkit` (new testkit-gated module, gated `pub` like `testgen`) provides a scaled base
@@ -448,6 +450,27 @@ merged segment (its adjacency is suppressed by the fold, so it is never read); p
 
 ### Phase 8 slice log (bench harness + hardening + docs — IN PROGRESS)
 
+- **8.3 DONE** (HP32) — **label-scan membership gate.** A whole-graph label scan's membership
+  fold (`CoreStack::fold_label_scan`) decoded a node block per segment (`resolve_node_row` on every
+  stack-touched id) to re-check labels. New resident manifest field `SegmentManifest.label_membership_
+  touch: Option<Vec<String>>` — the sorted labels whose node **membership** the segment changes (gain,
+  loss, born-with, or tombstoned-with); `None` = *unknown* (predating field / decline) ⇒ conservatively
+  "may touch anything", so correctness never depends on the gate; `Some(empty)` = a pure property/edge
+  patch. The **flush writer** computes it exactly in the same before/after label diff that feeds
+  `label_node_deltas` (but WITHOUT the ± cancellation — a swap that nets zero still moves membership);
+  the **T3 merge** unions the run's sets (`None` poisons to `None`). `fold_label_scan(label)` **skips
+  the entire stack** when no segment's touch set lists `label` — zero segment block reads for the fold
+  vs one per segment before. A naïve id-band/value-fence gate would be **unsound**: a label swap (drop
+  `:X` from A, add `:X` to B) preserves every count and fence yet moves membership. MAC-covered (the
+  field is in the canonicalised manifest); no version bump (`#[serde(default)]` + `None`-conservative).
+  Note the gate zeroes the *fold*, not a query's *property materialisation* of segment-resident rows
+  (`RETURN p.name` on a patched node still reads it) — the win lands on untouched-label scans and
+  fold-only/aggregate consumers, plus per-id CPU always. Tests: `label_scan_membership_gate_reads_no_
+  segment_blocks` (fold = 0 segment blocks at depth 4), `label_scan_gate_folds_a_membership_changing_
+  segment` (a born `:Person` is still folded — the safety-critical direction), extended
+  `optional_fields_default_when_absent` (absent ⇒ `None` ⇒ `membership_touches` true). Docs:
+  gate section in `SEGMENTED-CORE-READ-AMP.md`. **753 slater lib** (+1) + **141 graph-format** + 78
+  slater-delta + full workspace green, clippy (incl. benches/testkit, s3/gcs) + fmt clean.
 - **8.2 DONE** (HP31) — **object-store read-amp parity.** `benchkit` gained `Reader::open_store`
   (cold-open a graph over any `ObjectStore` via `Generation::open_with_store`), `build_stacked_store`
   (build the stacked set on fs, mirror it byte-for-byte into a fresh `MemObjectStore`, tear the fs

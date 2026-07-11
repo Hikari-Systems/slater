@@ -498,6 +498,97 @@ mod tests {
         std::fs::remove_dir_all(&root4).ok();
     }
 
+    /// The label-scan membership gate, measured in isolation: `build_stacked` patches only `age`
+    /// (a property), so every segment's `label_membership_touch` is empty and `fold_label_scan`
+    /// skips the whole stack — **zero** segment block reads to fold a `:Person` scan at depth 4,
+    /// versus one node block per segment without the gate. (A full query that also *materialises*
+    /// a segment-resident property still reads those rows for output — the gate zeroes the
+    /// membership fold, not the property read; the win is realised for a scan of an untouched
+    /// label or a fold-only consumer.)
+    #[test]
+    fn label_scan_membership_gate_reads_no_segment_blocks() {
+        let n = 4_000;
+        let (root, graph) = build_stacked("bk_foldgate", n, 4);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let stack = gen.stack();
+        assert_eq!(stack.segments().len(), 4);
+        // Every segment is a pure age patch → authoritative empty touch set.
+        assert!(stack
+            .segments()
+            .iter()
+            .all(|s| s.manifest.label_membership_touch.as_deref() == Some(&[])));
+
+        let before = stack.cache_metrics().misses;
+        let mut ids: Vec<u64> = (0..n).collect();
+        stack.fold_label_scan(&mut ids, "Person").unwrap();
+        let after = stack.cache_metrics().misses;
+
+        assert_eq!(
+            after - before,
+            0,
+            "membership-preserving segments contribute no fold block reads (gate skips the stack)"
+        );
+        // The fold left the id set exactly the base scan — no membership changed.
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len() as u64, n);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The safety-critical direction of the gate: a segment that **borns a new `:Person`**
+    /// changes Person membership, so its touch set lists Person and `fold_label_scan` must fold
+    /// it (never skip) — the born id appears in the scan. Guards against a touch set that
+    /// wrongly omits a changed label.
+    #[test]
+    fn label_scan_gate_folds_a_membership_changing_segment() {
+        let n = 2_000;
+        let (root, graph) = write_scale("bk_bornlabel", n);
+        let wal = root.join("_wal");
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&bench_delta_cfg(&wal), &root, None)
+            .unwrap();
+        {
+            let gen = graphs.get(&graph).unwrap();
+            let writer = graphs.writer(&graph).unwrap();
+            let q = "MERGE (p:Person {name:'zznew'}) SET p.age = 7";
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("flush");
+
+        let gen = graphs.get(&graph).unwrap();
+        let seg = &gen.stack().segments()[0];
+        assert_eq!(
+            seg.manifest.label_membership_touch.as_deref(),
+            Some(&["Person".to_string()][..]),
+            "a born :Person makes the segment touch Person membership"
+        );
+
+        // The fold must NOT skip: the born id (synthetic id == base node count) joins the scan.
+        let mut ids: Vec<u64> = (0..n).collect();
+        gen.stack().fold_label_scan(&mut ids, "Person").unwrap();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len() as u64,
+            n + 1,
+            "the born :Person is folded into the scan"
+        );
+        assert!(ids.contains(&n), "born id {n} present in the scan");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Read amplification is **backend-invariant**: serving the same stacked set through an
     /// in-memory `ObjectStore` pulls the identical base + segment block counts as the fs
     /// reader for every read shape. This is the parity a laptop can verify; a real-S3 run adds

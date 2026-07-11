@@ -438,6 +438,18 @@ impl CoreStack {
         if self.segments.is_empty() {
             return Ok(());
         }
+        // Skip the whole fold when no segment changes any node's membership in `label`: every
+        // touched id keeps its base membership, so the base scan is already exact. This gate is
+        // resident (`membership_touches` reads the manifest) — it avoids decoding a node block
+        // per segment for the common property-only-patch workload. A segment with an *unknown*
+        // touch set (`None`) reports `true`, so correctness never depends on the gate.
+        if !self
+            .segments
+            .iter()
+            .any(|seg| seg.manifest.membership_touches(label))
+        {
+            return Ok(());
+        }
         let mut touched: Vec<u64> = Vec::new();
         for seg in &self.segments {
             touched.extend_from_slice(seg.reader.node_ids());
@@ -566,6 +578,7 @@ mod tests {
             label_node_deltas: vec![("Person".into(), 1)],
             marginals_exact: true,
             dirty_indexes: vec![],
+            label_membership_touch: None,
             mac: None,
             files: vec![FileEntry {
                 name: "node.blk".into(),

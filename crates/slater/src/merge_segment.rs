@@ -227,6 +227,11 @@ pub fn write_merge_segment(
     let mut label_node_deltas: BTreeMap<String, i64> = BTreeMap::new();
     let mut reltype_edge_deltas: BTreeMap<String, i64> = BTreeMap::new();
     let mut marginals_exact = true;
+    // Union the run's membership-touch sets: a label the merged segment changes vs the
+    // segment below the run must have been changed by some input (changes compose), so the
+    // union is a correct (conservative) touch set. One `None` (unknown) input poisons the whole
+    // union to `None` — we cannot assert completeness the reader would trust to skip.
+    let mut label_membership_touch: Option<BTreeSet<String>> = Some(BTreeSet::new());
     for seg in inputs {
         let m = &seg.manifest;
         node_count_delta += m.node_count_delta;
@@ -238,6 +243,13 @@ pub fn write_merge_segment(
             *reltype_edge_deltas.entry(t.clone()).or_insert(0) += *d;
         }
         marginals_exact &= m.marginals_exact;
+        label_membership_touch = match (label_membership_touch.take(), &m.label_membership_touch) {
+            (Some(mut acc), Some(set)) => {
+                acc.extend(set.iter().cloned());
+                Some(acc)
+            }
+            _ => None,
+        };
     }
     label_node_deltas.retain(|_, d| *d != 0);
     reltype_edge_deltas.retain(|_, d| *d != 0);
@@ -270,6 +282,7 @@ pub fn write_merge_segment(
         label_node_deltas: label_node_deltas.into_iter().collect(),
         marginals_exact,
         dirty_indexes,
+        label_membership_touch: label_membership_touch.map(|s| s.into_iter().collect()),
         mac: None,
         files,
     };

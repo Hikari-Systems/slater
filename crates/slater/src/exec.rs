@@ -9384,6 +9384,7 @@ mod tests {
                     fragment: "idx_1.isam".into(),
                 },
             ],
+            label_membership_touch: None,
             mac: None,
             files: vec![FileEntry {
                 name: "node.blk".into(),
@@ -9723,6 +9724,7 @@ mod tests {
             label_node_deltas: vec![("Person".into(), 1)],
             marginals_exact: true,
             dirty_indexes: vec![],
+            label_membership_touch: None,
             mac: None,
             files: vec![FileEntry {
                 name: "node.blk".into(),
@@ -9886,6 +9888,7 @@ mod tests {
             label_node_deltas: vec![("N".into(), 1)],
             marginals_exact: true,
             dirty_indexes: vec![],
+            label_membership_touch: None,
             mac: None,
             files: vec![FileEntry {
                 name: "node.blk".into(),

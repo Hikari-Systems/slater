@@ -528,6 +528,11 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     // every base label with it (the empty `after` differs from every `before` label).
     let mut node_count_delta: i64 = 0;
     let mut label_node_deltas: BTreeMap<String, i64> = BTreeMap::new();
+    // Every label whose *membership* any node row changes vs the base — the per-node symmetric
+    // difference, unioned WITHOUT cancellation (unlike `label_node_deltas`, a drop-from-A +
+    // add-to-B that nets zero still changes the id set, so both labels stay touched). Lets a
+    // label scan skip a segment that touches none of the scanned label's members.
+    let mut label_membership_touch: BTreeSet<String> = BTreeSet::new();
     for n in &seg_nodes {
         match &n.base {
             None => {
@@ -537,6 +542,8 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 node_count_delta += 1;
                 for l in &n.labels {
                     *label_node_deltas.entry(l.clone()).or_insert(0) += 1;
+                    // A born node introduces a new id under each of its labels.
+                    label_membership_touch.insert(l.clone());
                 }
             }
             Some((_, base_labels)) => {
@@ -547,9 +554,11 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 let after: BTreeSet<&str> = n.labels.iter().map(String::as_str).collect();
                 for l in after.difference(&before) {
                     *label_node_deltas.entry((*l).to_string()).or_insert(0) += 1;
+                    label_membership_touch.insert((*l).to_string());
                 }
                 for l in before.difference(&after) {
                     *label_node_deltas.entry((*l).to_string()).or_insert(0) -= 1;
+                    label_membership_touch.insert((*l).to_string());
                 }
             }
         }
@@ -605,6 +614,10 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         label_node_deltas: label_node_deltas.into_iter().collect(),
         marginals_exact: true,
         dirty_indexes,
+        // Authoritative and exact: the flush materialises every node row, so it knows precisely
+        // which labels changed membership (empty ⇒ a pure property/edge patch the label scan
+        // can skip).
+        label_membership_touch: Some(label_membership_touch.into_iter().collect()),
         mac: None,
         files,
     };

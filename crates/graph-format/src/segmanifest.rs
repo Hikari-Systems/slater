@@ -103,6 +103,16 @@ pub struct SegmentManifest {
     #[serde(default)]
     pub dirty_indexes: Vec<DirtyIndex>,
 
+    /// The set of labels whose **node membership** this segment changes relative to the base:
+    /// a node gains or loses the label, is born carrying it, or is tombstoned while carrying
+    /// it. Resident and sorted, so a whole-graph label scan can **skip** a segment that
+    /// provably preserves a label's membership (no block reads) rather than decoding its every
+    /// touched row. `None` ⇒ *unknown* (a manifest predating this field, or a decline) and the
+    /// reader must not skip; `Some(set)` is authoritative. `Some(empty)` means the segment
+    /// changes no node's label membership at all (a pure property/edge patch).
+    #[serde(default)]
+    pub label_membership_touch: Option<Vec<String>>,
+
     /// Keyed-BLAKE3 MAC (hex) over the canonicalised manifest. `None` ⇒ plaintext segment.
     #[serde(default)]
     pub mac: Option<String>,
@@ -180,6 +190,17 @@ impl SegmentManifest {
             );
         }
         Ok(())
+    }
+
+    /// Whether this segment may change node membership in `label`. `true` when the touch set
+    /// is **unknown** (`None` — conservative: the reader must fold the segment) or explicitly
+    /// lists `label`; `false` only when an authoritative touch set omits it. A whole-graph
+    /// label scan folds a segment only when this is `true`.
+    pub fn membership_touches(&self, label: &str) -> bool {
+        match &self.label_membership_touch {
+            None => true,
+            Some(set) => set.binary_search_by(|l| l.as_str().cmp(label)).is_ok(),
+        }
     }
 
     /// The canonical byte string the MAC is computed over: this manifest with `mac`
@@ -304,6 +325,7 @@ mod tests {
                 property: "age".into(),
                 fragment: "idx_0.isam".into(),
             }],
+            label_membership_touch: Some(vec!["City".into(), "Person".into()]),
             mac: None,
             files,
         };
@@ -405,6 +427,7 @@ mod tests {
             "labelNodeDeltas",
             "marginalsExact",
             "dirtyIndexes",
+            "labelMembershipTouch",
             "encryption",
             "mac",
         ] {
@@ -415,6 +438,9 @@ mod tests {
         assert!(back.label_node_deltas.is_empty());
         assert!(!back.marginals_exact);
         assert!(back.dirty_indexes.is_empty());
+        // Absent ⇒ unknown ⇒ the reader must not skip (membership_touches is true).
+        assert!(back.label_membership_touch.is_none());
+        assert!(back.membership_touches("anything"));
         assert!(back.encryption.is_none());
         assert!(back.mac.is_none());
     }
