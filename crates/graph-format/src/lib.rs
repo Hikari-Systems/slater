@@ -41,6 +41,7 @@ pub mod nodelabels;
 pub mod postings;
 pub mod pq;
 pub mod segindex;
+pub mod segmanifest;
 pub mod segment;
 pub mod segpostings;
 pub mod setmanifest;

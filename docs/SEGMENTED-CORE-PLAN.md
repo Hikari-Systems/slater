@@ -118,10 +118,10 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 2 slice 3 (index + posting
-fragments). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–3
-done, next is slice 4 (`SEGMENT.json` signed marginals + per-index dirty bits + bands +
-inventory/hashes + `meta.bin` self-MAC parity with `manifest.rs`).
+**Branch:** `writeable`. **Committed through:** Phase 2 slice 4 (`SEGMENT.json`
+manifest). **Phase 1 is DONE.** In progress: Phase 2 (core-segment format) — slices 1–4
+done, next is slice 5 (populate `SegmentRef` in the set manifest — already forward-shaped
+— + codec goldens + fuzz targets). Slice 5 CLOSES Phase 2.
 
 **Safe handoff points (each is a green commit — clear context freely at any of these):**
 - HP0 — Phase 0.5 committed (`a6e4d34`).
@@ -163,6 +163,15 @@ inventory/hashes + `meta.bin` self-MAC parity with `manifest.rs`).
      clippy clean. **Slice 3 COMPLETE.**
   4. `SEGMENT.json` (signed marginal deltas as i64, per-index dirty bits, bands,
      inventory+hashes, encryption/MAC parity with `manifest.rs`).
+     **DONE** — `graph-format/src/segmanifest.rs`: `SegmentManifest` parallel to
+     `Manifest` — bands, i64 `node/edge_count_delta` + sparse per-reltype/-label deltas +
+     `marginals_exact` decline flag, `dirty_indexes` (per-index dirty bits w/ fragment
+     name), `FileEntry` inventory + `content_hash`, `EncryptionHeader`, keyed-BLAKE3 `mac`
+     (`seal_mac`/`verify_mac` reuse `derive_manifest_mac_key`). `verify_marginals`
+     enforces Σ reltype-edge-deltas == edge_count_delta when exact; `validate` on
+     magic/version; `read_via`/`key` under `segments/<uuid>/SEGMENT.json`. 10 tests
+     (roundtrip, content-hash + MAC tamper across fields, wrong-key/absent, negative
+     deltas, defaults, store I/O) green, clippy clean.
   5. Populate `SegmentRef` in the set manifest (already forward-shaped) + codec goldens
      + fuzz targets.
 Exit: round-trip + hand-computed codec goldens + fuzz green; encrypted segment
