@@ -118,8 +118,8 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.2 (`ad005a8`). **Phases
-1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.3 (adjacency fan-out gating).**
+**Branch:** `writeable`. **Committed through:** Phase 3 slice 3.3 (`a8057f2`). **Phases
+1–2 DONE; Phase 3 IN PROGRESS.** Next: **slice 3.4 (index-probe union + scans).**
 
 ### Phase 3 design (decided)
 
@@ -149,9 +149,11 @@ fixture — `segstack.rs::tests::write_segment` + `Generation::open` over an fs 
   `node_record`/`rel_record`/`all_properties`) preserve non-core-symbol keys. Precedence
   delta>segment>base. **Invariant for Phase 4: the delta must allocate synthetic ids above
   the *stack top*, not just above the base** (else a born id collides with a segment band).
-- **3.3** adjacency: merge base `outgoing/incoming` with each segment's `out_adj/in_adj`
-  fragments (`removed` suppresses, `may_hold_node` gates the fan-out) in
-  `read_adj_overlaid`/`overlay_adj`, then delta on top.
+- **3.3 DONE** (`a8057f2`): `overlay_segment_adj` folds each segment's `out_adj/in_adj`
+  fragment into the base list (oldest→newest; `removed` suppresses by edge_id, born
+  appends) in `read_adj_overlaid`, then the delta. Gated by NEW adjacency fences
+  `may_hold_out_adj/in_adj` (the node fence is wrong — an adjacency-only-touched node has
+  no node row). Merge order base→segments→delta.
 - **3.4** `scan_candidates`: RangeEq/RangeRange = base ISAM − per-segment `removals` ∪
   segment `lookup_eq/range`; LabelScan unions segment-carried label rows; RelTypeScan
   unions segment `postings` driving sets; then existing delta union.
@@ -182,7 +184,9 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   load/route/`core_stack()` wired into `Generation::open`, INERT (`1cc6b55`); 140
   graph-format + 702 slater lib tests green, clippy clean. ✓
 - HP5 — Phase 3 slice 3.2: node/edge full-row resolution seam (`ad005a8`); 704 slater lib
-  tests green (2 stacked-set oracle tests), clippy clean. ✓ ← current baseline.
+  tests green (2 stacked-set oracle tests), clippy clean. ✓
+- HP6 — Phase 3 slice 3.3: adjacency fan-out gating (`a8057f2`); 705 slater lib +
+  graph-format segment tests green, clippy clean. ✓ ← current baseline.
 
 **Immediate next step — start Phase 2 (core-segment format).** Build
 `graph-format/src/segment.rs` incrementally, each slice its own green commit:
