@@ -33,6 +33,7 @@ pub mod parser;
 pub mod plan;
 pub mod query;
 pub mod read_view;
+pub mod segstack;
 pub mod server;
 pub mod temporal;
 pub mod vector;

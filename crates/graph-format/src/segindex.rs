@@ -154,7 +154,6 @@ struct Fragment {
     removals: Vec<u64>,
 }
 
-/// The opened index fragments of one core segment.
 /// Parse and validate an `idx.meta` body (magic ‖ crc32c ‖ uvarint body) into the per-
 /// fragment `(label, prop, removals)` descriptors. The ISAM files are opened separately by
 /// the caller (differently for fs vs store), but the magic/crc/version checks are shared.
@@ -186,6 +185,7 @@ fn decode_idx_meta(meta: &[u8]) -> Result<Vec<(String, String, Vec<u64>)>> {
     Ok(out)
 }
 
+/// The opened index fragments of one core segment.
 pub struct SegmentIndexReader {
     fragments: Vec<Fragment>,
 }

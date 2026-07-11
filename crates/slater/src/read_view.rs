@@ -134,6 +134,13 @@ pub trait ReadView: Send + Sync {
     /// The immutable core generation underneath, when the concrete type is needed
     /// (cache keying already goes through [`ReadView::uuid`]).
     fn core_generation(&self) -> &Generation;
+
+    /// The immutable **core stack** (the base's upper core segments + id routing) that the
+    /// read seams merge *below* the delta. Empty for a singleton set / bare generation, so
+    /// a stack-aware seam short-circuits to the base with a single resident check.
+    fn core_stack(&self) -> &crate::segstack::CoreStack {
+        self.core_generation().stack()
+    }
 }
 
 /// The process-wide empty delta, handed out by a bare [`Generation`]'s

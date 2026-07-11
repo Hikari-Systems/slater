@@ -105,6 +105,12 @@ pub struct Generation {
     /// Per-relationship-type edge counts (same bounded-memory rationale). No caller
     /// ever enumerates the edge ids of a type, so only the counts are retained.
     reltype_counts: HashMap<u32, u64>,
+
+    /// The immutable **core stack** over this base: the set's upper core segments and the
+    /// id→member routing table (see [`crate::segstack`]). A singleton set (every graph
+    /// until the Phase 4 flush) carries an empty stack, and every read short-circuits to
+    /// the base readers above — behaviourally identical to a bare generation.
+    stack: crate::segstack::CoreStack,
 }
 
 /// One opened Vamana/PQ index. The medoid + R/alpha/PQ params live in the MANIFEST
@@ -193,13 +199,15 @@ impl Generation {
         // set manifest if one exists, else treat the uuid as an implicit singleton
         // (base = the uuid itself) — the fallback for fixtures and pre-set images.
         let uuid = GenId(Self::current_uuid_in(store, graph)?);
-        let base_uuid = if graph_format::setmanifest::SetManifest::exists_via(store, graph, uuid) {
-            let set = graph_format::setmanifest::SetManifest::read_via(store, graph, uuid)
-                .with_context(|| format!("read set manifest for {uuid} of graph {graph}"))?;
-            set.base
+        let set = if graph_format::setmanifest::SetManifest::exists_via(store, graph, uuid) {
+            graph_format::setmanifest::SetManifest::read_via(store, graph, uuid)
+                .with_context(|| format!("read set manifest for {uuid} of graph {graph}"))?
         } else {
-            uuid
+            // Implicit singleton: `current` names a bare generation, so the uuid *is* the
+            // base and there are no segments (fixtures and pre-set images).
+            graph_format::setmanifest::SetManifest::singleton(uuid, 0)
         };
+        let base_uuid = set.base;
         // Backend-relative key prefix for the base generation's files.
         let base = join_key(graph, &base_uuid.to_string());
         let dir = PathBuf::from(&base);
@@ -386,6 +394,25 @@ impl Generation {
             counts_from_vec(&manifest.reltype_edge_counts)
         };
 
+        // Load the set's upper core segments (the LSM stack over this base). A singleton set
+        // has none, so this is a zero-cost single-band routing table; a set with segments
+        // opens each segment's readers through the same store, sharing one block cache.
+        let stack = if set.segments.is_empty() {
+            crate::segstack::CoreStack::singleton(manifest.node_count, manifest.edge_count)
+        } else {
+            crate::segstack::CoreStack::load(
+                store,
+                graph,
+                &set,
+                manifest.node_count,
+                manifest.edge_count,
+                master_key,
+                verify_integrity,
+                range_index_cache_bytes,
+            )
+            .with_context(|| format!("load core segments for set {uuid} of graph {graph}"))?
+        };
+
         info!(
             graph,
             generation = %uuid,
@@ -395,6 +422,7 @@ impl Generation {
             reltypes = manifest.reltypes.len(),
             range_indexes = manifest.range_indexes.len(),
             vector_indexes = manifest.vector_indexes.len(),
+            segments = stack.segments().len(),
             "opened generation"
         );
 
@@ -419,7 +447,14 @@ impl Generation {
             property_key_ids,
             label_counts,
             reltype_counts,
+            stack,
         })
+    }
+
+    /// The immutable core stack over this base (the set's upper segments + id routing).
+    /// A singleton set carries an empty stack — see [`crate::segstack::CoreStack`].
+    pub fn stack(&self) -> &crate::segstack::CoreStack {
+        &self.stack
     }
 
     /// Read just the `current` pointer's generation UUID without opening (or
@@ -1260,6 +1295,110 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("not a set manifest"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opens_a_set_with_an_upper_segment() {
+        use graph_format::manifest::FileEntry;
+        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segment::{NodeRow, SegmentWriter};
+        use graph_format::setmanifest::{SegmentRef, SetManifest};
+
+        let (root, graph, base_uuid) = write_fixture("opens_a_set_with_an_upper_segment");
+        let seg_uuid = uuid::Uuid::from_u128(0x5_e600_0000_0000_0000_0000_0000_0002);
+        let set_uuid = uuid::Uuid::from_u128(0x5_e700_0000_0000_0000_0000_0000_0003);
+
+        // Write a segment carrying one born node at dense id 3 (the base has 3 nodes / 2 edges).
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        std::fs::create_dir_all(seg_dir.parent().unwrap()).unwrap();
+        let mut w = SegmentWriter::create(&seg_dir, 0x11, 4096, 3).unwrap();
+        w.push_node(
+            3,
+            &NodeRow {
+                labels: vec!["Person".into()],
+                props: vec![("name".into(), Value::Str("Zed".into()))],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.finish().unwrap();
+        let mut m = SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: SEGMENT_MANIFEST_VERSION,
+            segment_uuid: GenId(seg_uuid),
+            base: GenId(base_uuid),
+            created_unix: 0,
+            node_band: (3, 4),
+            edge_band: (2, 2), // no edges in this segment
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 1,
+            edge_count_delta: 0,
+            reltype_edge_deltas: vec![],
+            label_node_deltas: vec![("Person".into(), 1)],
+            marginals_exact: true,
+            dirty_indexes: vec![],
+            mac: None,
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 0,
+                blake3: "aa".into(),
+                sha256: None,
+                crc32c: None,
+            }],
+        };
+        m.set_content_hash();
+        m.write_to_dir(&seg_dir).unwrap();
+
+        // Publish a set over the same base and repoint `current` at it.
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = SetManifest::singleton(GenId(base_uuid), 0);
+        set.set_uuid = GenId(set_uuid);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        std::fs::write(
+            sets.join(format!("{set_uuid}.json")),
+            set.to_bytes().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join(&graph).join("current"), set_uuid.to_string()).unwrap();
+
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(gen.uuid(), GenId(set_uuid), "identity is the set uuid");
+        assert_eq!(
+            gen.base_uuid(),
+            GenId(base_uuid),
+            "base is the shared generation"
+        );
+        // The stack loaded the segment and routes the appended band to it…
+        assert_eq!(gen.stack().segments().len(), 1);
+        assert_eq!(
+            gen.stack().extents().nodes.route(3),
+            Some(graph_format::extents::SegmentOrd::Upper(0))
+        );
+        assert_eq!(
+            gen.stack().segments()[0]
+                .reader
+                .node_row(3)
+                .unwrap()
+                .unwrap()
+                .labels,
+            vec!["Person".to_string()]
+        );
+        // …but the base read surface is untouched — the stack is inert until Phase 3 wires it.
+        assert_eq!(
+            gen.node_count(),
+            3,
+            "node_count is still the base count in slice 3.1"
+        );
+        assert_eq!(
+            gen.node_props().props(0).unwrap(),
+            vec![(0, Value::Str("Alice".into())), (1, Value::Int(30))]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
