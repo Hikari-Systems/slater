@@ -148,6 +148,13 @@ done, next is slice 3 (ISAM fragment + removal sidecar; posting fragments).
      encrypted, empty, corrupt/foreign-magic reject) green, clippy clean.
      NOTE: `meta.bin` self-MAC + `SEGMENT.json` marginals are slice 4, not here.
   3. ISAM fragment + removal sidecar (reuse `write_isam_sorted`); posting fragments.
+     **3a DONE** — `graph-format/src/segindex.rs`: `write_index_fragments` +
+     `SegmentIndexReader`, one ISAM per `(label, prop)` over the segment's born/patched
+     `(value, id)` pairs (reuses `write_isam_with_cipher`/`IsamReader`) + resident
+     delta-varint removal sidecar in `idx.meta` (MAGIC+crc+version); `lookup_eq`/
+     `lookup_range`/`removals`/`indexed`, `open_if_present` for the no-index case,
+     plaintext + encrypted (absent-key refusal). 6 tests green, clippy clean.
+     **3b TODO** — posting fragments (per-reltype born src/tgt endpoint id lists).
   4. `SEGMENT.json` (signed marginal deltas as i64, per-index dirty bits, bands,
      inventory+hashes, encryption/MAC parity with `manifest.rs`).
   5. Populate `SegmentRef` in the set manifest (already forward-shaped) + codec goldens
