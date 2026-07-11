@@ -92,8 +92,10 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
 - **Phase 5 — T3 segment compaction + admission.** Size-tiered merges, tombstone
   reclamation, adjacency collapse, `maxUpperSegments`, scheduling; DECISIONS.md D50
   update to the four-rung ladder.
-- **Phase 6 — Batch resolve + fences on the write path.** Merge-join batch resolve;
-  fences/blooms on resolve.
+- **Phase 6 — Batch resolve + fences on the write path.** IN PROGRESS. Slice 6.1 DONE
+  (`HP20`): segment-aware `resolve_business_key` (folds the core stack — the note-(e) closure /
+  T2·T3 auto-trigger gate). Remaining: merge-join batch resolve; fences/blooms on resolve; then
+  the T2/T3 auto-trigger wire-up.
 - **Phase 7 — T4 retarget + GC.** `consolidate_graph` collapses a set to a singleton
   via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
@@ -118,8 +120,39 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 5 slice 5.3 (HP19). **Phases 1–4
-DONE; Phase 5 IN PROGRESS.**
+**Branch:** `writeable`. **Committed through:** Phase 6 slice 6.1 (HP20). **Phases 1–5
+DONE; Phase 6 IN PROGRESS.**
+
+**Phase 6 (write-path resolve) — slice 6.1 DONE (segment-aware `resolve_business_key`).**
+The single write-path resolver — `server::resolve_business_key`, the choke point for *every*
+business-key resolution (node `MERGE` via `resolve_op`, edge endpoints via `resolve_endpoint`)
+— now **folds the core stack** over the base equality probe, closing the 4.1 note (e) gap: it
+reads the base ids (`gen.range_index(idx).lookup_eq`, the index descriptor still comes from the
+base manifest via `index_for`), then, when the served set carries segments
+(`!stack.is_singleton()`), calls `CoreStack::fold_index_eq` (the same oldest→newest
+suppress-then-union fold the read path uses) and sort+dedups before the `[] → Absent /
+[one] → Unique / _ → Ambiguous` verdict. Effect: a `MERGE` of a key **flushed into a segment**
+resolves to the segment id and patches it (no duplicate born node); a base key **deleted into a
+segment** resolves `Absent` (its base index entry sits in the segment's `removals`, so a
+re-`MERGE` reborns it); a key **relocated by a segment patch** resolves only under its new
+value; a fold read error collapses to `Unindexed` (never `Absent` — matching the base probe's
+`Err`, so a read failure can't manufacture a duplicate). The **singleton set short-circuits to
+the base ids**, so a non-flushed graph is byte-for-byte unchanged. Edge-id resolution
+(`find_core_edge_id`) already went through the segment-aware read path (`outgoing_adj` over a
+`MergedView`), so only the node-key probe was the gap. **This is the correctness gate the T2/T3
+auto-triggers were waiting on** — with resolve now segment-aware, a concurrent re-`MERGE` of a
+just-flushed key during the freeze→retire window finds it in the segment instead of duplicating
+(and the flush/consolidation retire's own WAL-tail re-resolve, already *documented* as
+segment-aware at `server.rs:748`, actually is now). Two e2e oracles
+(`resolve_through_the_stack_reuses_a_flushed_key_no_duplicate`: flush 2 born nodes + a born
+edge, then re-`MERGE` the born key → patched not duplicated, re-`MERGE` a base key, add an edge
+off a segment-born endpoint, count stays 5 across a second flush + a reopen + a post-reopen
+re-`MERGE`; `resolve_reborns_a_key_deleted_into_a_segment`: delete a base node into a segment ⇒
+re-`MERGE` reborns it, a second `MERGE` is memtable-idempotent). **736 slater lib** (+2) + 140
+graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. **NEXT in Phase 6:**
+fences/blooms on the resolve fold (skip a segment whose value-range can't hold the key) and the
+merge-join **batch** resolve (the bulk-write ISAM floor — memory `bulk-delete-isam-resolve-floor`);
+then the small slice that wires the T2/T3 auto-triggers now that this gate is met.
 
 **Phase 5 (T3 segment compaction) — slice 5.3 DONE (admission policy).** The fourth rung of
 the D50 ladder is in: a **size-tiered run selector** and a policy entry point that drives the
@@ -226,17 +259,36 @@ delta (an adjacency-removal concern the patch materialiser doesn't own), and a f
 image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
 `as_memtable()` returns `None`).
 
-**Phase 5 NEXT after 5.3:** **Phase 5 is functionally complete** (writer 5.1 + hardening 5.2 +
-admission 5.3). What remains before calling the phase closed is only the **auto-firing wire-up**,
-which is **Phase-6-gated**: the write path must be able to resolve a *born* key against a segment
-(the 4.1 note (e) limitation) before either `flush_graph_to_segment` or
-`compact_graph_segments_auto` can safely be called from inside a write. So the next actual work is
-**Phase 6** (batch resolve + fences on the write path), after which a small slice wires both T2 and
-T3 auto-triggers (like the existing memtable→L0/L0→L0 auto-triggers) reading `memtableBytes` /
-`maxUpperSegments`. Deferred leanness carried from 5.1 (each benign, matching the flush writer's
-noted follow-ups): a born-then-deleted **edge** leaves an orphan edge row in the merged segment (its
-adjacency is suppressed by the fold, so it is never read); postings are a union (a stale driving hit
-is filtered by adjacency).
+**Phase 6 NEXT after 6.1:** the **note-(e) gate is now met** — `resolve_business_key` folds the
+stack, so the write path resolves a born/flushed key against a segment. What remains in Phase 6:
+(1) **fences/blooms on the resolve fold** — `fold_index_eq` probes every segment's index fragment;
+a per-fragment value-range fence (min/max, or a bloom) lets the fold skip a segment that can't
+hold the probed value; (2) the **merge-join batch resolve** — resolving each row's business key
+one-at-a-time does an uncached per-row ISAM block decompress (the bulk-write floor, memory
+`bulk-delete-isam-resolve-floor`); sort the batch's keys once and stream-merge them against the
+sorted index (base + each segment fragment) in one pass. Then the closing slice **wires the T2/T3
+auto-triggers** — `maybe_maintain_delta`-style hooks that fire `flush_graph_to_segment` at
+`memtableBytes`/segment-count thresholds and `compact_graph_segments_auto` at `maxUpperSegments`
+(the L0-internal memtable→L0/L0→L0 auto-maintenance already exists — this adds the two
+segment-tier rungs, safe now the resolve gate is met). **Phase 5 stays functionally complete**
+(writer 5.1 + hardening 5.2 + admission 5.3); deferred leanness carried from 5.1 (each benign): a
+born-then-deleted **edge** leaves an orphan edge row in the merged segment (its adjacency is
+suppressed by the fold, so it is never read); postings are a union (a stale driving hit is
+filtered by adjacency).
+
+### Phase 6 slice log
+- **6.1 DONE** (HP20): **segment-aware `resolve_business_key`** — the note-(e) closure and the
+  T2/T3 auto-trigger gate. The write path's single business-key resolver now folds the core stack
+  over the base equality probe (`CoreStack::fold_index_eq`, the read path's oldest→newest
+  suppress-then-union fold), sort+dedups, then verdicts `Absent`/`Unique`/`Ambiguous`; a fold read
+  error collapses to `Unindexed` (never `Absent`, so a read failure can't manufacture a duplicate);
+  the singleton set short-circuits to the base ids (a non-flushed graph is unchanged). Edge-id
+  resolution (`find_core_edge_id`) already used the segment-aware read path, so only the node-key
+  probe was the gap. Two e2e oracles
+  (`resolve_through_the_stack_reuses_a_flushed_key_no_duplicate`,
+  `resolve_reborns_a_key_deleted_into_a_segment`). **736 slater lib** (+2) + 140 graph-format + 78
+  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next is fences on
+  the fold, then the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
 
 ### Phase 5 slice log
 - **5.3 DONE** (HP19): **admission policy** — the fourth D50 rung. New pure predicate
@@ -591,8 +643,16 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   via 5.1 or `Ok(None)`) + config `deltaConfig.maxUpperSegments` (default 8). DECISIONS.md D50
   rewritten to the four-rung ladder; both T3 auto-firings stay Phase-6-gated. 8 selector unit tests
   + 1 e2e (`auto_compaction_admits_only_when_over_budget`). 734 slater lib + 140 graph-format + 78
-  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next real work is
-  Phase 6 (batch resolve), then a small T2/T3 auto-trigger wire-up.
+  slater-delta + full workspace green, clippy + fmt clean. **Phase 5 functionally complete.**
+- HP20 — Phase 6 slice 6.1: **segment-aware `resolve_business_key`** — the note-(e) closure /
+  T2·T3 auto-trigger gate. The write path's business-key resolver folds the core stack
+  (`CoreStack::fold_index_eq`) over the base probe, so a `MERGE` of a flushed key resolves to its
+  segment id (no duplicate), a key deleted-into-a-segment resolves `Absent` (reborns), and a
+  singleton set is unchanged. Two e2e oracles
+  (`resolve_through_the_stack_reuses_a_flushed_key_no_duplicate`,
+  `resolve_reborns_a_key_deleted_into_a_segment`). 736 slater lib + 140 graph-format + 78
+  slater-delta + full workspace green, clippy + fmt clean. ← current baseline; next in Phase 6 is
+  fences on the fold, then the merge-join batch resolve, then the T2/T3 auto-trigger wire-up.
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

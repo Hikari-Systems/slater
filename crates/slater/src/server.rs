@@ -3108,7 +3108,18 @@ enum KeyResolution {
 }
 
 /// Probe `(label, key, value)` against the label/property range index (an ISAM
-/// equality probe). The overlay's dense-id read index is built from a `Unique` hit.
+/// equality probe), then **fold the core stack** over it so the write path resolves the
+/// key the same way a read does (Phase 6, closing the 4.1 note (e) gap). The base
+/// generation carries the index descriptor (`index_for` reads its manifest); the segment
+/// fragments carry the born/patched/deleted contributions, folded oldest→newest by
+/// [`CoreStack::fold_index_eq`] (each segment's `removals` sidecar suppresses the
+/// base/older ids it supersedes, then its own matching ids union in — newest-wins). So a
+/// `MERGE` of a business key **flushed into a segment** resolves to the segment's id (no
+/// duplicate born node), a base key **deleted into a segment** resolves `Absent` (its
+/// index entry is in the segment's `removals`, so a re-`MERGE` reborns it), and a key
+/// **relocated by a segment patch** resolves under its new value only. The singleton
+/// (no-segment) set short-circuits to the base ids, so a non-flushed graph is unchanged.
+/// The overlay's dense-id read index is built from a `Unique` hit.
 fn resolve_business_key(gen: &Generation, label: &str, key: &str, value: &Value) -> KeyResolution {
     let labels = [label.to_string()];
     let Some(idx) = crate::plan::index_for(gen, &labels, key) else {
@@ -3117,9 +3128,23 @@ fn resolve_business_key(gen: &Generation, label: &str, key: &str, value: &Value)
     let Some(reader) = gen.range_index(&idx) else {
         return KeyResolution::Unindexed;
     };
-    let Ok(ids) = reader.lookup_eq(value) else {
+    let Ok(mut ids) = reader.lookup_eq(value) else {
         return KeyResolution::Unindexed;
     };
+    let stack = gen.stack();
+    if !stack.is_singleton() {
+        // A fold read failure collapses to `Unindexed` — the write cannot resolve the key,
+        // matching how the base probe's `Err` above is handled (a resolve-time read failure
+        // is treated as "cannot resolve", never as "absent" — an `Absent` would risk a
+        // duplicate born node).
+        if stack.fold_index_eq(&mut ids, label, key, value).is_err() {
+            return KeyResolution::Unindexed;
+        }
+        // The fold neither sorts nor dedups (base ids + per-segment unions), so a value
+        // carried by both the base and a segment fragment would appear twice.
+        ids.sort_unstable();
+        ids.dedup();
+    }
     match ids.as_slice() {
         [] => KeyResolution::Absent,
         [only] => KeyResolution::Unique(*only),
@@ -6908,6 +6933,260 @@ mod tests {
             matches!(eve.rows[0][0], Val::Int(60)),
             "Eve reloaded from the segment: {:?}",
             eve.rows[0][0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 6 slice 6.1: the write path resolves a business key **through the core stack**,
+    /// closing the 4.1 note (e) gap. After a flush moves born nodes into a segment, a
+    /// re-`MERGE` of one of those keys must resolve to the *segment* id — patching it in place
+    /// — rather than allocate a duplicate born node; a `MERGE` of a base key still resolves to
+    /// the base id; and an edge whose endpoint is a **segment-born** node resolves that
+    /// endpoint through the fold too. A second flush folds the patches/born edge into a second
+    /// segment and the counts are still duplicate-free after a reopen.
+    #[test]
+    fn resolve_through_the_stack_reuses_a_flushed_key_no_duplicate() {
+        let (root, _g) = testgen::write_indexed_people("resolve_stack_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let q = |graphs: &Graphs, q: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+
+        // Flush two born nodes + a born edge into an upper segment.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(b:Person {name:'Eve'})",
+        );
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+        assert!(
+            graphs.writer("people").unwrap().snapshot().is_empty(),
+            "delta retired empty after the flush"
+        );
+
+        // Re-MERGE the *segment-born* key Dave: it must resolve to the segment id and patch it,
+        // NOT create a second Dave. Without the stack fold, resolve returns Absent → duplicate.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 99");
+        // MERGE a *base* key: resolves to the base id and patches it.
+        write(&graphs, "MERGE (n:Person {name:'Alice'}) SET n.age = 31");
+        // An edge whose source endpoint is the segment-born Dave resolves that endpoint through
+        // the fold (via resolve_endpoint → resolve_business_key), and the base Carol as dst.
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Dave'})-[:KNOWS]->(c:Person {name:'Carol'})",
+        );
+
+        // Exactly one Dave, patched to 99 (the delta patch over the segment row).
+        let dave = q(&graphs, "MATCH (n:Person {name:'Dave'}) RETURN n.age");
+        assert_eq!(
+            dave.rows.len(),
+            1,
+            "exactly one Dave — no duplicate born node"
+        );
+        assert!(
+            matches!(dave.rows[0][0], Val::Int(99)),
+            "Dave patched to 99"
+        );
+        // Alice patched over the base row; still one Alice.
+        let alice = q(&graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.age");
+        assert_eq!(alice.rows.len(), 1, "exactly one Alice");
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(31)),
+            "Alice patched to 31"
+        );
+        // 3 base + 2 born = 5 people, no duplicates introduced by the re-MERGEs.
+        let n = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n.rows[0][0], Val::Int(5)),
+            "5 people: {:?}",
+            n.rows[0][0]
+        );
+        // Dave now KNOWS both Eve (segment edge) and Carol (the new born edge over a folded
+        // segment endpoint).
+        let mut targets: Vec<String> = q(
+            &graphs,
+            "MATCH (a:Person {name:'Dave'})-[:KNOWS]->(b) RETURN b.name",
+        )
+        .rows
+        .into_iter()
+        .map(|r| match &r[0] {
+            Val::Str(s) => s.clone(),
+            other => panic!("expected a name: {other:?}"),
+        })
+        .collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec!["Carol".to_string(), "Eve".to_string()],
+            "Dave KNOWS Eve + Carol"
+        );
+
+        // A second flush folds the patches + the new born edge into a second segment; the id
+        // space and counts are unchanged (the re-MERGEs never duplicated).
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the second delta flushes");
+        assert_eq!(
+            graphs.get("people").unwrap().stack().segments().len(),
+            2,
+            "two upper segments after the second flush"
+        );
+        let n2 = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n2.rows[0][0], Val::Int(5)),
+            "still 5 after the second flush"
+        );
+        let dave2 = q(&graphs, "MATCH (n:Person {name:'Dave'}) RETURN n.age");
+        assert_eq!(dave2.rows.len(), 1, "still one Dave");
+        assert!(
+            matches!(dave2.rows[0][0], Val::Int(99)),
+            "Dave 99 folded into seg 2"
+        );
+
+        // Reopen from disk: the two-segment set reloads and resolution still de-duplicates.
+        drop(graphs);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let n3 = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n3.rows[0][0], Val::Int(5)),
+            "5 after reopen: {:?}",
+            n3.rows[0][0]
+        );
+        // A re-MERGE of Dave after the reopen still resolves through the reloaded stack.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 77");
+        let dave3 = q(&graphs, "MATCH (n:Person {name:'Dave'}) RETURN n.age");
+        assert_eq!(
+            dave3.rows.len(),
+            1,
+            "still one Dave after reopen + re-MERGE"
+        );
+        assert!(
+            matches!(dave3.rows[0][0], Val::Int(77)),
+            "Dave re-patched to 77 post-reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 6 slice 6.1: a base key **deleted into a segment** resolves `Absent` on the write
+    /// path (its base index entry is superseded by the segment's `removals` sidecar, folded by
+    /// `CoreStack::fold_index_eq`), so a re-`MERGE` **reborns** it as a fresh born node rather
+    /// than resurrecting the tombstoned id — and a second re-`MERGE` is idempotent (the born
+    /// node resolves through the memtable's own identity, not the stack).
+    #[test]
+    fn resolve_reborns_a_key_deleted_into_a_segment() {
+        let (root, _g) = testgen::write_indexed_people("resolve_rebirth_e2e");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a node write: {q}"),
+            }
+        };
+        let q = |graphs: &Graphs, q: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+
+        // Delete a base node with no incident edges (Carol — the only base edge is Alice→Bob),
+        // then flush the tombstone into a segment.
+        write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the delete flushes");
+        assert!(graphs.writer("people").unwrap().snapshot().is_empty());
+        let n0 = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n0.rows[0][0], Val::Int(2)),
+            "Carol gone: 2 people left"
+        );
+        let gone = q(&graphs, "MATCH (n:Person {name:'Carol'}) RETURN n.age");
+        assert_eq!(
+            gone.rows.len(),
+            0,
+            "Carol resolves to nothing after the delete flush"
+        );
+
+        // MERGE Carol: resolve returns Absent (the segment removals suppress her base entry),
+        // so she is reborn as a fresh born node — count climbs back to 3.
+        write(&graphs, "MERGE (n:Person {name:'Carol'}) SET n.age = 41");
+        let n1 = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n1.rows[0][0], Val::Int(3)),
+            "Carol reborn: 3 people"
+        );
+        let carol = q(&graphs, "MATCH (n:Person {name:'Carol'}) RETURN n.age");
+        assert_eq!(carol.rows.len(), 1, "exactly one (reborn) Carol");
+        assert!(
+            matches!(carol.rows[0][0], Val::Int(41)),
+            "reborn Carol's age"
+        );
+
+        // A second MERGE is idempotent — the born Carol resolves through the memtable, not the
+        // stack (which still says Absent), so no fourth node appears.
+        write(&graphs, "MERGE (n:Person {name:'Carol'}) SET n.age = 42");
+        let n2 = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n2.rows[0][0], Val::Int(3)),
+            "re-MERGE idempotent: still 3"
+        );
+        let carol2 = q(&graphs, "MATCH (n:Person {name:'Carol'}) RETURN n.age");
+        assert_eq!(carol2.rows.len(), 1, "still one Carol");
+        assert!(
+            matches!(carol2.rows[0][0], Val::Int(42)),
+            "the born Carol re-patched"
         );
 
         std::fs::remove_dir_all(&root).ok();
