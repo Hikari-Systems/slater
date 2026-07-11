@@ -440,4 +440,21 @@ impl ObjectStore for S3ObjectStore {
             Ok(())
         })
     }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let full = self.full_key(key);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        run_blocking(&self.rt, async move {
+            // S3 `DeleteObject` is idempotent — deleting an absent key returns success.
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&full)
+                .send()
+                .await
+                .map_err(|e| sdk_err(&format!("S3 DELETE {full}"), e))?;
+            Ok(())
+        })
+    }
 }

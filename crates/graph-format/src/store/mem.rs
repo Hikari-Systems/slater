@@ -109,6 +109,11 @@ impl ObjectStore for MemObjectStore {
         Ok(())
     }
 
+    fn delete(&self, key: &str) -> Result<()> {
+        self.objects.write().unwrap().remove(key); // idempotent — absent key is a no-op
+        Ok(())
+    }
+
     /// Mirror the S3 backend's verification so the SHA-256 path is exercisable
     /// without a network: when the manifest records a SHA-256, recompute it from
     /// the stored bytes (standing in for S3's server-computed object checksum) and

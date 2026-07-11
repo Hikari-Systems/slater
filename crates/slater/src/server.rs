@@ -983,13 +983,13 @@ impl Graphs {
     /// A just-swapped-out set/segment may still be held by an in-flight reader that opened its
     /// `Generation` before the swap. On the local filesystem that reader holds the segment's
     /// files open, so `remove_dir_all` is safe for it (the inode outlives the unlink until the
-    /// reader drops) — but a reader mid-open, or a future remote backend that re-fetches blocks
-    /// lazily, is not. So an orphan is deleted only after it has been **observed unreferenced for
-    /// at least `grace_secs`**: the first sweep drops a `.gcmark` marker (its mtime is the
-    /// retirement observation), and a later sweep deletes once the marker has aged past the
-    /// grace. `grace_secs == 0` deletes on first sight (immediate mode — safe here because the
-    /// sweep holds the single-flight claim below, so no in-flight flush/compaction is publishing
-    /// a segment `current` does not yet name).
+    /// reader drops) — but a reader mid-open, or a remote backend that re-fetches a block lazily
+    /// after the object is gone, is not. So an orphan is deleted only after it has been
+    /// **observed unreferenced for at least `grace_secs`**: the first sweep stamps a marker under
+    /// `<graph>/.gc/` (its mtime is the retirement observation), and a later sweep deletes once
+    /// the marker has aged past the grace. `grace_secs == 0` deletes on first sight (immediate
+    /// mode — safe here because the sweep holds the single-flight claim below, so no in-flight
+    /// flush/compaction is publishing a segment `current` does not yet name).
     ///
     /// # Single-flight
     /// Takes the [`DeltaWriter::begin_consolidation`] claim (when a writable layer exists) so it
@@ -997,19 +997,20 @@ impl Graphs {
     /// bails "already in progress" (benign; the caller retries on a later write). A read-only
     /// graph has no writer and nothing mutates its stack, so the claim is skipped.
     ///
-    /// Local-filesystem only for now: deletion is `std::fs` under `data_dir`. A remote store
-    /// (which needs an `ObjectStore` delete) is a later sub-slice, so this is a no-op there.
+    /// # Backends (slice 7.4)
+    /// Works on **any** backend: an orphan is discovered by listing the store, its objects
+    /// removed via [`ObjectStore::delete`] (on a remote store) and its local staged directory
+    /// removed via `std::fs` (the staged copy a flush left under `data_dir` before uploading; on
+    /// a local-fs store the staged files *are* the objects, so `remove_dir_all` alone suffices
+    /// and the redundant object-delete is skipped). The grace marker is always a small local
+    /// file under `<graph>/.gc/` — the server's own bookkeeping of when it first saw the orphan,
+    /// independent of whether the segment was ever staged locally on this instance.
     pub fn gc_orphan_segments(
         &self,
         name: &str,
         data_dir: &Path,
         grace_secs: u64,
     ) -> Result<SegmentGcReport> {
-        // Remote/in-memory backends serve segments through the store, not `data_dir`, and the
-        // trait has no delete — reclaiming their objects is a later sub-slice.
-        if !self.store.is_local_fs() {
-            return Ok(SegmentGcReport::default());
-        }
         // Never race a stack mutation (flush / compaction / consolidation). A read-only graph
         // has no writable layer, so nothing mutates its stack and the claim is unnecessary.
         let _guard = match self.writer(name) {
@@ -1021,6 +1022,7 @@ impl Graphs {
             }
             None => None,
         };
+        let remote = !self.store.is_local_fs();
 
         // The live reference set: the set `current` names, plus its segments. A `current` that
         // names a bare generation uuid (a singleton — e.g. just after a retarget) has no set
@@ -1045,6 +1047,9 @@ impl Graphs {
             };
 
         let graph_dir = data_dir.join(name);
+        // Grace markers live here — always local (server-side bookkeeping), never in the segment
+        // dir (which may not exist on this instance for a store-backed segment).
+        let gc_dir = graph_dir.join(".gc");
         let now = now_unix();
         let mut report = SegmentGcReport::default();
 
@@ -1065,6 +1070,8 @@ impl Graphs {
                     Ok(now - mtime >= grace_secs as i64)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(&gc_dir)
+                        .with_context(|| format!("create gc dir {}", gc_dir.display()))?;
                     std::fs::File::create(marker)
                         .with_context(|| format!("stamp gc marker {}", marker.display()))?;
                     Ok(false)
@@ -1073,32 +1080,57 @@ impl Graphs {
             }
         };
 
-        // Orphaned segment directories. `segments/<uuid>/` the current set does not reference.
+        // Remove the local staged directory, tolerating an absent one (a store-backed segment
+        // this instance never staged) — the local counterpart of the object delete below.
+        let remove_local_dir = |dir: &Path| -> Result<()> {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("gc local dir {}", dir.display())),
+            }
+        };
+        let remove_local_file = |path: &Path| -> Result<()> {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("gc local file {}", path.display())),
+            }
+        };
+
+        // Orphaned segments. `segments/<uuid>/` the current set does not reference.
         let segments_dir = graph_dir.join("segments");
         for child in self.store.list(&join_key(name, "segments"))? {
             let Ok(uuid) = uuid::Uuid::parse_str(&child) else {
-                continue; // skip markers / tmp / anything not a bare uuid dir
+                continue; // skip anything not a bare uuid dir
             };
             if live_segments.contains(&GenId(uuid)) {
                 continue;
             }
-            let seg_dir = segments_dir.join(&child);
-            let marker = seg_dir.join(".gcmark");
-            if eligible(&marker)? {
-                std::fs::remove_dir_all(&seg_dir)
-                    .with_context(|| format!("gc segment dir {}", seg_dir.display()))?;
-                report.deleted_segments.push(GenId(uuid));
-            } else {
+            let marker = gc_dir.join(format!("seg-{uuid}"));
+            if !eligible(&marker)? {
                 report.marked += 1;
+                continue;
             }
+            // Remote: delete every object under the segment prefix (node.blk … SEGMENT.json).
+            if remote {
+                let prefix = join_key(name, &format!("segments/{child}"));
+                for f in self.store.list(&prefix)? {
+                    self.store
+                        .delete(&join_key(&prefix, &f))
+                        .with_context(|| format!("gc remote segment object {prefix}/{f}"))?;
+                }
+            }
+            // Local: the objects themselves on a local-fs store, else a staged copy.
+            remove_local_dir(&segments_dir.join(&child))?;
+            let _ = remove_local_file(&marker);
+            report.deleted_segments.push(GenId(uuid));
         }
 
-        // Stale set manifests. `sets/<uuid>.json` other than the current set (the marker for a
-        // set is a `.<uuid>.gcmark` sidecar, so it never collides with a `<uuid>.json`).
+        // Stale set manifests. `sets/<uuid>.json` other than the current set.
         let sets_dir = graph_dir.join("sets");
         for child in self.store.list(&join_key(name, "sets"))? {
             let Some(stem) = child.strip_suffix(".json") else {
-                continue; // skip markers (.<uuid>.gcmark) and *.tmp
+                continue; // skip *.tmp
             };
             let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
                 continue;
@@ -1106,16 +1138,22 @@ impl Graphs {
             if live_set == Some(GenId(uuid)) {
                 continue;
             }
-            let set_path = sets_dir.join(&child);
-            let marker = sets_dir.join(format!(".{uuid}.gcmark"));
-            if eligible(&marker)? {
-                std::fs::remove_file(&set_path)
-                    .with_context(|| format!("gc set manifest {}", set_path.display()))?;
-                let _ = std::fs::remove_file(&marker); // idempotent
-                report.deleted_sets.push(GenId(uuid));
-            } else {
+            let marker = gc_dir.join(format!("set-{uuid}"));
+            if !eligible(&marker)? {
                 report.marked += 1;
+                continue;
             }
+            if remote {
+                self.store
+                    .delete(&graph_format::setmanifest::SetManifest::key(
+                        name,
+                        GenId(uuid),
+                    ))
+                    .with_context(|| format!("gc remote set manifest {uuid}"))?;
+            }
+            remove_local_file(&sets_dir.join(&child))?;
+            let _ = remove_local_file(&marker);
+            report.deleted_sets.push(GenId(uuid));
         }
 
         if !report.deleted_segments.is_empty() || !report.deleted_sets.is_empty() {
@@ -8729,6 +8767,137 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Phase 7 slice 7.4: GC reclaims a **remote** store's orphaned objects, not only local
+    /// staged dirs. Over a `MemObjectStore` (`is_local_fs == false`), a stale set's manifest and
+    /// a compacted run's segment objects are removed from the store via `ObjectStore::delete`; a
+    /// store-native reopen then serves only the live merged segment.
+    #[test]
+    fn gc_reclaims_orphans_from_an_object_store() {
+        use graph_format::store::mem::MemObjectStore;
+        use graph_format::store::ObjectStore as _;
+
+        let (root, _g) = testgen::write_indexed_people("gc_memstore_74");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mem = Arc::new(MemObjectStore::new());
+        load_dir_into_mem(&mem, &root, &root);
+
+        let mut graphs =
+            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
+                .unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a node write: {q}"),
+            }
+        };
+        // Number of segment "dirs" and set manifest objects the store currently holds.
+        let store_segments =
+            |mem: &MemObjectStore| -> usize { mem.list("people/segments").unwrap().len() };
+        let store_sets = |mem: &MemObjectStore| -> usize {
+            mem.list("people/sets")
+                .unwrap()
+                .into_iter()
+                .filter(|n| n.ends_with(".json"))
+                .count()
+        };
+        let set_key = |u: GenId| graph_format::setmanifest::SetManifest::key("people", u);
+
+        // Two flushes upload two segments; set1 is now stale, set2 current.
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        let set1 = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store_segments(&mem), 2, "two segments uploaded");
+        assert_eq!(
+            store_sets(&mem),
+            2,
+            "set1 (stale) + set2 (current) uploaded"
+        );
+        assert!(mem.exists(&set_key(set1)).unwrap(), "set1 object present");
+
+        // GC reclaims the stale set1 manifest FROM THE STORE (not just a local file).
+        let rep = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(rep.deleted_sets.len(), 1);
+        assert!(
+            !mem.exists(&set_key(set1)).unwrap(),
+            "the stale set object was deleted from the store"
+        );
+        assert_eq!(store_sets(&mem), 1, "only the current set object remains");
+        assert_eq!(store_segments(&mem), 2, "both segments still live");
+
+        // Compact the two segments into one → the run's two segments orphan in the store.
+        graphs
+            .compact_graph_segments("people", &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(
+            store_segments(&mem),
+            3,
+            "2 compacted + 1 merged in the store pre-GC"
+        );
+
+        let rep = graphs.gc_orphan_segments("people", &root, 0).unwrap();
+        assert_eq!(
+            rep.deleted_segments.len(),
+            2,
+            "the run's segment objects reclaimed from the store"
+        );
+        assert_eq!(
+            rep.deleted_sets.len(),
+            1,
+            "the superseded set object reclaimed"
+        );
+        assert_eq!(
+            store_segments(&mem),
+            1,
+            "only the merged segment remains in the store"
+        );
+        assert_eq!(store_sets(&mem), 1);
+
+        // The merged segment's objects are intact — a store-native reopen serves every row.
+        drop(graphs);
+        let graphs =
+            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
+                .unwrap();
+        let gen = graphs.get("people").unwrap();
+        assert_eq!(
+            gen.stack().segments().len(),
+            1,
+            "merged segment loads from the store"
+        );
+        let view = MergedView::new(gen.as_ref(), DeltaSnapshot::empty());
+        let names: HashSet<String> = Engine::new(&view, &cache)
+            .run(&parser::parse("MATCH (n:Person) RETURN n.name").unwrap())
+            .unwrap()
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for n in ["Alice", "Bob", "Carol", "Dave", "Eve"] {
+            assert!(names.contains(n), "{n} served after store GC: {names:?}");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.2: a delta of **core-resolved node patches** (a `SET`/`REMOVE` on a
     /// node the base already carries) flushes into an upper segment as full replace-rows.
     /// Every kind is exercised end-to-end through the query overlay with an empty delta:
@@ -11325,17 +11494,16 @@ mod tests {
             };
             execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
         };
+        // Count the GC grace markers the sweep stamps under `<graph>/.gc/` (a `seg-<uuid>` per
+        // orphaned segment observed within the grace).
         let gcmark_count = |root: &Path| -> usize {
-            seg_dirs(root)
-                .iter()
-                .filter(|d| {
-                    root.join("people")
-                        .join("segments")
-                        .join(d)
-                        .join(".gcmark")
-                        .exists()
+            std::fs::read_dir(root.join("people").join(".gc"))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("seg-"))
+                        .count()
                 })
-                .count()
+                .unwrap_or(0)
         };
 
         // Four flushes tip the stack past maxUpperSegments and drive at least one compaction,

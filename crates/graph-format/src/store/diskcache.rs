@@ -441,6 +441,13 @@ impl ObjectStore for CachingObjectStore {
     fn put(&self, key: &str, bytes: &[u8], sha256_b64: Option<&str>) -> Result<()> {
         self.inner.put(key, bytes, sha256_b64)
     }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        // Delete from the backing store. Any blocks of `key` still resident in the disk cache
+        // are harmless — a GC'd object is unreferenced, so no reader requests them again, and
+        // they age out of the LRU on their own.
+        self.inner.delete(key)
+    }
 }
 
 /// One open object, reading through the [`DiskCache`]. Holds the object key (so

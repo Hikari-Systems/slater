@@ -99,13 +99,13 @@ immutable **upper core segments**, each the O(delta) at-rest product of a flush.
   touched block for a whole write batch). Slice 6.4 DONE (`HP23`): T2/T3 auto-trigger wire-up in
   `maybe_maintain_delta` (`segmentFlushBytes` flushes the delta into a core segment; the served
   stack over `maxUpperSegments` folds a run — beside the L0-internal rungs).
-- **Phase 7 — T4 retarget + GC.** Functionally complete. `consolidate_graph` collapses a set to
-  a singleton via the Phase-0 direct path; retired sets/segments GC'd after a grace period.
+- **Phase 7 — T4 retarget + GC.** DONE. `consolidate_graph` collapses a set to a singleton via
+  the Phase-0 direct path; retired sets/segments GC'd after a grace period.
   Slice 7.1 DONE (`HP24`): segment-aware consolidation dump (the retarget correctness gate —
   `serialise_binary_dump` folds the core stack). Slice 7.2 DONE (`HP25`): orphan segment/set GC
-  core (`Graphs::gc_orphan_segments`, local-fs, marker-based grace). Slice 7.3 DONE (`HP26`): GC
-  config (`deltaConfig.segmentGcGraceSecs`) + write-path wiring (post-compaction, post-retarget).
-  Slice 7.4 (optional): remote-store GC parity (`ObjectStore::delete`).
+  core (`Graphs::gc_orphan_segments`, marker-based grace). Slice 7.3 DONE (`HP26`): GC config
+  (`deltaConfig.segmentGcGraceSecs`) + write-path wiring (post-compaction, post-retarget). Slice
+  7.4 DONE (`HP27`): remote-store GC parity (`ObjectStore::delete`).
 - **Phase 8 — Bench harness + hardening + docs.** Read-amp harness (point lookup,
   2-hop, label scan, counts) over fs and S3, 0/2/4/8 segments, cold+warm.
 
@@ -128,16 +128,20 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.3 (HP26). **Phases 1–6 DONE;
-Phase 7 functionally complete** (7.1 retarget gate + 7.2 GC core + 7.3 config/wiring). The only
-work left is the **optional slice 7.4** — remote-store GC parity: add an `ObjectStore::delete`
-and have `gc_orphan_segments` reclaim a remote set/segment's objects (today it is a no-op on a
-non-local-fs store), with the grace covering lazy block re-fetch (the local-fs fd-persistence
-argument does not hold on a remote backend). If 7.4 is not pursued, **Phase 8** (bench harness +
-hardening + docs) is next. The retarget path is `consolidate_graph` (already segment-aware after
-7.1); the GC entry point is `Graphs::gc_orphan_segments(name, data_dir, grace_secs)`, wired into
-`maybe_maintain_delta` (post-compaction) and `execute_consolidate` (post-retarget) under
-`deltaConfig.segmentGcGraceSecs > 0`.
+**Branch:** `writeable`. **Committed through:** Phase 7 slice 7.4 (HP27). **Phases 1–7 DONE.**
+Next is **Phase 8** — bench harness + hardening + docs: a read-amp harness (point lookup, 2-hop,
+label scan, counts) over fs and S3 at 0/2/4/8 segments, cold + warm.
+
+Phase 7 (T4 retarget + GC) is complete: (7.1) `serialise_binary_dump` folds the core stack so
+`consolidate_graph` collapses a stacked set to a correct singleton via the Phase-0 direct path;
+(7.2) `Graphs::gc_orphan_segments(name, data_dir, grace_secs)` reclaims orphaned segment/set
+artifacts under a `.gc/`-marker grace, single-flight via `begin_consolidation`, never touching a
+generation dir; (7.3) `deltaConfig.segmentGcGraceSecs` (0 disables) wires the sweep into
+`maybe_maintain_delta` (post-compaction) and `execute_consolidate` (post-retarget); (7.4)
+`ObjectStore::delete` makes the sweep reclaim a remote store's objects too. Deferred `bail!`s still
+open in the *flush* writer (each benign, Phase-6-independent): patch-then-delete of the same core
+edge in one delta, and a flush over an off-heap L0 level (the T2 auto-trigger is gated off under
+`offHeapL0` for exactly that reason).
 
 **Phase 7 (T4 retarget + GC) — slice 7.1 DONE (segment-aware consolidation dump — the retarget
 correctness gate).** `consolidate_graph` already freezes the delta, dumps `MergedView(core, delta)`
@@ -463,9 +467,22 @@ Two slices:
   four auto-flushes drive a compaction whose orphaned run dirs the wired sweep marks with `.gcmark`
   within the grace, then an immediate explicit sweep reclaims them; every born row survives). **746
   slater lib** (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
-- **7.4 — remote-store GC parity (optional).** Add an `ObjectStore::delete` and reclaim a remote
-  set/segment's objects (with the grace covering lazy block re-fetch, where the fd-persistence
-  argument does not hold).
+- **7.4 DONE** (HP27) — **remote-store GC parity.** New `ObjectStore::delete(key)` (default bails
+  read-only; implemented by fs / mem / s3 `DeleteObject` / gcs `DeleteObjectRequest` /
+  disk-cache-passthrough — each idempotent on an absent key), and `gc_orphan_segments` now works on
+  **any** backend: it discovers orphans by listing the store, removes a remote segment's objects via
+  `delete` (list the segment prefix → delete each key) and its local staged dir via `remove_dir_all`
+  (on a local-fs store the staged files *are* the objects, so the redundant object-delete is skipped),
+  and reclaims a stale set's manifest object + local file. This **superseded 7.2's "local-fs only"
+  no-op** and moved the grace marker from inside the segment dir (`.gcmark`) to a local `<graph>/.gc/`
+  sidecar (`seg-<uuid>` / `set-<uuid>`) — server-side bookkeeping that does not depend on the segment
+  ever having been staged locally on this instance, so a store-backed instance that never staged a
+  segment still grace-tracks it. Reader safety unchanged (the grace covers a remote reader that
+  re-fetches a block lazily after the object is gone, where the local-fs fd-persistence argument does
+  not hold). One e2e (`gc_reclaims_orphans_from_an_object_store`: over a `MemObjectStore`, a stale
+  set's manifest and a compacted run's segment objects are deleted *from the store*, and a
+  store-native reopen serves only the live merged segment). **747 slater lib** (+1) + 141 graph-format
+  + 78 slater-delta + full workspace green, clippy (incl. `s3,gcs`) + fmt clean.
 
 ### Phase 6 slice log
 - **6.4 DONE** (HP23): **T2/T3 auto-trigger wire-up** — Phase 6 CLOSED. `maybe_maintain_delta`
@@ -960,9 +977,19 @@ public codecs), `segindex.rs` (ISAM fragments + removal sidecar), `segpostings.r
   Both on the blocking pool, guarded by the knob, a lost single-flight race / transient error benign
   (debug/warn — never fails the fold or the already-published consolidation). `build_writable_ctx_caps`
   gained a grace arg. One e2e (`write_path_auto_gc_marks_orphans_after_compaction`). **746 slater lib**
-  (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean. ← current
-  baseline; Phase 7 functionally complete (7.1 retarget gate + 7.2 GC core + 7.3 wiring); only the
-  optional 7.4 (remote-store `ObjectStore::delete` parity) remains.
+  (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy + fmt clean.
+- HP27 — Phase 7 slice 7.4: **remote-store GC parity**. New `ObjectStore::delete(key)` (default bails
+  read-only; fs / mem / s3 `DeleteObject` / gcs `DeleteObjectRequest` / disk-cache passthrough, each
+  idempotent on an absent key). `gc_orphan_segments` now reclaims on **any** backend: discover orphans
+  by listing the store, delete a remote segment's objects (list its prefix → `delete` each key) + its
+  local staged dir (`remove_dir_all`, skipped-redundant on local-fs where the files *are* the objects),
+  and a stale set's manifest object + local file. **Superseded 7.2's local-fs-only no-op**; moved the
+  grace marker from inside the segment dir (`.gcmark`) to a local `<graph>/.gc/` sidecar
+  (`seg-<uuid>`/`set-<uuid>`) so a store-backed instance that never staged a segment still
+  grace-tracks it. One e2e (`gc_reclaims_orphans_from_an_object_store`, over a `MemObjectStore`).
+  **747 slater lib** (+1) + 141 graph-format + 78 slater-delta + full workspace green, clippy (incl.
+  `s3,gcs`) + fmt clean. ← current baseline; **Phase 7 COMPLETE** (7.1–7.4). Next: **Phase 8** (bench
+  harness + hardening + docs).
 
 **Phase 2 slice log (all DONE — historical record of the core-segment format work):**
   1. `extents.rs` — resident routing table `sorted Vec<(band_base, segment_ord)>` for

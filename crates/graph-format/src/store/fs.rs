@@ -112,4 +112,13 @@ impl ObjectStore for FsObjectStore {
         }
         std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
     }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let path = self.path_for(key);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("delete {}", path.display())),
+        }
+    }
 }

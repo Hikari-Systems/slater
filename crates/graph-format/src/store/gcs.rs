@@ -37,6 +37,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use gcloud_storage::client::google_cloud_auth::credentials::CredentialsFile;
 use gcloud_storage::client::{Client, ClientConfig};
+use gcloud_storage::http::objects::delete::DeleteObjectRequest;
 use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
 use gcloud_storage::http::objects::list::ListObjectsRequest;
@@ -448,6 +449,25 @@ impl ObjectStore for GcsObjectStore {
                 .await
                 .map_err(|e| gcs_err(&format!("GCS upload {full}"), e))?;
             Ok(())
+        })
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let full = self.full_key(key);
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        run_blocking(&self.rt, async move {
+            let req = DeleteObjectRequest {
+                bucket: bucket.clone(),
+                object: full.clone(),
+                ..Default::default()
+            };
+            match client.delete_object(&req).await {
+                Ok(()) => Ok(()),
+                // Tolerate an already-absent object (idempotent), like the other backends.
+                Err(e) if is_not_found(&e) => Ok(()),
+                Err(e) => Err(gcs_err(&format!("GCS delete {full}"), e)),
+            }
         })
     }
 }

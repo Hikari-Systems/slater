@@ -135,6 +135,14 @@ pub trait ObjectStore: Send + Sync {
         anyhow::bail!("storage backend is read-only; cannot write {key}")
     }
 
+    /// Delete the object at `key`, tolerating an already-absent key (idempotent). Used by the
+    /// segment/set GC sweep to reclaim the objects an orphaned segment or superseded set left in
+    /// the store. The default refuses — a writable backend opts in by overriding (as it does for
+    /// [`put`](Self::put)); a read-only backend never accumulates orphans to reclaim.
+    fn delete(&self, key: &str) -> Result<()> {
+        anyhow::bail!("storage backend is read-only; cannot delete {key}")
+    }
+
     /// Whether this store is the plain local filesystem rooted at the data directory. A
     /// flush/build that writes objects directly under `data_dir` via `std::fs` has already
     /// published them through such a store, so no explicit `put` upload is required. Remote
