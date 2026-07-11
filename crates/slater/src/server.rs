@@ -59,7 +59,7 @@ use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
 use crate::read_view::{MergedView, ReadView};
-use slater_delta::{DeltaSnapshot, OpResolution, WalOp};
+use slater_delta::{DeltaSnapshot, Memtable, OpResolution, WalOp};
 
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
 const TAG_NODE: u8 = 0x4E;
@@ -609,12 +609,37 @@ impl Graphs {
         let frozen = writer
             .freeze()
             .with_context(|| format!("freeze writable delta for '{name}'"))?;
-        if !frozen.l0.is_empty() {
-            bail!("flush_to_segment over a stacked L0 level is not yet supported");
-        }
-        if frozen.snapshot.is_empty() {
+        if frozen.snapshot.is_empty() && frozen.l0.iter().all(|l| l.is_empty()) {
             return Ok(None); // nothing to flush; freeze's fresh WAL segment keeps taking writes
         }
+
+        // Fold the frozen snapshot with any spilled L0 levels into ONE newest-wins memtable
+        // (Phase 4c). The active memtable is newest; `frozen.l0` is newest-first — so the
+        // `merge_levels` order is `[snapshot, l0[0]…l0[n]]`. Every level was resolved against
+        // the same served core, so they share a `synthetic_base`; the merged memtable inherits
+        // it (= `prior_node_total`), keeping the writer's Phase-3.2 band assertion true. The
+        // no-L0 fast path flushes the snapshot directly (unchanged), so the merge — and its
+        // clone of the folded state — is only paid when levels actually stacked.
+        let merged: Option<Memtable> = if frozen.l0.is_empty() {
+            None
+        } else {
+            let mut levels: Vec<&Memtable> = Vec::with_capacity(1 + frozen.l0.len());
+            levels.push(frozen.snapshot.as_ref());
+            for lvl in &frozen.l0 {
+                match lvl.as_memtable() {
+                    Some(m) => levels.push(m),
+                    // Off-heap L0 stores a block image, not a memtable, so `merge_levels`
+                    // cannot fold it (the `LevelRead` trait is lossy for a full rebuild).
+                    // Resident L0 (the default) folds; off-heap flush is a later slice.
+                    None => bail!(
+                        "flush_to_segment over an off-heap L0 level is not yet supported \
+                         (resident L0 folds; off-heap needs a memtable rebuild)"
+                    ),
+                }
+            }
+            Some(Memtable::merge_levels(&levels))
+        };
+        let flush_mem: &Memtable = merged.as_ref().unwrap_or_else(|| frozen.snapshot.as_ref());
 
         // The appended band starts at the current stack top (base + every existing segment).
         let prior_node_total = core.stack().extents().nodes.total();
@@ -663,7 +688,7 @@ impl Graphs {
                 encryption_header,
                 created_unix,
             };
-            match crate::flush_segment::write_flush_segment(frozen.snapshot.as_ref(), &inp) {
+            match crate::flush_segment::write_flush_segment(flush_mem, &inp) {
                 Ok(m) => m,
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&seg_dir);
@@ -6701,6 +6726,154 @@ mod tests {
         assert!(
             Graphs::open_all(&root, None).is_err(),
             "an encrypted data dir must not open without the key"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Phase 4 slice 4.4-c: a flush over a **stacked L0** (the active memtable plus ≥2 sealed
+    /// L0 levels) folds every level newest-wins into ONE segment. A core node patched in all
+    /// three levels resolves to the newest value; born nodes allocated in different levels tile
+    /// contiguously above the shared base; a born edge whose endpoints span levels traverses.
+    /// All read back through an empty delta and survive a reopen.
+    #[test]
+    fn flush_to_segment_folds_a_stacked_l0() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_stacked_l0");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let base_uuid = graphs.get("people").unwrap().uuid();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+
+        // Level L0-oldest: patch a core node only (0 born).
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
+        assert!(graphs.writer("people").unwrap().flush_to_l0().unwrap());
+
+        // Level L0-newer: re-patch the same core node (newer wins over 99), born Dave, and a
+        // born edge Alice-KNOWS->Dave (a core endpoint + a same-level born endpoint).
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 77");
+        write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
+        write(
+            &graphs,
+            "MERGE (a:Person {name:'Alice'})-[:KNOWS]->(b:Person {name:'Dave'})",
+        );
+        assert!(graphs.writer("people").unwrap().flush_to_l0().unwrap());
+        assert_eq!(
+            graphs.writer("people").unwrap().l0_len(),
+            2,
+            "two L0 levels"
+        );
+
+        // Active memtable (newest): re-patch Alice again (55 wins over 77 and 99), born Eve.
+        write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 55");
+        write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
+        assert!(
+            !graphs.writer("people").unwrap().snapshot().is_empty(),
+            "active memtable carries the newest level"
+        );
+
+        // Flush: folds [active ⊕ L0-newer ⊕ L0-oldest] into one segment.
+        let set_uuid = graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("a stacked delta flushes");
+
+        let gen1 = graphs.get("people").unwrap();
+        assert_eq!(gen1.uuid(), set_uuid, "identity is the new set uuid");
+        assert_eq!(gen1.base_uuid(), base_uuid, "base preserved by the flush");
+        assert_eq!(gen1.stack().segments().len(), 1, "one folded upper segment");
+        let writer = graphs.writer("people").unwrap();
+        assert!(writer.snapshot().is_empty(), "delta retired empty");
+        assert_eq!(writer.l0_len(), 0, "L0 levels consumed by the flush");
+
+        let q = |graphs: &Graphs, q: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let w = graphs.writer("people").unwrap();
+            let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+            let ast = parser::parse(q).unwrap();
+            let r = Engine::new(&view, &cache).run(&ast).unwrap();
+            r
+        };
+
+        // Newest-wins across three levels: Alice's age is 55 (active), not 77 or 99.
+        let alice = q(&graphs, "MATCH (n:Person {name:'Alice'}) RETURN n.age");
+        assert!(
+            matches!(alice.rows[0][0], Val::Int(55)),
+            "Alice's newest patch wins across the stack: {:?}",
+            alice.rows[0][0]
+        );
+        // Born nodes from different levels both land (Dave from L0-newer, Eve from active).
+        let dave = q(&graphs, "MATCH (n:Person {name:'Dave'}) RETURN n.age");
+        assert!(
+            matches!(dave.rows[0][0], Val::Int(50)),
+            "Dave (born in a sealed L0) is in the segment: {:?}",
+            dave.rows[0][0]
+        );
+        let eve = q(&graphs, "MATCH (n:Person {name:'Eve'}) RETURN n.age");
+        assert!(
+            matches!(eve.rows[0][0], Val::Int(60)),
+            "Eve (born in the active level) is in the segment: {:?}",
+            eve.rows[0][0]
+        );
+        // Count: 3 base + 2 born = 5.
+        let n = q(&graphs, "MATCH (n:Person) RETURN count(*)");
+        assert!(
+            matches!(n.rows[0][0], Val::Int(5)),
+            "3 base + 2 born folded: {:?}",
+            n.rows[0][0]
+        );
+        // The born edge (endpoints resolved across levels) traverses.
+        let knows = q(
+            &graphs,
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(b) RETURN b.name ORDER BY b.name",
+        );
+        // Alice already KNOWS Bob in the base; the folded born edge adds Dave.
+        let targets: Vec<String> = knows
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            targets.contains(&"Dave".to_string()),
+            "the folded born edge Alice->Dave traverses: {targets:?}"
+        );
+
+        // Reopen from disk: the folded segment reloads and the merged data survives.
+        drop(writer);
+        drop(gen1);
+        drop(graphs);
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        let gen2 = graphs.get("people").unwrap();
+        assert_eq!(gen2.uuid(), set_uuid, "reopen names the flushed set");
+        assert_eq!(gen2.stack().segments().len(), 1, "folded segment reloaded");
+        let view = MergedView::new(gen2.as_ref(), DeltaSnapshot::empty());
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let alice2 = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert!(
+            matches!(alice2.rows[0][0], Val::Int(55)),
+            "newest-wins fold survives reopen: {:?}",
+            alice2.rows[0][0]
         );
 
         std::fs::remove_dir_all(&root).ok();

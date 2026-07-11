@@ -118,7 +118,7 @@ never correctness.
 
 ## RESUME HERE
 
-**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-b (HP14). **Phases 1–3
+**Branch:** `writeable`. **Committed through:** Phase 4 slice 4.4-c (HP15). **Phases 1–3
 DONE; Phase 4 IN PROGRESS.** The flush writer (`Graphs::flush_graph_to_segment` +
 `crate::flush_segment::write_flush_segment`) now materialises **born nodes/edges, core-resolved
 node patches, deletes, AND core-edge patches** — **every write op can now flush** (the last
@@ -139,12 +139,38 @@ untouched). Publishes/swaps/retires and reads back identically — surviving a r
 flush over an encrypted core now writes an encrypted segment** — a fresh per-segment cipher +
 KDF header is derived from the runtime `master_key`, `manifest.encryption` is stamped and the
 MAC sealed, and the read side re-derives the same cipher on reopen (the `master_key.is_some()`
-bail is gone). Next: **slice 4.4-c** (stacked L0 fold), then **4.4-d** (s3 upload); then
-auto-trigger wiring (Phase-6-gated). Still deferred and `bail!`ed: patch-**then-delete** of the
-same core edge in one delta (an adjacency-removal concern the patch materialiser doesn't own),
-and stacked L0 folds (`server.rs:612` `if !frozen.l0.is_empty()`).
+bail is gone). **A flush over a stacked L0 now folds** — when the freeze captures sealed L0
+levels beneath the active memtable, they merge newest-wins into one segment via
+`Memtable::merge_levels([snapshot, l0…])` (the active memtable is newest, `frozen.l0` is
+newest-first); born ids tile contiguously above the shared base and the merged `synthetic_base`
+stays `== prior_node_total`. Next: **slice 4.4-d** (s3 upload); then auto-trigger wiring
+(Phase-6-gated). Still deferred and `bail!`ed: patch-**then-delete** of the same core edge in
+one delta (an adjacency-removal concern the patch materialiser doesn't own), and a flush over an
+**off-heap** L0 level (resident L0 folds via `LevelRead::as_memtable`; off-heap stores a block
+image, not a memtable, so it needs a memtable rebuild the lossy trait can't give —
+`server.rs` `as_memtable()` returns `None`).
 
 ### Phase 4 slice log
+- **4.4-c DONE** (HP15): **stacked L0 fold**. A flush over a freeze that captured sealed L0
+  levels (active memtable + `frozen.l0`, previously `bail!`ed) now folds them into one segment.
+  When `frozen.l0` is non-empty, `flush_graph_to_segment` builds `[snapshot, l0[0]…l0[n]]`
+  (active memtable newest, `frozen.l0` newest-first — matching `DeltaSnapshot::with_levels`) and
+  calls `Memtable::merge_levels`, then flushes the merged memtable through the unchanged
+  `write_flush_segment`. The no-L0 fast path is untouched (snapshot flushed directly — no merge
+  clone paid). Correctness rests on stacked born-id allocation: `flush_to_l0`
+  (`delta_writer.rs:545`) rebases each new active memtable to `base + born_count`, so born ids
+  across levels tile `[base, base+total)` and the oldest level's `synthetic_base` is the global
+  base (= `prior_node_total`) — keeping the writer's Phase-3.2 band assertion true. The empty
+  guard widened to `snapshot.is_empty() && l0.all(is_empty)`, and `retire` already consumed
+  `frozen.consumed_l0`. **Off-heap L0 is deferred**: `merge_levels` needs concrete `Memtable`s,
+  so a new `LevelRead::as_memtable()` seam (`Some(self)` for a resident `Memtable`, default
+  `None`) downcasts each level; an off-heap level (a block image, not a memtable) returns `None`
+  and the flush `bail!`s — a rebuild the lossy `LevelRead` trait can't cheaply give. One new e2e
+  oracle (`flush_to_segment_folds_a_stacked_l0`): a core node patched in **all three** levels
+  (99→77→55) resolves newest-wins to 55; born Dave (sealed L0) + born Eve (active) tile above
+  the base; a born edge Alice→Dave (core + same-level born endpoints) traverses; all read back
+  through an empty delta and survive a reopen. 718 slater lib + full workspace green, clippy +
+  fmt clean.
 - **4.4-b DONE** (HP14): **encryption parity**. A flush over a core that is encrypted at rest
   now writes an encrypted segment instead of bailing. The caller
   (`Graphs::flush_graph_to_segment`) derives a **fresh per-segment** `BlockCipher` + manifest
@@ -443,32 +469,22 @@ Phase 3. **ALL EXIT CRITERIA MET — Phase 2 COMPLETE.**
 
 **Resume prompt to paste after a context clear:**
 > Resume the segmented-core work on branch `writeable`. Read `docs/SEGMENTED-CORE-PLAN.md`
-> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP14 (slice 4.4-b,
-> encryption parity).** Phases 1–3 DONE; Phase 4 IN PROGRESS. **Every write op now
-> materialises into a flush segment** (`write_flush_segment` has no remaining per-op
-> `bail!`), **and a flush over an encrypted core writes an encrypted segment.** Baseline:
-> **717 slater lib tests** (140 graph-format, 78 slater-delta), clippy clean.
+> "RESUME HERE" + the Phase 4 slice log first. **Committed through HP15 (slice 4.4-c,
+> stacked L0 fold).** Phases 1–3 DONE; Phase 4 IN PROGRESS. **Every write op materialises
+> into a flush segment**, **a flush over an encrypted core writes an encrypted segment**, and
+> **a flush over a stacked L0 folds all levels newest-wins into one segment.** Baseline:
+> **718 slater lib tests** (140 graph-format, 78 slater-delta), clippy clean.
 >
-> NEXT: **slice 4.4-c then 4.4-d — the rest of the deployment bundle.** Two limitation sites
-> remain in `Graphs::flush_graph_to_segment` (`crates/slater/src/server.rs`); each is its own
-> green commit + HP. Do NOT wire the auto-trigger — Phase-6-gated (needs segment-aware
-> write-path resolve; see 4.1 deferral note (e)). (4.4-b encryption parity is DONE:
-> per-segment cipher + header derived from `master_key`, `manifest.encryption` stamped,
-> MAC sealed, read side re-derives on reopen — see the slice log.)
+> NEXT: **slice 4.4-d — the last of the deployment bundle** (one limitation site left in
+> `Graphs::flush_graph_to_segment`). Do NOT wire the auto-trigger — Phase-6-gated (needs
+> segment-aware write-path resolve; see 4.1 deferral note (e)). (4.4-b encryption parity and
+> 4.4-c stacked L0 fold are DONE — see the slice log. Two orthogonal sub-deferrals remain,
+> both `bail!`ed: patch-then-delete of the same core edge in one delta, and a flush over an
+> **off-heap** L0 level — `LevelRead::as_memtable()` returns `None` for it, needing a
+> memtable rebuild the lossy trait can't give.)
 >
-> **4.4-c — STACKED L0 FOLD** (the real work): bail at `server.rs:612`
-> `if !frozen.l0.is_empty()`. Fold `snapshot ⊕ l0` into ONE newest-wins `SegmentData`.
-> Hard part: an L0 level is `OffheapSegment: LevelRead`, not a `Memtable`, but
-> `merge_levels` (`memtable.rs:1503`) needs concrete `Memtable`s. Route (a) deserialise each
-> L0 back to a `Memtable` (`from_segment_data` path, `memtable.rs` ~1500-1660) then
-> `merge_levels` — verify core-edge patches survive
-> (`merge_levels_preserves_a_core_edge_patch`, `memtable.rs:4501`); or (b) build
-> `SegmentData` from a `DeltaSnapshot::with_levels(snapshot, l0)` walk. Verify merged
-> `synthetic_base == prior_node_total` (`server.rs:620`). Test: spill ≥2 L0 levels, flush,
-> read back through empty delta + reopen; assert newest-wins across levels.
->
-> **4.4-d — S3 / OBJECT-STORE UPLOAD**: `publish_set_and_current` (`server.rs:738`) is
-> local-fs only (comment at `server.rs:733`). Upload segment dir (all sections + fragments
+> **4.4-d — S3 / OBJECT-STORE UPLOAD**: `publish_set_and_current` (`server.rs:763`) is
+> local-fs only (comment at `server.rs:758`). Upload segment dir (all sections + fragments
 > + `SEGMENT.json`) + set manifest to the configured `ObjectStore`, mirroring the builder's
 > upload (memory `s3-storage-backend`/`gcs-storage-backend`); durable before `current`
 > flips. Confirm `SegmentReader::open_via(store, ...)` (`segstack.rs:169`) reads it back.

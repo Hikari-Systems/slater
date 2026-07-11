@@ -2304,12 +2304,23 @@ pub trait LevelRead: std::fmt::Debug + Send + Sync {
     fn in_edges(&self, node: u64) -> Vec<DeltaEdge>;
     /// Owned edge delta by dense edge id.
     fn edge_delta_owned(&self, edge_id: u64) -> Option<EdgeDelta>;
+    /// Borrow this level as a concrete [`Memtable`] when it is resident, for a fold that
+    /// needs the full in-RAM maps (`by_dense`/`nodes`/`edges`/`interner`) the trait does not
+    /// expose — e.g. [`Memtable::merge_levels`] in the T2 flush. Off-heap levels return
+    /// `None` (their block image is not a memtable), so a caller that requires it must
+    /// handle that case.
+    fn as_memtable(&self) -> Option<&Memtable> {
+        None
+    }
 }
 
 /// The resident level: a [`Memtable`] answers every accessor from its in-RAM maps,
 /// cloning only where the trait's owned contract requires it (the borrow-returning
 /// inherent methods stay for the same-memtable fast paths and tests).
 impl LevelRead for Memtable {
+    fn as_memtable(&self) -> Option<&Memtable> {
+        Some(self)
+    }
     fn is_empty(&self) -> bool {
         Memtable::is_empty(self)
     }
