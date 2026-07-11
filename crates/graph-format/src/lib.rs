@@ -39,6 +39,7 @@ pub mod membudget;
 pub mod nodelabels;
 pub mod postings;
 pub mod pq;
+pub mod setmanifest;
 pub mod store;
 pub mod topology;
 pub mod vamana;
