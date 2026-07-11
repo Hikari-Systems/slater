@@ -190,6 +190,41 @@ impl DumpWriter {
         Ok(())
     }
 
+    /// Append a node whose label and property records are **already encoded** in the
+    /// canonical [`encode_labels_record`](crate::nodelabels::encode_labels_record) /
+    /// [`encode_props_record`](crate::columns::encode_props_record) layouts with global
+    /// symbol ids — a byte-copy from a base generation's stores, skipping the
+    /// decode + re-encode [`append_node`](Self::append_node) does. The caller must
+    /// have seeded the dump's symbol tables from the base manifest so the record's
+    /// ids stay valid. Same append-order contract as [`append_node`](Self::append_node).
+    pub fn append_node_raw(&mut self, labels_rec: &[u8], props_rec: &[u8]) -> Result<()> {
+        self.node_scratch.clear();
+        write_blob(&mut self.node_scratch, labels_rec);
+        write_blob(&mut self.node_scratch, props_rec);
+        self.nodes.append_record(&self.node_scratch)?;
+        self.node_count += 1;
+        Ok(())
+    }
+
+    /// Append an edge whose property record is **already encoded** (see
+    /// [`append_node_raw`](Self::append_node_raw)); `reltype` is a base/global reltype id.
+    pub fn append_edge_raw(
+        &mut self,
+        src: u64,
+        dst: u64,
+        reltype: u32,
+        props_rec: &[u8],
+    ) -> Result<()> {
+        self.edge_scratch.clear();
+        write_uvarint(&mut self.edge_scratch, src);
+        write_uvarint(&mut self.edge_scratch, dst);
+        write_uvarint(&mut self.edge_scratch, reltype as u64);
+        write_blob(&mut self.edge_scratch, props_rec);
+        self.edges.append_record(&self.edge_scratch)?;
+        self.edge_count += 1;
+        Ok(())
+    }
+
     /// Number of nodes / edges appended so far.
     pub fn node_count(&self) -> u64 {
         self.node_count

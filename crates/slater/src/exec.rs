@@ -1762,6 +1762,42 @@ impl<'g, V: ReadView> Engine<'g, V> {
         self.gen.property_key_name(kid).unwrap_or("?").to_string()
     }
 
+    /// Raw (undecoded) `node_labels.blk` record for a **core** node, read through the
+    /// block cache. The bytes are the canonical [`nodelabels::encode_labels_record`]
+    /// layout in the core generation's label ids — the consolidation dump byte-copies
+    /// them for untouched nodes, skipping decode + re-encode. Caller guarantees
+    /// `id < core_generation().node_count()`.
+    pub fn raw_node_labels(&self, id: u64) -> Result<crate::cache::BlockRecord> {
+        self.cache.record(
+            self.gen.node_labels().inner(),
+            self.gen.uuid(),
+            FileKind::NodeLabels,
+            id,
+        )
+    }
+
+    /// Raw (undecoded) `node_props.blk` record for a **core** node (see
+    /// [`Self::raw_node_labels`]). Caller guarantees `id < core node count`.
+    pub fn raw_node_props(&self, id: u64) -> Result<crate::cache::BlockRecord> {
+        self.cache.record(
+            self.gen.node_props().inner(),
+            self.gen.uuid(),
+            FileKind::NodeProps,
+            id,
+        )
+    }
+
+    /// Raw (undecoded) `edge_props.blk` record for a **core** edge (see
+    /// [`Self::raw_node_labels`]). Caller guarantees `id < core edge count`.
+    pub fn raw_edge_props(&self, id: u64) -> Result<crate::cache::BlockRecord> {
+        self.cache.record(
+            self.gen.edge_props().inner(),
+            self.gen.uuid(),
+            FileKind::EdgeProps,
+            id,
+        )
+    }
+
     fn check_deadline(&self) -> Result<()> {
         if let Some(d) = self.deadline {
             if Instant::now() >= d {

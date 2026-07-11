@@ -68,17 +68,32 @@ pub fn serialise_merge_dump<V: ReadView>(
     Ok(())
 }
 
-/// A first-seen symbol interner. Ids are assigned in interning order, so the dump's
-/// symbol tables reproduce deterministically (the range-index DDL is interned first,
-/// then nodes, then edges — mirroring the text path's DDL-before-data ordering) and
-/// dead symbols left by deletions are dropped.
-#[derive(Default)]
+/// A symbol interner. **Seeded from the base generation's symbol table** so a base
+/// entity's ids stay identity-valid — that is what lets the binary-dump fast path
+/// byte-copy a base label/property/edge record without remapping the ids inside it.
+/// Delta-born names append past the seeded range, in first-seen order, so a fixed
+/// `(core, delta)` reproduces deterministically. (Dead symbols left by deletions
+/// stay in the table; the builder tolerates unused symbols.)
 struct Interner {
     names: Vec<String>,
     index: HashMap<String, u32>,
 }
 
 impl Interner {
+    /// Seed from a base symbol table: `names[i]` keeps id `i`, so records already
+    /// encoded against the base table need no remap.
+    fn seeded(names: &[String]) -> Self {
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        Self {
+            names: names.to_vec(),
+            index,
+        }
+    }
+
     fn intern(&mut self, name: &str) -> u32 {
         if let Some(&id) = self.index.get(name) {
             return id;
@@ -131,40 +146,43 @@ fn intern_props(
 ///
 /// Unlike [`serialise_merge_dump`], node identity is not recovered from a business
 /// key: dense ids are carried directly (compacted to elide tombstones), so a node
-/// needs no range-indexed property. Endpoints are emitted as compacted ids, so no
-/// per-edge business-key lookup happens — the dump side is O(nodes + edges) with no
-/// endpoint reads, the source of the ~2× consolidation win.
+/// needs no range-indexed property, and endpoints are emitted as compacted ids with
+/// no per-edge business-key lookup.
+///
+/// # Byte-copy fast path (Phase 0.5)
+/// The symbol tables are **seeded from the base manifest**, so a base entity's label /
+/// property / reltype ids are identity-valid in the dump. Every entity the delta does
+/// not touch — the overwhelming majority during a consolidation — is then emitted by
+/// byte-copying its raw `node_labels` / `node_props` / `edge_props` record straight
+/// from the base stores (via the block cache), with no decode, no per-record `String`
+/// allocation, and no re-encode. Only delta-born or delta-patched entities take the
+/// decode + overlay + re-intern path. This turns the dump side from ~hundreds of
+/// millions of `rel_record` allocations into a near-sequential block copy.
 pub fn serialise_binary_dump<V: ReadView>(
     engine: &Engine<'_, V>,
     view: &V,
     dir: &Path,
 ) -> Result<()> {
-    let mut labels = Interner::default();
-    let mut reltypes = Interner::default();
-    let mut keys = Interner::default();
-
-    // Range-index DDL first: intern the indexed names before any data so their symbol
-    // ids are lowest and stable (mirrors the text path emitting `CREATE INDEX` first),
-    // and record the DDL for the dump's `meta.json`.
-    let mut range_indexes: Vec<DumpRangeIndex> = Vec::new();
-    for ri in &view.manifest().range_indexes {
-        match ri.entity {
-            EntityKind::Node => {
-                labels.intern(&ri.label_or_type);
-            }
-            EntityKind::Edge => {
-                reltypes.intern(&ri.label_or_type);
-            }
-        }
-        keys.intern(&ri.property);
-        range_indexes.push(DumpRangeIndex {
+    // Seed the symbol tables from the base generation so base records byte-copy without
+    // an id remap; delta-born names append past the seeded range.
+    let manifest = view.manifest();
+    let mut labels = Interner::seeded(&manifest.labels);
+    let mut reltypes = Interner::seeded(&manifest.reltypes);
+    let mut keys = Interner::seeded(&manifest.property_keys);
+    let range_indexes: Vec<DumpRangeIndex> = manifest
+        .range_indexes
+        .iter()
+        .map(|ri| DumpRangeIndex {
             entity: ri.entity,
             label_or_type: ri.label_or_type.clone(),
             property: ri.property.clone(),
-        });
-    }
+        })
+        .collect();
 
-    let tombs = view.delta().effective_tombstoned_ids();
+    let delta = view.delta();
+    let tombs = delta.effective_tombstoned_ids();
+    let core_nodes = view.core_generation().node_count();
+    let core_edges = view.core_generation().edge_count();
     let n = view.node_count();
     let mut w = DumpWriter::create(dir)?;
 
@@ -173,9 +191,18 @@ pub fn serialise_binary_dump<V: ReadView>(
     let mut label_ids: Vec<u32> = Vec::new();
     let mut prop_kv: Vec<(u32, Value)> = Vec::new();
     for old in 0..n {
-        if view.delta().is_tombstoned(old) {
+        if delta.is_tombstoned(old) {
             continue;
         }
+        // Fast path: a base node the delta does not touch (no patch, no label change,
+        // not born) — byte-copy its raw label + property records.
+        if old < core_nodes && delta.node_patch(old).is_none() {
+            let lb = engine.raw_node_labels(old)?;
+            let pb = engine.raw_node_props(old)?;
+            w.append_node_raw(&lb, &pb)?;
+            continue;
+        }
+        // Slow path: born or patched — decode, overlay, and re-intern.
         let (lnames, props) = engine.node_record(old)?;
         label_ids.clear();
         for l in &lnames {
@@ -189,18 +216,27 @@ pub fn serialise_binary_dump<V: ReadView>(
     // `outgoing_adj` is overlay-aware: it already drops tombstoned edges and edges to
     // tombstoned nodes and appends delta-born edges.
     for old_src in 0..n {
-        if view.delta().is_tombstoned(old_src) {
+        if delta.is_tombstoned(old_src) {
             continue;
         }
         let new_src = compact_id(tombs, old_src);
         for adj in engine.outgoing_adj(old_src)? {
             let old_dst = adj.neighbour.0;
             // Belt-and-braces: a node tombstone must never leak an edge into the rebuild.
-            if view.delta().is_tombstoned(old_dst) {
+            if delta.is_tombstoned(old_dst) {
                 continue;
             }
             let new_dst = compact_id(tombs, old_dst);
-            let (rtype_name, eprops) = engine.rel_record(adj.edge.0, adj.reltype)?;
+            let eid = adj.edge.0;
+            // Fast path: a base edge the delta does not patch — byte-copy its raw
+            // property record. `adj.reltype` is a base reltype id = dump id (seeded).
+            if eid < core_edges && delta.edge_patches(eid).is_empty() {
+                let pb = engine.raw_edge_props(eid)?;
+                w.append_edge_raw(new_src, new_dst, adj.reltype, &pb)?;
+                continue;
+            }
+            // Slow path: born or patched edge — decode, overlay, re-intern.
+            let (rtype_name, eprops) = engine.rel_record(eid, adj.reltype)?;
             let rt = reltypes.intern(&rtype_name);
             intern_props(&eprops, &mut keys, "r", &mut prop_kv)?;
             w.append_edge(new_src, new_dst, rt, &prop_kv)?;
