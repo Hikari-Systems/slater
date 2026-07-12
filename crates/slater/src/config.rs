@@ -101,6 +101,29 @@ mod de {
     pub fn usize_floor0<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
         i64(d).map(|v| usize::try_from(v).unwrap_or(0))
     }
+
+    /// The dense-degree-column residency policy: `"lazy"` (chunk-lazy, the default) or
+    /// `"pinned"` (eager, never evicted). Case-insensitive.
+    pub fn degree_residency<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<crate::degree_column::DegreeResidency, D::Error> {
+        use crate::degree_column::DegreeResidency;
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = DegreeResidency;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("\"lazy\" or \"pinned\"")
+            }
+            fn visit_str<E: Error>(self, v: &str) -> Result<DegreeResidency, E> {
+                match v.to_ascii_lowercase().as_str() {
+                    "lazy" => Ok(DegreeResidency::Lazy),
+                    "pinned" => Ok(DegreeResidency::Pinned),
+                    _ => Err(E::invalid_value(Unexpected::Str(v), &self)),
+                }
+            }
+        }
+        d.deserialize_str(V)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -473,6 +496,18 @@ pub struct CacheConfig {
         deserialize_with = "de::usize_floor0"
     )]
     pub range_index_cache_bytes: usize,
+    /// Residency policy for the dense per-node degree column (`node_degrees.blk`), which
+    /// backs the degree-sum `count(endpoint)` fast path. `"lazy"` (default) faults a
+    /// ~1 MiB chunk on first touch and frees cold chunks on the idle-TTL sweep — elastic,
+    /// so a query that never sums degrees (or touches only part of the id space) doesn't
+    /// hold the whole ~733 MB column. `"pinned"` prefaults the whole column at open and
+    /// never evicts — preferred for latency-critical or object-store deployments, where a
+    /// mid-query range-GET fault (~10–100 ms) is worse than the steady resident cost.
+    #[serde(
+        default = "default_degree_column",
+        deserialize_with = "de::degree_residency"
+    )]
+    pub degree_column: crate::degree_column::DegreeResidency,
 }
 
 impl CacheConfig {
@@ -703,6 +738,9 @@ fn default_result_cache() -> usize {
 fn default_range_index_cache() -> usize {
     16 * 1024 * 1024
 }
+fn default_degree_column() -> crate::degree_column::DegreeResidency {
+    crate::degree_column::DegreeResidency::Lazy
+}
 fn default_cache_ttl_ms() -> i64 {
     30 * 60 * 1000
 }
@@ -778,6 +816,7 @@ impl Default for CacheConfig {
             result_cache_bytes: default_result_cache(),
             cache_ttl_ms: default_cache_ttl_ms(),
             range_index_cache_bytes: default_range_index_cache(),
+            degree_column: default_degree_column(),
         }
     }
 }
@@ -1015,6 +1054,29 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn degree_column_defaults_lazy_and_parses_pinned() {
+        use crate::degree_column::DegreeResidency;
+        let default: CacheConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.degree_column, DegreeResidency::Lazy);
+
+        for (s, want) in [
+            ("lazy", DegreeResidency::Lazy),
+            ("pinned", DegreeResidency::Pinned),
+            ("PINNED", DegreeResidency::Pinned), // case-insensitive
+        ] {
+            let cfg: CacheConfig =
+                serde_json::from_value(serde_json::json!({ "degreeColumn": s })).unwrap();
+            assert_eq!(cfg.degree_column, want, "degreeColumn={s}");
+        }
+
+        // An unknown value is a hard config error, not a silent fallback.
+        assert!(serde_json::from_value::<CacheConfig>(
+            serde_json::json!({ "degreeColumn": "sometimes" })
+        )
+        .is_err());
     }
 
     #[test]

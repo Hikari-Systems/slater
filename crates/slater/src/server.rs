@@ -130,6 +130,10 @@ pub struct Graphs {
     /// applied when opening a generation here and on every hot-reload swap. `None` (the
     /// non-server openers) leaves range readers uncached.
     range_index_cache_bytes: Option<usize>,
+    /// Residency policy for each generation's dense degree column
+    /// (`config.cache.degreeColumn`), applied at open and on every hot-reload swap. The
+    /// non-server openers default to `Lazy`.
+    degree_residency: crate::degree_column::DegreeResidency,
     /// Per-graph writable-layer writers, populated only when the delta layer is
     /// enabled (`config.delta.enabled`). Empty otherwise — the read-only server is
     /// exactly what it was. Each writer is bound to the generation it resolved its
@@ -146,7 +150,13 @@ impl Graphs {
     /// [`open_all_with_store`]: Graphs::open_all_with_store
     pub fn open_all(data_dir: &Path, master_key: Option<&[u8]>) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(data_dir));
-        Self::open_all_with_store(store, master_key, true, None)
+        Self::open_all_with_store(
+            store,
+            master_key,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
     }
 
     /// Discover and open every graph in `store`, deriving each generation's block
@@ -159,6 +169,7 @@ impl Graphs {
         master_key: Option<&[u8]>,
         verify_integrity: bool,
         range_index_cache_bytes: Option<usize>,
+        degree_residency: crate::degree_column::DegreeResidency,
     ) -> Result<Self> {
         let names = store.list("").context("list graphs in data store")?;
         // Open every graph concurrently. Each open is dominated by serial S3
@@ -179,6 +190,7 @@ impl Graphs {
                     master_key,
                     verify_integrity,
                     range_index_cache_bytes,
+                    degree_residency,
                 )
                 .with_context(|| format!("open graph {name}"))?;
                 Ok((name, RwLock::new(Arc::new(gen))))
@@ -192,6 +204,7 @@ impl Graphs {
             acl_path: None,
             require_acl_stamp: false,
             range_index_cache_bytes,
+            degree_residency,
             writers: HashMap::new(),
         })
     }
@@ -407,6 +420,7 @@ impl Graphs {
                 self.master_key.as_deref(),
                 self.verify_integrity,
                 self.range_index_cache_bytes,
+                self.degree_residency,
             )
             .with_context(|| format!("open swapped-in generation {on_disk} of graph '{name}'"))?,
         );
@@ -2388,6 +2402,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         master_key.as_deref(),
         verify_integrity,
         Some(cfg.cache.range_index_cache_bytes),
+        cfg.cache.degree_column,
     )?;
     graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
     graphs
@@ -5282,6 +5297,7 @@ mod tests {
                 None,
                 false,
                 budget,
+                crate::degree_column::DegreeResidency::Lazy,
             )
             .expect("open generation");
             let open_elapsed = t_open.elapsed();
@@ -8872,9 +8888,14 @@ mod tests {
         let mem = Arc::new(MemObjectStore::new());
         load_dir_into_mem(&mem, &root, &root);
 
-        let mut graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let mut graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         graphs
             .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
@@ -8927,9 +8948,14 @@ mod tests {
 
         // Reopen reading ONLY through the mem store (no local fs): the flushed data is served.
         drop(graphs);
-        let graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         let gen = graphs.get("people").unwrap();
         assert_eq!(gen.uuid(), set_uuid, "store reopen names the flushed set");
         assert_eq!(gen.base_uuid(), base_uuid, "base preserved");
@@ -8969,9 +8995,14 @@ mod tests {
         let mem = Arc::new(MemObjectStore::new());
         load_dir_into_mem(&mem, &root, &root);
 
-        let mut graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let mut graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         graphs
             .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
@@ -9057,9 +9088,14 @@ mod tests {
 
         // The merged segment's objects are intact — a store-native reopen serves every row.
         drop(graphs);
-        let graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         let gen = graphs.get("people").unwrap();
         assert_eq!(
             gen.stack().segments().len(),
@@ -10781,9 +10817,14 @@ mod tests {
         let mem = Arc::new(MemObjectStore::new());
         load_dir_into_mem(&mem, &root, &root);
 
-        let mut graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let mut graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         graphs
             .enable_writable_layer(&delta_cfg(&wal), &root, None)
             .unwrap();
@@ -10850,9 +10891,14 @@ mod tests {
 
         // Reopen reading ONLY through the mem store: the folded data is served store-natively.
         drop(graphs);
-        let graphs =
-            Graphs::open_all_with_store(mem.clone() as Arc<dyn ObjectStore>, None, true, None)
-                .unwrap();
+        let graphs = Graphs::open_all_with_store(
+            mem.clone() as Arc<dyn ObjectStore>,
+            None,
+            true,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
+        .unwrap();
         let gen = graphs.get("people").unwrap();
         assert_eq!(gen.uuid(), set_uuid, "store reopen names the compacted set");
         assert_eq!(gen.base_uuid(), base_uuid, "base preserved");

@@ -193,7 +193,14 @@ impl Generation {
         master_key: Option<&[u8]>,
         verify_integrity: bool,
     ) -> Result<Self> {
-        Self::open_with_store_opts_cached(store, graph, master_key, verify_integrity, None)
+        Self::open_with_store_opts_cached(
+            store,
+            graph,
+            master_key,
+            verify_integrity,
+            None,
+            crate::degree_column::DegreeResidency::Lazy,
+        )
     }
 
     /// As [`open_with_store_opts`](Generation::open_with_store_opts), but with an
@@ -204,12 +211,17 @@ impl Generation {
     /// leaf once rather than once per probe. `None`/`0` opens the readers uncached (the
     /// behaviour every other open path keeps). The cache is owned by the generation, so
     /// dropping it on swap frees the budget.
+    ///
+    /// `degree_residency` selects the dense degree column's residency
+    /// ([`DegreeResidency`](crate::degree_column::DegreeResidency)): `Lazy` faults chunks on
+    /// demand and frees cold ones on the idle sweep; `Pinned` prefaults the whole column here.
     pub fn open_with_store_opts_cached(
         store: &dyn ObjectStore,
         graph: &str,
         master_key: Option<&[u8]>,
         verify_integrity: bool,
         range_index_cache_bytes: Option<usize>,
+        degree_residency: crate::degree_column::DegreeResidency,
     ) -> Result<Self> {
         // `current` names a *set* uuid. Resolve it to the base generation: read the
         // set manifest if one exists, else treat the uuid as an implicit singleton
@@ -385,9 +397,9 @@ impl Generation {
         // generation *retrofitted* with the column — or one built with it — loads it, and
         // one without falls back to the record's leading count. Present ⇒ the degree-sum
         // count fast path answers a penultimate-frontier lookup in O(1) with no I/O.
-        // Residency policy for the dense degree column. Chunk-lazy by default; slice-4 config
-        // (`cache.degreeColumn`) threads a `pinned` override here.
-        let degree_residency = crate::degree_column::DegreeResidency::Lazy;
+        // Residency policy for the dense degree column (`cache.degreeColumn`): chunk-lazy by
+        // default, or `pinned` (eager prefault, never evicted) for latency-critical/object-store
+        // deployments — threaded from config through the server's open/swap paths.
         let mut degree_column = None;
         let nd_key = join_key(&base, "node_degrees.blk");
         if store.exists(&nd_key)? {
