@@ -44,9 +44,26 @@ per-edge `edge_id` we remove is a smaller share of each record — but the absol
 | shortestPath ≤6 | 0.61 | 0.61 |
 
 **Identical** — no read-latency change or regression, at all three scales. `bench_wiki` uses light
-(non-hub) anchors, so it does **not** exercise the degree-sum multi-hop `count()` fast path (the degree
-column's headline read-perf win; v0.21.0 has no degree column at all). That shape wants a separate
-`bench_multihop` run.
+(non-hub) anchors, so it does **not** exercise the degree-sum multi-hop `count()` fast path — measured
+separately below.
+
+## Degree-sum multi-hop `count()` — the degree column's read-perf win (91.6M)
+
+`k`-hop `count(endpoint)` = sum of per-node degree over the penultimate frontier. The EF degree column
+answers each degree in O(1) with no adjacency read; v0.21.0 has **no degree column**, so it must read the
+out-degree of every penultimate-frontier node. Measured on the same 3 hubs (out-degree 137–194),
+`maxIntermediate=20M`, 30 s server timeout:
+
+| shape (per hub) | paths counted | v0.21.0 | v5 |
+|---|--:|--:|--:|
+| 2-hop `count()` | ~1.6 M | ~1 ms | ~1 ms |
+| **3-hop `count()`** | ~0.6–0.8 B | **timeout (>30 s)** | **283–410 ms** |
+
+2-hop is cheap for both (it reads only the ~190 penultimate *counts*). **3-hop is where the degree column
+decides it:** v0.21.0 cannot complete it within 30 s (it would read ~1.6 M frontier adjacency records);
+v5 sums the frontier degrees from the resident EF column and counts ~0.7 B paths in ~0.3 s — a **>70×**
+improvement (timeout → sub-half-second), at **anon 185 MiB**. This is the read-perf headline the
+latency table can't show, and it is specific to the degree column (writeable), absent in v0.21.0.
 
 ## Read memory — anon (engine heap), 91.6M
 
@@ -68,5 +85,5 @@ residency, jemalloc work — not the EF/edge_id_base changes alone), but it is r
 - **Topology on disk: −11% to −17%** (−2 GB at 91.6M), scale-robust, attributable to `edge_id_base`.
 - **Read latency: unchanged** across 1M/10M/91.6M.
 - **Read memory (engine heap): −55% at 91.6M**; not visible at 1M/10M (fits in cache).
-- The degree column adds a small resident structure that buys the O(1) degree-sum count fast path
-  (not exercised by `bench_wiki`).
+- **Degree-sum multi-hop `count()`: v0.21.0 times out (>30 s) at 91.6M; v5 does it in ~0.3 s** (>70×) —
+  the degree column's O(1) frontier-degree lookups vs reading ~1.6 M adjacency records.
