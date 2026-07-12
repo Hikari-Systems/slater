@@ -161,6 +161,14 @@ struct Cli {
     #[arg(long, default_value_t = graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR)]
     hub_degree_floor: u32,
 
+    /// Degree-column `zstd-dense` selection penalty: a chunk uses zstd only when its encoded
+    /// size is `<=` this fraction of the best decompress-free (Elias–Fano) encoding. Low (< 1)
+    /// favours decompress-free faults (fs/NVMe latency); `>= 1` favours smaller bytes-on-wire
+    /// (object store). Omit to default from `--compression-profile` (local ⇒ 0.5, remote/max
+    /// ⇒ 1.0). See the degree-column codec docs.
+    #[arg(long)]
+    degree_zstd_margin: Option<f64>,
+
     /// Optional `VectorIndexSpec[]` JSON sidecar declaring vector indexes.
     #[arg(long)]
     vector_index_json: Option<PathBuf>,
@@ -458,6 +466,24 @@ fn resolve_compression(cli: &Cli, publishing_remote: bool) -> (i32, String) {
     }
 }
 
+/// Resolve the degree-column `zstd-dense` selection margin. An explicit
+/// `--degree-zstd-margin` always wins; otherwise it tracks the compression profile — a local
+/// (fs/NVMe) target is latency-biased (0.5: prefer decompress-free EF), a remote/max
+/// (object-store) target is wire-biased (1.0: let zstd win when it is any smaller).
+fn resolve_degree_zstd_margin(cli: &Cli, publishing_remote: bool) -> f64 {
+    if let Some(m) = cli.degree_zstd_margin {
+        return m;
+    }
+    let profile_name = match cli.compression_profile {
+        CompressionProfile::Auto if publishing_remote => "remote",
+        CompressionProfile::Auto => "local",
+        CompressionProfile::Local => "local",
+        CompressionProfile::Remote => "remote",
+        CompressionProfile::Max => "max",
+    };
+    graph_format::degree_ef::margin_for_profile(profile_name)
+}
+
 /// Build the optional remote publish target from the `--publish-s3-*` /
 /// `--publish-gcs-*` flags. `None` ⇒ filesystem-only publish. Errors if a target
 /// is requested but the binary was built without the matching backend feature, or
@@ -549,6 +575,7 @@ fn main() -> Result<()> {
     let threads = resolve_threads(&cli);
     let publish_store = resolve_publish_store(&cli)?;
     let (zstd_level, compression_profile) = resolve_compression(&cli, publish_store.is_some());
+    let degree_zstd_margin = resolve_degree_zstd_margin(&cli, publish_store.is_some());
     if cli.pk.is_some() && matches!(cli.input_format, InputFormat::SlaterDump) {
         anyhow::bail!("--pk cannot be combined with --input-format=slater-dump");
     }
@@ -562,6 +589,7 @@ fn main() -> Result<()> {
         compression_profile,
         histogram_max_distinct: cli.histogram_max_distinct,
         hub_degree_floor: cli.hub_degree_floor,
+        degree_zstd_margin,
         vector_index_json: cli.vector_index_json.clone(),
         encryption_key,
         acl_blake3,

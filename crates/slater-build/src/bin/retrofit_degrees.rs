@@ -50,8 +50,14 @@ fn main() -> Result<()> {
         .get("topology.csr.blk")
         .unwrap_or(&(256 * 1024)) as usize;
     let path = dir.join("node_degrees.blk");
-    write_node_degrees(&path, &out, &inn, block, manifest.zstd_level, None)
-        .context("write node_degrees.blk")?;
+    // Match the generation's original codec bias: the zstd margin defaults from the compression
+    // profile recorded in the manifest (as a fresh build would), and its zstd level tunes the
+    // zstd-dense candidate. Keeps a retrofitted column's codec mix aligned with a rebuild.
+    let codec = graph_format::degree_ef::DegreeCodecOpts {
+        zstd_level: manifest.zstd_level,
+        zstd_margin: graph_format::degree_ef::margin_for_profile(&manifest.compression_profile),
+    };
+    write_node_degrees(&path, &out, &inn, block, codec, None).context("write node_degrees.blk")?;
     eprintln!(
         "retrofit_degrees: wrote {} ({} nodes) — out-degree Σ={}, in-degree Σ={}",
         path.display(),

@@ -77,6 +77,12 @@ pub struct BuildOptions {
     /// holds an exact degree for every node a query might stream. See
     /// [`graph_format::hubdegree`].
     pub hub_degree_floor: u32,
+    /// Degree-column `zstd-dense` selection penalty: zstd wins a chunk only when its size is
+    /// `<= degree_zstd_margin ×` the best decompress-free candidate. Low (< 1) = latency-biased
+    /// (prefer decompress-free EF, for fs/NVMe); `>= 1` = size/wire-biased (let zstd win, for
+    /// object stores). Resolved at the CLI from the compression profile / `--degree-zstd-margin`.
+    /// See [`graph_format::degree_ef::DegreeCodecOpts`].
+    pub degree_zstd_margin: f64,
     /// Optional `VectorIndexSpec[]` JSON sidecar (label/property/dim/metric).
     pub vector_index_json: Option<PathBuf>,
     /// At-rest encryption master key (raw bytes). `None` ⇒ plaintext image, the
@@ -140,6 +146,7 @@ impl Default for BuildOptions {
             compression_profile: "manual".into(),
             histogram_max_distinct: graph_format::histogram::DEFAULT_HISTOGRAM_MAX_DISTINCT,
             hub_degree_floor: graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR,
+            degree_zstd_margin: graph_format::degree_ef::DEFAULT_ZSTD_SELECT_MARGIN,
             vector_index_json: None,
             encryption_key: None,
             acl_blake3: None,

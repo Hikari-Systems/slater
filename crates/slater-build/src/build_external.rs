@@ -2131,7 +2131,10 @@ fn build_inner(
         &out_degs,
         &in_degs,
         opts.block_size,
-        opts.zstd_level,
+        graph_format::degree_ef::DegreeCodecOpts {
+            zstd_level: opts.zstd_level,
+            zstd_margin: opts.degree_zstd_margin,
+        },
         cipher.clone(),
     )?;
     block_sizes.insert("node_degrees.blk".into(), opts.block_size as u32);

@@ -2,23 +2,24 @@
 //! Chunk-lazy residency for the dense per-node degree column (`node_degrees.blk`).
 //!
 //! The column stores every node's exact out- and in-degree as a run of fixed
-//! [`DEGREES_PER_RECORD`]-wide records (see [`graph_format::nodedegree`]). Loading it whole
-//! costs `node_count × 8` bytes resident (~733 MB on the 91.6M-node graph) even for a query
-//! that never sums degrees or touches only part of the id space. This holder keeps the block
-//! reader instead and **faults a chunk on first touch**, retaining only the id-range chunks a
-//! query actually reads; cold chunks free on the idle-TTL sweep like the block cache, without
-//! routing through — and thrashing — the shared `BlockCache`.
+//! [`DEGREES_PER_RECORD`]-wide records, each a compact per-chunk Elias–Fano encoding (see
+//! [`graph_format::degree_ef`]). Loading it whole even for a query that never sums degrees or
+//! touches only part of the id space is wasteful. This holder keeps the block reader instead
+//! and **faults a chunk on first touch**, retaining only the id-range chunks a query actually
+//! reads; cold chunks free on the idle-TTL sweep like the block cache, without routing through
+//! — and thrashing — the shared `BlockCache`.
 //!
-//! A chunk fault is one ~1 MiB zstd decompress amortised over 262 K ids (~0.5–1.5 ms on fs,
-//! ~10–100 ms per range-GET on an object store), and the whole out-column is only ~350 chunks
-//! — so worst-case (touch everything) is a few hundred ms of faults, versus the 0.8 s the
-//! degree-sum count fast path takes over the resident column. For latency-critical or
-//! object-store deployments the `pinned` mode prefaults every chunk at open and never evicts.
+//! A chunk fault is one raw `pread` (~164 KB, no zstd) + EF parse amortised over 262 K ids
+//! (tens of µs on fs, ~10–100 ms per range-GET on an object store), and the whole out-column
+//! is only ~350 chunks. The resident form is EF (or `Constant`), ~6× smaller than a dense
+//! `u32` chunk, so the working set stays cache-friendly for the degree-sum count fast path.
+//! For latency-critical or object-store deployments the `pinned` mode prefaults every chunk at
+//! open and never evicts.
 //!
 //! Thread-safety / hot path: the accessor takes `&self` and is called from the parallel
 //! degree-sum walk (millions of scattered lookups over the ~350 chunks). Faults run **off the
-//! lock** — decompress into an `Arc<[u32]>`, then a brief write lock stores it (a concurrent
-//! fault of the same chunk just discards the loser; the bytes are identical). Hits take a
+//! lock** — decode into an `Arc<DegreeChunk>`, then a brief write lock stores it (a concurrent
+//! fault of the same chunk just discards the loser; the values are identical). Hits take a
 //! shared read lock and stamp a per-chunk atomic `last_used`, so parallel readers never
 //! serialise. A fault I/O error surfaces as `None` (identical to "no column"): the caller
 //! then falls back to the CSR leading-count peek, the same answer, just slower.
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use graph_format::blockfile::BlockFileReader;
+use graph_format::degree_ef::DegreeChunk;
 use graph_format::nodedegree::{read_degree_chunk, records_per_half, DEGREES_PER_RECORD};
 use tracing::warn;
 
@@ -47,8 +49,9 @@ pub enum DegreeResidency {
 /// monotonic `last_used` (nanos since the column's `created` base) stamped on every access so
 /// the idle sweep can drop cold chunks.
 struct Half {
-    /// `slots[c]` is chunk `c`'s decoded degrees, or `None` if not resident.
-    slots: RwLock<Vec<Option<Arc<[u32]>>>>,
+    /// `slots[c]` is chunk `c`'s decoded degrees (compact [`DegreeChunk`]), or `None` if
+    /// not resident.
+    slots: RwLock<Vec<Option<Arc<DegreeChunk>>>>,
     /// Per-chunk last-touch, nanos since `DegreeColumn::created`. Parallel to `slots`; read/
     /// written under a shared read lock (atomic), so hot lookups never take the write lock.
     last_used: Vec<AtomicU64>,
@@ -116,8 +119,12 @@ impl DegreeColumn {
         for outgoing in [true, false] {
             let half = if outgoing { &self.out } else { &self.in_ };
             for chunk in 0..self.per_half {
-                let decoded: Arc<[u32]> =
-                    read_degree_chunk(&self.reader, self.per_half, outgoing, chunk)?.into();
+                let decoded = Arc::new(read_degree_chunk(
+                    &self.reader,
+                    self.per_half,
+                    outgoing,
+                    chunk,
+                )?);
                 half.slots.write().unwrap()[chunk] = Some(decoded);
             }
         }
@@ -146,18 +153,17 @@ impl DegreeColumn {
         let decoded = self.chunk(half, outgoing, chunk)?;
         // Stamp last-touch (Relaxed: eviction only needs approximate recency).
         half.last_used[chunk].store(self.now_nanos(), Ordering::Relaxed);
-        decoded.get(off).copied()
+        decoded.degree_at(off)
     }
 
-    /// Return chunk `c` of `half`, faulting it if cold. The fault decompresses off the lock;
-    /// the write lock is held only to store (a concurrent winner is kept, our copy discarded).
-    fn chunk(&self, half: &Half, outgoing: bool, c: usize) -> Option<Arc<[u32]>> {
+    /// Return chunk `c` of `half`, faulting it if cold. The fault decodes off the lock; the
+    /// write lock is held only to store (a concurrent winner is kept, our copy discarded).
+    fn chunk(&self, half: &Half, outgoing: bool, c: usize) -> Option<Arc<DegreeChunk>> {
         if let Some(hit) = half.slots.read().unwrap()[c].clone() {
             return Some(hit);
         }
-        let decoded: Arc<[u32]> = match read_degree_chunk(&self.reader, self.per_half, outgoing, c)
-        {
-            Ok(v) => v.into(),
+        let decoded = match read_degree_chunk(&self.reader, self.per_half, outgoing, c) {
+            Ok(v) => Arc::new(v),
             Err(e) => {
                 warn!(error = %e, chunk = c, outgoing, "degree-column chunk fault failed; falling back to CSR peek");
                 return None;
@@ -227,6 +233,7 @@ impl DegreeColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graph_format::degree_ef::DegreeCodecOpts;
     use graph_format::nodedegree::write_node_degrees;
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -237,7 +244,7 @@ mod tests {
         let out: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2654435761)).collect();
         let inn: Vec<u32> = (0..n as u32).map(|i| (i % 5) + 1).collect();
         let path = tmp(&format!("col{n}.blk"));
-        write_node_degrees(&path, &out, &inn, 1 << 16, 3, None).unwrap();
+        write_node_degrees(&path, &out, &inn, 1 << 16, DegreeCodecOpts::default(), None).unwrap();
         (path, out, inn)
     }
 

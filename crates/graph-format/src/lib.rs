@@ -17,7 +17,12 @@
 /// `reltype_tgt.post`) and their manifest count vectors — see [`postings`].
 /// v3 adds the per-(label, property) value→count histograms (`prop_hist.blk`)
 /// and their manifest descriptors — see [`histogram`].
-pub const FORMAT_VERSION: u32 = 3;
+/// v4 changes the dense degree column (`node_degrees.blk`) from raw-u32 records in a
+/// zstd block container to per-chunk Elias–Fano records in a Raw block container — see
+/// [`degree_ef`]. The encoding is self-describing (per-chunk codec tag) but shares no bytes
+/// with v3's, so the version bump makes a v3 generation refuse at open (`generation.rs`)
+/// rather than misread the column; zero legacy installs, so old generations are rebuilt.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -29,6 +34,7 @@ pub mod codec;
 pub mod columns;
 pub mod consolidate_dump;
 pub mod crypto;
+pub mod degree_ef;
 pub mod extents;
 pub mod extsort;
 pub mod histogram;
@@ -60,7 +66,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 3);
+        assert_eq!(FORMAT_VERSION, 4);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

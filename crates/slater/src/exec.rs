@@ -10702,7 +10702,7 @@ mod tests {
             &[3, 1, 1, 0, 0],
             &[0, 1, 2, 1, 1],
             4096,
-            3,
+            graph_format::degree_ef::DegreeCodecOpts::default(),
             None,
         )
         .unwrap();

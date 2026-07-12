@@ -49,9 +49,51 @@ const BLOCKFILE_MAGIC: &[u8; 8] = b"SLBLK001";
 /// Magic for an AEAD-encrypted block file. The directory entries are wider (they
 /// carry a per-block nonce) so the two formats are never confused.
 const BLOCKFILE_MAGIC_ENC: &[u8; 8] = b"SLBLKE01";
+/// Magic for a **raw** (uncompressed) block file — blocks are stored verbatim, no
+/// zstd. `comp_len == raw_len`, so a read is a bare `pread` + slice with no
+/// decompress. Used where the record payload is already the queryable, near-entropy
+/// form (the Elias–Fano degree column), so a codec pass would be a ~1.0× tax paid on
+/// every fault. Directory layout is identical to the zstd format.
+const BLOCKFILE_MAGIC_RAW: &[u8; 8] = b"SLBLKR01";
+/// Magic for a raw + AEAD-encrypted block file (raw ⟂ encryption): blocks are the
+/// verbatim raw bytes sealed with the per-block nonce, so `comp_len == raw_len + 16`.
+const BLOCKFILE_MAGIC_RAW_ENC: &[u8; 8] = b"SLBLKX01";
 const FOOTER_LEN: u64 = 24; // dir_offset(8) + dir_len(8) + block_count(8)
 const DIR_ENTRY_LEN: usize = 20; // offset(8) + comp_len(4) + raw_len(4) + rec_count(4)
 const DIR_ENTRY_LEN_ENC: usize = DIR_ENTRY_LEN + NONCE_LEN; // + per-block nonce
+
+/// How a block file stores its block bodies. Orthogonal to encryption (either codec
+/// may be sealed with a per-block nonce). Recorded in the file magic, so the reader
+/// picks the decode path without a per-block flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BlockCodec {
+    /// zstd-compress each block independently (the default for every `.blk` file).
+    #[default]
+    Zstd,
+    /// Store each block verbatim — no compression. `comp_len == raw_len`.
+    Raw,
+}
+
+/// Pick the 8-byte magic for a `(codec, encrypted)` pair.
+fn magic_for(codec: BlockCodec, encrypted: bool) -> &'static [u8; 8] {
+    match (codec, encrypted) {
+        (BlockCodec::Zstd, false) => BLOCKFILE_MAGIC,
+        (BlockCodec::Zstd, true) => BLOCKFILE_MAGIC_ENC,
+        (BlockCodec::Raw, false) => BLOCKFILE_MAGIC_RAW,
+        (BlockCodec::Raw, true) => BLOCKFILE_MAGIC_RAW_ENC,
+    }
+}
+
+/// Decode an 8-byte magic into `(codec, encrypted)`, or `None` if unrecognised.
+fn magic_kind(magic: &[u8; 8]) -> Option<(BlockCodec, bool)> {
+    match magic {
+        m if m == BLOCKFILE_MAGIC => Some((BlockCodec::Zstd, false)),
+        m if m == BLOCKFILE_MAGIC_ENC => Some((BlockCodec::Zstd, true)),
+        m if m == BLOCKFILE_MAGIC_RAW => Some((BlockCodec::Raw, false)),
+        m if m == BLOCKFILE_MAGIC_RAW_ENC => Some((BlockCodec::Raw, true)),
+        _ => None,
+    }
+}
 
 /// Location of a record: which block, and which slot within that block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,15 +262,21 @@ impl SealState {
     }
 }
 
-/// Compress and (optionally) seal one raw block. The unit of pool work.
+/// Compress and (optionally) seal one raw block. The unit of pool work. Under
+/// [`BlockCodec::Raw`] the compress step is skipped and the block is stored verbatim
+/// (still sealed when a cipher is present).
 fn seal_block(
     raw: &[u8],
+    codec: BlockCodec,
     level: i32,
     cipher: Option<&BlockCipher>,
 ) -> Result<(Vec<u8>, Option<[u8; NONCE_LEN]>)> {
-    let comp = codec::compress(raw, level)?;
-    // On-disk bytes are the compressed block, sealed with the AEAD when a cipher is
-    // configured. `comp_len` then counts ciphertext (+16 tag).
+    let comp = match codec {
+        BlockCodec::Zstd => codec::compress(raw, level)?,
+        BlockCodec::Raw => raw.to_vec(),
+    };
+    // On-disk bytes are the (compressed-or-raw) block, sealed with the AEAD when a
+    // cipher is configured. `comp_len` then counts ciphertext (+16 tag).
     match cipher {
         Some(cipher) => {
             let nonce = BlockCipher::random_nonce();
@@ -243,6 +291,7 @@ fn seal_block(
 pub struct BlockFileWriter {
     file: BufWriter<File>,
     target: usize,
+    codec: BlockCodec,
     level: i32,
     offset: u64,
     dir: Vec<DirEntry>,
@@ -268,7 +317,7 @@ impl BlockFileWriter {
         target_block_bytes: usize,
         zstd_level: i32,
     ) -> Result<Self> {
-        Self::create_inner(path, target_block_bytes, zstd_level, None)
+        Self::create_inner(path, target_block_bytes, BlockCodec::Zstd, zstd_level, None)
     }
 
     /// Create a block file, optionally AEAD-encrypted. `cipher = None` writes the
@@ -280,7 +329,28 @@ impl BlockFileWriter {
         zstd_level: i32,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
-        Self::create_inner(path, target_block_bytes, zstd_level, cipher)
+        Self::create_inner(
+            path,
+            target_block_bytes,
+            BlockCodec::Zstd,
+            zstd_level,
+            cipher,
+        )
+    }
+
+    /// Create a block file with an explicit block codec, optionally AEAD-encrypted.
+    /// [`BlockCodec::Raw`] stores blocks verbatim (no zstd) — for payloads that are
+    /// already the queryable, near-entropy form (the Elias–Fano degree column), where a
+    /// codec pass would be a ~1.0× tax paid on every fault. `zstd_level` is ignored
+    /// under `Raw`.
+    pub fn create_with_codec(
+        path: impl AsRef<Path>,
+        target_block_bytes: usize,
+        codec: BlockCodec,
+        zstd_level: i32,
+        cipher: Option<Arc<BlockCipher>>,
+    ) -> Result<Self> {
+        Self::create_inner(path, target_block_bytes, codec, zstd_level, cipher)
     }
 
     /// [`BlockFileWriter::create`] that seals its blocks **inline**, on the appending
@@ -297,7 +367,8 @@ impl BlockFileWriter {
         target_block_bytes: usize,
         zstd_level: i32,
     ) -> Result<Self> {
-        let mut w = Self::create_inner(path, target_block_bytes, zstd_level, None)?;
+        let mut w =
+            Self::create_inner(path, target_block_bytes, BlockCodec::Zstd, zstd_level, None)?;
         w.seal = None;
         Ok(w)
     }
@@ -305,21 +376,19 @@ impl BlockFileWriter {
     fn create_inner(
         path: impl AsRef<Path>,
         target_block_bytes: usize,
+        codec: BlockCodec,
         zstd_level: i32,
         cipher: Option<Arc<BlockCipher>>,
     ) -> Result<Self> {
         let f = File::create(path.as_ref())
             .with_context(|| format!("create block file {}", path.as_ref().display()))?;
         let mut file = BufWriter::new(f);
-        let magic = if cipher.is_some() {
-            BLOCKFILE_MAGIC_ENC
-        } else {
-            BLOCKFILE_MAGIC
-        };
+        let magic = magic_for(codec, cipher.is_some());
         file.write_all(magic)?;
         Ok(Self {
             file,
             target: target_block_bytes.max(1),
+            codec,
             level: zstd_level,
             offset: magic.len() as u64,
             dir: Vec::new(),
@@ -412,7 +481,7 @@ impl BlockFileWriter {
 
         let Some(state) = self.seal.as_ref().map(Arc::clone) else {
             // Inline: the original single-threaded behaviour.
-            let (stored, nonce) = seal_block(&raw, self.level, self.cipher.as_deref())?;
+            let (stored, nonce) = seal_block(&raw, self.codec, self.level, self.cipher.as_deref())?;
             return self.write_sealed(Sealed {
                 stored,
                 raw_len: raw.len() as u32,
@@ -426,12 +495,13 @@ impl BlockFileWriter {
         // the same as one.
         inflight().acquire();
         *state.pending.lock().unwrap() += 1;
+        let codec = self.codec;
         let level = self.level;
         let cipher = self.cipher.clone();
         let st = Arc::clone(&state);
         let submitted = seal_pool().send(Box::new(move || {
             let raw_len = raw.len() as u32;
-            match seal_block(&raw, level, cipher.as_deref()) {
+            match seal_block(&raw, codec, level, cipher.as_deref()) {
                 Ok((stored, nonce)) => {
                     st.done.lock().unwrap().insert(
                         idx,
@@ -548,11 +618,10 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
     }
     let mut magic = [0u8; 8];
     File::open(&inputs[0])?.read_exact_at(&mut magic, 0)?;
-    let encrypted = match &magic {
-        m if m == BLOCKFILE_MAGIC => false,
-        m if m == BLOCKFILE_MAGIC_ENC => true,
-        _ => bail!("concat_block_files: bad magic in {}", inputs[0].display()),
-    };
+    // Codec is irrelevant to concat (blocks are copied verbatim); only the encrypted
+    // flag matters, since it sets the directory-entry width (nonce).
+    let (_, encrypted) = magic_kind(&magic)
+        .ok_or_else(|| anyhow!("concat_block_files: bad magic in {}", inputs[0].display()))?;
     let magic_len = magic.len() as u64;
 
     let mut out = File::create(out_path.as_ref())
@@ -641,6 +710,9 @@ pub struct BlockFileReader {
     /// Per-generation cipher, set iff the file is encrypted. Refused at open if
     /// the file is encrypted and no key was supplied (absent-key refusal).
     cipher: Option<Arc<BlockCipher>>,
+    /// Block-body codec, from the file magic. [`BlockCodec::Raw`] skips the zstd
+    /// decompress on every block read (bare `pread` + slice).
+    codec: BlockCodec,
 }
 
 impl BlockFileReader {
@@ -675,11 +747,8 @@ impl BlockFileReader {
 
         let mut magic = [0u8; 8];
         src.read_exact_at(&mut magic, 0)?;
-        let encrypted = match &magic {
-            m if m == BLOCKFILE_MAGIC => false,
-            m if m == BLOCKFILE_MAGIC_ENC => true,
-            _ => bail!("bad block file magic"),
-        };
+        let (codec, encrypted) =
+            magic_kind(&magic).ok_or_else(|| anyhow!("bad block file magic"))?;
         // Bind the cipher to what the file actually is: an encrypted file with no
         // key is refused; a plaintext file ignores any key it was handed.
         let cipher = if encrypted {
@@ -732,6 +801,7 @@ impl BlockFileReader {
             dir,
             block_start,
             cipher,
+            codec,
         })
     }
 
@@ -778,7 +848,26 @@ impl BlockFileReader {
             (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
             _ => stored,
         };
-        codec::decompress(&comp, e.raw_len as usize)
+        // Raw blocks are stored verbatim (the unseal above already yielded the raw
+        // bytes) — no decompress pass, which is the whole point of the Raw codec. zstd's
+        // frame decode used to validate the raw length implicitly; the Raw path has no such
+        // check, so verify the stored length matches the directory's `raw_len` — otherwise a
+        // truncated/corrupt block would reach `parse_block`/`read_record` with an offset table
+        // that overruns the data, panicking the query thread instead of surfacing a
+        // recoverable error (the degree-column fault handler turns `Err` into a CSR fallback).
+        match self.codec {
+            BlockCodec::Zstd => codec::decompress(&comp, e.raw_len as usize),
+            BlockCodec::Raw => {
+                if comp.len() != e.raw_len as usize {
+                    bail!(
+                        "raw block is {} bytes, directory says {}",
+                        comp.len(),
+                        e.raw_len
+                    );
+                }
+                Ok(comp)
+            }
+        }
     }
 
     /// Read and decompress a whole block by id.
@@ -806,6 +895,16 @@ impl BlockFileReader {
         }
         let start = offsets[slot] as usize;
         let end = offsets[slot + 1] as usize;
+        // A corrupt offset table (esp. on the un-checksummed Raw path) could have
+        // `start > end` or `end > data.len()`; validate before slicing so it errors rather
+        // than panicking the caller.
+        if start > end || end > data.len() {
+            bail!(
+                "record slot {} range {start}..{end} out of block data ({} B)",
+                loc.slot,
+                data.len()
+            );
+        }
         Ok(data[start..end].to_vec())
     }
 
@@ -918,11 +1017,20 @@ impl BlockFileReader {
 pub fn parse_block(raw: &[u8]) -> Result<(Vec<u32>, &[u8])> {
     let mut r = raw;
     let count = r.read_u32::<LittleEndian>()? as usize;
+    // Bound the header against the block length *before* allocating, so a corrupt `count`
+    // (e.g. from a truncated raw block) can neither over-allocate nor make `&raw[header_len..]`
+    // slice out of bounds — it returns an error instead of panicking.
+    let header_len = 4 + (count + 1) * 4;
+    if raw.len() < header_len {
+        bail!(
+            "block header ({header_len} B) exceeds block length ({} B)",
+            raw.len()
+        );
+    }
     let mut offsets = Vec::with_capacity(count + 1);
     for _ in 0..=count {
         offsets.push(r.read_u32::<LittleEndian>()?);
     }
-    let header_len = 4 + (count + 1) * 4;
     Ok((offsets, &raw[header_len..]))
 }
 
@@ -932,7 +1040,15 @@ pub fn record_from_block<'a>(offsets: &[u32], data: &'a [u8], slot: u32) -> Resu
     if slot + 1 >= offsets.len() {
         bail!("record slot out of range");
     }
-    Ok(&data[offsets[slot] as usize..offsets[slot + 1] as usize])
+    let start = offsets[slot] as usize;
+    let end = offsets[slot + 1] as usize;
+    if start > end || end > data.len() {
+        bail!(
+            "record slot {slot} range {start}..{end} out of block data ({} B)",
+            data.len()
+        );
+    }
+    Ok(&data[start..end])
 }
 
 /// Byte range of the `slot`-th record within the **whole** decompressed block
@@ -1124,6 +1240,86 @@ mod tests {
         for (loc, want) in locs.iter().zip(&expected) {
             assert_eq!(&r.read_record(*loc).unwrap(), want);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_block_offsets_error_not_panic() {
+        // A corrupt `count` must not over-allocate or slice out of bounds.
+        let mut bad_hdr = Vec::new();
+        bad_hdr.extend_from_slice(&100_000u32.to_le_bytes()); // claims 100k records
+        bad_hdr.extend_from_slice(&[0u8; 8]); // ...but the block is tiny
+        assert!(parse_block(&bad_hdr).is_err());
+        // An offset table whose ranges overrun the data region errors, not panics.
+        let offsets = [0u32, 50]; // end 50 > data len 10
+        let data = [0u8; 10];
+        assert!(record_from_block(&offsets, &data, 0).is_err());
+    }
+
+    #[test]
+    fn raw_codec_roundtrips_and_skips_compression() {
+        // Raw blocks are stored verbatim: comp_len == raw_len for every block, and the
+        // records read back byte-identical with no zstd pass.
+        let path = tmp("raw_many");
+        let mut w =
+            BlockFileWriter::create_with_codec(&path, 1024, BlockCodec::Raw, 3, None).unwrap();
+        let mut locs = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..300u32 {
+            // Highly compressible payload — zstd *would* shrink it, so equal lengths
+            // prove the codec was genuinely skipped.
+            let rec = vec![(i % 251) as u8; 40 + (i % 30) as usize];
+            locs.push(w.append_record(&rec).unwrap());
+            expected.push(rec);
+        }
+        let nblocks = w.finish().unwrap();
+        assert!(nblocks > 1, "small target should span multiple blocks");
+
+        let r = BlockFileReader::open(&path).unwrap();
+        assert_eq!(r.codec, BlockCodec::Raw);
+        for e in &r.dir {
+            assert_eq!(e.comp_len, e.raw_len, "raw blocks are stored uncompressed");
+        }
+        for (loc, want) in locs.iter().zip(&expected) {
+            assert_eq!(&r.read_record(*loc).unwrap(), want);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raw_encrypted_roundtrips() {
+        use crate::crypto::BlockCipher;
+        let path = tmp("raw_enc");
+        let cipher = Arc::new(BlockCipher::from_master(b"master-key", &[9u8; 32]));
+        let mut w = BlockFileWriter::create_with_codec(
+            &path,
+            1024,
+            BlockCodec::Raw,
+            3,
+            Some(cipher.clone()),
+        )
+        .unwrap();
+        let mut locs = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..400u32 {
+            let rec = format!("raw-secret-{i}-{}", "y".repeat((i % 35) as usize)).into_bytes();
+            locs.push(w.append_record(&rec).unwrap());
+            expected.push(rec);
+        }
+        let nblocks = w.finish().unwrap();
+        assert!(nblocks > 1);
+
+        let r = BlockFileReader::open_with_cipher(&path, Some(cipher)).unwrap();
+        assert_eq!(r.codec, BlockCodec::Raw);
+        // Sealed raw block counts ciphertext = raw + 16-byte tag.
+        for e in &r.dir {
+            assert_eq!(e.comp_len, e.raw_len + 16, "sealed raw = raw + AEAD tag");
+        }
+        for (loc, want) in locs.iter().zip(&expected) {
+            assert_eq!(&r.read_record(*loc).unwrap(), want);
+        }
+        // Absent key on a raw+enc file is still refused.
+        assert!(BlockFileReader::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
