@@ -344,15 +344,22 @@ pub struct EfMono {
 }
 
 impl EfMono {
-    /// Encode a non-decreasing `values` slice. Assumes non-empty; callers route empty /
-    /// all-equal sequences to [`PlaneKind::Constant`] before here.
-    fn encode(values: &[u64]) -> Self {
+    /// Encode a non-decreasing `values` slice.
+    pub fn encode(values: &[u64]) -> Self {
         debug_assert!(
             values.windows(2).all(|w| w[0] <= w[1]),
             "EfMono needs monotone input"
         );
-        let m = values.len();
-        let universe = *values.last().unwrap();
+        let universe = values.last().copied().unwrap_or(0);
+        Self::from_ascending(values.len(), universe, values.iter().copied())
+    }
+
+    /// Encode from a **streaming** ascending source whose length (`m`) and `universe` (the last
+    /// value, or 0 when empty) are known up front. One pass, no materialised `Vec` — so a caller
+    /// holding the values as a bitmap (endpoint postings) or an external-sort drain can encode
+    /// without a dense array. Produces byte-identical output to [`Self::encode`] on the same
+    /// sequence, which is what lets the builder's two posting write-paths agree.
+    pub fn from_ascending(m: usize, universe: u64, values: impl Iterator<Item = u64>) -> Self {
         let l = low_bits(universe, m as u64);
         let mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
 
@@ -364,16 +371,24 @@ impl EfMono {
         let low_bits_total = m * l as usize;
         let mut lows = vec![0u8; low_bits_total.div_ceil(8)];
 
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..m {
-            let v = values[i];
+        let mut count = 0usize;
+        let mut prev = 0u64;
+        for (i, v) in values.enumerate() {
+            debug_assert!(i == 0 || v >= prev, "from_ascending needs monotone input");
+            debug_assert!(
+                v <= universe,
+                "from_ascending value exceeds declared universe"
+            );
+            prev = v;
             let hi = (v >> l) as usize;
             let pos = hi + i;
             highs[pos / 64] |= 1u64 << (pos % 64);
             if l != 0 {
                 write_low(&mut lows, i * l as usize, v & mask, l);
             }
+            count += 1;
         }
+        debug_assert_eq!(count, m, "from_ascending element count disagreed with m");
 
         let sample = build_sample(&highs, m);
         Self {
@@ -402,8 +417,47 @@ impl EfMono {
         (((p - i) as u64) << self.l) | read_low(&self.lows, self.l, i)
     }
 
-    fn serialized_len(&self) -> usize {
+    /// First index whose value is `>= x` (in `0..=m`) — the skip primitive. Binary search over
+    /// the O(1) [`Self::value_at`].
+    #[inline]
+    pub fn successor(&self, x: u64) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.value_at(mid) < x {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Whether `x` is present. O(log m).
+    #[inline]
+    pub fn contains(&self, x: u64) -> bool {
+        let i = self.successor(x);
+        i < self.len() && self.value_at(i) == x
+    }
+
+    /// Iterate values in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.len()).map(move |i| self.value_at(i))
+    }
+
+    pub fn serialized_len(&self) -> usize {
         9 + self.lows.len() + self.highs.len() * 8
+    }
+
+    /// The exact serialised length an EF record over `m` elements with maximum value `universe`
+    /// will occupy, without building it — for buffer/budget reservation.
+    pub fn serialized_len_for(m: usize, universe: u64) -> usize {
+        let l = low_bits(universe, m as u64);
+        let low_bytes = (m * l as usize).div_ceil(8);
+        let hi_max = (universe >> l) as usize;
+        let nwords = (hi_max + m).div_ceil(64).max(1);
+        9 + low_bytes + nwords * 8
     }
 
     pub fn resident_bytes(&self) -> usize {
@@ -411,7 +465,7 @@ impl EfMono {
     }
 
     /// Serialise: `u32 m ‖ u8 l ‖ u32 n_words ‖ lows ‖ highs(u64 LE)`. The sample is rebuilt.
-    fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.serialized_len());
         out.extend_from_slice(&self.m.to_le_bytes());
         out.push(self.l);
@@ -423,7 +477,7 @@ impl EfMono {
         out
     }
 
-    fn deserialize(body: &[u8]) -> Result<Self> {
+    pub fn deserialize(body: &[u8]) -> Result<Self> {
         if body.len() < 9 {
             bail!("ef-mono body too short: {} bytes", body.len());
         }

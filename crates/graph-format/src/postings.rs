@@ -10,9 +10,15 @@
 //!
 //! The record index equals the reltype id (the same dense-id-is-record-index
 //! trick the CSR and label store use); a reltype with no edges gets an empty
-//! (count 0) record to keep the alignment. A record is
-//! `uvarint(count) ‖ uvarint(first) ‖ uvarint(delta)…` — ascending ids ⇒ small
-//! deltas ⇒ the per-block zstd packs them tightly.
+//! (count 0) record to keep the alignment. A record is an **Elias–Fano** encoding
+//! of the ascending distinct ids ([`EfMono`]) in a **Raw** block container — so a
+//! reltype scan is decompress-free and answers `contains`/`successor` in the
+//! encoded form (leapfrog-intersectable), rather than the old delta-varint list
+//! that had to be zstd-decompressed and walked end-to-end to skip anywhere. EF
+//! strictly dominates the alternatives here because the ids are distinct and
+//! ascending (a Constant/RLE would be one run per element); the record therefore
+//! commits to EF rather than running the general per-chunk plane selector, which
+//! keeps the builder's two write-paths byte-identical by construction.
 //!
 //! These let an unanchored typed traversal `(a)-[:T]->(b)` drive from the ~8% of
 //! nodes that actually have a `T` edge instead of label-scanning every node and
@@ -25,36 +31,21 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::blockfile::BlockFileWriter;
+use crate::blockfile::{BlockCodec, BlockFileWriter};
 use crate::crypto::BlockCipher;
+use crate::plane::EfMono;
 use crate::topology::Edge;
-use crate::wire::{read_uvarint, uvarint_len, write_uvarint};
 
-/// Encode one reltype's endpoint posting: a delta-varint list of ascending,
-/// already-distinct node ids. Callers must pass ids sorted ascending with no
-/// duplicates (see [`write_reltype_endpoint_postings`]).
+/// Encode one reltype's endpoint posting: an Elias–Fano record over ascending,
+/// already-distinct node ids ([`EfMono`]). Callers must pass ids sorted ascending
+/// with no duplicates (see [`write_reltype_endpoint_postings`]).
 pub fn encode_endpoint_posting(ids: &[u64]) -> Vec<u8> {
-    let mut rec = Vec::new();
-    write_uvarint(&mut rec, ids.len() as u64);
-    let mut prev = 0u64;
-    for &id in ids {
-        write_uvarint(&mut rec, id - prev);
-        prev = id;
-    }
-    rec
+    EfMono::encode(ids).serialize()
 }
 
 /// Decode one reltype's endpoint posting back into ascending node ids.
 pub fn decode_endpoint_posting(rec: &[u8]) -> Result<Vec<u64>> {
-    let mut r = rec;
-    let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
-    let mut prev = 0u64;
-    for _ in 0..count {
-        prev += read_uvarint(&mut r)?;
-        out.push(prev);
-    }
-    Ok(out)
+    Ok(EfMono::deserialize(rec)?.iter().collect())
 }
 
 /// One dense bit plane per reltype over the node id space: bit `n` of plane `t`
@@ -133,31 +124,45 @@ impl EndpointPlanes {
         &self.words[lo..lo + self.words_per_plane]
     }
 
-    /// Visit plane `reltype`'s set node ids in ascending order.
-    fn for_each_node(&self, reltype: u32, mut f: impl FnMut(u64)) {
-        for (w, word) in self.plane(reltype).iter().enumerate() {
-            let mut bits = word.load(Ordering::Relaxed);
-            while bits != 0 {
-                f((w as u64) * 64 + bits.trailing_zeros() as u64);
-                bits &= bits - 1;
-            }
-        }
+    /// Iterate plane `reltype`'s set node ids in ascending order (no allocation) — the
+    /// streaming source for [`EfMono::from_ascending`].
+    fn plane_iter(&self, reltype: u32) -> impl Iterator<Item = u64> + '_ {
+        self.plane(reltype)
+            .iter()
+            .enumerate()
+            .flat_map(|(w, word)| {
+                let base = (w as u64) * 64;
+                let mut bits = word.load(Ordering::Relaxed);
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        None
+                    } else {
+                        let t = bits.trailing_zeros() as u64;
+                        bits &= bits - 1;
+                        Some(base + t)
+                    }
+                })
+            })
     }
 
-    /// `(distinct node count, exact encoded record length)` for plane `reltype`.
-    fn plane_stat(&self, reltype: u32) -> (u64, usize) {
-        let count: u64 = self
-            .plane(reltype)
+    /// `(distinct node count, universe)` for plane `reltype`, where `universe` is the highest
+    /// set node id (0 for an empty plane). Both are the parameters [`EfMono`] needs to size an
+    /// EF record without materialising the id list.
+    fn plane_count_universe(&self, reltype: u32) -> (u64, u64) {
+        let words = self.plane(reltype);
+        let count: u64 = words
             .iter()
             .map(|w| w.load(Ordering::Relaxed).count_ones() as u64)
             .sum();
-        let mut len = uvarint_len(count);
-        let mut prev = 0u64;
-        self.for_each_node(reltype, |id| {
-            len += uvarint_len(id - prev);
-            prev = id;
-        });
-        (count, len)
+        let mut universe = 0u64;
+        for (w, word) in words.iter().enumerate().rev() {
+            let bits = word.load(Ordering::Relaxed);
+            if bits != 0 {
+                universe = (w as u64) * 64 + (63 - bits.leading_zeros() as u64);
+                break;
+            }
+        }
+        (count, universe)
     }
 
     /// Largest record [`write_endpoint_postings_from_planes`] will build. The
@@ -165,7 +170,10 @@ impl EndpointPlanes {
     /// copies `BlockFileWriter` makes of an over-target record) before writing.
     pub fn max_record_bytes(&self) -> usize {
         (0..self.reltype_count)
-            .map(|t| self.plane_stat(t).1)
+            .map(|t| {
+                let (count, universe) = self.plane_count_universe(t);
+                EfMono::serialized_len_for(count as usize, universe)
+            })
             .max()
             .unwrap_or(0)
     }
@@ -184,20 +192,23 @@ pub fn write_endpoint_postings_from_planes(
     zstd_level: i32,
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<Vec<u64>> {
-    let mut w = BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
+    // Raw container: the EF record is already the compact, queryable form, so a zstd pass would
+    // be a ~1.0× tax paid on every fault (see the degree column). `zstd_level` is ignored.
+    let mut w = BlockFileWriter::create_with_codec(
+        path,
+        target_block_bytes,
+        BlockCodec::Raw,
+        zstd_level,
+        cipher,
+    )?;
     let mut counts = Vec::with_capacity(planes.reltype_count as usize);
-    let mut rec: Vec<u8> = Vec::new();
     for t in 0..planes.reltype_count {
-        let (count, len) = planes.plane_stat(t);
-        rec.clear();
-        rec.reserve(len);
-        write_uvarint(&mut rec, count);
-        let mut prev = 0u64;
-        planes.for_each_node(t, |id| {
-            write_uvarint(&mut rec, id - prev);
-            prev = id;
-        });
-        debug_assert_eq!(rec.len(), len, "plane_stat disagreed with the encoder");
+        let (count, universe) = planes.plane_count_universe(t);
+        // Stream the plane's ascending set bits straight into EF — no materialised id list, so a
+        // single huge reltype over 91.6M nodes never allocates a dense array. Byte-identical to
+        // `encode_endpoint_posting` on the same set (both go through `EfMono::from_ascending`).
+        let rec =
+            EfMono::from_ascending(count as usize, universe, planes.plane_iter(t)).serialize();
         counts.push(count);
         w.append_record(&rec)?;
     }
@@ -261,7 +272,13 @@ pub fn write_endpoint_postings_from_sorted(
 ) -> Result<Vec<u64>> {
     use anyhow::bail;
     let mut counts = Vec::with_capacity(reltype_count as usize);
-    let mut w = BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
+    let mut w = BlockFileWriter::create_with_codec(
+        path,
+        target_block_bytes,
+        BlockCodec::Raw,
+        zstd_level,
+        cipher,
+    )?;
     let mut cur_rt: u32 = 0;
     let mut bucket: Vec<u64> = Vec::new();
     let mut last: Option<u64> = None;
@@ -309,7 +326,13 @@ fn write_buckets(
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<Vec<u64>> {
     let mut counts = Vec::with_capacity(buckets.len());
-    let mut w = BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
+    let mut w = BlockFileWriter::create_with_codec(
+        path,
+        target_block_bytes,
+        BlockCodec::Raw,
+        zstd_level,
+        cipher,
+    )?;
     for bucket in buckets.iter_mut() {
         bucket.sort_unstable();
         bucket.dedup();

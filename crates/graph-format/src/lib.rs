@@ -25,7 +25,12 @@
 /// v5 collapses the per-edge `edge_id` in the **forward** CSR half (`topology.csr.blk`) to a
 /// single `edge_id_base` per record (derived `edge_id = base + k`), since a source's outgoing
 /// edge ids are dense-contiguous — see [`topology`]. Reverse records keep the per-edge id.
-pub const FORMAT_VERSION: u32 = 5;
+/// v6 re-encodes the "no-decompress, usable-in-encoded-form" indexes onto the generic plane
+/// codec ([`plane`]): the per-reltype endpoint postings (`reltype_src.post`/`reltype_tgt.post`)
+/// move from delta-varint-in-zstd to Elias–Fano records in a Raw container — see [`postings`].
+/// (Later v6 slices re-plane `node_labels.blk`, `topology.csr.blk` and `isam`.) Batched into one
+/// bump so the 91.6M generation rebuilds once; zero legacy installs, so old generations refuse.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -70,7 +75,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 5);
+        assert_eq!(FORMAT_VERSION, 6);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }
