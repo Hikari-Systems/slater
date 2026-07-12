@@ -299,6 +299,35 @@ mod tests {
     }
 
     #[test]
+    fn idle_chunks_evicted_hot_survive_refault_same() {
+        let n = 3 * DEGREES_PER_RECORD + 9;
+        let (path, out, _) = build(n);
+        let reader = BlockFileReader::open(&path).unwrap();
+        let col = DegreeColumn::open(reader, n, DegreeResidency::Lazy).unwrap();
+
+        // Fault out-chunk 0; touching stamps last_used ≈ now.
+        let id = 5usize;
+        assert_eq!(col.out_degree(id as u64), Some(out[id]));
+        assert_eq!(col.resident_chunks(), 1);
+
+        // A huge TTL right after touch ⇒ still hot, nothing freed.
+        assert_eq!(
+            col.evict_expired(Instant::now(), Duration::from_secs(3600)),
+            0
+        );
+        assert_eq!(col.resident_chunks(), 1);
+
+        // A zero TTL ⇒ any touched chunk is now idle "past" the window ⇒ freed.
+        assert_eq!(col.evict_expired(Instant::now(), Duration::ZERO), 1);
+        assert_eq!(col.resident_chunks(), 0);
+
+        // Re-fault after eviction returns the same value (and re-materialises the chunk).
+        assert_eq!(col.out_degree(id as u64), Some(out[id]));
+        assert_eq!(col.resident_chunks(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn pinned_prefaults_everything() {
         let n = 3 * DEGREES_PER_RECORD + 1;
         let (path, out, inn) = build(n);

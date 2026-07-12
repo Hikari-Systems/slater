@@ -1432,6 +1432,7 @@ fn spawn_cache_maintenance(
     cache: Arc<BlockCache>,
     vector_cache: Arc<VectorIndexCache>,
     result_cache: Arc<ResultCache<QueryResult>>,
+    graphs: Arc<Graphs>,
     ttl: Duration,
 ) {
     // Check ~4x per TTL window so an entry is reclaimed within ~TTL+25% of going
@@ -1444,13 +1445,24 @@ fn spawn_cache_maintenance(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let (c, v, r) = (cache.clone(), vector_cache.clone(), result_cache.clone());
+            let (c, v, r, g) = (
+                cache.clone(),
+                vector_cache.clone(),
+                result_cache.clone(),
+                graphs.clone(),
+            );
             // Each sweep briefly takes the cache mutexes; run off the async reactor.
             if let Err(e) = tokio::task::spawn_blocking(move || {
                 let now = Instant::now();
                 c.evict_expired(now, ttl);
                 v.evict_expired(now, ttl);
                 r.evict_expired(now, ttl);
+                // Free dense-degree chunks idle past the TTL on every live generation — the
+                // chunk-lazy column's elastic tier, swept like the block cache (pinned columns
+                // and generations without a column are no-ops).
+                for gen in g.current_generations() {
+                    gen.evict_cold_degree_chunks(now, ttl);
+                }
             })
             .await
             {
@@ -2527,6 +2539,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             ctx.cache.clone(),
             ctx.vector_cache.clone(),
             ctx.result_cache.clone(),
+            ctx.graphs.clone(),
             ttl,
         );
     }
