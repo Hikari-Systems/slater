@@ -87,6 +87,16 @@ pub struct Generation {
     /// open; the grouped-index fast path reads them in place of an ISAM walk. Empty
     /// ⇒ no precompute (the fast path falls back to `distinct_key_counts`).
     prop_histograms: HashMap<String, Vec<(Value, u64)>>,
+    /// Hub-degree sidecar (`hub_degrees.blk`): ascending-by-id `(node_id, degree)` for
+    /// every core node whose out/in degree is at or above [`Self::hub_degree_floor`], so
+    /// a traversal can decide a node is a hub with an O(log n) binary search and no
+    /// adjacency read. Empty + `hub_degree_floor == None` ⇒ no sidecar (older generation);
+    /// the caller then falls back to the record's leading edge count.
+    hub_out_degrees: Vec<(u64, u32)>,
+    hub_in_degrees: Vec<(u64, u32)>,
+    /// Degree floor the sidecar was built with (`Some` ⇔ the sidecar is present). A node
+    /// absent from a list therefore has degree `< floor` in that direction.
+    hub_degree_floor: Option<u32>,
     /// Disk-native Vamana/PQ indexes (above the ANN threshold), keyed by
     /// `(label, property)`. Each holds its block reader, its position in
     /// `manifest.vector_indexes` (the cache ordinal), and its resident PQ codes.
@@ -341,6 +351,29 @@ impl Generation {
             }
         }
 
+        // Hub-degree sidecar (`hub_degrees.blk`): decode both lists resident (a few MB
+        // even on 91.6M nodes — hubs are rare). Gate on the manifest desc *and* file
+        // existence, so an older generation (no desc) or a hand-built fixture declines
+        // cleanly and the caller falls back to the record's leading edge count. Record 0
+        // is the out-hub list, record 1 the in-hub list.
+        let mut hub_out_degrees = Vec::new();
+        let mut hub_in_degrees = Vec::new();
+        let mut hub_degree_floor = None;
+        let hub_key = join_key(&base, "hub_degrees.blk");
+        if let Some(desc) = &manifest.hub_degrees {
+            if store.exists(&hub_key)? {
+                let reader = BlockFileReader::open_src(store.open(&hub_key)?, cipher.clone())
+                    .with_context(|| format!("open hub-degree sidecar {hub_key}"))?;
+                hub_out_degrees = graph_format::hubdegree::decode_hub_list(
+                    &reader.read_record_global(0).context("read hub out-list")?,
+                )?;
+                hub_in_degrees = graph_format::hubdegree::decode_hub_list(
+                    &reader.read_record_global(1).context("read hub in-list")?,
+                )?;
+                hub_degree_floor = Some(desc.floor);
+            }
+        }
+
         // Open the disk-native Vamana/PQ indexes (above the ANN threshold). Each
         // reads only its block-file footer + PQ codebook header at open; the
         // resident PQ codes are loaded once here (the navigation set the beam search
@@ -441,6 +474,9 @@ impl Generation {
             vectors,
             range_indexes,
             prop_histograms,
+            hub_out_degrees,
+            hub_in_degrees,
+            hub_degree_floor,
             vamana_indexes,
             label_ids,
             reltype_ids,
@@ -553,6 +589,34 @@ impl Generation {
     /// — the grouped-index fast path uses them to skip the O(index) walk.
     pub fn property_histogram(&self, name: &str) -> Option<&[(Value, u64)]> {
         self.prop_histograms.get(name).map(Vec::as_slice)
+    }
+
+    /// The hub-degree sidecar's floor if this generation carries one (`Some` ⇔
+    /// `hub_degrees.blk` was loaded). A node absent from a hub list has degree `< floor`
+    /// in that direction; a caller uses that to bound a non-listed node's degree instead
+    /// of assuming zero. `None` ⇒ no sidecar (older generation) ⇒ fall back to reading
+    /// the record's leading edge count.
+    pub fn hub_degree_floor(&self) -> Option<u32> {
+        self.hub_degree_floor
+    }
+
+    /// Exact **out**-degree of core node `node` if it is a listed hub (out-degree `>=`
+    /// the sidecar floor), else `None` (its out-degree is `< floor`, or there is no
+    /// sidecar). O(log n) binary search over the resident list, no adjacency read.
+    pub fn core_out_degree_if_hub(&self, node: u64) -> Option<u64> {
+        self.hub_out_degrees
+            .binary_search_by_key(&node, |&(id, _)| id)
+            .ok()
+            .map(|i| self.hub_out_degrees[i].1 as u64)
+    }
+
+    /// Exact **in**-degree of core node `node` if it is a listed hub, else `None`. The
+    /// reverse-direction counterpart of [`Self::core_out_degree_if_hub`].
+    pub fn core_in_degree_if_hub(&self, node: u64) -> Option<u64> {
+        self.hub_in_degrees
+            .binary_search_by_key(&node, |&(id, _)| id)
+            .ok()
+            .map(|i| self.hub_in_degrees[i].1 as u64)
     }
 
     /// The opened Vamana/PQ index over `(label, property)`, if one exists (i.e. the
@@ -1149,6 +1213,7 @@ mod tests {
             reltype_tgt_label_counts: vec![],
             schema_triple_counts: vec![],
             property_histograms: vec![],
+            hub_degrees: None,
             acl_blake3: None,
             mac: None,
             files,

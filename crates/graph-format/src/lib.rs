@@ -32,6 +32,7 @@ pub mod crypto;
 pub mod extents;
 pub mod extsort;
 pub mod histogram;
+pub mod hubdegree;
 pub mod ids;
 pub mod integrity;
 pub mod isam;

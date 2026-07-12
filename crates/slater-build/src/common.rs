@@ -19,7 +19,8 @@ use graph_format::histogram::{
 use graph_format::ids::Generation;
 use graph_format::integrity::content_hash;
 use graph_format::manifest::{
-    EncryptionHeader, EntityKind, Manifest, PropertyHistogramDesc, RangeIndexDesc, VectorIndexDesc,
+    EncryptionHeader, EntityKind, HubDegreeDesc, Manifest, PropertyHistogramDesc, RangeIndexDesc,
+    VectorIndexDesc,
 };
 use graph_format::store::{join_key, ObjectStore};
 
@@ -107,6 +108,10 @@ pub struct PublishInputs<'a> {
     /// aligned by position with that file's records. Produced by
     /// [`build_property_histograms`].
     pub property_histograms: Vec<PropertyHistogramDesc>,
+    /// Hub-degree sidecar descriptor (`hub_degrees.blk`). `Some` for every build that
+    /// wrote the sidecar (always, for the external builder); the file is in the fixed
+    /// inventory regardless.
+    pub hub_degrees: Option<HubDegreeDesc>,
     pub encryption_header: Option<EncryptionHeader>,
     pub encryption_key: &'a Option<Vec<u8>>,
     pub acl_blake3: Option<String>,
@@ -137,6 +142,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         "reltype_src.post".into(),
         "reltype_tgt.post".into(),
         "prop_hist.blk".into(),
+        "hub_degrees.blk".into(),
     ];
     for ri in &inp.range_indexes {
         file_names.push(format!("range/{}.isam", ri.name));
@@ -215,6 +221,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         reltype_tgt_label_counts: inp.reltype_tgt_label_counts,
         schema_triple_counts: inp.schema_triple_counts,
         property_histograms: inp.property_histograms,
+        hub_degrees: inp.hub_degrees,
         acl_blake3: inp.acl_blake3,
         mac: None,
         files,

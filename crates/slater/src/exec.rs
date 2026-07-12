@@ -5163,30 +5163,50 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// *reduce* degree) are ignored — so an over-estimate at worst over-streams, never
     /// OOMs by mistaking a hub for a normal node. A tombstoned node has degree 0.
     ///
-    /// Slice-2 temporary: the core term reads the (cached) CSR block for its leading
-    /// edge count. The build-side hub-degree sidecar (slice 3) replaces just that term
-    /// with an O(1), zero-I/O lookup; the segment/delta terms are unchanged.
+    /// The core term is an O(1), zero-I/O lookup in the build-side hub-degree sidecar
+    /// (`hub_degrees.blk`) when present; a generation built before the sidecar falls back
+    /// to reading the record's leading edge count (one cached block). The segment-born
+    /// and delta-born terms are always the same bounded reads.
     fn effective_degree_ub(&self, node: u64, dir: Direction) -> Result<u64> {
         let gen = self.gen;
         if gen.delta().is_tombstoned(node) {
             return Ok(0);
         }
         let one = |outgoing: bool| -> Result<u64> {
-            // Core: exact edge count from the record's leading uvarint (no full decode).
-            // A delta-born id (≥ core node count) has no core record ⇒ 0.
+            // Core degree. A delta-born id (≥ core node count) has no core record ⇒ 0.
+            // With the hub-degree sidecar (new builds): an O(1) lookup — exact for a
+            // listed hub, else the node is below the build floor, so its UB is `floor-1`
+            // (never under-counts). Without a sidecar (older generation): read the
+            // record's leading edge count (one cached block, no full decode).
             let core = if node >= gen.core_generation().node_count() {
                 0
             } else {
-                let topo = gen.topology();
-                let global = if outgoing {
-                    topo.outgoing_global(NodeId(node))
-                } else {
-                    topo.incoming_global(NodeId(node))
-                };
-                let rec =
-                    self.cache
-                        .record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-                topology::adj_count(&rec)?
+                let cg = gen.core_generation();
+                match cg.hub_degree_floor() {
+                    Some(floor) => {
+                        let listed = if outgoing {
+                            cg.core_out_degree_if_hub(node)
+                        } else {
+                            cg.core_in_degree_if_hub(node)
+                        };
+                        listed.unwrap_or(floor.saturating_sub(1) as u64)
+                    }
+                    None => {
+                        let topo = gen.topology();
+                        let global = if outgoing {
+                            topo.outgoing_global(NodeId(node))
+                        } else {
+                            topo.incoming_global(NodeId(node))
+                        };
+                        let rec = self.cache.record(
+                            topo.inner(),
+                            gen.uuid(),
+                            FileKind::Topology,
+                            global,
+                        )?;
+                        topology::adj_count(&rec)?
+                    }
+                }
             };
             // Segment-born upper bound: fence-gated fragment born counts (skipped for a
             // singleton stack). Bounded per node; deletions in the fragment are ignored.
@@ -10203,6 +10223,83 @@ mod tests {
             check(&view, &cache, 6);
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// Slice 3: with a hub-degree sidecar present, [`Engine::effective_degree_ub`] takes
+    /// its core term from the O(1) sidecar lookup — exact for a listed hub, `floor-1` for
+    /// a node below the floor — instead of reading the record's leading count. Attaches a
+    /// hand-written `hub_degrees.blk` to a `write_basic` fixture (node 0 out-degree 3;
+    /// node 2 in-degree 2) and re-seals the manifest, then checks the accessors and probe.
+    #[test]
+    fn effective_degree_ub_uses_hub_sidecar() {
+        use crate::read_view::MergedView;
+        use graph_format::integrity::{content_hash, hash_file};
+        use graph_format::manifest::{FileEntry, HubDegreeDesc, Manifest};
+
+        let (root, graph, uuid) = testgen::write_basic("hub_sidecar_reader");
+        let gendir = root.join(&graph).join(uuid.to_string());
+        // write_basic: node 0 out-edges e0→1, e2→3, e4→2 (out-degree 3); node 2 in-edges
+        // e1(1→2), e4(0→2) (in-degree 2). Floor 2 ⇒ out-hub {0:3}, in-hub {2:2}.
+        graph_format::hubdegree::write_hub_degrees(
+            gendir.join("hub_degrees.blk"),
+            &[(0, 3)],
+            &[(2, 2)],
+            4096,
+            3,
+            None,
+        )
+        .unwrap();
+
+        // Re-seal the (plaintext, MAC-less) manifest: add the file to the inventory,
+        // recompute the content hash, and record the descriptor.
+        let mut m = Manifest::read_from_dir(&gendir).unwrap();
+        let p = gendir.join("hub_degrees.blk");
+        m.files.push(FileEntry {
+            name: "hub_degrees.blk".into(),
+            bytes: std::fs::metadata(&p).unwrap().len(),
+            blake3: hash_file(&p).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        m.files.sort_by(|a, b| a.name.cmp(&b.name));
+        let inv: Vec<(String, String)> = m
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), f.blake3.clone()))
+            .collect();
+        m.content_hash = content_hash(&inv);
+        m.hub_degrees = Some(HubDegreeDesc {
+            floor: 2,
+            out_hubs: 1,
+            in_hubs: 1,
+        });
+        m.write_to_dir(&gendir).unwrap();
+
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(gen.hub_degree_floor(), Some(2));
+        assert_eq!(gen.core_out_degree_if_hub(0), Some(3));
+        assert_eq!(gen.core_out_degree_if_hub(1), None, "out-degree 1 < floor");
+        assert_eq!(gen.core_in_degree_if_hub(2), Some(2));
+        assert_eq!(gen.core_in_degree_if_hub(0), None);
+
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+        // Empty delta/segments ⇒ the UB is exactly the sidecar core term.
+        assert_eq!(
+            engine.effective_degree_ub(0, Direction::Outgoing).unwrap(),
+            3
+        );
+        // Node 1 is not listed out ⇒ UB = floor-1 = 1 (never under-counts its real 1).
+        assert_eq!(
+            engine.effective_degree_ub(1, Direction::Outgoing).unwrap(),
+            1
+        );
+        assert_eq!(
+            engine.effective_degree_ub(2, Direction::Incoming).unwrap(),
+            2
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A segment full row overrides/extends the base node reads it carries, births new

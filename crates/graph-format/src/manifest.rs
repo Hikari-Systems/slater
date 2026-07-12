@@ -79,6 +79,22 @@ pub struct PropertyHistogramDesc {
     pub distinct_count: u64,
 }
 
+/// Descriptor for the hub-degree sidecar (`hub_degrees.blk`). Records the degree
+/// `floor` at/above which a node was listed (so the reader knows an absent node has
+/// degree `< floor`) and the two list lengths (informational). Its presence gates the
+/// reader's zero-I/O hub probe; absence ⇒ fall back to the record's leading edge count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubDegreeDesc {
+    /// Degree at/above which a node is listed in `hub_degrees.blk` (its out or in
+    /// direction). A node absent from a list therefore has `< floor` in that direction.
+    pub floor: u32,
+    /// Number of nodes in the out-hub list (record 0).
+    pub out_hubs: u64,
+    /// Number of nodes in the in-hub list (record 1).
+    pub in_hubs: u64,
+}
+
 /// Descriptor for one declared vector index over a `(label, property)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,6 +260,13 @@ pub struct Manifest {
     /// falls back to `distinct_key_counts`). See [`PropertyHistogramDesc`].
     #[serde(default)]
     pub property_histograms: Vec<PropertyHistogramDesc>,
+    /// Hub-degree sidecar descriptor (`hub_degrees.blk`). `Some` ⇒ the generation
+    /// carries a per-node out/in degree list for nodes at/above
+    /// [`HubDegreeDesc::floor`], so a traversal can decide a node is a hub with O(1)
+    /// memory and no adjacency read. `None` ⇒ older generation without the sidecar;
+    /// the reader falls back to the record's leading edge count. See [`HubDegreeDesc`].
+    #[serde(default)]
+    pub hub_degrees: Option<HubDegreeDesc>,
     /// BLAKE3 digest (hex) of the live `acl.json` this generation was built
     /// against (`slater-build --acl`). `None` ⇒ not stamped (older images, or the
     /// flag was not given). When present, the server re-hashes the configured live
@@ -407,6 +430,7 @@ mod tests {
             reltype_tgt_label_counts: vec![],
             schema_triple_counts: vec![],
             property_histograms: vec![],
+            hub_degrees: None,
             acl_blake3: None,
             mac: None,
             files,

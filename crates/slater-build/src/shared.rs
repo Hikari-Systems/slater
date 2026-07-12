@@ -72,6 +72,11 @@ pub struct BuildOptions {
     /// histogram (it would be as large as the index for no benefit). `0` disables
     /// histograms entirely. See [`graph_format::histogram`].
     pub histogram_max_distinct: u64,
+    /// Degree at/above which a node is recorded in the `hub_degrees.blk` sidecar (its
+    /// out or in direction). Must be `<=` any query-side stream threshold so the sidecar
+    /// holds an exact degree for every node a query might stream. See
+    /// [`graph_format::hubdegree`].
+    pub hub_degree_floor: u32,
     /// Optional `VectorIndexSpec[]` JSON sidecar (label/property/dim/metric).
     pub vector_index_json: Option<PathBuf>,
     /// At-rest encryption master key (raw bytes). `None` ⇒ plaintext image, the
@@ -134,6 +139,7 @@ impl Default for BuildOptions {
             zstd_level: 3,
             compression_profile: "manual".into(),
             histogram_max_distinct: graph_format::histogram::DEFAULT_HISTOGRAM_MAX_DISTINCT,
+            hub_degree_floor: graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR,
             vector_index_json: None,
             encryption_key: None,
             acl_blake3: None,

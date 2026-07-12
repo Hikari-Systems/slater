@@ -2026,12 +2026,13 @@ fn build_inner(
     // topology + node labels, persisted so `open` need not rescan and the
     // label/reltype fast paths answer from resident metadata.
     let emit_summary_g = diag.phase("emit.graph_summaries");
-    let summaries = compute_graph_summaries(
+    let mut summaries = compute_graph_summaries(
         &tmp_dir.join("topology.csr.blk"),
         &tmp_dir.join("node_labels.blk"),
         node_count,
         reltypes.names().len(),
         labels.names().len(),
+        opts.hub_degree_floor,
         cipher.clone(),
         scratch_dir,
         &mem,
@@ -2096,6 +2097,29 @@ fn build_inner(
     block_sizes.insert("prop_hist.blk".into(), opts.block_size as u32);
     drop(emit_hist_g);
 
+    // hub_degrees.blk — per-node out/in degree for nodes at/above `hubDegreeFloor`,
+    // collected during the summary pass, so a traversal identifies a hub with no
+    // adjacency read. Always written (empty lists ⇒ two empty records) so the inventory
+    // and content hash stay stable.
+    let emit_hub_g = diag.phase("emit.hub_degrees");
+    let hub_out = std::mem::take(&mut summaries.out_hub_degrees);
+    let hub_in = std::mem::take(&mut summaries.in_hub_degrees);
+    graph_format::hubdegree::write_hub_degrees(
+        tmp_dir.join("hub_degrees.blk"),
+        &hub_out,
+        &hub_in,
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    block_sizes.insert("hub_degrees.blk".into(), opts.block_size as u32);
+    let hub_degrees = Some(graph_format::manifest::HubDegreeDesc {
+        floor: opts.hub_degree_floor,
+        out_hubs: hub_out.len() as u64,
+        in_hubs: hub_in.len() as u64,
+    });
+    drop(emit_hub_g);
+
     // ---- publish (via the shared scaffolding) ----
     let _publish_g = diag.phase("publish");
     diag.set_op("manifest + fsync + atomic publish", "", 0);
@@ -2125,6 +2149,7 @@ fn build_inner(
         reltype_tgt_label_counts: summaries.reltype_tgt_label_counts,
         schema_triple_counts: summaries.schema_triple_counts,
         property_histograms,
+        hub_degrees,
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
@@ -2773,6 +2798,11 @@ struct GraphSummaries {
     src_label_reltype_counts: Vec<(u32, u32, u64)>,
     reltype_tgt_label_counts: Vec<(u32, u32, u64)>,
     schema_triple_counts: Vec<(u32, u32, u32, u64)>,
+    /// Ascending-by-id `(node_id, degree)` for every node whose out/in degree is
+    /// `>= hub_degree_floor` — the `hub_degrees.blk` sidecar. Deterministic: each
+    /// worker owns a disjoint ascending id range and the concatenation is re-sorted.
+    out_hub_degrees: Vec<(u64, u32)>,
+    in_hub_degrees: Vec<(u64, u32)>,
 }
 
 /// Compute [`GraphSummaries`] over the finished stores with **no resident node→label
@@ -2810,6 +2840,7 @@ fn compute_graph_summaries(
     node_count: u64,
     n_reltypes: usize,
     n_labels: usize,
+    hub_degree_floor: u32,
     cipher: Option<Arc<BlockCipher>>,
     scratch_dir: &Path,
     mem: &Arc<MemoryBudget>,
@@ -2829,10 +2860,14 @@ fn compute_graph_summaries(
         src_label_reltype_counts: Vec::new(),
         reltype_tgt_label_counts: Vec::new(),
         schema_triple_counts: Vec::new(),
+        out_hub_degrees: Vec::new(),
+        in_hub_degrees: Vec::new(),
     };
     if node_count == 0 {
         return Ok(empty);
     }
+    // `>=` floor lists a node; a `floor` of 0 would list every node (allowed, discouraged).
+    let hub_floor = hub_degree_floor as u64;
 
     let topo = TopologyReader::open_with_cipher(topo_path, cipher.clone())?;
     let labels = NodeLabelsReader::open_with_cipher(labels_path, cipher)?;
@@ -2873,6 +2908,10 @@ fn compute_graph_summaries(
         first_label: Vec<u64>,
         src_marg: HashMap<(u32, u32), u64>,
         tgt_marg: HashMap<(u32, u32), u64>,
+        // Hub-degree sidecar: this worker's range's nodes with out/in degree >= floor,
+        // ascending by id (the range is scanned in id order in both halves).
+        out_hubs: Vec<(u64, u32)>,
+        in_hubs: Vec<(u64, u32)>,
     }
 
     let tallies: Vec<Result<Tally>> = {
@@ -2889,6 +2928,8 @@ fn compute_graph_summaries(
                             first_label: vec![0u64; n_labels],
                             src_marg: HashMap::new(),
                             tgt_marg: HashMap::new(),
+                            out_hubs: Vec::new(),
+                            in_hubs: Vec::new(),
                         };
                         let cache = graph_format::blockcache::BlockCache::new(LABEL_CACHE_BYTES);
                         let labels_of = |id: u64| -> Result<Vec<u32>> {
@@ -2902,6 +2943,11 @@ fn compute_graph_summaries(
                         // half, so the label tallies below count each node once.
                         topo_r.inner().for_each_record_in(lo, hi, |id, rec| {
                             let adjs = graph_format::topology::decode_adj(rec)?;
+                            // Out-degree hub: `adjs.len()` is the out-degree; the scan is
+                            // ascending in id, so `out_hubs` stays sorted.
+                            if adjs.len() as u64 >= hub_floor {
+                                t.out_hubs.push((id, adjs.len() as u32));
+                            }
                             let labs = labels_of(id)?;
                             if let Some(&f) = labs.first() {
                                 t.first_label[f as usize] += 1;
@@ -2939,7 +2985,12 @@ fn compute_graph_summaries(
                             node_count + hi,
                             |g, rec| {
                                 let adjs = graph_format::topology::decode_adj(rec)?;
-                                let labs = labels_of(g - node_count)?;
+                                let id = g - node_count;
+                                // In-degree hub: reverse adjacency length; ascending in id.
+                                if adjs.len() as u64 >= hub_floor {
+                                    t.in_hubs.push((id, adjs.len() as u32));
+                                }
+                                let labs = labels_of(id)?;
                                 for adj in &adjs {
                                     for &b in &labs {
                                         *t.tgt_marg.entry((adj.reltype, b)).or_insert(0) += 1;
@@ -2965,8 +3016,12 @@ fn compute_graph_summaries(
     let mut first_label = vec![0u64; n_labels];
     let mut src_marg: HashMap<(u32, u32), u64> = HashMap::new();
     let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
+    let mut out_hub_degrees: Vec<(u64, u32)> = Vec::new();
+    let mut in_hub_degrees: Vec<(u64, u32)> = Vec::new();
     for t in tallies {
         let t = t?;
+        out_hub_degrees.extend(t.out_hubs);
+        in_hub_degrees.extend(t.in_hubs);
         for (acc, v) in reltype_edge.iter_mut().zip(&t.reltype_edge) {
             *acc += v;
         }
@@ -3077,6 +3132,12 @@ fn compute_graph_summaries(
         .collect();
     schema_triple_counts.sort_unstable();
 
+    // Workers own disjoint ascending id ranges, so the concatenation is already sorted;
+    // sort anyway to make the sidecar independent of worker count/scheduling (the
+    // `emit_determinism` guarantee). Node ids are unique per direction ⇒ no dedup needed.
+    out_hub_degrees.sort_unstable();
+    in_hub_degrees.sort_unstable();
+
     Ok(GraphSummaries {
         reltype_edge_counts: reltype_edge,
         reltype_self_loop_counts: reltype_self,
@@ -3085,6 +3146,8 @@ fn compute_graph_summaries(
         src_label_reltype_counts,
         reltype_tgt_label_counts,
         schema_triple_counts,
+        out_hub_degrees,
+        in_hub_degrees,
     })
 }
 
@@ -3288,6 +3351,72 @@ mod tests {
         ));
         // No ANN files written for a brute-force index.
         assert!(!outcome.dir.join("vector/Doc.embedding.vamana").exists());
+    }
+
+    /// A dump with one hub node (`0`) linking out to `leaves` leaf nodes. `--cluster
+    /// none` ⇒ dense id == dump id, so the hub is node 0 and leaf `k` is node `k`.
+    fn hub_dump(leaves: usize) -> String {
+        let mut s = String::new();
+        s.push_str("CREATE (:Hub:__DumpVertex__ {__dump_id__: 0});\n");
+        for k in 1..=leaves {
+            s.push_str(&format!(
+                "CREATE (:Leaf:__DumpVertex__ {{__dump_id__: {k}}});\n"
+            ));
+        }
+        for k in 1..=leaves {
+            s.push_str(&format!(
+                "MATCH (a:__DumpVertex__ {{__dump_id__: 0}}), \
+                 (b:__DumpVertex__ {{__dump_id__: {k}}}) CREATE (a)-[:LINK]->(b);\n"
+            ));
+        }
+        s
+    }
+
+    /// Slice 3: the build emits a correct, deterministic `hub_degrees.blk` sidecar — the
+    /// hub node's exact out-degree in the out-list, nothing in the in-list (leaf in-degree
+    /// 1 < floor), the manifest descriptor records the floor + counts, and two independent
+    /// builds produce byte-identical sidecars and the same content hash.
+    #[test]
+    fn hub_degree_sidecar_is_emitted_and_deterministic() {
+        use graph_format::blockfile::BlockFileReader;
+        use graph_format::hubdegree::decode_hub_list;
+
+        let leaves = 10usize;
+        let build = |tag: &str| {
+            run_build(tag, &hub_dump(leaves), |o| {
+                o.hub_degree_floor = 4; // hub out-degree 10 >= 4; leaf in-degree 1 < 4
+            })
+        };
+        let a = build("hubdeg_a");
+        let b = build("hubdeg_b");
+
+        // Manifest descriptor: floor + list lengths (one out-hub, no in-hubs).
+        let ma = Manifest::read_from_dir(&a.dir).unwrap();
+        let desc = ma.hub_degrees.as_ref().expect("sidecar descriptor present");
+        assert_eq!(desc.floor, 4);
+        assert_eq!(desc.out_hubs, 1);
+        assert_eq!(desc.in_hubs, 0);
+        assert!(ma.files.iter().any(|f| f.name == "hub_degrees.blk"));
+
+        // The sidecar records the hub's exact out-degree and nothing on the in side.
+        let r = BlockFileReader::open(a.dir.join("hub_degrees.blk")).unwrap();
+        assert_eq!(r.total_records(), 2);
+        assert_eq!(
+            decode_hub_list(&r.read_record_global(0).unwrap()).unwrap(),
+            vec![(0u64, leaves as u32)]
+        );
+        assert!(decode_hub_list(&r.read_record_global(1).unwrap())
+            .unwrap()
+            .is_empty());
+
+        // Determinism: byte-identical sidecar and equal content hash across two builds.
+        let bytes_a = std::fs::read(a.dir.join("hub_degrees.blk")).unwrap();
+        let bytes_b = std::fs::read(b.dir.join("hub_degrees.blk")).unwrap();
+        assert_eq!(bytes_a, bytes_b, "hub_degrees.blk must be deterministic");
+        assert_eq!(a.content_hash, b.content_hash, "content hash must match");
+
+        let _ = std::fs::remove_dir_all(a.dir.parent().unwrap().parent().unwrap());
+        let _ = std::fs::remove_dir_all(b.dir.parent().unwrap().parent().unwrap());
     }
 
     #[test]

@@ -271,6 +271,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
         reltype_tgt_label_counts: vec![],
         schema_triple_counts: vec![],
         property_histograms: vec![],
+        hub_degrees: None,
         acl_blake3: None,
         mac: None,
         files,

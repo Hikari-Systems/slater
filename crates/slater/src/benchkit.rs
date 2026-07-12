@@ -187,6 +187,7 @@ pub fn write_scale(tag: &str, n: u64) -> (PathBuf, String) {
         reltype_tgt_label_counts: s.reltype_tgt_label_counts,
         schema_triple_counts: s.schema_triple_counts,
         property_histograms: vec![],
+        hub_degrees: None,
         acl_blake3: None,
         mac: None,
         files,

@@ -155,6 +155,12 @@ struct Cli {
     #[arg(long, default_value_t = graph_format::histogram::DEFAULT_HISTOGRAM_MAX_DISTINCT)]
     histogram_max_distinct: u64,
 
+    /// Degree at/above which a node is recorded in the `hub_degrees.blk` sidecar, so a
+    /// traversal can identify a hub with no adjacency read. Keep it `<=` the query-side
+    /// stream threshold. `0` records every node (not recommended on dense graphs).
+    #[arg(long, default_value_t = graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR)]
+    hub_degree_floor: u32,
+
     /// Optional `VectorIndexSpec[]` JSON sidecar declaring vector indexes.
     #[arg(long)]
     vector_index_json: Option<PathBuf>,
@@ -555,6 +561,7 @@ fn main() -> Result<()> {
         zstd_level,
         compression_profile,
         histogram_max_distinct: cli.histogram_max_distinct,
+        hub_degree_floor: cli.hub_degree_floor,
         vector_index_json: cli.vector_index_json.clone(),
         encryption_key,
         acl_blake3,
