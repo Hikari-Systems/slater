@@ -143,6 +143,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         "reltype_tgt.post".into(),
         "prop_hist.blk".into(),
         "hub_degrees.blk".into(),
+        "node_degrees.blk".into(),
     ];
     for ri in &inp.range_indexes {
         file_names.push(format!("range/{}.isam", ri.name));

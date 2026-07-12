@@ -2120,6 +2120,23 @@ fn build_inner(
     });
     drop(emit_hub_g);
 
+    // node_degrees.blk — the dense per-node out/in degree column (also collected during the
+    // summary pass), so the degree-sum count fast path answers a penultimate-frontier
+    // lookup in O(1) with no adjacency read. Always written (empty for a 0-node graph).
+    let emit_deg_g = diag.phase("emit.node_degrees");
+    let out_degs = std::mem::take(&mut summaries.out_degrees);
+    let in_degs = std::mem::take(&mut summaries.in_degrees);
+    graph_format::nodedegree::write_node_degrees(
+        tmp_dir.join("node_degrees.blk"),
+        &out_degs,
+        &in_degs,
+        opts.block_size,
+        opts.zstd_level,
+        cipher.clone(),
+    )?;
+    block_sizes.insert("node_degrees.blk".into(), opts.block_size as u32);
+    drop(emit_deg_g);
+
     // ---- publish (via the shared scaffolding) ----
     let _publish_g = diag.phase("publish");
     diag.set_op("manifest + fsync + atomic publish", "", 0);
@@ -2803,6 +2820,11 @@ struct GraphSummaries {
     /// worker owns a disjoint ascending id range and the concatenation is re-sorted.
     out_hub_degrees: Vec<(u64, u32)>,
     in_hub_degrees: Vec<(u64, u32)>,
+    /// Dense per-node out/in degree (degree of dense id `i` at index `i`) — the
+    /// `node_degrees.blk` column. Assembled in id order (each worker owns a contiguous
+    /// ascending range; the concatenation is dense and ordered).
+    out_degrees: Vec<u32>,
+    in_degrees: Vec<u32>,
 }
 
 /// Compute [`GraphSummaries`] over the finished stores with **no resident node→label
@@ -2862,6 +2884,8 @@ fn compute_graph_summaries(
         schema_triple_counts: Vec::new(),
         out_hub_degrees: Vec::new(),
         in_hub_degrees: Vec::new(),
+        out_degrees: Vec::new(),
+        in_degrees: Vec::new(),
     };
     if node_count == 0 {
         return Ok(empty);
@@ -2912,6 +2936,9 @@ fn compute_graph_summaries(
         // ascending by id (the range is scanned in id order in both halves).
         out_hubs: Vec<(u64, u32)>,
         in_hubs: Vec<(u64, u32)>,
+        // Dense per-node out/in degree for this worker's contiguous id range, in id order.
+        out_degrees: Vec<u32>,
+        in_degrees: Vec<u32>,
     }
 
     let tallies: Vec<Result<Tally>> = {
@@ -2930,6 +2957,8 @@ fn compute_graph_summaries(
                             tgt_marg: HashMap::new(),
                             out_hubs: Vec::new(),
                             in_hubs: Vec::new(),
+                            out_degrees: Vec::new(),
+                            in_degrees: Vec::new(),
                         };
                         let cache = graph_format::blockcache::BlockCache::new(LABEL_CACHE_BYTES);
                         let labels_of = |id: u64| -> Result<Vec<u32>> {
@@ -2948,6 +2977,8 @@ fn compute_graph_summaries(
                             if adjs.len() as u64 >= hub_floor {
                                 t.out_hubs.push((id, adjs.len() as u32));
                             }
+                            // Dense per-node out-degree (ascending id ⇒ in order).
+                            t.out_degrees.push(adjs.len() as u32);
                             let labs = labels_of(id)?;
                             if let Some(&f) = labs.first() {
                                 t.first_label[f as usize] += 1;
@@ -2986,6 +3017,8 @@ fn compute_graph_summaries(
                             |g, rec| {
                                 let adjs = graph_format::topology::decode_adj(rec)?;
                                 let id = g - node_count;
+                                // Dense per-node in-degree (ascending id ⇒ in order).
+                                t.in_degrees.push(adjs.len() as u32);
                                 // In-degree hub: reverse adjacency length; ascending in id.
                                 if adjs.len() as u64 >= hub_floor {
                                     t.in_hubs.push((id, adjs.len() as u32));
@@ -3018,10 +3051,16 @@ fn compute_graph_summaries(
     let mut tgt_marg: HashMap<(u32, u32), u64> = HashMap::new();
     let mut out_hub_degrees: Vec<(u64, u32)> = Vec::new();
     let mut in_hub_degrees: Vec<(u64, u32)> = Vec::new();
+    let mut out_degrees: Vec<u32> = Vec::with_capacity(node_count as usize);
+    let mut in_degrees: Vec<u32> = Vec::with_capacity(node_count as usize);
     for t in tallies {
         let t = t?;
         out_hub_degrees.extend(t.out_hubs);
         in_hub_degrees.extend(t.in_hubs);
+        // Workers own ascending, contiguous, disjoint ranges and `tallies` is in range
+        // order, so concatenating yields the dense degree columns in dense-id order.
+        out_degrees.extend(t.out_degrees);
+        in_degrees.extend(t.in_degrees);
         for (acc, v) in reltype_edge.iter_mut().zip(&t.reltype_edge) {
             *acc += v;
         }
@@ -3148,6 +3187,8 @@ fn compute_graph_summaries(
         schema_triple_counts,
         out_hub_degrees,
         in_hub_degrees,
+        out_degrees,
+        in_degrees,
     })
 }
 
@@ -3409,10 +3450,25 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // Determinism: byte-identical sidecar and equal content hash across two builds.
+        // The dense per-node degree column is emitted and exact: the hub (node 0) has
+        // `leaves` out-edges and 0 in; each leaf has 0 out and 1 in.
+        let ndr = BlockFileReader::open(a.dir.join("node_degrees.blk")).unwrap();
+        let (out_degs, in_degs) =
+            graph_format::nodedegree::read_node_degrees(&ndr, leaves + 1).unwrap();
+        assert_eq!(out_degs[0], leaves as u32);
+        assert_eq!(in_degs[0], 0);
+        for k in 1..=leaves {
+            assert_eq!(out_degs[k], 0, "leaf {k} out-degree");
+            assert_eq!(in_degs[k], 1, "leaf {k} in-degree");
+        }
+
+        // Determinism: byte-identical sidecar + column and equal content hash across builds.
         let bytes_a = std::fs::read(a.dir.join("hub_degrees.blk")).unwrap();
         let bytes_b = std::fs::read(b.dir.join("hub_degrees.blk")).unwrap();
         assert_eq!(bytes_a, bytes_b, "hub_degrees.blk must be deterministic");
+        let deg_a = std::fs::read(a.dir.join("node_degrees.blk")).unwrap();
+        let deg_b = std::fs::read(b.dir.join("node_degrees.blk")).unwrap();
+        assert_eq!(deg_a, deg_b, "node_degrees.blk must be deterministic");
         assert_eq!(a.content_hash, b.content_hash, "content hash must match");
 
         let _ = std::fs::remove_dir_all(a.dir.parent().unwrap().parent().unwrap());
