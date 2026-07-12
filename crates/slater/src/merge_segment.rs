@@ -26,7 +26,7 @@
 //!   a segment beneath the run) is kept, so it keeps superseding that lower row.
 //! - **Adjacency fragments** — per node, fold the inputs' `out_adj`/`in_adj` fragments
 //!   oldest→newest (a `removed` entry suppresses a prior born append by edge id, a born entry
-//!   appends), mirroring [`overlay_segment_adj`](crate::exec). A born-then-removed edge born
+//!   appends), mirroring [`for_each_adj_overlaid`](crate::exec). A born-then-removed edge born
 //!   within the run cancels (reclaimed); a `removed` of a below-run edge is carried so it
 //!   keeps suppressing the base/lower fragment.
 //! - **Index fragments** — per `(label, prop)`, fold the inputs' entry id-sets + removal

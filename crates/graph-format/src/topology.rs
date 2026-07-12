@@ -47,23 +47,42 @@ fn encode_adj(list: &[Adj]) -> Vec<u8> {
     rec
 }
 
-/// Decode one node's adjacency record
-/// (`uvarint(count) ‖ count × (uvarint(reltype) ‖ uvarint(neighbour) ‖ uvarint(edge))`).
-/// Public so a cached-block reader can decode a record it already holds.
-pub fn decode_adj(rec: &[u8]) -> Result<Vec<Adj>> {
+/// Decode one node's adjacency record edge-by-edge, invoking `f` for each [`Adj`]
+/// **without materialising the whole neighbour list**. The record is
+/// `uvarint(count) ‖ count × (uvarint(reltype) ‖ uvarint(neighbour) ‖ uvarint(edge))`,
+/// a leading count followed by sequential varints, so it is naturally streamable — the
+/// only unbounded part of a hub node's adjacency (out-degree in the millions) never
+/// needs to be held resident. [`decode_adj`] is exactly this visitor collected into a
+/// `Vec`; the streaming adjacency reader in the executor drives it in bounded chunks.
+pub fn decode_adj_into(rec: &[u8], mut f: impl FnMut(Adj) -> Result<()>) -> Result<()> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let reltype = read_uvarint(&mut r)? as u32;
         let neighbour = NodeId(read_uvarint(&mut r)?);
         let edge = EdgeId(read_uvarint(&mut r)?);
-        out.push(Adj {
+        f(Adj {
             reltype,
             neighbour,
             edge,
-        });
+        })?;
     }
+    Ok(())
+}
+
+/// Decode one node's adjacency record
+/// (`uvarint(count) ‖ count × (uvarint(reltype) ‖ uvarint(neighbour) ‖ uvarint(edge))`).
+/// Public so a cached-block reader can decode a record it already holds. Collects
+/// [`decode_adj_into`], reserving the leading `count` up front so a large hub record
+/// materialises without regrowth.
+pub fn decode_adj(rec: &[u8]) -> Result<Vec<Adj>> {
+    // The leading uvarint is the edge count — peek it to size the Vec exactly.
+    let count = read_uvarint(&mut { rec })? as usize;
+    let mut out = Vec::with_capacity(count);
+    decode_adj_into(rec, |a| {
+        out.push(a);
+        Ok(())
+    })?;
     Ok(out)
 }
 

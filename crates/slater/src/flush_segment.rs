@@ -20,7 +20,7 @@
 //! (the effective-row-empty case of a core patch: every base-indexed value moves to the
 //! `removals` sidecar, the node count and its labels net down by one) *and* the removal of
 //! its incident edges: the writer reads the deleted node's **effective adjacency** (base
-//! folded with every lower segment, mirroring [`overlay_segment_adj`](crate::exec)) and
+//! folded with every lower segment, mirroring [`for_each_adj_overlaid`](crate::exec)) and
 //! writes a `removed` adjacency fragment for each incident edge on the *surviving
 //! neighbour's* side (the read path drops a dead edge by that fragment's `edge_id`, never by
 //! a per-neighbour segment-tombstone check), netting each out of the edge/reltype marginals.
@@ -263,7 +263,7 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     }
     // (b) explicit core-edge deletes. Each is carried once in `adj_out` at its source with no
     //     edge id; identity semantics remove *every* parallel edge of that reltype to the
-    //     neighbour, mirroring the delta's `(reltype, neighbour)` suppression in `overlay_adj`.
+    //     neighbour, mirroring the delta's `(reltype, neighbour)` suppression in `for_each_adj_overlaid`.
     for (src, edges) in &data.adj_out {
         for e in edges {
             if e.edge_id.is_some() {
@@ -777,7 +777,7 @@ fn core_patch_labels(base_labels: &[String], delta: &NodeDelta) -> Vec<String> {
 
 /// Read node `node`'s **effective adjacency** below this flush in direction `outgoing`: the
 /// base CSR folded with every lower core segment's fragment, mirroring
-/// [`overlay_segment_adj`](crate::exec) (oldest→newest — a `removed` fragment suppresses by
+/// [`for_each_adj_overlaid`](crate::exec) (oldest→newest — a `removed` fragment suppresses by
 /// edge id, a born fragment appends). Returns `(edge_id, neighbour, reltype-name)` for each
 /// surviving incident edge — the input to a delete's removal fragments and netted marginals.
 /// A born endpoint id (≥ the base node count) has no base CSR record; its edges come wholly

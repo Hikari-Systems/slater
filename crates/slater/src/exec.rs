@@ -331,53 +331,175 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
     }
 }
 
-/// Fold the writable-layer edge delta (Phase 3) into node `node`'s core adjacency
-/// for one direction (`outgoing` = out-edges, else in-edges). Drops core edges the
-/// delta tombstones and any edge (core or born) whose neighbour is a **tombstoned
-/// node** — this is the traversal side of a relationship / node `DELETE`, and it
-/// closes the Phase-2b gap where a core edge to a deleted node was still walkable.
-/// Appends the node's delta-born edges, mapping each reltype **name** to its core id
-/// (a born edge of a reltype absent from the core cannot be represented as an `Adj`,
-/// so it is skipped — the write path requires the reltype to pre-exist). Callers gate
-/// on `delta.is_empty()`, so this runs only when a live delta is present.
-fn overlay_adj(
+/// Edges per chunk handed to a [`for_each_adj_overlaid`] visitor. Bounds a streamed
+/// hub's working set to O(chunk) neighbours regardless of degree; the collecting
+/// [`read_adj_overlaid`] wrapper is chunk-agnostic (it concatenates every chunk).
+const ADJ_STREAM_CHUNK: usize = 8192;
+
+/// Stream node `node`'s overlaid adjacency in one direction, invoking `emit` with
+/// `chunk`-sized `&[Adj]` slices instead of materialising the whole neighbour list.
+/// This is the **single** implementation of the core→segment→delta adjacency fold;
+/// [`read_adj_overlaid`] is exactly this visitor collected into a `Vec`, so the two
+/// are byte-for-byte identical (same edges, same order).
+///
+/// Why streaming: the core CSR record is the only unbounded part of a hub node's
+/// adjacency (out-degree in the millions), and it decodes edge-by-edge via
+/// [`topology::decode_adj_into`] — so a hub is walked at O(chunk) resident neighbours
+/// plus the two bounded overlays, never the full multi-GB list at once. The segment
+/// and delta overlays are bounded (segment count × fence-gated fragment; byte-capped
+/// delta) and are prepared once, up front.
+///
+/// The fold, reproduced exactly (see the deleted `overlay_segment_adj`/`overlay_adj`):
+///  1. **Segment overlay** (skipped for a singleton stack): fold each upper segment's
+///     fence-gated adjacency fragment oldest→newest. A `removed` entry suppresses the
+///     matching `edge_id`; a born entry appends. `core_removed` unions every segment's
+///     removals — correct for **core** edges, which precede every segment. `seg_born`
+///     carries the born edges surviving all *later* segments' removals, in append order.
+///  2. **Delta overlay** (skipped for an empty delta): `suppress` holds the
+///     `(reltype, neighbour)` pairs a delta tombstone drops; `delta_born` the born
+///     edges; and a tombstoned **neighbour node** drops any edge to it (the traversal
+///     side of a node `DELETE`). A born edge whose reltype is absent from the core is
+///     skipped (it cannot be an `Adj`).
+///  3. **Emit order**: surviving core edges, then surviving segment-born, then surviving
+///     delta-born — the exact order the materialised fold produced.
+///
+/// A **delta-born** node (id ≥ core node count) has no core record, so only its segment-
+/// and delta-born edges remain.
+fn for_each_adj_overlaid(
     gen: &dyn ReadView,
+    cache: &BlockCache,
     node: u64,
     outgoing: bool,
-    mut core: Vec<topology::Adj>,
-) -> Vec<topology::Adj> {
+    chunk: usize,
+    emit: &mut dyn FnMut(&[topology::Adj]) -> Result<()>,
+) -> Result<()> {
+    // --- Prepare the bounded segment overlay once (was `overlay_segment_adj`). ---
+    // `core_removed`: edge-ids any segment removes — applies to the core list, whose
+    // edges precede every segment, so a union is exact. `seg_born`: born edges surviving
+    // every *later* segment's removals, in the order the fold would append them.
+    let stack = gen.core_stack();
+    let mut core_removed: HashSet<u64> = HashSet::new();
+    let mut seg_born: Vec<topology::Adj> = Vec::new();
+    if !stack.is_singleton() {
+        for seg in stack.segments() {
+            let r = &seg.reader;
+            let frag = if outgoing {
+                if !r.may_hold_out_adj(node) {
+                    continue;
+                }
+                r.out_adj(node)?
+            } else {
+                if !r.may_hold_in_adj(node) {
+                    continue;
+                }
+                r.in_adj(node)?
+            };
+            if frag.is_empty() {
+                continue;
+            }
+            let mut seg_removed: HashSet<u64> = HashSet::new();
+            let mut this_born: Vec<topology::Adj> = Vec::new();
+            for e in frag {
+                if e.removed {
+                    seg_removed.insert(e.edge_id);
+                } else if let Some(rt) = gen.reltype_id(&e.reltype) {
+                    this_born.push(topology::Adj {
+                        reltype: rt,
+                        neighbour: NodeId(e.other),
+                        edge: EdgeId(e.edge_id),
+                    });
+                }
+            }
+            if !seg_removed.is_empty() {
+                // This segment's removals suppress born edges from earlier segments only
+                // (this_born is appended after), matching the incremental per-segment fold.
+                seg_born.retain(|a| !seg_removed.contains(&a.edge.0));
+                core_removed.extend(seg_removed.iter().copied());
+            }
+            seg_born.extend(this_born);
+        }
+    }
+
+    // --- Prepare the bounded delta overlay once (was `overlay_adj`). ---
     let delta = gen.delta();
-    let deltas = if outgoing {
-        delta.out_edges(node)
-    } else {
-        delta.in_edges(node)
-    };
-    // `(reltype-id, neighbour)` pairs a delta tombstone removes from the core list.
+    let has_delta = !delta.is_empty();
     let mut suppress: HashSet<(u32, u64)> = HashSet::new();
-    let mut born: Vec<topology::Adj> = Vec::new();
-    for e in deltas {
-        let Some(rt) = gen.reltype_id(&e.reltype) else {
-            continue;
+    let mut delta_born: Vec<topology::Adj> = Vec::new();
+    if has_delta {
+        let deltas = if outgoing {
+            delta.out_edges(node)
+        } else {
+            delta.in_edges(node)
         };
-        if e.tombstoned {
-            suppress.insert((rt, e.other));
-        } else if let Some(eid) = e.edge_id {
-            born.push(topology::Adj {
-                reltype: rt,
-                neighbour: NodeId(e.other),
-                edge: EdgeId(eid),
-            });
+        for e in deltas {
+            let Some(rt) = gen.reltype_id(&e.reltype) else {
+                continue;
+            };
+            if e.tombstoned {
+                suppress.insert((rt, e.other));
+            } else if let Some(eid) = e.edge_id {
+                delta_born.push(topology::Adj {
+                    reltype: rt,
+                    neighbour: NodeId(e.other),
+                    edge: EdgeId(eid),
+                });
+            }
         }
     }
-    core.retain(|a| {
-        !suppress.contains(&(a.reltype, a.neighbour.0)) && !delta.is_tombstoned(a.neighbour.0)
-    });
-    for a in born {
-        if !delta.is_tombstoned(a.neighbour.0) {
-            core.push(a);
+    // Delta filter applied to core + segment-born edges: drop a delta-suppressed
+    // `(reltype, neighbour)` or an edge to a tombstoned neighbour node. On an empty
+    // delta the whole overlay is skipped, exactly as the materialised fast path did.
+    let delta_keep = |a: &topology::Adj| -> bool {
+        !has_delta
+            || (!suppress.contains(&(a.reltype, a.neighbour.0))
+                && !delta.is_tombstoned(a.neighbour.0))
+    };
+
+    // Chunked emit: buffer survivors and flush a full `chunk`; a scoped closure so the
+    // final partial flush can run after the borrow of `emit`/`buf` is released.
+    let mut buf: Vec<topology::Adj> = Vec::new();
+    {
+        let mut push = |a: topology::Adj| -> Result<()> {
+            buf.push(a);
+            if buf.len() >= chunk {
+                emit(&buf)?;
+                buf.clear();
+            }
+            Ok(())
+        };
+        // 1. Surviving core edges, streamed edge-by-edge (never held whole for a hub).
+        if node < gen.core_generation().node_count() {
+            let topo = gen.topology();
+            let global = if outgoing {
+                topo.outgoing_global(NodeId(node))
+            } else {
+                topo.incoming_global(NodeId(node))
+            };
+            let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+            topology::decode_adj_into(&rec, |a| {
+                if !core_removed.contains(&a.edge.0) && delta_keep(&a) {
+                    push(a)?;
+                }
+                Ok(())
+            })?;
+        }
+        // 2. Surviving segment-born edges (delta filter applies, as they sit in the list).
+        for a in &seg_born {
+            if delta_keep(a) {
+                push(*a)?;
+            }
+        }
+        // 3. Surviving delta-born edges (tombstoned-neighbour filter only, matching the fold).
+        for a in &delta_born {
+            if !delta.is_tombstoned(a.neighbour.0) {
+                push(*a)?;
+            }
         }
     }
-    core
+    if !buf.is_empty() {
+        emit(&buf)?;
+    }
+    Ok(())
 }
 
 /// Read node `node`'s adjacency in one direction (`outgoing` = out-edges) through the
@@ -385,89 +507,20 @@ fn overlay_adj(
 /// core topology record, so its core adjacency is empty and only its born edges
 /// remain. The single reader behind the sequential [`Engine::outgoing`]/[`incoming`]
 /// and the parallel [`hops_par`]/[`neighbours_par`], so every traversal path applies
-/// the identical overlay. The empty-delta fast path returns the bare core adjacency.
+/// the identical overlay. Collects [`for_each_adj_overlaid`] — the one fold — so it is
+/// byte-for-byte the streamed neighbour list.
 fn read_adj_overlaid(
     gen: &dyn ReadView,
     cache: &BlockCache,
     node: u64,
     outgoing: bool,
 ) -> Result<Vec<topology::Adj>> {
-    let core = if node >= gen.core_generation().node_count() {
-        Vec::new()
-    } else {
-        let topo = gen.topology();
-        let global = if outgoing {
-            topo.outgoing_global(NodeId(node))
-        } else {
-            topo.incoming_global(NodeId(node))
-        };
-        let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-        topology::decode_adj(&rec)?
-    };
-    // Fold the core segment stack's adjacency fragments (below the delta), then the delta.
-    let core = overlay_segment_adj(gen, node, outgoing, core)?;
-    if gen.delta().is_empty() {
-        return Ok(core);
-    }
-    Ok(overlay_adj(gen, node, outgoing, core))
-}
-
-/// Fold every upper core segment's adjacency **fragment** for `node` into its base
-/// adjacency, oldest→newest (so a newer flush's removal wins over an older flush's born
-/// edge). A fragment carries only the edges a flush *added* or *removed*, never rewriting
-/// the whole neighbour list: a `removed` entry suppresses the matching `edge_id` from the
-/// list so far, a born entry appends (mapping its reltype **name** to the core id — a
-/// reltype absent from the core cannot be an `Adj`, so it is skipped, as for the delta).
-///
-/// Each segment is gated by its O(1) adjacency fence ([`SegmentReader::may_hold_out_adj`] /
-/// `may_hold_in_adj`) so an untouched node skips the segment without a binary search — the
-/// mechanism that keeps a stacked adjacency read close to the single base block read.
-/// Returns `core` unchanged for a singleton set.
-fn overlay_segment_adj(
-    gen: &dyn ReadView,
-    node: u64,
-    outgoing: bool,
-    mut core: Vec<topology::Adj>,
-) -> Result<Vec<topology::Adj>> {
-    let stack = gen.core_stack();
-    if stack.is_singleton() {
-        return Ok(core);
-    }
-    for seg in stack.segments() {
-        let r = &seg.reader;
-        let frag = if outgoing {
-            if !r.may_hold_out_adj(node) {
-                continue;
-            }
-            r.out_adj(node)?
-        } else {
-            if !r.may_hold_in_adj(node) {
-                continue;
-            }
-            r.in_adj(node)?
-        };
-        if frag.is_empty() {
-            continue;
-        }
-        let mut removed: HashSet<u64> = HashSet::new();
-        let mut born: Vec<topology::Adj> = Vec::new();
-        for e in frag {
-            if e.removed {
-                removed.insert(e.edge_id);
-            } else if let Some(rt) = gen.reltype_id(&e.reltype) {
-                born.push(topology::Adj {
-                    reltype: rt,
-                    neighbour: NodeId(e.other),
-                    edge: EdgeId(e.edge_id),
-                });
-            }
-        }
-        if !removed.is_empty() {
-            core.retain(|a| !removed.contains(&a.edge.0));
-        }
-        core.extend(born);
-    }
-    Ok(core)
+    let mut out = Vec::new();
+    for_each_adj_overlaid(gen, cache, node, outgoing, ADJ_STREAM_CHUNK, &mut |c| {
+        out.extend_from_slice(c);
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// Thread-safe single-node neighbour read for the parallel `shortestPath()` BFS:
@@ -9413,6 +9466,253 @@ mod tests {
 
     fn prop<'a>(props: &'a NamedProps, key: &str) -> Option<&'a Val> {
         props.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Slice 1 parity oracle: the pre-streaming **materialised** adjacency fold
+    /// (core read → per-segment fragment fold → delta fold), reproduced verbatim so the
+    /// streaming [`for_each_adj_overlaid`] can be checked byte-for-byte against it. This is
+    /// the frozen behaviour of the old `read_adj_overlaid` before it became a `collect`.
+    #[cfg(test)]
+    fn materialised_adj_fold(
+        gen: &dyn ReadView,
+        cache: &BlockCache,
+        node: u64,
+        outgoing: bool,
+    ) -> Vec<topology::Adj> {
+        // core
+        let mut core = if node >= gen.core_generation().node_count() {
+            Vec::new()
+        } else {
+            let topo = gen.topology();
+            let global = if outgoing {
+                topo.outgoing_global(NodeId(node))
+            } else {
+                topo.incoming_global(NodeId(node))
+            };
+            let rec = cache
+                .record(topo.inner(), gen.uuid(), FileKind::Topology, global)
+                .unwrap();
+            topology::decode_adj(&rec).unwrap()
+        };
+        // per-segment fold, oldest→newest
+        let stack = gen.core_stack();
+        if !stack.is_singleton() {
+            for seg in stack.segments() {
+                let r = &seg.reader;
+                let frag = if outgoing {
+                    if !r.may_hold_out_adj(node) {
+                        continue;
+                    }
+                    r.out_adj(node).unwrap()
+                } else {
+                    if !r.may_hold_in_adj(node) {
+                        continue;
+                    }
+                    r.in_adj(node).unwrap()
+                };
+                if frag.is_empty() {
+                    continue;
+                }
+                let mut removed: HashSet<u64> = HashSet::new();
+                let mut born: Vec<topology::Adj> = Vec::new();
+                for e in frag {
+                    if e.removed {
+                        removed.insert(e.edge_id);
+                    } else if let Some(rt) = gen.reltype_id(&e.reltype) {
+                        born.push(topology::Adj {
+                            reltype: rt,
+                            neighbour: NodeId(e.other),
+                            edge: EdgeId(e.edge_id),
+                        });
+                    }
+                }
+                if !removed.is_empty() {
+                    core.retain(|a| !removed.contains(&a.edge.0));
+                }
+                core.extend(born);
+            }
+        }
+        // delta fold
+        let delta = gen.delta();
+        if !delta.is_empty() {
+            let deltas = if outgoing {
+                delta.out_edges(node)
+            } else {
+                delta.in_edges(node)
+            };
+            let mut suppress: HashSet<(u32, u64)> = HashSet::new();
+            let mut born: Vec<topology::Adj> = Vec::new();
+            for e in deltas {
+                let Some(rt) = gen.reltype_id(&e.reltype) else {
+                    continue;
+                };
+                if e.tombstoned {
+                    suppress.insert((rt, e.other));
+                } else if let Some(eid) = e.edge_id {
+                    born.push(topology::Adj {
+                        reltype: rt,
+                        neighbour: NodeId(e.other),
+                        edge: EdgeId(eid),
+                    });
+                }
+            }
+            core.retain(|a| {
+                !suppress.contains(&(a.reltype, a.neighbour.0))
+                    && !delta.is_tombstoned(a.neighbour.0)
+            });
+            for a in born {
+                if !delta.is_tombstoned(a.neighbour.0) {
+                    core.push(a);
+                }
+            }
+        }
+        core
+    }
+
+    /// Slice 1: the streaming [`for_each_adj_overlaid`] reproduces the materialised
+    /// core→segment→delta fold **byte-for-byte** — same edges, same order — across
+    /// core-only / segment / delta / tombstone / node-delete fixtures, and the result is
+    /// invariant to the emit `chunk` size (chunk boundaries never reorder or drop edges).
+    /// [`read_adj_overlaid`] (now a `collect`) is asserted equal to the oracle too.
+    #[test]
+    fn for_each_adj_overlaid_byte_parity() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        // Every node/direction: collect wrapper == oracle, and every chunk size streams the
+        // same sequence with no empty/over-cap chunk.
+        let check = |view: &MergedView, cache: &BlockCache, max_node: u64| {
+            for node in 0..=max_node {
+                for outgoing in [true, false] {
+                    let want = materialised_adj_fold(view, cache, node, outgoing);
+                    let got = read_adj_overlaid(view, cache, node, outgoing).unwrap();
+                    assert_eq!(got, want, "collect parity node={node} out={outgoing}");
+                    for chunk in [1usize, 2, 3, 8192] {
+                        let mut streamed = Vec::new();
+                        for_each_adj_overlaid(view, cache, node, outgoing, chunk, &mut |c| {
+                            assert!(!c.is_empty(), "empty chunk node={node} chunk={chunk}");
+                            assert!(c.len() <= chunk, "over-cap chunk node={node} chunk={chunk}");
+                            streamed.extend_from_slice(c);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            streamed, want,
+                            "stream parity node={node} out={outgoing} chunk={chunk}"
+                        );
+                    }
+                }
+            }
+        };
+
+        // A: core-only — singleton stack + empty delta (both streaming fast paths).
+        {
+            let (root, graph, _) = testgen::write_basic("adj_stream_core");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let view = MergedView::read_only(&gen);
+            check(&view, &cache, 4);
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // B: one upper segment, empty delta — segment fold with a removed + born fragment.
+        {
+            let (root, graph, _) = write_basic_with_segment("adj_stream_seg");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let view = MergedView::read_only(&gen);
+            // Sanity: node 0's out list lost base e4 and gained segment e5 (fold is non-trivial).
+            let out0 = read_adj_overlaid(&view, &cache, 0, true).unwrap();
+            assert!(!out0.iter().any(|a| a.edge.0 == 4), "segment removed e4");
+            assert!(out0.iter().any(|a| a.edge.0 == 5), "segment born e5");
+            check(&view, &cache, 6);
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // C: segment + rich delta — born edge, edge suppression, and a node delete.
+        {
+            let (root, graph, _) = write_basic_with_segment("adj_stream_seg_delta");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let mut mem = Memtable::new();
+            // Register both endpoints so the edge delete resolves core dense ids.
+            mem.upsert_node("Person", "name", Value::Str("Alice".into()), Some(0), []);
+            mem.upsert_node("Person", "name", Value::Str("Bob".into()), Some(1), []);
+            // Delta-born out-edge 0→3 (Acme) KNOWS.
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Company",
+                "name",
+                Value::Str("Acme".into()),
+                Some(0),
+                Some(3),
+                [],
+            );
+            // Suppress base edge e0 (0→1 KNOWS).
+            mem.delete_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                Some(0),
+                Some(1),
+            );
+            // Node delete: Globex (4) — drops any edge whose neighbour is 4.
+            mem.delete_node("Company", "name", Value::Str("Globex".into()), Some(4));
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            // Sanity: the delta branches are actually live (else the oracle would trivially agree).
+            assert!(view.delta().is_tombstoned(4), "node 4 tombstoned in delta");
+            let knows = gen.reltype_id("KNOWS").unwrap();
+            let out0 = read_adj_overlaid(&view, &cache, 0, true).unwrap();
+            // e0 (0-[:KNOWS]->1) is delta-suppressed; the delta-born 0-[:KNOWS]->3 is present.
+            // (Check by neighbour, not edge id — a bare Memtable numbers born ids from 0.)
+            assert!(
+                !out0
+                    .iter()
+                    .any(|a| a.reltype == knows && a.neighbour.0 == 1),
+                "delta suppressed e0 (0->1 KNOWS)"
+            );
+            assert!(
+                out0.iter()
+                    .any(|a| a.reltype == knows && a.neighbour.0 == 3),
+                "delta-born 0->3 KNOWS present"
+            );
+            check(&view, &cache, 6);
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // D: delta only, no segments — empty stack fast path with a live delta + node delete.
+        {
+            let (root, graph, _) = testgen::write_basic("adj_stream_delta_only");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let mut mem = Memtable::new();
+            mem.upsert_node("Person", "name", Value::Str("Alice".into()), Some(0), []);
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Company",
+                "name",
+                Value::Str("Acme".into()),
+                Some(0),
+                Some(3),
+                [],
+            );
+            mem.delete_node("Person", "name", Value::Str("Carol".into()), Some(2));
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            assert!(view.delta().is_tombstoned(2), "node 2 tombstoned in delta");
+            check(&view, &cache, 4);
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// A segment full row overrides/extends the base node reads it carries, births new
