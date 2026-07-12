@@ -21,6 +21,7 @@ pub mod cache;
 pub mod config;
 pub mod consolidate;
 pub mod cron_window;
+pub mod degree_column;
 pub mod delta_writer;
 pub mod diag;
 pub mod dump;

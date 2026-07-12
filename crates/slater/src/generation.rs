@@ -98,12 +98,11 @@ pub struct Generation {
     /// absent from a list therefore has degree `< floor` in that direction.
     hub_degree_floor: Option<u32>,
     /// Dense per-node out/in degree column (`node_degrees.blk`) — every node's exact
-    /// degree, resident for an O(1) lookup with no adjacency read. Empty +
-    /// `has_node_degrees == false` ⇒ no column (older generation); the caller falls back
-    /// to the record's leading count. See [`crate::generation::Generation::node_out_degree`].
-    node_out_degrees: Vec<u32>,
-    node_in_degrees: Vec<u32>,
-    has_node_degrees: bool,
+    /// degree, for an O(1) lookup with no adjacency read. `None` ⇒ no column (older
+    /// generation); the caller falls back to the record's leading count. Present ⇒ residency
+    /// is **chunk-lazy** (a chunk faults on first touch, cold chunks free on the idle sweep)
+    /// unless configured `pinned`. See [`crate::generation::Generation::node_out_degree`].
+    degree_column: Option<crate::degree_column::DegreeColumn>,
     /// Disk-native Vamana/PQ indexes (above the ANN threshold), keyed by
     /// `(label, property)`. Each holds its block reader, its position in
     /// `manifest.vector_indexes` (the cache ordinal), and its resident PQ codes.
@@ -386,19 +385,22 @@ impl Generation {
         // generation *retrofitted* with the column — or one built with it — loads it, and
         // one without falls back to the record's leading count. Present ⇒ the degree-sum
         // count fast path answers a penultimate-frontier lookup in O(1) with no I/O.
-        let mut node_out_degrees = Vec::new();
-        let mut node_in_degrees = Vec::new();
-        let mut has_node_degrees = false;
+        // Residency policy for the dense degree column. Chunk-lazy by default; slice-4 config
+        // (`cache.degreeColumn`) threads a `pinned` override here.
+        let degree_residency = crate::degree_column::DegreeResidency::Lazy;
+        let mut degree_column = None;
         let nd_key = join_key(&base, "node_degrees.blk");
         if store.exists(&nd_key)? {
             let reader = BlockFileReader::open_src(store.open(&nd_key)?, cipher.clone())
                 .with_context(|| format!("open node-degree column {nd_key}"))?;
-            let (o, i) =
-                graph_format::nodedegree::read_node_degrees(&reader, manifest.node_count as usize)
-                    .with_context(|| format!("read node-degree column {nd_key}"))?;
-            node_out_degrees = o;
-            node_in_degrees = i;
-            has_node_degrees = true;
+            degree_column = Some(
+                crate::degree_column::DegreeColumn::open(
+                    reader,
+                    manifest.node_count as usize,
+                    degree_residency,
+                )
+                .with_context(|| format!("open node-degree column {nd_key}"))?,
+            );
         }
 
         // Open the disk-native Vamana/PQ indexes (above the ANN threshold). Each
@@ -504,9 +506,7 @@ impl Generation {
             hub_out_degrees,
             hub_in_degrees,
             hub_degree_floor,
-            node_out_degrees,
-            node_in_degrees,
-            has_node_degrees,
+            degree_column,
             vamana_indexes,
             label_ids,
             reltype_ids,
@@ -653,21 +653,26 @@ impl Generation {
     /// (`node_degrees.blk`) — O(1), no I/O — or `None` if this generation carries no
     /// column (fall back to the record's leading count).
     pub fn node_out_degree(&self, node: u64) -> Option<u32> {
-        if self.has_node_degrees {
-            self.node_out_degrees.get(node as usize).copied()
-        } else {
-            None
-        }
+        self.degree_column.as_ref().and_then(|c| c.out_degree(node))
     }
 
     /// Exact **in**-degree from the dense column, or `None` when absent. Counterpart of
     /// [`Self::node_out_degree`].
     pub fn node_in_degree(&self, node: u64) -> Option<u32> {
-        if self.has_node_degrees {
-            self.node_in_degrees.get(node as usize).copied()
-        } else {
-            None
-        }
+        self.degree_column.as_ref().and_then(|c| c.in_degree(node))
+    }
+
+    /// Drop dense-degree chunks untouched for at least `ttl` (chunk-lazy residency). No-op when
+    /// the generation carries no column or it is pinned. Returns the number of chunks freed —
+    /// the idle-TTL sweep calls this so cold degree chunks free like block-cache entries.
+    pub fn evict_cold_degree_chunks(
+        &self,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> usize {
+        self.degree_column
+            .as_ref()
+            .map_or(0, |c| c.evict_expired(now, ttl))
     }
 
     /// The opened Vamana/PQ index over `(label, property)`, if one exists (i.e. the
