@@ -1660,6 +1660,14 @@ pub struct Engine<'g, V: ReadView> {
     /// thread (the walk's parallelism is confined to `par_gather`), like
     /// `budget_used`.
     count_acc: Cell<Option<u64>>,
+    /// Degree-sum terminal (count fast path): when set, the chain walk stops one hop
+    /// short and, instead of expanding the final relationship, adds each penultimate
+    /// frontier node's **effective out/in degree** to `count_acc` — turning a k-hop
+    /// `count(endpoint)` into a (k-1)-hop walk plus an O(1)-per-node degree lookup, so
+    /// the widest final hop (the hubs) is never materialised. Armed only when the
+    /// pattern's final hop is a plain, unfiltered, count-only edge over a homogeneous
+    /// graph with no pending node-deletes (see [`Self::degree_terminal_dir`]).
+    degree_terminal: Cell<bool>,
     /// Server-wide intermediate budget shared across every concurrent query
     /// (`query.maxIntermediateGlobal`); `None` ⇒ no global guard. Charged in
     /// lock-step with `budget_used`; `global_charged` is this query's running
@@ -1719,6 +1727,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             max_scan: 0,
             scan_used: Cell::new(0),
             count_acc: Cell::new(None),
+            degree_terminal: Cell::new(false),
             global_budget: None,
             global_charged: Cell::new(0),
             max_shortest_path_explore: 0,
@@ -5063,6 +5072,15 @@ impl<'g, V: ReadView> Engine<'g, V> {
         } else {
             candidates
         };
+        // Degree-sum terminal: in count-pushdown mode (armed by `count_match`, no WHERE),
+        // if this post-reroot pattern's final hop qualifies, arm the walk to add each
+        // penultimate node's effective degree instead of expanding the last relationship.
+        // Checked on the *post-reroot* pattern, so a rerooted chain (whose new terminal is
+        // the filtered original anchor) declines automatically. Restored after the loop.
+        let degree_term = self.count_acc.get().is_some()
+            && where_.is_none()
+            && self.degree_terminal_dir(pattern).is_some();
+        let prev_degree_term = self.degree_terminal.replace(degree_term);
         let mut frame = binding.clone();
         let mut walk = Vec::new();
         for c in candidates {
@@ -5090,6 +5108,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 restore_binding(&mut frame, v, old);
             }
         }
+        self.degree_terminal.set(prev_degree_term);
         Ok(())
     }
 
@@ -5264,6 +5283,158 @@ impl<'g, V: ReadView> Engine<'g, V> {
         Ok(self.effective_degree_ub(node, dir)? >= self.adj_stream_threshold)
     }
 
+    /// The **exact** count of `node`'s incident edges in `dir` — the degree-sum terminal's
+    /// per-node contribution (see [`Self::degree_terminal`]). Composed from the maintained
+    /// degree marginals, never a full adjacency read: core degree (O(1) from the hub-degree
+    /// sidecar, else the CSR record's leading count), plus each segment's fence-gated
+    /// fragment (born − removed), plus the live delta (born − suppressed).
+    ///
+    /// Exact **only** under the [`Self::degree_terminal_dir`] preconditions — a homogeneous
+    /// final hop (so every incident edge counts) and no pending live node-deletes (so no
+    /// non-local tombstone correction is owed). The caller guarantees both before arming.
+    fn effective_incident_count(&self, node: u64, dir: Direction) -> Result<u64> {
+        match dir {
+            Direction::Outgoing => self.directed_edge_count(node, true),
+            Direction::Incoming => self.directed_edge_count(node, false),
+            Direction::Undirected => Ok(
+                self.directed_edge_count(node, true)? + self.directed_edge_count(node, false)?
+            ),
+        }
+    }
+
+    /// Exact effective out-degree (`outgoing`) or in-degree of `node`, composed across the
+    /// write path. See [`Self::effective_incident_count`] for the exactness preconditions.
+    fn directed_edge_count(&self, node: u64, outgoing: bool) -> Result<u64> {
+        let gen = self.gen;
+        let cg = gen.core_generation();
+        let mut deg: i64 = 0;
+        // Core: exact out/in degree — O(1) sidecar lookup for a listed (hub) node, else the
+        // record's leading edge count (one cached block, no decode). 0 for a delta-born id.
+        if node < cg.node_count() {
+            let listed = if outgoing {
+                cg.core_out_degree_if_hub(node)
+            } else {
+                cg.core_in_degree_if_hub(node)
+            };
+            deg += match listed {
+                Some(d) => d as i64,
+                None => {
+                    let topo = gen.topology();
+                    let global = if outgoing {
+                        topo.outgoing_global(NodeId(node))
+                    } else {
+                        topo.incoming_global(NodeId(node))
+                    };
+                    let rec =
+                        self.cache
+                            .record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+                    topology::adj_count(&rec)? as i64
+                }
+            };
+        }
+        // Segments: fence-gated fragment, born (+1) − removed (−1). Bounded per node; an
+        // untouched node skips the segment via its O(1) presence fence. Exact composition.
+        let stack = gen.core_stack();
+        if !stack.is_singleton() {
+            for seg in stack.segments() {
+                let r = &seg.reader;
+                let frag = if outgoing {
+                    if !r.may_hold_out_adj(node) {
+                        continue;
+                    }
+                    r.out_adj(node)?
+                } else {
+                    if !r.may_hold_in_adj(node) {
+                        continue;
+                    }
+                    r.in_adj(node)?
+                };
+                for e in frag {
+                    if e.removed {
+                        deg -= 1;
+                    } else {
+                        deg += 1;
+                    }
+                }
+            }
+        }
+        // Live delta: born edge (+1), suppressed core edge (−1). Node-tombstones are ruled
+        // out upfront (`degree_terminal_dir`), so no edge-to-deleted-node correction is owed.
+        let delta = gen.delta();
+        if !delta.is_empty() {
+            let edges = if outgoing {
+                delta.out_edges(node)
+            } else {
+                delta.in_edges(node)
+            };
+            for e in edges {
+                if e.tombstoned {
+                    deg -= 1;
+                } else if e.edge_id.is_some() {
+                    deg += 1;
+                }
+            }
+        }
+        Ok(deg.max(0) as u64)
+    }
+
+    /// Whether `pattern`'s final hop is a plain, unfiltered `count`-only edge that can be
+    /// answered by summing effective degree over the penultimate frontier instead of
+    /// expanding — returning that hop's [`Direction`] when so, else `None` (walk normally).
+    ///
+    /// Requires: an ordinary fixed-length chain (no path var / quantified segments /
+    /// selector / restrictor / variable-length hop); the final relationship carries no
+    /// property predicate and its type filter counts **every** incident edge (untyped, or
+    /// the graph has exactly one reltype the filter accepts, so degree == matching count);
+    /// the final node is unfiltered and not a back-reference to an earlier-bound variable
+    /// (which would restrict which endpoints count); and no live node-delete is pending
+    /// (which would make a maintained degree non-exact — see [`Self::directed_edge_count`]).
+    /// Intermediate hops may be typed/filtered — they are walked normally; only the final
+    /// hop is replaced.
+    fn degree_terminal_dir(&self, pattern: &Pattern) -> Option<Direction> {
+        if pattern.path_var.is_some()
+            || pattern.segments.is_some()
+            || pattern.selector.is_some()
+            || pattern.restrictor.is_some()
+            || pattern.rels.is_empty()
+            || pattern.rels.iter().any(|(r, _)| r.var_length.is_some())
+        {
+            return None;
+        }
+        let (last_rel, last_node) = pattern.rels.last().unwrap();
+        if !last_rel.props.is_empty() {
+            return None;
+        }
+        // Final-hop type must count every incident edge: untyped, or a single-reltype graph
+        // whose lone type the filter accepts (then out-degree == the matching-edge count).
+        match &last_rel.type_expr {
+            None => {}
+            Some(e) => {
+                let reltypes = &self.gen.manifest().reltypes;
+                if reltypes.len() != 1 || !e.eval(&|name| name == reltypes[0]) {
+                    return None;
+                }
+            }
+        }
+        // Final node unfiltered and a fresh endpoint (no cycle constraint).
+        if last_node.label_expr.is_some() || !last_node.props.is_empty() {
+            return None;
+        }
+        if let Some(v) = last_node.var.as_deref() {
+            let bound_earlier = pattern.start.var.as_deref() == Some(v)
+                || pattern.rels[..pattern.rels.len() - 1]
+                    .iter()
+                    .any(|(r, n)| r.var.as_deref() == Some(v) || n.var.as_deref() == Some(v));
+            if bound_earlier {
+                return None;
+            }
+        }
+        if self.gen.delta().has_tombstones() {
+            return None;
+        }
+        Some(last_rel.dir)
+    }
+
     /// The per-neighbour merge body of [`Self::par_walk`], factored out so both the
     /// parallel-gathered normal nodes and the sequentially-**streamed** hub nodes share
     /// it verbatim: `node_ok`, the next-var equality guard, the (structurally shared)
@@ -5385,6 +5556,24 @@ impl<'g, V: ReadView> Engine<'g, V> {
         frontier: Vec<ChainBranch>,
         out: &mut Vec<HashMap<String, Val>>,
     ) -> Result<()> {
+        // Degree-sum terminal: at the last hop, add each penultimate node's effective
+        // degree to the count instead of expanding the final (widest) relationship. Armed
+        // only in count mode over a qualifying pattern (see `degree_terminal_dir`).
+        if self.degree_terminal.get() && i + 1 == pattern.rels.len() {
+            let dir = pattern.rels[i].0.dir;
+            for b in &frontier {
+                self.check_deadline()?;
+                // One unit of walk-work per penultimate node — the degree lookup that
+                // replaces expanding its final edges. The count itself (`d`) is *not*
+                // charged: the fast path's whole point is to tally a huge final hop in
+                // O(1), so the traversal to build this frontier is what `maxScan` bounds.
+                self.charge_walk(1)?;
+                let d = self.effective_incident_count(b.cur, dir)?;
+                let n = self.count_acc.get().unwrap_or(0);
+                self.count_acc.set(Some(n + d));
+            }
+            return Ok(());
+        }
         if i == pattern.rels.len() {
             // Completion: charge + emit each branch in order (mirrors `expand_chain`'s
             // terminal — one intermediate per emitted row, path bound if requested).
@@ -5530,6 +5719,18 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // unwind without expanding further, so a query like the 3-hop that would
         // otherwise buffer ~28k paths for `LIMIT 100` stops after 100.
         if cap.is_some_and(|c| out.len() >= c) {
+            return Ok(());
+        }
+        // Degree-sum terminal (uncapped count fast path): at the last hop, add `cur`'s
+        // effective degree to the count instead of expanding the final relationship. See
+        // [`Self::degree_terminal`] / [`Self::par_walk`]'s matching short-circuit.
+        if self.degree_terminal.get() && i + 1 == pattern.rels.len() {
+            // One unit of walk-work (the degree lookup); the count is tallied in O(1) and
+            // deliberately not charged to `maxScan` (see `par_walk`'s matching hook).
+            self.charge_walk(1)?;
+            let d = self.effective_incident_count(cur, pattern.rels[i].0.dir)?;
+            let n = self.count_acc.get().unwrap_or(0);
+            self.count_acc.set(Some(n + d));
             return Ok(());
         }
         if i == pattern.rels.len() {
@@ -10136,6 +10337,148 @@ mod tests {
             check(&view, &cache, knows, 6);
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// Degree-sum terminal count fast path: a k-hop `count(endpoint)` answered by summing
+    /// effective degree over the penultimate frontier must equal the materialising walk —
+    /// across 1/2/3-hop, undirected, an anchor scan, and a live delta of edge writes — and
+    /// it must actually engage (not silently decline and pass via the walk). Node-deletes
+    /// and non-qualifying shapes decline to the walk, still correct.
+    #[test]
+    fn degree_terminal_count_matches_walk() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        fn pattern_of(q: &str) -> crate::parser::ast::Pattern {
+            let ast = parser::parse(q).unwrap();
+            let crate::parser::ast::Clause::Match(m) = &ast.head.reading[0] else {
+                panic!("not a match: {q}");
+            };
+            m.patterns[0].clone()
+        }
+        let count = |view: &MergedView, cache: &BlockCache, q: &str| -> i64 {
+            let ast = parser::parse(q).unwrap();
+            match Engine::new(view, cache).run(&ast).unwrap().rows[0][0] {
+                Val::Int(n) => n,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+        let rows = |view: &MergedView, cache: &BlockCache, q: &str| -> usize {
+            let ast = parser::parse(q).unwrap();
+            Engine::new(view, cache).run(&ast).unwrap().rows.len()
+        };
+
+        // Untyped final hops qualify even on write_basic's two-reltype graph (total degree
+        // == matching count). Fast `count(m)` must equal the materialised `RETURN m` rows.
+        let (root, graph, _) = testgen::write_basic("degterm");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        {
+            let view = MergedView::read_only(&gen);
+            let eng = Engine::new(&view, &cache);
+            let cases = [
+                (
+                    "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN count(m)",
+                    "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN m",
+                ),
+                (
+                    "MATCH (a:Person {name:'Alice'})-[]->()-[]->(m) RETURN count(m)",
+                    "MATCH (a:Person {name:'Alice'})-[]->()-[]->(m) RETURN m",
+                ),
+                (
+                    "MATCH (a:Person {name:'Alice'})-[]->()-[]->()-[]->(m) RETURN count(m)",
+                    "MATCH (a:Person {name:'Alice'})-[]->()-[]->()-[]->(m) RETURN m",
+                ),
+                (
+                    "MATCH (a:Person)-[]->(m) RETURN count(m)",
+                    "MATCH (a:Person)-[]->(m) RETURN m",
+                ),
+                (
+                    "MATCH (a:Person {name:'Alice'})-[]-(m) RETURN count(m)",
+                    "MATCH (a:Person {name:'Alice'})-[]-(m) RETURN m",
+                ),
+            ];
+            for (fast, refq) in cases {
+                assert!(
+                    eng.degree_terminal_dir(&pattern_of(fast)).is_some(),
+                    "degree terminal must engage for `{fast}`"
+                );
+                assert_eq!(
+                    count(&view, &cache, fast) as usize,
+                    rows(&view, &cache, refq),
+                    "count mismatch for `{fast}`"
+                );
+            }
+            // Shapes that must decline (→ walk): typed final hop on a multi-reltype graph,
+            // a filtered final node, a var-length hop, a path variable, a back-reference.
+            for q in [
+                "MATCH (a:Person {name:'Alice'})-[:KNOWS]->(m) RETURN count(m)",
+                "MATCH (a:Person {name:'Alice'})-[]->(m:Company) RETURN count(m)",
+                "MATCH (a:Person {name:'Alice'})-[*1..2]->(m) RETURN count(m)",
+                "MATCH p=(a:Person {name:'Alice'})-[]->(m) RETURN count(m)",
+                "MATCH (a:Person {name:'Alice'})-[]->(a) RETURN count(a)",
+            ] {
+                assert!(
+                    eng.degree_terminal_dir(&pattern_of(q)).is_none(),
+                    "degree terminal must decline for `{q}`"
+                );
+            }
+        }
+
+        // Live delta of edge writes: the composed degree must reflect the born edges.
+        {
+            let mut mem = Memtable::new();
+            for k in 0..3 {
+                mem.upsert_edge(
+                    "Person",
+                    "name",
+                    Value::Str("Alice".into()),
+                    "KNOWS",
+                    "Person",
+                    "name",
+                    Value::Str(format!("newpal{k}")),
+                    Some(0),
+                    None,
+                    [],
+                );
+            }
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let eng = Engine::new(&view, &cache);
+            let q = "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN count(m)";
+            assert!(eng.degree_terminal_dir(&pattern_of(q)).is_some());
+            assert_eq!(
+                count(&view, &cache, q) as usize,
+                rows(
+                    &view,
+                    &cache,
+                    "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN m"
+                ),
+                "delta-composed count must match the walk"
+            );
+        }
+
+        // Pending node-delete ⇒ decline (non-local), but the walk still counts correctly.
+        {
+            let mut mem = Memtable::new();
+            mem.delete_node("Company", "name", Value::Str("Globex".into()), Some(4));
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let eng = Engine::new(&view, &cache);
+            let q = "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN count(m)";
+            assert!(
+                eng.degree_terminal_dir(&pattern_of(q)).is_none(),
+                "a pending node-delete must decline the degree terminal"
+            );
+            assert_eq!(
+                count(&view, &cache, q) as usize,
+                rows(
+                    &view,
+                    &cache,
+                    "MATCH (a:Person {name:'Alice'})-[]->(m) RETURN m"
+                ),
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Slice 2: the hub routing probe [`Engine::effective_degree_ub`] is a **safe upper

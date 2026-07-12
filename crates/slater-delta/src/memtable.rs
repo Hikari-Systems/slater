@@ -2620,6 +2620,20 @@ impl DeltaSnapshot {
         false
     }
 
+    /// Whether **any** node is tombstoned anywhere in the delta (a live node-delete is
+    /// pending). O(#levels), allocates one bounded id list per level — a per-query gate,
+    /// not a hot path. Used to decline degree-count fast paths, whose exactness a node
+    /// delete would break (edges to a deleted node are filtered at read time, not
+    /// materialised per source, so a maintained per-node degree cannot reflect them until
+    /// the delete flushes/consolidates into the core).
+    pub fn has_tombstones(&self) -> bool {
+        if self.l0.is_empty() {
+            return !self.mem.tombstoned_ids().is_empty();
+        }
+        self.levels_newest_first()
+            .any(|l| !l.tombstoned_ids().is_empty())
+    }
+
     /// Count of delta-born-or-patched node identities, for scan-range planning. Summed
     /// across levels — an over-estimate when a core node is patched in several levels,
     /// which is fine for a planning bound.
