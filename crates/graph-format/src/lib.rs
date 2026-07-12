@@ -22,7 +22,10 @@
 /// [`degree_ef`]. The encoding is self-describing (per-chunk codec tag) but shares no bytes
 /// with v3's, so the version bump makes a v3 generation refuse at open (`generation.rs`)
 /// rather than misread the column; zero legacy installs, so old generations are rebuilt.
-pub const FORMAT_VERSION: u32 = 4;
+/// v5 collapses the per-edge `edge_id` in the **forward** CSR half (`topology.csr.blk`) to a
+/// single `edge_id_base` per record (derived `edge_id = base + k`), since a source's outgoing
+/// edge ids are dense-contiguous — see [`topology`]. Reverse records keep the per-edge id.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -66,7 +69,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 4);
+        assert_eq!(FORMAT_VERSION, 5);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

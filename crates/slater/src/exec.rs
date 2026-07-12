@@ -482,7 +482,7 @@ fn for_each_adj_overlaid(
                 topo.incoming_global(NodeId(node))
             };
             let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-            topology::decode_adj_into(&rec, |a| {
+            topology::decode_adj_into(&rec, outgoing, |a| {
                 if !core_removed.contains(&a.edge.0) && delta_keep(&a) {
                     push(a)?;
                 }
@@ -10041,7 +10041,7 @@ mod tests {
             let rec = cache
                 .record(topo.inner(), gen.uuid(), FileKind::Topology, global)
                 .unwrap();
-            topology::decode_adj(&rec).unwrap()
+            topology::decode_adj(&rec, outgoing).unwrap()
         };
         // per-segment fold, oldest→newest
         let stack = gen.core_stack();

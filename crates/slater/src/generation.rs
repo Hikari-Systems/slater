@@ -1036,7 +1036,7 @@ fn build_reltype_counts(topology: &TopologyReader) -> Result<HashMap<u32, u64>> 
         if global >= node_count {
             return Ok(()); // incoming half — already counted via the outgoing record
         }
-        for adj in graph_format::topology::decode_adj(rec)? {
+        for adj in graph_format::topology::decode_adj(rec, true)? {
             *counts.entry(adj.reltype).or_default() += 1;
         }
         Ok(())

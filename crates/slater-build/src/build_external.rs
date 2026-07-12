@@ -2648,8 +2648,15 @@ fn emit_forward_band(
         })?;
     }
 
-    let mut csr =
-        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, block_size, zstd_level, cipher.clone())?;
+    let mut csr = CsrHalfWriter::create_with_cipher(
+        csr_out,
+        lo,
+        hi,
+        true,
+        block_size,
+        zstd_level,
+        cipher.clone(),
+    )?;
     let mut eprops =
         BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, cipher)?;
     let mut rev_batch = BandBatcher::new(rev_spill, batch_threshold);
@@ -2786,7 +2793,7 @@ fn emit_reverse_band(
         })?;
     }
     let mut csr =
-        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, block_size, zstd_level, cipher)?;
+        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, false, block_size, zstd_level, cipher)?;
     let mut i = 0u64;
     for r in sorter.sorted()? {
         let er = r?;
@@ -2974,7 +2981,7 @@ fn compute_graph_summaries(
                         // node id in the graph falls in exactly one range's forward
                         // half, so the label tallies below count each node once.
                         topo_r.inner().for_each_record_in(lo, hi, |id, rec| {
-                            let adjs = graph_format::topology::decode_adj(rec)?;
+                            let adjs = graph_format::topology::decode_adj(rec, true)?;
                             // Out-degree hub: `adjs.len()` is the out-degree; the scan is
                             // ascending in id, so `out_hubs` stays sorted.
                             if adjs.len() as u64 >= hub_floor {
@@ -3018,7 +3025,7 @@ fn compute_graph_summaries(
                             node_count + lo,
                             node_count + hi,
                             |g, rec| {
-                                let adjs = graph_format::topology::decode_adj(rec)?;
+                                let adjs = graph_format::topology::decode_adj(rec, false)?;
                                 let id = g - node_count;
                                 // Dense per-node in-degree (ascending id ⇒ in order).
                                 t.in_degrees.push(adjs.len() as u32);

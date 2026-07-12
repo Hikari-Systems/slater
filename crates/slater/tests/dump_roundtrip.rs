@@ -142,6 +142,62 @@ async fn dump_round_trips_through_the_real_builder() {
             rebuilt.join("people").join("current").exists(),
             "rebuild produced no `current` generation pointer"
         );
+
+        // Serve the freshly-rebuilt generation and dump it again. This drives the *real*
+        // builder's forward CSR — where a source's edge ids are dense-contiguous, so the edge
+        // id is stored as `edge_id_base` and derived on read as `base + k` — through the serve +
+        // traversal path, and reads the edge property `r.since` via that derived id from
+        // `edge_props`. A wrong forward id or an `edge_props` misalignment would drop the edge
+        // or its property from the re-dump. (Node order can differ from the fixture after
+        // clustering, so assert on the business-key edge line, not the whole dump.)
+        let cfg2 = build_config(&rebuilt, &acl_path);
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            if let Err(e) = slater::server::serve_with_listener(cfg2, listener2).await {
+                eprintln!("rebuilt server ended: {e:#}");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let dump2_path = root.join("dump2.cypher");
+        let slater_bin2 = env!("CARGO_BIN_EXE_slater").to_string();
+        let port2 = addr2.port();
+        let dp2 = dump2_path.clone();
+        let out2 = tokio::task::spawn_blocking(move || {
+            Command::new(&slater_bin2)
+                .args([
+                    "dump",
+                    "people",
+                    "-u",
+                    "reporting",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port2.to_string(),
+                    "-o",
+                    dp2.to_str().unwrap(),
+                ])
+                .env("SLATER_DUMP_PASSWORD", "pw")
+                .output()
+                .expect("run slater dump on rebuilt")
+        })
+        .await
+        .unwrap();
+        assert!(
+            out2.status.success(),
+            "dump of the rebuilt generation failed: {}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+        let dump2 = std::fs::read_to_string(&dump2_path).unwrap();
+        assert!(
+            dump2.contains(
+                "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020;"
+            ),
+            "re-dump of the real-built generation lost the KNOWS edge or its r.since property \
+             (forward edge_id_base / edge_props): {dump2}"
+        );
+        server2.abort();
     } else {
         eprintln!("SLATER_BUILD_BIN unset — skipped the rebuild leg (dump text asserted only)");
     }
