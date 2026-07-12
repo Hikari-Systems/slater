@@ -128,6 +128,20 @@ async fn every_write_clause_over_bolt_survives_consolidation() {
         exec(&mut c, &g, "MERGE (n:Person {name:'Yan'}) ON CREATE SET n.origin = 'created' ON MATCH SET n.origin = 'matched'");
         assert_eq!(scalar(&mut c, &g, "MATCH (n:Person {name:'Yan'}) RETURN n.origin"), "str:matched");
 
+        // ── GQL INSERT spellings (lower onto the same create path) ────────────────
+        // Node INSERT == CREATE.
+        exec(&mut c, &g, "INSERT (n:Person {name: 'Gil', age: 7})");
+        assert_eq!(scalar(&mut c, &g, "MATCH (n:Person {name:'Gil'}) RETURN n.age"), "int:7");
+        // With the optional GQL dialect prefix (stripped before parsing).
+        exec(&mut c, &g, "GQL INSERT (n:Person {name: 'Hana', age: 8})");
+        assert_eq!(scalar(&mut c, &g, "MATCH (n:Person {name:'Hana'}) RETURN n.age"), "int:8");
+        // Edge INSERT == the edge_merge create-if-absent path.
+        exec(&mut c, &g, "INSERT (a:Person {name:'Gil'})-[:KNOWS]->(b:Person {name:'Hana'})");
+        assert_eq!(
+            scalar(&mut c, &g, "MATCH (a:Person {name:'Gil'})-[:KNOWS]->(b) RETURN count(b)"),
+            "int:1"
+        );
+
         // ── DELETE conformance ────────────────────────────────────────────────────
         // Alice still has her :KNOWS edge → a plain DELETE is rejected.
         assert!(

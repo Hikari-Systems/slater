@@ -3,7 +3,7 @@
 [![CI](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml/badge.svg)](https://github.com/Hikari-Systems/slater/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Hikari-Systems/slater?sort=semver)](https://github.com/Hikari-Systems/slater/releases/latest)
 
-> **In one line:** Slater serves a graph database the way SQLite serves a relational one — you bake the data into an immutable file, ship it anywhere, and serve it with **memory cost that's flat no matter how big the graph gets**. It is a **mostly-reads-some-writes** engine: reads are the design centre, and writes are layered on top without taxing them.
+> **In one line:** Slater serves **graphs that don't fit in memory** — 91.6M nodes / 1.5B edges at a few hundred MB of RAM — over standard **Bolt**, so any neo4j driver just works, with disk-native vector search sitting next to the graph, and it takes **live, durable writes** without giving that up. Resident memory is set by a cache budget you choose, **not** by the size of the graph.
 
 ---
 
@@ -11,30 +11,34 @@
 
 |  |  |  |  |
 |:--|:--|:--|:--|
-| [Why Slater exists](#why-slater-exists) | [Mostly reads, some writes](#mostly-reads-some-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
-| [How it works](#how-it-works) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
+| [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
+| [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
 | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
 | [Performance](#performance) | [License](#license) |
 ## Why Slater exists
 
 A **graph database** stores data as *things* (nodes) and the *relationships between them* (edges), with the relationships as first-class citizens. That's what you want when your questions are about connections rather than rows — "who's within three hops of this account?", "what's the full dependency chain behind this build?", "which accounts share a device, an address, and a card?" — the queries that become a swamp of recursive joins in SQL but fall out naturally in a graph.
 
-The catch with most graph databases (neo4j, Memgraph, FalkorDB) is that they're built to *write* as much as read: transactional, clustered, and holding the whole graph resident in RAM. A 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill.
+**The most common complaint about graph databases is that they don't scale past what you can hold in RAM.** Most of them (neo4j, Memgraph, FalkorDB) keep the whole graph resident: a 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill. And past a certain size they simply won't load: the 91.6M-node / 1.5B-edge Wikidata graph needs ~64–128&nbsp;GiB resident, so the in-memory engines can't open it at all.
 
-Slater is built for the other half of the problem: graphs that are **mostly read, with a trickle of writes** — knowledge graphs for RAG, recommendation and identity graphs, dependency graphs. You build the graph once, offline, into an immutable on-disk image; then any number of Slater servers serve it over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve.**
+Slater is the rebuttal. It serves that same 91.6M-node graph from **a few hundred MB of RAM**, because it pages the graph from an on-disk image on demand instead of holding it resident — so the graph size and the memory bill are decoupled.
 
-### Mostly reads, some writes
+Slater takes the opposite approach. You compile the graph once, offline, into a content-addressed on-disk image with `slater-build`; then any number of Slater servers serve it over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve** — you fan out cheap, stateless read replicas and let the store, not the heap, hold the graph.
 
-Batch-rebuilding a whole graph to correct one property, add one node, or retract one edge is a blunt instrument. So Slater takes writes too — but it refuses to pay for them on the read path.
+That makes it a natural fit for knowledge graphs behind RAG, recommendation and identity graphs, dependency graphs — anything large and connected you want to query cheaply and often. Disk-native vector search lives right next to the graph, so the same engine is the retrieval layer for embeddings too.
 
-Writes land in a **log-structured merge (LSM) layer over the immutable core**: a write-ahead log and an in-memory table, spilling to immutable delta segments, folded back into a fresh core by a periodic **consolidation**. The asymmetry is deliberate:
+### Reads and writes
 
-- **Reads over an unwritten graph cost exactly what they did before.** An empty delta is a single predictable branch, not a merge — the read-only path is byte-identical.
-- **The read tax scales with the size of the delta, not the size of the graph.** Whole-graph answers — `count(*)`, the label and relationship-type marginals — stay *metadata reads* even with writes outstanding: the delta keeps its own counters, so a `count(*)` over a 91.6M-node core with half a million pending writes still answers in tens of milliseconds without touching a single block.
-- **Writes are durable, not fast.** A single writer drains the queue; `SUCCESS` is returned only after the `fsync` that covers the write, so *acknowledged ⇒ durable*. Batch them (a write-`UNWIND` group-commits one `fsync` per batch rather than per row) and they're cheap; issue them one at a time and you'll feel every `fsync`. That's the intended trade.
-- **The write grammar is small on purpose.** Business-key `MERGE` / `MATCH … SET` / `DELETE` over nodes and relationships — enough to correct, insert and retract. It is not general Cypher write semantics, and it isn't trying to be.
+Slater is a **read-write** graph database. You don't rebuild the whole image to correct one property, add a node, or retract an edge — you write the change directly, over Bolt, and it lands durably. The trick is that writes never tax the read path.
 
-The writable layer is **off by default** (`delta.enabled`). Leave it off and Slater is exactly the read-only engine it always was.
+Writes accumulate in a **log-structured-merge (LSM) layer over the immutable core**: a write-ahead log and an in-memory table, spilling to immutable delta segments, folded back into a fresh core by a periodic **consolidation**. What that buys you:
+
+- **Reads over an unwritten graph cost exactly what they did before.** An empty delta is a single predictable branch, not a merge — the read path is byte-identical whether or not the writable layer is on.
+- **The read cost of a write scales with the size of the delta, not the size of the graph.** Whole-graph answers — `count(*)`, the label and relationship-type marginals — stay *metadata reads* even with writes outstanding: the delta keeps its own counters, so a `count(*)` over a 91.6M-node core with half a million pending writes still answers in tens of milliseconds without touching a single block.
+- **Acknowledged means durable.** A single writer drains the queue and returns `SUCCESS` only after the `fsync` that covers the write. Group your writes and they're cheap — a write-`UNWIND` commits one `fsync` per batch rather than per row.
+- **Business-key writes, in either dialect.** `MERGE` / `MATCH … SET` / `DELETE` (and `CREATE` / `REMOVE`, detach delete, relationship writes) keyed on a node's identity property — or the equivalent ISO GQL data-modifying statements (`INSERT` / `SET` / `REMOVE` / `DELETE`), which lower onto the same path. Correct, insert, upsert and retract, over nodes and edges, addressed the way your data already is.
+
+The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the pure immutable core and refuses writes. See [The writable layer](#the-writable-layer) for the full model.
 
 > **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
 > who insists on going by a single name — "Just… Slater" — and one of my favourite
@@ -43,14 +47,12 @@ The writable layer is **off by default** (`delta.enabled`). Leave it off and Sla
 
 ### What you get
 
-- **RAM set by your cache budget, not your graph size** — fan out as many read replicas as you like.
-- **A drop-in for the read path** — speaks Bolt, so any standard neo4j driver (JS, Python, Go…) works unchanged. It's the read subset of Cypher; nothing new to learn.
+- **RAM set by your cache budget, not your graph size** — fan out as many read replicas as you like; the graph never has to fit in memory.
+- **A drop-in for the graph** — speaks Bolt, so any standard neo4j driver (JS, Python, Go…) works unchanged. It's Cypher (plus a slice of ISO GQL, reads and writes); nothing new to learn.
+- **Live, durable writes** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE` over nodes and edges, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
-- **Durable writes when you need them** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE`, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Vector search built in** — disk-native approximate-nearest-neighbour (cosine KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline.
-- **Locked down by design** — writes off by default, optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, read-only container rootfs.
-
-**When *not* to use it:** if writes are the main event — high-throughput transactional mutation, multi-statement transactions with rollback, or full Cypher write semantics — Slater isn't your engine. It takes writes so you don't have to rebuild a graph to change one node, not so you can run an OLTP workload on it. The single writer is a durability floor, not a throughput story: read-heavy with a trickle of corrections is the shape it's built for.
+- **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas.
 
 ## Features
 
@@ -63,8 +65,9 @@ The writable layer is **off by default** (`delta.enabled`). Leave it off and Sla
 | **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
 | **Rugged under load** | The server and offline builder both compile with `#![forbid(unsafe_code)]` — the engine's only `unsafe` lives in the audited jemalloc allocator crate. The core is immutable, so reads take no locks and never wait on a writer; a single writer serialises mutations behind the write path alone. No GC pauses, no data races. One bad query can't take the server down. |
 | **Works with your neo4j tools** | Speaks Bolt 5.4 / 4.4 / 4.1 — use the standard neo4j drivers (JS, Python, Go, Java…), `cypher-shell`, or graph browsers unchanged. |
-| **Rich read-only Cypher** | A broad query surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
-| **ISO GQL support (read-only aspects)** | Speaks a read-only subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, and an optional `GQL`/`CYPHER` dialect prefix — alongside Cypher, in one engine. |
+| **Rich Cypher query surface** | A broad read surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
+| **Live, durable writes** | An opt-in single-writer LSM layer over the immutable core (`delta.enabled`): business-key `MERGE` / `SET` / `DELETE` / `CREATE` / `REMOVE` over nodes and relationships, batched write-`UNWIND` (one `fsync` per batch), and `CALL slater.consolidate()` — group-committed, `fsync`-durable, and folded back into a fresh core by consolidation. The read path is byte-identical when the delta is empty. |
+| **ISO GQL, read and write** | Speaks a subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, an optional `GQL`/`CYPHER` dialect prefix — and, with the writable layer on, GQL's data-modifying statements (`INSERT` / `SET` / `REMOVE` / `[DETACH] DELETE`) lower onto the same durable write path. Cypher and GQL, reads and writes, in one engine. |
 | **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
 | **Pluggable storage backends** | Serve the same generation format from a local filesystem, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-SSD cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
@@ -73,20 +76,21 @@ Two binaries make up the workspace:
 
 | Binary | Role |
 | --- | --- |
-| `slater` | The online, read-only Bolt server (the container ENTRYPOINT). |
-| `slater-build` | The offline writer: turns a primitive-Cypher dump into an immutable, content-hashed generation directory. |
+| `slater` | The online Bolt server (the container ENTRYPOINT): serves reads and, with `delta.enabled`, the single-writer durable write path. |
+| `slater-build` | The offline compiler: turns a primitive-Cypher dump into an immutable, content-hashed generation directory. |
 
-Slater splits writing from serving: the offline `slater-build` does all the heavy
-lifting — ingesting your data and compiling it into an immutable generation — so
-the serving process carries **none** of the write-side machinery (transaction
-logs, locks, GC, index rebalancing) on its hot path. That's what keeps reads fast
-and memory light. The serving process is therefore **read-only**, and within that
-envelope answers a broad Cypher surface — pattern matching,
-`WITH`/`UNION`/`CALL {…}` subqueries, 70+ scalar & aggregate functions, temporal &
-geospatial values, graph algorithms (`algo.*`), and disk-native vector KNN
-(`db.idx.vector.queryNodes`). To update a graph you build a new generation and
-atomically swap the `current` pointer; the running server picks the change up via
-its generation guard (see [Generation guard](#generation-guard)).
+Slater splits *bulk building* from *serving*: `slater-build` does the heavy lifting
+offline — ingesting your data and compiling it into an immutable generation — so a
+cold graph is never assembled on the serving hot path. Within the server, the read
+surface answers a broad Cypher slice — pattern matching, `WITH`/`UNION`/`CALL {…}`
+subqueries, 70+ scalar & aggregate functions, temporal & geospatial values, graph
+algorithms (`algo.*`), and disk-native vector KNN (`db.idx.vector.queryNodes`) —
+while the writable layer's delta overlay sits *below* that surface and is zero-cost
+when empty, so reads never carry the write-side machinery. You can update a graph
+two ways: write to it live over Bolt (see [The writable layer](#the-writable-layer)),
+or build a new generation offline and atomically swap the `current` pointer, which
+the running server picks up via its generation guard (see
+[Generation guard](#generation-guard)).
 
 ## Running with Docker
 
@@ -160,6 +164,56 @@ local (non-Docker) worked example.
 * Reads flow through **three bounded cache pools** — a decompressed-block LRU, a
   vector-index pool (resident PQ codes + a Vamana-block LRU), and a result LRU —
   each with its own byte budget. This is what keeps RSS flat.
+
+### The writable layer
+
+With `delta.enabled`, the immutable generation becomes the **fully-compacted bottom
+level (the "core")** of a small log-structured-merge tree, and live writes ride on
+top of it:
+
+```
+   write (Bolt)                                    read (Bolt)
+        │                                               │
+        ▼                                               ▼
+   ┌──────────────┐  flush   ┌──────────────┐    ┌──────────────────────┐
+   │ WAL + active │ ───────▶ │  L0 delta    │    │  a query pins one    │
+   │  memtable    │          │  segments    │    │  (core, delta) view  │
+   └──────────────┘          └──────┬───────┘    │  and reads the merge │
+        (fsync = ack)               │            └──────────────────────┘
+                          consolidation │  (folds core + delta → fresh core)
+                                        ▼
+                                 ┌─────────────┐
+                                 │  new core   │  (atomic `current` swap)
+                                 └─────────────┘
+```
+
+* **Durability floor — the WAL.** Each mutation is serialised behind a single
+  writer per graph, appended to a per-graph write-ahead log, and `fsync`ed before
+  the Bolt `SUCCESS` is returned — so *acknowledged ⇒ durable*, and a torn tail is
+  dropped on replay. A batched write-`UNWIND` appends its rows and commits **one**
+  `fsync` for the whole batch. The WAL is **local disk only** (it is not routed
+  through the storage backend), which makes a *writer* node stateful: it needs a
+  durable local volume at `delta.walDir`. Read replicas stay stateless.
+* **Memtable → L0 → consolidation.** Writes accumulate in an in-RAM memtable
+  (bounded by `delta.memtableBytes`); when it fills it flushes to an immutable L0
+  delta segment. A **consolidation** folds `{core + delta}` into a fresh core by
+  serialising the merged view back through `slater-build` and swapping `current`
+  atomically — the same content-hash guard as any published generation. Trigger it
+  by hand with `CALL slater.consolidate()`, automatically at `delta.deltaCorePercent`
+  of the core's size (optionally gated to an off-peak `delta.consolidateWindow`), or
+  let the `delta.deltaHardBytes` throttle backstop runaway growth.
+* **The overlay sits below the read surface.** The executor reads through a
+  `ReadView` that is either the bare core (delta always empty) or a merged
+  `(core, delta)` view; the engine is monomorphised over it, so an empty delta
+  compiles to a single predictable branch and the read-only path is byte-identical.
+  Whole-graph counters (`count(*)`, label/reltype marginals) are served from the
+  delta's own live counters, so they stay metadata reads even with writes pending.
+* **A query sees a stable snapshot.** It pins one `(core, delta)` tuple for its
+  whole life. There are no multi-statement transactions and no rollback — a write is
+  a durable, business-key-addressed correction, not an OLTP transaction.
+
+The exact write grammar and knobs are in the [Configuration](#environment--configuration)
+table (`delta.*`) and the [Worked example](#worked-example) below.
 
 ### Range indexes (ISAM)
 
@@ -344,14 +398,16 @@ enabled by setting `dataBackend.<s3|gcs>.diskCacheBytes > 0` and a writable
 
 ## Mounts
 
-The container runs with a **read-only root filesystem** and a non-root user
-(`appuser:1000`). Everything Slater needs is mounted read-only:
+A **read replica** runs with a **read-only root filesystem** and a non-root user
+(`appuser:1000`) — everything it needs is mounted read-only. A **writer**
+(`delta.enabled`) additionally needs one durable, writable volume for its WAL.
 
 | Path | Purpose | Notes |
 | --- | --- | --- |
-| `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | **Read-only**; produced by `slater-build`. May live on remote/network storage (e.g. NFS), so reads are not assumed to be fast local-SSD latencies. |
+| `/data` | The graph generations (`<graph>/<uuid>/…` + `current`). | **Read-only** for replicas; produced by `slater-build`. May live on remote/network storage (e.g. NFS), so reads are not assumed to be fast local-SSD latencies. |
 | `/sandbox` | Per-environment config overlay + secrets. | `/sandbox/config.json` is deep-merged over the baked-in `config.json`; also holds `acl.json`, TLS PEM material, the at-rest key file. |
-| `/tmp`, `/run` | Scratch (`tmpfs`). | Slater itself never writes to disk by default. |
+| `/tmp`, `/run` | Scratch (`tmpfs`). | A read replica never writes to disk by default. |
+| _(writer)_ `delta.walDir` | The write-ahead log + L0 delta segments, when `delta.enabled`. | **Writable**, and a **durable, real volume — never `tmpfs`** (it is the durability floor). A relative path resolves under the data dir; give a writer its own persistent volume here. |
 | _(optional)_ disk cache | The local-disk block cache, when `dataBackend.s3.diskCacheBytes` / `dataBackend.gcs.diskCacheBytes > 0`. | **Writable**, and a **real volume — not `tmpfs`**. Used by the `s3` and `gcs` backends; see [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
 ## Environment / configuration
@@ -397,6 +453,8 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `cache.blockCacheBytes` | `cache__blockCacheBytes` | 64 MiB | Decompressed block LRU budget. |
 | `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 64 MiB | Vector pool budget: resident brute-force kNN matrix (pre-normalised, no-gather scan) + resident PQ + Vamana-block LRU. kNN falls back to the block-cache gather path for any group that does not fit. |
 | `cache.resultCacheBytes` | `cache__resultCacheBytes` | 16 MiB | Result LRU budget. |
+| `cache.cacheTtlMs` | `cache__cacheTtlMs` | 1800000 (30 min) | Idle TTL: a cached entry untouched this long is reclaimed by a background sweep, freeing memory below the budgets when the working set goes quiet. `0` or negative disables the sweep. |
+| `cache.degreeColumn` | `cache__degreeColumn` | `lazy` | Residency of the dense per-node degree column (backs the degree-sum `count(endpoint)` fast path): `lazy` faults per-id chunks on touch and frees them on the idle sweep; `pinned` holds the whole column resident. |
 | `tls.cert` / `tls.key` | `tls__cert` / `tls__key` | _(empty)_ | PEM material; both set ⇒ `bolt+s`. Empty ⇒ plaintext (loopback dev). |
 | `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataBackend.fs.dir` and any attacker-writable path (server refuses to start if it resolves inside it); see `THREAT_MODEL.md` "Trust boundary". |
 | `encryption.keyEnv` | `encryption__keyEnv` | _(empty)_ | Env var holding the hex at-rest master key. |
@@ -407,7 +465,18 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | 64 | Vamana beam-search list size. |
 | `generationPollMs` | `generationPollMs` | 5000 | How often to poll each graph's `current`. |
 | `reloadStrategy` | `reloadStrategy` | `exit` | `exit` or `swap` on a generation change. |
+| `delta.enabled` | `delta__enabled` | `false` | Master switch for the writable layer. Off ⇒ every query serves the pure immutable core (no WAL opened) and write statements are refused. |
+| `delta.walDir` | `delta__walDir` | `wal` | Directory holding per-graph WAL segments (the durability floor). A relative path resolves under the data dir; one graph's segments live under `<walDir>/<graph>/`. Must be a **durable local volume — never `tmpfs`** or ephemeral instance storage. |
+| `delta.memtableBytes` | `delta__memtableBytes` | 64 MiB | Byte budget for a graph's in-RAM active memtable before it flushes to an immutable L0 delta segment (bounds resident memtable RAM). |
+| `delta.deltaCorePercent` | `delta__deltaCorePercent` | `0` (off) | Auto-consolidation threshold as a **percent of the core's entity count**: once the delta's changed-entity count reaches this fraction, a background consolidation folds it into a fresh core. A rebuild is O(core), so keep it rare (typical opt-in 5–25); `0` ⇒ only manual / scheduled consolidation. |
+| `delta.consolidateWindow` | `delta__consolidateWindow` | _(empty)_ | Off-peak cron window (server-local, hour granularity, `min hour dom mon dow`) gating the `deltaCorePercent` auto-consolidation. Empty ⇒ fire whenever due. Example: `0 1-5 * * *` = 01:00–05:59 daily. |
+| `delta.deltaHardBytes` | `delta__deltaHardBytes` | `0` (off) | Hard cap on total resident delta bytes: a write past it **throttles** (waits for a draining consolidation) — the OOM backstop. Set well above the `deltaCorePercent` working set. |
 | `cacheWarmingQuery` | `cacheWarmingQuery` | _(empty)_ | Cypher query run once at boot against every served graph, results discarded — faults the blocks needed to answer it into the block/vector cache so the first matching client query is served warm. Empty ⇒ disabled. A parse error is logged and warming is skipped; a per-graph execution error is logged and that graph skipped (the query need not be valid against every graph). Bounded by the same `query.*` limits and `query.timeoutMs` as a real query. |
+
+The writable layer carries a handful of further advanced knobs for tuning
+compaction (`delta.l0CompactionTrigger`, `delta.segmentFlushBytes`,
+`delta.maxUpperSegments`, `delta.offHeapL0`, `delta.segmentGcGraceSecs`); their
+defaults are sensible and they are documented in `docs/WRITABLE-PLAN.md`.
 
 **Resident memory** is approximately
 `blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead,
@@ -673,6 +742,51 @@ driver.close()
 
 The KNN `score` is the **cosine distance** (ascending — nearest first).
 
+### 4. Write to the graph (opt-in)
+
+Writes are off until you enable the delta layer and grant `write`. Give `myuser`
+both grants in `acl.json` — a writer needs `read` too, because resolving a business
+key to write it is itself a read:
+
+```json
+"grants": { "people": ["read", "write"] }
+```
+
+Rebuild the generation so the manifest stamps the updated ACL
+(`slater-build … --acl ./acl.json`), then start the server with the writable layer
+on and a durable WAL directory:
+
+```sh
+delta__enabled=true delta__walDir=./wal slater
+```
+
+Now correct, insert and retract over the *same* Bolt session — no rebuild:
+
+```js
+// Upsert a node by its business key, then set a property.
+await session.run(
+  "MERGE (p:Person {name: 'Dave'}) SET p.age = 33");
+
+// Batch many rows into one group-committed, fsync-durable write.
+await session.run(
+  `UNWIND $rows AS r MERGE (p:Person {name: r.name}) SET p.age = r.age`,
+  { rows: [ { name: 'Erin', age: 28 }, { name: 'Frank', age: 52 } ] });
+
+// Read it straight back — the delta overlays the immutable core.
+const r = await session.run(
+  "MATCH (p:Person {name: 'Dave'}) RETURN p.age AS age");
+console.log(r.records[0].get('age'));   // 33
+
+// Fold the accumulated delta back into a fresh immutable core (optional;
+// also runs automatically per delta.deltaCorePercent / delta.consolidateWindow).
+await session.run('CALL slater.consolidate()');
+```
+
+`SUCCESS` on a write returns only after the `fsync` that makes it durable. The
+write grammar is business-key `MERGE` / `MATCH … SET` / `DELETE` (plus `CREATE`,
+`REMOVE`, detach delete and relationship writes) — enough to correct, insert,
+upsert and retract, addressed by the identity property your data already carries.
+
 ## Development
 
 ```sh
@@ -713,12 +827,16 @@ the milestone ledger, and the decision log.
 
 ## Performance
 
-Six engines, one single-client suite, five graphs from a 62k-node toy to **Wikidata
-91.6M nodes / 766M edges**. Each engine is **measured in isolation** (every other container
-stopped — RSS and latency are its own footprint). Slater was tested with version 0.8.0; the other
-engines are the established cross-engine run (their performance is unchanged). All figures
-are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold = best in
-row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 and GCS backends trade local-read
+Up to six engines, one single-client suite, graphs from a 62k-node toy to **Wikidata
+91.6M nodes / 1.5B edges**. Each engine is **measured in isolation** (every other container
+stopped — RSS and latency are its own footprint). The **latency tables** below were
+**re-measured on Slater 0.21.0** (the writeable build): the small/medium graphs (MeSH, EU-AI-Act)
+freshly, and the 91.6M graph as a fresh **same-box, shared-anchor** slater-vs-Neo4j pass (see
+that table). The **resident-memory** figures carry forward from the earlier pass (measured via
+container cgroup; the read path is byte-identical with the writable layer idle). The other
+engines' numbers are the established cross-engine run (their versions/performance are unchanged).
+All figures are medians (ms) or peak resident memory (MiB). **Lower is better everywhere; bold =
+best in row.** slater was run on its **local-filesystem (`fs`) backend**; the S3 and GCS backends trade local-read
 latency for object-store round-trips (mitigated by the in-memory caches and the optional local-disk
 cache tier), so these figures characterise the engine, not a network-storage deployment.
 
@@ -731,7 +849,7 @@ cache tier), so these figures characterise the engine, not a network-storage dep
 | LadybugDB | embedded, columnar | manual buffer pool that must exceed the query |
 
 The three engines that **page from disk** — slater, Neo4j 5, and LadybugDB — load all five
-graphs. The **in-memory trio** (Memgraph · FalkorDB · ArcadeDB) cannot hold the 766M edge graph at
+graphs. The **in-memory trio** (Memgraph · FalkorDB · ArcadeDB) cannot hold the 1.5B edge graph at
 all (it needs ~64–128 GiB resident), and ArcadeDB's importer can't finish it either.
 
 ### Resident memory (MiB) — bounded as the graph grows ~1,500×
@@ -741,21 +859,20 @@ slater holds its graph in committed anonymous memory (own heap, Neo4j's off-heap
 a buffer pool), so its peak RSS *is* its committed footprint. slater alone serves from the
 **reclaimable OS page cache** of its on-disk store, so its figure is the anon working set; the
 store's page cache (evictable under pressure — slater keeps serving) is excluded, and shown as
-*total* in parentheses for the two wiki graphs. **Bold = lowest.**
+*total* in parentheses for the 91.6M graph. **Bold = lowest.**
 
 | graph (nodes / edges) | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
 | pole — 62k / 106k | **11** | 746 | 114 | 140 | 1,556 | 198 |
 | MeSH — 341k / 469k | **63** | 1,083 | 358 | 455 | 1,631 | 121 |
 | EU-AI-Act — 21k / 45k (+55 MiB vec) | **99** | 729 | 229 | 312 | 1,948 | 286 |
-| Wikidata — 1M / 13.8M | **33** *(295 total)* | ~2,330 | 2,716 | 1,506 | 2,247 | ~774 |
-| Wikidata — 91.6M / 766M | **584** *(4,595 total)* | ~2,900 | cannot-load | cannot-load | cannot-load | ~652 † |
+| Wikidata — 91.6M / 1.5B | **584** *(4,595 total)* | ~2,900 | cannot-load | cannot-load | cannot-load | ~652 † |
 
 slater is the **lowest at every scale** and grows ~50× while the graph grows ~1,500× — its
 footprint tracks the *query working set*, not the graph (idle ~16–71 MiB throughout). The
-in-memory trio grows ~linearly and can't load the 766M graph; Neo4j commits a ~2 GiB heap
+in-memory trio grows ~linearly and can't load the 1.5B graph; Neo4j commits a ~2 GiB heap
 regardless of query. († LadybugDB on the bounded shapes only — its hub / var-length /
-shortestPath traversals at 766M edges need its read pool raised to ≥2 GiB, vs slater's automatic
+shortestPath traversals at 1.5B edges need its read pool raised to ≥2 GiB, vs slater's automatic
 `maxIntermediate` cap.) The build-time value→count histograms add negligible resident memory —
 a few KB for a low-cardinality indexed column, and *zero* for unique-key graphs like Wikidata
 (`wikidata_id` exceeds the histogram cardinality cap, so none is stored) — so these figures are
@@ -765,53 +882,69 @@ unchanged by that feature.
 
 | shape | slater | Neo4j 5 | Memgraph | FalkorDB | ArcadeDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|--:|
-| count(*) all nodes | **0.57** | 15.0 | 23.8 | 16.4 | 82.0 | 2.2 |
-| label count | **0.58** | 4.2 | 20.7 | 1.1 | 4.4 | 4.3 |
-| indexed point lookup | 1.95 | 3.9 | **0.48** | **0.48** | 0.65 | 8.8 |
-| idx-eq count | **0.60** | 4.9 | 5.0 | 2.0 | 381 | 2.5 |
-| 1-hop (indexed anchor) | 1.32 | 5.8 | **1.21** | 4.1 | 390 | 4.9 |
-| 2-hop (unanchored) | **1.9** | 5.6 | 8.5 | 16.7 | 444 | 6.4 |
-| group-by / count(DISTINCT) | **0.50** | 47–51 | 63–64 | 31–39 | 411 | 5.3 |
-| full-scan `CONTAINS` | **0.59** | 5.4 | 24.1 | 1.7 | 16.3 | 4.1 |
+| count(*) all nodes | **0.41** | 15.0 | 23.8 | 16.4 | 82.0 | 2.2 |
+| label count | **0.42** | 4.2 | 20.7 | 1.1 | 4.4 | 4.3 |
+| indexed point lookup | **0.43** | 3.9 | 0.48 | 0.48 | 0.65 | 8.8 |
+| idx-eq count | **0.42** | 4.9 | 5.0 | 2.0 | 381 | 2.5 |
+| 1-hop (indexed anchor) | 1.28 | 5.8 | **1.21** | 4.1 | 390 | 4.9 |
+| 2-hop (unanchored) | **1.40** | 5.6 | 8.5 | 16.7 | 444 | 6.4 |
+| group-by / count(DISTINCT) | **0.45** | 47–51 | 63–64 | 31–39 | 411 | 5.3 |
+| full-scan `CONTAINS` | **0.43** | 5.4 | 24.1 | 1.7 | 16.3 | 4.1 |
 
-slater owns the **metadata / index / scan** shapes (count, label, idx-eq, scan — 10–150× the
-service engines), the **unanchored multi-hop** (2-hop 1.9 ms via the relationship-type scan,
-fastest in the field), and — via a build-time value→count histogram on the indexed grouping key —
-the **whole-label group-by / count(DISTINCT)** (0.5 ms, ahead of LadybugDB's columnar 5.3 ms). The
-in-memory servers keep only **point lookups & raw 1-hop** (0.5 ms vs slater's 1–2 ms). (pole
-62k/106k looks the same: slater sole-fastest on count/scan, ~2–3 ms on hops.)
+slater owns the **metadata / index / scan** shapes (count, label, idx-eq, scan — ~0.4 ms, 10–200× the
+service engines), the **indexed point lookup** (0.43 ms, now edging the in-memory pair's 0.48 ms),
+the **unanchored multi-hop** (2-hop 1.40 ms via the relationship-type scan, fastest in the field),
+and — via a build-time value→count histogram on the indexed grouping key — the **whole-label
+group-by / count(DISTINCT)** (0.45 ms, ahead of LadybugDB's columnar 5.3 ms). The in-memory servers
+keep only **raw 1-hop** (Memgraph 1.21 ms vs slater's 1.28 ms). (pole 62k/106k looks the same:
+slater sole-fastest on count/scan ~0.4 ms, ~1.3–2.6 ms on hops.)
 
 ### Latency (median ms) — vectors (EU-AI-Act kNN, 15k × 1024-dim)
 
 | shape | slater | Neo4j 5 | Memgraph | FalkorDB | LadybugDB |
 |---|--:|--:|--:|--:|--:|
-| kNN top-10 Concept | 3.1 | 8.6 | 1.9 | **1.2** | 2.8 |
-| kNN top-10 Chunk | 2.2 | 5.7 | 1.9 | **1.5** | 3.2 |
+| kNN top-10 Concept | 2.9 | 8.6 | 1.9 | **1.2** | 2.8 |
+| kNN top-10 Chunk | 2.4 | 5.7 | 1.9 | **1.5** | 3.2 |
 
 slater answers kNN with an **exact brute-force** scan (these sets are below its 50k-vector
 ANN threshold) where the others use an approximate resident HNSW — so slater's results are
 exact (recall 1.0). A SIMD distance kernel + a resident, pre-normalised vector matrix
-(v0.9.x) took Concept from ~23 → ~3.1 ms and Chunk from ~10 → ~2.2 ms, so slater now beats
+took Concept from ~23 → ~2.9 ms and Chunk from ~10 → ~2.4 ms, so slater now beats
 Neo4j and LadybugDB and is within ~1.4× of Memgraph, trailing only FalkorDB — while exact.
 
-### Latency (median ms) — graph ≫ RAM (Wikidata 91.6M / 766M)
+### Latency (median ms) — graph ≫ RAM (Wikidata 91.6M / 1.5B)
 
-Only the disk-backed engines load it (Memgraph / FalkorDB / ArcadeDB: cannot-load).
+The in-memory engines (Memgraph / FalkorDB / ArcadeDB) **cannot load** this graph at all
+(~64–128 GiB resident). Only slater and Neo4j 5 do. This is a **fresh same-box, same-day pass
+against a shared, fixed anchor set** — every query hits the *identical* nodes on both engines,
+so the head-to-head is apples-to-apples (a common `wikidata_id` pool of moderate-degree anchors;
+see the note below on why that matters). slater is shown at both fanouts (`query.maxFanout` 1 =
+throughput default, 8 = the latency dial that overlaps cold block reads). **Bold = best in row.**
 
-| shape | slater | Neo4j 5 | LadybugDB |
+| shape | slater (fan 1) | slater (fan 8) | Neo4j 5 |
 |---|--:|--:|--:|
-| count(*) all nodes | **0.58** | ~4,000 | 34 |
-| point lookup (indexed) | **1.30** | 9.7 | ~2,337 † |
-| 1-hop neighbours | **4.25** | 12.3 | 22.9 |
-| 2-hop | **17.4** ‡ | 17.4 | over-budget |
-| 3-hop | **26.7** | 74.9 | over-budget |
-| var-length `*1..2` distinct | **9.1** | 116 | over-budget |
-| shortestPath ≤6 | **52.6** (fan 8) | 131.9 | over-budget |
+| count(*) all nodes | **0.41** | 0.41 | 3606 |
+| point lookup (indexed) | 0.72 | **0.49** | 6.3 |
+| degree (1-hop count) | **0.43** | 0.44 | 6.0 |
+| 1-hop neighbours | 9.8 | **4.5** | 10.1 |
+| 2-hop | 37 | **23** | 34.5 |
+| 3-hop | 32 | **25** | 74 |
+| var-length `*1..2` distinct | 985 | 1056 | **47** |
 
-slater is **sole-fastest on every shape** at a fraction of the RAM — `count` is metadata-served
-(0.58 ms vs Neo4j's ~4 s disk scan, ≈7000×). († LadybugDB builds no secondary index → the point
-lookup is a full columnar scan; its hub/var-length shapes need its read pool raised to ≥2 GiB.
-‡ cold 2-hop is the one ~tie with Neo4j.)
+The honest picture: slater **dominates the metadata / index shapes** — `count(*)` is
+metadata-served (**0.41 ms vs Neo4j's 3.6 s** disk scan, ~8800×), and point-lookup / degree /
+3-hop run ~2–10× faster — is **even with Neo4j on 1–2-hop** (fanout 8 pulls ahead on cold reads),
+but **loses `var-length *1..2 distinct` decisively (≈1 s vs Neo4j's 47 ms)**: slater's
+variable-length distinct expansion is materially slower here, a real weakness worth its own
+investigation. All of that at a few hundred MB of RSS versus Neo4j's committed ~2 GiB heap.
+
+> **On the anchors.** These traversal numbers depend heavily on *which* nodes you start from —
+> a node one link from a Wikidata mega-hub ("human", "country") has a millions-strong 2-hop
+> neighbourhood, so var-length/hop cost swings by orders of magnitude with anchor choice. The
+> earlier edition of this table sampled each engine's *own* "first N by scan," which is neither
+> stable nor comparable; this pass fixes a single shared, degree-bounded anchor set for both
+> engines. (shortestPath is omitted from this pass — between two arbitrary anchors it is
+> path-existence-dependent and too high-variance to median meaningfully.)
 
 ### Multi-hop `count(*)` — memory decoupled from result size
 
@@ -828,7 +961,7 @@ The count holds O(1) rows. Charging is unchanged, so a mega-hub count still trip
 ### Per-query parallelism (`maxFanout`)
 
 Raising `query.maxFanout` overlaps a query's **cold, I/O-bound** block reads across cores —
-it helps large-cold-working-set disk-bound shapes and is flat on warm shapes. On the 766M
+it helps large-cold-working-set disk-bound shapes and is flat on warm shapes. On the 1.5B
 graph: shortestPath ≤6 **918 → 608 ms** (1.5×, largest search 6,269 → 2,350 ms, 2.7×);
 3-hop count **547 → 298 ms**. `maxFanout=1` is the default (throughput-oriented); `8` is the
 latency dial, at more transient worker memory.
@@ -837,13 +970,15 @@ latency dial, at more transient worker memory.
 
 | dimension | slater | best of the field | verdict |
 |---|---|---|---|
-| resident memory, any scale | 11–584 MiB (62k → 91.6M) | in-memory 1.5–2.7 GiB; can't load 766M | **slater** |
-| count / metadata / scan | ~0.6 ms | service engines 5–80 ms | **slater** (10–150×) |
-| indexed point / 1-hop | 1–2 ms | Memgraph · FalkorDB **0.5 ms** | trails the in-memory pair |
-| unanchored multi-hop (rows) | **1.9 ms** (MeSH 2-hop) | Neo4j 5.6 ms | **slater** (relationship-type scan) |
-| aggregation (group-by / DISTINCT) | **0.5 ms** | LadybugDB 5 ms (columnar) | **slater** (build-time histogram) |
-| kNN | 2–3 ms (exact) | FalkorDB **1.2 ms** (HNSW) | beats Neo4j/Ladybug; ~1.4× off Memgraph; exact |
-| traversal at 91.6M (≫ RAM) | 0.6–53 ms | Neo4j 10–4,000 ms; in-mem can't load | **slater** |
+| resident memory, any scale | 11–584 MiB (62k → 91.6M) | in-memory 1.5–2.7 GiB; can't load 1.5B | **slater** |
+| count / metadata / scan | ~0.4 ms | service engines 5–80 ms | **slater** (10–200×) |
+| indexed point lookup | **0.43 ms** (MeSH) | Memgraph · FalkorDB 0.48 ms | **slater** (edges the in-memory pair) |
+| unanchored multi-hop (rows) | **1.40 ms** (MeSH 2-hop) | Neo4j 5.6 ms | **slater** (relationship-type scan) |
+| aggregation (group-by / DISTINCT) | **0.45 ms** | LadybugDB 5 ms (columnar) | **slater** (build-time histogram) |
+| kNN | 2.4–2.9 ms (exact) | FalkorDB **1.2 ms** (HNSW) | beats Neo4j/Ladybug; ~1.4× off Memgraph; exact |
+| 91.6M metadata / point / degree / 3-hop | 0.4–32 ms | Neo4j 6–3,600 ms | **slater** (2–8800×) |
+| 91.6M 1–2-hop | 4.5–23 ms (fan 8) | Neo4j 10–35 ms | ~even |
+| 91.6M var-length `*1..2` distinct | ~1 s | Neo4j **47 ms** | **Neo4j** (a real slater weak spot) |
 | multi-hop `count(*)` at scale | 0.3–0.6 GiB | in-memory engines materialise the row set | **slater**, bounded |
 
 Full per-engine tables (pole, MeSH, EU-AI-Act + the `blockCacheBytes` RAM↔latency dial,

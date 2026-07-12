@@ -78,7 +78,11 @@ pub(crate) fn show_version() -> Rows {
 /// `SHOW DATABASES` — lists the graphs this user may read, one of which is flagged
 /// `default`/`home`. This is what populates a browser's database selector, letting
 /// the user pick a graph (which the driver then sends as the `db` field).
-pub(crate) fn show_databases(dbs: &[(String, bool)], address: &str) -> Rows {
+pub(crate) fn show_databases(
+    dbs: &[(String, bool)],
+    address: &str,
+    writable: impl Fn(&str) -> bool,
+) -> Rows {
     let columns = cols(&[
         "name",
         "type",
@@ -97,14 +101,17 @@ pub(crate) fn show_databases(dbs: &[(String, bool)], address: &str) -> Rows {
     let rows = dbs
         .iter()
         .map(|(name, is_default)| {
+            // `access` / `writer` reflect whether the writable layer is active for this
+            // graph (a per-graph delta writer exists), not a hardcoded read-only.
+            let rw = writable(name);
             vec![
                 s(name.clone()),
                 s("standard"),
                 PsValue::List(vec![]),
-                s("read-only"),
+                s(if rw { "read-write" } else { "read-only" }),
                 s(address),
                 s("primary"),
-                PsValue::Bool(false),
+                PsValue::Bool(rw),
                 s("online"),
                 s("online"),
                 s(""),

@@ -63,7 +63,8 @@ fn main() -> anyhow::Result<()> {
         port = cfg.server.port,
         data_dir = %cfg.data_dir(),
         tls = cfg.tls.enabled(),
-        "starting slater (read-only Bolt graph engine)"
+        writable = cfg.delta.enabled,
+        "starting slater (Bolt graph engine)"
     );
 
     // Build the tokio runtime ourselves (the stdlib-only subcommands above must run

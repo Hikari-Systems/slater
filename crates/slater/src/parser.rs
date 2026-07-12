@@ -23,6 +23,25 @@ use graph_format::ids::Value;
 #[grammar = "cypher.pest"]
 struct CypherParser;
 
+/// A read-grammar rejection of a write or procedure clause (`CREATE`, `MERGE`,
+/// `INSERT`, `SET`, `DELETE`, `CALL …`, …).
+///
+/// Carried as a **typed** error so callers classify it structurally with
+/// `err.downcast_ref::<WriteClauseRejected>()` rather than string-matching the
+/// message. The reason a write is refused isn't visible to the parser — the server
+/// words the client-facing failure by *why*: the writable layer being off (a
+/// read-only connection) vs an unsupported write *shape* (layer on) vs a missing ACL
+/// `write` grant — none of which a flat message can carry reliably. The `Display`
+/// text stays human-readable for the fallback path (`slater query`, logs).
+#[derive(Debug, thiserror::Error)]
+#[error("Slater is read-only; the '{clause}' clause is not permitted{location}")]
+pub struct WriteClauseRejected {
+    /// The uppercased keyword that triggered the rejection (e.g. `CREATE`, `INSERT`).
+    pub clause: String,
+    /// Message suffix naming where it was rejected (`""`, or `" in CALL {}"`).
+    pub location: &'static str,
+}
+
 /// Production-by-production conformance of `cypher.pest` against the openCypher
 /// reference grammar. Kept in its own file: it is a specification, not a unit test.
 #[cfg(test)]
@@ -687,6 +706,11 @@ pub fn parse_statement(input: &str) -> Result<ast::Statement> {
         if let Some(edge) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::edge_write) {
             return Ok(ast::Statement::WriteEdge(lower_edge_write(edge)?));
         }
+        // The GQL `INSERT` spelling lowers onto the same create AST (a node insert to
+        // `Statement::Create`, an edge insert to `Statement::WriteEdge`).
+        if let Some(insert) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::insert_stmt) {
+            return lower_insert_stmt(insert);
+        }
         if let Some(create) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::create_stmt) {
             return Ok(ast::Statement::Create(lower_create_stmt(create)?));
         }
@@ -999,21 +1023,27 @@ fn lower_create_stmt(pair: Pair<Rule>) -> Result<CreateStmt> {
         }
     }
     let node = node.expect("create_stmt always has a node pattern");
-    let var = node.var.ok_or_else(|| {
-        anyhow::anyhow!("a CREATE node must be named, e.g. CREATE (n:Label {{…}})")
-    })?;
+    node_pat_to_create(node, ret, "CREATE")
+}
+
+/// Reduce a labelled node pattern to a [`CreateStmt`]: a named, single-label node with
+/// at least one inline property (the server designates the range-indexed one as the
+/// business key), every value a literal/parameter. Shared by `CREATE (n:L {…})` and the
+/// GQL `INSERT (n:L {…})` spelling; `kw` names the surface keyword in error messages.
+fn node_pat_to_create(node: NodePat, ret: Option<ReturnClause>, kw: &str) -> Result<CreateStmt> {
+    let var = node
+        .var
+        .ok_or_else(|| anyhow::anyhow!("a {kw} node must be named, e.g. {kw} (n:Label {{…}})"))?;
     let label = node
         .label_expr
         .as_ref()
         .and_then(LabelExpr::as_single_atom)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "a CREATE node must carry exactly one label, e.g. CREATE (n:Label {{…}})"
-            )
+            anyhow::anyhow!("a {kw} node must carry exactly one label, e.g. {kw} (n:Label {{…}})")
         })?
         .clone();
     if node.props.is_empty() {
-        bail!("a CREATE node must carry at least one inline property (its business key), e.g. CREATE (n:Label {{key: value}})");
+        bail!("a {kw} node must carry at least one inline property (its business key), e.g. {kw} (n:Label {{key: value}})");
     }
     for (name, value) in &node.props {
         ensure_constant(value, &format!("the value of {var}.{name}"))?;
@@ -1024,6 +1054,78 @@ fn lower_create_stmt(pair: Pair<Rule>) -> Result<CreateStmt> {
         props: node.props,
         ret,
     })
+}
+
+/// Lower an `insert_stmt` (GQL `INSERT <pattern>`) onto the writable layer's existing
+/// create path — the "GQL spellings over existing writes" scope. A bare labelled node
+/// becomes a [`CreateStmt`] (`Statement::Create`, a delta-born node); a single
+/// business-key edge becomes an [`EdgeWriteStmt`] with [`EdgeWriteOp::Create`]
+/// (`Statement::WriteEdge`, the `edge_merge` create-if-absent path, auto-creating absent
+/// endpoints). Anything richer than these two shapes is rejected here with a clear
+/// message, the same way the rest of the write grammar bounds itself.
+fn lower_insert_stmt(pair: Pair<Rule>) -> Result<ast::Statement> {
+    let mut nodes: Vec<NodePat> = Vec::new();
+    let mut rel: Option<RelPat> = None;
+    let mut ret: Option<ReturnClause> = None;
+    for child in kids(pair) {
+        match child.as_rule() {
+            Rule::kw_insert => {}
+            Rule::node_pattern => nodes.push(lower_node_pattern(child)?),
+            Rule::rel_pattern => rel = Some(lower_rel_pattern(child)?),
+            Rule::return_clause => ret = Some(lower_return_clause(child)?),
+            Rule::EOI => {}
+            other => bail!("internal: unexpected insert_stmt child {other:?}"),
+        }
+    }
+    match rel {
+        // `INSERT (a:L {k:v})-[:R]->(b:M {j:w})` — create the edge (create-if-absent by
+        // edge identity, auto-creating absent endpoints), mirroring `edge_merge`.
+        Some(rel) => {
+            let mut it = nodes.into_iter();
+            let src = endpoint(
+                it.next().expect("insert edge always has a source node"),
+                "the source",
+            )?;
+            let dst = endpoint(
+                it.next()
+                    .expect("insert edge always has a destination node"),
+                "the destination",
+            )?;
+            if rel.dir != Direction::Outgoing {
+                bail!("an INSERT relationship must point left-to-right, e.g. INSERT (a)-[:R]->(b)");
+            }
+            if rel.var_length.is_some() {
+                bail!("an INSERT relationship cannot be variable-length");
+            }
+            if !rel.props.is_empty() {
+                bail!("relationship properties are not yet supported in an INSERT");
+            }
+            let reltype = rel
+                .type_expr
+                .as_ref()
+                .and_then(LabelExpr::as_single_atom)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "an INSERT relationship must carry exactly one type, e.g. INSERT (a)-[:R]->(b)"
+                    )
+                })?
+                .clone();
+            Ok(ast::Statement::WriteEdge(EdgeWriteStmt {
+                src,
+                reltype,
+                dst,
+                op: EdgeWriteOp::Create,
+                sets: Vec::new(),
+            }))
+        }
+        // `INSERT (n:Label {…})` — create a node unconditionally, the create_stmt path.
+        None => {
+            let node = nodes.into_iter().next().expect("insert always has a node");
+            Ok(ast::Statement::Create(node_pat_to_create(
+                node, ret, "INSERT",
+            )?))
+        }
+    }
 }
 
 /// Lower a `write_statement` into a [`WriteStmt`], enforcing the Phase 1c shape:
@@ -1395,7 +1497,11 @@ fn lower_single_query(pair: Pair<Rule>) -> Result<SingleQuery> {
                     .find(|p| p.as_rule() == Rule::forbidden_clause)
                     .map(|p| p.as_str().to_uppercase())
                     .unwrap_or_else(|| "WRITE".to_string());
-                bail!("Slater is read-only; the '{kw}' clause is not permitted");
+                return Err(WriteClauseRejected {
+                    clause: kw,
+                    location: "",
+                }
+                .into());
             }
             Rule::reading_clause => reading.push(lower_reading_clause(child)?),
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
@@ -1518,7 +1624,11 @@ fn lower_subquery_part(pair: Pair<Rule>) -> Result<(SingleQuery, bool, Imports)>
                     .find(|p| p.as_rule() == Rule::forbidden_clause)
                     .map(|p| p.as_str().to_uppercase())
                     .unwrap_or_else(|| "WRITE".to_string());
-                bail!("Slater is read-only; the '{kw}' clause is not permitted in CALL {{}}");
+                return Err(WriteClauseRejected {
+                    clause: kw,
+                    location: " in CALL {}",
+                }
+                .into());
             }
             Rule::reading_clause => reading.push(lower_reading_clause(child)?),
             Rule::return_clause => ret = Some(lower_return_clause(child)?),
@@ -3512,6 +3622,104 @@ mod tests {
                 .sets
                 .is_empty()
         );
+    }
+
+    // ── GQL write spellings (INSERT / SET / DELETE lowering onto the write path) ──
+
+    #[test]
+    fn gql_insert_node_lowers_to_a_create() {
+        // The GQL `INSERT` node spelling lowers onto the same `Statement::Create` as
+        // Cypher `CREATE` — a delta-born node with all properties inline.
+        let c = match parse_statement("INSERT (n:Person {name: 'Zoe', age: 1})").unwrap() {
+            Statement::Create(c) => c,
+            other => panic!("expected a Create, got {other:?}"),
+        };
+        assert_eq!(c.var, "n");
+        assert_eq!(c.label, "Person");
+        assert_eq!(
+            c.props,
+            vec![
+                ("name".to_string(), Expr::Literal(Value::Str("Zoe".into()))),
+                ("age".to_string(), Expr::Literal(Value::Int(1))),
+            ]
+        );
+    }
+
+    #[test]
+    fn gql_insert_edge_lowers_to_an_edge_create() {
+        // The GQL `INSERT` edge spelling lowers onto the `edge_merge` create-if-absent
+        // path (`Statement::WriteEdge` with `EdgeWriteOp::Create`).
+        let w = edge_write("INSERT (a:Person {name: 'Ann'})-[:KNOWS]->(b:Person {name: 'Bob'})");
+        assert_eq!(w.op, EdgeWriteOp::Create);
+        assert_eq!(w.reltype, "KNOWS");
+        assert_eq!(w.src.label, "Person");
+        assert_eq!(w.src.key, "name");
+        assert_eq!(w.src.key_value, Expr::Literal(Value::Str("Ann".into())));
+        assert_eq!(w.dst.key_value, Expr::Literal(Value::Str("Bob".into())));
+        assert!(w.sets.is_empty());
+    }
+
+    #[test]
+    fn gql_insert_node_requires_a_name_a_label_and_a_prop() {
+        // The bounds mirror CREATE's, phrased for the INSERT keyword.
+        assert!(write_err("INSERT (:Person {name: 'Zoe'})").contains("named"));
+        assert!(write_err("INSERT (n {name: 'Zoe'})").contains("one label"));
+        assert!(write_err("INSERT (n:Person)").contains("at least one inline property"));
+    }
+
+    #[test]
+    fn gql_insert_edge_rejects_undirected_and_var_length() {
+        assert!(
+            write_err("INSERT (a:Person {name: 'Ann'})-[:KNOWS]-(b:Person {name: 'Bob'})")
+                .contains("left-to-right")
+        );
+        assert!(write_err(
+            "INSERT (a:Person {name: 'Ann'})-[:KNOWS*1..2]->(b:Person {name: 'Bob'})"
+        )
+        .contains("variable-length"));
+    }
+
+    #[test]
+    fn gql_set_and_delete_already_flow_through_the_write_grammar() {
+        // GQL's SET / DELETE keywords are identical to Cypher's and anchor on a
+        // business-key MATCH, so they reach the existing write path unchanged — no new
+        // grammar was needed for them, only for INSERT.
+        let w = write("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10");
+        assert_eq!(w.var, "n");
+        let d = edge_write(
+            "MATCH (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) DELETE r",
+        );
+        assert_eq!(d.op, EdgeWriteOp::Delete);
+    }
+
+    #[test]
+    fn write_clause_rejection_is_a_typed_error() {
+        // Callers must classify the rejection structurally (downcast), not by message
+        // text — so the read parser returns a typed `WriteClauseRejected` carrying the
+        // offending clause. (The `Display` still reads "Slater is read-only …".)
+        for (q, kw) in [
+            ("CREATE (n:Person {name:'x'})", "CREATE"),
+            ("INSERT (n:Person {name:'x'})", "INSERT"),
+            ("MATCH (n) SET n.x = 1", "SET"),
+        ] {
+            let e = parse(q).unwrap_err();
+            let rej = e
+                .downcast_ref::<WriteClauseRejected>()
+                .unwrap_or_else(|| panic!("expected typed WriteClauseRejected for {q:?}"));
+            assert_eq!(rej.clause, kw);
+            assert!(
+                e.to_string().contains("read-only"),
+                "Display stays human-readable"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_is_rejected_as_read_only_by_the_read_parser() {
+        // With the writable layer off the server calls the read parser directly; an
+        // INSERT must land in the forbidden-clause path (rejected as read-only), exactly
+        // like CREATE / MERGE, rather than parsing as something else.
+        assert!(err("INSERT (n:Person {name: 'Zoe'})").contains("read-only"));
     }
 
     #[test]

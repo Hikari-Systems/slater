@@ -59,6 +59,12 @@ kw_delete = @{ ^"delete" ~ !ident_cont }
 kw_detach = @{ ^"detach" ~ !ident_cont }
 kw_remove = @{ ^"remove" ~ !ident_cont }
 kw_create = @{ ^"create" ~ !ident_cont }
+// GQL spells an unconditional insert as `INSERT <pattern>` (its CREATE). It lowers
+// onto the writable layer's existing create path — a node insert onto `create_stmt`
+// (delta-born node), an edge insert onto the `edge_merge` create-if-absent path — so
+// the executor needs no change; only the surface keyword differs. Like the rest of
+// GQL it appears only at statement head (a `write_statement` alternative).
+kw_insert = @{ ^"insert" ~ !ident_cont }
 kw_on = @{ ^"on" ~ !ident_cont }
 kw_call = @{ ^"call" ~ !ident_cont }
 kw_yield = @{ ^"yield" ~ !ident_cont }
@@ -116,6 +122,7 @@ union = { kw_union ~ kw_all? }
 write_statement = {
     SOI ~ (
         edge_write
+      | insert_stmt
       | create_stmt
       | (unwind_clause ~ (kw_match | kw_merge) ~ node_pattern ~ write_actions ~ return_clause?)
       | ((kw_match | kw_merge) ~ node_pattern ~ write_actions ~ return_clause?)
@@ -124,6 +131,16 @@ write_statement = {
 // `CREATE (n:Label {props})` — create a node unconditionally (Stage 7). All properties
 // are inline; the server designates the range-indexed one as the business key.
 create_stmt = { kw_create ~ node_pattern ~ return_clause? }
+
+// GQL `INSERT <pattern>` — the ISO GQL data-modifying insert, lowered onto the write
+// path Slater already has (Reading A of the GQL-writes track). Two shapes, matching
+// exactly what the write path can honour: a single labelled node (`INSERT (n:L {…})`
+// → the `create_stmt` create path) or a single business-key edge
+// (`INSERT (a:L {k:v})-[:R]->(b:M {j:w})` → the `edge_merge` create-if-absent path,
+// auto-creating absent endpoints). The optional `(rel_pattern ~ node_pattern)` tail
+// distinguishes the two at lowering; richer INSERT patterns are rejected there with a
+// clear message, the same way the write grammar bounds its other shapes.
+insert_stmt = { kw_insert ~ node_pattern ~ (rel_pattern ~ node_pattern)? ~ return_clause? }
 
 // The action(s) applied to a MATCH/MERGE-anchored node: an unconditional updating clause,
 // and/or (only for MERGE) `ON CREATE SET …` / `ON MATCH SET …` conditional blocks. At
@@ -207,7 +224,7 @@ forbidden_query = { reading_clause* ~ forbidden_clause ~ ANY* }
 // valid parse while every other procedure call is rejected as read-only. `CALL {`
 // (a subquery) is excluded by `!(inline_ws* ~ "{")` so `call_subquery` handles it.
 forbidden_clause = @{
-    (^"create" | ^"merge" | ^"set" | ^"delete" | ^"remove" | ^"detach"
+    (^"create" | ^"merge" | ^"insert" | ^"set" | ^"delete" | ^"remove" | ^"detach"
       | ^"foreach" | ^"load") ~ !ident_cont
   | ^"call" ~ !ident_cont ~ !(inline_ws* ~ "{") ~ !(inline_ws+ ~ (vector_proc | read_proc))
 }

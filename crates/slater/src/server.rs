@@ -1844,11 +1844,14 @@ impl ConnCtx {
             _ if q.starts_with("show databases") => Some(if memgraph {
                 introspect::show_databases_memgraph(&self.readable_databases(user))
             } else {
-                introspect::show_databases(&self.readable_databases(user), &self.bind_addr)
+                introspect::show_databases(&self.readable_databases(user), &self.bind_addr, |g| {
+                    self.graphs.writer(g).is_some()
+                })
             }),
             _ if q.starts_with("show default database") => Some(introspect::show_databases(
                 &self.readable_databases(user),
                 &self.bind_addr,
+                |g| self.graphs.writer(g).is_some(),
             )),
             _ if q.starts_with("show version") => Some(introspect::show_version()),
             _ if q.starts_with("show license info") => Some(introspect::show_license_info()),
@@ -2117,7 +2120,7 @@ impl Failure {
     /// Classify a parser/executor `anyhow` error into a Bolt status code.
     fn from_query_error(e: &anyhow::Error) -> Self {
         let m = e.to_string();
-        let code = if m.contains("read-only") {
+        let code = if e.downcast_ref::<parser::WriteClauseRejected>().is_some() {
             CODE_ACCESS_MODE
         } else if m.contains("syntax error") {
             CODE_SYNTAX
@@ -3195,8 +3198,22 @@ async fn handle_request(
             let writer = ctx.graphs.writer(&graph);
             let (columns, rows) = match &writer {
                 Some(w) => {
-                    let stmt = parser::parse_statement(&query)
-                        .map_err(|e| Failure::from_query_error(&e))?;
+                    let stmt = parser::parse_statement(&query).map_err(|e| {
+                        // The writable layer IS enabled for this graph, so a write-clause
+                        // rejection from the write parser means the *shape* is not one the
+                        // writable grammar supports — not that the connection is read-only.
+                        if e.downcast_ref::<parser::WriteClauseRejected>().is_some() {
+                            Failure::new(
+                                CODE_ACCESS_MODE,
+                                "unsupported write: the writable layer accepts business-key \
+                                 MERGE / SET / REMOVE / [DETACH] DELETE, CREATE / INSERT (GQL), \
+                                 and relationship writes only"
+                                    .to_string(),
+                            )
+                        } else {
+                            Failure::from_query_error(&e)
+                        }
+                    })?;
                     // A `read` grant selected the graph; mutating it needs `write` too.
                     authorize_statement(&ctx.acl.snapshot(), &user, &graph, &stmt)?;
                     match stmt {
@@ -3228,7 +3245,23 @@ async fn handle_request(
                     }
                 }
                 None => {
-                    let ast = parser::parse(&query).map_err(|e| Failure::from_query_error(&e))?;
+                    let ast = parser::parse(&query).map_err(|e| {
+                        // No writer for this graph ⇒ the writable layer is not enabled, so this
+                        // connection cannot mutate at all. Reword the write-clause rejection into a
+                        // connection-level message — distinct from an ACL write-grant denial
+                        // (reported by `authorize_statement` when the layer IS enabled) and from an
+                        // unsupported-shape rejection (the `Some` arm above).
+                        if e.downcast_ref::<parser::WriteClauseRejected>().is_some() {
+                            Failure::new(
+                                CODE_ACCESS_MODE,
+                                "this slater connection is read-only: the writable layer is not \
+                                 enabled (set delta.enabled)"
+                                    .to_string(),
+                            )
+                        } else {
+                            Failure::from_query_error(&e)
+                        }
+                    })?;
                     run_query(
                         ctx,
                         gen,

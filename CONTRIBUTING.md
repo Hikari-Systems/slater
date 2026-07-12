@@ -12,6 +12,30 @@ doing any on a project that is primarily aimed at my enjoyment and acting as an 
 If you like it and want to change it, please feel free to fork and modify (please rename it if you plan to 
 share it yourself), but mostly please don't submit pull requests. Thanks in advance for your understanding.
 
+## Error handling — typed errors, never string matching
+
+When code **branches on why an operation failed** — classifying an error to pick a
+status code, reword a message, retry, or fall back — match on a **typed error**, never
+on the text of an error message.
+
+```rust
+// NO — brittle: a message reword silently breaks the classification, and the same
+// wording can arise from unrelated causes.
+if e.to_string().contains("read-only") { /* … */ }
+
+// YES — structural: define a typed error and downcast (anyhow) or match the enum.
+#[derive(Debug, thiserror::Error)]
+#[error("Slater is read-only; the '{clause}' clause is not permitted")]
+pub struct WriteClauseRejected { pub clause: String }
+
+if e.downcast_ref::<WriteClauseRejected>().is_some() { /* … */ }
+```
+
+Message text is for humans and may change freely; behaviour must key off the type. A
+typed error also carries structured fields (here, the rejected `clause`) that callers
+would otherwise have to re-parse out of a string. `thiserror` is already a dependency;
+its `Display` can keep whatever human wording you like without becoming load-bearing.
+
 ## Formatting (local pre-commit gate)
 
 Formatting is enforced prettier/eslint-style: a pre-commit hook runs `rustfmt
