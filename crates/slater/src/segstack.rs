@@ -320,6 +320,39 @@ impl CoreStack {
             .sum()
     }
 
+    /// Net **out-degree** change for `node` summed across the stack — the segment term of
+    /// the hub probe ([`crate::exec`]). O(#segments), zero I/O: each segment's
+    /// `hub_degree_out_deltas` is a sorted sparse list, so a binary-search miss (the node's
+    /// `|Δ|` was below the build floor, or the segment predates the field) contributes 0.
+    /// A node missed this way has a bounded (`~floor × #segments`) segment degree that
+    /// materialises cheaply — only a million-edge hub matters, and any single flush that
+    /// creates one records it (its `|Δ| ≥ floor`). Zero for a singleton stack.
+    pub fn hub_out_degree_delta(&self, node: u64) -> i64 {
+        self.segments
+            .iter()
+            .map(|s| {
+                let d = &s.manifest.hub_degree_out_deltas;
+                d.binary_search_by_key(&node, |&(id, _)| id)
+                    .map(|i| d[i].1)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    /// Net **in**-degree change for `node` — the reverse-direction counterpart of
+    /// [`Self::hub_out_degree_delta`].
+    pub fn hub_in_degree_delta(&self, node: u64) -> i64 {
+        self.segments
+            .iter()
+            .map(|s| {
+                let d = &s.manifest.hub_degree_in_deltas;
+                d.binary_search_by_key(&node, |&(id, _)| id)
+                    .map(|i| d[i].1)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     /// The distinct reltype names carrying a delta anywhere in the stack — so a group-by /
     /// enumeration can surface a reltype a flush introduced that the base never had.
     pub fn segment_reltype_names(&self) -> Vec<String> {
@@ -576,6 +609,8 @@ mod tests {
             edge_count_delta: 1,
             reltype_edge_deltas: vec![("KNOWS".into(), 1)],
             label_node_deltas: vec![("Person".into(), 1)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: true,
             dirty_indexes: vec![],
             label_membership_touch: None,

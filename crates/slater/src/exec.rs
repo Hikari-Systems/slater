@@ -1683,8 +1683,12 @@ pub struct Engine<'g, V: ReadView> {
     /// Effective-degree at or above which a node's adjacency is **streamed** in bounded
     /// chunks rather than materialised whole (see [`Self::is_hub`]) — the hub cut-off that
     /// keeps a high-degree node from inflating a wide parallel gather. Defaults to
-    /// [`ADJ_STREAM_THRESHOLD`]; a later slice wires it to `query.adjStreamThreshold`.
+    /// [`ADJ_STREAM_THRESHOLD`]; the server sets it from `query.adjStreamThreshold`.
     adj_stream_threshold: u64,
+    /// Edges per chunk handed to the streaming adjacency reader (bounds a streamed hub's
+    /// live buffer). Defaults to [`ADJ_STREAM_CHUNK`]; the server sets it from
+    /// `query.adjStreamChunk`.
+    adj_stream_chunk: usize,
     /// Compiled user regexes, keyed by the final compile string. Engines live for
     /// one query, so this exists to stop `=~` recompiling its pattern per row.
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
@@ -1720,13 +1724,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
             max_shortest_path_explore: 0,
             fanout_pool: None,
             adj_stream_threshold: ADJ_STREAM_THRESHOLD,
+            adj_stream_chunk: ADJ_STREAM_CHUNK,
             regex_cache: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Override the hub-streaming degree cut-off (default [`ADJ_STREAM_THRESHOLD`]).
-    /// Used by tests to exercise the streaming route on a small fixture; a later slice
-    /// wires this to `query.adjStreamThreshold`.
+    /// Set the hub-streaming degree cut-off and chunk size (config
+    /// `query.adjStreamThreshold` / `query.adjStreamChunk`). A `chunk` of 0 is clamped to
+    /// 1 so the streamer always makes progress. Defaults are [`ADJ_STREAM_THRESHOLD`] /
+    /// [`ADJ_STREAM_CHUNK`].
+    pub fn with_adj_stream(mut self, threshold: u64, chunk: usize) -> Self {
+        self.adj_stream_threshold = threshold;
+        self.adj_stream_chunk = chunk.max(1);
+        self
+    }
+
+    /// Override just the hub-streaming degree cut-off (tests exercise the streaming route
+    /// on a small fixture by lowering it).
     #[cfg(test)]
     pub fn with_adj_stream_threshold(mut self, threshold: u64) -> Self {
         self.adj_stream_threshold = threshold;
@@ -5208,27 +5222,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     }
                 }
             };
-            // Segment-born upper bound: fence-gated fragment born counts (skipped for a
-            // singleton stack). Bounded per node; deletions in the fragment are ignored.
-            let mut seg = 0u64;
+            // Segment-born upper bound: the O(#segments), zero-I/O per-segment hub-degree
+            // delta fold (Component 2). `max(0, Δ)` — a net-negative segment contribution
+            // (more removed than born) is treated as 0, so the bound never deflates below
+            // the core term. Zero for a singleton stack.
             let stack = gen.core_stack();
-            if !stack.is_singleton() {
-                for s in stack.segments() {
-                    let r = &s.reader;
-                    let frag = if outgoing {
-                        if !r.may_hold_out_adj(node) {
-                            continue;
-                        }
-                        r.out_adj(node)?
-                    } else {
-                        if !r.may_hold_in_adj(node) {
-                            continue;
-                        }
-                        r.in_adj(node)?
-                    };
-                    seg += frag.iter().filter(|e| !e.removed).count() as u64;
-                }
-            }
+            let seg_delta = if outgoing {
+                stack.hub_out_degree_delta(node)
+            } else {
+                stack.hub_in_degree_delta(node)
+            };
+            let seg = seg_delta.max(0) as u64;
             // Delta-born (bounded by the byte-capped delta): count live born edges.
             let delta = gen.delta();
             let dlt = if delta.is_empty() {
@@ -5455,7 +5459,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         b.cur,
                         dir,
                         tf.as_ref(),
-                        ADJ_STREAM_CHUNK,
+                        self.adj_stream_chunk,
                         &mut |hops| {
                             self.charge_walk(hops.len() as u64)?;
                             for hop in hops {
@@ -5571,7 +5575,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     cur,
                     rel.dir,
                     tf.as_ref(),
-                    ADJ_STREAM_CHUNK,
+                    self.adj_stream_chunk,
                     &mut |hops| {
                         for hop in hops {
                             if !self.rel_ok(hop.edge, rel, binding)? {
@@ -9747,6 +9751,8 @@ mod tests {
             edge_count_delta: 0, // +1 born (e5), -1 removed (e4)
             reltype_edge_deltas: vec![("KNOWS".into(), 0)], // KNOWS: +e5 -e4
             label_node_deltas: vec![("Person".into(), 0)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: true,
             dirty_indexes: vec![
                 DirtyIndex {
@@ -10186,9 +10192,13 @@ mod tests {
             check(&view, &cache, 4);
             std::fs::remove_dir_all(&root).ok();
         }
-        // Segment + delta with edge-delete and node-delete: the bound stays ≥ actual.
+        // Core + delta with a born edge, an edge-delete, and a node-delete: core and delta
+        // terms are exact, so the bound stays ≥ actual. (A *segment*-born edge below the
+        // build floor is a documented, harmless under-count — the sidecar records only
+        // `|Δ| >= floor` — so it is covered separately by
+        // `segment_degree_delta_feeds_the_hub_probe`, not here.)
         {
-            let (root, graph, _) = write_basic_with_segment("ub_seg_delta");
+            let (root, graph, _) = testgen::write_basic("ub_delta");
             let gen = Generation::open(&root, &graph).unwrap();
             let cache = BlockCache::new(1 << 20);
             let mut mem = Memtable::new();
@@ -10220,7 +10230,7 @@ mod tests {
             mem.delete_node("Company", "name", Value::Str("Globex".into()), Some(4));
             let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
             assert!(view.delta().is_tombstoned(4));
-            check(&view, &cache, 6);
+            check(&view, &cache, 4);
             std::fs::remove_dir_all(&root).ok();
         }
     }
@@ -10299,6 +10309,84 @@ mod tests {
             engine.effective_degree_ub(2, Direction::Incoming).unwrap(),
             2
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Slice 4: a flush that borns many edges from one node records that node's out-degree
+    /// delta in the segment manifest (`|Δ| >= floor`), the `CoreStack` fold sums it, and
+    /// `effective_degree_ub` adds it to the core term — the O(#segments) segment path of the
+    /// hub probe, end to end (write → flush → segment manifest → fold → probe).
+    #[test]
+    fn segment_degree_delta_feeds_the_hub_probe() {
+        use crate::cache::VectorIndexCache;
+        use crate::config::DeltaConfig;
+        use crate::read_view::MergedView;
+        use crate::server::{execute_edge_write, Graphs};
+        use std::collections::HashMap;
+
+        let floor = graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR as u64;
+        let born = floor + 6; // 1030 born out-edges from Alice ⇒ Δ = 1030 >= floor
+        let (root, graph, _) = testgen::write_basic("seg_degree_delta");
+        let wal = root.join("_wal");
+        let cfg = DeltaConfig {
+            enabled: true,
+            wal_dir: wal.to_string_lossy().into_owned(),
+            memtable_bytes: 256 << 20,
+            l0_compaction_trigger: 0,
+            segment_flush_bytes: 0,
+            max_upper_segments: 0,
+            delta_core_percent: 0,
+            delta_hard_bytes: 0,
+            consolidate_window: String::new(),
+            builder_bin: "slater-build".to_string(),
+            off_heap_l0: false,
+            segment_gc_grace_secs: 0,
+        };
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.enable_writable_layer(&cfg, &root, None).unwrap();
+        {
+            let gen = graphs.get(&graph).unwrap();
+            let writer = graphs.writer(&graph).unwrap();
+            for k in 0..born {
+                let q = format!(
+                    "MERGE (a:Person {{name:'Alice'}})-[:KNOWS]->(c:Person {{name:'hubleaf{k}'}})"
+                );
+                match parser::parse_statement(&q).unwrap() {
+                    parser::ast::Statement::WriteEdge(w) => {
+                        execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                    }
+                    other => panic!("expected an edge write, got {other:?}"),
+                }
+            }
+        }
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes to a segment");
+
+        let gen = graphs.get(&graph).unwrap();
+        assert_eq!(gen.stack().segments().len(), 1);
+        // The segment manifest records Alice (node 0) with the exact out-degree delta.
+        let out_deltas = &gen.stack().segments()[0].manifest.hub_degree_out_deltas;
+        assert_eq!(
+            out_deltas.iter().find(|(id, _)| *id == 0).map(|(_, d)| *d),
+            Some(born as i64),
+            "segment out-degree delta for Alice: {out_deltas:?}"
+        );
+        // The fold sums it; the probe adds it to the (block-peek) core term (no core sidecar
+        // on this fixture): core out-degree 3 + segment Δ = 3 + born.
+        assert_eq!(gen.stack().hub_out_degree_delta(0), born as i64);
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(gen.as_ref());
+        let engine = Engine::new(&view, &cache);
+        assert_eq!(
+            engine.effective_degree_ub(0, Direction::Outgoing).unwrap(),
+            3 + born,
+        );
+        // With a low stream threshold the node is now a hub via the segment delta alone.
+        let hub_engine = Engine::new(&view, &cache).with_adj_stream_threshold(floor);
+        assert!(hub_engine.is_hub(0, Direction::Outgoing).unwrap());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -10609,6 +10697,8 @@ mod tests {
             edge_count_delta: 1,
             reltype_edge_deltas: vec![("KNOWS".into(), 1)],
             label_node_deltas: vec![("Person".into(), 1)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: true,
             dirty_indexes: vec![],
             label_membership_touch: None,
@@ -10773,6 +10863,8 @@ mod tests {
             edge_count_delta: 0,
             reltype_edge_deltas: vec![],
             label_node_deltas: vec![("N".into(), 1)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: true,
             dirty_indexes: vec![],
             label_membership_touch: None,

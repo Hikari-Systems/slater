@@ -42,7 +42,9 @@
     "maxScan": 500000000,
     "maxIntermediateGlobal": 8000000,
     "maxShortestPathExplore": 0,
-    "maxFanout": 1
+    "maxFanout": 1,
+    "adjStreamThreshold": 8192,
+    "adjStreamChunk": 8192
   },
   "vectorQuery": {
     "beamWidth": 64,

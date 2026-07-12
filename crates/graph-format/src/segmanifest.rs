@@ -91,6 +91,19 @@ pub struct SegmentManifest {
     /// Sparse per-label node-occurrence deltas (`label → Δ`). A new label is allowed.
     #[serde(default)]
     pub label_node_deltas: Vec<(String, i64)>,
+    /// Sparse per-node **out**-degree deltas (`node_id → born − removed`), listing only
+    /// nodes whose `|Δ| >=` the build hub-degree floor, ascending by id. Lets the hub
+    /// probe add a segment's degree contribution in O(1) per segment (binary search) with
+    /// no adjacency read. A node absent (its `|Δ|` was below the floor, or the manifest
+    /// predates this field) contributes 0 — safe: only a million-edge hub matters, and any
+    /// single flush that creates one records it (`|Δ| ≥ floor`); a missed node's segment
+    /// degree is bounded by `~floor × #segments` and materialises cheaply.
+    #[serde(default)]
+    pub hub_degree_out_deltas: Vec<(u64, i64)>,
+    /// Sparse per-node **in**-degree deltas — the reverse-direction counterpart of
+    /// [`Self::hub_degree_out_deltas`].
+    #[serde(default)]
+    pub hub_degree_in_deltas: Vec<(u64, i64)>,
     /// Whether the marginals are provably exact. `false` ⇒ the read path declines every
     /// count fast path for this segment and scans (the "empty ⇒ decline, never wrong"
     /// discipline). Defaults to `false` so an under-specified manifest is safe.
@@ -319,6 +332,8 @@ mod tests {
             edge_count_delta: 5,
             reltype_edge_deltas: vec![("KNOWS".into(), 3), ("IN".into(), 2)],
             label_node_deltas: vec![("Person".into(), 8), ("City".into(), 4)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: true,
             dirty_indexes: vec![DirtyIndex {
                 label: "Person".into(),

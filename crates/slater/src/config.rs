@@ -608,6 +608,16 @@ pub struct QueryConfig {
     /// cores; the effective fanout is `min(this, available cores)`.
     #[serde(default = "default_max_fanout", deserialize_with = "de::usize")]
     pub max_fanout: usize,
+    /// Effective (upper-bound) degree at or above which a node's adjacency is **streamed**
+    /// in bounded chunks instead of materialised whole, so a high-degree hub cannot inflate
+    /// a wide parallel gather (the fan-out OOM guard). Must be `>=` the build's
+    /// `hubDegreeFloor` so the sidecar holds an exact degree for every streamable node.
+    #[serde(default = "default_adj_stream_threshold", deserialize_with = "de::u64")]
+    pub adj_stream_threshold: u64,
+    /// Edges per chunk handed to the streaming adjacency reader — bounds a streamed hub's
+    /// live neighbour buffer to O(this) regardless of degree.
+    #[serde(default = "default_adj_stream_chunk", deserialize_with = "de::usize")]
+    pub adj_stream_chunk: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -739,6 +749,12 @@ fn default_max_shortest_path_explore() -> u64 {
 }
 fn default_max_fanout() -> usize {
     1 // sequential by default — opt in to per-query parallelism explicitly
+}
+fn default_adj_stream_threshold() -> u64 {
+    8192 // >= the build hubDegreeFloor (1024); above it a node streams
+}
+fn default_adj_stream_chunk() -> usize {
+    8192 // edges per streamed chunk
 }
 fn default_beam_width() -> u32 {
     64
@@ -925,6 +941,8 @@ impl Default for QueryConfig {
             max_intermediate_global: default_max_intermediate_global(),
             max_shortest_path_explore: default_max_shortest_path_explore(),
             max_fanout: default_max_fanout(),
+            adj_stream_threshold: default_adj_stream_threshold(),
+            adj_stream_chunk: default_adj_stream_chunk(),
         }
     }
 }

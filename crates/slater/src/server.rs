@@ -1505,6 +1505,11 @@ struct ConnCtx {
     /// Per-query `shortestPath()` BFS discovery cap (`query.maxShortestPathExplore`);
     /// 0 = unlimited.
     max_shortest_path_explore: u64,
+    /// Effective-degree at/above which a node's adjacency is streamed rather than
+    /// materialised (`query.adjStreamThreshold`), and the edges-per-chunk of that stream
+    /// (`query.adjStreamChunk`). Applied to every per-query engine — the fan-out hub guard.
+    adj_stream_threshold: u64,
+    adj_stream_chunk: usize,
     /// Shared worker pool for per-query parallelism (shortestPath frontier expansion,
     /// multi-hop expansion, brute-force kNN, anchor scans, …), sized to
     /// `query.maxFanout`. `None` when the fanout is ≤ 1 (sequential). Built once per
@@ -2445,6 +2450,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             cfg.query.max_intermediate_global,
         )),
         max_shortest_path_explore: cfg.query.max_shortest_path_explore,
+        adj_stream_threshold: cfg.query.adj_stream_threshold,
+        adj_stream_chunk: cfg.query.adj_stream_chunk,
         fanout_pool: build_fanout_pool(cfg.query.max_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
@@ -2569,6 +2576,8 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
     let max_scan = ctx.max_scan;
     let intermediate_budget = ctx.intermediate_budget.clone();
     let max_shortest_path_explore = ctx.max_shortest_path_explore;
+    let adj_stream_threshold = ctx.adj_stream_threshold;
+    let adj_stream_chunk = ctx.adj_stream_chunk;
     let fanout_pool = ctx.fanout_pool.clone();
     let timeout_ms = ctx.timeout_ms;
 
@@ -2584,6 +2593,7 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
                 .with_max_scan(max_scan)
                 .with_global_budget(intermediate_budget.as_ref())
                 .with_max_shortest_path_explore(max_shortest_path_explore)
+                .with_adj_stream(adj_stream_threshold, adj_stream_chunk)
                 .with_fanout_pool(fanout_pool.clone());
             if timeout_ms > 0 {
                 engine = engine.with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
@@ -4722,6 +4732,8 @@ async fn run_query(
     let max_scan = ctx.max_scan;
     let intermediate_budget = ctx.intermediate_budget.clone();
     let max_shortest_path_explore = ctx.max_shortest_path_explore;
+    let adj_stream_threshold = ctx.adj_stream_threshold;
+    let adj_stream_chunk = ctx.adj_stream_chunk;
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
     let graph_name = gen.graph().to_string();
@@ -4770,6 +4782,7 @@ async fn run_query(
                         .with_max_scan(max_scan)
                         .with_global_budget(intermediate_budget.as_ref())
                         .with_max_shortest_path_explore(max_shortest_path_explore)
+                        .with_adj_stream(adj_stream_threshold, adj_stream_chunk)
                         .with_fanout_pool(fanout_pool.clone());
                     if timeout_ms > 0 {
                         engine = engine
@@ -11991,6 +12004,8 @@ mod tests {
             max_scan: 500_000_000,
             intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
+            adj_stream_threshold: 8192,
+            adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
@@ -12155,6 +12170,8 @@ mod tests {
             max_scan: 500_000_000,
             intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
+            adj_stream_threshold: 8192,
+            adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),
@@ -12243,6 +12260,8 @@ mod tests {
             max_scan: 500_000_000,
             intermediate_budget: Arc::new(GlobalIntermediateBudget::new(8_000_000)),
             max_shortest_path_explore: 0,
+            adj_stream_threshold: 8192,
+            adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
             bind_addr: "127.0.0.1:7687".to_string(),

@@ -198,6 +198,8 @@ mod tests {
             edge_count_delta: 5,
             reltype_edge_deltas: vec![],
             label_node_deltas: vec![],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
             marginals_exact: false,
             dirty_indexes: vec![],
             label_membership_touch: None,

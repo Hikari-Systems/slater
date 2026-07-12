@@ -232,6 +232,14 @@ pub fn write_merge_segment(
     // union is a correct (conservative) touch set. One `None` (unknown) input poisons the whole
     // union to `None` — we cannot assert completeness the reader would trust to skip.
     let mut label_membership_touch: Option<BTreeSet<String>> = Some(BTreeSet::new());
+    // Per-node hub-degree deltas compose across the run the same way — sum each input's
+    // signed contribution, then re-threshold (a node whose net drops below the floor is
+    // dropped; net zero cancels). Summing already-thresholded inputs can miss a node whose
+    // per-input deltas were each sub-floor but sum over the floor — harmless: such a node
+    // has bounded (~floor × run) degree and materialises cheaply; only million-edge hubs,
+    // which any single input records, must be caught.
+    let mut hub_out: BTreeMap<u64, i64> = BTreeMap::new();
+    let mut hub_in: BTreeMap<u64, i64> = BTreeMap::new();
     for seg in inputs {
         let m = &seg.manifest;
         node_count_delta += m.node_count_delta;
@@ -241,6 +249,12 @@ pub fn write_merge_segment(
         }
         for (t, d) in &m.reltype_edge_deltas {
             *reltype_edge_deltas.entry(t.clone()).or_insert(0) += *d;
+        }
+        for (id, d) in &m.hub_degree_out_deltas {
+            *hub_out.entry(*id).or_insert(0) += *d;
+        }
+        for (id, d) in &m.hub_degree_in_deltas {
+            *hub_in.entry(*id).or_insert(0) += *d;
         }
         marginals_exact &= m.marginals_exact;
         label_membership_touch = match (label_membership_touch.take(), &m.label_membership_touch) {
@@ -253,6 +267,15 @@ pub fn write_merge_segment(
     }
     label_node_deltas.retain(|_, d| *d != 0);
     reltype_edge_deltas.retain(|_, d| *d != 0);
+    let hub_floor = graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR as i64;
+    let hub_degree_out_deltas: Vec<(u64, i64)> = hub_out
+        .into_iter()
+        .filter(|(_, d)| d.abs() >= hub_floor)
+        .collect();
+    let hub_degree_in_deltas: Vec<(u64, i64)> = hub_in
+        .into_iter()
+        .filter(|(_, d)| d.abs() >= hub_floor)
+        .collect();
 
     // ── inventory + manifest ─────────────────────────────────────────────────────────────
     let files = inventory(inp.seg_dir)?;
@@ -280,6 +303,8 @@ pub fn write_merge_segment(
         edge_count_delta,
         reltype_edge_deltas: reltype_edge_deltas.into_iter().collect(),
         label_node_deltas: label_node_deltas.into_iter().collect(),
+        hub_degree_out_deltas,
+        hub_degree_in_deltas,
         marginals_exact,
         dirty_indexes,
         label_membership_touch: label_membership_touch.map(|s| s.into_iter().collect()),

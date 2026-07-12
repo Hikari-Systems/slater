@@ -62,7 +62,7 @@
 //! no longer matches is listed in the segment's `removals` sidecar (Phase-3 obligation), so
 //! the oldest→newest `fold_index_*` retain yields newest-wins.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -580,6 +580,32 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     }
     reltype_edge_deltas.retain(|_, d| *d != 0);
 
+    // Per-node degree deltas for the hub sidecar (Component 2): a born edge adds one to its
+    // src's out-degree and its dst's in-degree; a suppressed edge subtracts one from each.
+    // Derived from the same disjoint born/suppressed sets as the edge marginals. Only nodes
+    // whose `|Δ| >=` the hub floor are recorded (sparse), ascending by id.
+    let mut out_deg_delta: HashMap<u64, i64> = HashMap::new();
+    let mut in_deg_delta: HashMap<u64, i64> = HashMap::new();
+    for (src, dst, _reltype) in live_born_edges.values() {
+        *out_deg_delta.entry(*src).or_insert(0) += 1;
+        *in_deg_delta.entry(*dst).or_insert(0) += 1;
+    }
+    for (src, dst, _reltype) in suppressed.values() {
+        *out_deg_delta.entry(*src).or_insert(0) -= 1;
+        *in_deg_delta.entry(*dst).or_insert(0) -= 1;
+    }
+    let hub_floor = graph_format::hubdegree::DEFAULT_HUB_DEGREE_FLOOR as i64;
+    let to_hub_deltas = |m: HashMap<u64, i64>| -> Vec<(u64, i64)> {
+        let mut v: Vec<(u64, i64)> = m
+            .into_iter()
+            .filter(|(_, d)| d.abs() >= hub_floor)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let hub_degree_out_deltas = to_hub_deltas(out_deg_delta);
+    let hub_degree_in_deltas = to_hub_deltas(in_deg_delta);
+
     let node_band = (synthetic_base, synthetic_base + data.born_count);
     let edge_band = (
         edge_synthetic_base,
@@ -612,6 +638,8 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         edge_count_delta,
         reltype_edge_deltas: reltype_edge_deltas.into_iter().collect(),
         label_node_deltas: label_node_deltas.into_iter().collect(),
+        hub_degree_out_deltas,
+        hub_degree_in_deltas,
         marginals_exact: true,
         dirty_indexes,
         // Authoritative and exact: the flush materialises every node row, so it knows precisely
