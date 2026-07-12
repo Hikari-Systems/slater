@@ -142,7 +142,8 @@ impl Overlay {
         // Single scan over all node buckets (global symbol ids), recording provs.
         if !probe_pairs.is_empty() {
             buckets::for_each_node_remapped(node_bkt, remaps, |prov, node| {
-                let labels = decode_labels(&node.labels_blob)?;
+                // The pass-1 `labels_blob` intermediate is always varint.
+                let labels = decode_labels(&node.labels_blob, false)?;
                 for &(lg, kg) in &probe_pairs {
                     if !labels.contains(&lg) {
                         continue;

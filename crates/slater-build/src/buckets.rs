@@ -462,7 +462,8 @@ impl ShardRemap {
 
 /// Re-encode a `node_labels.blk` blob, translating local label ids to global.
 pub fn remap_labels_blob(blob: &[u8], remap: &ShardRemap) -> Result<Blob> {
-    let ids = decode_labels(blob)?;
+    // The pass-1 `labels_blob` intermediate is always varint (the alphabet is not yet final).
+    let ids = decode_labels(blob, false)?;
     let mapped: Vec<u32> = ids.into_iter().map(|l| remap.map_label(l)).collect();
     Ok(labels_blob(&mapped))
 }

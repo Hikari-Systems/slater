@@ -815,6 +815,13 @@ impl BlockFileReader {
         *self.block_start.last().unwrap_or(&0)
     }
 
+    /// The block container codec (from the file magic) — lets a store built on this reader
+    /// derive its record encoding without a separate flag (e.g. `node_labels.blk` treats a
+    /// `Raw` container as bitmask records, a `Zstd` container as varint records).
+    pub fn codec(&self) -> BlockCodec {
+        self.codec
+    }
+
     /// Map a global record index (0-based, in append order) to its location.
     pub fn locate(&self, global: u64) -> Result<RecordLoc> {
         if global >= self.total_records() {

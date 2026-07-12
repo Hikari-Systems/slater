@@ -767,7 +767,7 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
             FileKind::NodeLabels,
             id,
         )?;
-        nodelabels::decode_labels(&rec)?
+        nodelabels::decode_labels(&rec, gen.node_labels().bitmask())?
     };
     // Label mutation overlay (Stage 5): fold out `REMOVE n:Label` drops and union in
     // `SET n:Label` additions. Labels are held by name; map through the core symbol

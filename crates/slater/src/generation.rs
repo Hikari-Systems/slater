@@ -889,8 +889,9 @@ impl Generation {
     /// footprint stays bounded and label scans pay the scan only when they run.
     pub fn collect_nodes_with_label(&self, label_id: u32) -> Result<Vec<u64>> {
         let mut ids = Vec::new();
+        let bitmask = self.node_labels.bitmask();
         self.node_labels.inner().for_each_record(|node_id, rec| {
-            if graph_format::nodelabels::decode_labels(rec)?.contains(&label_id) {
+            if graph_format::nodelabels::decode_labels(rec, bitmask)?.contains(&label_id) {
                 ids.push(node_id);
             }
             Ok(())
@@ -1010,8 +1011,9 @@ fn invert_symbols(symbols: &[String]) -> HashMap<String, u32> {
 /// ascending, so the postings stay sorted without an extra pass.
 fn build_label_counts(node_labels: &NodeLabelsReader) -> Result<HashMap<u32, u64>> {
     let mut counts: HashMap<u32, u64> = HashMap::new();
+    let bitmask = node_labels.bitmask();
     node_labels.inner().for_each_record(|_node_id, rec| {
-        for label_id in graph_format::nodelabels::decode_labels(rec)? {
+        for label_id in graph_format::nodelabels::decode_labels(rec, bitmask)? {
             *counts.entry(label_id).or_default() += 1;
         }
         Ok(())

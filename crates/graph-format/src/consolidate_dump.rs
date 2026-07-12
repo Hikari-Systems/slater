@@ -409,7 +409,11 @@ mod tests {
 
         let mut got_nodes = Vec::new();
         r.for_each_node(|id, lb, pb| {
-            got_nodes.push((id, decode_labels(lb).unwrap(), decode_props(pb).unwrap()));
+            got_nodes.push((
+                id,
+                decode_labels(lb, false).unwrap(),
+                decode_props(pb).unwrap(),
+            ));
             Ok(())
         })
         .unwrap();

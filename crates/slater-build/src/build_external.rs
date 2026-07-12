@@ -1506,11 +1506,14 @@ fn build_inner(
         opts.zstd_level,
         cipher.clone(),
     )?;
-    let mut labels_w = NodeLabelsWriter::create_with_cipher(
+    // Choose the label encoding by alphabet: a u64 bitmask (Raw container) when it fits, else
+    // varint (zstd). The alphabet is finalised by emit, so this is decided correctly here.
+    let mut labels_w = NodeLabelsWriter::create_for_alphabet(
         tmp_dir.join("node_labels.blk"),
         opts.block_size,
         opts.zstd_level,
         cipher.clone(),
+        labels.names().len(),
     )?;
 
     let emit_node_ranges =
@@ -1559,7 +1562,7 @@ fn build_inner(
         buckets::for_each_node_remapped(&node_bkt, emit_remaps, |prov, node| {
             diag.tick(prov);
             let node = fold_node(node, prov)?;
-            labels_w.append_raw(&node.labels_blob)?;
+            labels_w.append_blob(&node.labels_blob)?;
             props_w.append_raw(&node.props_blob)?;
             emit_node_ranges(&node, prov, &mut range_sorters)?;
             gather_node_vectors(&node, prov, &vec_specs, &mut pending)?;
@@ -1571,7 +1574,7 @@ fn build_inner(
             for (i, cnode) in ov.created.iter().enumerate() {
                 let final_id = base_node_count + i as u64;
                 diag.tick(final_id);
-                labels_w.append_raw(&cnode.labels_blob)?;
+                labels_w.append_blob(&cnode.labels_blob)?;
                 props_w.append_raw(&cnode.props_blob)?;
                 emit_node_ranges(cnode, final_id, &mut range_sorters)?;
                 gather_node_vectors(cnode, final_id, &vec_specs, &mut pending)?;
@@ -1617,7 +1620,7 @@ fn build_inner(
         let mut written = 0u64;
         for r in node_sorter.sorted()? {
             let ne = r?;
-            labels_w.append_raw(&ne.labels_blob)?;
+            labels_w.append_blob(&ne.labels_blob)?;
             props_w.append_raw(&ne.props_blob)?;
             written += 1;
             diag.tick(written);
@@ -2971,9 +2974,10 @@ fn compute_graph_summaries(
                             in_degrees: Vec::new(),
                         };
                         let cache = graph_format::blockcache::BlockCache::new(LABEL_CACHE_BYTES);
+                        let labels_bitmask = labels_r.bitmask();
                         let labels_of = |id: u64| -> Result<Vec<u32>> {
                             let rec = cache.record(labels_r.inner(), 0, 0, id)?;
-                            graph_format::nodelabels::decode_labels(&rec)
+                            graph_format::nodelabels::decode_labels(&rec, labels_bitmask)
                         };
                         let mut batcher = BandBatcher::new(spill_r, batch_threshold);
 
@@ -3128,7 +3132,10 @@ fn compute_graph_summaries(
                             .inner()
                             .for_each_record_in(lo, hi, |node_id, rec| {
                                 if pending.as_ref().is_some_and(|p| p.dst == node_id) {
-                                    let tgt_labs = graph_format::nodelabels::decode_labels(rec)?;
+                                    let tgt_labs = graph_format::nodelabels::decode_labels(
+                                        rec,
+                                        labels_r.bitmask(),
+                                    )?;
                                     while let Some(p) = pending.as_ref() {
                                         if p.dst != node_id {
                                             break;

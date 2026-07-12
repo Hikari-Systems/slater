@@ -552,7 +552,7 @@ mod tests {
         };
         let mut nodes = Vec::new();
         r.for_each_node(|_, lb, pb| {
-            let ls = decode_labels(lb)
+            let ls = decode_labels(lb, false)
                 .unwrap()
                 .into_iter()
                 .map(|l| labels[l as usize].clone())
