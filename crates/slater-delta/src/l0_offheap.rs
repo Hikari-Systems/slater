@@ -40,6 +40,7 @@ use anyhow::{bail, Context, Result};
 use graph_format::blockcache::BlockCache;
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::ids::Value;
+use graph_format::plane::{KeyColumn, PlaneCodecOpts};
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
 use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta};
@@ -47,7 +48,10 @@ use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 /// v2 adds the resident `tombstoned` dense-id column, so a merged live `count(*)` can
 /// enumerate this segment's suppressed rows without paging `node.blk`.
-const OFFHEAP_VERSION: u64 = 4;
+// v5: the four presence key columns (node/adj_out/adj_in/edge) moved from dense uvarint arrays
+// to compact plane records (`KeyColumn`); the secondary id lists stay `w_u64s`. ~6× smaller
+// resident key columns. Zero legacy L0 segments persist a version bump, so exact-match is safe.
+const OFFHEAP_VERSION: u64 = 5;
 
 /// Per-section cache discriminants (the `sub` in a [`BlockCache`] key). Distinct so the
 /// four sections of one segment never collide in the shared cache.
@@ -517,10 +521,10 @@ impl OffheapSegmentWriter {
         ] {
             write_uvarint(&mut body, s);
         }
-        w_u64s(&mut body, self.node_keys.iter().copied());
-        w_u64s(&mut body, self.adj_out_keys.iter().copied());
-        w_u64s(&mut body, self.adj_in_keys.iter().copied());
-        w_u64s(&mut body, self.edge_keys.iter().copied());
+        w_keycol(&mut body, &self.node_keys);
+        w_keycol(&mut body, &self.adj_out_keys);
+        w_keycol(&mut body, &self.adj_in_keys);
+        w_keycol(&mut body, &self.edge_keys);
         write_uvarint(&mut body, self.born_by_label.len() as u64);
         for (label, ids) in &self.born_by_label {
             w_str(&mut body, label);
@@ -647,6 +651,31 @@ fn r_u64s(r: &mut &[u8]) -> Result<Vec<u64>> {
     Ok(out)
 }
 
+/// Write an ascending distinct key column as a length-framed compact plane record
+/// (`uvarint(plane_len) ‖ plane_bytes`) — the `w_u64s` replacement for the four presence sets,
+/// ~6× smaller resident and on disk. Decoded once at open, so the latency-biased default opts
+/// (prefer a decompress-free codec) are right.
+fn w_keycol(buf: &mut Vec<u8>, keys: &[u64]) {
+    let rec =
+        KeyColumn::encode(keys, &PlaneCodecOpts::default()).expect("plane encode of key column");
+    write_uvarint(buf, rec.len() as u64);
+    buf.extend_from_slice(&rec);
+}
+
+/// Inverse of [`w_keycol`]. Fuzz-safe against a bogus length that overruns the buffer.
+fn r_keycol(r: &mut &[u8]) -> Result<KeyColumn> {
+    let len = read_uvarint(r)? as usize;
+    if len > r.len() {
+        bail!(
+            "L0 meta: key-column length {len} exceeds {} remaining bytes",
+            r.len()
+        );
+    }
+    let (rec, rest) = r.split_at(len);
+    *r = rest;
+    KeyColumn::decode(rec)
+}
+
 // ── reader ──────────────────────────────────────────────────────────────────────────
 
 /// An opened off-heap L0 segment: resident key columns + secondary indexes, with the
@@ -657,13 +686,13 @@ pub struct L0Reader {
     cache: Arc<BlockCache>,
 
     node_rdr: BlockFileReader,
-    node_keys: Vec<u64>,
+    node_keys: KeyColumn,
     adj_out_rdr: BlockFileReader,
-    adj_out_keys: Vec<u64>,
+    adj_out_keys: KeyColumn,
     adj_in_rdr: BlockFileReader,
-    adj_in_keys: Vec<u64>,
+    adj_in_keys: KeyColumn,
     edge_rdr: BlockFileReader,
-    edge_keys: Vec<u64>,
+    edge_keys: KeyColumn,
 
     synthetic_base: u64,
     edge_synthetic_base: u64,
@@ -737,10 +766,10 @@ impl L0Reader {
         let edge_delta_count = read_uvarint(&mut r)?;
         let born_count = read_uvarint(&mut r)?;
         let born_edge_count = read_uvarint(&mut r)?;
-        let node_keys = r_u64s(&mut r)?;
-        let adj_out_keys = r_u64s(&mut r)?;
-        let adj_in_keys = r_u64s(&mut r)?;
-        let edge_keys = r_u64s(&mut r)?;
+        let node_keys = r_keycol(&mut r)?;
+        let adj_out_keys = r_keycol(&mut r)?;
+        let adj_in_keys = r_keycol(&mut r)?;
+        let edge_keys = r_keycol(&mut r)?;
 
         let n_label = read_uvarint(&mut r)? as usize;
         let mut born_by_label = HashMap::with_capacity(n_label);
@@ -866,17 +895,20 @@ impl L0Reader {
     // ── merge accessors (resident key columns + secondary indexes) ──────────────────
     // A disk-native compaction ([`merge_run`]) enumerates the sorted union of keys from
     // these resident columns, then folds the payloads through a `DeltaSnapshot`.
-    pub fn node_dense_ids(&self) -> &[u64] {
-        &self.node_keys
+    // These materialise the compact key column for the disk-native compaction enumeration
+    // (a `Vec<u64>` the k-way `sorted_union` merges). Membership lookups elsewhere `find`
+    // directly rather than materialising.
+    pub fn node_dense_ids(&self) -> Vec<u64> {
+        self.node_keys.iter().collect()
     }
-    pub fn adj_out_nodes(&self) -> &[u64] {
-        &self.adj_out_keys
+    pub fn adj_out_nodes(&self) -> Vec<u64> {
+        self.adj_out_keys.iter().collect()
     }
-    pub fn adj_in_nodes(&self) -> &[u64] {
-        &self.adj_in_keys
+    pub fn adj_in_nodes(&self) -> Vec<u64> {
+        self.adj_in_keys.iter().collect()
     }
-    pub fn edge_ids(&self) -> &[u64] {
-        &self.edge_keys
+    pub fn edge_ids(&self) -> Vec<u64> {
+        self.edge_keys.iter().collect()
     }
     pub fn born_by_label_ref(&self) -> &HashMap<String, Vec<u64>> {
         &self.born_by_label
@@ -899,7 +931,7 @@ impl L0Reader {
     }
 
     fn node_entry(&self, dense_id: u64) -> Option<(String, String, Value, NodeDelta)> {
-        let idx = self.node_keys.binary_search(&dense_id).ok()?;
+        let idx = self.node_keys.find(dense_id)?;
         let bytes = self
             .record_bytes(&self.node_rdr, SUB_NODE, idx)
             .expect("l0 node record");
@@ -1041,7 +1073,7 @@ impl LevelRead for L0Reader {
     }
 
     fn out_edges(&self, node: u64) -> Vec<DeltaEdge> {
-        let Ok(idx) = self.adj_out_keys.binary_search(&node) else {
+        let Some(idx) = self.adj_out_keys.find(node) else {
             return Vec::new();
         };
         let bytes = self
@@ -1051,7 +1083,7 @@ impl LevelRead for L0Reader {
     }
 
     fn in_edges(&self, node: u64) -> Vec<DeltaEdge> {
-        let Ok(idx) = self.adj_in_keys.binary_search(&node) else {
+        let Some(idx) = self.adj_in_keys.find(node) else {
             return Vec::new();
         };
         let bytes = self
@@ -1061,20 +1093,20 @@ impl LevelRead for L0Reader {
     }
 
     fn edge_delta_owned(&self, edge_id: u64) -> Option<EdgeDelta> {
-        let idx = self.edge_keys.binary_search(&edge_id).ok()?;
+        let idx = self.edge_keys.find(edge_id)?;
         let bytes = self
             .record_bytes(&self.edge_rdr, SUB_EDGE, idx)
             .expect("l0 edge record");
         Some(decode_edge(&bytes).expect("decode l0 edge"))
     }
     fn node_dense_ids(&self) -> Vec<u64> {
-        self.node_keys.clone()
+        self.node_keys.iter().collect()
     }
     fn adj_out_nodes(&self) -> Vec<u64> {
-        self.adj_out_keys.clone()
+        self.adj_out_keys.iter().collect()
     }
     fn edge_ids(&self) -> Vec<u64> {
-        self.edge_keys.clone()
+        self.edge_keys.iter().collect()
     }
     fn core_patched_edges(&self) -> Vec<(u64, u64, u64, String)> {
         self.core_patched_edges.clone()
@@ -1241,8 +1273,8 @@ pub fn merge_run(
 }
 
 /// Sorted, de-duplicated union of several `u64` key columns.
-fn sorted_union<'a>(cols: impl Iterator<Item = &'a [u64]>) -> Vec<u64> {
-    let mut all: Vec<u64> = cols.flatten().copied().collect();
+fn sorted_union(cols: impl Iterator<Item = Vec<u64>>) -> Vec<u64> {
+    let mut all: Vec<u64> = cols.flatten().collect();
     all.sort_unstable();
     all.dedup();
     all

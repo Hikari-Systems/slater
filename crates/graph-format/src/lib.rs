@@ -49,6 +49,7 @@ pub mod manifest;
 pub mod membudget;
 pub mod nodedegree;
 pub mod nodelabels;
+pub mod plane;
 pub mod postings;
 pub mod pq;
 pub mod segindex;

@@ -35,7 +35,15 @@
 use anyhow::{bail, Result};
 
 use crate::codec;
+use crate::plane::{self, build_sample, low_bits, read_low, write_low};
 use crate::wire::{read_uvarint, write_uvarint};
+
+/// The degree column reuses the generic plane-codec knobs ([`crate::plane`]); these aliases keep
+/// the historical names at the call sites (`--degree-zstd-margin`, the retrofit tool) while the
+/// type and its selection semantics live in one place.
+pub use crate::plane::{
+    margin_for_profile, PlaneCodecOpts as DegreeCodecOpts, DEFAULT_ZSTD_SELECT_MARGIN,
+};
 
 /// Disk codec tag, one byte at the head of each stored record. The build picks the tag
 /// whose encoding is smallest for that chunk; the reader dispatches on it.
@@ -74,51 +82,6 @@ impl ChunkKind {
     }
 }
 
-/// One `select₁` sample per this many set bits. A lookup starts at the nearest sample and
-/// scans forward at most this many ones (~this-many/32 words at ~2 bits/element).
-const SELECT_SAMPLE: usize = 64;
-
-/// Default zstd-selection penalty (see [`DegreeCodecOpts::zstd_margin`]). Latency-biased:
-/// `zstd-dense` must be ≥ 2× smaller than the best decompress-free candidate to win.
-pub const DEFAULT_ZSTD_SELECT_MARGIN: f64 = 0.5;
-
-/// The default degree-column zstd margin for a resolved compression-profile name
-/// (`"local"`/`"remote"`/`"max"`/`"manual"`): wire-biased profiles (`remote`/`max`) let zstd
-/// win on any size gain; everything else is latency-biased. Shared by the build-CLI resolver
-/// and the retrofit tool so a retrofitted column matches a fresh build's codec mix.
-pub fn margin_for_profile(profile: &str) -> f64 {
-    match profile {
-        "remote" | "max" => 1.0,
-        _ => DEFAULT_ZSTD_SELECT_MARGIN,
-    }
-}
-
-/// Build-time codec knobs for the degree column. Deployment-dependent: a filesystem/NVMe
-/// target wants latency (prefer decompress-free EF, so a low `zstd_margin`); an object-store
-/// target wants small GETs (let zstd win more and compress harder, so a higher `zstd_margin`
-/// and `zstd_level`). Set at the CLI/build config, not baked in.
-#[derive(Clone, Copy, Debug)]
-pub struct DegreeCodecOpts {
-    /// zstd level for the `zstd-dense` candidate (the block container itself is uncompressed).
-    /// The `remote` compression profile resolves this to 19; `local` to 9.
-    pub zstd_level: i32,
-    /// `zstd-dense` wins only when its encoded size is ≤ `zstd_margin` × the smallest
-    /// *decompress-free* candidate (`ef`/`raw`). A zstd chunk pays a decompress **plus** an EF
-    /// re-encode on every (re)fault — recurring — whereas EF/`constant`/`raw` faults are
-    /// decode-light. So a low margin (< 1) makes zstd earn a large one-time disk/wire saving
-    /// (latency-biased); a margin ≥ 1 lets it win on any size tie or loss (size/wire-biased).
-    pub zstd_margin: f64,
-}
-
-impl Default for DegreeCodecOpts {
-    fn default() -> Self {
-        Self {
-            zstd_level: 3,
-            zstd_margin: DEFAULT_ZSTD_SELECT_MARGIN,
-        }
-    }
-}
-
 /// Elias–Fano encoding of a chunk's cumulative degree sequence `c[0..=n]` (`m = n+1`
 /// monotone values). Resident form: the packed low bits, the high-bits bitmap, and a
 /// sampled `select₁` index. Sizes to ~`(2 + ℓ)` bits per node.
@@ -135,28 +98,6 @@ pub struct EfChunk {
     /// `sample[s]` = bit position of the `(s·SELECT_SAMPLE)`-th one-bit. Rebuilt on decode,
     /// not serialised.
     sample: Box<[u32]>,
-}
-
-/// Position of the `k`-th set bit (0-indexed) within a single word. `k` must be `< w.count_ones()`.
-#[inline]
-fn select_in_word(mut w: u64, mut k: u32) -> usize {
-    loop {
-        let t = w.trailing_zeros();
-        if k == 0 {
-            return t as usize;
-        }
-        k -= 1;
-        w &= w - 1; // clear lowest set bit
-    }
-}
-
-/// `ℓ = ⌊log₂(total / m)⌋`, clamped to 0 (the degenerate all-small / all-zero case).
-fn low_bits(total: u64, m: u64) -> u8 {
-    if total < m || m == 0 {
-        0
-    } else {
-        (total / m).ilog2() as u8
-    }
 }
 
 impl EfChunk {
@@ -219,41 +160,13 @@ impl EfChunk {
     /// Low `ℓ` bits of cumulative element `i` (`i ∈ 0..=n`).
     #[inline]
     fn low(&self, i: usize) -> u64 {
-        if self.l == 0 {
-            return 0;
-        }
-        let bit = i * self.l as usize;
-        let byte = bit / 8;
-        let shift = bit % 8;
-        let mut buf = [0u8; 8];
-        let avail = self.lows.len().saturating_sub(byte).min(8);
-        buf[..avail].copy_from_slice(&self.lows[byte..byte + avail]);
-        let word = u64::from_le_bytes(buf);
-        (word >> shift) & ((1u64 << self.l) - 1)
+        read_low(&self.lows, self.l, i)
     }
 
     /// Position of the `i`-th one-bit (0-indexed) in the high bitmap — O(1) via the sample.
     #[inline]
     fn select1(&self, i: usize) -> usize {
-        let s = i / SELECT_SAMPLE;
-        let start = self.sample[s] as usize;
-        let ones_at_start = s * SELECT_SAMPLE;
-        if i == ones_at_start {
-            return start;
-        }
-        let mut remaining = i - ones_at_start; // additional ones to advance past `start`
-        let mut wi = (start + 1) / 64;
-        let boff = (start + 1) % 64;
-        let mut w = self.highs[wi] & (!0u64 << boff);
-        loop {
-            let c = w.count_ones() as usize;
-            if remaining <= c {
-                return wi * 64 + select_in_word(w, (remaining - 1) as u32);
-            }
-            remaining -= c;
-            wi += 1;
-            w = self.highs[wi];
-        }
+        plane::select1(&self.highs, &self.sample, i)
     }
 
     /// First set-bit position strictly after `p`. `p` is a valid one-bit position and a
@@ -472,37 +385,6 @@ impl RleChunk {
         }
         out
     }
-}
-
-/// Write `l` bits of `v` (LSB-first) at bit offset `bitoff` into `lows`. Build-time only,
-/// so a simple bit-by-bit loop is fine.
-fn write_low(lows: &mut [u8], bitoff: usize, v: u64, l: u8) {
-    for b in 0..l as usize {
-        if (v >> b) & 1 != 0 {
-            let p = bitoff + b;
-            lows[p / 8] |= 1 << (p % 8);
-        }
-    }
-}
-
-/// `sample[s]` = bit position of the `(s·SELECT_SAMPLE)`-th set bit, for the first `m` ones.
-fn build_sample(highs: &[u64], m: usize) -> Vec<u32> {
-    let mut sample = Vec::with_capacity(m / SELECT_SAMPLE + 1);
-    let mut ones = 0usize;
-    for (wi, &w) in highs.iter().enumerate() {
-        let mut ww = w;
-        while ww != 0 {
-            if ones % SELECT_SAMPLE == 0 {
-                sample.push((wi * 64 + ww.trailing_zeros() as usize) as u32);
-            }
-            ones += 1;
-            ww &= ww - 1;
-            if ones == m {
-                return sample;
-            }
-        }
-    }
-    sample
 }
 
 /// A degree chunk resident in RAM: always one of the two **compact** forms. Constructed by
@@ -753,7 +635,7 @@ mod tests {
         check_roundtrip(&[0, 5]); // leading zero
         check_roundtrip(&[5, 0, 0, 9, 0]); // interior zeros
                                            // Exactly on / around a select sample boundary.
-        let near_sample: Vec<u32> = (0..(SELECT_SAMPLE as u32 * 3 + 1))
+        let near_sample: Vec<u32> = (0..(crate::plane::SELECT_SAMPLE as u32 * 3 + 1))
             .map(|i| i % 9 + 1)
             .collect();
         check_roundtrip(&near_sample);

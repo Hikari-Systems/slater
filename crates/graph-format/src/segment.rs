@@ -56,6 +56,7 @@ use crate::blockcache::BlockCache;
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
+use crate::plane::{KeyColumn, PlaneCodecOpts};
 use crate::store::{join_key, ObjectStore};
 use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
@@ -64,7 +65,10 @@ use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
 const META_MAGIC: &[u8; 8] = b"SLSEG001";
 /// Segment section-format version. Bumped on any incompatible change to the on-disk
 /// section/meta layout; a reader refuses a version it does not understand.
-const SEGMENT_VERSION: u64 = 1;
+// v2: the four per-section key columns moved from dense uvarint arrays (`w_u64s`) to compact
+// plane records (`KeyColumn` — EF/RLE/bit-packed, chosen per column), ~6× smaller resident and
+// on disk. Zero legacy segments persist across a version bump, so exact-match refusal is safe.
+const SEGMENT_VERSION: u64 = 2;
 
 /// Per-section cache discriminants (the `sub` in a [`BlockCache`] key). Distinct so the
 /// four sections of one segment never collide in the shared cache.
@@ -254,20 +258,30 @@ fn decode_adj(mut r: &[u8]) -> Result<Vec<AdjEdge>> {
     Ok(out)
 }
 
-fn w_u64s(buf: &mut Vec<u8>, keys: &[u64]) {
-    write_uvarint(buf, keys.len() as u64);
-    for &k in keys {
-        write_uvarint(buf, k);
-    }
+/// Write one key column as a length-framed plane record: `uvarint(plane_len) ‖ plane_bytes`.
+/// The keys must be ascending distinct (every segment key column is). Encoded with the generic
+/// plane selector so a sorted-id presence set costs ~9–10 bits/entry instead of a dense u64.
+fn w_keycol(buf: &mut Vec<u8>, keys: &[u64]) {
+    // Key columns are decoded once at open and kept resident; a decompress-free codec is
+    // therefore preferred, which the default (latency-biased) opts already select for.
+    let rec =
+        KeyColumn::encode(keys, &PlaneCodecOpts::default()).expect("plane encode of key column");
+    write_uvarint(buf, rec.len() as u64);
+    buf.extend_from_slice(&rec);
 }
 
-fn r_u64s(r: &mut &[u8]) -> Result<Vec<u64>> {
-    let n = read_uvarint(r)? as usize;
-    let mut out = Vec::new(); // not pre-sized: fuzz-safe against a bogus count
-    for _ in 0..n {
-        out.push(read_uvarint(r)?);
+/// Inverse of [`w_keycol`]. Fuzz-safe: a bogus length that overruns the buffer returns `Err`.
+fn r_keycol(r: &mut &[u8]) -> Result<KeyColumn> {
+    let len = read_uvarint(r)? as usize;
+    if len > r.len() {
+        bail!(
+            "segment meta: key-column length {len} exceeds {} remaining bytes",
+            r.len()
+        );
     }
-    Ok(out)
+    let (rec, rest) = r.split_at(len);
+    *r = rest;
+    KeyColumn::decode(rec)
 }
 
 // ── public codec surface (goldens + fuzz) ──────────────────────────────────────────────
@@ -306,14 +320,14 @@ pub fn decode_adj_fragment(bytes: &[u8]) -> Result<Vec<AdjEdge>> {
 }
 
 /// The resident material a segment's `meta.bin` carries: the cache scope and the four
-/// per-section sorted key columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// per-section sorted key columns (compact planes, not dense `u64` arrays).
+#[derive(Debug, PartialEq, Eq)]
 pub struct SegmentMeta {
     pub scope: u128,
-    pub node_keys: Vec<u64>,
-    pub adj_out_keys: Vec<u64>,
-    pub adj_in_keys: Vec<u64>,
-    pub edge_keys: Vec<u64>,
+    pub node_keys: KeyColumn,
+    pub adj_out_keys: KeyColumn,
+    pub adj_in_keys: KeyColumn,
+    pub edge_keys: KeyColumn,
 }
 
 /// Parse and verify a segment `meta.bin` byte image (magic ‖ crc32c ‖ body). Never panics
@@ -337,10 +351,10 @@ pub fn decode_segment_meta(meta: &[u8]) -> Result<SegmentMeta> {
     }
     let scope = u128::from_le_bytes(r[..16].try_into().unwrap());
     r = &r[16..];
-    let node_keys = r_u64s(&mut r)?;
-    let adj_out_keys = r_u64s(&mut r)?;
-    let adj_in_keys = r_u64s(&mut r)?;
-    let edge_keys = r_u64s(&mut r)?;
+    let node_keys = r_keycol(&mut r)?;
+    let adj_out_keys = r_keycol(&mut r)?;
+    let adj_in_keys = r_keycol(&mut r)?;
+    let edge_keys = r_keycol(&mut r)?;
     if !r.is_empty() {
         bail!("segment meta: {} trailing bytes", r.len());
     }
@@ -481,10 +495,10 @@ impl SegmentWriter {
         let mut body = Vec::new();
         write_uvarint(&mut body, SEGMENT_VERSION);
         body.extend_from_slice(&self.scope.to_le_bytes());
-        w_u64s(&mut body, &self.node_keys);
-        w_u64s(&mut body, &self.adj_out_keys);
-        w_u64s(&mut body, &self.adj_in_keys);
-        w_u64s(&mut body, &self.edge_keys);
+        w_keycol(&mut body, &self.node_keys);
+        w_keycol(&mut body, &self.adj_out_keys);
+        w_keycol(&mut body, &self.adj_in_keys);
+        w_keycol(&mut body, &self.edge_keys);
         let crc = crc32c::crc32c(&body);
         let mut out = Vec::with_capacity(body.len() + 12);
         out.extend_from_slice(META_MAGIC);
@@ -503,13 +517,13 @@ pub struct SegmentReader {
     scope: u128,
     cache: Arc<BlockCache>,
     node_rdr: BlockFileReader,
-    node_keys: Vec<u64>,
+    node_keys: KeyColumn,
     adj_out_rdr: BlockFileReader,
-    adj_out_keys: Vec<u64>,
+    adj_out_keys: KeyColumn,
     adj_in_rdr: BlockFileReader,
-    adj_in_keys: Vec<u64>,
+    adj_in_keys: KeyColumn,
     edge_rdr: BlockFileReader,
-    edge_keys: Vec<u64>,
+    edge_keys: KeyColumn,
 }
 
 impl std::fmt::Debug for SegmentReader {
@@ -611,33 +625,29 @@ impl SegmentReader {
     }
 
     // ── resident key columns (the exact presence sets) ─────────────────────────────────
-    pub fn node_ids(&self) -> &[u64] {
-        &self.node_keys
+    // These lazily decode from the compact plane; callers that only test membership should use
+    // the `*_row`/`*_adj` methods (which `find` directly) rather than materialising the column.
+    pub fn node_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.node_keys.iter()
     }
-    pub fn adj_out_ids(&self) -> &[u64] {
-        &self.adj_out_keys
+    pub fn adj_out_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.adj_out_keys.iter()
     }
-    pub fn adj_in_ids(&self) -> &[u64] {
-        &self.adj_in_keys
+    pub fn adj_in_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.adj_in_keys.iter()
     }
-    pub fn edge_ids(&self) -> &[u64] {
-        &self.edge_keys
+    pub fn edge_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.edge_keys.iter()
     }
 
     // ── id-band fences (min, max) — the O(1) skip pre-filter ───────────────────────────
-    fn fence(keys: &[u64]) -> Option<(u64, u64)> {
-        match (keys.first(), keys.last()) {
-            (Some(&lo), Some(&hi)) => Some((lo, hi)),
-            _ => None,
-        }
-    }
     /// `[min, max]` node dense ids this segment carries, or `None` if it carries none.
     pub fn node_fence(&self) -> Option<(u64, u64)> {
-        Self::fence(&self.node_keys)
+        self.node_keys.fence()
     }
     /// `[min, max]` edge dense ids this segment carries, or `None`.
     pub fn edge_fence(&self) -> Option<(u64, u64)> {
-        Self::fence(&self.edge_keys)
+        self.edge_keys.fence()
     }
     /// Whether `dense` *could* be present (inside the node fence). A `false` lets a caller
     /// skip this segment with no binary search; a `true` still requires [`node_row`] to
@@ -656,11 +666,11 @@ impl SegmentReader {
     /// carries an adjacency fragment but *no* node row, so the node fence would wrongly skip
     /// it. Adjacency gating must use this fence.
     pub fn out_adj_fence(&self) -> Option<(u64, u64)> {
-        Self::fence(&self.adj_out_keys)
+        self.adj_out_keys.fence()
     }
     /// `[min, max]` node ids carrying an **incoming** adjacency fragment, or `None`.
     pub fn in_adj_fence(&self) -> Option<(u64, u64)> {
-        Self::fence(&self.adj_in_keys)
+        self.adj_in_keys.fence()
     }
     /// Whether `node` *could* carry an outgoing fragment (inside [`out_adj_fence`]). A `false`
     /// skips the segment for this node's out-adjacency with no binary search.
@@ -684,7 +694,7 @@ impl SegmentReader {
     /// The full node row for `dense`, or `None` if this segment does not carry it. A hit
     /// pages one block; a miss is a resident binary search with no I/O.
     pub fn node_row(&self, dense: u64) -> Result<Option<NodeRow>> {
-        let Ok(idx) = self.node_keys.binary_search(&dense) else {
+        let Some(idx) = self.node_keys.find(dense) else {
             return Ok(None);
         };
         let bytes = self.record_bytes(&self.node_rdr, SUB_NODE, idx)?;
@@ -693,7 +703,7 @@ impl SegmentReader {
 
     /// The full edge row for `edge_id`, or `None`.
     pub fn edge_row(&self, edge_id: u64) -> Result<Option<EdgeRow>> {
-        let Ok(idx) = self.edge_keys.binary_search(&edge_id) else {
+        let Some(idx) = self.edge_keys.find(edge_id) else {
             return Ok(None);
         };
         let bytes = self.record_bytes(&self.edge_rdr, SUB_EDGE, idx)?;
@@ -703,7 +713,7 @@ impl SegmentReader {
     /// This node's outgoing adjacency fragment (born/removed edges), or an empty vec if the
     /// segment carries no outgoing fragment for it.
     pub fn out_adj(&self, node: u64) -> Result<Vec<AdjEdge>> {
-        let Ok(idx) = self.adj_out_keys.binary_search(&node) else {
+        let Some(idx) = self.adj_out_keys.find(node) else {
             return Ok(Vec::new());
         };
         let bytes = self.record_bytes(&self.adj_out_rdr, SUB_ADJ_OUT, idx)?;
@@ -712,7 +722,7 @@ impl SegmentReader {
 
     /// This node's incoming adjacency fragment, or an empty vec.
     pub fn in_adj(&self, node: u64) -> Result<Vec<AdjEdge>> {
-        let Ok(idx) = self.adj_in_keys.binary_search(&node) else {
+        let Some(idx) = self.adj_in_keys.find(node) else {
             return Ok(Vec::new());
         };
         let bytes = self.record_bytes(&self.adj_in_rdr, SUB_ADJ_IN, idx)?;
@@ -863,8 +873,8 @@ mod tests {
         assert!(!r.may_hold_node(16));
         assert!(!r.may_hold_edge(99));
         assert!(r.may_hold_edge(100));
-        assert_eq!(r.node_ids(), &[10, 12, 15]);
-        assert_eq!(r.edge_ids(), &[100, 101]);
+        assert_eq!(r.node_ids().collect::<Vec<_>>(), vec![10, 12, 15]);
+        assert_eq!(r.edge_ids().collect::<Vec<_>>(), vec![100, 101]);
         // Adjacency fences are separate from the node fence: node 10 carries the only
         // outgoing fragment, node 15 the only incoming one.
         assert_eq!(r.out_adj_fence(), Some((10, 10)));
@@ -1062,10 +1072,10 @@ mod tests {
         let bytes = std::fs::read(dir.join("meta.bin")).unwrap();
         let m = decode_segment_meta(&bytes).unwrap();
         assert_eq!(m.scope, 0xABCD);
-        assert_eq!(m.node_keys, vec![10, 12, 15]);
-        assert_eq!(m.adj_out_keys, vec![10]);
-        assert_eq!(m.adj_in_keys, vec![15]);
-        assert_eq!(m.edge_keys, vec![100, 101]);
+        assert_eq!(m.node_keys, KeyColumn::from_keys(&[10, 12, 15]));
+        assert_eq!(m.adj_out_keys, KeyColumn::from_keys(&[10]));
+        assert_eq!(m.adj_in_keys, KeyColumn::from_keys(&[15]));
+        assert_eq!(m.edge_keys, KeyColumn::from_keys(&[100, 101]));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

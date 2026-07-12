@@ -137,7 +137,7 @@ pub fn write_merge_segment(
     // within-run born id (nothing below holds it); keep a below-run tombstone. ──────────────
     let mut node_rows: BTreeMap<u64, NodeRow> = BTreeMap::new();
     for seg in inputs {
-        for &id in seg.reader.node_ids() {
+        for id in seg.reader.node_ids() {
             if let Some(row) = seg.reader.node_row(id)? {
                 node_rows.insert(id, row); // oldest→newest: a later input overwrites
             }
@@ -151,7 +151,7 @@ pub fn write_merge_segment(
     // adjacency is suppressed by the fold below, matching pre-merge read semantics.) ────────
     let mut edge_rows: BTreeMap<u64, EdgeRow> = BTreeMap::new();
     for seg in inputs {
-        for &id in seg.reader.edge_ids() {
+        for id in seg.reader.edge_ids() {
             if let Some(row) = seg.reader.edge_row(id)? {
                 edge_rows.insert(id, row);
             }
@@ -336,12 +336,11 @@ fn fold_adjacency(
 ) -> Result<BTreeMap<u64, Vec<AdjEdge>>> {
     let mut nodes: BTreeSet<u64> = BTreeSet::new();
     for seg in inputs {
-        let keys = if outgoing {
-            seg.reader.adj_out_ids()
+        if outgoing {
+            nodes.extend(seg.reader.adj_out_ids());
         } else {
-            seg.reader.adj_in_ids()
-        };
-        nodes.extend(keys.iter().copied());
+            nodes.extend(seg.reader.adj_in_ids());
+        }
     }
 
     let mut frags: BTreeMap<u64, Vec<AdjEdge>> = BTreeMap::new();

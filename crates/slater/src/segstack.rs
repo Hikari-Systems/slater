@@ -485,7 +485,7 @@ impl CoreStack {
         }
         let mut touched: Vec<u64> = Vec::new();
         for seg in &self.segments {
-            touched.extend_from_slice(seg.reader.node_ids());
+            touched.extend(seg.reader.node_ids());
         }
         touched.sort_unstable();
         touched.dedup();
