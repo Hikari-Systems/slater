@@ -687,6 +687,14 @@ impl Generation {
             .map_or(0, |c| c.evict_expired(now, ttl))
     }
 
+    /// Dense-degree chunks currently resident (both halves), or `None` when the generation
+    /// carries no column. Diagnostic / test hook — lets a caller assert the chunk-lazy column
+    /// only materialised what it touched (e.g. that a hub answered from the sidecar faulted no
+    /// dense chunk).
+    pub fn degree_column_resident_chunks(&self) -> Option<usize> {
+        self.degree_column.as_ref().map(|c| c.resident_chunks())
+    }
+
     /// The opened Vamana/PQ index over `(label, property)`, if one exists (i.e. the
     /// index was built above the ANN threshold).
     pub fn vamana_index(&self, label: &str, property: &str) -> Option<&VamanaIndex> {

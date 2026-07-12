@@ -5308,24 +5308,29 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let gen = self.gen;
         let cg = gen.core_generation();
         let mut deg: i64 = 0;
-        // Core: exact out/in degree — the dense per-node degree column (O(1), no I/O) when
-        // present, else the hub-degree sidecar (O(1) for a listed hub), else the record's
-        // leading edge count (one cached block, no decode). 0 for a delta-born id.
+        // Core: exact out/in degree. Consult the **pinned** hub sidecar first (O(1), few MB,
+        // always resident, covers exactly the mega-hubs) so a hub's degree — which dominates
+        // count magnitude — never faults a chunk of the chunk-lazy dense column; then the dense
+        // per-node column (O(1) on a resident chunk, else one ~1 MiB chunk fault covering the
+        // next 262 K ids) for the long tail; then the record's leading edge count (one cached
+        // block, no decode) for a generation with neither. All three are the exact core degree
+        // — the sidecar and dense column agree on a listed hub — so the order is answer-neutral,
+        // only cheaper. 0 for a delta-born id.
         if node < cg.node_count() {
-            let dense = if outgoing {
-                cg.node_out_degree(node)
+            let listed = if outgoing {
+                cg.core_out_degree_if_hub(node)
             } else {
-                cg.node_in_degree(node)
+                cg.core_in_degree_if_hub(node)
             };
-            deg += match dense {
+            deg += match listed {
                 Some(d) => d as i64,
                 None => {
-                    let listed = if outgoing {
-                        cg.core_out_degree_if_hub(node)
+                    let dense = if outgoing {
+                        cg.node_out_degree(node)
                     } else {
-                        cg.core_in_degree_if_hub(node)
+                        cg.node_in_degree(node)
                     };
-                    match listed {
+                    match dense {
                         Some(d) => d as i64,
                         None => {
                             let topo = gen.topology();
@@ -10666,6 +10671,95 @@ mod tests {
             engine.effective_degree_ub(2, Direction::Incoming).unwrap(),
             2
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Slice 5: `directed_edge_count` consults the pinned hub sidecar *before* the chunk-lazy
+    /// dense column, so a mega-hub's degree is answered from the resident sidecar and faults no
+    /// dense chunk. Builds a `write_basic` fixture with BOTH `hub_degrees.blk` (floor 2 ⇒ out-hub
+    /// {0:3}) and the dense `node_degrees.blk`, then asserts: a hub lookup returns the exact
+    /// degree with zero resident chunks; a non-hub lookup (below the floor) does fault its chunk.
+    #[test]
+    fn hub_lookup_skips_dense_chunk_fault() {
+        use crate::read_view::MergedView;
+        use graph_format::integrity::{content_hash, hash_file};
+        use graph_format::manifest::{FileEntry, HubDegreeDesc, Manifest};
+
+        let (root, graph, uuid) = testgen::write_basic("hub_before_dense");
+        let gendir = root.join(&graph).join(uuid.to_string());
+        // write_basic degrees: out=[3,1,1,0,0], in=[0,1,2,1,1] over 5 nodes.
+        graph_format::hubdegree::write_hub_degrees(
+            gendir.join("hub_degrees.blk"),
+            &[(0, 3)],
+            &[(2, 2)],
+            4096,
+            3,
+            None,
+        )
+        .unwrap();
+        graph_format::nodedegree::write_node_degrees(
+            gendir.join("node_degrees.blk"),
+            &[3, 1, 1, 0, 0],
+            &[0, 1, 2, 1, 1],
+            4096,
+            3,
+            None,
+        )
+        .unwrap();
+
+        // Re-seal the plaintext manifest: add both files to the inventory, record the sidecar
+        // descriptor, and recompute the content hash.
+        let mut m = Manifest::read_from_dir(&gendir).unwrap();
+        for name in ["hub_degrees.blk", "node_degrees.blk"] {
+            let p = gendir.join(name);
+            m.files.push(FileEntry {
+                name: name.into(),
+                bytes: std::fs::metadata(&p).unwrap().len(),
+                blake3: hash_file(&p).unwrap(),
+                sha256: None,
+                crc32c: None,
+            });
+        }
+        m.files.sort_by(|a, b| a.name.cmp(&b.name));
+        let inv: Vec<(String, String)> = m
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), f.blake3.clone()))
+            .collect();
+        m.content_hash = content_hash(&inv);
+        m.hub_degrees = Some(HubDegreeDesc {
+            floor: 2,
+            out_hubs: 1,
+            in_hubs: 1,
+        });
+        m.write_to_dir(&gendir).unwrap();
+
+        let gen = Generation::open(&root, &graph).unwrap();
+        assert_eq!(gen.degree_column_resident_chunks(), Some(0), "cold at open");
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+
+        // Node 0 is an out-hub ⇒ answered by the sidecar, exact, no dense chunk faulted.
+        assert_eq!(engine.directed_edge_count(0, true).unwrap(), 3);
+        assert_eq!(
+            gen.degree_column_resident_chunks(),
+            Some(0),
+            "hub answered from the sidecar must not fault a dense chunk"
+        );
+
+        // Node 1 (out-degree 1 < floor) is not a hub ⇒ falls through to the dense column,
+        // which faults its chunk. Value is exact.
+        assert_eq!(engine.directed_edge_count(1, true).unwrap(), 1);
+        assert_eq!(
+            gen.degree_column_resident_chunks(),
+            Some(1),
+            "a non-hub lookup faults the dense chunk"
+        );
+        // Node 2 in-degree 2 is an in-hub ⇒ sidecar again, no new (in-half) chunk faulted.
+        assert_eq!(engine.directed_edge_count(2, false).unwrap(), 2);
+        assert_eq!(gen.degree_column_resident_chunks(), Some(1));
+
         std::fs::remove_dir_all(&root).ok();
     }
 
