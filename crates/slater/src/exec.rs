@@ -336,6 +336,12 @@ fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
 /// [`read_adj_overlaid`] wrapper is chunk-agnostic (it concatenates every chunk).
 const ADJ_STREAM_CHUNK: usize = 8192;
 
+/// Effective (upper-bound) degree at or above which a node is routed into the streaming
+/// reader instead of the whole-adjacency materialise — so a hub never inflates a wide
+/// parallel gather. Must be ≥ the build-side hub-degree sidecar floor so the sidecar
+/// holds an exact degree for every node a query might stream (slice 3).
+const ADJ_STREAM_THRESHOLD: u64 = 8192;
+
 /// Stream node `node`'s overlaid adjacency in one direction, invoking `emit` with
 /// `chunk`-sized `&[Adj]` slices instead of materialising the whole neighbour list.
 /// This is the **single** implementation of the core→segment→delta adjacency fold;
@@ -626,6 +632,69 @@ fn hops_par(
         }
     }
     Ok(out)
+}
+
+/// Stream node `node`'s type-filtered hops in `chunk`-sized batches, reproducing
+/// [`hops_par`]'s edge order (outgoing before incoming for an undirected hop) **without
+/// materialising the whole hop list** — the hub-node counterpart of `hops_par`, built on
+/// [`for_each_adj_overlaid`]. Like `hops_par` it applies only the type filter (the
+/// parallel walk is gated to relationship-property-free patterns); a caller that needs
+/// the relationship-property predicate (`rel_ok`) applies it per emitted hop. Routing a
+/// hub through this bounds its live buffer to `O(chunk)` hops instead of its full degree.
+fn for_each_hop_overlaid(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    node: u64,
+    dir: Direction,
+    tf: Option<&TypeFilter>,
+    chunk: usize,
+    emit: &mut dyn FnMut(&[Hop]) -> Result<()>,
+) -> Result<()> {
+    // (outgoing, incoming) sources in `hops_par` order: outgoing edges precede incoming
+    // for an undirected hop, and `incoming` flips start/end to the stored src→dst sense.
+    let dirs: &[(bool, bool)] = match dir {
+        Direction::Outgoing => &[(true, false)],
+        Direction::Incoming => &[(false, true)],
+        Direction::Undirected => &[(true, false), (false, true)],
+    };
+    let mut buf: Vec<Hop> = Vec::new();
+    for &(outgoing, incoming) in dirs {
+        for_each_adj_overlaid(gen, cache, node, outgoing, chunk, &mut |adjs| {
+            for a in adjs {
+                let keep = match tf {
+                    None => true,
+                    Some(TypeFilter::AnyOf(ids)) => ids.contains(&a.reltype),
+                    Some(TypeFilter::Expr(e)) => {
+                        e.eval(&|name| gen.reltype_id(name) == Some(a.reltype))
+                    }
+                };
+                if !keep {
+                    continue;
+                }
+                let (start, end) = if incoming {
+                    (a.neighbour.0, node)
+                } else {
+                    (node, a.neighbour.0)
+                };
+                buf.push(Hop {
+                    edge: a.edge.0,
+                    neighbour: a.neighbour.0,
+                    reltype: a.reltype,
+                    start,
+                    end,
+                });
+                if buf.len() >= chunk {
+                    emit(&buf)?;
+                    buf.clear();
+                }
+            }
+            Ok(())
+        })?;
+    }
+    if !buf.is_empty() {
+        emit(&buf)?;
+    }
+    Ok(())
 }
 
 /// Minimum frontier size below which a parallel multi-hop level's adjacency reads
@@ -1611,6 +1680,11 @@ pub struct Engine<'g, V: ReadView> {
     /// it; all mutation of the executor's interior-mutable caches stays on the calling
     /// thread, so they are never touched off-thread.
     fanout_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
+    /// Effective-degree at or above which a node's adjacency is **streamed** in bounded
+    /// chunks rather than materialised whole (see [`Self::is_hub`]) — the hub cut-off that
+    /// keeps a high-degree node from inflating a wide parallel gather. Defaults to
+    /// [`ADJ_STREAM_THRESHOLD`]; a later slice wires it to `query.adjStreamThreshold`.
+    adj_stream_threshold: u64,
     /// Compiled user regexes, keyed by the final compile string. Engines live for
     /// one query, so this exists to stop `=~` recompiling its pattern per row.
     regex_cache: RefCell<HashMap<String, regex::Regex>>,
@@ -1645,8 +1719,18 @@ impl<'g, V: ReadView> Engine<'g, V> {
             global_charged: Cell::new(0),
             max_shortest_path_explore: 0,
             fanout_pool: None,
+            adj_stream_threshold: ADJ_STREAM_THRESHOLD,
             regex_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Override the hub-streaming degree cut-off (default [`ADJ_STREAM_THRESHOLD`]).
+    /// Used by tests to exercise the streaming route on a small fixture; a later slice
+    /// wires this to `query.adjStreamThreshold`.
+    #[cfg(test)]
+    pub fn with_adj_stream_threshold(mut self, threshold: u64) -> Self {
+        self.adj_stream_threshold = threshold;
+        self
     }
 
     /// Supply the vector-index pool so `AnnMode::Vamana` indexes can be served.
@@ -5072,6 +5156,158 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 .all(|(r, _)| r.var_length.is_none() && r.props.is_empty())
     }
 
+    /// A conservative **upper bound** on node `node`'s overlaid degree in direction
+    /// `dir` — used to route a hub into the streaming reader *before* its adjacency is
+    /// materialised. It never under-counts a real hub: the core term is exact, the
+    /// segment-born and delta-born terms are added, and deletions/tombstones (which only
+    /// *reduce* degree) are ignored — so an over-estimate at worst over-streams, never
+    /// OOMs by mistaking a hub for a normal node. A tombstoned node has degree 0.
+    ///
+    /// Slice-2 temporary: the core term reads the (cached) CSR block for its leading
+    /// edge count. The build-side hub-degree sidecar (slice 3) replaces just that term
+    /// with an O(1), zero-I/O lookup; the segment/delta terms are unchanged.
+    fn effective_degree_ub(&self, node: u64, dir: Direction) -> Result<u64> {
+        let gen = self.gen;
+        if gen.delta().is_tombstoned(node) {
+            return Ok(0);
+        }
+        let one = |outgoing: bool| -> Result<u64> {
+            // Core: exact edge count from the record's leading uvarint (no full decode).
+            // A delta-born id (≥ core node count) has no core record ⇒ 0.
+            let core = if node >= gen.core_generation().node_count() {
+                0
+            } else {
+                let topo = gen.topology();
+                let global = if outgoing {
+                    topo.outgoing_global(NodeId(node))
+                } else {
+                    topo.incoming_global(NodeId(node))
+                };
+                let rec =
+                    self.cache
+                        .record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
+                topology::adj_count(&rec)?
+            };
+            // Segment-born upper bound: fence-gated fragment born counts (skipped for a
+            // singleton stack). Bounded per node; deletions in the fragment are ignored.
+            let mut seg = 0u64;
+            let stack = gen.core_stack();
+            if !stack.is_singleton() {
+                for s in stack.segments() {
+                    let r = &s.reader;
+                    let frag = if outgoing {
+                        if !r.may_hold_out_adj(node) {
+                            continue;
+                        }
+                        r.out_adj(node)?
+                    } else {
+                        if !r.may_hold_in_adj(node) {
+                            continue;
+                        }
+                        r.in_adj(node)?
+                    };
+                    seg += frag.iter().filter(|e| !e.removed).count() as u64;
+                }
+            }
+            // Delta-born (bounded by the byte-capped delta): count live born edges.
+            let delta = gen.delta();
+            let dlt = if delta.is_empty() {
+                0
+            } else {
+                let edges = if outgoing {
+                    delta.out_edges(node)
+                } else {
+                    delta.in_edges(node)
+                };
+                edges
+                    .iter()
+                    .filter(|e| e.edge_id.is_some() && !e.tombstoned)
+                    .count() as u64
+            };
+            Ok(core + seg + dlt)
+        };
+        Ok(match dir {
+            Direction::Outgoing => one(true)?,
+            Direction::Incoming => one(false)?,
+            Direction::Undirected => one(true)? + one(false)?,
+        })
+    }
+
+    /// Whether node `node` should be streamed rather than materialised for a hop in
+    /// direction `dir` — its [`Self::effective_degree_ub`] is at/above the engine's
+    /// `adj_stream_threshold`.
+    fn is_hub(&self, node: u64, dir: Direction) -> Result<bool> {
+        Ok(self.effective_degree_ub(node, dir)? >= self.adj_stream_threshold)
+    }
+
+    /// The per-neighbour merge body of [`Self::par_walk`], factored out so both the
+    /// parallel-gathered normal nodes and the sequentially-**streamed** hub nodes share
+    /// it verbatim: `node_ok`, the next-var equality guard, the (structurally shared)
+    /// binding layer, the path-walk track, and the `EXPAND_BATCH`-bounded depth-first
+    /// flush into the next hop. Consumes `hop` (it moves into the branch's `walk`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_merge_hop(
+        &self,
+        pattern: &Pattern,
+        i: usize,
+        start: u64,
+        rel: &RelPat,
+        next: &NodePat,
+        track_walk: bool,
+        b: &ChainBranch,
+        hop: Hop,
+        pending: &mut Vec<ChainBranch>,
+        out: &mut Vec<HashMap<String, Val>>,
+    ) -> Result<()> {
+        let nb = hop.neighbour;
+        if !self.node_ok(nb, next, &Scope::Frame(&b.binding), &[])? {
+            return Ok(());
+        }
+        if let Some(v) = &next.var {
+            if let Some(existing) = b.binding.get(v) {
+                if existing.loose_eq(&Val::Node(nb)) != Some(true) {
+                    return Ok(());
+                }
+            }
+        }
+        // Structural share: a hop that binds no variable carries the parent frame
+        // unchanged (an `Arc` bump); a binding hop layers a small delta over it.
+        let binding = if rel.var.is_none() && next.var.is_none() {
+            b.binding.clone()
+        } else {
+            let mut delta: Vec<(Box<str>, Val)> = Vec::with_capacity(2);
+            if let Some(v) = &rel.var {
+                delta.push((v.as_str().into(), hop.as_rel()));
+            }
+            if let Some(v) = &next.var {
+                delta.push((v.as_str().into(), Val::Node(nb)));
+            }
+            std::sync::Arc::new(Frame {
+                parent: Some(b.binding.clone()),
+                delta,
+            })
+        };
+        let walk = if track_walk {
+            let mut w = b.walk.clone();
+            w.push(hop);
+            w
+        } else {
+            Vec::new()
+        };
+        pending.push(ChainBranch {
+            cur: nb,
+            binding,
+            walk,
+        });
+        // Flush a full batch into the next hop immediately (depth-first on an in-order
+        // prefix) so the live frontier never exceeds one batch.
+        if pending.len() >= EXPAND_BATCH {
+            let batch = std::mem::take(pending);
+            self.par_walk(pattern, i + 1, start, batch, out)?;
+        }
+        Ok(())
+    }
+
     /// Parallel counterpart to [`Self::expand_chain`] for a fixed-length,
     /// property-free chain (gated by [`Self::chain_parallelizable`]). Walks the chain
     /// from anchor `cur` in **bounded breadth batches** ([`Self::par_walk`]): each
@@ -5160,69 +5396,80 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // so each read still fans out across the pool.
         for chunk in frontier.chunks(EXPAND_READ_CHUNK) {
             self.check_deadline()?;
-            // Gather: each chunk node's type-filtered adjacency, in parallel.
-            let nodes: Vec<u64> = chunk.iter().map(|b| b.cur).collect();
-            let neigh = par_gather(self.fanout_pool.as_deref(), &nodes, EXPAND_PAR_MIN, |&n| {
-                hops_par(gen, cache, n, dir, tf.as_ref())
-            })?;
-            // Charge the gathered hops against the intermediate budget (root cause 2b),
-            // mirroring the sequential `expand_one_hop`. `hops_par` runs on the rayon
+            // Route hub nodes out of the wide parallel gather: a hub's multi-million-edge
+            // adjacency materialised inside `par_gather` (up to a whole chunk of them at
+            // once) is the fan-out OOM. Decide per node from the cheap upper-bound degree
+            // probe; gather the *normal* nodes in parallel as before, and stream each hub
+            // sequentially in bounded chunks (its live buffer stays `O(ADJ_STREAM_CHUNK)`).
+            let hub: Vec<bool> = chunk
+                .iter()
+                .map(|b| self.is_hub(b.cur, dir))
+                .collect::<Result<_>>()?;
+            let normal_nodes: Vec<u64> = chunk
+                .iter()
+                .zip(&hub)
+                .filter(|(_, &h)| !h)
+                .map(|(b, _)| b.cur)
+                .collect();
+            let neigh = par_gather(
+                self.fanout_pool.as_deref(),
+                &normal_nodes,
+                EXPAND_PAR_MIN,
+                |&n| hops_par(gen, cache, n, dir, tf.as_ref()),
+            )?;
+            // Charge the gathered normal hops against the intermediate budget (root cause
+            // 2b), mirroring the sequential `expand_one_hop`. `hops_par` runs on the rayon
             // pool where `self.charge` (a non-`Sync` `Cell`) cannot be touched, so the
-            // charge stays here on the calling thread once the buffer is materialised —
-            // before the merge below clones it into per-branch bindings.
+            // charge stays here on the calling thread once the buffer is materialised.
+            // Streamed hub hops are charged per streamed chunk below, as they are produced.
             let produced: u64 = neigh.iter().map(|h| h.len() as u64).sum();
             self.charge_walk(produced)?;
-            // Merge in input order — the sequential `expand_chain` per-neighbour body:
-            // `node_ok`, the next-var equality guard, rel/next binding.
-            for (b, hops) in chunk.iter().zip(neigh) {
-                for hop in hops {
-                    let nb = hop.neighbour;
-                    if !self.node_ok(nb, next, &Scope::Frame(&b.binding), &[])? {
-                        continue;
-                    }
-                    if let Some(v) = &next.var {
-                        if let Some(existing) = b.binding.get(v) {
-                            if existing.loose_eq(&Val::Node(nb)) != Some(true) {
-                                continue;
+            // Merge in input order — `walk_merge_hop` is the shared per-neighbour body.
+            // Normal nodes consume their gathered hops (in chunk order); hub nodes stream.
+            let mut normal = neigh.into_iter();
+            for (b, &is_hub_node) in chunk.iter().zip(&hub) {
+                if is_hub_node {
+                    for_each_hop_overlaid(
+                        gen,
+                        cache,
+                        b.cur,
+                        dir,
+                        tf.as_ref(),
+                        ADJ_STREAM_CHUNK,
+                        &mut |hops| {
+                            self.charge_walk(hops.len() as u64)?;
+                            for hop in hops {
+                                self.walk_merge_hop(
+                                    pattern,
+                                    i,
+                                    start,
+                                    rel,
+                                    next,
+                                    track_walk,
+                                    b,
+                                    hop.clone(),
+                                    &mut pending,
+                                    out,
+                                )?;
                             }
-                        }
-                    }
-                    // Structural share: a hop that binds no variable carries the
-                    // parent frame unchanged (an `Arc` bump, no allocation — the
-                    // anonymous-intermediate hot path); a binding hop layers a small
-                    // delta over the shared parent.
-                    let binding = if rel.var.is_none() && next.var.is_none() {
-                        b.binding.clone()
-                    } else {
-                        let mut delta: Vec<(Box<str>, Val)> = Vec::with_capacity(2);
-                        if let Some(v) = &rel.var {
-                            delta.push((v.as_str().into(), hop.as_rel()));
-                        }
-                        if let Some(v) = &next.var {
-                            delta.push((v.as_str().into(), Val::Node(nb)));
-                        }
-                        std::sync::Arc::new(Frame {
-                            parent: Some(b.binding.clone()),
-                            delta,
-                        })
-                    };
-                    let walk = if track_walk {
-                        let mut w = b.walk.clone();
-                        w.push(hop);
-                        w
-                    } else {
-                        Vec::new()
-                    };
-                    pending.push(ChainBranch {
-                        cur: nb,
-                        binding,
-                        walk,
-                    });
-                    // Flush a full batch into the next hop immediately (depth-first on
-                    // an in-order prefix) so the live frontier never exceeds one batch.
-                    if pending.len() >= EXPAND_BATCH {
-                        let batch = std::mem::take(&mut pending);
-                        self.par_walk(pattern, i + 1, start, batch, out)?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    let hops = normal.next().expect("one gather result per normal node");
+                    for hop in hops {
+                        self.walk_merge_hop(
+                            pattern,
+                            i,
+                            start,
+                            rel,
+                            next,
+                            track_walk,
+                            b,
+                            hop,
+                            &mut pending,
+                            out,
+                        )?;
                     }
                 }
             }
@@ -5288,6 +5535,62 @@ impl<'g, V: ReadView> Engine<'g, V> {
         self.check_deadline()?;
         let (rel, next) = &pattern.rels[i];
         match &rel.var_length {
+            None if cap.is_none() && self.is_hub(cur, rel.dir)? => {
+                // Hub source on an uncapped chain: stream its adjacency in bounded chunks
+                // rather than materialise the whole hop list (bounds even a lone 10M-edge
+                // hub at fan=1). `for_each_hop_overlaid` applies only the type filter, so
+                // the relationship-property predicate (`rel_ok`) and the intermediate
+                // charge are applied per hop here — matching `expand_one_hop` exactly. The
+                // in-place binding/walk push→recurse→restore is unchanged. Gated to
+                // `cap.is_none()`: a pushed LIMIT keeps the early-exit materialise path.
+                let (gen, cache) = (self.gen, self.cache);
+                let tf = resolve_type_filter(gen, rel);
+                for_each_hop_overlaid(
+                    gen,
+                    cache,
+                    cur,
+                    rel.dir,
+                    tf.as_ref(),
+                    ADJ_STREAM_CHUNK,
+                    &mut |hops| {
+                        for hop in hops {
+                            if !self.rel_ok(hop.edge, rel, binding)? {
+                                continue;
+                            }
+                            self.charge_walk(1)?;
+                            let nb = hop.neighbour;
+                            if !self.node_ok(nb, next, &Scope::Map(binding), &[])? {
+                                continue;
+                            }
+                            if let Some(v) = &next.var {
+                                if let Some(existing) = binding.get(v) {
+                                    if existing.loose_eq(&Val::Node(nb)) != Some(true) {
+                                        continue;
+                                    }
+                                }
+                            }
+                            let prev_rel = rel
+                                .var
+                                .as_ref()
+                                .map(|v| (v.clone(), binding.insert(v.clone(), hop.as_rel())));
+                            let prev_next = next
+                                .var
+                                .as_ref()
+                                .map(|v| (v.clone(), binding.insert(v.clone(), Val::Node(nb))));
+                            walk.push(hop.clone());
+                            self.expand_chain(pattern, i + 1, nb, binding, start, walk, out, cap)?;
+                            walk.pop();
+                            if let Some((v, prev)) = prev_next {
+                                restore_binding(binding, v, prev);
+                            }
+                            if let Some((v, prev)) = prev_rel {
+                                restore_binding(binding, v, prev);
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
             None => {
                 for hop in self.expand_one_hop(cur, rel, binding)? {
                     if cap.is_some_and(|c| out.len() >= c) {
@@ -9715,6 +10018,193 @@ mod tests {
         }
     }
 
+    /// Slice 2: the streamed hop reader [`for_each_hop_overlaid`] yields the **same hops
+    /// in the same order** as the materialising [`hops_par`] — for every direction and a
+    /// range of type filters (untyped, a `:KNOWS` set, an empty set) — over core /
+    /// segment / segment+delta fixtures. This is the guarantee the hub routing rests on:
+    /// swapping a hub's materialise for a stream cannot change the traversal's result.
+    #[test]
+    fn for_each_hop_overlaid_matches_hops_par() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        // Hop has no PartialEq — compare by its full tuple projection.
+        let key = |h: &Hop| (h.edge, h.neighbour, h.reltype, h.start, h.end);
+        let check = |view: &MergedView, cache: &BlockCache, knows: u32, max_node: u64| {
+            let tfs: Vec<Option<TypeFilter>> = vec![
+                None,
+                Some(TypeFilter::AnyOf(vec![knows])),
+                Some(TypeFilter::AnyOf(vec![])),
+            ];
+            for node in 0..=max_node {
+                for dir in [
+                    Direction::Outgoing,
+                    Direction::Incoming,
+                    Direction::Undirected,
+                ] {
+                    for tf in &tfs {
+                        let want = hops_par(view, cache, node, dir, tf.as_ref()).unwrap();
+                        // A small chunk (3) forces multi-chunk streaming across boundaries.
+                        let mut got = Vec::new();
+                        for_each_hop_overlaid(view, cache, node, dir, tf.as_ref(), 3, &mut |c| {
+                            got.extend_from_slice(c);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert_eq!(
+                            got.iter().map(key).collect::<Vec<_>>(),
+                            want.iter().map(key).collect::<Vec<_>>(),
+                            "hop parity node={node} dir={dir:?} tf={tf:?}",
+                            tf = tf.as_ref().map(|_| "some")
+                        );
+                    }
+                }
+            }
+        };
+
+        // Core-only.
+        {
+            let (root, graph, _) = testgen::write_basic("hop_stream_core");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let knows = gen.reltype_id("KNOWS").unwrap();
+            let view = MergedView::read_only(&gen);
+            check(&view, &cache, knows, 4);
+            std::fs::remove_dir_all(&root).ok();
+        }
+        // Segment + delta (born edge, edge-delete, node-delete) — the full overlay.
+        {
+            let (root, graph, _) = write_basic_with_segment("hop_stream_seg_delta");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let knows = gen.reltype_id("KNOWS").unwrap();
+            let mut mem = Memtable::new();
+            mem.upsert_node("Person", "name", Value::Str("Alice".into()), Some(0), []);
+            mem.upsert_node("Person", "name", Value::Str("Bob".into()), Some(1), []);
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Company",
+                "name",
+                Value::Str("Acme".into()),
+                Some(0),
+                Some(3),
+                [],
+            );
+            mem.delete_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                Some(0),
+                Some(1),
+            );
+            mem.delete_node("Company", "name", Value::Str("Globex".into()), Some(4));
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            check(&view, &cache, knows, 6);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Slice 2: the hub routing probe [`Engine::effective_degree_ub`] is a **safe upper
+    /// bound** — it never under-counts a real hub, so no hub is ever mistaken for a normal
+    /// node and materialised. For every non-delta-tombstoned node the bound is ≥ the
+    /// actual overlaid degree (out+in for undirected); a delta-tombstoned node reports 0
+    /// (the documented "deleted, never expanded" contract).
+    #[test]
+    fn effective_degree_ub_never_undercounts() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let actual = |view: &MergedView, cache: &BlockCache, node: u64, dir: Direction| -> u64 {
+            let deg = |outgoing: bool| {
+                read_adj_overlaid(view, cache, node, outgoing)
+                    .unwrap()
+                    .len() as u64
+            };
+            match dir {
+                Direction::Outgoing => deg(true),
+                Direction::Incoming => deg(false),
+                Direction::Undirected => deg(true) + deg(false),
+            }
+        };
+        let check = |view: &MergedView, cache: &BlockCache, max_node: u64| {
+            let engine = Engine::new(view, cache);
+            for node in 0..=max_node {
+                for dir in [
+                    Direction::Outgoing,
+                    Direction::Incoming,
+                    Direction::Undirected,
+                ] {
+                    let ub = engine.effective_degree_ub(node, dir).unwrap();
+                    if view.delta().is_tombstoned(node) {
+                        assert_eq!(ub, 0, "delta-tombstoned node {node} probes to 0");
+                    } else {
+                        let got = actual(view, cache, node, dir);
+                        assert!(
+                            ub >= got,
+                            "under-count node={node} dir={dir:?}: ub={ub} < actual={got}"
+                        );
+                    }
+                }
+            }
+        };
+
+        // Core-only: the bound is exact (no deletions to over-count).
+        {
+            let (root, graph, _) = testgen::write_basic("ub_core");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let view = MergedView::read_only(&gen);
+            check(&view, &cache, 4);
+            std::fs::remove_dir_all(&root).ok();
+        }
+        // Segment + delta with edge-delete and node-delete: the bound stays ≥ actual.
+        {
+            let (root, graph, _) = write_basic_with_segment("ub_seg_delta");
+            let gen = Generation::open(&root, &graph).unwrap();
+            let cache = BlockCache::new(1 << 20);
+            let mut mem = Memtable::new();
+            mem.upsert_node("Person", "name", Value::Str("Alice".into()), Some(0), []);
+            mem.upsert_node("Person", "name", Value::Str("Bob".into()), Some(1), []);
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Company",
+                "name",
+                Value::Str("Acme".into()),
+                Some(0),
+                Some(3),
+                [],
+            );
+            mem.delete_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                Some(0),
+                Some(1),
+            );
+            mem.delete_node("Company", "name", Value::Str("Globex".into()), Some(4));
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            assert!(view.delta().is_tombstoned(4));
+            check(&view, &cache, 6);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
     /// A segment full row overrides/extends the base node reads it carries, births new
     /// entities, and tombstones nodes — through both `node_record` (all-props) and the
     /// single-property path. This is the read oracle for slice 3.2.
@@ -13698,6 +14188,73 @@ mod tests {
             .run(&parser::parse(q).unwrap())
             .expect("pool-configured shortestPath runs");
         assert_eq!(col0(&res), vec!["2"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Slice 2 integration: routing a hub through the streaming reader must return
+    /// **identical** results to materialising it — for both the sequential (`expand_chain`)
+    /// and pooled (`par_walk`) engines, over count / ordered-rows / undirected / path-var /
+    /// relationship-property (`rel_ok`) shapes. Driven by a low `adj_stream_threshold` (2)
+    /// so `write_basic`'s degree-3 anchor (Alice) streams while its degree-1 neighbours
+    /// materialise — a genuine hub/normal mix in one frontier. Each query is run four ways
+    /// (seq/pool × stream/materialise); all four must agree byte-for-byte.
+    #[test]
+    fn hub_streaming_matches_materialise() {
+        let (root, gen, cache, _) = budgeted_engine("exec_hub_stream", 1_000_000);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+            r.rows
+                .iter()
+                .map(|row| row.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        let queries = [
+            // 2-hop count — the count-pushdown terminal over a streamed hub frontier.
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN count(*)",
+            // 2-hop ordered rows with rel + node vars bound (Alice is the streamed hub).
+            "MATCH (a:Person)-[r1:KNOWS]->(b)-[r2:KNOWS]->(c) \
+             RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c",
+            // Type-alternation one-hop from the hub anchor (mixes KNOWS + WORKS_AT out-edges).
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b ORDER BY b",
+            // Same, UNORDERED — locks row-order preservation (streamed hop order must equal
+            // the materialised `hops_par` order, not merely the same set).
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS|WORKS_AT]->(b) RETURN b.name AS b",
+            // Undirected one-hop from the hub anchor (outgoing-then-incoming stream order).
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS]-(x) RETURN x.name AS x ORDER BY x",
+            // Path variable: the reconstructed path must match streamed vs materialised.
+            "MATCH p=(a:Person {name:'Alice'})-[:KNOWS]->(b)-[:KNOWS]->(c) \
+             RETURN length(p) AS len, nodes(p) AS ns",
+            // Relationship-property predicate: gated OUT of the parallel path (has props),
+            // so this exercises `expand_chain`'s hub arm applying `rel_ok` per streamed hop.
+            "MATCH (a:Person {name:'Alice'})-[:KNOWS {since:2020}]->(b) RETURN b.name AS b ORDER BY b",
+        ];
+        for q in queries {
+            let ast = parser::parse(q).unwrap();
+            let run = |pool: Option<std::sync::Arc<rayon::ThreadPool>>, threshold: u64| {
+                let mut e = Engine::new(&gen, &cache).with_adj_stream_threshold(threshold);
+                if let Some(p) = pool {
+                    e = e.with_fanout_pool(Some(p));
+                }
+                e.run(&ast)
+                    .unwrap_or_else(|err| panic!("`{q}` (threshold {threshold}) failed: {err:#}"))
+            };
+            // Materialise baseline (threshold beyond any degree) on the sequential engine.
+            let base = run(None, u64::MAX);
+            let variants = [
+                ("seq+stream", run(None, 2)),
+                ("pool+materialise", run(Some(pool.clone()), u64::MAX)),
+                ("pool+stream", run(Some(pool.clone()), 2)),
+            ];
+            for (tag, v) in &variants {
+                assert_eq!(base.columns, v.columns, "columns differ ({tag}) for `{q}`");
+                assert_eq!(disp(&base), disp(v), "rows differ ({tag}) for `{q}`");
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -47,6 +47,13 @@ fn encode_adj(list: &[Adj]) -> Vec<u8> {
     rec
 }
 
+/// The edge count of an adjacency record — its leading uvarint — **without** decoding
+/// the edges. O(1); lets a reader decide a node is a hub from the record bytes it
+/// already holds, before paying to decode a multi-million-edge neighbour list.
+pub fn adj_count(rec: &[u8]) -> Result<u64> {
+    read_uvarint(&mut { rec })
+}
+
 /// Decode one node's adjacency record edge-by-edge, invoking `f` for each [`Adj`]
 /// **without materialising the whole neighbour list**. The record is
 /// `uvarint(count) ‖ count × (uvarint(reltype) ‖ uvarint(neighbour) ‖ uvarint(edge))`,
