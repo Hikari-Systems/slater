@@ -38,6 +38,7 @@ pub mod integrity;
 pub mod isam;
 pub mod manifest;
 pub mod membudget;
+pub mod nodedegree;
 pub mod nodelabels;
 pub mod postings;
 pub mod pq;

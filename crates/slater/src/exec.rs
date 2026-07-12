@@ -5308,27 +5308,41 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let gen = self.gen;
         let cg = gen.core_generation();
         let mut deg: i64 = 0;
-        // Core: exact out/in degree — O(1) sidecar lookup for a listed (hub) node, else the
-        // record's leading edge count (one cached block, no decode). 0 for a delta-born id.
+        // Core: exact out/in degree — the dense per-node degree column (O(1), no I/O) when
+        // present, else the hub-degree sidecar (O(1) for a listed hub), else the record's
+        // leading edge count (one cached block, no decode). 0 for a delta-born id.
         if node < cg.node_count() {
-            let listed = if outgoing {
-                cg.core_out_degree_if_hub(node)
+            let dense = if outgoing {
+                cg.node_out_degree(node)
             } else {
-                cg.core_in_degree_if_hub(node)
+                cg.node_in_degree(node)
             };
-            deg += match listed {
+            deg += match dense {
                 Some(d) => d as i64,
                 None => {
-                    let topo = gen.topology();
-                    let global = if outgoing {
-                        topo.outgoing_global(NodeId(node))
+                    let listed = if outgoing {
+                        cg.core_out_degree_if_hub(node)
                     } else {
-                        topo.incoming_global(NodeId(node))
+                        cg.core_in_degree_if_hub(node)
                     };
-                    let rec =
-                        self.cache
-                            .record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-                    topology::adj_count(&rec)? as i64
+                    match listed {
+                        Some(d) => d as i64,
+                        None => {
+                            let topo = gen.topology();
+                            let global = if outgoing {
+                                topo.outgoing_global(NodeId(node))
+                            } else {
+                                topo.incoming_global(NodeId(node))
+                            };
+                            let rec = self.cache.record(
+                                topo.inner(),
+                                gen.uuid(),
+                                FileKind::Topology,
+                                global,
+                            )?;
+                            topology::adj_count(&rec)? as i64
+                        }
+                    }
                 }
             };
         }
@@ -14091,12 +14105,13 @@ mod tests {
     // (and the global budget). run_hub args: (tag, n, maxIntermediate, maxScan, global).
 
     #[test]
-    fn hub_count_one_hop_trips_scan_budget() {
-        // count-pushdown: the centre's `HUB_N`-edge read charges scan, tripping the
-        // tight scan cap — with the retained and global budgets *disabled*, proving the
-        // count is bounded by `maxScan` alone.
+    fn hub_count_one_hop_answered_by_degree_terminal() {
+        // The degree-sum terminal answers a 1-hop `count(neighbour)` from the hub's stored
+        // out-degree in O(1) — it never walks the `HUB_N`-edge adjacency, so the tight scan
+        // cap the old row-by-row walk tripped is no longer even approached. (The 2-hop
+        // variant below still trips: building its penultimate frontier reads the hub.)
         let (res, _) = run_hub(
-            "exec_hub_1hop_scan",
+            "exec_hub_1hop_degterm",
             HUB_N,
             0,
             HUB_TIGHT,
@@ -14104,9 +14119,11 @@ mod tests {
             false,
             "MATCH (c:Hub)-[:LINK]->(x) RETURN count(x)",
         );
+        let r = res.expect("degree terminal answers a 1-hop hub count without tripping maxScan");
         assert!(
-            is_scan_budget_err(&res),
-            "a count's hub read must trip maxScan: {res:?}"
+            matches!(r.rows[0][0], Val::Int(n) if n == HUB_N as i64),
+            "1-hop count == hub out-degree: {:?}",
+            r.rows[0][0]
         );
     }
 

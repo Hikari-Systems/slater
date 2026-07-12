@@ -97,6 +97,13 @@ pub struct Generation {
     /// Degree floor the sidecar was built with (`Some` ⇔ the sidecar is present). A node
     /// absent from a list therefore has degree `< floor` in that direction.
     hub_degree_floor: Option<u32>,
+    /// Dense per-node out/in degree column (`node_degrees.blk`) — every node's exact
+    /// degree, resident for an O(1) lookup with no adjacency read. Empty +
+    /// `has_node_degrees == false` ⇒ no column (older generation); the caller falls back
+    /// to the record's leading count. See [`crate::generation::Generation::node_out_degree`].
+    node_out_degrees: Vec<u32>,
+    node_in_degrees: Vec<u32>,
+    has_node_degrees: bool,
     /// Disk-native Vamana/PQ indexes (above the ANN threshold), keyed by
     /// `(label, property)`. Each holds its block reader, its position in
     /// `manifest.vector_indexes` (the cache ordinal), and its resident PQ codes.
@@ -374,6 +381,26 @@ impl Generation {
             }
         }
 
+        // Dense per-node degree column (`node_degrees.blk`): every node's exact out/in
+        // degree, resident. Gated purely on file existence (not a manifest field) so a
+        // generation *retrofitted* with the column — or one built with it — loads it, and
+        // one without falls back to the record's leading count. Present ⇒ the degree-sum
+        // count fast path answers a penultimate-frontier lookup in O(1) with no I/O.
+        let mut node_out_degrees = Vec::new();
+        let mut node_in_degrees = Vec::new();
+        let mut has_node_degrees = false;
+        let nd_key = join_key(&base, "node_degrees.blk");
+        if store.exists(&nd_key)? {
+            let reader = BlockFileReader::open_src(store.open(&nd_key)?, cipher.clone())
+                .with_context(|| format!("open node-degree column {nd_key}"))?;
+            let (o, i) =
+                graph_format::nodedegree::read_node_degrees(&reader, manifest.node_count as usize)
+                    .with_context(|| format!("read node-degree column {nd_key}"))?;
+            node_out_degrees = o;
+            node_in_degrees = i;
+            has_node_degrees = true;
+        }
+
         // Open the disk-native Vamana/PQ indexes (above the ANN threshold). Each
         // reads only its block-file footer + PQ codebook header at open; the
         // resident PQ codes are loaded once here (the navigation set the beam search
@@ -477,6 +504,9 @@ impl Generation {
             hub_out_degrees,
             hub_in_degrees,
             hub_degree_floor,
+            node_out_degrees,
+            node_in_degrees,
+            has_node_degrees,
             vamana_indexes,
             label_ids,
             reltype_ids,
@@ -617,6 +647,27 @@ impl Generation {
             .binary_search_by_key(&node, |&(id, _)| id)
             .ok()
             .map(|i| self.hub_in_degrees[i].1 as u64)
+    }
+
+    /// Exact **out**-degree of core node `node` from the dense degree column
+    /// (`node_degrees.blk`) — O(1), no I/O — or `None` if this generation carries no
+    /// column (fall back to the record's leading count).
+    pub fn node_out_degree(&self, node: u64) -> Option<u32> {
+        if self.has_node_degrees {
+            self.node_out_degrees.get(node as usize).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Exact **in**-degree from the dense column, or `None` when absent. Counterpart of
+    /// [`Self::node_out_degree`].
+    pub fn node_in_degree(&self, node: u64) -> Option<u32> {
+        if self.has_node_degrees {
+            self.node_in_degrees.get(node as usize).copied()
+        } else {
+            None
+        }
     }
 
     /// The opened Vamana/PQ index over `(label, property)`, if one exists (i.e. the
