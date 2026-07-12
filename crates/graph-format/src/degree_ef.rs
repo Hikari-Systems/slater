@@ -768,8 +768,8 @@ mod tests {
             assert_eq!(bytes.len(), 9);
             let chunk = decode_chunk(&bytes).unwrap();
             assert!(matches!(chunk, DegreeChunk::Constant { .. }));
-            for i in 0..degs.len() {
-                assert_eq!(chunk.degree_at(i), Some(degs[i]));
+            for (i, &d) in degs.iter().enumerate() {
+                assert_eq!(chunk.degree_at(i), Some(d));
             }
         }
     }
@@ -909,11 +909,10 @@ mod tests {
     fn rle_roundtrips_and_is_chosen_for_segmented_runs() {
         // Consecutive equal-degree runs (bulk-imported / sorted-degree region): RLE should be
         // chosen (decompress-free) and round-trip exactly.
-        let mut segmented: Vec<u32> = Vec::new();
-        segmented.extend(std::iter::repeat(0).take(3000)); // isolated tail
-        segmented.extend(std::iter::repeat(3).take(2000)); // bulk import, degree 3
-        segmented.extend(std::iter::repeat(1).take(1500));
-        segmented.extend(std::iter::repeat(7).take(500));
+        let mut segmented: Vec<u32> = vec![0u32; 3000]; // isolated tail
+        segmented.extend(std::iter::repeat_n(3, 2000)); // bulk import, degree 3
+        segmented.extend(std::iter::repeat_n(1, 1500));
+        segmented.extend(std::iter::repeat_n(7, 500));
         let bytes = encode_chunk(&segmented, &opts()).unwrap();
         assert_eq!(
             bytes[0],
@@ -990,9 +989,9 @@ mod tests {
             "latency-biased build keeps EF (decompress-free)"
         );
         // Both round-trip.
-        for i in 0..crushable.len() {
-            assert_eq!(decode_chunk(&wb).unwrap().degree_at(i), Some(crushable[i]));
-            assert_eq!(decode_chunk(&lb).unwrap().degree_at(i), Some(crushable[i]));
+        for (i, &c) in crushable.iter().enumerate() {
+            assert_eq!(decode_chunk(&wb).unwrap().degree_at(i), Some(c));
+            assert_eq!(decode_chunk(&lb).unwrap().degree_at(i), Some(c));
         }
     }
 
@@ -1031,8 +1030,8 @@ mod tests {
             !matches!(chunk, DegreeChunk::Rle(_)) || chunk.resident_bytes() < d.len() * 4,
             "resident form stays compact, not dense"
         );
-        for i in 0..d.len() {
-            assert_eq!(chunk.degree_at(i), Some(d[i]), "slot {i}");
+        for (i, &v) in d.iter().enumerate() {
+            assert_eq!(chunk.degree_at(i), Some(v), "slot {i}");
         }
     }
 }
