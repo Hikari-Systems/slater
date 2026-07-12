@@ -66,6 +66,34 @@ pub fn write_node_degrees(
     Ok(())
 }
 
+/// Read one [`DEGREES_PER_RECORD`]-wide degree **chunk** (record) into a `Vec<u32>`, for
+/// chunk-lazy residency — a single chunk fault is one block decompress that serves the next
+/// [`DEGREES_PER_RECORD`] ids, so a query that touches only part of the id space never
+/// materialises the whole column. `per_half` is [`records_per_half`] for the generation's
+/// node count; `outgoing` picks the half (out records are `0..per_half`, in records follow);
+/// `chunk` is the record index *within* that half (`0..per_half`). The returned vector holds
+/// the chunk's degrees in id order — its length is [`DEGREES_PER_RECORD`] for every chunk but
+/// the last of a half, which is `node_count % DEGREES_PER_RECORD` (or `DEGREES_PER_RECORD`
+/// when the count is an exact multiple). Byte-for-byte the same values [`read_node_degrees`]
+/// would place at that range.
+pub fn read_degree_chunk(
+    reader: &BlockFileReader,
+    per_half: usize,
+    outgoing: bool,
+    chunk: usize,
+) -> Result<Vec<u32>> {
+    if chunk >= per_half {
+        bail!("degree chunk {chunk} out of range (half has {per_half} records)");
+    }
+    let global = if outgoing { chunk } else { per_half + chunk };
+    let bytes = reader.read_record_global(global as u64)?;
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for c in bytes.chunks_exact(4) {
+        out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok(out)
+}
+
 /// Read the dense out/in degree columns resident. `node_count` is the generation's node
 /// count (the manifest's), used to size the halves. Returns `(out_degrees, in_degrees)`,
 /// each `node_count` long.
@@ -121,6 +149,37 @@ mod tests {
         let (got_out, got_in) = read_node_degrees(&r, n).unwrap();
         assert_eq!(got_out, out);
         assert_eq!(got_in, inn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chunk_read_matches_eager_slice() {
+        // Two-plus records per half so we exercise a full chunk, a partial last chunk, and
+        // the out/in half split.
+        let n = 2 * DEGREES_PER_RECORD + 37;
+        let out: Vec<u32> = (0..n as u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let inn: Vec<u32> = (0..n as u32).map(|i| i % 11).collect();
+        let path = tmp("chunk.blk");
+        write_node_degrees(&path, &out, &inn, 1 << 16, 3, None).unwrap();
+
+        let r = BlockFileReader::open(&path).unwrap();
+        let per_half = records_per_half(n);
+        assert_eq!(per_half, 3);
+        for chunk in 0..per_half {
+            let lo = chunk * DEGREES_PER_RECORD;
+            let hi = (lo + DEGREES_PER_RECORD).min(n);
+            assert_eq!(
+                read_degree_chunk(&r, per_half, true, chunk).unwrap(),
+                out[lo..hi],
+                "out chunk {chunk}"
+            );
+            assert_eq!(
+                read_degree_chunk(&r, per_half, false, chunk).unwrap(),
+                inn[lo..hi],
+                "in chunk {chunk}"
+            );
+        }
+        assert!(read_degree_chunk(&r, per_half, true, per_half).is_err());
         let _ = std::fs::remove_file(&path);
     }
 
