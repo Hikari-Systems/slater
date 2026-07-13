@@ -188,6 +188,14 @@ fn encode_int(v: i64, out: &mut Vec<u8>) {
 /// the smallest worker-thread stack.
 const MAX_DEPTH: usize = 256;
 
+/// This decoder is an *accept* gate on values that get persisted: the parameter of a
+/// `SET n.p = $param` is re-encoded by `graph_format::wire::write_value` into a property block
+/// or WAL record, and read back by `wire::read_value`, which refuses to decode past
+/// `MAX_VALUE_DEPTH` (HIK-85). Were this gate ever raised above that one, a client could write
+/// a property that nothing can read back — a data-loss bug. Enforced at compile time so the two
+/// constants cannot drift apart: accept depth ≤ decode depth.
+const _: () = assert!(MAX_DEPTH <= graph_format::wire::MAX_VALUE_DEPTH);
+
 /// Maximum number of values one message may decode into — every `PsValue` costs
 /// one, whether it is the root, a list item, a map key, a map value or a struct
 /// field.
