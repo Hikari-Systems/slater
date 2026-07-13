@@ -3941,9 +3941,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     // *after* it is materialised lets that one layer exhaust RSS before
                     // the budget ever trips (it OOM-killed the capped container); charging
                     // per branch trips the standard `maxIntermediate` budget mid-layer,
-                    // before the clones accumulate. Only emitted results are charged
-                    // elsewhere (above).
-                    self.charge(1)?;
+                    // before the clones accumulate. The charge is **proportional to the
+                    // branch's clone size** (`path.len()+1`, mirroring the result charge
+                    // above) — a fixed `charge(1)` under-counted a deep branch by a factor
+                    // of its depth, so the budget only tripped long after the O(depth)
+                    // clones had accumulated. Only emitted results are charged elsewhere.
+                    self.charge(path.len() as u64 + 1)?;
                     let mut npath = path.clone();
                     npath.push(hop);
                     let mut nvisited = visited.clone();
@@ -15745,6 +15748,38 @@ mod tests {
         let res = run_budgeted("exec_budget_allsp_ok", 1_000_000, q)
             .expect("a generous budget must not affect the query");
         assert_eq!(col0(&res), vec!["0"]); // no KNOWS path Person→Company
+    }
+
+    #[test]
+    fn all_shortest_charges_frontier_branches_proportional_to_depth() {
+        // Each live shortest-path branch clones a `Vec<Hop>` + `HashSet` whose size grows with
+        // its depth, but the frontier charge used a fixed `charge(1)`, under-counting a deep
+        // branch by a factor of its depth. On a length-12 chain the total charge is now
+        // ≈ L(L+1)/2 = 78 (proportional), where the old fixed accounting was ≈ 2L-1 = 23. A
+        // budget of 40 sits between them: it admitted the old accounting but must trip the new.
+        let (root, graph) = testgen::write_chain("exec_chain_depth_charge", 12);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let q = "MATCH ALL SHORTEST (a {name:'n0'})-[r:R*]->(b {name:'n12'}) RETURN size(r) AS l";
+        let ast = parser::parse(q).unwrap();
+
+        // A generous budget completes: the single length-12 path.
+        let ok = Engine::new(&gen, &cache)
+            .with_max_intermediate(10_000)
+            .run(&ast)
+            .expect("a generous budget completes the chain search");
+        assert!(matches!(ok.rows[0][0], Val::Int(12)), "{:?}", ok.rows[0][0]);
+
+        // The depth-proportional charge trips at 40; the old fixed `charge(1)` would not.
+        let err = Engine::new(&gen, &cache)
+            .with_max_intermediate(40)
+            .run(&ast)
+            .expect_err("the depth-proportional frontier charge must trip at 40");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
