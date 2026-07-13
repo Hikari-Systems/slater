@@ -2379,6 +2379,10 @@ struct Session {
 struct Framed<S> {
     stream: S,
     buf: Vec<u8>,
+    /// Resumable de-chunker: keeps a cursor into `buf` and the partial body across reads so
+    /// a message that arrives over many reads is reassembled in O(n), not O(n²) (it does not
+    /// re-scan the whole buffer on every partial read).
+    reassembler: chunk::ChunkReassembler,
     /// Largest reassembled message body this connection will currently accept. The
     /// framer is deliberately auth-blind — it owns a budget number, not the reason
     /// it changed. `handle_connection` starts it at the tight pre-auth cap and
@@ -2392,6 +2396,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         Self {
             stream,
             buf: Vec::with_capacity(8192),
+            reassembler: chunk::ChunkReassembler::new(),
             max_body,
         }
     }
@@ -2399,8 +2404,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
     /// Read the next complete (de-chunked) message body, or `None` at a clean EOF.
     async fn read_message(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
-            if let Some((body, consumed)) = chunk::decode_message_capped(&self.buf, self.max_body)?
-            {
+            if let Some((body, consumed)) = self.reassembler.feed(&self.buf, self.max_body)? {
                 self.buf.drain(..consumed);
                 return Ok(Some(body));
             }
