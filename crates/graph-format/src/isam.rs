@@ -30,7 +30,9 @@ use crate::crypto::{BlockCipher, NONCE_LEN};
 use crate::ids::Value;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
-use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
+use crate::wire::{
+    capacity_for, read_uvarint, read_value, write_uvarint, write_value, DecodeRejected,
+};
 
 const ISAM_MAGIC: &[u8; 8] = b"SLISM001";
 /// Magic for an AEAD-encrypted ISAM index: the block bytes are sealed compressed
@@ -438,6 +440,22 @@ impl IsamReader {
             None
         };
 
+        // `top_offset`/`top_len` come out of the footer, which is **plaintext even for an
+        // encrypted index** (the cipher covers the blocks and the top-level body, not the
+        // footer that locates them). So they are unauthenticated on-disk `u64`s on every
+        // configuration, and `vec![0u8; top_len]` sized one of them straight — a forged length
+        // is a 16-exabyte request that aborts the process before the short read can fail.
+        // The top-level must lie inside the file; check the claim, then the ceiling.
+        if top_offset.saturating_add(top_len) > len {
+            return Err(DecodeRejected::OutOfFile {
+                what: "isam top-level",
+                offset: top_offset,
+                len: top_len,
+                file_len: len,
+            }
+            .into());
+        }
+        codec::check_stored_len(top_len as usize)?;
         let mut stored_top = vec![0u8; top_len as usize];
         src.read_exact_at(&mut stored_top, top_offset)?;
         // Unseal the top-level when encrypted (a wrong key is caught here, at open).
@@ -446,7 +464,11 @@ impl IsamReader {
             _ => stored_top,
         };
         let mut tr = &top_bytes[..];
-        let mut top = Vec::with_capacity(block_count as usize);
+        // `block_count` is likewise an unauthenticated footer `u64`. A top-level entry costs
+        // ≥17 bytes (a value tag ‖ u64 offset ‖ u32 comp_len ‖ u32 raw_len; the nonce only
+        // adds to that), so reserve no more than the top-level body could hold — the loop
+        // below errors on the first short read.
+        let mut top = Vec::with_capacity(capacity_for(block_count as usize, top_bytes.len(), 17));
         for _ in 0..block_count {
             let first_key = read_value(&mut tr)?;
             let offset = tr.read_u64::<LittleEndian>()?;
@@ -525,7 +547,9 @@ impl IsamReader {
     fn decode_block(raw: &[u8]) -> Result<Vec<(Value, u64)>> {
         let mut r = raw;
         let count = read_uvarint(&mut r)? as usize;
-        let mut out = Vec::with_capacity(count);
+        // Untrusted count out of the (decompressed) leaf block; each entry costs ≥2 bytes
+        // (a value tag ‖ an id uvarint). Clamp the reservation — see `wire::capacity_for`.
+        let mut out = Vec::with_capacity(capacity_for(count, r.len(), 2));
         for _ in 0..count {
             let key = read_value(&mut r)?;
             let id = read_uvarint(&mut r)?;
@@ -748,6 +772,40 @@ impl IsamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HIK-80: the ISAM footer is **plaintext even for an encrypted index** — the cipher covers
+    // the blocks and the top-level body, not the footer that locates them. `top_len` is an
+    // unauthenticated on-disk `u64` that sized a read buffer directly, so forging it is an
+    // allocator abort at index open, on every configuration. Reaching the assertion is the
+    // proof: pre-fix the test binary dies allocating 16 exabytes.
+    #[test]
+    fn forged_footer_top_len_is_refused_at_open() {
+        let path = tmp("forged_top_len");
+        let entries: Vec<(Value, u64)> = (0..200u64).map(|i| (Value::Int(i as i64), i)).collect();
+        write_isam(&path, entries, 1 << 12, 3).unwrap();
+        assert!(IsamReader::open(&path).is_ok());
+
+        // Overwrite `top_len` (the second u64 of the 24-byte plaintext footer) with a claim the
+        // file cannot possibly honour. Every other byte of the index is untouched.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        let top_len_at = n - FOOTER_LEN as usize + 8;
+        bytes[top_len_at..top_len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match IsamReader::open(&path) {
+            Ok(_) => panic!("a forged top_len must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::OutOfFile { .. })
+            ),
+            "expected a typed OutOfFile rejection, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("slater_isam_{}_{}", std::process::id(), name))

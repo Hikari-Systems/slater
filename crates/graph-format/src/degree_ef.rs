@@ -36,7 +36,7 @@ use anyhow::{bail, Result};
 
 use crate::codec;
 use crate::plane::{self, build_sample, low_bits, read_low, write_low};
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint, DecodeRejected};
 
 /// The degree column reuses the generic plane-codec knobs ([`crate::plane`]); these aliases keep
 /// the historical names at the call sites (`--degree-zstd-margin`, the retrofit tool) while the
@@ -246,6 +246,19 @@ impl EfChunk {
         for w in body[hstart..hstart + high_bytes].chunks_exact(8) {
             highs.push(u64::from_le_bytes(w.try_into().unwrap()));
         }
+        // The byte-length check validates the body's shape, not its content: the high bitmap
+        // must hold exactly `m` one-bits, and with fewer, `select1` walks off the end of
+        // `highs`/`sample` — an out-of-bounds panic on an ordinary degree lookup. Same
+        // invariant, same reasoning as `plane::EfMono::deserialize`.
+        let ones: usize = highs.iter().map(|w| w.count_ones() as usize).sum();
+        if ones != m {
+            return Err(DecodeRejected::EfBitCount {
+                what: "ef degree chunk",
+                declared: m,
+                found: ones,
+            }
+            .into());
+        }
         let sample = build_sample(&highs, m);
         Ok(Self {
             n,
@@ -354,9 +367,24 @@ impl RleChunk {
     fn deserialize(body: &[u8]) -> Result<Self> {
         let mut r = body;
         let n = read_uvarint(&mut r)? as u32;
+        // `n` is not bounded by the record's byte length — run lengths are uvarints, so a
+        // six-byte single run can declare 4·10⁹ degrees and `to_degrees` would materialise a
+        // 17 GB `Vec`. Bound it by [`MAX_CHUNK_DEGREES`], which `encode_chunk` refuses to
+        // exceed — so nothing this rejects is anything a writer could have emitted.
+        if n as usize > MAX_CHUNK_DEGREES {
+            return Err(DecodeRejected::TooManyElements {
+                what: "rle degree chunk",
+                n: n as u64,
+                max: MAX_CHUNK_DEGREES,
+            }
+            .into());
+        }
         let run_count = read_uvarint(&mut r)? as usize;
-        let mut values = Vec::with_capacity(run_count);
-        let mut starts = Vec::with_capacity(run_count);
+        // Each run costs ≥2 bytes (value ‖ length); clamp the reservation to what the body can
+        // justify so a forged run count errors in the loop, not in the allocator.
+        let cap = capacity_for(run_count, r.len(), 2);
+        let mut values = Vec::with_capacity(cap);
+        let mut starts = Vec::with_capacity(cap);
         let mut acc = 0u64;
         for _ in 0..run_count {
             let value = read_uvarint(&mut r)? as u32;
@@ -461,7 +489,23 @@ fn resident_from_degrees(degrees: &[u32]) -> DegreeChunk {
 /// `ef`, `rle`, `raw`, and (penalised) `zstd-dense`, and keeps the winner per `opts`. A uniform
 /// (or all-zero) chunk falls out as a single-run `rle` — the smallest candidate and exactly the
 /// degenerate case EF is worst at; the empty chunk is an empty `rle`.
+/// Ceiling on the number of degrees in a single chunk record — the [`crate::plane::MAX_PLANE_VALUES`]
+/// argument, for `u32` degrees: an RLE chunk's `n` is not bounded by its byte length, so bound it
+/// by the format's own ceiling (this chunk's `RawU32` form would be `n * 4` bytes, which
+/// `codec::MAX_BLOCK_BYTES` refuses). Shared by the encoder and the decoder so the two agree.
+///
+/// A real chunk is [`crate::nodedegree::DEGREES_PER_RECORD`] = 262 144 degrees — this clears it
+/// by ~2000×, so it is a backstop against a forged record, never a constraint on a real one.
+pub const MAX_CHUNK_DEGREES: usize = codec::MAX_BLOCK_BYTES / 4;
+
 pub fn encode_chunk(degrees: &[u32], opts: &DegreeCodecOpts) -> Result<Vec<u8>> {
+    // Never emit a chunk the decoder would refuse (see `MAX_CHUNK_DEGREES`).
+    if degrees.len() > MAX_CHUNK_DEGREES {
+        bail!(
+            "degree chunk of {} degrees exceeds the {MAX_CHUNK_DEGREES}-degree ceiling",
+            degrees.len()
+        );
+    }
     let n = degrees.len();
 
     // Empty short-circuits to an empty `rle` record (the other candidates assume a non-empty

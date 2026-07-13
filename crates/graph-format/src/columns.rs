@@ -21,7 +21,7 @@ use anyhow::Result;
 use crate::blockfile::{BlockFileReader, BlockFileWriter, RecordLoc};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
-use crate::wire::{read_uvarint, read_value, skip_value, write_uvarint, write_value};
+use crate::wire::{capacity_for, read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
 /// Encode one entity's property record
 /// (`uvarint(count) ‖ count × ( uvarint(key_id) ‖ value )`) to bytes. The single
@@ -178,7 +178,9 @@ impl PropsReader {
 pub fn decode_props(rec: &[u8]) -> Result<Vec<(u32, Value)>> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Untrusted on-disk count; each pair costs ≥2 bytes (a key uvarint ‖ a value tag). Clamp
+    // the reservation to what the record can justify — see `wire::capacity_for`.
+    let mut out = Vec::with_capacity(capacity_for(count, r.len(), 2));
     for _ in 0..count {
         let key_id = read_uvarint(&mut r)? as u32;
         let value = read_value(&mut r)?;

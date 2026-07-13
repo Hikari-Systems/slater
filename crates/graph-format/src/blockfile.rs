@@ -44,6 +44,7 @@ use crate::crypto::{BlockCipher, NONCE_LEN};
 use crate::ids::BlockId;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
+use crate::wire::{capacity_for, DecodeRejected};
 
 const BLOCKFILE_MAGIC: &[u8; 8] = b"SLBLK001";
 /// Magic for an AEAD-encrypted block file. The directory entries are wider (they
@@ -767,11 +768,31 @@ impl BlockFileReader {
         let dir_len = fr.read_u64::<LittleEndian>()?;
         let block_count = fr.read_u64::<LittleEndian>()?;
 
+        // The footer is plaintext even for an encrypted file (the cipher covers the blocks and
+        // the directory body, not the footer that locates them), so `dir_offset`/`dir_len`/
+        // `block_count` are unauthenticated on-disk `u64`s on every configuration. Sizing
+        // `vec![0u8; dir_len]` straight off one is an allocator abort on a forged length,
+        // before the short read that would have caught it. The directory must lie inside the
+        // file — check the claim first, then the block ceiling.
+        if dir_offset.saturating_add(dir_len) > len {
+            return Err(DecodeRejected::OutOfFile {
+                what: "blockfile directory",
+                offset: dir_offset,
+                len: dir_len,
+                file_len: len,
+            }
+            .into());
+        }
+        codec::check_stored_len(dir_len as usize)?;
         let mut dir_bytes = vec![0u8; dir_len as usize];
         src.read_exact_at(&mut dir_bytes, dir_offset)?;
         let mut dr = &dir_bytes[..];
-        let mut dir = Vec::with_capacity(block_count as usize);
-        let mut block_start = Vec::with_capacity(block_count as usize + 1);
+        // A directory entry costs ≥20 bytes (u64 offset ‖ u32 comp_len ‖ u32 raw_len ‖ u32
+        // rec_count; the nonce only adds to that), so reserve no more than the directory body
+        // could hold — the loop below errors on the first short read.
+        let cap = capacity_for(block_count as usize, dir_bytes.len(), 20);
+        let mut dir = Vec::with_capacity(cap);
+        let mut block_start = Vec::with_capacity(cap + 1);
         let mut acc = 0u64;
         for _ in 0..block_count {
             let offset = dr.read_u64::<LittleEndian>()?;
@@ -1094,6 +1115,40 @@ pub fn record_range_in_block(raw: &[u8], slot: u32) -> Result<std::ops::Range<us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HIK-80: the block-file footer is plaintext even for an encrypted file, and `dir_len` — an
+    // on-disk `u64` — sized the directory read buffer directly. Forging it is an allocator abort
+    // at generation open. (Not one of the sites the ticket named; found in the sweep.)
+    #[test]
+    fn forged_footer_dir_len_is_refused_at_open() {
+        let path = tmp("forged_dir_len");
+        let mut w = BlockFileWriter::create(&path, 512, 3).unwrap();
+        for i in 0..100u32 {
+            w.append_record(format!("rec-{i}").as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+        assert!(BlockFileReader::open(&path).is_ok());
+
+        // `dir_len` is the second u64 of the 24-byte footer.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        let dir_len_at = n - FOOTER_LEN as usize + 8;
+        bytes[dir_len_at..dir_len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match BlockFileReader::open(&path) {
+            Ok(_) => panic!("a forged dir_len must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::OutOfFile { .. })
+            ),
+            "expected a typed OutOfFile rejection, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("slater_bf_{}_{}", std::process::id(), name))

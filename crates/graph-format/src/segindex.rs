@@ -47,7 +47,7 @@ use crate::crypto::BlockCipher;
 use crate::ids::Value;
 use crate::isam::{write_isam_with_cipher, IsamReader};
 use crate::store::{join_key, ObjectStore};
-use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
+use crate::wire::{capacity_for, read_uvarint, read_value, write_uvarint, write_value};
 
 /// Magic at the head of `idx.meta`.
 const IDX_MAGIC: &[u8; 8] = b"SLSEGIX1";
@@ -95,7 +95,10 @@ fn w_ids(buf: &mut Vec<u8>, ids: &[u64]) {
 
 fn r_ids(r: &mut &[u8]) -> Result<Vec<u64>> {
     let n = read_uvarint(r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    // `n` is an untrusted on-disk uvarint and each delta costs ≥1 byte, so reserve no more
+    // than the bytes left can justify (`wire::capacity_for`) — a forged count then runs the
+    // buffer dry and errors instead of aborting the process on a 16-exabyte allocation.
+    let mut out = Vec::with_capacity(capacity_for(n, r.len(), 1));
     let mut prev = 0u64;
     for _ in 0..n {
         prev += read_uvarint(r)?;
@@ -460,6 +463,22 @@ impl SegmentIndexReader {
 
 #[cfg(test)]
 mod tests {
+    // HIK-80: `r_ids` sized its `Vec` from the untrusted on-disk count. Six bytes declaring
+    // 2^64 ids was a 16-exabyte reservation — an allocator abort, i.e. the process dies — on a
+    // path reached whenever a segment's index metadata is opened. It must refuse instead, and
+    // reaching this assertion at all is the proof: pre-fix, the test binary aborts here.
+    #[test]
+    fn forged_removal_count_is_refused_not_preallocated() {
+        let mut rec = Vec::new();
+        write_uvarint(&mut rec, u64::MAX);
+        assert!(r_ids(&mut &rec[..]).is_err());
+
+        // An honest list still round-trips (the clamp only ever bounds the *reservation*).
+        let mut ok = Vec::new();
+        w_ids(&mut ok, &[3, 9, 900]);
+        assert_eq!(r_ids(&mut &ok[..]).unwrap(), vec![3, 9, 900]);
+    }
+
     use super::*;
     use std::path::PathBuf;
 

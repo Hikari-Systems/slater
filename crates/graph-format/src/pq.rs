@@ -34,7 +34,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint};
 
 /// PQ structural parameters, recorded so the store is self-describing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,14 +433,32 @@ impl PqReader {
         let subspaces = read_uvarint(&mut r)? as u32;
         let dsub = read_uvarint(&mut r)? as u32;
         let k = read_uvarint(&mut r)? as u32;
-        let params = PqParams {
-            dim,
-            subspaces,
-            dsub,
-            k,
-        };
-        let n = (subspaces * k * dsub) as usize;
-        let mut centroids = Vec::with_capacity(n);
+        // The four header fields are untrusted on-disk uvarints, and the codebook size is
+        // their *product*: `subspaces * k * dsub` was computed in `u32`, so it wrapped — a
+        // forged header could name a small `n` and a `dim`/`k` the rest of the reader then
+        // used at full width, or (in a debug build) simply panic on the overflow.
+        //
+        // Re-derive the params through the constructor that the writer used, so the invariants
+        // that make the product meaningful (`dsub == dim / subspaces`, `k = 2^bits` with
+        // `bits` in `1..=8`) are re-checked against the image rather than assumed.
+        if !k.is_power_of_two() {
+            bail!("PQ codebook header: k ({k}) is not a power of two");
+        }
+        let params = PqParams::new(dim, subspaces, k.trailing_zeros())
+            .context("PQ codebook header failed validation")?;
+        if params.dsub != dsub || params.k != k {
+            bail!(
+                "PQ codebook header is inconsistent: dsub={dsub}, k={k}, but dim={dim} over \
+                 {subspaces} subspaces implies dsub={}, k={}",
+                params.dsub,
+                params.k
+            );
+        }
+        // Even validated, `dim` is an unbounded `u32`, so the product still needs a checked
+        // multiply and the reservation still needs clamping by the bytes actually present
+        // (4 per `f32`) — the loop below errors on the first short read.
+        let n = checked_span("PQ codebook", subspaces as u64 * k as u64, dsub as usize)?;
+        let mut centroids = Vec::with_capacity(capacity_for(n, r.len(), 4));
         for _ in 0..n {
             centroids.push(r.read_f32::<LittleEndian>()?);
         }
@@ -459,8 +477,12 @@ impl PqReader {
     pub fn load_resident(&self) -> Result<ResidentPq> {
         let m = self.codebook.params.subspaces as usize;
         let total = self.inner.total_records();
-        let mut node_ids = Vec::with_capacity(total.saturating_sub(1) as usize);
-        let mut codes = Vec::with_capacity(total.saturating_sub(1) as usize * m);
+        // `total` is the block directory's record count — an on-disk number, not a count
+        // backed by a buffer we hold, and `n * m` would wrap. Reserve a bounded prefix and
+        // let the `Vec`s grow as the blocks are actually read (`wire::capacity_hint`).
+        let records = total.saturating_sub(1) as usize;
+        let mut node_ids = Vec::with_capacity(capacity_hint(records));
+        let mut codes = Vec::with_capacity(capacity_hint(records.saturating_mul(m)));
         let mut global: u64 = 0;
         // Whole-file load via a bounded concurrent read-ahead, so a remote backend
         // overlaps its fetch round-trips at generation open without holding more
