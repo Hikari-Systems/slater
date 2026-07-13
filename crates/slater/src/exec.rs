@@ -376,6 +376,7 @@ fn for_each_adj_overlaid(
     cache: &BlockCache,
     node: u64,
     outgoing: bool,
+    reltypes: Option<&[u32]>,
     chunk: usize,
     emit: &mut dyn FnMut(&[topology::Adj]) -> Result<()>,
 ) -> Result<()> {
@@ -482,22 +483,37 @@ fn for_each_adj_overlaid(
                 topo.incoming_global(NodeId(node))
             };
             let rec = cache.record(topo.inner(), gen.uuid(), FileKind::Topology, global)?;
-            topology::decode_adj_into(&rec, outgoing, |a| {
+            let mut core_visit = |a: topology::Adj| -> Result<()> {
                 if !core_removed.contains(&a.edge.0) && delta_keep(&a) {
                     push(a)?;
                 }
                 Ok(())
-            })?;
+            };
+            // Typed expand pushes the reltype set into the decoder, which skips a whole
+            // non-matching reltype run without decoding its neighbour bytes (the hub win);
+            // an untyped read decodes every run.
+            match reltypes {
+                Some(rts) => topology::decode_adj_into_filtered(
+                    &rec,
+                    outgoing,
+                    |rt| rts.contains(&rt),
+                    &mut core_visit,
+                )?,
+                None => topology::decode_adj_into(&rec, outgoing, &mut core_visit)?,
+            }
         }
+        // Segment/delta-born edges are small and uncompressed; apply the same reltype filter
+        // in the fold rather than in the (already-materialised) fragment.
+        let rt_keep = |a: &topology::Adj| reltypes.map_or(true, |rts| rts.contains(&a.reltype));
         // 2. Surviving segment-born edges (delta filter applies, as they sit in the list).
         for a in &seg_born {
-            if delta_keep(a) {
+            if rt_keep(a) && delta_keep(a) {
                 push(*a)?;
             }
         }
         // 3. Surviving delta-born edges (tombstoned-neighbour filter only, matching the fold).
         for a in &delta_born {
-            if !delta.is_tombstoned(a.neighbour.0) {
+            if rt_keep(a) && !delta.is_tombstoned(a.neighbour.0) {
                 push(*a)?;
             }
         }
@@ -521,11 +537,31 @@ fn read_adj_overlaid(
     node: u64,
     outgoing: bool,
 ) -> Result<Vec<topology::Adj>> {
+    read_adj_overlaid_filtered(gen, cache, node, outgoing, None)
+}
+
+/// [`read_adj_overlaid`] restricted to a reltype set (`None` = all). The set is pushed into the
+/// core CSR decode so a typed expand skips non-matching reltype runs without decoding them.
+fn read_adj_overlaid_filtered(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    node: u64,
+    outgoing: bool,
+    reltypes: Option<&[u32]>,
+) -> Result<Vec<topology::Adj>> {
     let mut out = Vec::new();
-    for_each_adj_overlaid(gen, cache, node, outgoing, ADJ_STREAM_CHUNK, &mut |c| {
-        out.extend_from_slice(c);
-        Ok(())
-    })?;
+    for_each_adj_overlaid(
+        gen,
+        cache,
+        node,
+        outgoing,
+        reltypes,
+        ADJ_STREAM_CHUNK,
+        &mut |c| {
+            out.extend_from_slice(c);
+            Ok(())
+        },
+    )?;
     Ok(out)
 }
 
@@ -544,7 +580,8 @@ fn neighbours_par(
 ) -> Result<Vec<u64>> {
     let mut out = Vec::new();
     let mut take = |outgoing: bool| -> Result<()> {
-        for a in read_adj_overlaid(gen, cache, node, outgoing)? {
+        // Push the reltype set into the decode so a typed expand skips non-matching runs.
+        for a in read_adj_overlaid_filtered(gen, cache, node, outgoing, type_ids)? {
             if type_ids.map_or(true, |ids| ids.contains(&a.reltype)) {
                 out.push(a.neighbour.0);
             }
@@ -591,13 +628,31 @@ fn hops_par(
     dir: Direction,
     tf: Option<&TypeFilter>,
 ) -> Result<Vec<Hop>> {
+    // A positive `:T1|T2` filter pushes into the decode (skips non-matching reltype runs); a
+    // boolean `Expr` cannot, so it stays a post-decode per-edge check below.
+    let rt_ids = match tf {
+        Some(TypeFilter::AnyOf(ids)) => Some(ids.as_slice()),
+        _ => None,
+    };
     let mut sources: Vec<(Vec<topology::Adj>, bool)> = Vec::new();
     match dir {
-        Direction::Outgoing => sources.push((read_adj_overlaid(gen, cache, node, true)?, false)),
-        Direction::Incoming => sources.push((read_adj_overlaid(gen, cache, node, false)?, true)),
+        Direction::Outgoing => sources.push((
+            read_adj_overlaid_filtered(gen, cache, node, true, rt_ids)?,
+            false,
+        )),
+        Direction::Incoming => sources.push((
+            read_adj_overlaid_filtered(gen, cache, node, false, rt_ids)?,
+            true,
+        )),
         Direction::Undirected => {
-            sources.push((read_adj_overlaid(gen, cache, node, true)?, false));
-            sources.push((read_adj_overlaid(gen, cache, node, false)?, true));
+            sources.push((
+                read_adj_overlaid_filtered(gen, cache, node, true, rt_ids)?,
+                false,
+            ));
+            sources.push((
+                read_adj_overlaid_filtered(gen, cache, node, false, rt_ids)?,
+                true,
+            ));
         }
     }
     let mut out = Vec::new();
@@ -657,9 +712,13 @@ fn for_each_hop_overlaid(
         Direction::Incoming => &[(false, true)],
         Direction::Undirected => &[(true, false), (false, true)],
     };
+    let rt_ids = match tf {
+        Some(TypeFilter::AnyOf(ids)) => Some(ids.as_slice()),
+        _ => None,
+    };
     let mut buf: Vec<Hop> = Vec::new();
     for &(outgoing, incoming) in dirs {
-        for_each_adj_overlaid(gen, cache, node, outgoing, chunk, &mut |adjs| {
+        for_each_adj_overlaid(gen, cache, node, outgoing, rt_ids, chunk, &mut |adjs| {
             for a in adjs {
                 let keep = match tf {
                     None => true,
@@ -10139,7 +10198,7 @@ mod tests {
                     assert_eq!(got, want, "collect parity node={node} out={outgoing}");
                     for chunk in [1usize, 2, 3, 8192] {
                         let mut streamed = Vec::new();
-                        for_each_adj_overlaid(view, cache, node, outgoing, chunk, &mut |c| {
+                        for_each_adj_overlaid(view, cache, node, outgoing, None, chunk, &mut |c| {
                             assert!(!c.is_empty(), "empty chunk node={node} chunk={chunk}");
                             assert!(c.len() <= chunk, "over-cap chunk node={node} chunk={chunk}");
                             streamed.extend_from_slice(c);
