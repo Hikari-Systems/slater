@@ -107,13 +107,13 @@ impl L0Level {
     }
 
     /// The resident memtable behind a [`L0Level::Resident`] — for resident L0→L0
-    /// compaction (`merge_levels`), which the caller uses only on resident levels.
-    fn resident_memtable(&self) -> &Arc<Memtable> {
+    /// compaction (`merge_levels`); `None` for an off-heap level. A stack can hold both
+    /// formats at once (the flush flag changed between runs; segments reload in the format
+    /// they were written), so this is fallible rather than a panic.
+    fn resident_memtable(&self) -> Option<&Arc<Memtable>> {
         match self {
-            L0Level::Resident(s) => s.memtable(),
-            L0Level::OffHeap { .. } => {
-                unreachable!("resident merge_levels called on an off-heap level")
-            }
+            L0Level::Resident(s) => Some(s.memtable()),
+            L0Level::OffHeap { .. } => None,
         }
     }
 
@@ -124,6 +124,12 @@ impl L0Level {
             L0Level::OffHeap { reader, .. } => Some(reader.clone()),
             L0Level::Resident(_) => None,
         }
+    }
+
+    /// Whether this level is an off-heap (directory) segment — the key compaction groups
+    /// a run by, since a run merges in **its own** format, not the writer's current flag.
+    fn is_off_heap(&self) -> bool {
+        matches!(self, L0Level::OffHeap { .. })
     }
 }
 
@@ -586,6 +592,14 @@ impl DeltaWriter {
     /// self-balancing: equal-sized flushes form same-tier runs that merge, and the merged
     /// results are themselves same-tier and merge in turn, so fan-out stays bounded.
     ///
+    /// **Mixed-format stacks.** The stack can hold both formats at once: `delta.offHeapL0`
+    /// only decides what a *flush* writes, while sealed segments reload in whichever format
+    /// they were written, so flipping the flag leaves off-heap directory levels under (or
+    /// over) resident file levels. The run is therefore selected within a *contiguous
+    /// same-format span* ([`select_compaction_run_in_stack`]) and merged in **that run's**
+    /// format — never in whatever the flag currently says. Each tier keeps compacting
+    /// across a flag flip, and no format ever reaches the other's merge path.
+    ///
     /// **Number-vs-stack-order reconciliation.** Merging a *partial* run leaves several
     /// L0 files, so their on-disk numbers must still agree with age/born-id-base order
     /// (`open` sorts by number). The merged segment therefore **reuses the run's oldest
@@ -610,9 +624,11 @@ impl DeltaWriter {
             return Ok(false);
         }
 
-        // Pick a contiguous run of similar-sized levels (over the newest-first stack).
+        // Pick a contiguous run of similar-sized levels **of one format** (over the
+        // newest-first stack): a mixed stack still compacts, each format tier on its own.
         let sizes: Vec<u64> = inner.l0.iter().map(|s| s.bytes()).collect();
-        let Some((start, end)) = select_compaction_run(&sizes) else {
+        let formats: Vec<bool> = inner.l0.iter().map(|s| s.is_off_heap()).collect();
+        let Some((start, end)) = select_compaction_run_in_stack(&sizes, &formats) else {
             return Ok(false); // a healthy size ladder — nothing same-tier to merge
         };
 
@@ -626,10 +642,12 @@ impl DeltaWriter {
             .map(|s| s.path().to_path_buf())
             .collect();
 
-        // Merge the run (newest-first) into one equivalent segment, in the run's own format:
-        // off-heap **streams** the sorted on-disk runs (RSS bounded to a block window, D54),
-        // resident folds in RAM via `merge_levels`.
-        let merged_level = if inner.off_heap {
+        // Merge the run (newest-first) into one equivalent segment, in **the run's own**
+        // format (every member shares it — the selection groups by format, and the reused
+        // oldest slot is that format's on-disk shape): off-heap **streams** the sorted
+        // on-disk runs (RSS bounded to a block window, D54), resident folds in RAM via
+        // `merge_levels`.
+        let merged_level = if formats[start] {
             let cache = inner
                 .block_cache
                 .clone()
@@ -639,7 +657,7 @@ impl DeltaWriter {
                 .map(|s| s.offheap_reader())
                 .collect::<Option<Vec<Arc<L0Reader>>>>()
             else {
-                return Ok(false); // a mixed stack (not expected in off-heap mode) — skip
+                return Ok(false); // unreachable by construction — never merge cross-format
             };
             merge_run(
                 &run,
@@ -652,10 +670,13 @@ impl DeltaWriter {
             open_l0_level(&oldest_path, Some(&cache))
                 .with_context(|| format!("reopen merged off-heap L0 segment {oldest_path:?}"))?
         } else {
-            let run: Vec<&Memtable> = inner.l0[start..end]
+            let Some(run) = inner.l0[start..end]
                 .iter()
-                .map(|s| s.resident_memtable().as_ref())
-                .collect();
+                .map(|s| s.resident_memtable().map(Arc::as_ref))
+                .collect::<Option<Vec<&Memtable>>>()
+            else {
+                return Ok(false); // unreachable by construction — never merge cross-format
+            };
             let merged = Memtable::merge_levels(&run);
             L0Segment::write(&merged, &oldest_path)
                 .with_context(|| format!("write compacted L0 segment {oldest_path:?}"))?;
@@ -1031,6 +1052,39 @@ fn select_compaction_run(sizes: &[u64]) -> Option<(usize, usize)> {
     best
 }
 
+/// Choose the compaction run over a **mixed-format** stack: [`select_compaction_run`]'s
+/// size-tier selection, restricted to a contiguous run of levels sharing one format
+/// (`off_heap[i]`). A run must be single-format because the two formats have different
+/// merge paths (in-RAM `merge_levels` vs streaming `merge_run`) and different on-disk
+/// shapes (file vs directory) — and a stack *is* mixed whenever the `delta.offHeapL0` flag
+/// changes between runs, since sealed segments reload in the format they were written.
+/// Restricting to a contiguous span keeps the run contiguous in the stack, so compaction's
+/// splice + oldest-file-number reuse (number order == born-id-base order) is unchanged.
+/// Same tie-break as [`select_compaction_run`] (longest run; tie → oldest), and identical
+/// to it on a single-format stack. Pure + deterministic.
+fn select_compaction_run_in_stack(sizes: &[u64], off_heap: &[bool]) -> Option<(usize, usize)> {
+    debug_assert_eq!(sizes.len(), off_heap.len());
+    let n = sizes.len();
+    let mut best: Option<(usize, usize)> = None;
+    let mut span_start = 0;
+    while span_start < n {
+        let mut span_end = span_start + 1;
+        while span_end < n && off_heap[span_end] == off_heap[span_start] {
+            span_end += 1;
+        }
+        if let Some((s, e)) = select_compaction_run(&sizes[span_start..span_end]) {
+            let (s, e) = (span_start + s, span_start + e);
+            // `>=` so a later (older) span's equal-length run wins the tie → oldest-first,
+            // matching `select_compaction_run`'s within-span tie-break.
+            if best.map_or(true, |(bs, be)| e - s >= be - bs) {
+                best = Some((s, e));
+            }
+        }
+        span_start = span_end;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,18 +1125,22 @@ mod tests {
         Arc::new(GfBlockCache::new(1 << 20))
     }
 
-    fn open_offheap(dir: &Path, cache: Arc<GfBlockCache>) -> DeltaWriter {
+    fn open_with_flag(dir: &Path, cache: Arc<GfBlockCache>, off_heap: bool) -> DeltaWriter {
         DeltaWriter::open_with_cache(
             dir,
             "g",
             GenId(uuid::Uuid::nil()),
             100,
             0,
-            true,
+            off_heap,
             Some(cache),
             resolve_ticker,
         )
         .unwrap()
+    }
+
+    fn open_offheap(dir: &Path, cache: Arc<GfBlockCache>) -> DeltaWriter {
+        open_with_flag(dir, cache, true)
     }
 
     /// An off-heap flush writes a **directory** segment whose reads (core patch + a
@@ -1260,6 +1318,178 @@ mod tests {
             Some(Value::Int(2)),
         );
         assert_eq!(snap.born_ids_with_label("Company"), vec![100, 101, 102]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-82. Flipping `delta.offHeapL0` off leaves a **mixed-format** stack (sealed
+    /// segments reload in whichever format they were written), and a write-triggered
+    /// compaction must not blow up on it: before the fix the resident branch called
+    /// `resident_memtable()` on an off-heap level and hit `unreachable!` *while holding the
+    /// writer mutex*, poisoning it (every later write/freeze/flush then panicked too).
+    /// Compaction must instead pick a single-format run and merge it in that run's own
+    /// format — so both tiers keep collapsing across the flag flip, reads are preserved and
+    /// the writer stays usable.
+    #[test]
+    fn compact_l0_on_a_mixed_format_stack_compacts_without_panicking() {
+        let dir = tmp("mixed_compact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = gf_cache();
+
+        // Two off-heap (directory) levels: each re-patches core node A (dense 10) and adds
+        // one born node (synthetic 100, 101).
+        {
+            let w = open_offheap(&dir, cache.clone());
+            for i in 0..2u64 {
+                w.write(
+                    upsert(
+                        "Company",
+                        "ticker",
+                        Value::Str("A".into()),
+                        &[("price", Value::Int(i as i64))],
+                    ),
+                    node(10),
+                )
+                .unwrap();
+                w.write(
+                    upsert(
+                        "Company",
+                        "ticker",
+                        Value::Str(format!("C{i}")),
+                        &[("n", Value::Int(i as i64))],
+                    ),
+                    OpResolution::Node(None),
+                )
+                .unwrap();
+                assert!(w.flush_to_l0().unwrap());
+            }
+            assert_eq!(w.l0_len(), 2);
+        }
+
+        // The operator flips `offHeapL0` off and restarts. The two directory segments
+        // reload as off-heap levels; the next flush writes a *resident* file on top of them
+        // — a mixed stack.
+        let w = open_with_flag(&dir, cache.clone(), false);
+        assert_eq!(
+            w.l0_len(),
+            2,
+            "the off-heap levels reload under the flag flip"
+        );
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(2))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C2".into()),
+                &[("n", Value::Int(2))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 3);
+        {
+            let inner = w.inner.lock().expect("delta writer lock");
+            let formats: Vec<bool> = inner.l0.iter().map(|s| s.is_off_heap()).collect();
+            assert_eq!(
+                formats,
+                vec![false, true, true],
+                "mixed stack, newest-first: a resident file over two off-heap directories",
+            );
+        }
+
+        let reads = |w: &DeltaWriter| {
+            let s = w.delta_snapshot();
+            (
+                s.born_ids_with_label("Company"),
+                s.node_patch(10)
+                    .and_then(|d| d.patches.get("price").cloned()),
+                s.node_patch(100).and_then(|d| d.patches.get("n").cloned()),
+                s.node_patch(101).and_then(|d| d.patches.get("n").cloned()),
+                s.node_patch(102).and_then(|d| d.patches.get("n").cloned()),
+            )
+        };
+        let before = reads(&w);
+        assert_eq!(
+            before,
+            (
+                vec![100, 101, 102],
+                Some(Value::Int(2)),
+                Some(Value::Int(0)),
+                Some(Value::Int(1)),
+                Some(Value::Int(2))
+            ),
+        );
+
+        // The off-heap tier compacts on its own (streamed through `merge_run`) — no panic,
+        // no poisoned lock, and the resident level on top is left alone.
+        assert!(w.compact_l0().unwrap(), "the off-heap tier compacts");
+        assert_eq!(w.l0_len(), 2, "the two off-heap levels merged into one");
+        assert_eq!(reads(&w), before, "reads unchanged by the mixed compaction");
+        {
+            let inner = w.inner.lock().expect("delta writer lock");
+            let formats: Vec<bool> = inner.l0.iter().map(|s| s.is_off_heap()).collect();
+            assert_eq!(
+                formats,
+                vec![false, true],
+                "the merged level kept the run's own (off-heap) format",
+            );
+        }
+
+        // The writer is still healthy after the compaction (the lock was never poisoned):
+        // another write + flush lands a second resident level, and the *resident* tier now
+        // compacts — in its own format — over the surviving off-heap level.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("C3".into()),
+                &[("n", Value::Int(3))],
+            ),
+            OpResolution::Node(None),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        assert_eq!(w.l0_len(), 3);
+        assert!(w.compact_l0().unwrap(), "the resident tier compacts");
+        assert_eq!(w.l0_len(), 2);
+        {
+            let inner = w.inner.lock().expect("delta writer lock");
+            let formats: Vec<bool> = inner.l0.iter().map(|s| s.is_off_heap()).collect();
+            assert_eq!(formats, vec![false, true], "still one level of each format");
+        }
+        let after = reads(&w);
+        assert_eq!(
+            after,
+            (
+                vec![100, 101, 102, 103],
+                Some(Value::Int(2)),
+                Some(Value::Int(0)),
+                Some(Value::Int(1)),
+                Some(Value::Int(2))
+            ),
+        );
+        assert_eq!(
+            w.delta_snapshot()
+                .node_patch(103)
+                .and_then(|d| d.patches.get("n").cloned()),
+            Some(Value::Int(3)),
+        );
+        drop(w);
+
+        // Durable + correctly ordered across a reopen: the merged segments reused their
+        // run's oldest file number, so on-disk number order still matches born-id order.
+        let w2 = open_with_flag(&dir, cache, false);
+        assert_eq!(w2.l0_len(), 2);
+        assert_eq!(reads(&w2), after, "mixed-compacted reads survive a reopen");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1941,6 +2171,51 @@ mod tests {
         // Within-ratio (4×) is same tier; just over is not.
         assert_eq!(select_compaction_run(&[100, 400]), Some((0, 2)));
         assert_eq!(select_compaction_run(&[100, 401]), None);
+    }
+
+    #[test]
+    fn select_compaction_run_in_stack_never_crosses_a_format_boundary() {
+        // A single-format stack selects exactly as the format-blind selector does.
+        for sizes in [
+            vec![],
+            vec![100],
+            vec![1000, 200, 40, 8],
+            vec![100, 100, 100],
+            vec![10_000, 100, 120, 90],
+            vec![100, 100, 9_000, 50, 60],
+        ] {
+            for off_heap in [false, true] {
+                let flags = vec![off_heap; sizes.len()];
+                assert_eq!(
+                    select_compaction_run_in_stack(&sizes, &flags),
+                    select_compaction_run(&sizes),
+                    "single-format stack {sizes:?} (off_heap={off_heap})",
+                );
+            }
+        }
+        // The tiers are same-size across the boundary, but a run may never span it: the
+        // longest single-format run wins (here the two off-heap levels).
+        assert_eq!(
+            select_compaction_run_in_stack(&[100, 100, 100], &[false, true, true]),
+            Some((1, 3)),
+        );
+        // Equal-length runs either side of the boundary → the OLDEST (largest start) wins,
+        // matching the format-blind tie-break.
+        assert_eq!(
+            select_compaction_run_in_stack(&[100, 100, 100, 100], &[false, false, true, true]),
+            Some((2, 4)),
+        );
+        // A same-tier pair that only exists *across* the boundary is not a run — the
+        // formats have different merge paths, so nothing is compacted.
+        assert_eq!(
+            select_compaction_run_in_stack(&[100, 100], &[false, true]),
+            None,
+        );
+        // A lone level of the other format between two runs does not join either.
+        assert_eq!(
+            select_compaction_run_in_stack(&[100, 100, 100], &[true, false, true]),
+            None,
+        );
     }
 
     #[test]
