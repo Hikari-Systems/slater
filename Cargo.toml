@@ -79,6 +79,33 @@ wide = "0.7"
 # Regular expressions (slater: `=~` operator + `string.*RegEx` functions).
 regex = "1"
 
+# Randomness (slater: the Cypher `rand()` function). Replaces a hand-rolled
+# per-thread SplitMix64 — a bespoke generator whose uniformity this repo would
+# otherwise have to re-argue on every review, which is the exact class of
+# bit-level reasoning that produced HIK-74 (`rand()` stuck in `[0.5, 0.75)`).
+#
+# `rand` 0.9 was already resolved in `Cargo.lock` (via `quinn-proto`) but nothing
+# compiled it. Adopting it adds SIX crates to the compiled graph, not the three
+# you would guess from `rand`'s direct deps — measured, not assumed
+# (`cargo tree -e normal --workspace`, diffed against the parent commit):
+#
+#   rand 0.9 ─┬─ rand_chacha 0.9 ─┬─ ppv-lite86 0.2 ── zerocopy 0.8
+#             │                   └─ rand_core 0.9 ── getrandom 0.3
+#             └─ rand_core 0.9 (*)
+#
+# `ppv-lite86`/`zerocopy` are ChaCha's SIMD backend and are unavoidable if we want
+# `ThreadRng` — ThreadRng *is* ChaCha12, so `rand_chacha` and its backend come with
+# it. `getrandom` 0.3 is a third co-existing major of a crate already compiled at
+# 0.2 (via ring/rustls) and 0.4 (via uuid); `rand_core` 0.9 likewise co-exists with
+# the 0.6 the crypto stack (argon2, chacha20poly1305) uses for its `OsRng`.
+# Cargo compiles each semver-major separately, so these are additive, not shared.
+#
+# That is the honest price of deleting a bespoke generator. Worth it: `ThreadRng`
+# is a thread-local ChaCha12 CSPRNG seeded once from the OS, so `rand()` costs no
+# per-row entropy syscall and no lock — and its uniformity is not a property this
+# repo has to defend on every review.
+rand = "0.9"
+
 # Global allocator on Linux (slater). jemalloc's background purge threads return
 # freed heap to the OS on a decay timer without the process making free() calls,
 # replacing the former idle-gated malloc_trim FFI. The `background_threads` feature
