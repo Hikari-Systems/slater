@@ -13,14 +13,22 @@
 //! round-trippable through a checkpoint.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::identity::SymbolId;
 
 /// First-seen interner: name -> dense id, preserving insertion order.
+///
+/// Each first-seen name is heap-allocated **once** as an `Arc<str>` shared between the
+/// id table (`names`) and the lookup map (`map`); the map holds a refcounted handle to
+/// the same allocation rather than a second copy of the string. `Arc` (not `Rc`) so the
+/// interner — and the [`crate::memtable::Memtable`] that owns it — stays `Send + Sync`
+/// for the published read snapshot. `HashMap<Arc<str>, _>: Borrow<str>` keeps lookups
+/// by `&str` allocation-free.
 #[derive(Debug, Default, Clone)]
 pub struct Interner {
-    map: HashMap<String, SymbolId>,
-    names: Vec<String>,
+    map: HashMap<Arc<str>, SymbolId>,
+    names: Vec<Arc<str>>,
 }
 
 impl Interner {
@@ -34,8 +42,10 @@ impl Interner {
             return id;
         }
         let id = self.names.len() as SymbolId;
-        self.names.push(name.to_owned());
-        self.map.insert(name.to_owned(), id);
+        // One allocation, shared: the map key is a refcount bump, not a second copy.
+        let shared: Arc<str> = Arc::from(name);
+        self.names.push(Arc::clone(&shared));
+        self.map.insert(shared, id);
         id
     }
 
@@ -46,20 +56,21 @@ impl Interner {
 
     /// Resolve an id back to its name.
     pub fn name(&self, id: SymbolId) -> Option<&str> {
-        self.names.get(id as usize).map(String::as_str)
+        self.names.get(id as usize).map(|s| &**s)
     }
 
     /// The ordered name table (id == index).
-    pub fn names(&self) -> &[String] {
+    pub fn names(&self) -> &[Arc<str>] {
         &self.names
     }
 
     /// Rebuild from a persisted name table (for resume / checkpoint restore).
     pub fn from_names(names: Vec<String>) -> Self {
+        let names: Vec<Arc<str>> = names.into_iter().map(Arc::from).collect();
         let map = names
             .iter()
             .enumerate()
-            .map(|(i, n)| (n.clone(), i as SymbolId))
+            .map(|(i, n)| (Arc::clone(n), i as SymbolId))
             .collect();
         Self { map, names }
     }
@@ -86,9 +97,20 @@ mod tests {
         let mut it = Interner::new();
         it.intern("a");
         it.intern("b");
-        let restored = Interner::from_names(it.names().to_vec());
+        let owned: Vec<String> = it.names().iter().map(|n| n.to_string()).collect();
+        let restored = Interner::from_names(owned);
         assert_eq!(restored.get("a"), Some(0));
         assert_eq!(restored.get("b"), Some(1));
         assert_eq!(restored.names(), it.names());
+    }
+
+    #[test]
+    fn first_seen_name_is_allocated_once_and_shared() {
+        // The single heap allocation is shared between the id table and the lookup map:
+        // exactly two strong refs, both pointing at the same allocation (no second copy).
+        let mut it = Interner::new();
+        it.intern("Company");
+        let handle = &it.names()[0];
+        assert_eq!(std::sync::Arc::strong_count(handle), 2);
     }
 }

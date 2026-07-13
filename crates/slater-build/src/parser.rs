@@ -63,7 +63,7 @@ impl<R: BufRead> StatementReader<R> {
 
     /// Return the next non-empty statement (trimmed), or `None` at end of input.
     pub fn next_statement(&mut self) -> Result<Option<String>> {
-        loop {
+        'outer: loop {
             // Drain whatever the BufReader already has, byte by byte, until a
             // top-level `;` completes a statement.
             let available = self.reader.fill_buf().context("read dump script")?;
@@ -73,7 +73,7 @@ impl<R: BufRead> StatementReader<R> {
                     return Ok(None);
                 }
                 self.done = true;
-                return Ok(self.take_statement());
+                return self.take_statement();
             }
             let mut consumed = 0;
             for &b in available {
@@ -108,11 +108,15 @@ impl<R: BufRead> StatementReader<R> {
                         b';' => {
                             // Statement boundary.
                             self.reader.consume(consumed);
-                            if let Some(s) = self.take_statement() {
+                            if let Some(s) = self.take_statement()? {
                                 return Ok(Some(s));
                             }
-                            // Empty statement (e.g. stray `;`): keep scanning.
-                            return self.next_statement();
+                            // Empty statement (e.g. stray `;`): keep scanning from the
+                            // next byte. Iterative on purpose — recursing here grew the
+                            // stack one frame per empty statement, so a script of many
+                            // stray `;` could overflow (only tail-call elimination, which
+                            // Rust does not guarantee, kept it from crashing).
+                            continue 'outer;
                         }
                         _ => self.buf.push(b),
                     }
@@ -122,14 +126,17 @@ impl<R: BufRead> StatementReader<R> {
         }
     }
 
-    fn take_statement(&mut self) -> Option<String> {
+    fn take_statement(&mut self) -> Result<Option<String>> {
         let bytes = std::mem::take(&mut self.buf);
-        let s = String::from_utf8_lossy(&bytes);
+        // Strict UTF-8: `from_utf8_lossy` would silently replace invalid bytes with
+        // U+FFFD, corrupting a property value (or a quoted identifier) rather than
+        // surfacing the malformed input. A dump is text; reject non-UTF-8 loudly.
+        let s = std::str::from_utf8(&bytes).context("dump statement is not valid UTF-8")?;
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(trimmed.to_string())
+            Ok(Some(trimmed.to_string()))
         }
     }
 }
@@ -867,6 +874,29 @@ mod tests {
             out.push(s);
         }
         out
+    }
+
+    #[test]
+    fn non_utf8_input_is_rejected_not_silently_corrupted() {
+        // A statement carrying an invalid UTF-8 byte (0xFF) must error, not be silently
+        // repaired into U+FFFD (which `from_utf8_lossy` would have done).
+        let mut bytes = b"CREATE (:A {t: '".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"'});");
+        let mut r = StatementReader::new(BufReader::new(&bytes[..]));
+        assert!(r.next_statement().is_err());
+    }
+
+    #[test]
+    fn many_empty_statements_do_not_recurse() {
+        // A long run of stray `;` used to recurse once per empty statement; make sure
+        // it scans iteratively and simply skips them (no stack overflow, no phantom
+        // statements). 100k separators is far past any tail-call safety net.
+        let mut script = ";".repeat(100_000);
+        script.push_str("CREATE (:A {});");
+        let v = stmts(&script);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "CREATE (:A {})");
     }
 
     #[test]

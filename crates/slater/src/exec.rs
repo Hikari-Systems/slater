@@ -1812,6 +1812,26 @@ impl Table {
     }
 }
 
+/// Typed executor limit violations (deadline, per-query / server-wide intermediate
+/// budget, shortestPath node cap). Each variant's `Display` reproduces the exact text
+/// the executor previously `bail!`ed, so message-based assertions still hold — but
+/// callers such as the diagnostics failure classifier now branch on the **type**
+/// (`downcast_ref::<ExecLimit>()`) instead of matching substrings, per the house
+/// typed-errors standard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExecLimit {
+    #[error("query exceeded its time limit")]
+    Deadline,
+    #[error(
+        "query exceeded the intermediate result budget of {0} elements (query.maxIntermediate)"
+    )]
+    IntermediateBudget(u64),
+    #[error("server-wide intermediate budget of {0} elements exhausted (query.maxIntermediateGlobal) — too many concurrent memory-heavy queries")]
+    GlobalBudget(u64),
+    #[error("shortestPath exceeded the node cap of {0} (query.maxShortestPathExplore)")]
+    ShortestPathCap(u64),
+}
+
 // ── Server-wide intermediate budget ─────────────────────────────────────────
 
 /// Process-wide ceiling on the **sum** of all in-flight queries' intermediate
@@ -2393,7 +2413,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     fn check_deadline(&self) -> Result<()> {
         if let Some(d) = self.deadline {
             if Instant::now() >= d {
-                bail!("query exceeded its time limit");
+                return Err(ExecLimit::Deadline.into());
             }
         }
         Ok(())
@@ -2409,10 +2429,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             let used = self.budget_used.get().saturating_add(n);
             self.budget_used.set(used);
             if used > self.max_intermediate {
-                bail!(
-                    "query exceeded the intermediate result budget of {} elements (query.maxIntermediate)",
-                    self.max_intermediate
-                );
+                return Err(ExecLimit::IntermediateBudget(self.max_intermediate).into());
             }
         }
         // Server-wide budget (config `query.maxIntermediateGlobal`; 0 disables) —
@@ -2423,11 +2440,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 self.global_charged
                     .set(self.global_charged.get().saturating_add(n));
                 if !g.try_charge(n) {
-                    bail!(
-                        "server-wide intermediate budget of {} elements exhausted \
-                         (query.maxIntermediateGlobal) — too many concurrent memory-heavy queries",
-                        g.limit()
-                    );
+                    return Err(ExecLimit::GlobalBudget(g.limit()).into());
                 }
             }
         }
@@ -4024,7 +4037,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let cap = self.max_shortest_path_explore;
         let mut discovered: u64 = 2; // the two endpoints are already held resident
         if cap != 0 && discovered > cap {
-            bail!("shortestPath exceeded the node cap of {cap} (query.maxShortestPathExplore)");
+            return Err(ExecLimit::ShortestPathCap(cap).into());
         }
 
         // `node -> (neighbour toward the seed, depth from the seed)`.
@@ -4113,10 +4126,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     set(mine, nb);
                     discovered += 1;
                     if cap != 0 && discovered > cap {
-                        bail!(
-                            "shortestPath exceeded the node cap of {cap} \
-                             (query.maxShortestPathExplore)"
-                        );
+                        return Err(ExecLimit::ShortestPathCap(cap).into());
                     }
                     if forward {
                         fpar.insert(nb, (node, depth));
@@ -9057,7 +9067,12 @@ fn walk_mode(r: Option<PathRestrictor>) -> WalkMode {
 
 fn varlen_bounds(vl: &VarLength) -> (u32, u32) {
     let min = vl.min.unwrap_or(1);
-    let max = vl.max.unwrap_or(MAX_VARLEN_HOPS).max(min);
+    // Do NOT clamp `max` up to `min`: an explicitly inverted range (`*5..3`, or an
+    // open `*20..` whose min exceeds the default hop cap) is an *empty* range, not a
+    // single length-`min` walk. Every consumer (`varlen`, `select_paths`,
+    // `shortestPath`) already yields nothing when `max < min`, so returning the raw
+    // bounds is correct — the old `.max(min)` silently rewrote `5..3` into `5..5`.
+    let max = vl.max.unwrap_or(MAX_VARLEN_HOPS);
     (min, max)
 }
 
@@ -15617,6 +15632,40 @@ mod tests {
         }
         assert_eq!(b.in_use(), 0, "balanced charge/release nets to zero");
         assert!(b.peak() >= 7, "peak captured the per-cycle high-water");
+    }
+
+    #[test]
+    fn varlen_bounds_inverted_range_stays_empty() {
+        // `*5..3`: an explicit max below min is an empty range. It must NOT be clamped
+        // to `5..5` (which would wrongly match exactly-length-5 walks). Every consumer
+        // treats `max < min` as "no path", so the raw inverted bounds are correct.
+        let vl = VarLength {
+            min: Some(5),
+            max: Some(3),
+        };
+        let (min, max) = varlen_bounds(&vl);
+        assert_eq!((min, max), (5, 3));
+        assert!(
+            max < min,
+            "inverted range must stay inverted (empty), not clamp"
+        );
+
+        // A normal range is unaffected.
+        assert_eq!(
+            varlen_bounds(&VarLength {
+                min: Some(2),
+                max: Some(4)
+            }),
+            (2, 4)
+        );
+        // An open `*` still spans 1..=MAX_VARLEN_HOPS.
+        assert_eq!(
+            varlen_bounds(&VarLength {
+                min: None,
+                max: None
+            }),
+            (1, MAX_VARLEN_HOPS)
+        );
     }
 
     #[test]

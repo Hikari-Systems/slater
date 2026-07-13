@@ -19,7 +19,7 @@ serde.workspace = true
 crc32c.workspace = true
 
 [lints.rust]
-# slater-delta contains no `unsafe`: the memtable is a plain owned map behind an
-# `ArcSwap` snapshot and the segment writers delegate to `graph-format`'s
-# (already-unsafe-free) block/ISAM writers. Forbid keeps it that way.
+# slater-delta contains no `unsafe`: the memtable is a plain owned map published
+# behind the writer's `RwLock<DeltaSnapshot>` and the segment writers delegate to
+# `graph-format`'s (already-unsafe-free) block/ISAM writers. Forbid keeps it that way.
 unsafe_code = "forbid"

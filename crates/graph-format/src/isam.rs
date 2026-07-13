@@ -241,11 +241,31 @@ struct TopEntry {
 /// A decoded ISAM leaf block: `(key, id)` pairs, ascending by key. Shared read-only.
 type DecodedBlock = Arc<Vec<(Value, u64)>>;
 
-/// Rough resident-byte estimate of a decoded block, for LRU budgeting. Exact for
-/// fixed-width keys (Int/Float); a small under-count for `Str` heap, which the budget
-/// tolerates.
+/// Resident-byte estimate of a decoded block, for LRU budgeting: the inline slice
+/// footprint plus the heap each key value owns beyond its `Value` struct. Counting the
+/// `Str`/`List`/`Vector` heap keeps the byte budget honest for string-keyed indexes
+/// (the old estimate counted only the fixed struct, so a block of long string keys
+/// looked far smaller than it was and the budget could be badly overshot).
 fn decoded_bytes(entries: &[(Value, u64)]) -> usize {
     std::mem::size_of_val(entries)
+        + entries
+            .iter()
+            .map(|(v, _)| value_heap_bytes(v))
+            .sum::<usize>()
+}
+
+/// Heap bytes a `Value` owns beyond its own struct footprint (already counted by
+/// `size_of_val` on the containing slice).
+fn value_heap_bytes(v: &Value) -> usize {
+    match v {
+        Value::Str(s) => s.len(),
+        Value::List(items) => {
+            items.len() * std::mem::size_of::<Value>()
+                + items.iter().map(value_heap_bytes).sum::<usize>()
+        }
+        Value::Vector(f) => f.len() * std::mem::size_of::<f32>(),
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) => 0,
+    }
 }
 
 struct DbcEntry {
@@ -772,6 +792,29 @@ impl IsamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_bytes_counts_str_key_heap() {
+        // Fixed-width keys: exactly the slice footprint, no heap.
+        let ints: Vec<(Value, u64)> = (0..8u64).map(|i| (Value::Int(i as i64), i)).collect();
+        assert_eq!(decoded_bytes(&ints), std::mem::size_of_val(ints.as_slice()));
+
+        // String keys own heap the old `size_of_val`-only estimate ignored.
+        let strs: Vec<(Value, u64)> = vec![
+            (Value::Str("a-fairly-long-string-key".into()), 0),
+            (Value::Str("another-long-key-value".into()), 1),
+        ];
+        let base = std::mem::size_of_val(strs.as_slice());
+        let heap: usize = strs
+            .iter()
+            .map(|(v, _)| match v {
+                Value::Str(s) => s.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(decoded_bytes(&strs), base + heap);
+        assert!(decoded_bytes(&strs) > base, "Str heap must be counted");
+    }
 
     // HIK-80: the ISAM footer is **plaintext even for an encrypted index** — the cipher covers
     // the blocks and the top-level body, not the footer that locates them. `top_len` is an

@@ -72,7 +72,13 @@ fn parse_field(spec: &str, min: u32, max: u32) -> Result<Field> {
         let mut v = lo;
         while v <= hi {
             allowed[v as usize] = true;
-            v += step;
+            // A huge `step` (near `u32::MAX`) would overflow `v += step` — a panic in
+            // debug, and in release a wrap back below `hi` that loops forever. Stop
+            // cleanly once the next multiple leaves the `u32` range.
+            v = match v.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
         }
     }
     Ok(Field { allowed })
@@ -208,5 +214,16 @@ mod tests {
             "non-numeric minute"
         );
         assert!(CronWindow::parse("0 * 0 * *").is_err(), "day-of-month 0");
+    }
+
+    #[test]
+    fn huge_step_does_not_overflow_or_hang() {
+        // A step near u32::MAX must terminate after the first multiple instead of
+        // overflowing (panic in debug / infinite wrap-around loop in release).
+        let step = u32::MAX;
+        let f = parse_field(&format!("0-23/{step}"), 0, 23).expect("parses");
+        // Only the low endpoint is set; the next multiple is out of the u32 range.
+        assert!(f.allowed[0]);
+        assert!(f.allowed[1..].iter().all(|&b| !b));
     }
 }

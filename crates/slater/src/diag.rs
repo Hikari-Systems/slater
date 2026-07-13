@@ -193,9 +193,12 @@ impl Diagnostics {
 
     /// A query is about to execute on the blocking pool.
     pub fn on_query_start(&self) {
-        // `queries_in_flight` is maintained unconditionally (two relaxed atomics —
-        // negligible on the hot path) so the allocator-trim idle gate can read it
-        // even when load-test diagnostics are off; the rest stays gated.
+        // `queries_in_flight` is maintained unconditionally (a single relaxed atomic —
+        // negligible on the hot path) so the live in-flight gauge is always reported in
+        // the diagnostics snapshot; the rest of the accounting stays gated on `enabled`.
+        // Because the increment is unconditional, *every* completion path
+        // (`on_query_ok` / `on_query_err` / `on_query_task_failed`) must decrement it
+        // unconditionally too, or the gauge leaks when diagnostics are off.
         self.queries_in_flight.fetch_add(1, Ordering::Relaxed);
         if self.enabled {
             self.queries_started.fetch_add(1, Ordering::Relaxed);
@@ -209,40 +212,48 @@ impl Diagnostics {
             self.latency.record(total_ms);
         }
     }
-    /// Live count of queries currently executing (always tracked). Used by the
-    /// allocator-trim task to fire only when the server is idle.
+    /// Live count of queries currently executing (always tracked, independent of the
+    /// `enabled` gate). Surfaced verbatim in the diagnostics snapshot as
+    /// `queries_in_flight`.
     pub fn in_flight(&self) -> i64 {
         self.queries_in_flight.load(Ordering::Relaxed)
     }
-    /// A query failed; classify the `anyhow` error into the right reason counter
-    /// by its message (the same string signatures `Failure::from_query_error`
-    /// keys on, plus the executor's budget / deadline / shortest-path messages).
+    /// A query failed; classify the `anyhow` error into the right reason counter. The
+    /// executor's limit family is matched by **type** (`crate::exec::ExecLimit` via
+    /// `downcast_ref`), per the house typed-errors standard; a pest syntax error has no
+    /// typed form yet, so it (and the typed `QueryTooDeep`, which is the same class) is
+    /// the one residual textual/`downcast` fallback.
     pub fn on_query_err(&self, err: &anyhow::Error) {
         self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         if !self.enabled {
             return;
         }
-        let m = err.to_string();
-        let counter = if m.contains("server-wide intermediate budget") {
-            &self.fail_global_budget
-        } else if m.contains("intermediate result budget") {
-            &self.fail_budget
-        } else if m.contains("exceeded its time limit") {
-            &self.fail_deadline
-        } else if m.contains("shortestPath exceeded the node cap") {
-            &self.fail_shortest_path
-        } else if m.contains("syntax error") {
-            &self.fail_parse
-        } else {
-            &self.fail_other
+        use crate::exec::ExecLimit;
+        let counter = match err.downcast_ref::<ExecLimit>() {
+            Some(ExecLimit::GlobalBudget(_)) => &self.fail_global_budget,
+            Some(ExecLimit::IntermediateBudget(_)) => &self.fail_budget,
+            Some(ExecLimit::Deadline) => &self.fail_deadline,
+            Some(ExecLimit::ShortestPathCap(_)) => &self.fail_shortest_path,
+            None => {
+                if err.downcast_ref::<crate::parser::QueryTooDeep>().is_some()
+                    || err.to_string().contains("syntax error")
+                {
+                    &self.fail_parse
+                } else {
+                    &self.fail_other
+                }
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
     /// The query task itself failed to join (panic / cancellation). Counts as an
     /// `other` failure and still balances the in-flight gauge.
     pub fn on_query_task_failed(&self) {
+        // Balance the unconditional `on_query_start` increment on *every* path,
+        // including when diagnostics are disabled — otherwise a task-join failure with
+        // diagnostics off would leak the gauge upward forever.
+        self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
         if self.enabled {
-            self.queries_in_flight.fetch_sub(1, Ordering::Relaxed);
             self.fail_other.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -534,17 +545,19 @@ mod tests {
 
     #[test]
     fn enabled_registry_counts_and_classifies() {
+        use crate::exec::ExecLimit;
         let d = Diagnostics::new(true);
         d.record_accepted();
         d.record_accepted();
         d.on_query_start();
         d.on_query_ok(5.0);
         d.on_query_start();
-        d.on_query_err(&anyhow::anyhow!(
-            "query exceeded the intermediate result budget of 1000000 elements (query.maxIntermediate)"
-        ));
+        // Classified by TYPE (downcast), not by matching the message text.
+        d.on_query_err(&anyhow::Error::new(ExecLimit::IntermediateBudget(
+            1_000_000,
+        )));
         d.on_query_start();
-        d.on_query_err(&anyhow::anyhow!("query exceeded its time limit"));
+        d.on_query_err(&anyhow::Error::new(ExecLimit::Deadline));
 
         assert_eq!(d.conn_accepted.load(Ordering::Relaxed), 2);
         assert_eq!(d.queries_started.load(Ordering::Relaxed), 3);
@@ -558,22 +571,35 @@ mod tests {
     }
 
     #[test]
-    fn server_wide_budget_error_is_classified_separately() {
-        // The server-wide guard's message contains "intermediate ... budget" too,
-        // so the classifier must key on "server-wide" first and not fold it into
-        // the per-query `fail_budget` counter.
+    fn budget_and_shortest_path_and_parse_are_classified_by_type() {
+        use crate::exec::ExecLimit;
         let d = Diagnostics::new(true);
+
+        // The server-wide budget is a distinct variant from the per-query one — the
+        // classifier must not fold it into `fail_budget` (both share the word "budget").
         d.on_query_start();
-        d.on_query_err(&anyhow::anyhow!(
-            "server-wide intermediate budget of 8000000 elements exhausted \
-             (query.maxIntermediateGlobal) — too many concurrent memory-heavy queries"
-        ));
+        d.on_query_err(&anyhow::Error::new(ExecLimit::GlobalBudget(8_000_000)));
         assert_eq!(d.fail_global_budget.load(Ordering::Relaxed), 1);
         assert_eq!(
             d.fail_budget.load(Ordering::Relaxed),
             0,
-            "the server-wide error must not count as a per-query budget failure"
+            "the server-wide variant must not count as a per-query budget failure"
         );
+
+        d.on_query_start();
+        d.on_query_err(&anyhow::Error::new(ExecLimit::ShortestPathCap(50_000)));
+        assert_eq!(d.fail_shortest_path.load(Ordering::Relaxed), 1);
+
+        // A pest syntax error has no typed form yet: still the textual fallback.
+        d.on_query_start();
+        d.on_query_err(&anyhow::anyhow!("parse error: syntax error at line 1"));
+        assert_eq!(d.fail_parse.load(Ordering::Relaxed), 1);
+
+        // An unrelated error lands in `fail_other`.
+        d.on_query_start();
+        d.on_query_err(&anyhow::anyhow!("no such graph"));
+        assert_eq!(d.fail_other.load(Ordering::Relaxed), 1);
+
         assert_eq!(d.queries_in_flight.load(Ordering::Relaxed), 0);
     }
 

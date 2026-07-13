@@ -48,7 +48,12 @@ impl Proposal {
 
     /// Does this proposal cover exactly `(major, minor)`?
     pub fn covers(&self, major: u8, minor: u8) -> bool {
-        self.major == major && minor <= self.minor && minor + self.range >= self.minor
+        // The client accepts `[self.minor - range, self.minor]`. Written as a
+        // subtraction guarded by `minor <= self.minor` so it never underflows — and,
+        // unlike the equivalent `minor + self.range >= self.minor`, never *overflows*
+        // `u8` on the attacker-controlled `range` byte (which would panic in debug and
+        // silently mis-negotiate in release).
+        self.major == major && minor <= self.minor && self.minor - minor <= self.range
     }
 }
 
@@ -110,6 +115,21 @@ mod tests {
     fn falls_back_to_4_4() {
         let buf = hello([prop(4, 4, 0), prop(4, 3, 0), prop(0, 0, 0), prop(0, 0, 0)]);
         assert_eq!(handle_client_hello(&buf).unwrap(), [0, 0, 4, 4]);
+    }
+
+    #[test]
+    fn covers_does_not_overflow_on_a_huge_range_byte() {
+        // A maximal `range` (attacker-controlled) must not overflow `u8` — the old
+        // `minor + range` would panic in debug at `minor = 4, range = 255` (4+255=259).
+        let p = Proposal {
+            major: 5,
+            minor: 4,
+            range: 255,
+        };
+        assert!(p.covers(5, 4)); // exact minor
+        assert!(p.covers(5, 0)); // the huge range reaches all the way down
+        assert!(!p.covers(5, 5)); // above self.minor is never covered
+        assert!(!p.covers(4, 4)); // wrong major
     }
 
     #[test]

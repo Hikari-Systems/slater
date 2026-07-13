@@ -1111,10 +1111,36 @@ impl AppConfig {
     }
 }
 
+impl ServerConfig {
+    /// Validate cross-field invariants that `serde` cannot express per field. Run at
+    /// boot so a contradictory config is rejected loudly, not discovered at runtime.
+    pub fn validate(&self) -> Result<()> {
+        // A *bounded* pre-auth cap must sit strictly below the global cap, so an
+        // anonymous flood can never consume every connection slot and starve
+        // authenticated readers of reachable headroom (the invariant the field doc
+        // promises). `0` means "unlimited" on either field, which opts that side out
+        // of the comparison — an operator opting out is their explicit choice.
+        if self.max_pre_auth_connections != 0
+            && self.max_connections != 0
+            && self.max_pre_auth_connections >= self.max_connections
+        {
+            anyhow::bail!(
+                "maxPreAuthConnections ({}) must be smaller than maxConnections ({}) so \
+                 authenticated connections always have reachable global headroom",
+                self.max_pre_auth_connections,
+                self.max_connections
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Load and deserialise the Slater config via the house-standard layered loader.
 pub fn load() -> Result<AppConfig> {
     let root = hs_utils::config::load_layered_value()?;
-    serde_json::from_value(root).context("deserialise Slater config")
+    let cfg: AppConfig = serde_json::from_value(root).context("deserialise Slater config")?;
+    cfg.server.validate()?;
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -1294,6 +1320,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_pre_auth_cap_at_or_above_global_cap() {
+        let bounded = |max: u64, pre: u64| -> ServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "maxConnections": max,
+                "maxPreAuthConnections": pre,
+            }))
+            .unwrap()
+        };
+        // pre-auth == global and pre-auth > global both starve authenticated readers.
+        assert!(bounded(100, 100).validate().is_err());
+        assert!(bounded(100, 200).validate().is_err());
+        // Strictly below is fine.
+        assert!(bounded(100, 99).validate().is_ok());
+        // 0 = unlimited on either side opts out of the comparison (operator's choice).
+        assert!(bounded(100, 0).validate().is_ok());
+        assert!(bounded(0, 100).validate().is_ok());
+    }
+
+    #[test]
     fn server_security_limits_default_on_and_generous() {
         let cfg: ServerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(cfg.max_message_bytes, 64 * 1024 * 1024);
@@ -1305,6 +1350,7 @@ mod tests {
         assert_eq!(cfg.max_connections_per_ip, 1_024);
         // The pre-auth budget must leave global headroom for authenticated readers.
         assert!(cfg.max_pre_auth_connections < cfg.max_connections);
+        assert!(cfg.validate().is_ok(), "the shipped defaults must validate");
         // Password hashing is bounded by default: concurrent verifies are capped well
         // below the blocking pool that query execution shares, and one connection gets
         // a small allowance of failed LOGONs.

@@ -8,9 +8,11 @@
 //! The memtable is authoritatively keyed by canonical **business identity**
 //! ([`crate::identity`]), never dense id — dense ids are per-generation and the
 //! `cluster` phase permutes them. It is written by a **single writer** and
-//! published to readers as an immutable [`DeltaSnapshot`] (via an `ArcSwap` in the
-//! server), so readers never block the writer and vice versa — it is deliberately
-//! **not** a concurrent/lock-free structure (writes are not being optimised).
+//! published to readers as an immutable [`DeltaSnapshot`] (held behind the writer's
+//! `RwLock<DeltaSnapshot>` — see `slater::delta_writer::DeltaWriter::published`),
+//! which readers clone whole, so readers never block the writer and vice versa — it
+//! is deliberately **not** a concurrent/lock-free structure (writes are not being
+//! optimised).
 //!
 //! # Two id spaces, deliberately
 //! - **Identity** `(label, key-property)` is interned to compact delta-local
