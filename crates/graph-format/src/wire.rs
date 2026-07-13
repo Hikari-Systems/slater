@@ -24,6 +24,48 @@ const TAG_STR: u8 = 4;
 const TAG_LIST: u8 = 5;
 const TAG_VECTOR: u8 = 6;
 
+/// Maximum value nesting a decode will follow, counting the value itself: a bare scalar
+/// is depth 1, an item of a top-level list is depth 2.
+///
+/// A list decodes by recursing, so nesting costs *stack*, and the length guards below do
+/// not bound it: `05 01` (TAG_LIST, one item) is a wholly credible header — one item needs
+/// one byte and there is one byte left — so a ~1 MiB run of `05 01` pairs is 500 000
+/// well-formed frames and overflows the stack. In Rust that is an abort, not a catchable
+/// panic: the whole server dies. Every caller of [`read_value`] / [`skip_value`] is holding
+/// untrusted bytes — a `.blk` block off disk (`columns`, `segment`, `segindex`, `isam`,
+/// `histogram`) or a WAL record being replayed (`slater-delta`) — and for a plaintext
+/// generation an attacker with data-dir write access forges those directly.
+///
+/// **Why 256 and not the ~64 the finding suggested.** Not for legitimacy headroom: a real
+/// property value nests 2–3 levels (a list of strings; a list of lists of ids), and nothing
+/// an upstream KG import can produce comes near even 16. The binding constraint is the other
+/// direction — *whatever the decoder refuses, the writer must never have accepted.* This is a
+/// live write path: a Bolt client can `SET n.p = $param`, and that parameter is admitted by
+/// `bolt::packstream`, whose own guard (`MAX_DEPTH`, HIK-79) allows nesting to 256 by the same
+/// counting rule. It then becomes a `Val`, then a [`Value`], and is persisted by [`write_value`],
+/// which is infallible and encodes whatever it is handed. A cap of 64 here would let a client
+/// write a 100-deep list, be told OK, and leave that property — and the WAL segment holding it —
+/// permanently unreadable: a stack-overflow DoS traded for a data-loss bug. Setting the decode
+/// gate exactly at the accept gate closes that. (A property value sits *inside* the params map,
+/// so its own subtree is bounded by 255 in practice — one level of margin.)
+///
+/// It concedes nothing to the attacker: 256 frames of [`read_value`] is tens of KiB, safe on the
+/// smallest (2 MiB) worker stack, while the attack needs ~500 000 frames.
+pub const MAX_VALUE_DEPTH: usize = 256;
+
+/// An encoded property value cannot be decoded.
+///
+/// Typed so callers classify it with `err.downcast_ref::<ValueDecodeError>()` rather than
+/// matching the message text (cf. [`crate::codec::BlockSizeExceeded`]): this is a corrupt or
+/// hostile image, not an I/O hiccup.
+#[derive(Debug, thiserror::Error)]
+pub enum ValueDecodeError {
+    /// The value nests past [`MAX_VALUE_DEPTH`]. Refused before recursing any further, so the
+    /// stack cost of a hostile value is bounded whatever the payload claims.
+    #[error("property value nests deeper than the {max}-level limit")]
+    DepthExceeded { max: usize },
+}
+
 /// Append an unsigned LEB128 varint.
 pub fn write_uvarint(buf: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -119,7 +161,22 @@ pub fn write_value(buf: &mut Vec<u8>, v: &Value) {
 /// keys the caller didn't ask for — a string/list/vector is stepped over rather
 /// than allocated, so reading one property of a many-property record costs no
 /// per-value heap allocation.
+///
+/// Nesting is bounded by [`MAX_VALUE_DEPTH`] — skipping recurses just as decoding does, so
+/// it overflows the stack on the same payload if left unguarded.
 pub fn skip_value(r: &mut &[u8]) -> Result<()> {
+    skip_value_at(r, 1)
+}
+
+/// `depth` is the nesting level of the value about to be skipped (root = 1). Checked on entry,
+/// so recursion stops *before* the frame that would take it past the cap.
+fn skip_value_at(r: &mut &[u8], depth: usize) -> Result<()> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(ValueDecodeError::DepthExceeded {
+            max: MAX_VALUE_DEPTH,
+        }
+        .into());
+    }
     let Some((&tag, rest)) = r.split_first() else {
         bail!("value truncated (no tag)");
     };
@@ -143,7 +200,7 @@ pub fn skip_value(r: &mut &[u8]) -> Result<()> {
         TAG_LIST => {
             let n = read_uvarint(r)? as usize;
             for _ in 0..n {
-                skip_value(r)?;
+                skip_value_at(r, depth + 1)?;
             }
         }
         TAG_VECTOR => {
@@ -169,7 +226,22 @@ fn skip_bytes(r: &mut &[u8], n: usize) -> Result<()> {
 }
 
 /// Decode a property value, advancing the slice.
+///
+/// Nesting is bounded by [`MAX_VALUE_DEPTH`]; a value nested past it is refused with
+/// [`ValueDecodeError::DepthExceeded`] rather than recursing until the stack overflows.
 pub fn read_value(r: &mut &[u8]) -> Result<Value> {
+    read_value_at(r, 1)
+}
+
+/// `depth` is the nesting level of the value about to be decoded (root = 1). Checked on entry,
+/// so recursion stops *before* the frame that would take it past the cap.
+fn read_value_at(r: &mut &[u8], depth: usize) -> Result<Value> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(ValueDecodeError::DepthExceeded {
+            max: MAX_VALUE_DEPTH,
+        }
+        .into());
+    }
     let Some((&tag, rest)) = r.split_first() else {
         bail!("value truncated (no tag)");
     };
@@ -203,7 +275,7 @@ pub fn read_value(r: &mut &[u8]) -> Result<Value> {
             // bails — same discipline as `packstream::read_list`.
             let mut items = Vec::with_capacity(n.min(r.len()));
             for _ in 0..n {
-                items.push(read_value(r)?);
+                items.push(read_value_at(r, depth + 1)?);
             }
             Value::List(items)
         }
@@ -257,6 +329,89 @@ mod tests {
         for v in [0i64, -1, 1, -1000, 1000, i64::MIN, i64::MAX] {
             assert_eq!(unzigzag(zigzag(v)), v);
         }
+    }
+
+    /// `levels` nested one-item lists wrapped around a `Null`, i.e. the `05 01 … 00` shape.
+    /// The innermost `Null` sits at depth `levels + 1`.
+    fn nested_list_bytes(levels: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(levels * 2 + 1);
+        for _ in 0..levels {
+            buf.push(TAG_LIST);
+            buf.push(1);
+        }
+        buf.push(TAG_NULL);
+        buf
+    }
+
+    /// A hostile value nests, it does not lie about lengths — so the pre-allocation guards
+    /// never fire. Pre-fix, this input killed the process outright: `fatal runtime error:
+    /// stack overflow, aborting` (SIGABRT), which no caller can catch. It must come back as a
+    /// typed `Err`, from both recursive entry points.
+    #[test]
+    fn over_nested_value_is_refused_not_a_stack_overflow() {
+        // ~400 KiB. Every header here is credible — one item declared, one byte left to hold
+        // it — so only the depth guard can stop it.
+        let buf = nested_list_bytes(200_000);
+
+        let mut r = &buf[..];
+        let err = read_value(&mut r).expect_err("over-nested value must be refused");
+        assert!(
+            matches!(
+                err.downcast_ref::<ValueDecodeError>(),
+                Some(ValueDecodeError::DepthExceeded { .. })
+            ),
+            "expected a typed DepthExceeded, got: {err}"
+        );
+
+        // `skip_value` recurses on exactly the same shape (`columns::decode_one` steps over
+        // the keys a query didn't ask for), so it needs the same guard.
+        let mut r = &buf[..];
+        let err = skip_value(&mut r).expect_err("over-nested value must be refused by skip too");
+        assert!(
+            matches!(
+                err.downcast_ref::<ValueDecodeError>(),
+                Some(ValueDecodeError::DepthExceeded { .. })
+            ),
+            "expected a typed DepthExceeded, got: {err}"
+        );
+    }
+
+    /// The bound must not reject valid graphs: everything up to the cap still round-trips, and
+    /// exactly one level past it is refused (the cap is off-by-one correct, not approximate).
+    #[test]
+    fn nesting_up_to_the_cap_still_decodes() {
+        // The deepest value the cap admits: `MAX_VALUE_DEPTH - 1` lists around a scalar leaves
+        // the scalar itself at depth `MAX_VALUE_DEPTH`.
+        let mut v = Value::Null;
+        for _ in 0..MAX_VALUE_DEPTH - 1 {
+            v = Value::List(vec![v]);
+        }
+        let mut buf = Vec::new();
+        write_value(&mut buf, &v);
+        assert_eq!(buf, nested_list_bytes(MAX_VALUE_DEPTH - 1));
+
+        let mut r = &buf[..];
+        assert_eq!(
+            read_value(&mut r).unwrap(),
+            v,
+            "value at the cap must decode"
+        );
+        assert!(r.is_empty());
+
+        let mut r = &buf[..];
+        skip_value(&mut r).expect("value at the cap must skip");
+        assert!(r.is_empty());
+
+        // One level deeper — the scalar now at `MAX_VALUE_DEPTH + 1` — is refused.
+        let over = nested_list_bytes(MAX_VALUE_DEPTH);
+        let mut r = &over[..];
+        let err = read_value(&mut r).expect_err("one past the cap must be refused");
+        assert!(matches!(
+            err.downcast_ref::<ValueDecodeError>(),
+            Some(ValueDecodeError::DepthExceeded { .. })
+        ));
+        let mut r = &over[..];
+        assert!(skip_value(&mut r).is_err());
     }
 
     #[test]
