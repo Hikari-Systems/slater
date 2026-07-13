@@ -1,8 +1,13 @@
-# cargo-fuzz targets for Slater's untrusted-input surface: the Cypher query
-# parser and the Bolt/PackStream decoders. Kept as its own workspace (the empty
-# `[workspace]` table below) so the instrumented `libfuzzer-sys` dependency never
-# leaks into the main workspace build. Requires a nightly toolchain + cargo-fuzz;
-# see `.github/workflows/ci.yml` (the `fuzz` job) and `cargo fuzz run <target>`.
+# cargo-fuzz targets for Slater's untrusted-input surface: the read-only Cypher
+# query parser (`parse_query`) and the write-enabled statement parser
+# (`parse_statement`); the Bolt/PackStream decoders (`chunk_decode`,
+# `packstream_decode`); the core-segment record/meta decoders (`segment_decode`);
+# and the writable-layer delta formats — the shared value codec (`wire_read_value`)
+# and the on-disk WAL segment decoder (`wal_replay`). Kept as its own workspace (the
+# empty `[workspace]` table below) so the instrumented `libfuzzer-sys` dependency
+# never leaks into the main workspace build. Requires a nightly toolchain +
+# cargo-fuzz; see `.github/workflows/{fuzz-nightly,release}.yml` (the `fuzz` jobs)
+# and `cargo fuzz run <target>`.
 [package]
 name = "slater-fuzz"
 version = "0.0.0"
@@ -20,6 +25,9 @@ path = "../crates/slater"
 
 [dependencies.graph-format]
 path = "../crates/graph-format"
+
+[dependencies.slater-delta]
+path = "../crates/slater-delta"
 
 [workspace]
 
@@ -47,6 +55,27 @@ bench = false
 [[bin]]
 name = "segment_decode"
 path = "fuzz_targets/segment_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_statement"
+path = "fuzz_targets/parse_statement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_read_value"
+path = "fuzz_targets/wire_read_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_replay"
+path = "fuzz_targets/wal_replay.rs"
 test = false
 doc = false
 bench = false

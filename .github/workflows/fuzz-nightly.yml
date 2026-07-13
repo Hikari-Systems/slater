@@ -1,7 +1,8 @@
 name: fuzz-nightly
 
-# Continuous fuzzing of the untrusted-input decoders (the Cypher parser + the
-# Bolt/PackStream decoders — the same targets the release gate runs). This job
+# Continuous fuzzing of the untrusted-input decoders (the read + write Cypher
+# parsers, the Bolt/PackStream decoders, the core-segment decoders, and the
+# writable-layer delta codecs — the same targets the release gate runs). This job
 # PERSISTS libFuzzer's coverage corpus in the GitHub Actions cache so coverage
 # accumulates across runs instead of restarting from empty each time; the release
 # gate (release.yml's `fuzz` job) then restores this same corpus for a fast,
@@ -43,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_query, packstream_decode, chunk_decode]
+        target: [parse_query, parse_statement, packstream_decode, chunk_decode, segment_decode, wire_read_value, wal_replay]
     steps:
       - name: Checkout
         uses: actions/checkout@v6

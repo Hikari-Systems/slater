@@ -196,7 +196,12 @@ pub fn read_value(r: &mut &[u8]) -> Result<Value> {
         }
         TAG_LIST => {
             let n = read_uvarint(r)? as usize;
-            let mut items = Vec::with_capacity(n);
+            // `n` is an untrusted uvarint; each element is ≥1 byte (a value tag), so
+            // a valid list of `n` items needs ≥`n` bytes remaining. Cap the
+            // pre-allocation at the bytes actually left so a forged huge length can't
+            // drive an out-of-memory allocation before the loop's first short read
+            // bails — same discipline as `packstream::read_list`.
+            let mut items = Vec::with_capacity(n.min(r.len()));
             for _ in 0..n {
                 items.push(read_value(r)?);
             }
@@ -204,7 +209,9 @@ pub fn read_value(r: &mut &[u8]) -> Result<Value> {
         }
         TAG_VECTOR => {
             let n = read_uvarint(r)? as usize;
-            let mut xs = Vec::with_capacity(n);
+            // Each element is a 4-byte `f32`, so bound the pre-allocation by
+            // `remaining / 4` (see `TAG_LIST`) against a forged length.
+            let mut xs = Vec::with_capacity(n.min(r.len() / 4));
             for _ in 0..n {
                 xs.push(r.read_f32::<LittleEndian>()?);
             }

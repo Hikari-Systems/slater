@@ -384,7 +384,7 @@ impl WalRecord {
                 let key = read_str(r)?;
                 let value = read_value(r)?;
                 let n = read_uvarint(r)? as usize;
-                let mut patches = Vec::with_capacity(n);
+                let mut patches = Vec::with_capacity(n.min(r.len()));
                 for _ in 0..n {
                     let prop = read_str(r)?;
                     let val = read_value(r)?;
@@ -414,7 +414,7 @@ impl WalRecord {
                 let key = read_str(r)?;
                 let value = read_value(r)?;
                 let n = read_uvarint(r)? as usize;
-                let mut props = Vec::with_capacity(n);
+                let mut props = Vec::with_capacity(n.min(r.len()));
                 for _ in 0..n {
                     props.push(read_str(r)?);
                 }
@@ -433,7 +433,7 @@ impl WalRecord {
                 let key = read_str(r)?;
                 let value = read_value(r)?;
                 let n = read_uvarint(r)? as usize;
-                let mut patches = Vec::with_capacity(n);
+                let mut patches = Vec::with_capacity(n.min(r.len()));
                 for _ in 0..n {
                     let prop = read_str(r)?;
                     let val = read_value(r)?;
@@ -454,12 +454,12 @@ impl WalRecord {
                 let key = read_str(r)?;
                 let value = read_value(r)?;
                 let na = read_uvarint(r)? as usize;
-                let mut added = Vec::with_capacity(na);
+                let mut added = Vec::with_capacity(na.min(r.len()));
                 for _ in 0..na {
                     added.push(read_str(r)?);
                 }
                 let nr = read_uvarint(r)? as usize;
-                let mut removed = Vec::with_capacity(nr);
+                let mut removed = Vec::with_capacity(nr.min(r.len()));
                 for _ in 0..nr {
                     removed.push(read_str(r)?);
                 }
@@ -483,7 +483,7 @@ impl WalRecord {
                 let dst_key = read_str(r)?;
                 let dst_value = read_value(r)?;
                 let n = read_uvarint(r)? as usize;
-                let mut patches = Vec::with_capacity(n);
+                let mut patches = Vec::with_capacity(n.min(r.len()));
                 for _ in 0..n {
                     let prop = read_str(r)?;
                     let val = read_value(r)?;
@@ -646,6 +646,18 @@ pub fn replay_segment(path: &Path) -> Result<Replay> {
     let bytes = fs::read(path).with_context(|| format!("read WAL segment {path:?}"))?;
     let mut out = Replay::default();
     replay_bytes(&bytes, &mut out).with_context(|| format!("replay WAL segment {path:?}"))?;
+    Ok(out)
+}
+
+/// Fuzz/test entry point: replay a single in-memory segment image, exercising the
+/// frame framing (`len ‖ crc ‖ payload`) and the `decode_record_body` byte decoder
+/// without touching the filesystem. Held to the same never-panic /
+/// no-giant-pre-allocation contract as the core-segment and wire decoders (see the
+/// `wal_replay` fuzz target). Prefer [`replay_segment`]/[`replay_dir`] for real use.
+#[doc(hidden)]
+pub fn replay_bytes_for_fuzz(bytes: &[u8]) -> Result<Replay> {
+    let mut out = Replay::default();
+    replay_bytes(bytes, &mut out)?;
     Ok(out)
 }
 

@@ -81,8 +81,9 @@ jobs:
         run: cargo test --workspace --locked
 
   # ── Gate: fuzz the untrusted-input decoders before shipping a tag ──────────
-  # The Cypher parser and the Bolt/PackStream decoders (targets in `fuzz/`) each
-  # get a time-boxed libFuzzer run. Runs on tag pushes, manual dispatch, and every
+  # The read + write Cypher parsers, the Bolt/PackStream decoders, the core-segment
+  # decoders, and the writable-layer delta codecs (targets in `fuzz/`) each get a
+  # time-boxed libFuzzer run. Runs on tag pushes, manual dispatch, and every
   # `writeable` branch push (the only job that does the last — see the `test` gate),
   # so the new write-grammar parser surface is fuzzed per commit. The targets fan
   # out one-per-runner across the matrix so they run in parallel and a crash fails
@@ -96,7 +97,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_query, packstream_decode, chunk_decode]
+        target: [parse_query, parse_statement, packstream_decode, chunk_decode, segment_decode, wire_read_value, wal_replay]
     steps:
       - name: Checkout the tag
         uses: actions/checkout@v6
