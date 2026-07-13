@@ -5844,6 +5844,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
             }
         }
+        // Relationship-uniqueness (openCypher relationship-isomorphism): a multi-hop
+        // chain must not reuse an edge already bound earlier in the same walk. `track_walk`
+        // is set for such chains (see `par_walk`), so `b.walk` holds the prior hops; the
+        // scan is O(chain length). This rejects exactly the hops the sequential
+        // `expand_chain` rejects, so leaf order and the charge sequence stay identical.
+        if track_walk && b.walk.iter().any(|h| h.edge == hop.edge) {
+            return Ok(());
+        }
         // Structural share: a hop that binds no variable carries the parent frame
         // unchanged (an `Arc` bump); a binding hop layers a small delta over it.
         let binding = if rel.var.is_none() && next.var.is_none() {
@@ -5977,7 +5985,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let (rel, next) = &pattern.rels[i];
         let tf = resolve_type_filter(gen, rel);
         let dir = rel.dir;
-        let track_walk = pattern.path_var.is_some();
+        // Track the per-branch walk when a path variable needs it, OR when the chain
+        // has more than one relationship — a multi-hop chain needs the prior hops'
+        // edge ids to enforce relationship-uniqueness in `walk_merge_hop`. A single-hop
+        // chain has no earlier edge to collide with, so it stays allocation-free.
+        let track_walk = pattern.path_var.is_some() || pattern.rels.len() > 1;
         let mut pending: Vec<ChainBranch> = Vec::new();
         // Read in small node-chunks, not the whole frontier at once: a chunk's
         // adjacency buffer (`neigh`) is freed before the next is read, so live read
@@ -6173,6 +6185,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
                                     }
                                 }
                             }
+                            // Relationship-uniqueness (openCypher relationship-isomorphism):
+                            // an edge already bound earlier in this chain cannot be reused
+                            // (e.g. an undirected 2-hop bouncing back over the same edge).
+                            // `walk` holds this walk's prior hops; scan is O(chain length).
+                            if walk.iter().any(|h| h.edge == hop.edge) {
+                                continue;
+                            }
                             let prev_rel = rel
                                 .var
                                 .as_ref()
@@ -6211,6 +6230,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                             }
                         }
                     }
+                    // Relationship-uniqueness (openCypher relationship-isomorphism): skip a
+                    // hop whose edge is already bound earlier in this chain. `walk` holds
+                    // this walk's prior hops; the scan is O(chain length).
+                    if walk.iter().any(|h| h.edge == hop.edge) {
+                        continue;
+                    }
                     let prev_rel = rel
                         .var
                         .as_ref()
@@ -6235,7 +6260,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let (min, max) = varlen_bounds(vl);
                 let mode = walk_mode(pattern.restrictor);
                 let mut paths: Vec<(Vec<Hop>, u64)> = Vec::new();
-                let mut used = HashSet::new();
+                // Seed the trail's used-edge set with the edges already bound by the
+                // fixed prefix of this chain, so relationship-uniqueness holds across the
+                // fixed→var-length boundary (a `*` segment can't re-walk an earlier hop's
+                // edge). Only consulted in Trail mode; varlen only removes edges it itself
+                // inserts, so these seeds persist for the whole segment.
+                let mut used: HashSet<u64> = walk.iter().map(|h| h.edge).collect();
                 // `visited` (node-uniqueness for ACYCLIC/SIMPLE) is seeded with the
                 // walk's start node so a hop back to it is detected — rejected by
                 // ACYCLIC, allowed once as the closing endpoint by SIMPLE.
@@ -15942,6 +15972,148 @@ mod tests {
             (Err(_), Err(_)) => {} // both trip the budget — consistent
             _ => panic!("budget behaviour differs: seq={seq:?}, par={par:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fixed_chain_enforces_relationship_uniqueness() {
+        // HIK-81: a fixed-length chain must not traverse the same relationship twice
+        // within one MATCH (openCypher relationship-isomorphism / relationship-uniqueness).
+        // `write_cycle` is a directed triangle a→b→c→a with an extra chord c→b, i.e. edges
+        //   e0: a→b   e1: b→c   e2: c→a   e3: c→b
+        // so b and c are joined by TWO distinct undirected edges (e1, e3) — a genuine
+        // 2-cycle — while every node also offers a same-edge bounce-back. Every expected
+        // row below is derived by hand from that edge list, not from another slater path.
+        let (root, graph) = testgen::write_cycle("exec_reluniq");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let pool = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap(),
+        );
+        let disp = |r: &QueryResult| -> Vec<Vec<String>> {
+            r.rows
+                .iter()
+                .map(|row| row.iter().map(|c| c.to_display()).collect())
+                .collect()
+        };
+        // Sequential walk (`expand_chain`).
+        let run_seq = |q: &str| {
+            let ast = parser::parse(q).unwrap();
+            disp(
+                &Engine::new(&gen, &cache)
+                    .run(&ast)
+                    .unwrap_or_else(|e| panic!("seq `{q}` failed: {e:#}")),
+            )
+        };
+        // Parallel breadth-first walk (`expand_chain_par` / `walk_merge_hop`).
+        let run_par = |q: &str| {
+            let ast = parser::parse(q).unwrap();
+            disp(
+                &Engine::new(&gen, &cache)
+                    .with_fanout_pool(Some(pool.clone()))
+                    .run(&ast)
+                    .unwrap_or_else(|e| panic!("par `{q}` failed: {e:#}")),
+            )
+        };
+        // Hub-streaming arm of the sequential walk (threshold 1 makes every anchor stream).
+        let run_hub = |q: &str| {
+            let ast = parser::parse(q).unwrap();
+            disp(
+                &Engine::new(&gen, &cache)
+                    .with_adj_stream_threshold(1)
+                    .run(&ast)
+                    .unwrap_or_else(|e| panic!("hub `{q}` failed: {e:#}")),
+            )
+        };
+
+        // (1) Undirected closed 2-walk anchored at b, binding both edges. Undirected
+        //     neighbours of b are {a via e0, c via e1, c via e3}. Returning to b:
+        //       via a: only e0 connects a–b ⇒ r2 == r1 ⇒ rejected (same edge).
+        //       via c: e1 and e3 both connect b–c ⇒ the two DISTINCT-edge pairings survive.
+        //     Expected (ORDER BY e1, e2): [c,1,3] and [c,3,1]. The three degenerate
+        //     bounce-backs (e0/e0, e1/e1, e3/e3) must NOT appear — pre-fix they did, so
+        //     this assertion fails without the fix (5 rows, incl. r1 == r2).
+        let q = "MATCH (x {name:'b'})-[r1]-(y)-[r2]-(x) \
+                 RETURN y.name AS y, id(r1) AS e1, id(r2) AS e2 ORDER BY e1, e2";
+        let expected = vec![
+            vec!["c".to_string(), "1".to_string(), "3".to_string()],
+            vec!["c".to_string(), "3".to_string(), "1".to_string()],
+        ];
+        assert_eq!(
+            run_seq(q),
+            expected,
+            "sequential must drop bounce-backs, keep the true 2-cycle"
+        );
+        assert_eq!(
+            run_par(q),
+            expected,
+            "parallel (expand_chain_par) must match"
+        );
+        assert_eq!(
+            run_hub(q),
+            expected,
+            "hub-streaming arm must enforce uniqueness too"
+        );
+        for row in run_seq(q) {
+            assert_ne!(
+                row[1], row[2],
+                "a surviving row must bind two distinct edges"
+            );
+        }
+
+        // (2) count(*) of the same closed walk = 2 (the two genuine 2-cycles), NOT 5
+        //     (the pre-fix bounce-back inflation). `degree_terminal_dir` declines here
+        //     because the closing node reuses the start variable, so the count flows
+        //     through the per-hop merge that now enforces uniqueness.
+        let cq = "MATCH (x {name:'b'})-[r1]-(y)-[r2]-(x) RETURN count(*)";
+        assert_eq!(
+            run_seq(cq),
+            vec![vec!["2".to_string()]],
+            "count(*) must exclude bounce-backs"
+        );
+        assert_eq!(run_par(cq), vec![vec!["2".to_string()]]);
+
+        // (3) The rule binds ANONYMOUS relationship elements too, not only named vars:
+        //     the same closed walk with no rel variables still yields exactly 2.
+        let aq = "MATCH (x {name:'b'})-[]-(y)-[]-(x) RETURN count(*)";
+        assert_eq!(
+            run_seq(aq),
+            vec![vec!["2".to_string()]],
+            "anonymous rels are unique too"
+        );
+        assert_eq!(run_par(aq), vec![vec!["2".to_string()]]);
+
+        // (4) Positive control — nodes may repeat, only relationships are unique, and a
+        //     legitimately distinct-edge directed 3-hop chain from a is unaffected.
+        //     Directed edges out of a: a-e0->b-e1->c-{e2->a, e3->b}. Both length-3 paths
+        //     use three distinct edges, so both survive (one revisits node a).
+        //       a→b→c→a  (e0,e1,e2)  and  a→b→c→b  (e0,e1,e3)
+        let q3 = "MATCH (a {name:'a'})-[r1]->(m)-[r2]->(n)-[r3]->(z) \
+                  RETURN z.name AS z, id(r1) AS e1, id(r2) AS e2, id(r3) AS e3 ORDER BY z";
+        let expected3 = vec![
+            vec![
+                "a".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "2".to_string(),
+            ],
+            vec![
+                "b".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "3".to_string(),
+            ],
+        ];
+        assert_eq!(
+            run_seq(q3),
+            expected3,
+            "distinct-edge 3-hop chains must still be returned"
+        );
+        assert_eq!(run_par(q3), expected3);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
