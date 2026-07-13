@@ -157,6 +157,29 @@ authenticated principals over Bolt).
   `pre_auth_budget_rejects_excess_anonymous_connections`, `per_ip_cap_rejects_excess_from_one_source`,
   `login_deadline_closes_an_idle_unauthenticated_connection`.
 
+- [x] **✅ DONE — TLS handshake was unbounded and unaccounted (slow-loris pool exhaustion).**
+  `serve_conn` awaited `acceptor.accept(sock)` with no deadline while already holding the global
+  `conn_limit` permit the accept loop had reserved for it — and the two guards that bound an
+  anonymous socket, the pre-auth permit and the login deadline, were both armed *inside*
+  `handle_connection`, which does not run until TLS completes. A peer that finished TCP and then
+  never sent a ClientHello was therefore subject to neither: uncounted by
+  `server.maxPreAuthConnections` and never reaped. Enough of them took every global slot, the
+  accept loop parked on `conn_limit` and stopped draining the kernel queue, and the server refused
+  all new connections. The plaintext path was protected by both guards; TLS — what production runs
+  — by neither.
+  *Fixed (HIK-72):* the antechamber permit and the login deadline are now taken at the TCP
+  `accept()` and handed down through the handshake, so the deadline is a single budget over the
+  whole pre-auth window (TLS handshake → Bolt handshake → `HELLO` → `LOGON`, no stage boundary at
+  which a peer can refresh its allowance) and a socket stalled mid-ClientHello holds a pre-auth
+  slot like any other anonymous peer. The handshake itself is bounded by the sooner of that
+  deadline and `server.tlsHandshakeTimeoutMs` (default 5 s), which is deliberately independent so
+  the guard does not lapse when an operator sets `loginTimeoutMs = 0`. The global permit stays
+  where it was — acquired *before* `accept()` — on purpose: taking it after the handshake would
+  let the accept loop drain the kernel queue without bound and spawn unbounded in-flight rustls
+  state machines, trading a server that refuses connections for one whose heap grows without
+  limit. Tests: `a_stalled_tls_handshake_does_not_hold_a_connection_permit`,
+  `tls_handshake_deadline_is_the_sooner_of_the_two_bounds`.
+
 - [x] **✅ DONE — argon2id ran synchronously on the reactor (auth DoS).** `authenticate()` was a
   sync fn: the ACL re-read and the argon2id verify (~19 MiB, tens of ms — and an unknown principal
   burns the same cost, deliberately, so it cannot be found by timing) ran directly on a tokio

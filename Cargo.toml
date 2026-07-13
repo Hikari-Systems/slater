@@ -40,6 +40,9 @@ tokio = { version = "1", features = ["full"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# Test-only: mints a throwaway self-signed cert so the TLS accept path can be driven in a
+# unit test (the slow-loris handshake guard) without committing key material to the repo.
+rcgen = "0.13"
 
 # Storage codec (graph-format).
 zstd = "0.13"

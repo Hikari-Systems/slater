@@ -63,6 +63,7 @@ unsafe_code = "forbid"
 
 [dev-dependencies]
 criterion.workspace = true
+rcgen.workspace = true
 
 [[bench]]
 name = "vector_knn"

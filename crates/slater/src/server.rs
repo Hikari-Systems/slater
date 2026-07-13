@@ -41,7 +41,7 @@ use rayon::prelude::*;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant as TokioInstant};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn, Level};
@@ -1569,13 +1569,18 @@ struct ConnCtx {
     max_message_bytes: usize,
     /// Reassembly-body cap before `LOGON` (tight; ratchets up on auth).
     max_pre_auth_bytes: usize,
-    /// Handshake→`LOGON` deadline (ms); 0 = none.
+    /// TLS handshake→Bolt handshake→`LOGON` deadline (ms); 0 = none. Armed at `accept()`
+    /// (see [`PreAuth::admit`]), so it bounds the whole pre-auth window as one budget.
     login_timeout_ms: u64,
+    /// Deadline (ms) for the TLS handshake alone, on top of `login_timeout_ms` —
+    /// whichever expires first wins (`server.tlsHandshakeTimeoutMs`); 0 = none.
+    tls_handshake_timeout_ms: u64,
     /// Idle read timeout (ms) for an authenticated connection; 0 = none.
     idle_timeout_ms: u64,
     /// Budget for connections that have not yet completed `LOGON`. A connection holds
-    /// one permit from its first byte until authentication succeeds, then releases it,
-    /// so a flood of anonymous sockets cannot starve authenticated readers.
+    /// one permit from the TCP `accept()` — *before* the TLS handshake, not after it —
+    /// until authentication succeeds, then releases it, so a flood of anonymous sockets
+    /// cannot starve authenticated readers. See [`PreAuth`].
     pre_auth_limit: Arc<Semaphore>,
     /// Budget for argon2id password verifies running **at once**
     /// (`server.maxConcurrentAuth`). A `LOGON` takes a permit before it hands the verify
@@ -2508,6 +2513,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_message_bytes: cfg.server.max_message_bytes,
         max_pre_auth_bytes: cfg.server.max_pre_auth_bytes,
         login_timeout_ms: cfg.server.login_timeout_ms,
+        tls_handshake_timeout_ms: cfg.server.tls_handshake_timeout_ms,
         idle_timeout_ms: cfg.server.idle_timeout_ms,
         pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
             cfg.server.max_pre_auth_connections,
@@ -2553,6 +2559,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_connections_per_ip = cfg.server.max_connections_per_ip,
         max_concurrent_auth = cfg.server.max_concurrent_auth,
         max_auth_failures = cfg.server.max_auth_failures,
+        login_timeout_ms = cfg.server.login_timeout_ms,
+        tls_handshake_timeout_ms = cfg.server.tls_handshake_timeout_ms,
         "slater Bolt listener ready"
     );
 
@@ -2805,14 +2813,91 @@ fn try_acquire_per_ip(
     })
 }
 
+/// The two things that bound an *anonymous* connection: its antechamber slot and its
+/// deadline to stop being anonymous. Both are taken at the TCP `accept()`, in
+/// [`PreAuth::admit`], and handed down through the TLS handshake into the Bolt state
+/// machine — **not** created inside `handle_connection`, which is one stage too late.
+///
+/// That ordering is the fix for HIK-72. When the permit and the deadline were armed
+/// behind the TLS handshake, a peer that completed TCP and then simply never sent a
+/// ClientHello was invisible to both: it sat in `acceptor.accept()` forever, holding the
+/// global `conn_limit` permit the accept loop had already reserved for it, while the
+/// antechamber cap (`maxPreAuthConnections`, deliberately a fraction of `maxConnections`
+/// so authenticated readers always have headroom) counted it as nothing. Enough such
+/// peers took every global slot; the accept loop then parked on `conn_limit` and stopped
+/// draining the kernel queue. The plaintext path was never exposed — `handle_connection`
+/// runs immediately there — so the hole was TLS-only, and TLS is what production runs.
+struct PreAuth {
+    /// Antechamber slot, held from `accept()` until `LOGON` succeeds. `Option` because
+    /// `handle_connection` releases it on the transition to authenticated (and reclaims
+    /// one on `LOGOFF`), so an authenticated reader does not squat the anonymous budget.
+    permit: Option<OwnedSemaphorePermit>,
+    /// Deadline for the *whole* pre-auth window — TLS handshake, Bolt handshake, `HELLO`,
+    /// `LOGON` — as a single budget. Armed once, so advancing a stage does not refresh
+    /// the allowance and no stage boundary leaves a gap for a slow peer to sit in.
+    deadline: Option<TokioInstant>,
+}
+
+impl PreAuth {
+    /// Admit a freshly accepted socket to the antechamber, or `None` when it is full.
+    /// Rejecting rather than queueing is the point: parking anonymous sockets would just
+    /// hold file descriptors, the very exhaustion this defends against.
+    fn admit(ctx: &Arc<ConnCtx>) -> Option<Self> {
+        let permit = match ctx.pre_auth_limit.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("pre-auth connection budget reached; rejecting connection");
+                ctx.diag.record_rejected_pre_auth();
+                return None;
+            }
+        };
+        Some(Self {
+            permit: Some(permit),
+            deadline: (ctx.login_timeout_ms > 0)
+                .then(|| TokioInstant::now() + Duration::from_millis(ctx.login_timeout_ms)),
+        })
+    }
+
+    /// The deadline the TLS handshake must finish by: the sooner of the pre-auth window
+    /// and `server.tlsHandshakeTimeoutMs`. The dedicated bound is not redundant — a TLS
+    /// handshake is a 2-RTT machine exchange and deserves a far tighter leash than a
+    /// login window sized for a driver's `HELLO`/`LOGON` round trips, and `loginTimeoutMs`
+    /// may legitimately be set to 0, which must not silently un-bound the handshake.
+    fn tls_deadline(&self, ctx: &Arc<ConnCtx>) -> Option<TokioInstant> {
+        let handshake = (ctx.tls_handshake_timeout_ms > 0)
+            .then(|| TokioInstant::now() + Duration::from_millis(ctx.tls_handshake_timeout_ms));
+        match (handshake, self.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// (Optionally) wrap the socket in TLS, then run the Bolt connection.
+///
+/// The antechamber slot and the login deadline are taken *here*, before the TLS
+/// handshake, and the handshake itself is bounded — see [`PreAuth`].
 async fn serve_conn(sock: TcpStream, tls: Option<TlsAcceptor>, ctx: Arc<ConnCtx>) -> Result<()> {
+    let pre_auth = match PreAuth::admit(&ctx) {
+        Some(p) => p,
+        None => return Ok(()), // antechamber full; the socket is dropped here
+    };
     match tls {
         Some(acceptor) => {
-            let stream = acceptor.accept(sock).await.context("TLS handshake")?;
-            handle_connection(stream, ctx).await
+            let stream = match pre_auth.tls_deadline(&ctx) {
+                Some(dl) => timeout_at(dl, acceptor.accept(sock))
+                    .await
+                    .map_err(|_| {
+                        debug!("TLS handshake not completed within the deadline; closing");
+                        ctx.diag.record_login_timeout();
+                        anyhow!("TLS handshake not completed within the deadline")
+                    })?
+                    .context("TLS handshake")?,
+                None => acceptor.accept(sock).await.context("TLS handshake")?,
+            };
+            handle_connection(stream, ctx, pre_auth).await
         }
-        None => handle_connection(sock, ctx).await,
+        None => handle_connection(sock, ctx, pre_auth).await,
     }
 }
 
@@ -2853,26 +2938,21 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 // ── Connection state machine ──────────────────────────────────────────────────
 
 /// Run one Bolt connection from handshake to close.
-async fn handle_connection<S>(stream: S, ctx: Arc<ConnCtx>) -> Result<()>
+///
+/// `pre_auth` carries the antechamber slot and the login deadline, both already armed at
+/// the TCP `accept()` by [`serve_conn`] — the deadline therefore covers the TLS handshake
+/// that has just happened as well as the Bolt handshake about to happen, as one budget.
+async fn handle_connection<S>(stream: S, ctx: Arc<ConnCtx>, pre_auth: PreAuth) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Hold a pre-auth budget slot from the first byte until LOGON succeeds. If the
-    // antechamber is full, reject immediately — queuing anonymous sockets would just
-    // hold file descriptors, the very exhaustion this defends against.
-    let mut pre_auth_permit = match ctx.pre_auth_limit.clone().try_acquire_owned() {
-        Ok(p) => Some(p),
-        Err(_) => {
-            debug!("pre-auth connection budget reached; rejecting connection");
-            ctx.diag.record_rejected_pre_auth();
-            return Ok(());
-        }
-    };
-
-    // The whole pre-auth phase (handshake → HELLO → LOGON) must finish within the
-    // login deadline — the slow-loris guard a byte cap alone leaves open.
-    let login_deadline = (ctx.login_timeout_ms > 0)
-        .then(|| TokioInstant::now() + Duration::from_millis(ctx.login_timeout_ms));
+    // Antechamber slot, held until LOGON succeeds; the deadline the pre-auth phase (TLS
+    // handshake → Bolt handshake → HELLO → LOGON) must finish within — the slow-loris
+    // guard a byte cap alone leaves open.
+    let PreAuth {
+        permit: mut pre_auth_permit,
+        deadline: login_deadline,
+    } = pre_auth;
 
     // Start under the tight pre-auth body cap; it ratchets up once LOGON succeeds.
     let mut framed = Framed::new(stream, ctx.max_pre_auth_bytes);
@@ -12292,6 +12372,7 @@ mod tests {
             max_message_bytes: 64 * 1024 * 1024,
             max_pre_auth_bytes: 64 * 1024,
             login_timeout_ms: 0,
+            tls_handshake_timeout_ms: 0,
             idle_timeout_ms: 0,
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
             auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
@@ -12400,6 +12481,7 @@ mod tests {
         max_message_bytes: usize,
         max_pre_auth_bytes: usize,
         login_timeout_ms: u64,
+        tls_handshake_timeout_ms: u64,
         idle_timeout_ms: u64,
         max_pre_auth_connections: usize,
         max_per_ip: usize,
@@ -12414,6 +12496,7 @@ mod tests {
                 max_message_bytes: 64 * 1024 * 1024,
                 max_pre_auth_bytes: 64 * 1024,
                 login_timeout_ms: 0, // off by default so unrelated tests never time out
+                tls_handshake_timeout_ms: 0,
                 idle_timeout_ms: 0,
                 max_pre_auth_connections: 4_096,
                 max_per_ip: 0,                // unlimited by default
@@ -12464,6 +12547,7 @@ mod tests {
             max_message_bytes: limits.max_message_bytes,
             max_pre_auth_bytes: limits.max_pre_auth_bytes,
             login_timeout_ms: limits.login_timeout_ms,
+            tls_handshake_timeout_ms: limits.tls_handshake_timeout_ms,
             idle_timeout_ms: limits.idle_timeout_ms,
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
                 limits.max_pre_auth_connections,
@@ -12559,6 +12643,7 @@ mod tests {
             max_message_bytes: 64 * 1024 * 1024,
             max_pre_auth_bytes: 64 * 1024,
             login_timeout_ms: 0,
+            tls_handshake_timeout_ms: 0,
             idle_timeout_ms: 0,
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
             auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
@@ -12698,7 +12783,9 @@ mod tests {
     }
 
     /// Spawn the connection handler over a fresh loopback listener, returning the
-    /// bound address so a client can connect.
+    /// bound address so a client can connect. Goes through `serve_conn` (plaintext),
+    /// not `handle_connection` directly, so the tests exercise the same admission path
+    /// as production: the antechamber permit and the login deadline are taken at accept.
     async fn spawn_server(ctx: Arc<ConnCtx>) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12707,7 +12794,7 @@ mod tests {
                 let (sock, _) = listener.accept().await.unwrap();
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(sock, ctx).await;
+                    let _ = serve_conn(sock, None, ctx).await;
                 });
             }
         });
@@ -14478,6 +14565,144 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), Client::connect(addr))
             .await
             .expect("a slot must free once the first connection closes");
+    }
+
+    /// A throwaway self-signed acceptor, minted in-process — no key material in the repo
+    /// and nothing to expire. The TLS tests below never validate the chain (the client
+    /// side is a raw socket), so a bare `localhost` leaf is all the server needs.
+    fn test_tls_acceptor() -> TlsAcceptor {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(issued.key_pair.serialize_der());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key.into())
+            .unwrap();
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// HIK-72. A peer that completes TCP and then never sends a ClientHello must be torn
+    /// down and must not hold a connection slot while it stalls.
+    ///
+    /// The regression this pins has two halves, and the test fails on either:
+    ///
+    /// 1. **Ordering.** The antechamber permit is taken at `accept()`, so a socket still
+    ///    inside the TLS handshake is *counted* against `maxPreAuthConnections`. When the
+    ///    permit was taken behind the handshake (in `handle_connection`), anonymous TLS
+    ///    sockets were uncounted and could occupy the entire global pool — the plaintext
+    ///    path's headroom guarantee simply did not exist on the TLS path.
+    /// 2. **Liveness.** The handshake is bounded, so the slot comes back. With exactly one
+    ///    global permit, B is served only if A's stalled handshake is actually torn down;
+    ///    before the fix A held it forever and the accept loop stopped draining the queue.
+    ///
+    /// `loginTimeoutMs` is deliberately **off** here: the handshake bound has to stand on
+    /// its own, or the guard would evaporate for any operator who widened the login window.
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_does_not_hold_a_connection_permit() {
+        let (_root, ctx) = build_ctx_limited(
+            "tls_slow_loris",
+            TestLimits {
+                // 1s, sampled at 200ms below: a 5× margin, so a loaded CI box cannot
+                // tear A down before the mid-handshake assertion gets to look at it.
+                tls_handshake_timeout_ms: 1_000,
+                login_timeout_ms: 0, // off on purpose — the handshake bound stands alone
+                max_pre_auth_connections: 8,
+                ..Default::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn_limit = Arc::new(Semaphore::new(1)); // exactly one slot to fight over
+        let (_tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let gauges = ctx.clone();
+        tokio::spawn(accept_loop(
+            listener,
+            ctx,
+            Some(test_tls_acceptor()),
+            conn_limit,
+            rx,
+        ));
+
+        // A: completes the TCP handshake, then says nothing at all. Never a ClientHello.
+        let _slow_loris = TcpStream::connect(addr).await.unwrap();
+
+        // Half 1 — while A is stalled *mid-handshake*, it is already accounted for: it
+        // holds an antechamber slot. (The global pool is not worth asserting on: the
+        // accept loop reserves its next permit *before* parking in `accept()`, so with a
+        // pool of one, "none available" is just as true of an idle server.)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            gauges.pre_auth_limit.available_permits(),
+            7,
+            "a socket stalled mid-ClientHello must hold a pre-auth slot — the permit is \
+             taken at accept, not behind the TLS handshake"
+        );
+
+        // Half 2 — B gets served only once A's handshake is torn down and its permits are
+        // released. Note connecting proves nothing: the kernel completes the TCP handshake
+        // into the listen backlog even while the accept loop is parked on `conn_limit`. So
+        // B speaks, and waits to be spoken to — a rustls server that has actually accepted
+        // the socket answers a bogus ClientHello with an alert (or closes); a server whose
+        // accept loop is starved leaves B's read hanging forever, which is the pre-fix
+        // behaviour this test is here to catch.
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        b.write_all(b"\x16\x03\x01\x00\x05not a real ClientHello")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(5), b.read(&mut buf))
+            .await
+            .expect(
+                "the accept loop never came back round: the stalled TLS handshake is still \
+                 holding the only connection permit",
+            )
+            .ok();
+
+        // And A is gone, not merely overtaken: the slot it held comes *back*. It was torn
+        // down at the deadline rather than held for as long as the attacker cares to keep
+        // the socket open — which is the whole claim. (B is on its way out too, having
+        // been sent an alert, so wait for the pool to settle rather than sampling it.)
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while gauges.pre_auth_limit.available_permits() < 8 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the stalled handshake never released its antechamber slot ({} still in use)",
+            8 - gauges.pre_auth_limit.available_permits(),
+        );
+    }
+
+    /// The TLS handshake is bounded by whichever of the two deadlines lands first, and
+    /// by either one alone when the other is off.
+    #[tokio::test]
+    async fn tls_handshake_deadline_is_the_sooner_of_the_two_bounds() {
+        let deadline_ms = |login_timeout_ms, tls_handshake_timeout_ms| {
+            let (_root, ctx) = build_ctx_limited(
+                "tls_deadline",
+                TestLimits {
+                    login_timeout_ms,
+                    tls_handshake_timeout_ms,
+                    ..Default::default()
+                },
+            );
+            let pre_auth = PreAuth::admit(&ctx).expect("antechamber is empty");
+            let now = TokioInstant::now();
+            pre_auth
+                .tls_deadline(&ctx)
+                .map(|dl| (dl - now).as_millis() as u64)
+        };
+        // The login window is the whole pre-auth budget, so a handshake bound inside it
+        // is what binds; a login window shorter than the handshake bound overrides it.
+        assert!(matches!(deadline_ms(10_000, 5_000), Some(ms) if (4_900..=5_000).contains(&ms)));
+        assert!(matches!(deadline_ms(1_000, 5_000), Some(ms) if (900..=1_000).contains(&ms)));
+        // Either alone still bounds the handshake. The `loginTimeoutMs = 0` row is the
+        // one that matters: it is why the handshake gets its own knob at all.
+        assert!(matches!(deadline_ms(0, 5_000), Some(ms) if (4_900..=5_000).contains(&ms)));
+        assert!(matches!(deadline_ms(10_000, 0), Some(ms) if (9_900..=10_000).contains(&ms)));
+        // Both off = unbounded. Documented as "do not".
+        assert_eq!(deadline_ms(0, 0), None);
     }
 
     #[tokio::test]

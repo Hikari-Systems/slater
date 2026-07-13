@@ -232,10 +232,26 @@ pub struct ServerConfig {
     /// instant authentication succeeds, and back down on `LOGOFF`.
     #[serde(default = "default_max_pre_auth_bytes", deserialize_with = "de::usize")]
     pub max_pre_auth_bytes: usize,
-    /// Deadline (ms) for an unauthenticated peer to complete handshake → `LOGON`.
+    /// Deadline (ms) for an unauthenticated peer to complete TLS handshake → Bolt
+    /// handshake → `LOGON`. Armed at `accept()`, so it bounds the *whole* pre-auth
+    /// window as one budget — a peer cannot refresh its allowance by advancing a stage.
     /// Closes the slow-loris a byte cap alone leaves open. 0 = no deadline.
     #[serde(default = "default_login_timeout_ms", deserialize_with = "de::u64")]
     pub login_timeout_ms: u64,
+    /// Deadline (ms) for the **TLS handshake** alone, on top of `loginTimeoutMs` —
+    /// whichever expires first wins. A handshake is a 2-RTT machine-to-machine exchange,
+    /// so it warrants a far tighter bound than a login window that must also cover a
+    /// driver's `HELLO`/`LOGON` round trips; and unlike `loginTimeoutMs` (which an
+    /// operator may legitimately set to 0 for a slow interactive auth flow) this one
+    /// must never lapse, because a peer stalled mid-ClientHello holds a connection slot
+    /// while being invisible to every guard that lives behind the handshake. 0 = no
+    /// deadline (do not: with `loginTimeoutMs` also 0, a stalled ClientHello would hold
+    /// its slot forever and enough of them would exhaust `maxConnections`).
+    #[serde(
+        default = "default_tls_handshake_timeout_ms",
+        deserialize_with = "de::u64"
+    )]
+    pub tls_handshake_timeout_ms: u64,
     /// Idle read timeout (ms) for an **authenticated** connection between messages.
     /// 0 (default) = no timeout — pooled drivers legitimately hold idle connections.
     #[serde(default = "default_idle_timeout_ms", deserialize_with = "de::u64")]
@@ -721,6 +737,9 @@ fn default_max_pre_auth_bytes() -> usize {
 }
 fn default_login_timeout_ms() -> u64 {
     10_000
+}
+fn default_tls_handshake_timeout_ms() -> u64 {
+    5_000 // a 2-RTT exchange; generous even for a bad mobile link, brutal to a stall
 }
 fn default_idle_timeout_ms() -> u64 {
     0 // off — pooled drivers legitimately hold idle authenticated connections
@@ -1260,6 +1279,16 @@ mod tests {
             "unbounded by default would be a DoS"
         );
         assert!(cfg.max_concurrent_auth < cfg.max_blocking_threads.max(512));
+        // The TLS handshake is bounded by default and *more* tightly than the login
+        // window it sits inside: a peer stalled mid-ClientHello holds a connection slot
+        // while being invisible to every guard behind the handshake, so it must not be
+        // given a window sized for a driver's HELLO/LOGON round trips.
+        assert_eq!(cfg.tls_handshake_timeout_ms, 5_000);
+        assert!(
+            cfg.tls_handshake_timeout_ms > 0,
+            "unbounded by default is the slow-loris hole"
+        );
+        assert!(cfg.tls_handshake_timeout_ms < cfg.login_timeout_ms);
     }
 
     #[test]
@@ -1270,6 +1299,7 @@ mod tests {
             "maxMessageBytes": 1024,
             "maxPreAuthBytes": 256,
             "loginTimeoutMs": 2000,
+            "tlsHandshakeTimeoutMs": 750,
             "idleTimeoutMs": 60000,
             "maxConnections": 8,
             "maxPreAuthConnections": 4,
@@ -1282,6 +1312,7 @@ mod tests {
             "maxMessageBytes": "1024",
             "maxPreAuthBytes": "256",
             "loginTimeoutMs": "2000",
+            "tlsHandshakeTimeoutMs": "750",
             "idleTimeoutMs": "60000",
             "maxConnections": "8",
             "maxPreAuthConnections": "4",
@@ -1294,6 +1325,7 @@ mod tests {
             assert_eq!(cfg.max_message_bytes, 1024);
             assert_eq!(cfg.max_pre_auth_bytes, 256);
             assert_eq!(cfg.login_timeout_ms, 2000);
+            assert_eq!(cfg.tls_handshake_timeout_ms, 750);
             assert_eq!(cfg.idle_timeout_ms, 60000);
             assert_eq!(cfg.max_connections, 8);
             assert_eq!(cfg.max_pre_auth_connections, 4);

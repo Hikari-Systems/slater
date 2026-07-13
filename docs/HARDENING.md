@@ -35,10 +35,21 @@ only runs *after* `LOGON`, so parser panics are post-auth and isolated (see belo
   pre-allocation by the bytes actually remaining (`n.min(remaining())`), so a 5-byte
   message claiming a ~2.5-billion element count fails fast instead of requesting
   gigabytes. (Regression test: `forged_length_headers_bail_without_huge_allocation`.)
-- **Login deadline.** An unauthenticated peer must finish handshake → `LOGON` within
-  `server.loginTimeoutMs` (default 10 s) or be closed, defeating the slow-loris a byte
-  cap alone leaves open. `server.idleTimeoutMs` adds an optional post-auth idle timeout
-  (off by default — pooled drivers legitimately hold idle connections).
+- **Login deadline.** An unauthenticated peer must finish TLS handshake → Bolt handshake
+  → `LOGON` within `server.loginTimeoutMs` (default 10 s) or be closed, defeating the
+  slow-loris a byte cap alone leaves open. The deadline is armed at `accept()`, so it is a
+  single budget over the *whole* pre-auth window: a peer cannot refresh its allowance by
+  advancing a stage, and no gap is left between the stages to sit in. `server.idleTimeoutMs`
+  adds an optional post-auth idle timeout (off by default — pooled drivers legitimately
+  hold idle connections).
+- **TLS handshake deadline** (`server.tlsHandshakeTimeoutMs`, default 5 s): a second,
+  tighter bound on the handshake alone; whichever of the two lands first wins. It is not
+  redundant. A handshake is a 2-RTT machine-to-machine exchange and has no business being
+  given a window sized for a driver's `HELLO`/`LOGON` round trips — and `loginTimeoutMs`
+  may legitimately be set to `0`, which must not silently un-bound it. A peer stalled
+  mid-ClientHello is the worst case there is: it holds a connection slot while sitting
+  *behind* every guard that lives after the handshake, so it is the one deadline that has
+  to stand on its own.
 
 ## Connection-resource controls
 
@@ -51,7 +62,11 @@ bounded-RSS guarantee held only for well-behaved clients. With them it is uncond
   refuses new SYNs — the process never accepts a descriptor it cannot service.
 - **Pre-auth budget** (`server.maxPreAuthConnections`, default 4096): a smaller, separate
   cap on connections that have not yet authenticated, so a flood of anonymous sockets
-  cannot starve the authenticated readers that have released their pre-auth slot.
+  cannot starve the authenticated readers that have released their pre-auth slot. The slot
+  is taken at `accept()` — *before* the TLS handshake, not after it — so a peer stalled
+  mid-ClientHello is counted. (When it was taken behind the handshake, anonymous TLS
+  sockets were invisible to this cap and could occupy the entire global pool: the headroom
+  guarantee existed on the plaintext path and not on the TLS one.)
 - **Per-source cap** (`server.maxConnectionsPerIp`, default 1024): keyed on the /32 for
   IPv4 and the /64 for IPv6 (an attacker controls a whole /64), so one source cannot
   monopolise the global pool.

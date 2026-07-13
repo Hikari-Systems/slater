@@ -147,10 +147,16 @@ accepted risk so future changes stay aware of it.
   pre-auth budget is tight (`server.maxPreAuthBytes`, default 64 KiB); it ratchets up to the
   generous authenticated cap (`server.maxMessageBytes`, default 64 MiB) on a verified `LOGON`
   and back down on `LOGOFF`. This runs before authentication, so it is the most important cap.
-- **Pre-auth slow-loris.** An unauthenticated peer must complete handshake → `LOGON` within
-  `server.loginTimeoutMs` (default 10 s) or the connection is closed, so an anonymous peer cannot
-  hold a socket open indefinitely. (`server.idleTimeoutMs` adds an optional post-auth idle
-  timeout; off by default, since pooled drivers legitimately hold idle connections.)
+- **Pre-auth slow-loris.** An unauthenticated peer must complete TLS handshake → Bolt handshake
+  → `LOGON` within `server.loginTimeoutMs` (default 10 s) or the connection is closed, so an
+  anonymous peer cannot hold a socket open indefinitely. The deadline is armed at `accept()` and
+  the pre-auth connection slot is taken there too, so both cover the TLS handshake rather than
+  starting behind it — a peer that completes TCP and then never sends a ClientHello is counted
+  against `server.maxPreAuthConnections` and is reaped like any other stalled anonymous socket.
+  `server.tlsHandshakeTimeoutMs` (default 5 s) bounds the handshake more tightly still, and does
+  so independently of `loginTimeoutMs` so the guard cannot lapse when an operator widens the login
+  window. (`server.idleTimeoutMs` adds an optional post-auth idle timeout; off by default, since
+  pooled drivers legitimately hold idle connections.)
 - **Connection-count exhaustion.** The listener acquires a global permit *before* `accept()`
   (`server.maxConnections`), so at capacity back-pressure flows into the kernel listen backlog
   rather than the heap — the process never accepts a descriptor it cannot service. A separate,
