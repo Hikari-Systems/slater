@@ -213,6 +213,7 @@ fn open_input(input_path: &str, offset: u64) -> Result<Box<dyn BufRead>> {
 /// block-streaming reader stdin-safe without seeking.
 fn last_statement_end(buf: &[u8]) -> usize {
     let mut in_string: Option<u8> = None;
+    let mut in_ident = false;
     let mut escaped = false;
     let mut last_end = 0usize;
     for (i, &b) in buf.iter().enumerate() {
@@ -224,9 +225,15 @@ fn last_statement_end(buf: &[u8]) -> usize {
             } else if b == q {
                 in_string = None;
             }
+        } else if in_ident {
+            // Backtick-quoted identifier: no `\` escapes, the closing backtick ends it.
+            if b == b'`' {
+                in_ident = false;
+            }
         } else {
             match b {
                 b'\'' | b'"' => in_string = Some(b),
+                b'`' => in_ident = true,
                 b';' => last_end = i + 1,
                 _ => {}
             }

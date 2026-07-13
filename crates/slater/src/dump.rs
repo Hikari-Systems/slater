@@ -28,6 +28,10 @@ use std::time::Duration;
 
 use crate::bolt::client::BoltClient;
 use crate::bolt::packstream::PsValue;
+// The dialect's identifier escaper is owned by `consolidate` (the other emitter of
+// this dialect); a dump and a consolidation must quote identically or the two dumps
+// would not be interchangeable inputs to `slater-build`.
+use crate::consolidate::quote_ident;
 
 /// PackStream struct tags for a Bolt `Node` / `Relationship` value (Bolt 5.x).
 const TAG_NODE: u8 = 0x4E;
@@ -336,11 +340,24 @@ fn dump_graph(
     // any preamble would be parsed as (broken) Cypher. The dump is emitted as pure
     // rebuildable statements. CREATE INDEX DDL first, so the rebuild recreates
     // indexes before the MERGEs that rely on them. Sorted for a deterministic dump.
+    // Every identifier is backtick-quoted where it is not a bare-legal name (HIK-84):
+    // labels/reltypes/property keys are arbitrary strings, and un-quoted they would
+    // re-parse as *structure* when an operator rebuilds this dump.
     for (label, prop) in &schema.node_indexes {
-        writeln!(out, "CREATE INDEX FOR (n:{label}) ON (n.{prop});")?;
+        writeln!(
+            out,
+            "CREATE INDEX FOR (n:{}) ON (n.{});",
+            quote_ident(label),
+            quote_ident(prop)
+        )?;
     }
     for (rtype, prop) in &schema.rel_indexes {
-        writeln!(out, "CREATE INDEX FOR ()-[r:{rtype}]->() ON (r.{prop});")?;
+        writeln!(
+            out,
+            "CREATE INDEX FOR ()-[r:{}]->() ON (r.{});",
+            quote_ident(rtype),
+            quote_ident(prop)
+        )?;
     }
 
     // Nodes: one MERGE per node, keyed on its resolved business key.
@@ -444,8 +461,16 @@ fn emit_node(
         format!("node identity {label}.{key} has a value that cannot be a MERGE key")
     })?;
     let (_labels, props) = node_parts(v).expect("node_parts succeeded in node_identity");
-    let label_str = labels.join(":");
-    write!(out, "MERGE (n:{label_str} {{{key}: {key_lit}}})")?;
+    let label_str = labels
+        .iter()
+        .map(|l| quote_ident(l))
+        .collect::<Vec<_>>()
+        .join(":");
+    write!(
+        out,
+        "MERGE (n:{label_str} {{{}: {key_lit}}})",
+        quote_ident(key)
+    )?;
     emit_set(
         props,
         "n",
@@ -490,7 +515,12 @@ fn emit_edge(
     );
     write!(
         out,
-        "MERGE (a:{al} {{{ak}: {av_lit}}})-[r:{rtype}]->(b:{bl} {{{bk}: {bv_lit}}})"
+        "MERGE (a:{} {{{}: {av_lit}}})-[r:{}]->(b:{} {{{}: {bv_lit}}})",
+        quote_ident(al),
+        quote_ident(ak),
+        quote_ident(rtype),
+        quote_ident(bl),
+        quote_ident(bk)
     )?;
     emit_set(rprops, "r", None, out, warnings, &format!("{rtype} edge"))?;
     writeln!(out, ";")?;
@@ -523,7 +553,7 @@ fn emit_set(
     kept.sort_by(|a, b| a.0.cmp(b.0));
     for (i, (name, lit)) in kept.iter().enumerate() {
         let sep = if i == 0 { " SET" } else { "," };
-        write!(out, "{sep} {var}.{name} = {lit}")?;
+        write!(out, "{sep} {var}.{} = {lit}", quote_ident(name))?;
     }
     Ok(())
 }
@@ -897,6 +927,82 @@ mod tests {
         assert_eq!(
             out,
             "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020;\n"
+        );
+    }
+
+    // ── Identifier quoting (HIK-84: no injection into the rebuild) ──
+
+    #[test]
+    fn emit_node_quotes_a_hostile_property_key() {
+        // The key from the finding: un-quoted it closes the MERGE's SET and splices a
+        // second statement into the rebuilt script (the build splitter breaks on `;`).
+        let s = schema(None, &[], &[("Person", "name")]);
+        let hostile = "`x` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a";
+        let n = node(
+            0,
+            &["Person"],
+            &[("name", PsValue::str("Alice")), (hostile, PsValue::Int(1))],
+        );
+        let (out, _) = render(|o, w| emit_node(&n, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (n:Person {name: 'Alice'}) SET n.```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a` = 1;\n"
+        );
+        // The whole payload lives inside one backtick-quoted name: no bare `;`, and the
+        // only unquoted `SET` is the statement's own.
+        let payload = out.split_once(" SET n.").unwrap().1;
+        assert!(payload.starts_with('`'), "key is not quoted: {out}");
+    }
+
+    #[test]
+    fn emit_node_quotes_hostile_labels_and_the_identity_key() {
+        let s = schema(None, &[("Odd Label", "id key")], &[]);
+        let n = node(
+            0,
+            &["Odd Label", "Zz) CREATE (:Pwned {x:1}) //"],
+            &[("id key", PsValue::str("k1"))],
+        );
+        let (out, _) = render(|o, w| emit_node(&n, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (n:`Odd Label`:`Zz) CREATE (:Pwned {x:1}) //` {`id key`: 'k1'});\n"
+        );
+    }
+
+    #[test]
+    fn emit_edge_quotes_a_hostile_reltype() {
+        let s = schema(None, &[], &[("Person", "name")]);
+        let a = node(0, &["Person"], &[("name", PsValue::str("Alice"))]);
+        let b = node(1, &["Person"], &[("name", PsValue::str("Bob"))]);
+        let r = rel("KNOWS]->(:Pwned) //", &[]);
+        let (out, _) = render(|o, w| emit_edge(&a, &r, &b, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (a:Person {name: 'Alice'})-[r:`KNOWS]->(:Pwned) //`]->(b:Person {name: 'Bob'});\n"
+        );
+    }
+
+    #[test]
+    fn a_hostile_string_value_stays_inside_its_literal() {
+        // Values were already escaped; pin it — a `;` or a quote in a value must not end
+        // the statement or close the literal (the build splitter is quote+escape aware).
+        let s = schema(None, &[], &[("Person", "name")]);
+        let n = node(
+            0,
+            &["Person"],
+            &[
+                ("name", PsValue::str("Alice")),
+                (
+                    "bio",
+                    PsValue::str("a'; MERGE (m:Owned {id:'atk'}) SET m.a = 'x\\\n`"),
+                ),
+            ],
+        );
+        let (out, _) = render(|o, w| emit_node(&n, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (n:Person {name: 'Alice'}) SET n.bio = \
+             'a\\'; MERGE (m:Owned {id:\\'atk\\'}) SET m.a = \\'x\\\\\\n`';\n"
         );
     }
 
