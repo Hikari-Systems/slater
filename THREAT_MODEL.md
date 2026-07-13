@@ -38,6 +38,20 @@ in place.
   network storage). This proves the files are **complete and self-consistent**, *not* that
   they are **authentic** — `content_hash` excludes `MANIFEST.json` itself, so an attacker who
   rewrites the data files *and* the manifest defeats it (when no key is in play).
+- **Object-store per-file verify never downgrades a requested content digest (HIK-97).** On
+  a network backend (S3/GCS) the per-file check at open compares the object's
+  *server-computed* checksum (S3 `x-amz-checksum-sha256`, GCS `crc32c`) to the manifest's
+  from a metadata request, no body read. If the manifest recorded a SHA-256 but the object
+  carries **no** server-stored one (e.g. an out-of-band upload under S3's default CRC64-NVME),
+  the S3 backend does **not** fall back to a byte-length completeness check — that would
+  satisfy a requested content digest with "the file is the right length", catching truncation
+  but not a same-length tamper. It instead reads the object body once and re-verifies it
+  against the manifest's canonical BLAKE3 (the trait's default check), preserving the
+  content-grade guarantee at the cost of a GET. A byte-length check is used **only** when the
+  manifest recorded no content digest at all (a pre-checksum generation), where there is
+  nothing to compare. Note this hardens *plaintext* images specifically: an encrypted image's
+  AEAD tag already catches any block tamper on read (detection is merely deferred to first
+  touch), whereas a plaintext image has no other content-authenticity check on this path.
 
 ## New protections
 

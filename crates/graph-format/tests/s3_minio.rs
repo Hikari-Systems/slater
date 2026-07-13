@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use graph_format::integrity::sha256_base64;
+use graph_format::integrity::{hash_bytes, sha256_base64};
 use graph_format::store::diskcache::{CachingObjectStore, DiskCache};
 use graph_format::store::s3::{S3Config, S3ObjectStore};
 use graph_format::store::{FileIntegrity, ObjectStore, RandomReadAt};
@@ -117,6 +117,75 @@ fn s3_roundtrip_and_sha256_verify() {
     );
 
     eprintln!("S3/MinIO integration: all assertions passed");
+}
+
+/// HIK-97 regression, end-to-end: an object whose manifest recorded a SHA-256 but
+/// which S3 stores with **no** server SHA-256 (uploaded without a checksum, as an
+/// out-of-band `aws s3 cp` under the default CRC64-NVME would leave it) must be
+/// verified by a body re-hash against the manifest's BLAKE3 — it must **not** pass
+/// on byte length alone. A same-length tampered overwrite must be rejected, which
+/// is exactly the case the pre-fix length-only fallback let through.
+#[test]
+fn verify_rehashes_body_when_server_sha256_absent() {
+    let Some(cfg) = config_or_skip() else {
+        eprintln!("skipping s3_minio: set SLATER_S3_TEST_ENDPOINT to run");
+        return;
+    };
+    let store = S3ObjectStore::connect(&cfg).expect("connect S3");
+
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+    let key = "g/u/no_checksum.blk";
+    // PUT WITHOUT a checksum → S3 stores no server SHA-256 for this object.
+    store.put(key, &data, None).expect("put without checksum");
+
+    let sha = sha256_base64(&data); // the manifest asked for a SHA-256 ...
+    let good_blake3 = hash_bytes(&data); // ... and carries the canonical BLAKE3.
+
+    // Correct content: the object has no server SHA-256 to compare the manifest's
+    // against, so verify re-reads the body and matches it to BLAKE3 → passes.
+    store
+        .verify_file(
+            key,
+            &FileIntegrity {
+                size: data.len() as u64,
+                blake3: &good_blake3,
+                sha256: Some(&sha),
+                crc32c: None,
+            },
+        )
+        .expect("verify_file re-hashes the body and passes on a matching BLAKE3");
+
+    // Tamper: overwrite with a DIFFERENT body of the SAME LENGTH, still with no
+    // server SHA-256. The pre-fix length-only check would have PASSED this; the
+    // body re-hash must reject it.
+    let mut tampered = data.clone();
+    tampered[0] ^= 0xFF;
+    assert_eq!(
+        tampered.len(),
+        data.len(),
+        "tamper preserves the byte length"
+    );
+    store
+        .put(key, &tampered, None)
+        .expect("overwrite with a tampered, same-length body");
+
+    let err = store
+        .verify_file(
+            key,
+            &FileIntegrity {
+                size: data.len() as u64,
+                blake3: &good_blake3, // manifest still claims the ORIGINAL digest
+                sha256: Some(&sha),
+                crc32c: None,
+            },
+        )
+        .expect_err("a same-length tampered body must be rejected, not passed on length");
+    assert!(
+        format!("{err:#}").contains("re-hash") || format!("{err:#}").contains("BLAKE3"),
+        "expected a content re-hash failure, got: {err:#}"
+    );
+
+    eprintln!("S3/MinIO HIK-97: body re-hash on an absent server SHA-256 verified");
 }
 
 /// An [`ObjectStore`] that counts positional reads reaching the inner store, so
