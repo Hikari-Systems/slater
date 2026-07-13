@@ -24,6 +24,92 @@ const TAG_STR: u8 = 4;
 const TAG_LIST: u8 = 5;
 const TAG_VECTOR: u8 = 6;
 
+/// A decoder refused a length claim it read off disk.
+///
+/// Typed so a caller classifies it with `err.downcast_ref::<DecodeRejected>()` rather than
+/// matching the message text: like [`crate::codec::BlockSizeExceeded`], this says *the image
+/// is corrupt or hostile*, which is a different thing from an I/O error and a caller may want
+/// to tell the two apart.
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeRejected {
+    /// A length/count product overflowed, so the bound derived from it is meaningless. A
+    /// forged varint that wraps `n * elem_size` to a *small* number would otherwise sail
+    /// through a length check and then be `with_capacity`'d at full width.
+    #[error("{what}: length {n} × {elem} overflows")]
+    LengthOverflow {
+        what: &'static str,
+        n: u64,
+        elem: usize,
+    },
+    /// An on-disk offset/length pair does not lie inside the file it claims to index.
+    #[error("{what}: {offset}+{len} lies outside the {file_len}-byte file")]
+    OutOfFile {
+        what: &'static str,
+        offset: u64,
+        len: u64,
+        file_len: u64,
+    },
+    /// An Elias–Fano high bitmap does not hold the number of one-bits its header declares.
+    /// `select₁` walks the bitmap counting ones and would index past its end — a panic.
+    #[error("{what}: high bitmap holds {found} one-bits, header declares {declared}")]
+    EfBitCount {
+        what: &'static str,
+        declared: usize,
+        found: usize,
+    },
+    /// A run-length record's element count is above what the format could ever store.
+    #[error("{what}: declares {n} elements, above the {max}-element ceiling")]
+    TooManyElements {
+        what: &'static str,
+        n: u64,
+        max: usize,
+    },
+}
+
+/// How many elements to *reserve* for a `count`-element sequence being decoded out of
+/// `remaining` bytes, where the encoding spends at least `min_elem_bytes` per element.
+///
+/// `count` comes off disk — a uvarint, or an on-disk `u32`/`u64` — and for a plaintext
+/// generation an attacker with data-dir write access forges it. `Vec::with_capacity(count)`
+/// on that number is an allocator abort (a `u64` count is a 16-exabyte request), which kills
+/// the process on a path as ordinary as a scan. But a *valid* sequence of `count` elements
+/// cannot fit in fewer than `count * min_elem_bytes` bytes, so anything above
+/// `remaining / min_elem_bytes` is a claim the input cannot possibly honour.
+///
+/// This bounds the **reservation only** — never acceptance. The decode loop still runs to the
+/// declared `count` and fails on its first short read, so the error a forged length produces
+/// is unchanged; all that changes is that we no longer allocate for it first. Nothing a
+/// legitimate writer can emit is rejected by this, and an under-reservation costs one regrow.
+#[inline]
+pub fn capacity_for(count: usize, remaining: usize, min_elem_bytes: usize) -> usize {
+    count.min(remaining / min_elem_bytes.max(1))
+}
+
+/// Ceiling on a reservation whose count is *not* backed by a buffer we hold — a blockfile
+/// directory's record total, a manifest's node count. There is no `remaining` to clamp
+/// against, and the count is still untrusted, so reserve a bounded prefix and let the `Vec`
+/// grow: reaching 91.6M (wikidata) from here is ~7 doublings, which is nothing beside the
+/// block reads that fill it.
+pub const MAX_UNBACKED_PREALLOC: usize = 1 << 20;
+
+/// See [`MAX_UNBACKED_PREALLOC`].
+#[inline]
+pub fn capacity_hint(count: usize) -> usize {
+    count.min(MAX_UNBACKED_PREALLOC)
+}
+
+/// `n * elem`, as a `usize`, or [`DecodeRejected::LengthOverflow`]. Use wherever a length
+/// read off disk is multiplied by an element width before being compared against a buffer:
+/// in release builds `n * elem` *wraps*, and a forged `n` chosen to wrap to exactly the
+/// buffer's length passes the check and reaches `with_capacity(n)` at full width.
+#[inline]
+pub fn checked_span(what: &'static str, n: u64, elem: usize) -> Result<usize> {
+    usize::try_from(n)
+        .ok()
+        .and_then(|n| n.checked_mul(elem))
+        .ok_or_else(|| DecodeRejected::LengthOverflow { what, n, elem }.into())
+}
+
 /// Maximum value nesting a decode will follow, counting the value itself: a bare scalar
 /// is depth 1, an item of a top-level list is depth 2.
 ///
@@ -273,7 +359,7 @@ fn read_value_at(r: &mut &[u8], depth: usize) -> Result<Value> {
             // pre-allocation at the bytes actually left so a forged huge length can't
             // drive an out-of-memory allocation before the loop's first short read
             // bails — same discipline as `packstream::read_list`.
-            let mut items = Vec::with_capacity(n.min(r.len()));
+            let mut items = Vec::with_capacity(capacity_for(n, r.len(), 1));
             for _ in 0..n {
                 items.push(read_value_at(r, depth + 1)?);
             }
@@ -283,7 +369,7 @@ fn read_value_at(r: &mut &[u8], depth: usize) -> Result<Value> {
             let n = read_uvarint(r)? as usize;
             // Each element is a 4-byte `f32`, so bound the pre-allocation by
             // `remaining / 4` (see `TAG_LIST`) against a forged length.
-            let mut xs = Vec::with_capacity(n.min(r.len() / 4));
+            let mut xs = Vec::with_capacity(capacity_for(n, r.len(), 4));
             for _ in 0..n {
                 xs.push(r.read_f32::<LittleEndian>()?);
             }

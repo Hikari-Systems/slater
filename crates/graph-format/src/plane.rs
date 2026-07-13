@@ -32,7 +32,7 @@
 use anyhow::{bail, Result};
 
 use crate::codec;
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint, DecodeRejected};
 
 /// One `select₁` sample per this many set bits (see [`select1`]).
 pub(crate) const SELECT_SAMPLE: usize = 64;
@@ -501,6 +501,22 @@ impl EfMono {
         for w in body[hstart..hstart + high_bytes].chunks_exact(8) {
             highs.push(u64::from_le_bytes(w.try_into().unwrap()));
         }
+        // The byte-length check above validates the *shape* of the body but says nothing about
+        // its content: an EF high bitmap must hold exactly `m` one-bits (one per value), and
+        // nothing so far requires that. With fewer, `build_sample` returns a short sample and
+        // `select1` — which walks `highs` counting ones until it has passed `i` of them —
+        // indexes `sample[s]` / `highs[wi]` off the end of the slice. That is an out-of-bounds
+        // panic on an ordinary `value_at`, from bytes an attacker with data-dir write access
+        // controls. Verify the invariant here, once at decode, rather than on every select.
+        let ones: usize = highs.iter().map(|w| w.count_ones() as usize).sum();
+        if ones != m as usize {
+            return Err(DecodeRejected::EfBitCount {
+                what: "ef-mono plane",
+                declared: m as usize,
+                found: ones,
+            }
+            .into());
+        }
         let sample = build_sample(&highs, m as usize);
         Ok(Self {
             m,
@@ -599,9 +615,27 @@ impl RleU64 {
     fn deserialize(body: &[u8]) -> Result<Self> {
         let mut r = body;
         let n = read_uvarint(&mut r)? as u32;
+        // Unlike the other plane codecs, RLE's element count `n` is *not* bounded by the
+        // record's byte length: run lengths are uvarints, so `01 ff ff ff ff 0f` — six bytes —
+        // is a well-formed single run declaring 4·10⁹ values, and `to_values` would then
+        // materialise a 34 GB `Vec`. Bound `n` by the format's own ceiling: the same plane's
+        // `RawU64` form is `n * 8` bytes, which `codec::MAX_BLOCK_BYTES` already refuses, so a
+        // plane above that many values is not one any writer could have emitted.
+        const MAX_PLANE_VALUES: usize = codec::MAX_BLOCK_BYTES / 8;
+        if n as usize > MAX_PLANE_VALUES {
+            return Err(DecodeRejected::TooManyElements {
+                what: "rle plane",
+                n: n as u64,
+                max: MAX_PLANE_VALUES,
+            }
+            .into());
+        }
         let run_count = read_uvarint(&mut r)? as usize;
-        let mut values = Vec::with_capacity(run_count);
-        let mut starts = Vec::with_capacity(run_count);
+        // Each run costs ≥2 bytes (value ‖ length), so clamp the reservation to what the body
+        // can justify — a forged run count errors in the loop, not in the allocator.
+        let cap = capacity_for(run_count, r.len(), 2);
+        let mut values = Vec::with_capacity(cap);
+        let mut starts = Vec::with_capacity(cap);
         let mut acc = 0u64;
         for _ in 0..run_count {
             let value = read_uvarint(&mut r)?;

@@ -46,7 +46,7 @@ use anyhow::{bail, Result};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::ids::{EdgeId, NodeId};
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// One adjacency entry: a typed edge to a neighbouring node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +200,10 @@ fn parse_adj_header(rec: &[u8], forward: bool) -> Result<Option<AdjHeader<'_>>> 
         (false, 0)
     };
     let num_runs = read_uvarint(&mut r)? as usize;
-    let mut dir = Vec::with_capacity(num_runs);
+    // Untrusted on-disk count; a run costs ≥3 bytes (reltype ‖ count ‖ nbytes, each a
+    // uvarint), so reserve no more than the remaining bytes could hold — a forged count then
+    // errors on its first short read instead of aborting on the allocation.
+    let mut dir = Vec::with_capacity(capacity_for(num_runs, r.len(), 3));
     for _ in 0..num_runs {
         let rt = read_uvarint(&mut r)? as u32;
         let rc = read_uvarint(&mut r)? as usize;
@@ -303,7 +306,10 @@ pub fn decode_adj_into_filtered(
 pub fn decode_adj(rec: &[u8], forward: bool) -> Result<Vec<Adj>> {
     // The leading uvarint is the edge count — peek it to size the Vec exactly.
     let count = read_uvarint(&mut { rec })? as usize;
-    let mut out = Vec::with_capacity(count);
+    // The count is a *claim* off disk, so reserve against what the record could hold (each
+    // edge costs ≥1 byte) rather than the claim itself: a hub's 10M-edge record still
+    // reserves exactly, a forged 2^64 count reserves nothing and `decode_adj_into` errors.
+    let mut out = Vec::with_capacity(capacity_for(count, rec.len(), 1));
     decode_adj_into(rec, forward, |a| {
         out.push(a);
         Ok(())

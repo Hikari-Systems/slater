@@ -36,7 +36,7 @@ use anyhow::{bail, Result};
 
 use crate::codec;
 use crate::plane::{self, build_sample, low_bits, read_low, write_low};
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint, DecodeRejected};
 
 /// The degree column reuses the generic plane-codec knobs ([`crate::plane`]); these aliases keep
 /// the historical names at the call sites (`--degree-zstd-margin`, the retrofit tool) while the
@@ -246,6 +246,19 @@ impl EfChunk {
         for w in body[hstart..hstart + high_bytes].chunks_exact(8) {
             highs.push(u64::from_le_bytes(w.try_into().unwrap()));
         }
+        // The byte-length check validates the body's shape, not its content: the high bitmap
+        // must hold exactly `m` one-bits, and with fewer, `select1` walks off the end of
+        // `highs`/`sample` — an out-of-bounds panic on an ordinary degree lookup. Same
+        // invariant, same reasoning as `plane::EfMono::deserialize`.
+        let ones: usize = highs.iter().map(|w| w.count_ones() as usize).sum();
+        if ones != m {
+            return Err(DecodeRejected::EfBitCount {
+                what: "ef degree chunk",
+                declared: m,
+                found: ones,
+            }
+            .into());
+        }
         let sample = build_sample(&highs, m);
         Ok(Self {
             n,
@@ -354,9 +367,26 @@ impl RleChunk {
     fn deserialize(body: &[u8]) -> Result<Self> {
         let mut r = body;
         let n = read_uvarint(&mut r)? as u32;
+        // `n` is not bounded by the record's byte length — run lengths are uvarints, so a
+        // six-byte single run can declare 4·10⁹ degrees and `to_degrees` would materialise a
+        // 17 GB `Vec`. Bound it by the format's own ceiling: the same chunk's `RawU32` form is
+        // `n * 4` bytes, which `codec::MAX_BLOCK_BYTES` already refuses (and a real chunk is
+        // orders of magnitude smaller than that — see `nodedegree::records_per_half`).
+        const MAX_CHUNK_DEGREES: usize = codec::MAX_BLOCK_BYTES / 4;
+        if n as usize > MAX_CHUNK_DEGREES {
+            return Err(DecodeRejected::TooManyElements {
+                what: "rle degree chunk",
+                n: n as u64,
+                max: MAX_CHUNK_DEGREES,
+            }
+            .into());
+        }
         let run_count = read_uvarint(&mut r)? as usize;
-        let mut values = Vec::with_capacity(run_count);
-        let mut starts = Vec::with_capacity(run_count);
+        // Each run costs ≥2 bytes (value ‖ length); clamp the reservation to what the body can
+        // justify so a forged run count errors in the loop, not in the allocator.
+        let cap = capacity_for(run_count, r.len(), 2);
+        let mut values = Vec::with_capacity(cap);
+        let mut starts = Vec::with_capacity(cap);
         let mut acc = 0u64;
         for _ in 0..run_count {
             let value = read_uvarint(&mut r)? as u32;

@@ -44,7 +44,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::pq::{sq_l2, Lcg};
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// A `(0..count)` index into a Vamana graph — a node's position in the file.
 pub type VamanaIndex = u32;
@@ -380,12 +380,15 @@ pub fn decode_node(rec: &[u8]) -> Result<VamanaNode> {
     let mut r = rec;
     let node_id = read_uvarint(&mut r)?;
     let dim = read_uvarint(&mut r)? as usize;
-    let mut vector = Vec::with_capacity(dim);
+    // `dim` and `degree` are untrusted on-disk uvarints. A vector element is 4 bytes and a
+    // neighbour ≥1, so reserve only what the record's remaining bytes could hold: a forged
+    // count then errors on the first short read instead of aborting on the allocation.
+    let mut vector = Vec::with_capacity(capacity_for(dim, r.len(), 4));
     for _ in 0..dim {
         vector.push(r.read_f32::<LittleEndian>()?);
     }
     let degree = read_uvarint(&mut r)? as usize;
-    let mut neighbours = Vec::with_capacity(degree);
+    let mut neighbours = Vec::with_capacity(capacity_for(degree, r.len(), 1));
     for _ in 0..degree {
         neighbours.push(read_uvarint(&mut r)? as u32);
     }

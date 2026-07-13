@@ -27,7 +27,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_hint, checked_span, read_uvarint, write_uvarint};
 
 /// One stored vector and the dense node it belongs to.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,7 +145,10 @@ impl VectorStoreReader {
 
     /// Fetch a whole index group `[first_record, first_record + count)`.
     pub fn group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
-        let mut out = Vec::with_capacity(count as usize);
+        // `count` comes from an index-group descriptor read off disk, and no buffer bounds it
+        // here — reserve a bounded prefix and grow as the records are actually read. Each
+        // iteration's `get` errors past the end of the file (`wire::capacity_hint`).
+        let mut out = Vec::with_capacity(capacity_hint(count as usize));
         for g in first_record..first_record + count {
             out.push(self.get(g)?);
         }
@@ -171,13 +174,18 @@ pub fn decode_vector(rec: &[u8]) -> Result<VectorEntry> {
 fn decode(rec: &[u8]) -> Result<VectorEntry> {
     let mut r = rec;
     let node_id = read_uvarint(&mut r)?;
-    let dim = read_uvarint(&mut r)? as usize;
-    if r.len() != dim * 4 {
+    let dim = read_uvarint(&mut r)?;
+    // `dim` is an untrusted uvarint, so `dim * 4` is a *product of on-disk data*: computed in
+    // `usize` it wraps, and a forged `dim` chosen to wrap to exactly `r.len()` passes the
+    // check below and reaches `with_capacity(dim)` at its full width. Multiply checked.
+    let span = checked_span("vector record", dim, 4)?;
+    if r.len() != span {
         bail!(
             "vector record length mismatch (dim {dim}, {} bytes left)",
             r.len()
         );
     }
+    let dim = dim as usize;
     let mut vector = Vec::with_capacity(dim);
     for _ in 0..dim {
         vector.push(r.read_f32::<LittleEndian>()?);

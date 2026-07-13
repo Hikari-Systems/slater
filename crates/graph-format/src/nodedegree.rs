@@ -27,6 +27,7 @@ use anyhow::{bail, Result};
 use crate::blockfile::{BlockCodec, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::degree_ef::{decode_chunk, encode_chunk, DegreeChunk, DegreeCodecOpts};
+use crate::wire::capacity_hint;
 
 /// Degrees per stored record (u32 each ⇒ 1 MiB records at 2^18). Bounds a record's size
 /// while keeping the record count small (a few hundred on a 91.6M-node graph).
@@ -112,8 +113,13 @@ pub fn read_node_degrees(
             per_half * 2
         );
     }
-    let mut out = Vec::with_capacity(node_count);
-    let mut inn = Vec::with_capacity(node_count);
+    // `node_count` is the manifest's — on-disk, and in a plaintext generation forgeable. The
+    // record-count check above ties it to the file, but only loosely (a block's `rec_count` is
+    // itself an on-disk `u32`), so do not size two `Vec`s straight off it: reserve a bounded
+    // prefix and grow as the records are actually read. The length check below still holds the
+    // result to exactly `node_count`.
+    let mut out = Vec::with_capacity(capacity_hint(node_count));
+    let mut inn = Vec::with_capacity(capacity_hint(node_count));
     for r in 0..total {
         let bytes = reader.read_record_global(r as u64)?;
         let dst = if r < per_half { &mut out } else { &mut inn };

@@ -27,7 +27,7 @@ use anyhow::Result;
 
 use crate::blockfile::BlockFileWriter;
 use crate::crypto::BlockCipher;
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// Default degree floor at/above which a node is recorded in the sidecar. Chosen well
 /// below any sane query-side stream threshold so the sidecar holds an exact degree for
@@ -54,7 +54,9 @@ pub fn encode_hub_list(entries: &[(u64, u32)]) -> Vec<u8> {
 pub fn decode_hub_list(rec: &[u8]) -> Result<Vec<(u64, u32)>> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Untrusted on-disk count; each pair costs ≥2 bytes (id delta ‖ degree). Clamp the
+    // reservation to what the record can justify — see `wire::capacity_for`.
+    let mut out = Vec::with_capacity(capacity_for(count, r.len(), 2));
     let mut prev = 0u64;
     for _ in 0..count {
         let id = prev + read_uvarint(&mut r)?;

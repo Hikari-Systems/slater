@@ -32,7 +32,7 @@ use crate::blockfile::BlockFileWriter;
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
 use crate::isam::IsamReader;
-use crate::wire::{read_uvarint, read_value, write_uvarint, write_value};
+use crate::wire::{capacity_for, read_uvarint, read_value, write_uvarint, write_value};
 
 /// Default cap on a histogram's distinct-key count. A `(label, property)` whose
 /// index has more than this many distinct values is not given a histogram (the
@@ -55,7 +55,9 @@ pub fn encode_histogram(pairs: &[(Value, u64)]) -> Vec<u8> {
 pub fn decode_histogram(rec: &[u8]) -> Result<Vec<(Value, u64)>> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Untrusted on-disk count; each pair costs ≥2 bytes (a value tag ‖ a run count). Clamp the
+    // reservation to what the record can justify — see `wire::capacity_for`.
+    let mut out = Vec::with_capacity(capacity_for(count, r.len(), 2));
     for _ in 0..count {
         let v = read_value(&mut r)?;
         let n = read_uvarint(&mut r)?;

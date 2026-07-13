@@ -41,7 +41,7 @@ use graph_format::blockcache::BlockCache;
 use graph_format::blockfile::{BlockFileReader, BlockFileWriter};
 use graph_format::ids::Value;
 use graph_format::plane::{KeyColumn, PlaneCodecOpts};
-use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
+use graph_format::wire::{capacity_for, read_uvarint, read_value, write_uvarint, write_value};
 
 use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta};
 
@@ -236,7 +236,10 @@ fn encode_adj(edges: &[DeltaEdge]) -> Vec<u8> {
 
 fn decode_adj(mut r: &[u8]) -> Result<Vec<DeltaEdge>> {
     let n = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    // `n` is an untrusted count out of an mmapped L0 record; each edge costs ≥1 byte, so clamp
+    // the reservation to the bytes present (`wire::capacity_for`) — a forged count then runs
+    // the record dry and errors instead of aborting the process in the allocator.
+    let mut out = Vec::with_capacity(capacity_for(n, r.len(), 1));
     for _ in 0..n {
         let other = read_uvarint(&mut r)?;
         let reltype = r_str(&mut r)?;
@@ -644,7 +647,8 @@ fn w_u64s(buf: &mut Vec<u8>, it: impl ExactSizeIterator<Item = u64>) {
 
 fn r_u64s(r: &mut &[u8]) -> Result<Vec<u64>> {
     let n = read_uvarint(r)? as usize;
-    let mut out = Vec::with_capacity(n);
+    // Untrusted on-disk count, ≥1 byte per id — clamp the reservation to the bytes left.
+    let mut out = Vec::with_capacity(capacity_for(n, r.len(), 1));
     for _ in 0..n {
         out.push(read_uvarint(r)?);
     }
@@ -771,19 +775,23 @@ impl L0Reader {
         let adj_in_keys = r_keycol(&mut r)?;
         let edge_keys = r_keycol(&mut r)?;
 
+        // Every count below is an untrusted uvarint out of the mmapped meta record. Each
+        // entry costs at least the bytes noted, so clamp the reservation to what the record
+        // could actually hold (`wire::capacity_for`): a forged count then runs the buffer dry
+        // in the loop and errors, instead of aborting the process in the allocator first.
         let n_label = read_uvarint(&mut r)? as usize;
-        let mut born_by_label = HashMap::with_capacity(n_label);
+        let mut born_by_label = HashMap::with_capacity(capacity_for(n_label, r.len(), 2));
         for _ in 0..n_label {
             let label = r_str(&mut r)?;
             born_by_label.insert(label, r_u64s(&mut r)?);
         }
         let n_bi = read_uvarint(&mut r)? as usize;
-        let mut born_index = Vec::with_capacity(n_bi);
+        let mut born_index = Vec::with_capacity(capacity_for(n_bi, r.len(), 3));
         for _ in 0..n_bi {
             let label = r_str(&mut r)?;
             let id = read_uvarint(&mut r)?;
             let np = read_uvarint(&mut r)? as usize;
-            let mut props = Vec::with_capacity(np);
+            let mut props = Vec::with_capacity(capacity_for(np, r.len(), 2));
             for _ in 0..np {
                 let p = r_str(&mut r)?;
                 let v = read_value(&mut r)?;
@@ -792,7 +800,7 @@ impl L0Reader {
             born_index.push(BornIndexEntry { label, id, props });
         }
         let n_cp = read_uvarint(&mut r)? as usize;
-        let mut core_patched = Vec::with_capacity(n_cp);
+        let mut core_patched = Vec::with_capacity(capacity_for(n_cp, r.len(), 3));
         for _ in 0..n_cp {
             let label = r_str(&mut r)?;
             let prop = r_str(&mut r)?;
@@ -800,7 +808,7 @@ impl L0Reader {
             core_patched.push((label, prop, id));
         }
         let n_bid = read_uvarint(&mut r)? as usize;
-        let mut born_by_identity = HashMap::with_capacity(n_bid);
+        let mut born_by_identity = HashMap::with_capacity(capacity_for(n_bid, r.len(), 2));
         for _ in 0..n_bid {
             let len = read_uvarint(&mut r)? as usize;
             if r.len() < len {
@@ -817,7 +825,7 @@ impl L0Reader {
         let edge_tombstones = r[0] != 0;
         r = &r[1..];
         let n_ber = read_uvarint(&mut r)? as usize;
-        let mut born_edges_by_reltype = HashMap::with_capacity(n_ber);
+        let mut born_edges_by_reltype = HashMap::with_capacity(capacity_for(n_ber, r.len(), 2));
         for _ in 0..n_ber {
             let reltype = r_str(&mut r)?;
             born_edges_by_reltype.insert(reltype, read_uvarint(&mut r)?);
@@ -830,7 +838,7 @@ impl L0Reader {
         r = &r[1..];
         let r_label_ids = |r: &mut &[u8]| -> Result<HashMap<String, Vec<u64>>> {
             let n = read_uvarint(r)? as usize;
-            let mut m = HashMap::with_capacity(n);
+            let mut m = HashMap::with_capacity(capacity_for(n, r.len(), 2));
             for _ in 0..n {
                 let label = r_str(r)?;
                 m.insert(label, r_u64s(r)?);
@@ -842,7 +850,7 @@ impl L0Reader {
         let label_overlay_ids = r_u64s(&mut r)?;
         // v4: core-edge patch endpoints.
         let n_cpe = read_uvarint(&mut r)? as usize;
-        let mut core_patched_edges = Vec::with_capacity(n_cpe);
+        let mut core_patched_edges = Vec::with_capacity(capacity_for(n_cpe, r.len(), 4));
         for _ in 0..n_cpe {
             let eid = read_uvarint(&mut r)?;
             let src = read_uvarint(&mut r)?;
@@ -1283,6 +1291,24 @@ fn sorted_union(cols: impl Iterator<Item = Vec<u64>>) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HIK-80: the L0 meta/adjacency decoders sized their `Vec`s and `HashMap`s from untrusted
+    // on-disk counts. These records are mmapped straight off the data dir, so a forged count is
+    // an allocator abort — the whole process — on delta open. Reaching the assertion is the
+    // proof: pre-fix, the test binary dies in the allocator rather than failing.
+    #[test]
+    fn forged_l0_counts_are_refused_not_preallocated() {
+        let mut rec = Vec::new();
+        write_uvarint(&mut rec, u64::MAX);
+        assert!(r_u64s(&mut &rec[..]).is_err());
+        assert!(decode_adj(&rec).is_err());
+
+        // Honest records still round-trip: the clamp bounds the reservation, never acceptance.
+        let mut ok = Vec::new();
+        w_u64s(&mut ok, [7u64, 8, 9].into_iter());
+        assert_eq!(r_u64s(&mut &ok[..]).unwrap(), vec![7, 8, 9]);
+    }
+
     use crate::memtable::Memtable;
     use crate::wal::WalOp;
     use crate::OpResolution;

@@ -32,7 +32,7 @@ use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockCodec, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
-use crate::wire::{read_uvarint, write_uvarint};
+use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// Largest label alphabet that fits the `u64` bitmask encoding. At or below this the store
 /// uses fixed 8-byte masks in a Raw container; above it, delta-free varint lists in zstd.
@@ -255,7 +255,9 @@ impl NodeLabelsReader {
 fn decode_labels_varint(rec: &[u8]) -> Result<Vec<u32>> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // Untrusted on-disk count, ≥1 byte per label id: clamp the reservation to the bytes left
+    // (`wire::capacity_for`) so a forged count errors in the loop rather than in the allocator.
+    let mut out = Vec::with_capacity(capacity_for(count, r.len(), 1));
     for _ in 0..count {
         out.push(read_uvarint(&mut r)? as u32);
     }
