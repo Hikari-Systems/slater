@@ -9046,7 +9046,12 @@ fn walk_mode(r: Option<PathRestrictor>) -> WalkMode {
 
 fn varlen_bounds(vl: &VarLength) -> (u32, u32) {
     let min = vl.min.unwrap_or(1);
-    let max = vl.max.unwrap_or(MAX_VARLEN_HOPS).max(min);
+    // Do NOT clamp `max` up to `min`: an explicitly inverted range (`*5..3`, or an
+    // open `*20..` whose min exceeds the default hop cap) is an *empty* range, not a
+    // single length-`min` walk. Every consumer (`varlen`, `select_paths`,
+    // `shortestPath`) already yields nothing when `max < min`, so returning the raw
+    // bounds is correct — the old `.max(min)` silently rewrote `5..3` into `5..5`.
+    let max = vl.max.unwrap_or(MAX_VARLEN_HOPS);
     (min, max)
 }
 
@@ -15606,6 +15611,40 @@ mod tests {
         }
         assert_eq!(b.in_use(), 0, "balanced charge/release nets to zero");
         assert!(b.peak() >= 7, "peak captured the per-cycle high-water");
+    }
+
+    #[test]
+    fn varlen_bounds_inverted_range_stays_empty() {
+        // `*5..3`: an explicit max below min is an empty range. It must NOT be clamped
+        // to `5..5` (which would wrongly match exactly-length-5 walks). Every consumer
+        // treats `max < min` as "no path", so the raw inverted bounds are correct.
+        let vl = VarLength {
+            min: Some(5),
+            max: Some(3),
+        };
+        let (min, max) = varlen_bounds(&vl);
+        assert_eq!((min, max), (5, 3));
+        assert!(
+            max < min,
+            "inverted range must stay inverted (empty), not clamp"
+        );
+
+        // A normal range is unaffected.
+        assert_eq!(
+            varlen_bounds(&VarLength {
+                min: Some(2),
+                max: Some(4)
+            }),
+            (2, 4)
+        );
+        // An open `*` still spans 1..=MAX_VARLEN_HOPS.
+        assert_eq!(
+            varlen_bounds(&VarLength {
+                min: None,
+                max: None
+            }),
+            (1, MAX_VARLEN_HOPS)
+        );
     }
 
     #[test]
