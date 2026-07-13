@@ -6,6 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints.rust]
+# graph-format contains no `unsafe`: the block/ISAM writers, codecs and crypto all
+# build on safe std + audited crates (no raw mmap or pointer work of its own). Forbid
+# keeps it that way, matching its sibling crates.
+unsafe_code = "forbid"
+
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true

@@ -10,6 +10,11 @@ license.workspace = true
 # builder (`slater-build`). Deliberately tiny deps: no graph/runtime, no regex/chrono,
 # no vector kernel — those back impure functions that stay in the query engine.
 
+[lints.rust]
+# slater-scalar is a pure, dependency-light evaluator with no `unsafe`. Forbid keeps
+# it that way, matching its sibling crates.
+unsafe_code = "forbid"
+
 [dependencies]
 graph-format.workspace = true
 anyhow.workspace = true
