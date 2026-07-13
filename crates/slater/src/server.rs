@@ -5295,13 +5295,19 @@ mod tests {
     use crate::testgen;
     use tokio::net::TcpStream;
 
-    /// Micro-benchmark isolating the write-resolve cost: time `resolve_business_key`
-    /// over the 30%-delete segment (`wikidata_id` in `0..=p30`, ascending), cached vs
-    /// uncached, against a real large core — no WAL/memtable/flush machinery. Answers
-    /// "is the ISAM resolve the bulk-delete bottleneck, and does the range cache fix it?".
-    /// Env-gated + `#[ignore]`; point it at a data dir:
-    /// `SLATER_SMOKE_DATADIR=/home/rickk/perf-gens/wiki1m SLATER_SMOKE_GRAPH=wiki1m \
-    ///   cargo test -p slater --lib bench_resolve_business_key -- --ignored --nocapture`
+    /// Micro-benchmark isolating the write-resolve cost: time **and resident memory** of
+    /// `resolve_business_key` over the 30%-delete segment (`wikidata_id` in `0..=p30`,
+    /// ascending), cached vs uncached, against a real large core — no WAL/memtable/flush
+    /// machinery. Answers "is the ISAM resolve the bulk-delete bottleneck, does the range
+    /// cache fix it, and what does the batch path cost in RSS?". RSS is sampled per phase
+    /// (`/proc/self/statm`) plus the process `VmHWM`: the per-row path stays flat, the
+    /// batch path's working set scales with `SLATER_SMOKE_BENCH_N` (raise it to see it).
+    /// Gated behind the `perf-mem` build switch (so the bench and its Linux-only `/proc`
+    /// RSS sampling are excluded from a normal `cargo test`), plus env-gated + `#[ignore]`:
+    /// `SLATER_SMOKE_DATADIR=<dir> SLATER_SMOKE_GRAPH=<graph> \
+    ///   cargo test -p slater --lib --features perf-mem \
+    ///   bench_resolve_business_key -- --ignored --nocapture`
+    #[cfg(feature = "perf-mem")]
     #[test]
     #[ignore = "needs a prebuilt generation; see SLATER_SMOKE_DATADIR"]
     fn bench_resolve_business_key_over_the_segment() {
@@ -5319,6 +5325,35 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5000);
         let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(&data_dir));
+
+        // Resident set size right now (`/proc/self/statm` field 2 × page, matching
+        // slater-build's `diag::rss_bytes`) and the process-wide high-water mark
+        // (`VmHWM`). The per-row path holds nothing across iterations; the batch path
+        // materialises the whole distinct value set + the merge-join's `Vec<Vec<u64>>`
+        // of ids resident, so its working set grows with the batch size — the memory
+        // side of the bulk-write floor. Deltas are noisy at small N (glibc/jemalloc
+        // retain freed pages); raise `SLATER_SMOKE_BENCH_N` to see the batch cost grow.
+        fn rss_now() -> u64 {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * 4096)
+        }
+        fn rss_peak() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines().find_map(|l| {
+                        l.strip_prefix("VmHWM:")?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                })
+                .map_or(0, |kb| kb * 1024)
+        }
+        let mib = |b: u64| b as f64 / 1048576.0;
 
         let run = |label: &str, budget: Option<usize>| {
             // verify_integrity = false: the copy-completeness re-hash of a 1M-node core
@@ -5338,31 +5373,51 @@ mod tests {
             if let Some(r) = gen.range_index("node_Entity_wikidata_id") {
                 println!("  index blocks = {}", r.num_blocks());
             }
+            let rss_open = rss_now();
             let lo = p30 - n + 1;
             let t0 = std::time::Instant::now();
             let mut hits = 0u64;
-            for k in lo..=p30 {
+            let mut rss_perrow_peak = rss_open;
+            for (i, k) in (lo..=p30).enumerate() {
                 if let KeyResolution::Unique(_) =
                     resolve_business_key(&gen, "Entity", "wikidata_id", &Value::Int(k))
                 {
                     hits += 1;
                 }
+                // Sample sparsely — the per-row path frees each probe's decode buffer,
+                // so resident stays flat; this confirms it rather than costing a syscall
+                // per key.
+                if i % 512 == 0 {
+                    rss_perrow_peak = rss_perrow_peak.max(rss_now());
+                }
             }
             let loop_elapsed = t0.elapsed();
+            let rss_after_perrow = rss_now();
             println!(
                 "{label}: open {open_elapsed:?}; per-row resolved {n} keys ({hits} hits) in \
                  {loop_elapsed:?} ({:.1} µs/resolve)",
                 loop_elapsed.as_micros() as f64 / n as f64
             );
+            println!(
+                "  mem: rss after open {:.1}MiB → after per-row {:.1}MiB (Δ{:+.1}, loop-peak {:.1}MiB)",
+                mib(rss_open),
+                mib(rss_after_perrow),
+                mib(rss_after_perrow) - mib(rss_open),
+                mib(rss_perrow_peak),
+            );
 
             // The batch merge-join resolve (slice 6.3): sweep the same ascending run once
             // instead of one point probe per key. Same verdicts, one decompress per touched
             // block for the whole batch — the bulk-write floor fix.
+            let rss_before_batch = rss_now();
             let values: Vec<Value> = (lo..=p30).map(Value::Int).collect();
             let refs: Vec<&Value> = values.iter().collect();
             let t1 = std::time::Instant::now();
             let batch = resolve_business_keys_batch(&gen, "Entity", "wikidata_id", &refs);
             let batch_elapsed = t1.elapsed();
+            // Sample while the result (and any allocator pages the merge-join's transient
+            // `Vec<Vec<u64>>` grew into) is still resident, before `batch`/`values` drop.
+            let rss_after_batch = rss_now();
             let batch_hits = batch
                 .iter()
                 .filter(|r| matches!(r, KeyResolution::Unique(_)))
@@ -5374,6 +5429,16 @@ mod tests {
                 batch_elapsed.as_micros() as f64 / n as f64,
                 loop_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
             );
+            println!(
+                "  mem: rss before batch {:.1}MiB → after batch {:.1}MiB (Δ{:+.1} for {n} keys resident); \
+                 process VmHWM {:.1}MiB",
+                mib(rss_before_batch),
+                mib(rss_after_batch),
+                mib(rss_after_batch) - mib(rss_before_batch),
+                mib(rss_peak()),
+            );
+            drop(batch);
+            drop(values);
         };
 
         run("uncached", None);

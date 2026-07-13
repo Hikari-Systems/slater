@@ -48,6 +48,11 @@ gcs = ["graph-format/gcs"]
 # Expose the `testgen` fixture builder to benchmarks (off by default; not shipped
 # in a normal build). Required by the `delta_overlay` read-regression bench.
 testkit = []
+# Compile the write-resolve perf/memory micro-bench
+# (`bench_resolve_business_key_over_the_segment`). Off by default so the bench —
+# and its Linux-only `/proc/self/{statm,status}` RSS sampling — is never built or
+# run by a normal `cargo test`; enable with `--features perf-mem`.
+perf-mem = []
 
 [lints.rust]
 # The server is entirely free of `unsafe`: heap return to the OS is now jemalloc's
