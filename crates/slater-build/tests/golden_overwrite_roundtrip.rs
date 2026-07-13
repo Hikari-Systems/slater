@@ -315,6 +315,222 @@ fn external_overwrite_build_is_deterministic() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+// ---------------------------------------------------------------------------------
+// MERGE idempotency (HIK-83). The base-node scan in pass 1.9 runs before the overwrite
+// statements are resolved, so it cannot see nodes that the resolve loop itself creates.
+// Without dedup, every 0-match MERGE on one absent business key synthesised its own
+// node: two nodes sharing a business key, and two entries in that key's range index.
+//
+// The base section here deliberately does NOT contain 'NEW' or 'ALSO'. The overlay then
+// MERGEs each of them more than once, splitting the SET props across statements (the
+// exact shape called out in the report), including a conflicting write to one key.
+const MERGE_DUP_DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);
+CREATE INDEX FOR (n:Concept) ON (n.name);
+CREATE (:Concept:__DumpVertex__ {__dump_id__: 0, name: 'A'});
+MERGE (n:Concept {name: 'NEW'}) SET n.k = 1, n.v = 10;
+MERGE (n:Concept {name: 'NEW'}) SET n.extra = 'x';
+MERGE (n:Concept {name: 'NEW'}) SET n.v = 20;
+MERGE (n:Concept:Tagged {name: 'ALSO'}) SET n.k = 2;
+MERGE (n:Concept {name: 'ALSO'}) SET n.j = 3;
+MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;
+DROP INDEX ON :__DumpVertex__(__dump_id__);
+"#;
+
+// Repeated 0-match MERGEs of one business key must converge on ONE node carrying the
+// union of the SET props (last-writer-wins per key) — not one node per statement.
+#[test]
+fn external_merge_0match_is_idempotent_within_one_run() {
+    let work = unique_dir("mergedup");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, MERGE_DUP_DUMP).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "mergedup",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "ldg",
+        ])
+        // Maximum parallelism: one statement per shard, so the MERGEs of one key are
+        // parsed by different workers and only meet again in pass 1.9.
+        .env("SLATER_SHARD_BYTES", "1")
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("mergedup");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+
+    // Base 'A' + one 'NEW' + one 'ALSO' — three MERGEs of 'NEW' and two of 'ALSO' must
+    // not synthesise five nodes.
+    assert_eq!(
+        m.node_count, 3,
+        "each business key must yield exactly one MERGE-created node"
+    );
+
+    let np = PropsReader::open(gen_dir.join("node_props.blk")).unwrap();
+    let mut ids_of: HashMap<String, Vec<u64>> = HashMap::new();
+    for id in 0..m.node_count {
+        if let Some(Value::Str(s)) = prop(&np.props(id).unwrap(), &m.property_keys, "name") {
+            ids_of.entry(s.clone()).or_default().push(id);
+        }
+    }
+    assert_eq!(ids_of["NEW"].len(), 1, "one node for business key 'NEW'");
+    assert_eq!(ids_of["ALSO"].len(), 1, "one node for business key 'ALSO'");
+
+    let get = |name: &str, key: &str| -> Option<Value> {
+        prop(&np.props(ids_of[name][0]).unwrap(), &m.property_keys, key).cloned()
+    };
+    // The props of all three 'NEW' MERGEs landed on the one node, last-write-wins on `v`.
+    assert_eq!(
+        get("NEW", "k"),
+        Some(Value::Int(1)),
+        "first MERGE's SET kept"
+    );
+    assert_eq!(
+        get("NEW", "extra"),
+        Some(Value::Str("x".into())),
+        "second MERGE folded onto the created node"
+    );
+    assert_eq!(
+        get("NEW", "v"),
+        Some(Value::Int(20)),
+        "later MERGE's write to an existing key wins"
+    );
+    assert_eq!(get("ALSO", "k"), Some(Value::Int(2)));
+    assert_eq!(get("ALSO", "j"), Some(Value::Int(3)));
+
+    // Extra labels are unioned and do NOT split the identity: `MERGE (n:Concept:Tagged
+    // {name:'ALSO'})` and `MERGE (n:Concept {name:'ALSO'})` are the same node, which
+    // keeps both labels.
+    let nl =
+        graph_format::nodelabels::NodeLabelsReader::open(gen_dir.join("node_labels.blk")).unwrap();
+    let also: Vec<&str> = nl
+        .labels(ids_of["ALSO"][0])
+        .unwrap()
+        .iter()
+        .map(|&l| m.labels[l as usize].as_str())
+        .collect();
+    assert!(also.contains(&"Concept"), "identity label kept: {also:?}");
+    assert!(
+        also.contains(&"Tagged"),
+        "extra label unioned, not dropped: {also:?}"
+    );
+
+    // The business-key range index must not be corrupted: one id per key.
+    let isam = IsamReader::open(gen_dir.join("range/node_Concept_name.isam")).unwrap();
+    assert_eq!(
+        isam.lookup_eq(&Value::Str("NEW".into())).unwrap(),
+        vec![ids_of["NEW"][0]],
+        "range index must hold exactly one id for a business key"
+    );
+    assert_eq!(
+        isam.lookup_eq(&Value::Str("ALSO".into())).unwrap(),
+        vec![ids_of["ALSO"][0]]
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+// Applying the same overlay patch section TWICE must converge: re-running an idempotent
+// patch is the whole point of MERGE. Build the dump once, then build it again with the
+// patch section duplicated, and assert the two generations agree node-for-node.
+#[test]
+fn external_overlay_patch_applied_twice_converges() {
+    let work = unique_dir("twice");
+
+    // (base + patch) vs (base + patch + patch), with the patch section repeated verbatim.
+    let patch: Vec<&str> = DUMP
+        .lines()
+        .filter(|l| l.starts_with("MERGE ") || (l.starts_with("MATCH ") && l.contains(" SET ")))
+        .collect();
+    assert!(!patch.is_empty(), "DUMP must carry a patch section");
+    let twice = DUMP.replace(
+        "MATCH (n:__DumpVertex__) REMOVE",
+        &format!("{}\nMATCH (n:__DumpVertex__) REMOVE", patch.join("\n")),
+    );
+
+    let build = |tag: &str, text: &str| -> (PathBuf, Manifest) {
+        let data_dir = work.join(format!("data_{tag}"));
+        let input = work.join(format!("dump_{tag}.cypher"));
+        std::fs::write(&input, text).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+            .args(["--pk", "__dump_id__"])
+            .args([
+                "--input",
+                input.to_str().unwrap(),
+                "--graph",
+                "twice",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--cluster",
+                "ldg",
+            ])
+            .output()
+            .expect("run slater-build");
+        assert!(
+            out.status.success(),
+            "build {tag} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let graph_dir = data_dir.join("twice");
+        let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+        let gen_dir = graph_dir.join(gen.trim());
+        let m = Manifest::read_from_dir(&gen_dir).unwrap();
+        m.verify_content_hash().unwrap();
+        (gen_dir, m)
+    };
+
+    let (once_dir, once_m) = build("once", DUMP);
+    let (twice_dir, twice_m) = build("twice", &twice);
+
+    assert_eq!(
+        once_m.node_count, twice_m.node_count,
+        "re-applying the same overlay patch must not add nodes"
+    );
+    assert_eq!(once_m.edge_count, twice_m.edge_count);
+
+    // Content, not just counts: every node's full property map must be identical.
+    // Compare by business key (`name`), since ids are cluster-assigned.
+    let by_name = |dir: &PathBuf, m: &Manifest| -> BTreeMap<String, BTreeMap<String, Value>> {
+        let np = PropsReader::open(dir.join("node_props.blk")).unwrap();
+        let mut out = BTreeMap::new();
+        for id in 0..m.node_count {
+            let props = np.props(id).unwrap();
+            let name = match prop(&props, &m.property_keys, "name") {
+                Some(Value::Str(s)) => s.clone(),
+                _ => panic!("node {id} has no name"),
+            };
+            let map: BTreeMap<String, Value> = props
+                .iter()
+                .map(|(k, v)| (m.property_keys[*k as usize].clone(), v.clone()))
+                .collect();
+            assert!(out.insert(name, map).is_none(), "duplicate business key");
+        }
+        out
+    };
+    assert_eq!(
+        by_name(&once_dir, &once_m),
+        by_name(&twice_dir, &twice_m),
+        "applying the overlay patch twice must converge to the same node content"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
 #[test]
 fn external_overwrite_missing_edge_fails() {
     let work = unique_dir("edgemiss");
