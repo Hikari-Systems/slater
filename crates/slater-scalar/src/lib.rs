@@ -301,6 +301,67 @@ pub enum BinOp {
     Mod,
 }
 
+impl BinOp {
+    /// The Cypher source spelling, for error messages.
+    fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+        }
+    }
+}
+
+/// Integer arithmetic whose result does not fit in a signed 64-bit integer.
+///
+/// Cypher integers are `i64`, and Slater — like Neo4j — **refuses** to produce a
+/// value it cannot represent: it does not wrap, saturate, or silently promote to
+/// `f64`. Every one of those alternatives answers the query with a number that is
+/// simply wrong; an error is the only honest reply. (Neo4j raises `ArithmeticError`
+/// / "long overflow" here, so this also keeps us Cypher-compatible.)
+///
+/// This exists as a **typed** error, not a message, because the release profile
+/// carries no `overflow-checks`: before this type, `+`/`-`/`*`/unary `-` wrapped
+/// silently in production and panicked in debug — the same query giving a quiet
+/// wrong answer in prod and killing the process under test. Every integer path in
+/// this crate and in the query engine's `arith`/`Expr::Neg`/`sum` now goes through
+/// `checked_*` and reports overflow *here*, so **debug and release agree** and the
+/// profile setting no longer changes behaviour. Callers classify it with
+/// `err.downcast_ref::<ArithmeticOverflow>()`, never by matching the message text.
+#[derive(Debug, thiserror::Error)]
+#[error("integer overflow evaluating `{expr}`: the result does not fit in a signed 64-bit integer")]
+pub struct ArithmeticOverflow {
+    /// The operation that overflowed, rendered with its operands — e.g.
+    /// `9223372036854775807 + 1`, `-(-9223372036854775808)`, `sum(): 1 + 2`.
+    pub expr: String,
+}
+
+impl ArithmeticOverflow {
+    /// `lhs <op> rhs` overflowed.
+    pub fn binary(op: &str, lhs: i64, rhs: i64) -> Self {
+        Self {
+            expr: format!("{lhs} {op} {rhs}"),
+        }
+    }
+
+    /// A unary operator overflowed. Only `-i64::MIN` can: the two's-complement
+    /// range is asymmetric, so `i64::MIN` has no positive counterpart.
+    pub fn unary(op: &str, operand: i64) -> Self {
+        Self {
+            expr: format!("{op}({operand})"),
+        }
+    }
+
+    /// An aggregate's running total overflowed while folding in the next value.
+    pub fn aggregate(name: &str, acc: i64, next: i64) -> Self {
+        Self {
+            expr: format!("{name}: {acc} + {next}"),
+        }
+    }
+}
+
 /// Comparison operator. Mirrors the query engine's `CmpOp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CmpOp {
@@ -316,7 +377,8 @@ pub enum CmpOp {
 /// yields NULL; `+` with any string operand concatenates (and with a list operand
 /// builds/extends a list); Int+Int stays Int; otherwise both sides coerce to
 /// Float. Division / modulo by zero, and arithmetic on non-numeric non-string
-/// operands, are errors.
+/// operands, are errors — as is an integer result that does not fit in an `i64`
+/// ([`ArithmeticOverflow`]); integer arithmetic never wraps.
 pub fn eval_binop(op: BinOp, a: Value, b: Value) -> Result<Value> {
     if matches!(a, Value::Null) || matches!(b, Value::Null) {
         return Ok(Value::Null);
@@ -346,23 +408,33 @@ pub fn eval_binop(op: BinOp, a: Value, b: Value) -> Result<Value> {
     }
     if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
         let (x, y) = (*x, *y);
-        return Ok(match op {
-            BinOp::Add => Value::Int(x + y),
-            BinOp::Sub => Value::Int(x - y),
-            BinOp::Mul => Value::Int(x * y),
+        // Every integer op is `checked_*`: an `i64` result that does not exist is an
+        // `ArithmeticOverflow`, never a wrapped value and never a panic. Keep this in
+        // lockstep with `arith` in `slater/src/exec.rs`.
+        let checked = match op {
+            BinOp::Add => x.checked_add(y),
+            BinOp::Sub => x.checked_sub(y),
+            BinOp::Mul => x.checked_mul(y),
             BinOp::Div => {
                 if y == 0 {
                     bail!("integer division by zero");
                 }
-                Value::Int(x / y)
+                // `i64::MIN / -1` is the one overflowing division. Unlike `+`/`-`/`*`
+                // it panics even in release (Rust always checks division overflow),
+                // so `checked_div` is a liveness fix, not just a correctness one.
+                x.checked_div(y)
             }
             BinOp::Mod => {
                 if y == 0 {
                     bail!("integer modulo by zero");
                 }
-                Value::Int(x % y)
+                x.checked_rem(y)
             }
-        });
+        };
+        return match checked {
+            Some(v) => Ok(Value::Int(v)),
+            None => bail!(ArithmeticOverflow::binary(op.symbol(), x, y)),
+        };
     }
     match (value_as_num(&a), value_as_num(&b)) {
         (Some(x), Some(y)) => Ok(Value::Float(match op {
@@ -893,6 +965,7 @@ mod tests {
         );
         // division by zero is an error for integers.
         assert!(eval_binop(BinOp::Div, Value::Int(1), Value::Int(0)).is_err());
+        // (overflow: `int_arithmetic_overflows_to_a_typed_error`)
         // arithmetic on two non-numeric non-strings errors.
         assert!(eval_binop(BinOp::Sub, Value::Bool(true), Value::Bool(false)).is_err());
     }
@@ -931,5 +1004,66 @@ mod tests {
         assert!(!truthy(&Value::Null));
         assert!(!truthy(&Value::Int(1)));
         assert!(!truthy(&s("true")));
+    }
+
+    /// Integer arithmetic that leaves `i64` is a typed [`ArithmeticOverflow`] — it
+    /// never wraps, never saturates, never promotes to `f64`.
+    ///
+    /// Regression for HIK-73. The release profile carries no `overflow-checks`, so
+    /// `+`/`-`/`*` here wrapped silently in a release build while panicking in a
+    /// debug one. This test pins the **release** behaviour rather than the debug
+    /// panic: it demands an `Err`, so the pre-fix code fails it in release by
+    /// returning `Ok(<wrapped>)` — not merely by failing to panic.
+    ///
+    /// This is `slater-build`'s arithmetic too: the builder's `SET` evaluator
+    /// (`merge_build::eval_set_expr`) forwards this `Result` with `?`, so an
+    /// overflowing build-time `SET` now fails the build instead of persisting a
+    /// wrapped integer into the graph.
+    #[test]
+    fn int_arithmetic_overflows_to_a_typed_error() {
+        // Classified by *type*, never by message text (house rule).
+        let overflowed = |op, a, b| {
+            eval_binop(op, a, b)
+                .err()
+                .is_some_and(|e| e.downcast_ref::<ArithmeticOverflow>().is_some())
+        };
+
+        assert!(overflowed(BinOp::Add, Value::Int(i64::MAX), Value::Int(1)));
+        assert!(overflowed(BinOp::Sub, Value::Int(i64::MIN), Value::Int(1)));
+        assert!(overflowed(BinOp::Mul, Value::Int(i64::MAX), Value::Int(2)));
+        assert!(overflowed(BinOp::Mul, Value::Int(i64::MIN), Value::Int(-1)));
+        // `i64::MIN / -1` (and `%`) are worse than a wrap: Rust checks division
+        // overflow in *every* profile, so these **panicked in release too** — a
+        // build-time `SET` could take the builder down. Now a clean error.
+        assert!(overflowed(BinOp::Div, Value::Int(i64::MIN), Value::Int(-1)));
+        assert!(overflowed(BinOp::Mod, Value::Int(i64::MIN), Value::Int(-1)));
+
+        // Representable results are untouched, including at the boundary.
+        assert_eq!(
+            eval_binop(BinOp::Add, Value::Int(2), Value::Int(3)).unwrap(),
+            Value::Int(5)
+        );
+        assert_eq!(
+            eval_binop(BinOp::Sub, Value::Int(i64::MAX), Value::Int(1)).unwrap(),
+            Value::Int(i64::MAX - 1)
+        );
+        assert_eq!(
+            eval_binop(BinOp::Div, Value::Int(i64::MIN), Value::Int(1)).unwrap(),
+            Value::Int(i64::MIN)
+        );
+        assert_eq!(
+            eval_binop(BinOp::Mod, Value::Int(i64::MIN), Value::Int(2)).unwrap(),
+            Value::Int(0)
+        );
+
+        // Division by zero keeps its own distinct error — not an overflow.
+        assert!(!overflowed(BinOp::Div, Value::Int(1), Value::Int(0)));
+        assert!(eval_binop(BinOp::Div, Value::Int(1), Value::Int(0)).is_err());
+        assert!(!overflowed(BinOp::Mod, Value::Int(1), Value::Int(0)));
+        // A float operand still promotes and saturates to inf, as before.
+        assert!(matches!(
+            eval_binop(BinOp::Mul, Value::Float(f64::MAX), Value::Float(2.0)).unwrap(),
+            Value::Float(f) if f.is_infinite()
+        ));
     }
 }

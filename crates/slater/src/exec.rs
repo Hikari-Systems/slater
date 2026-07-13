@@ -51,6 +51,7 @@ use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
 use graph_format::{columns, nodelabels, topology};
 use rayon::prelude::*;
+use slater_scalar::ArithmeticOverflow;
 
 /// Unbounded variable-length expansion (`*` / `*n..`) is capped at this many hops,
 /// so a runaway traversal on a densely connected graph cannot blow up. Explicit
@@ -7173,7 +7174,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 self.has_labels(&b, labels)
             }
             Expr::Neg(e) => match self.eval(e, scope, aggs)? {
-                Val::Int(i) => Ok(Val::Int(-i)),
+                // `-i64::MIN` has no `i64` value (the two's-complement range is
+                // asymmetric), so negation is checked like every other integer op —
+                // it wrapped back to `i64::MIN` in release before this.
+                Val::Int(i) => match i.checked_neg() {
+                    Some(v) => Ok(Val::Int(v)),
+                    None => bail!(ArithmeticOverflow::unary("-", i)),
+                },
                 Val::Float(f) => Ok(Val::Float(-f)),
                 Val::Null => Ok(Val::Null),
                 other => bail!("cannot negate {}", other.to_display()),
@@ -9043,11 +9050,26 @@ fn flip_dir(d: Direction) -> Direction {
 /// the length clamps to the length), and a non-positive width yields `&[]`.
 fn slice_range<T>(xs: &[T], start: i64, end: i64) -> &[T] {
     let len = xs.len() as i64;
-    let mut s = if start < 0 { len - start.abs() } else { start };
+    // A negative bound counts from the end: `len - |bound|`, which is just
+    // `len + bound`. Saturating, because `|i64::MIN|` is not an `i64` — `.abs()`
+    // panicked on `xs[-9223372036854775808..]` in a debug build and wrapped in a
+    // release one. Saturation is exactly right *here* (unlike in `arith`, where a
+    // saturated answer would be a lie): both bounds are immediately clamped into
+    // `0..=len` anyway, so a bound that saturates lands on the same clamp it would
+    // have reached with infinite-precision arithmetic.
+    let mut s = if start < 0 {
+        len.saturating_add(start)
+    } else {
+        start
+    };
     if s < 0 {
         s = 0;
     }
-    let mut e = if end < 0 { len - end.abs() } else { end };
+    let mut e = if end < 0 {
+        len.saturating_add(end)
+    } else {
+        end
+    };
     if e > len {
         e = len;
     }
@@ -9058,7 +9080,15 @@ fn slice_range<T>(xs: &[T], start: i64, end: i64) -> &[T] {
 }
 
 fn list_index(len: usize, i: i64) -> Option<usize> {
-    let idx = if i < 0 { len as i64 + i } else { i };
+    // Saturating for the same reason as `slice_range`: `len as i64 + i64::MIN`
+    // overflows, and an out-of-range index is `None` either way — so saturating to
+    // `i64::MIN` reaches the same `None` without wrapping (release) or panicking
+    // (debug). `xs[-9223372036854775808]` is simply out of range.
+    let idx = if i < 0 {
+        (len as i64).saturating_add(i)
+    } else {
+        i
+    };
     if idx < 0 || idx as usize >= len {
         None
     } else {
@@ -9323,6 +9353,18 @@ fn build_duration(m: &[(String, Val)]) -> Result<Val> {
     )))
 }
 
+/// The Cypher source spelling of a binary operator, for error messages.
+fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Pow => "^",
+    }
+}
+
 fn arith(op: BinOp, a: Val, b: Val) -> Result<Val> {
     if matches!(a, Val::Null) || matches!(b, Val::Null) {
         return Ok(Val::Null);
@@ -9361,26 +9403,41 @@ fn arith(op: BinOp, a: Val, b: Val) -> Result<Val> {
     // Pure integer arithmetic stays integer; any float operand promotes.
     if let (Val::Int(x), Val::Int(y)) = (&a, &b) {
         let (x, y) = (*x, *y);
-        return Ok(match op {
-            BinOp::Add => Val::Int(x + y),
-            BinOp::Sub => Val::Int(x - y),
-            BinOp::Mul => Val::Int(x * y),
+        // Exponentiation always yields a Float, even for integer operands
+        // (`2 ^ 3` = 8.0), matching Neo4j — so it cannot overflow an `i64`.
+        if let BinOp::Pow = op {
+            return Ok(Val::Float((x as f64).powf(y as f64)));
+        }
+        // Everything else is `checked_*`: an integer result Cypher's `i64` cannot
+        // represent is a clean `ArithmeticOverflow`, never a wrapped value (the
+        // release profile carries no `overflow-checks`) and never a panic. Kept in
+        // lockstep with `eval_binop` in `slater-scalar` (shared with the builder).
+        let checked = match op {
+            BinOp::Add => x.checked_add(y),
+            BinOp::Sub => x.checked_sub(y),
+            BinOp::Mul => x.checked_mul(y),
             BinOp::Div => {
                 if y == 0 {
                     bail!("integer division by zero");
                 }
-                Val::Int(x / y)
+                // `i64::MIN / -1` is the one overflowing division, and it panics even
+                // in release (Rust always checks division overflow) — so this arm is a
+                // liveness fix: `RETURN -9223372036854775808 / -1` took the process
+                // down rather than returning a wrong answer.
+                x.checked_div(y)
             }
             BinOp::Mod => {
                 if y == 0 {
                     bail!("integer modulo by zero");
                 }
-                Val::Int(x % y)
+                x.checked_rem(y)
             }
-            // Exponentiation always yields a Float, even for integer operands
-            // (`2 ^ 3` = 8.0), matching Neo4j.
-            BinOp::Pow => Val::Float((x as f64).powf(y as f64)),
-        });
+            BinOp::Pow => unreachable!("Pow returns Float above"),
+        };
+        return match checked {
+            Some(v) => Ok(Val::Int(v)),
+            None => bail!(ArithmeticOverflow::binary(binop_symbol(op), x, y)),
+        };
     }
     match (a.as_num(), b.as_num()) {
         (Some(x), Some(y)) => Ok(Val::Float(match op {
@@ -9585,12 +9642,24 @@ fn in_list(needle: &Val, haystack: &Val) -> Val {
     }
 }
 
+/// `sum()` over integers stays an integer and **errors** if the total leaves `i64`.
+///
+/// It does not promote to `f64` on overflow (FalkorDB does; Neo4j raises "long
+/// overflow"). Promotion would make the *result type* depend on the data — the same
+/// query returning a Bolt Integer today and a Float tomorrow because one more row
+/// landed — and `f64` is exact only to 2^53, so a promoted total past 2^63 is still
+/// the wrong number, merely wrong with a decimal point. A total that overflows was
+/// garbage before this change (it wrapped, silently, in release); failing loudly can
+/// only replace a wrong answer, never a right one.
 fn sum(vals: &[Val]) -> Result<Val> {
     if vals.iter().all(|v| matches!(v, Val::Int(_))) {
         let mut s = 0i64;
         for v in vals {
             if let Val::Int(i) = v {
-                s += i;
+                s = match s.checked_add(*i) {
+                    Some(v) => v,
+                    None => bail!(ArithmeticOverflow::aggregate("sum()", s, *i)),
+                };
             }
         }
         return Ok(Val::Int(s));
@@ -11853,6 +11922,192 @@ mod tests {
         let mut v: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
         v.sort();
         v
+    }
+
+    /// Did this evaluation fail with a typed [`ArithmeticOverflow`]?
+    ///
+    /// Classified by *type*, never by message text (house rule).
+    fn overflowed(r: Result<Val>) -> bool {
+        r.err()
+            .is_some_and(|e| e.downcast_ref::<ArithmeticOverflow>().is_some())
+    }
+
+    /// Integer arithmetic that leaves `i64` **errors**; it never wraps, and never
+    /// panics.
+    ///
+    /// Regression for HIK-73. `[profile.release]` sets no `overflow-checks`, so
+    /// before the fix `+`/`-`/`*` wrapped silently in production while panicking
+    /// under `cargo test` (a debug build) — the same query quietly lying in prod and
+    /// killing the process under test. These assertions pin the **release**
+    /// behaviour, not the debug panic: they demand an `Err`, so the pre-fix code
+    /// fails them in a release build by returning `Ok(<wrapped>)`, not merely by
+    /// failing to panic. Run under both profiles, they prove the two now agree.
+    #[test]
+    fn arith_int_overflow_is_a_typed_error_not_a_wrap() {
+        assert!(overflowed(arith(
+            BinOp::Add,
+            Val::Int(i64::MAX),
+            Val::Int(1)
+        )));
+        assert!(overflowed(arith(
+            BinOp::Sub,
+            Val::Int(i64::MIN),
+            Val::Int(1)
+        )));
+        assert!(overflowed(arith(
+            BinOp::Mul,
+            Val::Int(i64::MAX),
+            Val::Int(2)
+        )));
+        assert!(overflowed(arith(
+            BinOp::Mul,
+            Val::Int(i64::MIN),
+            Val::Int(-1)
+        )));
+        // `i64::MIN / -1` and `i64::MIN % -1` are a harder bug than the wrap: Rust
+        // checks division overflow in *every* profile, so these panicked in release
+        // too — `RETURN -9223372036854775808 / -1` was a remote process kill, not a
+        // wrong answer. Now a clean error.
+        assert!(overflowed(arith(
+            BinOp::Div,
+            Val::Int(i64::MIN),
+            Val::Int(-1)
+        )));
+        assert!(overflowed(arith(
+            BinOp::Mod,
+            Val::Int(i64::MIN),
+            Val::Int(-1)
+        )));
+
+        // Representable arithmetic is untouched, including at the boundary.
+        assert!(matches!(
+            arith(BinOp::Add, Val::Int(2), Val::Int(3)).unwrap(),
+            Val::Int(5)
+        ));
+        assert!(matches!(
+            arith(BinOp::Sub, Val::Int(i64::MAX), Val::Int(1)).unwrap(),
+            Val::Int(x) if x == i64::MAX - 1
+        ));
+        assert!(matches!(
+            arith(BinOp::Div, Val::Int(i64::MIN), Val::Int(1)).unwrap(),
+            Val::Int(i64::MIN)
+        ));
+        assert!(matches!(
+            arith(BinOp::Mod, Val::Int(i64::MIN), Val::Int(2)).unwrap(),
+            Val::Int(0)
+        ));
+        // Division / modulo by zero keep their own distinct errors — not overflows.
+        assert!(!overflowed(arith(BinOp::Div, Val::Int(1), Val::Int(0))));
+        assert!(arith(BinOp::Div, Val::Int(1), Val::Int(0)).is_err());
+        assert!(!overflowed(arith(BinOp::Mod, Val::Int(1), Val::Int(0))));
+        assert!(arith(BinOp::Mod, Val::Int(1), Val::Int(0)).is_err());
+        // `^` yields a Float even for integer operands, so it cannot overflow i64.
+        assert!(matches!(
+            arith(BinOp::Pow, Val::Int(2), Val::Int(3)).unwrap(),
+            Val::Float(f) if f == 8.0
+        ));
+        // A float operand still promotes and saturates to inf, as before.
+        assert!(matches!(
+            arith(BinOp::Mul, Val::Float(f64::MAX), Val::Float(2.0)).unwrap(),
+            Val::Float(f) if f.is_infinite()
+        ));
+    }
+
+    /// `sum()` over integers errors past `i64` rather than wrapping — and rather
+    /// than promoting to `f64` (FalkorDB promotes; Neo4j errors; we error).
+    ///
+    /// Regression for HIK-73: `RETURN sum(n.big)` past `i64::MAX` returned a
+    /// *negative* total in release.
+    #[test]
+    fn sum_of_ints_past_i64_errors_rather_than_wrapping() {
+        assert!(matches!(
+            sum(&[Val::Int(1), Val::Int(2)]).unwrap(),
+            Val::Int(3)
+        ));
+        assert!(matches!(
+            sum(&[Val::Int(i64::MAX), Val::Int(0)]).unwrap(),
+            Val::Int(x) if x == i64::MAX
+        ));
+        assert!(overflowed(sum(&[Val::Int(i64::MAX), Val::Int(1)])));
+        assert!(overflowed(sum(&[Val::Int(i64::MAX), Val::Int(i64::MAX)])));
+        assert!(overflowed(sum(&[Val::Int(i64::MIN), Val::Int(-1)])));
+        // The overflow is detected mid-fold, not just on the final pair.
+        assert!(overflowed(sum(&[
+            Val::Int(i64::MAX),
+            Val::Int(1),
+            Val::Int(-1)
+        ])));
+        // A float in the column still sums as f64 (unchanged).
+        assert!(matches!(
+            sum(&[Val::Int(1), Val::Float(0.5)]).unwrap(),
+            Val::Float(f) if f == 1.5
+        ));
+    }
+
+    /// Unary `-` on `i64::MIN` errors instead of wrapping back to `i64::MIN`
+    /// (`-x == x`, a silent absurdity) — end-to-end through a real query, so the
+    /// `Expr::Neg` eval arm and the Bolt-visible failure are both covered.
+    #[test]
+    fn negating_i64_min_errors_rather_than_wrapping_to_itself() {
+        let (root, graph, _) = testgen::write_basic("exec_neg_overflow");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let run = |q: &str| engine.run(&parser::parse(q).unwrap());
+
+        // `i64::MIN`, spelled without an out-of-range literal: -(i64::MAX) - 1.
+        let err = run("RETURN -(-9223372036854775807 - 1) AS v")
+            .expect_err("negating i64::MIN must fail, not wrap");
+        assert!(
+            err.downcast_ref::<ArithmeticOverflow>().is_some(),
+            "expected a typed ArithmeticOverflow, got: {err}"
+        );
+        // Same query shape one step inside the boundary still evaluates.
+        let res = run("RETURN -(-9223372036854775807) AS v").unwrap();
+        assert!(matches!(res.rows[0][0], Val::Int(x) if x == i64::MAX));
+
+        // `i64::MIN / -1` — this one *panicked*, in release as well as debug, so
+        // before the fix this query killed the server process. Now it is a clean,
+        // per-query failure and the engine survives it.
+        let err = run("RETURN (-9223372036854775807 - 1) / -1 AS v")
+            .expect_err("i64::MIN / -1 must fail, not panic");
+        assert!(
+            err.downcast_ref::<ArithmeticOverflow>().is_some(),
+            "expected a typed ArithmeticOverflow, got: {err}"
+        );
+        // The engine is still usable after the failed query.
+        let res = run("RETURN 1 + 1 AS v").unwrap();
+        assert!(matches!(res.rows[0][0], Val::Int(2)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An extreme negative list index / slice bound is out of range, not a crash.
+    ///
+    /// Same bug class as the rest of HIK-73, found by sweeping the file for
+    /// unchecked `i64`: `list_index` computed `len as i64 + i` and `slice_range`
+    /// took `start.abs()`, and `|i64::MIN|` is not an `i64`. Both **panicked in a
+    /// debug build** (`attempt to negate with overflow`) and wrapped in a release
+    /// one — so `RETURN [1,2,3][-9223372036854775808]` crashed any dev/test build.
+    #[test]
+    fn extreme_negative_list_bounds_are_out_of_range_not_an_overflow() {
+        let xs = [1, 2, 3];
+        // Slicing: an unreachably-negative start clamps to the whole list, exactly
+        // as a merely-large negative one does.
+        assert_eq!(slice_range(&xs, i64::MIN, 3), &xs[..]);
+        assert_eq!(slice_range(&xs, -100, 3), &xs[..]);
+        assert_eq!(slice_range(&xs, 0, i64::MIN), &[] as &[i32]);
+        assert_eq!(slice_range(&xs, i64::MIN, i64::MAX), &xs[..]);
+        // Ordinary slices are unaffected.
+        assert_eq!(slice_range(&xs, 1, 3), &xs[1..]);
+        assert_eq!(slice_range(&xs, -2, 3), &xs[1..]);
+
+        // Indexing: out of range → None, not a wrapped (in-range!) index.
+        assert_eq!(list_index(3, i64::MIN), None);
+        assert_eq!(list_index(3, -4), None);
+        assert_eq!(list_index(3, i64::MAX), None);
+        assert_eq!(list_index(3, -1), Some(2));
+        assert_eq!(list_index(3, 0), Some(0));
     }
 
     /// All rows as display strings, sorted, for order-free whole-result equality.

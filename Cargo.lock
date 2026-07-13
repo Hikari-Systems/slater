@@ -3300,6 +3300,7 @@ dependencies = [
  "anyhow",
  "graph-format",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
