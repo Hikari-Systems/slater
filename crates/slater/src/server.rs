@@ -143,6 +143,17 @@ pub struct Graphs {
     /// exactly what it was. Each writer is bound to the generation it resolved its
     /// dense ids against (`DeltaWriter::core_uuid`).
     writers: HashMap<String, Arc<DeltaWriter>>,
+    /// Serialises generation swaps per graph. Two independent actors publish a new
+    /// `current` and then swap the served slot onto it: the background generation
+    /// guard ([`guard_sweep`], polling on a timer) and the writer-side stack mutations
+    /// (consolidate / flush / compact). Without this lock they interleave — the guard
+    /// swaps the op's freshly published generation in first, the op's own swap then
+    /// reports "unchanged", and the op skips the post-swap work that retires the delta
+    /// it just folded in, orphaning it against the old core.
+    ///
+    /// Keyed exactly like `graphs` (both are fixed at construction). A **leaf** lock:
+    /// only the per-graph slot `RwLock` is taken beneath it, never the reverse.
+    swap_locks: HashMap<String, Mutex<()>>,
 }
 
 impl Graphs {
@@ -200,6 +211,7 @@ impl Graphs {
                 Ok((name, RwLock::new(Arc::new(gen))))
             })
             .collect::<Result<HashMap<_, _>>>()?;
+        let swap_locks = graphs.keys().map(|n| (n.clone(), Mutex::new(()))).collect();
         Ok(Self {
             store,
             master_key: master_key.map(<[u8]>::to_vec),
@@ -210,6 +222,7 @@ impl Graphs {
             range_index_cache_bytes,
             degree_residency,
             writers: HashMap::new(),
+            swap_locks,
         })
     }
 
@@ -387,6 +400,24 @@ impl Graphs {
         self.graphs.is_empty()
     }
 
+    /// The per-graph swap mutex (see [`Graphs::swap_locks`]).
+    ///
+    /// Poison is recovered from rather than propagated: the lock guards `()`, and a
+    /// panic mid-swap leaves the slot holding either the old or the new
+    /// `Arc<Generation>` — both complete, neither torn — so there is no broken
+    /// invariant to protect a later swapper from. Propagating poison would instead
+    /// wedge every future hot-reload *and* every future consolidation of the graph on
+    /// one unrelated panic. Mirrors the writable layer's poison-tolerant locks.
+    fn swap_lock(&self, name: &str) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let lock = self
+            .swap_locks
+            .get(name)
+            .ok_or_else(|| anyhow!("graph '{name}' is not served"))?;
+        Ok(lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
     /// If `<data_dir>/<name>/current` now names a different generation, open and
     /// **validate** it (the content-hash copy-completeness guard), pin its resident
     /// PQ into `vector_cache`, atomically swap the live `Arc`, and unpin the old
@@ -400,11 +431,13 @@ impl Graphs {
     /// its own resident-PQ `Arc`) to completion, so they are unaffected by the
     /// unpin; the block/result/PQ caches key on the generation UUID, so the old
     /// generation's entries orphan for free (D18/D27/D32).
-    fn swap_if_changed(
-        &self,
-        name: &str,
-        vector_cache: &VectorIndexCache,
-    ) -> Result<Option<GenId>> {
+    ///
+    /// **The caller must hold the graph's [swap mutex](Graphs::swap_lock)** — both
+    /// callers have to make a decision *atomically with* the swap ([`guard_sweep`]: is
+    /// this pointer change mine to apply? [`Self::adopt_published_generation`]: which
+    /// generation is served now?), so they take the lock themselves and call this body
+    /// rather than a self-locking wrapper (a std `Mutex` is not reentrant).
+    fn swap_locked(&self, name: &str, vector_cache: &VectorIndexCache) -> Result<Option<GenId>> {
         let slot = self
             .graphs
             .get(name)
@@ -446,6 +479,56 @@ impl Graphs {
         // lazily-built brute-force matrices — so it does not linger past the swap.
         vector_cache.unpin_generation(live.uuid());
         Ok(Some(new_gen.uuid()))
+    }
+
+    /// The publish step of a writer-side stack mutation (consolidate / flush / compact):
+    /// adopt the generation the caller has just published as `<name>/current`, and return
+    /// **the generation now served** — whether this call swapped it in or found it already
+    /// swapped in.
+    ///
+    /// # Why not a bare [`Self::swap_locked`]
+    /// A bare swap answers *"did **I** perform the swap?"* (`Ok(Some)` vs `Ok(None)`).
+    /// That is the wrong question here, and using its answer to gate the op's work is a lost
+    /// update. The background generation guard polls the very same `current` pointer, so a
+    /// poll landing between the op's publish and the op's swap applies the new generation
+    /// **first**; the op's swap then reports `Ok(None)`, the op treats a successful build
+    /// as a failure, and its cleanup — `retire`, the only thing that drops the folded
+    /// delta's WAL and rebinds the writer to the new core — is skipped. The delta is left
+    /// bound to a generation that is no longer served, which every later consolidation
+    /// refuses as orphaned: one unlucky poll wedges the writable layer permanently.
+    ///
+    /// Cleanup ownership does not belong to whoever wins a race for the swap; it belongs
+    /// to the op that froze the delta, and to nobody else (the guard does not know a delta
+    /// exists). So the op asks the question whose answer is the same whoever won — *which
+    /// generation is served now?* — and the [swap mutex](Graphs::swap_lock) makes the read
+    /// of the served slot atomic against the guard, so the answer is never a torn
+    /// intermediate.
+    ///
+    /// # The caller still checks *what* it adopted
+    /// An unchanged pointer is not an error here — it is the answer. It means the served
+    /// generation already equals the on-disk `current`, which is either the caller's own
+    /// published generation (the guard got there first) or the pre-existing one (nothing
+    /// was published at all — e.g. a builder that exited 0 without writing a generation).
+    /// The caller distinguishes the two, because only the caller knows which id it
+    /// expected, and bails on the latter *before* running any cleanup.
+    ///
+    /// Returns the served `Arc<Generation>` itself, not just its id: the caller's cleanup
+    /// needs both (the id to re-bind the writer to, the generation to re-resolve the WAL
+    /// tail against and to take the new node/edge extents from), and reading them together
+    /// under the swap mutex is what makes them consistent — a later `get()` could observe a
+    /// *different* generation and rebind the writer to one id while rebasing it on another's
+    /// extents.
+    fn adopt_published_generation(
+        &self,
+        name: &str,
+        vector_cache: &VectorIndexCache,
+    ) -> Result<Arc<Generation>> {
+        let _swap = self.swap_lock(name)?;
+        // Swap if the pointer moved; *ignore whether it was us who moved it* — that is the
+        // whole point. Errors (a corrupt/incomplete new generation) still propagate.
+        self.swap_locked(name, vector_cache)?;
+        self.get(name)
+            .ok_or_else(|| anyhow!("graph '{name}' is not served"))
     }
 
     /// Consolidate `name`'s writable delta into a fresh immutable generation
@@ -536,14 +619,20 @@ impl Graphs {
         }
         let _ = std::fs::remove_dir_all(&dump_path);
 
-        // Publish: pick up the freshly built generation (validated + PQ-pinned) and
-        // swap the served slot to it.
-        let new_uuid = self
-            .swap_if_changed(name, vector_cache)
-            .with_context(|| format!("swap in consolidated generation for '{name}'"))?
-            .ok_or_else(|| {
-                anyhow!("builder for '{name}' did not publish a new generation (current unchanged)")
-            })?;
+        // Publish: adopt the freshly built generation (validated + PQ-pinned) into the
+        // served slot. The background guard polls the same `current` pointer and may have
+        // swapped it in already; `adopt_published_generation` reports what is served
+        // either way, so the retire below runs whoever won the swap — it is *this* call's
+        // to run, and skipping it would orphan the delta we just folded in.
+        let new_gen = self
+            .adopt_published_generation(name, vector_cache)
+            .with_context(|| format!("swap in consolidated generation for '{name}'"))?;
+        let new_uuid = new_gen.uuid();
+        // Still the pre-consolidation core ⇒ the builder exited 0 without publishing
+        // anything. Nothing was folded in, so bail *before* retire: the delta stays live.
+        if new_uuid == core.uuid() {
+            bail!("builder for '{name}' did not publish a new generation (current unchanged)");
+        }
 
         // Retire: the delta now lives in the new core, so drop the consumed WAL
         // segments and re-bind the writer to the new generation (re-basing the
@@ -551,9 +640,6 @@ impl Graphs {
         // post-freeze write is replayed onto the new core via `resolve_op` bound to the
         // freshly-swapped generation — a business key that was delta-born pre-freeze
         // re-resolves to its now-real dense id (Phase 4a).
-        let new_gen = self.get(name).ok_or_else(|| {
-            anyhow!("consolidated generation for '{name}' vanished before retire")
-        })?;
         writer
             .retire(
                 &frozen.consumed,
@@ -743,17 +829,19 @@ impl Graphs {
             .with_context(|| format!("upload flush segment for '{name}' to the object store"))?;
         }
 
-        // Swap the served generation to the new set (its stack now carries the segment).
-        let new_uuid = self
-            .swap_if_changed(name, vector_cache)
-            .with_context(|| format!("swap in flushed set for '{name}'"))?
-            .ok_or_else(|| {
-                anyhow!("flush for '{name}' published a set but `current` was unchanged")
-            })?;
-        debug_assert_eq!(new_uuid, set_uuid);
+        // Swap the served generation to the new set (its stack now carries the segment) —
+        // or find that the background guard, polling the same `current`, already did. The
+        // retire below is ours to run either way (see `adopt_published_generation`).
         let new_gen = self
-            .get(name)
-            .ok_or_else(|| anyhow!("flushed set for '{name}' vanished before retire"))?;
+            .adopt_published_generation(name, vector_cache)
+            .with_context(|| format!("swap in flushed set for '{name}'"))?;
+        let new_uuid = new_gen.uuid();
+        if new_uuid != set_uuid {
+            bail!(
+                "flush for '{name}' published set {set_uuid} but the served generation is \
+                 {new_uuid} — refusing to retire the delta"
+            );
+        }
 
         // Retire: the flushed writes now live in the segment. Drop the consumed WAL and
         // rebase the memtable past the new stack top (base + every segment band, incl. the
@@ -919,16 +1007,18 @@ impl Graphs {
             .with_context(|| format!("upload merged segment for '{name}' to the object store"))?;
         }
 
-        let new_uuid = self
-            .swap_if_changed(name, vector_cache)
-            .with_context(|| format!("swap in compacted set for '{name}'"))?
-            .ok_or_else(|| {
-                anyhow!("compaction for '{name}' published a set but `current` was unchanged")
-            })?;
-        debug_assert_eq!(new_uuid, set_uuid);
+        // As in flush: adopt the published set, whether we swap it in or the background
+        // guard already has. The rebind below is ours to run either way.
         let new_gen = self
-            .get(name)
-            .ok_or_else(|| anyhow!("compacted set for '{name}' vanished before rebind"))?;
+            .adopt_published_generation(name, vector_cache)
+            .with_context(|| format!("swap in compacted set for '{name}'"))?;
+        let new_uuid = new_gen.uuid();
+        if new_uuid != set_uuid {
+            bail!(
+                "compaction for '{name}' published set {set_uuid} but the served generation is \
+                 {new_uuid} — refusing to rebind the delta"
+            );
+        }
 
         // The merged band unions the run's, so the id space is unchanged — the delta's ids
         // stay valid. Verify before rebinding (fail safe rather than corrupt the overlay).
@@ -1345,6 +1435,12 @@ enum SweepAction {
 /// validates the new generation and swaps it in (a corrupt/incomplete one is
 /// logged and the old kept). Per-graph errors never abort the sweep.
 ///
+/// A graph with a writer-side stack mutation in flight — consolidate / flush /
+/// compact — is **left alone**: those ops publish `current` themselves and own the
+/// swap that follows it (see [`Graphs::adopt_published_generation`]). The guard is
+/// here to notice generations published *behind the server's back* (an external
+/// rebuild + rsync), not the server's own.
+///
 /// Pure and synchronous (the swap does blocking IO) so it is unit-testable; the
 /// async [`spawn_generation_guard`] wraps it with the poll timer + shutdown wiring.
 fn guard_sweep(
@@ -1354,6 +1450,13 @@ fn guard_sweep(
     acl: Option<&AclHandle>,
 ) -> SweepAction {
     for name in graphs.names() {
+        // Hold the graph's swap mutex across the whole decision: the read of the served
+        // generation, the read of `current`, and the swap that may follow. It serialises
+        // this sweep against the writer-side ops, which take the same lock to adopt what
+        // they publish.
+        let Ok(_swap) = graphs.swap_lock(&name) else {
+            continue; // not served (the map is fixed at construction, so: unreachable)
+        };
         let Some(live) = graphs.get(&name) else {
             continue;
         };
@@ -1367,9 +1470,27 @@ fn guard_sweep(
         if on_disk == live.uuid().0 {
             continue;
         }
+        // The pointer moved — but is this change the server's own? A consolidation, flush
+        // or compaction publishes `current` and then swaps the served slot onto it itself,
+        // because only it can run the retire/rebind that follows. Stealing that swap makes
+        // its own report "unchanged" and silently skips the retire, orphaning the delta.
+        //
+        // Deferring on the claim is exact, not a narrowing of the window: an op that has
+        // published `current` still holds it (`ConsolidationGuard` releases it only after
+        // retire, which runs after the op's own swap — and that swap must first take the
+        // mutex we are holding right now). So an op cannot have published *and* finished
+        // while we hold this lock: a pointer change seen with the claim set is always the
+        // op's own, still pending its swap. Leave it. It is picked up on a later poll if
+        // the op somehow does not adopt it.
+        if graphs.writer(&name).is_some_and(|w| w.is_consolidating()) {
+            debug!(graph = %name, "generation guard: deferring to an in-flight consolidation/flush/compaction");
+            continue;
+        }
         match strategy {
             ReloadStrategy::Exit => return SweepAction::Shutdown(name),
-            ReloadStrategy::Swap => match graphs.swap_if_changed(&name, vector_cache) {
+            // We already hold the swap mutex, so call the locked body directly (a std
+            // `Mutex` is not reentrant).
+            ReloadStrategy::Swap => match graphs.swap_locked(&name, vector_cache) {
                 Ok(Some(new)) => {
                     info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)");
                     // The swap's policy check already verified the live acl.json
@@ -11656,6 +11777,181 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A `people` graph with the writable layer on and Alice's age patched to 99 in the
+    /// delta — the fixture the two guard-race regressions below both consolidate from.
+    /// Returns the root, the `Graphs`, the pre-consolidation generation and its writer.
+    fn consolidation_race_fixture(
+        tag: &str,
+    ) -> (PathBuf, Graphs, Arc<Generation>, Arc<DeltaWriter>) {
+        let (root, _graph) = testgen::write_indexed_people(tag);
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let gen0 = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        assert!(!writer.snapshot().is_empty(), "the delta carries the write");
+        (root, graphs, gen0, writer)
+    }
+
+    /// The background generation guard polls the very same `current` pointer a
+    /// consolidation publishes, so a poll can land **inside** the publish window and swap
+    /// the freshly built generation in before the consolidation's own swap reaches it.
+    ///
+    /// Cleanup ownership must not hinge on who won that race. Only the consolidation can
+    /// retire the delta it just folded into the new core — the guard does not even know a
+    /// delta exists — so the consolidation must do its retire whether it performed the
+    /// swap or merely found it already performed.
+    ///
+    /// The interleaving is forced deterministically (no threads, no sleeps) through the
+    /// `build` seam, which `consolidate_graph` invokes at exactly the instant the builder
+    /// publishes `current`: the injected builder publishes the new generation and then
+    /// runs *the guard's own swap* (`guard_swap` — the body `guard_sweep` executes), so
+    /// the served slot already carries the new generation when the consolidation gets
+    /// there.
+    ///
+    /// Before the fix the consolidation's swap returned `Ok(None)` here and the op failed
+    /// with "did not publish a new generation" **despite a successful build** — the delta
+    /// was never retired and stayed bound to the old core, which wedges every subsequent
+    /// consolidation forever (`core_uuid() != core.uuid()` ⇒ "the delta is orphaned").
+    #[test]
+    fn consolidation_retires_the_delta_when_the_guard_wins_the_swap() {
+        let (root, graphs, gen0, writer) = consolidation_race_fixture("consolidate_guard_race");
+        let wal_dir = writer.wal_dir();
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0001);
+        let build = |_d: &Path, _g: &str, dd: &Path| -> Result<()> {
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            // The guard's poll lands here — after the builder published `current`, before
+            // the consolidation swaps the served slot onto it — and wins the swap.
+            let swapped = guard_swap(&graphs, "people", &vc).unwrap();
+            assert_eq!(
+                swapped.map(|g| g.0),
+                Some(new_uuid),
+                "the guard swapped the consolidation's generation in first"
+            );
+            Ok(())
+        };
+        let published = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+
+        // A successful build is reported as one, not as a false failure.
+        assert_eq!(published.0, new_uuid, "the built generation is reported");
+        assert_eq!(graphs.get("people").unwrap().uuid().0, new_uuid);
+
+        // …and the cleanup the losing swap used to skip actually ran: the writer is
+        // re-bound to the new core (not orphaned on the old one), the folded delta is
+        // gone, and the consumed WAL segment was dropped (only freeze's fresh, empty
+        // segment remains).
+        assert_eq!(
+            writer.core_uuid().0,
+            new_uuid,
+            "retire re-bound the writer to the new core — the delta is not orphaned"
+        );
+        assert_ne!(writer.core_uuid(), gen0.uuid());
+        assert!(
+            writer.snapshot().is_empty(),
+            "retire dropped the folded delta"
+        );
+        assert_eq!(
+            wal_count(&wal_dir),
+            1,
+            "the consumed WAL segment was retired"
+        );
+        assert!(!writer.is_consolidating(), "the claim was released");
+
+        // The write is served from the new core, with nothing left overlaying it.
+        let gen1 = graphs.get("people").unwrap();
+        let view = MergedView::new(gen1.as_ref(), writer.delta_snapshot());
+        let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+        let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+        assert!(
+            matches!(age, Val::Int(99)),
+            "folded write served from the core"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other half of the fix: the guard does not *take* the swap in the first place.
+    /// A graph with a consolidation/flush/compaction in flight publishes its own
+    /// `current` and owns the swap that follows, so the guard leaves it alone — under
+    /// `swap` (it must not steal the swap) and under `exit` (it must not tear the process
+    /// down over the server's own publish, which is what it did before).
+    ///
+    /// Same deterministic seam: the real `guard_sweep` runs *inside* the publish window.
+    #[test]
+    fn guard_sweep_defers_to_an_in_flight_consolidation() {
+        let (root, graphs, gen0, writer) = consolidation_race_fixture("consolidate_guard_defer");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0002);
+        let gen0_for_build = gen0.clone();
+        let build = |_d: &Path, _g: &str, dd: &Path| -> Result<()> {
+            testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
+            // `current` has moved, and the consolidation has not yet swapped. A guard poll
+            // landing here must defer on both strategies.
+            assert!(matches!(
+                guard_sweep(&graphs, &vc, ReloadStrategy::Swap, None),
+                SweepAction::Continue
+            ));
+            assert_eq!(
+                graphs.get("people").unwrap().uuid(),
+                gen0_for_build.uuid(),
+                "the guard left the swap to the in-flight consolidation"
+            );
+            assert!(
+                matches!(
+                    guard_sweep(&graphs, &vc, ReloadStrategy::Exit, None),
+                    SweepAction::Continue
+                ),
+                "reloadStrategy=exit must not shut the process down over our own publish"
+            );
+            Ok(())
+        };
+        let published = graphs
+            .consolidate_graph("people", &cache, &vc, &root, build)
+            .unwrap();
+
+        // The consolidation performed its own swap and retired the delta.
+        assert_eq!(published.0, new_uuid);
+        assert_eq!(graphs.get("people").unwrap().uuid().0, new_uuid);
+        assert_eq!(
+            writer.core_uuid().0,
+            new_uuid,
+            "writer re-bound to the new core"
+        );
+        assert!(writer.snapshot().is_empty(), "delta retired");
+
+        // With the claim released, the guard is back on duty for this graph: a *foreign*
+        // generation (an external rebuild) is still swapped in as before.
+        assert!(!writer.is_consolidating());
+        let foreign = publish_copy_as_new_generation(&root, "people", None);
+        assert!(matches!(
+            guard_sweep(&graphs, &vc, ReloadStrategy::Swap, None),
+            SweepAction::Continue
+        ));
+        assert_eq!(
+            graphs.get("people").unwrap().uuid().0,
+            foreign,
+            "the guard still swaps generations published behind the server's back"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// True end-to-end consolidation through the real `slater-build` binary. Ignored
     /// by default — `cargo test -p slater` does not build the builder. Run it with
     /// the binary located via `SLATER_BUILD_BIN` (or on `PATH`):
@@ -14601,6 +14897,16 @@ mod tests {
         new_uuid
     }
 
+    /// Exactly the swap the generation guard performs on a graph it is allowed to swap:
+    /// take the graph's swap mutex, then adopt whatever `current` names. `guard_sweep`
+    /// inlines this (it must hold the same lock across its *decision*, not just the
+    /// swap), so this is how a test makes the guard's swap happen at a chosen instant —
+    /// including inside another operation's publish window.
+    fn guard_swap(graphs: &Graphs, name: &str, vc: &VectorIndexCache) -> Result<Option<GenId>> {
+        let _swap = graphs.swap_lock(name)?;
+        graphs.swap_locked(name, vc)
+    }
+
     #[test]
     fn swap_refuses_a_truncated_new_generation() {
         let (root, _g, old) = testgen::write_basic("guard_swap_refuse");
@@ -14609,7 +14915,7 @@ mod tests {
 
         // A half-copied (truncated) new generation is published under `current`.
         publish_copy_as_new_generation(&root, "people", Some("node_props.blk"));
-        let err = graphs.swap_if_changed("people", &vc).err().unwrap();
+        let err = guard_swap(&graphs, "people", &vc).err().unwrap();
         assert!(
             err.chain().any(|e| e.to_string().contains("integrity")),
             "unexpected error: {err:#}"
@@ -14629,7 +14935,7 @@ mod tests {
         let in_flight = graphs.get("people").unwrap();
 
         let new = publish_copy_as_new_generation(&root, "people", None);
-        let swapped = graphs.swap_if_changed("people", &vc).unwrap();
+        let swapped = guard_swap(&graphs, "people", &vc).unwrap();
         assert_eq!(swapped.map(|g| g.0), Some(new));
 
         // New queries see the new generation; the in-flight handle still reads old.
@@ -14637,7 +14943,54 @@ mod tests {
         assert_eq!(in_flight.uuid().0, old);
 
         // A second swap with no further change on disk is a clean no-op.
-        assert!(graphs.swap_if_changed("people", &vc).unwrap().is_none());
+        assert!(guard_swap(&graphs, "people", &vc).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The publish primitive that consolidation, flush and compaction all share. Flush and
+    /// compaction have no injectable seam inside their publish window (they write `current`
+    /// themselves), so the property the guard race turns on is asserted here directly: once
+    /// an op has published a generation, `adopt_published_generation` gives it the same
+    /// answer — *this is the served generation* — whether the op swapped it in itself or
+    /// the guard got there first. It never reports "nothing was published" for a generation
+    /// that was.
+    #[test]
+    fn adopt_published_generation_is_idempotent_after_a_racing_swap() {
+        let (root, _g, old) = testgen::write_basic("adopt_after_race");
+        let graphs = Graphs::open_all(&root, None).unwrap();
+        let vc = VectorIndexCache::new(1 << 20);
+
+        // Nothing published: the answer is the generation already served. This is how a
+        // caller detects a builder that exited 0 without publishing anything (it compares
+        // against the core it started from) — the check the old `Ok(None)` used to make.
+        assert_eq!(
+            graphs
+                .adopt_published_generation("people", &vc)
+                .unwrap()
+                .uuid()
+                .0,
+            old,
+            "an unchanged pointer reports the served generation"
+        );
+
+        // Now an op publishes, and the guard wins the swap. The op must still get *its own*
+        // generation back — the whole point: its post-swap cleanup is keyed off this answer.
+        let new = publish_copy_as_new_generation(&root, "people", None);
+        assert_eq!(
+            guard_swap(&graphs, "people", &vc).unwrap().map(|g| g.0),
+            Some(new),
+            "the guard swapped first"
+        );
+        assert_eq!(
+            graphs
+                .adopt_published_generation("people", &vc)
+                .unwrap()
+                .uuid()
+                .0,
+            new,
+            "the op adopts the generation it published, whoever performed the swap"
+        );
+        assert_eq!(graphs.get("people").unwrap().uuid().0, new);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -14702,7 +15055,7 @@ mod tests {
         assert!(vc.resident_pq(old.uuid(), 0).is_some());
 
         let new = publish_copy_as_new_generation(&root, "docs", None);
-        graphs.swap_if_changed("docs", &vc).unwrap();
+        guard_swap(&graphs, "docs", &vc).unwrap();
 
         // The new generation's PQ is now pinned and the old generation's released —
         // so the pool's resident set tracks the live generation (D32).
