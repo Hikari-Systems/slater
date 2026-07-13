@@ -30,7 +30,11 @@
 /// move from delta-varint-in-zstd to Elias–Fano records in a Raw container — see [`postings`].
 /// (Later v6 slices re-plane `node_labels.blk`, `topology.csr.blk` and `isam`.) Batched into one
 /// bump so the 91.6M generation rebuilds once; zero legacy installs, so old generations refuse.
-pub const FORMAT_VERSION: u32 = 6;
+/// v7 folds the degenerate `Constant` codec into single-run `Rle` in both the generic plane
+/// codec ([`plane`]) and the degree column ([`degree_ef`]) — a constant is just a run, so the
+/// dedicated `Constant` tag is gone. (Further v7 slices re-plane `node_labels.blk` and the
+/// reltype postings' dense endpoint sets.)
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -75,7 +79,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 6);
+        assert_eq!(FORMAT_VERSION, 7);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

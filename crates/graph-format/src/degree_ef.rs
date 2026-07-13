@@ -4,7 +4,7 @@
 //! A degree chunk (up to [`DEGREES_PER_RECORD`](crate::nodedegree::DEGREES_PER_RECORD)
 //! per-node degrees) is stored on disk in whichever of a few codecs is **smallest**
 //! (`constant`/`ef`/`rle`/`raw`/`zstd-dense`), and materialised in RAM as one of three
-//! **compact** forms — [`DegreeChunk::Constant`], [`DegreeChunk::Ef`], or [`DegreeChunk::Rle`]
+//! **compact** forms — [`DegreeChunk::Ef`] or [`DegreeChunk::Rle`] (a uniform run is a single-run Rle)
 //! — never a dense 1 MiB `u32` array. The disk codec minimises bytes; the resident codec
 //! minimises RAM.
 //!
@@ -50,9 +50,6 @@ pub use crate::plane::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum ChunkKind {
-    /// Every degree in the chunk is identical (incl. the all-zero isolated tail). Body:
-    /// `u32 n ‖ u32 degree`. Beats EF on the degenerate chunks EF is worst at.
-    Constant = 0,
     /// Elias–Fano over the intra-chunk cumulative sum. Body: [`EfChunk`] serialisation.
     /// The common winner for heterogeneous / hub-heavy chunks.
     Ef = 1,
@@ -72,7 +69,6 @@ enum ChunkKind {
 impl ChunkKind {
     fn from_u8(b: u8) -> Result<Self> {
         Ok(match b {
-            0 => Self::Constant,
             1 => Self::Ef,
             2 => Self::RawU32,
             3 => Self::ZstdDense,
@@ -101,8 +97,9 @@ pub struct EfChunk {
 }
 
 impl EfChunk {
-    /// Encode a chunk's degrees. Assumes `degrees` is non-empty; callers route empty /
-    /// all-equal chunks to [`ChunkKind::Constant`] before here.
+    /// Encode a chunk's degrees. Assumes `degrees` is non-empty; the empty chunk is routed to
+    /// an empty [`ChunkKind::Rle`] before here (an all-equal chunk still encodes fine, but the
+    /// selector prefers its cheaper single-run `rle`).
     fn encode(degrees: &[u32]) -> Self {
         let n = degrees.len();
         let m = n + 1; // cumulative has n+1 elements: c[0..=n]
@@ -275,8 +272,16 @@ pub struct RleChunk {
 }
 
 impl RleChunk {
-    /// Build the (value, start) runs from a degree slice. `degrees` must be non-empty.
+    /// Build the (value, start) runs from a degree slice. An empty slice is an empty run set
+    /// (a uniform slice is a single run).
     fn from_degrees(degrees: &[u32]) -> Self {
+        if degrees.is_empty() {
+            return Self {
+                n: 0,
+                values: Box::from([]),
+                starts: Box::from([]),
+            };
+        }
         let mut values = Vec::new();
         let mut starts = Vec::new();
         let mut prev = degrees[0];
@@ -387,11 +392,10 @@ impl RleChunk {
     }
 }
 
-/// A degree chunk resident in RAM: always one of the two **compact** forms. Constructed by
-/// [`decode_chunk`]; queried by the degree-column holder.
+/// A degree chunk resident in RAM: `Ef`, or `Rle` (a uniform/all-zero chunk is a single-run
+/// `Rle` — there is no dedicated constant form). Constructed by [`decode_chunk`]; queried by
+/// the degree-column holder.
 pub enum DegreeChunk {
-    /// Every node in the chunk has this degree (`n` nodes).
-    Constant { n: u32, degree: u32 },
     /// Elias–Fano over the cumulative degrees.
     Ef(EfChunk),
     /// Run-length encoding of consecutive equal degrees.
@@ -402,7 +406,6 @@ impl DegreeChunk {
     /// Number of nodes in the chunk.
     pub fn len(&self) -> usize {
         match self {
-            DegreeChunk::Constant { n, .. } => *n as usize,
             DegreeChunk::Ef(ef) => ef.len(),
             DegreeChunk::Rle(rle) => rle.len(),
         }
@@ -415,7 +418,6 @@ impl DegreeChunk {
     /// Approximate resident footprint of the chunk's payload (bytes).
     pub fn resident_bytes(&self) -> usize {
         match self {
-            DegreeChunk::Constant { .. } => std::mem::size_of::<u32>() * 2,
             DegreeChunk::Ef(ef) => ef.resident_bytes(),
             DegreeChunk::Rle(rle) => rle.resident_bytes(),
         }
@@ -429,7 +431,6 @@ impl DegreeChunk {
             return None;
         }
         Some(match self {
-            DegreeChunk::Constant { degree, .. } => *degree,
             DegreeChunk::Ef(ef) => ef.degree_at(off),
             DegreeChunk::Rle(rle) => rle.degree_at(off),
         })
@@ -438,39 +439,36 @@ impl DegreeChunk {
     /// Materialise the chunk's degrees in id order — for the eager full read and tests.
     pub fn to_degrees(&self) -> Vec<u32> {
         match self {
-            DegreeChunk::Constant { n, degree } => vec![*degree; *n as usize],
             DegreeChunk::Ef(ef) => (0..ef.len()).map(|i| ef.degree_at(i)).collect(),
             DegreeChunk::Rle(rle) => rle.to_degrees(),
         }
     }
 }
 
-/// Build the compact resident form directly from a degree slice: `Constant` when uniform,
-/// else `Ef`. Used both to decode a `raw`/`zstd-dense` disk chunk and to construct EF.
+/// Build the compact resident form directly from a degree slice: a single-run `Rle` when uniform
+/// (or empty), else `Ef`. Used both to decode a `raw`/`zstd-dense` disk chunk and to construct EF.
 fn resident_from_degrees(degrees: &[u32]) -> DegreeChunk {
     match degrees.first() {
-        None => DegreeChunk::Constant { n: 0, degree: 0 },
-        Some(&first) if degrees.iter().all(|&d| d == first) => DegreeChunk::Constant {
-            n: degrees.len() as u32,
-            degree: first,
-        },
-        _ => DegreeChunk::Ef(EfChunk::encode(degrees)),
+        Some(&first) if !degrees.iter().all(|&d| d == first) => {
+            DegreeChunk::Ef(EfChunk::encode(degrees))
+        }
+        // Uniform or empty → one run.
+        _ => DegreeChunk::Rle(RleChunk::from_degrees(degrees)),
     }
 }
 
 /// Encode a chunk's degrees to a compact on-disk record: `[kind:u8] ‖ body`. Tries
-/// `constant`, `ef`, `raw`, and (penalised) `zstd-dense`, and keeps the winner per `opts`.
+/// `ef`, `rle`, `raw`, and (penalised) `zstd-dense`, and keeps the winner per `opts`. A uniform
+/// (or all-zero) chunk falls out as a single-run `rle` — the smallest candidate and exactly the
+/// degenerate case EF is worst at; the empty chunk is an empty `rle`.
 pub fn encode_chunk(degrees: &[u32], opts: &DegreeCodecOpts) -> Result<Vec<u8>> {
     let n = degrees.len();
 
-    // Constant (incl. empty / all-zero) short-circuits: nothing beats ~9 bytes, and EF's
-    // worst case is exactly a constant/zero chunk.
-    if degrees.is_empty() || degrees.iter().all(|&d| d == degrees[0]) {
-        let degree = degrees.first().copied().unwrap_or(0);
-        let mut out = Vec::with_capacity(9);
-        out.push(ChunkKind::Constant as u8);
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-        out.extend_from_slice(&degree.to_le_bytes());
+    // Empty short-circuits to an empty `rle` record (the other candidates assume a non-empty
+    // slice). A *uniform* slice falls through: its one-run `rle` is the smallest and wins below.
+    if degrees.is_empty() {
+        let mut out = vec![ChunkKind::Rle as u8];
+        RleChunk::from_degrees(degrees).serialize_into(&mut out);
         return Ok(out);
     }
 
@@ -531,23 +529,12 @@ pub fn encode_chunk(degrees: &[u32], opts: &DegreeCodecOpts) -> Result<Vec<u8>> 
 }
 
 /// Decode a stored record into its compact resident form. `raw`/`zstd-dense` are decoded to
-/// the degree array and **re-encoded to EF (or Constant)** so nothing dense stays resident.
+/// the degree array and **re-encoded to EF (or a single-run Rle)** so nothing dense stays resident.
 pub fn decode_chunk(bytes: &[u8]) -> Result<DegreeChunk> {
     let (&tag, body) = bytes
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty degree-chunk record"))?;
     match ChunkKind::from_u8(tag)? {
-        ChunkKind::Constant => {
-            if body.len() != 8 {
-                bail!(
-                    "constant degree-chunk body is {} bytes, expected 8",
-                    body.len()
-                );
-            }
-            let n = u32::from_le_bytes(body[0..4].try_into().unwrap());
-            let degree = u32::from_le_bytes(body[4..8].try_into().unwrap());
-            Ok(DegreeChunk::Constant { n, degree })
-        }
         ChunkKind::Ef => Ok(DegreeChunk::Ef(EfChunk::deserialize(body)?)),
         ChunkKind::Rle => Ok(DegreeChunk::Rle(RleChunk::deserialize(body)?)),
         ChunkKind::RawU32 => {
@@ -631,7 +618,7 @@ mod tests {
 
     #[test]
     fn roundtrip_boundaries() {
-        check_roundtrip(&[7]); // single node → Constant
+        check_roundtrip(&[7]); // single node → single-run Rle
         check_roundtrip(&[0, 5]); // leading zero
         check_roundtrip(&[5, 0, 0, 9, 0]); // interior zeros
                                            // Exactly on / around a select sample boundary.
@@ -642,18 +629,28 @@ mod tests {
     }
 
     #[test]
-    fn constant_and_zero_chunks_use_constant_codec() {
-        // All-equal and all-zero pick Constant (tag 0), tiny + O(1) resident.
+    fn constant_and_zero_chunks_use_single_run_rle() {
+        // All-equal and all-zero have no dedicated codec — they are the smallest single-run Rle.
         for degs in [vec![0u32; 5000], vec![3u32; 5000]] {
             let bytes = encode_chunk(&degs, &opts()).unwrap();
-            assert_eq!(bytes[0], ChunkKind::Constant as u8);
-            assert_eq!(bytes.len(), 9);
+            assert_eq!(bytes[0], ChunkKind::Rle as u8);
             let chunk = decode_chunk(&bytes).unwrap();
-            assert!(matches!(chunk, DegreeChunk::Constant { .. }));
+            assert!(matches!(chunk, DegreeChunk::Rle(_)));
             for (i, &d) in degs.iter().enumerate() {
                 assert_eq!(chunk.degree_at(i), Some(d));
             }
         }
+    }
+
+    #[test]
+    fn empty_chunk_roundtrips_as_rle() {
+        let bytes = encode_chunk(&[], &opts()).unwrap();
+        assert_eq!(bytes[0], ChunkKind::Rle as u8);
+        let chunk = decode_chunk(&bytes).unwrap();
+        assert_eq!(chunk.len(), 0);
+        assert!(chunk.is_empty());
+        assert_eq!(chunk.degree_at(0), None);
+        assert_eq!(chunk.to_degrees(), Vec::<u32>::new());
     }
 
     #[test]
@@ -770,7 +767,7 @@ mod tests {
         eprintln!("  -- resident --");
         eprintln!("  dense u32 (today)          : {:>10} B", dense_resident);
         eprintln!(
-            "  EF/Constant (this change)  : {:>10} B  ({:.2}x smaller)",
+            "  EF/Rle (this change)       : {:>10} B  ({:.2}x smaller)",
             resident_total,
             dense_resident as f64 / resident_total as f64,
         );
@@ -896,7 +893,7 @@ mod tests {
     #[test]
     fn zstd_dense_decodes_to_compact_resident() {
         // Interleaved repetition that zstd crushes (wire-biased so it's chosen): whatever the
-        // disk tag, the resident form must be compact (Constant/Ef/Rle), never a raw dense array.
+        // disk tag, the resident form must be compact (Ef/Rle), never a raw dense array.
         let d: Vec<u32> = (0..6000u32).map(|i| 2 + (i % 2)).collect();
         let bytes = encode_chunk(
             &d,

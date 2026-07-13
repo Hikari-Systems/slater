@@ -5,9 +5,10 @@
 //! a compact resident form that is never a dense array.
 //!
 //! A plane is stored on disk in whichever of a few codecs is **smallest**
-//! (`constant`/`ef`/`rle`/`bitpacked`/`raw`/`zstd-dense`), and materialised in RAM as one of
-//! four **compact** forms — [`PlaneChunk::Constant`], [`PlaneChunk::Ef`], [`PlaneChunk::Rle`]
-//! or [`PlaneChunk::BitPacked`]. `constant`, `ef`, `rle` and `bitpacked` are **decompress-free**
+//! (`ef`/`rle`/`bitpacked`/`raw`/`zstd-dense`), and materialised in RAM as one of
+//! three **compact** forms — [`PlaneChunk::Ef`], [`PlaneChunk::Rle`]
+//! or [`PlaneChunk::BitPacked`]. A constant (or empty) run is just a single-run `rle`, so it
+//! needs no dedicated codec. `ef`, `rle` and `bitpacked` are **decompress-free**
 //! and are each their own resident form; `raw`/`zstd-dense` are disk-only and decode to a
 //! compact resident form on fault, so nothing dense stays resident. `zstd-dense` alone pays a
 //! decompress on fault and is penalised in selection (see [`PlaneCodecOpts::zstd_margin`]).
@@ -224,14 +225,15 @@ fn bp_write(words: &mut [u64], width: u8, i: usize, v: u64) {
 pub struct BitPacked {
     n: u32,
     base: u64,
-    /// Bits per element, `1..=64` (a `0`-width plane is `Constant`, not `BitPacked`).
+    /// Bits per element, `1..=64` (a uniform run is a single-run `Rle`, never a `0`-width plane).
     width: u8,
     words: Box<[u64]>,
 }
 
 impl BitPacked {
-    /// Build from a value slice. `values` must be non-empty and not all-equal (all-equal is
-    /// `Constant`). `base` is the min; `width` covers `max - base`.
+    /// Build from a value slice. `values` must be non-empty; a uniform slice is representable
+    /// (`width == 1`, all-zero payload) but the selector prefers its cheaper single-run `Rle`.
+    /// `base` is the min; `width` covers `max - base`.
     fn from_values(values: &[u64]) -> Self {
         let base = *values.iter().min().unwrap();
         let max = *values.iter().max().unwrap();
@@ -526,6 +528,13 @@ pub struct RleU64 {
 
 impl RleU64 {
     fn from_values(values: &[u64]) -> Self {
+        if values.is_empty() {
+            return Self {
+                n: 0,
+                values: Box::from([]),
+                starts: Box::from([]),
+            };
+        }
         let mut vals = Vec::new();
         let mut starts = Vec::new();
         let mut prev = values[0];
@@ -636,8 +645,6 @@ impl RleU64 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 enum PlaneKind {
-    /// Every value is identical. Body: `uvarint(n) ‖ uvarint(value)`.
-    Constant = 0,
     /// Elias–Fano over the monotone values. Body: [`EfMono`] serialisation.
     Ef = 1,
     /// Dense `u64`-LE, uncompressed. Body: `n × u64`. Escape hatch.
@@ -653,7 +660,6 @@ enum PlaneKind {
 impl PlaneKind {
     fn from_u8(b: u8) -> Result<Self> {
         Ok(match b {
-            0 => Self::Constant,
             1 => Self::Ef,
             2 => Self::RawU64,
             3 => Self::ZstdDense,
@@ -664,10 +670,9 @@ impl PlaneKind {
     }
 }
 
-/// A monotone plane resident in RAM: always one of the four **compact** forms.
+/// A monotone plane resident in RAM: always one of the three **compact** forms. A uniform
+/// (or empty) run is a single-run [`RleU64`] — there is no dedicated constant form.
 pub enum PlaneChunk {
-    /// Every element equals `value` (`n` elements).
-    Constant { n: u32, value: u64 },
     /// Elias–Fano over the monotone values.
     Ef(EfMono),
     /// Run-length of consecutive equal values.
@@ -679,7 +684,6 @@ pub enum PlaneChunk {
 impl PlaneChunk {
     pub fn len(&self) -> usize {
         match self {
-            PlaneChunk::Constant { n, .. } => *n as usize,
             PlaneChunk::Ef(e) => e.len(),
             PlaneChunk::Rle(r) => r.len(),
             PlaneChunk::BitPacked(b) => b.len(),
@@ -692,7 +696,6 @@ impl PlaneChunk {
 
     pub fn resident_bytes(&self) -> usize {
         match self {
-            PlaneChunk::Constant { .. } => std::mem::size_of::<u32>() + std::mem::size_of::<u64>(),
             PlaneChunk::Ef(e) => e.resident_bytes(),
             PlaneChunk::Rle(r) => r.resident_bytes(),
             PlaneChunk::BitPacked(b) => b.resident_bytes(),
@@ -706,7 +709,6 @@ impl PlaneChunk {
             return None;
         }
         Some(match self {
-            PlaneChunk::Constant { value, .. } => *value,
             PlaneChunk::Ef(e) => e.value_at(i),
             PlaneChunk::Rle(r) => r.value_at(i),
             PlaneChunk::BitPacked(b) => b.value_at(i),
@@ -718,10 +720,6 @@ impl PlaneChunk {
     /// the same predecessor/successor search a sorted key column performs, in the encoded form.
     #[inline]
     pub fn successor(&self, x: u64) -> usize {
-        // Constant short-circuit avoids `len` selects on a degenerate chunk.
-        if let PlaneChunk::Constant { n, value } = self {
-            return if x <= *value { 0 } else { *n as usize };
-        }
         let mut lo = 0usize;
         let mut hi = self.len();
         while lo < hi {
@@ -739,7 +737,6 @@ impl PlaneChunk {
     /// Materialise all values in index order — for the eager read and tests.
     pub fn to_values(&self) -> Vec<u64> {
         match self {
-            PlaneChunk::Constant { n, value } => vec![*value; *n as usize],
             PlaneChunk::Ef(e) => (0..e.len()).map(|i| e.value_at(i)).collect(),
             PlaneChunk::Rle(r) => r.to_values(),
             PlaneChunk::BitPacked(b) => (0..b.len()).map(|i| b.value_at(i)).collect(),
@@ -747,32 +744,32 @@ impl PlaneChunk {
     }
 }
 
-/// Build the compact resident form directly from a value slice: `Constant` when uniform, else
-/// `Ef`. Used to decode a `raw`/`zstd-dense` disk chunk so nothing dense stays resident.
+/// Build the compact resident form directly from a value slice: a single-run `Rle` when uniform
+/// (or empty), else `Ef`. Used to decode a `raw`/`zstd-dense` disk chunk so nothing dense stays
+/// resident.
 fn resident_from_values(values: &[u64]) -> PlaneChunk {
     match values.first() {
-        None => PlaneChunk::Constant { n: 0, value: 0 },
-        Some(&first) if values.iter().all(|&v| v == first) => PlaneChunk::Constant {
-            n: values.len() as u32,
-            value: first,
-        },
-        _ => PlaneChunk::Ef(EfMono::encode(values)),
+        Some(&first) if !values.iter().all(|&v| v == first) => {
+            PlaneChunk::Ef(EfMono::encode(values))
+        }
+        // Uniform or empty → one run.
+        _ => PlaneChunk::Rle(RleU64::from_values(values)),
     }
 }
 
 /// Encode a **non-decreasing** `values` slice to a compact on-disk record: `[kind:u8] ‖ body`.
-/// Prices `constant`, `ef`, `rle`, `bitpacked`, `raw`, and (penalised) `zstd-dense`, and keeps
-/// the smallest per `opts` — with `zstd-dense` taxed for the decompress it costs on every fault.
+/// Prices `ef`, `rle`, `bitpacked`, `raw`, and (penalised) `zstd-dense`, and keeps the smallest
+/// per `opts` — with `zstd-dense` taxed for the decompress it costs on every fault. A uniform run
+/// falls out as a single-run `rle` (a constant is just a run); the empty slice is an empty `rle`.
 pub fn encode_plane(values: &[u64], opts: &PlaneCodecOpts) -> Result<Vec<u8>> {
     let n = values.len();
 
-    // Constant (incl. empty) short-circuits: nothing beats a few bytes.
-    if values.is_empty() || values.iter().all(|&v| v == values[0]) {
-        let value = values.first().copied().unwrap_or(0);
-        let mut out = Vec::with_capacity(1 + 10 + 10);
-        out.push(PlaneKind::Constant as u8);
-        write_uvarint(&mut out, n as u64);
-        write_uvarint(&mut out, value);
+    // Empty short-circuits to an empty single-`Rle` record — `BitPacked::from_values` and the
+    // other candidates assume a non-empty slice. A *uniform* slice falls through: its one-run
+    // `Rle` candidate is the smallest and wins the selection below (a constant is just a run).
+    if values.is_empty() {
+        let mut out = vec![PlaneKind::Rle as u8];
+        RleU64::from_values(values).serialize_into(&mut out);
         return Ok(out);
     }
 
@@ -833,20 +830,12 @@ pub fn encode_plane(values: &[u64], opts: &PlaneCodecOpts) -> Result<Vec<u8>> {
 }
 
 /// Decode a stored plane record into its compact resident form. `raw`/`zstd-dense` decode to the
-/// value array and re-encode to `Ef`/`Constant` so nothing dense stays resident.
+/// value array and re-encode to `Ef`/`Rle` so nothing dense stays resident.
 pub fn decode_plane(bytes: &[u8]) -> Result<PlaneChunk> {
     let (&tag, mut body) = bytes
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty plane record"))?;
     match PlaneKind::from_u8(tag)? {
-        PlaneKind::Constant => {
-            let n = read_uvarint(&mut body)? as u32;
-            let value = read_uvarint(&mut body)?;
-            if !body.is_empty() {
-                bail!("constant plane body has {} trailing bytes", body.len());
-            }
-            Ok(PlaneChunk::Constant { n, value })
-        }
         PlaneKind::Ef => Ok(PlaneChunk::Ef(EfMono::deserialize(body)?)),
         PlaneKind::Rle => Ok(PlaneChunk::Rle(RleU64::deserialize(body)?)),
         PlaneKind::BitPacked => Ok(PlaneChunk::BitPacked(BitPacked::deserialize(body)?)),
@@ -1059,7 +1048,7 @@ mod tests {
 
     #[test]
     fn roundtrip_boundaries() {
-        check_roundtrip(&[7]); // single → Constant
+        check_roundtrip(&[7]); // single → single-run Rle
         check_roundtrip(&[0, 5]);
         check_roundtrip(&[0, 0, 3, 3, 3, 9]); // equal runs → RLE candidate, still monotone
         let near_sample: Vec<u64> = (0..(SELECT_SAMPLE as u64 * 3 + 1)).map(|i| i * 3).collect();
@@ -1067,18 +1056,30 @@ mod tests {
     }
 
     #[test]
-    fn constant_uses_constant_codec() {
+    fn constant_uses_single_run_rle() {
+        // A uniform run has no dedicated codec — it is the smallest single-run `Rle`.
         for vals in [vec![0u64; 5000], vec![42u64; 5000]] {
             let bytes = encode_plane(&vals, &opts()).unwrap();
-            assert_eq!(bytes[0], PlaneKind::Constant as u8);
+            assert_eq!(bytes[0], PlaneKind::Rle as u8);
             let chunk = decode_plane(&bytes).unwrap();
-            assert!(matches!(chunk, PlaneChunk::Constant { .. }));
+            assert!(matches!(chunk, PlaneChunk::Rle(_)));
             assert_eq!(chunk.value_at(0), Some(vals[0]));
             assert_eq!(chunk.value_at(4999), Some(vals[0]));
-            // successor across the constant.
+            // successor across the constant run.
             assert_eq!(chunk.successor(vals[0]), 0);
             assert_eq!(chunk.successor(vals[0] + 1), 5000);
         }
+    }
+
+    #[test]
+    fn empty_plane_roundtrips_as_rle() {
+        let bytes = encode_plane(&[], &opts()).unwrap();
+        assert_eq!(bytes[0], PlaneKind::Rle as u8);
+        let chunk = decode_plane(&bytes).unwrap();
+        assert_eq!(chunk.len(), 0);
+        assert!(chunk.is_empty());
+        assert_eq!(chunk.value_at(0), None);
+        assert_eq!(chunk.to_values(), Vec::<u64>::new());
     }
 
     #[test]
@@ -1137,10 +1138,7 @@ mod tests {
             let chunk = decode_plane(&bytes).unwrap();
             assert!(matches!(
                 chunk,
-                PlaneChunk::Ef(_)
-                    | PlaneChunk::Constant { .. }
-                    | PlaneChunk::Rle(_)
-                    | PlaneChunk::BitPacked(_)
+                PlaneChunk::Ef(_) | PlaneChunk::Rle(_) | PlaneChunk::BitPacked(_)
             ));
             for (i, &v) in sorted.iter().enumerate() {
                 assert_eq!(chunk.value_at(i), Some(v));
