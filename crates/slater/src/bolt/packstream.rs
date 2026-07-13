@@ -188,19 +188,59 @@ fn encode_int(v: i64, out: &mut Vec<u8>) {
 /// the smallest worker-thread stack.
 const MAX_DEPTH: usize = 256;
 
+/// Maximum number of values one message may decode into — every `PsValue` costs
+/// one, whether it is the root, a list item, a map key, a map value or a struct
+/// field.
+///
+/// The per-container capacity guards below bound each pre-allocation by the bytes
+/// *left in the buffer*, but a `PsValue` is 32 bytes and the densest wire encodings
+/// (`0xC0` Null, a tiny int, an empty tiny list) are one byte each — so a single
+/// list header with a 64-million count followed by 64 MiB of Nulls stays inside
+/// `chunk::MAX_MESSAGE_BYTES` yet expands into ~2 GB of nodes. Bounding the whole
+/// structure, not just each container, caps that amplification: 2 M × 32 B ≈ 64 MiB
+/// of decoded nodes, the same order as the message-byte cap the peer already had to
+/// respect. It is far above any legitimate parameter payload — a batched
+/// write-`UNWIND` of 100 000 rows × 10 properties is ~1.1 M values.
+pub const MAX_VALUES: usize = 2_000_000;
+
+/// The decoded structure exceeded the [`MAX_VALUES`] budget.
+///
+/// Typed so callers classify it with `err.downcast_ref::<ValueBudgetExceeded>()`
+/// rather than string-matching the message: a peer sending an amplifying message is
+/// a resource-exhaustion attempt, not a malformed-frame mistake, and the server may
+/// want to treat the two differently.
+#[derive(Debug, thiserror::Error)]
+#[error("packstream: message decodes to more than {max_values} values")]
+pub struct ValueBudgetExceeded {
+    pub max_values: usize,
+}
+
 /// A cursor over a PackStream byte buffer.
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
     depth: usize,
+    /// Values still allowed; decremented once per decoded `PsValue`.
+    budget: usize,
+    /// The budget this decoder started with (for the error message only).
+    max_values: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
+        Self::with_max_values(buf, MAX_VALUES)
+    }
+
+    /// As [`Decoder::new`], but with an explicit value budget. Mirrors
+    /// `chunk::decode_message_capped`: the explicit cap keeps the limit testable
+    /// without building a multi-megabyte adversarial buffer.
+    pub fn with_max_values(buf: &'a [u8], max_values: usize) -> Self {
         Self {
             buf,
             pos: 0,
             depth: 0,
+            budget: max_values,
+            max_values,
         }
     }
 
@@ -232,8 +272,17 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
-    /// Decode the next value, guarding against unbounded container recursion.
+    /// Decode the next value, guarding against unbounded container recursion and
+    /// against a container whose declared element count expands the message into
+    /// far more memory than its bytes.
     pub fn read_value(&mut self) -> Result<PsValue> {
+        if self.budget == 0 {
+            return Err(ValueBudgetExceeded {
+                max_values: self.max_values,
+            }
+            .into());
+        }
+        self.budget -= 1;
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
@@ -242,6 +291,14 @@ impl<'a> Decoder<'a> {
         let r = self.read_value_inner();
         self.depth -= 1;
         r
+    }
+
+    /// How many elements it is worth pre-allocating room for: no more than the
+    /// declared count, the bytes left (every element needs ≥1 marker byte) or the
+    /// values still in budget. Without the budget term a forged count could drive a
+    /// multi-gigabyte `with_capacity` before the first element is even read.
+    fn capacity_for(&self, declared: usize) -> usize {
+        declared.min(self.remaining()).min(self.budget)
     }
 
     fn read_value_inner(&mut self) -> Result<PsValue> {
@@ -329,12 +386,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_list(&mut self, n: usize) -> Result<PsValue> {
-        // `n` is an attacker-controlled u32; each element is ≥1 byte, so a valid
-        // list of `n` items needs ≥`n` bytes of body. Cap the pre-allocation at
-        // the bytes actually remaining so a bogus huge length (e.g. `0xD6` with a
-        // 2.5-billion count in a 5-byte message) can't drive an out-of-memory
-        // allocation before the loop's first short read bails.
-        let mut items = Vec::with_capacity(n.min(self.remaining()));
+        // `n` is an attacker-controlled u32; see `capacity_for` — a bogus huge
+        // length (e.g. `0xD6` with a 2.5-billion count in a 5-byte message) must not
+        // drive an out-of-memory allocation before the loop's first short read bails.
+        let mut items = Vec::with_capacity(self.capacity_for(n));
         for _ in 0..n {
             items.push(self.read_value()?);
         }
@@ -342,9 +397,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_map(&mut self, n: usize) -> Result<PsValue> {
-        // See `read_list`: bound the pre-allocation by the remaining bytes (each
-        // entry is ≥2 bytes), so a forged length cannot OOM the decoder.
-        let mut entries = Vec::with_capacity(n.min(self.remaining()));
+        // See `capacity_for`. An entry is two values (key + value) and ≥2 bytes, so
+        // halving is the tight bound here.
+        let mut entries = Vec::with_capacity(self.capacity_for(n.saturating_mul(2)) / 2);
         for _ in 0..n {
             let key = match self.read_value()? {
                 PsValue::String(s) => s,
@@ -358,9 +413,8 @@ impl<'a> Decoder<'a> {
 
     fn read_struct(&mut self, field_count: usize) -> Result<PsValue> {
         let tag = self.u8()?;
-        // See `read_list`: bound the pre-allocation by the remaining bytes so a
-        // forged field count cannot OOM the decoder.
-        let mut fields = Vec::with_capacity(field_count.min(self.remaining()));
+        // See `capacity_for`: a forged field count must not OOM the decoder.
+        let mut fields = Vec::with_capacity(self.capacity_for(field_count));
         for _ in 0..field_count {
             fields.push(self.read_value()?);
         }
@@ -370,7 +424,12 @@ impl<'a> Decoder<'a> {
 
 /// Decode exactly one value from `buf`, erroring if there are trailing bytes.
 pub fn from_slice(buf: &[u8]) -> Result<PsValue> {
-    let mut d = Decoder::new(buf);
+    from_slice_capped(buf, MAX_VALUES)
+}
+
+/// As [`from_slice`], but with an explicit value budget (see [`MAX_VALUES`]).
+pub fn from_slice_capped(buf: &[u8], max_values: usize) -> Result<PsValue> {
+    let mut d = Decoder::with_max_values(buf, max_values);
     let v = d.read_value()?;
     if d.remaining() != 0 {
         bail!("packstream: {} trailing bytes after value", d.remaining());
@@ -401,6 +460,62 @@ mod tests {
         // `0xB?` tiny-struct is ≤15 fields, but the u32 list path above is the
         // unbounded one; also check a u16 list length with no body.
         assert!(from_slice(&[0xD5, 0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn amplifying_message_is_refused_by_the_value_budget() {
+        // Regression (HIK-79): every wire byte can become a 32-byte `PsValue`, so a
+        // list header with a huge count followed by that many one-byte Nulls stays
+        // under the 64 MiB message cap while expanding into gigabytes of nodes. The
+        // per-container byte bound does not catch it — the body really is that long.
+        // 8 M Nulls (an 8 MB body) decoded into ~256 MB of nodes before this fix.
+        let count = 8_000_000u32;
+        let mut msg = vec![0xD6];
+        msg.extend_from_slice(&count.to_be_bytes());
+        msg.resize(msg.len() + count as usize, 0xC0);
+        let err = from_slice(&msg).expect_err("amplifying list must be refused");
+        assert_eq!(
+            err.downcast_ref::<ValueBudgetExceeded>()
+                .map(|e| e.max_values),
+            Some(MAX_VALUES),
+            "expected a typed ValueBudgetExceeded, got: {err}"
+        );
+
+        // The budget bounds the whole structure, not each container: a fan of many
+        // small lists that individually pass every per-container check still trips it.
+        let mut nested = vec![0xD6];
+        nested.extend_from_slice(&count.to_be_bytes());
+        nested.resize(nested.len() + count as usize, 0x90); // empty tiny lists
+        assert!(from_slice(&nested)
+            .unwrap_err()
+            .downcast_ref::<ValueBudgetExceeded>()
+            .is_some());
+    }
+
+    #[test]
+    fn value_budget_admits_legitimate_payloads() {
+        // A batched write-`UNWIND` shape: 20 000 rows of a 3-property map, i.e.
+        // 1 (root list) + 20 000 maps + 20 000 × 3 × 2 (key + value) = 140 001 values.
+        // Well inside the budget — the bound must not reject honest large messages.
+        let rows: Vec<PsValue> = (0..20_000i64)
+            .map(|i| {
+                PsValue::Map(vec![
+                    ("id".into(), PsValue::Int(i)),
+                    ("name".into(), PsValue::str(format!("n{i}"))),
+                    ("ok".into(), PsValue::Bool(true)),
+                ])
+            })
+            .collect();
+        let msg = to_vec(&PsValue::List(rows));
+        assert!(from_slice(&msg).is_ok());
+
+        // And the cap is exact: the same message decodes on a budget of its value
+        // count but not one value short of it.
+        assert!(from_slice_capped(&msg, 140_001).is_ok());
+        assert!(from_slice_capped(&msg, 140_000)
+            .unwrap_err()
+            .downcast_ref::<ValueBudgetExceeded>()
+            .is_some());
     }
 
     #[test]
