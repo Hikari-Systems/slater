@@ -15,10 +15,12 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use graph_format::crypto::BlockCipher;
+use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::manifest::{AnnMode, Metric, VectorIndexDesc};
 use graph_format::pq::{train_codebooks, PqParams, PqWriter};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
+use graph_format::wire::{read_uvarint, write_uvarint};
 
 use crate::model::VectorIndexStmt;
 
@@ -216,22 +218,93 @@ impl Interner {
 /// build is offline, and more iterations only sharpen the codebook a little.
 const PQ_ITERS: usize = 25;
 
-/// An index's gathered vectors, awaiting a brute-force-vs-Vamana routing decision.
+/// A declared vector index, awaiting a brute-force-vs-Vamana routing decision.
+///
+/// The gathered `(node_id, vector)` entries are **not** held here — they are spilled
+/// to a per-index [`ExtSorter<PendingVector>`] under a [`MemoryBudget`] reservation
+/// (like every other build sink) and streamed into the writer. Holding them resident
+/// in a `Vec` here accumulated `nodes × dim × 4` bytes off-budget, OOMing large
+/// `--pk` builds regardless of `--max-memory`. Only the routing metadata and the
+/// pushed `count` (needed for the `count >= ann_threshold` decision before the sorter
+/// is drained) live on the struct.
 pub(crate) struct PendingIndex {
     pub(crate) label: String,
     pub(crate) property: String,
     pub(crate) dim: u32,
     pub(crate) metric: Metric,
-    pub(crate) entries: Vec<(u64, Vec<f32>)>,
+    /// Number of `(node_id, vector)` entries pushed into this index's sorter.
+    pub(crate) count: u64,
 }
 
-/// Route each gathered [`PendingIndex`] by cardinality and write the vector store
+/// One gathered vector, spilled to and merged back from the per-index sorter.
+///
+/// Keyed by a per-index monotonic `seq` assigned in push (scan) order, so
+/// [`ExtSorter::sorted`] restores the **exact insertion order** — byte-identical to
+/// the previous fully-resident `Vec`, for both the identity and permutation build
+/// paths (where entries are in scan order, not `node_id` order). `id`/`vec` are the
+/// payload. The record is self-delimiting: `seq` and `id` are uvarints and the vector
+/// is the remaining bytes as little-endian `f32`s, so no length prefix is needed.
+pub(crate) struct PendingVector {
+    pub(crate) seq: u64,
+    pub(crate) id: u64,
+    pub(crate) vec: Vec<f32>,
+}
+
+impl SortRecord for PendingVector {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        write_uvarint(buf, self.seq);
+        write_uvarint(buf, self.id);
+        for x in &self.vec {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    fn decode(r: &mut &[u8]) -> Result<Self> {
+        let seq = read_uvarint(r)?;
+        let id = read_uvarint(r)?;
+        if r.len() % 4 != 0 {
+            bail!(
+                "PendingVector record has a truncated f32 tail ({} bytes)",
+                r.len()
+            );
+        }
+        let mut vec = Vec::with_capacity(r.len() / 4);
+        for chunk in r.chunks_exact(4) {
+            vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        *r = &r[r.len()..];
+        Ok(PendingVector { seq, id, vec })
+    }
+    fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        // `seq` is unique within an index, so this is a total order (one sorter per
+        // index — seqs never collide across the records a sorter holds).
+        self.seq.cmp(&other.seq)
+    }
+    fn size_hint(&self) -> usize {
+        // 2 uvarints (≤10B each) + the f32 payload — the run-file cost.
+        20 + self.vec.len() * 4
+    }
+    fn resident_hint(&self) -> usize {
+        // The struct plus the heap the `Vec<f32>` owns: this is what the budget must
+        // see so the sorter spills before the vector set exceeds its reservation.
+        std::mem::size_of::<Self>() + self.vec.len() * 4
+    }
+}
+
+/// Route each declared [`PendingIndex`] by cardinality and write the vector store
 /// (`vectors.f32.blk`) plus any Vamana/PQ files. Both build paths gather the
 /// `(node_id, vector)` sets differently but emit the index identically. Returns the
 /// manifest descriptors and the extra (Vamana/PQ) inventory file names.
+///
+/// `sorters[i]` holds index `pending[i]`'s gathered entries, spilled under a budget
+/// reservation and merged back in scan (`seq`) order — the same order the entries
+/// were pushed, so the emitted store is byte-identical to appending them from a
+/// resident `Vec`. The brute-force arm streams straight from the merge into the
+/// writer (peak resident bounded by the reservation, not the set size); the Vamana
+/// arm has to collect the group resident because its v1 graph build is in-memory.
 pub(crate) fn write_vector_indexes(
     tmp_dir: &Path,
     pending: &[PendingIndex],
+    sorters: Vec<ExtSorter<PendingVector>>,
     opts: &BuildOptions,
     cipher: Option<Arc<BlockCipher>>,
     block_sizes: &mut BTreeMap<String, u32>,
@@ -247,21 +320,28 @@ pub(crate) fn write_vector_indexes(
         opts.zstd_level,
         cipher.clone(),
     )?;
-    for pi in pending {
-        let count = pi.entries.len() as u64;
+    for (pi, sorter) in pending.iter().zip(sorters) {
+        let count = pi.count;
         if count >= opts.ann_threshold && vamana_eligible(pi, opts) {
-            // Disk-native Vamana/PQ path.
-            let (desc, files) = build_vamana_index(tmp_dir, pi, opts, cipher.clone())?;
+            // Disk-native Vamana/PQ path. The in-memory graph build needs the whole
+            // group resident, so materialise it here (in scan order) — but only for
+            // this one index, and only at write time, not accumulated across the scan.
+            let entries: Vec<(u64, Vec<f32>)> = sorter
+                .sorted()?
+                .map(|r| r.map(|e| (e.id, e.vec)))
+                .collect::<Result<_>>()?;
+            let (desc, files) = build_vamana_index(tmp_dir, pi, &entries, opts, cipher.clone())?;
             for (name, block) in &files {
                 vector_files.push(name.clone());
                 block_sizes.insert(name.clone(), *block);
             }
             vector_indexes.push(desc);
         } else {
-            // Brute-force: append the group to vectors.f32.blk (M5 path).
+            // Brute-force: stream the group straight into vectors.f32.blk (M5 path).
             let first_record = w.len();
-            for (nid, xs) in &pi.entries {
-                w.append(*nid, xs)?;
+            for entry in sorter.sorted()? {
+                let entry = entry?;
+                w.append(entry.id, &entry.vec)?;
             }
             vector_indexes.push(VectorIndexDesc {
                 label: pi.label.clone(),
@@ -328,11 +408,12 @@ fn normalise(v: &[f32]) -> Vec<f32> {
 fn build_vamana_index(
     tmp_dir: &Path,
     pi: &PendingIndex,
+    entries: &[(u64, Vec<f32>)],
     opts: &BuildOptions,
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<(VectorIndexDesc, Vec<(String, u32)>)> {
     // Normalise once; both the graph build and PQ training work in this space.
-    let normed: Vec<Vec<f32>> = pi.entries.iter().map(|(_, v)| normalise(v)).collect();
+    let normed: Vec<Vec<f32>> = entries.iter().map(|(_, v)| normalise(v)).collect();
 
     let graph = build_vamana(&normed, opts.vamana_r as usize, opts.vamana_alpha)
         .with_context(|| format!("build Vamana graph for {}.{}", pi.label, pi.property))?;
@@ -357,7 +438,7 @@ fn build_vamana_index(
             .iter()
             .map(|&j| new_of[j as usize])
             .collect();
-        vw.append(pi.entries[old as usize].0, &normed[old as usize], &nbrs)?;
+        vw.append(entries[old as usize].0, &normed[old as usize], &nbrs)?;
     }
     vw.finish()?;
 
@@ -375,7 +456,7 @@ fn build_vamana_index(
     )?;
     for &old in &order {
         let codes = codebook.encode(&normed[old as usize])?;
-        pw.append_codes(pi.entries[old as usize].0, &codes)?;
+        pw.append_codes(entries[old as usize].0, &codes)?;
     }
     pw.finish()?;
 
@@ -384,7 +465,7 @@ fn build_vamana_index(
         property: pi.property.clone(),
         dim: pi.dim,
         metric: pi.metric,
-        count: pi.entries.len() as u64,
+        count: entries.len() as u64,
         // first_record is a vectors.f32.blk offset; the Vamana arm never reads that
         // store, so it is irrelevant here (D31).
         first_record: 0,
@@ -443,4 +524,150 @@ pub(crate) fn load_vector_sidecar(path: &Path) -> Result<Vec<VectorIndexStmt>> {
             metric: s.metric,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod vector_gather_tests {
+    //! Regression tests for HIK-96: the vector gather is spilled to a budgeted
+    //! `ExtSorter` instead of accumulated fully resident in a `Vec`. They pin the two
+    //! properties the fix must hold: (1) peak resident vector state is bounded by the
+    //! reservation — the sorter spills to disk rather than holding the whole set — and
+    //! (2) the emitted `vectors.f32.blk` is byte-identical regardless of how much the
+    //! sorter spilled, i.e. scan order is preserved.
+
+    use super::*;
+    use graph_format::extsort::ExtSorter;
+    use graph_format::membudget::MemoryBudget;
+    use graph_format::vectors::VectorStoreReader;
+
+    /// A deterministic dim-`dim` vector for node `i` (distinct across `i`).
+    fn vec_for(i: u64, dim: u32) -> Vec<f32> {
+        (0..dim).map(|d| (i as f32) * 0.5 + d as f32).collect()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("slater_hik96_{}_{}", std::process::id(), name))
+    }
+
+    fn count_run_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map(|x| x == "run").unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The sorter spills its runs to disk under a tiny reservation — it does **not**
+    /// hold all N vectors resident — and the merge yields them back in exact scan
+    /// (`seq`) order. This is the bound the old resident `Vec` violated.
+    #[test]
+    fn vector_sorter_spills_and_preserves_scan_order() {
+        let dir = scratch("spill");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let n = 4000u64;
+        let dim = 16u32;
+        // Reserve only ~4 KiB — far below n × (≈40 + dim×4) bytes — so a resident Vec
+        // could never fit and the sorter is forced to spill. `new_inline` spills
+        // synchronously on this thread, so the run files are on disk deterministically
+        // by the time we look (no pool-worker race).
+        let budget = MemoryBudget::new(1 << 20);
+        let res = budget.reserve_now("test", 4096, 1).unwrap();
+        let mut sorter = ExtSorter::<PendingVector>::new_inline(&dir, res, 1).unwrap();
+        for i in 0..n {
+            sorter
+                .push(PendingVector {
+                    seq: i,
+                    id: 10_000 + i,
+                    vec: vec_for(i, dim),
+                })
+                .unwrap();
+        }
+        // Bound proof: the vector set was spilled, not held resident.
+        assert!(
+            count_run_files(&dir) > 1,
+            "expected the sorter to spill multiple run files under a tiny reservation, \
+             found {}",
+            count_run_files(&dir)
+        );
+
+        // Order proof: merged output is exactly the insertion order.
+        let mut seen = 0u64;
+        for (expected, rec) in sorter.sorted().unwrap().enumerate() {
+            let rec = rec.unwrap();
+            assert_eq!(rec.seq, expected as u64);
+            assert_eq!(rec.id, 10_000 + expected as u64);
+            assert_eq!(rec.vec, vec_for(expected as u64, dim));
+            seen += 1;
+        }
+        assert_eq!(seen, n, "every pushed vector must survive the round-trip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build one brute-force index's `vectors.f32.blk` from a per-index sorter with a
+    /// given reservation, returning (raw store bytes, read-back entries).
+    fn build_store(dir: &Path, entries: &[(u64, Vec<f32>)], dim: u32, res_bytes: usize) -> Vec<u8> {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let budget = MemoryBudget::new(res_bytes.max(1) * 4);
+        let res = budget.reserve_now("test", res_bytes, 1).unwrap();
+        let mut sorter = ExtSorter::<PendingVector>::new(dir, res, 3).unwrap();
+        for (seq, (id, v)) in entries.iter().enumerate() {
+            sorter
+                .push(PendingVector {
+                    seq: seq as u64,
+                    id: *id,
+                    vec: v.clone(),
+                })
+                .unwrap();
+        }
+        let pending = vec![PendingIndex {
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim,
+            metric: Metric::Cosine,
+            count: entries.len() as u64,
+        }];
+        let opts = BuildOptions::default(); // ann_threshold 50_000 ⇒ brute-force arm
+        let mut block_sizes = BTreeMap::new();
+        write_vector_indexes(dir, &pending, vec![sorter], &opts, None, &mut block_sizes).unwrap();
+        std::fs::read(dir.join("vectors.f32.blk")).unwrap()
+    }
+
+    /// The emitted store is byte-identical whether the sorter ran as a single resident
+    /// run or spilled into many — scan order is preserved end to end — and every
+    /// `(id, vec)` is present and correct on read-back.
+    #[test]
+    fn vector_store_is_byte_identical_regardless_of_spill() {
+        let dim = 8u32;
+        let n = 1500u64;
+        let entries: Vec<(u64, Vec<f32>)> =
+            (0..n).map(|i| (7_000 + i * 3, vec_for(i, dim))).collect();
+
+        // Huge reservation ⇒ one resident run (the pre-fix all-resident shape).
+        let big_dir = scratch("byte_big");
+        let bytes_big = build_store(&big_dir, &entries, dim, 64 << 20);
+        // Tiny reservation ⇒ many spilled runs (the fix's bounded path).
+        let small_dir = scratch("byte_small");
+        let bytes_small = build_store(&small_dir, &entries, dim, 4096);
+
+        assert_eq!(
+            bytes_big, bytes_small,
+            "vectors.f32.blk must be byte-identical regardless of spill (scan order preserved)"
+        );
+
+        // Correctness: every (id, vec) survives, in order.
+        let reader = VectorStoreReader::open(small_dir.join("vectors.f32.blk")).unwrap();
+        assert_eq!(reader.len(), n);
+        for (i, (id, v)) in entries.iter().enumerate() {
+            let got = reader.get(i as u64).unwrap();
+            assert_eq!(got.node_id, *id);
+            assert_eq!(&got.vector, v);
+        }
+        let _ = std::fs::remove_dir_all(&big_dir);
+        let _ = std::fs::remove_dir_all(&small_dir);
+    }
 }

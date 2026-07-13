@@ -44,7 +44,9 @@ use crate::merge_build;
 use crate::model::{Entity, RangeIndexStmt, Statement, VectorIndexStmt};
 use crate::parser::{parse_statement, parse_statement_with_id_field, StatementReader};
 use crate::resolve::{DumpResolver, NO_DUMP};
-use crate::shared::{parse_metric, write_vector_indexes, BuildOptions, Interner, PendingIndex};
+use crate::shared::{
+    parse_metric, write_vector_indexes, BuildOptions, Interner, PendingIndex, PendingVector,
+};
 
 const DUMP_VERTEX: &str = "__DumpVertex__";
 const DUMP_ID: &str = "__dump_id__";
@@ -1488,8 +1490,21 @@ fn build_inner(
     // during the node scan (the vectors were routed to `vec_props` in pass 1). The
     // index files themselves are written by the shared `write_vector_indexes`. Each
     // spec is `(pending_idx, label_id, property, dim)`.
+    //
+    // Each index's entries are spilled to a budgeted `ExtSorter` (keyed by scan order)
+    // rather than accumulated resident in a `Vec` — a dim-768 embedding over tens of
+    // millions of nodes is tens of GB, and holding it off-budget OOMed the build
+    // regardless of `--max-memory`. The sorters are reserved here, *before* the
+    // node-store sorter below grabs `mem.available()`, and drained by
+    // `write_vector_indexes` after the scan; they mirror the range-sorter discipline.
     let mut vec_specs: Vec<(usize, Option<u32>, String, u32)> = Vec::new();
     let mut pending: Vec<PendingIndex> = Vec::new();
+    let mut vector_sorters: Vec<ExtSorter<PendingVector>> = Vec::new();
+    let vector_want = if vector_stmts.is_empty() {
+        0
+    } else {
+        (mem.total() / 8 / vector_stmts.len()).max(VECTOR_SORT_FLOOR)
+    };
     for vi in &vector_stmts {
         vec_specs.push((
             pending.len(),
@@ -1502,8 +1517,13 @@ fn build_inner(
             property: vi.property.clone(),
             dim: vi.dim,
             metric: parse_metric(&vi.metric)?,
-            entries: Vec::new(),
+            count: 0,
         });
+        vector_sorters.push(ExtSorter::<PendingVector>::new(
+            scratch_dir,
+            mem.reserve_now("vector-index sorter", vector_want, VECTOR_SORT_FLOOR)?,
+            opts.zstd_level,
+        )?);
     }
 
     // --- node stores: node_props.blk + node_labels.blk ---
@@ -1572,7 +1592,7 @@ fn build_inner(
             labels_w.append_blob(&node.labels_blob)?;
             props_w.append_raw(&node.props_blob)?;
             emit_node_ranges(&node, prov, &mut range_sorters)?;
-            gather_node_vectors(&node, prov, &vec_specs, &mut pending)?;
+            gather_node_vectors(&node, prov, &vec_specs, &mut pending, &mut vector_sorters)?;
             Ok(())
         })?;
         // MERGE-created overlay nodes follow at prov = base_node_count + i (= final id
@@ -1584,7 +1604,13 @@ fn build_inner(
                 labels_w.append_blob(&cnode.labels_blob)?;
                 props_w.append_raw(&cnode.props_blob)?;
                 emit_node_ranges(cnode, final_id, &mut range_sorters)?;
-                gather_node_vectors(cnode, final_id, &vec_specs, &mut pending)?;
+                gather_node_vectors(
+                    cnode,
+                    final_id,
+                    &vec_specs,
+                    &mut pending,
+                    &mut vector_sorters,
+                )?;
             }
         }
     } else {
@@ -1601,7 +1627,13 @@ fn build_inner(
             let node = fold_node(node, prov)?;
             let final_id = perm.final_of(prov);
             emit_node_ranges(&node, final_id, &mut range_sorters)?;
-            gather_node_vectors(&node, final_id, &vec_specs, &mut pending)?;
+            gather_node_vectors(
+                &node,
+                final_id,
+                &vec_specs,
+                &mut pending,
+                &mut vector_sorters,
+            )?;
             node_sorter.push(NodeEmit {
                 final_id,
                 labels_blob: node.labels_blob,
@@ -1615,7 +1647,13 @@ fn build_inner(
             for (i, cnode) in ov.created.iter().enumerate() {
                 let final_id = perm.final_of(base_node_count + i as u64);
                 emit_node_ranges(cnode, final_id, &mut range_sorters)?;
-                gather_node_vectors(cnode, final_id, &vec_specs, &mut pending)?;
+                gather_node_vectors(
+                    cnode,
+                    final_id,
+                    &vec_specs,
+                    &mut pending,
+                    &mut vector_sorters,
+                )?;
                 node_sorter.push(NodeEmit {
                     final_id,
                     labels_blob: cnode.labels_blob.clone(),
@@ -2058,8 +2096,14 @@ fn build_inner(
         "indexes",
         pending.len() as u64,
     );
-    let (vector_indexes, vector_files) =
-        write_vector_indexes(tmp_dir, &pending, opts, cipher.clone(), &mut block_sizes)?;
+    let (vector_indexes, vector_files) = write_vector_indexes(
+        tmp_dir,
+        &pending,
+        vector_sorters,
+        opts,
+        cipher.clone(),
+        &mut block_sizes,
+    )?;
     drop(emit_vec_g);
 
     // --- range/*.isam (each fed its external-sorted stream) ---
@@ -2195,6 +2239,7 @@ fn gather_node_vectors(
     final_id: u64,
     specs: &[(usize, Option<u32>, String, u32)],
     pending: &mut [PendingIndex],
+    sorters: &mut [ExtSorter<PendingVector>],
 ) -> Result<()> {
     for (idx, label_id, property, dim) in specs {
         let Some(lid) = label_id else { continue };
@@ -2207,7 +2252,16 @@ fn gather_node_vectors(
                         xs.len()
                     );
                 }
-                pending[*idx].entries.push((final_id, xs.clone()));
+                // Spill to the per-index sorter under its reservation, keyed by scan
+                // order (`count`) so the merge restores exact insertion order. No
+                // resident accumulation of the vector set here.
+                let seq = pending[*idx].count;
+                sorters[*idx].push(PendingVector {
+                    seq,
+                    id: final_id,
+                    vec: xs.clone(),
+                })?;
+                pending[*idx].count += 1;
             }
         }
     }
@@ -2617,6 +2671,13 @@ const FWD_SINK_BATCH: usize = 8192;
 /// they take a modest floor rather than [`MIN_SORT_BYTES`]: a graph declaring many
 /// indexes must not starve the band workers, which is where the bytes actually go.
 const RANGE_SORT_FLOOR: usize = 1 << 20;
+
+/// Smallest reservation a vector-index sorter is given. Like the range sorters,
+/// vector sorters are long-lived (created before the scan, drained by
+/// `write_vector_indexes` after it) and typically few, so a modest floor keeps a
+/// graph declaring several vector indexes from starving the band workers while still
+/// letting each sorter form runs and make progress.
+const VECTOR_SORT_FLOOR: usize = 1 << 20;
 
 /// Emit one forward node band `[lo, hi)`: sort the band's edges, assign
 /// `final_edge_id = base + i`, write the band's forward CSR half and `edge_props`
