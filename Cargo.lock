@@ -1508,7 +1508,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "graph-format"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3217,7 +3217,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slater"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "slater-build"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "slater-delta"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "crc32c",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "slater-scalar"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "graph-format",
