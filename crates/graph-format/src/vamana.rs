@@ -99,11 +99,26 @@ pub fn build_vamana(vectors: &[Vec<f32>], r: usize, alpha: f32) -> Result<Vamana
     // Search-list size during construction — wider than R for better candidates.
     let l_build = (r * 2).max(64);
 
+    // Reused generation-stamped scratch for `greedy_search_build`'s expanded set: one
+    // allocation for the whole build, "cleared" by bumping `search_gen` per search
+    // (O(1)) rather than reallocating an n-sized array per node (O(n²) allocation).
+    let mut expanded_stamp = vec![0u32; n];
+    let mut search_gen: u32 = 0;
+
     // Two passes: alpha = 1 (short edges first), then the real alpha (long edges).
     for &pass_alpha in &[1.0f32, alpha.max(1.0)] {
         let order = random_permutation(n, &mut rng);
         for &p in &order {
-            let visited = greedy_search_build(medoid, p, &adjacency, vectors, l_build);
+            search_gen += 1;
+            let visited = greedy_search_build(
+                medoid,
+                p,
+                &adjacency,
+                vectors,
+                l_build,
+                &mut expanded_stamp,
+                search_gen,
+            );
             // Candidate pool = everything the search touched, plus p's current
             // neighbours, minus p itself.
             let mut cands: Vec<u32> = visited;
@@ -167,24 +182,31 @@ fn random_permutation(n: usize, rng: &mut Lcg) -> Vec<usize> {
 /// Greedy search over the *current* graph from `start` towards point `p`, using
 /// exact squared-L2 over full vectors. Returns every node it expanded (the
 /// candidate pool for pruning).
+///
+/// `expanded_stamp` is a caller-owned scratch buffer of length `vectors.len()`,
+/// reused across every call: a node counts as expanded on this search iff its stamp
+/// equals `gen`. The caller bumps `gen` before each call, so "clearing" the visited
+/// marks is O(1) — without this the per-node build reallocated (and zeroed) an
+/// n-sized bool array on every one of its `n` calls, i.e. O(n²) allocation.
 fn greedy_search_build(
     start: usize,
     p: usize,
     adjacency: &[Vec<u32>],
     vectors: &[Vec<f32>],
     l_size: usize,
+    expanded_stamp: &mut [u32],
+    gen: u32,
 ) -> Vec<u32> {
     let d = |x: usize| sq_l2(&vectors[x], &vectors[p]);
     let mut beam: Vec<(f64, u32)> = vec![(d(start), start as u32)];
-    let mut expanded = vec![false; vectors.len()];
     let mut visited = Vec::new();
     while let Some((_, cur)) = beam
         .iter()
         .copied()
-        .filter(|(_, i)| !expanded[*i as usize])
+        .filter(|(_, i)| expanded_stamp[*i as usize] != gen)
         .min_by(|a, b| a.0.total_cmp(&b.0))
     {
-        expanded[cur as usize] = true;
+        expanded_stamp[cur as usize] = gen;
         visited.push(cur);
         for &nb in &adjacency[cur as usize] {
             if !beam.iter().any(|(_, i)| *i == nb) {
@@ -545,6 +567,41 @@ mod tests {
             sorted.len(),
             200,
             "layout must be a permutation of all nodes"
+        );
+    }
+
+    #[test]
+    fn greedy_search_build_scratch_reuse_is_isolated_across_generations() {
+        // The build reuses one `expanded_stamp` buffer across every per-node search,
+        // bumping the generation instead of reallocating. A search run against a buffer
+        // already dirtied by a prior generation must return exactly what a pristine
+        // buffer would — the generation stamp isolates the reuse.
+        let vectors = vec![
+            vec![0.0f32, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            vec![3.0, 0.0],
+        ];
+        let adjacency: Vec<Vec<u32>> = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let n = vectors.len();
+        let l = 8;
+
+        // Reference: a fresh (all-zero) buffer per call.
+        let mut fresh1 = vec![0u32; n];
+        let ref_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut fresh1, 1);
+        let mut fresh2 = vec![0u32; n];
+        let ref_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut fresh2, 1);
+
+        // Reused buffer with a bumped generation: the second call must not see the
+        // first call's stamps.
+        let mut shared = vec![0u32; n];
+        let shar_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut shared, 1);
+        let shar_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut shared, 2);
+
+        assert_eq!(shar_a, ref_a);
+        assert_eq!(
+            shar_b, ref_b,
+            "a bumped generation must isolate the reused scratch buffer"
         );
     }
 
