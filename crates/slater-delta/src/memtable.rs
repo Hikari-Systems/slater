@@ -534,10 +534,21 @@ impl Memtable {
 
     /// Tombstone the node identified by `(label, key, value)`: reads suppress the
     /// core row and it is dropped at consolidation. `resolved` is the node's
-    /// current-core dense id (an ISAM probe on the `slater` side); `None` for a
-    /// business key absent from the core (a harmless no-op tombstone until Phase 2
-    /// delta-born nodes). A tombstone drops any prior patches — a deleted node
-    /// carries no properties — and wins last-writer-wins with [`Self::upsert_node`].
+    /// current-core dense id (an ISAM probe on the `slater` side), or a lower level's
+    /// born synthetic id (the writer substitutes it); `None` for a business key the
+    /// writer resolved against neither. A tombstone drops any prior patches — a deleted
+    /// node carries no properties — and wins last-writer-wins with [`Self::upsert_node`].
+    ///
+    /// A key that resolves to **no dense id anywhere** (not in the core, not born in a
+    /// lower level, not born here) exists nowhere: there is nothing to suppress, so the
+    /// delete stores nothing at all — mirroring [`Self::delete_edge`]'s
+    /// [`Self::born_endpoint_dense`] guard. Storing an entry for it would be a *phantom*:
+    /// unreachable on read (a node read resolves through `by_dense`, which such an entry
+    /// never enters) yet enough to make [`Self::is_empty`] false and
+    /// [`Self::node_delta_count`] over-count — and an empty delta is what gates the
+    /// reader's zero-cost overlay and the whole-graph metadata fast paths, so one no-op
+    /// `DELETE` would silently turn them into full scans. (`merge_levels` correspondingly
+    /// drops any such entry at flush.)
     ///
     /// Shared by live writes and WAL replay so the two paths cannot diverge.
     pub fn delete_node(&mut self, label: &str, key: &str, value: Value, resolved: Option<u64>) {
@@ -547,7 +558,16 @@ impl Memtable {
             value,
         );
         let ck = identity.canonical_key();
-        if !self.nodes.contains_key(&ck) {
+        // Resolve the suppressed dense id *before* storing anything: the caller's
+        // `resolved`, else the synthetic id of a node born in *this* level. An entry that
+        // already exists here is kept and tombstoned either way (its dense id was
+        // registered when it was created).
+        let already_synthetic = self.nodes.get(&ck).map(|e| e.synthetic);
+        let is_new = already_synthetic.is_none();
+        if is_new && resolved.is_none() {
+            return; // exists nowhere — an inert no-op tombstone, stored nowhere
+        }
+        if is_new {
             self.bytes += ck.len() + std::mem::size_of::<NodeEntry>();
         }
         let entry = self.nodes.entry(ck.clone()).or_insert_with(|| NodeEntry {
@@ -561,15 +581,11 @@ impl Memtable {
         entry.delta.replaced = false;
         entry.delta.labels_added.clear();
         entry.delta.labels_removed.clear();
-        let already_synthetic = entry.synthetic;
-        // Record the suppressed dense id. `resolved` is the core dense id, or a lower
-        // level's born synthetic id (the writer substitutes it); `already_synthetic`
-        // catches a node born in *this* level. A key that resolves to neither exists
-        // nowhere — an inert no-op tombstone that must not be counted.
+        // Record the suppressed dense id.
         if let Some(dense) = resolved {
             self.by_dense.insert(dense, ck);
             self.tombstoned.insert(dense);
-        } else if let Some(dense) = already_synthetic {
+        } else if let Some(dense) = already_synthetic.flatten() {
             self.tombstoned.insert(dense);
         }
     }
@@ -4230,6 +4246,86 @@ mod tests {
         let s = snap(mem, vec![]);
         assert!(s.effective_tombstoned_ids().is_empty());
         assert_eq!(s.born_count(), 0, "a no-op tombstone allocates no born id");
+    }
+
+    #[test]
+    fn noop_tombstone_stores_no_phantom_entry() {
+        // HIK-77. A delete of a business key that exists *nowhere* (not in the core, not
+        // born) must store nothing at all — no `NodeEntry`, no bytes, no index touch.
+        // A stored entry would be a phantom: unreachable on read (nothing maps to it in
+        // `by_dense`) yet enough to make `is_empty()` lie, which costs every reader the
+        // zero-cost overlay and the delta-gated metadata fast paths.
+        let mut mem = Memtable::with_synthetic_base(100);
+        let bytes_before = mem.bytes();
+        mem.delete_node("Person", "name", Value::Str("Ghost".into()), None);
+        assert!(
+            mem.is_empty(),
+            "a no-op tombstone must leave the delta empty"
+        );
+        assert_eq!(mem.node_delta_count(), 0, "no phantom node entry is stored");
+        assert_eq!(mem.edge_delta_count(), 0);
+        assert_eq!(
+            mem.bytes(),
+            bytes_before,
+            "a no-op tombstone charges no bytes (flush-size accounting stays true)"
+        );
+        assert_eq!(mem.born_count(), 0, "it allocates no born id");
+        assert!(mem.tombstoned_ids().is_empty(), "it suppresses nothing");
+
+        // The published snapshot agrees — this is the predicate the reader gates on.
+        let s = snap(mem, vec![]);
+        assert!(s.is_empty(), "the snapshot's fast-path predicate holds");
+        assert_eq!(s.node_delta_count(), 0);
+        assert!(s.effective_tombstoned_ids().is_empty());
+    }
+
+    #[test]
+    fn noop_tombstone_guard_does_not_swallow_real_deletes() {
+        // The guard keys off "resolves to no dense id anywhere", so every delete that
+        // *does* resolve must still tombstone exactly as before — and a no-op delete
+        // beside them must not perturb them or the edge deltas (the topology overlay
+        // suppresses a deleted node's incident edges off `tombstoned`, so an over- or
+        // under-populated suppressed set is a correctness bug, not just a perf one).
+        let mut mem = Memtable::with_synthetic_base(100);
+        // (a) a core-resolved key: tombstoned by dense id.
+        mem.delete_node("Person", "name", Value::Str("Alice".into()), Some(7));
+        // (b) a node born in this level: tombstoned by its synthetic id.
+        mem.upsert_node("Person", "name", Value::Str("Ann".into()), None, []);
+        mem.delete_node("Person", "name", Value::Str("Ann".into()), None);
+        // (c) an edge between two core nodes, tombstoned.
+        mem.delete_edge(
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Carol".into()),
+            Some(1),
+            Some(2),
+        );
+        // (d) the no-op: a key that exists nowhere.
+        mem.delete_node("Person", "name", Value::Str("Ghost".into()), None);
+
+        assert!(!mem.is_empty());
+        assert_eq!(
+            mem.node_delta_count(),
+            2,
+            "the core-resolved delete and the born delete — the ghost adds nothing"
+        );
+        assert_eq!(mem.edge_delta_count(), 1, "the edge tombstone is untouched");
+        let mut ids = mem.tombstoned_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![7, 100], "core dense 7 and born synthetic 100");
+
+        let s = snap(mem, vec![]);
+        assert!(s.is_tombstoned(7), "the core node is still deleted");
+        assert!(s.is_tombstoned(100), "the born node is still deleted");
+        assert!(!s.is_tombstoned(1), "an untouched core node is not");
+        assert!(
+            s.node_patch(7).expect("core tombstone").tombstoned,
+            "the core delete still carries its tombstone"
+        );
     }
 
     #[test]

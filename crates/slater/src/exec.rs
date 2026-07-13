@@ -12094,6 +12094,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// HIK-77. A `DELETE` of a business key that exists nowhere is a no-op, and must
+    /// leave the **delta empty** — because an empty delta is what gates the metadata
+    /// fast paths. This asserts the fast path is *still taken* (the gated recogniser
+    /// returns `Some`, i.e. the answer comes from resident metadata with no block reads),
+    /// not merely that the count happens to be numerically right — the matcher would
+    /// return the same numbers while scanning the graph, which at 91.6M nodes is the
+    /// known OOM shape.
+    #[test]
+    fn noop_node_delete_keeps_the_metadata_fast_path_engaged() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, gen) = meta_gen("meta_noop_delete");
+        let cache = BlockCache::new(1 << 20);
+        // A labelled-endpoint schema-cube shape: `try_reltype_meta_fast_path` answers it
+        // from the resident marginals over a pure core, and **declines** (⇒ full matcher)
+        // the moment the delta is non-empty. So "did it return `Some`?" is exactly "was
+        // the fast path taken?".
+        let ast = parser::parse("MATCH (:Person)-[r]->() RETURN type(r) AS t, count(*) AS c")
+            .expect("parse");
+
+        // Truth: the same query over the pure core, fast-pathed.
+        let core_view = MergedView::read_only(&gen);
+        let want = Engine::new(&core_view, &cache)
+            .try_reltype_meta_fast_path(&ast.head)
+            .unwrap()
+            .expect("the fast path answers this shape over a pure core");
+
+        // A delta holding *only* a delete of a key that exists nowhere.
+        let mut mem = Memtable::new();
+        mem.delete_node("Person", "name", Value::Str("Nobody".into()), None);
+        let (mem_empty, mem_deltas) = (mem.is_empty(), mem.node_delta_count());
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let eng = Engine::new(&view, &cache);
+
+        // The load-bearing assertion: the recogniser still answers, so the query is still
+        // served from resident metadata rather than falling through to the matcher.
+        let got = eng
+            .try_reltype_meta_fast_path(&ast.head)
+            .unwrap()
+            .expect("the metadata fast path must still be engaged after a no-op DELETE");
+        assert_eq!(rows_disp(&got), rows_disp(&want), "same resident answer");
+        // Why it stays engaged: the no-op tombstone stored nothing, so the delta — the
+        // reader's fast-path predicate — is still empty.
+        assert!(mem_empty, "a no-op tombstone leaves the memtable empty");
+        assert_eq!(mem_deltas, 0, "…and stores no phantom node entry");
+        assert!(
+            view.delta().is_empty(),
+            "the reader's fast-path predicate still holds after a no-op DELETE"
+        );
+        // …and the query as a whole still answers correctly.
+        assert_eq!(rows_disp(&eng.run(&ast).unwrap()), rows_disp(&want));
+
+        // Control: a delete that *does* resolve populates the delta, and the same
+        // recogniser then declines — so the assertion above is genuinely sensitive to
+        // delta emptiness (it fails on the pre-fix `delete_node`, which stored a phantom
+        // entry for `Nobody`). The real delete also still tombstones its node, so the
+        // topology overlay keeps suppressing its incident edges.
+        let mut mem = Memtable::new();
+        mem.delete_node("Admin", "name", Value::Str("Carol".into()), Some(2));
+        let live = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        assert!(
+            !live.delta().is_empty(),
+            "a real delete populates the delta"
+        );
+        assert!(live.delta().is_tombstoned(2), "and suppresses node 2");
+        assert!(
+            Engine::new(&live, &cache)
+                .try_reltype_meta_fast_path(&ast.head)
+                .unwrap()
+                .is_none(),
+            "over a live delta the labelled-endpoint cube declines — the gate this test guards"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn meta_order_by_skip_limit() {
         // A trailing ORDER BY / SKIP / LIMIT is applied to the finished metadata rows,
