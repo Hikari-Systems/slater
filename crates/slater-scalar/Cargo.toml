@@ -14,3 +14,4 @@ license.workspace = true
 graph-format.workspace = true
 anyhow.workspace = true
 serde.workspace = true
+thiserror.workspace = true
