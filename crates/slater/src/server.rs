@@ -2131,6 +2131,12 @@ impl Failure {
         let m = e.to_string();
         let code = if e.downcast_ref::<parser::WriteClauseRejected>().is_some() {
             CODE_ACCESS_MODE
+        } else if e.downcast_ref::<parser::QueryTooDeep>().is_some() {
+            // A query rejected for nesting past the parser's depth bound is malformed
+            // input, not a failed execution — same class as a syntax error (GQL 42000).
+            // Classified by *type*: the depth guards run before the text ever reaches
+            // pest, so there is no "syntax error" prefix on the message to match.
+            CODE_SYNTAX
         } else if m.contains("syntax error") {
             CODE_SYNTAX
         } else {
