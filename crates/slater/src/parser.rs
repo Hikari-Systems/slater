@@ -1839,14 +1839,18 @@ fn lower_for_clause(pair: Pair<Rule>) -> Result<UnwindClause> {
 }
 
 fn lower_with_clause(pair: Pair<Rule>) -> Result<WithClause> {
-    let distinct = has_keyword(&pair, "distinct");
+    // DISTINCT comes from the captured `kw_distinct` token, never from the clause
+    // text: `WITH n.x AS distinct` projects one column, it does not de-duplicate.
+    let mut distinct = false;
     let mut body = None;
     let mut where_ = None;
     for child in pair.into_inner() {
         match child.as_rule() {
+            Rule::kw_with => {}
+            Rule::kw_distinct => distinct = true,
             Rule::projection_body => body = Some(lower_projection_body(child)?),
             Rule::where_clause => where_ = Some(lower_expr(only_child(child)?)?),
-            _ => {}
+            other => bail!("internal: unexpected with_clause child {other:?}"),
         }
     }
     Ok(WithClause {
@@ -1857,14 +1861,20 @@ fn lower_with_clause(pair: Pair<Rule>) -> Result<WithClause> {
 }
 
 fn lower_return_clause(pair: Pair<Rule>) -> Result<ReturnClause> {
-    let distinct = has_keyword(&pair, "distinct");
-    let body = pair
-        .into_inner()
-        .find(|p| p.as_rule() == Rule::projection_body)
-        .ok_or_else(|| anyhow::anyhow!("RETURN without projection"))?;
+    // As in `lower_with_clause`: only a `kw_distinct` token sets the flag.
+    let mut distinct = false;
+    let mut body = None;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::kw_return => {}
+            Rule::kw_distinct => distinct = true,
+            Rule::projection_body => body = Some(lower_projection_body(child)?),
+            other => bail!("internal: unexpected return_clause child {other:?}"),
+        }
+    }
     Ok(ReturnClause {
         distinct,
-        body: lower_projection_body(body)?,
+        body: body.ok_or_else(|| anyhow::anyhow!("RETURN without projection"))?,
     })
 }
 
@@ -2718,23 +2728,29 @@ fn lower_primary(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn lower_function(pair: Pair<Rule>) -> Result<Expr> {
-    let distinct = has_keyword(&pair, "distinct");
-    let mut iter = pair.into_inner();
-    let name = ident_text(iter.next().unwrap())?;
+    // `function_call = { func_name ~ "(" ~ kw_distinct? ~ (func_arg ~ ("," ~ func_arg)*)? ~ ")" }`.
+    // The aggregate DISTINCT flag is the captured `kw_distinct` token: an argument
+    // that merely mentions the word — `count(n.tag = 'distinct')` — is not distinct.
+    let mut distinct = false;
+    let mut name = None;
     let mut args = Vec::new();
     let mut star = false;
-    for a in iter {
-        if a.as_rule() != Rule::func_arg {
-            continue;
-        }
-        let inner = only_child(a)?;
-        match inner.as_rule() {
-            Rule::star_arg => star = true,
-            _ => args.push(lower_expr(inner)?),
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::func_name => name = Some(ident_text(child)?),
+            Rule::kw_distinct => distinct = true,
+            Rule::func_arg => {
+                let inner = only_child(child)?;
+                match inner.as_rule() {
+                    Rule::star_arg => star = true,
+                    _ => args.push(lower_expr(inner)?),
+                }
+            }
+            other => bail!("internal: unexpected function_call child {other:?}"),
         }
     }
     Ok(Expr::Function {
-        name,
+        name: name.ok_or_else(|| anyhow::anyhow!("internal: function call without a name"))?,
         distinct,
         args: if star {
             FuncArgs::Star
@@ -3088,14 +3104,6 @@ fn only_child(pair: Pair<Rule>) -> Result<Pair<Rule>> {
     kids(pair)
         .next()
         .ok_or_else(|| anyhow::anyhow!("expected a child rule"))
-}
-
-/// Whether `kw` appears as a standalone keyword in the (lowercased) matched text
-/// of `pair` — used for `DISTINCT` flags that the grammar does not capture.
-fn has_keyword(pair: &Pair<Rule>, kw: &str) -> bool {
-    pair.as_str()
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|w| w.eq_ignore_ascii_case(kw))
 }
 
 /// Extract an identifier's text, unquoting a backtick-escaped name if present.
@@ -4257,6 +4265,67 @@ mod tests {
             dirs("MATCH (n) RETURN n ORDER BY n.description, n.x DESC, n.y"),
             [SortDir::Asc, SortDir::Desc, SortDir::Asc]
         );
+    }
+
+    #[test]
+    fn distinct_comes_from_the_keyword_not_the_text() {
+        /// The RETURN clause's DISTINCT flag.
+        fn ret_distinct(q: &str) -> bool {
+            ok(q).head.ret.distinct
+        }
+        /// The first WITH clause's DISTINCT flag.
+        fn with_distinct(q: &str) -> bool {
+            ok(q)
+                .head
+                .reading
+                .iter()
+                .find_map(|c| match c {
+                    Clause::With(w) => Some(w.distinct),
+                    _ => None,
+                })
+                .expect("query has a WITH clause")
+        }
+        /// The DISTINCT flag of the function call projected as the first RETURN item.
+        fn func_distinct(q: &str) -> bool {
+            match &ok(q).head.ret.body.items[0].expr {
+                Expr::Function { distinct, .. } => *distinct,
+                other => panic!("expected a function call, got {other:?}"),
+            }
+        }
+
+        // The bare word `distinct` inside a clause — as an alias, a string literal,
+        // or a property name — must not de-duplicate. All of these dedup'd before.
+        assert!(!ret_distinct("MATCH (n) RETURN n.name AS distinct"));
+        assert!(!ret_distinct(
+            "MATCH (n) RETURN n.name, 'these are distinct' AS note"
+        ));
+        assert!(!ret_distinct("MATCH (n) RETURN n.distinct AS d"));
+        assert!(!ret_distinct("MATCH (n) RETURN n.tag = 'distinct' AS d"));
+        assert!(!with_distinct(
+            "MATCH (n) WITH n.x AS distinct, n AS m WHERE distinct > 1 RETURN m"
+        ));
+        assert!(!func_distinct(
+            "MATCH (n) RETURN count(n.tag = 'distinct') AS c"
+        ));
+
+        // A name that merely *embeds* the word is likewise untouched. (The old text
+        // scan word-matched, so this case was already safe — pin it so it stays so.)
+        assert!(!ret_distinct("MATCH (n) RETURN n.distinct_id AS d"));
+
+        // The real keyword still sets the flag, at every level.
+        assert!(ret_distinct("MATCH (n) RETURN DISTINCT n.name"));
+        assert!(with_distinct("MATCH (n) WITH DISTINCT n RETURN n"));
+        assert!(func_distinct(
+            "MATCH (n) RETURN count(DISTINCT n.name) AS c"
+        ));
+        // …and the two flags are independent: an aggregate DISTINCT does not make the
+        // projection DISTINCT, and vice versa.
+        assert!(!ret_distinct(
+            "MATCH (n) RETURN count(DISTINCT n.name) AS c"
+        ));
+        assert!(!func_distinct(
+            "MATCH (n) RETURN DISTINCT count(n.name) AS c"
+        ));
     }
 
     #[test]
