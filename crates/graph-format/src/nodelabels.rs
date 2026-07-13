@@ -134,24 +134,17 @@ impl NodeLabelsWriter {
         target_block_bytes: usize,
         zstd_level: i32,
         cipher: Option<Arc<BlockCipher>>,
-        label_alphabet: usize,
+        _label_alphabet: usize,
     ) -> Result<Self> {
-        if !use_bitmask(label_alphabet) {
-            return Self::create_with_cipher(path, target_block_bytes, zstd_level, cipher);
-        }
-        Ok(Self {
-            // Raw container: a bitmask record is already the queryable form; a zstd pass would be
-            // a ~1.0× tax paid on every fault. `zstd_level` is ignored under Raw.
-            inner: BlockFileWriter::create_with_codec(
-                path,
-                target_block_bytes,
-                BlockCodec::Raw,
-                zstd_level,
-                cipher,
-            )?,
-            next: 0,
-            bitmask: true,
-        })
+        // v7: always varint+zstd. The v6 "u64 bitmask in a Raw container" mode (selected for a
+        // small alphabet) was decompress-free but a net size regression: on a single-label graph
+        // it stored a constant column at a flat 8 bytes/node **uncompressed** — measured 120 MB
+        // at 10M nodes, ~1.1 GB at 91.6M — where varint+zstd is 26 MB / ~240 MB (4.5× smaller,
+        // and the pre-v6 size). The masks are not uniform enough for the Raw form to pay off, and
+        // label predicates are answered from the resident metadata fast path anyway, so the
+        // decompress-free read bought nothing. The reader's bitmask decode path is retained for
+        // API stability but now never triggers — every store is a zstd container.
+        Self::create_with_cipher(path, target_block_bytes, zstd_level, cipher)
     }
 
     /// Append one node's label-id list; returns its dense node id. Encodes in the writer's mode.
@@ -308,9 +301,10 @@ mod tests {
     }
 
     #[test]
-    fn node_labels_roundtrip_bitmask() {
-        let path = tmp("roundtrip_bitmask");
-        // Small alphabet ⇒ bitmask mode (Raw container). Includes id 63, the top bit.
+    fn node_labels_small_alphabet_uses_varint() {
+        // v7: create_for_alphabet always builds a varint+zstd store (the bitmask-Raw mode was a
+        // net regression). A small alphabet must still round-trip — via varint, not bitmask.
+        let path = tmp("small_alphabet_varint");
         let mut w = NodeLabelsWriter::create_for_alphabet(&path, 1024, 3, None, 64).unwrap();
         let nodes: Vec<Vec<u32>> = vec![vec![0, 1], vec![], vec![2], vec![0, 2, 3], vec![63]];
         for (i, ls) in nodes.iter().enumerate() {
@@ -319,13 +313,13 @@ mod tests {
         w.finish().unwrap();
 
         let r = NodeLabelsReader::open(&path).unwrap();
-        assert!(r.bitmask(), "Raw container ⇒ bitmask mode");
+        assert!(!r.bitmask(), "v7 always varint+zstd (never bitmask-Raw)");
         assert_eq!(r.len(), nodes.len() as u64);
         for (i, ls) in nodes.iter().enumerate() {
             assert_eq!(&r.labels(i as u64).unwrap(), ls, "node {i}");
         }
-        // append_blob from a pass-1 varint blob lands the same mask.
-        let path2 = tmp("roundtrip_blob");
+        // append_blob from a pass-1 varint blob round-trips too (a byte-copy in varint mode).
+        let path2 = tmp("varint_blob");
         let mut w2 = NodeLabelsWriter::create_for_alphabet(&path2, 1024, 3, None, 10).unwrap();
         for ls in &nodes {
             if ls.iter().all(|&l| l < 10) {
@@ -334,7 +328,7 @@ mod tests {
         }
         w2.finish().unwrap();
         let r2 = NodeLabelsReader::open(&path2).unwrap();
-        assert!(r2.bitmask());
+        assert!(!r2.bitmask());
         let mut j = 0;
         for ls in &nodes {
             if ls.iter().all(|&l| l < 10) {
