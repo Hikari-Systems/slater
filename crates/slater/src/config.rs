@@ -308,6 +308,22 @@ pub struct ServerConfig {
     /// 0 = unlimited.
     #[serde(default = "default_max_auth_failures", deserialize_with = "de::usize")]
     pub max_auth_failures: usize,
+    /// Cap on write statements **executing at once**. A write resolves business keys
+    /// against the core (ISAM `pread` + decompress, and a network round-trip on a remote
+    /// backend), materialises adjacency, then appends to the WAL and fsyncs — so it runs
+    /// on a blocking thread, never on a reactor worker. Every mutation of one graph is
+    /// then serialised behind that graph's single `DeltaWriter` lock, so permits beyond a
+    /// small handful buy nothing but blocking-pool threads parked on a mutex — which is
+    /// the starvation this cap exists to prevent, since query execution runs on the same
+    /// pool. A few permits still pay for themselves: key resolution happens *outside* the
+    /// writer lock, and separate graphs have separate writers. 0 = unlimited (do not: a
+    /// write flood would then fill the blocking pool with threads waiting on the writer
+    /// lock and reads would queue behind them).
+    #[serde(
+        default = "default_max_concurrent_writes",
+        deserialize_with = "de::usize"
+    )]
+    pub max_concurrent_writes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -758,6 +774,9 @@ fn default_max_concurrent_auth() -> usize {
 }
 fn default_max_auth_failures() -> usize {
     3 // a fat-fingered password is retried, a credential-stuffer is hung up on
+}
+fn default_max_concurrent_writes() -> usize {
+    4 // enough to pipeline key resolution against the writer lock, far below the pool
 }
 fn default_log_level() -> String {
     // `info` already surfaces the per-query `query executed` timing summary (the
@@ -1279,6 +1298,15 @@ mod tests {
             "unbounded by default would be a DoS"
         );
         assert!(cfg.max_concurrent_auth < cfg.max_blocking_threads.max(512));
+        // Write execution is bounded by default too: writes run on the same blocking pool
+        // as queries and serialise behind one writer lock per graph, so an unbounded
+        // flood would park the pool on a mutex and reads would queue behind it.
+        assert_eq!(cfg.max_concurrent_writes, 4);
+        assert!(
+            cfg.max_concurrent_writes > 0,
+            "unbounded by default would starve the blocking pool that reads share"
+        );
+        assert!(cfg.max_concurrent_writes < cfg.max_blocking_threads.max(512));
         // The TLS handshake is bounded by default and *more* tightly than the login
         // window it sits inside: a peer stalled mid-ClientHello holds a connection slot
         // while being invisible to every guard behind the handshake, so it must not be
@@ -1306,6 +1334,7 @@ mod tests {
             "maxConnectionsPerIp": 2,
             "maxConcurrentAuth": 2,
             "maxAuthFailures": 5,
+            "maxConcurrentWrites": 3,
         }))
         .unwrap();
         let from_str: ServerConfig = serde_json::from_value(serde_json::json!({
@@ -1319,6 +1348,7 @@ mod tests {
             "maxConnectionsPerIp": "2",
             "maxConcurrentAuth": "2",
             "maxAuthFailures": "5",
+            "maxConcurrentWrites": "3",
         }))
         .unwrap();
         for cfg in [&from_num, &from_str] {
@@ -1332,6 +1362,7 @@ mod tests {
             assert_eq!(cfg.max_connections_per_ip, 2);
             assert_eq!(cfg.max_concurrent_auth, 2);
             assert_eq!(cfg.max_auth_failures, 5);
+            assert_eq!(cfg.max_concurrent_writes, 3);
         }
     }
 }

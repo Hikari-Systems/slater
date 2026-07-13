@@ -19,7 +19,11 @@
 //! - **Execution runs on `spawn_blocking`** (the planner/executor and its `pread`s
 //!   are synchronous), and the rows are encoded to `PsValue` *inside* that blocking
 //!   task so all storage IO — including resolving a returned node's labels and
-//!   properties — stays off the async reactor.
+//!   properties — stays off the async reactor. **Writes** are no exception (their key
+//!   resolution, adjacency materialisation and WAL append+fsync are just as blocking):
+//!   they go to the same pool via [`execute_write_off_reactor`], under the
+//!   `server.maxConcurrentWrites` cap that keeps a write flood — serialised behind one
+//!   writer lock per graph — from swallowing the pool that queries share.
 //! - **Buffered streaming.** `RUN` executes and buffers the (already `max_rows`-
 //!   bounded) result, replying `SUCCESS {fields}`; the following `PULL` drains the
 //!   buffer as `RECORD`s then a final `SUCCESS {has_more}`. Pull-time `n` is honoured.
@@ -1591,6 +1595,12 @@ struct ConnCtx {
     /// Failed `LOGON`s one connection may make before it is closed
     /// (`server.maxAuthFailures`); 0 = unlimited.
     max_auth_failures: usize,
+    /// Budget for write statements **executing at once** (`server.maxConcurrentWrites`).
+    /// A RUN takes a permit before it hands the write to a blocking thread and holds it
+    /// until the write actually finishes, so a write flood can neither wedge a reactor
+    /// worker nor swamp the blocking pool that query execution runs on. See
+    /// [`execute_write_off_reactor`].
+    write_limit: Arc<Semaphore>,
     /// Live per-source connection counts (key: /32 for IPv4, /64 for IPv6).
     per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// Per-source concurrent-connection cap; 0 = unlimited.
@@ -2528,6 +2538,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             cfg.server.max_concurrent_auth,
         ))),
         max_auth_failures: cfg.server.max_auth_failures,
+        write_limit: Arc::new(Semaphore::new(semaphore_permits(
+            cfg.server.max_concurrent_writes,
+        ))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: cfg.server.max_connections_per_ip,
         diag: Arc::new(crate::diag::Diagnostics::new(cfg.load_test_diagnostics)),
@@ -2565,6 +2578,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_connections_per_ip = cfg.server.max_connections_per_ip,
         max_concurrent_auth = cfg.server.max_concurrent_auth,
         max_auth_failures = cfg.server.max_auth_failures,
+        max_concurrent_writes = cfg.server.max_concurrent_writes,
         login_timeout_ms = cfg.server.login_timeout_ms,
         tls_handshake_timeout_ms = cfg.server.tls_handshake_timeout_ms,
         "slater Bolt listener ready"
@@ -3423,18 +3437,41 @@ async fn handle_request(
                     // A `read` grant selected the graph; mutating it needs `write` too.
                     authorize_statement(&ctx.acl.snapshot(), &user, &graph, &stmt)?;
                     match stmt {
+                        // The three write shapes all execute off the reactor, under the
+                        // `maxConcurrentWrites` cap — see `execute_write_off_reactor`.
                         parser::ast::Statement::Write(stmt) => {
-                            let out = execute_write(w, gen.as_ref(), &stmt, &param_vals)?;
+                            let out = execute_write_off_reactor(
+                                ctx,
+                                w,
+                                &gen,
+                                WriteJob::Node(Box::new(stmt)),
+                                param_vals,
+                            )
+                            .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
                             out
                         }
                         parser::ast::Statement::Create(stmt) => {
-                            let out = execute_create(w, gen.as_ref(), &stmt, &param_vals)?;
+                            let out = execute_write_off_reactor(
+                                ctx,
+                                w,
+                                &gen,
+                                WriteJob::Create(stmt),
+                                param_vals,
+                            )
+                            .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
                             out
                         }
                         parser::ast::Statement::WriteEdge(stmt) => {
-                            let out = execute_edge_write(w, gen.as_ref(), &stmt, &param_vals)?;
+                            let out = execute_write_off_reactor(
+                                ctx,
+                                w,
+                                &gen,
+                                WriteJob::Edge(stmt),
+                                param_vals,
+                            )
+                            .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
                             out
                         }
@@ -3981,6 +4018,99 @@ fn delete_has_relationships_error() -> Failure {
          relationships, use DETACH DELETE."
             .into(),
     )
+}
+
+/// One parsed write statement, ready to execute. The three write shapes differ only in
+/// which `execute_*` they dispatch to; carrying them in one owned enum lets a single
+/// helper move any of them onto a blocking thread.
+enum WriteJob {
+    /// Boxed: a `WriteStmt` is much the biggest of the three, and every `WriteJob` is
+    /// moved into a blocking task.
+    Node(Box<parser::ast::WriteStmt>),
+    Create(parser::ast::CreateStmt),
+    Edge(parser::ast::EdgeWriteStmt),
+}
+
+impl WriteJob {
+    /// Run the write. Called on a blocking thread, never on the reactor.
+    fn run(
+        self,
+        writer: &Arc<DeltaWriter>,
+        gen: &Generation,
+        params: &HashMap<String, Val>,
+    ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+        match self {
+            WriteJob::Node(stmt) => execute_write(writer, gen, &stmt, params),
+            WriteJob::Create(stmt) => execute_create(writer, gen, &stmt, params),
+            WriteJob::Edge(stmt) => execute_edge_write(writer, gen, &stmt, params),
+        }
+    }
+}
+
+/// Execute one write statement **off the reactor**, under a concurrency cap.
+///
+/// A write is not cheap and it is not pure CPU: it resolves business keys against the
+/// core (ISAM `pread` + zstd decompress — a network round trip on an S3/GCS backend),
+/// materialises adjacency, then appends to the WAL and **fsyncs**. Running that inline in
+/// the async `handle_request` — as the three RUN write arms did — parks a tokio *reactor*
+/// worker for the whole of it, so one slow write stalls every other connection that
+/// worker is driving and a handful of concurrent writes deafen the server entirely. Read
+/// execution ([`run_query`]), consolidation and the delta-maintenance rungs have always
+/// been on `spawn_blocking`; the write arms were the odd ones out (module doc, top of
+/// file). So:
+///
+/// * the whole statement — resolve, adjacency, WAL append, fsync — moves to a blocking
+///   thread, leaving the reactor free to keep driving every other connection's IO;
+/// * `write_limit` caps how many writes execute **at once**. The cap is the point, not a
+///   detail: every mutation of one graph is serialised behind that graph's single
+///   [`DeltaWriter`] lock, so a bare `spawn_blocking` would merely relocate the problem —
+///   a write flood would hand tokio's 512-thread blocking pool an unbounded queue of
+///   tasks that immediately park on a mutex they cannot get, and *read queries, which run
+///   on that same pool*, would starve behind them. A small cap keeps the pool free.
+///   Permits above a handful buy nothing anyway (they only queue on the writer lock); the
+///   handful that is there pays for itself because key resolution — the expensive,
+///   IO-bound part — happens *outside* the lock, and separate graphs have separate
+///   writers. Waiters park asynchronously: no thread, no reactor worker, and their number
+///   is bounded by `server.maxConnections` (a writer is authenticated by construction);
+/// * the permit is moved **into** the blocking closure, so it is released when the write
+///   actually finishes rather than when a hung-up client cancels the await (a cancelled
+///   `spawn_blocking` still runs to completion — releasing the permit early would let a
+///   client who disconnects mid-write overrun the cap).
+///
+/// Write ordering is unaffected: one connection's requests are handled strictly in
+/// sequence, and the order in which concurrent connections' writes land was — and still
+/// is — decided by the single writer lock, not by this gate.
+///
+/// A panicked or aborted write task **fails closed**: the caller reports a failure, never
+/// a SUCCESS. Durability is unchanged — the ack is still written only after
+/// `DeltaWriter`'s fsync has returned.
+async fn execute_write_off_reactor(
+    ctx: &Arc<ConnCtx>,
+    writer: &Arc<DeltaWriter>,
+    gen: &Arc<Generation>,
+    job: WriteJob,
+    params: HashMap<String, Val>,
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    let permit = ctx
+        .write_limit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Failure::new(CODE_EXECUTION, "server is shutting down".into()))?;
+
+    let writer = writer.clone();
+    let gen = gen.clone();
+    tokio::task::spawn_blocking(move || {
+        // Held until the write is done, not until the caller stops waiting for it.
+        let _permit = permit;
+        job.run(&writer, gen.as_ref(), &params)
+    })
+    .await
+    .map_err(|e| {
+        // A panicked/aborted write is not acknowledged: the client is told it failed.
+        warn!(error = %e, "write task did not complete");
+        Failure::new(CODE_EXECUTION, "the write did not complete".into())
+    })?
 }
 
 /// Execute one durable write: build the WAL op sequence from the parsed statement +
@@ -12383,6 +12513,7 @@ mod tests {
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
             auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
             max_auth_failures: 3,
+            write_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: 0,
             diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -12493,6 +12624,10 @@ mod tests {
         max_per_ip: usize,
         max_concurrent_auth: usize,
         max_auth_failures: usize,
+        max_concurrent_writes: usize,
+        /// Turn the writable layer on for the fixture graph (WAL under `<root>/_wal`), so
+        /// the ctx has a `DeltaWriter` and the RUN write arms are reachable.
+        writable: bool,
         load_test_diagnostics: bool,
     }
 
@@ -12508,6 +12643,8 @@ mod tests {
                 max_per_ip: 0,                // unlimited by default
                 max_concurrent_auth: 4,       // as in prod
                 max_auth_failures: 3,         // as in prod
+                max_concurrent_writes: 4,     // as in prod
+                writable: false,              // read-only unless a test asks for writes
                 load_test_diagnostics: false, // diagnostics off by default, as in prod
             }
         }
@@ -12521,7 +12658,13 @@ mod tests {
         let (root, _graph, _) = testgen::write_basic(tag);
         let acl_path = write_acl(&root);
         let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
-        let graphs = Arc::new(Graphs::open_all(&root, None).unwrap());
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        if limits.writable {
+            graphs
+                .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+                .unwrap();
+        }
+        let graphs = Arc::new(graphs);
         let cache = Arc::new(BlockCache::new(1 << 20));
         let vector_cache = Arc::new(VectorIndexCache::new(1 << 20));
         for gen in graphs.current_generations() {
@@ -12562,6 +12705,9 @@ mod tests {
                 limits.max_concurrent_auth,
             ))),
             max_auth_failures: limits.max_auth_failures,
+            write_limit: Arc::new(Semaphore::new(semaphore_permits(
+                limits.max_concurrent_writes,
+            ))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: limits.max_per_ip,
             diag: Arc::new(crate::diag::Diagnostics::new(limits.load_test_diagnostics)),
@@ -12654,6 +12800,7 @@ mod tests {
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
             auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
             max_auth_failures: 3,
+            write_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: 0,
             diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -13871,6 +14018,243 @@ mod tests {
         assert_eq!(
             n, 0,
             "the connection should have been closed after 2 failed LOGONs"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A ctx whose fixture graph has the writable layer on, with an explicit
+    /// `maxConcurrentWrites` cap — the harness for the write-gate tests.
+    fn build_gated_write_ctx(tag: &str, max_concurrent_writes: usize) -> (PathBuf, Arc<ConnCtx>) {
+        build_ctx_limited(
+            tag,
+            TestLimits {
+                writable: true,
+                max_concurrent_writes,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A batched `UNWIND … MERGE … SET` over `rows` fresh business keys, prefixed by `tag`
+    /// so concurrent jobs never touch the same key. Batched on purpose: it is a *single*
+    /// write (one resolve sweep, one group commit, one fsync) that costs enough wall time
+    /// to be measured against, which is what the reactor-stall calibration needs.
+    fn batch_write_job(tag: &str, rows: usize) -> (WriteJob, HashMap<String, Val>) {
+        let list = Val::List(
+            (0..rows)
+                .map(|i| {
+                    Val::Map(vec![
+                        ("name".into(), Val::Str(format!("{tag}-{i}"))),
+                        ("age".into(), Val::Int(i as i64)),
+                    ])
+                })
+                .collect(),
+        );
+        let params = HashMap::from([("rows".to_string(), list)]);
+        let stmt = match parser::parse_statement(
+            "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => panic!("expected a node write"),
+        };
+        (WriteJob::Node(Box::new(stmt)), params)
+    }
+
+    /// Live node count over the core ⊕ delta — proof a write actually landed.
+    fn overlaid_node_count(ctx: &Arc<ConnCtx>, graph: &str) -> i64 {
+        let gen = ctx.graphs.get(graph).unwrap();
+        let writer = ctx.graphs.writer(graph).unwrap();
+        let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
+        let res = Engine::new(&view, ctx.cache.as_ref())
+            .run(&parser::parse("MATCH (n:Person) RETURN count(*)").unwrap())
+            .unwrap();
+        match res.rows[0][0] {
+            Val::Int(n) => n,
+            ref v => panic!("count is not an int: {v:?}"),
+        }
+    }
+
+    /// HIK-87 regression: write execution must not run on the reactor.
+    ///
+    /// `#[tokio::test]` is a **current-thread** runtime — the one place a blocked reactor is
+    /// directly observable. Spawned tasks only advance when the test yields, and a single
+    /// `yield_now()` gives every ready task exactly one poll. If the writes run inline (the
+    /// bug), that one trip through the scheduler costs FLOOD × one write — the whole server
+    /// is deaf for that long, every other connection on that worker included. With the write
+    /// handed to a blocking thread, each poll parks immediately and the reactor comes
+    /// straight back.
+    ///
+    /// The bound is calibrated against a *measured* write on this box and build profile
+    /// rather than a hard-coded millisecond, so it neither flakes on a slow machine nor
+    /// passes vacuously on a fast one.
+    #[tokio::test]
+    async fn writes_do_not_block_the_reactor() {
+        const FLOOD: usize = 8;
+        const ROWS: usize = 500;
+        let (root, ctx) = build_gated_write_ctx("server_writes_off_reactor", 4);
+        let gen = ctx.graphs.get("people").unwrap();
+        let writer = ctx.graphs.writer("people").expect("writable layer is on");
+
+        // Calibrate: what one write of this shape costs. Warm first — the first write mints
+        // the WAL segment and faults in the ISAM blocks the resolve sweeps.
+        let (job, params) = batch_write_job("warm", ROWS);
+        execute_write_off_reactor(&ctx, &writer, &gen, job, params)
+            .await
+            .unwrap();
+        let (job, params) = batch_write_job("calibrate", ROWS);
+        let t0 = Instant::now();
+        execute_write_off_reactor(&ctx, &writer, &gen, job, params)
+            .await
+            .unwrap();
+        let one_write = t0.elapsed();
+        assert!(
+            one_write >= Duration::from_millis(1),
+            "a {ROWS}-row group commit should cost real time; measured {one_write:?} — is the \
+             write actually resolving and fsyncing?"
+        );
+
+        // Build the jobs up front: parsing and materialising the rows is caller-side work,
+        // and it must not be confused with the execution we are timing.
+        let jobs: Vec<_> = (0..FLOOD)
+            .map(|i| batch_write_job(&format!("flood-{i}"), ROWS))
+            .collect();
+        let flood: Vec<_> = jobs
+            .into_iter()
+            .map(|(job, params)| {
+                let ctx = ctx.clone();
+                let writer = writer.clone();
+                let gen = gen.clone();
+                tokio::spawn(async move {
+                    execute_write_off_reactor(&ctx, &writer, &gen, job, params).await
+                })
+            })
+            .collect();
+
+        let t0 = Instant::now();
+        tokio::task::yield_now().await;
+        let reactor_stall = t0.elapsed();
+        assert!(
+            reactor_stall < one_write,
+            "the reactor was held for {reactor_stall:?} while {FLOOD} writes executed (one \
+             write = {one_write:?}) — write execution is running on a reactor worker"
+        );
+
+        // …and every write still committed: this is not a fast path that skipped the work.
+        for t in flood {
+            t.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            overlaid_node_count(&ctx, "people"),
+            3 + ((FLOOD + 2) * ROWS) as i64,
+            "3 fixture people + every row of the warm, calibration and flood batches"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The concurrency cap is what stops the fix from simply *moving* the denial of service
+    /// into tokio's 512-thread blocking pool — the pool query execution runs on. Writes to
+    /// one graph serialise behind that graph's single `DeltaWriter` lock, so an uncapped
+    /// `spawn_blocking` would hand the pool an unbounded queue of tasks that immediately
+    /// park on a mutex, and reads would starve behind them.
+    ///
+    /// While a flood is in flight no permit is left; once it drains every permit is back —
+    /// and every write committed, in one graph's serialised order.
+    #[tokio::test]
+    async fn concurrent_writes_are_capped() {
+        const FLOOD: usize = 6;
+        const CAP: usize = 2;
+        const ROWS: usize = 500;
+        let (root, ctx) = build_gated_write_ctx("server_writes_capped", CAP);
+        assert_eq!(ctx.write_limit.available_permits(), CAP);
+        let gen = ctx.graphs.get("people").unwrap();
+        let writer = ctx.graphs.writer("people").expect("writable layer is on");
+
+        let jobs: Vec<_> = (0..FLOOD)
+            .map(|i| batch_write_job(&format!("capped-{i}"), ROWS))
+            .collect();
+        let flood: Vec<_> = jobs
+            .into_iter()
+            .map(|(job, params)| {
+                let ctx = ctx.clone();
+                let writer = writer.clone();
+                let gen = gen.clone();
+                tokio::spawn(async move {
+                    execute_write_off_reactor(&ctx, &writer, &gen, job, params).await
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ctx.write_limit.available_permits(),
+            0,
+            "every write permit should be in use while a flood is queued"
+        );
+
+        for t in flood {
+            t.await.unwrap().unwrap();
+        }
+        // The cap is fully released once the flood drains — the permit lives with the write,
+        // not with the caller — and no write was lost to the gate.
+        assert_eq!(ctx.write_limit.available_permits(), CAP);
+        assert_eq!(
+            overlaid_node_count(&ctx, "people"),
+            3 + (FLOOD * ROWS) as i64,
+            "every capped write committed its whole batch"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `spawn_blocking` task cannot be cancelled: if the client hangs up mid-write, the
+    /// await on the join handle is dropped but the write runs to completion — as it must,
+    /// since its WAL append and fsync may already have happened (we never un-commit a
+    /// durable write; we simply never get to ack it).
+    ///
+    /// So the permit is moved *into* the closure. Held in the async frame instead, it would
+    /// be released the instant the caller was cancelled while the write still ran — and a
+    /// flood of clients that disconnect mid-write could overrun the cap at will, which is
+    /// exactly the blocking-pool starvation the cap exists to prevent.
+    #[tokio::test]
+    async fn an_abandoned_write_holds_its_permit_and_still_commits() {
+        const ROWS: usize = 2_000;
+        const CAP: usize = 2;
+        let (root, ctx) = build_gated_write_ctx("server_write_abandoned", CAP);
+        let gen = ctx.graphs.get("people").unwrap();
+        let writer = ctx.graphs.writer("people").expect("writable layer is on");
+
+        let (job, params) = batch_write_job("abandoned", ROWS);
+        let task = {
+            let ctx = ctx.clone();
+            let writer = writer.clone();
+            let gen = gen.clone();
+            tokio::spawn(async move {
+                execute_write_off_reactor(&ctx, &writer, &gen, job, params).await
+            })
+        };
+        // One poll: the permit is taken and the write is handed to the blocking pool.
+        tokio::task::yield_now().await;
+        assert_eq!(ctx.write_limit.available_permits(), CAP - 1);
+
+        // The client hangs up: the caller is cancelled, the write is not.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            ctx.write_limit.available_permits(),
+            CAP - 1,
+            "an abandoned write must keep its permit while it is still running — releasing it \
+             at cancellation lets a hung-up client overrun the cap"
+        );
+
+        // It runs to completion and its rows are durable, permit released only then.
+        while ctx.write_limit.available_permits() < CAP {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            overlaid_node_count(&ctx, "people"),
+            3 + ROWS as i64,
+            "the abandoned write committed; a durable write is never rolled back because the \
+             client stopped listening"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
