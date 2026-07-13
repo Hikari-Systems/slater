@@ -9450,49 +9450,25 @@ fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 /// A uniform random `f64` in `[0, 1)` for `rand()`.
 ///
-/// Backed by a per-thread [SplitMix64] generator, seeded once per thread from
-/// the OS CSPRNG (`uuid`'s v4 generator, so no extra dependency). Each draw
-/// takes the top 53 bits of a 64-bit output word and divides by `2^53` — the
-/// standard construction for a uniformly distributed double in `[0, 1)`.
+/// `rand`'s `StandardUniform` for `f64` is exactly the construction this needs:
+/// 53 uniformly random bits scaled by `2^-53`, so the result is uniform over
+/// `[0, 1)` and **1.0 is unreachable** — which is what `rand()`'s contract, and
+/// the `(0.0..1.0)` assertion in `rand_is_uniform_over_unit_interval`, require.
 ///
-/// Do *not* go back to slicing bits straight out of a v4 UUID: its 128 bits are
-/// not all random. The version nibble (byte 6) and the RFC-4122 variant bits
-/// (top two bits of byte 8) are fixed. The previous implementation took the
-/// **low** 64 bits — which start at that variant byte — so after `>> 11` the two
-/// most-significant mantissa bits were always `1` then `0`, confining every draw
-/// to `[0.5, 0.75)` and making e.g. `WHERE rand() < 0.1` unsatisfiable.
+/// `rand::rng()` is a `ThreadRng`: a thread-local ChaCha12 CSPRNG seeded once
+/// from the OS, so a per-row `rand()` costs no entropy syscall and no lock.
 ///
-/// [SplitMix64]: https://dl.acm.org/doi/10.1145/2660193.2660195
+/// This deliberately owns no generator of its own. It used to (HIK-102 retired a
+/// hand-rolled SplitMix64), and before that it sliced bits straight out of a v4
+/// UUID — which is the bug worth remembering: a UUID's 128 bits are *not* all
+/// random. The version nibble (byte 6) and the RFC-4122 variant bits (top two of
+/// byte 8) are fixed. Taking the **low** 64 bits started at that variant byte, so
+/// after `>> 11` the two most-significant mantissa bits were always `1` then `0`,
+/// confining every draw to `[0.5, 0.75)` and making `WHERE rand() < 0.1`
+/// unsatisfiable (HIK-74). Do not reintroduce either shortcut.
 fn random_f64() -> f64 {
-    /// The SplitMix64 increment (odd; 2^64 / golden ratio).
-    const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-
-    std::thread_local! {
-        /// `None` until this thread's first draw seeds it from the OS CSPRNG.
-        static STATE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    }
-
-    let mut s = STATE.with(|state| {
-        let seeded = state.get().unwrap_or_else(|| {
-            // A v4 UUID carries 122 CSPRNG bits. Fold both halves together (with
-            // a rotation) so the fixed version/variant fields land on random bits
-            // rather than surviving into the seed.
-            let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
-            hi ^ lo.rotate_left(32)
-        });
-        // Advance the counter *before* mixing, so the seed itself is never emitted.
-        let next = seeded.wrapping_add(GAMMA);
-        state.set(Some(next));
-        next
-    });
-
-    // SplitMix64 finalizer (MurmurHash3-style avalanche).
-    s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    s ^= s >> 31;
-
-    // 53 uniformly random bits / 2^53 ⇒ uniform in [0, 1), never 1.0.
-    ((s >> 11) as f64) / ((1u64 << 53) as f64)
+    use rand::Rng as _;
+    rand::rng().random::<f64>()
 }
 
 /// Milliseconds since the Unix epoch for `timestamp()` (FalkorDB's `time_t`-ms).
