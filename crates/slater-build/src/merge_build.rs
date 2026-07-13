@@ -1063,6 +1063,17 @@ impl KeyProv {
 /// partition file is itself sorted by that key — exactly the "one" side the parallel
 /// per-partition merge-join in [`resolve_edges`] consumes. Returns the distinct-node
 /// count. (prov ids are still assigned in global identity order, so deterministic.)
+/// A node's full label set for emit: its identity `label` first, then the extra
+/// labels (from `SET n:Extra`) with the identity label filtered out. A dump that
+/// redundantly re-states the identity label as an extra (`MERGE (n:P {..}) SET n:P`)
+/// must not emit `P` twice, or `count(:P)` over-counts that node.
+fn union_node_labels(label: u32, extra: &std::collections::BTreeSet<u32>) -> Vec<u32> {
+    let mut all_labels = Vec::with_capacity(1 + extra.len());
+    all_labels.push(label);
+    all_labels.extend(extra.iter().copied().filter(|&l| l != label));
+    all_labels
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dedup_nodes(
     node_merge_bkt: &Path,
@@ -1138,9 +1149,7 @@ pub(crate) fn dedup_nodes(
                      prov: &mut u64|
      -> Result<()> {
         if let Some((label, key, value)) = cur.take() {
-            let mut all_labels = Vec::with_capacity(1 + extra.len());
-            all_labels.push(label);
-            all_labels.extend(extra.iter().copied());
+            let all_labels = union_node_labels(label, extra);
             extra.clear();
             nodes_w.append_node(&NodeRec {
                 dump_id: None,
@@ -1785,6 +1794,26 @@ fn cmp_key_triple(k: &KeyProv, ep: &EndpointRef) -> Ordering {
         .cmp(&ep.label)
         .then_with(|| k.key.cmp(&ep.key))
         .then_with(|| value_cmp_exact(&k.value, &ep.value))
+}
+
+#[cfg(test)]
+mod label_union_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn identity_label_is_never_duplicated_in_the_union() {
+        // Extra labels {2, 3} plus a redundant identity {1} → 1 appears once only.
+        let extra: BTreeSet<u32> = [1, 2, 3].into_iter().collect();
+        assert_eq!(union_node_labels(1, &extra), vec![1, 2, 3]);
+
+        // No redundancy: identity first, then the distinct extras (BTreeSet order).
+        let extra: BTreeSet<u32> = [2, 3].into_iter().collect();
+        assert_eq!(union_node_labels(1, &extra), vec![1, 2, 3]);
+
+        // Only the identity label.
+        assert_eq!(union_node_labels(7, &BTreeSet::new()), vec![7]);
+    }
 }
 
 #[cfg(test)]
