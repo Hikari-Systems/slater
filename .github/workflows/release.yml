@@ -111,11 +111,18 @@ jobs:
       - name: Install the nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      # One shared build cache across all matrix legs (and shared with
+      # fuzz-nightly.yml). Every target links the SAME instrumented dependency graph —
+      # only the final target binary differs — so a per-target key stored ~7 duplicate
+      # full builds and churned the 10 GB repo cache budget. `shared-key` gives one
+      # stable key for the whole matrix; the first leg to finish saves it, the rest
+      # restore the warm deps and just link their own binary. (The per-target *corpus*
+      # cache below is separate and stays keyed per target.)
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          key: ${{ matrix.target }}
+          shared-key: fuzz-build
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
