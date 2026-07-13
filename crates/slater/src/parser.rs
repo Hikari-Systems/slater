@@ -42,6 +42,73 @@ pub struct WriteClauseRejected {
     pub location: &'static str,
 }
 
+/// A query rejected for nesting too deeply to parse within the worker stack.
+///
+/// Both the pest parse and the AST lowering are recursive descent, so nesting in the
+/// *source* becomes stack frames. A Rust stack overflow is an **uncatchable abort** —
+/// one query would take the whole process down with every other tenant's connection —
+/// so the depth is bounded up front instead. Carried as a **typed** error, classified
+/// with `err.downcast_ref::<QueryTooDeep>()` rather than by message text.
+///
+/// The two `surface` values name the two guards; see [`MAX_SOURCE_NESTING`] and
+/// [`MAX_PARSE_TREE_DEPTH`] for why one is not enough.
+#[derive(Debug, thiserror::Error)]
+#[error("query is too deeply nested: {surface} depth {depth} exceeds the limit of {limit}")]
+pub struct QueryTooDeep {
+    /// The depth measured, in the units of `limit`.
+    pub depth: usize,
+    /// The limit that was exceeded.
+    pub limit: usize,
+    /// Which guard tripped: `"source"` (the pre-parse scan of the query text) or
+    /// `"structural"` (the post-parse walk of the parse tree).
+    pub surface: &'static str,
+}
+
+/// Cap on the nesting the **pre-parse source scan** ([`check_source_nesting`]) admits.
+///
+/// This one exists to protect *pest itself*: its generated parser is recursive descent
+/// and there is no hook to count frames inside it, so its only possible bound is on the
+/// text handed to it. Measured on a 2 MiB stack (the tokio worker default), pest alone
+/// aborts at nesting depth ~1024 in release and ~128 in debug; 64 keeps it inside both
+/// with a 2x margin on the worse (debug) profile.
+///
+/// It is deliberately *looser* than [`MAX_PARSE_TREE_DEPTH`], which is what actually
+/// bounds what a client can run: this scan is a lexical over-approximation (see
+/// [`check_source_nesting`] for why it must over-count `CASE`), so keeping it generous
+/// means the over-count never rejects a query the exact guard would have allowed.
+const MAX_SOURCE_NESTING: usize = 64;
+
+/// Cap on the depth of the **parse tree** ([`check_parse_tree_depth`]), and so on the
+/// recursion depth of the `lower_*` walk over it — the surface that overflows *first*
+/// (a 2 MiB stack aborts at nesting depth ~192 in release, ~48 in debug: the lowering
+/// costs ~5x more stack per level than the pest parse it consumes).
+///
+/// Counted in parse-tree levels, not source characters, because that is the currency
+/// the recursion is actually paid in. One level of source nesting descends the whole
+/// precedence chain (`expr → or_expr → … → primary → parens`, ~13 rules), so 400 admits
+/// **~28-30 levels of real nesting** (measured, across every nesting construct in the
+/// grammar) — 3x deeper than any hand-written query, and still 1.5x inside the worst
+/// (debug) ceiling.
+///
+/// Note the limit costs nothing for *long* queries, only *deeply nested* ones: the
+/// grammar spells operator chains, argument lists and `WHEN` branches as repetitions
+/// (`or_expr = { xor_expr ~ (kw_or ~ xor_expr)* }`, `not_op*`, `when_clause+`), so a
+/// 400-term `AND` chain, a 50-branch `CASE` and a 40-argument call are all depth 1.
+///
+/// It also has to stay **under `wire::MAX_VALUE_DEPTH` (256)**, the bound the property
+/// decoder refuses past (HIK-85). A literal in the query text can be persisted by
+/// `SET n.p = [[[…]]]`, and `write_value` is infallible: a nesting cap above the decode
+/// gate would let a client write a value the storage layer then refuses to read back.
+/// ~30 clears that by an order of magnitude, so the parser is the tighter gate — the
+/// safe direction.
+const MAX_PARSE_TREE_DEPTH: usize = 400;
+
+/// The parser is a *writer* into the property decoder's world, so it must never admit
+/// nesting the decoder would refuse — cf. the same assertion in `bolt::packstream`, the
+/// other gate on that path. A drift is a compile error rather than a class of value that
+/// can be written and never read back.
+const _: () = assert!(MAX_SOURCE_NESTING <= graph_format::wire::MAX_VALUE_DEPTH);
+
 /// Production-by-production conformance of `cypher.pest` against the openCypher
 /// reference grammar. Kept in its own file: it is a specification, not a unit test.
 #[cfg(test)]
@@ -681,10 +748,153 @@ use ast::*;
 /// Parse a read-only Cypher query into its AST. Errors on a syntax error or on a
 /// write/procedure clause (Slater is read-only).
 pub fn parse(input: &str) -> Result<Query> {
+    check_source_nesting(input)?;
     let mut pairs = CypherParser::parse(Rule::query, input)
         .map_err(|e| anyhow::anyhow!("syntax error: {e}"))?;
     let query = pairs.next().expect("query rule yields one pair");
+    check_parse_tree_depth(&query)?;
     lower_query(query)
+}
+
+/// Bound the nesting of the query *text*, before pest ever sees it.
+///
+/// Pest's generated parser is recursive descent over a grammar whose every recursive
+/// cycle back to `expr`/`pattern`/`label_expr`/`query` has to consume an opening `(`,
+/// `[` or `{` — **or the keyword `CASE`**, which is the one construct that nests with no
+/// bracket at all (`CASE WHEN CASE WHEN … END THEN … END`). Counting those four is
+/// therefore an upper bound on how deep pest can recurse, and the only bound available:
+/// generated code offers nowhere to hang a frame counter.
+///
+/// It must be an *over*-approximation, never an under-one, so it deliberately **never
+/// credits an `END` as closing a `CASE`**. `case` and `end` are legal identifiers here
+/// (the grammar dropped its `!reserved` guard so that `RETURN n.end` and `{limit: 1}`
+/// parse), so a scanner that popped on `END` would be trivially bypassable: in
+/// `CASE WHEN end THEN CASE WHEN end THEN …` every `end` is a *variable* in the `WHEN`
+/// expression, and crediting it would pin the counter near zero while the real parse
+/// depth — and the stack — grew without bound. Over-counting merely rejects a query with
+/// an implausible number of `CASE` keywords; under-counting would abort the process.
+///
+/// The exact depth is enforced afterwards, on the real parse tree, by
+/// [`check_parse_tree_depth`] — which is why this one can afford to be blunt.
+fn check_source_nesting(input: &str) -> Result<()> {
+    let mut depth = 0usize; // running `(`/`[`/`{` nesting
+    let mut cases = 0usize; // `CASE` keywords seen (never decremented; see above)
+    let mut max = 0usize;
+    let mut prev_significant = ' '; // last non-space char, to spot `.case` property keys
+
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Skip over anything whose contents are not grammar: a bracket inside a
+            // string or a comment is just a character.
+            '\'' | '"' => {
+                while let Some(s) = chars.next() {
+                    // `escape = @{ "\\" ~ ANY }` — a backslash escapes the next char, so
+                    // `'\''` is a one-character string, not an unterminated one.
+                    if s == '\\' {
+                        chars.next();
+                    } else if s == c {
+                        break;
+                    }
+                }
+            }
+            // `quoted_name = _{ ("`" ~ (!"`" ~ ANY)* ~ "`")+ }` — no escapes inside.
+            '`' => {
+                for s in chars.by_ref() {
+                    if s == '`' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for s in chars.by_ref() {
+                    if s == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut star = false;
+                for s in chars.by_ref() {
+                    if star && s == '/' {
+                        break;
+                    }
+                    star = s == '*';
+                }
+            }
+            '(' | '[' | '{' => depth += 1,
+            // Saturating: an unbalanced closer is a syntax error, pest's to report.
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            // A word: consume it whole so `case` only matches the keyword and never a
+            // prefix of `casement`, and so a digit run can't be mistaken for one.
+            _ if c.is_alphanumeric() || c == '_' => {
+                let mut word = String::from(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' {
+                        word.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // `n.case` is a property key, not a `CASE` expression.
+                if prev_significant != '.' && word.eq_ignore_ascii_case("case") {
+                    cases += 1;
+                }
+            }
+            _ => {}
+        }
+        if !c.is_whitespace() {
+            prev_significant = c;
+        }
+        max = max.max(depth + cases);
+    }
+
+    if max > MAX_SOURCE_NESTING {
+        return Err(QueryTooDeep {
+            depth: max,
+            limit: MAX_SOURCE_NESTING,
+            surface: "source",
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Bound the depth of the parse tree, and so the recursion depth of the `lower_*` walk
+/// about to descend it — the surface that overflows first.
+///
+/// Measured on the tree rather than the text, so no amount of keyword trickery can fool
+/// it (unlike [`check_source_nesting`], which has to guess at `CASE`), and no grammar
+/// rule can be forgotten: a nesting construct added to `cypher.pest` later is counted
+/// automatically, without anyone remembering to add it to a list here.
+///
+/// Walks **iteratively**, with an explicit stack — a recursive depth check would be the
+/// very stack overflow it exists to prevent.
+fn check_parse_tree_depth(root: &Pair<Rule>) -> Result<()> {
+    let mut stack = vec![root.clone().into_inner()];
+    let mut max = 1usize;
+    while let Some(top) = stack.last_mut() {
+        match top.next() {
+            Some(child) => {
+                stack.push(child.into_inner());
+                max = max.max(stack.len());
+                if max > MAX_PARSE_TREE_DEPTH {
+                    return Err(QueryTooDeep {
+                        depth: max,
+                        limit: MAX_PARSE_TREE_DEPTH,
+                        surface: "structural",
+                    }
+                    .into());
+                }
+            }
+            None => {
+                stack.pop();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse a statement that may be a read query **or** a writable-layer write
@@ -694,6 +904,10 @@ pub fn parse(input: &str) -> Result<Query> {
 /// calls this only when the writable layer is enabled; otherwise it calls
 /// [`parse`], which never yields a write.
 pub fn parse_statement(input: &str) -> Result<ast::Statement> {
+    // Both parse attempts below are recursive descent over the same grammar, so the
+    // source bound has to come first — `parse()` re-checks (it is also a public entry
+    // point), which costs one more linear scan of the text and nothing else.
+    check_source_nesting(input)?;
     // `CALL slater.consolidate()` — the Phase 5 consolidation trigger. Its own SOI/EOI
     // anchored rule, so a successful parse means the whole input is exactly that call.
     if CypherParser::parse(Rule::consolidate_call, input).is_ok() {
@@ -701,6 +915,9 @@ pub fn parse_statement(input: &str) -> Result<ast::Statement> {
     }
     if let Ok(mut pairs) = CypherParser::parse(Rule::write_statement, input) {
         let stmt = pairs.next().expect("write_statement rule yields one pair");
+        // The write lowering is recursive too (a SET value, a MERGE key, an UNWIND list
+        // are all `Expr`s), so it needs the same tree bound the read path gets.
+        check_parse_tree_depth(&stmt)?;
         // A relationship write (Phase 3c) parses to a single `edge_write` child; a CREATE
         // to a single `create_stmt`; the node write's tokens are inline. Dispatch on which.
         if let Some(edge) = kids(stmt.clone()).find(|c| c.as_rule() == Rule::edge_write) {
@@ -5232,5 +5449,268 @@ mod tests {
                 "expected deterministic: {q:?}"
             );
         }
+    }
+
+    // ── Nesting-depth bound (HIK-76) ────────────────────────────────────────────
+    //
+    // Both the pest parse and the `lower_*` walk are recursive descent, so nesting in
+    // the query text becomes stack frames. A Rust stack overflow is an *uncatchable
+    // abort*, so these cannot be written as `#[should_panic]`: without the guard the
+    // whole test binary dies (SIGABRT), taking the run with it. That is exactly the
+    // production failure — one query, every tenant's connection dropped — so the tests
+    // run the parse on a thread with the **2 MiB stack a tokio worker gets**, which is
+    // both the real budget and the reason a regression here can never pass silently.
+
+    /// Parse `q` on a 2 MiB stack, as the server would.
+    fn parse_on_worker_stack(q: String) -> Result<Query> {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse(&q))
+            .expect("spawn")
+            .join()
+            .expect("the parse must not overflow the stack")
+    }
+
+    /// The nesting constructs a query can recurse through — every arm of `primary` that
+    /// can contain an `expr`, plus the pattern and clause nestings. `CASE` earns its
+    /// place: it is the one construct that nests with **no bracket at all**.
+    fn nested(kind: &str, depth: usize) -> String {
+        let mut s = "1".to_string();
+        for _ in 0..depth {
+            s = match kind {
+                "parens" => format!("({s})"),
+                "list" => format!("[{s}]"),
+                "map" => format!("{{a: {s}}}"),
+                "call" => format!("abs({s})"),
+                "case" => format!("CASE WHEN true THEN {s} ELSE 2 END"),
+                "index" => format!("[{s}][0]"),
+                "reduce" => format!("reduce(acc = 0, x IN [1] | {s})"),
+                "listcomp" => format!("[x IN [1] | {s}]"),
+                "patcomp" => format!("[(a)-[:R]->(b) | {s}]"),
+                "mapproj" => format!("n{{k: {s}}}"),
+                _ => unreachable!("unknown construct {kind}"),
+            };
+        }
+        format!("MATCH (n) RETURN {s}")
+    }
+
+    const CONSTRUCTS: [&str; 10] = [
+        "parens", "list", "map", "call", "case", "index", "reduce", "listcomp", "patcomp",
+        "mapproj",
+    ];
+
+    #[test]
+    fn pathological_nesting_is_refused_not_fatal() {
+        // The reported repro: a few KB of text, ~5000 nested parens.
+        let err = parse_on_worker_stack(nested("parens", 5000)).unwrap_err();
+        assert!(
+            err.downcast_ref::<QueryTooDeep>().is_some(),
+            "expected a typed QueryTooDeep, got: {err}"
+        );
+    }
+
+    #[test]
+    fn every_nesting_construct_is_bounded() {
+        // Not just the one in the repro: each recursive descent path in the grammar.
+        for kind in CONSTRUCTS {
+            let err = parse_on_worker_stack(nested(kind, 2000)).unwrap_err();
+            assert!(
+                err.downcast_ref::<QueryTooDeep>().is_some(),
+                "{kind}: expected a typed QueryTooDeep, got: {err}"
+            );
+        }
+        // Clause-level nesting recurses too: `CALL {}` subqueries and `EXISTS {}`.
+        let subqueries = format!(
+            "{}RETURN 1 AS x{} RETURN x",
+            "CALL { ".repeat(500),
+            " }".repeat(500)
+        );
+        let mut exists = "true".to_string();
+        for _ in 0..500 {
+            exists = format!("EXISTS {{ MATCH (a) WHERE {exists} }}");
+        }
+        for q in [subqueries, format!("RETURN {exists}")] {
+            let err = parse_on_worker_stack(q).unwrap_err();
+            assert!(
+                err.downcast_ref::<QueryTooDeep>().is_some(),
+                "expected a typed QueryTooDeep, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nesting_a_case_behind_an_end_variable_does_not_evade_the_guard() {
+        // `case` and `end` are legal identifiers (the grammar dropped its `!reserved`
+        // guard so `RETURN n.end` parses), so `CASE WHEN end THEN …` nests a CASE whose
+        // `end` is a *variable*, not the closing keyword. A scanner that popped its
+        // depth on `END` would sit at zero here while the real parse depth — and the
+        // stack — ran away. The source scan must never credit an `END`.
+        let mut q = "1".to_string();
+        for _ in 0..2000 {
+            q = format!("CASE WHEN end THEN {q} ELSE 2 END");
+        }
+        let err = parse_on_worker_stack(format!("RETURN {q}")).unwrap_err();
+        assert!(
+            err.downcast_ref::<QueryTooDeep>().is_some(),
+            "expected a typed QueryTooDeep, got: {err}"
+        );
+    }
+
+    #[test]
+    fn writes_are_bounded_too() {
+        // `parse_statement` runs its own parse + lowering (a SET value is an `Expr`),
+        // so the write path needs the same bound the read path gets.
+        let q = format!(
+            "MATCH (n:C {{k: 'a'}}) SET n.p = {}1{}",
+            "[".repeat(2000),
+            "]".repeat(2000)
+        );
+        let err = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || parse_statement(&q))
+            .expect("spawn")
+            .join()
+            .expect("the parse must not overflow the stack")
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<QueryTooDeep>().is_some(),
+            "expected a typed QueryTooDeep, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nesting_just_under_the_limit_still_parses() {
+        // The bound has to leave real queries alone: 25 levels is already ~3x deeper
+        // than anything hand-written, and every construct still parses there.
+        for kind in CONSTRUCTS {
+            let q = nested(kind, 25);
+            parse_on_worker_stack(q.clone())
+                .unwrap_or_else(|e| panic!("{kind} at depth 25 must parse, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn long_queries_are_not_deep_queries() {
+        // The grammar spells chains as repetitions, not recursion, so length costs no
+        // depth. These are the shapes a bound this tight would plausibly break — they
+        // must all still parse.
+        let and_chain = format!("RETURN {}", vec!["true"; 400].join(" AND "));
+        let or_chain = format!("RETURN {}", vec!["n.x = 1"; 400].join(" OR "));
+        let arith = format!("RETURN {}", vec!["1"; 400].join(" + "));
+        let nots = format!("RETURN {}true", "NOT ".repeat(200));
+        // A big CASE: 50 WHEN branches are siblings, not nesting.
+        let wide_case = format!(
+            "RETURN CASE {} ELSE 0 END",
+            (0..50)
+                .map(|i| format!("WHEN n.x = {i} THEN {i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // 60 *sequential* CASE expressions — the source scan cannot credit an `END`, so
+        // it over-counts these; the limit is set high enough (64) that a pivot-style
+        // projection still runs, and the exact parse-tree guard sees them as depth 1.
+        let many_cases = format!(
+            "RETURN {}",
+            (0..60)
+                .map(|i| format!("CASE WHEN n.x = {i} THEN 1 ELSE 0 END AS c{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let wide_call = format!("RETURN coalesce({})", vec!["n.x"; 100].join(", "));
+        let long_list = format!("RETURN [{}]", vec!["1"; 1000].join(", "));
+        for q in [
+            and_chain,
+            or_chain,
+            arith,
+            nots,
+            wide_case,
+            many_cases,
+            wide_call,
+            long_list,
+            // Nested calls at a realistic depth.
+            "RETURN toFloat(coalesce(toString(trim(n.name)), '0'))".into(),
+            // Brackets that are not nesting: inside strings, inside comments, and the
+            // `case`/`end` words used as property keys.
+            "RETURN '(((((((((' AS s, \"[[[[[[\" AS t".into(),
+            "RETURN 1 // ((((((((((((\n".into(),
+            "RETURN 1 /* {{{{{{{{{{ */ AS x".into(),
+            "MATCH (n) RETURN n.end, n.case".into(),
+            "MATCH (n) RETURN n.x AS x ORDER BY x LIMIT 1".into(),
+        ] {
+            parse_on_worker_stack(q.clone()).unwrap_or_else(|e| panic!("must parse {q:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_backtick_quoted_name_does_not_unbalance_the_scan() {
+        // `quoted_name` can hold anything, brackets included; the scan skips it whole.
+        let q = "MATCH (n) RETURN n.`weird((((name` AS x";
+        parse_on_worker_stack(q.into()).unwrap_or_else(|e| panic!("must parse {q:?}: {e}"));
+    }
+
+    #[test]
+    fn the_source_scan_bounds_pest_before_it_recurses() {
+        // Depth past MAX_SOURCE_NESTING is refused by the pre-parse scan — pest never
+        // sees the text. (Between the two limits, the exact parse-tree guard catches it
+        // instead; either way the client gets the same typed error.)
+        let err = parse_on_worker_stack(nested("parens", MAX_SOURCE_NESTING + 1)).unwrap_err();
+        let deep = err
+            .downcast_ref::<QueryTooDeep>()
+            .unwrap_or_else(|| panic!("expected a typed QueryTooDeep, got: {err}"));
+        assert_eq!(deep.surface, "source");
+        assert_eq!(deep.limit, MAX_SOURCE_NESTING);
+    }
+
+    #[test]
+    fn pattern_and_label_nesting_are_bounded_too() {
+        // Not every recursive descent path runs through an expression. A parenthesised
+        // pattern element (`MATCH ((((n))))`) and a parenthesised label expression
+        // (`le_atom = { le_name | "(" ~ label_expr ~ ")" }`) recurse on their own, and
+        // they are *cheap* per level — a shallow tree, so the parse-tree guard never
+        // fires on them. They are held by the source guard instead, which is exactly why
+        // it exists: it is the backstop for a construct that nests deeply without
+        // costing much tree. (Unbounded, both survive past depth 256 on a 2 MiB stack —
+        // so a 64 bound leaves room to spare.)
+        let shapes: [fn(usize) -> String; 2] = [
+            |d| format!("MATCH {}(n){} RETURN n", "(".repeat(d), ")".repeat(d)),
+            |d| format!("MATCH (n:{}A{}) RETURN n", "(".repeat(d), ")".repeat(d)),
+        ];
+        for mk in shapes {
+            // Just under the limit: still parses. (The node pattern's own `(n)` is a
+            // bracket too, so `MAX_SOURCE_NESTING - 1` wrappers is the deepest that fits.)
+            parse_on_worker_stack(mk(MAX_SOURCE_NESTING - 1))
+                .unwrap_or_else(|e| panic!("must parse just under the limit: {e}"));
+            for d in [MAX_SOURCE_NESTING, 500, 5000] {
+                let err = parse_on_worker_stack(mk(d)).unwrap_err();
+                assert!(
+                    err.downcast_ref::<QueryTooDeep>().is_some(),
+                    "depth {d}: expected a typed QueryTooDeep, got: {err}"
+                );
+            }
+        }
+        // The shallow, real spellings keep working.
+        ok("MATCH ((n)) RETURN n");
+        ok("MATCH (n:(A|B)) RETURN n");
+    }
+
+    #[test]
+    fn literal_nesting_stays_under_the_property_decoder_bound() {
+        // A query-text literal can be persisted (`SET n.p = [[[…]]]`) and `write_value`
+        // is infallible, so the parser must not admit a value the property decoder
+        // (`wire::MAX_VALUE_DEPTH`, HIK-85) would then refuse to read back. The parser
+        // is the tighter gate by an order of magnitude. (The constants are pinned to each
+        // other by a `const _: () = assert!(…)` above; this covers the *behaviour* — what
+        // the parser will actually accept.)
+        let deepest_accepted = (1..=MAX_SOURCE_NESTING)
+            .rev()
+            .find(|&d| parse(&nested("list", d)).is_ok())
+            .expect("some depth must parse");
+        assert!(
+            deepest_accepted < graph_format::wire::MAX_VALUE_DEPTH,
+            "the parser admits a {deepest_accepted}-deep literal, at or past the {}-deep \
+             bound the property decoder refuses — such a value would be written and then \
+             be permanently unreadable",
+            graph_format::wire::MAX_VALUE_DEPTH
+        );
     }
 }
