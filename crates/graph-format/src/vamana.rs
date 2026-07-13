@@ -34,6 +34,7 @@
 // those fields' widths); storing the index sidesteps that entirely and costs no
 // extra resident memory.
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -434,7 +435,11 @@ where
     FE: Fn(&[f32]) -> f32,
 {
     let beam_width = beam_width.max(k).max(1);
-    let mut expanded = vec![false; num_nodes];
+    // A search touches only O(beam_width · expansions) nodes, so track the expanded
+    // set in a `HashSet` that grows with the work done — not a `vec![false; num_nodes]`
+    // bool array sized to the *whole index*, which made each query allocate (and zero)
+    // memory proportional to the index rather than the search.
+    let mut expanded: HashSet<VamanaIndex> = HashSet::new();
     // Working candidate list, kept ascending by PQ estimate and capped to L.
     let mut beam: Vec<(f32, VamanaIndex)> = vec![(estimate(medoid), medoid)];
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -442,10 +447,10 @@ where
     while let Some((_, cur)) = beam
         .iter()
         .copied()
-        .filter(|(_, i)| !expanded[*i as usize])
+        .filter(|(_, i)| !expanded.contains(i))
         .min_by(|a, b| a.0.total_cmp(&b.0))
     {
-        expanded[cur as usize] = true;
+        expanded.insert(cur);
         let (vector, neighbours) = fetch(cur)?;
         hits.push(SearchHit {
             index: cur,
@@ -453,7 +458,7 @@ where
         });
         for nb in neighbours {
             if (nb as usize) < num_nodes
-                && !expanded[nb as usize]
+                && !expanded.contains(&nb)
                 && !beam.iter().any(|(_, i)| *i == nb)
             {
                 beam.push((estimate(nb), nb));
@@ -622,5 +627,42 @@ mod tests {
             recall >= 0.85,
             "Vamana+PQ recall@{k} was {recall:.3}, expected ≥ 0.85"
         );
+    }
+
+    #[test]
+    fn beam_search_scratch_is_bounded_by_visited_not_index_size() {
+        // A search over a *huge* index that only touches a handful of nodes must not
+        // allocate memory proportional to the index. Pre-fix `beam_search` opened with
+        // `vec![false; num_nodes]`, so this `num_nodes` would have forced a ~1 GiB
+        // bool array per query; the `HashSet` now grows only with the nodes expanded.
+        // The search still returns the correct exact-ranked top-k over the tiny graph.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0], // 0 = medoid / entry
+            vec![1.0, 0.0], // 1
+            vec![0.0, 1.0], // 2
+            vec![2.0, 0.0], // 3
+            vec![0.0, 2.0], // 4
+        ];
+        // A tiny connected graph: 0 -> {1,2}, 1 -> {3}, 2 -> {4}.
+        let adjacency: Vec<Vec<VamanaIndex>> = vec![vec![1, 2], vec![3], vec![4], vec![], vec![]];
+        let query = [0.5f32, 0.0];
+        let exact = |v: &[f32]| (v[0] - query[0]).powi(2) + (v[1] - query[1]).powi(2);
+
+        let huge_num_nodes = 1usize << 30; // 1 073 741 824 — a billion-entry bool array pre-fix.
+        let hits = beam_search(
+            0,
+            8,
+            3,
+            huge_num_nodes,
+            |i| exact(&vectors[i as usize]), // estimate == exact here (navigation still valid)
+            |i| Ok((vectors[i as usize].clone(), adjacency[i as usize].clone())),
+            exact,
+        )
+        .unwrap();
+
+        // Closest three to (0.5, 0) by squared-L2: node 1 (0.25), node 0 (0.25 → tie,
+        // broken by lower index so 0 first), node 2 (1.25).
+        let got: Vec<VamanaIndex> = hits.iter().map(|h| h.index).collect();
+        assert_eq!(got, vec![0, 1, 2], "exact-ranked top-3 over the tiny graph");
     }
 }
