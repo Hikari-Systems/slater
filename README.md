@@ -624,7 +624,11 @@ slater-build --input people.cypher --graph people --data-dir ./data
 
 Each label's identity key is the property carried by its range index; override
 with `--key Label=prop` (repeatable) or a global `--pk <field>`. `CREATE INDEX`
-DDL is emitted first so the rebuild recreates the indexes. Vectors (and other
+DDL is emitted first so the rebuild recreates the indexes. A multi-label node
+keeps **every** label — it is emitted as `MERGE (n:Ident:Other {key: v})`, with
+the identity label (the one supplying the business key) first and the rest
+sorted; the merge is keyed on the identity label alone, so the trailing labels
+are written onto the node without creating another one. Vectors (and other
 values with no Cypher-literal spelling) cannot ride a `MERGE` dump and are dropped
 with a warning on stderr. Exit status is `0` on success, `1` on error.
 

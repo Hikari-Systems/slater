@@ -43,6 +43,73 @@ fn write_acl(root: &Path) -> std::path::PathBuf {
     path
 }
 
+/// Run the real `slater-build` over `input`, producing a generation of graph `people`
+/// under `data_dir`. Panics if the builder fails.
+fn run_builder(builder: &str, input: &Path, data_dir: &Path) {
+    std::fs::create_dir_all(data_dir).unwrap();
+    let status = Command::new(builder)
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "people",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run slater-build");
+    assert!(status.success(), "slater-build failed on {input:?}");
+    assert!(
+        data_dir.join("people").join("current").exists(),
+        "slater-build produced no `current` generation pointer in {data_dir:?}"
+    );
+}
+
+/// Serve `data_dir` over Bolt, run the real `slater dump` binary against it into
+/// `out_path`, and return the dump text. The server is torn down before returning.
+async fn serve_and_dump(data_dir: &Path, acl_path: &Path, out_path: &Path) -> String {
+    let cfg = build_config(data_dir, acl_path);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        if let Err(e) = slater::server::serve_with_listener(cfg, listener).await {
+            eprintln!("server ended: {e:#}");
+        }
+    });
+    // Let the server open the graph before the client connects.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let slater_bin = env!("CARGO_BIN_EXE_slater").to_string();
+    let op = out_path.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(&slater_bin)
+            .args([
+                "dump",
+                "people",
+                "-u",
+                "reporting",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "-o",
+                op.to_str().unwrap(),
+            ])
+            .env("SLATER_DUMP_PASSWORD", "pw")
+            .output()
+            .expect("run slater dump")
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert!(
+        out.status.success(),
+        "slater dump failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(out_path).unwrap()
+}
+
 fn build_config(root: &Path, acl_path: &Path) -> slater::config::AppConfig {
     // The fixture is built unstamped, so `requireAclStamp` is off (as in the other
     // in-process server tests); the slow poll keeps the guard idle for the test.
@@ -203,5 +270,93 @@ async fn dump_round_trips_through_the_real_builder() {
     }
 
     server.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The seed graph for the multi-label round-trip: Alice is `:Person:Employee`, Bob is
+/// plain `:Person`. Both are keyed on `Person.name` — `Employee` is a bare marker label
+/// with no index, which is exactly the shape the dump used to drop.
+const MULTI_LABEL_SEED: &str = "\
+CREATE INDEX FOR (n:Person) ON (n.name);
+MERGE (n:Person:Employee {name: 'Alice'}) SET n.age = 30;
+MERGE (n:Person {name: 'Bob'}) SET n.age = 25;
+MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020;
+";
+
+/// Count the node `MERGE` statements in a dump (edge MERGEs bind `a`, not `n`).
+fn node_merge_lines(dump: &str) -> Vec<&str> {
+    dump.lines()
+        .filter(|l| l.starts_with("MERGE (n:"))
+        .collect()
+}
+
+/// Regression for HIK-70: `dump` used to emit only a node's identity label, so every
+/// other label was silently lost on the documented dump → build → serve round-trip.
+///
+/// This drives the **real** loop rather than just asserting the emitted text: seed a
+/// multi-label graph through the real `slater-build`, serve it, dump it with the real
+/// `slater dump`, rebuild *that dump* with the real `slater-build`, then serve and
+/// re-dump the rebuild. The final dump is read back out of the rebuilt generation's
+/// `node_labels`, so it can only carry `:Employee` if the label actually survived the
+/// full trip. It also pins the MERGE semantics: the extra label must not fork a second
+/// node (the node MERGE count stays at 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns the slater binary and the real builder; needs SLATER_BUILD_BIN"]
+async fn multi_label_nodes_keep_every_label_through_the_real_round_trip() {
+    let Ok(builder) = std::env::var("SLATER_BUILD_BIN") else {
+        eprintln!("SLATER_BUILD_BIN unset — skipping the multi-label round-trip");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("slater_mlrt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let acl_path = write_acl(&root);
+
+    // Leg 1: seed → real builder → generation.
+    let seed = root.join("seed.cypher");
+    std::fs::write(&seed, MULTI_LABEL_SEED).unwrap();
+    let built = root.join("built");
+    run_builder(&builder, &seed, &built);
+
+    // Leg 2: serve the built generation and dump it.
+    let dump1 = serve_and_dump(&built, &acl_path, &root.join("dump1.cypher")).await;
+    assert!(
+        dump1.contains("MERGE (n:Person:Employee {name: 'Alice'})"),
+        "dump dropped Alice's `:Employee` label (identity label only): {dump1}"
+    );
+    assert!(
+        dump1.contains("MERGE (n:Person {name: 'Bob'})"),
+        "single-label node did not survive the dump: {dump1}"
+    );
+
+    // Leg 3: rebuild *the dump* → serve → re-dump. `:Employee` can only appear here if
+    // the builder actually persisted it, so this closes the loop the module promises.
+    let rebuilt = root.join("rebuilt");
+    run_builder(&builder, &root.join("dump1.cypher"), &rebuilt);
+    let dump2 = serve_and_dump(&rebuilt, &acl_path, &root.join("dump2.cypher")).await;
+    assert!(
+        dump2.contains("MERGE (n:Person:Employee {name: 'Alice'})"),
+        "rebuilt generation lost Alice's `:Employee` label: {dump2}"
+    );
+
+    // MERGE semantics: the extra label rides the identity merge, it does not create a
+    // second Alice. Two nodes in, two nodes out — and the edge still resolves.
+    assert_eq!(
+        node_merge_lines(&dump2).len(),
+        2,
+        "the extra label forked a node — expected 2 node MERGEs: {dump2}"
+    );
+    assert!(
+        dump2.contains(
+            "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = 2020;"
+        ),
+        "the edge did not survive the multi-label round-trip: {dump2}"
+    );
+
+    // The dump is a fixed point: dumping the rebuild reproduces the dump it was built
+    // from (labels included), so the round-trip is stable, not merely lossless once.
+    assert_eq!(dump1, dump2, "dump → build → dump is not a fixed point");
+
     let _ = std::fs::remove_dir_all(&root);
 }

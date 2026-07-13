@@ -387,23 +387,36 @@ fn node_parts(v: &PsValue) -> Option<NodeParts<'_>> {
     }
 }
 
-/// Resolve a node's `(identity label, key property, key value)` from its labels +
-/// properties. Labels are tried in sorted order for a deterministic choice.
+/// Resolve a node's `(ordered labels, key property, key value)` from its labels +
+/// properties. Labels are tried in sorted order for a deterministic choice; the
+/// returned list is the node's **whole** label set with the identity label first and
+/// the rest sorted, so a multi-label node round-trips (mirrors `consolidate`, which
+/// orders the tail by core label id — a dump only sees Bolt label names, so it sorts).
 fn node_identity<'a>(
     v: &'a PsValue,
     schema: &'a Schema,
-) -> Result<(&'a str, &'a str, &'a PsValue)> {
+) -> Result<(Vec<&'a str>, &'a str, &'a PsValue)> {
     let (labels, props) = node_parts(v).context("expected a Node value")?;
     let mut names: Vec<&'a str> = labels.iter().filter_map(PsValue::as_str).collect();
     names.sort_unstable();
-    for &label in &names {
+    for (i, &label) in names.iter().enumerate() {
         // `key_for`'s output lifetime is tied to `&schema` (= 'a), so `key` and the
         // found value both outlive the loop and can be returned.
         let Some(key) = schema.key_for(label) else {
             continue;
         };
         if let Some((_, val)) = props.iter().find(|(k, _)| k == key) {
-            return Ok((label, key, val));
+            // Identity label first, then every other label in sorted order.
+            let mut ordered = Vec::with_capacity(names.len());
+            ordered.push(label);
+            ordered.extend(
+                names
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, l)| *l),
+            );
+            return Ok((ordered, key, val));
         }
     }
     bail!(
@@ -412,19 +425,27 @@ fn node_identity<'a>(
     )
 }
 
-/// `MERGE (n:Label {key: v}) SET n.p = v, …;` for one node.
+/// `MERGE (n:Ident:Other {key: v}) SET n.p = v, …;` for one node — **all** of the
+/// node's labels, identity first. The build MERGE dialect keys the merge on the
+/// leading (identity) label + key alone and unions the trailing labels onto the
+/// node, so carrying them costs no extra node; dropping them would silently lose
+/// them on the rebuild.
 fn emit_node(
     v: &PsValue,
     schema: &Schema,
     out: &mut impl Write,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
-    let (label, key, key_val) = node_identity(v, schema)?;
+    let (labels, key, key_val) = node_identity(v, schema)?;
+    let label = *labels
+        .first()
+        .expect("node_identity yields an identity label");
     let key_lit = literal(key_val).with_context(|| {
         format!("node identity {label}.{key} has a value that cannot be a MERGE key")
     })?;
     let (_labels, props) = node_parts(v).expect("node_parts succeeded in node_identity");
-    write!(out, "MERGE (n:{label} {{{key}: {key_lit}}})")?;
+    let label_str = labels.join(":");
+    write!(out, "MERGE (n:{label_str} {{{key}: {key_lit}}})")?;
     emit_set(
         props,
         "n",
@@ -446,8 +467,12 @@ fn emit_edge(
     out: &mut impl Write,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
+    // An edge endpoint is addressed by its identity label + key alone; the node's full
+    // label set is written by its own node MERGE (mirrors `consolidate::emit_edges_from`).
     let (al, ak, av) = node_identity(a, schema)?;
     let (bl, bk, bv) = node_identity(b, schema)?;
+    let al = al.first().copied().expect("identity label");
+    let bl = bl.first().copied().expect("identity label");
     let (rtype, rprops) = match r {
         PsValue::Struct { tag, fields } if *tag == TAG_RELATIONSHIP => {
             let ty = fields.get(3).and_then(PsValue::as_str).unwrap_or_default();
@@ -760,11 +785,74 @@ mod tests {
     #[test]
     fn emit_node_picks_the_sorted_label_with_a_key() {
         // Two labels; only `Person` has a key, and labels are tried sorted so the
-        // choice is deterministic regardless of Bolt's label order.
+        // choice is deterministic regardless of Bolt's label order. `Person` therefore
+        // leads the MERGE as the identity label — but `Zebra` is still carried (HIK-70):
+        // the identity choice decides the *merge key*, not which labels survive.
         let s = schema(None, &[], &[("Person", "name")]);
         let n = node(0, &["Zebra", "Person"], &[("name", PsValue::str("Bob"))]);
         let (out, _) = render(|o, w| emit_node(&n, &s, o, w));
-        assert_eq!(out, "MERGE (n:Person {name: 'Bob'});\n");
+        assert_eq!(out, "MERGE (n:Person:Zebra {name: 'Bob'});\n");
+    }
+
+    #[test]
+    fn emit_node_keeps_every_label_identity_first() {
+        // Regression (HIK-70): a multi-label node used to dump as only its identity
+        // label, so the rebuild silently lost the rest. All labels must ride the MERGE,
+        // identity first — the build dialect merges on the leading label + key and
+        // unions the trailing ones, so this adds labels without adding nodes.
+        let s = schema(None, &[], &[("Person", "name")]);
+        let n = node(
+            0,
+            // Bolt order is deliberately not the emitted order.
+            &["Employee", "Person"],
+            &[("name", PsValue::str("Alice")), ("age", PsValue::Int(30))],
+        );
+        let (out, warns) = render(|o, w| emit_node(&n, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (n:Person:Employee {name: 'Alice'}) SET n.age = 30;\n"
+        );
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn emit_node_orders_the_non_identity_labels_deterministically() {
+        // The identity label leads; the rest are sorted, so the dump is byte-stable
+        // whatever order Bolt hands the labels back in.
+        let s = schema(None, &[], &[("Person", "name")]);
+        let a = node(
+            0,
+            &["Zebra", "Admin", "Person"],
+            &[("name", PsValue::str("A"))],
+        );
+        let b = node(
+            0,
+            &["Person", "Zebra", "Admin"],
+            &[("name", PsValue::str("A"))],
+        );
+        let (oa, _) = render(|o, w| emit_node(&a, &s, o, w));
+        let (ob, _) = render(|o, w| emit_node(&b, &s, o, w));
+        assert_eq!(oa, "MERGE (n:Person:Admin:Zebra {name: 'A'});\n");
+        assert_eq!(oa, ob);
+    }
+
+    #[test]
+    fn emit_edge_addresses_endpoints_by_identity_label_only() {
+        // The endpoint patterns must stay single-label: the node's full label set is
+        // written by its own node MERGE, and re-listing it here would only bloat the dump.
+        let s = schema(None, &[], &[("Person", "name")]);
+        let a = node(
+            0,
+            &["Employee", "Person"],
+            &[("name", PsValue::str("Alice"))],
+        );
+        let b = node(1, &["Person", "Manager"], &[("name", PsValue::str("Bob"))]);
+        let r = rel("KNOWS", &[]);
+        let (out, _) = render(|o, w| emit_edge(&a, &r, &b, &s, o, w));
+        assert_eq!(
+            out,
+            "MERGE (a:Person {name: 'Alice'})-[r:KNOWS]->(b:Person {name: 'Bob'});\n"
+        );
     }
 
     #[test]
