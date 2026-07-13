@@ -369,10 +369,8 @@ impl RleChunk {
         let n = read_uvarint(&mut r)? as u32;
         // `n` is not bounded by the record's byte length — run lengths are uvarints, so a
         // six-byte single run can declare 4·10⁹ degrees and `to_degrees` would materialise a
-        // 17 GB `Vec`. Bound it by the format's own ceiling: the same chunk's `RawU32` form is
-        // `n * 4` bytes, which `codec::MAX_BLOCK_BYTES` already refuses (and a real chunk is
-        // orders of magnitude smaller than that — see `nodedegree::records_per_half`).
-        const MAX_CHUNK_DEGREES: usize = codec::MAX_BLOCK_BYTES / 4;
+        // 17 GB `Vec`. Bound it by [`MAX_CHUNK_DEGREES`], which `encode_chunk` refuses to
+        // exceed — so nothing this rejects is anything a writer could have emitted.
         if n as usize > MAX_CHUNK_DEGREES {
             return Err(DecodeRejected::TooManyElements {
                 what: "rle degree chunk",
@@ -491,7 +489,23 @@ fn resident_from_degrees(degrees: &[u32]) -> DegreeChunk {
 /// `ef`, `rle`, `raw`, and (penalised) `zstd-dense`, and keeps the winner per `opts`. A uniform
 /// (or all-zero) chunk falls out as a single-run `rle` — the smallest candidate and exactly the
 /// degenerate case EF is worst at; the empty chunk is an empty `rle`.
+/// Ceiling on the number of degrees in a single chunk record — the [`crate::plane::MAX_PLANE_VALUES`]
+/// argument, for `u32` degrees: an RLE chunk's `n` is not bounded by its byte length, so bound it
+/// by the format's own ceiling (this chunk's `RawU32` form would be `n * 4` bytes, which
+/// `codec::MAX_BLOCK_BYTES` refuses). Shared by the encoder and the decoder so the two agree.
+///
+/// A real chunk is [`crate::nodedegree::DEGREES_PER_RECORD`] = 262 144 degrees — this clears it
+/// by ~2000×, so it is a backstop against a forged record, never a constraint on a real one.
+pub const MAX_CHUNK_DEGREES: usize = codec::MAX_BLOCK_BYTES / 4;
+
 pub fn encode_chunk(degrees: &[u32], opts: &DegreeCodecOpts) -> Result<Vec<u8>> {
+    // Never emit a chunk the decoder would refuse (see `MAX_CHUNK_DEGREES`).
+    if degrees.len() > MAX_CHUNK_DEGREES {
+        bail!(
+            "degree chunk of {} degrees exceeds the {MAX_CHUNK_DEGREES}-degree ceiling",
+            degrees.len()
+        );
+    }
     let n = degrees.len();
 
     // Empty short-circuits to an empty `rle` record (the other candidates assume a non-empty

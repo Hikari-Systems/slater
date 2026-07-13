@@ -45,6 +45,22 @@ pub const DEFAULT_ZSTD_SELECT_MARGIN: f64 = 0.5;
 /// (`"local"`/`"remote"`/`"max"`/`"manual"`): wire-biased profiles (`remote`/`max`) let zstd
 /// win on any size gain; everything else is latency-biased. Shared by the build-CLI resolver
 /// and any retrofit tool so a retrofitted plane matches a fresh build's codec mix.
+/// Ceiling on the number of values in a single plane record.
+///
+/// Every plane codec but RLE has its element count bounded by the record's own byte length —
+/// `RawU64` spends 8 bytes a value, `BitPacked` at least one bit, EF's high bitmap one bit per
+/// value. RLE does not: run lengths are uvarints, so six bytes are a well-formed single run
+/// declaring 4·10⁹ values, and materialising that plane is a 34 GB allocation from a six-byte
+/// record. The bound has to come from somewhere else, so it comes from the format's own
+/// ceiling: this plane's `RawU64` form would be `n * 8` bytes, and `codec::MAX_BLOCK_BYTES`
+/// already refuses a block that large. A plane above this is one no other codec could have
+/// stored, so [`encode_plane`] refuses to *write* it and the RLE decoder refuses to read it —
+/// the two agree, and a legitimate record can never be rejected.
+///
+/// 268M values: ~3× the 91.6M-node wikidata key column, the largest plane the builder emits
+/// (and that one is distinct-ascending, so it encodes as EF, never RLE).
+pub const MAX_PLANE_VALUES: usize = codec::MAX_BLOCK_BYTES / 8;
+
 pub fn margin_for_profile(profile: &str) -> f64 {
     match profile {
         "remote" | "max" => 1.0,
@@ -618,10 +634,8 @@ impl RleU64 {
         // Unlike the other plane codecs, RLE's element count `n` is *not* bounded by the
         // record's byte length: run lengths are uvarints, so `01 ff ff ff ff 0f` — six bytes —
         // is a well-formed single run declaring 4·10⁹ values, and `to_values` would then
-        // materialise a 34 GB `Vec`. Bound `n` by the format's own ceiling: the same plane's
-        // `RawU64` form is `n * 8` bytes, which `codec::MAX_BLOCK_BYTES` already refuses, so a
-        // plane above that many values is not one any writer could have emitted.
-        const MAX_PLANE_VALUES: usize = codec::MAX_BLOCK_BYTES / 8;
+        // materialise a 34 GB `Vec`. Bound it by [`MAX_PLANE_VALUES`], which `encode_plane`
+        // refuses to exceed — so nothing this rejects is anything a writer could have emitted.
         if n as usize > MAX_PLANE_VALUES {
             return Err(DecodeRejected::TooManyElements {
                 what: "rle plane",
@@ -796,6 +810,14 @@ fn resident_from_values(values: &[u64]) -> PlaneChunk {
 /// per `opts` — with `zstd-dense` taxed for the decompress it costs on every fault. A uniform run
 /// falls out as a single-run `rle` (a constant is just a run); the empty slice is an empty `rle`.
 pub fn encode_plane(values: &[u64], opts: &PlaneCodecOpts) -> Result<Vec<u8>> {
+    // Never emit a record the decoder would refuse: `MAX_PLANE_VALUES` is a *shared* bound, so
+    // the RLE arm cannot write a plane whose `n` `RleU64::deserialize` will reject.
+    if values.len() > MAX_PLANE_VALUES {
+        bail!(
+            "plane of {} values exceeds the {MAX_PLANE_VALUES}-value ceiling",
+            values.len()
+        );
+    }
     let n = values.len();
 
     // Empty short-circuits to an empty single-`Rle` record — `BitPacked::from_values` and the
