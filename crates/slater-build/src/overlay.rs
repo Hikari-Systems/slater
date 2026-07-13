@@ -16,11 +16,15 @@
 //!     ids); a patch matching no edge is an error (edge create-on-absent is not a v1
 //!     feature);
 //!   * **created nodes** — synthesised by a MERGE whose match found nothing; emitted
-//!     after the node scan with provisional ids `base_node_count + i`.
+//!     after the node scan with provisional ids `base_node_count + i`. MERGE is
+//!     idempotent, so these are deduplicated by business key `(label, key, value)`:
+//!     a second 0-match MERGE on a key already created here folds its SET props onto
+//!     that node (the node scan runs before this stage and cannot see them).
 //!
 //! Set-prop "last-writer-wins" is per key: applying patches in statement order, a
 //! later assignment to the same key overrides an earlier one; unnamed keys are kept.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -167,6 +171,13 @@ impl Overlay {
             created: Vec::new(),
         };
 
+        // 0-match MERGE targets, in first-seen order, keyed by business key so a second
+        // MERGE on the same absent key folds onto the node the first one created instead
+        // of synthesising a duplicate (the node scan above predates this loop and so can
+        // never see them). Held decoded, and encoded to `NodeRec` once at the end.
+        let mut created: Vec<CreatedNode> = Vec::new();
+        let mut created_idx: HashMap<(u32, u32, VKey), usize> = HashMap::new();
+
         // Resolve node overwrites.
         for (o, &ri) in node_ovr.iter().zip(&node_req) {
             let set_props = intern_node_set_props(&o.set_props, keys)?;
@@ -176,9 +187,30 @@ impl Overlay {
                     overlay.node.entry(p).or_default().push(set_props.clone());
                 }
             } else if o.is_merge {
-                overlay
-                    .created
-                    .push(make_node(&o.match_, &set_props, labels, keys));
+                // MERGE is idempotent, so the identity is the business key
+                // `(label, key, value)` — NOT the full label set: `extra_labels` are
+                // unioned onto the node, exactly as the merge-dump node fold does.
+                let ident = (
+                    labels.intern(&o.match_.label),
+                    keys.intern(&o.match_.key),
+                    vkey(&o.match_.value),
+                );
+                match created_idx.entry(ident) {
+                    Entry::Occupied(e) => {
+                        let node = &mut created[*e.get()];
+                        for l in &o.match_.extra_labels {
+                            let lg = labels.intern(l);
+                            if !node.label_gids.contains(&lg) {
+                                node.label_gids.push(lg);
+                            }
+                        }
+                        set_onto(&mut node.props, &set_props);
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(created.len());
+                        created.push(make_node(&o.match_, &set_props, labels, keys));
+                    }
+                }
             } else {
                 eprintln!(
                     "note: MATCH (:{} {{{}: {:?}}}) SET … matched no node — overlay no-op",
@@ -186,6 +218,8 @@ impl Overlay {
                 );
             }
         }
+
+        overlay.created = created.into_iter().map(CreatedNode::into_rec).collect();
 
         // Resolve edge overwrites. Endpoints/reltype that resolve to nothing mean the
         // edge cannot exist → error (edge create-on-absent is not supported in v1).
@@ -274,13 +308,7 @@ impl Overlay {
 fn apply_patches(blob: &[u8], patches: &[Vec<(u32, Value)>]) -> Result<Vec<u8>> {
     let mut props = decode_props(blob)?;
     for patch in patches {
-        for (k, v) in patch {
-            if let Some(slot) = props.iter_mut().find(|(ek, _)| ek == k) {
-                slot.1 = v.clone();
-            } else {
-                props.push((*k, v.clone()));
-            }
-        }
+        set_onto(&mut props, patch);
     }
     Ok(encode_props_record(&props))
 }
@@ -327,34 +355,59 @@ fn intern_node_set_props(
     Ok(out)
 }
 
-/// Synthesise a node for a 0-match MERGE: it carries the match `label`, the match
-/// `{key: value}`, and the SET props (last-wins if a SET targets the match key).
+/// A node synthesised by a 0-match MERGE, held decoded while the resolve loop runs so
+/// that a later MERGE on the same business key can fold onto it (see [`Overlay::build`])
+/// rather than duplicate it. Encoded to a [`NodeRec`] by [`CreatedNode::into_rec`] once
+/// resolution is done.
+struct CreatedNode {
+    label_gids: Vec<u32>,
+    props: Vec<(u32, Value)>,
+}
+
+impl CreatedNode {
+    fn into_rec(self) -> NodeRec {
+        NodeRec {
+            dump_id: None,
+            labels_blob: buckets::labels_blob(&self.label_gids),
+            props_blob: buckets::props_blob(&self.props),
+            vec_props: Vec::new(),
+        }
+    }
+}
+
+/// Synthesise a node for a 0-match MERGE: it carries the match `label` (plus any
+/// `extra_labels`), the match `{key: value}`, and the SET props (last-wins if a SET
+/// targets the match key).
 fn make_node(
     m: &NodeMatch,
     set_props: &[(u32, Value)],
     labels: &mut Interner,
     keys: &mut Interner,
-) -> NodeRec {
+) -> CreatedNode {
     let label_gid = labels.intern(&m.label);
     let mut label_gids = Vec::with_capacity(1 + m.extra_labels.len());
     label_gids.push(label_gid);
     for l in &m.extra_labels {
-        label_gids.push(labels.intern(l));
+        let lg = labels.intern(l);
+        if !label_gids.contains(&lg) {
+            label_gids.push(lg);
+        }
     }
     let key_gid = keys.intern(&m.key);
     let mut props: Vec<(u32, Value)> = vec![(key_gid, m.value.clone())];
+    set_onto(&mut props, set_props);
+    CreatedNode { label_gids, props }
+}
+
+/// Apply one set-prop list to a decoded property list, per-key last-writer-wins: each
+/// `(key, value)` overrides an existing key or appends a new one.
+fn set_onto(props: &mut Vec<(u32, Value)>, set_props: &[(u32, Value)]) {
     for (k, v) in set_props {
         if let Some(slot) = props.iter_mut().find(|(ek, _)| ek == k) {
             slot.1 = v.clone();
         } else {
             props.push((*k, v.clone()));
         }
-    }
-    NodeRec {
-        dump_id: None,
-        labels_blob: buckets::labels_blob(&label_gids),
-        props_blob: buckets::props_blob(&props),
-        vec_props: Vec::new(),
     }
 }
 
