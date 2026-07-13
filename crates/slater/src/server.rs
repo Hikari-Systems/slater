@@ -1493,13 +1493,21 @@ fn guard_sweep(
             ReloadStrategy::Swap => match graphs.swap_locked(&name, vector_cache) {
                 Ok(Some(new)) => {
                     info!(graph = %name, generation = %new, "swapped to a new generation (reloadStrategy=swap)");
-                    // The swap's policy check already verified the live acl.json
-                    // hashes to the new generation's stamp, so adopt it now: this is
-                    // the legitimate channel for an ACL change (rebuild + publish),
-                    // and it keeps the in-memory ACL in step with the new stamp so a
-                    // later stamp-enforced poll does not reject the matching file.
+                    // Adopt the ACL published alongside the new generation — this is the
+                    // legitimate channel for an ACL change (rebuild + publish) — but adopt
+                    // it *stamp-enforced*, exactly as the hot-reload poll does. The swap's
+                    // policy check hashed the live acl.json and verified it against the new
+                    // stamp, but that is a *separate read*; re-using its verdict to justify
+                    // an unconditional `reload()` is a check-then-load TOCTOU — the file can
+                    // change between the two reads, so the bytes actually loaded need not be
+                    // the bytes that were verified. `reload_checked` closes that: it reads
+                    // acl.json once, hashes *those* bytes, and installs the parsed ACL only
+                    // when that digest still matches every served generation's stamp — so the
+                    // bytes loaded are the bytes checked, and the stamp is enforced on this
+                    // reload just like on `poll_checked`. A file that no longer matches (an
+                    // in-window tamper) is refused and the last-good ACL keeps serving.
                     if let Some(acl) = acl {
-                        acl.reload();
+                        acl.reload_checked(|d| graphs.acl_digest_acceptable(d));
                     }
                 }
                 Ok(None) => {} // raced back to the live generation
@@ -15029,6 +15037,82 @@ mod tests {
         ));
         assert_ne!(new, old);
         assert_eq!(graphs.get("people").unwrap().uuid().0, new);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-93: the generation guard must not adopt an `acl.json` that fails the served
+    /// ACL stamp. The swap's own policy check hashes the live `acl.json` (read #1); the
+    /// post-swap ACL adopt is a *second* read, and if it re-reads the file unconditionally
+    /// (the old `reload()`), the bytes it loads need not be the bytes read #1 verified — a
+    /// check-then-load TOCTOU. The adopt now goes through `reload_checked`, which hashes
+    /// the exact bytes it loads and installs them only when that digest still matches every
+    /// served generation's stamp, so the bytes loaded are the bytes checked.
+    ///
+    /// The race is made deterministic with two graphs and no threads: `people` is stamped
+    /// against `acl.json` bytes A (it pins the ACL); `docs` is unstamped and is the graph
+    /// the guard legitimately swaps (its swap policy check passes regardless of the live
+    /// ACL). Before the sweep, `acl.json` is tampered to bytes B (a `secret` self-grant),
+    /// standing in for a file that changed after read #1. The guard swaps `docs` and then
+    /// adopts the ACL: the old unconditional `reload()` adopted B unverified (self-grant
+    /// live); `reload_checked` re-checks B against `people`'s stamp `digest(A)`, mismatches,
+    /// and keeps the last-good ACL.
+    #[test]
+    fn guard_swap_refuses_a_stamp_violating_acl_after_the_swap() {
+        // Two graphs in one root: `people` (from the fixture) and a copy `docs`. The
+        // manifest embeds the graph name, so re-stamp the copy's `graph` field to "docs"
+        // (a field content_hash does not cover, and the plaintext fixture carries no MAC).
+        let (root, _g, _) = testgen::write_basic("guard_acl_toctou");
+        copy_dir_all(&root.join("people"), &root.join("docs"));
+        patch_manifest(&root, "docs", "graph", serde_json::json!("docs"));
+
+        // acl.json bytes A grant `reporting`/`pw` read on `people`. Stamp only `people`
+        // with digest(A); `docs` stays unstamped, so the guard may swap it freely.
+        let acl_path = write_acl(&root);
+        let digest_a = graph_format::integrity::hash_file(&acl_path).unwrap();
+        patch_manifest(&root, "people", "aclBlake3", serde_json::json!(digest_a));
+
+        let acl = AclHandle::load(&acl_path).unwrap();
+        assert!(acl.snapshot().can_read("reporting", "people"));
+        assert!(!acl.snapshot().can_read("reporting", "secret"));
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs.set_manifest_policy(Some(acl_path.clone()), false);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        // Publish a fresh generation for the *unstamped* `docs`, so the guard swaps it.
+        publish_copy_as_new_generation(&root, "docs", None);
+
+        // Tamper acl.json to bytes B: a `secret` self-grant. digest(B) != digest(A), so B
+        // violates `people`'s served stamp (a fresh argon2 salt alone already diverges A).
+        let tampered = serde_json::json!({
+            "users": { "reporting": { "passwordArgon2id": hash_password("pw").unwrap(),
+                "grants": { "people": ["read"], "secret": ["read"] } } }
+        });
+        std::fs::write(&acl_path, tampered.to_string()).unwrap();
+
+        // Sweep: swaps `docs`, then adopts the ACL through the stamp gate.
+        assert!(matches!(
+            guard_sweep(&graphs, &vc, ReloadStrategy::Swap, Some(&acl)),
+            SweepAction::Continue
+        ));
+        // `docs` really was swapped, so the adopt path ran.
+        assert_ne!(
+            graphs.get("docs").unwrap().uuid().0,
+            graphs.get("people").unwrap().uuid().0,
+            "the guard should have swapped docs to its new generation"
+        );
+
+        // The stamp-violating self-grant must NOT have been adopted (pre-fix: it was),
+        // and the last-good stamp-matching ACL keeps serving.
+        assert!(
+            !acl.snapshot().can_read("reporting", "secret"),
+            "guard must not adopt an acl.json that violates a served generation's stamp"
+        );
+        assert_eq!(
+            acl.digest(),
+            digest_a,
+            "the stamp-matching last-good ACL must be kept"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
