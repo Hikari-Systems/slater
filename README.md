@@ -21,7 +21,7 @@ A **graph database** stores data as *things* (nodes) and the *relationships betw
 
 **The most common complaint about graph databases is that they don't scale past what you can hold in RAM.** Many of them (eg neo4j, Memgraph, FalkorDB, etc) keep the whole graph resident: a 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill. And past a certain size they simply won't load: eg the 90 million node / 1.5B-edge Wikidata graph needs ~64–128&nbsp;GiB resident, so the in-memory engines can't open it at all.
 
-Slater is the rebuttal. It serves that same 91.6M-node graph from **a few hundred MB of RAM**, because it pages the graph from an on-disk image on demand instead of holding it resident — so the graph size and the memory bill are decoupled.
+Slater is the rebuttal. It serves that same 90M-node graph from **a few hundred MB of RAM**, because it pages the graph from an on-disk image on demand instead of holding it resident — so the graph size and the memory bill are decoupled.
 
 Slater takes the opposite approach. You compile the graph once, offline, into a content-addressed on-disk image with `slater-build`; then any number of Slater servers serve it over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve** — you fan out cheap, stateless read replicas and let the store, not the heap, hold the graph.
 
