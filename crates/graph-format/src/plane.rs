@@ -851,12 +851,17 @@ pub fn decode_plane(bytes: &[u8]) -> Result<PlaneChunk> {
         }
         PlaneKind::ZstdDense => {
             let n = read_uvarint(&mut body)? as usize;
-            let dense = codec::decompress(body, n * 8)?;
-            if dense.len() != n * 8 {
+            // `n` is an on-disk varint: `n * 8` must not wrap (a wrapped product would be a
+            // *small* bound that a body could then satisfy). `decompress` treats the product
+            // as a hard cap and refuses anything above the block ceiling, so a forged `n`
+            // costs an error, not an allocation.
+            let raw_len = n.saturating_mul(8);
+            let dense = codec::decompress(body, raw_len)?;
+            if dense.len() != raw_len {
                 bail!(
                     "zstd plane decoded {} bytes, expected {}",
                     dense.len(),
-                    n * 8
+                    raw_len
                 );
             }
             let vals: Vec<u64> = dense

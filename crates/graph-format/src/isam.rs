@@ -508,6 +508,10 @@ impl IsamReader {
     /// decode the cache memoises.
     fn decompress_block(&self, b: usize) -> Result<Vec<u8>> {
         let t = &self.top[b];
+        // `comp_len` is an unvalidated on-disk `u32`; check the claim before sizing a buffer
+        // from it (see `codec::check_stored_len`). `raw_len` below is likewise a claim, which
+        // `codec::decompress` enforces as a hard output cap.
+        codec::check_stored_len(t.comp_len as usize)?;
         let mut stored = vec![0u8; t.comp_len as usize];
         self.src.read_exact_at(&mut stored, t.offset)?;
         let comp = match (&self.cipher, &t.nonce) {

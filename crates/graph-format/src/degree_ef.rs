@@ -552,12 +552,16 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<DegreeChunk> {
                 bail!("zstd degree-chunk body too short: {} bytes", body.len());
             }
             let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
-            let dense = codec::decompress(&body[4..], n * 4)?;
-            if dense.len() != n * 4 {
+            // `n` is an on-disk `u32`, so `n * 4` is at most 16 GiB and cannot wrap; it is a
+            // *claim*, which `decompress` enforces as a hard output cap (and refuses outright
+            // above the block ceiling) rather than pre-allocating on it.
+            let raw_len = n.saturating_mul(4);
+            let dense = codec::decompress(&body[4..], raw_len)?;
+            if dense.len() != raw_len {
                 bail!(
                     "zstd degree-chunk decoded {} bytes, expected {}",
                     dense.len(),
-                    n * 4
+                    raw_len
                 );
             }
             let degs: Vec<u32> = dense

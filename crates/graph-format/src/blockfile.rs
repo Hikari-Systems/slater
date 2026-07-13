@@ -883,6 +883,9 @@ impl BlockFileReader {
             .dir
             .get(block.index())
             .with_context(|| format!("block {} out of range", block.0))?;
+        // `comp_len` is an unvalidated on-disk `u32` — a forged directory could ask for a
+        // 4 GiB buffer for a block the file does not even contain. Check the claim first.
+        codec::check_stored_len(e.comp_len as usize)?;
         let mut stored = vec![0u8; e.comp_len as usize];
         self.src.read_exact_at(&mut stored, e.offset)?;
         self.decode_stored(e, stored)
