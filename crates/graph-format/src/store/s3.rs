@@ -85,6 +85,18 @@ fn sdk_err(context: &str, e: impl std::error::Error) -> anyhow::Error {
     anyhow!("{context}: {}", DisplayErrorContext(&e))
 }
 
+/// Validate an S3 `content_length` header before trusting it as an object size.
+/// `content_length` is a signed `i64`; a missing or negative value would otherwise
+/// become an absurd `u64` via `as` (a silent wrap), so reject both — matching the
+/// guard the GCS backend already applies to its object size.
+fn checked_content_length(content_length: Option<i64>, ctx: &str) -> Result<u64> {
+    match content_length {
+        None => bail!("{ctx} has no content length"),
+        Some(len) if len < 0 => bail!("{ctx} reported a negative content length {len}"),
+        Some(len) => Ok(len as u64),
+    }
+}
+
 /// Range GET exactly `len` bytes of `key` at `offset` and return them.
 async fn get_range(
     client: &Client,
@@ -314,15 +326,14 @@ impl ObjectStore for S3ObjectStore {
                 .send()
                 .await
                 .map_err(|e| sdk_err(&format!("S3 HEAD {fk}"), e))?;
-            head.content_length()
-                .ok_or_else(|| anyhow!("S3 HEAD {fk} has no content length"))
+            checked_content_length(head.content_length(), &format!("S3 HEAD {fk}"))
         })?;
         Ok(Arc::new(S3Object {
             client: self.client.clone(),
             rt: self.rt.clone(),
             bucket: self.bucket.clone(),
             key: full,
-            len: len as u64,
+            len,
         }))
     }
 
@@ -571,5 +582,14 @@ mod tests {
         // intended behaviour regardless of what the object happens to carry.
         assert_eq!(plan_verify(None, None), VerifyPlan::Complete);
         assert_eq!(plan_verify(None, Some("c2VydmVy")), VerifyPlan::Complete);
+    }
+
+    #[test]
+    fn checked_content_length_rejects_missing_and_negative() {
+        assert!(checked_content_length(None, "HEAD x").is_err());
+        assert!(checked_content_length(Some(-1), "HEAD x").is_err());
+        assert!(checked_content_length(Some(i64::MIN), "HEAD x").is_err());
+        assert_eq!(checked_content_length(Some(0), "HEAD x").unwrap(), 0);
+        assert_eq!(checked_content_length(Some(4096), "HEAD x").unwrap(), 4096);
     }
 }
