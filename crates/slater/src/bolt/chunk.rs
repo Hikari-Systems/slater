@@ -232,14 +232,11 @@ mod tests {
         let mut result = None;
         for (i, b) in framed.iter().enumerate() {
             buf.push(*b);
-            match re.feed(&buf, MAX_MESSAGE_BYTES).unwrap() {
-                Some((got, consumed)) => {
-                    assert_eq!(i + 1, framed.len(), "completes only on the final byte");
-                    assert_eq!(consumed, framed.len());
-                    result = Some(got);
-                    break;
-                }
-                None => {}
+            if let Some((got, consumed)) = re.feed(&buf, MAX_MESSAGE_BYTES).unwrap() {
+                assert_eq!(i + 1, framed.len(), "completes only on the final byte");
+                assert_eq!(consumed, framed.len());
+                result = Some(got);
+                break;
             }
         }
         assert_eq!(result.unwrap(), body, "reassembled body matches");
