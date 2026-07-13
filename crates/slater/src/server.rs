@@ -138,6 +138,10 @@ pub struct Graphs {
     /// (`config.cache.degreeColumn`), applied at open and on every hot-reload swap. The
     /// non-server openers default to `Lazy`.
     degree_residency: crate::degree_column::DegreeResidency,
+    /// Byte budget for each lazy dense degree column (`config.cache.degreeColumnBytes`), applied
+    /// at open and on every hot-reload swap. `None` (the non-server openers) uses
+    /// [`DEFAULT_BUDGET_BYTES`](crate::degree_column::DEFAULT_BUDGET_BYTES).
+    degree_column_bytes: Option<usize>,
     /// Per-graph writable-layer writers, populated only when the delta layer is
     /// enabled (`config.delta.enabled`). Empty otherwise — the read-only server is
     /// exactly what it was. Each writer is bound to the generation it resolved its
@@ -171,6 +175,7 @@ impl Graphs {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
     }
 
@@ -185,6 +190,7 @@ impl Graphs {
         verify_integrity: bool,
         range_index_cache_bytes: Option<usize>,
         degree_residency: crate::degree_column::DegreeResidency,
+        degree_column_bytes: Option<usize>,
     ) -> Result<Self> {
         let names = store.list("").context("list graphs in data store")?;
         // Open every graph concurrently. Each open is dominated by serial S3
@@ -206,6 +212,7 @@ impl Graphs {
                     verify_integrity,
                     range_index_cache_bytes,
                     degree_residency,
+                    degree_column_bytes,
                 )
                 .with_context(|| format!("open graph {name}"))?;
                 Ok((name, RwLock::new(Arc::new(gen))))
@@ -221,6 +228,7 @@ impl Graphs {
             require_acl_stamp: false,
             range_index_cache_bytes,
             degree_residency,
+            degree_column_bytes,
             writers: HashMap::new(),
             swap_locks,
         })
@@ -458,6 +466,7 @@ impl Graphs {
                 self.verify_integrity,
                 self.range_index_cache_bytes,
                 self.degree_residency,
+                self.degree_column_bytes,
             )
             .with_context(|| format!("open swapped-in generation {on_disk} of graph '{name}'"))?,
         );
@@ -2573,6 +2582,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         verify_integrity,
         Some(cfg.cache.range_index_cache_bytes),
         cfg.cache.degree_column,
+        Some(cfg.cache.degree_column_bytes),
     )?;
     graphs.set_manifest_policy(Some(PathBuf::from(&cfg.acl_path)), cfg.require_acl_stamp);
     graphs
@@ -5849,6 +5859,7 @@ mod tests {
                 false,
                 budget,
                 crate::degree_column::DegreeResidency::Lazy,
+                None,
             )
             .expect("open generation");
             let open_elapsed = t_open.elapsed();
@@ -9475,6 +9486,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         graphs
@@ -9535,6 +9547,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         let gen = graphs.get("people").unwrap();
@@ -9582,6 +9595,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         graphs
@@ -9675,6 +9689,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         let gen = graphs.get("people").unwrap();
@@ -11404,6 +11419,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         graphs
@@ -11478,6 +11494,7 @@ mod tests {
             true,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
         .unwrap();
         let gen = graphs.get("people").unwrap();
