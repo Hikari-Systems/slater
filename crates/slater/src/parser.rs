@@ -1920,13 +1920,19 @@ fn lower_proj_item(pair: Pair<Rule>) -> Result<ProjItem> {
 }
 
 fn lower_sort_item(pair: Pair<Rule>) -> Result<(Expr, SortDir)> {
-    let text = pair.as_str().to_lowercase();
-    let dir = if text.contains("desc") {
-        SortDir::Desc
-    } else {
-        SortDir::Asc
-    };
-    let expr = lower_expr(kids(pair).next().unwrap())?;
+    // The direction comes from the captured `kw_asc`/`kw_desc` token, never from
+    // the item's text: `ORDER BY n.description` must sort ascending.
+    let mut expr = None;
+    let mut dir = SortDir::Asc;
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::kw_asc => dir = SortDir::Asc,
+            Rule::kw_desc => dir = SortDir::Desc,
+            Rule::expr => expr = Some(lower_expr(child)?),
+            other => bail!("internal: unexpected sort_item child {other:?}"),
+        }
+    }
+    let expr = expr.ok_or_else(|| anyhow::anyhow!("internal: sort_item without an expression"))?;
     Ok((expr, dir))
 }
 
@@ -4194,6 +4200,63 @@ mod tests {
         assert_eq!(q.head.ret.body.items[0].alias.as_deref(), Some("name"));
         assert_eq!(q.head.ret.body.order_by.len(), 1);
         assert_eq!(q.head.ret.body.order_by[0].1, SortDir::Desc);
+    }
+
+    #[test]
+    fn sort_direction_comes_from_the_keyword_not_the_text() {
+        fn dirs(q: &str) -> Vec<SortDir> {
+            ok(q)
+                .head
+                .ret
+                .body
+                .order_by
+                .iter()
+                .map(|(_, dir)| *dir)
+                .collect()
+        }
+
+        // A sort key whose *text* contains "desc" still sorts ascending by default.
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.description"),
+            [SortDir::Asc]
+        );
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.descriptor"),
+            [SortDir::Asc]
+        );
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.name + 'descending'"),
+            [SortDir::Asc]
+        );
+        // An alias bound to such a name is no different.
+        assert_eq!(
+            dirs("MATCH (n) RETURN n.body AS descr ORDER BY descr"),
+            [SortDir::Asc]
+        );
+
+        // Explicit keywords still win, in both spellings.
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.description DESC"),
+            [SortDir::Desc]
+        );
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.description DESCENDING"),
+            [SortDir::Desc]
+        );
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.description ASC"),
+            [SortDir::Asc]
+        );
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.x ASCENDING"),
+            [SortDir::Asc]
+        );
+
+        // Direction is per sort item, not smeared across the list.
+        assert_eq!(
+            dirs("MATCH (n) RETURN n ORDER BY n.description, n.x DESC, n.y"),
+            [SortDir::Asc, SortDir::Desc, SortDir::Asc]
+        );
     }
 
     #[test]
