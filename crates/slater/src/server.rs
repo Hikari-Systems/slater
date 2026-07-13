@@ -2379,6 +2379,10 @@ struct Session {
 struct Framed<S> {
     stream: S,
     buf: Vec<u8>,
+    /// Resumable de-chunker: keeps a cursor into `buf` and the partial body across reads so
+    /// a message that arrives over many reads is reassembled in O(n), not O(n²) (it does not
+    /// re-scan the whole buffer on every partial read).
+    reassembler: chunk::ChunkReassembler,
     /// Largest reassembled message body this connection will currently accept. The
     /// framer is deliberately auth-blind — it owns a budget number, not the reason
     /// it changed. `handle_connection` starts it at the tight pre-auth cap and
@@ -2392,6 +2396,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         Self {
             stream,
             buf: Vec::with_capacity(8192),
+            reassembler: chunk::ChunkReassembler::new(),
             max_body,
         }
     }
@@ -2399,8 +2404,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
     /// Read the next complete (de-chunked) message body, or `None` at a clean EOF.
     async fn read_message(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
-            if let Some((body, consumed)) = chunk::decode_message_capped(&self.buf, self.max_body)?
-            {
+            if let Some((body, consumed)) = self.reassembler.feed(&self.buf, self.max_body)? {
                 self.buf.drain(..consumed);
                 return Ok(Some(body));
             }
@@ -10246,6 +10250,113 @@ mod tests {
                 Val::Int(3)
             ),
             "node count stable across a reopen"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// HIK-100 sub-item 6: deleting several core edges off one hub in a single delta must
+    /// resolve that hub's effective adjacency (base CSR + every lower segment) **once**, not
+    /// once per deleted edge — the O(D²)→O(D) memoisation. A first flush turns a fan of born
+    /// edges into a lower segment (making them *core*); a second delta deletes several of them
+    /// and flushes. The thread-local `EFFECTIVE_ADJ_CALLS` counter (the flush runs inline on
+    /// this thread) proves the bound, and the survivor set proves the fold is unchanged.
+    #[test]
+    fn effective_adj_memoised_per_hub_on_multi_edge_delete() {
+        let (root, _g) = testgen::write_indexed_people("flush_seg_hub_effadj");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, qy: &str| {
+            let gen = graphs.get("people").unwrap();
+            let writer = graphs.writer("people").unwrap();
+            match parser::parse_statement(qy).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                parser::ast::Statement::WriteEdge(w) => {
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {qy}"),
+            }
+        };
+        let q = |graphs: &Graphs, qy: &str| -> QueryResult {
+            let gen = graphs.get("people").unwrap();
+            let snap = graphs
+                .writer("people")
+                .map(|w| w.delta_snapshot())
+                .unwrap_or_else(DeltaSnapshot::empty);
+            let view = MergedView::new(gen.as_ref(), snap);
+            let r = Engine::new(&view, &cache)
+                .run(&parser::parse(qy).unwrap())
+                .unwrap();
+            r
+        };
+
+        // Build a hub H0 with a fan of five KNOWS edges to fresh leaves, then flush so the fan
+        // lands in a lower core segment.
+        write(&graphs, "MERGE (h:Person {name:'H0'}) SET h.age = 40");
+        for i in 1..=5 {
+            write(
+                &graphs,
+                &format!("MERGE (l:Person {{name:'L{i}'}}) SET l.age = {i}"),
+            );
+            write(
+                &graphs,
+                &format!("MERGE (h:Person {{name:'H0'}})-[:KNOWS]->(l:Person {{name:'L{i}'}})"),
+            );
+        }
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the fan flushes into a segment");
+
+        // Delete three of H0's now-core KNOWS edges — three explicit core-edge deletes, all at
+        // the same hub source, in one delta.
+        for i in 1..=3 {
+            write(
+                &graphs,
+                &format!(
+                    "MATCH (h:Person {{name:'H0'}})-[r:KNOWS]->(l:Person {{name:'L{i}'}}) DELETE r"
+                ),
+            );
+        }
+
+        // Flush inline on this thread; count effective_adj calls across this flush only.
+        crate::flush_segment::EFFECTIVE_ADJ_CALLS.with(|c| c.set(0));
+        graphs
+            .flush_graph_to_segment("people", &vc, &root)
+            .unwrap()
+            .expect("the edge deletes flush a non-empty delta");
+        let calls = crate::flush_segment::EFFECTIVE_ADJ_CALLS.with(|c| c.get());
+        assert_eq!(
+            calls, 1,
+            "effective_adj resolved once for the hub, not once per deleted edge (got {calls})"
+        );
+
+        // The fold is unchanged: exactly the two undeleted edges remain, to L4 and L5.
+        let mut names: Vec<String> = q(
+            &graphs,
+            "MATCH (h:Person {name:'H0'})-[:KNOWS]->(l) RETURN l.name",
+        )
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Val::Str(s) => s.clone(),
+            o => panic!("expected a name, got {o:?}"),
+        })
+        .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["L4".to_string(), "L5".to_string()],
+            "only the three deleted edges are gone"
         );
 
         std::fs::remove_dir_all(&root).ok();

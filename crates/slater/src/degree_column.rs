@@ -20,11 +20,13 @@
 //! degree-sum walk (millions of scattered lookups over the ~350 chunks). Faults run **off the
 //! lock** — decode into an `Arc<DegreeChunk>`, then a brief write lock stores it (a concurrent
 //! fault of the same chunk just discards the loser; the values are identical). Hits take a
-//! shared read lock and stamp a per-chunk atomic `last_used`, so parallel readers never
-//! serialise. A fault I/O error surfaces as `None` (identical to "no column"): the caller
-//! then falls back to the CSR leading-count peek, the same answer, just slower.
+//! shared read lock and only set a coarse per-chunk CLOCK `referenced` bit (recency is tracked
+//! CLOCK-style, not with a per-lookup wall-clock read + shared `last_used` store), so parallel
+//! readers never serialise on a shared timestamp cache line. A fault I/O error surfaces as
+//! `None` (identical to "no column"): the caller then falls back to the CSR leading-count peek,
+//! the same answer, just slower.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -54,16 +56,25 @@ pub enum DegreeResidency {
     Pinned,
 }
 
-/// One direction's lazily-faulted chunks. Slots are `None` until touched; each carries a
-/// monotonic `last_used` (nanos since the column's `created` base) stamped on every access so
-/// the idle sweep can drop cold chunks.
+/// One direction's lazily-faulted chunks. Slots are `None` until touched. Recency is tracked
+/// CLOCK-style: the hot lookup path only sets a cheap per-chunk `referenced` bit, while
+/// `last_used` is stamped on fault and re-stamped by the idle sweep (and consulted, coldest
+/// first, by the byte-budget pressure evictor) — so a lookup never reads the wall clock nor
+/// churns a shared timestamp atomic.
 struct Half {
     /// `slots[c]` is chunk `c`'s decoded degrees (compact [`DegreeChunk`]), or `None` if
     /// not resident.
     slots: RwLock<Vec<Option<Arc<DegreeChunk>>>>,
-    /// Per-chunk last-touch, nanos since `DegreeColumn::created`. Parallel to `slots`; read/
-    /// written under a shared read lock (atomic), so hot lookups never take the write lock.
+    /// Per-chunk last-refresh, nanos since `DegreeColumn::created`. Stamped when a chunk is
+    /// faulted in and re-stamped by the idle sweep for any chunk touched since the last sweep;
+    /// it is *not* written on the hot lookup path (that recency lives in `referenced`). Parallel
+    /// to `slots`; orders eviction candidates coldest-first.
     last_used: Vec<AtomicU64>,
+    /// Per-chunk CLOCK reference bit, set on every lookup (coarsely — a no-op once already set)
+    /// and cleared by the idle sweep *and* by the byte-budget evictor's first pass (each grants
+    /// a set-bit chunk one second chance). Parallel to `slots`. This is the *only* write the hot
+    /// lookup path makes, replacing a per-lookup clock read + timestamp store.
+    referenced: Vec<AtomicBool>,
 }
 
 impl Half {
@@ -71,6 +82,7 @@ impl Half {
         Self {
             slots: RwLock::new(vec![None; chunks]),
             last_used: (0..chunks).map(|_| AtomicU64::new(0)).collect(),
+            referenced: (0..chunks).map(|_| AtomicBool::new(false)).collect(),
         }
     }
 }
@@ -181,8 +193,14 @@ impl DegreeColumn {
         let off = idx % DEGREES_PER_RECORD;
         let half = if outgoing { &self.out } else { &self.in_ };
         let decoded = self.chunk(half, outgoing, chunk)?;
-        // Stamp last-touch (Relaxed: eviction only needs approximate recency).
-        half.last_used[chunk].store(self.now_nanos(), Ordering::Relaxed);
+        // Coarse CLOCK reference: set the bit (skip the store once already set, so a hot chunk's
+        // cache line stays clean for concurrent readers). No wall-clock read and no shared
+        // `last_used` store on the hot path — the idle sweep and the byte-budget evictor convert
+        // this bit into a second chance / a `last_used` refresh.
+        let refd = &half.referenced[chunk];
+        if !refd.load(Ordering::Relaxed) {
+            refd.store(true, Ordering::Relaxed);
+        }
         decoded.degree_at(off)
     }
 
@@ -212,12 +230,14 @@ impl DegreeColumn {
                 .fetch_add(decoded.resident_bytes(), Ordering::Relaxed);
             slots[c] = Some(decoded.clone());
         }
-        // Stamp the just-faulted chunk as most-recently-used *before* enforcing the budget, so
-        // the pressure sweep never evicts the very chunk we are about to return (no
-        // evict-then-refault thrash, no use-after-evict). A reader still holding a returned
-        // `Arc` after an eviction keeps its bytes alive by refcount; a re-fault decodes
-        // byte-identically from the same file.
+        // Stamp the just-faulted chunk's fault time and mark it referenced *before* enforcing
+        // the budget, so the pressure sweep never evicts the very chunk we are about to return
+        // (it is also explicitly protected below — no evict-then-refault thrash, no
+        // use-after-evict). A fresh chunk starts a full TTL window and a set reference bit. A
+        // reader still holding a returned `Arc` after an eviction keeps its bytes alive by
+        // refcount; a re-fault decodes byte-identically from the same file.
         half.last_used[c].store(self.now_nanos(), Ordering::Relaxed);
+        half.referenced[c].store(true, Ordering::Relaxed);
         self.enforce_budget(outgoing, c);
         Some(decoded)
     }
@@ -243,6 +263,14 @@ impl DegreeColumn {
                 if slot.is_none() {
                     continue;
                 }
+                // CLOCK second chance: a chunk touched since the last sweep clears its reference
+                // bit and refreshes `last_used` to this sweep's `now`, surviving this pass. Only
+                // a chunk untouched across a whole sweep interval *and* aged past the TTL is
+                // evicted.
+                if half.referenced[c].swap(false, Ordering::Relaxed) {
+                    half.last_used[c].store(now_nanos, Ordering::Relaxed);
+                    continue;
+                }
                 let last = half.last_used[c].load(Ordering::Relaxed);
                 if now_nanos.saturating_sub(last) > ttl_nanos {
                     if let Some(chunk) = slot.take() {
@@ -256,12 +284,19 @@ impl DegreeColumn {
         freed
     }
 
-    /// Evict the coldest resident chunks (LRU by `last_used`, across both halves) until total
-    /// resident bytes are back within `budget_bytes`. Called on every fault, so `Lazy` stays
+    /// Evict resident chunks until total resident bytes are back within `budget_bytes`, using
+    /// CLOCK second-chance eviction across both halves. Called on every fault, so `Lazy` stays
     /// bounded even when the idle-TTL sweep is disabled (`cacheTtlMs <= 0`). No-op under `Pinned`
     /// or an uncapped (`0`) budget. `(protect_outgoing, protect_chunk)` names the just-faulted
     /// chunk, which is excluded from eviction — guaranteeing the fault's own chunk survives (the
     /// keep-at-least-one floor) and never thrashes.
+    ///
+    /// Recency is read from the CLOCK `referenced` bit, not from `last_used`: since the hot
+    /// lookup path no longer stamps `last_used` (it sets the bit instead), a purely
+    /// `last_used`-ordered evictor would evict an actively-read-but-old chunk while keeping a
+    /// cold-but-recently-faulted one. Instead, a chunk whose bit is set earns one second chance
+    /// (its bit is cleared and it is spared this call); a chunk whose bit is clear is evicted.
+    /// `last_used` only orders candidates coldest-first within each phase.
     fn enforce_budget(&self, protect_outgoing: bool, protect_chunk: usize) {
         if self.budget_bytes == 0 || self.residency == DegreeResidency::Pinned {
             return;
@@ -269,9 +304,9 @@ impl DegreeColumn {
         if self.resident_bytes.load(Ordering::Relaxed) <= self.budget_bytes {
             return;
         }
-        // Snapshot resident chunks (coldest first) off the write locks. The protected chunk is
-        // never a candidate. The snapshot may be raced by a concurrent fault/evict, so each
-        // eviction re-checks the slot under the write lock before dropping it.
+        // Snapshot resident, non-protected chunks (coldest `last_used` first) off the write
+        // locks. The snapshot may be raced by a concurrent fault/evict, so `evict_chunk`
+        // re-checks the slot under the write lock before dropping it.
         let mut cands: Vec<(u64, bool, usize)> = Vec::new();
         for outgoing in [true, false] {
             let half = if outgoing { &self.out } else { &self.in_ };
@@ -284,16 +319,46 @@ impl DegreeColumn {
             }
         }
         cands.sort_unstable_by_key(|&(last_used, _, _)| last_used);
-        for (_, outgoing, c) in cands {
+
+        // First pass (the CLOCK hand): spare chunks hit since they were faulted/last swept
+        // (reference bit set — clear it and defer them), evict cold chunks (bit clear) coldest
+        // first. This is what keeps a hot chunk resident under pressure and evicts a cold one,
+        // even when the hot chunk's `last_used` is the older of the two.
+        let mut spared: Vec<(bool, usize)> = Vec::with_capacity(cands.len());
+        for &(_, outgoing, c) in &cands {
             if self.resident_bytes.load(Ordering::Relaxed) <= self.budget_bytes {
-                break;
+                return;
             }
             let half = if outgoing { &self.out } else { &self.in_ };
-            let mut slots = half.slots.write().unwrap();
-            if let Some(chunk) = slots[c].take() {
-                self.resident_bytes
-                    .fetch_sub(chunk.resident_bytes(), Ordering::Relaxed);
+            if half.referenced[c].swap(false, Ordering::Relaxed) {
+                spared.push((outgoing, c));
+                continue;
             }
+            self.evict_chunk(half, c);
+        }
+
+        // Second pass: evicting the cold chunks alone did not free enough, so the byte budget —
+        // a hard bound that must hold even when every resident chunk is hot — forces us to
+        // reclaim the spared chunks too, still coldest-first. Their bits were cleared in the
+        // first pass, so no chunk gets more than one second chance: `Σ resident ≤ budget` is
+        // restored and the sweep terminates regardless of concurrent re-referencing.
+        for (outgoing, c) in spared {
+            if self.resident_bytes.load(Ordering::Relaxed) <= self.budget_bytes {
+                return;
+            }
+            let half = if outgoing { &self.out } else { &self.in_ };
+            self.evict_chunk(half, c);
+        }
+    }
+
+    /// Drop resident chunk `c` of `half` under its write lock, debiting its resident bytes.
+    /// Re-checks the slot (the enforce-budget candidate snapshot is taken off-lock, so a
+    /// concurrent fault/evict may have changed it) and is a no-op if the slot is already empty.
+    fn evict_chunk(&self, half: &Half, c: usize) {
+        let mut slots = half.slots.write().unwrap();
+        if let Some(chunk) = slots[c].take() {
+            self.resident_bytes
+                .fetch_sub(chunk.resident_bytes(), Ordering::Relaxed);
         }
     }
 
@@ -408,20 +473,29 @@ mod tests {
         // Uncapped (0): isolate the idle-TTL path from budget pressure.
         let col = DegreeColumn::open(reader, n, DegreeResidency::Lazy, 0).unwrap();
 
-        // Fault out-chunk 0; touching stamps last_used ≈ now.
+        // Fault out-chunk 0; the fault stamps last_used and sets the CLOCK reference bit.
         let id = 5usize;
         assert_eq!(col.out_degree(id as u64), Some(out[id]));
         assert_eq!(col.resident_chunks(), 1);
 
-        // A huge TTL right after touch ⇒ still hot, nothing freed.
+        // Deterministic, clock-independent sweep instants (all safely after `created`) so the
+        // second sweep's `now` is strictly after the first's — the CLOCK second chance refreshes
+        // `last_used` on the first sweep, so a bare `Instant::now()` pair could tie under load.
+        let base = Instant::now();
+
+        // A huge TTL right after touch ⇒ referenced ⇒ CLOCK second chance, nothing freed (but
+        // the reference bit is now cleared).
         assert_eq!(
-            col.evict_expired(Instant::now(), Duration::from_secs(3600)),
+            col.evict_expired(base + Duration::from_millis(10), Duration::from_secs(3600)),
             0
         );
         assert_eq!(col.resident_chunks(), 1);
 
-        // A zero TTL ⇒ any touched chunk is now idle "past" the window ⇒ freed.
-        assert_eq!(col.evict_expired(Instant::now(), Duration::ZERO), 1);
+        // A later zero-TTL sweep ⇒ bit clear (not re-touched) and aged past the window ⇒ freed.
+        assert_eq!(
+            col.evict_expired(base + Duration::from_millis(20), Duration::ZERO),
+            1
+        );
         assert_eq!(col.resident_chunks(), 0);
 
         // Re-fault after eviction returns the same value (and re-materialises the chunk).
@@ -507,6 +581,133 @@ mod tests {
         for (id, &deg) in out.iter().enumerate() {
             assert_eq!(col.out_degree(id as u64), Some(deg), "refault id {id}");
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn touched_chunk_gets_a_clock_second_chance() {
+        // The hot lookup path no longer stamps a wall-clock timestamp; it sets a coarse CLOCK
+        // reference bit. The idle sweep clears the bit and grants a second chance, so a chunk
+        // touched since the last sweep survives one eviction pass. Pre-fix (a plain last_used
+        // stamp), a zero-TTL sweep evicted it on the *first* pass.
+        // (Distinct `n` from the other tests so its temp file never collides under parallelism.)
+        let n = 3 * DEGREES_PER_RECORD + 13;
+        let (path, out, _) = build(n);
+        let reader = BlockFileReader::open(&path).unwrap();
+        // Uncapped (0): isolate the idle-TTL / CLOCK path from budget pressure.
+        let col = DegreeColumn::open(reader, n, DegreeResidency::Lazy, 0).unwrap();
+
+        let id = 5usize;
+        assert_eq!(col.out_degree(id as u64), Some(out[id]));
+        assert_eq!(col.resident_chunks(), 1);
+
+        // Deterministic, monotonic sweep instants (the second strictly after the first, since the
+        // second chance refreshes `last_used` on the first sweep).
+        let base = Instant::now();
+
+        // First zero-TTL sweep: referenced since the fault ⇒ CLOCK second chance, survives.
+        assert_eq!(
+            col.evict_expired(base + Duration::from_millis(10), Duration::ZERO),
+            0
+        );
+        assert_eq!(col.resident_chunks(), 1);
+
+        // No further touch: the next sweep finds the bit clear and evicts.
+        assert_eq!(
+            col.evict_expired(base + Duration::from_millis(20), Duration::ZERO),
+            1
+        );
+        assert_eq!(col.resident_chunks(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn budget_pressure_spares_hot_chunk_evicts_cold_by_reference_bit() {
+        // The reconciliation of HIK-94 (byte-budget pressure eviction) with HIK-100 (the hot
+        // path stamps a CLOCK reference bit instead of `last_used`). A naive union would keep
+        // HIK-94's pure `last_used`-ordered evictor while HIK-100 stops updating `last_used` on
+        // hits — so pressure eviction would pick victims by *fault time*, blind to the reference
+        // bit, and could evict a hot, actively-read chunk while keeping a cold one. This test
+        // constructs exactly that trap and proves the reconciled evictor avoids it: the hot
+        // chunk (older `last_used`, reference bit set) survives, the cold chunk (newer
+        // `last_used`, reference bit clear) is the victim.
+        let n = 3 * DEGREES_PER_RECORD + 5; // 4 out-chunks
+        let (path, out, _) = build(n);
+
+        let hot = 0usize; // chunk 0
+        let cold = 1usize; // chunk 1
+        let trigger = 2usize; // chunk 2
+        let hot_id = (hot * DEGREES_PER_RECORD) as u64;
+        let cold_id = (cold * DEGREES_PER_RECORD) as u64;
+        let trigger_id = (trigger * DEGREES_PER_RECORD) as u64;
+
+        // Measure the exact resident footprint of the three chunks (their EF sizes differ). A
+        // budget one byte under all three forces enforce_budget to evict exactly one chunk;
+        // evicting the (smaller-or-equal) cold chunk always drops back under budget, so the
+        // choice of victim — not the arithmetic — is what this test pins down.
+        let probe = DegreeColumn::open(
+            BlockFileReader::open(&path).unwrap(),
+            n,
+            DegreeResidency::Lazy,
+            0,
+        )
+        .unwrap();
+        assert_eq!(probe.out_degree(hot_id), Some(out[hot_id as usize]));
+        assert_eq!(probe.out_degree(cold_id), Some(out[cold_id as usize]));
+        assert_eq!(probe.out_degree(trigger_id), Some(out[trigger_id as usize]));
+        let three = probe.resident_bytes();
+        assert!(three > 1);
+        let budget = three - 1;
+
+        let reader = BlockFileReader::open(&path).unwrap();
+        let col = DegreeColumn::open(reader, n, DegreeResidency::Lazy, budget).unwrap();
+
+        // Deterministic, clock-independent `now`s (all safely after `created`).
+        let base = Instant::now();
+        let huge = Duration::from_secs(3600);
+
+        // Fault HOT, then a huge-TTL sweep clears its bit and stamps last_used = base+10ms
+        // (referenced ⇒ second chance, nothing freed). HOT is now bit-clear, last_used old.
+        assert_eq!(col.out_degree(hot_id), Some(out[hot_id as usize]));
+        assert_eq!(col.evict_expired(base + Duration::from_millis(10), huge), 0);
+
+        // Fault COLD (bit set), then a second huge-TTL sweep: COLD is referenced ⇒ its bit is
+        // cleared and last_used refreshed to base+20ms (newer than HOT's); HOT is *not*
+        // referenced (bit already clear, not re-hit) ⇒ its last_used is left untouched (old).
+        assert_eq!(col.out_degree(cold_id), Some(out[cold_id as usize]));
+        assert_eq!(col.evict_expired(base + Duration::from_millis(20), huge), 0);
+
+        // Re-hit HOT: the hot path sets its reference bit (but does NOT touch last_used, which
+        // stays the *older* base+10ms). COLD keeps its clear bit and the *newer* base+20ms.
+        assert_eq!(col.out_degree(hot_id), Some(out[hot_id as usize]));
+
+        // State now: HOT = (bit set, last_used older); COLD = (bit clear, last_used newer).
+        // A pure last_used LRU evictor would evict HOT (older) — the naive-merge bug.
+        assert!(col.out.slots.read().unwrap()[hot].is_some());
+        assert!(col.out.slots.read().unwrap()[cold].is_some());
+        assert_eq!(col.resident_chunks(), 2);
+
+        // Fault the trigger ⇒ three resident, over the two-chunk budget ⇒ enforce_budget runs.
+        assert_eq!(col.out_degree(trigger_id), Some(out[trigger_id as usize]));
+
+        // The reconciliation: HOT survives (reference bit granted it a second chance), COLD is
+        // evicted (bit clear), even though COLD's last_used is newer. The trigger it protected
+        // stays. Byte budget still honoured.
+        assert!(
+            col.out.slots.read().unwrap()[hot].is_some(),
+            "the actively-hit chunk was evicted — enforce_budget ignored the reference bit"
+        );
+        assert!(
+            col.out.slots.read().unwrap()[cold].is_none(),
+            "the cold chunk survived — enforce_budget evicted by fault time, not recency"
+        );
+        assert!(col.out.slots.read().unwrap()[trigger].is_some());
+        assert_eq!(col.resident_chunks(), 2);
+        assert!(col.resident_bytes() <= budget);
+
+        // Values remain correct (re-faulting the evicted cold chunk is byte-identical).
+        assert_eq!(col.out_degree(hot_id), Some(out[hot_id as usize]));
+        assert_eq!(col.out_degree(cold_id), Some(out[cold_id as usize]));
         let _ = std::fs::remove_file(&path);
     }
 }

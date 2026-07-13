@@ -80,6 +80,77 @@ pub fn decode_complete(buf: &[u8]) -> Result<(Vec<u8>, usize)> {
     }
 }
 
+/// A **resumable** Bolt message reassembler.
+///
+/// [`decode_message_capped`] restarts from the front of the buffer on every call, so a
+/// framer that retries it as bytes trickle in re-scans (and re-copies) everything already
+/// received — O(n²) work for a large message that arrives in many small reads. This keeps a
+/// cursor into the caller's buffer plus the partial body across calls, so each chunk-payload
+/// byte is copied into the body exactly once (O(n)).
+///
+/// Usage mirrors the framer's read loop: the caller appends bytes to its own buffer and calls
+/// [`feed`](Self::feed) with the whole buffer (front **not** yet drained). On `Some`, the
+/// reassembler has reset for the next message and the caller drains `consumed` bytes.
+#[derive(Default)]
+pub struct ChunkReassembler {
+    /// The in-progress message body assembled so far (across chunks).
+    body: Vec<u8>,
+    /// Offset in the caller's buffer of the next chunk header not yet folded into `body`.
+    /// Persists across `feed` calls (the resumable cursor); reset to 0 when a message
+    /// completes and the caller drains.
+    pos: usize,
+    /// Test-only: total payload bytes copied into `body`. Proves the single-copy (O(n))
+    /// property — for one message it equals the final body length.
+    #[cfg(test)]
+    copied: usize,
+}
+
+impl ChunkReassembler {
+    /// A fresh reassembler with an empty body and a zero cursor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resume reassembly against `buf` (the caller's whole receive buffer). Returns the
+    /// reassembled body plus the number of bytes consumed from the front of `buf` (chunk
+    /// headers + payloads + the terminating `00 00`) once a message completes, or `Ok(None)`
+    /// when more bytes are needed. On `Some` the reassembler is reset for the next message.
+    pub fn feed(&mut self, buf: &[u8], max_body: usize) -> Result<Option<(Vec<u8>, usize)>> {
+        loop {
+            if self.pos + 2 > buf.len() {
+                return Ok(None); // header not fully arrived; resume from `pos` next call
+            }
+            let len = u16::from_be_bytes([buf[self.pos], buf[self.pos + 1]]) as usize;
+            if len == 0 {
+                // End-of-message marker: hand back the body and reset for the next message.
+                let consumed = self.pos + 2;
+                let body = std::mem::take(&mut self.body);
+                self.pos = 0;
+                return Ok(Some((body, consumed)));
+            }
+            if self.pos + 2 + len > buf.len() {
+                return Ok(None); // payload not fully arrived; resume from this header
+            }
+            if self.body.len() + len > max_body {
+                bail!("Bolt message exceeds the {max_body}-byte limit; closing connection");
+            }
+            self.body
+                .extend_from_slice(&buf[self.pos + 2..self.pos + 2 + len]);
+            #[cfg(test)]
+            {
+                self.copied += len;
+            }
+            self.pos += 2 + len;
+        }
+    }
+
+    /// Test-only: total payload bytes copied into the body since construction.
+    #[cfg(test)]
+    pub fn bytes_copied(&self) -> usize {
+        self.copied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +215,59 @@ mod tests {
         assert!(decode_message_capped(&stream, 4).is_err());
         // The same stream is fine under a cap that admits it.
         assert!(decode_message_capped(&stream, 64).unwrap().is_some());
+    }
+
+    #[test]
+    fn reassembler_copies_each_byte_once_across_trickled_reads() {
+        // A large multi-chunk message arriving one byte at a time must reassemble
+        // correctly and copy each payload byte exactly once. Pre-fix the framer re-ran
+        // `decode_message_capped` from the buffer front on every read, re-copying the whole
+        // accumulated body each time — O(n²) copies; here the cursor advances so total
+        // copied == body length.
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let framed = frame(&body);
+
+        let mut re = ChunkReassembler::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut result = None;
+        for (i, b) in framed.iter().enumerate() {
+            buf.push(*b);
+            if let Some((got, consumed)) = re.feed(&buf, MAX_MESSAGE_BYTES).unwrap() {
+                assert_eq!(i + 1, framed.len(), "completes only on the final byte");
+                assert_eq!(consumed, framed.len());
+                result = Some(got);
+                break;
+            }
+        }
+        assert_eq!(result.unwrap(), body, "reassembled body matches");
+        assert_eq!(
+            re.bytes_copied(),
+            body.len(),
+            "each payload byte copied exactly once (no quadratic re-copy)"
+        );
+    }
+
+    #[test]
+    fn reassembler_handles_back_to_back_and_caps() {
+        // Two messages in one buffer: decode the first, drain, decode the second.
+        let mut re = ChunkReassembler::new();
+        let mut stream = frame(b"first");
+        stream.extend_from_slice(&frame(b"second"));
+        let (m1, c1) = re.feed(&stream, 64).unwrap().unwrap();
+        assert_eq!(m1, b"first");
+        let rest = &stream[c1..];
+        let (m2, _) = re.feed(rest, 64).unwrap().unwrap();
+        assert_eq!(m2, b"second");
+
+        // The body cap still trips mid-stream, exactly as the one-shot decoder's does.
+        let mut over = ChunkReassembler::new();
+        let mut flood = Vec::new();
+        for _ in 0..2 {
+            flood.extend_from_slice(&3u16.to_be_bytes());
+            flood.extend_from_slice(b"abc");
+        }
+        flood.extend_from_slice(&[0, 0]);
+        assert!(over.feed(&flood, 4).is_err());
     }
 
     #[test]

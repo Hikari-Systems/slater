@@ -265,13 +265,29 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     //     edge id; identity semantics remove *every* parallel edge of that reltype to the
     //     neighbour, mirroring the delta's `(reltype, neighbour)` suppression in `for_each_adj_overlaid`.
     for (src, edges) in &data.adj_out {
+        // Only sources carrying an explicit core-edge delete (a no-id adjacency entry) need the
+        // base/lower-segment adjacency resolved. Compute `effective_adj` — which reads the base
+        // CSR *and every lower segment* — **once per hub** and index it by `(neighbour, reltype)`,
+        // so `D` deletes on a `D`-degree hub cost O(D) rather than re-reading that adjacency per
+        // deleted edge (the O(D²) blow-up on a hub-heavy delete).
+        if !edges.iter().any(|e| e.edge_id.is_none()) {
+            continue;
+        }
+        let eff = effective_adj(inp.core, *src, /*outgoing=*/ true)?;
+        let mut by_key: HashMap<(u64, &str), Vec<u64>> = HashMap::new();
+        for (eid, other, reltype) in &eff {
+            by_key
+                .entry((*other, reltype.as_str()))
+                .or_default()
+                .push(*eid);
+        }
         for e in edges {
             if e.edge_id.is_some() {
                 continue;
             }
-            for (eid, other, reltype) in effective_adj(inp.core, *src, /*outgoing=*/ true)? {
-                if other == e.other && reltype == e.reltype {
-                    suppressed.insert(eid, (*src, e.other, reltype));
+            if let Some(eids) = by_key.get(&(e.other, e.reltype.as_str())) {
+                for &eid in eids {
+                    suppressed.insert(eid, (*src, e.other, e.reltype.clone()));
                 }
             }
         }
@@ -803,6 +819,14 @@ fn core_patch_labels(base_labels: &[String], delta: &NodeDelta) -> Vec<String> {
     set.into_iter().collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Test-only per-thread call counter for `effective_adj`, proving the O(D²)→O(D)
+    // memoisation (the flush runs inline on the caller's thread, so this is not polluted by
+    // concurrently-running tests). See `effective_adj_memoised_per_hub_on_multi_edge_delete`.
+    pub(crate) static EFFECTIVE_ADJ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Read node `node`'s **effective adjacency** below this flush in direction `outgoing`: the
 /// base CSR folded with every lower core segment's fragment, mirroring
 /// [`for_each_adj_overlaid`](crate::exec) (oldest→newest — a `removed` fragment suppresses by
@@ -811,6 +835,8 @@ fn core_patch_labels(base_labels: &[String], delta: &NodeDelta) -> Vec<String> {
 /// A born endpoint id (≥ the base node count) has no base CSR record; its edges come wholly
 /// from the segment fragments.
 fn effective_adj(core: &Generation, node: u64, outgoing: bool) -> Result<Vec<(u64, u64, String)>> {
+    #[cfg(test)]
+    EFFECTIVE_ADJ_CALLS.with(|c| c.set(c.get() + 1));
     let base_nodes = core.topology().node_count();
     let mut list: Vec<(u64, u64, String)> = if node < base_nodes {
         let adjs = if outgoing {

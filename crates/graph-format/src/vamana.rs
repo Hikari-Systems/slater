@@ -34,6 +34,7 @@
 // those fields' widths); storing the index sidesteps that entirely and costs no
 // extra resident memory.
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -98,11 +99,26 @@ pub fn build_vamana(vectors: &[Vec<f32>], r: usize, alpha: f32) -> Result<Vamana
     // Search-list size during construction — wider than R for better candidates.
     let l_build = (r * 2).max(64);
 
+    // Reused generation-stamped scratch for `greedy_search_build`'s expanded set: one
+    // allocation for the whole build, "cleared" by bumping `search_gen` per search
+    // (O(1)) rather than reallocating an n-sized array per node (O(n²) allocation).
+    let mut expanded_stamp = vec![0u32; n];
+    let mut search_gen: u32 = 0;
+
     // Two passes: alpha = 1 (short edges first), then the real alpha (long edges).
     for &pass_alpha in &[1.0f32, alpha.max(1.0)] {
         let order = random_permutation(n, &mut rng);
         for &p in &order {
-            let visited = greedy_search_build(medoid, p, &adjacency, vectors, l_build);
+            search_gen += 1;
+            let visited = greedy_search_build(
+                medoid,
+                p,
+                &adjacency,
+                vectors,
+                l_build,
+                &mut expanded_stamp,
+                search_gen,
+            );
             // Candidate pool = everything the search touched, plus p's current
             // neighbours, minus p itself.
             let mut cands: Vec<u32> = visited;
@@ -166,24 +182,31 @@ fn random_permutation(n: usize, rng: &mut Lcg) -> Vec<usize> {
 /// Greedy search over the *current* graph from `start` towards point `p`, using
 /// exact squared-L2 over full vectors. Returns every node it expanded (the
 /// candidate pool for pruning).
+///
+/// `expanded_stamp` is a caller-owned scratch buffer of length `vectors.len()`,
+/// reused across every call: a node counts as expanded on this search iff its stamp
+/// equals `gen`. The caller bumps `gen` before each call, so "clearing" the visited
+/// marks is O(1) — without this the per-node build reallocated (and zeroed) an
+/// n-sized bool array on every one of its `n` calls, i.e. O(n²) allocation.
 fn greedy_search_build(
     start: usize,
     p: usize,
     adjacency: &[Vec<u32>],
     vectors: &[Vec<f32>],
     l_size: usize,
+    expanded_stamp: &mut [u32],
+    gen: u32,
 ) -> Vec<u32> {
     let d = |x: usize| sq_l2(&vectors[x], &vectors[p]);
     let mut beam: Vec<(f64, u32)> = vec![(d(start), start as u32)];
-    let mut expanded = vec![false; vectors.len()];
     let mut visited = Vec::new();
     while let Some((_, cur)) = beam
         .iter()
         .copied()
-        .filter(|(_, i)| !expanded[*i as usize])
+        .filter(|(_, i)| expanded_stamp[*i as usize] != gen)
         .min_by(|a, b| a.0.total_cmp(&b.0))
     {
-        expanded[cur as usize] = true;
+        expanded_stamp[cur as usize] = gen;
         visited.push(cur);
         for &nb in &adjacency[cur as usize] {
             if !beam.iter().any(|(_, i)| *i == nb) {
@@ -434,7 +457,11 @@ where
     FE: Fn(&[f32]) -> f32,
 {
     let beam_width = beam_width.max(k).max(1);
-    let mut expanded = vec![false; num_nodes];
+    // A search touches only O(beam_width · expansions) nodes, so track the expanded
+    // set in a `HashSet` that grows with the work done — not a `vec![false; num_nodes]`
+    // bool array sized to the *whole index*, which made each query allocate (and zero)
+    // memory proportional to the index rather than the search.
+    let mut expanded: HashSet<VamanaIndex> = HashSet::new();
     // Working candidate list, kept ascending by PQ estimate and capped to L.
     let mut beam: Vec<(f32, VamanaIndex)> = vec![(estimate(medoid), medoid)];
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -442,10 +469,10 @@ where
     while let Some((_, cur)) = beam
         .iter()
         .copied()
-        .filter(|(_, i)| !expanded[*i as usize])
+        .filter(|(_, i)| !expanded.contains(i))
         .min_by(|a, b| a.0.total_cmp(&b.0))
     {
-        expanded[cur as usize] = true;
+        expanded.insert(cur);
         let (vector, neighbours) = fetch(cur)?;
         hits.push(SearchHit {
             index: cur,
@@ -453,7 +480,7 @@ where
         });
         for nb in neighbours {
             if (nb as usize) < num_nodes
-                && !expanded[nb as usize]
+                && !expanded.contains(&nb)
                 && !beam.iter().any(|(_, i)| *i == nb)
             {
                 beam.push((estimate(nb), nb));
@@ -544,6 +571,41 @@ mod tests {
     }
 
     #[test]
+    fn greedy_search_build_scratch_reuse_is_isolated_across_generations() {
+        // The build reuses one `expanded_stamp` buffer across every per-node search,
+        // bumping the generation instead of reallocating. A search run against a buffer
+        // already dirtied by a prior generation must return exactly what a pristine
+        // buffer would — the generation stamp isolates the reuse.
+        let vectors = vec![
+            vec![0.0f32, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            vec![3.0, 0.0],
+        ];
+        let adjacency: Vec<Vec<u32>> = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let n = vectors.len();
+        let l = 8;
+
+        // Reference: a fresh (all-zero) buffer per call.
+        let mut fresh1 = vec![0u32; n];
+        let ref_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut fresh1, 1);
+        let mut fresh2 = vec![0u32; n];
+        let ref_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut fresh2, 1);
+
+        // Reused buffer with a bumped generation: the second call must not see the
+        // first call's stamps.
+        let mut shared = vec![0u32; n];
+        let shar_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut shared, 1);
+        let shar_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut shared, 2);
+
+        assert_eq!(shar_a, ref_a);
+        assert_eq!(
+            shar_b, ref_b,
+            "a bumped generation must isolate the reused scratch buffer"
+        );
+    }
+
+    #[test]
     fn vamana_store_roundtrips_nodes_and_adjacency() {
         let vectors = unit_vectors(8, 40);
         let g = build_vamana(&vectors, 8, 1.2).unwrap();
@@ -622,5 +684,42 @@ mod tests {
             recall >= 0.85,
             "Vamana+PQ recall@{k} was {recall:.3}, expected ≥ 0.85"
         );
+    }
+
+    #[test]
+    fn beam_search_scratch_is_bounded_by_visited_not_index_size() {
+        // A search over a *huge* index that only touches a handful of nodes must not
+        // allocate memory proportional to the index. Pre-fix `beam_search` opened with
+        // `vec![false; num_nodes]`, so this `num_nodes` would have forced a ~1 GiB
+        // bool array per query; the `HashSet` now grows only with the nodes expanded.
+        // The search still returns the correct exact-ranked top-k over the tiny graph.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0], // 0 = medoid / entry
+            vec![1.0, 0.0], // 1
+            vec![0.0, 1.0], // 2
+            vec![2.0, 0.0], // 3
+            vec![0.0, 2.0], // 4
+        ];
+        // A tiny connected graph: 0 -> {1,2}, 1 -> {3}, 2 -> {4}.
+        let adjacency: Vec<Vec<VamanaIndex>> = vec![vec![1, 2], vec![3], vec![4], vec![], vec![]];
+        let query = [0.5f32, 0.0];
+        let exact = |v: &[f32]| (v[0] - query[0]).powi(2) + (v[1] - query[1]).powi(2);
+
+        let huge_num_nodes = 1usize << 30; // 1 073 741 824 — a billion-entry bool array pre-fix.
+        let hits = beam_search(
+            0,
+            8,
+            3,
+            huge_num_nodes,
+            |i| exact(&vectors[i as usize]), // estimate == exact here (navigation still valid)
+            |i| Ok((vectors[i as usize].clone(), adjacency[i as usize].clone())),
+            exact,
+        )
+        .unwrap();
+
+        // Closest three to (0.5, 0) by squared-L2: node 1 (0.25), node 0 (0.25 → tie,
+        // broken by lower index so 0 first), node 2 (1.25).
+        let got: Vec<VamanaIndex> = hits.iter().map(|h| h.index).collect();
+        assert_eq!(got, vec![0, 1, 2], "exact-ranked top-3 over the tiny graph");
     }
 }

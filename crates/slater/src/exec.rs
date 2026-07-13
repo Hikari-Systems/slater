@@ -3753,6 +3753,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
             let srcs = self.endpoint_candidates(&p.start, &seed, m.where_.as_ref())?;
             let dsts = self.endpoint_candidates(end, &seed, m.where_.as_ref())?;
 
+            // Bound the |srcs|×|dsts| search fan-out: with two free endpoints this launches a
+            // separate shortest-path search for every (src, dst) pair — quadratic in the scanned
+            // id space. Charge the product up front. It is self-scaling: a bound endpoint is a
+            // single candidate, so this only bites when *both* endpoints are free and large (the
+            // pathological case), and it trips the standard `maxIntermediate` budget before the
+            // searches run rather than after they have burned the graph.
+            self.charge(srcs.len().saturating_mul(dsts.len()) as u64)?;
+
             let mut matches: Vec<HashMap<String, Val>> = Vec::new();
             for &src in &srcs {
                 for &dst in &dsts {
@@ -3941,9 +3949,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     // *after* it is materialised lets that one layer exhaust RSS before
                     // the budget ever trips (it OOM-killed the capped container); charging
                     // per branch trips the standard `maxIntermediate` budget mid-layer,
-                    // before the clones accumulate. Only emitted results are charged
-                    // elsewhere (above).
-                    self.charge(1)?;
+                    // before the clones accumulate. The charge is **proportional to the
+                    // branch's clone size** (`path.len()+1`, mirroring the result charge
+                    // above) — a fixed `charge(1)` under-counted a deep branch by a factor
+                    // of its depth, so the budget only tripped long after the O(depth)
+                    // clones had accumulated. Only emitted results are charged elsewhere.
+                    self.charge(path.len() as u64 + 1)?;
                     let mut npath = path.clone();
                     npath.push(hop);
                     let mut nvisited = visited.clone();
@@ -15745,6 +15756,78 @@ mod tests {
         let res = run_budgeted("exec_budget_allsp_ok", 1_000_000, q)
             .expect("a generous budget must not affect the query");
         assert_eq!(col0(&res), vec!["0"]); // no KNOWS path Person→Company
+    }
+
+    #[test]
+    fn all_shortest_charges_frontier_branches_proportional_to_depth() {
+        // Each live shortest-path branch clones a `Vec<Hop>` + `HashSet` whose size grows with
+        // its depth, but the frontier charge used a fixed `charge(1)`, under-counting a deep
+        // branch by a factor of its depth. On a length-12 chain the total charge is now
+        // ≈ L(L+1)/2 = 78 (proportional), where the old fixed accounting was ≈ 2L-1 = 23. A
+        // budget of 40 sits between them: it admitted the old accounting but must trip the new.
+        let (root, graph) = testgen::write_chain("exec_chain_depth_charge", 12);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let q = "MATCH ALL SHORTEST (a {name:'n0'})-[r:R*]->(b {name:'n12'}) RETURN size(r) AS l";
+        let ast = parser::parse(q).unwrap();
+
+        // A generous budget completes: the single length-12 path.
+        let ok = Engine::new(&gen, &cache)
+            .with_max_intermediate(10_000)
+            .run(&ast)
+            .expect("a generous budget completes the chain search");
+        assert!(matches!(ok.rows[0][0], Val::Int(12)), "{:?}", ok.rows[0][0]);
+
+        // The depth-proportional charge trips at 40; the old fixed `charge(1)` would not.
+        let err = Engine::new(&gen, &cache)
+            .with_max_intermediate(40)
+            .run(&ast)
+            .expect_err("the depth-proportional frontier charge must trip at 40");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_free_endpoint_selector_charges_the_search_product() {
+        // A selector with two free endpoints scans all candidates on each side and launches a
+        // shortest-path search for every (src, dst) pair — quadratic in the id space. On the
+        // isolated fixture (8 nodes, no edges) each search does ~0 frontier work, so the old
+        // code sailed under a small budget however many pairs it ran; the fix charges the 8×8
+        // product up front, tripping before the fan-out runs.
+        let (root, graph) = testgen::write_isolated("exec_2free_product", 8);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let two_free = "MATCH ALL SHORTEST (a)-[r:R*]->(b) RETURN count(*) AS c";
+        let ast = parser::parse(two_free).unwrap();
+        let err = Engine::new(&gen, &cache)
+            .with_max_intermediate(20)
+            .run(&ast)
+            .expect_err("two free endpoints must charge |srcs|×|dsts|");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        // A generous budget still completes (no edges ⇒ no path ⇒ count 0).
+        let ok = Engine::new(&gen, &cache)
+            .with_max_intermediate(10_000)
+            .run(&ast)
+            .expect("a generous budget completes");
+        assert_eq!(col0(&ok), vec!["0"]);
+
+        // Constraining one endpoint to a single candidate drops the product to 1×8 = 8, which
+        // the same budget admits — the charge bites only the pathological two-free case.
+        let one_bound = "MATCH ALL SHORTEST (a {name:'n0'})-[r:R*]->(b) RETURN count(*) AS c";
+        let ast2 = parser::parse(one_bound).unwrap();
+        let ok2 = Engine::new(&gen, &cache)
+            .with_max_intermediate(20)
+            .run(&ast2)
+            .expect("one constrained endpoint stays under the budget");
+        assert_eq!(col0(&ok2), vec!["0"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
