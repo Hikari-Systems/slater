@@ -290,17 +290,10 @@ pub fn serialise_binary_dump<V: ReadView>(
 /// same indexes forward (and business keys stay resolvable for later writes).
 fn emit_index_ddl<V: ReadView>(view: &V, out: &mut impl Write) -> Result<()> {
     for ri in &view.manifest().range_indexes {
+        let (lt, prop) = (quote_ident(&ri.label_or_type), quote_ident(&ri.property));
         match ri.entity {
-            EntityKind::Node => writeln!(
-                out,
-                "CREATE INDEX FOR (n:{}) ON (n.{});",
-                ri.label_or_type, ri.property
-            )?,
-            EntityKind::Edge => writeln!(
-                out,
-                "CREATE INDEX FOR ()-[r:{}]->() ON (r.{});",
-                ri.label_or_type, ri.property
-            )?,
+            EntityKind::Node => writeln!(out, "CREATE INDEX FOR (n:{lt}) ON (n.{prop});")?,
+            EntityKind::Edge => writeln!(out, "CREATE INDEX FOR ()-[r:{lt}]->() ON (r.{prop});")?,
         }
     }
     Ok(())
@@ -375,11 +368,18 @@ fn emit_node<V: ReadView>(
     let (labels, props) = engine.node_record(id)?;
     let (ident_labels, key, key_value) = node_identity(view, id, &labels, &props)?;
     // `MERGE (n:Ident:Other {key: v})` — all labels, identity first. The build MERGE
-    // dialect matches on the leading (identity) label and writes the whole list.
-    let label_str = ident_labels.join(":");
+    // dialect matches on the leading (identity) label and writes the whole list. Every
+    // identifier is quoted on the way out (HIK-84): a label or key is arbitrary text,
+    // and un-quoted it would re-parse as *structure* in the rebuild.
+    let label_str = ident_labels
+        .iter()
+        .map(|l| quote_ident(l))
+        .collect::<Vec<_>>()
+        .join(":");
     write!(
         out,
-        "MERGE (n:{label_str} {{{key}: {}}})",
+        "MERGE (n:{label_str} {{{}: {}}})",
+        quote_ident(&key),
         literal(&key_value)
     )?;
     emit_set(&props, "n", Some(&key), out)?;
@@ -423,8 +423,13 @@ fn emit_edges_from<V: ReadView>(
         let (rtype, eprops) = engine.rel_record(adj.edge.0, adj.reltype)?;
         write!(
             out,
-            "MERGE (a:{sl} {{{sk}: {}}})-[r:{rtype}]->(b:{dl} {{{dk}: {}}})",
+            "MERGE (a:{} {{{}: {}}})-[r:{}]->(b:{} {{{}: {}}})",
+            quote_ident(&sl),
+            quote_ident(&sk),
             literal(&sv),
+            quote_ident(&rtype),
+            quote_ident(&dl),
+            quote_ident(&dk),
             literal(&dv)
         )?;
         emit_set(&eprops, "r", None, out)?;
@@ -453,7 +458,7 @@ fn emit_set(
     kept.sort_by(|a, b| a.0.cmp(b.0));
     for (i, (name, v)) in kept.iter().enumerate() {
         let sep = if i == 0 { " SET" } else { "," };
-        write!(out, "{sep} {var}.{name} = {}", literal(v))?;
+        write!(out, "{sep} {var}.{} = {}", quote_ident(name), literal(v))?;
     }
     Ok(())
 }
@@ -491,6 +496,37 @@ fn format_float(f: f64) -> String {
     } else {
         format!("{s}.0")
     }
+}
+
+/// Render an **identifier** — a label, relationship type, property key or index
+/// property — for the builder's `label` / `reltype` / `key` rules.
+///
+/// A name is emitted bare only when it is exactly what those rules accept bare:
+/// non-empty and `[A-Za-z0-9_]` throughout. Anything else is backtick-quoted with
+/// every inner backtick doubled (`` ` `` → ``` `` ```), which is openCypher's
+/// `EscapedSymbolicName` and the exact inverse of `slater-build`'s
+/// `parser::unquote_key`. The empty name spells `` `` ``.
+///
+/// This is a **security** boundary, not cosmetics (HIK-84): labels, reltypes and
+/// property keys are arbitrary strings over Bolt, so an un-quoted name like
+/// `` `x` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a `` would re-parse as *structure*
+/// when an operator rebuilds the dump. Quoted, it is inert — the builder's statement
+/// splitter is backtick-aware, so not even a `;` inside a name ends the statement.
+pub(crate) fn quote_ident(s: &str) -> String {
+    let bare = !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if bare {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('`');
+    for c in s.chars() {
+        if c == '`' {
+            out.push('`');
+        }
+        out.push(c);
+    }
+    out.push('`');
+    out
 }
 
 /// Single-quote and escape a string for the builder's `sq_inner` rule, matching its
@@ -573,6 +609,28 @@ mod tests {
     /// The property value of `name` in a node/edge's decoded props, if present.
     fn prop<'a>(props: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
         props.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// HIK-84: identifiers are bare only when the builder's `label`/`reltype`/`key`
+    /// rules accept them bare; everything else is backtick-quoted with inner backticks
+    /// doubled, so no name can re-parse as structure in a rebuild.
+    #[test]
+    fn identifiers_are_quoted_unless_bare_legal() {
+        assert_eq!(quote_ident("Person"), "Person");
+        assert_eq!(quote_ident("_id2"), "_id2");
+        assert_eq!(quote_ident("Odd Label"), "`Odd Label`");
+        assert_eq!(quote_ident("a-b"), "`a-b`");
+        assert_eq!(quote_ident("café"), "`café`");
+        // The escape-the-escape case: an inner backtick is doubled.
+        assert_eq!(quote_ident("a`b"), "`a``b`");
+        assert_eq!(quote_ident("`"), "````");
+        // The empty name has a spelling too (`` `` `` — the grammar's `*`).
+        assert_eq!(quote_ident(""), "``");
+        // The finding's payload is inert once quoted: it is one name, not a statement.
+        assert_eq!(
+            quote_ident("`x` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a"),
+            "```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a`"
+        );
     }
 
     #[test]

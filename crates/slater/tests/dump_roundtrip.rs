@@ -290,6 +290,106 @@ fn node_merge_lines(dump: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The seed graph for the injection round-trip (HIK-84). Every identifier here is
+/// *hostile*: a label carrying a `;`, a reltype carrying a `;` and a comment, and two
+/// property keys that — un-quoted — would close the `SET` and splice a whole extra
+/// statement into the rebuilt script (`MERGE (m:Owned …)`, `CREATE (:Pwned …)`). The
+/// first key is verbatim the payload from the finding. A `bio` value carries a quote,
+/// a backslash, a newline, a `;` and a backtick, so the *value* escaping is pinned on
+/// the same trip. Written in the quoted dialect, so the real builder ingesting this
+/// seed at all is already proof that its grammar accepts every form `dump` now emits.
+const HOSTILE_SEED: &str = r#"CREATE INDEX FOR (n:Person) ON (n.name);
+MERGE (n:Person:`Odd Label; DROP INDEX` {name: 'Alice'}) SET n.age = 30, n.```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a` = 1, n.`x``) CREATE (:Pwned {y:1}) //` = 2, n.bio = 'a\'; MERGE (m:Owned {id:\'atk\'}) SET m.b = 1;\nline2 \\ back `tick';
+MERGE (n:Person {name: 'Bob'}) SET n.age = 25;
+MERGE (a:Person {name: 'Alice'})-[r:`KNOWS OF; //`]->(b:Person {name: 'Bob'}) SET r.since = 2020;
+"#;
+
+/// Regression for HIK-84: `dump` interpolated labels, reltypes and property keys into
+/// the emitted Cypher **raw**. Property keys are arbitrary strings over Bolt, so a
+/// hostile key spliced an independent statement into the script an operator later fed
+/// to `slater-build` — a stored, cross-privilege injection into the rebuild.
+///
+/// This drives the whole loop rather than asserting the emitted text looks quoted:
+/// seed through the real `slater-build`, serve, dump with the real `slater dump`,
+/// rebuild *that dump*, re-serve, re-dump. The assertions are on the **rebuilt
+/// generation**: if any identifier re-parsed as structure, the rebuild would carry an
+/// extra `:Owned`/`:Pwned` node, so the node count (and the statement count) is the
+/// injection oracle. The fixed-point check then proves the trip is lossless, not just
+/// safe — every hostile name and value comes back byte-identical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns the slater binary and the real builder; needs SLATER_BUILD_BIN"]
+async fn hostile_identifiers_cannot_inject_structure_into_the_rebuild() {
+    let Ok(builder) = std::env::var("SLATER_BUILD_BIN") else {
+        eprintln!("SLATER_BUILD_BIN unset — skipping the injection round-trip");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("slater_injrt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let acl_path = write_acl(&root);
+
+    // Leg 1: hostile seed → real builder → generation.
+    let seed = root.join("seed.cypher");
+    std::fs::write(&seed, HOSTILE_SEED).unwrap();
+    let built = root.join("built");
+    run_builder(&builder, &seed, &built);
+
+    // Leg 2: serve it and dump it. Every hostile name must come back backtick-quoted,
+    // with the inner backticks doubled (the escape-the-escape case).
+    let dump1 = serve_and_dump(&built, &acl_path, &root.join("dump1.cypher")).await;
+    for expected in [
+        // Labels: identity first, the hostile one quoted.
+        "MERGE (n:Person:`Odd Label; DROP INDEX` {name: 'Alice'})",
+        // The finding's payload, inert: one quoted *name*, inner backticks doubled.
+        "n.```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a` = 1",
+        // A key that would otherwise close the pattern and create a second node.
+        "n.`x``) CREATE (:Pwned {y:1}) //` = 2",
+        // Reltype.
+        "-[r:`KNOWS OF; //`]->",
+        // The value escaping (unchanged, but pinned): quote, backslash, newline, `;`.
+        r#"n.bio = 'a\'; MERGE (m:Owned {id:\'atk\'}) SET m.b = 1;\nline2 \\ back `tick'"#,
+    ] {
+        assert!(
+            dump1.contains(expected),
+            "dump did not quote/escape as expected — missing `{expected}` in:\n{dump1}"
+        );
+    }
+
+    // Leg 3: rebuild *the dump* → serve → re-dump, and read the answer out of the
+    // rebuilt generation.
+    let rebuilt = root.join("rebuilt");
+    run_builder(&builder, &root.join("dump1.cypher"), &rebuilt);
+    let dump2 = serve_and_dump(&rebuilt, &acl_path, &root.join("dump2.cypher")).await;
+
+    // The injection oracle: nothing executed as structure. Two nodes in, two nodes out
+    // — an `:Owned`/`:Pwned` node spliced by a hostile key would be a third node MERGE.
+    assert_eq!(
+        node_merge_lines(&dump2).len(),
+        2,
+        "the rebuild grew a node — an identifier re-parsed as structure:\n{dump2}"
+    );
+    assert!(
+        !dump2.contains("MERGE (n:Owned") && !dump2.contains("MERGE (n:Pwned"),
+        "the rebuilt generation carries an injected node:\n{dump2}"
+    );
+    // …and no spliced index/DDL either: 1 index + 2 nodes + 1 edge, exactly.
+    assert_eq!(
+        dump2.lines().count(),
+        4,
+        "the rebuild has extra statements:\n{dump2}"
+    );
+
+    // Lossless as well as safe: the hostile names and values survive the trip intact
+    // (the dump of the rebuild reproduces the dump it was built from, byte for byte).
+    assert_eq!(
+        dump1, dump2,
+        "hostile identifiers/values did not round-trip byte-identically"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Regression for HIK-70: `dump` used to emit only a node's identity label, so every
 /// other label was silently lost on the documented dump → build → serve round-trip.
 ///

@@ -187,6 +187,16 @@ number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (^"e" ~ ("+" | "-")? ~
 // --- lexical -------------------------------------------------------------------
 
 var = @{ (ASCII_ALPHANUMERIC | "_")+ }
-label = @{ (ASCII_ALPHANUMERIC | "_")+ }
-reltype = @{ (ASCII_ALPHANUMERIC | "_")+ }
-key = @{ ("`" ~ (!"`" ~ ANY)+ ~ "`") | (ASCII_ALPHANUMERIC | "_")+ }
+label = @{ quoted_ident | (ASCII_ALPHANUMERIC | "_")+ }
+reltype = @{ quoted_ident | (ASCII_ALPHANUMERIC | "_")+ }
+key = @{ quoted_ident | (ASCII_ALPHANUMERIC | "_")+ }
+
+// A backtick-quoted identifier, so a label / reltype / property key can carry any
+// character the database can hold (spaces, `;`, quotes, braces) without the dump
+// text re-parsing as *structure* — the injection HIK-84 closed. This is openCypher's
+// `EscapedSymbolicName = ("`" ~ (!"`" ~ ANY)* ~ "`")+` and mirrors `cypher.pest`'s
+// `quoted_name` exactly: the `+` is how a literal backtick is escaped (`` `a``b` ``
+// is the single name ``a`b``), and the `*` lets `` `` `` name the empty string.
+// `parser::unquote_key` is the decoder. The statement splitter is backtick-aware for
+// the same reason, so a `;` inside a quoted name does not end the statement.
+quoted_ident = _{ ("`" ~ (!"`" ~ ANY)* ~ "`")+ }

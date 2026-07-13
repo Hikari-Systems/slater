@@ -29,18 +29,22 @@ struct PrimitiveCypher;
 // ---------------------------------------------------------------------------
 
 /// Splits a dump script into statements on top-level `;`. Operates on bytes: the
-/// delimiters it tracks (`;`, `'`, `"`, `\`) are all ASCII, and UTF-8
+/// delimiters it tracks (`;`, `'`, `"`, `` ` ``, `\`) are all ASCII, and UTF-8
 /// continuation bytes are always `>= 0x80`, so byte-level scanning never splits a
 /// multibyte character or mistakes one for a delimiter.
 ///
 // DESIGN: dump scripts can be very large (multi-paragraph markdown text fields),
 // so we never slurp the whole file — we pull bytes from a `BufRead` and emit one
-// statement at a time. A `;` is a separator only outside a string literal; inside
-// a literal (single- or double-quoted, with `\` escapes) it is ordinary text.
+// statement at a time. A `;` is a separator only outside a string literal *and*
+// outside a backtick-quoted identifier; inside a literal (single- or double-quoted,
+// with `\` escapes) or inside a quoted name (no escapes — a doubled backtick simply
+// closes and re-opens one) it is ordinary text.
 pub struct StatementReader<R: BufRead> {
     reader: R,
     buf: Vec<u8>,
     in_string: Option<u8>,
+    /// Inside a backtick-quoted identifier (`` `a b` ``), where `;`/quotes are text.
+    in_ident: bool,
     escaped: bool,
     done: bool,
 }
@@ -51,6 +55,7 @@ impl<R: BufRead> StatementReader<R> {
             reader,
             buf: Vec::new(),
             in_string: None,
+            in_ident: false,
             escaped: false,
             done: false,
         }
@@ -82,10 +87,22 @@ impl<R: BufRead> StatementReader<R> {
                         self.in_string = None;
                     }
                     self.buf.push(b);
+                } else if self.in_ident {
+                    // A quoted name has no `\` escapes: the only terminator is the
+                    // closing backtick. (A doubled backtick closes and immediately
+                    // re-opens, which keeps `;`/quotes inside it text either way.)
+                    if b == b'`' {
+                        self.in_ident = false;
+                    }
+                    self.buf.push(b);
                 } else {
                     match b {
                         b'\'' | b'"' => {
                             self.in_string = Some(b);
+                            self.buf.push(b);
+                        }
+                        b'`' => {
+                            self.in_ident = true;
                             self.buf.push(b);
                         }
                         b';' => {
@@ -208,7 +225,7 @@ fn parse_edge_create(pair: Pair<Rule>, id_field: &str) -> Result<Statement> {
             Rule::rel_detail => {
                 for d in child.into_inner() {
                     match d.as_rule() {
-                        Rule::reltype => reltype = d.as_str().to_string(),
+                        Rule::reltype => reltype = unquote_key(d.as_str()),
                         Rule::prop_map => props = parse_prop_map(d)?,
                         _ => {}
                     }
@@ -564,7 +581,7 @@ fn parse_edge_overwrite(pair: Pair<Rule>) -> Result<Statement> {
             Rule::rel_detail => {
                 for d in c.into_inner() {
                     if d.as_rule() == Rule::reltype {
-                        reltype = d.as_str().to_string();
+                        reltype = unquote_key(d.as_str());
                     }
                     // A property map on the matched relationship is ignored: edges are
                     // located by (src, dst, reltype), not by rel-property in v1.
@@ -601,7 +618,7 @@ fn parse_create_index(pair: Pair<Rule>) -> Result<Statement> {
                 // (var? ":" label)
                 for c in child.into_inner() {
                     if c.as_rule() == Rule::label {
-                        label_or_type = c.as_str().to_string();
+                        label_or_type = unquote_key(c.as_str());
                     }
                 }
             }
@@ -609,7 +626,7 @@ fn parse_create_index(pair: Pair<Rule>) -> Result<Statement> {
                 entity = Entity::Edge;
                 for c in child.into_inner() {
                     if c.as_rule() == Rule::reltype {
-                        label_or_type = c.as_str().to_string();
+                        label_or_type = unquote_key(c.as_str());
                     }
                 }
             }
@@ -697,7 +714,7 @@ fn parse_node_pattern(pair: Pair<Rule>) -> Result<ParsedPattern> {
             Rule::labels => {
                 for l in child.into_inner() {
                     if l.as_rule() == Rule::label {
-                        labels.push(l.as_str().to_string());
+                        labels.push(unquote_key(l.as_str()));
                     }
                 }
             }
@@ -803,11 +820,16 @@ fn parse_string(pair: Pair<Rule>) -> String {
     out
 }
 
+/// Decode an identifier token (label, reltype, property key) into its text: a
+/// backtick-quoted name loses its outer backticks and un-doubles the inner ones
+/// (`` `a``b` `` → ``a`b``, `` `` `` → the empty name); a bare name is itself. The
+/// inverse of the emitters' `quote_ident` (`slater::consolidate`), and the reason a
+/// hostile property key cannot splice structure into a rebuilt dump (HIK-84).
 fn unquote_key(s: &str) -> String {
-    s.strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .unwrap_or(s)
-        .to_string()
+    match s.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        Some(inner) => inner.replace("``", "`"),
+        None => s.to_string(),
+    }
 }
 
 fn as_int(v: &Value) -> Option<i64> {
@@ -858,6 +880,82 @@ mod tests {
         // Trailing statement without a final `;` is still emitted.
         let v2 = stmts("CREATE (:A {})");
         assert_eq!(v2.len(), 1);
+    }
+
+    /// HIK-84: a backtick-quoted identifier is opaque to the splitter — a `;` or a
+    /// quote inside a hostile property key must not end the statement (that is exactly
+    /// how an un-quoted key used to splice a second statement into the rebuild).
+    #[test]
+    fn splitter_treats_a_quoted_identifier_as_opaque() {
+        let script = "MERGE (n:A {k: 1}) SET n.```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a` = 1;\nCREATE (:B {});";
+        let v = stmts(script);
+        assert_eq!(
+            v.len(),
+            2,
+            "a quoted name was split on its inner `;`: {v:?}"
+        );
+        assert!(v[0].starts_with("MERGE (n:A"));
+        assert_eq!(v[1], "CREATE (:B {})");
+        // A backtick *inside a string literal* is text, not an identifier quote — the
+        // string state machine still wins.
+        let v2 = stmts("CREATE (:A {t: 'a ` b'});\nCREATE (:B {});");
+        assert_eq!(
+            v2.len(),
+            2,
+            "a backtick in a string desynced the splitter: {v2:?}"
+        );
+    }
+
+    /// HIK-84: the parser accepts every form the emitters (`slater::consolidate` /
+    /// `slater::dump`) now produce, and decodes it back to the original name — labels,
+    /// reltypes, keys and index properties, including the doubled-backtick escape.
+    #[test]
+    fn quoted_identifiers_round_trip_through_the_parser() {
+        let hostile_key = "`x` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a";
+        let s = "MERGE (n:`Odd Label`:`Zz) CREATE (:Pwned {x:1}) //` {`id key`: 'k1'}) \
+                 SET n.```x`` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a` = 1";
+        let Statement::NodeOverwrite(n) = parse_statement(s).unwrap() else {
+            panic!("expected a node overwrite");
+        };
+        assert_eq!(n.match_.label, "Odd Label");
+        assert_eq!(n.match_.extra_labels, vec!["Zz) CREATE (:Pwned {x:1}) //"]);
+        assert_eq!(n.match_.key, "id key");
+        assert_eq!(n.match_.value, Value::Str("k1".into()));
+        // One SET assignment — the payload is a *name*, not a spliced statement.
+        assert_eq!(n.set_props.len(), 1);
+        assert_eq!(n.set_props[0].0, hostile_key);
+
+        // Reltype + edge endpoints.
+        let e = "MERGE (a:`Odd Label` {`id key`: 'k1'})-[r:`KNOWS OF; //`]->(b:`Odd Label` {`id key`: 'k2'})";
+        let Statement::EdgeOverwrite(e) = parse_statement(e).unwrap() else {
+            panic!("expected an edge overwrite");
+        };
+        assert_eq!(e.reltype, "KNOWS OF; //");
+        assert_eq!(e.src.label, "Odd Label");
+        assert_eq!(e.dst.key, "id key");
+
+        // Index DDL, both entity forms.
+        let Statement::RangeIndex(ni) =
+            parse_statement("CREATE INDEX FOR (n:`Odd Label`) ON (n.`id key`)").unwrap()
+        else {
+            panic!("expected a range index");
+        };
+        assert_eq!(ni.entity, Entity::Node);
+        assert_eq!(ni.label_or_type, "Odd Label");
+        assert_eq!(ni.property, "id key");
+        let Statement::RangeIndex(ei) =
+            parse_statement("CREATE INDEX FOR ()-[r:`KNOWS OF; //`]->() ON (r.`w t`)").unwrap()
+        else {
+            panic!("expected a range index");
+        };
+        assert_eq!(ei.entity, Entity::Edge);
+        assert_eq!(ei.label_or_type, "KNOWS OF; //");
+        assert_eq!(ei.property, "w t");
+
+        // A bare name is unchanged, and the empty name has a spelling.
+        assert_eq!(unquote_key("Person"), "Person");
+        assert_eq!(unquote_key("``"), "");
+        assert_eq!(unquote_key("`a``b`"), "a`b");
     }
 
     #[test]
