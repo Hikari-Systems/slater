@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::blockcache::BlockCache;
+use crate::blockcache::{BlockCache, BlockRecord};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::ids::Value;
@@ -686,9 +686,11 @@ impl SegmentReader {
         matches!(self.in_adj_fence(), Some((lo, hi)) if lo <= node && node <= hi)
     }
 
-    fn record_bytes(&self, reader: &BlockFileReader, sub: u32, idx: usize) -> Result<Vec<u8>> {
-        let rec = self.cache.record(reader, self.scope, sub, idx as u64)?;
-        Ok(rec.as_slice().to_vec())
+    /// The raw record bytes for `(sub, idx)`, as a zero-copy [`BlockRecord`] borrowing the
+    /// cached, decompressed block (an `Arc` clone, no copy). Callers decode straight from
+    /// `rec.as_slice()` rather than owning a fresh `Vec` per read.
+    fn record_bytes(&self, reader: &BlockFileReader, sub: u32, idx: usize) -> Result<BlockRecord> {
+        self.cache.record(reader, self.scope, sub, idx as u64)
     }
 
     /// The full node row for `dense`, or `None` if this segment does not carry it. A hit
@@ -697,8 +699,8 @@ impl SegmentReader {
         let Some(idx) = self.node_keys.find(dense) else {
             return Ok(None);
         };
-        let bytes = self.record_bytes(&self.node_rdr, SUB_NODE, idx)?;
-        Ok(Some(decode_node(&bytes)?))
+        let rec = self.record_bytes(&self.node_rdr, SUB_NODE, idx)?;
+        Ok(Some(decode_node(rec.as_slice())?))
     }
 
     /// The full edge row for `edge_id`, or `None`.
@@ -706,8 +708,8 @@ impl SegmentReader {
         let Some(idx) = self.edge_keys.find(edge_id) else {
             return Ok(None);
         };
-        let bytes = self.record_bytes(&self.edge_rdr, SUB_EDGE, idx)?;
-        Ok(Some(decode_edge(&bytes)?))
+        let rec = self.record_bytes(&self.edge_rdr, SUB_EDGE, idx)?;
+        Ok(Some(decode_edge(rec.as_slice())?))
     }
 
     /// This node's outgoing adjacency fragment (born/removed edges), or an empty vec if the
@@ -716,8 +718,8 @@ impl SegmentReader {
         let Some(idx) = self.adj_out_keys.find(node) else {
             return Ok(Vec::new());
         };
-        let bytes = self.record_bytes(&self.adj_out_rdr, SUB_ADJ_OUT, idx)?;
-        decode_adj(&bytes)
+        let rec = self.record_bytes(&self.adj_out_rdr, SUB_ADJ_OUT, idx)?;
+        decode_adj(rec.as_slice())
     }
 
     /// This node's incoming adjacency fragment, or an empty vec.
@@ -725,8 +727,8 @@ impl SegmentReader {
         let Some(idx) = self.adj_in_keys.find(node) else {
             return Ok(Vec::new());
         };
-        let bytes = self.record_bytes(&self.adj_in_rdr, SUB_ADJ_IN, idx)?;
-        decode_adj(&bytes)
+        let rec = self.record_bytes(&self.adj_in_rdr, SUB_ADJ_IN, idx)?;
+        decode_adj(rec.as_slice())
     }
 }
 
@@ -890,6 +892,37 @@ mod tests {
         let cache = Arc::new(BlockCache::new(1 << 20));
         let r = SegmentReader::open(&dir, cache).unwrap();
         assert_sample(&r);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn record_bytes_yields_borrowed_records_decodable_in_place() {
+        // `record_bytes` hands back a zero-copy `BlockRecord` (an `Arc` clone of the cached
+        // block, not an owned `Vec` copy per read); callers decode straight from the borrowed
+        // slice. Two records can be held at once, and decoding them in place matches the
+        // public accessors — the whole point of dropping the `.to_vec()`.
+        let dir = tmp("recbytes");
+        write_sample(&dir, 4096, None);
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let r = SegmentReader::open(&dir, cache).unwrap();
+
+        let idx10 = r.node_keys.find(10).unwrap();
+        let idx15 = r.node_keys.find(15).unwrap();
+        // Hold both borrowed records alive simultaneously.
+        let rec10 = r.record_bytes(&r.node_rdr, SUB_NODE, idx10).unwrap();
+        let rec15 = r.record_bytes(&r.node_rdr, SUB_NODE, idx15).unwrap();
+
+        assert_eq!(
+            decode_node(rec10.as_slice()).unwrap().labels,
+            vec!["Person".to_string()]
+        );
+        assert_eq!(
+            decode_node(rec15.as_slice()).unwrap().labels,
+            vec!["City".to_string(), "Place".to_string()]
+        );
+        // Re-reading the same record returns byte-identical content (no per-read mutation).
+        let rec10b = r.record_bytes(&r.node_rdr, SUB_NODE, idx10).unwrap();
+        assert_eq!(rec10.as_slice(), rec10b.as_slice());
         std::fs::remove_dir_all(&dir).ok();
     }
 
