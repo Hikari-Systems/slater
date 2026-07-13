@@ -537,8 +537,6 @@ pub struct WalSink {
     dir: PathBuf,
     path: PathBuf,
     file: BufWriter<File>,
-    /// Highest seq appended but not yet returned by a completed `commit`.
-    highest_appended: Option<Seq>,
 }
 
 impl WalSink {
@@ -584,7 +582,6 @@ impl WalSink {
             dir: dir.to_path_buf(),
             path,
             file,
-            highest_appended: None,
         })
     }
 
@@ -603,7 +600,6 @@ impl WalSink {
         let mut payload = Vec::new();
         rec.encode_payload(&mut payload);
         write_frame(&mut self.file, &payload)?;
-        self.highest_appended = Some(rec.seq);
         Ok(())
     }
 
