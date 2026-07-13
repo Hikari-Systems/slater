@@ -14,11 +14,17 @@
 //! of the ascending distinct ids ([`EfMono`]) in a **Raw** block container — so a
 //! reltype scan is decompress-free and answers `contains`/`successor` in the
 //! encoded form (leapfrog-intersectable), rather than the old delta-varint list
-//! that had to be zstd-decompressed and walked end-to-end to skip anywhere. EF
-//! strictly dominates the alternatives here because the ids are distinct and
-//! ascending (a Constant/RLE would be one run per element); the record therefore
-//! commits to EF rather than running the general per-chunk plane selector, which
-//! keeps the builder's two write-paths byte-identical by construction.
+//! that had to be zstd-decompressed and walked end-to-end to skip anywhere.
+//!
+//! EF over the *set* is the right form when it is sparse. But a **dense** set — a
+//! single-reltype graph where ~all nodes are endpoints (Wikidata's LINK covers 99.7%
+//! of nodes) — is EF's worst case (~2 bits/element over tens of millions). There the
+//! **complement** (the sparse *absent* ids) is dramatically smaller, and a set and its
+//! complement carry the same information; so the encoder keeps the smaller of `EF(set)`
+//! and `EF(complement)` (tag [`POST_EF`] / [`POST_EF_COMPLEMENT`]), decoding either back
+//! to the same ascending ids — the co-candidate the plane roadmap requires rather than
+//! committing blindly to EF. Both write-paths share one encoder, so they stay
+//! byte-identical by construction.
 //!
 //! These let an unanchored typed traversal `(a)-[:T]->(b)` drive from the ~8% of
 //! nodes that actually have a `T` edge instead of label-scanning every node and
@@ -29,23 +35,93 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockCodec, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::plane::EfMono;
 use crate::topology::Edge;
+use crate::wire::{read_uvarint, write_uvarint};
 
-/// Encode one reltype's endpoint posting: an Elias–Fano record over ascending,
-/// already-distinct node ids ([`EfMono`]). Callers must pass ids sorted ascending
-/// with no duplicates (see [`write_reltype_endpoint_postings`]).
+/// Posting record tag (leading byte). The set is ascending distinct node ids over a universe
+/// `[0, universe]` (`universe` = the max id). A *dense* set — most of the universe is present, as
+/// for a single-reltype graph where ~all nodes are endpoints — is far smaller stored as its
+/// **complement** (the absent ids), which is sparse; both forms are EF and stay decompress-free.
+const POST_EF: u8 = 0; // EF over the ascending present ids
+const POST_EF_COMPLEMENT: u8 = 1; // uvarint(universe) ‖ EF over the ascending *absent* ids
+
+/// Whether the complement (absent ids in `[0, universe]`) encodes strictly smaller than the set.
+/// Both are EF over the same universe, so this compares their exact serialised sizes — the
+/// "EF is not always the winner; a dense set's complement is" co-candidate the roadmap requires.
+fn complement_is_smaller(count: u64, universe: u64) -> bool {
+    if count == 0 {
+        return false;
+    }
+    let comp = (universe + 1).saturating_sub(count);
+    EfMono::serialized_len_for(comp as usize, universe)
+        < EfMono::serialized_len_for(count as usize, universe)
+}
+
+/// Sorted absent ids in `[0, universe]` given the ascending present ids, over the same universe.
+fn complement_from_ascending(present: impl Iterator<Item = u64>, universe: u64) -> Vec<u64> {
+    let mut present = present.peekable();
+    let mut comp = Vec::new();
+    for n in 0..=universe {
+        if present.peek() == Some(&n) {
+            present.next();
+        } else {
+            comp.push(n);
+        }
+    }
+    comp
+}
+
+/// Encode one reltype's endpoint posting from an **ascending, distinct** id stream whose `count`
+/// and `universe` (max id, 0 when empty) are known — the shared core of both write paths, so they
+/// stay byte-identical. Picks EF over the set, or (when smaller) EF over the set's complement.
+fn encode_posting_from_ascending(
+    count: u64,
+    universe: u64,
+    present: impl Iterator<Item = u64>,
+) -> Vec<u8> {
+    if complement_is_smaller(count, universe) {
+        // The complement is the sparse side, so materialising it (not the huge set) is cheap.
+        let comp = complement_from_ascending(present, universe);
+        let mut out = vec![POST_EF_COMPLEMENT];
+        write_uvarint(&mut out, universe);
+        out.extend_from_slice(&EfMono::encode(&comp).serialize());
+        out
+    } else {
+        let mut out = vec![POST_EF];
+        out.extend_from_slice(
+            &EfMono::from_ascending(count as usize, universe, present).serialize(),
+        );
+        out
+    }
+}
+
+/// Encode one reltype's endpoint posting over ascending, already-distinct node ids. Callers must
+/// pass ids sorted ascending with no duplicates (see [`write_reltype_endpoint_postings`]).
 pub fn encode_endpoint_posting(ids: &[u64]) -> Vec<u8> {
-    EfMono::encode(ids).serialize()
+    let universe = ids.last().copied().unwrap_or(0);
+    encode_posting_from_ascending(ids.len() as u64, universe, ids.iter().copied())
 }
 
 /// Decode one reltype's endpoint posting back into ascending node ids.
 pub fn decode_endpoint_posting(rec: &[u8]) -> Result<Vec<u64>> {
-    Ok(EfMono::deserialize(rec)?.iter().collect())
+    let (&tag, mut body) = rec
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty endpoint posting record"))?;
+    match tag {
+        POST_EF => Ok(EfMono::deserialize(body)?.iter().collect()),
+        POST_EF_COMPLEMENT => {
+            let universe = read_uvarint(&mut body)?;
+            let comp: Vec<u64> = EfMono::deserialize(body)?.iter().collect();
+            // set = [0, universe] \ complement.
+            Ok(complement_from_ascending(comp.into_iter(), universe))
+        }
+        _ => bail!("unknown endpoint posting tag {tag}"),
+    }
 }
 
 /// One dense bit plane per reltype over the node id space: bit `n` of plane `t`
@@ -172,7 +248,9 @@ impl EndpointPlanes {
         (0..self.reltype_count)
             .map(|t| {
                 let (count, universe) = self.plane_count_universe(t);
-                EfMono::serialized_len_for(count as usize, universe)
+                // Upper bound: 1 tag byte + a uvarint(universe) (≤10) + the EF-of-set size (the
+                // complement form, when chosen, is strictly smaller than the EF-of-set part).
+                11 + EfMono::serialized_len_for(count as usize, universe)
             })
             .max()
             .unwrap_or(0)
@@ -204,11 +282,11 @@ pub fn write_endpoint_postings_from_planes(
     let mut counts = Vec::with_capacity(planes.reltype_count as usize);
     for t in 0..planes.reltype_count {
         let (count, universe) = planes.plane_count_universe(t);
-        // Stream the plane's ascending set bits straight into EF — no materialised id list, so a
-        // single huge reltype over 91.6M nodes never allocates a dense array. Byte-identical to
-        // `encode_endpoint_posting` on the same set (both go through `EfMono::from_ascending`).
-        let rec =
-            EfMono::from_ascending(count as usize, universe, planes.plane_iter(t)).serialize();
+        // Stream the plane's ascending set bits straight into the posting encoder — no materialised
+        // id list for the (sparse) EF case, so a single huge reltype over 91.6M nodes never
+        // allocates a dense array; a *dense* reltype instead materialises only its small complement.
+        // Byte-identical to `encode_endpoint_posting` on the same set (shared encoder + decision).
+        let rec = encode_posting_from_ascending(count, universe, planes.plane_iter(t));
         counts.push(count);
         w.append_record(&rec)?;
     }
@@ -365,11 +443,68 @@ mod tests {
     }
 
     #[test]
-    fn posting_roundtrips_including_empty() {
+    fn posting_roundtrips_including_empty_and_dense() {
+        // sparse / empty / single all round-trip via the EF-of-set form.
         for ids in [vec![], vec![0u64], vec![0, 1, 5, 5000, 5001]] {
             let rec = encode_endpoint_posting(&ids);
+            assert_eq!(rec[0], POST_EF, "sparse set keeps EF-of-set");
             assert_eq!(decode_endpoint_posting(&rec).unwrap(), ids);
         }
+        // A dense set picks the complement form: smaller than EF-of-set, same round-trip.
+        let dense: Vec<u64> = (0..100_000u64).filter(|n| n % 1000 != 7).collect();
+        let rec = encode_endpoint_posting(&dense);
+        assert_eq!(
+            rec[0], POST_EF_COMPLEMENT,
+            "dense set stores its complement"
+        );
+        assert!(
+            rec.len() < EfMono::encode(&dense).serialize().len(),
+            "complement must be smaller than EF-of-set ({} vs {})",
+            rec.len(),
+            EfMono::encode(&dense).serialize().len()
+        );
+        assert_eq!(decode_endpoint_posting(&rec).unwrap(), dense);
+    }
+
+    #[test]
+    fn dense_reltype_complement_is_identical_across_both_write_paths() {
+        // reltype 0 ~98% dense over the node space (complement form); reltype 1 sparse (EF form).
+        let node_count = 5000u64;
+        let want0: Vec<u64> = (0..node_count).filter(|n| n % 50 != 3).collect();
+        let want1: Vec<u64> = vec![1, 7, 4999];
+
+        let planes = EndpointPlanes::new(2, node_count);
+        for &n in &want0 {
+            planes.set(0, n);
+        }
+        for &n in &want1 {
+            planes.set(1, n);
+        }
+        let a = tmp("dense_planes");
+        let cp = write_endpoint_postings_from_planes(&a, &planes, 4096, 3, None).unwrap();
+
+        let mut pairs: Vec<(u32, u64)> = want0.iter().map(|&n| (0u32, n)).collect();
+        pairs.extend(want1.iter().map(|&n| (1u32, n)));
+        pairs.sort_unstable();
+        let b = tmp("dense_sorted");
+        let cs =
+            write_endpoint_postings_from_sorted(&b, 2, pairs.into_iter().map(Ok), 4096, 3, None)
+                .unwrap();
+
+        assert_eq!(cp, cs);
+        assert_eq!(cp, vec![want0.len() as u64, want1.len() as u64]);
+        // Both write paths must agree byte-for-byte (content hash + budget-check invariant).
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+
+        let r = BlockFileReader::open(&a).unwrap();
+        let rec0 = r.read_record_global(0).unwrap();
+        let rec1 = r.read_record_global(1).unwrap();
+        assert_eq!(rec0[0], POST_EF_COMPLEMENT, "dense reltype 0 → complement");
+        assert_eq!(rec1[0], POST_EF, "sparse reltype 1 → EF-of-set");
+        assert_eq!(decode_endpoint_posting(&rec0).unwrap(), want0);
+        assert_eq!(decode_endpoint_posting(&rec1).unwrap(), want1);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 
     #[test]
