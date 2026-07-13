@@ -1234,6 +1234,13 @@ const SCAN_PAR_MIN: usize = 64;
 /// out-adjacency reads gather on the shared fanout pool.
 const BUILD_VIEW_PAR_MIN: usize = 64;
 
+/// Node batch size for [`Engine::build_view`]'s chunked adjacency gather: the view is
+/// filled a chunk at a time so the retained edge count is charged against
+/// `maxIntermediate` incrementally and the deadline is checked as it fills, rather
+/// than materialising the whole subgraph's adjacency in one uninterruptible gather.
+/// Large enough that the per-chunk pool dispatch stays amortised.
+const BUILD_VIEW_CHUNK: usize = 65_536;
+
 /// First window an anchor sweep ([`CandidateStream`]) pulls from the id space, in dense
 /// node ids. Deliberately small: a pushed `LIMIT 1` must not walk further into the id
 /// space than it has to.
@@ -4342,6 +4349,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         continue;
                     }
                 }
+                // Each retained output row is charged, so an N-row input table crossed
+                // with a per-row `algo.*` accumulates against the cumulative budget
+                // rather than materialising for free.
+                self.charge(1)?;
                 out_rows.push(r);
             }
         }
@@ -4406,7 +4417,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
         queue.push_back((source, 0i64));
         let mut nodes: Vec<Val> = Vec::new();
         let mut edges: Vec<Val> = Vec::new();
+        // `nodes`/`edges`/`visited` grow over the reachable subgraph, so the loop is
+        // both memory- and time-bounded here: `charge` caps the retained `Val`s
+        // against `maxIntermediate` (two per discovered node — one `Val::Node`, one
+        // `Val::Rel`), and a per-pop `check_deadline` makes a runaway
+        // `algo.BFS(src, 0, NULL)` abort at `timeoutMs` rather than materialising tens
+        // of millions of rows uninterruptibly. The deadline read is dwarfed by the
+        // per-node `outgoing` block fetch, so an unconditional check is cheap enough
+        // to guarantee prompt cancellation.
         while let Some((node, lvl)) = queue.pop_front() {
+            self.check_deadline()?;
             if !unlimited && lvl >= max_level {
                 continue;
             }
@@ -4418,6 +4438,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
                 let nb = a.neighbour.0;
                 if visited.insert(nb) {
+                    // Charge before pushing so growth is bounded at the point of
+                    // allocation, not after the whole subgraph is already resident.
+                    self.charge(2)?;
                     nodes.push(Val::Node(nb));
                     edges.push(Val::Rel {
                         id: a.edge.0,
@@ -4441,7 +4464,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
     fn algo_components(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
         let (labels, rels, _) = self.parse_algo_config("WCC", args, &[])?;
         let view = self.build_view(labels.as_deref(), rels.as_deref())?;
-        let roots = algo::wcc(view.nodes.len(), &view.undirected_edges());
+        let roots = algo::wcc(view.nodes.len(), &view.undirected_edges(), &|| {
+            self.check_deadline()
+        })?;
         let group_id = canonical_group_ids(&view.nodes, &roots);
         Ok(view
             .nodes
@@ -4461,7 +4486,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let labels = self.scalar_label_filter("pageRank", &args[0])?;
         let rels = self.scalar_reltype_filter("pageRank", &args[1])?;
         let view = self.build_view(labels.as_deref(), rels.as_deref())?;
-        let scores = algo::pagerank(view.nodes.len(), &view.out);
+        let scores = algo::pagerank(view.nodes.len(), &view.out, &|| self.check_deadline())?;
         Ok(view
             .nodes
             .iter()
@@ -4475,7 +4500,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     fn algo_harmonic(&self, args: &[Val]) -> Result<Vec<Vec<Val>>> {
         let (labels, rels, _) = self.parse_algo_config("HarmonicCentrality", args, &[])?;
         let view = self.build_view(labels.as_deref(), rels.as_deref())?;
-        let hc = algo::harmonic(view.nodes.len(), &view.out);
+        let hc = algo::harmonic(view.nodes.len(), &view.out, &|| self.check_deadline())?;
         Ok(view
             .nodes
             .iter()
@@ -4503,7 +4528,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
         }
         let view = self.build_view(labels.as_deref(), rels.as_deref())?;
-        let cb = algo::betweenness(view.nodes.len(), &view.out);
+        let cb = algo::betweenness(view.nodes.len(), &view.out, &|| self.check_deadline())?;
         Ok(view
             .nodes
             .iter()
@@ -4528,7 +4553,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
         }
         let view = self.build_view(labels.as_deref(), rels.as_deref())?;
-        let comm = algo::cdlp(view.nodes.len(), &view.undirected_adj(), max_iter);
+        let comm = algo::cdlp(view.nodes.len(), &view.undirected_adj(), max_iter, &|| {
+            self.check_deadline()
+        })?;
         let group_id = canonical_group_ids(&view.nodes, &comm);
         Ok(view
             .nodes
@@ -4653,24 +4680,42 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 set.into_iter().collect()
             }
         };
+        // The view (`nodes`, `pos`, and the `out` adjacency) is retained for the whole
+        // algorithm run, so it is charged against `maxIntermediate` — an unfiltered
+        // `algo.*` over a 91.6M-node store would otherwise OOM building the view before
+        // any algorithm ran, ignoring the memory budget entirely. Charge the node-sized
+        // structures first (`nodes` + `pos` + the `out` outer vec), so a huge selection
+        // trips the budget before a single adjacency block is read.
+        self.charge(nodes.len() as u64)?;
         let pos: HashMap<u64, usize> = nodes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
         // Each selected node's out-adjacency read is independent and touches only the
         // Sync cache, so gather the reads on the shared fanout pool (Task 11).
         // `neighbours_par` keeps the stored edge order and applies the same rel-type
         // filter, so mapping each neighbour through `pos` (single-threaded, `pos` is
         // shared read-only) yields the same 0-based index the sequential build did —
-        // byte-for-byte identical node list + `out`.
+        // byte-for-byte identical node list + `out`. The gather is chunked so the
+        // retained edge count is charged incrementally and the deadline is observed as
+        // the view fills, bounding both memory and time before the algorithm starts;
+        // concatenating chunks in order keeps the output identical to a single gather.
         let (gen, cache) = (self.gen, self.cache);
-        let adj: Vec<Vec<u64>> = par_gather(
-            self.fanout_pool.as_deref(),
-            &nodes,
-            BUILD_VIEW_PAR_MIN,
-            |&id| neighbours_par(gen, cache, id, Direction::Outgoing, rels),
-        )?;
-        let out: Vec<Vec<usize>> = adj
-            .iter()
-            .map(|nbs| nbs.iter().filter_map(|nb| pos.get(nb).copied()).collect())
-            .collect();
+        let mut out: Vec<Vec<usize>> = Vec::with_capacity(nodes.len());
+        for chunk in nodes.chunks(BUILD_VIEW_CHUNK) {
+            self.check_deadline()?;
+            let adj: Vec<Vec<u64>> = par_gather(
+                self.fanout_pool.as_deref(),
+                chunk,
+                BUILD_VIEW_PAR_MIN,
+                |&id| neighbours_par(gen, cache, id, Direction::Outgoing, rels),
+            )?;
+            let mut edges = 0u64;
+            for nbs in &adj {
+                let mapped: Vec<usize> = nbs.iter().filter_map(|nb| pos.get(nb).copied()).collect();
+                edges += mapped.len() as u64;
+                out.push(mapped);
+            }
+            // The retained `out` adjacency is walk work materialised for the run.
+            self.charge(edges)?;
+        }
         Ok(GraphView { nodes, out })
     }
 
@@ -18365,6 +18410,120 @@ mod tests {
              CALL algo.BFS(n, -1, NULL) YIELD nodes RETURN nodes",
         );
         assert_eq!(res.rows.len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── HIK-88: algo.* must honour the memory budget and the query deadline ──────
+
+    #[test]
+    fn algo_bfs_charges_the_intermediate_budget() {
+        // BFS from Alice reaches four nodes (Bob, Carol, Acme, Globex), charging two
+        // elements per discovered node (one `Val::Node`, one `Val::Rel`) against
+        // `maxIntermediate`. Pre-fix the loop grew `nodes`/`edges`/`visited` with no
+        // `charge`, so it ran to completion regardless of the budget; now a tiny
+        // budget trips before the whole reachable subgraph is materialised. The query
+        // keeps the BFS result unexpanded (`RETURN size(nodes)`, no UNWIND) so only
+        // the BFS's own charge — not downstream row-building — can trip the budget.
+        let q = "MATCH (a:Person {name: 'Alice'}) \
+                 CALL algo.BFS(a, 0, NULL) YIELD nodes RETURN size(nodes) AS k";
+        let (root, gen, cache, _) = budgeted_engine("exec_algo_bfs_budget", 0);
+        // A generous budget completes and reaches all four nodes.
+        let res = Engine::new(&gen, &cache)
+            .with_max_intermediate(1_000)
+            .run(&parser::parse(q).unwrap())
+            .expect("a generous budget lets the BFS finish");
+        assert!(matches!(res.rows[0][0], Val::Int(4)));
+        // A budget below the retained-node charge must abort with the budget error
+        // rather than running the BFS to completion.
+        let err = Engine::new(&gen, &cache)
+            .with_max_intermediate(3)
+            .run(&parser::parse(q).unwrap())
+            .expect_err("a tiny budget must bound the BFS");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the intermediate-budget error, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn algo_bfs_observes_the_deadline() {
+        // The BFS pop loop now checks the deadline each iteration, so a runaway
+        // `algo.BFS(src, 0, NULL)` aborts at `timeoutMs` instead of materialising the
+        // whole reachable subgraph uninterruptibly.
+        let q = "MATCH (a:Person {name: 'Alice'}) \
+                 CALL algo.BFS(a, 0, NULL) YIELD nodes RETURN nodes";
+        let (root, gen, cache, _) = budgeted_engine("exec_algo_bfs_deadline", 0);
+        let res = Engine::new(&gen, &cache)
+            .run(&parser::parse(q).unwrap())
+            .expect("no deadline lets the BFS finish");
+        assert_eq!(res.rows.len(), 1);
+        let err = Engine::new(&gen, &cache)
+            .with_deadline(Instant::now() - std::time::Duration::from_secs(1))
+            .run(&parser::parse(q).unwrap())
+            .expect_err("an elapsed deadline must abort the BFS");
+        assert!(
+            format!("{err:#}").contains("time limit"),
+            "expected the deadline error, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The whole `build_view`-backed family (every `algo.*` except BFS) exercised by
+    /// the budget / deadline guards, so a fix to BFS alone can't pass this.
+    const ALGO_VIEW_PROCS: [&str; 5] = [
+        "CALL algo.WCC() YIELD node RETURN node",
+        "CALL algo.pageRank(NULL, NULL) YIELD node RETURN node",
+        "CALL algo.HarmonicCentrality() YIELD node RETURN node",
+        "CALL algo.betweenness() YIELD node RETURN node",
+        "CALL algo.labelPropagation() YIELD node RETURN node",
+    ];
+
+    #[test]
+    fn algo_view_procs_charge_the_intermediate_budget() {
+        // `build_view` materialises the whole selected subgraph (nodes + position map
+        // + out-adjacency) before the algorithm runs. Pre-fix that ignored
+        // `maxIntermediate` entirely — an OOM on a large store. Now it charges the
+        // node count up front, so a budget below the 5-node fixture trips each proc.
+        let (root, gen, cache, _) = budgeted_engine("exec_algo_view_budget", 0);
+        for q in ALGO_VIEW_PROCS {
+            let ast = parser::parse(q).unwrap();
+            Engine::new(&gen, &cache)
+                .with_max_intermediate(10_000)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("{q}: a generous budget should succeed: {e:#}"));
+            let err = Engine::new(&gen, &cache)
+                .with_max_intermediate(1)
+                .run(&ast)
+                .expect_err("a budget below the node count must bound the view");
+            assert!(
+                format!("{err:#}").contains("intermediate result budget"),
+                "{q}: expected the intermediate-budget error, got: {err:#}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn algo_view_procs_observe_the_deadline() {
+        // `build_view` checks the deadline as it fills, and each algorithm kernel is
+        // threaded an interrupt it polls while working, so the `O(V·E)` centrality
+        // procs abort at `timeoutMs` instead of wedging the connection.
+        let (root, gen, cache, _) = budgeted_engine("exec_algo_view_deadline", 0);
+        for q in ALGO_VIEW_PROCS {
+            let ast = parser::parse(q).unwrap();
+            Engine::new(&gen, &cache)
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("{q}: no deadline should succeed: {e:#}"));
+            let err = Engine::new(&gen, &cache)
+                .with_deadline(Instant::now() - std::time::Duration::from_secs(1))
+                .run(&ast)
+                .expect_err("an elapsed deadline must abort the view proc");
+            assert!(
+                format!("{err:#}").contains("time limit"),
+                "{q}: expected the deadline error, got: {err:#}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
