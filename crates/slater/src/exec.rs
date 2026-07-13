@@ -1233,6 +1233,105 @@ const SCAN_PAR_MIN: usize = 64;
 /// out-adjacency reads gather on the shared fanout pool.
 const BUILD_VIEW_PAR_MIN: usize = 64;
 
+/// First window an anchor sweep ([`CandidateStream`]) pulls from the id space, in dense
+/// node ids. Deliberately small: a pushed `LIMIT 1` must not walk further into the id
+/// space than it has to.
+const CAND_WINDOW_MIN: u64 = 1_024;
+
+/// Largest window an anchor sweep pulls (ids). The window ramps ×8 from
+/// [`CAND_WINDOW_MIN`] to this, so an *uncapped* sweep amortises the per-window record
+/// locate + block decompress back to the cost of the old single-pass scan, while the
+/// scan's whole resident footprint stays bounded at 64 K ids — 512 KB — instead of one
+/// `Vec<u64>` over the entire id space (733 MB on the 91.6M-node graph).
+const CAND_WINDOW_MAX: u64 = 65_536;
+
+/// Where a [`CandidateStream`]'s ids come from.
+enum CandidateSrc<'a> {
+    /// Ids the caller already holds (a candidate set hoisted across input rows) — handed
+    /// out in windows without being copied, and already tombstone-suppressed.
+    Ready(&'a [u64]),
+    /// Ids this scan materialised: an id seek, an index lookup, a reltype endpoint
+    /// posting, or a label scan whose segment/delta overlay needs the sorted union.
+    /// Already tombstone-suppressed. Bounded by the query (a seek, a posting) rather than
+    /// by the graph, which is why it may be built in one go.
+    Owned(Vec<u64>),
+    /// A lazy sweep of `next..end` over the dense id space: the whole space
+    /// (`NodeScan::AllNodes`) when `label` is `None`, else the nodes carrying `label`
+    /// (`NodeScan::LabelScan` over a pure core with no delta), decoded from the
+    /// node-label column window by window.
+    Sweep {
+        label: Option<u32>,
+        next: u64,
+        end: u64,
+    },
+}
+
+/// A lazy, bounded-window cursor over an anchor scan's candidate node ids, drained with
+/// [`Engine::next_candidates`]. The reason it exists: the anchor scan used to collect the
+/// *entire* id space into one `Vec<u64>` before a single row was produced, so a pushed
+/// `LIMIT` could only truncate the row loop that walked it — the 733 MB allocation had
+/// already happened.
+struct CandidateStream<'a> {
+    src: CandidateSrc<'a>,
+    /// Cursor into a `Ready`/`Owned` id list; unused by a sweep.
+    pos: usize,
+    /// The current window's ids (a sweep only). Reused across windows.
+    buf: Vec<u64>,
+    /// Ids the next sweep window covers; ramps to [`CAND_WINDOW_MAX`].
+    window: u64,
+}
+
+impl<'a> CandidateStream<'a> {
+    fn new(src: CandidateSrc<'a>) -> Self {
+        Self {
+            src,
+            pos: 0,
+            buf: Vec::new(),
+            window: CAND_WINDOW_MIN,
+        }
+    }
+    /// A lazy sweep of `0..end`, restricted to `label`'s nodes when set.
+    fn sweep(label: Option<u32>, end: u64) -> Self {
+        Self::new(CandidateSrc::Sweep {
+            label,
+            next: 0,
+            end,
+        })
+    }
+    /// Ids this scan materialised (already tombstone-suppressed).
+    fn owned(ids: Vec<u64>) -> Self {
+        Self::new(CandidateSrc::Owned(ids))
+    }
+    /// Ids the caller holds (already tombstone-suppressed).
+    fn ready(ids: &'a [u64]) -> Self {
+        Self::new(CandidateSrc::Ready(ids))
+    }
+    /// The single node an already-bound anchor variable pins. Not a scan: nothing to
+    /// suppress, since the binding came from a scan that already did.
+    fn single(id: u64) -> Self {
+        Self::new(CandidateSrc::Owned(vec![id]))
+    }
+
+    /// An **upper bound** on the ids this stream can yield — exact for a materialised
+    /// source, the swept id range for a sweep (a label sweep yields no more than the ids
+    /// it walks). Used only to decide whether the pooled anchor prefilter is worth arming.
+    fn upper_bound(&self) -> usize {
+        match &self.src {
+            CandidateSrc::Ready(ids) => ids.len(),
+            CandidateSrc::Owned(ids) => ids.len(),
+            CandidateSrc::Sweep { next, end, .. } => end.saturating_sub(*next) as usize,
+        }
+    }
+}
+
+/// The next `CAND_WINDOW_MAX` ids of a materialised candidate list, advancing `pos`.
+fn slice_window<'s>(ids: &'s [u64], pos: &mut usize) -> Option<&'s [u64]> {
+    let lo = (*pos).min(ids.len());
+    let hi = lo.saturating_add(CAND_WINDOW_MAX as usize).min(ids.len());
+    *pos = hi;
+    (lo < hi).then(|| &ids[lo..hi])
+}
+
 /// Map `f` over `items` on the shared fanout pool (or sequentially when the pool is
 /// absent or `items` is smaller than `min_batch`), preserving input order. `f` must
 /// read only Sync state (&Generation/&BlockCache) — never the !Sync Engine.
@@ -1713,6 +1812,14 @@ pub struct Engine<'g, V: ReadView> {
     /// only on the calling thread, like `budget_used`.
     max_scan: u64,
     scan_used: Cell<u64>,
+    /// Dense node ids the anchor scans of this run have produced — the id space they
+    /// actually touched, *not* a budget (an anchor scan is charged to neither: a point
+    /// lookup must stay ~free, and `max_scan` meters walk work). It exists because
+    /// "how much of the graph did the anchor scan walk?" is the only way to see, from the
+    /// outside, that a pushed `LIMIT` really does stop the scan rather than truncate a row
+    /// loop over an already-materialised id space. Reset per [`run`](Self::run); read via
+    /// [`anchor_ids_scanned`](Self::anchor_ids_scanned).
+    scanned_ids: Cell<u64>,
     /// Count-pushdown accumulator. `Some(n)` ⇒ the chain-walk emit leaves tally a
     /// completed row here and skip materialising it (the `RETURN count(*)` fast
     /// path); `None` ⇒ normal row-building. Per-query, touched only on the calling
@@ -1785,6 +1892,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             budget_used: Cell::new(0),
             max_scan: 0,
             scan_used: Cell::new(0),
+            scanned_ids: Cell::new(0),
             count_acc: Cell::new(None),
             degree_terminal: Cell::new(false),
             global_budget: None,
@@ -1887,6 +1995,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// single "elements touched" work figure. Reset at the start of each `run`.
     pub fn cost(&self) -> u64 {
         self.budget_used.get().saturating_add(self.scan_used.get())
+    }
+
+    /// Dense node ids the anchor scans of the last [`run`](Self::run) produced — how much
+    /// of the id space the scan actually walked. Bounded by a pushed `LIMIT`, because the
+    /// scan is a stream ([`Engine::candidate_stream`]) and not a `Vec` over the whole graph.
+    /// Reset at the start of each `run`.
+    pub fn anchor_ids_scanned(&self) -> u64 {
+        self.scanned_ids.get()
     }
 
     // ── Cached record reads (D18) ───────────────────────────────────────────
@@ -2269,6 +2385,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     fn run_inner(&self, q: &Query) -> Result<QueryResult> {
         self.budget_used.set(0); // per-run budget; engines may be reused
         self.scan_used.set(0);
+        self.scanned_ids.set(0);
         self.global_charged.set(0);
         let mut result = self.run_single(&q.head)?;
         for (union_all, part) in &q.tail {
@@ -3594,10 +3711,15 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let bound = bound_scalars(binding);
                 let scan = choose_node_scan(self.gen, node, where_, &self.plan_params, &bound);
                 let guaranteed = self.scan_guaranteed_labels(&scan);
+                // Streamed: only the survivors are retained, never the candidate set as
+                // well (an endpoint of a quantified pattern can be a full-width scan).
                 let mut out = Vec::new();
-                for c in self.scan_candidates(&scan)? {
-                    if self.node_ok(c, node, &Scope::Map(binding), &guaranteed)? {
-                        out.push(c);
+                let mut stream = self.candidate_stream(&scan)?;
+                while let Some(batch) = self.next_candidates(&mut stream)? {
+                    for &c in batch {
+                        if self.node_ok(c, node, &Scope::Map(binding), &guaranteed)? {
+                            out.push(c);
+                        }
                     }
                 }
                 Ok(out)
@@ -3981,8 +4103,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 &HashMap::new(),
             );
             let guaranteed = self.scan_guaranteed_labels(&scan);
-            let candidates = self.scan_candidates(&scan)?;
-            Some((guaranteed, candidates))
+            Some((guaranteed, scan))
+        };
+        // A *multi-row* input against an uncorrelated anchor is a cartesian product: every
+        // input row revisits every candidate, so derive the ids once and replay them rather
+        // than re-running the sweep per row (which would re-read the label column once per
+        // row). A single input row — the seed, or a `WITH` that collapsed to one — streams,
+        // so `LIMIT` short-circuits the scan: the case the bounded-memory invariant turns on.
+        let shared: Option<Vec<u64>> = match &hoisted {
+            Some((_, scan)) if table.rows.len() > 1 => Some(self.scan_candidates(scan)?),
+            _ => None,
         };
 
         let mut out_cols = table.cols.clone();
@@ -4002,11 +4132,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 .cloned()
                 .zip(in_row.iter().cloned())
                 .collect();
-            // The hoisted plan, or a per-row index seek keyed by this row's scalars.
+            // The hoisted plan (streamed, or replayed from the shared set), or a per-row
+            // index seek keyed by this row's scalars.
             let per_row;
-            let (guaranteed, candidates): (&[u32], &[u64]) = match &hoisted {
-                Some((g, c)) => (g, c),
-                None => {
+            let (guaranteed, mut stream): (&[u32], CandidateStream) = match (&hoisted, &shared) {
+                (Some((g, _)), Some(ids)) => (g, CandidateStream::ready(ids)),
+                (Some((g, scan)), None) => (g, self.candidate_stream(scan)?),
+                (None, _) => {
                     let bound = bound_scalars(&in_binding);
                     let scan = choose_node_scan(
                         self.gen,
@@ -4015,32 +4147,34 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         &self.plan_params,
                         &bound,
                     );
-                    let guaranteed = self.scan_guaranteed_labels(&scan);
-                    let candidates = self.scan_candidates(&scan)?;
-                    per_row = (guaranteed, candidates);
-                    (&per_row.0, &per_row.1)
+                    per_row = self.scan_guaranteed_labels(&scan);
+                    let stream = self.candidate_stream(&scan)?;
+                    (&per_row, stream)
                 }
             };
-            for &c in candidates {
-                // Stage 6: honour a pushed `LIMIT` (no ORDER BY/aggregation/DISTINCT)
-                // so a bare `MATCH (n:L) … LIMIT k` scans only k matching nodes.
-                if cap.is_some_and(|cc| out_rows.len() >= cc) {
-                    break 'outer;
-                }
-                if !self.node_ok(c, start, &Scope::Map(&in_binding), guaranteed)? {
-                    continue;
-                }
-                let mut row = in_row.clone();
-                if start.var.is_some() {
-                    row.push(Val::Node(c));
-                }
-                if let Some(w) = m.where_.as_ref() {
-                    if !truthy(&self.eval(w, &Scope::Row(&out_cols, &row), None)?) {
+            while let Some(batch) = self.next_candidates(&mut stream)? {
+                for &c in batch {
+                    // Stage 6: honour a pushed `LIMIT` (no ORDER BY/aggregation/DISTINCT)
+                    // so a bare `MATCH (n:L) … LIMIT k` scans only k matching nodes — and,
+                    // now that the scan is a stream, stops producing candidates too.
+                    if cap.is_some_and(|cc| out_rows.len() >= cc) {
+                        break 'outer;
+                    }
+                    if !self.node_ok(c, start, &Scope::Map(&in_binding), guaranteed)? {
                         continue;
                     }
+                    let mut row = in_row.clone();
+                    if start.var.is_some() {
+                        row.push(Val::Node(c));
+                    }
+                    if let Some(w) = m.where_.as_ref() {
+                        if !truthy(&self.eval(w, &Scope::Row(&out_cols, &row), None)?) {
+                            continue;
+                        }
+                    }
+                    self.charge(1)?;
+                    out_rows.push(row);
                 }
-                self.charge(1)?;
-                out_rows.push(row);
             }
         }
         Ok(Some(Table {
@@ -5058,9 +5192,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // candidate, so `node_ok` can skip re-decoding a label record for them
         // (root cause 2). Only the scanned branch yields guarantees; an already-bound
         // anchor is a single node we still verify in full.
-        let (candidates, guaranteed): (Vec<u64>, Vec<u32>) =
+        let (mut candidates, guaranteed): (CandidateStream, Vec<u32>) =
             match start.var.as_deref().and_then(|v| binding.get(v)) {
-                Some(Val::Node(id)) => (vec![*id], Vec::new()),
+                Some(Val::Node(id)) => (CandidateStream::single(*id), Vec::new()),
                 Some(_) => return Ok(()), // bound to a non-node → cannot match
                 None => {
                     // The anchor is the only place the planner picks a scan strategy.
@@ -5077,7 +5211,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     // matched set is identical. See `maybe_rel_type_scan`.
                     let scan = maybe_rel_type_scan(self.gen, &scan, pattern).unwrap_or(scan);
                     let guaranteed = self.scan_guaranteed_labels(&scan);
-                    (self.scan_candidates(&scan)?, guaranteed)
+                    (self.candidate_stream(&scan)?, guaranteed)
                 }
             };
         // One mutable frame for the whole anchor loop. Each candidate binds the
@@ -5105,31 +5239,24 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // + `loose_eq`. Gated to uncapped scans: a pushed `LIMIT` would over-read the
         // whole candidate set before the cap could stop the scan (the plan's early-exit
         // rule), so capped scans keep the inline per-candidate filter with its break.
+        // The scan is a stream now, so the filter runs a window at a time (each window is
+        // ≫ `SCAN_PAR_MIN`, so it still fans out) rather than over one giant `Vec`; the
+        // width gate reads the stream's upper bound instead of a materialised length.
         let prefilter = cap.is_none()
             && self.fanout_pool.is_some()
-            && candidates.len() >= SCAN_PAR_MIN
+            && candidates.upper_bound() >= SCAN_PAR_MIN
             && self.anchor_filter_reads(start, &guaranteed);
-        let candidates: Vec<u64> = if prefilter {
-            let wants: Vec<(&str, Val)> = start
+        // Candidate-independent, so evaluated once for the whole scan (single-threaded —
+        // it may route through the !Sync evaluator); the pool workers then do only Sync
+        // label/column reads + `loose_eq`.
+        let wants: Vec<(&str, Val)> = if prefilter {
+            start
                 .props
                 .iter()
                 .map(|(k, e)| Ok((k.as_str(), self.eval(e, &Scope::Map(binding), None)?)))
-                .collect::<Result<_>>()?;
-            let (gen, cache) = (self.gen, self.cache);
-            let label_expr = start.label_expr.as_ref();
-            let pass = par_gather(
-                self.fanout_pool.as_deref(),
-                &candidates,
-                SCAN_PAR_MIN,
-                |&c| node_ok_par(gen, cache, c, label_expr, &wants, &guaranteed),
-            )?;
-            candidates
-                .into_iter()
-                .zip(pass)
-                .filter_map(|(c, ok)| ok.then_some(c))
-                .collect()
+                .collect::<Result<_>>()?
         } else {
-            candidates
+            Vec::new()
         };
         // Degree-sum terminal: in count-pushdown mode (armed by `count_match`, no WHERE),
         // if this post-reroot pattern's final hop qualifies, arm the walk to add each
@@ -5142,29 +5269,45 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let prev_degree_term = self.degree_terminal.replace(degree_term);
         let mut frame = binding.clone();
         let mut walk = Vec::new();
-        for c in candidates {
-            // Stage 6: once a pushed `LIMIT` is met, stop scanning anchors — the
-            // remaining candidates can only add rows the projection would truncate.
-            if cap.is_some_and(|cc| out.len() >= cc) {
-                break;
+        // Filter verdicts for the current window (`prefilter` only), reused across windows.
+        let mut pass: Vec<bool> = Vec::new();
+        'scan: while let Some(batch) = self.next_candidates(&mut candidates)? {
+            if prefilter {
+                let (gen, cache) = (self.gen, self.cache);
+                let label_expr = start.label_expr.as_ref();
+                pass = par_gather(self.fanout_pool.as_deref(), batch, SCAN_PAR_MIN, |&c| {
+                    node_ok_par(gen, cache, c, label_expr, &wants, &guaranteed)
+                })?;
             }
-            // Already filtered in parallel above when `prefilter`; otherwise check the
-            // anchor's labels/inline props inline (with the loop's early-exit break).
-            if !prefilter && !self.node_ok(c, start, &Scope::Map(&frame), &guaranteed)? {
-                continue;
-            }
-            let prev = start
-                .var
-                .as_ref()
-                .map(|v| (v.clone(), frame.insert(v.clone(), Val::Node(c))));
-            if parallel {
-                self.expand_chain_par(pattern, c, &frame, out, cap)?;
-            } else {
-                debug_assert!(walk.is_empty());
-                self.expand_chain(pattern, 0, c, &mut frame, c, &mut walk, out, cap)?;
-            }
-            if let Some((v, old)) = prev {
-                restore_binding(&mut frame, v, old);
+            for (i, &c) in batch.iter().enumerate() {
+                // Stage 6: once a pushed `LIMIT` is met, stop scanning anchors — the
+                // remaining candidates can only add rows the projection would truncate,
+                // and the stream stops producing them.
+                if cap.is_some_and(|cc| out.len() >= cc) {
+                    break 'scan;
+                }
+                // Already filtered in parallel above when `prefilter`; otherwise check the
+                // anchor's labels/inline props inline (with the loop's early-exit break).
+                if prefilter {
+                    if !pass[i] {
+                        continue;
+                    }
+                } else if !self.node_ok(c, start, &Scope::Map(&frame), &guaranteed)? {
+                    continue;
+                }
+                let prev = start
+                    .var
+                    .as_ref()
+                    .map(|v| (v.clone(), frame.insert(v.clone(), Val::Node(c))));
+                if parallel {
+                    self.expand_chain_par(pattern, c, &frame, out, cap)?;
+                } else {
+                    debug_assert!(walk.is_empty());
+                    self.expand_chain(pattern, 0, c, &mut frame, c, &mut walk, out, cap)?;
+                }
+                if let Some((v, old)) = prev {
+                    restore_binding(&mut frame, v, old);
+                }
             }
         }
         self.degree_terminal.set(prev_degree_term);
@@ -6194,9 +6337,48 @@ impl<'g, V: ReadView> Engine<'g, V> {
         Ok(out)
     }
 
-    /// Candidate node ids for a chosen scan strategy.
-    fn scan_candidates(&self, scan: &NodeScan) -> Result<Vec<u64>> {
+    /// Candidate node ids for a chosen scan strategy, as a **lazy** bounded-window
+    /// stream (drain it with [`Engine::next_candidates`]).
+    ///
+    /// The two full-width sweeps — `AllNodes` and a plain `LabelScan`, the only strategies
+    /// whose size is the *graph's*, not the query's — are produced a window at a time and
+    /// never materialised. A pushed `LIMIT` therefore stops the scan itself, instead of
+    /// merely truncating a row loop over an already-built `Vec` of the whole id space
+    /// (733 MB of `Vec<u64>` on the 91.6M-node graph, allocated before the first row and
+    /// charged to no budget — the defect this replaces). The scan's resident footprint is
+    /// now one window, [`CAND_WINDOW_MAX`] ids, whatever the graph's size.
+    ///
+    /// Every other strategy is bounded by an index seek or a precomputed posting and is
+    /// materialised eagerly, exactly as before, then tombstone-suppressed. Anchor scans are
+    /// deliberately charged to neither budget (a point lookup must stay ~free — see
+    /// `shortest_path_any_succeeds_under_tiny_budget` — and `maxScan` meters *walk* work —
+    /// see `hub_count_one_hop_answered_by_degree_terminal`); what they touch is instead
+    /// counted in [`Engine::anchor_ids_scanned`].
+    ///
+    /// A `LabelScan` is only lazy over a *pure core with no delta*: with a segment stack
+    /// or a write delta, membership is a sorted union of base ∪ segment-born ∪ delta-born
+    /// ids (a node can gain or lose the label above the base), which cannot be produced in
+    /// ascending order window-by-window — so that shape keeps the eager fold.
+    fn candidate_stream<'c>(&self, scan: &NodeScan) -> Result<CandidateStream<'c>> {
         let ids = match scan {
+            // The dense id space, produced lazily. `node_count` is the *scan bound* (base
+            // + every segment's born band + the delta's born ids), and per-window
+            // tombstone suppression drops deleted ids exactly as the eager sweep did — so
+            // this arm is correct for every stack/delta shape.
+            NodeScan::AllNodes => {
+                return Ok(CandidateStream::sweep(None, self.gen.node_count()));
+            }
+            // Pure core, no delta: re-derive the label's ids window-by-window from the
+            // node-label column (the same single pass `collect_nodes_with_label` makes,
+            // just resumable).
+            NodeScan::LabelScan { label_id }
+                if self.gen.core_stack().is_singleton() && self.gen.delta().is_empty() =>
+            {
+                return Ok(CandidateStream::sweep(
+                    Some(*label_id),
+                    self.gen.node_count(),
+                ));
+            }
             // Already bounds-checked + deduped by the planner; yield as-is. An
             // empty list is a seek that matched no node.
             NodeScan::IdSeek { ids } => ids.clone(),
@@ -6328,7 +6510,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
                 ids
             }
-            NodeScan::AllNodes => (0..self.gen.node_count()).collect(),
             // Distinct edge-having endpoint nodes for the typed first hop (the
             // precomputed posting). Ascending+deduped, same contract as a label
             // scan; the first hop re-filters by reltype so this only narrows.
@@ -6363,30 +6544,111 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 ids
             }
         };
-        self.suppress_tombstoned(ids)
+        let mut ids = ids;
+        self.suppress_tombstoned_in_place(&mut ids)?;
+        self.scanned_ids
+            .set(self.scanned_ids.get().saturating_add(ids.len() as u64));
+        Ok(CandidateStream::owned(ids))
+    }
+
+    /// The next window of candidate ids from `s`, or `None` once the scan is exhausted.
+    /// The slice borrows the stream and stays valid until the next call.
+    ///
+    /// A lazy window is decoded, tombstone-suppressed and counted into
+    /// [`Engine::anchor_ids_scanned`] as it is produced — so a consumer that stops early
+    /// (a pushed `LIMIT`) leaves the rest of the id space untouched. A window that
+    /// suppression (or the label filter) empties is skipped, not yielded, so a caller never
+    /// mistakes it for the end of the scan.
+    fn next_candidates<'s>(&self, s: &'s mut CandidateStream<'_>) -> Result<Option<&'s [u64]>> {
+        let CandidateStream {
+            src,
+            pos,
+            buf,
+            window,
+        } = s;
+        let (label, next, end) = match src {
+            // Materialised sources are handed out in windows too, so a capped consumer
+            // walks no further into them than it must. They are already suppressed and
+            // counted, so no per-window work is done here.
+            CandidateSrc::Ready(ids) => return Ok(slice_window(ids, pos)),
+            CandidateSrc::Owned(ids) => return Ok(slice_window(ids, pos)),
+            CandidateSrc::Sweep { label, next, end } => (label, next, end),
+        };
+        buf.clear();
+        while *next < *end {
+            let (lo, hi) = (*next, (*next + *window).min(*end));
+            *next = hi;
+            // Ramp the window: the first one is small so a `LIMIT 1` touches ~1 K ids,
+            // then it grows to `CAND_WINDOW_MAX` so an uncapped sweep amortises the
+            // per-window block locate/decompress back to the old single-pass cost.
+            *window = window.saturating_mul(8).min(CAND_WINDOW_MAX);
+            // A long sweep is now interruptible: the eager collect ran to completion before
+            // the executor could look at the clock again.
+            self.check_deadline()?;
+            self.scanned_ids
+                .set(self.scanned_ids.get().saturating_add(hi - lo));
+            match label {
+                None => buf.extend(lo..hi),
+                Some(l) => {
+                    let labels = self.gen.node_labels();
+                    let (bitmask, want) = (labels.bitmask(), *l);
+                    labels.inner().for_each_record_in(lo, hi, |node_id, rec| {
+                        if graph_format::nodelabels::decode_labels(rec, bitmask)?.contains(&want) {
+                            buf.push(node_id);
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+            self.suppress_tombstoned_in_place(buf)?;
+            if !buf.is_empty() {
+                return Ok(Some(buf.as_slice()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Candidate node ids for a chosen scan strategy, **materialised**. The eager
+    /// counterpart of [`Engine::candidate_stream`], for the consumers that genuinely need
+    /// the whole set at once: the `algo.*` subgraph view (it builds an index over it), the
+    /// indexed count fast path (it wants only the length), a candidate set hoisted across
+    /// many input rows, and the scan-seam tests.
+    fn scan_candidates(&self, scan: &NodeScan) -> Result<Vec<u64>> {
+        let mut s = self.candidate_stream(scan)?;
+        // An eagerly-materialised source is already the answer.
+        if let CandidateSrc::Owned(ids) = s.src {
+            return Ok(ids);
+        }
+        let mut out = Vec::new();
+        while let Some(batch) = self.next_candidates(&mut s)? {
+            out.extend_from_slice(batch);
+        }
+        Ok(out)
     }
 
     /// Drop candidate dense ids a deletion has tombstoned — the delta's (Phase 2) *and* the
     /// core stack's (a flush that deleted a node): a deleted node must never bind as an
     /// anchor. The pure-core singleton with an empty delta returns the input untouched, so
-    /// the read-only path pays nothing.
-    fn suppress_tombstoned(&self, ids: Vec<u64>) -> Result<Vec<u64>> {
+    /// the read-only path pays nothing. In place, so a scan window is filtered without a
+    /// second allocation.
+    fn suppress_tombstoned_in_place(&self, ids: &mut Vec<u64>) -> Result<()> {
         let delta = self.gen.delta();
         let stack = self.gen.core_stack();
         if delta.is_empty() && stack.is_singleton() {
-            return Ok(ids);
+            return Ok(());
         }
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            if delta.is_tombstoned(id) {
+        let (mut keep, mut i) = (0usize, 0usize);
+        while i < ids.len() {
+            let id = ids[i];
+            i += 1;
+            if delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?) {
                 continue;
             }
-            if !stack.is_singleton() && stack.is_node_tombstoned(id)? {
-                continue;
-            }
-            out.push(id);
+            ids[keep] = id;
+            keep += 1;
         }
-        Ok(out)
+        ids.truncate(keep);
+        Ok(())
     }
 
     /// The `(label, property)` a node range index is defined on, for the delta-born
@@ -15141,6 +15403,70 @@ mod tests {
                 _ => panic!("budget={budget} behaviour differs: seq={seq:?}, par={par:?}"),
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-78: an anchor scan must be a **stream**, not one `Vec<u64>` over the whole id
+    /// space built before the first row is produced. The observable is
+    /// `anchor_ids_scanned()` — the ids the scan actually walked, counted at the one place
+    /// they are produced.
+    ///
+    /// * The **control**: a full-width scan that matches nothing must still walk the whole
+    ///   id space, on both the `AllNodes` and the `LabelScan` sweep. Without this, "the
+    ///   capped scan walked few ids" would be vacuous (a counter that always reads 0 would
+    ///   satisfy it).
+    /// * The **claim**: the *same* scans under `LIMIT 1` must walk no more than the first
+    ///   window — a few hundredths of the id space — not all of it. An eager scan fails
+    ///   this even if it counts honestly, because a pushed `LIMIT` could only truncate the
+    ///   row loop *after* every id had already been produced and held. (Verified: with the
+    ///   sweeps reverted to `(0..node_count).collect()` / `collect_nodes_with_label`, this
+    ///   assertion reports 20 000 walked ids and fails.)
+    #[test]
+    fn anchor_scan_streams_and_limit_short_circuits() {
+        const N: u64 = 20_000;
+        let (root, graph) = testgen::write_wide("exec_scan_stream", N);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let run = |q: &str| -> (usize, u64) {
+            let ast = parser::parse(q).unwrap();
+            let eng = Engine::new(&gen, &cache);
+            let out = eng
+                .run(&ast)
+                .unwrap_or_else(|e| panic!("`{q}` failed: {e:#}"));
+            (out.rows.len(), eng.anchor_ids_scanned())
+        };
+
+        // Control: an uncapped scan walks the whole id space (and the fixture has no index,
+        // so `WHERE n.name = …` really is a full sweep, not a seek).
+        for q in [
+            "MATCH (n) WHERE n.name = 'nobody' RETURN n", // AllNodes
+            "MATCH (n:Person {team:'Green'}) RETURN n",   // LabelScan
+        ] {
+            let (rows, walked) = run(q);
+            assert_eq!(rows, 0, "`{q}` matches nothing");
+            assert_eq!(walked, N, "`{q}` must walk the whole id space");
+        }
+
+        // The claim: `LIMIT 1` stops the scan inside its first window instead of producing
+        // 20 000 ids up front. That window is also the scan's entire resident footprint.
+        let ceiling = CAND_WINDOW_MIN;
+        for q in [
+            "MATCH (n) RETURN n LIMIT 1",        // AllNodes
+            "MATCH (n:Person) RETURN n LIMIT 1", // LabelScan
+        ] {
+            let (rows, walked) = run(q);
+            assert_eq!(rows, 1, "`{q}` returns one row");
+            assert!(
+                walked <= ceiling,
+                "`{q}` walked {walked} ids (> {ceiling}) of a {N}-id space — LIMIT did not \
+                 short-circuit the scan"
+            );
+        }
+
+        // The stream still yields exactly the ids the eager sweep did.
+        let (rows, walked) = run("MATCH (n:Person) RETURN n");
+        assert_eq!(rows, N as usize / 2, "every :Person still matches");
+        assert_eq!(walked, N, "…and the label sweep still walks the id space");
         let _ = std::fs::remove_dir_all(&root);
     }
 
