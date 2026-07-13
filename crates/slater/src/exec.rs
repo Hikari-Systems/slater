@@ -468,6 +468,12 @@ fn for_each_adj_overlaid(
     let mut buf: Vec<topology::Adj> = Vec::new();
     {
         let mut push = |a: topology::Adj| -> Result<()> {
+            // Test-only seam: count every surviving edge handed toward the visitor. A
+            // short-circuit probe (`has_incident_edge`/`find_outgoing_edge`, chunk 1) increments
+            // this once and stops; the materialising readers increment it once per edge. The
+            // regression test asserts the probe walks O(1) edges, not the whole hub adjacency.
+            #[cfg(test)]
+            ADJ_VISIT_COUNT.with(|c| c.set(c.get() + 1));
             buf.push(a);
             if buf.len() >= chunk {
                 emit(&buf)?;
@@ -564,6 +570,90 @@ fn read_adj_overlaid_filtered(
         },
     )?;
     Ok(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of surviving adjacency edges handed to a [`for_each_adj_overlaid`]
+    /// visitor. The short-circuit-probe regression test resets it, runs a probe, and asserts
+    /// it advanced by O(1) rather than the node's full degree. Thread-local so parallel tests
+    /// don't clobber each other's count — the single-node reader runs entirely on the calling
+    /// thread (no fanout), so the count is exact.
+    pub(crate) static ADJ_VISIT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero-sized sentinel raised from a [`for_each_adj_overlaid`] `emit` callback to stop the
+/// stream at the first edge of interest — the existence-probe / first-match short-circuit.
+/// It is caught and swallowed by [`any_adj_overlaid`] / [`find_outgoing_edge_overlaid`]
+/// (matched by *type* via `downcast_ref`, never by message), so it never escapes as a real
+/// error. Using the stream's own early-return keeps a hub's multi-million-edge adjacency from
+/// being decoded or materialised just to answer "is there at least one edge?".
+#[derive(Debug)]
+struct AdjScanStop;
+
+impl std::fmt::Display for AdjScanStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("adjacency scan short-circuited")
+    }
+}
+
+impl std::error::Error for AdjScanStop {}
+
+/// Does node `node` have **any** surviving (post-overlay) edge in direction `outgoing`?
+/// Streams the overlaid adjacency one edge at a time and stops at the first survivor via the
+/// [`AdjScanStop`] sentinel — so a hub node is never walked to completion nor materialised into
+/// a `Vec`. Overlay-exact: it sees a delta-born edge and drops a delta-tombstoned one, because
+/// it shares the single [`for_each_adj_overlaid`] fold with the materialising readers.
+fn any_adj_overlaid(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    node: u64,
+    outgoing: bool,
+) -> Result<bool> {
+    let mut found = false;
+    let r = for_each_adj_overlaid(gen, cache, node, outgoing, None, 1, &mut |batch| {
+        if !batch.is_empty() {
+            found = true;
+            return Err(AdjScanStop.into());
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => Ok(found),
+        Err(e) if e.downcast_ref::<AdjScanStop>().is_some() => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// The edge id of the first surviving (post-overlay) `src -[reltype]-> dst` out-edge, or `None`.
+/// Pushes the reltype set into the CSR decode (a typed run skip) and stops at the first matching
+/// neighbour via the [`AdjScanStop`] sentinel — so finding one edge of a hub source never
+/// materialises its whole out-adjacency. Overlay-exact via the shared fold; the caller controls
+/// which edges are in scope by choosing the view (an empty-delta view sees core edges only).
+fn find_outgoing_edge_overlaid(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    src: u64,
+    reltype: u32,
+    dst: u64,
+) -> Result<Option<u64>> {
+    let mut hit: Option<u64> = None;
+    let rts = [reltype];
+    let r = for_each_adj_overlaid(gen, cache, src, true, Some(&rts), 1, &mut |batch| {
+        if let Some(a) = batch
+            .iter()
+            .find(|a| a.reltype == reltype && a.neighbour.0 == dst)
+        {
+            hit = Some(a.edge.0);
+            return Err(AdjScanStop.into());
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => Ok(hit),
+        Err(e) if e.downcast_ref::<AdjScanStop>().is_some() => Ok(hit),
+        Err(e) => Err(e),
+    }
 }
 
 /// Thread-safe single-node neighbour read for the parallel `shortestPath()` BFS:
@@ -2228,6 +2318,28 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// check, which must see relationships in *both* directions.
     pub fn incoming_adj(&self, id: u64) -> Result<Vec<topology::Adj>> {
         self.incoming(id)
+    }
+
+    /// Does node `id` have **any** incident relationship (outgoing or incoming) in the
+    /// overlaid view? The existence half of [`Self::outgoing_adj`]/[`Self::incoming_adj`]:
+    /// it short-circuits on the first surviving edge instead of materialising the whole
+    /// adjacency `Vec`, so the DELETE-conformance check on a high-degree hub stops at edge 1
+    /// rather than decoding (and allocating) its millions of neighbours. Overlay-exact — it
+    /// sees a delta-born edge and drops a delta-tombstoned one, exactly as the collecting
+    /// readers, because it shares the one [`for_each_adj_overlaid`] fold.
+    pub fn has_incident_edge(&self, id: u64) -> Result<bool> {
+        Ok(any_adj_overlaid(self.gen, self.cache, id, true)?
+            || any_adj_overlaid(self.gen, self.cache, id, false)?)
+    }
+
+    /// The edge id of the first `src -[reltype]-> dst` out-edge in the overlaid view, or
+    /// `None`. The existence-resolving analogue of a filtered [`Self::outgoing_adj`] `find`:
+    /// it pushes the reltype into the CSR decode and stops at the first matching neighbour,
+    /// so it never materialises a hub source's out-adjacency to locate one edge. Which edges
+    /// are in scope follows the view — over an empty-delta view it returns the core edge id
+    /// only (the `MERGE`-idempotency / core-edge-patch resolver's requirement).
+    pub fn find_outgoing_edge(&self, src: u64, reltype: u32, dst: u64) -> Result<Option<u64>> {
+        find_outgoing_edge_overlaid(self.gen, self.cache, src, reltype, dst)
     }
 
     /// Resolve a relationship's type name and named properties — the material a
@@ -10712,6 +10824,144 @@ mod tests {
             check(&view, &cache, 4);
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// HIK-91: the write-path existence probe [`Engine::has_incident_edge`] short-circuits on
+    /// the **first** surviving edge instead of materialising the whole adjacency (the cost the
+    /// per-row plain-DELETE conformance check used to pay, once per row, for a hub). The
+    /// regression seam is [`ADJ_VISIT_COUNT`]: the probe walks O(1) edges; the materialising
+    /// `outgoing_adj` reader walks the node's full degree. Correctness is also pinned — a node
+    /// WITH relationships and one WITHOUT are both classified right, including edges that live
+    /// **only in the delta** (a delta-born edge counts; a delta-tombstoned core edge does not).
+    #[test]
+    fn has_incident_edge_short_circuits_and_is_overlay_exact() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let visits = || ADJ_VISIT_COUNT.with(|c| c.get());
+        let reset = || ADJ_VISIT_COUNT.with(|c| c.set(0));
+
+        let (root, graph, _) = testgen::write_basic("hik91_probe");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // --- Core-only view (empty delta). ---
+        // Node 0 (Alice) is a mini-hub: out-edges e0(->1), e2(->3), e4(->2). The materialising
+        // reader decodes all three; the probe stops at the first.
+        {
+            let view = MergedView::read_only(&gen);
+            let engine = Engine::new(&view, &cache);
+
+            reset();
+            assert!(
+                engine.has_incident_edge(0).unwrap(),
+                "node 0 has outgoing relationships"
+            );
+            assert_eq!(
+                visits(),
+                1,
+                "probe must short-circuit at the first edge, not walk the whole adjacency"
+            );
+
+            // Contrast: the full-materialise reader the pre-fix check used walks every out-edge.
+            reset();
+            let all = engine.outgoing_adj(0).unwrap();
+            assert_eq!(all.len(), 3, "node 0 has three out-edges");
+            assert_eq!(
+                visits(),
+                3,
+                "materialising reader walks the whole list (the old cost)"
+            );
+
+            // Node 3 (Acme) has no out-edges but an incoming WORKS_AT (e2). The probe must check
+            // both directions — it short-circuits on the single incoming edge (1 out-scan of 0
+            // survivors + 1 in survivor).
+            reset();
+            assert!(
+                engine.has_incident_edge(3).unwrap(),
+                "node 3 has an incoming relationship"
+            );
+            assert_eq!(
+                visits(),
+                1,
+                "incoming-only node: exactly one surviving edge visited"
+            );
+        }
+
+        // --- Overlaid view: delta-born edge, delta-tombstoned core edge, isolated born node. ---
+        {
+            let knows = gen.reltype_id("KNOWS").unwrap();
+            let works_at = gen.reltype_id("WORKS_AT").unwrap();
+            let mut mem = Memtable::new();
+            // A brand-new delta-born node (dense id 5) with a single born out-edge 5 -[:KNOWS]-> 1.
+            mem.upsert_node("Person", "name", Value::Str("Dave".into()), Some(5), []);
+            mem.upsert_edge(
+                "Person",
+                "name",
+                Value::Str("Dave".into()),
+                "KNOWS",
+                "Person",
+                "name",
+                Value::Str("Bob".into()),
+                Some(5),
+                Some(1),
+                [],
+            );
+            // A second delta-born node (dense id 6) with NO edges — the "without relationships" case.
+            mem.upsert_node("Person", "name", Value::Str("Eve".into()), Some(6), []);
+            // Tombstone node 3 (Acme)'s only edge, the core WORKS_AT e2 (0->3), so node 3 becomes
+            // relationship-free through the overlay even though the core carries an edge to it.
+            mem.delete_edge(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                "WORKS_AT",
+                "Company",
+                "name",
+                Value::Str("Acme".into()),
+                Some(0),
+                Some(3),
+            );
+            let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let engine = Engine::new(&view, &cache);
+
+            // Delta-born node with an edge → has relationships (edge lives only in the delta).
+            assert!(
+                engine.has_incident_edge(5).unwrap(),
+                "delta-born node 5 has a born out-edge"
+            );
+            // Delta-born node with no edges → no relationships.
+            assert!(
+                !engine.has_incident_edge(6).unwrap(),
+                "delta-born node 6 is isolated"
+            );
+            // Core node whose sole edge is tombstoned by the delta → no relationships (a plain
+            // DELETE of it must be allowed). This is why a core-only degree read is unsafe here.
+            assert!(
+                !engine.has_incident_edge(3).unwrap(),
+                "node 3's only (core) edge is delta-tombstoned"
+            );
+
+            // find_outgoing_edge over the core-only view resolves the genuine core edge id and
+            // short-circuits; a non-existent (reltype, dst) returns None.
+            let core_view = MergedView::read_only(&gen);
+            let core_engine = Engine::new(&core_view, &cache);
+            reset();
+            assert_eq!(
+                core_engine.find_outgoing_edge(0, works_at, 3).unwrap(),
+                Some(2),
+                "0 -[:WORKS_AT]-> 3 is core edge e2"
+            );
+            assert_eq!(visits(), 1, "find stops at the matching edge");
+            assert_eq!(
+                core_engine.find_outgoing_edge(0, knows, 3).unwrap(),
+                None,
+                "there is no 0 -[:KNOWS]-> 3 edge"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Slice 2: the streamed hop reader [`for_each_hop_overlaid`] yields the **same hops
