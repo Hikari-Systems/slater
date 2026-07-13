@@ -3753,6 +3753,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
             let srcs = self.endpoint_candidates(&p.start, &seed, m.where_.as_ref())?;
             let dsts = self.endpoint_candidates(end, &seed, m.where_.as_ref())?;
 
+            // Bound the |srcs|×|dsts| search fan-out: with two free endpoints this launches a
+            // separate shortest-path search for every (src, dst) pair — quadratic in the scanned
+            // id space. Charge the product up front. It is self-scaling: a bound endpoint is a
+            // single candidate, so this only bites when *both* endpoints are free and large (the
+            // pathological case), and it trips the standard `maxIntermediate` budget before the
+            // searches run rather than after they have burned the graph.
+            self.charge(srcs.len().saturating_mul(dsts.len()) as u64)?;
+
             let mut matches: Vec<HashMap<String, Val>> = Vec::new();
             for &src in &srcs {
                 for &dst in &dsts {
@@ -15779,6 +15787,46 @@ mod tests {
             format!("{err:#}").contains("intermediate result budget"),
             "expected the budget error, got: {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_free_endpoint_selector_charges_the_search_product() {
+        // A selector with two free endpoints scans all candidates on each side and launches a
+        // shortest-path search for every (src, dst) pair — quadratic in the id space. On the
+        // isolated fixture (8 nodes, no edges) each search does ~0 frontier work, so the old
+        // code sailed under a small budget however many pairs it ran; the fix charges the 8×8
+        // product up front, tripping before the fan-out runs.
+        let (root, graph) = testgen::write_isolated("exec_2free_product", 8);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let two_free = "MATCH ALL SHORTEST (a)-[r:R*]->(b) RETURN count(*) AS c";
+        let ast = parser::parse(two_free).unwrap();
+        let err = Engine::new(&gen, &cache)
+            .with_max_intermediate(20)
+            .run(&ast)
+            .expect_err("two free endpoints must charge |srcs|×|dsts|");
+        assert!(
+            format!("{err:#}").contains("intermediate result budget"),
+            "expected the budget error, got: {err:#}"
+        );
+        // A generous budget still completes (no edges ⇒ no path ⇒ count 0).
+        let ok = Engine::new(&gen, &cache)
+            .with_max_intermediate(10_000)
+            .run(&ast)
+            .expect("a generous budget completes");
+        assert_eq!(col0(&ok), vec!["0"]);
+
+        // Constraining one endpoint to a single candidate drops the product to 1×8 = 8, which
+        // the same budget admits — the charge bites only the pathological two-free case.
+        let one_bound = "MATCH ALL SHORTEST (a {name:'n0'})-[r:R*]->(b) RETURN count(*) AS c";
+        let ast2 = parser::parse(one_bound).unwrap();
+        let ok2 = Engine::new(&gen, &cache)
+            .with_max_intermediate(20)
+            .run(&ast2)
+            .expect("one constrained endpoint stays under the budget");
+        assert_eq!(col0(&ok2), vec!["0"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

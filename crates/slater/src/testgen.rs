@@ -1437,6 +1437,118 @@ pub fn write_chain(tag: &str, len: u64) -> (PathBuf, String) {
     (root, graph)
 }
 
+/// `n` **isolated** nodes (`n0..n{n-1}`, label `N`) with the reltype `R` declared but **zero
+/// edges**. A shortest-path selector between two free endpoints scans all `n` for each side and
+/// launches `n²` searches, every one of which returns immediately (no edges) — so the frontier
+/// work is ~0 but the *number* of searches is quadratic. The fixture for the two-free-endpoint
+/// fan-out charge.
+pub fn write_isolated(tag: &str, n: u64) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_000a);
+    let graph = "isolated".to_string();
+    let root = std::env::temp_dir().join(format!("slater_isofix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for i in 0..n {
+        np.append(&[(0, Value::Str(format!("n{i}")))]).unwrap();
+    }
+    np.finish().unwrap();
+
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..n {
+        nl.append(&[0]).unwrap();
+    }
+    nl.finish().unwrap();
+
+    // No edges, but both edge-side files still exist and `R` is a declared reltype so a
+    // `-[:R*]->` selector type-checks.
+    PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+    write_csr(dir.join("topology.csr.blk"), n, &[], BLOCK, LEVEL).unwrap();
+
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: n,
+        edge_count: 0,
+        labels: vec!["N".into()],
+        reltypes: vec!["R".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        hub_degrees: None,
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
 /// A **wide** fixture of `n` nodes for the parallel anchor-filter test (Task 10):
 /// enough candidates to clear `SCAN_PAR_MIN` so the pooled `node_ok` prefilter
 /// actually fans out. Node `i` is `:Person` when `i` is even, else `:Company`; every
