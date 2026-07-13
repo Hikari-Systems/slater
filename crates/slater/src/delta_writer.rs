@@ -34,10 +34,37 @@
 //! generation whose dense ids no longer line up. Re-resolving a live delta across a
 //! hot-reload swap is out of scope for Phase 1c — consolidation (Phase 1d) is the
 //! sanctioned path that folds the delta into a fresh core.
+//!
+//! # A panic under the writer lock must not end the graph
+//! The writer lock is held across code that *can* panic — [`Memtable::apply`], the L0
+//! encoders/mergers, and (in [`DeltaWriter::retire`]) a **caller-supplied** `resolve`
+//! closure. A `std` lock poisons on a panic-while-held, so an `.expect()` at every
+//! acquisition would turn one panic into a permanent, per-graph write outage: every
+//! later write, flush, compaction and republish would panic on the poisoned lock until
+//! the process restarted (see the `compact_l0` `unreachable!` that shipped as a real
+//! outage). Two invariants remove that failure mode, and both are load-bearing:
+//!
+//! 1. **Every mutating critical section is panic-*atomic*.** Each is written as
+//!    *prepare* — all fallible and panic-prone work on **locals**, touching nothing the
+//!    lock protects — followed by *install*, a run of moves (assignments,
+//!    `Vec::insert`/`splice`/`clear`) which cannot unwind. A panic therefore always
+//!    leaves [`WriterInner`] exactly as it was before the call, and the published
+//!    snapshot (only ever *assigned* an already-built value) with it. Keep new code in
+//!    that shape: nothing that can panic may run between the first and last write to
+//!    `WriterInner`.
+//! 2. **Acquisition never panics.** Because (1) makes a poison flag carry no
+//!    information — the state behind it is intact by construction — [`DeltaWriter`]
+//!    takes its guards through [`lock_writer`]/[`read_lock`]/[`write_lock`], which
+//!    recover the guard from a `PoisonError` and clear the flag.
+//!
+//! The panic itself still unwinds, loudly, to whoever asked for the write: the one
+//! query (or one background flush task) fails and is logged, and the graph keeps
+//! serving reads *and* writes. That is the trade — a broken invariant surfaces as a
+//! failed op rather than a process abort — and it is sound only while (1) holds.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{Context, Result};
 use graph_format::blockcache::BlockCache as GfBlockCache;
@@ -159,9 +186,16 @@ struct WriterInner {
     dir: PathBuf,
     /// The segment currently open for appends.
     sink: WalSink,
-    /// The authoritative active memtable; the published snapshot's newest level is a
-    /// clone of it.
-    mem: Memtable,
+    /// The authoritative active memtable, shared by `Arc` with the published snapshot's
+    /// newest level.
+    ///
+    /// **Never mutated in place — only replaced wholesale.** A write clones it, applies
+    /// the whole batch to that private copy, and installs the result with one move
+    /// (copy-on-write), so a panic inside [`Memtable::apply`] cannot leave a half-applied
+    /// batch behind (the module-level panic-atomicity invariant). Sharing the `Arc` with
+    /// the published snapshot keeps the cost at exactly one deep clone per batch — the
+    /// clone `published_snapshot` used to make anyway — and makes `freeze` free.
+    mem: Arc<Memtable>,
     /// The sealed L0 levels beneath the active memtable, **newest first** (empty on the
     /// common no-flush path). Each flush prepends one; consolidation clears them. A level
     /// is resident or off-heap per [`WriterInner::off_heap`].
@@ -201,6 +235,37 @@ pub struct DeltaWriter {
     /// themselves continue landing in the memtable + WAL and survive the build (Phase
     /// 4a); the memtable simply grows until retire, bounded by the 4d-ii hard cap.
     consolidating: AtomicBool,
+}
+
+/// Take the writer mutex, **recovering** it if a previous holder panicked.
+///
+/// A poisoned lock here says only "someone panicked while holding this" — it says nothing
+/// about the state behind it, and by the module's panic-atomicity invariant that state is
+/// the pre-panic one, intact. Propagating the poison (`.expect()`) would therefore convert
+/// a single panicking op into a permanent per-graph write outage for no safety gain; so the
+/// guard is recovered with [`PoisonError::into_inner`] and the flag cleared, and the next
+/// write proceeds against the state the panicking one never managed to change.
+fn lock_writer(m: &Mutex<WriterInner>) -> MutexGuard<'_, WriterInner> {
+    let guard = m.lock().unwrap_or_else(PoisonError::into_inner);
+    m.clear_poison();
+    guard
+}
+
+/// Take a read guard, recovering from a poisoned `RwLock` — see [`lock_writer`]. (An
+/// `RwLock` only poisons on a panic under its *write* guard; the writer's write sections
+/// are single moves, so this is belt-and-braces — but no acquisition in this file may be a
+/// panic site.)
+fn read_lock<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    let guard = l.read().unwrap_or_else(PoisonError::into_inner);
+    l.clear_poison();
+    guard
+}
+
+/// Take a write guard, recovering from a poisoned `RwLock` — see [`read_lock`].
+fn write_lock<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    let guard = l.write().unwrap_or_else(PoisonError::into_inner);
+    l.clear_poison();
+    guard
 }
 
 impl DeltaWriter {
@@ -282,6 +347,7 @@ impl DeltaWriter {
         let sink = WalSink::create(&dir, next_segment)
             .with_context(|| format!("open WAL segment {next_segment} under {dir:?}"))?;
 
+        let mem = Arc::new(mem);
         let published = published_snapshot(&mem, &l0);
         Ok(Self {
             graph: graph.to_string(),
@@ -329,25 +395,21 @@ impl DeltaWriter {
     /// The core generation the delta's dense ids were resolved against. The server
     /// overlays this delta only on a generation with this UUID.
     pub fn core_uuid(&self) -> GenId {
-        *self.core_uuid.read().expect("delta core-uuid lock")
+        *read_lock(&self.core_uuid)
     }
 
     /// A consistent immutable snapshot of the **active memtable** — one `Arc` clone, no
     /// writer contention. Used by the writer's single-memtable diagnostics and tests; a
     /// read overlay wants [`Self::delta_snapshot`] (which also carries the L0 levels).
     pub fn snapshot(&self) -> Arc<Memtable> {
-        self.published
-            .read()
-            .expect("delta snapshot lock")
-            .active_memtable()
-            .clone()
+        read_lock(&self.published).active_memtable().clone()
     }
 
     /// The full published delta — the active memtable **and** every sealed L0 level,
     /// folded atomically. A query pins this for its whole life; the read overlay
     /// (`server::delta_for_read`) builds its `MergedView` from it.
     pub fn delta_snapshot(&self) -> DeltaSnapshot {
-        self.published.read().expect("delta snapshot lock").clone()
+        read_lock(&self.published).clone()
     }
 
     /// The synthetic dense id of a delta-born node with this business identity that is
@@ -361,9 +423,7 @@ impl DeltaWriter {
         key: &str,
         value: &Value,
     ) -> Option<u64> {
-        self.published
-            .read()
-            .expect("delta snapshot lock")
+        read_lock(&self.published)
             .l0_levels()
             .iter()
             .find_map(|m| m.born_synthetic_for_identity(label, key, value))
@@ -377,18 +437,19 @@ impl DeltaWriter {
     /// `execute_write` plant the tombstone's `by_dense` mapping, suppressing a node
     /// already flushed to an L0 level on read.
     pub fn born_synthetic_in_delta(&self, label: &str, key: &str, value: &Value) -> Option<u64> {
-        self.published
-            .read()
-            .expect("delta snapshot lock")
-            .born_synthetic_for_identity(label, key, value)
+        read_lock(&self.published).born_synthetic_for_identity(label, key, value)
     }
 
     /// Publish `mem ⊕ l0` as one atomic [`DeltaSnapshot`], so a lock-free reader never
     /// observes a half-applied flush (data in neither or both of the memtable and a new
     /// L0 level). Called under the writer lock after every state change.
+    ///
+    /// Part of every caller's *install* phase: the snapshot is fully built before the
+    /// guard is taken, and the guard only ever sees a move-assign, so publishing cannot
+    /// panic (and cannot publish a half-built delta).
     fn republish(&self, inner: &WriterInner) {
         let published = published_snapshot(&inner.mem, &inner.l0);
-        *self.published.write().expect("delta snapshot lock") = published;
+        *write_lock(&self.published) = published;
     }
 
     /// The current delta epoch (monotonic; bumps on every published write).
@@ -396,44 +457,64 @@ impl DeltaWriter {
         self.epoch.load(Ordering::Acquire)
     }
 
-    /// Durably apply one write: append the record, commit (fsync — the ack
-    /// barrier), fold it into the authoritative memtable, and publish the new
-    /// snapshot. Returns the durable sequence number. `resolved` is the caller's
-    /// resolved dense-id context ([`OpResolution`]) — a `None` endpoint marks a
-    /// delta-born node/edge (Phase 2/3).
+    /// Durably apply one write: fold it into a private copy of the authoritative memtable,
+    /// append the record, commit (fsync — the ack barrier), then install the new memtable
+    /// and publish the new snapshot. Returns the durable sequence number. `resolved` is the
+    /// caller's resolved dense-id context ([`OpResolution`]) — a `None` endpoint marks a
+    /// delta-born node/edge (Phase 2/3). Same three-phase shape (and the same failure and
+    /// panic atomicity) as [`Self::write_batch`], for a single op.
     pub fn write(&self, op: WalOp, resolved: OpResolution) -> Result<Seq> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
+
+        // --- prepare: fold into a private copy; `inner` is untouched, so a panic in
+        //     `apply` leaves the writer exactly as it was.
+        let mut mem = (*inner.mem).clone();
+        mem.apply(&op, resolved);
+
+        // --- durably commit the record (the ack barrier). On failure the copy is dropped:
+        //     nothing applied, nothing published.
         let seq = inner.seq.next();
         let rec = WalRecord { seq, op };
         inner.sink.append(&rec).context("append WAL record")?;
         inner.sink.commit(seq).context("commit WAL batch")?;
         inner.seq = seq;
-        inner.mem.apply(&rec.op, resolved);
-        // Publish the new delta (active memtable ⊕ unchanged L0 levels), then bump the
-        // epoch so readers keying on it see the new state (publish-before-bump: an
-        // observer that reads the higher epoch also sees the swapped-in snapshot).
+
+        // --- install: moves only. Publish the new delta (active memtable ⊕ unchanged L0
+        //     levels), then bump the epoch so readers keying on it see the new state
+        //     (publish-before-bump: an observer that reads the higher epoch also sees the
+        //     swapped-in snapshot).
+        inner.mem = Arc::new(mem);
         self.republish(&inner);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(seq)
     }
 
     /// Durably apply a **batch** of writes under a single group commit — the fix for the
-    /// one-fsync-per-statement cost that dominates bulk-write throughput. It appends every
-    /// record, then does **one** `commit` (a single fsync — the ack barrier for the whole
-    /// batch), folds all ops into the memtable, and does **one** publish + epoch bump.
-    /// Returns the durable sequence number of the last op (the whole batch is durable
-    /// once this returns).
+    /// one-fsync-per-statement cost that dominates bulk-write throughput. It folds every op
+    /// into the memtable, appends every record, then does **one** `commit` (a single fsync —
+    /// the ack barrier for the whole batch) and **one** publish + epoch bump. Returns the
+    /// durable sequence number of the last op (the whole batch is durable once this returns).
     ///
-    /// **Atomic on failure:** the memtable is applied only *after* the commit fsync
-    /// succeeds, so if any append or the commit fails, no op in the batch is applied or
-    /// published, and the un-committed records are dropped on replay (no commit marker) —
-    /// the batch is rejected whole, never half-applied. An empty batch is a no-op.
+    /// **Atomic on failure *and* on panic.** The batch is folded into a **private copy** of
+    /// the memtable, which is installed only once every record is durable — so if any append
+    /// or the commit fails, no op is applied or published (and the un-committed records are
+    /// dropped on replay: no commit marker), and if [`Memtable::apply`] *panics* the WAL has
+    /// not been touched either. Either way the batch is rejected whole, never half-applied,
+    /// and the writer is left usable (module invariant 1). An empty batch is a no-op.
+    ///
+    /// The copy is not an extra cost: `published_snapshot` deep-cloned the memtable on every
+    /// write in any case, and this copy *is* the one it publishes.
     pub fn write_batch(&self, ops: &[(WalOp, OpResolution)]) -> Result<Seq> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
         if ops.is_empty() {
             return Ok(inner.seq);
         }
-        // 1. Append every record (fast; no fsync yet).
+        // 1. Prepare: fold every op into a private copy of the authoritative memtable.
+        let mut mem = (*inner.mem).clone();
+        for (op, resolved) in ops {
+            mem.apply(op, *resolved);
+        }
+        // 2. Append every record (fast; no fsync yet).
         let mut last = inner.seq;
         for (op, _) in ops {
             let seq = inner.seq.next();
@@ -445,13 +526,11 @@ impl DeltaWriter {
             inner.seq = seq;
             last = seq;
         }
-        // 2. One commit = one fsync for the whole batch (the ack barrier).
+        // 3. One commit = one fsync for the whole batch (the ack barrier).
         inner.sink.commit(last).context("commit WAL batch")?;
-        // 3. Fold every op into the authoritative memtable (only after the fsync).
-        for (op, resolved) in ops {
-            inner.mem.apply(op, *resolved);
-        }
-        // 4. One publish + epoch bump for the batch (publish-before-bump, as in `write`).
+        // 4. Install (moves only) + one publish + epoch bump for the batch
+        //    (publish-before-bump, as in `write`).
+        inner.mem = Arc::new(mem);
         self.republish(&inner);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(last)
@@ -472,7 +551,7 @@ impl DeltaWriter {
     /// until `retire`; the freeze-to-a-live-memtable "writes never block" behaviour
     /// is Phase 4 admission control.
     pub fn freeze(&self) -> Result<Frozen> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
         // Everything committed so far — the active memtable, the sealed L0 levels, and
         // the WAL segment about to be sealed — is the frozen delta. Capture the paths
         // before opening the fresh segment so the fresh one is never in the consumed set.
@@ -484,7 +563,9 @@ impl DeltaWriter {
         })?;
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at freeze")?;
-        let snapshot = Arc::new(inner.mem.clone());
+        // The memtable is shared, never mutated in place (the write path replaces it
+        // wholesale), so the frozen snapshot is a plain `Arc` clone — no deep copy.
+        let snapshot = Arc::clone(&inner.mem);
         let l0: Vec<Arc<dyn LevelRead>> = inner.l0.iter().map(|s| s.level_arc()).collect();
         Ok(Frozen {
             snapshot,
@@ -504,8 +585,12 @@ impl DeltaWriter {
     /// delete the pre-flush WAL segments (their writes now live in the durable L0 file).
     /// The new levels are published atomically, so a concurrent reader never sees the
     /// flushed data in neither or both of the memtable and the new L0 level.
+    ///
+    /// All of the panic-prone work (the L0 encode) runs *before* the first write to
+    /// `WriterInner`, so a panic in the encoder leaves the writer untouched and usable —
+    /// see the module's panic-atomicity invariant. Keep it that way.
     pub fn flush_to_l0(&self) -> Result<bool> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
         // Checked under the lock so it serialises with freeze/retire: a consolidation
         // must not have an L0 segment appear between its freeze and its retire.
         if self.consolidating.load(Ordering::Acquire) {
@@ -560,7 +645,7 @@ impl DeltaWriter {
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at flush")?;
 
-        inner.mem = Memtable::with_bases(node_base, edge_base);
+        inner.mem = Arc::new(Memtable::with_bases(node_base, edge_base));
         inner.l0.insert(0, level); // newest-first
 
         // 4. The flushed writes are durable in the L0 file (fsynced above), so the
@@ -614,8 +699,12 @@ impl DeltaWriter {
     /// protects live readers, but a crash between writing the merged file and deleting the
     /// run's newer members would leave both on disk (a redundant born-id range) until the
     /// next compaction — a pre-existing limitation, not worsened here.
+    ///
+    /// The whole merge (the panic-prone part — this is where the `unreachable!` that took a
+    /// graph's write path down with it used to live) runs before the stack is spliced, so a
+    /// panic in it leaves `WriterInner` untouched and the writer usable. Keep it that way.
     pub fn compact_l0(&self) -> Result<bool> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
         // As with `flush_to_l0`: never mutate the L0 stack during a consolidation.
         if self.consolidating.load(Ordering::Acquire) {
             return Ok(false);
@@ -735,41 +824,51 @@ impl DeltaWriter {
         new_core_edge_count: u64,
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().expect("delta writer lock");
+        let mut inner = lock_writer(&self.inner);
         // The consumed WAL segments' + L0 levels' writes are now in the new core — drop
         // them. The currently-open (post-freeze) WAL segment is never in `consumed`
         // (freeze rotated to it), so it survives and keeps taking appends after this
         // rebuild. Every L0 level present at freeze was folded into the new core, so the
         // whole stack retires; 4c-B does not admit a flush during a consolidation (that
-        // in-flight guard is 4d), so the stack at retire is exactly `consumed_l0`.
+        // in-flight guard is 4d), so the stack at retire is exactly `consumed_l0`. This
+        // must precede the replay below (which reads the WAL directory and must see only
+        // the surviving segments); it changes nothing the writer lock protects.
         for path in consumed {
             remove_if_present(path)?;
         }
         for path in consumed_l0 {
             remove_if_present(path)?;
         }
-        inner.l0.clear();
 
-        // Rebuild the live memtable from the surviving (post-freeze) WAL segments, each
-        // write re-resolved against the new core. Re-base the synthetic id spaces on the
-        // freshly built core: its node/edge counts now include the folded-in delta-born
-        // entities (including any that were flushed to an L0 level), so a post-freeze
-        // born id starts past them and a post-freeze re-write of a folded born key
-        // re-resolves to its now-real dense id.
+        // Prepare — on locals. Rebuild the live memtable from the surviving (post-freeze)
+        // WAL segments, each write re-resolved against the new core. Re-base the synthetic
+        // id spaces on the freshly built core: its node/edge counts now include the
+        // folded-in delta-born entities (including any that were flushed to an L0 level), so
+        // a post-freeze born id starts past them and a post-freeze re-write of a folded born
+        // key re-resolves to its now-real dense id.
+        //
+        // `resolve` is **caller code invoked under the writer lock**, and `apply` can panic,
+        // so this is the writer's most exposed panic site — which is exactly why the L0 stack
+        // is cleared in the install phase *below* rather than here: a panic leaves
+        // `WriterInner` (memtable, L0 stack, seq) exactly as it was and `core_uuid` still
+        // bound to the old core, so the writer stays usable, the server keeps failing safe to
+        // the pure new core (the same posture as a retire that returns `Err`), and the retire
+        // is retryable — `remove_if_present` tolerates the already-deleted paths.
         let mut mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
         let replay = replay_dir(&inner.dir)
             .with_context(|| format!("replay post-freeze WAL dir {:?}", inner.dir))?;
         for rec in &replay.records {
             mem.apply(&rec.op, resolve(&rec.op));
         }
-        inner.seq = replay.last_seq;
-        inner.mem = mem;
 
-        // Publish the rebuilt overlay first (no L0 now), then re-bind the core UUID (see
-        // the ordering note above). The seq counter stays monotonic from the replayed
-        // high-water mark.
+        // Install — moves only. Publish the rebuilt overlay first (no L0 now), then re-bind
+        // the core UUID (see the ordering note above). The seq counter stays monotonic from
+        // the replayed high-water mark.
+        inner.l0.clear();
+        inner.seq = replay.last_seq;
+        inner.mem = Arc::new(mem);
         self.republish(&inner);
-        *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
+        *write_lock(&self.core_uuid) = new_core_uuid;
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -786,8 +885,8 @@ impl DeltaWriter {
     /// the epoch bump invalidates any delta-overlaid result-cache entry keyed on the old set.
     pub fn rebind_core_uuid(&self, new_core_uuid: GenId) {
         // Serialise against an in-flight write so a mutation never straddles the rebind.
-        let _inner = self.inner.lock().expect("delta writer lock");
-        *self.core_uuid.write().expect("delta core-uuid lock") = new_core_uuid;
+        let _inner = lock_writer(&self.inner);
+        *write_lock(&self.core_uuid) = new_core_uuid;
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -799,19 +898,19 @@ impl DeltaWriter {
     /// Approximate resident **active-memtable** size in bytes — checked against the
     /// memtable→L0 flush cap (a full memtable flushes; the L0 levels don't count here).
     pub fn bytes(&self) -> usize {
-        self.inner.lock().expect("delta writer lock").mem.bytes()
+        lock_writer(&self.inner).mem.bytes()
     }
 
     /// Approximate resident size of the **whole** delta (active memtable + every L0
     /// level) — checked against the total-delta soft/hard caps (Phase 4d).
     pub fn total_bytes(&self) -> usize {
-        let inner = self.inner.lock().expect("delta writer lock");
+        let inner = lock_writer(&self.inner);
         inner.mem.bytes() + inner.l0.iter().map(|s| s.bytes() as usize).sum::<usize>()
     }
 
     /// The number of sealed L0 levels currently overlaid (diagnostics / tests).
     pub fn l0_len(&self) -> usize {
-        self.inner.lock().expect("delta writer lock").l0.len()
+        lock_writer(&self.inner).l0.len()
     }
 
     /// Total changed-entity count across the whole delta (nodes + edges, summed over
@@ -820,13 +919,13 @@ impl DeltaWriter {
     /// an entity is touched in several levels, which only makes the trigger fire a
     /// little sooner (safe).
     pub fn delta_entity_count(&self) -> usize {
-        let s = self.published.read().expect("delta snapshot lock");
+        let s = read_lock(&self.published);
         s.node_delta_count() + s.edge_delta_count()
     }
 
     /// The directory holding this graph's WAL segments.
     pub fn wal_dir(&self) -> PathBuf {
-        self.inner.lock().expect("delta writer lock").dir.clone()
+        lock_writer(&self.inner).dir.clone()
     }
 }
 
@@ -879,12 +978,12 @@ fn next_segment_number(dir: &Path) -> Result<u64> {
 }
 
 /// Build the atomic published [`DeltaSnapshot`] from the active memtable and the L0
-/// stack (newest-first): clone the memtable into a fresh level and gather the L0
-/// segments' immutable memtable handles.
-fn published_snapshot(mem: &Memtable, l0: &[L0Level]) -> DeltaSnapshot {
-    let mem = Arc::new(mem.clone());
+/// stack (newest-first): share the memtable (it is immutable once installed — the write
+/// path replaces it wholesale rather than mutating it) and gather the L0 segments'
+/// immutable memtable handles.
+fn published_snapshot(mem: &Arc<Memtable>, l0: &[L0Level]) -> DeltaSnapshot {
     let levels: Vec<Arc<dyn LevelRead>> = l0.iter().map(|s| s.level_arc()).collect();
-    DeltaSnapshot::with_levels(mem, levels)
+    DeltaSnapshot::with_levels(Arc::clone(mem), levels)
 }
 
 /// Open a sealed L0 segment at `path` in whichever format it was written: a **directory**
@@ -2377,6 +2476,183 @@ mod tests {
         assert!(w.flush_to_l0().unwrap(), "flush resumes after release");
         assert!(w.compact_l0().unwrap(), "compaction resumes after release");
         assert_eq!(w.l0_len(), 1, "three segments compacted to one");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A panic **while the writer lock is held** must not take the graph's write path down
+    /// with it, and must not leave a torn delta behind.
+    ///
+    /// `retire` calls the caller's `resolve` closure under the writer mutex, so a panicking
+    /// resolver is a real panic-while-held — the same shape as the `compact_l0`
+    /// `unreachable!` that shipped as a permanent per-graph write outage. Before the fix
+    /// this test dies twice over: the `std` mutex is **poisoned**, so the very next
+    /// `write()` panics on `.expect("delta writer lock")` (and so does every later write,
+    /// flush, compaction and `l0_len()` — until the process restarts); and `retire` had
+    /// already cleared the L0 stack *before* running the panicking replay, so simply making
+    /// the lock non-poisoning (e.g. `parking_lot`) would instead let the next write publish
+    /// a delta whose sealed L0 level has silently vanished. Both are asserted here.
+    #[test]
+    fn panic_under_the_writer_lock_leaves_the_graph_writable_and_untorn() {
+        let dir = tmp("panic_under_lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        let old_core = GenId(uuid::Uuid::from_u128(30));
+        let new_core = GenId(uuid::Uuid::from_u128(31));
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+
+        // A (dense 10) is written and flushed, so its patch lives **only** in the sealed L0
+        // level — a reader that loses the L0 stack loses this write.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("price", Value::Int(1))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap(), "memtable had writes to flush");
+        assert_eq!(w.l0_len(), 1);
+
+        let frozen = w.freeze().unwrap();
+
+        // A post-freeze write, so retire's replay has a record to hand to `resolve`.
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("B".into()),
+                &[("price", Value::Int(2))],
+            ),
+            node(20),
+        )
+        .unwrap();
+        let epoch_before = w.epoch();
+
+        // Retire with a resolver that panics — i.e. a panic inside the writer's critical
+        // section, holding the mutex.
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            w.retire(
+                &frozen.consumed,
+                &frozen.consumed_l0,
+                new_core,
+                100,
+                0,
+                |_op: &WalOp| -> OpResolution { panic!("resolver blew up under the writer lock") },
+            )
+        }));
+        assert!(boom.is_err(), "the resolver panicked under the writer lock");
+
+        // 1. The graph is still WRITABLE. (Pre-fix: this panics on the poisoned mutex.)
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("B".into()),
+                &[("price", Value::Int(3))],
+            ),
+            node(20),
+        )
+        .expect("a panic under the lock must not end the graph's write path");
+        assert!(w.epoch() > epoch_before, "the recovered write published");
+
+        // 2. Nothing is TORN. The failed retire installed none of its state, so the writer
+        //    still holds the pre-retire delta — the L0 stack included — and the write above
+        //    republished *that*, not a half-retired one. (This is what a bare `parking_lot`
+        //    swap would break: the pre-fix `retire` clears `l0` before the panicking replay,
+        //    so the write above would have published a delta with no L0 level and A's patch
+        //    would be gone.)
+        assert_eq!(w.l0_len(), 1, "the L0 stack survived the panicking retire");
+        let snap = w.delta_snapshot();
+        assert_eq!(
+            snap.node_patch(10)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(1)),
+            "the L0-only write is still readable after a panic under the lock",
+        );
+        assert_eq!(
+            snap.node_patch(20)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(3)),
+            "the post-panic write is readable",
+        );
+        assert_eq!(
+            w.core_uuid(),
+            old_core,
+            "a retire that panicked did not re-bind the core",
+        );
+
+        // 3. Every other lock-taking read path still works (nothing is poisoned).
+        assert!(w.bytes() > 0);
+        assert!(w.total_bytes() > 0);
+        assert!(w.delta_entity_count() > 0);
+        assert_eq!(w.wal_dir(), dir);
+
+        // 4. The retire is retryable — a clean resolver completes it (the deleted consumed
+        //    paths are tolerated), so the graph converges rather than needing a restart.
+        w.retire(
+            &frozen.consumed,
+            &frozen.consumed_l0,
+            new_core,
+            100,
+            0,
+            resolve_ticker,
+        )
+        .expect("retire is retryable after a panicking one");
+        assert_eq!(w.core_uuid(), new_core);
+        assert_eq!(w.l0_len(), 0, "the retry retired the L0 stack");
+
+        // 5. …and so does maintenance.
+        assert!(w.flush_to_l0().is_ok(), "flush works after the panic");
+        assert!(w.compact_l0().is_ok(), "compaction works after the panic");
+        assert!(w.freeze().is_ok(), "freeze works after the panic");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The memtable fold is copy-on-write, so a batch is applied whole or not at all: the
+    /// published snapshot never shows a half-applied batch, and the memtable the writer
+    /// keeps is the one it published.
+    #[test]
+    fn a_batch_is_applied_whole_and_shares_the_published_memtable() {
+        let dir = tmp("batch_cow");
+        let _ = std::fs::remove_dir_all(&dir);
+        let w =
+            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        w.write_batch(&[
+            (
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("A".into()),
+                    &[("price", Value::Int(1))],
+                ),
+                node(10),
+            ),
+            (
+                upsert(
+                    "Company",
+                    "ticker",
+                    Value::Str("B".into()),
+                    &[("price", Value::Int(2))],
+                ),
+                node(20),
+            ),
+        ])
+        .unwrap();
+
+        let snap = w.snapshot();
+        assert_eq!(
+            snap.node_patch(10)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(1)),
+        );
+        assert_eq!(
+            snap.node_patch(20)
+                .and_then(|d| d.patches.get("price").cloned()),
+            Some(Value::Int(2)),
+        );
+        // The writer installed the very `Arc` it published (no second deep clone).
+        assert!(Arc::ptr_eq(&snap, &lock_writer(&w.inner).mem));
         std::fs::remove_dir_all(&dir).ok();
     }
 
