@@ -161,6 +161,16 @@ accepted risk so future changes stay aware of it.
   also what makes the **bounded-RSS guarantee hold under adversarial connection load**, not just
   well-behaved clients. These are defence-in-depth behind the primary control (network ACLs + an
   L4 proxy); see `docs/HARDENING.md` "Network posture".
+- **Authentication flood.** argon2id is deliberately expensive (~19 MiB, tens of ms), and an
+  unknown principal burns the same cost against a dummy hash so a missing account cannot be found
+  by timing — so a `LOGON` flood is a CPU/memory flood by design. The verify runs on a blocking
+  thread, never on a reactor worker (a few concurrent verifies would otherwise wedge every worker
+  and deafen the whole server), and `server.maxConcurrentAuth` (default 4) caps how many run at
+  once, so the flood cannot swallow the blocking pool that query execution shares either.
+  `server.maxAuthFailures` (default 3) hangs up on a socket that spends its allowance of failed
+  `LOGON`s, so one connection cannot queue verifies for its entire login window; it is a per-
+  connection cap, never per account, so it cannot be used to lock a user out. See
+  `docs/HARDENING.md` "Authentication cost controls".
 - **`range()` blow-up.** `range()` refuses a span whose element count exceeds a guardrail
   (1M ≈ 48 MB) and uses checked arithmetic, closing a single-query OOM / infinite-loop (the
   result-row cap does not catch it, since a giant list is one row). This is the lone guard

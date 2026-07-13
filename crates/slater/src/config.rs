@@ -270,6 +270,28 @@ pub struct ServerConfig {
         deserialize_with = "de::usize"
     )]
     pub max_blocking_threads: usize,
+    /// Cap on argon2id password verifies running **at once**. Password hashing is
+    /// deliberately expensive (~19 MiB of scratch and tens of ms of CPU per verify, and
+    /// an unknown principal burns the same cost so it cannot be identified by timing),
+    /// so an unauthenticated `LOGON` flood is a CPU/memory flood by construction. Each
+    /// verify runs on a blocking thread, never on a reactor worker; this caps how many
+    /// of those threads (and how much argon2 scratch) auth may hold, leaving the
+    /// blocking pool free to keep running queries. Small on purpose — even 4 sustains
+    /// ~100 logins/s. 0 = unlimited (do not: a flood would then park the whole blocking
+    /// pool and gigabytes of scratch).
+    #[serde(
+        default = "default_max_concurrent_auth",
+        deserialize_with = "de::usize"
+    )]
+    pub max_concurrent_auth: usize,
+    /// Failed `LOGON`s one connection may make before the server closes it. Stops a
+    /// single socket from queueing password verifies for its whole login window; a
+    /// determined attacker must pay a fresh TCP + Bolt handshake per few attempts, and
+    /// is then bounded by `maxConnectionsPerIp` / `maxPreAuthConnections`. Per
+    /// *connection*, never per account — so it cannot be abused to lock a user out.
+    /// 0 = unlimited.
+    #[serde(default = "default_max_auth_failures", deserialize_with = "de::usize")]
+    pub max_auth_failures: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -711,6 +733,12 @@ fn default_max_pre_auth_connections() -> usize {
 }
 fn default_max_connections_per_ip() -> usize {
     1_024
+}
+fn default_max_concurrent_auth() -> usize {
+    4 // ~100 logins/s of headroom; bounds argon2 scratch at ~4 × 19 MiB
+}
+fn default_max_auth_failures() -> usize {
+    3 // a fat-fingered password is retried, a credential-stuffer is hung up on
 }
 fn default_log_level() -> String {
     // `info` already surfaces the per-query `query executed` timing summary (the
@@ -1222,6 +1250,16 @@ mod tests {
         assert_eq!(cfg.max_connections_per_ip, 1_024);
         // The pre-auth budget must leave global headroom for authenticated readers.
         assert!(cfg.max_pre_auth_connections < cfg.max_connections);
+        // Password hashing is bounded by default: concurrent verifies are capped well
+        // below the blocking pool that query execution shares, and one connection gets
+        // a small allowance of failed LOGONs.
+        assert_eq!(cfg.max_concurrent_auth, 4);
+        assert_eq!(cfg.max_auth_failures, 3);
+        assert!(
+            cfg.max_concurrent_auth > 0,
+            "unbounded by default would be a DoS"
+        );
+        assert!(cfg.max_concurrent_auth < cfg.max_blocking_threads.max(512));
     }
 
     #[test]
@@ -1236,6 +1274,8 @@ mod tests {
             "maxConnections": 8,
             "maxPreAuthConnections": 4,
             "maxConnectionsPerIp": 2,
+            "maxConcurrentAuth": 2,
+            "maxAuthFailures": 5,
         }))
         .unwrap();
         let from_str: ServerConfig = serde_json::from_value(serde_json::json!({
@@ -1246,6 +1286,8 @@ mod tests {
             "maxConnections": "8",
             "maxPreAuthConnections": "4",
             "maxConnectionsPerIp": "2",
+            "maxConcurrentAuth": "2",
+            "maxAuthFailures": "5",
         }))
         .unwrap();
         for cfg in [&from_num, &from_str] {
@@ -1256,6 +1298,8 @@ mod tests {
             assert_eq!(cfg.max_connections, 8);
             assert_eq!(cfg.max_pre_auth_connections, 4);
             assert_eq!(cfg.max_connections_per_ip, 2);
+            assert_eq!(cfg.max_concurrent_auth, 2);
+            assert_eq!(cfg.max_auth_failures, 5);
         }
     }
 }

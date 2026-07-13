@@ -157,6 +157,22 @@ authenticated principals over Bolt).
   `pre_auth_budget_rejects_excess_anonymous_connections`, `per_ip_cap_rejects_excess_from_one_source`,
   `login_deadline_closes_an_idle_unauthenticated_connection`.
 
+- [x] **✅ DONE — argon2id ran synchronously on the reactor (auth DoS).** `authenticate()` was a
+  sync fn: the ACL re-read and the argon2id verify (~19 MiB, tens of ms — and an unknown principal
+  burns the same cost, deliberately, so it cannot be found by timing) ran directly on a tokio
+  reactor worker from `handle_request`. A handful of concurrent `LOGON`s therefore wedged every
+  worker and the server stopped serving *all* connections — asymmetric with query execution, which
+  had always been on `spawn_blocking`.
+  *Fixed (HIK-90):* the poll + verify move to a blocking thread, gated by a small semaphore
+  (`server.maxConcurrentAuth`, default 4) whose permit is held by the hash itself — so an uncapped
+  flood cannot relocate the DoS into the 512-thread blocking pool that query execution shares, and
+  a client hanging up mid-`LOGON` cannot leak the cap. The wait for a permit is bounded by
+  `server.loginTimeoutMs`, and `server.maxAuthFailures` (default 3, per connection — never per
+  account, so it cannot lock a user out) hangs up on a socket that spends its allowance of failed
+  attempts. The timing-equalisation against username enumeration is unchanged. Tests:
+  `concurrent_logons_do_not_block_the_reactor`, `concurrent_verifies_are_capped`,
+  `unknown_principal_still_pays_for_a_full_verify`, `repeated_bad_logons_close_the_connection`.
+
 - [x] **✅ DONE — Config / key-location trust boundary.** The MAC's trust root is the master key, and the
   config only *names* where that key is read from (`encryption.keyFile`/`keyEnv`). An attacker
   with write access to both the config and the data dir can substitute their own key and forge a

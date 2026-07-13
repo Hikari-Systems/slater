@@ -59,6 +59,29 @@ bounded-RSS guarantee held only for well-behaved clients. With them it is uncond
 All default **on but generous** — invisible to a legitimate client population, a backstop
 under adversarial load. `0` disables any individual limit.
 
+## Authentication cost controls
+
+Password hashing is *meant* to be expensive: argon2id at ~19 MiB of scratch and tens of ms
+of CPU per verify, and an unknown principal burns the **same** cost against a dummy hash so
+a missing account cannot be identified by timing. An unauthenticated `LOGON` flood is
+therefore a CPU/memory flood by construction, and two controls bound it.
+
+- **Verifies run off the reactor, under a cap** (`server.maxConcurrentAuth`, default 4):
+  the ACL re-read and the hash are handed to a blocking thread — never a reactor worker,
+  which a handful of concurrent `LOGON`s would otherwise wedge, deafening every connection
+  the server has. The cap is what keeps that from merely relocating the problem: tokio's
+  blocking pool is 512 threads deep with an unbounded queue, so an uncapped flood would
+  park gigabytes of argon2 scratch *and* starve query execution of the threads it runs on.
+  Waiters park asynchronously (no thread, no reactor worker), bounded by the pre-auth
+  connection cap, and their wait is bounded by `server.loginTimeoutMs`. Small is fine — 4
+  concurrent verifies sustain ~100 logins/s.
+- **Per-connection attempt cap** (`server.maxAuthFailures`, default 3): a socket that
+  burns its allowance of failed `LOGON`s is closed, so it cannot keep queueing verifies for
+  its whole login window; a stuffer must pay a fresh TCP + Bolt handshake every few
+  guesses, and is then bounded by the per-source and pre-auth connection caps. The cap is
+  per *connection*, never per account — it cannot be turned around and used to lock a
+  victim's user out.
+
 ## Panic isolation
 
 Query execution runs on `spawn_blocking`; a panic there surfaces as a `JoinError` and the

@@ -1577,6 +1577,15 @@ struct ConnCtx {
     /// one permit from its first byte until authentication succeeds, then releases it,
     /// so a flood of anonymous sockets cannot starve authenticated readers.
     pre_auth_limit: Arc<Semaphore>,
+    /// Budget for argon2id password verifies running **at once**
+    /// (`server.maxConcurrentAuth`). A `LOGON` takes a permit before it hands the verify
+    /// to a blocking thread and holds it until the hash actually finishes, so a flood of
+    /// auth attempts can neither wedge a reactor worker nor swamp the blocking pool that
+    /// query execution runs on. See [`verify_off_reactor`].
+    auth_limit: Arc<Semaphore>,
+    /// Failed `LOGON`s one connection may make before it is closed
+    /// (`server.maxAuthFailures`); 0 = unlimited.
+    max_auth_failures: usize,
     /// Live per-source connection counts (key: /32 for IPv4, /64 for IPv6).
     per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// Per-source concurrent-connection cap; 0 = unlimited.
@@ -2195,6 +2204,14 @@ struct Session {
     tx_graph: Option<String>,
     /// Negotiated Bolt version `(major, minor)`; gates element-id struct fields.
     version: (u8, u8),
+    /// Failed authentication attempts on this connection. Once it reaches
+    /// `ConnCtx::max_auth_failures` the connection is closed — one socket does not get
+    /// to queue password verifies for its whole login window. Reset on a success.
+    auth_failures: usize,
+    /// The connection's handshake→`LOGON` deadline, if one is configured. Held here so
+    /// the wait for an argon2 permit is bounded by the same deadline that bounds the
+    /// pre-auth reads: a queued verify must not outlive the login window.
+    login_deadline: Option<TokioInstant>,
 }
 
 // ── Framing over an async stream ──────────────────────────────────────────────
@@ -2495,6 +2512,10 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
             cfg.server.max_pre_auth_connections,
         ))),
+        auth_limit: Arc::new(Semaphore::new(semaphore_permits(
+            cfg.server.max_concurrent_auth,
+        ))),
+        max_auth_failures: cfg.server.max_auth_failures,
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: cfg.server.max_connections_per_ip,
         diag: Arc::new(crate::diag::Diagnostics::new(cfg.load_test_diagnostics)),
@@ -2530,6 +2551,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_connections = cfg.server.max_connections,
         max_pre_auth_connections = cfg.server.max_pre_auth_connections,
         max_connections_per_ip = cfg.server.max_connections_per_ip,
+        max_concurrent_auth = cfg.server.max_concurrent_auth,
+        max_auth_failures = cfg.server.max_auth_failures,
         "slater Bolt listener ready"
     );
 
@@ -2883,6 +2906,8 @@ where
         pending: None,
         tx_graph: None,
         version: (reply[3], reply[2]),
+        auth_failures: 0,
+        login_deadline,
     };
 
     loop {
@@ -2994,19 +3019,35 @@ where
                 sess.failed = true;
             }
         }
+
+        // Per-connection auth-attempt cap. The failure has been reported, so hang up:
+        // a socket that has burned its allowance must not keep queueing argon2 verifies
+        // (each ~19 MiB and tens of ms) for the rest of its login window. Per connection,
+        // never per account — this cannot be used to lock a victim's user out.
+        if ctx.max_auth_failures > 0 && sess.auth_failures >= ctx.max_auth_failures {
+            debug!(
+                failures = sess.auth_failures,
+                "authentication-attempt cap reached; closing connection"
+            );
+            break;
+        }
     }
     Ok(())
 }
 
 /// Verify `basic`-scheme credentials from a `LOGON` (or 4.4 `HELLO`) metadata map
 /// against the ACL, recording the user on the session on success.
-fn authenticate(
+///
+/// The credential check itself is deliberately *not* done here — see
+/// [`verify_off_reactor`], which runs it on a blocking thread under a concurrency cap.
+async fn authenticate(
     sess: &mut Session,
     ctx: &Arc<ConnCtx>,
     meta: &PsValue,
 ) -> std::result::Result<(), Failure> {
     let scheme = meta.get("scheme").and_then(PsValue::as_str).unwrap_or("");
     if scheme != "basic" {
+        sess.auth_failures = sess.auth_failures.saturating_add(1);
         ctx.diag.record_auth_failure();
         return Err(Failure::unauthorized(
             "only the 'basic' authentication scheme is supported",
@@ -3015,26 +3056,105 @@ fn authenticate(
     let principal = meta
         .get("principal")
         .and_then(PsValue::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let credentials = meta
         .get("credentials")
         .and_then(PsValue::as_str)
-        .unwrap_or("");
-    // Pick up any out-of-band ACL edit before authenticating — but only adopt one
-    // whose digest still matches the served generation's `aclBlake3` stamp. A
-    // post-generation edit to `acl.json` (e.g. self-granting a read) is refused and
-    // the last-good ACL kept; the legitimate way to change access control is to
-    // rebuild and publish a generation stamped against the new file.
-    let graphs = ctx.graphs.clone();
-    ctx.acl
-        .poll_checked(|digest| graphs.acl_digest_acceptable(digest));
-    if ctx.acl.snapshot().verify(principal, credentials) {
-        sess.user = Some(principal.to_string());
-        Ok(())
-    } else {
-        ctx.diag.record_auth_failure();
-        Err(Failure::unauthorized("invalid principal or credentials"))
+        .unwrap_or("")
+        .to_string();
+
+    // The login deadline governs the *pre-auth* window, so it bounds the wait for a
+    // verify permit only while the session is unauthenticated: an anonymous peer's queued
+    // attempt cannot outlive the window it belongs to. A LOGON on an already-authenticated
+    // session (re-auth / token rotation, without a LOGOFF) is past that window by
+    // construction and must not be refused by it.
+    let deadline = sess.login_deadline.filter(|_| sess.user.is_none());
+    let verified = verify_off_reactor(ctx, &principal, &credentials, deadline).await;
+    match verified {
+        Ok(true) => {
+            sess.auth_failures = 0;
+            sess.user = Some(principal);
+            Ok(())
+        }
+        Ok(false) => {
+            sess.auth_failures = sess.auth_failures.saturating_add(1);
+            ctx.diag.record_auth_failure();
+            Err(Failure::unauthorized("invalid principal or credentials"))
+        }
+        Err(f) => {
+            sess.auth_failures = sess.auth_failures.saturating_add(1);
+            ctx.diag.record_auth_failure();
+            Err(f)
+        }
     }
+}
+
+/// Poll the ACL and verify one credential pair **off the reactor**, under a concurrency
+/// cap. Returns whether the credentials are good; `Err` is a refusal that never reveals
+/// whether the principal exists.
+///
+/// argon2id is expensive on purpose — ~19 MiB of scratch and tens of ms of CPU per
+/// verify — and an unknown principal burns the *same* cost against a dummy hash
+/// ([`crate::acl::Acl::verify`]) so a missing account cannot be spotted by timing. That
+/// equalisation is a security property and stays; what must not happen is paying for it
+/// on a reactor worker, where a handful of concurrent `LOGON`s wedge every thread the
+/// server has (query execution has always run on `spawn_blocking` — auth was the odd one
+/// out). So:
+///
+/// * the poll (a filesystem re-read of `acl.json`) and the hash both move to a blocking
+///   thread, leaving the reactor free to keep driving every other connection's IO;
+/// * `auth_limit` caps how many verifies run **at once**. Without it the naive fix would
+///   merely relocate the denial of service: tokio's blocking pool is 512 threads deep
+///   with an unbounded queue, so an auth flood would park gigabytes of argon2 scratch
+///   *and* starve query execution of the very threads it runs on. Callers wait for a
+///   permit asynchronously — no thread, no reactor worker — and their number is already
+///   bounded by the pre-auth connection cap;
+/// * the permit is moved **into** the blocking closure, so it is released when the hash
+///   actually finishes rather than when a hung-up client cancels the await (a cancelled
+///   `spawn_blocking` still runs to completion; releasing early would let the cap be
+///   overrun by clients that disconnect mid-LOGON).
+///
+/// The wait for a permit is bounded by the connection's login deadline, so a queued
+/// verify cannot outlive the login window it belongs to.
+async fn verify_off_reactor(
+    ctx: &Arc<ConnCtx>,
+    principal: &str,
+    credentials: &str,
+    login_deadline: Option<TokioInstant>,
+) -> std::result::Result<bool, Failure> {
+    let acquire = ctx.auth_limit.clone().acquire_owned();
+    let permit = match login_deadline {
+        Some(dl) => timeout_at(dl, acquire).await.map_err(|_| {
+            debug!("login deadline passed while queued for a password verify; refusing");
+            ctx.diag.record_login_timeout();
+            Failure::unauthorized("authentication timed out")
+        })?,
+        None => acquire.await,
+    }
+    .map_err(|_| Failure::unauthorized("server is shutting down"))?;
+
+    let acl = ctx.acl.clone();
+    let graphs = ctx.graphs.clone();
+    let principal = principal.to_string();
+    let credentials = credentials.to_string();
+    tokio::task::spawn_blocking(move || {
+        // Held until the hash is done, not until the caller stops waiting for it.
+        let _permit = permit;
+        // Pick up any out-of-band ACL edit before authenticating — but only adopt one
+        // whose digest still matches the served generation's `aclBlake3` stamp. A
+        // post-generation edit to `acl.json` (e.g. self-granting a read) is refused and
+        // the last-good ACL kept; the legitimate way to change access control is to
+        // rebuild and publish a generation stamped against the new file.
+        acl.poll_checked(|digest| graphs.acl_digest_acceptable(digest));
+        acl.snapshot().verify(&principal, &credentials)
+    })
+    .await
+    .map_err(|e| {
+        // A panicked/aborted verify fails closed.
+        warn!(error = %e, "password verification task did not complete");
+        Failure::unauthorized("invalid principal or credentials")
+    })
 }
 
 /// Handle one decoded request, returning the messages to send back (in order) or a
@@ -3051,7 +3171,7 @@ async fn handle_request(
             // in HELLO. Authenticate here only when credentials are present, so a
             // 5.x HELLO (no `scheme`) simply opens the connection.
             if meta.get("scheme").is_some() {
-                authenticate(sess, ctx, &meta)?;
+                authenticate(sess, ctx, &meta).await?;
             }
             Ok(vec![message::success(vec![
                 ("server".into(), PsValue::str(SERVER_AGENT)),
@@ -3063,7 +3183,7 @@ async fn handle_request(
         }
 
         Request::Logon(meta) => {
-            authenticate(sess, ctx, &meta)?;
+            authenticate(sess, ctx, &meta).await?;
             Ok(vec![message::success(vec![])])
         }
 
@@ -12174,6 +12294,8 @@ mod tests {
             login_timeout_ms: 0,
             idle_timeout_ms: 0,
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
+            auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
+            max_auth_failures: 3,
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: 0,
             diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -12281,6 +12403,8 @@ mod tests {
         idle_timeout_ms: u64,
         max_pre_auth_connections: usize,
         max_per_ip: usize,
+        max_concurrent_auth: usize,
+        max_auth_failures: usize,
         load_test_diagnostics: bool,
     }
 
@@ -12293,6 +12417,8 @@ mod tests {
                 idle_timeout_ms: 0,
                 max_pre_auth_connections: 4_096,
                 max_per_ip: 0,                // unlimited by default
+                max_concurrent_auth: 4,       // as in prod
+                max_auth_failures: 3,         // as in prod
                 load_test_diagnostics: false, // diagnostics off by default, as in prod
             }
         }
@@ -12342,6 +12468,10 @@ mod tests {
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(
                 limits.max_pre_auth_connections,
             ))),
+            auth_limit: Arc::new(Semaphore::new(semaphore_permits(
+                limits.max_concurrent_auth,
+            ))),
+            max_auth_failures: limits.max_auth_failures,
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: limits.max_per_ip,
             diag: Arc::new(crate::diag::Diagnostics::new(limits.load_test_diagnostics)),
@@ -12431,6 +12561,8 @@ mod tests {
             login_timeout_ms: 0,
             idle_timeout_ms: 0,
             pre_auth_limit: Arc::new(Semaphore::new(semaphore_permits(4_096))),
+            auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
+            max_auth_failures: 3,
             per_ip: Arc::new(Mutex::new(HashMap::new())),
             max_per_ip: 0,
             diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -12499,6 +12631,8 @@ mod tests {
             pending: None,
             tx_graph: None,
             version: (5, 4),
+            auth_failures: 0,
+            login_deadline: None,
         };
         // BEGIN naming an unserved graph fails at BEGIN, before any RUN.
         let bad =
@@ -12679,6 +12813,14 @@ mod tests {
             PsValue::Struct {
                 tag: message::tag::PULL,
                 fields: vec![PsValue::Map(vec![("n".into(), PsValue::Int(-1))])],
+            }
+        }
+
+        /// Clears the Bolt FAILED state a failed LOGON leaves behind.
+        fn reset() -> PsValue {
+            PsValue::Struct {
+                tag: message::tag::RESET,
+                fields: vec![],
             }
         }
     }
@@ -13360,6 +13502,283 @@ mod tests {
         c.recv().await;
         c.send(Client::run("MATCH (n) RETURN n")).await;
         assert_eq!(c.recv().await.0, message::tag::FAILURE);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `LOGON` metadata map, as `authenticate` sees it once the message is decoded.
+    fn logon_meta(user: &str, pw: &str) -> PsValue {
+        PsValue::Map(vec![
+            ("scheme".into(), PsValue::str("basic")),
+            ("principal".into(), PsValue::str(user)),
+            ("credentials".into(), PsValue::str(pw)),
+        ])
+    }
+
+    /// A freshly handshaken, unauthenticated session (no login deadline).
+    fn pre_auth_session() -> Session {
+        Session {
+            user: None,
+            failed: false,
+            pending: None,
+            tx_graph: None,
+            version: (5, 4),
+            auth_failures: 0,
+            login_deadline: None,
+        }
+    }
+
+    /// HIK-90 regression: argon2id must not run on the reactor.
+    ///
+    /// `#[tokio::test]` is a **current-thread** runtime — the one place a blocked reactor
+    /// is directly observable. Spawned tasks only advance when the test yields, and a
+    /// single `yield_now()` gives every ready task exactly one poll. If the verify runs
+    /// inline (the bug), that one trip through the scheduler costs `FLOOD × one verify`
+    /// — the whole server is deaf for that long. With the verify handed to a blocking
+    /// thread, the poll parks immediately and the reactor comes straight back.
+    ///
+    /// The bound is calibrated against a *measured* verify on this machine and build
+    /// profile rather than a hard-coded millisecond count, so it neither flakes on a slow
+    /// box nor passes vacuously on a fast one.
+    #[tokio::test]
+    async fn concurrent_logons_do_not_block_the_reactor() {
+        const FLOOD: usize = 8;
+        let (root, ctx) = build_ctx("server_auth_off_reactor");
+
+        // Calibrate: what one verify costs. An unknown principal deliberately burns a
+        // full dummy hash (anti-enumeration), so this is the flood's per-attempt price.
+        // The first unknown-principal verify also *mints* the lazy dummy hash — a second
+        // argon2 — so warm it before timing anything.
+        assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+            .await
+            .unwrap());
+        let t0 = Instant::now();
+        assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+            .await
+            .unwrap());
+        let one_verify = t0.elapsed();
+        assert!(
+            one_verify >= Duration::from_millis(1),
+            "argon2id should cost real time; measured {one_verify:?} — is the ACL path being skipped?"
+        );
+
+        let flood: Vec<_> = (0..FLOOD)
+            .map(|_| {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let mut sess = pre_auth_session();
+                    authenticate(&mut sess, &ctx, &logon_meta("nobody", "wrong")).await
+                })
+            })
+            .collect();
+
+        let t0 = Instant::now();
+        tokio::task::yield_now().await;
+        let reactor_stall = t0.elapsed();
+        assert!(
+            reactor_stall < one_verify,
+            "the reactor was held for {reactor_stall:?} while {FLOOD} LOGONs verified \
+             (one verify = {one_verify:?}) — the hash is running on a reactor worker"
+        );
+
+        // …and every attempt still failed: this is not a fast-path that skips the hash.
+        for t in flood {
+            let err = t.await.unwrap().unwrap_err();
+            assert_eq!(err.code, CODE_UNAUTHORIZED);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The concurrency cap is what stops the fix from simply *moving* the denial of
+    /// service into tokio's 512-thread blocking pool (which query execution shares).
+    ///
+    /// Two things are checked. The direct one: while a flood is in flight, no permit is
+    /// left, and once it drains every permit is back — the permit lives with the hash, not
+    /// with the caller, so a client that hangs up mid-`LOGON` cannot leak the cap. The
+    /// corroborating one: 6 verifies under a cap of 2 take several *waves* of a single
+    /// verify's wall time, i.e. they did not all run at once. (This box has more than two
+    /// cores, so uncapped they would not serialise on CPU alone.)
+    #[tokio::test]
+    async fn concurrent_verifies_are_capped() {
+        const FLOOD: usize = 6;
+        const CAP: usize = 2;
+        let (root, ctx) = build_ctx_limited(
+            "server_auth_capped",
+            TestLimits {
+                max_concurrent_auth: CAP,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.auth_limit.available_permits(), CAP);
+
+        // Warm the lazily-minted dummy hash, then time a single verify (see
+        // `concurrent_logons_do_not_block_the_reactor`).
+        assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+            .await
+            .unwrap());
+        let t0 = Instant::now();
+        assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+            .await
+            .unwrap());
+        let one_verify = t0.elapsed();
+
+        let flood: Vec<_> = (0..FLOOD)
+            .map(|_| {
+                let ctx = ctx.clone();
+                tokio::spawn(async move { verify_off_reactor(&ctx, "nobody", "wrong", None).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            ctx.auth_limit.available_permits(),
+            0,
+            "every verify permit should be in use while a flood is queued"
+        );
+
+        let t0 = Instant::now();
+        for t in flood {
+            assert!(!t.await.unwrap().unwrap());
+        }
+        let elapsed = t0.elapsed();
+        // FLOOD/CAP = 3 waves in principle; assert 2, so per-verify variance (the first
+        // hash pays the cold 19 MiB allocation) cannot flake it. Uncapped, all FLOOD would
+        // run together and this would land near a single verify.
+        assert!(
+            elapsed >= one_verify * 2,
+            "{FLOOD} verifies under a cap of {CAP} finished in {elapsed:?} (one verify = \
+             {one_verify:?}) — they cannot have been serialised into waves"
+        );
+        // The cap is fully released once the flood drains — the permit lives with the
+        // hash, not with the caller.
+        assert_eq!(ctx.auth_limit.available_permits(), CAP);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The unknown-principal path must keep burning a full argon2id verify against the
+    /// dummy hash: that equalisation is what stops username enumeration by timing, and
+    /// moving the hash off the reactor must not have "optimised" it away.
+    #[tokio::test]
+    async fn unknown_principal_still_pays_for_a_full_verify() {
+        let (root, ctx) = build_ctx("server_auth_timing_equalised");
+
+        // Warm the lazily-built dummy hash so its one-off mint is not counted.
+        assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+            .await
+            .unwrap());
+
+        let t0 = Instant::now();
+        assert!(!verify_off_reactor(&ctx, "reporting", "wrong", None)
+            .await
+            .unwrap());
+        let known_user = t0.elapsed();
+
+        let t0 = Instant::now();
+        assert!(!verify_off_reactor(&ctx, "no-such-user", "wrong", None)
+            .await
+            .unwrap());
+        let unknown_user = t0.elapsed();
+
+        // Same work, so the same order of magnitude. A skipped verify would be orders of
+        // magnitude faster, which is exactly what the enumeration attack looks for.
+        assert!(
+            unknown_user * 2 >= known_user,
+            "an unknown principal took {unknown_user:?} against {known_user:?} for a known \
+             one — the timing equalisation is gone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The login deadline bounds the *wait* for a verify permit — a queued attempt must
+    /// not outlive the login window it belongs to. But that window is the **pre-auth** one:
+    /// it must not be turned around and used to refuse a re-auth (LOGON without LOGOFF —
+    /// token rotation) on a session that authenticated long ago, whose deadline is in the
+    /// past by construction. (An expired deadline only bites when the acquire actually has
+    /// to wait; with a permit free, `timeout_at` takes it and never trips.)
+    #[tokio::test]
+    async fn an_expired_login_deadline_bounds_the_pre_auth_wait_only() {
+        let (root, ctx) = build_ctx_limited(
+            "server_auth_deadline",
+            TestLimits {
+                max_concurrent_auth: 1,
+                ..Default::default()
+            },
+        );
+        let expired = TokioInstant::now() - Duration::from_secs(1);
+
+        // Occupy the single verify permit, so the next attempt must queue.
+        let hog = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move { verify_off_reactor(&ctx, "nobody", "wrong", None).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(ctx.auth_limit.available_permits(), 0);
+
+        // Unauthenticated and past its deadline: refused rather than queued — even with
+        // the right password, so an anonymous flood cannot sit in the queue for ever.
+        let mut anon = pre_auth_session();
+        anon.login_deadline = Some(expired);
+        let err = authenticate(&mut anon, &ctx, &logon_meta("reporting", "pw"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, CODE_UNAUTHORIZED);
+        assert!(
+            anon.user.is_none(),
+            "a timed-out attempt must not authenticate"
+        );
+
+        // Already authenticated: the same expired deadline must NOT refuse a re-auth. It
+        // waits for the permit (which the hog is holding) and then verifies.
+        let mut live = pre_auth_session();
+        live.user = Some("reporting".into());
+        live.login_deadline = Some(expired);
+        authenticate(&mut live, &ctx, &logon_meta("reporting", "pw"))
+            .await
+            .unwrap();
+        assert_eq!(live.user.as_deref(), Some("reporting"));
+
+        assert!(!hog.await.unwrap().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A connection gets a small allowance of failed LOGONs and is then hung up on, so a
+    /// single socket cannot keep queueing verifies for its whole login window.
+    #[tokio::test]
+    async fn repeated_bad_logons_close_the_connection() {
+        let (root, ctx) = build_ctx_limited(
+            "server_auth_attempt_cap",
+            TestLimits {
+                max_auth_failures: 2,
+                ..Default::default()
+            },
+        );
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // A failed LOGON puts the connection in the Bolt FAILED state, so a stuffer must
+        // RESET between guesses — that is the attempt loop the cap has to bound.
+        c.send(Client::logon("reporting", "wrong")).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::FAILURE);
+        assert_eq!(
+            fields[0].get("code").and_then(PsValue::as_str),
+            Some(CODE_UNAUTHORIZED)
+        );
+        c.send(Client::reset()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // Second failure spends the allowance: the FAILURE is still reported…
+        c.send(Client::logon("reporting", "wrong")).await;
+        assert_eq!(c.recv().await.0, message::tag::FAILURE);
+
+        // …and then the server hangs up — RESET does not launder the attempt count, and no
+        // further guess on this socket ever reaches the hash.
+        let mut tmp = [0u8; 64];
+        let n = c.stream.read(&mut tmp).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "the connection should have been closed after 2 failed LOGONs"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
