@@ -22,8 +22,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::bolt::client::BoltClient;
@@ -148,26 +148,84 @@ fn run(args: DumpArgs, default_port: u16) -> Result<()> {
     let schema = fetch_schema(&mut conn, graph, &overrides, args.pk.as_deref())
         .with_context(|| format!("reading the schema of graph '{graph}'"))?;
 
-    // Buffer the whole dump, then write it out in one shot — so a mid-dump failure
-    // (an unidentifiable node, a lost connection) never leaves a truncated file.
-    let mut buf: Vec<u8> = Vec::new();
-    let warnings = dump_graph(&mut conn, graph, &schema, &mut buf)
-        .with_context(|| format!("dumping graph '{graph}'"))?;
-
-    match args.out.as_deref() {
-        Some(path) => std::fs::write(path, &buf)
-            .with_context(|| format!("writing dump to {}", path.display()))?,
+    // Stream straight to the sink — the dump is never buffered whole in RAM, so it
+    // stays bounded on a graph larger than this process's memory (HIK-98). Nodes and
+    // edges are pulled from the server in bounded batches and written as they arrive.
+    let warnings = match args.out.as_deref() {
+        // A file target is made atomic without a full in-RAM buffer: write to a
+        // sibling temp file, fsync, then rename over the destination. A mid-dump
+        // failure removes the temp file and never leaves a truncated destination.
+        Some(path) => dump_to_file(&mut conn, graph, &schema, path)?,
+        // stdout is not seekable, so it cannot be atomic: on a mid-dump error the
+        // bytes already streamed stay on the pipe (the caller sees the non-zero exit).
         None => {
             let stdout = std::io::stdout();
-            let mut w = stdout.lock();
-            w.write_all(&buf).context("writing dump to stdout")?;
-            w.flush().ok();
+            let mut w = BufWriter::new(stdout.lock());
+            let warnings = dump_graph(&mut conn, graph, &schema, &mut w)
+                .with_context(|| format!("dumping graph '{graph}'"))?;
+            w.flush().context("writing dump to stdout")?;
+            warnings
         }
-    }
+    };
     for warning in warnings {
         eprintln!("slater dump: warning: {warning}");
     }
     Ok(())
+}
+
+/// Dump `graph` to `path` atomically: stream into a sibling temp file, `fsync` it,
+/// then `rename` over `path`. Never buffers the whole dump in RAM (HIK-98), and a
+/// failure at any point removes the temp file rather than leaving a truncated dump.
+fn dump_to_file(
+    conn: &mut BoltClient,
+    graph: &str,
+    schema: &Schema,
+    path: &Path,
+) -> Result<Vec<String>> {
+    let tmp = temp_dump_path(path);
+    let file = std::fs::File::create(&tmp)
+        .with_context(|| format!("creating temp dump file {}", tmp.display()))?;
+    // Any failure after the temp file exists must remove it, so a broken dump never
+    // leaves a stray `.dump-tmp` beside the target (and never a truncated target — the
+    // rename is the last, atomic step).
+    match dump_to_file_inner(conn, graph, schema, file, &tmp, path) {
+        Ok(warnings) => Ok(warnings),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("dumping graph '{graph}'"))
+        }
+    }
+}
+
+/// The body of [`dump_to_file`], factored so its caller can clean up the temp file on
+/// *any* error path (write, flush, fsync or rename).
+fn dump_to_file_inner(
+    conn: &mut BoltClient,
+    graph: &str,
+    schema: &Schema,
+    file: std::fs::File,
+    tmp: &Path,
+    dest: &Path,
+) -> Result<Vec<String>> {
+    let mut w = BufWriter::new(file);
+    let warnings = dump_graph(conn, graph, schema, &mut w)?;
+    let file = w
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("flushing dump to {}: {}", tmp.display(), e.error()))?;
+    file.sync_all()
+        .with_context(|| format!("fsyncing dump {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(tmp, dest)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), dest.display()))?;
+    Ok(warnings)
+}
+
+/// A sibling temp path for the atomic write (same directory, so `rename` stays on
+/// one filesystem). The pid keeps concurrent dumps of the same target from colliding.
+fn temp_dump_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".dump-tmp.{}", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// `--list`: print the graph names the authenticated user may read, one per line,
@@ -324,12 +382,64 @@ fn fetch_schema(
 
 // ── Graph dump ───────────────────────────────────────────────────────────────
 
+/// How many result rows the dump pulls from the server per Bolt `PULL`. The dump
+/// holds at most this many rows resident at once (HIK-98): peak memory is bounded by
+/// the batch, not by the node/edge count, so a graph larger than the dumper's RAM
+/// still exports. Large enough that the per-batch round-trip is a rounding error,
+/// small enough that a batch is negligible next to the graph.
+const DUMP_PULL_BATCH: i64 = 10_000;
+
+/// A source of dump result rows, delivered in bounded batches. The dump drives the
+/// server through this seam so the whole result set is never materialised in the
+/// client (HIK-98). [`BoltClient`] implements it with a batched `PULL`; a fake
+/// implementation lets the memory bound be tested without a socket.
+trait RowSource {
+    /// `RUN` `query` against graph `db` and hand each result row to `sink` as it
+    /// arrives, pulling from the server in bounded batches. An error from `sink`
+    /// aborts the scan and is propagated.
+    fn for_each_row(
+        &mut self,
+        query: &str,
+        db: &str,
+        sink: &mut dyn FnMut(Vec<PsValue>) -> Result<()>,
+    ) -> Result<()>;
+}
+
+impl RowSource for BoltClient {
+    fn for_each_row(
+        &mut self,
+        query: &str,
+        db: &str,
+        sink: &mut dyn FnMut(Vec<PsValue>) -> Result<()>,
+    ) -> Result<()> {
+        // `run_stream`'s callback is `io::Result` (the client is stdlib-only), but the
+        // sink returns `anyhow`. Carry a sink error out of band so the real cause — not
+        // a generic I/O error — is what surfaces, and abort the pull the moment it fails.
+        let mut sink_err: Option<anyhow::Error> = None;
+        let pull = self.run_stream(query, Some(db), DUMP_PULL_BATCH, |row| {
+            if let Err(e) = sink(row) {
+                sink_err = Some(e);
+                return Err(std::io::Error::other("dump emit aborted"));
+            }
+            Ok(())
+        });
+        if let Some(e) = sink_err {
+            return Err(e);
+        }
+        pull.map(|_columns| ()).map_err(anyhow::Error::from)
+    }
+}
+
 /// Dump `graph`'s schema DDL, nodes and edges as business-key `MERGE` Cypher into
 /// `out`. Returns any non-fatal warnings (e.g. properties dropped because they are
 /// vectors/temporals a `MERGE` dump cannot carry). A node with no resolvable
 /// identity key is a hard error.
+///
+/// Nodes and edges are streamed from `src` in bounded batches and emitted straight
+/// into `out` as they arrive, so peak memory is bounded by the batch, not the graph
+/// (HIK-98). Generic over [`RowSource`] so the bound can be exercised in a test.
 fn dump_graph(
-    conn: &mut BoltClient,
+    src: &mut impl RowSource,
     graph: &str,
     schema: &Schema,
     out: &mut impl Write,
@@ -360,25 +470,23 @@ fn dump_graph(
         )?;
     }
 
-    // Nodes: one MERGE per node, keyed on its resolved business key.
-    let (_ncols, nrows) = conn
-        .run_pull("MATCH (n) RETURN n", Some(graph))
-        .context("scanning nodes (MATCH (n) RETURN n)")?;
-    for row in &nrows {
+    // Nodes: one MERGE per node, keyed on its resolved business key. Emitted straight
+    // to `out` as each row streams in — never collected into a graph-sized Vec.
+    src.for_each_row("MATCH (n) RETURN n", graph, &mut |row| {
         let node = row.first().context("node row is empty")?;
-        emit_node(node, schema, out, &mut warnings)?;
-    }
+        emit_node(node, schema, out, &mut warnings)
+    })
+    .context("scanning nodes (MATCH (n) RETURN n)")?;
 
     // Edges: one MERGE per relationship, keyed on both endpoints' business keys.
-    let (_ecols, erows) = conn
-        .run_pull("MATCH (a)-[r]->(b) RETURN a, r, b", Some(graph))
-        .context("scanning edges (MATCH (a)-[r]->(b) RETURN a, r, b)")?;
-    for row in &erows {
+    src.for_each_row("MATCH (a)-[r]->(b) RETURN a, r, b", graph, &mut |row| {
         let (Some(a), Some(r), Some(b)) = (row.first(), row.get(1), row.get(2)) else {
             bail!("edge row does not have three fields (a, r, b)");
         };
-        emit_edge(a, r, b, schema, out, &mut warnings)?;
-    }
+        emit_edge(a, r, b, schema, out, &mut warnings)
+    })
+    .context("scanning edges (MATCH (a)-[r]->(b) RETURN a, r, b)")?;
+
     Ok(warnings)
 }
 
@@ -1024,5 +1132,140 @@ mod tests {
             out,
             "MERGE (n:Person {name: 'A'}) SET n.alpha = 2, n.zeta = 1;\n"
         );
+    }
+
+    // ── Bounded-memory streaming (HIK-98) ──
+
+    /// A fake [`RowSource`] that delivers pre-built rows in fixed-size batches and
+    /// records the largest batch it ever held resident — the seam that lets the memory
+    /// bound be asserted without a socket. `batch == usize::MAX` models the pre-fix
+    /// `run_pull`, which returned the whole result set in a single Vec.
+    struct BatchSource {
+        batch: usize,
+        node_rows: Vec<Vec<PsValue>>,
+        edge_rows: Vec<Vec<PsValue>>,
+        peak: usize,
+    }
+
+    impl BatchSource {
+        fn new(batch: usize, nodes: Vec<PsValue>, edges: Vec<(PsValue, PsValue, PsValue)>) -> Self {
+            BatchSource {
+                batch,
+                node_rows: nodes.into_iter().map(|n| vec![n]).collect(),
+                edge_rows: edges.into_iter().map(|(a, r, b)| vec![a, r, b]).collect(),
+                peak: 0,
+            }
+        }
+
+        fn peak_resident(&self) -> usize {
+            self.peak
+        }
+    }
+
+    impl RowSource for BatchSource {
+        fn for_each_row(
+            &mut self,
+            query: &str,
+            _db: &str,
+            sink: &mut dyn FnMut(Vec<PsValue>) -> Result<()>,
+        ) -> Result<()> {
+            let rows = if query.starts_with("MATCH (n)") {
+                std::mem::take(&mut self.node_rows)
+            } else {
+                std::mem::take(&mut self.edge_rows)
+            };
+            let chunk = self.batch.max(1);
+            for group in rows.chunks(chunk) {
+                // One PULL batch: only these rows are resident in the client at once.
+                let resident: Vec<Vec<PsValue>> = group.to_vec();
+                self.peak = self.peak.max(resident.len());
+                for row in resident {
+                    sink(row)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression for HIK-98: `dump_graph` used to pull every node and every edge into
+    /// one `Vec` (`run_pull`, `PULL n:-1`) and accumulate the whole output in a second
+    /// `Vec<u8>` — both O(graph), so a large export OOMed the dump process. It must now
+    /// stream in bounded batches, holding no more than one batch resident.
+    ///
+    /// The same fixture is dumped two ways through the `RowSource` seam: a batch of 4
+    /// (streaming) and a single batch of everything (the pre-fix `run_pull` shape). The
+    /// streaming peak is bounded by the batch; the all-in-RAM peak is the whole graph —
+    /// the bound the fix removes, and what a `peak <= batch` assertion catches. The two
+    /// outputs are then asserted **byte-identical**: streaming changed *when* bytes are
+    /// produced, never *which* bytes (same order, same HIK-84 quoting).
+    #[test]
+    fn streaming_dump_bounds_resident_rows_and_is_byte_identical() {
+        let s = schema(None, &[], &[("Person", "name")]);
+        let n = 25usize; // comfortably more than the streaming batch of 4
+        let nodes: Vec<PsValue> = (0..n)
+            .map(|i| {
+                node(
+                    i as i64,
+                    &["Person"],
+                    &[("name", PsValue::str(format!("p{i:02}")))],
+                )
+            })
+            .collect();
+        let edges: Vec<(PsValue, PsValue, PsValue)> = (0..5)
+            .map(|i| {
+                let a = node(
+                    i as i64,
+                    &["Person"],
+                    &[("name", PsValue::str(format!("p{i:02}")))],
+                );
+                let b = node(
+                    (i + 1) as i64,
+                    &["Person"],
+                    &[("name", PsValue::str(format!("p{:02}", i + 1)))],
+                );
+                (
+                    a,
+                    rel("KNOWS", &[("since", PsValue::Int(2000 + i as i64))]),
+                    b,
+                )
+            })
+            .collect();
+
+        // Streaming: a batch of 4 — the dumper must never hold more than a batch.
+        let mut streaming = BatchSource::new(4, nodes.clone(), edges.clone());
+        let mut stream_out = Vec::new();
+        dump_graph(&mut streaming, "g", &s, &mut stream_out).unwrap();
+        assert!(
+            streaming.peak_resident() <= 4,
+            "held {} rows resident at once — the dump did not stream in bounded batches",
+            streaming.peak_resident()
+        );
+
+        // All-in-RAM reference: one batch of everything (the pre-fix `run_pull`).
+        let mut buffered = BatchSource::new(usize::MAX, nodes, edges);
+        let mut buffered_out = Vec::new();
+        dump_graph(&mut buffered, "g", &s, &mut buffered_out).unwrap();
+        assert_eq!(
+            buffered.peak_resident(),
+            n,
+            "the reference must materialise every node row — that is the pre-fix bound"
+        );
+
+        // Byte-identical: same order, same quoting.
+        assert_eq!(
+            stream_out, buffered_out,
+            "the streaming dump diverged from the all-in-RAM dump"
+        );
+
+        // …and it is a real dump: one MERGE per node, one per edge. (This fixture's
+        // `Schema` carries no `node_indexes`, so there is no CREATE INDEX preamble;
+        // the DDL path is covered by the `dump_roundtrip` integration test.)
+        let text = String::from_utf8(stream_out).unwrap();
+        assert!(
+            text.starts_with("MERGE (n:Person {name: 'p00'});\n"),
+            "unexpected dump head: {text}"
+        );
+        assert_eq!(text.matches("MERGE (n:Person").count(), n);
+        assert_eq!(text.matches("-[r:KNOWS]->").count(), 5);
     }
 }

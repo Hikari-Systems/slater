@@ -89,12 +89,104 @@ impl BoltClient {
     /// As [`Self::run_pull`], but with query **parameters** (the RUN message's second
     /// field) — e.g. a `$rows` list to drive a batched write-`UNWIND` under one
     /// group-commit. `params` is the parameter map; pass an empty vec for none.
+    ///
+    /// This materialises the **whole** result set in the client; for a scan that can
+    /// be graph-sized (a dump), prefer [`Self::run_stream`], which holds only one
+    /// batch resident at a time.
     pub fn run_pull_params(
         &mut self,
         query: &str,
         params: Vec<(String, PsValue)>,
         db: Option<&str>,
     ) -> std::io::Result<(Vec<String>, Vec<Vec<PsValue>>)> {
+        let mut rows: Vec<Vec<PsValue>> = Vec::new();
+        let columns = self.run_stream_params(query, params, db, -1, |row| {
+            rows.push(row);
+            Ok(())
+        })?;
+        Ok((columns, rows))
+    }
+
+    /// `RUN` a statement (optionally against graph `db`), then `PULL` its records in
+    /// bounded **batches** of `batch`, handing each row to `on_row` as it arrives.
+    ///
+    /// Unlike [`Self::run_pull`], the whole result set is never materialised in the
+    /// client: at most `batch` rows are resident at once, so exporting a graph larger
+    /// than the client's RAM stays bounded (HIK-98). The server honours a positive
+    /// `PULL {n}` and reports `has_more` in the trailing SUCCESS; while it is set we
+    /// send the next `PULL` on the same statement. `batch` must be positive.
+    pub fn run_stream(
+        &mut self,
+        query: &str,
+        db: Option<&str>,
+        batch: i64,
+        on_row: impl FnMut(Vec<PsValue>) -> std::io::Result<()>,
+    ) -> std::io::Result<Vec<String>> {
+        debug_assert!(batch > 0, "run_stream needs a positive batch size");
+        self.run_stream_params(query, Vec::new(), db, batch, on_row)
+    }
+
+    /// [`Self::run_stream`] with query parameters; also the shared engine behind
+    /// [`Self::run_pull_params`] (which passes `batch = -1` to drain in one PULL).
+    /// A negative `batch` means "all remaining rows in a single PULL"; a positive
+    /// one chunks the stream and re-`PULL`s while the server reports `has_more`.
+    fn run_stream_params(
+        &mut self,
+        query: &str,
+        params: Vec<(String, PsValue)>,
+        db: Option<&str>,
+        batch: i64,
+        mut on_row: impl FnMut(Vec<PsValue>) -> std::io::Result<()>,
+    ) -> std::io::Result<Vec<String>> {
+        let columns = self.send_run(query, params, db)?;
+        loop {
+            self.send(
+                tag::PULL,
+                vec![PsValue::Map(vec![("n".into(), PsValue::Int(batch))])],
+            )?;
+            let has_more = loop {
+                let (t, fields) = self.recv()?;
+                if t == tag::RECORD {
+                    // A RECORD carries a single List field: the row's values.
+                    match fields.into_iter().next() {
+                        Some(PsValue::List(vals)) => on_row(vals)?,
+                        Some(other) => on_row(vec![other])?,
+                        None => on_row(Vec::new())?,
+                    }
+                } else if t == tag::SUCCESS {
+                    // A batched PULL leaves the statement open when more rows remain;
+                    // `has_more` tells us to send the next PULL rather than finish.
+                    break matches!(
+                        fields.first().and_then(|m| m.get("has_more")),
+                        Some(PsValue::Bool(true))
+                    );
+                } else {
+                    let detail = fields
+                        .first()
+                        .and_then(|m| m.get("message"))
+                        .and_then(PsValue::as_str)
+                        .unwrap_or("unknown error")
+                        .to_string();
+                    return Err(std::io::Error::other(format!(
+                        "Bolt PULL for `{query}` failed: {detail}"
+                    )));
+                }
+            };
+            if !has_more {
+                return Ok(columns);
+            }
+        }
+    }
+
+    /// Send a `RUN` (optionally against graph `db`, with `params`) and return the
+    /// result's column names from its `SUCCESS` `fields` metadata. The caller then
+    /// drives `PULL`/`DISCARD` on the open statement.
+    fn send_run(
+        &mut self,
+        query: &str,
+        params: Vec<(String, PsValue)>,
+        db: Option<&str>,
+    ) -> std::io::Result<Vec<String>> {
         let mut extra: Vec<(String, PsValue)> = Vec::new();
         if let Some(db) = db.filter(|s| !s.is_empty()) {
             extra.push(("db".into(), PsValue::str(db)));
@@ -107,7 +199,7 @@ impl BoltClient {
                 PsValue::Map(extra),
             ],
         )?;
-        let columns = run_ok
+        Ok(run_ok
             .first()
             .and_then(|m| m.get("fields"))
             .and_then(|f| match f {
@@ -119,37 +211,7 @@ impl BoltClient {
                 ),
                 _ => None,
             })
-            .unwrap_or_default();
-
-        self.send(
-            tag::PULL,
-            vec![PsValue::Map(vec![("n".into(), PsValue::Int(-1))])],
-        )?;
-        let mut rows: Vec<Vec<PsValue>> = Vec::new();
-        loop {
-            let (t, fields) = self.recv()?;
-            if t == tag::RECORD {
-                // A RECORD carries a single List field: the row's values.
-                match fields.into_iter().next() {
-                    Some(PsValue::List(vals)) => rows.push(vals),
-                    Some(other) => rows.push(vec![other]),
-                    None => rows.push(Vec::new()),
-                }
-            } else if t == tag::SUCCESS {
-                break;
-            } else {
-                let detail = fields
-                    .first()
-                    .and_then(|m| m.get("message"))
-                    .and_then(PsValue::as_str)
-                    .unwrap_or("unknown error")
-                    .to_string();
-                return Err(std::io::Error::other(format!(
-                    "Bolt PULL for `{query}` failed: {detail}"
-                )));
-            }
-        }
-        Ok((columns, rows))
+            .unwrap_or_default())
     }
 
     /// Send `RESET` to clear a FAILED/streaming state (after a query FAILURE the server
