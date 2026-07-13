@@ -7,25 +7,36 @@
 //! **incoming** adjacency. Isolated nodes get an empty (count 0) record so the global
 //! index stays aligned with the dense node id.
 //!
-//! The two halves encode a record differently, because edge ids are dense-contiguous in the
-//! **forward** direction but not the reverse:
+//! ## Record layout: a reltype directory over per-run neighbour bytes
+//!
+//! Reltype is factored **out** of the per-edge loop into a small per-record **directory** — one
+//! `(reltype, run_count, run_nbytes)` entry per maximal run of consecutive same-reltype edges —
+//! followed by the concatenated per-run neighbour bytes. Because the builder sorts each node's
+//! edges reltype-major (`(src, reltype, dst)` forward, `(dst, reltype, src)` reverse), a node has
+//! one run per distinct reltype. `run_nbytes` lets [`decode_adj_into_filtered`] **skip** a whole
+//! non-matching reltype run without decoding it — so `(v)-[:T]->(?)` on a hub touches only `T`'s
+//! run instead of decoding every neighbour and filtering afterwards. Factoring reltype into the
+//! directory also shrinks the record (one reltype varint per *run*, not per *edge*).
+//!
+//! The two halves differ only in the edge-id encoding, because edge ids are dense-contiguous in
+//! the **forward** direction but not the reverse:
 //! - **forward** (`0..N`): `uvarint(count) ‖ [ u8(flag) ‖ … ] (when count>0)`. The builder
-//!   assigns edge ids as a running counter in forward-CSR storage order (sorted by `final_src`),
-//!   so a source node's outgoing edges normally have gap-free ascending ids — then `flag =
-//!   CONTIGUOUS` and the body is `uvarint(edge_id_base) ‖ count × ( uvarint(reltype) ‖
-//!   uvarint(neighbour) )`, with the `k`-th edge's id derived as `edge_id_base + k`. This
-//!   replaces one `edge_id` varint **per edge** with one **per record**. If a writer ever
-//!   produces non-contiguous ids (e.g. a hand-written fixture), `flag = EXPLICIT` and the body
-//!   keeps a per-edge id — always exact, just no saving.
-//! - **reverse** (`N..2N`): `uvarint(count) ‖ count × ( uvarint(reltype) ‖ uvarint(neighbour)
-//!   ‖ uvarint(edge_id) )`. A node's incoming edges come from many sources, so their ids are a
-//!   sparse ascending subset — no base to derive from, keep the per-edge id (no flag).
+//!   assigns edge ids as a running counter in forward-CSR storage order, so a source node's
+//!   outgoing edges have gap-free ascending ids — then `flag = CONTIGUOUS`, the head carries one
+//!   `uvarint(edge_id_base)`, and the `k`-th edge's id is `edge_id_base + k` (`k` counts across
+//!   runs, in record order). Body per run is `run_count × uvarint(neighbour)`. A writer that
+//!   produces non-contiguous ids (a fixture) sets `flag = EXPLICIT` and the body keeps a per-edge
+//!   id (`run_count × ( uvarint(neighbour) ‖ uvarint(edge_id) )`) — always exact, just no saving.
+//! - **reverse** (`N..2N`): no flag; the body always carries per-edge ids
+//!   (`run_count × ( uvarint(neighbour) ‖ uvarint(edge_id) )`), since a node's incoming edges
+//!   come from many sources (a sparse ascending id subset with no base to derive from).
 //!
 //! `edge_id` must equal the dense `edge_props.blk` row index (and the segment/delta join key),
-//! so the forward `base + k` derivation reproduces the exact absolute ids the builder wrote.
-//! Decoders therefore take the record's direction (`forward`), which every reader knows from
-//! the global record index (`< N` ⇒ forward). `adj_count` reads only the leading count uvarint,
-//! identical in both halves.
+//! so the forward `base + k` derivation reproduces the exact absolute ids the builder wrote — the
+//! builder assigns `final_edge_id` and writes `edge_props` in the same forward-emit order, so the
+//! reltype-major sort reorders both together. Decoders take the record's direction (`forward`),
+//! which every reader knows from the global record index (`< N` ⇒ forward). `adj_count` reads
+//! only the leading count uvarint, identical in both halves.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -59,13 +70,52 @@ pub struct Edge {
 const FWD_CONTIGUOUS: u8 = 1;
 const FWD_EXPLICIT: u8 = 0;
 
-/// Encode a **forward** (outgoing) adjacency record. When a source's outgoing edge ids are
-/// dense-contiguous — which the real builder always produces (edge ids are a running counter in
-/// forward-CSR order) — the per-edge `edge_id` collapses to one `edge_id_base` at the head,
-/// derived on read as `base + k`. Otherwise (e.g. a hand-written test fixture, or any writer that
-/// assigns ids out of forward order) the record falls back to storing per-edge ids, so decoding
-/// is always exact; a one-byte flag after the count distinguishes the two. Adaptive per record,
-/// so a non-contiguous record is never mis-derived — it just forgoes the saving.
+/// Build the **reltype directory** and neighbour body for an adjacency list. Reltype is factored
+/// out of the per-edge loop into a directory of consecutive-equal-reltype *runs* — one
+/// `(reltype, run_count, run_nbytes)` entry per run — followed by the concatenated per-run
+/// neighbour bytes. `run_nbytes` is the byte length a run's neighbours occupy, so a
+/// reltype-filtered decode can skip a whole non-matching run without decoding it (the typed-expand
+/// win). `per_edge_id` appends each edge's id after its neighbour (EXPLICIT forward / reverse);
+/// under `edge_id_base` (CONTIGUOUS forward) the id is derived and omitted. Runs preserve list
+/// order, so the `k`-th emitted edge is the `k`-th list element — which keeps `base + k` exact.
+fn encode_runs(list: &[Adj], per_edge_id: bool) -> (Vec<(u32, usize, usize)>, Vec<u8>) {
+    let mut dir: Vec<(u32, usize, usize)> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < list.len() {
+        let rt = list[i].reltype;
+        let start = body.len();
+        let mut j = i;
+        while j < list.len() && list[j].reltype == rt {
+            write_uvarint(&mut body, list[j].neighbour.0);
+            if per_edge_id {
+                write_uvarint(&mut body, list[j].edge.0);
+            }
+            j += 1;
+        }
+        dir.push((rt, j - i, body.len() - start));
+        i = j;
+    }
+    (dir, body)
+}
+
+/// Append `uvarint(num_runs) ‖ num_runs × (uvarint(reltype) ‖ uvarint(run_count) ‖
+/// uvarint(run_nbytes))`.
+fn write_directory(rec: &mut Vec<u8>, dir: &[(u32, usize, usize)]) {
+    write_uvarint(rec, dir.len() as u64);
+    for &(rt, rc, nb) in dir {
+        write_uvarint(rec, rt as u64);
+        write_uvarint(rec, rc as u64);
+        write_uvarint(rec, nb as u64);
+    }
+}
+
+/// Encode a **forward** (outgoing) adjacency record: `uvarint(count) ‖ u8(flag) ‖ … `. When a
+/// source's outgoing edge ids are dense-contiguous — which the real builder always produces (edge
+/// ids are a running counter in forward-CSR order) — the per-edge `edge_id` collapses to one
+/// `edge_id_base` at the head (`CONTIGUOUS`), derived on read as `base + k`. Otherwise (a
+/// hand-written fixture, or a writer that assigns ids out of forward order) it falls back to
+/// per-edge ids (`EXPLICIT`), always exact. Both carry the [reltype directory](encode_runs).
 fn encode_adj_forward(list: &[Adj]) -> Vec<u8> {
     let mut rec = Vec::new();
     write_uvarint(&mut rec, list.len() as u64);
@@ -80,31 +130,30 @@ fn encode_adj_forward(list: &[Adj]) -> Vec<u8> {
     if contiguous {
         rec.push(FWD_CONTIGUOUS);
         write_uvarint(&mut rec, base);
-        for a in list {
-            write_uvarint(&mut rec, a.reltype as u64);
-            write_uvarint(&mut rec, a.neighbour.0);
-        }
+        let (dir, body) = encode_runs(list, false);
+        write_directory(&mut rec, &dir);
+        rec.extend_from_slice(&body);
     } else {
         rec.push(FWD_EXPLICIT);
-        for a in list {
-            write_uvarint(&mut rec, a.reltype as u64);
-            write_uvarint(&mut rec, a.neighbour.0);
-            write_uvarint(&mut rec, a.edge.0);
-        }
+        let (dir, body) = encode_runs(list, true);
+        write_directory(&mut rec, &dir);
+        rec.extend_from_slice(&body);
     }
     rec
 }
 
 /// Encode a **reverse** (incoming) adjacency record: incoming edge ids are a sparse ascending
-/// subset (edges from many sources), so keep the per-edge `edge_id`.
+/// subset (edges from many sources), so keep the per-edge `edge_id`. Carries the same reltype
+/// directory as forward (no flag byte — reverse is always per-edge id).
 fn encode_adj_reverse(list: &[Adj]) -> Vec<u8> {
     let mut rec = Vec::new();
     write_uvarint(&mut rec, list.len() as u64);
-    for a in list {
-        write_uvarint(&mut rec, a.reltype as u64);
-        write_uvarint(&mut rec, a.neighbour.0);
-        write_uvarint(&mut rec, a.edge.0);
+    if list.is_empty() {
+        return rec;
     }
+    let (dir, body) = encode_runs(list, true);
+    write_directory(&mut rec, &dir);
+    rec.extend_from_slice(&body);
     rec
 }
 
@@ -115,24 +164,28 @@ pub fn adj_count(rec: &[u8]) -> Result<u64> {
     read_uvarint(&mut { rec })
 }
 
-/// Decode one node's adjacency record edge-by-edge, invoking `f` for each [`Adj`]
-/// **without materialising the whole neighbour list**. `forward` selects the record format
-/// (see the module docs): a forward record derives `edge_id = edge_id_base + k`, a reverse
-/// record reads a per-edge id. Either way it is a leading count followed by sequential varints,
-/// so it stays streamable — the only unbounded part of a hub node's adjacency (out-degree in
-/// the millions) never needs to be held resident. [`decode_adj`] is this visitor collected into
-/// a `Vec`; the streaming adjacency reader in the executor drives it in bounded chunks.
-pub fn decode_adj_into(
-    rec: &[u8],
-    forward: bool,
-    mut f: impl FnMut(Adj) -> Result<()>,
-) -> Result<()> {
+/// Parsed record header: whether edge ids are derived (`base + k`) or per-edge, the base, and the
+/// reltype directory — followed by the remaining `body` (the concatenated per-run neighbour bytes).
+struct AdjHeader<'a> {
+    /// `true` ⇒ CONTIGUOUS forward: edge id is `base + k`, no per-edge id in the body. `false` ⇒
+    /// EXPLICIT forward or reverse: each edge carries its own id after its neighbour.
+    derive_base: bool,
+    base: u64,
+    dir: Vec<(u32, usize, usize)>,
+    body: &'a [u8],
+}
+
+/// Parse a record's count, flag/base and reltype directory. Returns `None` for an empty record.
+fn parse_adj_header(rec: &[u8], forward: bool) -> Result<Option<AdjHeader<'_>>> {
     let mut r = rec;
     let count = read_uvarint(&mut r)? as usize;
+    if count == 0 {
+        return Ok(None);
+    }
     // A non-empty forward record carries a one-byte flag after the count: CONTIGUOUS ⇒ one
-    // `edge_id_base` follows and the k-th edge's id is `base + k`; EXPLICIT ⇒ per-edge ids (the
-    // non-contiguous fallback). Reverse records have no flag and always carry per-edge ids.
-    let (derive_base, base) = if forward && count > 0 {
+    // `edge_id_base` follows and the k-th edge's id is `base + k`; EXPLICIT ⇒ per-edge ids.
+    // Reverse records have no flag and always carry per-edge ids.
+    let (derive_base, base) = if forward {
         if r.is_empty() {
             bail!("truncated forward adjacency record (missing codec flag)");
         }
@@ -146,19 +199,99 @@ pub fn decode_adj_into(
     } else {
         (false, 0)
     };
-    for k in 0..count {
-        let reltype = read_uvarint(&mut r)? as u32;
-        let neighbour = NodeId(read_uvarint(&mut r)?);
-        let edge = EdgeId(if derive_base {
-            base + k as u64
+    let num_runs = read_uvarint(&mut r)? as usize;
+    let mut dir = Vec::with_capacity(num_runs);
+    for _ in 0..num_runs {
+        let rt = read_uvarint(&mut r)? as u32;
+        let rc = read_uvarint(&mut r)? as usize;
+        let nb = read_uvarint(&mut r)? as usize;
+        dir.push((rt, rc, nb));
+    }
+    Ok(Some(AdjHeader {
+        derive_base,
+        base,
+        dir,
+        body: r,
+    }))
+}
+
+/// Decode one node's adjacency record edge-by-edge, invoking `f` for each [`Adj`]
+/// **without materialising the whole neighbour list**. `forward` selects the record format
+/// (see the module docs): a forward record derives `edge_id = edge_id_base + k`, a reverse
+/// record reads a per-edge id. It stays streamable — the only unbounded part of a hub node's
+/// adjacency (out-degree in the millions) never needs to be held resident. [`decode_adj`] is
+/// this visitor collected into a `Vec`; the streaming adjacency reader drives it in bounded
+/// chunks. See [`decode_adj_into_filtered`] to decode only selected reltypes.
+pub fn decode_adj_into(
+    rec: &[u8],
+    forward: bool,
+    mut f: impl FnMut(Adj) -> Result<()>,
+) -> Result<()> {
+    let Some(mut h) = parse_adj_header(rec, forward)? else {
+        return Ok(());
+    };
+    let mut k = 0u64;
+    for (rt, rc, _nb) in h.dir {
+        for _ in 0..rc {
+            let neighbour = NodeId(read_uvarint(&mut h.body)?);
+            let edge = EdgeId(if h.derive_base {
+                h.base + k
+            } else {
+                read_uvarint(&mut h.body)?
+            });
+            f(Adj {
+                reltype: rt,
+                neighbour,
+                edge,
+            })?;
+            k += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Decode only the edges whose reltype satisfies `want`, invoking `f` for each — skipping a
+/// non-matching reltype run **without decoding its neighbour bytes** (the run's `run_nbytes` in
+/// the directory is jumped over). This is the typed-expand fast path: `(v)-[:T]->(?)` on a hub
+/// touches only `T`'s run instead of decoding every neighbour of every reltype and filtering
+/// afterwards. `base + k` stays exact because `k` advances across skipped runs too.
+pub fn decode_adj_into_filtered(
+    rec: &[u8],
+    forward: bool,
+    want: impl Fn(u32) -> bool,
+    mut f: impl FnMut(Adj) -> Result<()>,
+) -> Result<()> {
+    let Some(mut h) = parse_adj_header(rec, forward)? else {
+        return Ok(());
+    };
+    let mut k = 0u64;
+    for (rt, rc, nb) in h.dir {
+        if want(rt) {
+            for _ in 0..rc {
+                let neighbour = NodeId(read_uvarint(&mut h.body)?);
+                let edge = EdgeId(if h.derive_base {
+                    h.base + k
+                } else {
+                    read_uvarint(&mut h.body)?
+                });
+                f(Adj {
+                    reltype: rt,
+                    neighbour,
+                    edge,
+                })?;
+                k += 1;
+            }
         } else {
-            read_uvarint(&mut r)?
-        });
-        f(Adj {
-            reltype,
-            neighbour,
-            edge,
-        })?;
+            // Skip the whole run: jump its neighbour bytes and advance the id counter.
+            if nb > h.body.len() {
+                bail!(
+                    "adjacency run byte length {nb} exceeds remaining {}",
+                    h.body.len()
+                );
+            }
+            h.body = &h.body[nb..];
+            k += rc as u64;
+        }
     }
     Ok(())
 }
@@ -635,6 +768,81 @@ mod tests {
         let empty = encode_adj_forward(&[]);
         assert!(decode_adj(&empty, true).unwrap().is_empty());
         assert_eq!(adj_count(&empty).unwrap(), 0);
+    }
+
+    #[test]
+    fn filtered_decode_matches_full_then_filter() {
+        // A hub with several reltypes; reltype-major so each reltype is one run. Filtered decode
+        // must equal decode-all-then-filter, and derive exact edge ids across skipped runs.
+        let mut list = Vec::new();
+        let mut e = 0u64;
+        // reltype 0: neighbours 1,4,9 ; reltype 2: 2,3 ; reltype 5: 7,8,10,11
+        for (rt, nbrs) in [
+            (0u32, vec![1u64, 4, 9]),
+            (2, vec![2, 3]),
+            (5, vec![7, 8, 10, 11]),
+        ] {
+            for nb in nbrs {
+                list.push(Adj {
+                    reltype: rt,
+                    neighbour: NodeId(nb),
+                    edge: EdgeId(e),
+                });
+                e += 1;
+            }
+        }
+        let enc = encode_adj_forward(&list);
+        assert_eq!(enc[1], FWD_CONTIGUOUS);
+        // Full decode round-trips the whole list in order.
+        assert_eq!(decode_adj(&enc, true).unwrap(), list);
+
+        // Filter to reltypes {2, 5}: must equal full-decode filtered, with edge ids intact.
+        for want_set in [
+            vec![2u32],
+            vec![5],
+            vec![0, 5],
+            vec![2, 5],
+            vec![9 /*absent*/],
+        ] {
+            let mut got = Vec::new();
+            decode_adj_into_filtered(
+                &enc,
+                true,
+                |rt| want_set.contains(&rt),
+                |a| {
+                    got.push(a);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let want: Vec<Adj> = list
+                .iter()
+                .copied()
+                .filter(|a| want_set.contains(&a.reltype))
+                .collect();
+            assert_eq!(got, want, "filter {want_set:?}");
+        }
+
+        // Reverse records (per-edge ids) filter identically.
+        let enc_rev = encode_adj_reverse(&list);
+        let mut got = Vec::new();
+        decode_adj_into_filtered(
+            &enc_rev,
+            false,
+            |rt| rt == 2,
+            |a| {
+                got.push(a);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            list.iter()
+                .copied()
+                .filter(|a| a.reltype == 2)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

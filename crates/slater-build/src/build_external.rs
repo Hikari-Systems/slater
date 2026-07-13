@@ -2305,8 +2305,15 @@ impl SortRecord for EdgeFwd {
         })
     }
     fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        // Reltype-major within a source (then dst, then prov for determinism): groups each
+        // source's outgoing edges into one run per reltype, which is what the CSR record's
+        // reltype directory encodes and what a typed expand skips-to. `final_src` stays the
+        // primary key, so edge ids assigned in this order remain gap-free per source
+        // (CONTIGUOUS `edge_id_base + k` survives) and edge_props — written in the same
+        // forward-emit order — stays aligned.
         self.final_src
             .cmp(&other.final_src)
+            .then(self.reltype.cmp(&other.reltype))
             .then(self.final_dst.cmp(&other.final_dst))
             .then(self.prov_edge_id.cmp(&other.prov_edge_id))
     }
@@ -2342,8 +2349,13 @@ impl SortRecord for EdgeRev {
         })
     }
     fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        // Reltype-major within a destination (then src, then edge id for determinism): one run
+        // per reltype in the reverse record's directory, matching the forward half. Reverse
+        // records carry per-edge ids, so this reordering does not affect id correctness.
         self.final_dst
             .cmp(&other.final_dst)
+            .then(self.reltype.cmp(&other.reltype))
+            .then(self.final_src.cmp(&other.final_src))
             .then(self.final_edge_id.cmp(&other.final_edge_id))
     }
     fn size_hint(&self) -> usize {
