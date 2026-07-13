@@ -4115,19 +4115,25 @@ fn node_has_relationships(
     let view = MergedView::new(gen, delta);
     let cache = BlockCache::new(1 << 16);
     let engine = crate::exec::Engine::new(&view, &cache);
-    let map_err = |e: anyhow::Error| {
+    node_has_relationships_via(&engine, id)
+}
+
+/// The engine-driven core of [`node_has_relationships`]: does `id` have any incident
+/// relationship in the engine's overlaid view? Uses the short-circuit existence probe
+/// ([`Engine::has_incident_edge`]) so a high-degree hub stops at its first live edge instead
+/// of materialising the whole adjacency `Vec`. Factored out so the batched DELETE path can
+/// hoist **one** engine (over the shared per-batch cache) out of its per-row loop rather than
+/// rebuild a throwaway 64 KiB `BlockCache` + engine — and fully re-decode a hub — every row.
+fn node_has_relationships_via<V: ReadView>(
+    engine: &Engine<'_, V>,
+    id: u64,
+) -> std::result::Result<bool, Failure> {
+    engine.has_incident_edge(id).map_err(|e: anyhow::Error| {
         Failure::new(
             CODE_EXECUTION,
             format!("check the node's incident relationships: {e:#}"),
         )
-    };
-    if !engine.outgoing_adj(id).map_err(map_err)?.is_empty() {
-        return Ok(true);
-    }
-    if !engine.incoming_adj(id).map_err(map_err)?.is_empty() {
-        return Ok(true);
-    }
-    Ok(false)
+    })
 }
 
 /// The error a plain (non-`DETACH`) `DELETE` raises when its node still has
@@ -4686,6 +4692,19 @@ fn execute_write_batch(
         row_to_distinct.iter().map(|&d| resolved[d]).collect()
     };
 
+    // Hoist a single overlaid view + block cache + engine for the whole batch so the plain-DELETE
+    // conformance probe below reuses them across every row, instead of allocating a throwaway
+    // 64 KiB `BlockCache` (and re-decoding a hub's adjacency) per row. No op mutates the memtable
+    // inside this loop — the ops accumulate and commit in the single `write_batch` after it — so
+    // the pre-loop snapshot is the pre-batch state every per-row check would otherwise re-snapshot,
+    // byte-identical. Built unconditionally (cheap: `Engine::new` allocates nothing material and
+    // the cache stays empty until the first probe reads a block); the probe fires only for a plain
+    // DELETE batch.
+    let batch_delta = DeltaSnapshot::from_memtable(writer.snapshot());
+    let batch_view = MergedView::new(gen, batch_delta);
+    let batch_cache = BlockCache::new(1 << 16);
+    let batch_engine = crate::exec::Engine::new(&batch_view, &batch_cache);
+
     let mut ops: Vec<(WalOp, OpResolution)> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let key_value = &key_values[i];
@@ -4728,7 +4747,7 @@ fn execute_write_batch(
         // creates precedes the check).
         if let WriteOp::Delete { detach: false, .. } = &stmt.op {
             if let Some(id) = resolved {
-                if node_has_relationships(writer, gen, id)? {
+                if node_has_relationships_via(&batch_engine, id)? {
                     return Err(delete_has_relationships_error());
                 }
             }
@@ -4790,16 +4809,15 @@ fn find_core_edge_id(
     let cache = BlockCache::new(1 << 16);
     let view = MergedView::read_only(gen);
     let engine = crate::exec::Engine::new(&view, &cache);
-    let adj = engine.outgoing_adj(src).map_err(|e| {
+    // Short-circuit at the first matching out-edge instead of materialising the source's whole
+    // out-adjacency `Vec` to `find()` one edge — a hub source is never fully decoded. The
+    // empty-delta (`read_only`) view keeps this core-only, so it returns the genuine core edge id.
+    engine.find_outgoing_edge(src, reltype, dst).map_err(|e| {
         Failure::new(
             CODE_EXECUTION,
             format!("check for an existing relationship: {e:#}"),
         )
-    })?;
-    Ok(adj
-        .iter()
-        .find(|a| a.reltype == reltype && a.neighbour.0 == dst)
-        .map(|a| a.edge.0))
+    })
 }
 
 /// Execute one durable relationship write (Phase 3c): resolve both endpoints, build
