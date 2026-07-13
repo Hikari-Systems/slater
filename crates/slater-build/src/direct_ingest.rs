@@ -26,6 +26,44 @@ use crate::buckets::{Blob, BucketWriter, EdgeRec, NodeRec};
 use crate::diag::BuildDiag;
 use crate::model::{Entity, RangeIndexStmt};
 
+/// A dump edge names something the dump itself does not contain.
+///
+/// The ingest is a **trust boundary**: a consolidation dump is an opaque binary file named
+/// on the command line, and `--input-format=slater-dump` hands its bytes straight to the
+/// post-resolve pipeline — no parse, no dedup, no endpoint resolution, so none of the
+/// front-half's checks are in the way. An endpoint or reltype id is therefore a *claim*
+/// made by that file, to be checked against what the file declares it holds, not a value to
+/// index with.
+///
+/// Typed (and `pub`) so a caller classifies it with `err.downcast_ref::<DumpEdgeInvalid>()`
+/// rather than matching message text: this is a corrupt-or-hostile input, not an I/O fault,
+/// and the two want different operator responses.
+#[derive(Debug, thiserror::Error)]
+pub enum DumpEdgeInvalid {
+    /// `src` or `dst` is not a node the dump contains.
+    #[error(
+        "dump edge {edge_id} has {end} endpoint {node}, but the dump declares only \
+         {node_count} node(s) (valid ids are 0..{node_count})"
+    )]
+    Endpoint {
+        edge_id: u64,
+        /// `"src"` or `"dst"` — which end is out of range.
+        end: &'static str,
+        node: u64,
+        node_count: u64,
+    },
+    /// `reltype` is not a relationship type the dump names.
+    #[error(
+        "dump edge {edge_id} has reltype id {reltype}, but the dump declares only \
+         {reltype_count} reltype(s) (valid ids are 0..{reltype_count})"
+    )]
+    Reltype {
+        edge_id: u64,
+        reltype: u32,
+        reltype_count: usize,
+    },
+}
+
 /// The post-resolve inputs a dump ingest produces — the same values the Cypher
 /// front-half hands the clustering phase.
 pub struct IngestResult {
@@ -72,10 +110,49 @@ pub fn ingest_dump(
 
     // Edges → edge bucket. Endpoints are already compacted node ids (= provisional
     // ids); the provisional edge id is the dump record position.
+    //
+    // They are also the *only* untrusted ids in the build that nothing else resolves: the
+    // Cypher front-half earns its endpoints by looking a business key up in a node table,
+    // so an edge to a node that does not exist cannot survive resolve. A dump's endpoints
+    // skip all of that and are indexed with directly — by the LDG partition table, by the
+    // emit band router, by `EndpointPlanes`'s plane arithmetic. Check them here, at the
+    // boundary where the dump's bytes become build records, so every downstream consumer
+    // (cluster, emit, and a `--resume` that picks the buckets back up) gets ids that are
+    // in range by construction. Downstream is *not* a safe place to catch this: an
+    // out-of-range endpoint reaches `Permutation::Table::final_of` as a raw `Vec` index
+    // (index-out-of-bounds panic, in a scoped worker thread, naming no edge), and
+    // `EndpointPlanes::set`'s `reltype * words_per_plane + (node >> 6)` can land
+    // *in bounds inside a neighbouring reltype's plane* — a silently wrong posting bit,
+    // caught today only because an unrelated emit invariant aborts the build first.
+    //
+    // Cost: three compares against loop-invariant locals, per edge, always-not-taken on a
+    // well-formed dump. Nothing is allocated and nothing is touched that the append below
+    // does not already touch — next to the varint decode, the blob copy and the zstd
+    // re-compress each edge pays in this same loop, it does not show up.
+    let reltype_count = r.meta().reltypes.len();
     diag.set_op("ingest dump edges", "edges", edge_count);
     let mut ew = BucketWriter::create(edge_bkt, block_bytes, zstd_level)
         .with_context(|| format!("create edge bucket {}", edge_bkt.display()))?;
     r.for_each_edge(|id, src, dst, reltype, props_blob| {
+        for (end, node) in [("src", src), ("dst", dst)] {
+            if node >= node_count {
+                return Err(DumpEdgeInvalid::Endpoint {
+                    edge_id: id,
+                    end,
+                    node,
+                    node_count,
+                }
+                .into());
+            }
+        }
+        if reltype as usize >= reltype_count {
+            return Err(DumpEdgeInvalid::Reltype {
+                edge_id: id,
+                reltype,
+                reltype_count,
+            }
+            .into());
+        }
         ew.append_edge(&EdgeRec {
             prov_edge_id: id,
             src_prov: src,
@@ -85,7 +162,8 @@ pub fn ingest_dump(
         })?;
         diag.progress_add(1);
         Ok(())
-    })?;
+    })
+    .with_context(|| format!("ingest consolidation dump {}", dump_dir.display()))?;
     ew.finish().context("finish edge bucket")?;
 
     let range_stmts = r
@@ -110,4 +188,147 @@ pub fn ingest_dump(
         keys: r.meta().property_keys.clone(),
         range_stmts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use graph_format::consolidate_dump::DumpWriter;
+    use graph_format::ids::Value;
+
+    use super::*;
+
+    /// A dump with `NODES` nodes and `RELTYPES` reltypes, plus a well-formed edge and one
+    /// caller-supplied edge — which the tests below make out of range in each of the three
+    /// ways a hostile dump can. `DumpWriter` validates neither, so it can write them.
+    const NODES: u64 = 3;
+    const RELTYPES: usize = 2;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "slater_ingest_{}_{tag}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write a dump whose last edge is `(src, dst, reltype)`, then ingest it.
+    fn ingest_with_edge(tag: &str, src: u64, dst: u64, reltype: u32) -> Result<IngestResult> {
+        let work = scratch(tag);
+        let dump = work.join("dump");
+        let mut w = DumpWriter::create(&dump).unwrap();
+        for i in 0..NODES {
+            w.append_node(&[0], &[(0, Value::Int(i as i64))]).unwrap();
+        }
+        w.append_edge(0, 1, 0, &[]).unwrap(); // well-formed
+        w.append_edge(src, dst, reltype, &[]).unwrap(); // under test
+        w.finish(
+            vec!["N".into()],
+            (0..RELTYPES).map(|i| format!("R{i}")).collect(),
+            vec!["k".into()],
+            vec![],
+        )
+        .unwrap();
+
+        ingest_dump(
+            &dump,
+            &work.join("node_bkt"),
+            &work.join("edge_bkt"),
+            64 * 1024,
+            1,
+            &BuildDiag::disabled(),
+        )
+    }
+
+    /// Ingest a dump carrying this edge and require that it is *refused*. The panic
+    /// message here is the pre-fix failure: without the boundary check `ingest_dump`
+    /// returns `Ok` and writes the out-of-range id into the edge bucket.
+    fn expect_rejected(tag: &str, src: u64, dst: u64, reltype: u32) -> anyhow::Error {
+        match ingest_with_edge(tag, src, dst, reltype) {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "hostile dump (src={src}, dst={dst}, reltype={reltype}; {NODES} nodes, \
+                 {RELTYPES} reltypes) was ingested instead of rejected"
+            ),
+        }
+    }
+
+    fn endpoint_err(e: &anyhow::Error) -> (&'static str, u64) {
+        match e.downcast_ref::<DumpEdgeInvalid>() {
+            Some(DumpEdgeInvalid::Endpoint { end, node, .. }) => (end, *node),
+            other => panic!("expected DumpEdgeInvalid::Endpoint, got {other:?} ({e:#})"),
+        }
+    }
+
+    /// The control: a dump whose ids are all in range still ingests. Guards against a
+    /// bounds check that is simply wrong (e.g. an off-by-one rejecting the last node).
+    #[test]
+    fn well_formed_dump_ingests() {
+        // Both endpoints at the extremes of the valid range, and the last valid reltype.
+        let ing = ingest_with_edge("ok", NODES - 1, 0, RELTYPES as u32 - 1).unwrap();
+        assert_eq!(ing.node_count, NODES);
+        assert_eq!(ing.edge_count, 2);
+        assert_eq!(ing.reltypes.len(), RELTYPES);
+    }
+
+    /// A dump edge whose `src` names a node the dump does not contain is refused at the
+    /// ingest boundary. Before this check, `ingest_dump` returned `Ok` and wrote the
+    /// out-of-range id into the edge bucket, where the *default* `--cluster=ldg` build
+    /// then indexed the LDG partition table with it and panicked (`index out of bounds`)
+    /// in a scoped worker thread.
+    #[test]
+    fn out_of_range_src_is_rejected() {
+        let err = expect_rejected("src", 999, 1, 0);
+        assert_eq!(endpoint_err(&err), ("src", 999));
+    }
+
+    /// As above for `dst` — which reached `EndpointPlanes::set`'s plane arithmetic, where
+    /// it either panicked on the raw `Vec` index or, worse, landed in bounds inside a
+    /// neighbouring reltype's plane and set a posting bit for the wrong reltype.
+    #[test]
+    fn out_of_range_dst_is_rejected() {
+        let err = expect_rejected("dst", 0, 999, 0);
+        assert_eq!(endpoint_err(&err), ("dst", 999));
+    }
+
+    /// `node_count` itself is out of range — the off-by-one a `>` instead of `>=` lets in.
+    #[test]
+    fn endpoint_equal_to_node_count_is_rejected() {
+        let err = expect_rejected("eq", 0, NODES, 0);
+        assert_eq!(endpoint_err(&err), ("dst", NODES));
+    }
+
+    /// A reltype id the dump's own reltype table does not name. Endpoints are valid here,
+    /// so nothing downstream of the ingest is looking: on the plane path this panicked,
+    /// and it is the id that would be written into the CSR and the postings.
+    #[test]
+    fn out_of_range_reltype_is_rejected() {
+        let err = expect_rejected("rt", 0, 1, 7);
+        match err.downcast_ref::<DumpEdgeInvalid>() {
+            Some(DumpEdgeInvalid::Reltype {
+                reltype,
+                reltype_count,
+                ..
+            }) => {
+                assert_eq!((*reltype, *reltype_count), (7, RELTYPES));
+            }
+            other => panic!("expected DumpEdgeInvalid::Reltype, got {other:?} ({err:#})"),
+        }
+    }
+
+    /// The error survives the `with_context` wrap on the ingest call — i.e. a caller can
+    /// still classify it by *type*, which is the whole point of it being typed.
+    #[test]
+    fn rejection_is_typed_not_a_bare_message() {
+        let err = expect_rejected("typed", 999, 1, 0);
+        assert!(err.downcast_ref::<DumpEdgeInvalid>().is_some());
+        // and the context that names the input is still there for the operator
+        assert!(format!("{err:#}").contains("ingest consolidation dump"));
+    }
 }
