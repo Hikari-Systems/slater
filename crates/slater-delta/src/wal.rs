@@ -534,6 +534,7 @@ impl WalRecord {
 /// sealed segments to an object store is a separate seam.
 pub struct WalSink {
     segment: u64,
+    dir: PathBuf,
     path: PathBuf,
     file: BufWriter<File>,
     /// Highest seq appended but not yet returned by a completed `commit`.
@@ -542,9 +543,11 @@ pub struct WalSink {
 
 impl WalSink {
     /// Open segment `segment` under `dir`, creating `dir` if needed and writing the
-    /// magic header. The magic becomes durable with the first `commit`.
+    /// magic header. The magic becomes durable with the first `commit`; the segment's
+    /// *directory entry* is made durable here, before any writer can ack against it.
     pub fn create(dir: impl AsRef<Path>, segment: u64) -> Result<Self> {
         let dir = dir.as_ref();
+        let dir_existed = dir.is_dir();
         fs::create_dir_all(dir).with_context(|| format!("create WAL dir {dir:?}"))?;
         let path = segment_path(dir, segment);
         let file = OpenOptions::new()
@@ -561,8 +564,24 @@ impl WalSink {
         // missing magic. (`replay_bytes` also tolerates a 0-byte segment for the
         // power-loss-before-flush case.)
         file.flush().context("flush WAL magic on create")?;
+        // Make the *directory entry* durable before the sink is handed to a writer.
+        // `commit`'s fdatasync persists the segment's data and size but says nothing
+        // about the name that finds it: without this, a power loss after an acked
+        // commit can leave the file unreachable and the acked write is lost. One fsync
+        // per segment — off the per-commit group-commit path.
+        fsync_dir(dir)?;
+        // If the WAL dir itself is new, its own entry in the parent is equally
+        // volatile: fsyncing a directory does not persist the link that names it. On a
+        // graph's first-ever write that would take the whole dir — segment and all —
+        // down with it. Only on the create-the-dir path; segment rotation skips it.
+        if !dir_existed {
+            if let Some(parent) = dir.parent().filter(|p| p.is_dir()) {
+                fsync_dir(parent)?;
+            }
+        }
         Ok(Self {
             segment,
+            dir: dir.to_path_buf(),
             path,
             file,
             highest_appended: None,
@@ -605,18 +624,43 @@ impl WalSink {
     }
 
     /// Flush + fsync and hand back the sealed (immutable) segment descriptor. The
-    /// caller opens a fresh segment for subsequent writes.
+    /// caller opens a fresh segment for subsequent writes. Unlike `commit` this syncs
+    /// the file's full metadata and re-fsyncs the parent directory, so the sealed
+    /// segment the shipping tier picks up is durable name and all.
     pub fn seal(mut self) -> Result<SealedSegment> {
         self.file.flush().context("flush WAL buffer on seal")?;
         self.file
             .get_ref()
-            .sync_data()
+            .sync_all()
             .context("fsync WAL segment on seal")?;
+        fsync_dir(&self.dir)?;
         Ok(SealedSegment {
             segment: self.segment,
             path: self.path,
         })
     }
+}
+
+/// Open `dir` and fsync it, making the directory entries created under it durable.
+///
+/// A failure here is a **hard error**: this is the WAL, and its callers ack writes to
+/// the client on the strength of it. It is deliberately not the best-effort
+/// `let _ = d.sync_all()` used on the L0 publish path.
+fn fsync_dir(dir: &Path) -> Result<()> {
+    let d = File::open(dir).with_context(|| format!("open WAL dir for fsync {dir:?}"))?;
+    d.sync_all()
+        .with_context(|| format!("fsync WAL dir {dir:?}"))?;
+    #[cfg(test)]
+    DIR_FSYNCS.with(|n| n.set(n.get() + 1));
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: counts [`fsync_dir`] calls on the current thread, so a test can pin
+    /// *that the directory is synced* on create/seal (a real power-loss test is out of
+    /// reach in-process). Thread-local, so parallel tests can't perturb each other.
+    static DIR_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// An immutable, sealed WAL segment — the unit the object-store shipping tier
@@ -1022,6 +1066,64 @@ mod tests {
         assert_eq!(replay.records, vec![a, b]);
         assert_eq!(replay.last_seq, Seq(2));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (HIK-71): `create` and `seal` must fsync the segment's *parent
+    /// directory*, not just the segment file. Without it a commit can be acked while
+    /// the directory entry naming the segment is still only in page cache, and a power
+    /// loss loses an acknowledged write.
+    ///
+    /// A real power-loss test is out of reach in-process, so this pins the observable
+    /// behaviour — the dir fsync is performed on the create and seal paths — via the
+    /// thread-local `DIR_FSYNCS` counter. It does not (and cannot) prove the kernel /
+    /// filesystem / drive honoured the fsync.
+    #[test]
+    fn create_and_seal_fsync_the_parent_dir() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_dirsync_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let before = DIR_FSYNCS.with(|n| n.get());
+        let mut sink = WalSink::create(&dir, 0).unwrap();
+        let after_create = DIR_FSYNCS.with(|n| n.get());
+        assert_eq!(
+            after_create,
+            before + 2,
+            "creating the first segment must fsync the WAL dir (the segment's entry) \
+             and its parent (the freshly created dir's own entry)"
+        );
+
+        // Group commit stays on fdatasync alone — the dir entry is already durable, so
+        // no further dir fsync belongs on the per-commit ack path.
+        sink.append(&upsert(1, "L", "k", Value::Int(1), &[]))
+            .unwrap();
+        sink.commit(Seq(1)).unwrap();
+        assert_eq!(DIR_FSYNCS.with(|n| n.get()), after_create);
+
+        sink.seal().unwrap();
+        let after_seal = DIR_FSYNCS.with(|n| n.get());
+        assert_eq!(after_seal, after_create + 1, "seal must fsync the WAL dir");
+
+        // Rotation into an existing dir: the new segment's entry still needs the dir
+        // fsync, but the parent does not — the dir itself is already durable.
+        let next = WalSink::create(&dir, 1).unwrap();
+        assert_eq!(DIR_FSYNCS.with(|n| n.get()), after_seal + 1);
+        next.seal().unwrap();
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failed directory fsync must surface as an error, never be swallowed: the
+    /// callers ack client writes on the strength of it.
+    #[test]
+    fn fsync_dir_propagates_failure() {
+        let missing =
+            std::env::temp_dir().join(format!("slater_wal_absent_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        let err = fsync_dir(&missing).expect_err("fsync of a non-existent dir must fail");
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("the io::Error must be preserved in the chain");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
