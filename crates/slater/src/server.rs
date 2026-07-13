@@ -3693,13 +3693,33 @@ async fn handle_request(
             Ok(msgs)
         }
 
-        Request::Discard(_) => {
-            // The discarded result still completes the statement, so carry the same
-            // additive GQLSTATUS completion status as the final PULL.
-            let row_count = sess.pending.as_ref().map_or(0, |p| p.rows.len());
-            sess.pending = None;
-            let mut meta = vec![("has_more".into(), PsValue::Bool(false))];
-            meta.extend(gqlstatus_completion(row_count));
+        Request::Discard(meta) => {
+            // DISCARD honours its `n` exactly as PULL does — it just drops the rows
+            // instead of streaming them. `n < 0` (the default) discards everything;
+            // a positive `n` discards up to `n` and leaves `has_more` set if the
+            // buffer still holds rows (a subsequent PULL/DISCARD continues from there).
+            let Some(pending) = sess.pending.as_mut() else {
+                // Nothing pending: a bare completion (mirrors the whole-buffer case).
+                let mut meta = vec![("has_more".into(), PsValue::Bool(false))];
+                meta.extend(gqlstatus_completion(0));
+                return Ok(vec![message::success(meta)]);
+            };
+            let n = meta.get("n").and_then(PsValue::as_int).unwrap_or(-1);
+            let remaining = pending.rows.len() - pending.sent;
+            let drop = if n < 0 {
+                remaining
+            } else {
+                (n as usize).min(remaining)
+            };
+            pending.sent += drop;
+            let has_more = pending.sent < pending.rows.len();
+            let mut meta = vec![("has_more".into(), PsValue::Bool(has_more))];
+            // Only the terminal message (buffer drained) carries the additive
+            // GQLSTATUS completion status, matching the final PULL.
+            if !has_more {
+                meta.extend(gqlstatus_completion(pending.rows.len()));
+                sess.pending = None;
+            }
             Ok(vec![message::success(meta)])
         }
 
@@ -13395,6 +13415,13 @@ mod tests {
             }
         }
 
+        fn discard(n: i64) -> PsValue {
+            PsValue::Struct {
+                tag: message::tag::DISCARD,
+                fields: vec![PsValue::Map(vec![("n".into(), PsValue::Int(n))])],
+            }
+        }
+
         /// Clears the Bolt FAILED state a failed LOGON leaves behind.
         fn reset() -> PsValue {
             PsValue::Struct {
@@ -13442,6 +13469,42 @@ mod tests {
             }
         }
         assert_eq!(names, vec!["Alice", "Bob", "Carol"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn discard_honours_its_n_and_leaves_the_rest_pending() {
+        let (root, ctx) = build_ctx("server_discard_n");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // Three rows pending.
+        c.send(Client::run(
+            "MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        ))
+        .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // DISCARD n=2 drops two rows without emitting RECORDs and reports has_more.
+        c.send(Client::discard(2)).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(fields[0].get("has_more"), Some(&PsValue::Bool(true)));
+
+        // The remaining row is still there: DISCARD -1 drains it and completes.
+        c.send(Client::discard(-1)).await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(tag, message::tag::SUCCESS);
+        assert_eq!(fields[0].get("has_more"), Some(&PsValue::Bool(false)));
+
+        // Buffer drained: a follow-up PULL now errors (no pending result).
+        c.send(Client::pull_all()).await;
+        assert_eq!(c.recv().await.0, message::tag::FAILURE);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
