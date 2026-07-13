@@ -104,12 +104,15 @@ pub trait ObjectStore: Send + Sync {
     /// The default reads the whole object and checks its BLAKE3 digest — exact,
     /// backend-agnostic, but O(bytes). A backend overrides this with the cheapest
     /// *native* check it can offer: the S3 backend compares the object's
-    /// `Content-Length` from a `HEAD` (a metadata request, **no body read**),
-    /// which is a sound completeness check there because an S3 `PUT` is atomic —
-    /// a partial upload never produces a visible object, so "present and the right
-    /// size" means "fully published". A backend that can have the store itself
-    /// recompute a content digest (e.g. via an object checksum baked in at
-    /// publish) can strengthen this without reading the body — see the S3 impl.
+    /// server-stored SHA-256 to the manifest's from a `HEAD` (a metadata request,
+    /// **no body read**), a content-grade check. When the manifest recorded a
+    /// SHA-256 but the object carries none (e.g. an out-of-band upload under a
+    /// different checksum), the S3 backend falls back to this default's body
+    /// re-hash rather than to a weaker length check — a requested content digest is
+    /// never silently satisfied by size alone. The byte-length completeness check
+    /// (`Content-Length` from the same `HEAD`, sound because an S3 `PUT` is atomic —
+    /// "present and the right size" means "fully published") is used only when the
+    /// manifest recorded no content digest at all. See the S3 impl.
     fn verify_file(&self, key: &str, expected: &FileIntegrity) -> Result<()> {
         let src = self.open(key)?;
         let computed = crate::integrity::hash_object(src.as_ref())

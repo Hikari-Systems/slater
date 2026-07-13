@@ -34,6 +34,39 @@ authenticated principals over Bolt).
   and `acl::tests::a_read_grant_never_implies_write` pins the predicate. Verified end-to-end over
   Bolt: a read-only user is refused all nine statements and the graph is provably unmutated.
 
+## Closed — S3 per-file verify downgraded a manifest SHA-256 to a length check (2026-07-13, HIK-97)
+
+- [x] **✅ FIXED — `verify_file` silently degraded a requested SHA-256 to byte length.** On the
+  S3 backend, the per-file integrity check at generation open compares the object's
+  server-stored SHA-256 (from `HEAD`) to the manifest's. When the manifest recorded a SHA-256
+  but the object carried **none** server-stored (e.g. it was uploaded out-of-band under S3's
+  default CRC64-NVME checksum), the `(_, None)` arm fell through to a `Content-Length`
+  completeness check — with no warning. An operator who asked for a content digest silently got
+  "the file is the right length", which catches truncation but not tampering. **Impact:** an
+  attacker with bucket-write (but without the master key or the MAC'd manifest) could overwrite
+  a *plaintext* block with same-length malicious bytes lacking a `checksum-sha256`, and verify
+  would pass on size alone. (Encrypted images still fail at the AEAD tag on read — detection is
+  only deferred there.)
+
+  **Fix (`crates/graph-format/src/store/s3.rs`):** split the fallback. `(Some, None)` — manifest
+  wants a SHA-256 the object can't prove server-side — now re-reads the object body and verifies
+  it against the manifest's canonical BLAKE3 (the trait's default `verify_file`), restoring the
+  content-grade guarantee at the cost of one GET; it is **not** a downgrade. The byte-length
+  completeness floor is used only for `(None, _)` — a pre-checksum generation with nothing to
+  compare. The routing is a pure, unit-tested `plan_verify()` so the invariant "a requested
+  SHA-256 never falls back to length" is pinned without a network. slater's own `put` always
+  stores a SHA-256, so a slater-published generation stays on the metadata-only path and never
+  pays the body read.
+
+  **Tests:** `s3::tests::manifest_sha256_without_server_sha256_never_downgrades_to_length` (+
+  siblings) pins the routing; `s3_minio::verify_rehashes_body_when_server_sha256_absent`
+  exercises the end-to-end path against MinIO (PUT with no checksum; a same-length tamper is
+  rejected, which the pre-fix length check would have passed).
+
+  **Sibling still open:** the GCS backend (`store/gcs.rs`) has the analogous `(_, None)` shape
+  for its CRC32C check — a manifest CRC32C with no server-stored one falls back to length. Not
+  in HIK-97's scope; flagged for a follow-up.
+
 ## Status at a glance
 
 **5 done · 1 in progress · 3 open** (as of 2026-06-12)

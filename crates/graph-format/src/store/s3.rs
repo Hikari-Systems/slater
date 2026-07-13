@@ -11,12 +11,18 @@
 //! open the backend reads it back with `HEAD` + checksum mode and compares it to
 //! the value recorded in the manifest. SHA-256 is collision-resistant and the
 //! stored checksum is server-authoritative, so this is a content-grade check at
-//! one metadata request per file. When an object carries no server-stored
-//! SHA-256 (e.g. it was uploaded with S3's default full-object checksum,
-//! CRC64-NVME, which the manifest's SHA-256 cannot be compared against), the
-//! check falls back to copy-completeness (byte length) — S3 still validated the
-//! object against its own checksum at upload, so this confirms an intact, complete
-//! copy, just not a manifest content-match. See [`S3ObjectStore::verify_file`].
+//! one metadata request per file. When the manifest recorded a SHA-256 but the
+//! object carries no server-stored one (e.g. it was uploaded with S3's default
+//! full-object checksum, CRC64-NVME, which the manifest's SHA-256 cannot be
+//! compared against), the backend does **not** downgrade to a byte-length check —
+//! that would satisfy a requested content digest with "the file is the right
+//! length", which catches truncation but not tampering. Instead it reads the
+//! object body once and re-verifies it against the manifest's canonical BLAKE3,
+//! restoring the same content-grade guarantee at the cost of a GET (exactly the
+//! trait's default `verify_file`). The length-only completeness check is used
+//! solely when the manifest itself recorded no SHA-256 (a pre-checksum
+//! generation), where there is nothing to compare. See
+//! [`S3ObjectStore::verify_file`].
 //!
 //! `aws-sdk-s3` is async; the [`ObjectStore`] trait is synchronous (the serve
 //! path runs under `spawn_blocking`). The bridge is contained entirely here: the
@@ -171,6 +177,34 @@ impl S3ObjectStore {
     fn full_key(&self, key: &str) -> String {
         join_key(&self.prefix, key)
     }
+
+    /// Verify an object by reading its bytes and re-hashing them against the
+    /// manifest's canonical BLAKE3 — the fallback [`verify_file`](ObjectStore::verify_file)
+    /// takes when the manifest recorded a SHA-256 but the object carries none
+    /// server-stored. This is the *same* content-grade guarantee as the server-side
+    /// SHA-256 comparison (BLAKE3 is collision-resistant), paid for with one GET;
+    /// it is deliberately not a downgrade to a length-only check, which would catch
+    /// truncation but not tampering. slater's own `put` always stores a SHA-256, so
+    /// a slater-published generation stays on the metadata-only path and never
+    /// reaches here — the body read is incurred only by objects that genuinely lack
+    /// a server checksum (out-of-band copies, or a tampered overwrite), which is the
+    /// correct condition for paying it. `full` is the prefix-joined key, used only
+    /// for diagnostics.
+    fn verify_by_rehash(&self, key: &str, full: &str, expected: &FileIntegrity) -> Result<()> {
+        let src = self.open(key)?;
+        let computed = crate::integrity::hash_object(src.as_ref())
+            .with_context(|| format!("re-hash {full} (no server-stored SHA-256 to compare)"))?;
+        if computed != expected.blake3 {
+            bail!(
+                "object {full} failed its content re-hash \
+                 (manifest BLAKE3 {}, recomputed {}) — refusing to serve a mismatched object; \
+                 it carries no server-stored SHA-256, so its bytes were re-read and hashed",
+                expected.blake3,
+                computed
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One S3 object, read by `Range` GET. Holds a clone of the client + runtime so
@@ -228,6 +262,41 @@ impl RandomReadAt for S3Object {
             }
             Ok(out)
         })
+    }
+}
+
+/// How [`S3ObjectStore::verify_file`] should check an object, decided purely from
+/// the manifest's recorded SHA-256 and the object's server-stored SHA-256 (read
+/// from `HEAD`). Split out as a total, side-effect-free function so the
+/// security-critical routing — in particular that a requested SHA-256 is *never*
+/// silently satisfied by a byte-length check — is unit-testable without a network.
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyPlan {
+    /// Manifest and object both carry a SHA-256: compare the two (content-grade,
+    /// no body read).
+    CompareSha256,
+    /// The manifest recorded a SHA-256 but the object has none server-stored. Read
+    /// the body and re-verify it against the manifest's canonical BLAKE3. This is
+    /// deliberately **not** a downgrade to a length check — the requested content
+    /// guarantee is preserved, just paid for with a GET.
+    ReHashBody,
+    /// The manifest recorded no SHA-256 (a generation built before checksums): there
+    /// is nothing to compare against, so a byte-length copy-completeness check is
+    /// the intended floor.
+    Complete,
+}
+
+/// Route an integrity check from `(manifest SHA-256, object SHA-256)`.
+///
+/// The one rule that matters for the security invariant: a manifest that recorded
+/// a SHA-256 must never be satisfied by anything weaker than a content-grade
+/// check, so `(Some, None)` maps to [`VerifyPlan::ReHashBody`], never to
+/// [`VerifyPlan::Complete`].
+fn plan_verify(manifest_sha256: Option<&str>, object_sha256: Option<&str>) -> VerifyPlan {
+    match (manifest_sha256, object_sha256) {
+        (Some(_), Some(_)) => VerifyPlan::CompareSha256,
+        (Some(_), None) => VerifyPlan::ReHashBody,
+        (None, _) => VerifyPlan::Complete,
     }
 }
 
@@ -353,68 +422,71 @@ impl ObjectStore for S3ObjectStore {
 
     fn verify_file(&self, key: &str, expected: &FileIntegrity) -> Result<()> {
         // Content-grade check from object metadata, no body read: ask S3 for the
-        // object's stored SHA-256 (server-computed at upload) and compare it to
-        // the manifest's. Falls back to a Content-Length completeness check when
-        // the manifest has no SHA-256 (a generation built before checksums) — an
-        // S3 PUT is atomic, so a present, right-sized object is a complete one.
+        // object's stored SHA-256 (server-computed at upload) and compare it to the
+        // manifest's. When the manifest recorded a SHA-256 but the object carries
+        // none (e.g. an out-of-band upload under S3's default CRC64-NVME checksum),
+        // fall back to a body re-hash against BLAKE3 — never to a length-only check,
+        // which would silently satisfy a requested content digest with mere size.
+        // Only a manifest with no SHA-256 at all (a pre-checksum generation) uses
+        // the copy-completeness (byte-length) floor.
         let full = self.full_key(key);
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let want = expected.sha256.map(str::to_string);
         let size = expected.size;
-        run_blocking(&self.rt, async move {
-            let head = client
-                .head_object()
-                .bucket(&bucket)
-                .key(&full)
-                .checksum_mode(ChecksumMode::Enabled)
-                .send()
-                .await
-                .map_err(|e| sdk_err(&format!("S3 HEAD {full} for integrity check"), e))?;
-            // Right-sized object ⇒ a complete copy. S3 validates every object
-            // against its own server-stored full-object checksum at upload, so an
-            // object present at the manifest's byte length is intact-at-rest. This
-            // is the integrity floor when a content-grade SHA-256 comparison is not
-            // available.
-            let check_complete = || -> Result<()> {
+        // One metadata request (HEAD, no body read): the object's server-stored
+        // SHA-256 and its byte length.
+        let (object_sha256, content_length) = run_blocking(&self.rt, {
+            let full = full.clone();
+            async move {
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&full)
+                    .checksum_mode(ChecksumMode::Enabled)
+                    .send()
+                    .await
+                    .map_err(|e| sdk_err(&format!("S3 HEAD {full} for integrity check"), e))?;
                 let len = head
                     .content_length()
                     .ok_or_else(|| anyhow!("S3 HEAD {full} has no content length"))?;
-                if len as u64 != size {
+                Ok::<(Option<String>, i64), anyhow::Error>((
+                    head.checksum_sha256().map(str::to_string),
+                    len,
+                ))
+            }
+        })?;
+
+        match plan_verify(want.as_deref(), object_sha256.as_deref()) {
+            // Strong path: both sides carry a SHA-256. SHA-256 is collision-resistant
+            // and S3's stored value is server-authoritative, so this is content-grade.
+            VerifyPlan::CompareSha256 => {
+                // Both are `Some` by construction of the plan.
+                let (want, got) = (want.unwrap_or_default(), object_sha256.unwrap_or_default());
+                if got != want {
                     bail!(
-                        "object {full} failed its copy-completeness check \
-                         (manifest {size} bytes, S3 reports {len}) — refusing to serve an incomplete copy"
+                        "object {full} failed its SHA-256 integrity check \
+                         (manifest {want}, S3 {got}) — refusing to serve a mismatched object"
                     );
                 }
                 Ok(())
-            };
-            match (want, head.checksum_sha256()) {
-                // Strong path: the object carries a server-stored SHA-256; compare
-                // it to the manifest's. SHA-256 is collision-resistant and the
-                // stored value is server-authoritative, so this is content-grade.
-                (Some(want), Some(got)) => {
-                    if got != want {
-                        bail!(
-                            "object {full} failed its SHA-256 integrity check \
-                             (manifest {want}, S3 {got}) — refusing to serve a mismatched object"
-                        );
-                    }
-                }
-                // The object has no server-stored SHA-256 — it was uploaded with
-                // S3's default full-object checksum (CRC64-NVME) instead of SHA-256,
-                // so the manifest's SHA-256 has nothing to compare against. S3 still
-                // validated the object against its CRC64-NVME at upload, so fall back
-                // to the completeness check rather than refusing to serve. Weaker
-                // than the SHA-256 comparison: it proves the copy is complete and
-                // intact-at-rest, not that its bytes match the manifest.
-                (_, None) => check_complete()?,
-                // No manifest SHA-256 (a generation built before checksums): the
-                // object's own checksum is irrelevant to a content comparison, so
-                // fall back to completeness as before.
-                (None, Some(_)) => check_complete()?,
             }
-            Ok(())
-        })
+            // The manifest asked for a SHA-256 the object cannot prove server-side.
+            // Restore the guarantee with a body re-hash rather than trusting length.
+            VerifyPlan::ReHashBody => self.verify_by_rehash(key, &full, expected),
+            // No manifest SHA-256 (a pre-checksum generation): a present, right-sized
+            // object is a complete one (an S3 PUT is atomic), which is the intended
+            // floor when there is nothing to compare against.
+            VerifyPlan::Complete => {
+                if content_length as u64 != size {
+                    bail!(
+                        "object {full} failed its copy-completeness check \
+                         (manifest {size} bytes, S3 reports {content_length}) — refusing to serve an incomplete copy"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     fn put(&self, key: &str, bytes: &[u8], sha256_b64: Option<&str>) -> Result<()> {
@@ -456,5 +528,48 @@ impl ObjectStore for S3ObjectStore {
                 .map_err(|e| sdk_err(&format!("S3 DELETE {full}"), e))?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_verify, VerifyPlan};
+
+    // Regression for HIK-97: when the manifest recorded a SHA-256 but the object
+    // carries none server-stored, `verify_file` must NOT downgrade to a byte-length
+    // completeness check (which catches truncation but not tampering). Before the
+    // fix the routing collapsed this case into the completeness arm; it must now
+    // route to a body re-hash. This pins the security-critical decision without a
+    // network or a live S3.
+    #[test]
+    fn manifest_sha256_without_server_sha256_never_downgrades_to_length() {
+        // The bug case: a requested SHA-256, no server-stored one → body re-hash,
+        // never `Complete` (the length-only floor).
+        assert_eq!(
+            plan_verify(Some("bWFuaWZlc3Q="), None),
+            VerifyPlan::ReHashBody,
+            "a requested SHA-256 with no server checksum must re-hash the body, \
+             never fall back to a length-only completeness check"
+        );
+        assert_ne!(
+            plan_verify(Some("bWFuaWZlc3Q="), None),
+            VerifyPlan::Complete
+        );
+    }
+
+    #[test]
+    fn both_present_compares_sha256() {
+        assert_eq!(
+            plan_verify(Some("bWFuaWZlc3Q="), Some("c2VydmVy")),
+            VerifyPlan::CompareSha256
+        );
+    }
+
+    #[test]
+    fn no_manifest_sha256_uses_completeness_floor() {
+        // A pre-checksum generation: nothing to compare, so the length floor is the
+        // intended behaviour regardless of what the object happens to carry.
+        assert_eq!(plan_verify(None, None), VerifyPlan::Complete);
+        assert_eq!(plan_verify(None, Some("c2VydmVy")), VerifyPlan::Complete);
     }
 }
