@@ -562,6 +562,19 @@ pub struct CacheConfig {
         deserialize_with = "de::degree_residency"
     )]
     pub degree_column: crate::degree_column::DegreeResidency,
+    /// Soft byte cap on the resident dense degree column when `degreeColumn=lazy`. The column
+    /// faults chunks on demand; this bounds how many stay resident by evicting the coldest on
+    /// each fault — a pressure path that holds **even when the idle-TTL sweep is disabled**
+    /// (`cacheTtlMs <= 0`), so `lazy` cannot silently degrade to an uncapped `pinned`. It is the
+    /// column's own budget (not shared with the block cache), mirroring the separate
+    /// `blockCacheBytes` / `vectorCacheBytes` / `resultCacheBytes` pools. `0` disables the cap
+    /// (unbounded — the pre-fix behaviour, an explicit opt-out). Ignored under `pinned` (kept
+    /// fully resident). Defaults to 256 MiB.
+    #[serde(
+        default = "default_degree_column_bytes",
+        deserialize_with = "de::usize_floor0"
+    )]
+    pub degree_column_bytes: usize,
 }
 
 impl CacheConfig {
@@ -807,6 +820,9 @@ fn default_range_index_cache() -> usize {
 fn default_degree_column() -> crate::degree_column::DegreeResidency {
     crate::degree_column::DegreeResidency::Lazy
 }
+fn default_degree_column_bytes() -> usize {
+    crate::degree_column::DEFAULT_BUDGET_BYTES
+}
 fn default_cache_ttl_ms() -> i64 {
     30 * 60 * 1000
 }
@@ -883,6 +899,7 @@ impl Default for CacheConfig {
             cache_ttl_ms: default_cache_ttl_ms(),
             range_index_cache_bytes: default_range_index_cache(),
             degree_column: default_degree_column(),
+            degree_column_bytes: default_degree_column_bytes(),
         }
     }
 }

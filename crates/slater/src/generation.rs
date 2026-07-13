@@ -200,6 +200,7 @@ impl Generation {
             verify_integrity,
             None,
             crate::degree_column::DegreeResidency::Lazy,
+            None,
         )
     }
 
@@ -214,7 +215,10 @@ impl Generation {
     ///
     /// `degree_residency` selects the dense degree column's residency
     /// ([`DegreeResidency`](crate::degree_column::DegreeResidency)): `Lazy` faults chunks on
-    /// demand and frees cold ones on the idle sweep; `Pinned` prefaults the whole column here.
+    /// demand and frees cold ones on the idle sweep and on byte-budget pressure; `Pinned`
+    /// prefaults the whole column here. `degree_column_bytes` is that lazy byte budget (`None`
+    /// ⇒ [`DEFAULT_BUDGET_BYTES`](crate::degree_column::DEFAULT_BUDGET_BYTES)); it is ignored
+    /// under `Pinned`.
     pub fn open_with_store_opts_cached(
         store: &dyn ObjectStore,
         graph: &str,
@@ -222,6 +226,7 @@ impl Generation {
         verify_integrity: bool,
         range_index_cache_bytes: Option<usize>,
         degree_residency: crate::degree_column::DegreeResidency,
+        degree_column_bytes: Option<usize>,
     ) -> Result<Self> {
         // `current` names a *set* uuid. Resolve it to the base generation: read the
         // set manifest if one exists, else treat the uuid as an implicit singleton
@@ -410,6 +415,7 @@ impl Generation {
                     reader,
                     manifest.node_count as usize,
                     degree_residency,
+                    degree_column_bytes.unwrap_or(crate::degree_column::DEFAULT_BUDGET_BYTES),
                 )
                 .with_context(|| format!("open node-degree column {nd_key}"))?,
             );
