@@ -9448,12 +9448,51 @@ fn haversine_metres(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS * c
 }
 
-/// A uniform random `f64` in `[0, 1)` for `rand()`. Drawn from the same
-/// CSPRNG that backs `uuid`'s v4 generator (so no extra dependency): 53 high
-/// bits of a fresh UUID divided by `2^53` give a correctly-distributed double.
+/// A uniform random `f64` in `[0, 1)` for `rand()`.
+///
+/// Backed by a per-thread [SplitMix64] generator, seeded once per thread from
+/// the OS CSPRNG (`uuid`'s v4 generator, so no extra dependency). Each draw
+/// takes the top 53 bits of a 64-bit output word and divides by `2^53` — the
+/// standard construction for a uniformly distributed double in `[0, 1)`.
+///
+/// Do *not* go back to slicing bits straight out of a v4 UUID: its 128 bits are
+/// not all random. The version nibble (byte 6) and the RFC-4122 variant bits
+/// (top two bits of byte 8) are fixed. The previous implementation took the
+/// **low** 64 bits — which start at that variant byte — so after `>> 11` the two
+/// most-significant mantissa bits were always `1` then `0`, confining every draw
+/// to `[0.5, 0.75)` and making e.g. `WHERE rand() < 0.1` unsatisfiable.
+///
+/// [SplitMix64]: https://dl.acm.org/doi/10.1145/2660193.2660195
 fn random_f64() -> f64 {
-    let bits = (uuid::Uuid::new_v4().as_u128() as u64) >> 11; // keep 53 bits
-    (bits as f64) / ((1u64 << 53) as f64)
+    /// The SplitMix64 increment (odd; 2^64 / golden ratio).
+    const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    std::thread_local! {
+        /// `None` until this thread's first draw seeds it from the OS CSPRNG.
+        static STATE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    let mut s = STATE.with(|state| {
+        let seeded = state.get().unwrap_or_else(|| {
+            // A v4 UUID carries 122 CSPRNG bits. Fold both halves together (with
+            // a rotation) so the fixed version/variant fields land on random bits
+            // rather than surviving into the seed.
+            let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
+            hi ^ lo.rotate_left(32)
+        });
+        // Advance the counter *before* mixing, so the seed itself is never emitted.
+        let next = seeded.wrapping_add(GAMMA);
+        state.set(Some(next));
+        next
+    });
+
+    // SplitMix64 finalizer (MurmurHash3-style avalanche).
+    s = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    s ^= s >> 31;
+
+    // 53 uniformly random bits / 2^53 ⇒ uniform in [0, 1), never 1.0.
+    ((s >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
 /// Milliseconds since the Unix epoch for `timestamp()` (FalkorDB's `time_t`-ms).
@@ -18242,6 +18281,67 @@ mod tests {
         for p in [root, root2] {
             let _ = std::fs::remove_dir_all(&p);
         }
+    }
+
+    /// Regression (HIK-74): `rand()` must cover the whole of `[0, 1)`, not a
+    /// sliver of it. The old implementation sliced the *low* 64 bits of a v4
+    /// UUID, whose two most-significant bits are the fixed RFC-4122 variant
+    /// (`10`), so every draw landed in `[0.5, 0.75)` — `WHERE rand() < 0.1` could
+    /// never match, and `ORDER BY rand()` shuffled over a quarter of the range.
+    ///
+    /// The bounds below are deliberately loose: with a correct uniform generator
+    /// and `N = 20_000` draws, every assertion here fails with probability far
+    /// below 1e-9 (an empty octile alone is `(7/8)^20000 ≈ 1e-1160`), so this is
+    /// a distribution test that cannot realistically flake in CI.
+    #[test]
+    fn rand_is_uniform_over_unit_interval() {
+        const N: usize = 20_000;
+        const BUCKETS: usize = 8;
+
+        let mut hist = [0usize; BUCKETS];
+        let mut sum = 0.0f64;
+        let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+
+        for _ in 0..N {
+            let x = random_f64();
+            // Hard invariant: the contract is [0, 1), so 1.0 and NaN are bugs.
+            assert!(
+                (0.0..1.0).contains(&x),
+                "rand() escaped [0, 1): {x} (NaN? {})",
+                x.is_nan()
+            );
+            hist[(x * BUCKETS as f64) as usize] += 1;
+            sum += x;
+            min = min.min(x);
+            max = max.max(x);
+        }
+
+        // Every octile is hit. This is the assertion the pre-fix code failed:
+        // it only ever populated bucket 4 ([0.5, 0.625)).
+        for (i, &count) in hist.iter().enumerate() {
+            assert!(
+                count > 0,
+                "octile {i} ([{:.3}, {:.3})) never drawn in {N} samples — rand() is not uniform: {hist:?}",
+                i as f64 / BUCKETS as f64,
+                (i + 1) as f64 / BUCKETS as f64,
+            );
+        }
+
+        // The tails are reached, and the mean sits where a uniform mean should.
+        // (σ of the mean of N uniforms is 1/√(12N) ≈ 0.002, so ±0.02 is ~10σ.)
+        assert!(
+            min < 0.05,
+            "min draw {min} — low tail unreachable: {hist:?}"
+        );
+        assert!(
+            max > 0.95,
+            "max draw {max} — high tail unreachable: {hist:?}"
+        );
+        let mean = sum / N as f64;
+        assert!(
+            (0.48..0.52).contains(&mean),
+            "mean of {N} draws is {mean}, expected ≈ 0.5: {hist:?}"
+        );
     }
 
     // ── relationship-type scan: identical results with the posting on vs off ───
