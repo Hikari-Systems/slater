@@ -755,6 +755,60 @@ fn decode_props_pairs(r: &mut &[u8]) -> Result<Vec<(u32, Value)>> {
     Ok(out)
 }
 
+/// Bytes `v` owns on the heap, beyond its own inline `size_of::<Value>()` slot.
+/// Strings and lists/vectors are counted by allocation capacity; nested lists
+/// recurse. Used by the merge records' `resident_hint` so the sort budget counts
+/// the string/list heap a `Value` drags along, not just its enum footprint.
+fn value_heap_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) => 0,
+        Value::Str(s) => s.capacity(),
+        Value::Vector(f) => f.capacity() * std::mem::size_of::<f32>(),
+        Value::List(items) => {
+            items.capacity() * std::mem::size_of::<Value>()
+                + items.iter().map(value_heap_bytes).sum::<usize>()
+        }
+    }
+}
+
+/// Bytes a `SetExprI` tree owns on the heap, beyond its own inline
+/// `size_of::<SetExprI>()` slot: the boxed children, the `Func` name and arg
+/// vector, `Case`'s when/else arms, and any `Value` string/list heap under a
+/// `Lit`. O(number of nodes) — the tree is finite, so the recursion terminates.
+/// Mirrors the traversal shape of [`remap_set_expr`].
+fn set_expr_heap(e: &SetExprI) -> usize {
+    const NODE: usize = std::mem::size_of::<SetExprI>();
+    match e {
+        SetExprI::Lit(v) => value_heap_bytes(v),
+        SetExprI::Prop(_) => 0,
+        SetExprI::Func { name, args } => {
+            name.capacity() + args.capacity() * NODE + args.iter().map(set_expr_heap).sum::<usize>()
+        }
+        SetExprI::BinOp { l, r, .. }
+        | SetExprI::Cmp { l, r, .. }
+        | SetExprI::And(l, r)
+        | SetExprI::Or(l, r) => 2 * NODE + set_expr_heap(l) + set_expr_heap(r),
+        SetExprI::Not(inner) => NODE + set_expr_heap(inner),
+        SetExprI::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            let mut h = whens.capacity() * std::mem::size_of::<(SetExprI, SetExprI)>();
+            if let Some(s) = subject {
+                h += NODE + set_expr_heap(s);
+            }
+            for (c, t) in whens {
+                h += set_expr_heap(c) + set_expr_heap(t);
+            }
+            if let Some(e) = els {
+                h += NODE + set_expr_heap(e);
+            }
+            h
+        }
+    }
+}
+
 impl SortRecord for NodeMergeRec {
     fn encode(&self, buf: &mut Vec<u8>) {
         write_uvarint(buf, self.label as u64);
@@ -796,6 +850,22 @@ impl SortRecord for NodeMergeRec {
     }
     fn size_hint(&self) -> usize {
         24 + 16 * self.set_props.len()
+    }
+    /// Resident (in-buffer) bytes — the number the sort budget actually spends.
+    /// `size_hint` above estimates the *encoded* run-file size and must stay that
+    /// way (it is the run-size proxy); it flat-counts 16 bytes per SET prop and so
+    /// ignores the `SetExprI` expression trees, the string/list `Value` heap, and
+    /// the extra-label vector this record holds resident. Account all of it here so
+    /// `ExtSorter` spills before it blows past `--max-memory` (HIK-92).
+    fn resident_hint(&self) -> usize {
+        let mut h = std::mem::size_of::<Self>();
+        h += self.extra_labels.capacity() * std::mem::size_of::<u32>();
+        h += value_heap_bytes(&self.value);
+        h += self.set_props.capacity() * std::mem::size_of::<(u32, SetExprI)>();
+        for (_, e) in &self.set_props {
+            h += set_expr_heap(e);
+        }
+        h
     }
 }
 
@@ -1175,6 +1245,13 @@ impl SortRecord for EndpointRef {
     }
     fn size_hint(&self) -> usize {
         24
+    }
+    /// Resident (in-buffer) bytes. `size_hint`'s flat 24 is the encoded run-file
+    /// estimate and stays as-is; it ignores the string/list heap of the business
+    /// key `value`, which for a long key dominates the record. Count it here so the
+    /// resolve sorter honours `--max-memory` (HIK-92).
+    fn resident_hint(&self) -> usize {
+        std::mem::size_of::<Self>() + value_heap_bytes(&self.value)
     }
 }
 
@@ -1821,5 +1898,92 @@ mod set_expr_tests {
             encode_set_expr(&mut buf2, &decoded);
             assert_eq!(buf, buf2, "re-encode of decoded tree must match");
         }
+    }
+
+    /// HIK-92: the sort budget counts `resident_hint`, not `size_hint`. A record
+    /// carrying a heavy SET expression tree and a long string key must report a
+    /// resident cost that reflects the real heap it holds — not the flat
+    /// `24 + 16*len` `size_hint`, which under-counts it by an order of magnitude and
+    /// lets the dedup/resolve sorters blow past `--max-memory`.
+    #[test]
+    fn node_merge_rec_resident_hint_counts_set_tree_and_value_heap() {
+        let long_key = "Q".to_string() + &"1234567890".repeat(30); // ~300-byte key
+        let rec = NodeMergeRec {
+            label: 0,
+            extra_labels: vec![1, 2, 3],
+            key: 0,
+            value: Value::Str(long_key.clone()),
+            // Two heavy CASE/BinOp/Cmp/Func append-idiom trees.
+            set_props: vec![
+                (0, append_idiom(0, "Acme Corporation Limited")),
+                (1, append_idiom(1, "Some Long Affiliation String Here")),
+            ],
+            seq: 0,
+        };
+
+        let flat_size_hint = 24 + 16 * rec.set_props.len(); // the buggy accounting
+        let resident = rec.resident_hint();
+
+        // The old default (`size_of::<Self>() + size_hint`) would have counted only
+        // the flat estimate plus the struct footprint. The corrected hint must be
+        // far larger — it now sees the ~300-byte key and the two expression trees.
+        assert!(
+            resident > std::mem::size_of::<NodeMergeRec>() + flat_size_hint * 4,
+            "resident_hint {resident} should dwarf the flat size_hint accounting \
+             ({} + {flat_size_hint})",
+            std::mem::size_of::<NodeMergeRec>(),
+        );
+        // And it must at least cover the string key's heap plus the struct itself —
+        // a concrete lower bound on what is genuinely allocated.
+        assert!(
+            resident >= std::mem::size_of::<NodeMergeRec>() + long_key.len(),
+            "resident_hint {resident} must cover the {}-byte key heap",
+            long_key.len(),
+        );
+        // Sanity ceiling: the estimate stays within a sane factor of a hand-rolled
+        // real-allocation lower bound (struct + key + both trees' node count), so it
+        // is not wildly over-counting either.
+        let real_lb = std::mem::size_of::<NodeMergeRec>()
+            + long_key.len()
+            + rec
+                .set_props
+                .iter()
+                .map(|(_, e)| set_expr_heap(e))
+                .sum::<usize>();
+        assert!(
+            resident <= real_lb * 4,
+            "resident_hint {resident} should be within ~4x of the real lower bound {real_lb}",
+        );
+    }
+
+    /// HIK-92: `EndpointRef` had the same flat-24 defect for long string business
+    /// keys. `size_hint` stays 24 (encoded/run-file estimate); `resident_hint` must
+    /// account the key's string heap.
+    #[test]
+    fn endpoint_ref_resident_hint_counts_string_key_heap() {
+        let long_key = "urn:business-key:".to_string() + &"abcdefghij".repeat(25); // ~270 bytes
+        let ep = EndpointRef {
+            label: 4,
+            key: 7,
+            value: Value::Str(long_key.clone()),
+            edge_seq: 42,
+            which: 1,
+        };
+        assert_eq!(ep.size_hint(), 24, "size_hint stays the encoded estimate");
+        assert!(
+            ep.resident_hint() >= std::mem::size_of::<EndpointRef>() + long_key.len(),
+            "resident_hint {} must cover the {}-byte key heap on top of the struct",
+            ep.resident_hint(),
+            long_key.len(),
+        );
+        // A short-key endpoint owns no meaningful heap: resident ≈ struct footprint.
+        let short = EndpointRef {
+            label: 0,
+            key: 0,
+            value: Value::Int(1),
+            edge_seq: 0,
+            which: 0,
+        };
+        assert_eq!(short.resident_hint(), std::mem::size_of::<EndpointRef>());
     }
 }
