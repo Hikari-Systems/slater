@@ -579,7 +579,11 @@ impl Graphs {
         // L0 segment there would be dropped by `retire`, losing its writes — Phase
         // 4d-ii). The guard releases the claim on every exit path (RAII).
         if !writer.begin_consolidation() {
-            bail!("a consolidation for '{name}' is already in progress");
+            return Err(ConsolidationInProgress {
+                op: "consolidation",
+                graph: name.to_string(),
+            }
+            .into());
         }
         let _consolidation_guard = ConsolidationGuard(writer.clone());
         let core = self
@@ -701,7 +705,11 @@ impl Graphs {
         // A flush and a consolidation both mutate the set/stack — share the exclusive claim
         // (and suppress auto flush/compaction over the freeze→retire window). RAII release.
         if !writer.begin_consolidation() {
-            bail!("a consolidation or flush for '{name}' is already in progress");
+            return Err(ConsolidationInProgress {
+                op: "consolidation or flush",
+                graph: name.to_string(),
+            }
+            .into());
         }
         let _guard = ConsolidationGuard(writer.clone());
 
@@ -899,7 +907,11 @@ impl Graphs {
             .writer(name)
             .ok_or_else(|| anyhow!("graph '{name}' has no writable layer to compact"))?;
         if !writer.begin_consolidation() {
-            bail!("a consolidation or flush for '{name}' is already in progress");
+            return Err(ConsolidationInProgress {
+                op: "consolidation or flush",
+                graph: name.to_string(),
+            }
+            .into());
         }
         let _guard = ConsolidationGuard(writer.clone());
 
@@ -1127,7 +1139,11 @@ impl Graphs {
         let _guard = match self.writer(name) {
             Some(w) => {
                 if !w.begin_consolidation() {
-                    bail!("a consolidation or flush for '{name}' is already in progress");
+                    return Err(ConsolidationInProgress {
+                        op: "consolidation or flush",
+                        graph: name.to_string(),
+                    }
+                    .into());
                 }
                 Some(ConsolidationGuard(w))
             }
@@ -5154,12 +5170,24 @@ fn window_permits(
     }
 }
 
+/// A flush / compaction / consolidation found the exclusive per-graph consolidation
+/// claim already held by another in-flight operation. Benign — the other op is doing
+/// the work — so the segment-tier auto-triggers log it at debug, not warn. Typed so the
+/// classifier branches on the error *type* rather than matching its message text.
+#[derive(Debug, thiserror::Error)]
+#[error("a {op} for '{graph}' is already in progress")]
+struct ConsolidationInProgress {
+    /// The operation phrase, so the rendered message reads naturally at each site
+    /// ("consolidation" vs "consolidation or flush").
+    op: &'static str,
+    graph: String,
+}
+
 /// Whether an error is a lost `begin_consolidation` single-flight race — a flush or a
-/// compaction that found another flush/consolidation already holding the exclusive claim
-/// (`bail!("… is already in progress")`). Benign: the other op is doing the work, so the
-/// segment-tier auto-triggers log this at debug rather than warn.
+/// compaction that found another flush/consolidation already holding the exclusive
+/// claim. Branches on the typed [`ConsolidationInProgress`] cause.
 fn is_already_in_progress(e: &anyhow::Error) -> bool {
-    format!("{e:#}").contains("already in progress")
+    e.downcast_ref::<ConsolidationInProgress>().is_some()
 }
 
 /// Fire a background consolidation for `graph`, detached from the write that triggered
@@ -6002,6 +6030,35 @@ mod tests {
         assert_eq!(d.in_flight(), 1);
         d.on_query_err(&anyhow::anyhow!("boom"));
         assert_eq!(d.in_flight(), 0);
+
+        // A task-join failure must also decrement with diagnostics OFF, otherwise the
+        // gauge (whose increment is unconditional) leaks upward forever.
+        d.on_query_start();
+        assert_eq!(d.in_flight(), 1);
+        d.on_query_task_failed();
+        assert_eq!(d.in_flight(), 0);
+    }
+
+    #[test]
+    fn is_already_in_progress_matches_only_the_typed_cause() {
+        let typed = anyhow::Error::new(ConsolidationInProgress {
+            op: "consolidation",
+            graph: "people".into(),
+        });
+        assert!(is_already_in_progress(&typed));
+        // Display text is preserved (the downstream Failure-message path relies on it).
+        assert_eq!(
+            typed.to_string(),
+            "a consolidation for 'people' is already in progress"
+        );
+        // A *different* error that merely happens to contain the words must NOT match —
+        // the old substring test produced exactly this false positive.
+        assert!(!is_already_in_progress(&anyhow::anyhow!(
+            "some other job already in progress elsewhere"
+        )));
+        assert!(!is_already_in_progress(&anyhow::anyhow!(
+            "unrelated failure"
+        )));
     }
 
     #[test]
