@@ -59,9 +59,310 @@ pub struct VamanaGraph {
     pub medoid: VamanaIndex,
 }
 
+// ── The construction seams ─────────────────────────────────────────────────────
+//
+// The two construction primitives (`greedy_search_over`, `robust_prune_over`) need
+// exactly two things from the world: the **distance between two stored points**, and
+// a **node's out-neighbours**. Neither ever looks at a raw vector, and neither cares
+// where the data lives. Cutting the seam there is what lets one definition serve all
+// three arms:
+//
+//   * the offline slab build (here)          — points in RAM, adjacency in RAM
+//   * the in-memory RW index (FreshDiskANN)  — points in RAM, adjacency in RAM
+//   * the on-disk StreamingMerge             — points and adjacency read through a
+//                                              block cache, with a dirty overlay
+//
+// The disk arm cannot materialise its adjacency (91.6M × R=32 × 4 B ≈ 11.7 GB), which
+// is why the adjacency is a trait and not a `&[Vec<u32>]`.
+
+/// The distance between two *stored* points, in the space the graph is built in
+/// (squared-L2 over already-normalised vectors, for a cosine index — D29).
+///
+/// `dist` returns `Result` because a disk-backed implementation does IO.
+pub trait PointSet {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Distance from point `a` to point `b`.
+    fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64>;
+}
+
+/// The offline build's point set: a resident slab of vectors.
+pub struct SlabPoints<'a>(pub &'a [Vec<f32>]);
+
+impl PointSet for SlabPoints<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
+        Ok(sq_l2(&self.0[a as usize], &self.0[b as usize]))
+    }
+}
+
+/// Read a node's out-neighbours.
+///
+/// Fills a **caller-owned buffer** rather than returning a `Vec` or a `Cow`: the build
+/// expands O(n·L) nodes, so allocating per expansion would be a real regression at
+/// 91.6M — and this is a refactor that must not change performance any more than it
+/// changes output. The slab impl allocates nothing in steady state (the buffer is
+/// reused); a disk impl decodes straight into it. It also sidesteps the `Cow` lifetime
+/// that would otherwise fight the `&mut` borrow in [`insert_point`]'s back-link loop.
+pub trait AdjRead {
+    fn neighbours_into(&self, i: VamanaIndex, out: &mut Vec<VamanaIndex>) -> Result<()>;
+}
+
+/// Replace a node's out-neighbours. Split from [`AdjRead`] so a search can take a
+/// shared borrow of the graph while an insert takes an exclusive one.
+pub trait AdjWrite: AdjRead {
+    fn set_neighbours(&mut self, i: VamanaIndex, nbrs: Vec<VamanaIndex>) -> Result<()>;
+}
+
+impl AdjRead for Vec<Vec<VamanaIndex>> {
+    fn neighbours_into(&self, i: VamanaIndex, out: &mut Vec<VamanaIndex>) -> Result<()> {
+        out.clear();
+        out.extend_from_slice(&self[i as usize]);
+        Ok(())
+    }
+}
+
+impl AdjWrite for Vec<Vec<VamanaIndex>> {
+    fn set_neighbours(&mut self, i: VamanaIndex, nbrs: Vec<VamanaIndex>) -> Result<()> {
+        self[i as usize] = nbrs;
+        Ok(())
+    }
+}
+
+/// The "already expanded" set for one greedy search.
+///
+/// Two shapes, because the two arms have opposite cost profiles:
+/// - [`Expanded::Stamps`] — a generation-stamped array. O(n) memory, but **O(1) to
+///   clear** (bump the generation), so the offline build allocates it *once* for the
+///   whole build instead of reallocating an n-sized array per node — which was O(n²)
+///   allocation before it was fixed.
+/// - [`Expanded::Set`] — grows with the work done, not the index size. The disk arm
+///   must not allocate a 366 MB stamp array per search over a 91.6M-record index.
+///   (This is the same trade-off [`beam_search`] already makes for itself.)
+pub enum Expanded<'a> {
+    Stamps { buf: &'a mut [u32], gen: u32 },
+    Set(HashSet<VamanaIndex>),
+}
+
+impl Expanded<'_> {
+    pub fn seen(&self, i: VamanaIndex) -> bool {
+        match self {
+            Expanded::Stamps { buf, gen } => buf[i as usize] == *gen,
+            Expanded::Set(s) => s.contains(&i),
+        }
+    }
+
+    pub fn mark(&mut self, i: VamanaIndex) {
+        match self {
+            Expanded::Stamps { buf, gen } => buf[i as usize] = *gen,
+            Expanded::Set(s) => {
+                s.insert(i);
+            }
+        }
+    }
+
+    /// Begin a fresh search. O(1) for the stamped arm, O(visited) for the set.
+    ///
+    /// Called by [`greedy_search_over`] itself, so a caller cannot forget it. That is
+    /// deliberate: the stamped arm starts at `gen = 0` over a **zeroed** buffer, so
+    /// searching without a `begin` would read *every* node as already-expanded, expand
+    /// nothing, and hand robust-prune an empty candidate pool — a silently degraded
+    /// graph with no error and no panic. The scratch is purely an allocation-reuse
+    /// vehicle; making it own its own reset removes the landmine.
+    fn begin(&mut self) {
+        match self {
+            Expanded::Stamps { buf, gen } => {
+                *gen = gen.wrapping_add(1);
+                // On wrap, `gen` collides with the zeroed buffer and every node reads
+                // as seen. Not hypothetical: the RW index runs one search per vector
+                // insert for the lifetime of the process, so a long-lived writer
+                // reaches 2^32 searches in weeks. Re-zero and skip 0.
+                if *gen == 0 {
+                    buf.fill(0);
+                    *gen = 1;
+                }
+            }
+            Expanded::Set(s) => s.clear(),
+        }
+    }
+}
+
+/// Greedy search over the *current* graph from `start` towards point `p`. Returns every
+/// node it expanded — the candidate pool for pruning.
+///
+/// Generic (not `dyn`) so the offline build keeps static dispatch in its hot loop.
+pub fn greedy_search_over<A, P>(
+    start: VamanaIndex,
+    p: VamanaIndex,
+    adj: &A,
+    points: &P,
+    l_size: usize,
+    expanded: &mut Expanded,
+) -> Result<Vec<VamanaIndex>>
+where
+    A: AdjRead + ?Sized,
+    P: PointSet + ?Sized,
+{
+    // Own the reset rather than trusting the caller to have done it — see `begin`.
+    expanded.begin();
+    let mut beam: Vec<(f64, VamanaIndex)> = vec![(points.dist(start, p)?, start)];
+    let mut visited = Vec::new();
+    let mut nbrs: Vec<VamanaIndex> = Vec::new();
+    while let Some((_, cur)) = beam
+        .iter()
+        .copied()
+        .filter(|(_, i)| !expanded.seen(*i))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+    {
+        expanded.mark(cur);
+        visited.push(cur);
+        adj.neighbours_into(cur, &mut nbrs)?;
+        for &nb in &nbrs {
+            if !beam.iter().any(|(_, i)| *i == nb) {
+                beam.push((points.dist(nb, p)?, nb));
+            }
+        }
+        // A *stable* sort: swapping this for `sort_unstable_by` would reorder ties and
+        // silently change which nodes survive the truncate — i.e. change the output.
+        beam.sort_by(|a, b| a.0.total_cmp(&b.0));
+        beam.truncate(l_size);
+    }
+    Ok(visited)
+}
+
+/// Vamana robust prune: from `candidates`, pick up to `r` out-neighbours for `p`,
+/// greedily taking the closest and discarding any candidate `c` that the chosen `p*`
+/// "dominates" (`alpha · d(p*, c) ≤ d(p, c)`).
+pub fn robust_prune_over<P>(
+    p: VamanaIndex,
+    candidates: &[VamanaIndex],
+    alpha: f32,
+    r: usize,
+    points: &P,
+) -> Result<Vec<VamanaIndex>>
+where
+    P: PointSet + ?Sized,
+{
+    let alpha = alpha as f64;
+    let mut pool: Vec<(f64, VamanaIndex)> = Vec::with_capacity(candidates.len());
+    for &c in candidates {
+        if c == p {
+            continue;
+        }
+        pool.push((points.dist(c, p)?, c));
+    }
+    pool.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut out: Vec<VamanaIndex> = Vec::with_capacity(r);
+    while let Some((_, pstar)) = pool.first().copied() {
+        out.push(pstar);
+        if out.len() >= r {
+            break;
+        }
+        // Drop pstar and everything it dominates. Rebuilt rather than `retain`ed
+        // because the domination test now does IO and `?` cannot cross a closure — the
+        // rebuild preserves relative order exactly as `retain` did, which matters: the
+        // pool stays distance-sorted and `pool.first()` is the next `p*`.
+        let mut next = Vec::with_capacity(pool.len());
+        for &(d_pc, c) in &pool {
+            if c == pstar {
+                continue;
+            }
+            let d_star_c = points.dist(pstar, c)?;
+            if alpha * d_star_c > d_pc {
+                next.push((d_pc, c));
+            }
+        }
+        pool = next;
+    }
+    Ok(out)
+}
+
+/// The scalar shape of one insertion: where to enter, how hard to search, how far to
+/// prune. Bundled (like [`BeamParams`]) so [`insert_point`]'s signature stays legible.
+#[derive(Debug, Clone, Copy)]
+pub struct InsertParams {
+    /// Entry point for the greedy search.
+    pub medoid: VamanaIndex,
+    /// Robust-prune long-edge factor.
+    pub alpha: f32,
+    /// Out-degree bound.
+    pub r: usize,
+    /// Search-list size during construction — wider than `r` for better candidates.
+    pub l_build: usize,
+}
+
+/// One Vamana insertion: greedy-search from the medoid, robust-prune the visited set
+/// into `p`'s out-neighbours, then make those edges symmetric — re-pruning any
+/// neighbour whose degree overflows `r`.
+///
+/// The single definition shared by the offline build, the in-memory RW index and the
+/// on-disk StreamingMerge.
+pub fn insert_point<G, P>(
+    p: VamanaIndex,
+    graph: &mut G,
+    points: &P,
+    params: InsertParams,
+    expanded: &mut Expanded,
+) -> Result<()>
+where
+    G: AdjWrite + ?Sized,
+    P: PointSet + ?Sized,
+{
+    let InsertParams {
+        medoid,
+        alpha,
+        r,
+        l_build,
+    } = params;
+    let visited = greedy_search_over(medoid, p, &*graph, points, l_build, expanded)?;
+
+    // Candidate pool = everything the search touched, plus p's current neighbours,
+    // minus p itself.
+    let mut cands: Vec<VamanaIndex> = visited;
+    let mut cur: Vec<VamanaIndex> = Vec::new();
+    graph.neighbours_into(p, &mut cur)?;
+    cands.extend_from_slice(&cur);
+    cands.sort_unstable();
+    cands.dedup();
+    cands.retain(|&c| c != p);
+
+    let pruned = robust_prune_over(p, &cands, alpha, r, points)?;
+    graph.set_neighbours(p, pruned.clone())?;
+
+    // Make the new edges symmetric, re-pruning any neighbour that overflows.
+    let mut nbrs_j: Vec<VamanaIndex> = Vec::new();
+    for &j in &pruned {
+        graph.neighbours_into(j, &mut nbrs_j)?;
+        let mut changed = false;
+        if !nbrs_j.contains(&p) {
+            nbrs_j.push(p);
+            changed = true;
+        }
+        if nbrs_j.len() > r {
+            nbrs_j = robust_prune_over(j, &nbrs_j, alpha, r, points)?;
+            changed = true;
+        }
+        // Writing only when changed is equivalent to the original's unconditional
+        // in-place write, and saves the disk arm a pointless dirty-page mark.
+        if changed {
+            graph.set_neighbours(j, std::mem::take(&mut nbrs_j))?;
+        }
+    }
+    Ok(())
+}
+
 /// Build a single-layer Vamana graph over `vectors` (each `dim`-long, expected
 /// already L2-normalised for a cosine index — D29). `r` bounds out-degree; `alpha`
 /// is the robust-prune long-edge factor (1.2 is typical). Deterministic.
+///
+/// Output is an input to the generation content hash — see
+/// `build_vamana_adjacency_is_golden`. The LCG seed, the Fisher–Yates order, the
+/// candidate-pool sort/dedup and the beam's stable sort are all load-bearing.
 pub fn build_vamana(vectors: &[Vec<f32>], r: usize, alpha: f32) -> Result<VamanaGraph> {
     let n = vectors.len();
     if n == 0 {
@@ -98,49 +399,32 @@ pub fn build_vamana(vectors: &[Vec<f32>], r: usize, alpha: f32) -> Result<Vamana
 
     // Search-list size during construction — wider than R for better candidates.
     let l_build = (r * 2).max(64);
+    let points = SlabPoints(vectors);
 
-    // Reused generation-stamped scratch for `greedy_search_build`'s expanded set: one
-    // allocation for the whole build, "cleared" by bumping `search_gen` per search
-    // (O(1)) rather than reallocating an n-sized array per node (O(n²) allocation).
-    let mut expanded_stamp = vec![0u32; n];
-    let mut search_gen: u32 = 0;
+    // One stamp array for the whole build; `begin()` clears it in O(1).
+    let mut stamps = vec![0u32; n];
+    let mut expanded = Expanded::Stamps {
+        buf: &mut stamps,
+        gen: 0,
+    };
 
     // Two passes: alpha = 1 (short edges first), then the real alpha (long edges).
     for &pass_alpha in &[1.0f32, alpha.max(1.0)] {
         let order = random_permutation(n, &mut rng);
+        let params = InsertParams {
+            medoid: medoid as VamanaIndex,
+            alpha: pass_alpha,
+            r,
+            l_build,
+        };
         for &p in &order {
-            search_gen += 1;
-            let visited = greedy_search_build(
-                medoid,
-                p,
-                &adjacency,
-                vectors,
-                l_build,
-                &mut expanded_stamp,
-                search_gen,
-            );
-            // Candidate pool = everything the search touched, plus p's current
-            // neighbours, minus p itself.
-            let mut cands: Vec<u32> = visited;
-            cands.extend_from_slice(&adjacency[p]);
-            cands.sort_unstable();
-            cands.dedup();
-            cands.retain(|&c| c as usize != p);
-
-            let pruned = robust_prune(p, &cands, pass_alpha, r, vectors);
-            adjacency[p] = pruned.clone();
-
-            // Make the new edges symmetric, re-pruning any neighbour that overflows.
-            for &j in &pruned {
-                let j = j as usize;
-                if !adjacency[j].contains(&(p as u32)) {
-                    adjacency[j].push(p as u32);
-                }
-                if adjacency[j].len() > r {
-                    let cand_j = adjacency[j].clone();
-                    adjacency[j] = robust_prune(j, &cand_j, pass_alpha, r, vectors);
-                }
-            }
+            insert_point(
+                p as VamanaIndex,
+                &mut adjacency,
+                &points,
+                params,
+                &mut expanded,
+            )?;
         }
     }
 
@@ -177,82 +461,6 @@ fn random_permutation(n: usize, rng: &mut Lcg) -> Vec<usize> {
         order.swap(i, j);
     }
     order
-}
-
-/// Greedy search over the *current* graph from `start` towards point `p`, using
-/// exact squared-L2 over full vectors. Returns every node it expanded (the
-/// candidate pool for pruning).
-///
-/// `expanded_stamp` is a caller-owned scratch buffer of length `vectors.len()`,
-/// reused across every call: a node counts as expanded on this search iff its stamp
-/// equals `gen`. The caller bumps `gen` before each call, so "clearing" the visited
-/// marks is O(1) — without this the per-node build reallocated (and zeroed) an
-/// n-sized bool array on every one of its `n` calls, i.e. O(n²) allocation.
-fn greedy_search_build(
-    start: usize,
-    p: usize,
-    adjacency: &[Vec<u32>],
-    vectors: &[Vec<f32>],
-    l_size: usize,
-    expanded_stamp: &mut [u32],
-    gen: u32,
-) -> Vec<u32> {
-    let d = |x: usize| sq_l2(&vectors[x], &vectors[p]);
-    let mut beam: Vec<(f64, u32)> = vec![(d(start), start as u32)];
-    let mut visited = Vec::new();
-    while let Some((_, cur)) = beam
-        .iter()
-        .copied()
-        .filter(|(_, i)| expanded_stamp[*i as usize] != gen)
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-    {
-        expanded_stamp[cur as usize] = gen;
-        visited.push(cur);
-        for &nb in &adjacency[cur as usize] {
-            if !beam.iter().any(|(_, i)| *i == nb) {
-                beam.push((d(nb as usize), nb));
-            }
-        }
-        beam.sort_by(|a, b| a.0.total_cmp(&b.0));
-        beam.truncate(l_size);
-    }
-    visited
-}
-
-/// Vamana robust prune: from `candidates` (sorted by nothing in particular), pick
-/// up to `r` out-neighbours for `p`, greedily taking the closest and discarding any
-/// candidate `c` that the chosen `p*` "dominates" (`alpha · d(p*, c) ≤ d(p, c)`).
-fn robust_prune(
-    p: usize,
-    candidates: &[u32],
-    alpha: f32,
-    r: usize,
-    vectors: &[Vec<f32>],
-) -> Vec<u32> {
-    let alpha = alpha as f64;
-    let mut pool: Vec<(f64, u32)> = candidates
-        .iter()
-        .filter(|&&c| c as usize != p)
-        .map(|&c| (sq_l2(&vectors[c as usize], &vectors[p]), c))
-        .collect();
-    pool.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    let mut out: Vec<u32> = Vec::with_capacity(r);
-    while let Some((_, pstar)) = pool.first().copied() {
-        out.push(pstar);
-        if out.len() >= r {
-            break;
-        }
-        // Drop pstar and any candidate it dominates.
-        pool.retain(|&(d_pc, c)| {
-            if c == pstar {
-                return false;
-            }
-            let d_star_c = sq_l2(&vectors[pstar as usize], &vectors[c as usize]);
-            alpha * d_star_c > d_pc
-        });
-    }
-    out
 }
 
 /// A BFS order from the medoid — the locality layout. Nodes unreachable from the
@@ -587,6 +795,44 @@ mod tests {
         scored.into_iter().take(k).map(|(_, i)| i).collect()
     }
 
+    /// The build's adjacency, serialised in a canonical, order-sensitive form. Any
+    /// change to the neighbour *order* (not just the neighbour *set*) shows up here —
+    /// which is the point: the order is what the BFS layout and the on-disk bytes
+    /// depend on.
+    fn adjacency_digest(g: &VamanaGraph) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(&(g.medoid as u64).to_le_bytes());
+        h.update(&(g.adjacency.len() as u64).to_le_bytes());
+        for nbrs in &g.adjacency {
+            h.update(&(nbrs.len() as u64).to_le_bytes());
+            for &nb in nbrs {
+                h.update(&nb.to_le_bytes());
+            }
+        }
+        h.finalize().to_hex().to_string()
+    }
+
+    /// `build_vamana`'s output is an input to the generation content hash, so it must
+    /// be byte-stable across refactors. This pins it to a **recorded artefact** — the
+    /// digest was captured from the pre-`PointSet`-refactor implementation and must not
+    /// move. (A recorded constant is independently-derived truth; comparing two live
+    /// implementations against each other would not be — see CONTRIBUTING.)
+    ///
+    /// If this fails, something in the construction order changed: the LCG seed, the
+    /// Fisher–Yates permutation, the candidate-pool sort/dedup, the beam's *stable*
+    /// sort, or the robust-prune domination order. None of those are safe to change.
+    #[test]
+    fn build_vamana_adjacency_is_golden() {
+        let vectors = unit_vectors(16, 200);
+        let g = build_vamana(&vectors, 24, 1.2).unwrap();
+        assert_eq!(
+            adjacency_digest(&g),
+            "9b637d11308e6f76392b2b6792bf577c283ba4780cd24efc258c8ac47f3fef81",
+            "build_vamana adjacency changed — see the doc comment; this is not a test to \
+             re-baseline casually"
+        );
+    }
+
     #[test]
     fn build_produces_bounded_degree_and_reachable_graph() {
         let vectors = unit_vectors(16, 200);
@@ -610,10 +856,14 @@ mod tests {
 
     #[test]
     fn greedy_search_build_scratch_reuse_is_isolated_across_generations() {
-        // The build reuses one `expanded_stamp` buffer across every per-node search,
-        // bumping the generation instead of reallocating. A search run against a buffer
-        // already dirtied by a prior generation must return exactly what a pristine
-        // buffer would — the generation stamp isolates the reuse.
+        // The build reuses one stamp buffer across every per-node search, bumping the
+        // generation instead of reallocating. A search run against a buffer already
+        // dirtied by a prior generation must return exactly what a pristine buffer
+        // would — the generation stamp isolates the reuse.
+        //
+        // Truth here is hand-derived, not read off a second implementation. The graph
+        // is the path 0—1—2—3 with the points evenly spaced on a line, so a greedy walk
+        // from one end towards the other expands the nodes strictly in path order.
         let vectors = vec![
             vec![0.0f32, 0.0],
             vec![1.0, 0.0],
@@ -621,26 +871,84 @@ mod tests {
             vec![3.0, 0.0],
         ];
         let adjacency: Vec<Vec<u32>> = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let points = SlabPoints(&vectors);
         let n = vectors.len();
         let l = 8;
 
-        // Reference: a fresh (all-zero) buffer per call.
-        let mut fresh1 = vec![0u32; n];
-        let ref_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut fresh1, 1);
-        let mut fresh2 = vec![0u32; n];
-        let ref_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut fresh2, 1);
+        let forward: Vec<VamanaIndex> = vec![0, 1, 2, 3]; // walk 0 → 3
+        let backward: Vec<VamanaIndex> = vec![3, 2, 1, 0]; // walk 3 → 0
 
-        // Reused buffer with a bumped generation: the second call must not see the
-        // first call's stamps.
-        let mut shared = vec![0u32; n];
-        let shar_a = greedy_search_build(0, 3, &adjacency, &vectors, l, &mut shared, 1);
-        let shar_b = greedy_search_build(3, 0, &adjacency, &vectors, l, &mut shared, 2);
+        // A reused buffer across two searches. `greedy_search_over` resets the scratch
+        // itself, so a stale stamp from the first search must not leak into the second.
+        let mut stamps = vec![0u32; n];
+        let mut ex = Expanded::Stamps {
+            buf: &mut stamps,
+            gen: 0,
+        };
+        let a = greedy_search_over(0, 3, &adjacency, &points, l, &mut ex).unwrap();
+        let b = greedy_search_over(3, 0, &adjacency, &points, l, &mut ex).unwrap();
 
-        assert_eq!(shar_a, ref_a);
         assert_eq!(
-            shar_b, ref_b,
-            "a bumped generation must isolate the reused scratch buffer"
+            a, forward,
+            "the FIRST search over a zeroed stamp buffer must expand the whole path — \
+             if the generation still matched the zeroed buffer, every node would read as \
+             already-expanded and this would come back empty"
         );
+        assert_eq!(
+            b, backward,
+            "a bumped generation must isolate the reused scratch buffer — a stale stamp \
+             would make the second search skip already-'expanded' nodes"
+        );
+
+        // The `Set` arm (the disk arm's scratch, which grows with work done rather than
+        // with index size) must satisfy the same contract. Asserted against the same
+        // hand-derived truth, not against the `Stamps` arm.
+        let mut ex = Expanded::Set(HashSet::new());
+        let a = greedy_search_over(0, 3, &adjacency, &points, l, &mut ex).unwrap();
+        let b = greedy_search_over(3, 0, &adjacency, &points, l, &mut ex).unwrap();
+        assert_eq!(a, forward);
+        assert_eq!(b, backward, "Expanded::Set must reset per search");
+    }
+
+    /// The stamp generation is a `u32` bumped once per search, and the RW index runs one
+    /// search per vector insert for the whole life of the process — so a long-lived
+    /// writer really does reach 2^32 searches. On wrap, a naive `gen` returns to `0`,
+    /// which is exactly what a *zeroed* stamp buffer holds: every node would read as
+    /// already-expanded, the search would expand nothing, and robust-prune would be
+    /// handed an empty candidate pool. Silently degraded graph, no error, no panic.
+    ///
+    /// Drive the counter right up to the wrap and check the search still works.
+    #[test]
+    fn expanded_stamp_generation_survives_a_u32_wrap() {
+        let vectors = vec![
+            vec![0.0f32, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            vec![3.0, 0.0],
+        ];
+        let adjacency: Vec<Vec<u32>> = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let points = SlabPoints(&vectors);
+
+        // Park the generation one short of wrapping, and dirty the buffer with stamps
+        // that a naive wrap-to-zero would collide with.
+        let mut stamps = vec![0u32; vectors.len()];
+        let mut ex = Expanded::Stamps {
+            buf: &mut stamps,
+            gen: u32::MAX,
+        };
+
+        // This search wraps the generation. It must still expand the whole path.
+        let visited = greedy_search_over(0, 3, &adjacency, &points, 8, &mut ex).unwrap();
+        assert_eq!(
+            visited,
+            vec![0, 1, 2, 3],
+            "the search across the generation wrap expanded nothing — the wrapped \
+             generation collided with the zeroed stamp buffer"
+        );
+
+        // And the search *after* the wrap must still be isolated from it.
+        let visited = greedy_search_over(3, 0, &adjacency, &points, 8, &mut ex).unwrap();
+        assert_eq!(visited, vec![3, 2, 1, 0]);
     }
 
     #[test]
