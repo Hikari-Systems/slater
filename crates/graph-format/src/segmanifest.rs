@@ -71,6 +71,13 @@ pub struct DirtyIndex {
 pub struct DirtyVector {
     pub label: String,
     pub property: String,
+    /// The segment's **sealed, read-only Vamana index** for this `(label, property)`, when its
+    /// live embedded set crossed [`crate::segvamana::SEGMENT_INDEX_MIN_VECTORS`] at flush/merge
+    /// (T2/T3). `None` ⇒ the segment carries only the id sidecar ([`crate::segvectors`]) and a
+    /// KNN read brute-forces it. MAC-covered like every field: a forged `medoid`, or a forged
+    /// `Some`/`None`, would silently corrupt or hide a segment's search.
+    #[serde(default)]
+    pub graph: Option<crate::segvamana::SealedVamanaMeta>,
 }
 
 /// The `SEGMENT.json` manifest.
@@ -437,6 +444,7 @@ mod tests {
             m.dirty_vectors.push(DirtyVector {
                 label: "Person".into(),
                 property: "embedding".into(),
+                graph: None,
             })
         });
         check("file hash", &|m| m.files[0].blake3 = "zz".into());
