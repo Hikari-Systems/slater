@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::manifest::{AnnMode, Metric, VectorIndexDesc};
-use graph_format::pq::{normalise, train_codebooks, PqParams, PqWriter};
+use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqWriter};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::wire::{read_uvarint, write_uvarint};
@@ -359,19 +359,15 @@ pub(crate) fn write_vector_indexes(
     Ok((vector_indexes, vector_files))
 }
 
-/// Whether an above-threshold index can use the Vamana/PQ path. v1 supports the
-/// **cosine** metric only (the build normalises to unit vectors and navigates by
-/// squared-L2 — D29), and PQ needs `pq_subspaces` to divide the dimension. Anything
-/// else falls back to brute force, with a note on stderr.
+/// Whether an above-threshold index can use the Vamana/PQ path.
+///
+/// All three metrics are supported (v8): each is mapped into a space where squared-L2 —
+/// the only thing Vamana's robust prune is sound over — ranks the way the metric does. See
+/// `graph_format::pq::ann_point`. The one remaining gate is PQ's: `pq_subspaces` must
+/// divide the dimension. (It is the same gate for dot, whose ANN space is `dim + dim/m`
+/// over `m + 1` subspaces and so divides exactly when `dim` divides by `m`.) Anything else
+/// falls back to brute force, with a note on stderr.
 fn vamana_eligible(pi: &PendingIndex, opts: &BuildOptions) -> bool {
-    if pi.metric != Metric::Cosine {
-        eprintln!(
-            "note: vector index {}.{} is above the ANN threshold but its metric is not cosine; \
-             building brute-force (Vamana v1 is cosine-only)",
-            pi.label, pi.property
-        );
-        return false;
-    }
     if !pi.dim.is_multiple_of(opts.pq_subspaces) {
         eprintln!(
             "note: vector index {}.{} dim {} is not divisible by --pq-subspaces {}; \
@@ -398,11 +394,42 @@ fn build_vamana_index(
     opts: &BuildOptions,
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<(VectorIndexDesc, Vec<(String, u32)>)> {
-    // Normalise once; both the graph build and PQ training work in this space. The one
-    // definition of that space lives in `graph_format::pq` (D29) — see its invariant.
-    let normed: Vec<Vec<f32>> = entries.iter().map(|(_, v)| normalise(v)).collect();
+    // The ANN space: the transform under which squared-L2 — the only thing robust prune is
+    // sound over — ranks the way this index's metric does. Both the graph build and PQ
+    // training work in it, and the query path maps the query into the *same* space through
+    // `ann_query`. One definition, in `graph_format::pq` (the D29 invariant, generalised to
+    // all three metrics) — see its DESIGN note for why two arms must not disagree here.
+    //
+    // The **stored** vectors stay raw (below): the space is a navigation device, and the
+    // exact re-rank scores the raw vector with the true metric.
+    let params = ann_pq_params(pi.metric, pi.dim, opts.pq_subspaces, opts.pq_bits)?;
+    let space_dim = params.dim as usize;
+    // M = max‖x‖ over the indexed set — the dot/MIPS augmentation constant. Computed over
+    // *every* entry, which is what makes `M² − ‖x‖² ≥ 0` hold for all of them.
+    let max_norm = entries
+        .iter()
+        .map(|(_, v)| l2_norm(v))
+        .fold(0.0f64, f64::max);
+    // M is recorded in the MANIFEST as an f32, and a vector of large-but-legal f32
+    // components (1024 dimensions of 3e38) has a norm that overflows f32 to `+inf`. That
+    // is not merely a dot-index problem: `serde_json` serialises a non-finite float as
+    // `null`, so the manifest of *any* metric would fail to read back — the build would
+    // "succeed" and publish a generation the server cannot open. Refuse it here, where the
+    // message can say why.
+    if (max_norm as f32).is_infinite() {
+        bail!(
+            "vector index {}.{} has a maximum vector norm ({max_norm:e}) that overflows f32; \
+             its magnitudes are too large to index",
+            pi.label,
+            pi.property
+        );
+    }
+    let points: Vec<Vec<f32>> = entries
+        .iter()
+        .map(|(_, v)| ann_point(pi.metric, v, max_norm, space_dim))
+        .collect::<Result<_>>()?;
 
-    let graph = build_vamana(&normed, opts.vamana_r as usize, opts.vamana_alpha)
+    let graph = build_vamana(&points, opts.vamana_r as usize, opts.vamana_alpha)
         .with_context(|| format!("build Vamana graph for {}.{}", pi.label, pi.property))?;
     let order = bfs_order(&graph);
     // old (build) index → new (storage/layout) index.
@@ -425,13 +452,17 @@ fn build_vamana_index(
             .iter()
             .map(|&j| new_of[j as usize])
             .collect();
-        vw.append(entries[old as usize].0, &normed[old as usize], &nbrs)?;
+        // The **raw** vector, not the ANN-space point: magnitudes must survive a rebuild
+        // (a consolidation reads its vectors back out of here), and the exact re-rank
+        // scores the raw vector under the true metric. The record carries no node id —
+        // the `.pq` written below is the single layout→id map.
+        vw.append(&entries[old as usize].1, &nbrs)?;
     }
     vw.finish()?;
 
-    // `.pq`: trained codebooks + per-vector codes, same layout order.
-    let params = PqParams::new(pi.dim, opts.pq_subspaces, opts.pq_bits)?;
-    let codebook = train_codebooks(&normed, params, PQ_ITERS)
+    // `.pq`: trained codebooks + per-vector codes, same layout order — in the ANN space,
+    // which is what the resident beam navigates by.
+    let codebook = train_codebooks(&points, params, PQ_ITERS)
         .with_context(|| format!("train PQ codebooks for {}.{}", pi.label, pi.property))?;
     let pq_rel = format!("vector/{}.{}.pq", pi.label, pi.property);
     let mut pw = PqWriter::create_with_cipher(
@@ -442,7 +473,7 @@ fn build_vamana_index(
         cipher,
     )?;
     for &old in &order {
-        let codes = codebook.encode(&normed[old as usize])?;
+        let codes = codebook.encode(&points[old as usize])?;
         pw.append_codes(entries[old as usize].0, &codes)?;
     }
     pw.finish()?;
@@ -462,6 +493,9 @@ fn build_vamana_index(
             medoid: medoid_new as u64,
             pq_subspaces: opts.pq_subspaces,
             pq_bits: opts.pq_bits,
+            // A freshly built index has no holes: the builder only ever sees live vectors.
+            live_count: entries.len() as u64,
+            max_norm: max_norm as f32,
         },
     };
     Ok((

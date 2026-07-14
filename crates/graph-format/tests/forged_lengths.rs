@@ -122,17 +122,39 @@ fn vector_dim_product_cannot_wrap_past_the_length_check() {
 #[test]
 fn vamana_dim_and_degree_are_bounded_by_the_record() {
     // Neither the vector dim (4 bytes each) nor the neighbour count (≥1 byte each) was
-    // length-checked before its reservation.
+    // length-checked before its reservation. The v8 record dropped its leading `node_id`
+    // (it is now `dim ‖ vec ‖ degree ‖ adj`), so both forged lengths sit one field earlier
+    // — the guards had to move with them, and this is what proves they did.
     let mut rec = Vec::new();
-    uvarint(&mut rec, 1); // node_id
     uvarint(&mut rec, u64::MAX); // dim
     assert!(graph_format::vamana::decode_node(&rec).is_err());
 
     let mut rec = Vec::new();
-    uvarint(&mut rec, 1); // node_id
     uvarint(&mut rec, 0); // dim: no vector
     uvarint(&mut rec, u64::MAX); // degree
     assert!(graph_format::vamana::decode_node(&rec).is_err());
+
+    // A dim the record *nearly* honours is rejected too: 2 elements declared, only one
+    // element's bytes present. `capacity_for` clamps the reservation to what the remaining
+    // bytes could hold, and the short read then errors — it must not quietly truncate.
+    let mut rec = Vec::new();
+    uvarint(&mut rec, 2);
+    rec.extend_from_slice(&1.0f32.to_le_bytes());
+    assert!(graph_format::vamana::decode_node(&rec).is_err());
+
+    // An honest record in the new layout still round-trips.
+    let mut ok = Vec::new();
+    uvarint(&mut ok, 2); // dim
+    for v in [1.0f32, 2.0] {
+        ok.extend_from_slice(&v.to_le_bytes());
+    }
+    uvarint(&mut ok, 3); // degree
+    for nb in [7u64, 8, 9] {
+        uvarint(&mut ok, nb);
+    }
+    let got = graph_format::vamana::decode_node(&ok).unwrap();
+    assert_eq!(got.vector, vec![1.0, 2.0]);
+    assert_eq!(got.neighbours, vec![7, 8, 9]);
 }
 
 #[test]

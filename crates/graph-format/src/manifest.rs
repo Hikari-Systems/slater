@@ -37,11 +37,41 @@ pub enum AnnMode {
         /// the BFS permutation (D30). Since the BFS is seeded from the medoid it is
         /// always `0` in practice; it is kept explicit so a future layout that does
         /// not start at the medoid stays readable.
+        ///
+        /// # The invariant: **never orphan the medoid**
+        ///
+        /// Every beam search enters here and nowhere else. A *deleted* medoid is fine —
+        /// its `.pq` id becomes [`crate::pq::HOLE`], it is never emitted, and it stays a
+        /// navigational waypoint like any other hole. What must **never** happen is a
+        /// delete-splice removing the medoid's *out-edges*: that isolates the entry point,
+        /// every search then expands exactly one node and returns nothing useful, and
+        /// recall for the whole index silently goes to zero — no error, no panic. The
+        /// generation open path refuses an index whose medoid has no out-edges (with more
+        /// than one record) rather than serve it; a splice must skip the medoid, or
+        /// re-point `medoid` first.
         medoid: u64,
-        /// PQ subspace count.
+        /// PQ subspace count **as configured** (`--pq-subspaces`). The codebook's own
+        /// `subspaces` is this `+ 1` for a dot index, which carries an extra subspace for
+        /// the MIPS norm augmentation — see [`crate::pq::ann_pq_params`]. Read the
+        /// codebook, not this field, when you need the code width.
         pq_subspaces: u32,
         /// Bits per PQ subspace code.
         pq_bits: u32,
+        /// Records in the `.vamana`/`.pq` that are **not** holes — the emitted-eligible
+        /// count. `VectorIndexDesc::count` is the *record* count (holes included), which is
+        /// what bounds a layout ordinal; this is what a user-visible "how many vectors are
+        /// in this index" answer wants. Equal to `count` on a freshly built index.
+        live_count: u64,
+        /// The largest L2 norm over the indexed vectors — the `M` of the dot/MIPS norm
+        /// augmentation (`x' = [x, √(M² − ‖x‖²)]`, see [`crate::pq::ann_point`]).
+        ///
+        /// Recorded for **every** metric, but only read for [`Metric::Dot`]. It is here
+        /// because it is not recoverable later: a graph carried through a consolidation by
+        /// reference must augment any *newly inserted* point with the same `M` its existing
+        /// points were augmented with, and re-deriving `M` from the survivors would give a
+        /// different (smaller) constant and silently place the new point in a different
+        /// space from the rest of the graph.
+        max_norm: f32,
     },
 }
 
@@ -107,6 +137,12 @@ pub struct VectorIndexDesc {
     pub property: String,
     pub dim: u32,
     pub metric: Metric,
+    /// **Records** in the index — for a Vamana index that means holes included, because a
+    /// layout ordinal is a record position and the adjacency is expressed in ordinals. It
+    /// is therefore the bound a neighbour ordinal is checked against; using the live count
+    /// there would reject perfectly valid neighbours (a hole is a legal, navigable
+    /// neighbour) and quietly cut recall. See [`AnnMode::Vamana::live_count`] for the count
+    /// that *is* the number of live vectors.
     pub count: u64,
     /// Index of this index's first vector record in `vectors.f32.blk`. Its
     /// vectors occupy the contiguous global range `[firstRecord, firstRecord +
@@ -115,6 +151,32 @@ pub struct VectorIndexDesc {
     #[serde(default)]
     pub first_record: u64,
     pub mode: AnnMode,
+}
+
+impl VectorIndexDesc {
+    /// Vectors a query can actually be returned: [`Self::count`] minus the holes. A
+    /// brute-force index has no holes, so it is just the count.
+    pub fn live_count(&self) -> u64 {
+        match self.mode {
+            AnnMode::BruteForce => self.count,
+            // Clamped: a manifest is an untrusted on-disk document, and a forged
+            // `liveCount > count` must not underflow the ratio below.
+            AnnMode::Vamana { live_count, .. } => live_count.min(self.count),
+        }
+    }
+
+    /// The fraction of the index's records that are tombstoned holes, in `[0, 1]`.
+    ///
+    /// Holes are navigated but never emitted, so they cost IO and beam width without
+    /// returning anything — which is what makes this the rebuild trigger (and a `/health`
+    /// field): past some ratio the index should be rebuilt rather than accumulate. An empty
+    /// index is `0.0`, not `NaN`.
+    pub fn dead_ratio(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        (self.count - self.live_count()) as f64 / self.count as f64
+    }
 }
 
 /// At-rest encryption header — KDF parameters and salt only. The key itself is
@@ -362,9 +424,7 @@ impl Manifest {
         let path = dir.as_ref().join("MANIFEST.json");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let m: Manifest =
-            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        Ok(m)
+        parse_manifest(&text).with_context(|| format!("parse {}", path.display()))
     }
 
     /// Read and parse `MANIFEST.json` for the generation rooted at `base_key`
@@ -374,14 +434,87 @@ impl Manifest {
         let bytes = store
             .read_all(&key)
             .with_context(|| format!("read {key}"))?;
-        let m: Manifest = serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
-        Ok(m)
+        let text = std::str::from_utf8(&bytes).with_context(|| format!("parse {key}"))?;
+        parse_manifest(text).with_context(|| format!("parse {key}"))
     }
+}
+
+/// Parse a MANIFEST document, **checking its format version first**.
+///
+/// The `Manifest` struct is schema-locked to the *current* `FORMAT_VERSION`: every field
+/// added by a version bump is a required field. So a manifest from an older version does
+/// not fail with "wrong version" — it fails inside serde, on whichever field happens to be
+/// new, with a message naming a Rust struct field (`missing field 'live_count'`). The
+/// reader's actual version gate then never runs, because the parse died before it.
+///
+/// That is precisely backwards at the one moment it matters: a format bump is exactly when
+/// every existing generation on disk must be refused, and refused *legibly* — "rebuild
+/// required", not a serde field name. So read the version out first. It is the one field
+/// whose meaning is stable across versions, which is the entire point of having it.
+fn parse_manifest(text: &str) -> Result<Manifest> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct VersionProbe {
+        format_version: u32,
+    }
+    // A document too broken to yield even a version falls through to the full parse, whose
+    // error is the more useful one there.
+    if let Ok(p) = serde_json::from_str::<VersionProbe>(text) {
+        if p.format_version != crate::FORMAT_VERSION {
+            anyhow::bail!(
+                "MANIFEST is on-disk format version {}, but this build understands version {}. \
+                 Slater has no backwards compatibility: the generation must be rebuilt.",
+                p.format_version,
+                crate::FORMAT_VERSION
+            );
+        }
+    }
+    Ok(serde_json::from_str(text)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A format bump makes every *new* `AnnMode::Vamana` field a required field, so an
+    /// older manifest carrying a Vamana index does not fail with "wrong version" — it
+    /// fails inside serde on a field name (`missing field 'live_count'`), and the reader's
+    /// version gate never runs, because the parse died before reaching it. That is exactly
+    /// backwards at the one moment it matters: a bump is *when* every generation on disk
+    /// must be refused, and refused legibly.
+    ///
+    /// The input here is a real one: it is what a v7 generation with an ANN index looks
+    /// like on disk right now.
+    #[test]
+    fn an_older_manifest_is_refused_on_its_version_not_on_a_serde_field() {
+        let v7 = r#"{
+            "magic":"SLATER01","formatVersion":7,
+            "buildUuid":"00000000-0000-0000-0000-000000000001","graph":"docs",
+            "createdUnix":1700000000,"contentHash":"abc","blockSizes":{},
+            "codec":"zstd","zstdLevel":3,"compressionProfile":"",
+            "nodeCount":10,"edgeCount":0,
+            "labels":["Doc"],"reltypes":[],"propertyKeys":["embedding"],
+            "rangeIndexes":[],
+            "vectorIndexes":[{"label":"Doc","property":"embedding","dim":8,
+              "metric":"cosine","count":10,"firstRecord":0,
+              "mode":{"kind":"vamana","r":24,"alpha":1.2,"medoid":0,
+                      "pq_subspaces":8,"pq_bits":8}}],
+            "reltypeSourceCounts":[],"reltypeTargetCounts":[],"reltypeEdgeCounts":[],
+            "reltypeSelfLoopCounts":[],"labelNodeCounts":[],"firstLabelCounts":[],
+            "srcLabelReltypeCounts":[],"reltypeTgtLabelCounts":[],
+            "schemaTripleCounts":[],"propertyHistograms":[],"files":[]
+        }"#;
+        let err = parse_manifest(v7).unwrap_err().to_string();
+        assert!(
+            err.contains("format version 7") && err.contains("rebuilt"),
+            "an old manifest must be refused on its version, with a rebuild instruction. \
+             Got: {err}"
+        );
+        assert!(
+            !err.contains("missing field"),
+            "the operator must not be shown a serde field name. Got: {err}"
+        );
+    }
 
     fn sample() -> Manifest {
         let files = vec![FileEntry {

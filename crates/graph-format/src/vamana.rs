@@ -11,13 +11,15 @@
 //!
 //! Three things live here, in build → store → search order:
 //! 1. [`build_vamana`] — construct the adjacency + pick the medoid (pure, in-memory,
-//!    offline-only). Operates on **normalised** vectors with squared-L2 (monotonic
-//!    in cosine on unit vectors — D29), so it is metric-agnostic given the caller
-//!    normalised for cosine.
+//!    offline-only). Operates on squared-L2 over points **already mapped into the
+//!    metric's ANN space** by [`crate::pq::ann_point`] (unit vectors for cosine; raw
+//!    for L2; norm-augmented for dot/MIPS — see there). It is therefore metric-agnostic:
+//!    robust-prune's domination test needs a true metric, and every arm hands it one.
 //! 2. [`bfs_order`] + [`VamanaWriter`]/[`VamanaReader`] — the on-disk block file
-//!    `[node_id ‖ full vec ‖ adjacency]`, laid out by BFS-from-medoid for locality
-//!    so a walk touches few distinct blocks. Goes through the same `blockfile` seam
-//!    as every other store (zstd + the M6 AEAD for free — D28).
+//!    `[full raw vec ‖ adjacency]`, laid out by BFS-from-medoid for locality so a walk
+//!    touches few distinct blocks. Goes through the same `blockfile` seam as every
+//!    other store (zstd + the M6 AEAD for free — D28). It carries **no node id**: the
+//!    `.pq` file is the single layout→id map (see [`VamanaNode`], [`crate::pq::HOLE`]).
 //! 3. [`beam_search`] — the generic greedy beam walk. It is parameterised over a
 //!    resident PQ *estimate* (navigation, no IO) and a block-reading *fetch* (full
 //!    vector + neighbours), with an *exact* re-rank closure, so the **same** search
@@ -356,9 +358,12 @@ where
     Ok(())
 }
 
-/// Build a single-layer Vamana graph over `vectors` (each `dim`-long, expected
-/// already L2-normalised for a cosine index — D29). `r` bounds out-degree; `alpha`
-/// is the robust-prune long-edge factor (1.2 is typical). Deterministic.
+/// Build a single-layer Vamana graph over `vectors` — each already mapped into the
+/// metric's ANN space by [`crate::pq::ann_point`], because the build measures **squared-L2**
+/// and robust-prune's domination test is only sound over a true metric. (Cosine ⇒ unit
+/// vectors, D29; L2 ⇒ raw; dot ⇒ norm-augmented, since inner product has no triangle
+/// inequality.) `r` bounds out-degree; `alpha` is the robust-prune long-edge factor (1.2 is
+/// typical). Deterministic.
 ///
 /// Output is an input to the generation content hash — see
 /// `build_vamana_adjacency_is_golden`. The LCG seed, the Fisher–Yates order, the
@@ -492,11 +497,19 @@ pub fn bfs_order(graph: &VamanaGraph) -> Vec<VamanaIndex> {
 
 // ── `.vamana` block-file store ─────────────────────────────────────────────────
 
-/// One decoded Vamana node: its dense graph node id, full vector, and out-neighbour
-/// indices (in vamana-index space).
+/// One decoded Vamana node: its full vector and out-neighbour indices (in vamana-index
+/// space).
+///
+/// **No node id** (v8). The record used to carry one, and *nothing on the query path ever
+/// read it* — `exec.rs` emits `ResidentPq::node_ids[i]` from the small `.pq` file, which is
+/// the only layout→id map anyone consults. Two copies of the map existed and the ~370 GB
+/// file held the one nobody used. Dropping it makes the `.vamana` **pure geometry**: a
+/// consolidation permutes every dense id (`compact_id`, then the LDG cluster pass), and a
+/// file that mentions no dense id at all is unaffected by that — it can be carried by
+/// reference instead of rebuilt. That is the whole point of the change; do not put an id
+/// back in here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VamanaNode {
-    pub node_id: u64,
     pub vector: Vec<f32>,
     pub neighbours: Vec<VamanaIndex>,
 }
@@ -528,14 +541,17 @@ impl VamanaWriter {
     }
 
     /// Append one node; returns its vamana index (= append position).
-    pub fn append(
-        &mut self,
-        node_id: u64,
-        vector: &[f32],
-        neighbours: &[VamanaIndex],
-    ) -> Result<VamanaIndex> {
+    ///
+    /// The **raw** vector, not a normalised one (v8): the graph and the PQ codebook are
+    /// built in a metric-dependent transformed space (see [`crate::pq::ann_point`]), but the
+    /// record stores what the user wrote, so magnitudes survive a rebuild and the exact
+    /// re-rank can score dot/L2 as well as cosine.
+    ///
+    /// The record carries no node id — the caller's `.pq` file is the single layout→id map
+    /// (see [`VamanaNode`]). The two files must be appended in lockstep: `.vamana` record `i`
+    /// and `.pq` code record `i` are the same vector.
+    pub fn append(&mut self, vector: &[f32], neighbours: &[VamanaIndex]) -> Result<VamanaIndex> {
         let mut rec = Vec::with_capacity(16 + vector.len() * 4 + neighbours.len() * 4);
-        write_uvarint(&mut rec, node_id);
         write_uvarint(&mut rec, vector.len() as u64);
         for x in vector {
             rec.write_f32::<LittleEndian>(*x)?;
@@ -604,12 +620,11 @@ impl VamanaReader {
     }
 }
 
-/// Decode a Vamana record (`uvarint(node_id) ‖ uvarint(dim) ‖ dim×f32 ‖
-/// uvarint(degree) ‖ degree×uvarint(index)`). Public so a cached-block reader can
-/// decode a record sliced out of a block it already holds decompressed.
+/// Decode a Vamana record (`uvarint(dim) ‖ dim×f32 ‖ uvarint(degree) ‖
+/// degree×uvarint(index)`). Public so a cached-block reader can decode a record sliced
+/// out of a block it already holds decompressed.
 pub fn decode_node(rec: &[u8]) -> Result<VamanaNode> {
     let mut r = rec;
-    let node_id = read_uvarint(&mut r)?;
     let dim = read_uvarint(&mut r)? as usize;
     // `dim` and `degree` are untrusted on-disk uvarints. A vector element is 4 bytes and a
     // neighbour ≥1, so reserve only what the record's remaining bytes could hold: a forged
@@ -623,11 +638,7 @@ pub fn decode_node(rec: &[u8]) -> Result<VamanaNode> {
     for _ in 0..degree {
         neighbours.push(read_uvarint(&mut r)? as u32);
     }
-    Ok(VamanaNode {
-        node_id,
-        vector,
-        neighbours,
-    })
+    Ok(VamanaNode { vector, neighbours })
 }
 
 // ── Generic beam search ─────────────────────────────────────────────────────────
@@ -938,7 +949,11 @@ mod tests {
     }
 
     #[test]
-    fn vamana_store_roundtrips_nodes_and_adjacency() {
+    fn vamana_store_roundtrips_geometry_and_the_pq_holds_the_ids() {
+        // v8: the `.vamana` record is pure geometry — vector + adjacency, no node id. The
+        // layout→id map lives once, in the `.pq`. This pins both halves of that split:
+        // the geometry round-trips through the `.vamana`, and the id comes back from the
+        // `.pq` written in the same layout order.
         let vectors = unit_vectors(8, 40);
         let g = build_vamana(&vectors, 8, 1.2).unwrap();
         let order = bfs_order(&g);
@@ -947,25 +962,85 @@ mod tests {
         for (new_idx, &old) in order.iter().enumerate() {
             new_of[old as usize] = new_idx as u32;
         }
+        // A stand-in for dense node ids that is *not* the layout order, so a test that
+        // accidentally recovered the layout index instead of the id would fail.
+        let node_id_of = |old: u32| 1000 + old as u64;
 
         let path = std::env::temp_dir().join(format!("slater_vam_{}_{}", std::process::id(), "rt"));
+        let pq_path =
+            std::env::temp_dir().join(format!("slater_vampq_{}_{}", std::process::id(), "rt"));
         let mut w = VamanaWriter::create_with_cipher(&path, 4096, 3, None).unwrap();
+        let params = PqParams::new(8, 2, 4).unwrap();
+        let cb = train_codebooks(&vectors, params, 10).unwrap();
+        let mut pw = crate::pq::PqWriter::create_with_cipher(&pq_path, &cb, 4096, 3, None).unwrap();
         for &old in &order {
             let nbrs: Vec<u32> = g.adjacency[old as usize]
                 .iter()
                 .map(|&j| new_of[j as usize])
                 .collect();
-            w.append(old as u64, &vectors[old as usize], &nbrs).unwrap();
+            w.append(&vectors[old as usize], &nbrs).unwrap();
+            pw.append_codes(node_id_of(old), &cb.encode(&vectors[old as usize]).unwrap())
+                .unwrap();
         }
         w.finish().unwrap();
+        pw.finish().unwrap();
 
         let r = VamanaReader::open_with_cipher(&path, None).unwrap();
+        let resident = crate::pq::PqReader::open_with_cipher(&pq_path, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
         assert_eq!(r.len(), 40);
-        // Node at storage index 0 is the medoid (BFS root); its node_id is the old
-        // medoid index and its neighbours are remapped.
+        assert_eq!(resident.len(), 40);
+        // Storage index 0 is the medoid (the BFS root). Its geometry comes from the
+        // `.vamana`; its dense node id comes from the `.pq`, and from nowhere else.
         let n0 = r.node(0).unwrap();
-        assert_eq!(n0.node_id, g.medoid as u64);
         assert_eq!(n0.vector, vectors[g.medoid as usize]);
+        assert!(!n0.neighbours.is_empty());
+        assert_eq!(resident.node_ids[0], node_id_of(g.medoid));
+        // Every record's id round-trips, and none is a hole.
+        for (new_idx, &old) in order.iter().enumerate() {
+            assert_eq!(resident.node_ids[new_idx], node_id_of(old));
+            assert!(!resident.is_hole(new_idx));
+        }
+        assert_eq!(resident.live_count(), 40);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&pq_path);
+    }
+
+    /// The hole sentinel, at the layer that owns it. A `HOLE` id is not a node id: it must
+    /// never be mistaken for one, and it must not disturb the codes beside it.
+    #[test]
+    fn pq_hole_sentinel_marks_a_record_dead_without_touching_its_codes() {
+        let vectors = unit_vectors(8, 12);
+        let params = PqParams::new(8, 2, 4).unwrap();
+        let cb = train_codebooks(&vectors, params, 10).unwrap();
+        let path = std::env::temp_dir().join(format!("slater_pqhole_{}", std::process::id()));
+        let mut pw = crate::pq::PqWriter::create_with_cipher(&path, &cb, 4096, 3, None).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            // Records 3 and 7 are holes; the rest carry ids.
+            let id = if i == 3 || i == 7 {
+                crate::pq::HOLE
+            } else {
+                i as u64
+            };
+            pw.append_codes(id, &cb.encode(v).unwrap()).unwrap();
+        }
+        pw.finish().unwrap();
+
+        let resident = crate::pq::PqReader::open_with_cipher(&path, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        assert_eq!(resident.len(), 12, "a hole is still a record");
+        assert_eq!(resident.live_count(), 10);
+        for i in 0..12 {
+            assert_eq!(resident.is_hole(i), i == 3 || i == 7);
+        }
+        // A hole's codes are intact — that is what keeps it navigable: the beam still
+        // estimates a distance for it and still expands it.
+        assert_eq!(resident.codes_of(3), cb.encode(&vectors[3]).unwrap());
+        assert!(!resident.is_hole(999), "out of range is not a hole");
         let _ = std::fs::remove_file(&path);
     }
 

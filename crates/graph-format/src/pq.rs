@@ -38,6 +38,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
+use crate::manifest::Metric;
 use crate::wire::{capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint};
 
 /// PQ structural parameters, recorded so the store is self-describing.
@@ -185,6 +186,125 @@ pub fn normalise_into(v: &[f32], out: &mut Vec<f32>) {
         return;
     }
     out.extend(v.iter().map(|&x| (x as f64 / norm) as f32));
+}
+
+// ── The ANN space: one transform, shared by the builder and the query path ─────
+//
+// DESIGN (v8): the Vamana graph is built with **squared-L2** and navigated by a PQ
+// estimate of the same, because robust-prune's domination test (`alpha·d(p*,c) ≤ d(p,c)`)
+// is only sound over a true metric. Not every index metric *is* one, so each is first
+// mapped into a space where squared-L2 ranks the way the metric does. The three
+// transforms live here, in **one** definition, for exactly the reason `normalise` does:
+// the builder transforms the stored points and the query path transforms the query, and
+// two arms that disagree about the space navigate by a quantity that is not the one they
+// rank by — a quietly degraded recall with no error and no panic.
+//
+// The exact re-rank is untouched by all of this: it scores the **raw** stored vector
+// against the **raw** query with the true metric (`slater::vector::distance`). The ANN
+// space is a navigation device only.
+
+/// Map a **stored** vector into the ANN space for `metric` — the space its PQ codes are
+/// trained/encoded in and its Vamana edges are chosen in.
+///
+/// * **Cosine** — L2-normalise (D29). Squared-L2 on unit vectors is `2 − 2·cos`, monotone
+///   in cosine distance.
+/// * **L2** — identity. Squared-L2 *is* the metric.
+/// * **Dot / MIPS** — the trap. Inner product is not a metric (no triangle inequality), so
+///   robust-prune over raw dot is unsound and the PQ estimate of `‖q − x‖²` is not even
+///   monotone in `⟨q, x⟩` (it carries a `‖x‖²` term that varies per candidate). The
+///   standard fix is the **norm augmentation**: store `x' = [x, √(M² − ‖x‖²), 0…]` with
+///   `M = max‖x‖` over the indexed set, and query with `q' = [q, 0, 0…]`. Then
+///   `‖q' − x'‖² = ‖q‖² + M² − 2⟨q, x⟩`, which is a per-query **constant minus twice the
+///   true dot** — so nearest-neighbour in L2 on `x'` is exactly maximum inner product on
+///   `x`, and every Vamana/PQ primitive is reused unchanged over a genuine metric.
+///
+/// `space_dim` must be [`ann_pq_params`]'s `dim` for the same `(metric, dim, subspaces)`.
+///
+/// `max_norm` is only read for [`Metric::Dot`]. `M² − ‖x‖²` is `≥ 0` in exact arithmetic
+/// (M is the maximum), but `M` round-trips through the manifest as an `f32` and can land a
+/// hair below the f64 norm of the argmax vector, so the difference is clamped at zero —
+/// which is that vector's true augmentation anyway. Without the clamp it is a `NaN`
+/// coordinate, and a `NaN` is *ordered*, not rejected, by `total_cmp`.
+pub fn ann_point(metric: Metric, v: &[f32], max_norm: f64, space_dim: usize) -> Result<Vec<f32>> {
+    match metric {
+        Metric::Cosine => Ok(normalise(v)),
+        Metric::L2 => Ok(v.to_vec()),
+        Metric::Dot => {
+            if space_dim <= v.len() {
+                bail!(
+                    "the dot/MIPS ANN space needs room for the norm augmentation: \
+                     space_dim {space_dim} must exceed dim {}",
+                    v.len()
+                );
+            }
+            // `M` must be finite. It is `max‖x‖` accumulated in f64 and stored as an f32,
+            // and a vector of large-but-perfectly-legal f32 components (1024 dimensions of
+            // 3e38, say) overflows f32 to `+inf`. Every augmentation would then be `inf`,
+            // every squared-L2 between two points `inf − inf` = **NaN** — and a NaN is
+            // *ordered* by `total_cmp`, not rejected, so the graph build would silently
+            // produce garbage. Refuse loudly instead.
+            if !max_norm.is_finite() {
+                bail!(
+                    "the dot/MIPS augmentation needs a finite max norm, got {max_norm}: the \
+                     indexed vectors' magnitudes overflow f32"
+                );
+            }
+            let mut out = v.to_vec();
+            out.resize(space_dim, 0.0);
+            let norm = l2_norm(v);
+            out[v.len()] = (max_norm * max_norm - norm * norm).max(0.0).sqrt() as f32;
+            Ok(out)
+        }
+    }
+}
+
+/// Map a **query** vector into the ANN space for `metric` — the counterpart of
+/// [`ann_point`], and the only transform the read path performs.
+///
+/// Note the asymmetry for [`Metric::Dot`]: the query's augmented coordinates are **zero**,
+/// not `√(M² − ‖q‖²)`. That is what makes the augmentation work (it kills the cross term),
+/// and it is why the read path never needs `M`.
+pub fn ann_query(metric: Metric, q: &[f32], space_dim: usize) -> Result<Vec<f32>> {
+    match metric {
+        Metric::Cosine => Ok(normalise(q)),
+        Metric::L2 => Ok(q.to_vec()),
+        Metric::Dot => {
+            if space_dim < q.len() {
+                bail!(
+                    "query dim {} exceeds the ANN space dim {space_dim}",
+                    q.len()
+                );
+            }
+            let mut out = q.to_vec();
+            out.resize(space_dim, 0.0);
+            Ok(out)
+        }
+    }
+}
+
+/// The PQ parameters for `metric`'s ANN space over `dim`-dimensional vectors, given the
+/// index's configured `subspaces`/`bits`. `subspaces` must divide `dim` (the same gate the
+/// builder already applies).
+///
+/// Cosine and L2 quantise the vector as-is, so the params are the caller's. Dot needs room
+/// for the norm augmentation, and a single extra *coordinate* would leave the dimension
+/// indivisible by `subspaces` for every realistic shape (`dim = 768, m = 8` ⇒ 769). So it
+/// gets one extra **subspace** instead: `dim + dsub` over `m + 1` subspaces, which leaves
+/// `dsub = dim/m` exactly as it was and needs no new divisibility rule. That last subspace
+/// holds `[√(M² − ‖x‖²), 0, …, 0]` — the augmentation alone, quantised against its own `k`
+/// centroids (effectively a 1-D codebook, so it is quantised finely), while the padding
+/// zeros are the same in every point and in the query and so contribute exactly 0 to the
+/// ADC.
+pub fn ann_pq_params(metric: Metric, dim: u32, subspaces: u32, bits: u32) -> Result<PqParams> {
+    match metric {
+        Metric::Cosine | Metric::L2 => PqParams::new(dim, subspaces, bits),
+        Metric::Dot => {
+            if subspaces == 0 || dim == 0 || !dim.is_multiple_of(subspaces) {
+                bail!("PQ subspaces ({subspaces}) must divide dim ({dim})");
+            }
+            PqParams::new(dim + dim / subspaces, subspaces + 1, bits)
+        }
+    }
 }
 
 /// Per-query ADC lookup table: `table[s*k + c]` is the squared-L2 distance from the
@@ -415,7 +535,9 @@ impl PqWriter {
         })
     }
 
-    /// Append one vector's codes (in vamana-index / layout order).
+    /// Append one vector's codes (in vamana-index / layout order). `node_id` is the dense
+    /// graph node this record maps to — or [`HOLE`] if the record is a tombstoned hole,
+    /// which is navigable but never emitted.
     pub fn append_codes(&mut self, node_id: u64, codes: &[u8]) -> Result<()> {
         if codes.len() != self.m {
             bail!("expected {} codes, got {}", self.m, codes.len());
@@ -432,9 +554,28 @@ impl PqWriter {
     }
 }
 
+/// The tombstone sentinel in a `.pq` node-id column: `node_ids[i] == HOLE` ⇒ layout
+/// ordinal `i` is a **hole** — a record whose vector is deleted.
+///
+/// A hole is *never emitted* from a search but is *still navigated through*: it keeps its
+/// out-edges and stays a waypoint, which is precisely the `emit → None` contract
+/// `vamana::beam_search` already implements. Dropping it from the walk instead would
+/// disconnect whatever lies behind it and silently cost recall on the **live** nodes.
+///
+/// Why holes and never compaction: a layout ordinal *is* a record position, and every
+/// adjacency entry in every record is an ordinal. Compacting one deleted record shifts
+/// every subsequent ordinal and invalidates the entire file — an O(N) rewrite of ~370 GB
+/// to reclaim a few per cent. Freed slots are instead reused by later inserts.
+///
+/// `u64::MAX` is safe as a sentinel because it is not a reachable dense node id: ids are
+/// assigned densely from 0 and the graph would need 2^64 nodes to reach it.
+pub const HOLE: u64 = u64::MAX;
+
 /// All of a PQ index's codes held **resident** — the navigation set for the beam
-/// search. `node_ids[i]` is the dense graph node for vamana index `i`, and its
-/// codes are `codes[i*m .. i*m+m]`.
+/// search — and, since v8, the **single** layout→id map for the index (the `.vamana`
+/// record no longer carries one). `node_ids[i]` is the dense graph node for vamana index
+/// `i`, or [`HOLE`] if that record is a tombstoned hole; its codes are
+/// `codes[i*m .. i*m+m]`.
 #[derive(Debug, Clone)]
 pub struct ResidentPq {
     pub codebook: Codebook,
@@ -449,13 +590,25 @@ impl ResidentPq {
         &self.codes[i * self.m..i * self.m + self.m]
     }
 
-    /// Number of indexed vectors.
+    /// Number of **records** — holes included. This is the bound on a valid layout
+    /// ordinal, so it (never [`Self::live_count`]) is what bounds-checks a neighbour id.
     pub fn len(&self) -> usize {
         self.node_ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.node_ids.is_empty()
+    }
+
+    /// Whether layout ordinal `i` is a tombstoned [`HOLE`]. Out-of-range ⇒ `false`: a
+    /// forged neighbour ordinal is rejected by the search's `num_nodes` bound, not here.
+    pub fn is_hole(&self, i: usize) -> bool {
+        self.node_ids.get(i).copied() == Some(HOLE)
+    }
+
+    /// Number of records that are **not** holes — the emitted-eligible count.
+    pub fn live_count(&self) -> usize {
+        self.node_ids.iter().filter(|&&id| id != HOLE).count()
     }
 
     /// Approximate resident footprint in bytes (codes + node-id table + codebook).
@@ -653,6 +806,221 @@ mod tests {
         assert_eq!(l2_norm(&[3.0, 4.0]), 5.0);
         assert_eq!(l2_norm(&[0.0, 0.0]), 0.0);
         assert!((l2_norm(&[1.0, 2.0, 3.0]) - 14.0f64.sqrt()).abs() < 1e-12);
+    }
+
+    // ── The ANN space ────────────────────────────────────────────────────────────
+
+    /// Dot's ANN space adds one **subspace** (not one coordinate): a single extra
+    /// coordinate would leave `dim + 1` indivisible by `subspaces` for every realistic
+    /// shape, and the index would fall back to brute force. `dsub` must come out unchanged.
+    #[test]
+    fn ann_pq_params_adds_one_subspace_for_dot_and_keeps_dsub() {
+        // The realistic shape: 768-dim embeddings, 8 subspaces. `dim + 1 = 769` is prime.
+        assert!(
+            !769u32.is_multiple_of(8),
+            "premise: a bare +1 would not divide"
+        );
+        let p = ann_pq_params(Metric::Dot, 768, 8, 8).unwrap();
+        assert_eq!((p.dim, p.subspaces, p.dsub), (768 + 96, 9, 96));
+        // Cosine and L2 quantise the vector as-is.
+        for m in [Metric::Cosine, Metric::L2] {
+            let p = ann_pq_params(m, 768, 8, 8).unwrap();
+            assert_eq!((p.dim, p.subspaces, p.dsub), (768, 8, 96));
+        }
+        // The divisibility gate is the same one for all three.
+        assert!(ann_pq_params(Metric::Dot, 10, 3, 8).is_err());
+    }
+
+    /// **The one place a subtle maths error hides behind plausible-looking recall.**
+    ///
+    /// The MIPS→L2 norm augmentation claims that ranking by squared-L2 in the augmented
+    /// space *is* ranking by the true inner product, reversed. If it is only *correlated*
+    /// with it, recall against a dot-product ground truth still looks respectable and
+    /// nothing anywhere errors — the index just quietly returns the wrong neighbours.
+    ///
+    /// So check the claim itself, not a recall proxy. Two assertions, both against
+    /// hand-derived truth:
+    ///  1. the identity `‖q′ − x′‖² = ‖q‖² + M² − 2⟨q, x⟩` — the augmented distance is a
+    ///     per-query **constant minus twice the true dot**, so the `‖x‖²` term that makes
+    ///     plain L2 useless for MIPS is exactly cancelled;
+    ///  2. therefore, for every pair `(x, y)`, `augL2(x) < augL2(y)` **iff**
+    ///     `⟨q,x⟩ > ⟨q,y⟩`. Exhaustive over every pair of a random set, with vectors of
+    ///     deliberately *unequal* norms — the case where a scale-invariant (cosine-shaped)
+    ///     mistake would rank correctly by direction and wrongly by magnitude.
+    #[test]
+    fn dot_augmentation_ranks_by_the_true_inner_product() {
+        let dim = 12;
+        let n = 60;
+        let mut rng = Lcg(0x5111_a7e1_d070_0001);
+        // Wildly varying magnitudes: |v| spans ~0.1 to ~10. If the transform were secretly
+        // ranking by direction alone, these are what expose it.
+        let raw: Vec<Vec<f32>> = (0..n)
+            .map(|_| {
+                let scale = 0.1 + 10.0 * rng.next_f64();
+                (0..dim)
+                    .map(|_| ((rng.next_f64() - 0.5) * scale) as f32)
+                    .collect()
+            })
+            .collect();
+        let max_norm = raw.iter().map(|v| l2_norm(v)).fold(0.0f64, f64::max);
+        let params = ann_pq_params(Metric::Dot, dim as u32, 4, 8).unwrap();
+        let space_dim = params.dim as usize;
+
+        let dot = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| *x as f64 * *y as f64)
+                .sum::<f64>()
+        };
+
+        let points: Vec<Vec<f32>> = raw
+            .iter()
+            .map(|v| ann_point(Metric::Dot, v, max_norm, space_dim).unwrap())
+            .collect();
+
+        // Every augmented point is exactly M long — that is what the augmentation *is*
+        // (it lifts every point onto the sphere of radius M), and it is why the cross term
+        // vanishes. A NaN from an unclamped sqrt would fail here first.
+        for p in &points {
+            assert!(
+                (l2_norm(p) - max_norm).abs() < 1e-4,
+                "augmented norm {} != M {max_norm}",
+                l2_norm(p)
+            );
+        }
+
+        for qi in 0..8 {
+            let q = &raw[qi * 7 % n];
+            let qa = ann_query(Metric::Dot, q, space_dim).unwrap();
+            let qn2 = l2_norm(q).powi(2);
+
+            // (1) The identity.
+            for (x, xa) in raw.iter().zip(&points) {
+                let aug = sq_l2(&qa, xa);
+                let predicted = qn2 + max_norm * max_norm - 2.0 * dot(q, x);
+                assert!(
+                    (aug - predicted).abs() < 1e-3 * predicted.abs().max(1.0),
+                    "‖q'-x'‖² = {aug} but ‖q‖² + M² − 2⟨q,x⟩ = {predicted}"
+                );
+            }
+
+            // (2) The consequence: the augmented-L2 order IS the reversed true-dot order.
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let (di, dj) = (dot(q, &raw[i]), dot(q, &raw[j]));
+                    let (ai, aj) = (sq_l2(&qa, &points[i]), sq_l2(&qa, &points[j]));
+                    // Skip near-ties, where f32 storage noise can legitimately flip an
+                    // order the f64 truth calls a hair apart.
+                    if (di - dj).abs() < 1e-4 {
+                        continue;
+                    }
+                    assert_eq!(
+                        ai < aj,
+                        di > dj,
+                        "augmented L2 ranked {i} vs {j} the wrong way: augL2 {ai} vs {aj}, \
+                         true dot {di} vs {dj}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The query is augmented with **zeros**, not with `√(M² − ‖q‖²)`. That asymmetry is
+    /// the whole trick — it is what kills the cross term — and it is why the read path
+    /// never needs `M`. Augmenting the query like a point would reintroduce a
+    /// query-dependent term and break the ranking, so pin the shape.
+    #[test]
+    fn ann_query_pads_dot_with_zeros_and_leaves_the_others_alone() {
+        let params = ann_pq_params(Metric::Dot, 4, 2, 8).unwrap();
+        let space_dim = params.dim as usize; // 4 + 2 = 6
+        assert_eq!(space_dim, 6);
+        let q = ann_query(Metric::Dot, &[1.0, 2.0, 3.0, 4.0], space_dim).unwrap();
+        assert_eq!(q, vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+
+        // A *point* with the same coordinates gets the augmentation in slot `dim`, and
+        // zeros only in the padding.
+        let m = 10.0f64;
+        let p = ann_point(Metric::Dot, &[1.0, 2.0, 3.0, 4.0], m, space_dim).unwrap();
+        let norm2 = 1.0f64 + 4.0 + 9.0 + 16.0;
+        assert_eq!(p[..4], [1.0, 2.0, 3.0, 4.0]);
+        assert!((p[4] as f64 - (m * m - norm2).sqrt()).abs() < 1e-4);
+        assert_eq!(p[5], 0.0);
+
+        // Cosine normalises both sides; L2 is the identity on both.
+        assert_eq!(
+            ann_query(Metric::Cosine, &[3.0, 4.0], 2).unwrap(),
+            [0.6, 0.8]
+        );
+        assert_eq!(
+            ann_point(Metric::Cosine, &[3.0, 4.0], 5.0, 2).unwrap(),
+            [0.6, 0.8]
+        );
+        assert_eq!(ann_query(Metric::L2, &[3.0, 4.0], 2).unwrap(), [3.0, 4.0]);
+        assert_eq!(
+            ann_point(Metric::L2, &[3.0, 4.0], 5.0, 2).unwrap(),
+            [3.0, 4.0]
+        );
+    }
+
+    /// `M` round-trips through the MANIFEST as an `f32`, so for the argmax vector the
+    /// stored `M` can land a hair *below* its true f64 norm and `M² − ‖x‖²` goes negative.
+    /// Unclamped that is `sqrt(-ε)` = **NaN**, and a NaN coordinate is *ordered* by
+    /// `total_cmp`, not rejected — it would sink into the results as a plausible-looking
+    /// distance. The clamp yields 0.0, which is that vector's true augmentation anyway.
+    #[test]
+    fn dot_augmentation_clamps_the_argmax_vector_instead_of_producing_nan() {
+        let v = vec![0.1f32, 0.7, 0.3, 0.5];
+        let true_norm = l2_norm(&v);
+        // Exactly what the builder does: compute M in f64, store f32, read back f32.
+        let m_stored = (true_norm as f32) as f64;
+        assert!(
+            m_stored < true_norm,
+            "premise: this vector's f32 norm really does round below its f64 norm \
+             ({m_stored} vs {true_norm})"
+        );
+        let p = ann_point(Metric::Dot, &v, m_stored, 6).unwrap();
+        assert!(p.iter().all(|x| x.is_finite()), "got {p:?}");
+        assert_eq!(p[4], 0.0, "the argmax vector's augmentation is exactly 0");
+    }
+
+    /// An `M` that overflows f32 must be **refused**, not propagated. `M` is `max‖x‖` in
+    /// f64 but is stored as an f32, and a vector of large-but-legal f32 components
+    /// overflows it to `+inf` — after which every augmented point is `inf`, every pairwise
+    /// squared-L2 is `inf − inf` = **NaN**, and `total_cmp` *orders* NaNs rather than
+    /// rejecting them. The graph build would run to completion over garbage geometry and
+    /// report nothing wrong.
+    #[test]
+    fn dot_augmentation_refuses_a_max_norm_that_overflows_f32() {
+        // 1024 dimensions of 3e38 — every component a finite, legal f32.
+        let v = vec![3.0e38f32; 1024];
+        assert!(v.iter().all(|x| x.is_finite()), "premise: legal f32 input");
+        let m = l2_norm(&v);
+        assert!(
+            m.is_finite(),
+            "the f64 norm is fine — it is the f32 that is not"
+        );
+        assert!(
+            (m as f32).is_infinite(),
+            "premise: this norm really does overflow f32"
+        );
+
+        let err = ann_point(Metric::Dot, &v, m as f32 as f64, 1024 + 128).unwrap_err();
+        assert!(
+            err.to_string().contains("finite max norm"),
+            "expected a refusal, got: {err}"
+        );
+
+        // And the failure it prevents: an infinite M silently yields NaN geometry.
+        let bad = {
+            let mut out = v.clone();
+            out.resize(1024 + 128, 0.0);
+            out[1024] = (f64::INFINITY - m * m).max(0.0).sqrt() as f32;
+            out
+        };
+        assert!(
+            sq_l2(&bad, &bad).is_nan() || bad[1024].is_infinite(),
+            "premise: this is what an unguarded infinite M produces"
+        );
     }
 
     /// Deterministic synthetic clusters: `clusters` blobs of `per` points in

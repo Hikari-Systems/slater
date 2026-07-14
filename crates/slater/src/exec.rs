@@ -47,7 +47,7 @@ use crate::vector;
 use graph_format::ids::{EdgeId, NodeId, Value};
 use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
 use graph_format::postings::EndpointPostingIter;
-use graph_format::pq::{normalise, AdcTable};
+use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
 use graph_format::{columns, nodelabels, topology};
@@ -5745,13 +5745,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
             anyhow::anyhow!("Vamana index files for (:{label} {{{property}}}) are not open")
         })?;
         let resident = &index.pq;
+        // The **record** count, holes included — a hole is a legal, navigable neighbour, so
+        // this (never the live count) is what bounds-checks a neighbour ordinal. Using the
+        // live count here would reject valid ordinals and silently cut recall.
         let n = resident.len();
         if n == 0 || k == 0 {
             return Ok(Vec::new());
         }
 
-        // PQ navigates in the normalised space the codebook was trained in (D29).
-        let qn = normalise(query);
+        // PQ navigates in the ANN space the codebook was trained in — normalised for
+        // cosine (D29), raw for L2, norm-augmented for dot/MIPS. The *same* transform the
+        // builder applied to the stored points, from the one definition in `graph_format::pq`;
+        // an arm that disagreed here would navigate by a quantity it does not rank by.
+        let qn = graph_format::pq::ann_query(metric, query, resident.codebook.params.dim as usize)?;
         let adc = AdcTable::new(&resident.codebook, &qn)?;
 
         let gen_id = self.gen.uuid();
@@ -5771,16 +5777,26 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let node = vamana::decode_node(&rec)?;
                 Ok((node.vector, node.neighbours))
             },
-            // Exact re-rank uses the original query (cosine is scale-invariant, so
-            // the normalised stored vectors give the same distance).
+            // Exact re-rank: the **raw** query against the **raw** stored vector, under the
+            // true metric — the same `distance` the brute-force arm scores with, so the two
+            // arms' scores are on one scale and `merge_topk` interleaves them correctly. The
+            // ANN space above is navigation only; it never reaches a score.
             |v| vector::distance(metric, query, v) as f32,
-            // The layout index → dense node id mapping, and the liveness gate: a
-            // tombstoned node is still expanded (it stays a navigational waypoint)
-            // but is not emitted. Resolving the node id here also gives `beam_search`
-            // the key it needs to tie-break on node id (D26) rather than on the
-            // arbitrary BFS layout index.
+            // The layout index → dense node id mapping, and the two liveness gates: a dead
+            // node is still expanded (it stays a navigational waypoint) but is not emitted.
+            //
+            //  * `HOLE` — the record is tombstoned *in the index itself* (v8). The `.pq`
+            //    node-id column is the only layout→id map, so this is the whole
+            //    delete-in-the-base story.
+            //  * `live` — the node is tombstoned in the delta/stack above the base.
+            //
+            // Resolving the node id here also gives `beam_search` the key it needs to
+            // tie-break on node id (D26) rather than on the arbitrary BFS layout index.
             |i| {
                 let node_id = resident.node_ids[i as usize];
+                if node_id == graph_format::pq::HOLE {
+                    return Ok(None);
+                }
                 match live {
                     Some(f) if !f(node_id)? => Ok(None),
                     _ => Ok(Some(node_id)),
@@ -18517,6 +18533,171 @@ mod tests {
         assert!(
             blocks_total > 16,
             "test needs the store to span many blocks"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The hole contract (v8).** `.pq` `node_ids[i] == HOLE` ⇒ layout ordinal `i` is a
+    /// tombstoned record: **never emitted, still navigated through**.
+    ///
+    /// The two halves fail in opposite directions, and both are silent:
+    ///  * emit a hole ⇒ a deleted vector comes back as a live node;
+    ///  * *prune* a hole from the walk instead of just from the results ⇒ whatever lies
+    ///    behind it becomes unreachable and recall on the **live** nodes quietly drops.
+    ///
+    /// So this holes the **medoid** — the fixed entry point of every beam search — along
+    /// with the query's own nearest neighbours. If a hole were dropped from navigation, a
+    /// holed medoid would isolate the entry point and recall for the whole index would go
+    /// to **zero**, which is precisely the failure mode `AnnMode::Vamana::medoid` warns
+    /// about. Passing at ≥ 0.9 recall *over the live set* is therefore a direct assertion
+    /// that a hole is still a waypoint.
+    #[test]
+    fn vamana_hole_is_a_waypoint_but_never_emitted() {
+        let fix = testgen::VamanaFixture {
+            n: 2000,
+            dim: 32,
+            r: 24,
+            alpha: 1.2,
+            pq_subspaces: 8,
+            pq_bits: 8,
+            vector_block_size: 8192,
+        };
+        let k = 10;
+        let queries = 20;
+        // The queries this test will actually issue.
+        let query_of = |qi: usize, raw: &[Vec<f32>]| -> Vec<f32> {
+            let mut q = raw[(qi * 97) % fix.n].clone();
+            q[0] += 0.05;
+            q
+        };
+        let rank_by_distance = |q: &[f32], raw: &[Vec<f32>]| -> Vec<(f64, u64)> {
+            let mut v: Vec<(f64, u64)> = raw
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (1.0 - vector::cosine_similarity(q, x), i as u64))
+                .collect();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            v
+        };
+
+        // Pick the victims: the **true top-2 of every query the loop below issues**. That
+        // choice is load-bearing. Holing nodes that no query would have returned anyway
+        // makes the suppression assertion vacuous — it passes whether or not the sentinel
+        // is honoured, because the hole was never a top-k candidate in the first place.
+        // These are the two nodes each query *must* have surfaced, so a hole that leaks
+        // has nowhere to hide. (Deriving them needs the vectors, and the fixture only
+        // yields them once written — so build once, choose, rebuild with them holed.)
+        let (probe_root, _probe_graph, raw) = testgen::write_vamana("exec_vamana_hole_probe", &fix);
+        let victims: HashSet<u64> = (0..queries)
+            .flat_map(|qi| {
+                rank_by_distance(&query_of(qi, &raw), &raw)
+                    .into_iter()
+                    .take(2)
+                    .map(|(_, id)| id)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&probe_root);
+
+        // Rebuild with those, **and the medoid**, holed.
+        let holed_extra = victims.clone();
+        let (root, graph, raw2, medoid_node_id) =
+            testgen::write_vamana_holed("exec_vamana_hole", &fix, move |id, is_medoid| {
+                is_medoid || holed_extra.contains(&id)
+            });
+        assert_eq!(raw2, raw, "the fixture must be deterministic across builds");
+        let mut holed: HashSet<u64> = victims.clone();
+        holed.insert(medoid_node_id);
+
+        let gen = Generation::open(&root, &graph).unwrap();
+        let vi_desc = &gen.manifest().vector_indexes[0];
+        // `count` is the RECORD count — holes included. It is what bounds a neighbour
+        // ordinal, so it must not shrink when records are tombstoned.
+        assert_eq!(vi_desc.count, fix.n as u64);
+        assert_eq!(vi_desc.live_count(), (fix.n - holed.len()) as u64);
+        assert!((vi_desc.dead_ratio() - holed.len() as f64 / fix.n as f64).abs() < 1e-12);
+
+        let block_cache = BlockCache::new(1 << 20);
+        let (ord, pq_bytes) = {
+            let vi = gen.vamana_index("Doc", "embedding").unwrap();
+            (vi.ord, vi.pq.resident_bytes())
+        };
+        assert_eq!(
+            gen.vamana_index("Doc", "embedding")
+                .unwrap()
+                .pq
+                .live_count(),
+            fix.n - holed.len()
+        );
+        let vec_cache = VectorIndexCache::new(pq_bytes + 64 * 1024);
+        vec_cache.pin(
+            gen.uuid(),
+            ord,
+            gen.vamana_index("Doc", "embedding").unwrap().pq.clone(),
+        );
+
+        // Ground truth: brute force over the **live** set only. A hole is deleted, so the
+        // truth a correct index must reproduce is the truth without it.
+        let mut recall_sum = 0.0f64;
+        for qi in 0..queries {
+            let q = query_of(qi, &raw);
+            let ranked = rank_by_distance(&q, &raw);
+            // Premise check: this query really is dominated by holed nodes — its true
+            // nearest neighbour is one. Without this the emit assertion below proves
+            // nothing.
+            assert!(holed.contains(&ranked[0].1));
+            let truth_k: HashSet<u64> = ranked
+                .iter()
+                .filter(|(_, id)| !holed.contains(id))
+                .take(k)
+                .map(|(_, id)| *id)
+                .collect();
+
+            let mut params = HashMap::new();
+            params.insert(
+                "q".to_string(),
+                Val::List(q.iter().map(|x| Val::Float(*x as f64)).collect()),
+            );
+            let engine = Engine::new(&gen, &block_cache)
+                .with_vector_cache(&vec_cache, 96)
+                .with_params(params);
+            let ast = parser::parse(
+                "CALL db.idx.vector.queryNodes('Doc', 'embedding', 10, $q) \
+                 YIELD node, score RETURN id(node) AS id, score",
+            )
+            .unwrap();
+            let res = engine.run(&ast).unwrap();
+
+            let got: HashSet<u64> = res
+                .rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(n) => n as u64,
+                    _ => panic!("id(node) should be an integer"),
+                })
+                .collect();
+            // (a) A hole is never emitted — not the medoid, not the query's own nearest.
+            for id in &holed {
+                assert!(
+                    !got.contains(id),
+                    "holed node {id} was emitted (medoid = {medoid_node_id})"
+                );
+            }
+            // And the sentinel itself must never leak out as a node id.
+            assert!(!got.contains(&graph_format::pq::HOLE));
+
+            let found = truth_k.iter().filter(|id| got.contains(id)).count();
+            recall_sum += found as f64 / k as f64;
+        }
+        // (b) A hole is still a waypoint. The entry point of every search is holed; if
+        // holes were pruned from the walk rather than only from the results, this would be
+        // 0.0, not ≥ 0.9.
+        let recall = recall_sum / queries as f64;
+        assert!(
+            recall >= 0.9,
+            "recall@{k} over the live set was {recall:.3} with the medoid holed — a hole \
+             must stay navigable, not just unemitted"
         );
 
         let _ = std::fs::remove_dir_all(&root);
