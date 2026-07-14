@@ -22,7 +22,11 @@
 // navigating by PQ-estimated squared-L2 ranks candidates identically to cosine —
 // while the final re-rank still uses the *exact* cosine distance on the full
 // vectors. Training on normalised vectors keeps the codebooks in the same space the
-// estimate works in. Callers pass already-normalised vectors; this module does the
+// estimate works in. Callers pass already-normalised vectors, and they normalise
+// through [`normalise`] — this module owns the **single** definition of that space.
+// Every arm whose score reaches `slater`'s `vector::merge_topk` must go through it; two
+// arms that normalise differently score on different scales and the merge interleaves
+// them wrongly, with no error and no panic. Beyond that, this module does the
 // quantisation maths only.
 
 use std::io::Read;
@@ -125,6 +129,62 @@ pub(crate) fn sq_l2(a: &[f32], b: &[f32]) -> f64 {
         acc += d * d;
     }
     acc
+}
+
+/// The L2 norm `|v|`, accumulated in f64. The f64 accumulation is not incidental:
+/// see [`normalise`].
+pub fn l2_norm(v: &[f32]) -> f64 {
+    v.iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// L2-normalise `v` to unit length — **the one definition of the cosine space (D29)**.
+///
+/// # The invariant
+///
+/// Every arm that produces a score consumed by `slater`'s `vector::merge_topk` must
+/// normalise through *this* function. `merge_topk` folds the per-level neighbours of
+/// several independent arms (base Vamana/PQ, brute-force, resident matrix, and the
+/// FreshDiskANN RW index) into one global top-`k` by comparing their scores directly.
+/// Two arms that normalise even slightly differently — a different zero-norm guard, a
+/// different accumulation width — emit scores on subtly different scales, and the merge
+/// then interleaves them *wrongly with no error and no panic*. Do not re-introduce a
+/// local copy; that is precisely how this becomes a silent-wrong-answer bug.
+///
+/// # Zero norm
+///
+/// A zero vector has no direction, so it is returned **unchanged** (all-zero). That is
+/// what makes the downstream contract hold: its dot product with any unit vector is 0,
+/// hence cosine similarity 0 and cosine **distance 1** — the same value
+/// `slater`'s `cosine_similarity`/`score_fast` define for a zero-norm operand, i.e.
+/// maximally distant rather than `NaN`.
+///
+/// # Why the division is in f64
+///
+/// The obvious `let inv = (1.0 / norm) as f32; v.iter().map(|x| x * inv)` is *wrong* for
+/// a small-but-nonzero norm: for `|v| < ~1.2e-38` (f32 min-normal) the reciprocal
+/// overflows f32 to `+inf`, and every component becomes `inf`/`NaN`. A legal subnormal
+/// f32 embedding such as `[1e-44, 0.0, 0.0]` hits it, and a `NaN` row is *silently*
+/// mis-ordered in the top-`k` rather than rejected. Dividing in f64 and rounding once,
+/// at the end, is exact for the same input.
+pub fn normalise(v: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(v.len());
+    normalise_into(v, &mut out);
+    out
+}
+
+/// [`normalise`], **appended** to `out` rather than freshly allocated — for callers
+/// decoding many vectors into one contiguous row-major buffer (`ResidentMatrix`), which
+/// must not allocate per row. Identical semantics, zero-norm contract included.
+pub fn normalise_into(v: &[f32], out: &mut Vec<f32>) {
+    let norm = l2_norm(v);
+    if norm == 0.0 {
+        out.extend_from_slice(v);
+        return;
+    }
+    out.extend(v.iter().map(|&x| (x as f64 / norm) as f32));
 }
 
 /// Per-query ADC lookup table: `table[s*k + c]` is the squared-L2 distance from the
@@ -520,6 +580,80 @@ impl PqReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 3-4-5 triangle: `|(3,4)| = 5`, so the unit vector is exactly `(0.6, 0.8)`
+    /// — both are exactly representable in f32, so this is an equality, not an epsilon.
+    #[test]
+    fn normalise_matches_hand_computation() {
+        assert_eq!(normalise(&[3.0, 4.0]), vec![0.6, 0.8]);
+        assert_eq!(normalise(&[-3.0, 4.0]), vec![-0.6, 0.8]);
+        // Already unit → unchanged; scale-invariance: 10x the input, same output.
+        assert_eq!(normalise(&[0.0, 1.0]), vec![0.0, 1.0]);
+        assert_eq!(normalise(&[30.0, 40.0]), vec![0.6, 0.8]);
+    }
+
+    /// **The zero-norm contract** (the `slater` side of it is pinned in
+    /// `vector::zero_norm_vector_is_maximally_distant`): a zero vector has no
+    /// direction, so it is returned unchanged rather than becoming `NaN`. Its dot
+    /// product with any unit row is then 0 ⇒ cosine similarity 0 ⇒ **distance 1**.
+    #[test]
+    fn normalise_leaves_a_zero_vector_alone() {
+        let z = normalise(&[0.0, 0.0, 0.0]);
+        assert_eq!(z, vec![0.0, 0.0, 0.0]);
+        assert!(
+            z.iter().all(|x| x.is_finite()),
+            "a zero vector must not be NaN"
+        );
+        // The consequence the read path depends on: dot(zero, unit) == 0 ⇒ dist 1.
+        let unit = normalise(&[3.0, 4.0, 0.0]);
+        let dot: f32 = z.iter().zip(&unit).map(|(a, b)| a * b).sum();
+        assert_eq!(1.0 - dot, 1.0);
+        // -0.0 is still a zero norm (`sqrt(0.0) == 0.0`), so it must not divide either.
+        assert!(normalise(&[-0.0, 0.0]).iter().all(|x| x.is_finite()));
+    }
+
+    /// A **subnormal** norm must still normalise to a finite unit vector. The naive
+    /// `let inv = (1.0 / norm) as f32; x * inv` overflows f32 here (`1/1e-44 ≈ 1e44`
+    /// → `+inf`), turning every component into `inf`/`NaN` — which a top-k orders by
+    /// `total_cmp` and so *silently* mis-ranks rather than rejecting. The zero guard
+    /// does not catch it: the norm is small, not zero.
+    #[test]
+    fn normalise_survives_a_subnormal_norm() {
+        let tiny = 1e-44f32; // subnormal, but not zero
+        assert!(tiny > 0.0 && tiny.is_finite());
+        assert!(
+            ((1.0f64 / l2_norm(&[tiny, 0.0])) as f32).is_infinite(),
+            "premise: the f32 reciprocal of this norm really does overflow"
+        );
+
+        let u = normalise(&[tiny, 0.0]);
+        assert!(u.iter().all(|x| x.is_finite()), "got {u:?}");
+        assert_eq!(u, vec![1.0, 0.0]);
+
+        // And in the general (non-axis-aligned) case it is still unit length.
+        let u = normalise(&[3.0 * tiny, 4.0 * tiny]);
+        assert!(u.iter().all(|x| x.is_finite()), "got {u:?}");
+        assert!((l2_norm(&u) - 1.0).abs() < 1e-6, "|u| = {}", l2_norm(&u));
+    }
+
+    /// `normalise_into` appends (it is how `ResidentMatrix` fills one contiguous
+    /// row-major buffer without a per-row allocation) and never disturbs what is
+    /// already in the buffer.
+    #[test]
+    fn normalise_into_appends_without_clobbering() {
+        let mut buf = vec![7.0f32, 7.0];
+        normalise_into(&[3.0, 4.0], &mut buf);
+        normalise_into(&[0.0, 0.0], &mut buf);
+        assert_eq!(buf, vec![7.0, 7.0, 0.6, 0.8, 0.0, 0.0]);
+    }
+
+    /// `l2_norm` is the same f64 accumulation `normalise` divides by — hand-checked.
+    #[test]
+    fn l2_norm_matches_hand_computation() {
+        assert_eq!(l2_norm(&[3.0, 4.0]), 5.0);
+        assert_eq!(l2_norm(&[0.0, 0.0]), 0.0);
+        assert!((l2_norm(&[1.0, 2.0, 3.0]) - 14.0f64.sqrt()).abs() < 1e-12);
+    }
 
     /// Deterministic synthetic clusters: `clusters` blobs of `per` points in
     /// `dim` dimensions, each blob centred at a distinct corner, lightly jittered.

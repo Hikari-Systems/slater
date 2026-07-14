@@ -31,6 +31,7 @@ use rayon::prelude::*;
 use wide::f32x8;
 
 use graph_format::manifest::Metric;
+use graph_format::pq::{l2_norm, normalise, normalise_into};
 use graph_format::vectors::VectorEntry;
 
 /// A liveness predicate over dense node ids: `false` suppresses the node from the
@@ -203,10 +204,39 @@ fn score_fast(metric: Metric, query: &[f32], query_norm: f64, candidate: &[f32])
     match metric {
         Metric::Cosine => {
             let (dot, vn2) = dot_and_norm2(query, candidate);
-            // Zero-norm vector has no direction → similarity 0 → distance 1
-            // (mirrors [`cosine_similarity`]'s defined-as-0 behaviour).
-            if query_norm == 0.0 || vn2 == 0.0 {
-                return 1.0;
+            // The f32 kernel only carries the cosine contract inside f32's *range*.
+            // Outside it the reduction is not merely imprecise, it is wrong — and
+            // silently so:
+            //
+            //   * `v·v` **underflows to exactly 0.0** for a subnormal-norm candidate
+            //     (`[3e-44, 4e-44]` ⇒ `v·v = 2.4e-87` ⇒ `0.0f32`). The old `vn2 == 0.0`
+            //     guard then read that as "zero vector" and returned distance 1 —
+            //     maximally distant — for a candidate that is exactly *co-directional*
+            //     with the query (true distance 0).
+            //   * `v·v` **overflows to +inf** for a large candidate (`|v| > ~1.8e19`,
+            //     e.g. `[1e30, 0.0]`), making `sim = dot/inf = 0` ⇒ distance 1 again.
+            //   * a subnormal *query* underflows `dot` to 0, flattening every candidate
+            //     to distance 1 (the top-k degenerates to node-id order).
+            //
+            // None of these raise, and the resident-matrix arm — which normalises through
+            // `pq::normalise` in f64 and so gets these right — would score the same vector
+            // completely differently. Both arms feed [`merge_topk`], so the disagreement
+            // shows up as a level-dependent, unreproducibly wrong top-k (HIK-109).
+            //
+            // So: when the f32 reduction leaves its valid range, defer to the exact f64
+            // [`distance`] this function is documented to mirror. That is a cold path —
+            // real embeddings are normal f32s — *except* for one degenerate case that is
+            // entirely plausible: an embedding column of genuine zeros (unfilled). Those
+            // would take the f64 pass on every candidate, so answer a truly-zero operand
+            // with the old cheap early-out (an f32 compare scan that exits on the first
+            // non-zero, so a subnormal vector still reaches the exact path immediately).
+            // `cosine_similarity` defines a zero operand as similarity 0 ⇒ distance 1,
+            // so the two agree; this is a short-circuit, not a second contract.
+            if !vn2.is_normal() || !dot.is_finite() || query_norm < f32::MIN_POSITIVE as f64 {
+                if query_norm == 0.0 || candidate.iter().all(|x| *x == 0.0) {
+                    return 1.0;
+                }
+                return distance(Metric::Cosine, query, candidate);
             }
             let sim = dot as f64 / (query_norm * (vn2 as f64).sqrt());
             1.0 - sim
@@ -217,15 +247,12 @@ fn score_fast(metric: Metric, query: &[f32], query_norm: f64, candidate: &[f32])
 }
 
 /// `|query|` for the cosine path (f64 sum for stability; once per query). Returns
-/// `0.0` for the other metrics, which don't use it.
+/// `0.0` for the other metrics, which don't use it. The norm itself comes from
+/// [`graph_format::pq::l2_norm`] — the same accumulation the one [`normalise`] uses.
 #[inline]
 fn query_norm_for(metric: Metric, query: &[f32]) -> f64 {
     match metric {
-        Metric::Cosine => query
-            .iter()
-            .map(|x| (*x as f64) * (*x as f64))
-            .sum::<f64>()
-            .sqrt(),
+        Metric::Cosine => l2_norm(query),
         _ => 0.0,
     }
 }
@@ -469,18 +496,10 @@ impl ResidentMatrix {
             }
             node_ids.push(e.node_id);
             if metric == Metric::Cosine {
-                let norm = e
-                    .vector
-                    .iter()
-                    .map(|x| (*x as f64) * (*x as f64))
-                    .sum::<f64>()
-                    .sqrt();
-                if norm > 0.0 {
-                    let inv = (1.0 / norm) as f32;
-                    data.extend(e.vector.iter().map(|x| x * inv));
-                } else {
-                    data.extend_from_slice(&e.vector); // zero stays zero (sim 0 → dist 1)
-                }
+                // The one normalisation (D29) — appended straight into the contiguous
+                // buffer, so a row still costs no allocation. Zero stays zero (sim 0 →
+                // dist 1); see `pq::normalise` for the invariant.
+                normalise_into(&e.vector, &mut data);
             } else {
                 data.extend_from_slice(&e.vector);
             }
@@ -516,19 +535,14 @@ enum PreparedQuery<'a> {
 impl PreparedQuery<'_> {
     fn prepare(metric: Metric, query: &[f32]) -> PreparedQuery<'_> {
         match metric {
-            Metric::Cosine => {
-                let n = query
-                    .iter()
-                    .map(|x| (*x as f64) * (*x as f64))
-                    .sum::<f64>()
-                    .sqrt();
-                if n == 0.0 {
-                    PreparedQuery::CosineZero
-                } else {
-                    let inv = (1.0 / n) as f32;
-                    PreparedQuery::CosineUnit(query.iter().map(|x| x * inv).collect())
-                }
-            }
+            // The query is normalised by the *same* function as the matrix rows
+            // (`pq::normalise` — D29), so `1 - dot` is the cosine distance and the
+            // scores this arm feeds `merge_topk` are on the base arm's scale.
+            // `CosineZero` is a short-circuit, not a different answer: a zero query
+            // normalises to zero, whose dot with any row is 0, i.e. distance 1 — the
+            // same value the branch returns.
+            Metric::Cosine if l2_norm(query) == 0.0 => PreparedQuery::CosineZero,
+            Metric::Cosine => PreparedQuery::CosineUnit(normalise(query)),
             _ => PreparedQuery::Raw(query),
         }
     }
@@ -659,6 +673,119 @@ mod tests {
         )
         .unwrap();
         assert!((n[0].score - 1.0).abs() < 1e-12);
+    }
+
+    /// The **gathered** arm's f32 kernel must not mistake an out-of-f32-range operand
+    /// for a zero one. Truth, computed by hand: every candidate below is an exact
+    /// positive multiple of the query, so it is co-directional ⇒ cosine similarity 1
+    /// ⇒ **distance 0**. Scale-invariance is the whole point of cosine.
+    ///
+    /// Before the guard, `dot_and_norm2` accumulated `v·v` in f32, which underflows to
+    /// `0.0` for the subnormal row and overflows to `+inf` for the huge one; the old
+    /// `vn2 == 0.0` guard read the first as a zero vector and the second divided by
+    /// `inf` — both returning distance **1**, i.e. "maximally distant", for a vector
+    /// pointing exactly *at* the query. Silent: no error, no NaN, just a wrong rank.
+    #[test]
+    fn out_of_f32_range_candidates_are_not_mistaken_for_zero_vectors() {
+        let tiny = 1e-44f32; // subnormal: 3·tiny² and 4·tiny² underflow f32 to 0
+        assert!(tiny > 0.0 && tiny.is_finite() && !tiny.is_normal());
+        let huge = 1e30f32; // huge: huge² overflows f32 to +inf
+        assert!((huge * huge).is_infinite());
+
+        let query = [3.0f32, 4.0];
+        for (id, v) in [
+            (1u64, [3.0 * tiny, 4.0 * tiny]),
+            (2, [3.0 * huge, 4.0 * huge]),
+        ] {
+            let got = brute_force_knn(&[entry(id, &v)], &query, 1, Metric::Cosine, None).unwrap();
+            assert!(
+                got[0].score.abs() < 1e-6,
+                "{v:?} is co-directional with {query:?} ⇒ distance 0, got {}",
+                got[0].score
+            );
+        }
+
+        // A subnormal *query* must likewise still rank by direction, not flatten every
+        // candidate to distance 1: (3,4) is co-directional, (-3,-4) is opposite (⇒ 2).
+        let got = brute_force_knn(
+            &[entry(1, &[3.0, 4.0]), entry(2, &[-3.0, -4.0])],
+            &[3.0 * tiny, 4.0 * tiny],
+            2,
+            Metric::Cosine,
+            None,
+        )
+        .unwrap();
+        assert_eq!(got[0].node_id, 1, "got {got:?}");
+        assert!(got[0].score.abs() < 1e-6, "got {}", got[0].score);
+        assert!((got[1].score - 2.0).abs() < 1e-6, "got {}", got[1].score);
+    }
+
+    /// The same zero-norm contract on the **resident-matrix** arm, which normalises
+    /// its rows and its query up front (through the one `pq::normalise`) instead of
+    /// scoring raw vectors. Both directions must agree with the gathered arm above:
+    /// a zero-norm operand has no direction ⇒ similarity 0 ⇒ **distance exactly 1**.
+    /// This is the arm whose score is fed to [`merge_topk`] beside the base's, so a
+    /// zero handled as `NaN` here would be silently mis-ordered, not rejected.
+    #[test]
+    fn zero_norm_is_distance_one_on_the_resident_matrix_too() {
+        // Zero *row*, non-zero query.
+        let m = ResidentMatrix::from_entries(
+            2,
+            Metric::Cosine,
+            vec![entry(7, &[0.0, 0.0]), entry(8, &[3.0, 4.0])],
+        )
+        .unwrap();
+        assert!(m.data.iter().all(|x| x.is_finite()), "{:?}", m.data);
+        // The live row is normalised: (3,4)/5 = (0.6, 0.8), exactly.
+        assert_eq!(&m.data[2..4], &[0.6f32, 0.8]);
+
+        let got = brute_force_knn_matrix(&m, &[3.0, 4.0], 2, None).unwrap();
+        assert_eq!(got[0].node_id, 8);
+        assert!(
+            got[0].score.abs() < 1e-6,
+            "self is distance 0: {}",
+            got[0].score
+        );
+        assert_eq!(got[1].node_id, 7);
+        assert!(
+            (got[1].score - 1.0).abs() < 1e-12,
+            "zero row must be distance 1, got {}",
+            got[1].score
+        );
+
+        // Zero *query*, non-zero rows: every row is distance 1.
+        let got = brute_force_knn_matrix(&m, &[0.0, 0.0], 2, None).unwrap();
+        assert!(
+            got.iter().all(|n| (n.score - 1.0).abs() < 1e-12),
+            "a zero query must be distance 1 from everything, got {got:?}"
+        );
+    }
+
+    /// A **subnormal-norm** row is a real embedding (f32 subnormals are legal), and
+    /// must land in the matrix as a finite unit row. Normalising by an f32 reciprocal
+    /// would overflow (`1/1e-44` → `+inf`) and store `NaN`, which `TopK`'s `total_cmp`
+    /// sorts to the *end* — the row would silently vanish from the top-k rather than
+    /// being its own nearest neighbour. See `pq::normalise`.
+    #[test]
+    fn subnormal_norm_row_scores_as_a_unit_vector() {
+        let tiny = 1e-44f32;
+        let m = ResidentMatrix::from_entries(
+            2,
+            Metric::Cosine,
+            vec![entry(1, &[3.0 * tiny, 4.0 * tiny]), entry(2, &[-1.0, 0.0])],
+        )
+        .unwrap();
+        assert!(m.data.iter().all(|x| x.is_finite()), "{:?}", m.data);
+
+        // Cosine is scale-invariant, so the tiny row points exactly where (3,4) does:
+        // querying (3,4) must return it first, at distance ~0 — not NaN, not last.
+        let got = brute_force_knn_matrix(&m, &[3.0, 4.0], 2, None).unwrap();
+        assert_eq!(got[0].node_id, 1, "got {got:?}");
+        assert!(
+            got[0].score.abs() < 1e-6,
+            "distance ~0, got {}",
+            got[0].score
+        );
     }
 
     #[test]

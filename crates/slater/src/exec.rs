@@ -47,7 +47,7 @@ use crate::vector;
 use graph_format::ids::{EdgeId, NodeId, Value};
 use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
 use graph_format::postings::EndpointPostingIter;
-use graph_format::pq::AdcTable;
+use graph_format::pq::{normalise, AdcTable};
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
 use graph_format::{columns, nodelabels, topology};
@@ -9506,20 +9506,6 @@ fn three_valued(v: &Val) -> Option<bool> {
 /// Whether a value is definitely TRUE (the predicate-pass test).
 fn truthy(v: &Val) -> bool {
     matches!(v, Val::Bool(true))
-}
-
-/// L2-normalise a query vector to unit length (the cosine PQ space — D29). A zero
-/// vector is returned unchanged.
-fn normalise(v: &[f32]) -> Vec<f32> {
-    let norm: f64 = v
-        .iter()
-        .map(|&x| (x as f64) * (x as f64))
-        .sum::<f64>()
-        .sqrt();
-    if norm == 0.0 {
-        return v.to_vec();
-    }
-    v.iter().map(|&x| (x as f64 / norm) as f32).collect()
 }
 
 /// Executor-internal view of a GQL path restrictor (`Pattern.restrictor`), with the

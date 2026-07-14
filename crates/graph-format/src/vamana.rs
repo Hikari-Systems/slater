@@ -744,29 +744,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq::{train_codebooks, AdcTable, PqParams};
-
-    fn norm(v: &mut [f32]) {
-        let n: f64 = v
-            .iter()
-            .map(|&x| (x as f64) * (x as f64))
-            .sum::<f64>()
-            .sqrt();
-        if n > 0.0 {
-            for x in v.iter_mut() {
-                *x = (*x as f64 / n) as f32;
-            }
-        }
-    }
+    use crate::pq::{normalise, train_codebooks, AdcTable, PqParams};
 
     /// `n` unit vectors in `dim` dimensions, deterministic.
     fn unit_vectors(dim: usize, n: usize) -> Vec<Vec<f32>> {
         let mut rng = Lcg(0x1234_5678_9abc_def0);
         (0..n)
             .map(|_| {
-                let mut v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
-                norm(&mut v);
-                v
+                let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+                normalise(&v)
             })
             .collect()
     }
@@ -1005,7 +991,7 @@ mod tests {
             // Use a held-out-ish query: a stored vector perturbed slightly.
             let mut query = vectors[(q * 37) % n].clone();
             query[0] += 0.05;
-            norm(&mut query);
+            let query = normalise(&query);
 
             let adc = AdcTable::new(&cb, &query).unwrap();
             let hits = beam_search(
