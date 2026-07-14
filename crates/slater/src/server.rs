@@ -9361,6 +9361,87 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The flush must decide vector-index membership by the node's **effective label set** —
+    /// the same question the read fold asks — not by the label the write anchored on.
+    ///
+    /// They differ on a multi-label node whose business key lives on a label other than the
+    /// index's, which is an ordinary shape: key on `(:Keyed {name})`, vector index on
+    /// `(:Doc {embedding})`. Ask the anchor label and the segment's `vec.meta` sidecar names
+    /// nobody, so the fold's candidate set never sees the node — and since the sidecar is the
+    /// *only* channel that can express either fact (D12: the row cannot), two writes are
+    /// silently undone by a background job:
+    ///
+    /// * a **re-embed** reverts to the stale base vector at the flush;
+    /// * a **removal** resurfaces the vector the user deleted.
+    ///
+    /// Both are invisible until someone queries — no error, no panic, no log line.
+    #[test]
+    fn a_flush_keys_vector_membership_on_the_effective_labels_not_the_anchor() {
+        // Base: node 0 at 0.9, node 1 at 0.2, node 2 at 0.4. Every node is :Doc:Keyed.
+        let base: Vec<Vec<f32>> = [0.9, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("vec_levels_anchor", &base, "Keyed");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![1, 2, 0], "base order: 0.2, 0.4, 0.9");
+
+        // Re-embed node 0 at distance 0 — through the *Keyed* anchor, while the index is on Doc.
+        let v = at_distance(0.0);
+        let parts: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+        vwrite(
+            &graphs,
+            &graph,
+            &format!(
+                "MATCH (n:Keyed {{name:'d00'}}) SET n.embedding = vecf32([{}])",
+                parts.join(", ")
+            ),
+        );
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1, 2],
+            "the re-embed leads from the delta"
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the re-embed flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1, 2],
+            "…and must still lead once flushed — a write silently reverting to the stale base \
+             vector at a background flush is the worst kind of wrong"
+        );
+
+        // The removal half, through the same anchor.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Keyed {name:'d01'}) REMOVE n.embedding",
+        );
+        assert_eq!(ids(&graphs), vec![0, 2], "node 1 leaves the index");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the removal flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 2],
+            "…and must stay gone — the flush must carry the removal, or the deleted embedding \
+             resurfaces"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.

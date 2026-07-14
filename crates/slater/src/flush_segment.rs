@@ -520,7 +520,22 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     //
     // The embeddings themselves need no fragment — `Value::Vector` is a first-class wire
     // type, so a written vector is already in the node's row (see `segvectors`).
+    //
+    // Membership is decided by the node's **effective label set**, which is the same question
+    // the read fold asks (`exec::vector_levels`: "the index is scoped to a label, and a write
+    // can add one"). Asking the *identity* label instead — the label the write happened to
+    // anchor on — is a different question, and the two differ on a multi-label node whose
+    // business key lives on a label other than the index's: `MATCH (n:Keyed {name:'x'}) SET
+    // n.embedding = …` where the index is on `(:Doc {embedding})`. The embedding is then live
+    // in the delta and *silently reverts to the stale base vector at the flush* (the sidecar
+    // names nobody, so the fold's candidate set never sees it) — and a `REMOVE n.embedding`
+    // through the same anchor resurfaces the vector the user deleted. The row carries the
+    // vector either way; only the sidecar decides whether anyone looks.
     let vector_indexes = &inp.core.manifest().vector_indexes;
+    let effective_labels: BTreeMap<u64, &[String]> = seg_nodes
+        .iter()
+        .map(|n| (n.id, n.labels.as_slice()))
+        .collect();
     let mut vec_specs: Vec<VectorSpec> = Vec::new();
     for vi in vector_indexes {
         let mut spec = VectorSpec {
@@ -529,9 +544,15 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             ids: Vec::new(),
             removals: Vec::new(),
         };
-        for (dense, label, _key, _key_value, nd) in &data.nodes {
-            if label != &vi.label || nd.tombstoned {
+        for (dense, _label, _key, _key_value, nd) in &data.nodes {
+            if nd.tombstoned {
                 // A tombstoned node is suppressed by its tombstone, not by a vector removal.
+                continue;
+            }
+            let labelled = effective_labels
+                .get(dense)
+                .is_some_and(|ls| ls.iter().any(|l| l == &vi.label));
+            if !labelled {
                 continue;
             }
             if matches!(nd.patches.get(&vi.property), Some(Value::Vector(_))) {

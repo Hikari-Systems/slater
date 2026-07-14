@@ -354,12 +354,30 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
 /// test can drive real `MATCH (n:Doc {name:'d07'}) SET n.embedding = …` writes against it,
 /// flush them into core segments, and exercise the write ladder's levels for real.
 pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
+    write_vector_docs_keyed(tag, vectors, "Doc")
+}
+
+/// [`write_vector_docs`] with the business key on a **second label**: every node is
+/// `:Doc:<key_label>`, the `name` range index is declared on `(key_label, name)`, and the
+/// vector index is still on `(:Doc {embedding})`.
+///
+/// So a write anchors on `key_label` while the vector index is scoped to `Doc` — the one shape
+/// that tells apart "is this node in the index" asked of the node's *effective label set* (what
+/// the read fold asks) from the same question asked of the write's *anchor* label (what the
+/// segment flush asks). In a single-label graph the two coincide and every test passes either
+/// way.
+pub fn write_vector_docs_keyed(
+    tag: &str,
+    vectors: &[Vec<f32>],
+    key_label: &str,
+) -> (PathBuf, String) {
     assert!(!vectors.is_empty(), "a vector fixture needs vectors");
     let dim = vectors[0].len();
     assert!(
         vectors.iter().all(|v| v.len() == dim),
         "every fixture vector must have the index's dimension"
     );
+    let two_label = key_label != "Doc";
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0004);
     let graph = "docs".to_string();
     let root = std::env::temp_dir().join(format!("slater_vecdocs_{}_{tag}", std::process::id()));
@@ -367,6 +385,7 @@ pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
     std::fs::create_dir_all(dir.join("range")).unwrap();
 
     let name_of = |i: usize| format!("d{i:02}");
+    let isam_name = format!("node_{key_label}_name");
 
     // node_props.blk — the embedding is routed out to the vector store (D12), so the row holds
     // only the business key, exactly as the builder writes it.
@@ -374,7 +393,11 @@ pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
     let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
     for i in 0..vectors.len() {
         np.append(&[(0, Value::Str(name_of(i)))]).unwrap();
-        nl.append(&[0]).unwrap();
+        if two_label {
+            nl.append(&[0, 1]).unwrap();
+        } else {
+            nl.append(&[0]).unwrap();
+        }
     }
     np.finish().unwrap();
     nl.finish().unwrap();
@@ -401,7 +424,7 @@ pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
     vw.finish().unwrap();
 
     write_isam(
-        dir.join("range").join("node_Doc_name.isam"),
+        dir.join("range").join(format!("{isam_name}.isam")),
         (0..vectors.len())
             .map(|i| (Value::Str(name_of(i)), i as u64))
             .collect(),
@@ -413,13 +436,14 @@ pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
     let mut block_sizes = BTreeMap::new();
     let mut files = Vec::new();
     for name in [
-        "node_props.blk",
-        "node_labels.blk",
-        "edge_props.blk",
-        "topology.csr.blk",
-        "vectors.f32.blk",
-        "range/node_Doc_name.isam",
+        "node_props.blk".to_string(),
+        "node_labels.blk".to_string(),
+        "edge_props.blk".to_string(),
+        "topology.csr.blk".to_string(),
+        "vectors.f32.blk".to_string(),
+        format!("range/{isam_name}.isam"),
     ] {
+        let name = name.as_str();
         let path = dir.join(name);
         files.push(FileEntry {
             name: name.to_string(),
@@ -451,13 +475,17 @@ pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
         encryption: None,
         node_count: vectors.len() as u64,
         edge_count: 0,
-        labels: vec!["Doc".into()],
+        labels: if two_label {
+            vec!["Doc".into(), key_label.into()]
+        } else {
+            vec!["Doc".into()]
+        },
         reltypes: vec![],
         property_keys: vec!["name".into(), "embedding".into()],
         range_indexes: vec![RangeIndexDesc {
-            name: "node_Doc_name".into(),
+            name: isam_name.clone(),
             entity: EntityKind::Node,
-            label_or_type: "Doc".into(),
+            label_or_type: key_label.into(),
             property: "name".into(),
         }],
         vector_indexes: vec![VectorIndexDesc {
