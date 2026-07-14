@@ -34,7 +34,13 @@
 /// codec ([`plane`]) and the degree column ([`degree_ef`]) — a constant is just a run, so the
 /// dedicated `Constant` tag is gone. (Further v7 slices re-plane `node_labels.blk` and the
 /// reltype postings' dense endpoint sets.)
-pub const FORMAT_VERSION: u32 = 7;
+/// v8 reshapes the vector ANN stores (FreshDiskANN S1): the `.vamana` record drops its
+/// `node_id` and becomes **pure geometry** (`dim ‖ vec ‖ degree ‖ adj`), so a consolidation
+/// — which permutes every dense id — need not rewrite it at all; the `.pq` file becomes the
+/// single layout→id map, with [`pq::HOLE`] (`u64::MAX`) marking a tombstoned record; stored
+/// vectors are **raw** rather than L2-normalised (magnitudes survive a rebuild); and the
+/// Vamana arm serves L2 and dot indexes, not cosine alone — see [`vamana`] and [`pq`].
+pub const FORMAT_VERSION: u32 = 8;
 
 /// The Slater on-disk magic, written at the head of the MANIFEST for a quick
 /// "is this a Slater generation at all" check before any JSON parsing.
@@ -80,7 +86,7 @@ mod tests {
     #[test]
     fn format_version_is_stable() {
         // A change here is a deliberate, breaking format bump — update readers.
-        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(FORMAT_VERSION, 8);
         assert_eq!(MAGIC, b"SLATER01");
     }
 }

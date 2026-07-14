@@ -46,7 +46,7 @@ use graph_format::manifest::{
     RangeIndexDesc, VectorIndexDesc,
 };
 use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
-use graph_format::pq::{normalise, train_codebooks, PqParams, PqWriter};
+use graph_format::pq::{normalise, train_codebooks, PqParams, PqWriter, HOLE};
 use graph_format::topology::{write_csr, write_csr_with_cipher, Edge, TopologyReader};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
@@ -1975,12 +1975,32 @@ pub struct VamanaFixture {
     pub vector_block_size: usize,
 }
 
+/// [`write_vamana_holed`] with no holes — every record live.
+pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f32>>) {
+    let (root, graph, raw, _) = write_vamana_holed(tag, f, |_, _| false);
+    (root, graph, raw)
+}
+
 /// Build a synthetic generation whose single `(:Doc, embedding)` vector index is an
 /// above-threshold **Vamana/PQ** index of `n` unit vectors, mirroring exactly what
 /// `slater-build` writes (graph build → BFS layout → PQ codes in the same order).
-/// Returns `(data_dir, graph, raw_vectors)` so a test can compute brute-force
-/// ground truth. The graph has `n` `:Doc` nodes and no edges.
-pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f32>>) {
+///
+/// `hole(node_id, is_medoid)` decides, per record, whether its `.pq` id is written as the
+/// tombstone sentinel `pq::HOLE` instead of the node id — making it a **hole**: navigable,
+/// never emitted. `is_medoid` is passed because the medoid's node id is not knowable to the
+/// caller before the graph is built, and holing the *medoid* is the sharpest test of the
+/// waypoint contract there is: it is the fixed entry point of every beam search, so if a
+/// hole were dropped from *navigation* rather than only from *emission*, holing it would
+/// take recall for the whole index to zero.
+///
+/// Returns `(data_dir, graph, raw_vectors, medoid_node_id)`; `raw_vectors[i]` is dense node
+/// `i`'s vector, so a test can compute brute-force ground truth over whichever subset it
+/// left live. The graph has `n` `:Doc` nodes and no edges.
+pub fn write_vamana_holed(
+    tag: &str,
+    f: &VamanaFixture,
+    hole: impl Fn(u64, bool) -> bool,
+) -> (PathBuf, String, Vec<Vec<f32>>, u64) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0003);
     let graph = "docs".to_string();
     let root = std::env::temp_dir().join(format!("slater_vamfix_{}_{tag}", std::process::id()));
@@ -2046,7 +2066,8 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
             .iter()
             .map(|&j| new_of[j as usize])
             .collect();
-        vw.append(old as u64, &raw[old as usize], &nbrs).unwrap();
+        // Pure geometry — the record carries no node id (v8); the `.pq` below is the map.
+        vw.append(&raw[old as usize], &nbrs).unwrap();
     }
     vw.finish().unwrap();
 
@@ -2060,8 +2081,19 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
         None,
     )
     .unwrap();
+    // The `.pq` node-id column IS the layout→id map, and a `HOLE` in it is a tombstoned
+    // record: still walked through, never emitted.
+    let medoid_node_id = graph_v.medoid as u64;
+    let mut live_count = 0u64;
     for &old in &order {
-        pw.append_codes(old as u64, &codebook.encode(&raw[old as usize]).unwrap())
+        let node_id = old as u64;
+        let id = if hole(node_id, node_id == medoid_node_id) {
+            HOLE
+        } else {
+            live_count += 1;
+            node_id
+        };
+        pw.append_codes(id, &codebook.encode(&raw[old as usize]).unwrap())
             .unwrap();
     }
     pw.finish().unwrap();
@@ -2132,6 +2164,10 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
                 medoid: medoid_new as u64,
                 pq_subspaces: f.pq_subspaces,
                 pq_bits: f.pq_bits,
+                live_count,
+                // The fixture's vectors are already unit length, so M = 1; a cosine index
+                // never reads it anyway.
+                max_norm: 1.0,
             },
         }],
         reltype_source_counts: vec![],
@@ -2156,5 +2192,5 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
     )
     .unwrap();
 
-    (root, graph, raw)
+    (root, graph, raw, medoid_node_id)
 }

@@ -30,6 +30,7 @@ use graph_format::ids::Value;
 use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
 use graph_format::manifest::Manifest;
+use graph_format::manifest::VectorIndexDesc;
 use graph_format::nodelabels::NodeLabelsReader;
 use graph_format::postings::{
     decode_endpoint_posting, endpoint_posting_cursor, EndpointPostingIter,
@@ -139,6 +140,71 @@ pub struct VamanaIndex {
     pub ord: u32,
     pub reader: VamanaReader,
     pub pq: Arc<ResidentPq>,
+}
+
+/// Refuse a Vamana index whose structure would make every search on it quietly wrong.
+///
+/// Each of these is a **silent** failure — a wrong or empty answer with no error anywhere —
+/// which is why they are checked once at open, where the cost is one extra `pread`, rather
+/// than left to surface as "recall got worse".
+///
+/// 1. **The `.pq` is the layout→id map.** Since v8 it is the *only* one: the `.vamana`
+///    record is pure geometry. If the two files disagree on record count, every layout
+///    ordinal past the shorter of them maps to the wrong node — or panics the emit closure.
+/// 2. **The medoid must exist.** It is the entry point of every beam search, and the search
+///    indexes the resident codes with it directly; an out-of-range medoid is an immediate
+///    panic on an ordinary query.
+/// 3. **The medoid must not be orphaned.** A *deleted* medoid is fine — a hole is still a
+///    waypoint. A medoid with **no out-edges** is not: every search enters there, expands
+///    it, finds nothing to push onto the beam, and terminates having seen exactly one node.
+///    Recall for the entire index goes to zero, with no error and no panic. This is the
+///    invariant a delete-splice must preserve (see `AnnMode::Vamana::medoid`); here is
+///    where a violation is caught.
+fn validate_vamana_index(
+    stem: &str,
+    reader: &VamanaReader,
+    pq: &ResidentPq,
+    desc: &VectorIndexDesc,
+    medoid: u64,
+) -> Result<()> {
+    let records = reader.len();
+    if pq.len() as u64 != records {
+        bail!(
+            "vector index {stem} is inconsistent: the .vamana holds {records} records but its \
+             .pq layout→id map holds {} — they are written in lockstep and index each other by \
+             position",
+            pq.len()
+        );
+    }
+    if desc.count != records {
+        bail!(
+            "vector index {stem} is inconsistent: the MANIFEST declares {} records but the \
+             .vamana holds {records} (`count` is the record count, holes included)",
+            desc.count
+        );
+    }
+    if records == 0 {
+        return Ok(());
+    }
+    if medoid >= records {
+        bail!(
+            "vector index {stem} names medoid layout ordinal {medoid}, but the .vamana holds \
+             only {records} records"
+        );
+    }
+    if records > 1 {
+        let entry = reader
+            .node(medoid as u32)
+            .with_context(|| format!("read the medoid record of vector index {stem}"))?;
+        if entry.neighbours.is_empty() {
+            bail!(
+                "vector index {stem} has an orphaned medoid (layout ordinal {medoid} has no \
+                 out-edges): it is the fixed entry point of every beam search, so every query \
+                 would expand one node and return nothing — recall would be zero, silently"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Generation {
@@ -430,9 +496,9 @@ impl Generation {
         // stay brute-force over `vectors.f32.blk` and open nothing extra.
         let mut vamana_indexes = HashMap::new();
         for (ord, vi) in manifest.vector_indexes.iter().enumerate() {
-            if !matches!(vi.mode, AnnMode::Vamana { .. }) {
+            let AnnMode::Vamana { medoid, .. } = vi.mode else {
                 continue;
-            }
+            };
             let stem = format!("vector/{}.{}", vi.label, vi.property);
             let reader = VamanaReader::open_src(
                 store.open(&join_key(&base, &format!("{stem}.vamana")))?,
@@ -448,6 +514,7 @@ impl Generation {
                 pq.load_resident()
                     .with_context(|| format!("load resident PQ codes for {stem}.pq"))?,
             );
+            validate_vamana_index(&stem, &reader, &resident, vi, medoid)?;
             vamana_indexes.insert(
                 (vi.label.clone(), vi.property.clone()),
                 VamanaIndex {

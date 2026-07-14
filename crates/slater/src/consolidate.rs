@@ -45,6 +45,7 @@ use anyhow::{bail, Context, Result};
 use graph_format::consolidate_dump::{DumpRangeIndex, DumpVectorIndex, DumpWriter};
 use graph_format::ids::Value;
 use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
+use graph_format::pq::HOLE;
 use graph_format::vectors::VectorEntry;
 
 use crate::exec::{val_to_value, Engine, NamedProps};
@@ -379,11 +380,19 @@ pub fn serialise_binary_dump<V: ReadView>(
 /// group and hence a silently vector-less rebuild, which is exactly the failure this
 /// path exists to prevent.
 ///
-/// One inherent lossiness, worth knowing: a Vamana index stores its vectors
-/// **L2-normalised** (the space its graph and PQ codebooks were built in — D29), so
-/// the original magnitudes are gone from the core and cannot be recovered here. Vamana
-/// is cosine-only (`vamana_eligible`) and cosine is scale-invariant, so every KNN score
-/// round-trips exactly; only a vector's length is lost.
+/// Two v8 details govern the Vamana arm here:
+///
+/// * The `.vamana` record carries **no node id** — it is pure geometry. The `.pq` node-id
+///   column is the single layout→id map, so the id for record `i` is `index.pq.node_ids[i]`.
+/// * A record whose id is [`HOLE`] is a **tombstone** and must be skipped: carrying it
+///   forward would resurrect a deleted vector, which no other read path would ever surface.
+///   `desc.count` is the *record* count (holes included), so the loop runs over all of them
+///   and filters; the survivors are what the rebuild re-indexes.
+///
+/// The vectors themselves are stored **raw** since v8, so nothing is lost in the round-trip.
+/// (Before v8 they were stored L2-normalised and their magnitudes were gone for good —
+/// harmless only because Vamana was cosine-only and cosine is scale-invariant. It is no
+/// longer cosine-only, and it no longer loses them.)
 fn read_index_vectors<V: ReadView>(
     engine: &Engine<'_, V>,
     view: &V,
@@ -401,15 +410,21 @@ fn read_index_vectors<V: ReadView>(
                         desc.label, desc.property
                     )
                 })?;
-            (0..desc.count as u32)
-                .map(|i| {
-                    let node = index.reader.node(i)?;
-                    Ok(VectorEntry {
-                        node_id: node.node_id,
-                        vector: node.vector,
-                    })
-                })
-                .collect()
+            // Driven off the `.pq` id column, not `desc.count`: it is the map, and the open
+            // path has already refused the generation if the two files' record counts
+            // disagree. Indexing it by a manifest count instead would be an unchecked
+            // subscript on an untrusted number.
+            let mut out = Vec::with_capacity(index.pq.live_count());
+            for (i, &node_id) in index.pq.node_ids.iter().enumerate() {
+                if node_id == HOLE {
+                    continue;
+                }
+                out.push(VectorEntry {
+                    node_id,
+                    vector: index.reader.node(i as u32)?.vector,
+                });
+            }
+            Ok(out)
         }
     }
 }

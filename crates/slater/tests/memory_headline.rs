@@ -173,7 +173,8 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
             .iter()
             .map(|&j| new_of[j as usize])
             .collect();
-        vw.append(old as u64, &raw[old as usize], &nbrs).unwrap();
+        // v8: the record is pure geometry — the `.pq` below is the layout→id map.
+        vw.append(&raw[old as usize], &nbrs).unwrap();
     }
     vw.finish().unwrap();
 
@@ -259,6 +260,9 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
                 medoid: medoid_new as u64,
                 pq_subspaces: PQ_SUBSPACES,
                 pq_bits: PQ_BITS,
+                // No holes in the fixture; the vectors are unit length, so M = 1.
+                live_count: N as u64,
+                max_norm: 1.0,
             },
         }],
         reltype_source_counts: vec![],

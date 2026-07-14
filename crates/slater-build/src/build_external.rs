@@ -3295,8 +3295,8 @@ fn compute_graph_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graph_format::manifest::{AnnMode, Manifest};
-    use graph_format::pq::{AdcTable, PqReader};
+    use graph_format::manifest::{AnnMode, Manifest, Metric};
+    use graph_format::pq::{ann_query, AdcTable, PqReader};
     use graph_format::vamana::{beam_search, BeamParams, VamanaReader};
 
     /// A deterministic LCG so the synthetic dump is reproducible without a `rand`
@@ -3336,13 +3336,33 @@ mod tests {
     /// embedding, plus a cosine vector index over `(:Doc, embedding)`. Returns the
     /// script and the raw (un-normalised) vectors for ground-truth checks.
     fn synthetic_dump(n: usize, dim: usize) -> (String, Vec<Vec<f32>>) {
+        synthetic_dump_metric(n, dim, "cosine", false)
+    }
+
+    /// [`synthetic_dump`] over an arbitrary metric. `vary_norms` gives each vector a
+    /// different length, which is what makes an L2 or dot ground truth *mean* anything:
+    /// on vectors of equal length all three metrics induce the same ranking, so a test
+    /// over them could not tell a correct dot index from one silently ranking by direction.
+    fn synthetic_dump_metric(
+        n: usize,
+        dim: usize,
+        metric: &str,
+        vary_norms: bool,
+    ) -> (String, Vec<Vec<f32>>) {
         let mut rng = Lcg(0xDEAD_BEEF_1234);
         let mut script = String::new();
         script.push_str("CALL db.idx.vector.createNodeIndex('Doc', 'embedding', ");
-        script.push_str(&format!("{dim}, 'cosine');\n"));
+        script.push_str(&format!("{dim}, '{metric}');\n"));
         let mut vectors = Vec::with_capacity(n);
         for i in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+            let scale = if vary_norms {
+                0.2 + 4.0 * rng.next_f64()
+            } else {
+                1.0
+            };
+            let v: Vec<f32> = (0..dim)
+                .map(|_| ((rng.next_f64() - 0.5) * scale) as f32)
+                .collect();
             let body: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
             script.push_str(&format!(
                 "CREATE (:Doc:__DumpVertex__ {{__dump_id__: {i}, embedding: vecf32([{}])}});\n",
@@ -3478,6 +3498,146 @@ mod tests {
         }
         let recall = recall_sum / queries as f64;
         assert!(recall >= 0.8, "build→read recall@{k} was {recall:.3}");
+    }
+
+    /// **The metric extension, end to end through the real builder.** Vamana used to be
+    /// cosine-only; L2 and dot silently fell back to brute force above the ANN threshold.
+    /// Now all three build a graph, and each must recover the top-`k` its *own* metric
+    /// defines — not the top-`k` cosine defines. The vectors deliberately have unequal
+    /// norms, which is the only setting where the three metrics disagree; on unit vectors
+    /// this test would pass even if every index secretly ranked by cosine.
+    ///
+    /// Ground truth is an exhaustive scan with a hand-written distance for each metric,
+    /// not a second implementation of the index.
+    #[test]
+    fn vamana_recall_holds_for_cosine_l2_and_dot() {
+        let dim = 16;
+        let n = 400;
+        let k = 10;
+        let queries = 15;
+
+        // Hand-written, independently derived ground-truth distances. Ascending = nearer,
+        // matching the `score` contract (D26): dot is *negated* (a larger inner product is
+        // nearer), and L2 is squared (monotone in the true L2, so it orders identically).
+        fn truth_distance(metric: Metric, q: &[f32], v: &[f32]) -> f64 {
+            let dot: f64 = q.iter().zip(v).map(|(x, y)| *x as f64 * *y as f64).sum();
+            match metric {
+                Metric::Dot => -dot,
+                Metric::L2 => q
+                    .iter()
+                    .zip(v)
+                    .map(|(x, y)| {
+                        let d = *x as f64 - *y as f64;
+                        d * d
+                    })
+                    .sum(),
+                Metric::Cosine => {
+                    let (nq, nv) = (
+                        q.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt(),
+                        v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt(),
+                    );
+                    1.0 - dot / (nq * nv)
+                }
+            }
+        }
+
+        for (token, metric) in [
+            ("cosine", Metric::Cosine),
+            ("euclidean", Metric::L2),
+            ("dot", Metric::Dot),
+        ] {
+            let (script, vectors) = synthetic_dump_metric(n, dim, token, true);
+            let outcome = run_build(&format!("vam_{token}"), &script, |o| {
+                o.ann_threshold = 50;
+                o.vamana_r = 24;
+                o.vamana_alpha = 1.2;
+                o.pq_subspaces = 8;
+                o.pq_bits = 8;
+            });
+
+            let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();
+            let desc = &manifest.vector_indexes[0];
+            assert_eq!(desc.metric, metric);
+            let (medoid, live_count) = match desc.mode {
+                AnnMode::Vamana {
+                    medoid, live_count, ..
+                } => (medoid, live_count),
+                AnnMode::BruteForce => panic!(
+                    "{token} is above the ANN threshold and must now build Vamana, \
+                     not fall back to brute force"
+                ),
+            };
+            // Freshly built ⇒ no holes.
+            assert_eq!(desc.count, n as u64);
+            assert_eq!(live_count, n as u64);
+            assert_eq!(desc.dead_ratio(), 0.0);
+
+            let vam = VamanaReader::open_with_cipher(
+                outcome.dir.join("vector/Doc.embedding.vamana"),
+                None,
+            )
+            .unwrap();
+            let resident =
+                PqReader::open_with_cipher(outcome.dir.join("vector/Doc.embedding.pq"), None)
+                    .unwrap()
+                    .load_resident()
+                    .unwrap();
+
+            // The stored vectors are **raw** (v8): magnitudes survive. Before v8 the
+            // Vamana arm normalised them away, which is exactly what made dot and L2
+            // impossible.
+            let n0 = vam.node(0).unwrap();
+            let stored_norm: f64 = n0.vector.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+            assert!(
+                (stored_norm.sqrt() - 1.0).abs() > 1e-3,
+                "the {token} index stored a normalised vector — magnitudes must be kept raw"
+            );
+
+            let mut recall_sum = 0.0f64;
+            for qi in 0..queries {
+                let query = &vectors[(qi * 23) % n];
+                // The query goes into the ANN space for navigation; the exact re-rank
+                // scores the raw query against the raw stored vector.
+                let qa = ann_query(metric, query, resident.codebook.params.dim as usize).unwrap();
+                let adc = AdcTable::new(&resident.codebook, &qa).unwrap();
+                let hits = beam_search(
+                    BeamParams {
+                        medoid: medoid as u32,
+                        beam_width: 64,
+                        k,
+                        // The record count — holes included, were there any.
+                        num_nodes: resident.len(),
+                    },
+                    |i| adc.estimate(resident.codes_of(i as usize)),
+                    |i| {
+                        let node = vam.node(i).unwrap();
+                        Ok((node.vector, node.neighbours))
+                    },
+                    |v| truth_distance(metric, query, v) as f32,
+                    |i| Ok(Some(resident.node_ids[i as usize])),
+                )
+                .unwrap();
+
+                let got: std::collections::HashSet<u64> = hits.iter().map(|h| h.node_id).collect();
+                let mut truth: Vec<(f64, u64)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (truth_distance(metric, query, v), i as u64))
+                    .collect();
+                truth.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let found = truth
+                    .iter()
+                    .take(k)
+                    .filter(|(_, id)| got.contains(id))
+                    .count();
+                recall_sum += found as f64 / k as f64;
+            }
+            let recall = recall_sum / queries as f64;
+            assert!(
+                recall >= 0.9,
+                "{token} recall@{k} was {recall:.3}, expected ≥ 0.9"
+            );
+        }
     }
 
     #[test]
