@@ -50,13 +50,14 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
 use graph_format::ids::{Generation as GenId, Value};
-use graph_format::manifest::EncryptionHeader;
+use graph_format::manifest::{AnnMode, EncryptionHeader};
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
     DirtyIndex, DirtyVector, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
+use graph_format::segvamana::seal_segment_index;
 use graph_format::segvectors::{write_vector_fragments, VectorSpec};
 
 use crate::flush_segment::{inventory, SEG_BLOCK_BYTES, SEG_ZSTD_LEVEL};
@@ -72,6 +73,10 @@ pub struct MergeInputs<'a> {
     pub seg_uuid: GenId,
     /// The base generation the run (and so the merged segment) deltas over — unchanged.
     pub base_uuid: GenId,
+    /// The served base generation itself — for the vector-index descriptors (metric/dim) and
+    /// the base codebook a rebuilt segment Vamana reuses (HIK-113). The fold over `inputs` does
+    /// not otherwise touch the base; this is read only when re-sealing a segment index.
+    pub base: &'a crate::generation::Generation,
     /// The at-rest block cipher for the merged segment's sections (`None` = plaintext), and
     /// the runtime master key used to seal the manifest MAC (`None` = no MAC).
     pub cipher: Option<Arc<BlockCipher>>,
@@ -215,14 +220,67 @@ pub fn write_merge_segment(
     let vec_specs = fold_vectors(inputs, &node_rows, &within_run_node);
     write_vector_fragments(inp.seg_dir, &vec_specs)
         .with_context(|| format!("write merged vector sidecar at {}", inp.seg_dir.display()))?;
-    let dirty_vectors: Vec<DirtyVector> = vec_specs
-        .iter()
-        .filter(|s| !s.ids.is_empty() || !s.removals.is_empty())
-        .map(|s| DirtyVector {
-            label: s.label.clone(),
-            property: s.prop.clone(),
-        })
-        .collect();
+
+    // ── rebuild each merged index's read-only Vamana from the folded live id set (HIK-113). ──
+    // The merged segment is bounded by the size-tiered policy, so an O(merged) rebuild is
+    // bounded by construction — no StreamingMerge needed. Below the floor the sealer writes
+    // nothing (the level is brute-forced from the sidecar). The vectors are the merged node
+    // rows' own embeddings; the descriptor (metric/dim) and the reusable base codebook come
+    // from the served base generation.
+    let mut dirty_vectors: Vec<DirtyVector> = Vec::with_capacity(vec_specs.len());
+    for spec in &vec_specs {
+        let meta = if spec.ids.is_empty() {
+            None
+        } else if let Some(desc) = inp
+            .base
+            .manifest()
+            .vector_indexes
+            .iter()
+            .find(|d| d.label == spec.label && d.property == spec.prop)
+        {
+            let entries: Vec<(u64, Vec<f32>)> = spec
+                .ids
+                .iter()
+                .filter_map(|&id| {
+                    node_rows.get(&id).and_then(|row| {
+                        row.props.iter().find_map(|(k, v)| match v {
+                            Value::Vector(vec) if *k == spec.prop => Some((id, vec.clone())),
+                            _ => None,
+                        })
+                    })
+                })
+                .collect();
+            let base = inp
+                .base
+                .vamana_index(&spec.label, &spec.prop)
+                .and_then(|bi| match &desc.mode {
+                    AnnMode::Vamana { max_norm, .. } => Some((&bi.pq.codebook, *max_norm as f64)),
+                    _ => None,
+                });
+            seal_segment_index(
+                inp.seg_dir,
+                &spec.label,
+                &spec.prop,
+                &entries,
+                desc.metric,
+                desc.dim,
+                base,
+                inp.cipher.clone(),
+                SEG_BLOCK_BYTES,
+                SEG_ZSTD_LEVEL,
+            )
+            .with_context(|| format!("re-seal merged vector index {}.{}", spec.label, spec.prop))?
+        } else {
+            None
+        };
+        if !spec.ids.is_empty() || !spec.removals.is_empty() || meta.is_some() {
+            dirty_vectors.push(DirtyVector {
+                label: spec.label.clone(),
+                property: spec.prop.clone(),
+                graph: meta,
+            });
+        }
+    }
 
     // ── posting fragments: union the per-reltype driving sets (a superset stays correct) ────
     let posting_specs = fold_postings(inputs);

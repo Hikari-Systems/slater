@@ -976,6 +976,7 @@ impl Graphs {
                 seg_dir: &seg_dir,
                 seg_uuid,
                 base_uuid: core.base_uuid(),
+                base: core.as_ref(),
                 cipher,
                 master_key: self.master_key.as_deref(),
                 encryption_header,
