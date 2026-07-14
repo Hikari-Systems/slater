@@ -986,21 +986,23 @@ fn suppress_indexed_vector(
     Ok(v)
 }
 
-/// What the levels **above the base** say about a vector index — the write-visibility
+/// What **one level above the base** says about a vector index — the write-visibility
 /// primitive the base's sealed, immutable index cannot provide.
-pub struct VectorOverlay {
-    /// `(node_id, vector)` for every node a level above the base embeds or re-embeds. Its
-    /// base entry, if any, is stale and must be suppressed.
+#[derive(Default)]
+pub struct VectorLevel {
+    /// `(node_id, vector)` for every node this level embeds or re-embeds. The entry any
+    /// level *below* it holds for that node is stale and must be suppressed.
     pub entries: Vec<graph_format::vectors::VectorEntry>,
-    /// Nodes whose embedding a level above the base **removed** (`REMOVE n.embedding`, or a
-    /// `SET n = {…}` that dropped it). Their base entry must be suppressed with *nothing*
-    /// put in its place — the node is simply no longer in the index.
+    /// Nodes whose embedding this level **took away** — `REMOVE n.embedding`, a `SET n = {…}`
+    /// that dropped it, or an overwrite with a non-vector value. Every level below must be
+    /// suppressed with *nothing* put in its place: the node is simply no longer in the index.
     pub removed: Vec<u64>,
 }
 
-impl VectorOverlay {
-    /// Every node whose base entry this overlay invalidates — re-embedded or un-embedded.
-    /// The base arm must suppress these in its **scan**, not in the merge afterwards.
+impl VectorLevel {
+    /// Every node whose *lower*-level entry this level invalidates — re-embedded or
+    /// un-embedded. A lower level must suppress these in its **scan**, not in the merge
+    /// afterwards (see [`vector::merge_topk`]).
     pub fn superseded(&self) -> HashSet<u64> {
         self.entries
             .iter()
@@ -1014,11 +1016,90 @@ impl VectorOverlay {
     }
 }
 
-/// Fold the delta and the core segments into a [`VectorOverlay`] for one vector index.
+/// The write ladder's two mutable tiers, resolved **per level** for one vector index.
 ///
-/// Two consumers, and they must agree or a vector goes missing: the KNN path unions this
-/// with the base's own arm, and the consolidation dump carries it so a rebuild does not drop
-/// a freshly-written embedding on the floor.
+/// The base's index is sealed at build time; everything above it lives here. The levels are
+/// kept apart rather than flattened because each one has a *different* set of levels above
+/// it, and therefore a different suppression set:
+///
+/// ```text
+/// base_live     = suppress( delta.superseded ∪ segments.superseded ∪ tombstones )
+/// segments_live = suppress( delta.superseded ∪ tombstones )
+/// delta_live    = suppress( tombstones )                      // nothing is above the delta
+/// ```
+///
+/// A flattened overlay can only express the first line. That is enough while the levels
+/// above the base are brute-forced through a single matrix (each node appears in it exactly
+/// once, newest-wins), and it stops being enough the moment a level gets an index of its own
+/// and scans itself: level *i* still physically holds the vector that level *i+1* superseded,
+/// and suppressing it with the *global* set would also drop the newer entry that replaced it.
+/// Suppression is per level, and it happens in that level's **scan** — never in the merge, which
+/// [deliberately does not dedup](vector::merge_topk): a stale duplicate that reaches the merge
+/// has already been able to take one of the `k` slots and evict a live candidate, so the k-th
+/// neighbour goes missing rather than merely being misordered. Silently.
+#[derive(Default)]
+pub struct VectorLevels {
+    /// Newest: the write delta (memtable + sealed L0). Nothing is above it.
+    pub delta: VectorLevel,
+    /// The core segments, folded newest-wins **across segments only** — the write delta is
+    /// deliberately *not* applied, so this level holds what the segments themselves say, even
+    /// where the delta has since superseded it. Suppressed by `delta.superseded()`.
+    pub segments: VectorLevel,
+}
+
+impl VectorLevels {
+    /// Every node whose **base** entry some level above it invalidates. The union, because
+    /// the base is below both.
+    pub fn superseded(&self) -> HashSet<u64> {
+        let mut s = self.segments.superseded();
+        s.extend(self.delta.superseded());
+        s
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.delta.is_empty() && self.segments.is_empty()
+    }
+
+    /// The levels flattened newest-wins into the effective `(node_id, vector)` set above the
+    /// base — the delta's entries, plus a segment entry for every node the delta did not
+    /// supersede. The **consolidation dump**'s view: it rewrites the graph, so it wants one
+    /// vector per node, not a scan of each level.
+    ///
+    /// Derived from the same two levels the KNN path reads, so the dump cannot disagree with
+    /// the query about which vector wins — a disagreement would drop a vector on the floor,
+    /// and only on consolidation.
+    pub fn into_effective_entries(self) -> Vec<graph_format::vectors::VectorEntry> {
+        let newer = self.delta.superseded();
+        let mut out = self.delta.entries;
+        out.extend(
+            self.segments
+                .entries
+                .into_iter()
+                .filter(|e| !newer.contains(&e.node_id)),
+        );
+        out
+    }
+}
+
+/// What one level says about node `id`'s embedding for a vector index.
+enum LevelSays {
+    /// The level carries an embedding: it supersedes every level below.
+    Vector(Vec<f32>),
+    /// The level took the embedding away — `REMOVE`d, dropped by a `SET n = {…}` replace, or
+    /// overwritten with a value that is not a vector. Every level below is suppressed with
+    /// nothing in its place.
+    Gone,
+    /// The level says nothing about this node's embedding: whatever is below it stands (an
+    /// older segment's, or the base's — which a column read cannot even see, per D12).
+    Nothing,
+}
+
+/// Split the delta and the core segments into per-level [`VectorLevels`] for one vector index.
+///
+/// Two consumers, and they must agree or a vector goes missing: the KNN path scans each level
+/// against the base's own arm, and the consolidation dump carries them so a rebuild does not
+/// drop a freshly-written embedding on the floor. Both derive from *this* fold — see
+/// [`VectorLevels::into_effective_entries`].
 ///
 /// # Why removals need their own channel
 /// An indexed embedding is routed **out** of the column store (D12), so a node's property
@@ -1030,86 +1111,148 @@ impl VectorOverlay {
 /// segment says so via its `vec.meta` sidecar ([`graph_format::segvectors`]).
 ///
 /// # Cost
-/// O(vectors touched), not O(graph) and not O(segment): the candidate set is the delta's
-/// touched nodes plus exactly the ids the segments' sidecars name, so a large segment that
-/// embedded three nodes contributes three candidates, not its whole row count. Newest-wins
-/// then comes for free from [`node_prop_raw`] (delta patch over segment row over base).
-pub fn overlay_index_vectors(
+/// O(vectors touched), not O(graph) and not O(segment): the segment candidates are exactly the
+/// ids the sidecars name (a large segment that embedded three nodes contributes three
+/// candidates, not its whole row count) and the delta's are the nodes it touched. Each level
+/// resolves *itself* — the segments through [`CoreStack::resolve_node_row`](crate::segstack::CoreStack::resolve_node_row),
+/// which is already delta-free, and the delta through its own `NodeDelta`.
+pub fn vector_levels(
     gen: &dyn ReadView,
     cache: &BlockCache,
     desc: &VectorIndexDesc,
-) -> Result<VectorOverlay> {
+) -> Result<VectorLevels> {
     let delta = gen.delta();
     let stack = gen.core_stack();
     if delta.is_empty() && stack.is_singleton() {
-        return Ok(VectorOverlay {
-            entries: Vec::new(),
-            removed: Vec::new(),
-        });
+        return Ok(VectorLevels::default());
     }
 
-    // Candidates: every node the delta touched, plus exactly the ids the segments' sidecars
-    // name for this index. A segment with no `vec.meta` contributes nothing at all.
-    let mut ids = delta.node_dense_ids();
-    for seg in stack.segments() {
-        if let Some(v) = &seg.vectors {
-            ids.extend_from_slice(v.ids(&desc.label, &desc.property));
-            ids.extend_from_slice(v.removals(&desc.label, &desc.property));
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-
-    let mut entries = Vec::new();
-    let mut removed = Vec::new();
-    for id in ids {
-        // A deleted node takes its embedding with it, and its tombstone already suppresses
-        // it on every arm — it needs no vector removal on top.
-        if delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?) {
-            continue;
-        }
-        // The index is scoped to a label, and a write can add one (`SET n:Label`), so
-        // resolve the effective label set rather than trusting the base's.
-        let labelled = node_label_ids_par(gen, cache, id)?
+    // A deleted node takes its embedding with it, and its tombstone already suppresses it on
+    // every arm — it needs no vector removal on top. Applied to both levels' candidates.
+    let dead = |id: u64| -> Result<bool> {
+        Ok(delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
+    };
+    // The index is scoped to a label, and a write can add one (`SET n:Label`), so resolve the
+    // *effective* label set rather than trusting the base's. It is a property of the node, not
+    // of a level, so both levels ask the same question.
+    let indexed = |id: u64| -> Result<bool> {
+        Ok(node_label_ids_par(gen, cache, id)?
             .into_iter()
-            .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label));
-        if !labelled {
-            continue;
+            .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label)))
+    };
+
+    // ── the segments level: what the core segments say, with the delta *not* applied ──────
+    let mut segments = VectorLevel::default();
+    if !stack.is_singleton() {
+        // Candidates: exactly the ids the segments' sidecars name for this index. A segment
+        // with no `vec.meta` contributes nothing at all.
+        let mut ids = Vec::new();
+        for seg in stack.segments() {
+            if let Some(v) = &seg.vectors {
+                ids.extend_from_slice(v.ids(&desc.label, &desc.property));
+                ids.extend_from_slice(v.removals(&desc.label, &desc.property));
+            }
         }
-        match node_prop_raw(gen, cache, id, &desc.property)? {
-            // The winning level carries an embedding: it supersedes whatever is below.
-            Val::Vector(v) => entries.push(graph_format::vectors::VectorEntry {
-                node_id: id,
-                vector: v,
-            }),
-            // No embedding at the winning level. That is only a *removal* if some level
-            // above the base says so — otherwise this node simply never had one, or still
-            // has the base's (which a column read cannot see, per D12).
-            _ if removes_vector(gen, id, desc) => removed.push(id),
-            _ => {}
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            if dead(id)? || !indexed(id)? {
+                continue;
+            }
+            match segment_says(gen, id, desc)? {
+                LevelSays::Vector(v) => segments.entries.push(graph_format::vectors::VectorEntry {
+                    node_id: id,
+                    vector: v,
+                }),
+                LevelSays::Gone => segments.removed.push(id),
+                LevelSays::Nothing => {}
+            }
         }
     }
-    Ok(VectorOverlay { entries, removed })
+
+    // ── the delta level: what the write delta itself says ─────────────────────────────────
+    let mut level = VectorLevel::default();
+    if !delta.is_empty() {
+        for id in delta.node_dense_ids() {
+            if dead(id)? || !indexed(id)? {
+                continue;
+            }
+            match delta_says(gen, id, desc) {
+                LevelSays::Vector(v) => level.entries.push(graph_format::vectors::VectorEntry {
+                    node_id: id,
+                    vector: v,
+                }),
+                LevelSays::Gone => level.removed.push(id),
+                LevelSays::Nothing => {}
+            }
+        }
+    }
+
+    Ok(VectorLevels {
+        delta: level,
+        segments,
+    })
 }
 
-/// Whether a level above the base **removed** node `id`'s embedding for `desc`. See
-/// [`overlay_index_vectors`] — value absence cannot answer this, so ask the levels.
-fn removes_vector(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> bool {
-    if let Some(nd) = gen.delta().node_patch(id) {
-        // A replace-all that re-set the embedding is not a removal — but it took the
-        // `Val::Vector` arm above, so reaching here means it really is gone.
-        if nd.replaced || nd.removed.contains(&desc.property) {
-            return true;
+/// What the **write delta** says about node `id`'s embedding — the delta alone, with no core
+/// or segment fallback (that is the whole point of the level split).
+fn delta_says(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> LevelSays {
+    let Some(nd) = gen.delta().node_patch(id) else {
+        return LevelSays::Nothing;
+    };
+    match nd.patches.get(&desc.property) {
+        Some(Value::Vector(v)) => LevelSays::Vector(v.clone()),
+        // The delta named the property but not with a vector (`SET n.embedding = 5`, which the
+        // write path admits — `validate_vector_dims` only constrains a `Value::Vector`). The
+        // newest level says this node has no embedding, so it has none: leaving the level below
+        // to keep scoring its stale vector is exactly the silent wrongness a removal exists to
+        // prevent.
+        Some(_) => LevelSays::Gone,
+        // A replace-all that re-set the embedding is not a removal — but it took the `Vector`
+        // arm above, so reaching here means it really is gone.
+        None if nd.replaced || nd.removed.contains(&desc.property) => LevelSays::Gone,
+        None => LevelSays::Nothing,
+    }
+}
+
+/// What the **core segments** say about node `id`'s embedding, folded newest-wins across
+/// segments only — the write delta above them is deliberately not applied.
+///
+/// The vector itself rides the node's row ([`graph_format::segvectors`]: `Value::Vector` is a
+/// first-class wire type, so a fragment would be a second copy), and a flush writes the full
+/// *effective* row, so the newest segment carrying the id already holds the newest vector —
+/// no cross-segment fold. What the rows cannot express is a removal, and that is what the
+/// `vec.meta` sidecars are for.
+fn segment_says(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> Result<LevelSays> {
+    let stack = gen.core_stack();
+    if let Some(row) = stack.resolve_node_row(id)? {
+        // A tombstone row is the segments deleting the node, not un-embedding it; the caller
+        // already dropped tombstoned candidates.
+        if !row.tombstoned {
+            match row.props.iter().find(|(k, _)| k == &desc.property) {
+                Some((_, Value::Vector(v))) => return Ok(LevelSays::Vector(v.clone())),
+                // Named, but not a vector — see `delta_says`.
+                Some(_) => return Ok(LevelSays::Gone),
+                // Absent, which is ambiguous: this row may be a node flushed for an unrelated
+                // reason that still holds the base's (D12-routed, row-invisible) vector. Only
+                // the sidecar below can tell.
+                None => {}
+            }
         }
     }
-    // Newest segment first: a later re-embed would have been caught above, so a segment that
-    // names this id in its removals is the last word on it.
-    gen.core_stack().segments().iter().rev().any(|seg| {
+    // Newest segment first: a later re-embed would have been caught by the row read above, so a
+    // segment that names this id in its removals is the last word on it.
+    let removed = stack.segments().iter().rev().any(|seg| {
         seg.vectors.as_ref().is_some_and(|v| {
             v.removals(&desc.label, &desc.property)
                 .binary_search(&id)
                 .is_ok()
         })
+    });
+    Ok(if removed {
+        LevelSays::Gone
+    } else {
+        LevelSays::Nothing
     })
 }
 
@@ -2422,10 +2565,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// blocks and they stay warm for repeat queries. When a fanout pool is
     /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
     /// (cache lookup + zstd decode) gather in parallel, preserving record order.
-    /// Every `(node_id, vector)` the delta and the core segments hold for `desc` — see
-    /// the free fn [`overlay_index_vectors`].
-    pub(crate) fn overlay_index_vectors(&self, desc: &VectorIndexDesc) -> Result<VectorOverlay> {
-        overlay_index_vectors(self.gen, self.cache, desc)
+    /// What each level above the base holds for `desc`, resolved per level — see the free fn
+    /// [`vector_levels`].
+    pub(crate) fn vector_levels(&self, desc: &VectorIndexDesc) -> Result<VectorLevels> {
+        vector_levels(self.gen, self.cache, desc)
     }
 
     pub(crate) fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
@@ -5366,27 +5509,32 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
         // The levels above the base carry vectors the sealed base index cannot: a node
         // embedded since the build has no entry in it at all, and a node *re*-embedded
-        // since the build has a stale one. Brute-forced exactly — the overlay is bounded
-        // by `memtableBytes` and `maxUpperSegments`, so it is small by construction. Two
+        // since the build has a stale one. Brute-forced exactly — the levels are bounded
+        // by `memtableBytes` and `maxUpperSegments`, so they are small by construction. Two
         // properties fall out of that: a freshly-written vector gets **exact** recall, and
         // the base's own recall is untouched.
         //
-        // Built per query rather than cached, which is what keeps the Σ-over-levels
-        // pinning trap closed by construction: the vector pool's resident matrices are
-        // charged to the budget but never evicted, so a cached per-level matrix would grow
-        // the pinned set without bound as segments accumulate. Building costs O(overlay),
-        // the same order as the brute-force scan it feeds.
-        let overlay = self.overlay_index_vectors(&desc)?;
-        let superseded = overlay.superseded();
-        let overlay_matrix = if overlay.entries.is_empty() {
-            None
-        } else {
-            Some(vector::ResidentMatrix::from_entries(
-                dim,
-                metric,
-                overlay.entries,
-            )?)
+        // Kept as *separate levels* rather than one flattened overlay, because each level has
+        // a different set of levels above it and therefore a different suppression set (see
+        // `VectorLevels`). Built per query rather than cached, which is what keeps the
+        // Σ-over-levels pinning trap closed by construction: the vector pool's resident
+        // matrices are charged to the budget but never evicted, so a cached per-level matrix
+        // would grow the pinned set without bound as segments accumulate. Building costs
+        // O(vectors touched), the same order as the brute-force scan it feeds.
+        let levels = self.vector_levels(&desc)?;
+        // Everything *newer* than the segments, and everything newer than the base.
+        let above_segments = levels.delta.superseded();
+        let above_base = levels.superseded();
+        let matrix_of = |entries: Vec<VectorEntry>| -> Result<Option<vector::ResidentMatrix>> {
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(vector::ResidentMatrix::from_entries(
+                dim, metric, entries,
+            )?))
         };
+        let segments_matrix = matrix_of(levels.segments.entries)?;
+        let delta_matrix = matrix_of(levels.delta.entries)?;
 
         // A vector index is built over the **base** generation and is immutable, so a
         // node deleted since the build is still in it. The delta/stack tombstones are
@@ -5394,23 +5542,26 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // KNN arms would hand back a deleted node as a live `Val::Node` (every other
         // read path already suppresses them; see `suppress_tombstoned_in_place`).
         //
-        // A node the overlay re-embedded is suppressed here for the same reason: its base
-        // vector is stale. It must lose in the base's *scan*, not in the merge afterwards
-        // — `merge_topk` cannot drop it late without risking the k-th slot (see there).
+        // A node a *newer* level re-embedded is suppressed for the same reason: this level's
+        // vector for it is stale. It must lose in this level's **scan**, not in the merge
+        // afterwards — `merge_topk` cannot drop it late without risking the k-th slot (see
+        // there). Which levels are "newer" is what differs per arm, and it is the whole point
+        // of the split: the base is below both levels, the segments are below only the delta,
+        // and nothing at all is above the delta.
         let delta = self.gen.delta();
         let stack = self.gen.core_stack();
-        let live_fn = |id: u64| -> Result<bool> {
-            if superseded.contains(&id) {
-                return Ok(false);
-            }
-            if delta.is_tombstoned(id) {
-                return Ok(false);
-            }
-            if !stack.is_singleton() && stack.is_node_tombstoned(id)? {
-                return Ok(false);
-            }
-            Ok(true)
+        let tombstoned = |id: u64| -> Result<bool> {
+            Ok(delta.is_tombstoned(id)
+                || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
         };
+        let live_fn =
+            |id: u64| -> Result<bool> { Ok(!above_base.contains(&id) && !tombstoned(id)?) };
+        let segments_live_fn =
+            |id: u64| -> Result<bool> { Ok(!above_segments.contains(&id) && !tombstoned(id)?) };
+        // `vector_levels` already dropped the tombstoned candidates, so this is defence in
+        // depth rather than load-bearing — but the delta *is* a scanned level like any other,
+        // and it keeps the three arms uniform for the day it gets an index of its own.
+        let delta_live_fn = |id: u64| -> Result<bool> { Ok(!tombstoned(id)?) };
         // A pure-core generation with an empty delta can have no tombstones and no overlay,
         // so the read-only estate pays nothing at all for this.
         let live: Option<vector::LivePredicate> = if delta.is_empty() && stack.is_singleton() {
@@ -5501,26 +5652,45 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     self.vamana_knn(vc, *medoid, metric, &query, k, live)?
                 }
             };
-            // Fold the levels above the base in. The overlay is scanned exactly (no ANN),
-            // and the base arm has already suppressed every node it supersedes, so the
-            // merge is a straight scored fold — see `vector::merge_topk` for why it must
-            // not dedup here instead.
-            let neighbours = match &overlay_matrix {
-                None => neighbours,
-                Some(m) => {
-                    let fresh = vector::brute_force_knn_matrix_par(
+            // Fold the levels above the base in. Each level is scanned exactly (no ANN), and
+            // each has already suppressed — in its own scan — every node a *newer* level
+            // supersedes, so the merge is a straight scored fold. See `vector::merge_topk`
+            // for why it must not dedup here instead.
+            let scan = |m: &Option<vector::ResidentMatrix>,
+                        live: vector::LivePredicate|
+             -> Result<Vec<vector::Neighbour>> {
+                match m {
+                    None => Ok(Vec::new()),
+                    Some(m) => vector::brute_force_knn_matrix_par(
                         self.fanout_pool.as_deref(),
                         m,
                         &query,
                         k,
                         KNN_PAR_MIN,
-                        // `overlay_index_vectors` already dropped tombstoned nodes, and
-                        // nothing supersedes the newest level.
-                        None,
-                    )?;
-                    vector::merge_topk([neighbours, fresh], k)
+                        Some(live),
+                    ),
                 }
             };
+            let neighbours = if segments_matrix.is_none() && delta_matrix.is_none() {
+                neighbours
+            } else {
+                let segs = scan(&segments_matrix, &segments_live_fn)?;
+                let fresh = scan(&delta_matrix, &delta_live_fn)?;
+                vector::merge_topk([neighbours, segs, fresh], k)
+            };
+            // A node id can reach the merged top-k from at most one level: the level that
+            // holds its *effective* vector. A duplicate is therefore always a suppression
+            // bug — and a silent one, because the stale copy has already taken a slot from a
+            // live candidate by the time anyone could notice.
+            debug_assert_eq!(
+                neighbours
+                    .iter()
+                    .map(|n| n.node_id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                neighbours.len(),
+                "duplicate node id in the merged top-k — a level failed to suppress: {neighbours:?}"
+            );
             for nb in neighbours {
                 let mut r = row.clone();
                 for bound in &new_vars {

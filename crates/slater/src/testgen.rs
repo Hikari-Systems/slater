@@ -345,6 +345,183 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     (root, graph, uuid)
 }
 
+/// A vector fixture with the base embeddings under the caller's control: one `:Doc` node per
+/// entry of `vectors`, keyed by `name` (`"d00"`, `"d01"`, … — zero-padded so the business-key
+/// ISAM's lexicographic order matches the dense id order), each carrying `vectors[i]` in a
+/// brute-force **cosine** index on `(:Doc {embedding})`. No edges.
+///
+/// The `(Doc, name)` range index is what the write path resolves a business key through, so a
+/// test can drive real `MATCH (n:Doc {name:'d07'}) SET n.embedding = …` writes against it,
+/// flush them into core segments, and exercise the write ladder's levels for real.
+pub fn write_vector_docs(tag: &str, vectors: &[Vec<f32>]) -> (PathBuf, String) {
+    write_vector_docs_keyed(tag, vectors, "Doc")
+}
+
+/// [`write_vector_docs`] with the business key on a **second label**: every node is
+/// `:Doc:<key_label>`, the `name` range index is declared on `(key_label, name)`, and the
+/// vector index is still on `(:Doc {embedding})`.
+///
+/// So a write anchors on `key_label` while the vector index is scoped to `Doc` — the one shape
+/// that tells apart "is this node in the index" asked of the node's *effective label set* (what
+/// the read fold asks) from the same question asked of the write's *anchor* label (what the
+/// segment flush asks). In a single-label graph the two coincide and every test passes either
+/// way.
+pub fn write_vector_docs_keyed(
+    tag: &str,
+    vectors: &[Vec<f32>],
+    key_label: &str,
+) -> (PathBuf, String) {
+    assert!(!vectors.is_empty(), "a vector fixture needs vectors");
+    let dim = vectors[0].len();
+    assert!(
+        vectors.iter().all(|v| v.len() == dim),
+        "every fixture vector must have the index's dimension"
+    );
+    let two_label = key_label != "Doc";
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0004);
+    let graph = "docs".to_string();
+    let root = std::env::temp_dir().join(format!("slater_vecdocs_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(dir.join("range")).unwrap();
+
+    let name_of = |i: usize| format!("d{i:02}");
+    let isam_name = format!("node_{key_label}_name");
+
+    // node_props.blk — the embedding is routed out to the vector store (D12), so the row holds
+    // only the business key, exactly as the builder writes it.
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for i in 0..vectors.len() {
+        np.append(&[(0, Value::Str(name_of(i)))]).unwrap();
+        if two_label {
+            nl.append(&[0, 1]).unwrap();
+        } else {
+            nl.append(&[0]).unwrap();
+        }
+    }
+    np.finish().unwrap();
+    nl.finish().unwrap();
+
+    // No edges, but the readers still expect the files.
+    PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+    write_csr(
+        dir.join("topology.csr.blk"),
+        vectors.len() as u64,
+        &[],
+        BLOCK,
+        LEVEL,
+    )
+    .unwrap();
+
+    // vectors.f32.blk — the group is `[first_record, count)`, in dense node order (D10).
+    let mut vw = VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL).unwrap();
+    for (i, v) in vectors.iter().enumerate() {
+        vw.append(i as u64, v).unwrap();
+    }
+    vw.finish().unwrap();
+
+    write_isam(
+        dir.join("range").join(format!("{isam_name}.isam")),
+        (0..vectors.len())
+            .map(|i| (Value::Str(name_of(i)), i as u64))
+            .collect(),
+        BLOCK,
+        LEVEL,
+    )
+    .unwrap();
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    for name in [
+        "node_props.blk".to_string(),
+        "node_labels.blk".to_string(),
+        "edge_props.blk".to_string(),
+        "topology.csr.blk".to_string(),
+        "vectors.f32.blk".to_string(),
+        format!("range/{isam_name}.isam"),
+    ] {
+        let name = name.as_str();
+        let path = dir.join(name);
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes: std::fs::metadata(&path).unwrap().len(),
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        block_sizes.insert(name.to_string(), BLOCK as u32);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: vectors.len() as u64,
+        edge_count: 0,
+        labels: if two_label {
+            vec!["Doc".into(), key_label.into()]
+        } else {
+            vec!["Doc".into()]
+        },
+        reltypes: vec![],
+        property_keys: vec!["name".into(), "embedding".into()],
+        range_indexes: vec![RangeIndexDesc {
+            name: isam_name.clone(),
+            entity: EntityKind::Node,
+            label_or_type: key_label.into(),
+            property: "name".into(),
+        }],
+        vector_indexes: vec![VectorIndexDesc {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: dim as u32,
+            metric: Metric::Cosine,
+            count: vectors.len() as u64,
+            first_record: 0,
+            mode: AnnMode::BruteForce,
+        }],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        hub_degrees: None,
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}
+
 /// A fully single-label, range-indexed fixture for the consolidation serialiser
 /// (every node has a recoverable business key). Three `:Person` nodes keyed by
 /// `name`, plus one `:KNOWS` edge carrying `since`:

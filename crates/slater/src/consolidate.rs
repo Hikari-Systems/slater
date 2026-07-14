@@ -326,10 +326,15 @@ pub fn serialise_binary_dump<V: ReadView>(
         // vector in the graph through a per-node insert to override a handful of them.
         //
         // `superseded` covers a **removal** as well as a re-embed: a node whose embedding was
-        // taken away has no overlay entry to overwrite the base's with, so without
-        // suppressing it here the rebuild would quietly restore the vector the user deleted.
-        let overlay = engine.overlay_index_vectors(desc)?;
-        let superseded = overlay.superseded();
+        // taken away has no entry above the base to overwrite it with, so without suppressing
+        // it here the rebuild would quietly restore the vector the user deleted.
+        //
+        // The levels are flattened newest-wins for the dump (a rebuild wants one vector per
+        // node, not a scan of each level) — but from the *same* `VectorLevels` the KNN path
+        // reads, so the two consumers cannot disagree about which level wins. A disagreement
+        // would drop a vector on the floor, and only on consolidation.
+        let levels = engine.vector_levels(desc)?;
+        let superseded = levels.superseded();
         let push = |node_id: u64, vector: Vec<f32>, vectors: &mut Vec<_>| {
             // A node the delta or a segment deleted takes its embedding with it.
             if combined_tombs.binary_search(&node_id).is_ok() {
@@ -343,7 +348,7 @@ pub fn serialise_binary_dump<V: ReadView>(
             }
             push(e.node_id, e.vector, &mut vectors);
         }
-        for e in overlay.entries {
+        for e in levels.into_effective_entries() {
             push(e.node_id, e.vector, &mut vectors);
         }
         vector_indexes.push(DumpVectorIndex {

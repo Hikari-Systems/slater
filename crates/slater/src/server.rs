@@ -8957,6 +8957,491 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ── the write ladder's vector levels (HIK-111) ────────────────────────────────────────
+
+    /// The unit query vector every level test scores against.
+    const VQ: [f32; 2] = [1.0, 0.0];
+
+    /// The unit 2-vector at cosine **distance** `d` from [`VQ`]: `cos θ = 1 − d`, so the
+    /// distance a KNN scan reports for it is `d` itself (to f32 rounding). Lets a fixture and
+    /// a write be specified directly in the quantity the assertions are about.
+    fn at_distance(d: f64) -> Vec<f32> {
+        let cos = 1.0 - d;
+        let sin = (1.0 - cos * cos).max(0.0).sqrt();
+        vec![cos as f32, sin as f32]
+    }
+
+    /// `SET n.embedding = vecf32([…])` for a `:Doc` fixture node, as Cypher text.
+    fn set_embedding(name: &str, v: &[f32]) -> String {
+        let parts: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+        format!(
+            "MATCH (n:Doc {{name:'{name}'}}) SET n.embedding = vecf32([{}])",
+            parts.join(", ")
+        )
+    }
+
+    /// Run a write statement against the graph's delta.
+    fn vwrite(graphs: &Graphs, graph: &str, q: &str) {
+        vwrite_params(graphs, graph, q, &HashMap::new());
+    }
+
+    /// [`vwrite`] with bound parameters. A vector with a negative component has no *literal*
+    /// spelling the Phase 1c write grammar admits (a unary minus is an expression, not a
+    /// literal), so a re-embed onto an arbitrary vector has to go through `vecf32($v)`.
+    fn vwrite_params(graphs: &Graphs, graph: &str, q: &str, params: &HashMap<String, Val>) {
+        let gen = graphs.get(graph).unwrap();
+        let writer = graphs.writer(graph).unwrap();
+        match parser::parse_statement(q).unwrap() {
+            parser::ast::Statement::Write(w) => {
+                execute_write(&writer, gen.as_ref(), &w, params)
+                    .unwrap_or_else(|e| panic!("write failed ({q}): {e:?}"));
+            }
+            _ => panic!("expected a write: {q}"),
+        }
+    }
+
+    /// Re-embed a `:Doc` fixture node onto `vector`, through a bound `vecf32($v)`.
+    fn embed_param(graphs: &Graphs, graph: &str, name: &str, vector: &[f32]) {
+        let mut params = HashMap::new();
+        params.insert(
+            "v".to_string(),
+            Val::List(vector.iter().map(|x| Val::Float(*x as f64)).collect()),
+        );
+        vwrite_params(
+            graphs,
+            graph,
+            &format!("MATCH (n:Doc {{name:'{name}'}}) SET n.embedding = vecf32($v)"),
+            &params,
+        );
+    }
+
+    /// KNN over the merged view (base + segments + delta), as `(id, score)` in rank order.
+    fn vknn(
+        graphs: &Graphs,
+        graph: &str,
+        cache: &BlockCache,
+        q: &[f32],
+        k: usize,
+    ) -> Vec<(u64, f64)> {
+        let gen = graphs.get(graph).unwrap();
+        let snap = DeltaSnapshot::from_memtable(graphs.writer(graph).unwrap().snapshot());
+        let view = MergedView::new(gen.as_ref(), snap);
+        let parts: Vec<String> = q.iter().map(|x| format!("{x:?}")).collect();
+        let ast = parser::parse(&format!(
+            "CALL db.idx.vector.queryNodes('Doc', 'embedding', {k}, vecf32([{}])) \
+             YIELD node, score RETURN id(node) AS id, score",
+            parts.join(", ")
+        ))
+        .unwrap();
+        let res = Engine::new(&view, cache).run(&ast).unwrap();
+        res.rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Val::Int(i), Val::Float(s)) => (*i as u64, *s),
+                other => panic!("unexpected KNN row {other:?}"),
+            })
+            .collect()
+    }
+
+    /// **The hazard.** Node 7 is embedded at three different levels at once: the sealed base
+    /// holds its original vector, a core **segment** re-embedded it, and the **delta**
+    /// re-embedded it again. Only the delta's vector is live; the other two are stale copies
+    /// of the same node id.
+    ///
+    /// `merge_topk` deliberately does not dedup by node id, so a stale copy that survives its
+    /// level's scan does not merely misorder the results — it takes one of the `k` slots and
+    /// **evicts a live candidate**, and the k-th neighbour goes missing. No error, no panic,
+    /// no log line. The numbers are chosen so that both stale copies are *closer* to the query
+    /// than the live one (0.0 and 0.1 vs 0.5): a stale entry that is farther away can never win
+    /// a slot, so it would prove nothing.
+    ///
+    /// Truth, computed by hand from the effective newest-wins vector set
+    /// {d00: 0.2, d01: 0.3, d02: 0.55, d07: **0.5**, …}: the top-4 is
+    /// `[d00 0.2, d01 0.3, d07 0.5, d02 0.55]`.
+    ///
+    /// Suppress the base with the global set but let the *segment's* copy through (one flat
+    /// overlay, no per-level suppression) and you get `[d07 0.1, d00 0.2, d01 0.3, d07 0.5]` —
+    /// node 7 twice, and the live d02 evicted off the end of k.
+    #[test]
+    fn knn_suppresses_a_stale_vector_at_every_level_it_lives_at() {
+        let base: Vec<Vec<f32>> = [0.2, 0.3, 0.55, 0.9, 0.95, 1.0, 1.05, 0.0]
+            .iter()
+            .map(|d| at_distance(*d))
+            .collect();
+        let (root, graph) = testgen::write_vector_docs("vec_levels_hazard", &base);
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // A segment re-embeds node 7 — stale, but *closer* to the query than the truth.
+        vwrite(&graphs, &graph, &set_embedding("d07", &at_distance(0.1)));
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the re-embed flushes into a segment");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 1);
+
+        // The delta re-embeds it again. This is the live vector.
+        vwrite(&graphs, &graph, &set_embedding("d07", &at_distance(0.5)));
+
+        let got = vknn(&graphs, &graph, &cache, &VQ, 4);
+        let want = [(0u64, 0.2f64), (1, 0.3), (7, 0.5), (2, 0.55)];
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            want.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "the top-4 over the effective (newest-wins) vector set; got {got:?}"
+        );
+        for ((gid, gs), (wid, ws)) in got.iter().zip(&want) {
+            assert_eq!(gid, wid);
+            assert!(
+                (gs - ws).abs() < 1e-5,
+                "node {gid} should score {ws}, got {gs}"
+            );
+        }
+        assert_eq!(
+            got.iter().filter(|(id, _)| *id == 7).count(),
+            1,
+            "node 7 must appear exactly once — it is embedded at three levels and only the \
+             delta's vector is live; got {got:?}"
+        );
+        assert!(
+            got.iter().any(|(id, _)| *id == 2),
+            "the k-th live neighbour (d02) must still be there — a stale duplicate that reaches \
+             the merge evicts it, silently; got {got:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same three-level stack, seen by the **other** consumer of the fold: the binary
+    /// consolidation dump. If the dump and the KNN path disagree about which level wins, a
+    /// vector goes missing on consolidation — and only on consolidation, where nothing is
+    /// looking. So the dump must carry exactly one vector per node, the newest one, and a
+    /// removal must stay removed.
+    #[test]
+    fn the_consolidation_dump_carries_one_vector_per_node_newest_wins() {
+        let base: Vec<Vec<f32>> = [0.2, 0.3, 0.55, 0.9, 0.95, 1.0, 1.05, 0.0]
+            .iter()
+            .map(|d| at_distance(*d))
+            .collect();
+        let (root, graph) = testgen::write_vector_docs("vec_levels_dump", &base);
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // Segment: re-embed node 7, and remove node 3's embedding.
+        vwrite(&graphs, &graph, &set_embedding("d07", &at_distance(0.1)));
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Doc {name:'d03'}) REMOVE n.embedding",
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the writes flush into a segment");
+        // Delta: re-embed node 7 again (superseding the segment's copy), and remove node 4's.
+        vwrite(&graphs, &graph, &set_embedding("d07", &at_distance(0.5)));
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Doc {name:'d04'}) REMOVE n.embedding",
+        );
+
+        let gen = graphs.get(&graph).unwrap();
+        let snap = DeltaSnapshot::from_memtable(graphs.writer(&graph).unwrap().snapshot());
+        let view = MergedView::new(gen.as_ref(), snap);
+        let dump = root.join("_dump");
+        std::fs::create_dir_all(&dump).unwrap();
+        crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dump)
+            .unwrap();
+
+        let reader = graph_format::consolidate_dump::DumpReader::open(&dump).unwrap();
+        let mut dumped: Vec<(u64, Vec<f32>)> = Vec::new();
+        reader
+            .for_each_vector(|node_id, _key_id, v| {
+                dumped.push((node_id, v.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        dumped.sort_by_key(|(id, _)| *id);
+
+        let ids: Vec<u64> = dumped.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 5, 6, 7],
+            "one vector per node with a live embedding: 3 and 4 were removed (at different \
+             levels), and every other node keeps exactly one — got {ids:?}"
+        );
+        let seven = &dumped.iter().find(|(id, _)| *id == 7).unwrap().1;
+        assert_eq!(
+            seven,
+            &at_distance(0.5),
+            "node 7's dumped vector must be the delta's (the newest level), not the segment's \
+             stale copy nor the base's"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A **randomised** cross-level property test: the merged top-k must *equal* an exact
+    /// brute force over the effective live vector set — not approximate it, not recall it.
+    ///
+    /// The truth is derived from the write script the test itself issues (base vectors, then
+    /// each round's re-embeds / removals / node deletes replayed into a plain map), never read
+    /// off a second implementation of the fold. The base index is `AnnMode::BruteForce`, so
+    /// both sides are exact and the assertion is equality of ids *and* scores.
+    #[test]
+    fn knn_across_levels_equals_a_brute_force_over_the_live_set() {
+        // Deterministic PRNG (the fixture path takes no `rand` dependency).
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        fn unit_vec(state: &mut u64) -> Vec<f32> {
+            let mut v: Vec<f32> = (0..3)
+                .map(|_| (next(state) % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n < 1e-3 {
+                return vec![1.0, 0.0, 0.0];
+            }
+            for x in &mut v {
+                *x /= n;
+            }
+            v
+        }
+
+        const N: usize = 12;
+        for seed in 0..8u64 {
+            let st = &mut (0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let base: Vec<Vec<f32>> = (0..N).map(|_| unit_vec(st)).collect();
+            let (root, graph) =
+                testgen::write_vector_docs(&format!("vec_levels_prop_{seed}"), &base);
+            let wal = root.join("_wal");
+            let cache = BlockCache::new(1 << 20);
+            let vc = VectorIndexCache::new(1 << 20);
+            let mut graphs = Graphs::open_all(&root, None).unwrap();
+            graphs
+                .enable_writable_layer(&delta_cfg(&wal), &root, None)
+                .unwrap();
+
+            // The independently-derived truth: the effective live vector set, replayed from
+            // the very statements the test issues.
+            let mut live: HashMap<u64, Vec<f32>> = base
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v))
+                .collect();
+            let mut deleted: HashSet<u64> = HashSet::new();
+
+            // 0–3 core segments, then a final round that stays in the delta.
+            let segments = (next(st) % 4) as usize;
+            for round in 0..=segments {
+                for id in 0..N as u64 {
+                    if deleted.contains(&id) || !next(st).is_multiple_of(3) {
+                        continue; // ~1 node in 3 is touched per round
+                    }
+                    let name = format!("d{id:02}");
+                    match next(st) % 8 {
+                        0 => {
+                            vwrite(
+                                &graphs,
+                                &graph,
+                                &format!("MATCH (n:Doc {{name:'{name}'}}) DELETE n"),
+                            );
+                            deleted.insert(id);
+                            live.remove(&id);
+                        }
+                        1 | 2 => {
+                            vwrite(
+                                &graphs,
+                                &graph,
+                                &format!("MATCH (n:Doc {{name:'{name}'}}) REMOVE n.embedding"),
+                            );
+                            live.remove(&id);
+                        }
+                        _ => {
+                            let v = unit_vec(st);
+                            embed_param(&graphs, &graph, &name, &v);
+                            live.insert(id, v);
+                        }
+                    }
+                }
+                // Every round but the last is flushed down into a core segment; the last one
+                // stays in the write delta, so the query sees all three tiers at once.
+                if round < segments {
+                    graphs.flush_graph_to_segment(&graph, &vc, &root).unwrap();
+                }
+            }
+
+            for _ in 0..3 {
+                let q = unit_vec(st);
+                let k = 1 + (next(st) % 6) as usize;
+                // Exact brute force over the live set, in the engine's total order (D26:
+                // distance ascending, node id ascending on a tie).
+                let mut want: Vec<(u64, f64)> = live
+                    .iter()
+                    .map(|(id, v)| (*id, 1.0 - crate::vector::cosine_similarity(&q, v)))
+                    .collect();
+                want.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                want.truncate(k);
+
+                let got = vknn(&graphs, &graph, &cache, &q, k);
+                assert_eq!(
+                    got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    want.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    "seed {seed}, {segments} segment(s), k={k}: the merged top-k must equal the \
+                     brute force over the live set\n  got  {got:?}\n  want {want:?}"
+                );
+                for ((_, gs), (_, ws)) in got.iter().zip(&want) {
+                    assert!((gs - ws).abs() < 1e-5, "score {gs} vs {ws}");
+                }
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// Overwriting an indexed embedding with a **non-vector** value takes the node out of the
+    /// index. The write path admits it (`validate_vector_dims` only constrains a
+    /// `Value::Vector`), and the newest level then says this node has no embedding — so it has
+    /// none. Leaving the level below to go on scoring its stale vector is exactly the silent
+    /// wrongness a removal exists to prevent, at either level.
+    #[test]
+    fn a_non_vector_overwrite_takes_the_node_out_of_the_index() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs("vec_levels_scalar", &base);
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![0, 1, 2], "all three start in the index");
+
+        // In the delta: node 0's embedding becomes an integer.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Doc {name:'d00'}) SET n.embedding = 5",
+        );
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "the delta says node 0 has no embedding, so its stale base vector must not score"
+        );
+
+        // And through a flush, where the segment's *row* is what says so.
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the overwrite flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "…and it must still not score once the overwrite lives in a core segment"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The flush must decide vector-index membership by the node's **effective label set** —
+    /// the same question the read fold asks — not by the label the write anchored on.
+    ///
+    /// They differ on a multi-label node whose business key lives on a label other than the
+    /// index's, which is an ordinary shape: key on `(:Keyed {name})`, vector index on
+    /// `(:Doc {embedding})`. Ask the anchor label and the segment's `vec.meta` sidecar names
+    /// nobody, so the fold's candidate set never sees the node — and since the sidecar is the
+    /// *only* channel that can express either fact (D12: the row cannot), two writes are
+    /// silently undone by a background job:
+    ///
+    /// * a **re-embed** reverts to the stale base vector at the flush;
+    /// * a **removal** resurfaces the vector the user deleted.
+    ///
+    /// Both are invisible until someone queries — no error, no panic, no log line.
+    #[test]
+    fn a_flush_keys_vector_membership_on_the_effective_labels_not_the_anchor() {
+        // Base: node 0 at 0.9, node 1 at 0.2, node 2 at 0.4. Every node is :Doc:Keyed.
+        let base: Vec<Vec<f32>> = [0.9, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("vec_levels_anchor", &base, "Keyed");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![1, 2, 0], "base order: 0.2, 0.4, 0.9");
+
+        // Re-embed node 0 at distance 0 — through the *Keyed* anchor, while the index is on Doc.
+        let v = at_distance(0.0);
+        let parts: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+        vwrite(
+            &graphs,
+            &graph,
+            &format!(
+                "MATCH (n:Keyed {{name:'d00'}}) SET n.embedding = vecf32([{}])",
+                parts.join(", ")
+            ),
+        );
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1, 2],
+            "the re-embed leads from the delta"
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the re-embed flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1, 2],
+            "…and must still lead once flushed — a write silently reverting to the stale base \
+             vector at a background flush is the worst kind of wrong"
+        );
+
+        // The removal half, through the same anchor.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Keyed {name:'d01'}) REMOVE n.embedding",
+        );
+        assert_eq!(ids(&graphs), vec![0, 2], "node 1 leaves the index");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the removal flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 2],
+            "…and must stay gone — the flush must carry the removal, or the deleted embedding \
+             resurfaces"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.
