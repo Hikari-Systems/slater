@@ -282,18 +282,23 @@ supported object-store backends** — the published image ships with both compil
 in, so each is configuration-only, and a generation built once can be served from
 any of them (even migrated `fs` → S3 → GCS) without a rebuild.
 
-| `dataBackend.kind` | Positional read | Integrity at open (no body download) | Credentials |
+| `dataBackend.kind` | Positional read | Integrity at open | Credentials |
 | --- | --- | --- | --- |
 | `fs` *(default)* | `pread` | full BLAKE3 re-hash of each file | — |
-| `s3` | HTTP `Range` GET | server **SHA-256** via `HEAD` (→ byte-size check if absent) | config keys, AWS chain, or IAM role |
-| `gcs` | HTTP range read | server **CRC32C** via `get_object` (→ byte-size check if absent) | ADC / Workload Identity, or service-account JSON |
+| `s3` | HTTP `Range` GET | server **SHA-256** via `HEAD` (→ BLAKE3 body re-hash if absent) | config keys, AWS chain, or IAM role |
+| `gcs` | HTTP range read | server **CRC32C** via `get_object` (→ BLAKE3 body re-hash if absent) | ADC / Workload Identity, or service-account JSON |
 
 Both object stores verify integrity from the **checksum the store already
 computes and keeps**, fetched as object metadata: `slater-build` sends the
 checksum on upload (the store validates the bytes against it and stores it), and
 the server reads it back at open and compares it to the manifest — one metadata
 request per file, no body download. It is content-grade and identical in spirit
-across S3 (SHA-256) and GCS (CRC32C).
+across S3 (SHA-256) and GCS (CRC32C). When an object carries **no** server-stored
+checksum (copied in out-of-band, or uploaded with a different default), the server
+**re-hashes the object body against the manifest BLAKE3** rather than trusting its
+byte length — a requested integrity check is never silently downgraded to a size
+comparison. Slater-published generations always carry the checksum, so they stay on
+the cheap metadata path.
 
 ### Filesystem (`fs`)
 
@@ -433,7 +438,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `server.maxConcurrentWrites` | `server__maxConcurrentWrites` | 4 | Cap on write statements **executing at once** (0 ⇒ unlimited, not recommended). A write resolves business keys against the core (`pread` + decompress, a round trip on S3/GCS) and then appends to the WAL and fsyncs, so it runs on a blocking thread, never on the reactor. Every mutation of one graph is serialised behind that graph's single writer lock, so permits beyond a handful only park blocking-pool threads on a mutex — and that pool is the one query execution shares. |
 | `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 | `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root holding `<graph>/<generation>/` for the `fs` backend (and the local area the at-rest key file must stay outside of). |
-| `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open (a cheap metadata check on every backend). |
+| `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open. `fs` re-hashes every file; object stores compare the store's own checksum (one metadata request) and fall back to a body re-hash when the object carries none — never to a length-only check. See the [backend table](#storage-backends-filesystem--s3--gcs). |
 | `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket name (required when `kind=s3`). |
 | `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ resolved from the environment. |
 | `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint URL for an S3-compatible store (MinIO, localstack); empty ⇒ standard AWS endpoint. |
@@ -458,7 +463,8 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 64 MiB | Vector pool budget: resident brute-force kNN matrix (pre-normalised, no-gather scan) + resident PQ + Vamana-block LRU. kNN falls back to the block-cache gather path for any group that does not fit. |
 | `cache.resultCacheBytes` | `cache__resultCacheBytes` | 16 MiB | Result LRU budget. |
 | `cache.cacheTtlMs` | `cache__cacheTtlMs` | 1800000 (30 min) | Idle TTL: a cached entry untouched this long is reclaimed by a background sweep, freeing memory below the budgets when the working set goes quiet. `0` or negative disables the sweep. |
-| `cache.degreeColumn` | `cache__degreeColumn` | `lazy` | Residency of the dense per-node degree column (backs the degree-sum `count(endpoint)` fast path): `lazy` faults per-id chunks on touch and frees them on the idle sweep; `pinned` holds the whole column resident. |
+| `cache.degreeColumn` | `cache__degreeColumn` | `lazy` | Residency of the dense per-node degree column (backs the degree-sum `count(endpoint)` fast path): `lazy` faults per-id chunks on touch and reclaims them under memory pressure (see `degreeColumnBytes`) as well as on the idle sweep; `pinned` holds the whole column resident and ignores the budget. |
+| `cache.degreeColumnBytes` | `cache__degreeColumnBytes` | 256 MiB | Byte budget for the `lazy` degree column, enforced **on the fault path**: once resident chunks exceed it, the coldest are evicted (CLOCK) before the next chunk is admitted, so the column stays bounded even when `cacheTtlMs ≤ 0` disables the idle sweep. `0` ⇒ uncapped (not recommended). Ignored under `pinned`. |
 | `tls.cert` / `tls.key` | `tls__cert` / `tls__key` | _(empty)_ | PEM material; both set ⇒ `bolt+s`. Empty ⇒ plaintext (loopback dev). |
 | `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataBackend.fs.dir` and any attacker-writable path (server refuses to start if it resolves inside it); see `THREAT_MODEL.md` "Trust boundary". |
 | `encryption.keyEnv` | `encryption__keyEnv` | _(empty)_ | Env var holding the hex at-rest master key. |
@@ -483,8 +489,10 @@ compaction (`delta.l0CompactionTrigger`, `delta.segmentFlushBytes`,
 defaults are sensible and they are documented in `docs/WRITABLE-PLAN.md`.
 
 **Resident memory** is approximately
-`blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead,
-**independent of graph size** — that is the headline guarantee, exercised by the
+`blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead
+(plus up to `degreeColumnBytes` for the `lazy` degree column, once the degree-sum
+`count(endpoint)` fast path is exercised), **independent of graph size** — that is
+the headline guarantee, exercised by the
 `rss_stays_bounded_under_sustained_knn_load` integration test. Per-connection
 buffers live *outside* the cache budgets, so the guarantee holds under adversarial
 load only because `server.maxConnections` bounds how many can exist at once.
@@ -632,7 +640,10 @@ DDL is emitted first so the rebuild recreates the indexes. A multi-label node
 keeps **every** label — it is emitted as `MERGE (n:Ident:Other {key: v})`, with
 the identity label (the one supplying the business key) first and the rest
 sorted; the merge is keyed on the identity label alone, so the trailing labels
-are written onto the node without creating another one. Vectors (and other
+are written onto the node without creating another one. Labels, relationship
+types and property keys containing special characters are backtick-quoted on
+emission, so unusual names round-trip faithfully and cannot inject Cypher into the
+rebuild. Vectors (and other
 values with no Cypher-literal spelling) cannot ride a `MERGE` dump and are dropped
 with a warning on stderr. Exit status is `0` on success, `1` on error.
 
