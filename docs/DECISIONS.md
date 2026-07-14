@@ -1460,3 +1460,53 @@ Cross-checked at other scales, where the answer *is* deterministic: 1M Wikidata 
 **both** paths; Monarch-KG (63 reltypes — the only real dataset exercising `reltype_count > 3`) hashes
 `89d2e818…` on both paths, with all 63 per-reltype source and target counts matching the pre-change
 manifest.
+
+### D62 — Vectors survive a consolidation, and KNN is delta-aware
+Two holes in the vector path, both silent, both closed here.
+
+**Consolidation destroyed the core's vectors.** A consolidation is dump-and-rebuild, and an
+*indexed* embedding is routed **out** of the column store (D12) — so the dumper, which walks
+node properties through the `ReadView`, never saw one. The dump format had no place to put one
+anyway, and the builder's dump-ingest branch hard-zeroed `vector_stmts`. The result: any write
+at all on a vector-carrying graph (even `SET n.name = 'x'`) followed by a consolidation produced
+a fresh generation with **no embeddings and an empty `vector_indexes`** — no error, no warning,
+exit 0. Note the text `MERGE` path rendered a vector as the literal `null` precisely to dodge
+`merge_build`'s `reject_vector` bail, which is how a loud failure became a silent one.
+
+The binary dump now carries them: a `vectors.blk` stream (`uvarint(node_id) ‖ uvarint(key_id) ‖
+uvarint(dim) ‖ dim × f32`, ascending by `(node_id, key_id)`) plus a `vector_indexes` section in
+`meta.json`. The builder merge-joins the stream against its ascending node stream — one cursor,
+no map — and rebuilds each index, **re-routing by cardinality** against its own `ann_threshold`
+(an index that shrank below the threshold comes back brute-force, one that grew past it comes
+back Vamana). Vectors are keyed by the **compacted** id because the rebuild permutes dense ids.
+
+Two things the reader must get right, because both fail silently:
+- **The two arms store vectors in different files (D31).** Brute-force → `vectors.f32.blk` at
+  `[first_record, first_record + count)`. Vamana → its own `.vamana` blocks, and *not* in
+  `vectors.f32.blk` at all (its `first_record` is a meaningless `0`). Read the wrong store and
+  you get an empty group, i.e. a vector-less rebuild that still exits 0.
+- **A Vamana index stores its vectors L2-normalised** (the space its graph + PQ codebooks were
+  built in — D29), so the original magnitudes are *not recoverable from the core*. Vamana is
+  cosine-only and cosine is scale-invariant, so every KNN score round-trips exactly; only a
+  vector's length is lost. There is nowhere else to recover it from.
+
+The `MERGE` text dump cannot express an embedding at all, so it now **refuses** a graph with
+vector indexes instead of quietly nulling them out.
+
+**KNN ignored the delta.** `apply_vector_call` read only the base manifest, and `MergedView`'s
+`vectors()`/`vamana_index()` delegate straight to the core, so a node **deleted** via `DELETE`
+was still returned by `db.idx.vector.queryNodes` as a live `Val::Node` — every other read path
+suppresses tombstones (`suppress_tombstoned_in_place`); the vector path was the lone exception.
+Both arms now take a `LivePredicate`:
+- Brute force checks it in `TopK` *after* the distance comparison admits a candidate, so the
+  probe runs O(k) times per scan, not O(N), and the top-k is taken over the **live** set (a dead
+  node never occupies one of the `k` slots).
+- `beam_search` takes an `emit(i) -> Option<node_id>` closure that gates only the `hits.push`.
+  A suppressed node is **still expanded** — it stays a navigational *waypoint*, since pruning it
+  from the walk would disconnect the region behind it and cost recall on the live nodes.
+  Navigation is therefore identical with or without suppression; only the emitted set shrinks.
+
+Resolving the node id in `emit` also fixed a **D26 violation**: the Vamana arm broke distance
+ties on the *layout index* (BFS-from-medoid order, arbitrary w.r.t. node id) while brute force
+broke them on the node id, so the two arms disagreed at the `k` boundary. Both now tie-break on
+ascending node id.

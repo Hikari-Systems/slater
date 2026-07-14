@@ -33,6 +33,16 @@ use wide::f32x8;
 use graph_format::manifest::Metric;
 use graph_format::vectors::VectorEntry;
 
+/// A liveness predicate over dense node ids: `false` suppresses the node from the
+/// results without otherwise affecting the scan. A node deleted in the delta (or by
+/// a segment flush) still sits in the sealed base index — the base is immutable, so
+/// the only place a delete can take effect on the read path is here.
+///
+/// Fallible because resolving a node over the core stack can read a block. Callers
+/// pass `None` on a pure-core generation with an empty delta, so a read-only estate
+/// pays nothing.
+pub type LivePredicate<'a> = &'a (dyn Fn(u64) -> Result<bool> + Sync);
+
 /// One KNN hit: the dense node id and its distance score (see the module DESIGN
 /// note — smaller is closer).
 #[derive(Debug, Clone, PartialEq)]
@@ -256,6 +266,37 @@ impl TopK {
             heap: BinaryHeap::with_capacity(k.saturating_add(1).min(1 << 16)),
         }
     }
+    /// Whether `(score, node_id)` would enter the top-`k` on **distance alone**.
+    /// Checked before the liveness probe so a candidate that already loses on
+    /// distance never pays for one — which is what keeps filtering ~free: the probe
+    /// runs O(k) times over a scan, not O(N).
+    #[inline]
+    fn admits(&self, node_id: u64, score: f64) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        if self.heap.len() < self.k {
+            return true;
+        }
+        let item = HeapItem { score, node_id };
+        self.heap.peek().is_some_and(|worst| item < *worst)
+    }
+    /// Score `(node_id, score)` into the heap, consulting `live` only if it would be
+    /// admitted. A suppressed node is dropped outright — it does not displace a live
+    /// candidate, so the result is the exact top-`k` over the *live* set.
+    #[inline]
+    fn push_live(&mut self, node_id: u64, score: f64, live: Option<LivePredicate>) -> Result<()> {
+        if !self.admits(node_id, score) {
+            return Ok(());
+        }
+        if let Some(f) = live {
+            if !f(node_id)? {
+                return Ok(());
+            }
+        }
+        self.push(node_id, score);
+        Ok(())
+    }
     #[inline]
     fn push(&mut self, node_id: u64, score: f64) {
         if self.k == 0 {
@@ -292,11 +333,16 @@ impl TopK {
 /// by score then by node id; fewer than `k` if the group is smaller. Scoring uses
 /// the fast f32 SIMD kernels and a bounded top-`k` heap (see [`score_fast`] /
 /// [`TopK`]).
+///
+/// `live` (when present) suppresses deleted nodes from the result — see
+/// [`LivePredicate`]. The top-`k` is taken over the live set, so a deleted node
+/// never occupies one of the `k` slots.
 pub fn brute_force_knn(
     entries: &[VectorEntry],
     query: &[f32],
     k: usize,
     metric: Metric,
+    live: Option<LivePredicate>,
 ) -> Result<Vec<Neighbour>> {
     let query_norm = query_norm_for(metric, query);
     let mut topk = TopK::new(k);
@@ -309,7 +355,8 @@ pub fn brute_force_knn(
                 e.vector.len()
             );
         }
-        topk.push(e.node_id, score_fast(metric, query, query_norm, &e.vector));
+        let score = score_fast(metric, query, query_norm, &e.vector);
+        topk.push_live(e.node_id, score, live)?;
     }
     Ok(topk.into_sorted())
 }
@@ -330,10 +377,11 @@ pub fn brute_force_knn_par(
     k: usize,
     metric: Metric,
     min_par: usize,
+    live: Option<LivePredicate>,
 ) -> Result<Vec<Neighbour>> {
     let pool = match pool {
         Some(p) if k > 0 && entries.len() >= min_par => p,
-        _ => return brute_force_knn(entries, query, k, metric),
+        _ => return brute_force_knn(entries, query, k, metric, live),
     };
     // One chunk per worker keeps the per-chunk top-k bounded (≤ k each) and the merge
     // small. `brute_force_knn` over a chunk scores it exactly and reduces to its top-k.
@@ -344,7 +392,7 @@ pub fn brute_force_knn_par(
     let partials: Vec<Vec<Neighbour>> = pool.install(|| {
         entries
             .par_chunks(chunk)
-            .map(|c| brute_force_knn(c, query, k, metric))
+            .map(|c| brute_force_knn(c, query, k, metric, live))
             .collect::<Result<Vec<_>>>()
     })?;
     // Merge the per-chunk top-k lists into one bounded top-k. The global k-smallest
@@ -471,7 +519,8 @@ fn scan_matrix_range(
     start: usize,
     end: usize,
     k: usize,
-) -> TopK {
+    live: Option<LivePredicate>,
+) -> Result<TopK> {
     let mut topk = TopK::new(k);
     for i in start..end {
         let row = &m.data[i * m.dim..(i + 1) * m.dim];
@@ -485,9 +534,9 @@ fn scan_matrix_range(
                 Metric::Cosine => unreachable!("cosine uses CosineUnit/CosineZero"),
             },
         };
-        topk.push(m.node_ids[i], score);
+        topk.push_live(m.node_ids[i], score, live)?;
     }
-    topk
+    Ok(topk)
 }
 
 /// Brute-force kNN over a [`ResidentMatrix`] — same contract and result as
@@ -497,6 +546,7 @@ pub fn brute_force_knn_matrix(
     m: &ResidentMatrix,
     query: &[f32],
     k: usize,
+    live: Option<LivePredicate>,
 ) -> Result<Vec<Neighbour>> {
     if query.len() != m.dim {
         bail!(
@@ -506,7 +556,7 @@ pub fn brute_force_knn_matrix(
         );
     }
     let pq = PreparedQuery::prepare(m.metric, query);
-    Ok(scan_matrix_range(m, &pq, m.metric, 0, m.rows(), k).into_sorted())
+    Ok(scan_matrix_range(m, &pq, m.metric, 0, m.rows(), k, live)?.into_sorted())
 }
 
 /// Parallel [`brute_force_knn_matrix`] — identical result, chunked one range per
@@ -517,6 +567,7 @@ pub fn brute_force_knn_matrix_par(
     query: &[f32],
     k: usize,
     min_par: usize,
+    live: Option<LivePredicate>,
 ) -> Result<Vec<Neighbour>> {
     if query.len() != m.dim {
         bail!(
@@ -528,7 +579,7 @@ pub fn brute_force_knn_matrix_par(
     let n = m.rows();
     let pool = match pool {
         Some(p) if k > 0 && n >= min_par => p,
-        _ => return brute_force_knn_matrix(m, query, k),
+        _ => return brute_force_knn_matrix(m, query, k, live),
     };
     let pq = PreparedQuery::prepare(m.metric, query);
     let metric = m.metric;
@@ -540,9 +591,9 @@ pub fn brute_force_knn_matrix_par(
     let partials: Vec<Vec<Neighbour>> = pool.install(|| {
         ranges
             .par_iter()
-            .map(|&(s, e)| scan_matrix_range(m, &pq, metric, s, e, k).into_sorted())
-            .collect()
-    });
+            .map(|&(s, e)| Ok(scan_matrix_range(m, &pq, metric, s, e, k, live)?.into_sorted()))
+            .collect::<Result<Vec<_>>>()
+    })?;
     let mut merged = TopK::new(k);
     for nb in partials.into_iter().flatten() {
         merged.push(nb.node_id, nb.score);
@@ -576,7 +627,14 @@ mod tests {
     #[test]
     fn zero_norm_vector_is_maximally_distant() {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
-        let n = brute_force_knn(&[entry(7, &[0.0, 0.0])], &[1.0, 1.0], 1, Metric::Cosine).unwrap();
+        let n = brute_force_knn(
+            &[entry(7, &[0.0, 0.0])],
+            &[1.0, 1.0],
+            1,
+            Metric::Cosine,
+            None,
+        )
+        .unwrap();
         assert!((n[0].score - 1.0).abs() < 1e-12);
     }
 
@@ -590,7 +648,7 @@ mod tests {
             entry(3, &[0.9, 0.05]),
         ];
         let query = [1.0, 0.0];
-        let got = brute_force_knn(&entries, &query, 3, Metric::Cosine).unwrap();
+        let got = brute_force_knn(&entries, &query, 3, Metric::Cosine, None).unwrap();
 
         // Reference: distance = 1 - cosine_similarity, ascending, tie-break node id.
         let mut reference: Vec<Neighbour> = entries
@@ -628,14 +686,14 @@ mod tests {
     #[test]
     fn k_larger_than_group_returns_all() {
         let entries = vec![entry(0, &[1.0, 0.0]), entry(1, &[0.0, 1.0])];
-        let got = brute_force_knn(&entries, &[1.0, 0.0], 10, Metric::Cosine).unwrap();
+        let got = brute_force_knn(&entries, &[1.0, 0.0], 10, Metric::Cosine, None).unwrap();
         assert_eq!(got.len(), 2);
     }
 
     #[test]
     fn dimension_mismatch_is_an_error() {
         let entries = vec![entry(0, &[1.0, 0.0, 0.0])];
-        let err = brute_force_knn(&entries, &[1.0, 0.0], 1, Metric::Cosine)
+        let err = brute_force_knn(&entries, &[1.0, 0.0], 1, Metric::Cosine, None)
             .err()
             .unwrap();
         assert!(err.to_string().contains("dimension"), "got: {err}");
@@ -666,8 +724,9 @@ mod tests {
             .unwrap();
         for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
             for k in [1usize, 5, 50, 999, 1000, 2000] {
-                let seq = brute_force_knn(&entries, &query, k, metric).unwrap();
-                let par = brute_force_knn_par(Some(&pool), &entries, &query, k, metric, 1).unwrap();
+                let seq = brute_force_knn(&entries, &query, k, metric, None).unwrap();
+                let par =
+                    brute_force_knn_par(Some(&pool), &entries, &query, k, metric, 1, None).unwrap();
                 assert_eq!(seq, par, "metric {metric:?}, k {k}");
             }
         }
@@ -677,10 +736,10 @@ mod tests {
     fn knn_par_falls_back_below_threshold_and_without_pool() {
         let entries = spread(50);
         let query = [0.1f32, 0.2, 0.3];
-        let seq = brute_force_knn(&entries, &query, 5, Metric::Cosine).unwrap();
+        let seq = brute_force_knn(&entries, &query, 5, Metric::Cosine, None).unwrap();
         // No pool → sequential.
         assert_eq!(
-            brute_force_knn_par(None, &entries, &query, 5, Metric::Cosine, 1).unwrap(),
+            brute_force_knn_par(None, &entries, &query, 5, Metric::Cosine, 1, None).unwrap(),
             seq
         );
         // Pool present but group below `min_par` → sequential fallback, still correct.
@@ -689,7 +748,8 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(
-            brute_force_knn_par(Some(&pool), &entries, &query, 5, Metric::Cosine, 256).unwrap(),
+            brute_force_knn_par(Some(&pool), &entries, &query, 5, Metric::Cosine, 256, None)
+                .unwrap(),
             seq
         );
     }
@@ -709,6 +769,7 @@ mod tests {
             5,
             Metric::Cosine,
             1,
+            None,
         )
         .err()
         .unwrap();
@@ -729,9 +790,10 @@ mod tests {
         for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
             let m = ResidentMatrix::from_entries(3, metric, entries.clone()).unwrap();
             for k in [1usize, 5, 50, 999, 1000, 2000] {
-                let want = brute_force_knn(&entries, &query, k, metric).unwrap();
-                let mat = brute_force_knn_matrix(&m, &query, k).unwrap();
-                let mat_par = brute_force_knn_matrix_par(Some(&pool), &m, &query, k, 1).unwrap();
+                let want = brute_force_knn(&entries, &query, k, metric, None).unwrap();
+                let mat = brute_force_knn_matrix(&m, &query, k, None).unwrap();
+                let mat_par =
+                    brute_force_knn_matrix_par(Some(&pool), &m, &query, k, 1, None).unwrap();
                 assert_eq!(
                     mat.iter().map(|n| n.node_id).collect::<Vec<_>>(),
                     want.iter().map(|n| n.node_id).collect::<Vec<_>>(),
@@ -753,11 +815,11 @@ mod tests {
         // Zero-norm query → every distance 1; zero-norm row → that row's distance 1.
         let entries = vec![entry(0, &[0.0, 0.0]), entry(1, &[1.0, 1.0])];
         let m = ResidentMatrix::from_entries(2, Metric::Cosine, entries).unwrap();
-        let zero_q = brute_force_knn_matrix(&m, &[0.0, 0.0], 2).unwrap();
+        let zero_q = brute_force_knn_matrix(&m, &[0.0, 0.0], 2, None).unwrap();
         for n in &zero_q {
             assert!((n.score - 1.0).abs() < 1e-6, "{n:?}");
         }
-        let real_q = brute_force_knn_matrix(&m, &[1.0, 1.0], 2).unwrap();
+        let real_q = brute_force_knn_matrix(&m, &[1.0, 1.0], 2, None).unwrap();
         // Node 1 (same direction) is closest (~0); node 0 (zero) is distance 1.
         assert_eq!(real_q[0].node_id, 1);
         assert!(real_q[0].score < 1e-6);

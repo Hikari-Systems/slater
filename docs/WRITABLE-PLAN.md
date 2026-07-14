@@ -259,10 +259,20 @@ properties; (5) edges — `MATCH (a…),(b…) MERGE (a)-[:TYPE {props}]->(b);` 
 endpoints' business keys (so the edge query returns endpoint labels + key props);
 (6) a Cypher-literal escaper for string/number/bool/null/list values.
 
-**Known limitation — vectors.** `vecf32` properties cannot be carried in a `MERGE`
-dump (the build path rejects vector values; see the vectors non-goal). A dump of a
-graph with embeddings either omits them or must use the `--pk`/`CREATE`-style
-offline rebuild path — flag this in the tool's output and docs.
+**Known limitation — vectors in the `MERGE` dump.** `vecf32` properties cannot be
+carried in a `MERGE` dump: the build path rejects vector values outright
+(`merge_build::reject_vector`). `serialise_merge_dump` therefore **refuses** a graph
+that declares vector indexes rather than emitting each embedding as a `null` literal,
+which is what it used to do — silently rebuilding the graph without its vectors. A text
+dump of a vector-carrying graph must use the `--pk`/`CREATE`-style offline path.
+
+This is a limitation of the *text* dialect only. **Consolidation carries vectors.** It
+takes the binary path (`serialise_binary_dump`), whose dump has a `vectors.blk` stream
+and a `vector_indexes` section in `meta.json`; the builder re-attaches each embedding to
+its node and rebuilds the index, re-routing by cardinality against its own
+`ann_threshold`. Embeddings need their own stream because an *indexed* one is routed
+**out** of the column store (D12) and so is absent from a node's property record — which
+is exactly why this went unnoticed: the dumper simply never saw them.
 
 **Net-new pieces / dependencies:** promote `BoltConn` to shared; a schema-introspection
 query for range indexes; a **list-readable-graphs** call over Bolt for `-l`/`--list`

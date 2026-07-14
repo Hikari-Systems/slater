@@ -12306,6 +12306,211 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **The vector regression gate.** A consolidation used to destroy the core's own
+    /// embeddings and vector indexes — silently, exit 0, no warning — and *any* write was
+    /// enough to get you there: the dump only reads the column store, but an indexed
+    /// embedding is routed *out* of it (D12), so the dumper never saw one; the dump format
+    /// had nowhere to put one; and the builder hard-zeroed `vector_stmts` on the dump path.
+    /// So this fixture's `SET n.age` — which has nothing to do with embeddings — was enough
+    /// to lose every vector in the graph.
+    ///
+    /// Asserts the whole round trip: the index declaration survives, and KNN returns the
+    /// *same* neighbours with the *same* scores across the rebuild.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn consolidate_carries_vector_indexes_and_embeddings() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let (root, graph, _) = testgen::write_basic("consolidate_vectors");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        // Carol's own embedding as the query, so the ranking is unambiguous.
+        let knn = |gen: &Generation| -> Vec<(i64, String)> {
+            let view = MergedView::read_only(gen);
+            let ast = parser::parse(
+                "CALL db.idx.vector.queryNodes('Person', 'embedding', 3, vecf32([0.9, 0.8, 0.7])) \
+                 YIELD node, score RETURN id(node) AS id, score",
+            )
+            .unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    // Scores are compared as text at full precision: the rebuild legitimately
+                    // re-encodes the vectors, so pin the contract that is actually promised —
+                    // same order, same scores to the last digit shown.
+                    (Val::Int(id), Val::Float(s)) => (*id, format!("{s:.9}")),
+                    other => panic!("unexpected KNN row {other:?}"),
+                })
+                .collect()
+        };
+
+        let gen0 = graphs.get(&graph).unwrap();
+        assert_eq!(
+            gen0.manifest().vector_indexes.len(),
+            1,
+            "fixture must start with a vector index"
+        );
+        let before = knn(gen0.as_ref());
+        assert_eq!(before.len(), 3, "all three Person embeddings are indexed");
+
+        // A write that has nothing whatever to do with the embeddings.
+        let writer = graphs.writer(&graph).unwrap();
+        let stmt = match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 99")
+            .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+        graphs
+            .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+
+        let gen1 = graphs.get(&graph).unwrap();
+        assert_eq!(
+            gen1.manifest().vector_indexes.len(),
+            1,
+            "the vector index must survive consolidation (this is the bug: it used to vanish)"
+        );
+        assert_eq!(
+            knn(gen1.as_ref()),
+            before,
+            "KNN must return identical neighbours and scores across a consolidation"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The **Vamana** arm of the same gate, which is the one that would silently ship
+    /// zeros. A Vamana index's full vectors live in its `.vamana` blocks and are *not* in
+    /// `vectors.f32.blk` at all — its `first_record` is recorded as a meaningless `0` (D31)
+    /// — so a carry-through that read the brute-force store for it would find an empty
+    /// group, rebuild an index with no rows, and still exit 0.
+    ///
+    /// The rebuild re-routes by cardinality against its *own* `ann_threshold` (the default
+    /// 50k, since `run_builder` passes no override), so these 400 vectors come back as a
+    /// brute-force index. That is correct, and it is also what makes the assertion sharp:
+    /// the vectors have to survive a Vamana→brute-force transcode to score at all.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
+        use graph_format::manifest::AnnMode;
+
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let work =
+            std::env::temp_dir().join(format!("slater_vamana_consol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let data = work.join("data");
+        let wal = work.join("_wal");
+
+        // 400 × dim-16 cosine vectors: enough to clear an `--ann-threshold 50`, and
+        // `pq_subspaces = 8` divides 16, so the index is Vamana-eligible (D29).
+        let (dim, n) = (16usize, 400usize);
+        let mut seed: u64 = 0xDEAD_BEEF_1234;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let mut script =
+            format!("CALL db.idx.vector.createNodeIndex('Doc', 'embedding', {dim}, 'cosine');\n");
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let body: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+            script.push_str(&format!(
+                "CREATE (:Doc:__DumpVertex__ {{__dump_id__: {i}, embedding: vecf32([{}])}});\n",
+                body.join(", ")
+            ));
+            vectors.push(v);
+        }
+        let input = work.join("dump.cypher");
+        std::fs::write(&input, &script).unwrap();
+
+        let ok = std::process::Command::new(&bin)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--pk", "__dump_id__"])
+            .args(["--cluster", "none"])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .status()
+            .expect("spawn slater-build")
+            .success();
+        assert!(ok, "the fixture build must succeed");
+
+        let mut graphs = Graphs::open_all(&data, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &data, None)
+            .unwrap();
+        let cache = BlockCache::new(1 << 22);
+        let vc = VectorIndexCache::new(1 << 22);
+
+        let gen0 = graphs.get("docs").unwrap();
+        let desc0 = &gen0.manifest().vector_indexes[0];
+        assert!(
+            matches!(desc0.mode, AnnMode::Vamana { .. }),
+            "the fixture must actually be a Vamana index, else this proves nothing"
+        );
+        assert_eq!(desc0.count, n as u64);
+
+        graphs
+            .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+
+        let gen1 = graphs.get("docs").unwrap();
+        let vidx = &gen1.manifest().vector_indexes;
+        assert_eq!(
+            vidx.len(),
+            1,
+            "the vector index must survive consolidation of a Vamana graph"
+        );
+        assert_eq!(
+            vidx[0].count, n as u64,
+            "every vector must be carried out of the .vamana blocks — a 0 here is the \
+             'read the wrong store' bug, which is silent by construction"
+        );
+
+        // The data has to be the real thing, not zeros: query with node 7's own embedding
+        // and it must come back first, at distance ~0. (`--cluster none` ⇒ dense id == i.)
+        let probe: Vec<String> = vectors[7].iter().map(|x| format!("{x:.6}")).collect();
+        let view = MergedView::read_only(gen1.as_ref());
+        let ast = parser::parse(&format!(
+            "CALL db.idx.vector.queryNodes('Doc', 'embedding', 1, vecf32([{}])) \
+             YIELD node, score RETURN id(node) AS id, score",
+            probe.join(", ")
+        ))
+        .unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        assert_eq!(res.rows.len(), 1, "the rebuilt index must return a hit");
+        assert!(
+            matches!(res.rows[0][0], Val::Int(7)),
+            "a node's own embedding must be its own nearest neighbour, got {:?}",
+            res.rows[0][0]
+        );
+        let Val::Float(score) = res.rows[0][1] else {
+            panic!("score should be a float");
+        };
+        assert!(
+            score.abs() < 1e-5,
+            "an exact match must score ~0 (cosine is scale-invariant, so the .vamana file's \
+             normalised vectors round-trip exactly); got {score}"
+        );
+        std::fs::remove_dir_all(&work).ok();
+    }
+
     /// Every operation of the write grammar, so a new one cannot be added without being
     /// listed here. Each must parse to a mutating statement.
     fn every_write_statement() -> Vec<&'static str> {

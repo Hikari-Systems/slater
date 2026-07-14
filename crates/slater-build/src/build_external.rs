@@ -919,7 +919,10 @@ fn build_inner(
             reltypes = Interner::from_names(ing.reltypes);
             keys = Interner::from_names(ing.keys);
             range_stmts = ing.range_stmts;
-            vector_stmts = Vec::new();
+            // Vector indexes ride the dump (its `vectors.blk` + `meta.vector_indexes`).
+            // This used to be `Vec::new()`, which is what silently rebuilt every
+            // vector-carrying graph with no vectors and no vector indexes at all.
+            vector_stmts = ing.vector_stmts;
             checkpoint(
                 scratch_dir,
                 &BuildState {
@@ -3294,7 +3297,7 @@ mod tests {
     use super::*;
     use graph_format::manifest::{AnnMode, Manifest};
     use graph_format::pq::{AdcTable, PqReader};
-    use graph_format::vamana::{beam_search, VamanaReader};
+    use graph_format::vamana::{beam_search, BeamParams, VamanaReader};
 
     /// A deterministic LCG so the synthetic dump is reproducible without a `rand`
     /// dependency (mirrors graph-format's training RNG).
@@ -3440,24 +3443,26 @@ mod tests {
             let query = unit(&vectors[(q * 23) % n]);
             let adc = AdcTable::new(&resident.codebook, &query).unwrap();
             let hits = beam_search(
-                medoid as u32,
-                64,
-                k,
-                n,
+                BeamParams {
+                    medoid: medoid as u32,
+                    beam_width: 64,
+                    k,
+                    num_nodes: n,
+                },
                 |i| adc.estimate(resident.codes_of(i as usize)),
                 |i| {
                     let node = vam.node(i).unwrap();
                     Ok((node.vector, node.neighbours))
                 },
                 |v| cosine_distance(&query, v),
+                // Nothing is deleted here; the resident PQ carries the layout
+                // index → dense node id mapping the search reports.
+                |i| Ok(Some(resident.node_ids[i as usize])),
             )
             .unwrap();
-            // Map hits back to dense node ids and compare with brute force over the
-            // original (raw) vectors. `--cluster none` ⇒ dense id == dump index.
-            let got: std::collections::HashSet<u64> = hits
-                .iter()
-                .map(|h| vam.node(h.index).unwrap().node_id)
-                .collect();
+            // Compare with brute force over the original (raw) vectors; the search
+            // already reports dense node ids. `--cluster none` ⇒ dense id == dump index.
+            let got: std::collections::HashSet<u64> = hits.iter().map(|h| h.node_id).collect();
             let mut truth: Vec<(f32, u64)> = vectors
                 .iter()
                 .enumerate()

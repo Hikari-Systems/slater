@@ -32,7 +32,11 @@ pub enum AnnMode {
         r: u32,
         /// Long-edge pruning factor.
         alpha: f32,
-        /// Entry medoid (dense node id within the index's vector set).
+        /// Entry point: the medoid's **vamana layout index** (its record position in
+        /// the `.vamana` file), *not* a dense node id — the builder records it after
+        /// the BFS permutation (D30). Since the BFS is seeded from the medoid it is
+        /// always `0` in practice; it is kept explicit so a future layout that does
+        /// not start at the medoid stays readable.
         medoid: u64,
         /// PQ subspace count.
         pq_subspaces: u32,

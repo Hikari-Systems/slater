@@ -2244,7 +2244,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// blocks and they stay warm for repeat queries. When a fanout pool is
     /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
     /// (cache lookup + zstd decode) gather in parallel, preserving record order.
-    fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
+    pub(crate) fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
         let ids: Vec<u64> = (first_record..first_record + count).collect();
         let (gen, cache) = (self.gen, self.cache);
         par_gather(self.fanout_pool.as_deref(), &ids, KNN_PAR_MIN, |&g| {
@@ -5155,6 +5155,30 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let count = desc.count;
         let mode = desc.mode.clone();
 
+        // A vector index is built over the **base** generation and is immutable, so a
+        // node deleted since the build is still in it. The delta/stack tombstones are
+        // the only place that delete can take effect on this path — without this the
+        // KNN arms would hand back a deleted node as a live `Val::Node` (every other
+        // read path already suppresses them; see `suppress_tombstoned_in_place`).
+        let delta = self.gen.delta();
+        let stack = self.gen.core_stack();
+        let live_fn = |id: u64| -> Result<bool> {
+            if delta.is_tombstoned(id) {
+                return Ok(false);
+            }
+            if !stack.is_singleton() && stack.is_node_tombstoned(id)? {
+                return Ok(false);
+            }
+            Ok(true)
+        };
+        // A pure-core generation with an empty delta can have no tombstones, so the
+        // read-only estate pays nothing at all for this.
+        let live: Option<vector::LivePredicate> = if delta.is_empty() && stack.is_singleton() {
+            None
+        } else {
+            Some(&live_fn)
+        };
+
         // The bound YIELD names introduced into scope, in YIELD order.
         let mut new_vars: Vec<String> = Vec::new();
         for (_, bound) in &vc.yields {
@@ -5221,6 +5245,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         &query,
                         k,
                         KNN_PAR_MIN,
+                        live,
                     )?,
                     None => vector::brute_force_knn_par(
                         self.fanout_pool.as_deref(),
@@ -5229,10 +5254,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         k,
                         metric,
                         KNN_PAR_MIN,
+                        live,
                     )?,
                 },
                 AnnMode::Vamana { medoid, .. } => {
-                    self.vamana_knn(&vc.label, &vc.property, *medoid, metric, &query, k)?
+                    self.vamana_knn(vc, *medoid, metric, &query, k, live)?
                 }
             };
             for nb in neighbours {
@@ -5274,13 +5300,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// is PQ codes only — never a full in-memory graph.
     fn vamana_knn(
         &self,
-        label: &str,
-        property: &str,
+        vc: &VectorCallClause,
         medoid: u64,
         metric: graph_format::manifest::Metric,
         query: &[f32],
         k: usize,
+        live: Option<vector::LivePredicate>,
     ) -> Result<Vec<vector::Neighbour>> {
+        let (label, property) = (vc.label.as_str(), vc.property.as_str());
         let pool = self.vec_cache.ok_or_else(|| {
             anyhow::anyhow!("vector-index cache is not configured; cannot serve a Vamana index")
         })?;
@@ -5301,10 +5328,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let reader = index.reader.inner();
         let ord = index.ord;
         let hits = beam_search(
-            medoid as u32,
-            self.beam_width,
-            k,
-            n,
+            vamana::BeamParams {
+                medoid: medoid as u32,
+                beam_width: self.beam_width,
+                k,
+                num_nodes: n,
+            },
             |i| adc.estimate(resident.codes_of(i as usize)),
             |i| {
                 // One coalesced block read per expansion (cached in the vector pool).
@@ -5315,11 +5344,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // Exact re-rank uses the original query (cosine is scale-invariant, so
             // the normalised stored vectors give the same distance).
             |v| vector::distance(metric, query, v) as f32,
+            // The layout index → dense node id mapping, and the liveness gate: a
+            // tombstoned node is still expanded (it stays a navigational waypoint)
+            // but is not emitted. Resolving the node id here also gives `beam_search`
+            // the key it needs to tie-break on node id (D26) rather than on the
+            // arbitrary BFS layout index.
+            |i| {
+                let node_id = resident.node_ids[i as usize];
+                match live {
+                    Some(f) if !f(node_id)? => Ok(None),
+                    _ => Ok(Some(node_id)),
+                }
+            },
         )?;
         Ok(hits
             .into_iter()
             .map(|h| vector::Neighbour {
-                node_id: resident.node_ids[h.index as usize],
+                node_id: h.node_id,
                 score: h.exact as f64,
             })
             .collect())
@@ -17091,6 +17132,70 @@ mod tests {
         assert_eq!(
             after_second.misses, after_first.misses,
             "the vector group should be served from resident blocks on the second run"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A vector index is built over the base generation and is immutable, so a node
+    /// deleted afterwards is still *in* it. Every other read path suppresses a
+    /// tombstoned node; before this fix the KNN path did not, and handed the deleted
+    /// node back as a live `Val::Node` — the vector arm was the one hole.
+    #[test]
+    fn vector_knn_suppresses_delta_deleted_nodes() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph, _) = testgen::write_basic("exec_knn_delete");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        // Carol's own embedding as the query, so she is the exact match (distance 0)
+        // and must come back first — this is what makes her absence below meaningful.
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 3, vecf32([0.9, 0.8, 0.7])) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        let ids = |res: &QueryResult| -> Vec<i64> {
+            res.rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(i) => i,
+                    ref other => panic!("id should be an integer, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // Baseline: with no delta, Carol (2) is the nearest hit.
+        let before = Engine::new(&MergedView::read_only(&gen), &cache)
+            .run(&ast)
+            .unwrap();
+        assert_eq!(
+            ids(&before),
+            vec![2, 0, 1],
+            "the exact match must lead on a pure-core read"
+        );
+
+        // Delete Carol. Her vector is still in the sealed index, so only the delta
+        // tombstone can keep her out of the results.
+        let mut mem = Memtable::new();
+        mem.delete_node("Person", "name", Value::Str("Carol".into()), Some(2));
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        assert!(
+            view.delta().is_tombstoned(2),
+            "Carol tombstoned in the delta"
+        );
+
+        let after = Engine::new(&view, &cache).run(&ast).unwrap();
+        let got = ids(&after);
+        assert!(
+            !got.contains(&2),
+            "a deleted node must not be returned by KNN, got {got:?}"
+        );
+        assert_eq!(
+            got,
+            vec![0, 1],
+            "the two live Person embeddings remain, still exact-ranked"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

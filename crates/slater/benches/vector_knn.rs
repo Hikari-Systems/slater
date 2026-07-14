@@ -72,7 +72,7 @@ fn bench_knn(c: &mut Criterion) {
         let entries = make_group(n, 0x1234_5678 ^ n as u64);
         seq.throughput(Throughput::Elements(n as u64));
         seq.bench_with_input(BenchmarkId::from_parameter(name), &entries, |b, entries| {
-            b.iter(|| brute_force_knn(entries, &query, K, Metric::Cosine).unwrap());
+            b.iter(|| brute_force_knn(entries, &query, K, Metric::Cosine, None).unwrap());
         });
     }
     seq.finish();
@@ -83,7 +83,8 @@ fn bench_knn(c: &mut Criterion) {
         par.throughput(Throughput::Elements(n as u64));
         par.bench_with_input(BenchmarkId::from_parameter(name), &entries, |b, entries| {
             b.iter(|| {
-                brute_force_knn_par(Some(&pool), entries, &query, K, Metric::Cosine, 256).unwrap()
+                brute_force_knn_par(Some(&pool), entries, &query, K, Metric::Cosine, 256, None)
+                    .unwrap()
             });
         });
     }
@@ -101,7 +102,7 @@ fn bench_knn(c: &mut Criterion) {
         .unwrap();
         mat.throughput(Throughput::Elements(n as u64));
         mat.bench_with_input(BenchmarkId::from_parameter(name), &m, |b, m| {
-            b.iter(|| brute_force_knn_matrix(m, &query, K).unwrap());
+            b.iter(|| brute_force_knn_matrix(m, &query, K, None).unwrap());
         });
     }
     mat.finish();
@@ -116,7 +117,7 @@ fn bench_knn(c: &mut Criterion) {
         .unwrap();
         mat_par.throughput(Throughput::Elements(n as u64));
         mat_par.bench_with_input(BenchmarkId::from_parameter(name), &m, |b, m| {
-            b.iter(|| brute_force_knn_matrix_par(Some(&pool), m, &query, K, 256).unwrap());
+            b.iter(|| brute_force_knn_matrix_par(Some(&pool), m, &query, K, 256, None).unwrap());
         });
     }
     mat_par.finish();

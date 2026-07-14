@@ -17,14 +17,14 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use graph_format::consolidate_dump::DumpReader;
-use graph_format::manifest::EntityKind;
+use graph_format::manifest::{EntityKind, Metric};
 
 use crate::buckets::{Blob, BucketWriter, EdgeRec, NodeRec};
 use crate::diag::BuildDiag;
-use crate::model::{Entity, RangeIndexStmt};
+use crate::model::{Entity, RangeIndexStmt, VectorIndexStmt};
 
 /// A dump edge names something the dump itself does not contain.
 ///
@@ -73,6 +73,18 @@ pub struct IngestResult {
     pub reltypes: Vec<String>,
     pub keys: Vec<String>,
     pub range_stmts: Vec<RangeIndexStmt>,
+    pub vector_stmts: Vec<VectorIndexStmt>,
+}
+
+/// The canonical token for a metric, as `shared::parse_metric` reads it back. Kept
+/// explicit (rather than a `Debug`/`Display` derive) so a rename of the enum cannot
+/// silently produce a token the builder no longer parses.
+fn metric_token(m: Metric) -> &'static str {
+    match m {
+        Metric::Cosine => "cosine",
+        Metric::L2 => "l2",
+        Metric::Dot => "dot",
+    }
 }
 
 /// Ingest the dump at `dump_dir`, writing `node_bkt` / `edge_bkt` as single-segment
@@ -90,23 +102,65 @@ pub fn ingest_dump(
         .with_context(|| format!("open consolidation dump {}", dump_dir.display()))?;
     let (node_count, edge_count) = (r.meta().node_count, r.meta().edge_count);
 
+    // Embeddings, ascending by `(node_id, key_id)`. An *indexed* embedding is routed
+    // out of the column store (D12), so it is absent from the props blob below and has
+    // to be re-attached from its own stream — without this the rebuild silently drops
+    // every vector and every vector index.
+    //
+    // Held resident, which bounds a consolidation by the size of its vector set. That is
+    // the same ceiling the rest of the vector path already has (the dump side gathers
+    // them to sort, and `build_vamana_index` materialises a whole index group to build
+    // its graph), so it adds no new limit — but it is a real one.
+    let keys = r.meta().property_keys.clone();
+    let mut vectors: Vec<(u64, u32, Vec<f32>)> = Vec::new();
+    r.for_each_vector(|node_id, key_id, vector| {
+        vectors.push((node_id, key_id, vector));
+        Ok(())
+    })?;
+
     // Nodes → node bucket. The dump's `(labels, props)` blobs are already the
     // canonical `encode_labels_record` / `encode_props_record` bytes in global symbol
-    // ids, so each is byte-copied into a `NodeRec` with no dump id and no vectors.
+    // ids, so each is byte-copied into a `NodeRec` with no dump id; its embeddings are
+    // merge-joined off `vectors` (both streams ascend by node id, so one cursor does it).
     diag.set_op("ingest dump nodes", "nodes", node_count);
     let mut nw = BucketWriter::create(node_bkt, block_bytes, zstd_level)
         .with_context(|| format!("create node bucket {}", node_bkt.display()))?;
-    r.for_each_node(|_, labels_blob, props_blob| {
+    let mut vcur = 0usize;
+    r.for_each_node(|id, labels_blob, props_blob| {
+        let mut vec_props: Vec<(String, Vec<f32>)> = Vec::new();
+        while let Some((nid, key_id, _)) = vectors.get(vcur) {
+            if *nid != id {
+                break;
+            }
+            let name = keys.get(*key_id as usize).cloned().with_context(|| {
+                format!("dump vector for node {id} names property key {key_id}, out of range")
+            })?;
+            let (_, _, v) = std::mem::take(&mut vectors[vcur]);
+            vec_props.push((name, v));
+            vcur += 1;
+        }
         nw.append_node(&NodeRec {
             dump_id: None,
             labels_blob: Blob::from_slice(labels_blob),
             props_blob: Blob::from_slice(props_blob),
-            vec_props: Vec::new(),
+            vec_props,
         })?;
         diag.progress_add(1);
         Ok(())
     })?;
     nw.finish().context("finish node bucket")?;
+    // Every embedding must have found its node. A leftover means the dump's vector
+    // stream names a node the node stream does not contain (or is misordered) — a
+    // corrupt dump, and exactly the kind of thing that would otherwise show up much
+    // later as an index that is quietly missing rows.
+    if vcur != vectors.len() {
+        let (orphan, _, _) = vectors[vcur];
+        bail!(
+            "dump vectors.blk has {} embedding(s) that no node claimed (first names node {orphan}); \
+             the stream must be ascending by node id and every node id must exist",
+            vectors.len() - vcur
+        );
+    }
 
     // Edges → edge bucket. Endpoints are already compacted node ids (= provisional
     // ids); the provisional edge id is the dump record position.
@@ -180,6 +234,23 @@ pub fn ingest_dump(
         })
         .collect();
 
+    // The vector-index declarations. The builder re-derives the ANN parameters from its
+    // own `BuildOptions` (they are build options, not per-index state), so it re-routes
+    // by cardinality exactly as a fresh build would: an index that has shrunk below
+    // `ann_threshold` since the last build comes back as brute-force, and one that has
+    // grown past it comes back as Vamana.
+    let vector_stmts = r
+        .meta()
+        .vector_indexes
+        .iter()
+        .map(|vi| VectorIndexStmt {
+            label: vi.label.clone(),
+            property: vi.property.clone(),
+            dim: vi.dim,
+            metric: metric_token(vi.metric).to_string(),
+        })
+        .collect();
+
     Ok(IngestResult {
         node_count,
         edge_count,
@@ -187,6 +258,7 @@ pub fn ingest_dump(
         reltypes: r.meta().reltypes.clone(),
         keys: r.meta().property_keys.clone(),
         range_stmts,
+        vector_stmts,
     })
 }
 
@@ -232,6 +304,7 @@ mod tests {
             vec!["N".into()],
             (0..RELTYPES).map(|i| format!("R{i}")).collect(),
             vec!["k".into()],
+            vec![],
             vec![],
         )
         .unwrap();

@@ -424,38 +424,67 @@ pub fn decode_node(rec: &[u8]) -> Result<VamanaNode> {
 
 // ── Generic beam search ─────────────────────────────────────────────────────────
 
-/// One search result: the vamana index reached and its **exact** distance.
+/// One search result: the vamana index reached, the emit key `emit` returned for it
+/// (the caller's dense node id), and its **exact** distance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchHit {
     pub index: VamanaIndex,
+    pub node_id: u64,
     pub exact: f32,
 }
 
-/// Greedy beam search from `medoid` for the `k` nearest neighbours.
+/// The scalar shape of a beam search: where to enter, how wide to search, how many
+/// hits to keep, and how big the graph is. Bundled so [`beam_search`]'s signature is
+/// the four closures plus one parameter block rather than eight positional arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct BeamParams {
+    /// Entry point: the medoid's layout index (D30).
+    pub medoid: VamanaIndex,
+    /// Search-list size `L` (≥ `k` for good recall); raised to `k` if smaller.
+    pub beam_width: usize,
+    /// How many hits to return.
+    pub k: usize,
+    /// Total nodes in the graph (bounds-checks neighbour ids).
+    pub num_nodes: usize,
+}
+
+/// Greedy beam search from the medoid for the `k` nearest neighbours.
 ///
-/// - `num_nodes` — total nodes in the graph.
-/// - `beam_width` — search-list size `L` (≥ `k` for good recall).
 /// - `estimate(i)` — the **PQ-estimated** distance of index `i` to the query;
 ///   resident, cheap, used for *navigation* (which node to expand next). No IO.
 /// - `fetch(i)` — reads node `i`'s block and returns `(full_vector, neighbours)`;
 ///   the one IO per expansion. The full vector feeds the exact re-rank.
 /// - `exact(&v)` — the exact distance of a full vector to the query (the score the
 ///   caller ultimately reports), used to re-rank the expanded set.
+/// - `emit(i)` — maps index `i` to the dense node id to report, or `None` to
+///   **suppress** it from the results. A suppressed node is still fetched and its
+///   neighbours are still pushed onto the beam, so a node deleted in the delta
+///   remains a navigational **waypoint** — dropping it from the graph instead would
+///   disconnect the region behind it and silently cost recall on the live nodes.
+///   Navigation is therefore identical with or without suppression; only the emitted
+///   set shrinks. (If more than `k`-worth of the neighbourhood is suppressed the
+///   search can return fewer than `k` hits — widen `beam_width` to compensate.)
 ///
-/// Returns up to `k` hits, ascending by exact distance.
-pub fn beam_search<F, FE>(
-    medoid: VamanaIndex,
-    beam_width: usize,
-    k: usize,
-    num_nodes: usize,
+/// Returns up to `k` hits, ascending by exact distance, ties broken by ascending
+/// node id (the D26 contract — the same total order the brute-force arm produces).
+pub fn beam_search<F, FE, FL>(
+    params: BeamParams,
     estimate: impl Fn(VamanaIndex) -> f32,
     mut fetch: F,
     exact: FE,
+    emit: FL,
 ) -> Result<Vec<SearchHit>>
 where
     F: FnMut(VamanaIndex) -> Result<(Vec<f32>, Vec<VamanaIndex>)>,
     FE: Fn(&[f32]) -> f32,
+    FL: Fn(VamanaIndex) -> Result<Option<u64>>,
 {
+    let BeamParams {
+        medoid,
+        beam_width,
+        k,
+        num_nodes,
+    } = params;
     let beam_width = beam_width.max(k).max(1);
     // A search touches only O(beam_width · expansions) nodes, so track the expanded
     // set in a `HashSet` that grows with the work done — not a `vec![false; num_nodes]`
@@ -474,10 +503,15 @@ where
     {
         expanded.insert(cur);
         let (vector, neighbours) = fetch(cur)?;
-        hits.push(SearchHit {
-            index: cur,
-            exact: exact(&vector),
-        });
+        // Emit only if the caller still considers this node live; either way its
+        // neighbours go on the beam below, so a dead node stays a waypoint.
+        if let Some(node_id) = emit(cur)? {
+            hits.push(SearchHit {
+                index: cur,
+                node_id,
+                exact: exact(&vector),
+            });
+        }
         for nb in neighbours {
             if (nb as usize) < num_nodes
                 && !expanded.contains(&nb)
@@ -490,7 +524,11 @@ where
         beam.truncate(beam_width);
     }
 
-    hits.sort_by(|a, b| a.exact.total_cmp(&b.exact).then(a.index.cmp(&b.index)));
+    // Tie-break on the **node id**, not the layout index: the layout is BFS-from-medoid
+    // order, which is arbitrary w.r.t. node id, so tie-breaking on it would give a
+    // different (though still deterministic) order from the brute-force arm and break
+    // the D26 contract at the k boundary.
+    hits.sort_by(|a, b| a.exact.total_cmp(&b.exact).then(a.node_id.cmp(&b.node_id)));
     hits.truncate(k);
     Ok(hits)
 }
@@ -663,13 +701,17 @@ mod tests {
 
             let adc = AdcTable::new(&cb, &query).unwrap();
             let hits = beam_search(
-                g.medoid,
-                beam_width,
-                k,
-                n,
+                BeamParams {
+                    medoid: g.medoid,
+                    beam_width,
+                    k,
+                    num_nodes: n,
+                },
                 |i| adc.estimate(&codes[i as usize]),
                 |i| Ok((vectors[i as usize].clone(), g.adjacency[i as usize].clone())),
                 |v| cosine_distance(&query, v),
+                // No index→node-id remap and nothing suppressed in this fixture.
+                |i| Ok(Some(i as u64)),
             )
             .unwrap();
 
@@ -707,19 +749,104 @@ mod tests {
 
         let huge_num_nodes = 1usize << 30; // 1 073 741 824 — a billion-entry bool array pre-fix.
         let hits = beam_search(
-            0,
-            8,
-            3,
-            huge_num_nodes,
+            BeamParams {
+                medoid: 0,
+                beam_width: 8,
+                k: 3,
+                num_nodes: huge_num_nodes,
+            },
             |i| exact(&vectors[i as usize]), // estimate == exact here (navigation still valid)
             |i| Ok((vectors[i as usize].clone(), adjacency[i as usize].clone())),
             exact,
+            |i| Ok(Some(i as u64)),
         )
         .unwrap();
 
-        // Closest three to (0.5, 0) by squared-L2: node 1 (0.25), node 0 (0.25 → tie,
-        // broken by lower index so 0 first), node 2 (1.25).
+        // Closest three to (0.5, 0) by squared-L2: nodes 0 and 1 tie at 0.25, node 2
+        // is 1.25. With `emit` mapping index → index, the D26 node-id tie-break puts
+        // 0 before 1.
         let got: Vec<VamanaIndex> = hits.iter().map(|h| h.index).collect();
         assert_eq!(got, vec![0, 1, 2], "exact-ranked top-3 over the tiny graph");
+    }
+
+    #[test]
+    fn beam_search_breaks_distance_ties_on_node_id_not_layout_index() {
+        // D26: ties on score break by **ascending node id**, so the Vamana arm agrees
+        // with the brute-force arm. The `.vamana` layout is BFS-from-medoid order,
+        // which is arbitrary w.r.t. node id — tie-breaking on the layout index (as the
+        // search used to) silently disagrees with brute force at the k boundary.
+        //
+        // Indices 0 and 1 sit at the same distance from the query, but their node ids
+        // are in the *opposite* order: index 0 → id 100, index 1 → id 5. A node-id
+        // tie-break must therefore emit index 1 first; a layout-index tie-break emits
+        // index 0 first, which is the bug.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0], // index 0 → node id 100
+            vec![1.0, 0.0], // index 1 → node id 5
+            vec![0.0, 1.0], // index 2 → node id 7
+        ];
+        let adjacency: Vec<Vec<VamanaIndex>> = vec![vec![1, 2], vec![0, 2], vec![0, 1]];
+        let node_ids: [u64; 3] = [100, 5, 7];
+        let query = [0.5f32, 0.0];
+        let exact = |v: &[f32]| (v[0] - query[0]).powi(2) + (v[1] - query[1]).powi(2);
+
+        let hits = beam_search(
+            BeamParams {
+                medoid: 0,
+                beam_width: 8,
+                k: 2,
+                num_nodes: vectors.len(),
+            },
+            |i| exact(&vectors[i as usize]),
+            |i| Ok((vectors[i as usize].clone(), adjacency[i as usize].clone())),
+            exact,
+            |i| Ok(Some(node_ids[i as usize])),
+        )
+        .unwrap();
+
+        // Both tie at 0.25; ascending node id puts 5 (index 1) ahead of 100 (index 0).
+        assert_eq!(
+            hits.iter().map(|h| h.node_id).collect::<Vec<_>>(),
+            vec![5, 100],
+            "a distance tie must break on ascending node id (D26), not on layout index"
+        );
+    }
+
+    #[test]
+    fn beam_search_suppressed_nodes_stay_navigable_waypoints() {
+        // A deleted node must not be *emitted*, but it must still be *expanded* — it is
+        // the only way to reach what lies behind it. Here index 1 is the sole bridge to
+        // index 2: suppressing it must still yield index 2, which is the whole point of
+        // gating `hits.push` rather than pruning the node from the walk.
+        let vectors: Vec<Vec<f32>> = vec![
+            vec![9.0, 0.0], // 0 = entry, far from the query
+            vec![1.0, 0.0], // 1 = the bridge — suppressed
+            vec![0.0, 0.0], // 2 = the nearest live node, reachable only via 1
+        ];
+        let adjacency: Vec<Vec<VamanaIndex>> = vec![vec![1], vec![2], vec![]];
+        let query = [0.0f32, 0.0];
+        let exact = |v: &[f32]| (v[0] - query[0]).powi(2) + (v[1] - query[1]).powi(2);
+
+        let hits = beam_search(
+            BeamParams {
+                medoid: 0,
+                beam_width: 8,
+                k: 3,
+                num_nodes: vectors.len(),
+            },
+            |i| exact(&vectors[i as usize]),
+            |i| Ok((vectors[i as usize].clone(), adjacency[i as usize].clone())),
+            exact,
+            // Index 1 is "deleted": navigable, never emitted.
+            |i| Ok((i != 1).then_some(i as u64)),
+        )
+        .unwrap();
+
+        let got: Vec<u64> = hits.iter().map(|h| h.node_id).collect();
+        assert_eq!(
+            got,
+            vec![2, 0],
+            "the suppressed bridge must not be emitted but must still be walked through to reach 2"
+        );
     }
 }

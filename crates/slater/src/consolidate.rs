@@ -42,9 +42,10 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use graph_format::consolidate_dump::{DumpRangeIndex, DumpWriter};
+use graph_format::consolidate_dump::{DumpRangeIndex, DumpVectorIndex, DumpWriter};
 use graph_format::ids::Value;
-use graph_format::manifest::EntityKind;
+use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
+use graph_format::vectors::VectorEntry;
 
 use crate::exec::{val_to_value, Engine, NamedProps};
 use crate::read_view::ReadView;
@@ -52,11 +53,31 @@ use crate::read_view::ReadView;
 /// Serialise `engine`'s view to a business-key `MERGE` dump on `out`. The engine
 /// must wrap the [`ReadView`] being dumped (a `MergedView` to capture the delta, or
 /// a bare `Generation` for a plain export).
+///
+/// **Refuses a graph that carries vector indexes.** The `MERGE` dialect has no
+/// spelling for an embedding — `merge_build` rejects a vector literal outright — so a
+/// text dump of a vector-carrying graph is lossy *by construction*: every embedding
+/// would render as the literal `null` and the rebuilt graph would have none. That used
+/// to happen silently. It is a hard error now; consolidation itself takes the binary
+/// path ([`serialise_binary_dump`]), which does carry vectors.
 pub fn serialise_merge_dump<V: ReadView>(
     engine: &Engine<'_, V>,
     view: &V,
     out: &mut impl Write,
 ) -> Result<()> {
+    let vidx = &view.manifest().vector_indexes;
+    if !vidx.is_empty() {
+        let names: Vec<String> = vidx
+            .iter()
+            .map(|d| format!("(:{} {{{}}})", d.label, d.property))
+            .collect();
+        bail!(
+            "cannot write a MERGE dump for a graph with vector indexes ({}): the MERGE \
+             dialect cannot carry embeddings, so the dump would silently drop them. Use the \
+             binary consolidation dump (`serialise_binary_dump`), which carries vectors.",
+            names.join(", ")
+        );
+    }
     emit_index_ddl(view, out)?;
     let n = view.node_count();
     for id in 0..n {
@@ -118,8 +139,15 @@ fn compact_id(tombs: &[u64], old: u64) -> u64 {
 }
 
 /// Fold a node/edge's named props into `(key_id, Value)` pairs against `keys`,
-/// dropping vector-valued props (a consolidation-dump non-goal, exactly as the text
-/// path renders them away) and refusing a non-scalar value (a bug, never silent).
+/// refusing a non-scalar value (a bug, never silent).
+///
+/// A `Value::Vector` here is an **unindexed** inline embedding — D12 routes an
+/// *indexed* one out of the column store, so it never reaches this function. Inline
+/// vectors are carried: `encode_props_record` encodes them, and the byte-copy fast
+/// path ([`DumpWriter::append_node_raw`]) already preserves them verbatim, so dropping
+/// them here (as this used to) meant a node lost its vector iff it happened to be
+/// delta-patched — the same graph, two different answers depending on which path a
+/// node took.
 fn intern_props(
     props: &NamedProps,
     keys: &mut Interner,
@@ -129,9 +157,6 @@ fn intern_props(
     out.clear();
     for (name, val) in props {
         match val_to_value(val) {
-            // Vectors do not ride a consolidation dump; the text path emits them as a
-            // `null` literal, which removes the property — dropping it here is the same.
-            Some(Value::Vector(_)) => continue,
             Some(v) => out.push((keys.intern(name), v)),
             None => bail!("property {var}.{name} is not a scalar value"),
         }
@@ -276,14 +301,93 @@ pub fn serialise_binary_dump<V: ReadView>(
         }
     }
 
+    // Vectors. An *indexed* embedding is routed out of the column store (D12), so the
+    // node loop above cannot see it — it is simply not in the props record. Without
+    // this pass the rebuild produces a generation with no embeddings and an empty
+    // `vector_indexes`, silently: the dump would be well-formed, the build would exit
+    // 0, and `db.idx.vector.queryNodes` would then report no such index.
+    //
+    // Vectors are keyed by *compacted* id, because the rebuild re-clusters and permutes
+    // dense ids — anything keyed by the old id would be attached to the wrong node.
+    // `compact_id` is monotone, so sorting on the new id also gives the ascending order
+    // `append_vector` requires (and the builder merge-joins against).
+    let mut vector_indexes: Vec<DumpVectorIndex> = Vec::new();
+    let mut vectors: Vec<(u64, u32, Vec<f32>)> = Vec::new(); // (new_id, key_id, vector)
+    for desc in &manifest.vector_indexes {
+        let key_id = keys.intern(&desc.property);
+        for e in read_index_vectors(engine, view, desc)? {
+            // A node the delta or a segment deleted takes its embedding with it.
+            if combined_tombs.binary_search(&e.node_id).is_ok() {
+                continue;
+            }
+            vectors.push((compact_id(&combined_tombs, e.node_id), key_id, e.vector));
+        }
+        vector_indexes.push(DumpVectorIndex {
+            label: desc.label.clone(),
+            property: desc.property.clone(),
+            dim: desc.dim,
+            metric: desc.metric,
+        });
+    }
+    vectors.sort_by_key(|(id, key, _)| (*id, *key));
+    for (id, key, v) in &vectors {
+        w.append_vector(*id, *key, v)?;
+    }
+
     w.finish(
         labels.into_names(),
         reltypes.into_names(),
         keys.into_names(),
         range_indexes,
+        vector_indexes,
     )
     .context("finish binary consolidation dump")?;
     Ok(())
+}
+
+/// Every `(node_id, vector)` a vector index holds, read back out of the core.
+///
+/// The two arms keep their vectors in **different files**, and that is the whole trap
+/// here (D31): a brute-force index's full-precision vectors live in `vectors.f32.blk`
+/// at `[first_record, first_record + count)`, while a Vamana index's live in its own
+/// `.vamana` blocks and are *not* in `vectors.f32.blk` at all — its `first_record` is
+/// recorded as a meaningless `0`. Reading the wrong store for the mode yields an empty
+/// group and hence a silently vector-less rebuild, which is exactly the failure this
+/// path exists to prevent.
+///
+/// One inherent lossiness, worth knowing: a Vamana index stores its vectors
+/// **L2-normalised** (the space its graph and PQ codebooks were built in — D29), so
+/// the original magnitudes are gone from the core and cannot be recovered here. Vamana
+/// is cosine-only (`vamana_eligible`) and cosine is scale-invariant, so every KNN score
+/// round-trips exactly; only a vector's length is lost.
+fn read_index_vectors<V: ReadView>(
+    engine: &Engine<'_, V>,
+    view: &V,
+    desc: &VectorIndexDesc,
+) -> Result<Vec<VectorEntry>> {
+    match desc.mode {
+        AnnMode::BruteForce => engine.vector_group(desc.first_record, desc.count),
+        AnnMode::Vamana { .. } => {
+            let index = view
+                .vamana_index(&desc.label, &desc.property)
+                .with_context(|| {
+                    format!(
+                        "Vamana index files for (:{} {{{}}}) are not open; \
+                         cannot carry its vectors through consolidation",
+                        desc.label, desc.property
+                    )
+                })?;
+            (0..desc.count as u32)
+                .map(|i| {
+                    let node = index.reader.node(i)?;
+                    Ok(VectorEntry {
+                        node_id: node.node_id,
+                        vector: node.vector,
+                    })
+                })
+                .collect()
+        }
+    }
 }
 
 /// `CREATE INDEX …;` for every range index, so the rebuilt generation carries the
@@ -653,9 +757,10 @@ mod tests {
 
     #[test]
     fn serialise_refuses_unidentifiable_node() {
-        // write_basic's Company nodes (Acme/Globex) carry a label with no range
-        // index, so consolidation must refuse rather than emit an unkeyed node.
-        let (root, graph, _) = testgen::write_basic("consolidate_refuse");
+        // A node whose labels carry no range-indexed property has no business key, so the
+        // `MERGE` dump must refuse rather than emit an unkeyed node. `write_meta` declares
+        // no range indexes at all, so its very first node trips this.
+        let (root, graph, _) = testgen::write_meta("consolidate_refuse");
         let gen = Generation::open(&root, &graph).unwrap();
         let cache = BlockCache::new(1 << 20);
         let view = MergedView::read_only(&gen);
@@ -664,8 +769,29 @@ mod tests {
         let err = serialise_merge_dump(&engine, &view, &mut buf).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Company"),
-            "expected a Company refusal, got: {msg}"
+            msg.contains("no range-indexed business-key"),
+            "expected an unidentifiable-node refusal, got: {msg}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn merge_dump_refuses_a_graph_with_vector_indexes() {
+        // The `MERGE` dialect has no spelling for an embedding (`merge_build` rejects a
+        // vector literal), so a text dump of a vector-carrying graph would silently render
+        // every embedding as `null` and rebuild the graph without them. Refuse instead.
+        // The binary consolidation dump is the path that actually carries vectors.
+        let (root, graph, _) = testgen::write_basic("consolidate_refuse_vectors");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let view = MergedView::read_only(&gen);
+        let engine = Engine::new(&view, &cache);
+        let mut buf = Vec::new();
+        let err = serialise_merge_dump(&engine, &view, &mut buf).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vector indexes") && msg.contains("(:Person {embedding})"),
+            "expected a vector-index refusal naming the index, got: {msg}"
         );
         std::fs::remove_dir_all(&root).ok();
     }

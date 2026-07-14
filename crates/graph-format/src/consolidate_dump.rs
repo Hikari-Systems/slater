@@ -13,10 +13,10 @@
 //! builder skips parse, node dedup, and endpoint resolution entirely, entering its
 //! pipeline at the post-resolve `EdgeRec`/`NodeRec` shape.
 //!
-//! # Layout — a directory of three files
+//! # Layout — a directory of four files
 //! - `meta.json` — [`DumpMeta`]: magic/version, node & edge counts, the global
 //!   `labels` / `reltypes` / `property_keys` symbol tables (so record ids are
-//!   self-describing), and the range-index DDL to recreate.
+//!   self-describing), and the range- and vector-index declarations to recreate.
 //! - `nodes.blk` — a [`BlockFileWriter`] container, one record per surviving node in
 //!   ascending **compacted** dense-id order (record index *is* the new node id).
 //!   A record is `blob(labels_record) ‖ blob(props_record)` where the two inner
@@ -26,6 +26,12 @@
 //! - `edges.blk` — a [`BlockFileWriter`] container, one record per edge in emit
 //!   order: `uvarint(src) ‖ uvarint(dst) ‖ uvarint(reltype) ‖ blob(props_record)`,
 //!   endpoints already resolved to compacted node ids.
+//! - `vectors.blk` — one record per embedding, ascending by `(node_id, key_id)`:
+//!   `uvarint(node_id) ‖ uvarint(key_id) ‖ uvarint(dim) ‖ dim × f32(LE)`. Embeddings
+//!   need their own stream because an *indexed* one is routed **out** of the column
+//!   store (D12) and so is simply absent from a node's props record — before this
+//!   file existed, a consolidation silently rebuilt the graph with no vectors and no
+//!   vector indexes at all.
 //!
 //! # Why binary, not the text dialect
 //! The text dump reads *both endpoints' node records per edge* to recover their
@@ -48,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::columns::encode_props_record_into;
 use crate::ids::Value;
-use crate::manifest::EntityKind;
+use crate::manifest::{EntityKind, Metric};
 use crate::nodelabels::encode_labels_record_into;
 use crate::wire::{read_uvarint, write_uvarint};
 
@@ -58,7 +64,7 @@ pub const DUMP_MAGIC: &str = "SLDUMP01";
 
 /// Dump-format version. Bumped on any incompatible change to the record or meta
 /// layout; the builder refuses a dump whose version it does not understand.
-pub const DUMP_VERSION: u32 = 1;
+pub const DUMP_VERSION: u32 = 2;
 
 /// zstd level for the transient dump files. Low: the dump is written once and read
 /// once, so build/parse CPU dominates any saved bytes.
@@ -71,6 +77,7 @@ pub const DUMP_BLOCK: usize = 1 << 20;
 const META_FILE: &str = "meta.json";
 const NODES_FILE: &str = "nodes.blk";
 const EDGES_FILE: &str = "edges.blk";
+const VECTORS_FILE: &str = "vectors.blk";
 
 /// A range index to recreate on the rebuilt generation. Mirrors the text dump's
 /// `CREATE INDEX FOR (n:Label) ON (n.prop)` DDL — only the entity, label/type and
@@ -82,7 +89,19 @@ pub struct DumpRangeIndex {
     pub property: String,
 }
 
-/// The dump's `meta.json`: everything the builder needs that is not in the two
+/// A vector index to recreate on the rebuilt generation. The ANN parameters (`R`,
+/// `alpha`, PQ subspaces/bits, the ANN threshold) are *build* options, not per-index
+/// state, so the rebuild re-derives them exactly as a fresh build would — only the
+/// declaration travels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DumpVectorIndex {
+    pub label: String,
+    pub property: String,
+    pub dim: u32,
+    pub metric: Metric,
+}
+
+/// The dump's `meta.json`: everything the builder needs that is not in the
 /// `.blk` streams. Symbol tables make the record ids self-describing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DumpMeta {
@@ -98,6 +117,9 @@ pub struct DumpMeta {
     pub property_keys: Vec<String>,
     /// Range indexes to recreate on the rebuilt generation.
     pub range_indexes: Vec<DumpRangeIndex>,
+    /// Vector indexes to recreate. Empty for a graph that carries none.
+    #[serde(default)]
+    pub vector_indexes: Vec<DumpVectorIndex>,
 }
 
 /// Append `blob(rec) = uvarint(len) ‖ rec`, so a reader can split concatenated
@@ -125,10 +147,14 @@ pub struct DumpWriter {
     dir: PathBuf,
     nodes: BlockFileWriter,
     edges: BlockFileWriter,
+    vectors: BlockFileWriter,
     node_count: u64,
     edge_count: u64,
+    vector_count: u64,
+    last_vector_key: Option<(u64, u32)>,
     node_scratch: Vec<u8>,
     edge_scratch: Vec<u8>,
+    vector_scratch: Vec<u8>,
     props_scratch: Vec<u8>,
 }
 
@@ -141,14 +167,19 @@ impl DumpWriter {
             .with_context(|| format!("create dump dir {}", dir.display()))?;
         let nodes = BlockFileWriter::create(dir.join(NODES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
         let edges = BlockFileWriter::create(dir.join(EDGES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
+        let vectors = BlockFileWriter::create(dir.join(VECTORS_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
         Ok(Self {
             dir,
             nodes,
             edges,
+            vectors,
             node_count: 0,
             edge_count: 0,
+            vector_count: 0,
+            last_vector_key: None,
             node_scratch: Vec::new(),
             edge_scratch: Vec::new(),
+            vector_scratch: Vec::new(),
             props_scratch: Vec::new(),
         })
     }
@@ -225,12 +256,47 @@ impl DumpWriter {
         Ok(())
     }
 
-    /// Number of nodes / edges appended so far.
+    /// Append one node's embedding: `uvarint(node_id) ‖ uvarint(key_id) ‖ uvarint(dim)
+    /// ‖ dim × f32(LE)`, where `node_id` is the **compacted** dense id and `key_id`
+    /// indexes the dump's `property_keys`.
+    ///
+    /// Must be called in ascending `(node_id, key_id)` order — the builder merge-joins
+    /// this stream against the ascending node stream in one pass, so an out-of-order
+    /// append would silently attach an embedding to the wrong node (or drop it). The
+    /// order is asserted rather than trusted: a violation is a bug, never data loss.
+    pub fn append_vector(&mut self, node_id: u64, key_id: u32, vector: &[f32]) -> Result<()> {
+        if let Some(last) = self.last_vector_key {
+            if (node_id, key_id) <= last {
+                bail!(
+                    "dump vectors must be appended in ascending (node_id, key_id) order: \
+                     ({node_id}, {key_id}) follows ({}, {})",
+                    last.0,
+                    last.1
+                );
+            }
+        }
+        self.last_vector_key = Some((node_id, key_id));
+        self.vector_scratch.clear();
+        write_uvarint(&mut self.vector_scratch, node_id);
+        write_uvarint(&mut self.vector_scratch, key_id as u64);
+        write_uvarint(&mut self.vector_scratch, vector.len() as u64);
+        for x in vector {
+            self.vector_scratch.extend_from_slice(&x.to_le_bytes());
+        }
+        self.vectors.append_record(&self.vector_scratch)?;
+        self.vector_count += 1;
+        Ok(())
+    }
+
+    /// Number of nodes / edges / vectors appended so far.
     pub fn node_count(&self) -> u64 {
         self.node_count
     }
     pub fn edge_count(&self) -> u64 {
         self.edge_count
+    }
+    pub fn vector_count(&self) -> u64 {
+        self.vector_count
     }
 
     /// Flush the block files and write `meta.json`. Consumes the writer.
@@ -240,11 +306,13 @@ impl DumpWriter {
         reltypes: Vec<String>,
         property_keys: Vec<String>,
         range_indexes: Vec<DumpRangeIndex>,
+        vector_indexes: Vec<DumpVectorIndex>,
     ) -> Result<()> {
         let node_count = self.node_count;
         let edge_count = self.edge_count;
         self.nodes.finish().context("finish dump nodes.blk")?;
         self.edges.finish().context("finish dump edges.blk")?;
+        self.vectors.finish().context("finish dump vectors.blk")?;
         let meta = DumpMeta {
             magic: DUMP_MAGIC.to_string(),
             version: DUMP_VERSION,
@@ -254,6 +322,7 @@ impl DumpWriter {
             reltypes,
             property_keys,
             range_indexes,
+            vector_indexes,
         };
         let json = serde_json::to_vec_pretty(&meta).context("serialise dump meta")?;
         let meta_path = self.dir.join(META_FILE);
@@ -269,6 +338,7 @@ pub struct DumpReader {
     meta: DumpMeta,
     nodes: BlockFileReader,
     edges: BlockFileReader,
+    vectors: BlockFileReader,
 }
 
 impl DumpReader {
@@ -309,7 +379,13 @@ impl DumpReader {
                 meta.edge_count
             );
         }
-        Ok(Self { meta, nodes, edges })
+        let vectors = BlockFileReader::open(dir.join(VECTORS_FILE))?;
+        Ok(Self {
+            meta,
+            nodes,
+            edges,
+            vectors,
+        })
     }
 
     pub fn meta(&self) -> &DumpMeta {
@@ -344,6 +420,39 @@ impl DumpReader {
             let props_blob = read_blob(&mut r)?;
             f(id, src, dst, reltype, props_blob)
         })
+    }
+
+    /// Stream every embedding in ascending `(node_id, key_id)` order: `(node_id,
+    /// key_id, vector)`. `node_id` is a compacted dense id and `key_id` indexes
+    /// [`DumpMeta::property_keys`], so the builder can merge-join this against the
+    /// ascending node stream in a single pass.
+    pub fn for_each_vector(
+        &self,
+        mut f: impl FnMut(u64, u32, Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        self.vectors.for_each_record(|_, rec| {
+            let mut r = rec;
+            let node_id = read_uvarint(&mut r)?;
+            let key_id = read_uvarint(&mut r)? as u32;
+            let dim = read_uvarint(&mut r)? as usize;
+            if r.len() < dim * 4 {
+                bail!(
+                    "dump vector for node {node_id} truncated: want {} bytes, have {}",
+                    dim * 4,
+                    r.len()
+                );
+            }
+            let vector: Vec<f32> = r[..dim * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            f(node_id, key_id, vector)
+        })
+    }
+
+    /// Total embeddings in the dump.
+    pub fn vector_count(&self) -> u64 {
+        self.vectors.total_records()
     }
 }
 
@@ -398,6 +507,7 @@ mod tests {
                 label_or_type: "Person".into(),
                 property: "name".into(),
             }],
+            vec![],
         )
         .unwrap();
 
@@ -447,7 +557,7 @@ mod tests {
         let dir = tmp("foreign");
         let _ = std::fs::remove_dir_all(&dir);
         let w = DumpWriter::create(&dir).unwrap();
-        w.finish(vec![], vec![], vec![], vec![]).unwrap();
+        w.finish(vec![], vec![], vec![], vec![], vec![]).unwrap();
         // Corrupt the magic.
         let meta_path = dir.join(META_FILE);
         let mut meta: DumpMeta =
@@ -477,6 +587,7 @@ mod tests {
                 vec!["Person".into()],
                 vec!["KNOWS".into()],
                 vec!["name".into(), "since".into()],
+                vec![],
                 vec![],
             )
             .unwrap();
