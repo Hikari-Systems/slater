@@ -536,9 +536,20 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             }
             if matches!(nd.patches.get(&vi.property), Some(Value::Vector(_))) {
                 spec.ids.push(*dense);
-            } else if nd.replaced || nd.removed.contains(&vi.property) {
-                // The node's embedding is gone. Note a `replaced` node that re-set the
-                // embedding took the branch above, so this really is a removal.
+            } else if nd.patches.contains_key(&vi.property)
+                || nd.replaced
+                || nd.removed.contains(&vi.property)
+            {
+                // The node's embedding is gone. Three ways to lose one, and all three have to
+                // land here or the level below goes on scoring a vector a newer level already
+                // took away: `REMOVE n.embedding`; a `SET n = {…}` replace that did not re-set
+                // it (one that did took the branch above); and an overwrite with a value that
+                // is **not** a vector (`SET n.embedding = 5` — the write path admits it, since
+                // `validate_vector_dims` only constrains a `Value::Vector`). The read fold
+                // takes the same position on all three (`exec::delta_says`), so the flush must
+                // not lose one of them: the flushed row would say `embedding = 5` while nothing
+                // suppressed the base, and the stale base vector would resurface *at the
+                // flush* — the write silently undone by a background job.
                 spec.removals.push(*dense);
             }
             // Otherwise the delta says nothing about this node's embedding, and the level
