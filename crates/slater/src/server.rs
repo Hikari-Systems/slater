@@ -2391,6 +2391,13 @@ struct Session {
 
 // ── Framing over an async stream ──────────────────────────────────────────────
 
+/// A write on the pre-auth path ran past the login deadline. Typed (HIK-103) so the
+/// accept-loop error sink branches on the cause's *type* rather than matching its message
+/// text, and can count it against the same login-timeout counter as a stalled pre-auth read.
+#[derive(Debug, thiserror::Error)]
+#[error("pre-auth socket write exceeded the login deadline")]
+struct WriteDeadlineExceeded;
+
 /// A Bolt message framer over any async byte stream (plain TCP or TLS).
 struct Framed<S> {
     stream: S,
@@ -2405,6 +2412,15 @@ struct Framed<S> {
     /// bumps it to the generous post-auth cap once `LOGON` succeeds (ratcheting it
     /// back down on `LOGOFF`).
     max_body: usize,
+    /// Deadline for a single write, when one applies. The write-side counterpart of the
+    /// bounded pre-auth reads (HIK-103): a zero-window peer that completes the handshake and
+    /// then stops reading would otherwise park the server in `write_all`/`flush` for as long
+    /// as it keeps the socket open, while holding an antechamber permit. Like `max_body`, the
+    /// framer is auth-blind here — it owns a deadline, not the reason it is set.
+    /// `handle_connection` sets it to the login deadline while unauthenticated and clears it
+    /// once `LOGON` succeeds, so an authenticated client is left free to read its own results
+    /// at its own pace (a slow post-auth reader is back-pressure, not an attack).
+    write_deadline: Option<TokioInstant>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
@@ -2414,6 +2430,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
             buf: Vec::with_capacity(8192),
             reassembler: chunk::ChunkReassembler::new(),
             max_body,
+            write_deadline: None,
         }
     }
 
@@ -2447,13 +2464,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         }
     }
 
-    async fn write_message(&mut self, msg: &PsValue) -> Result<()> {
-        self.stream.write_all(&message::to_wire(msg)).await?;
+    /// Write raw bytes, bounded by `write_deadline` when it is set. A stalled write in the
+    /// pre-auth window is torn down at the deadline (surfaced as [`WriteDeadlineExceeded`])
+    /// so the connection is dropped and its antechamber permit released, rather than parked
+    /// while a zero-window peer holds the socket open (HIK-103). When no deadline is set the
+    /// path is the bare `await` it always was.
+    async fn write_all_bounded(&mut self, bytes: &[u8]) -> Result<()> {
+        match self.write_deadline {
+            Some(dl) => timeout_at(dl, self.stream.write_all(bytes))
+                .await
+                .map_err(|_| anyhow!(WriteDeadlineExceeded))??,
+            None => self.stream.write_all(bytes).await?,
+        }
         Ok(())
     }
 
+    async fn write_message(&mut self, msg: &PsValue) -> Result<()> {
+        self.write_all_bounded(&message::to_wire(msg)).await
+    }
+
     async fn flush(&mut self) -> Result<()> {
-        self.stream.flush().await?;
+        match self.write_deadline {
+            Some(dl) => timeout_at(dl, self.stream.flush())
+                .await
+                .map_err(|_| anyhow!(WriteDeadlineExceeded))??,
+            None => self.stream.flush().await?,
+        }
         Ok(())
     }
 }
@@ -2908,10 +2944,16 @@ async fn accept_loop(
                 ctx.diag.record_accepted();
                 let ctx = ctx.clone();
                 let tls = tls.clone();
+                let diag = ctx.diag.clone(); // error sink; `ctx` is moved into `serve_conn`
                 tokio::spawn(async move {
                     let _permit = permit; // global slot, released on connection end
                     let _per_ip_guard = per_ip_guard; // per-source count, released on end
                     if let Err(e) = serve_conn(sock, tls, ctx).await {
+                        // A write torn down at the login deadline is a login-window timeout,
+                        // same as a stalled pre-auth read — count it on the same gauge (HIK-103).
+                        if e.downcast_ref::<WriteDeadlineExceeded>().is_some() {
+                            diag.record_login_timeout();
+                        }
                         warn!(%peer, error = %e, "connection ended with error");
                     }
                 });
@@ -3133,8 +3175,11 @@ where
         deadline: login_deadline,
     } = pre_auth;
 
-    // Start under the tight pre-auth body cap; it ratchets up once LOGON succeeds.
+    // Start under the tight pre-auth body cap; it ratchets up once LOGON succeeds. The
+    // write deadline is armed to the same login deadline that bounds the pre-auth reads, so
+    // the handshake reply below is on the budget too (HIK-103); it is cleared on LOGON.
     let mut framed = Framed::new(stream, ctx.max_pre_auth_bytes);
+    framed.write_deadline = login_deadline;
 
     // Handshake: 20 bytes (preamble + four proposals), reply with the agreed
     // 4-byte version, or four zero bytes if we share none (the client disconnects).
@@ -3154,7 +3199,7 @@ where
             .context("read handshake")?,
     };
     let reply = handshake::handle_client_hello(&hello)?;
-    framed.stream.write_all(&reply).await?;
+    framed.write_all_bounded(&reply).await?;
     framed.flush().await?;
     if reply == handshake::NO_VERSION {
         return Ok(());
@@ -3175,9 +3220,16 @@ where
         // released on the transition to authenticated and reclaimed on LOGOFF.
         if sess.user.is_some() {
             framed.max_body = ctx.max_message_bytes;
+            // Authenticated: leave writes unbounded — the client is trusted to read its own
+            // (possibly large) results at its own pace; a slow reader here is back-pressure,
+            // not the pre-auth slow-loris the deadline defends against (HIK-103).
+            framed.write_deadline = None;
             pre_auth_permit = None; // free the antechamber slot for the next anon peer
         } else {
             framed.max_body = ctx.max_pre_auth_bytes;
+            // Unauthenticated: the login deadline bounds this window's writes as well as its
+            // reads, so a stalled pre-auth reply cannot pin an antechamber permit (HIK-103).
+            framed.write_deadline = login_deadline;
             if pre_auth_permit.is_none() {
                 // Returned to unauthenticated (LOGOFF / re-auth): reclaim a slot or
                 // close. A logged-off connection must not keep the generous budget,
@@ -15765,6 +15817,141 @@ mod tests {
             "the stalled handshake never released its antechamber slot ({} still in use)",
             8 - gauges.pre_auth_limit.available_permits(),
         );
+    }
+
+    /// HIK-103. A peer that completes the pre-auth handshake and then never drains its
+    /// receive window must not park the server in a pre-auth write while holding an
+    /// antechamber permit — the login deadline has to bound the *writes* of that window,
+    /// not only its reads (HIK-72 covered the reads).
+    ///
+    /// The mock stream hands over a valid ClientHello and then returns `Poll::Pending` on
+    /// every write: a zero-window client that reads nothing back. Two halves, and the fix
+    /// is what makes the first pass:
+    ///   * **bounded** — with a login deadline set, `handle_connection` is torn down at the
+    ///     deadline (a [`WriteDeadlineExceeded`]) and the antechamber permit comes back.
+    ///     Before the fix the write ignored the deadline and this hung for the full 5s.
+    ///   * **unbounded** — with no deadline (the pre-fix write behaviour on *every* path),
+    ///     the write parks and the permit stays held, proving the stall and the permit-hold
+    ///     are real and that the deadline is precisely what releases them.
+    #[tokio::test]
+    async fn a_stalled_pre_auth_write_is_bounded_by_the_login_deadline() {
+        /// Delivers a fixed ClientHello, then reads nothing more and never accepts a write —
+        /// a peer with a zero receive window that has stopped draining the socket.
+        struct StallWriter {
+            hello: Vec<u8>,
+            read_off: usize,
+        }
+        impl AsyncRead for StallWriter {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                let remaining = &this.hello[this.read_off..];
+                if remaining.is_empty() {
+                    // Handshake delivered; now silent. (The write blocks first regardless.)
+                    return std::task::Poll::Pending;
+                }
+                let n = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..n]);
+                this.read_off += n;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for StallWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending // zero receive window: never accepts a byte
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        // A valid 20-byte ClientHello: preamble + four version proposals (5.4 first).
+        let client_hello = || {
+            let mut h = Vec::new();
+            h.extend_from_slice(&handshake::PREAMBLE);
+            h.extend_from_slice(&[0, 0, 4, 5]);
+            h.extend_from_slice(&[0, 0, 0, 0]);
+            h.extend_from_slice(&[0, 0, 0, 0]);
+            h.extend_from_slice(&[0, 0, 0, 0]);
+            h
+        };
+        let (_root, ctx) = build_ctx("hik103_stalled_pre_auth_write");
+
+        // Bounded: a login deadline is set, so the stalled reply write is torn down at it
+        // and the antechamber permit is released. (`handle_connection` owns the permit, so
+        // returning drops it.) Pre-fix, the write ignored the deadline and this hung 5s.
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().try_acquire_owned().unwrap();
+        assert_eq!(sem.available_permits(), 0, "the permit is held on entry");
+        let pre_auth = PreAuth {
+            permit: Some(permit),
+            deadline: Some(TokioInstant::now() + Duration::from_millis(200)),
+        };
+        let stream = StallWriter {
+            hello: client_hello(),
+            read_off: 0,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_connection(stream, ctx.clone(), pre_auth),
+        )
+        .await
+        .expect("the stalled pre-auth write was never torn down at the login deadline");
+        let err =
+            outcome.expect_err("a stalled pre-auth write must surface an error, not close cleanly");
+        assert!(
+            err.downcast_ref::<WriteDeadlineExceeded>().is_some(),
+            "the teardown must be the write-deadline breach, got: {err:?}"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the antechamber permit must come back once the stalled write is torn down"
+        );
+
+        // Unbounded (the pre-fix write behaviour): no deadline, so the write parks forever
+        // and keeps its permit. Sampled while the task is still alive — proof that the stall
+        // and the permit-hold are real, and that the deadline above is what tears them down.
+        let sem2 = Arc::new(Semaphore::new(1));
+        let permit2 = sem2.clone().try_acquire_owned().unwrap();
+        let pre_auth2 = PreAuth {
+            permit: Some(permit2),
+            deadline: None,
+        };
+        let stream2 = StallWriter {
+            hello: client_hello(),
+            read_off: 0,
+        };
+        let ctx2 = ctx.clone();
+        let task = tokio::spawn(async move { handle_connection(stream2, ctx2, pre_auth2).await });
+        tokio::time::sleep(Duration::from_millis(300)).await; // clears the handshake read, parks in the write
+        assert!(
+            !task.is_finished(),
+            "with no write deadline the pre-auth write parks — the pre-fix behaviour"
+        );
+        assert_eq!(
+            sem2.available_permits(),
+            0,
+            "a parked pre-auth write keeps holding its antechamber permit"
+        );
+        task.abort();
+        let _ = std::fs::remove_dir_all(&_root);
     }
 
     /// The TLS handshake is bounded by whichever of the two deadlines lands first, and
