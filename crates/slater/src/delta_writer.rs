@@ -475,8 +475,13 @@ impl DeltaWriter {
         //     nothing applied, nothing published.
         let seq = inner.seq.next();
         let rec = WalRecord { seq, op };
-        inner.sink.append(&rec).context("append WAL record")?;
-        inner.sink.commit(seq).context("commit WAL batch")?;
+        // One atomic append+commit: on any append/commit error — *or* a mid-batch
+        // panic — the WAL segment is rolled back to its pre-batch offset, so a failed
+        // write leaves no frame a later commit could retro-commit (HIK-105).
+        inner
+            .sink
+            .append_batch(std::slice::from_ref(&rec), seq)
+            .context("append+commit WAL record")?;
         inner.seq = seq;
 
         // --- install: moves only. Publish the new delta (active memtable ⊕ unchanged L0
@@ -514,20 +519,26 @@ impl DeltaWriter {
         for (op, resolved) in ops {
             mem.apply(op, *resolved);
         }
-        // 2. Append every record (fast; no fsync yet).
+        // 2. Build the batch's records (assigning seqs). No I/O yet.
+        let mut recs = Vec::with_capacity(ops.len());
         let mut last = inner.seq;
         for (op, _) in ops {
             let seq = inner.seq.next();
-            let rec = WalRecord {
-                seq,
-                op: op.clone(),
-            };
-            inner.sink.append(&rec).context("append WAL record")?;
             inner.seq = seq;
             last = seq;
+            recs.push(WalRecord {
+                seq,
+                op: op.clone(),
+            });
         }
-        // 3. One commit = one fsync for the whole batch (the ack barrier).
-        inner.sink.commit(last).context("commit WAL batch")?;
+        // 3. Append every record + one commit fsync (the ack barrier) — atomically. If
+        //    any append fails, the commit fails, *or the thread unwinds mid-batch*, the
+        //    segment is rolled back to its pre-batch offset, so a partial batch never
+        //    leaves frames the next commit marker would retro-commit (HIK-105).
+        inner
+            .sink
+            .append_batch(&recs, last)
+            .context("append+commit WAL batch")?;
         // 4. Install (moves only) + one publish + epoch bump for the batch
         //    (publish-before-bump, as in `write`).
         inner.mem = Arc::new(mem);
