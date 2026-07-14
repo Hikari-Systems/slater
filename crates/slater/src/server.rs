@@ -484,10 +484,17 @@ impl Graphs {
         for vi in new_gen.vamana_indexes() {
             vector_cache.pin(new_gen.uuid(), vi.ord, vi.pq.clone());
         }
+        // Sealed segment indexes (HIK-113): pin the new generation's before the swap.
+        pin_segment_pqs(new_gen.as_ref(), vector_cache);
         *slot.write().unwrap() = new_gen.clone();
         // Free the retired generation's whole resident set — pinned PQ codes *and*
         // lazily-built brute-force matrices — so it does not linger past the swap.
         vector_cache.unpin_generation(live.uuid());
+        // The base `unpin_generation` is keyed by the *generation* uuid; a segment's PQ is
+        // keyed by the *segment* uuid, so unpin the retired segments explicitly or every T3
+        // merge leaks their pinned bytes (the pinning trap — segment retirement funnels
+        // through this swap on both the merge and the set-swap paths).
+        unpin_retired_segment_pqs(&live, &new_gen, vector_cache);
         Ok(Some(new_gen.uuid()))
     }
 
@@ -1710,6 +1717,9 @@ struct ConnCtx {
     fanout_pool: Option<Arc<rayon::ThreadPool>>,
     /// Beam-search list size for the Vamana arm (`vectorQuery.beamWidth`).
     beam_width: usize,
+    /// Beam-search list size for the per-segment read-only temp indexes
+    /// (`vectorQuery.tempBeamWidth`, HIK-113).
+    temp_beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
     bind_addr: String,
     /// Graph flagged as the home database in `SHOW DATABASES` (`config.defaultGraph`);
@@ -2624,6 +2634,56 @@ pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
 // drive the real production wiring in-process over an ephemeral loopback port
 // and sample its own RSS — rather than asserting on a mock. See D34.
 
+/// Pin every sealed **segment** index's resident PQ codes (HIK-113) into the vector-index
+/// pool, keyed by the **segment uuid** + segment-local ordinal (segment uuids are globally
+/// unique, so they never collide with a base generation's key). Returns the count pinned.
+///
+/// Idempotent: re-pinning the same `(seg_uuid, ord)` replaces its byte accounting. Only the PQ
+/// codes are pinned (bounded — ~m bytes per vector); the `.vamana` blocks read the evictable
+/// LRU, and a `ResidentMatrix` is deliberately never installed for a segment (the Σ-over-
+/// segments pinning trap: pinned bytes are charged to the budget but never reclaimed by
+/// eviction, so an unbounded pinned set would grow the budget without bound — see `cache.rs`).
+fn pin_segment_pqs(gen: &Generation, cache: &VectorIndexCache) -> usize {
+    let mut n = 0;
+    for seg in gen.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                cache.pin(seg.manifest.segment_uuid, ix.ord, ix.pq.clone());
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Unpin the PQ codes of every sealed segment index the retiring generation `old` carried that
+/// the newly-served `new` does **not** — the concrete gap the pinning trap warns about (HIK-113).
+///
+/// `unpin_generation` frees only the base generation's pinned set (keyed by the *generation*
+/// uuid); a segment's PQ is keyed by the *segment* uuid, so without this call every T3 merge (or
+/// any swap that drops a segment) would leak the retired segment's pinned bytes forever. A
+/// segment carried by **both** generations (e.g. one a merge left untouched) keeps its pin — the
+/// new generation re-pinned it, and its uuid is in `kept`.
+fn unpin_retired_segment_pqs(old: &Generation, new: &Generation, cache: &VectorIndexCache) {
+    let mut kept: HashSet<(u128, u32)> = HashSet::new();
+    for seg in new.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                kept.insert((seg.manifest.segment_uuid.0.as_u128(), ix.ord));
+            }
+        }
+    }
+    for seg in old.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                if !kept.contains(&(seg.manifest.segment_uuid.0.as_u128(), ix.ord)) {
+                    cache.unpin(seg.manifest.segment_uuid, ix.ord);
+                }
+            }
+        }
+    }
+}
+
 /// Serve on an already-bound listener. Factored out of [`serve`] so a caller can
 /// bind the port itself — notably the bounded-RSS integration test, which binds
 /// an ephemeral `127.0.0.1:0` loopback port, learns its address, and then drives
@@ -2675,6 +2735,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             vector_cache.pin(gen.uuid(), vi.ord, vi.pq.clone());
             pinned += 1;
         }
+        // Sealed segment indexes (HIK-113) pin their resident PQ under the segment uuid.
+        pinned += pin_segment_pqs(gen.as_ref(), &vector_cache);
     }
     if pinned > 0 {
         info!(
@@ -2727,6 +2789,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         adj_stream_chunk: cfg.query.adj_stream_chunk,
         fanout_pool: build_fanout_pool(cfg.query.max_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
+        temp_beam_width: cfg.vector_query.temp_beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
         use_selection: RwLock::new(HashMap::new()),
@@ -2858,6 +2921,7 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
     let cache = ctx.cache.clone();
     let vector_cache = ctx.vector_cache.clone();
     let beam_width = ctx.beam_width;
+    let temp_beam_width = ctx.temp_beam_width;
     let max_rows = ctx.max_rows;
     let max_intermediate = ctx.max_intermediate;
     let max_scan = ctx.max_scan;
@@ -2875,6 +2939,7 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
             let g_start = Instant::now();
             let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
                 .with_vector_cache(vector_cache.as_ref(), beam_width)
+                .with_temp_beam_width(temp_beam_width)
                 .with_max_rows(max_rows)
                 .with_max_intermediate(max_intermediate)
                 .with_max_scan(max_scan)
@@ -5536,6 +5601,7 @@ async fn run_query(
     let adj_stream_chunk = ctx.adj_stream_chunk;
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
+    let temp_beam_width = ctx.temp_beam_width;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the info level being active OR
     // load-test diagnostics being enabled: when both are off, we take no
@@ -5576,6 +5642,7 @@ async fn run_query(
                 None => {
                     let mut engine = Engine::new(&view, cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
+                        .with_temp_beam_width(temp_beam_width)
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)

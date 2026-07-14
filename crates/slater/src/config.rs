@@ -727,6 +727,14 @@ pub struct QueryConfig {
 pub struct VectorQueryConfig {
     #[serde(default = "default_beam_width", deserialize_with = "deser_u32_or_str")]
     pub beam_width: u32,
+    /// Beam-search list size `L` for the **per-segment** read-only temp indexes (HIK-113).
+    /// A segment level heavily superseded by newer levels can under-return, so a wider `L`
+    /// here is cheap insurance — the temp indexes are small.
+    #[serde(
+        default = "default_temp_beam_width",
+        deserialize_with = "deser_u32_or_str"
+    )]
+    pub temp_beam_width: u32,
     #[serde(default = "default_max_hops", deserialize_with = "deser_u32_or_str")]
     pub max_hops: u32,
     /// The FreshDiskANN RW-index over the write delta (`crate::rwindex`) — the safety valves
@@ -918,6 +926,12 @@ fn default_rw_max_vectors() -> usize {
 }
 fn default_beam_width() -> u32 {
     64
+}
+fn default_temp_beam_width() -> u32 {
+    // Wider than the base `beam_width`: a per-segment temp index is small, so a wider search
+    // list costs little, and it recovers recall on a level many of whose nodes are suppressed
+    // by newer levels (`beam_search` returns fewer than `k` when the neighbourhood is thinned).
+    128
 }
 fn default_max_hops() -> u32 {
     256
@@ -1112,6 +1126,7 @@ impl Default for VectorQueryConfig {
     fn default() -> Self {
         Self {
             beam_width: default_beam_width(),
+            temp_beam_width: default_temp_beam_width(),
             max_hops: default_max_hops(),
             rw_index: RwIndexConfig::default(),
         }
