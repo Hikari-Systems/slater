@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use graph_format::integrity::crc32c_base64;
+use graph_format::integrity::{crc32c_base64, hash_bytes};
 use graph_format::store::diskcache::{CachingObjectStore, DiskCache};
 use graph_format::store::gcs::{GcsConfig, GcsObjectStore};
 use graph_format::store::{FileIntegrity, ObjectStore, RandomReadAt};
@@ -110,6 +110,69 @@ fn gcs_roundtrip_and_crc32c_verify() {
     );
 
     eprintln!("GCS/fake-gcs-server integration: all assertions passed");
+}
+
+/// HIK-107 regression, end-to-end: a same-length tampered overwrite of an object
+/// whose manifest still claims the ORIGINAL content digests must be rejected by
+/// `verify_file` — it must **not** pass on byte length alone (the pre-fix `(_, None)`
+/// arm's failure mode). This is the sibling of `s3_minio::verify_rehashes_body_when_server_sha256_absent`.
+///
+/// Note a real GCS/`fake-gcs-server` difference from S3: GCS's `put` *always* sends
+/// a CRC32C (GCS validates every write against it) and the server always stores &
+/// returns one, so — unlike S3, where `put(.., None)` genuinely leaves an object
+/// with no server SHA-256 — there is no way through slater's public API to store a
+/// CRC32C-less object against the emulator. The `(Some manifest, None server) →
+/// ReHashBody` routing is therefore pinned by the pure `gcs::tests` unit tests. What
+/// *is* reproducible end-to-end, and is the actual attack, is the same-length tamper:
+/// this test proves `verify_file` rejects it. If a backend ever does report an object
+/// with no server CRC32C, the same manifest (which carries the canonical BLAKE3)
+/// drives the body re-hash and the rejection still holds.
+#[test]
+fn verify_rejects_same_length_tamper() {
+    let Some(cfg) = config_or_skip() else {
+        eprintln!("skipping verify_rejects_same_length_tamper: set SLATER_GCS_TEST_ENDPOINT");
+        return;
+    };
+    let store = GcsObjectStore::connect(&cfg).expect("connect GCS");
+
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+    let key = "g/u/tamper.blk";
+    store.put(key, &data, None).expect("put original");
+
+    let good_crc = crc32c_base64(&data);
+    let good_blake3 = hash_bytes(&data);
+    let manifest = FileIntegrity {
+        size: data.len() as u64,
+        blake3: &good_blake3,
+        sha256: None,
+        crc32c: Some(&good_crc),
+    };
+
+    // Correct content verifies.
+    store
+        .verify_file(key, &manifest)
+        .expect("verify_file passes on untampered content");
+
+    // Tamper: overwrite with a DIFFERENT body of the SAME LENGTH. The manifest still
+    // claims the ORIGINAL digests. A length-only check would pass this (same size);
+    // `verify_file` must reject it — via the server-CRC compare when the emulator
+    // recomputes a fresh CRC32C for the tampered bytes, or via the body re-hash
+    // against the manifest BLAKE3 if the object carries no server CRC32C.
+    let mut tampered = data.clone();
+    tampered[0] ^= 0xFF;
+    assert_eq!(tampered.len(), data.len(), "tamper preserves byte length");
+    store.put(key, &tampered, None).expect("overwrite tampered");
+
+    let err = store
+        .verify_file(key, &manifest)
+        .expect_err("a same-length tampered body must be rejected, not passed on length");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CRC32C") || msg.contains("re-hash") || msg.contains("BLAKE3"),
+        "expected a content-integrity failure (CRC32C compare or body re-hash), got: {msg}"
+    );
+
+    eprintln!("GCS/fake-gcs-server HIK-107: same-length tamper rejected end-to-end");
 }
 
 /// An [`ObjectStore`] that counts positional reads reaching the inner store, so
