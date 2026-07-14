@@ -729,6 +729,34 @@ pub struct VectorQueryConfig {
     pub beam_width: u32,
     #[serde(default = "default_max_hops", deserialize_with = "deser_u32_or_str")]
     pub max_hops: u32,
+    /// The FreshDiskANN RW-index over the write delta (`crate::rwindex`) — the safety valves
+    /// on the delta arm of `db.idx.vector.queryNodes`.
+    #[serde(default)]
+    pub rw_index: RwIndexConfig,
+}
+
+/// Safety valves for the in-memory RW-index over the write delta (`vectorQuery.rwIndex.*`).
+///
+/// Every one of these turns the delta arm back into the brute-forced resident matrix that
+/// shipped before the index existed — **the same answer, a different cost**. That is the whole
+/// point: a recall or memory regression in production is one config flip from neutralised.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RwIndexConfig {
+    /// The kill switch. Off ⇒ every delta arm brute-forces.
+    #[serde(default = "default_true", deserialize_with = "de::bool")]
+    pub enabled: bool,
+    /// Below this many touched delta nodes, don't build an index: a linear scan of a resident
+    /// matrix beats a graph walk at small `n`, and a proximity graph's recall at tiny `n` is
+    /// not free.
+    #[serde(default = "default_rw_min_vectors", deserialize_with = "de::usize")]
+    pub min_vectors: usize,
+    /// Above this many **rows** (dead ones included — an update appends a row and reclaims it
+    /// only at consolidation), refuse the index and brute-force. This is what bounds the
+    /// resident set: the index is charged separately from `vectorCacheBytes`, because it is
+    /// derived state bounded by the delta, not a cache of the core.
+    #[serde(default = "default_rw_max_vectors", deserialize_with = "de::usize")]
+    pub max_vectors: usize,
 }
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
@@ -875,6 +903,18 @@ fn default_adj_stream_threshold() -> u64 {
 }
 fn default_adj_stream_chunk() -> usize {
     8192 // edges per streamed chunk
+}
+fn default_rw_min_vectors() -> usize {
+    2_000
+}
+fn default_rw_max_vectors() -> usize {
+    // Sized by the **rebuild**, not by RAM. A rebuild (first query after a restart, or after a
+    // touched-journal gap) re-inserts the whole delta on the read path at ~2 ms/vector at dim
+    // 768 (measured — see `graph_format::rwvamana`), so 50 k is already a ~100 s first-query
+    // stall at that dimension and a few seconds at dim 128. Above it, brute-force: an O(n) SIMD
+    // scan of 50 k×768 is ~20 ms/query, which beats paying minutes to build a graph that then
+    // saves 18 ms. The 200 k the ticket suggested would be a *seven-minute* stall.
+    50_000
 }
 fn default_beam_width() -> u32 {
     64
@@ -1073,6 +1113,26 @@ impl Default for VectorQueryConfig {
         Self {
             beam_width: default_beam_width(),
             max_hops: default_max_hops(),
+            rw_index: RwIndexConfig::default(),
+        }
+    }
+}
+impl Default for RwIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_vectors: default_rw_min_vectors(),
+            max_vectors: default_rw_max_vectors(),
+        }
+    }
+}
+
+impl From<RwIndexConfig> for crate::rwindex::RwIndexConfig {
+    fn from(c: RwIndexConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            min_vectors: c.min_vectors,
+            max_vectors: c.max_vectors,
         }
     }
 }
