@@ -86,3 +86,9 @@ harness = false
 [[bench]]
 name = "blockcache"
 harness = false
+
+# Same measurement for the ISAM decoded-leaf-block cache (HIK-106): aggregate *hit*
+# throughput at 1/4/16 threads on a resident working set.
+[[bench]]
+name = "decodedblockcache"
+harness = false
