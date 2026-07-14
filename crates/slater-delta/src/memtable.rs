@@ -2598,6 +2598,19 @@ impl DeltaSnapshot {
         self.mem.is_empty() && self.l0.iter().all(|m| m.is_empty())
     }
 
+    /// Every dense node id any level carries a delta for (core-resolved or born), sorted
+    /// and de-duplicated — the candidate set for a fold that must visit each touched node
+    /// exactly once. Bounded by the delta size, not the graph's.
+    pub fn node_dense_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .levels_oldest_first()
+            .flat_map(|l| l.node_dense_ids())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Resolve a node delta by current-core dense id, folded newest-wins across all
     /// levels (Phase 4c). A *core* dense id's patches may be split across levels — they
     /// merge per-property (newer wins), a tombstone clears+deletes and a newer upsert

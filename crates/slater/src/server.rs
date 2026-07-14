@@ -3991,6 +3991,96 @@ fn delta_for_read(writer: &Arc<DeltaWriter>, gen: &Arc<Generation>) -> ReadOverl
     }
 }
 
+/// Coerce a bound value to a dense `f32` vector — the `vecf32($p)` write spelling.
+///
+/// Bolt has no vector type, so a driver sends an embedding as a list of numbers and it
+/// arrives as a [`Val::List`] (`ps_to_val` is type-blind — it cannot know the target
+/// property is vector-indexed). This is the write-side twin of the KNN path's
+/// `eval_query_vector` coercion, and it keeps the two directions symmetric: a vector
+/// returned to a driver is likewise rendered as a float list.
+fn coerce_vecf32(v: Value, what: &str) -> std::result::Result<Value, Failure> {
+    let items = match v {
+        Value::Vector(_) => return Ok(v),
+        Value::List(items) => items,
+        other => {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                format!(
+                    "{what}: vecf32() needs a list of numbers, got {}",
+                    other.type_name()
+                ),
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for x in items {
+        let n = match x {
+            Value::Float(f) => f,
+            Value::Int(i) => i as f64,
+            other => {
+                return Err(Failure::new(
+                    CODE_REQUEST,
+                    format!(
+                        "{what}: vecf32() elements must be numbers, got {}",
+                        other.type_name()
+                    ),
+                ))
+            }
+        };
+        out.push(n as f32);
+    }
+    Ok(Value::Vector(out))
+}
+
+/// Reject an embedding whose dimension disagrees with the index it is written to.
+///
+/// Both KNN arms hard-error on a dim mismatch, and a bad row would otherwise ride the T2
+/// flush into a segment and the rebuild into the next generation before anyone noticed.
+/// The write is the one place to catch it cheaply, and the one place that can still
+/// report it to the client. A vector on an *unindexed* `(label, property)` is unconstrained
+/// — it is an ordinary inline value, and the core admits those at any width.
+fn validate_vector_dims(ops: &[WalOp], gen: &Generation) -> std::result::Result<(), Failure> {
+    let indexes = &gen.manifest().vector_indexes;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let check = |label: &str, prop: &str, v: &Value| -> std::result::Result<(), Failure> {
+        let Value::Vector(xs) = v else {
+            return Ok(());
+        };
+        let Some(d) = indexes
+            .iter()
+            .find(|d| d.label == label && d.property == prop)
+        else {
+            return Ok(());
+        };
+        if xs.len() != d.dim as usize {
+            return Err(Failure::new(
+                CODE_REQUEST,
+                format!(
+                    "the vector index on (:{label} {{{prop}}}) is {}-dimensional, but the value \
+                     assigned to {prop} has {} dimensions",
+                    d.dim,
+                    xs.len()
+                ),
+            ));
+        }
+        Ok(())
+    };
+    for op in ops {
+        match op {
+            WalOp::UpsertNode { label, patches, .. }
+            | WalOp::ReplaceNode { label, patches, .. } => {
+                for (prop, v) in patches {
+                    check(label, prop, v)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate a Phase 1c write's constant expression (a literal or a parameter) to a
 /// storable [`Value`] against the query's parameters.
 fn write_value(
@@ -3999,6 +4089,24 @@ fn write_value(
     what: &str,
 ) -> std::result::Result<Value, Failure> {
     use parser::ast::Expr;
+    // `vecf32($p)` is the one call `ensure_constant` admits: its value is knowable only
+    // once the parameter is bound, so unlike the all-literal form it cannot be folded at
+    // lowering. Anything else non-constant was rejected there.
+    if let Some(arg) = parser::as_vecf32_arg(e) {
+        let val = match arg {
+            Expr::Param(name) => params.get(name).ok_or_else(|| {
+                Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
+            })?,
+            _ => unreachable!("lower_write_statement folds or rejects vecf32 over {what}"),
+        };
+        let v = crate::exec::val_to_value(val).ok_or_else(|| {
+            Failure::new(
+                CODE_REQUEST,
+                format!("{what} is not a storable scalar value"),
+            )
+        })?;
+        return coerce_vecf32(v, what);
+    }
     let val = match e {
         Expr::Literal(v) => return Ok(v.clone()),
         Expr::Param(name) => params.get(name).ok_or_else(|| {
@@ -4398,6 +4506,8 @@ pub(crate) fn execute_write(
             |e, what| write_value(e, params, what),
         )?);
     }
+    // After the conditional fold, so an `ON CREATE SET` embedding is checked too.
+    validate_vector_dims(&ops, gen)?;
     let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
     let first = ops.first().expect("a node write yields at least one op");
     let resolved = resolve_node_op(writer, gen, first, is_set, stmt.upsert)?;
@@ -4674,6 +4784,12 @@ fn eval_row_value(
     what: &str,
 ) -> std::result::Result<Value, Failure> {
     use parser::ast::Expr;
+    // `SET n.embedding = vecf32(r.emb)` — the batched spelling. The argument is itself a
+    // row reference, so evaluate it through this same restricted grammar and coerce.
+    if let Some(arg) = parser::as_vecf32_arg(e) {
+        let v = eval_row_value(arg, var, row, params, what)?;
+        return coerce_vecf32(v, what);
+    }
     let val: Val = match e {
         Expr::Literal(v) => return Ok(v.clone()),
         Expr::Param(name) => params.get(name).cloned().ok_or_else(|| {
@@ -4840,6 +4956,7 @@ fn execute_write_batch(
                 |e, what| eval_row_value(e, var, row, params, what),
             )?);
         }
+        validate_vector_dims(&row_ops, gen)?;
         let is_set = !matches!(stmt.op, WriteOp::Delete { .. });
         debug_assert!(!row_ops.is_empty(), "a node write yields at least one op");
         let resolved = resolve_node_op_from(
@@ -12386,6 +12503,127 @@ mod tests {
             before,
             "KNN must return identical neighbours and scores across a consolidation"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The delta arm of the same gate. Now that an embedding can be *written*, the dump
+    /// must carry the levels above the base too: a node re-embedded since the build has a
+    /// stale vector in the sealed base index, and reading only the base would rebuild the
+    /// graph around the old embedding — silently, since the index itself survives and the
+    /// count is unchanged. The overlay must win.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn consolidate_carries_a_delta_written_vector_over_the_base() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let (root, graph, _) = testgen::write_basic("consolidate_delta_vector");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+
+        // Re-embed Alice (0) to a vector far from her original, and query with the *new*
+        // one. If the rebuild kept her stale base embedding she will not lead.
+        let newvec = [0.0f32, 0.0, 1.0];
+        let writer = graphs.writer(&graph).unwrap();
+        let gen0 = graphs.get(&graph).unwrap();
+        let stmt = match parser::parse_statement(
+            "MATCH (n:Person {name:'Alice'}) SET n.embedding = vecf32([0.0, 0.0, 1.0])",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        drop(gen0);
+
+        graphs
+            .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+
+        let gen1 = graphs.get(&graph).unwrap();
+        assert_eq!(
+            gen1.manifest().vector_indexes.len(),
+            1,
+            "the vector index must survive the consolidation"
+        );
+        let view = MergedView::read_only(gen1.as_ref());
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 3, vecf32([0.0, 0.0, 1.0])) \
+             YIELD node, score RETURN id(node) AS id, score",
+        )
+        .unwrap();
+        let res = Engine::new(&view, &cache).run(&ast).unwrap();
+        let (id, score) = match (&res.rows[0][0], &res.rows[0][1]) {
+            (Val::Int(i), Val::Float(s)) => (*i, *s),
+            other => panic!("unexpected KNN row {other:?}"),
+        };
+        // Alice is now the *exact* match for the query, so she must lead at distance ~0.
+        assert_eq!(
+            id, 0,
+            "the delta-written embedding must have been carried into the rebuild — Alice is \
+             the exact match for her own new vector; a stale base vector would not lead"
+        );
+        assert!(
+            score.abs() < 1e-6,
+            "the exact match scores ~0 (cosine distance to itself), got {score}"
+        );
+        // And the new vector is what was stored, not the old one.
+        assert_eq!(
+            gen1.manifest().vector_indexes[0].dim as usize,
+            newvec.len(),
+            "dim is unchanged by the re-embed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A wrong-width embedding must be refused at the write. Both KNN arms hard-error on a
+    /// dim mismatch, and a bad row would otherwise ride the flush into a segment and the
+    /// rebuild into the next generation before anyone noticed.
+    #[test]
+    fn a_write_rejects_an_embedding_of_the_wrong_dimension() {
+        let (root, graph, _) = testgen::write_basic("write_bad_vector_dim");
+        let wal = root.join("_wal");
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let writer = graphs.writer(&graph).unwrap();
+        let gen = graphs.get(&graph).unwrap();
+
+        // The fixture's index on (:Person {embedding}) is 3-dimensional.
+        let stmt = match parser::parse_statement(
+            "MATCH (n:Person {name:'Alice'}) SET n.embedding = vecf32([1.0, 2.0])",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        let e = execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
+            .expect_err("a 2-dim value on a 3-dim index must be refused");
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("3-dimensional") && msg.contains("2 dimensions"),
+            "the error should name both widths, got: {msg}"
+        );
+
+        // An *unindexed* vector property is unconstrained — the core admits any width.
+        let ok = match parser::parse_statement(
+            "MATCH (n:Person {name:'Alice'}) SET n.shadow = vecf32([1.0, 2.0])",
+        )
+        .unwrap()
+        {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+        execute_write(&writer, gen.as_ref(), &ok, &HashMap::new())
+            .expect("an unindexed vector property carries no dimension contract");
         std::fs::remove_dir_all(&root).ok();
     }
 

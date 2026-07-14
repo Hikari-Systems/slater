@@ -37,7 +37,7 @@
 //! serialises byte-identically — the property the consolidation golden gate rests
 //! on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -315,12 +315,32 @@ pub fn serialise_binary_dump<V: ReadView>(
     let mut vectors: Vec<(u64, u32, Vec<f32>)> = Vec::new(); // (new_id, key_id, vector)
     for desc in &manifest.vector_indexes {
         let key_id = keys.intern(&desc.property);
-        for e in read_index_vectors(engine, view, desc)? {
+        // The sealed base index, then the levels above it (delta patches and segment rows)
+        // folded newest-wins: a node re-embedded since the build must carry its *new*
+        // vector into the rebuild, and a node embedded for the first time since the build
+        // has no base entry at all.
+        //
+        // The overlay is the small side (bounded by `memtableBytes` and `maxUpperSegments`)
+        // and the base is the whole index, so the overlay drives the suppression and the
+        // base still streams straight through — folding both into one map would put every
+        // vector in the graph through a per-node insert to override a handful of them.
+        let overlay = engine.overlay_index_vectors(desc)?;
+        let superseded: HashSet<u64> = overlay.iter().map(|e| e.node_id).collect();
+        let push = |node_id: u64, vector: Vec<f32>, vectors: &mut Vec<_>| {
             // A node the delta or a segment deleted takes its embedding with it.
-            if combined_tombs.binary_search(&e.node_id).is_ok() {
+            if combined_tombs.binary_search(&node_id).is_ok() {
+                return;
+            }
+            vectors.push((compact_id(&combined_tombs, node_id), key_id, vector));
+        };
+        for e in read_index_vectors(engine, view, desc)? {
+            if superseded.contains(&e.node_id) {
                 continue;
             }
-            vectors.push((compact_id(&combined_tombs, e.node_id), key_id, e.vector));
+            push(e.node_id, e.vector, &mut vectors);
+        }
+        for e in overlay {
+            push(e.node_id, e.vector, &mut vectors);
         }
         vector_indexes.push(DumpVectorIndex {
             label: desc.label.clone(),

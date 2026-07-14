@@ -1030,12 +1030,15 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                 "to SET a relationship property, name the relationship: MERGE (a)-[r:R]->(b) SET r.p = …"
             )
         })?;
-        for (set_var, prop, value) in sets {
+        for (set_var, prop, mut value) in sets {
             if set_var != rvar {
                 bail!(
                     "SET must target the relationship variable '{rvar}', not '{set_var}' (a relationship write mutates one edge)"
                 );
             }
+            // Vector indexes are node-only, so an edge's vector is an unindexed inline
+            // value — stored in the column store and read back verbatim, like the core's.
+            fold_vecf32(&mut value);
             ensure_constant(&value, &format!("the value assigned to {rvar}.{prop}"))?;
             out_sets.push((prop, value));
         }
@@ -1262,13 +1265,15 @@ fn node_pat_to_create(node: NodePat, ret: Option<ReturnClause>, kw: &str) -> Res
     if node.props.is_empty() {
         bail!("a {kw} node must carry at least one inline property (its business key), e.g. {kw} (n:Label {{key: value}})");
     }
-    for (name, value) in &node.props {
+    let mut props = node.props;
+    for (name, value) in props.iter_mut() {
+        fold_vecf32(value);
         ensure_constant(value, &format!("the value of {var}.{name}"))?;
     }
     Ok(CreateStmt {
         var,
         label,
-        props: node.props,
+        props,
         ret,
     })
 }
@@ -1450,12 +1455,13 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
             bail!("a write must SET or REMOVE at least one property or label");
         }
         let mut out = Vec::with_capacity(set_items.len());
-        for (svar, item) in set_items {
+        for (svar, mut item) in set_items {
             if svar != var {
                 bail!(
                     "SET must target the anchor variable '{var}', not '{svar}' (a write mutates one node)"
                 );
             }
+            fold_set_item_vectors(&mut item);
             // A plain write's values must be constants; a write-UNWIND's may reference
             // the alias's fields (validated per-row at execution).
             if unwind.is_none() {
@@ -1501,10 +1507,11 @@ fn validate_conditional_sets(
         bail!("ON {which} SET is only valid on MERGE, not MATCH");
     }
     let mut out = Vec::with_capacity(items.len());
-    for (svar, item) in items {
+    for (svar, mut item) in items {
         if svar != var {
             bail!("ON {which} SET must target the anchor variable '{var}', not '{svar}'");
         }
+        fold_set_item_vectors(&mut item);
         if !is_unwind {
             ensure_set_item_constant(&item, var)?;
         }
@@ -1534,10 +1541,67 @@ fn ensure_set_item_constant(item: &SetItem, var: &str) -> Result<()> {
 /// A Phase 1c write's business-key value and every SET right-hand side must be a
 /// value known without reading the graph: a literal or a parameter. (Computed
 /// right-hand sides such as `n.x + 1` land in a later phase.)
+///
+/// `write_value`/`eval_row_value` on the server side match this admission set exactly
+/// — one of them `unreachable!()`s on anything else — so the two must move together.
 fn ensure_constant(e: &Expr, what: &str) -> Result<()> {
     match e {
         Expr::Literal(_) | Expr::Param(_) => Ok(()),
+        // `vecf32($p)` cannot fold at lowering (the parameter is bound per execution),
+        // so it reaches the write path as a call and is coerced there.
+        e if as_vecf32_arg(e).is_some_and(|a| matches!(a, Expr::Param(_))) => Ok(()),
         _ => bail!("{what} must be a literal or a parameter in a Phase 1c write"),
+    }
+}
+
+/// The sole argument of a `vecf32(x)` call, or `None` for any other expression.
+pub fn as_vecf32_arg(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("vecf32") => match args {
+            FuncArgs::Args(a) if a.len() == 1 => Some(&a[0]),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Constant-fold `vecf32([<numeric literals>])` into a `Value::Vector` literal.
+///
+/// A vector literal is spelled as a *call* over a list literal, so it lowers to
+/// `Expr::Function` over `Expr::List` — neither of which `ensure_constant` admits (a
+/// bare list literal is `Expr::List`, not `Expr::Literal(Value::List)`; there is no
+/// folding pass to make it one). Its arguments are known at lowering time, so fold it
+/// here and everything downstream stays on the `Expr::Literal` fast path.
+///
+/// Folds only the all-literal form. `vecf32($p)` is left alone for the write path to
+/// coerce once `$p` is bound, and anything else is left for `ensure_constant` to reject.
+fn fold_vecf32(e: &mut Expr) {
+    let Some(Expr::List(items)) = as_vecf32_arg(e) else {
+        return;
+    };
+    let mut xs = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Expr::Literal(Value::Float(f)) => xs.push(*f as f32),
+            Expr::Literal(Value::Int(i)) => xs.push(*i as f32),
+            // A non-numeric element is a user error, but it is not this function's to
+            // report: leave the call intact and let evaluation name the bad element.
+            _ => return,
+        }
+    }
+    *e = Expr::Literal(Value::Vector(xs));
+}
+
+/// Fold every vector literal a `SET` item can carry, in place.
+fn fold_set_item_vectors(item: &mut SetItem) {
+    match item {
+        SetItem::Prop { value, .. } => fold_vecf32(value),
+        SetItem::ReplaceMap(map) | SetItem::MergeMap(map) => {
+            for (_, v) in map.iter_mut() {
+                fold_vecf32(v);
+            }
+        }
+        SetItem::AddLabels(_) => {}
     }
 }
 
@@ -4191,6 +4255,60 @@ mod tests {
             assert!(
                 e.contains("read-only") && e.contains(kw),
                 "for {q:?} expected read-only/{kw}, got: {e}"
+            );
+        }
+    }
+
+    /// The all-literal `vecf32([...])` write spelling folds to a `Value::Vector` literal
+    /// at lowering, so `ensure_constant` admits it and the write path stays on the
+    /// `Expr::Literal` fast path (`write_value` would otherwise `unreachable!()`).
+    #[test]
+    fn folds_a_literal_vecf32_write_to_a_vector_literal() {
+        let w = write("MERGE (n:Doc {id: 1}) SET n.embedding = vecf32([0.5, 0.25, 2])");
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET");
+        };
+        let SetItem::Prop { prop, value } = &items[0] else {
+            panic!("expected a property SET");
+        };
+        assert_eq!(prop, "embedding");
+        // Note the integer element folds to a float — vecf32 is a dense f32 vector.
+        assert_eq!(
+            *value,
+            Expr::Literal(Value::Vector(vec![0.5, 0.25, 2.0])),
+            "a literal vecf32 must fold to a vector literal, not stay an Expr::Function"
+        );
+    }
+
+    /// `vecf32($p)` cannot fold (the parameter is bound per execution), so it must
+    /// survive lowering as a call — and `ensure_constant` must admit that one shape.
+    #[test]
+    fn admits_vecf32_over_a_parameter_in_a_write() {
+        let w = write("MERGE (n:Doc {id: 1}) SET n.embedding = vecf32($e)");
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET");
+        };
+        let SetItem::Prop { value, .. } = &items[0] else {
+            panic!("expected a property SET");
+        };
+        assert!(
+            matches!(as_vecf32_arg(value), Some(Expr::Param(p)) if p == "e"),
+            "vecf32($p) should reach the write path as a call over the param, got {value:?}"
+        );
+    }
+
+    /// The fold is not a licence to admit arbitrary calls: a non-vecf32 function, and a
+    /// vecf32 over a non-constant argument, are both still rejected.
+    #[test]
+    fn still_rejects_non_constant_write_values() {
+        for q in [
+            "MERGE (n:Doc {id: 1}) SET n.x = toUpper('a')",
+            "MERGE (n:Doc {id: 1}) SET n.embedding = vecf32(n.other)",
+        ] {
+            let e = write_err(q);
+            assert!(
+                e.contains("must be a literal or a parameter") || e == "read-only",
+                "for {q:?} got: {e}"
             );
         }
     }

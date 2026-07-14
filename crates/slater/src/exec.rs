@@ -45,7 +45,7 @@ use crate::read_view::ReadView;
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{EdgeId, NodeId, Value};
-use graph_format::manifest::{AnnMode, EntityKind};
+use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
 use graph_format::postings::EndpointPostingIter;
 use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
@@ -946,10 +946,114 @@ fn node_label_ids_par(gen: &dyn ReadView, cache: &BlockCache, id: u64) -> Result
     Ok(ids)
 }
 
+/// D12: an *indexed* embedding is routed **out** of the column store at build time, so a
+/// column read of one yields `Null` from the core — it is served by the KNN path, not by
+/// `RETURN n.embedding`. A delta- or segment-written embedding, though, *does* still sit
+/// in the node's property map: that map is what carries it through the WAL, the L0, the
+/// T2 flush and the consolidation rebuild, so it is deliberately not stripped at write
+/// time. Suppress it on the way out instead, or one query would answer `Null` for a
+/// core-resident node and a vector for a freshly-written one — the same graph giving two
+/// answers depending on which level the node happens to live in.
+///
+/// Cheap by construction: a non-vector value returns before touching the manifest, and a
+/// graph that declares no vector index never resolves labels. An *unindexed* inline
+/// vector reads back verbatim, exactly as it does from the core.
+fn suppress_indexed_vector(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    id: u64,
+    key: &str,
+    v: Val,
+) -> Result<Val> {
+    if !matches!(v, Val::Vector(_)) {
+        return Ok(v);
+    }
+    let indexed: Vec<&str> = gen
+        .manifest()
+        .vector_indexes
+        .iter()
+        .filter(|d| d.property == key)
+        .map(|d| d.label.as_str())
+        .collect();
+    if indexed.is_empty() {
+        return Ok(v);
+    }
+    for lid in node_label_ids_par(gen, cache, id)? {
+        if gen.label_name(lid).is_some_and(|n| indexed.contains(&n)) {
+            return Ok(Val::Null);
+        }
+    }
+    Ok(v)
+}
+
+/// Every `(node_id, vector)` the levels **above the base** hold for a vector index — the
+/// delta's property patches and the core segments' full rows, folded newest-wins.
+///
+/// This is the write-visibility primitive the base's sealed, immutable index cannot
+/// provide. Two consumers, and they must agree or a vector goes missing: the KNN path
+/// unions it with the base's own arm, and the consolidation dump carries it so a rebuild
+/// does not drop a freshly-written embedding on the floor.
+///
+/// Newest-wins comes for free from [`node_prop_raw`] (delta patch over segment row over
+/// base record), so a re-embedded node yields its *new* vector here and its base entry is
+/// suppressed by the caller. Tombstoned and mislabelled nodes are dropped. Cost is
+/// O(touched nodes), not O(graph) — the candidate set is the delta plus the segments'
+/// rows, both bounded by `memtableBytes` and `maxUpperSegments`.
+pub fn overlay_index_vectors(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    desc: &VectorIndexDesc,
+) -> Result<Vec<graph_format::vectors::VectorEntry>> {
+    let delta = gen.delta();
+    let stack = gen.core_stack();
+    if delta.is_empty() && stack.is_singleton() {
+        return Ok(Vec::new());
+    }
+    let mut ids = delta.node_dense_ids();
+    for seg in stack.segments() {
+        ids.extend(seg.reader.node_ids());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut out = Vec::new();
+    for id in ids {
+        if delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?) {
+            continue;
+        }
+        // The index is scoped to a label, and a delta write can add one (`SET n:Label`),
+        // so resolve the effective label set rather than trusting the base's.
+        let labelled = node_label_ids_par(gen, cache, id)?
+            .into_iter()
+            .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label));
+        if !labelled {
+            continue;
+        }
+        if let Val::Vector(v) = node_prop_raw(gen, cache, id, &desc.property)? {
+            out.push(graph_format::vectors::VectorEntry {
+                node_id: id,
+                vector: v,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Thread-safe read of node `id`'s value for property `key` (or `Null` if absent),
 /// decoding only the requested key from the cached record. The free-fn body behind
 /// [`Engine::node_prop`]; used by the parallel anchor filter ([`node_ok_par`]).
+///
+/// A *column* read, so D12 applies: an indexed embedding reads as `Null`. The vector
+/// paths (KNN, the consolidation dump) want the embedding itself and read through
+/// [`node_prop_raw`] instead.
 fn node_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
+    let v = node_prop_raw(gen, cache, id, key)?;
+    suppress_indexed_vector(gen, cache, id, key, v)
+}
+
+/// The value actually stored at the winning level for `(id, key)` — delta patch over
+/// segment row over base record — with no D12 suppression. See [`node_prop_par`].
+fn node_prop_raw(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> Result<Val> {
     // Writable-layer overlay (Phase 1c): a live delta patch on this property wins
     // last-writer-wins over the core value, and can introduce a property the core
     // never had. The empty-delta fast path skips the whole probe.
@@ -2244,6 +2348,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// blocks and they stay warm for repeat queries. When a fanout pool is
     /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
     /// (cache lookup + zstd decode) gather in parallel, preserving record order.
+    /// Every `(node_id, vector)` the delta and the core segments hold for `desc` — see
+    /// the free fn [`overlay_index_vectors`].
+    pub(crate) fn overlay_index_vectors(&self, desc: &VectorIndexDesc) -> Result<Vec<VectorEntry>> {
+        overlay_index_vectors(self.gen, self.cache, desc)
+    }
+
     pub(crate) fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
         let ids: Vec<u64> = (first_record..first_record + count).collect();
         let (gen, cache) = (self.gen, self.cache);
@@ -2270,14 +2380,38 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// `Node` structure carries. Reads route through the block cache like any other
     /// record access, so encoding a returned node reuses already-resident blocks.
     pub fn node_record(&self, id: u64) -> Result<(Vec<String>, NamedProps)> {
-        let labels = self
+        let labels: Vec<String> = self
             .node_label_ids(id)?
             .into_iter()
             .filter_map(|l| self.gen.label_name(l).map(|s| s.to_string()))
             .collect();
         let mut props = self.core_named_props(id)?;
         self.overlay_node_props(id, &mut props);
+        self.suppress_indexed_vectors_named(&labels, &mut props);
         Ok((labels, props))
+    }
+
+    /// Strip every *indexed* embedding from a node's name-space property map — the
+    /// whole-map twin of [`suppress_indexed_vector`], and for the same reason (D12: a
+    /// column read of an indexed embedding yields `Null` from the core, so it must yield
+    /// `Null` from the delta and the segments too).
+    ///
+    /// This is also what keeps a delta-written embedding out of the **column store** at
+    /// consolidation: the dumper walks node properties through this fold, so an indexed
+    /// vector never reaches `intern_props`. It rides the dump's dedicated vector stream
+    /// instead. The T2 flush is unaffected — it builds its rows straight from the
+    /// memtable, not through the `ReadView`, so the vector still reaches the segment.
+    fn suppress_indexed_vectors_named(&self, labels: &[String], named: &mut NamedProps) {
+        if !named.iter().any(|(_, v)| matches!(v, Val::Vector(_))) {
+            return;
+        }
+        let indexes = &self.gen.manifest().vector_indexes;
+        named.retain(|(k, v)| {
+            !(matches!(v, Val::Vector(_))
+                && indexes
+                    .iter()
+                    .any(|d| &d.property == k && labels.contains(&d.label)))
+        });
     }
 
     /// Node `id`'s **core-stack** properties in name space (below the delta): the winning
@@ -7978,6 +8112,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 // Core-stack row (segment or base) in name space, then the delta overlay.
                 let mut out = self.core_named_props(*id)?;
                 self.overlay_node_props(*id, &mut out);
+                let labels: Vec<String> = self
+                    .node_label_ids(*id)?
+                    .into_iter()
+                    .filter_map(|l| self.gen.label_name(l).map(|s| s.to_string()))
+                    .collect();
+                self.suppress_indexed_vectors_named(&labels, &mut out);
                 Ok(out)
             }
             // `core_named_edge_props` already folds the segment row and the delta patches.
@@ -17196,6 +17336,92 @@ mod tests {
             got,
             vec![0, 1],
             "the two live Person embeddings remain, still exact-ranked"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D12 read parity. An *indexed* embedding is routed out of the column store at build
+    /// time, so a core node's `n.embedding` reads as `Null`. A delta-written embedding is
+    /// deliberately left in the node's property map (that map carries it to the flush and
+    /// the rebuild), so without an explicit suppression the same query would answer `Null`
+    /// for a core-resident node and a vector for a freshly-written one.
+    ///
+    /// An *unindexed* vector property is not covered by D12 and must still read back — it
+    /// is an ordinary inline value, exactly as it is in the core.
+    #[test]
+    fn a_delta_written_indexed_vector_reads_as_null_like_the_core() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph, _) = testgen::write_basic("exec_d12_delta_vector");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Alice (0) is core-resident and Person.embedding is vector-indexed, so her
+        // embedding already reads as Null — the behaviour the delta must match.
+        let base = Engine::new(&MergedView::read_only(&gen), &cache)
+            .run(&parser::parse("MATCH (n:Person {name: 'Alice'}) RETURN n.embedding").unwrap())
+            .unwrap();
+        assert!(
+            matches!(base.rows[0][0], Val::Null),
+            "a core node's indexed embedding reads as Null (D12), got {:?}",
+            base.rows[0][0]
+        );
+
+        // Re-embed Alice, and give her an unindexed vector property alongside.
+        let mut mem = Memtable::new();
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(0),
+            [
+                ("embedding".to_string(), Value::Vector(vec![0.1, 0.2, 0.3])),
+                ("shadow".to_string(), Value::Vector(vec![0.4, 0.5])),
+            ],
+        );
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        let eng = Engine::new(&view, &cache);
+
+        let got = eng
+            .run(
+                &parser::parse(
+                    "MATCH (n:Person {name: 'Alice'}) RETURN n.embedding AS e, n.shadow AS s",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            matches!(got.rows[0][0], Val::Null),
+            "a delta-written *indexed* embedding must read as Null too, or the same graph \
+             answers two ways depending on which level the node lives in; got {:?}",
+            got.rows[0][0]
+        );
+        assert!(
+            matches!(&got.rows[0][1], Val::Vector(v) if v == &[0.4, 0.5]),
+            "an unindexed vector property is not routed out, so it must read back verbatim; \
+             got {:?}",
+            got.rows[0][1]
+        );
+
+        // The whole-map read (`RETURN n` / properties(n)) must agree with the column read.
+        let all = eng
+            .run(
+                &parser::parse("MATCH (n:Person {name: 'Alice'}) RETURN properties(n) AS p")
+                    .unwrap(),
+            )
+            .unwrap();
+        let Val::Map(props) = &all.rows[0][0] else {
+            panic!("properties() should yield a map");
+        };
+        assert!(
+            !props.iter().any(|(k, _)| k == "embedding"),
+            "the indexed embedding must be absent from properties(n), got {props:?}"
+        );
+        assert!(
+            props.iter().any(|(k, _)| k == "shadow"),
+            "the unindexed vector must survive properties(n), got {props:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
