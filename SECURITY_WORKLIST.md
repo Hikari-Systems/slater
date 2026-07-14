@@ -63,9 +63,39 @@ authenticated principals over Bolt).
   exercises the end-to-end path against MinIO (PUT with no checksum; a same-length tamper is
   rejected, which the pre-fix length check would have passed).
 
-  **Sibling still open:** the GCS backend (`store/gcs.rs`) has the analogous `(_, None)` shape
-  for its CRC32C check — a manifest CRC32C with no server-stored one falls back to length. Not
-  in HIK-97's scope; flagged for a follow-up.
+  **Sibling (now closed, HIK-107):** the GCS backend (`store/gcs.rs`) had the analogous
+  `(_, None)` shape for its CRC32C check — see the entry below.
+
+## Closed — GCS per-file verify downgraded a manifest CRC32C to a length check (2026-07-14, HIK-107)
+
+- [x] **✅ FIXED — the GCS sibling of HIK-97.** `GcsObjectStore::verify_file` compared the
+  object's server-stored CRC32C (from a metadata `get_object`) to the manifest's. When the
+  manifest recorded a CRC32C but the object carried **none** server-stored (a composite object,
+  or an out-of-band copy), the `(_, None)` arm fell through to a `Content-Length` completeness
+  check — with no warning. A requested content digest was silently satisfied by "the file is the
+  right length", which catches truncation but not a same-length tamper. **Impact** is identical
+  to HIK-97 on GCS-backed deployments: an attacker with bucket-write (but without the master key
+  or the MAC'd manifest) could overwrite a *plaintext* block with same-length malicious bytes and
+  verify would pass on size alone. (Encrypted images still fail at the AEAD tag on read —
+  detection is only deferred there.)
+
+  **Fix (`crates/graph-format/src/store/gcs.rs`):** mirror HIK-97 exactly. The routing is now a
+  pure, unit-tested `plan_verify()`: `(Some, Some)` → compare CRC32C (unchanged, content-grade,
+  no body read); `(Some, None)` → re-read the object body and verify it against the manifest's
+  canonical BLAKE3 (the trait's default `verify_file`), restoring the content-grade guarantee at
+  the cost of one GET — **not** a downgrade; `(None, _)` → the byte-length completeness floor
+  (a pre-checksum generation with nothing to compare) — the only case that uses length. slater's
+  own `put` always sends a CRC32C, so every slater-published object carries a server CRC32C and
+  stays on the metadata-only path; the body read is paid only by objects that genuinely lack a
+  server checksum.
+
+  **Tests:** `gcs::tests::manifest_crc32c_without_server_crc32c_never_downgrades_to_length` (+
+  siblings) pins the routing without a network — proving `(Some, None)` routes to a body re-hash,
+  never the length floor (fails on the pre-fix logic). `gcs_emulator::verify_rejects_same_length_tamper`
+  exercises the end-to-end tamper rejection against `fake-gcs-server`. (Note: unlike S3, GCS's
+  `put` always stores a CRC32C and the emulator always returns one, so the server-CRC-absent arm
+  itself is not reproducible against the emulator through slater's API — hence the unit tests pin
+  that specific arm.)
 
 ## Status at a glance
 
