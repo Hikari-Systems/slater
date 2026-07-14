@@ -31,3 +31,8 @@ perf/datasets
 /target-dc
 /target-merge
 target-merge
+
+# Saved browser pages (Claude conversation exports) — never part of the tree
+*.html:Zone.Identifier
+/*- Claude.html
+/*- Claude_files/
