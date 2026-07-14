@@ -46,6 +46,7 @@ use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{EdgeId, NodeId, Value};
 use graph_format::manifest::{AnnMode, EntityKind};
+use graph_format::postings::EndpointPostingIter;
 use graph_format::pq::AdcTable;
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
@@ -1362,6 +1363,45 @@ enum CandidateSrc<'a> {
         next: u64,
         end: u64,
     },
+    /// A lazy **k-way merge** of several ascending id sources over the dense id space,
+    /// produced window by window (HIK-104). Used where the eager path needed a *sorted union*
+    /// across the base generation and the delta/segment overlays — `LabelScan` under a segment
+    /// stack or write delta, and every `RelTypeScan` — which a single window cursor cannot
+    /// emit. Each source is individually ascending+distinct; the merge partitions the id space
+    /// into the *same* ramping windows as [`CandidateSrc::Sweep`] and, per window `[lo, hi)`,
+    /// pulls only the ids each source has in that range, then `sort`+`dedup`s that bounded
+    /// buffer — reproducing the eager `sort_unstable`+`dedup` exactly while keeping the resident
+    /// footprint to one window. `next..end` is the undecoded id range.
+    Merge {
+        srcs: Vec<MergeSrc>,
+        next: u64,
+        end: u64,
+    },
+}
+
+/// One ascending, distinct source of an anchor k-way merge ([`CandidateSrc::Merge`]).
+enum MergeSrc {
+    /// A write-bounded, already ascending+deduped id list — the segment/delta overlay of a
+    /// label scan (stack label-carriers ∪ delta born/added-label ids), or one segment's
+    /// endpoint posting slice. `pos` is the next unread index.
+    Mat { ids: Vec<u64>, pos: usize },
+    /// A lazy sweep of the base node-label column: ascending ids carrying `label`, decoded a
+    /// window at a time, **minus** `exclude` (ids the segment stack overrides — their label
+    /// membership is decided by a `Mat` overlay instead, mirroring `fold_label_scan`'s
+    /// `retain`). The column has records only below `col_end`; higher ids are born ids the
+    /// overlay supplies.
+    LabelCol {
+        label: u32,
+        exclude: HashSet<u64>,
+        col_end: u64,
+    },
+    /// A lazy walk of a base endpoint posting, owning only the compressed Elias–Fano form
+    /// (a few bits/id, not the expanded 733 MB `Vec`). `head` is the value already pulled from
+    /// the cursor that straddles into a later window (`>= hi`), held until its window arrives.
+    Posting {
+        iter: EndpointPostingIter,
+        head: Option<u64>,
+    },
 }
 
 /// A lazy, bounded-window cursor over an anchor scan's candidate node ids, drained with
@@ -1396,6 +1436,10 @@ impl<'a> CandidateStream<'a> {
             end,
         })
     }
+    /// A lazy k-way merge of `srcs` over the dense id space `0..end`.
+    fn merge(srcs: Vec<MergeSrc>, end: u64) -> Self {
+        Self::new(CandidateSrc::Merge { srcs, next: 0, end })
+    }
     /// Ids this scan materialised (already tombstone-suppressed).
     fn owned(ids: Vec<u64>) -> Self {
         Self::new(CandidateSrc::Owned(ids))
@@ -1418,6 +1462,10 @@ impl<'a> CandidateStream<'a> {
             CandidateSrc::Ready(ids) => ids.len(),
             CandidateSrc::Owned(ids) => ids.len(),
             CandidateSrc::Sweep { next, end, .. } => end.saturating_sub(*next) as usize,
+            // The id space the merge can still sweep — an upper bound on the distinct ids it
+            // can yield (each is a node id in `next..end`), which is all the prefilter gate
+            // needs.
+            CandidateSrc::Merge { next, end, .. } => end.saturating_sub(*next) as usize,
         }
     }
 }
@@ -6686,51 +6734,77 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
                 ids
             }
+            // LabelScan under a segment stack or a write delta (HIK-104). Membership is a
+            // sorted union of the base label column, the stack's re-decided carriers and the
+            // delta's born/added-label ids — which the eager path built into one `Vec` (the
+            // 733 MB base collect) before the first row. Stream it as a k-way merge instead:
+            // the base column is a lazy `LabelCol` source (minus the stack-overridden ids),
+            // the write-bounded overlay is one `Mat` source, and per-window `sort`+`dedup`
+            // reproduces the eager union exactly, one window resident.
             NodeScan::LabelScan { label_id } => {
-                let mut ids = self.gen.collect_nodes_with_label(*label_id)?;
-                // Core stack: a segment full row can add or drop a label (or tombstone the
-                // node), so every stack-touched id's membership is recomputed from its
-                // effective row, and born ids carrying the label are added.
                 let stack = self.gen.core_stack();
+                let delta = self.gen.delta();
                 let label = self.gen.label_name(*label_id).map(str::to_string);
+                // Stack overlay: `exclude` are the ids whose base membership the stack
+                // overrides (removed from the base sweep), `carriers` the subset whose
+                // effective row still carries the label (re-added) — the exact split
+                // `fold_label_scan` performs.
+                let mut exclude: HashSet<u64> = HashSet::new();
+                let mut overlay: Vec<u64> = Vec::new();
                 if !stack.is_singleton() {
                     if let Some(label) = label.as_deref() {
-                        stack.fold_label_scan(&mut ids, label)?;
+                        if let Some((touched, carriers)) = stack.label_scan_overlay(label)? {
+                            exclude = touched.into_iter().collect();
+                            overlay = carriers;
+                        }
                     }
                 }
-                // Delta-born nodes (Phase 2c) are not in the core label postings —
-                // append the synthetic ids carrying this label so a created node shows
-                // up in a label scan. Stage 5 also appends core/born ids that *gained*
-                // this label via `SET n:Label`; a core node that *dropped* it stays in
-                // the postings but is re-checked and rejected by `node_ok` (the scan is
-                // no longer trusted to prove the label — see `scan_guaranteed_labels`).
-                // Tombstoned ids are dropped by the suppression below. The empty-delta
-                // fast path skips the lookup entirely.
-                let delta = self.gen.delta();
+                // Delta-born nodes (Phase 2c) are not in the base label column; ids that
+                // *gained* the label via `SET n:Label` are re-added here too. A core node
+                // that *dropped* the label stays in the base sweep and is re-checked and
+                // rejected by `node_ok` (the scan is not trusted to prove the label — see
+                // `scan_guaranteed_labels`); tombstoned ids are dropped by per-window
+                // suppression. The empty-delta fast path skips the lookup entirely.
                 if !delta.is_empty() {
                     if let Some(label) = label.as_deref() {
-                        ids.extend(delta.born_ids_with_label(label));
-                        ids.extend(delta.ids_with_added_label(label));
+                        overlay.extend(delta.born_ids_with_label(label));
+                        overlay.extend(delta.ids_with_added_label(label));
                     }
                 }
-                if !stack.is_singleton() || !delta.is_empty() {
-                    ids.sort_unstable();
-                    ids.dedup();
+                overlay.sort_unstable();
+                overlay.dedup();
+                let mut srcs = vec![MergeSrc::LabelCol {
+                    label: *label_id,
+                    exclude,
+                    col_end: self.gen.node_label_column_len(),
+                }];
+                if !overlay.is_empty() {
+                    srcs.push(MergeSrc::Mat {
+                        ids: overlay,
+                        pos: 0,
+                    });
                 }
-                ids
+                return Ok(CandidateStream::merge(srcs, self.gen.node_count()));
             }
-            // Distinct edge-having endpoint nodes for the typed first hop (the
-            // precomputed posting). Ascending+deduped, same contract as a label
-            // scan; the first hop re-filters by reltype so this only narrows.
+            // Distinct edge-having endpoint nodes for the typed first hop (HIK-104). The
+            // base posting expands to the whole endpoint set (733 MB for a dense reltype),
+            // so stream it: each base posting is a lazy `Posting` cursor over the compressed
+            // Elias–Fano form, each segment's endpoint slice a write-bounded `Mat` source, and
+            // the k-way merge produces the ascending+deduped union a window at a time. Postings
+            // carry no removals — a superset stays correct because the first hop re-filters by
+            // reltype (and per-window suppression drops deleted nodes).
             NodeScan::RelTypeScan {
                 reltype_ids, side, ..
             } => {
-                let mut ids = self
+                let mut srcs: Vec<MergeSrc> = self
                     .gen
-                    .collect_endpoint_nodes_for_reltypes(reltype_ids, *side)?;
-                // Union each segment's endpoint driving set for these reltypes. Postings
-                // carry no removals — a superset stays correct because the first hop
-                // re-filters by reltype (and `suppress_tombstoned` drops deleted nodes).
+                    .endpoint_posting_cursors(reltype_ids, *side)?
+                    .into_iter()
+                    .map(|mut iter| {
+                        let head = iter.next();
+                        MergeSrc::Posting { iter, head }
+                    })
+                    .collect();
                 let stack = self.gen.core_stack();
                 if !stack.is_singleton() {
                     for seg in stack.segments() {
@@ -6739,18 +6813,28 @@ impl<'g, V: ReadView> Engine<'g, V> {
                             let Some(name) = self.gen.reltype_name(rt) else {
                                 continue;
                             };
+                            let mut seg_ids: Vec<u64> = Vec::new();
                             if matches!(side, RelEndpointSide::Source | RelEndpointSide::Either) {
-                                ids.extend_from_slice(post.src_ids(name));
+                                seg_ids.extend_from_slice(post.src_ids(name));
                             }
                             if matches!(side, RelEndpointSide::Target | RelEndpointSide::Either) {
-                                ids.extend_from_slice(post.tgt_ids(name));
+                                seg_ids.extend_from_slice(post.tgt_ids(name));
+                            }
+                            if !seg_ids.is_empty() {
+                                // A segment's src and tgt slices are each ascending+distinct,
+                                // but their concatenation (Either side) is not — normalise so
+                                // the merge's per-source ascending invariant holds.
+                                seg_ids.sort_unstable();
+                                seg_ids.dedup();
+                                srcs.push(MergeSrc::Mat {
+                                    ids: seg_ids,
+                                    pos: 0,
+                                });
                             }
                         }
                     }
-                    ids.sort_unstable();
-                    ids.dedup();
                 }
-                ids
+                return Ok(CandidateStream::merge(srcs, self.gen.node_count()));
             }
         };
         let mut ids = ids;
@@ -6781,6 +6865,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // counted, so no per-window work is done here.
             CandidateSrc::Ready(ids) => return Ok(slice_window(ids, pos)),
             CandidateSrc::Owned(ids) => return Ok(slice_window(ids, pos)),
+            CandidateSrc::Merge { srcs, next, end } => {
+                return self.next_merge_window(srcs, next, end, buf, window);
+            }
             CandidateSrc::Sweep { label, next, end } => (label, next, end),
         };
         buf.clear();
@@ -6809,6 +6896,90 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     })?;
                 }
             }
+            self.suppress_tombstoned_in_place(buf)?;
+            if !buf.is_empty() {
+                return Ok(Some(buf.as_slice()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drain the next non-empty window of a k-way anchor merge ([`CandidateSrc::Merge`],
+    /// HIK-104). It partitions the id space into the *same* ramping windows a sweep uses;
+    /// per window `[lo, hi)` it pulls only the ids each source has in range — the base label
+    /// column decoded lazily (minus the stack-overridden ids), each base endpoint posting
+    /// walked from its compressed Elias–Fano cursor, and the write-bounded overlays advanced
+    /// by index — then `sort_unstable`+`dedup`s that bounded buffer. Every id falls in exactly
+    /// one window, so this reproduces the eager path's global `sort`+`dedup` ordering and
+    /// cross-source dedup exactly while the resident footprint stays one window. Tombstones are
+    /// suppressed per window (a `SET`-dropped label is left to `node_ok`, as before), the
+    /// id-space frontier walked is counted into [`Engine::anchor_ids_scanned`] so a pushed
+    /// `LIMIT` stops the merge, and empty windows are skipped rather than yielded.
+    fn next_merge_window<'b>(
+        &self,
+        srcs: &mut [MergeSrc],
+        next: &mut u64,
+        end: &mut u64,
+        buf: &'b mut Vec<u64>,
+        window: &mut u64,
+    ) -> Result<Option<&'b [u64]>> {
+        buf.clear();
+        while *next < *end {
+            let (lo, hi) = (*next, (*next + *window).min(*end));
+            *next = hi;
+            *window = window.saturating_mul(8).min(CAND_WINDOW_MAX);
+            self.check_deadline()?;
+            self.scanned_ids
+                .set(self.scanned_ids.get().saturating_add(hi - lo));
+            for src in srcs.iter_mut() {
+                match src {
+                    // Write-bounded, already ascending+distinct: emit its ids below `hi`. The
+                    // cursor is monotone, so everything left is `>= lo` already.
+                    MergeSrc::Mat { ids, pos } => {
+                        while *pos < ids.len() && ids[*pos] < hi {
+                            buf.push(ids[*pos]);
+                            *pos += 1;
+                        }
+                    }
+                    // Ascending Elias–Fano posting cursor: emit its ids below `hi`, keeping the
+                    // straddling head for the window it belongs to.
+                    MergeSrc::Posting { iter, head } => {
+                        while let Some(h) = *head {
+                            if h < hi {
+                                buf.push(h);
+                                *head = iter.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    // The base label column, decoded lazily over this window (clamped to the
+                    // column's records; higher ids are born ids the overlay supplies), keeping
+                    // the label's carriers that the stack does not override.
+                    MergeSrc::LabelCol {
+                        label,
+                        exclude,
+                        col_end,
+                    } => {
+                        let chi = hi.min(*col_end);
+                        if lo < chi {
+                            let labels = self.gen.node_labels();
+                            let (bitmask, want) = (labels.bitmask(), *label);
+                            labels.inner().for_each_record_in(lo, chi, |node_id, rec| {
+                                if graph_format::nodelabels::decode_labels(rec, bitmask)?
+                                    .contains(&want)
+                                    && !exclude.contains(&node_id)
+                                {
+                                    buf.push(node_id);
+                                }
+                                Ok(())
+                            })?;
+                        }
+                    }
+                }
+            }
+            buf.sort_unstable();
+            buf.dedup();
             self.suppress_tombstoned_in_place(buf)?;
             if !buf.is_empty() {
                 return Ok(Some(buf.as_slice()));
@@ -16398,6 +16569,143 @@ mod tests {
         let (rows, walked) = run("MATCH (n:Person) RETURN n");
         assert_eq!(rows, N as usize / 2, "every :Person still matches");
         assert_eq!(walked, N, "…and the label sweep still walks the id space");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-104: the *two arms HIK-78 left eager* — a `LabelScan` under a write delta and every
+    /// `RelTypeScan` — must also stream, via the order-preserving k-way merge. Same observable
+    /// as HIK-78 (`anchor_ids_scanned()` = the id space the scan actually walked); the extra
+    /// obligation is that the merge reproduce the eager `sort`+`dedup` **union across sources**
+    /// (base ∪ delta/segment overlay) exactly — order, dedup and tombstone suppression.
+    ///
+    /// A rows-only test would pass without the fix (the eager path returned the same rows); the
+    /// claim is proven only against the *walked* count, under a delta and for a reltype scan.
+    #[test]
+    fn merged_and_reltype_scans_stream_and_limit_short_circuits() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        // ── LabelScan under a write delta (the case this ticket exists for) ──────────────
+        const N: u64 = 20_000;
+        let (root, graph) = testgen::write_wide("hik104_labelscan_delta", N);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // A live delta: two born :Person nodes + one deleted base :Person (node 2). This forces
+        // the *merge* arm — a plain `LabelScan` is lazy only over a pure core with an empty
+        // delta — and gives the merge a non-empty overlay plus a tombstone to suppress.
+        let mut mem = Memtable::new();
+        mem.upsert_node("Person", "name", Value::Str("newp0".into()), None, []);
+        mem.upsert_node("Person", "name", Value::Str("newp1".into()), None, []);
+        mem.delete_node("Person", "name", Value::Str("node0002".into()), Some(2));
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        assert!(
+            view.delta().is_tombstoned(2),
+            "node 2 tombstoned in the delta"
+        );
+        let nc = view.node_count();
+        assert!(nc > N, "delta-born ids extend the scan bound");
+
+        let person = view.label_id("Person").unwrap();
+        let scan = NodeScan::LabelScan { label_id: person };
+
+        // Correctness vs independently-derived truth: the merged candidate set is exactly the
+        // base :Person ids (evens, from the fixture invariant) minus the tombstone, unioned
+        // with the delta's born :Person ids — ascending and deduped, one window at a time.
+        let born: Vec<u64> = view.delta().born_ids_with_label("Person");
+        assert_eq!(born.len(), 2, "two born :Person nodes in the delta");
+        let mut expected: Vec<u64> = (0..N).step_by(2).filter(|&i| i != 2).collect();
+        expected.extend(&born);
+        expected.sort_unstable();
+        expected.dedup();
+
+        let eng = Engine::new(&view, &cache);
+        let got = eng.scan_candidates(&scan).unwrap();
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "merged label scan must be strictly ascending + deduped, got {got:?}"
+        );
+        assert_eq!(
+            got, expected,
+            "merged label scan = base ∪ overlay, minus tombstones"
+        );
+        // The uncapped drain walked the whole id space (control: the claim below is non-vacuous).
+        assert_eq!(
+            eng.anchor_ids_scanned(),
+            nc,
+            "uncapped merge walks the whole id space"
+        );
+
+        // The claim: under `LIMIT 1` the merge stops inside its first window (≤ `CAND_WINDOW_MIN`
+        // of a 20 000-id space) instead of materialising the union up front.
+        let eng2 = Engine::new(&view, &cache);
+        let out = eng2
+            .run(&parser::parse("MATCH (n:Person) RETURN n LIMIT 1").unwrap())
+            .unwrap();
+        assert_eq!(out.rows.len(), 1, "LIMIT 1 returns one row");
+        assert!(
+            eng2.anchor_ids_scanned() <= CAND_WINDOW_MIN,
+            "LIMIT 1 walked {} ids (> {CAND_WINDOW_MIN}) under a delta — merge did not \
+             short-circuit",
+            eng2.anchor_ids_scanned()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // ── RelTypeScan over a dense endpoint posting (the 733 MB-class base) ────────────
+        const M: u64 = 5_000;
+        let (root, graph) = testgen::write_rel_chain("hik104_reltype", M);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // A delta that deletes one endpoint (node 100) — proves the merge's per-window
+        // suppression runs for a reltype scan under a write delta too.
+        let mut mem = Memtable::new();
+        mem.delete_node("N", "name", Value::Str("node0100".into()), Some(100));
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        assert!(
+            view.delta().is_tombstoned(100),
+            "node 100 tombstoned in the delta"
+        );
+        let mnc = view.node_count();
+
+        let t = view.reltype_id("T").unwrap();
+        let scan = NodeScan::RelTypeScan {
+            reltype_ids: vec![t],
+            side: RelEndpointSide::Source,
+            guaranteed_label: None,
+        };
+        // Every node but the last is a T source; the tombstone drops node 100.
+        let expected: Vec<u64> = (0..M - 1).filter(|&i| i != 100).collect();
+
+        let eng = Engine::new(&view, &cache);
+        let got = eng.scan_candidates(&scan).unwrap();
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "merged reltype scan must be strictly ascending + deduped"
+        );
+        assert_eq!(
+            got, expected,
+            "reltype scan = dense posting minus the tombstone"
+        );
+        assert_eq!(
+            eng.anchor_ids_scanned(),
+            mnc,
+            "uncapped reltype merge walks the whole id space"
+        );
+
+        // Short-circuit: pulling a single window walks no more than the first window, even
+        // though the base posting covers ~all M nodes.
+        let eng2 = Engine::new(&view, &cache);
+        let mut s = eng2.candidate_stream(&scan).unwrap();
+        let first = eng2.next_candidates(&mut s).unwrap();
+        assert!(first.is_some(), "the first window yields candidates");
+        assert!(
+            eng2.anchor_ids_scanned() <= CAND_WINDOW_MIN,
+            "one window walked {} ids (> {CAND_WINDOW_MIN}) of a {M}-id space — reltype merge \
+             did not short-circuit",
+            eng2.anchor_ids_scanned()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

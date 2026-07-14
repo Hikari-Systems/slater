@@ -31,6 +31,7 @@ use graph_format::ids::{Generation as GenId, NodeId, Value};
 use graph_format::isam::IsamReader;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
+use graph_format::postings::EndpointPostingIter;
 use graph_format::topology::TopologyReader;
 use graph_format::vectors::VectorStoreReader;
 use slater_delta::DeltaSnapshot;
@@ -127,6 +128,16 @@ pub trait ReadView: Send + Sync {
         reltype_ids: &[u32],
         side: RelEndpointSide,
     ) -> Result<Vec<u64>>;
+    /// Lazy ascending cursors over the base endpoint postings (the streaming counterpart of
+    /// [`Self::collect_endpoint_nodes_for_reltypes`]); see [`Generation::endpoint_posting_cursors`].
+    fn endpoint_posting_cursors(
+        &self,
+        reltype_ids: &[u32],
+        side: RelEndpointSide,
+    ) -> Result<Vec<EndpointPostingIter>>;
+    /// Records in the base node-label column — the dense id range a base label scan sweeps;
+    /// see [`Generation::node_label_column_len`].
+    fn node_label_column_len(&self) -> u64;
 
     // ── Overlay handles ──────────────────────────────────────────────────────
     /// The delta layers captured for this view (empty for a bare [`Generation`]).
@@ -325,6 +336,16 @@ impl ReadView for Generation {
         side: RelEndpointSide,
     ) -> Result<Vec<u64>> {
         Generation::collect_endpoint_nodes_for_reltypes(self, reltype_ids, side)
+    }
+    fn endpoint_posting_cursors(
+        &self,
+        reltype_ids: &[u32],
+        side: RelEndpointSide,
+    ) -> Result<Vec<EndpointPostingIter>> {
+        Generation::endpoint_posting_cursors(self, reltype_ids, side)
+    }
+    fn node_label_column_len(&self) -> u64 {
+        Generation::node_label_column_len(self)
     }
     fn delta(&self) -> &DeltaSnapshot {
         empty_delta()
@@ -752,6 +773,16 @@ impl ReadView for MergedView<'_> {
     ) -> Result<Vec<u64>> {
         self.core
             .collect_endpoint_nodes_for_reltypes(reltype_ids, side)
+    }
+    fn endpoint_posting_cursors(
+        &self,
+        reltype_ids: &[u32],
+        side: RelEndpointSide,
+    ) -> Result<Vec<EndpointPostingIter>> {
+        self.core.endpoint_posting_cursors(reltype_ids, side)
+    }
+    fn node_label_column_len(&self) -> u64 {
+        self.core.node_label_column_len()
     }
     fn delta(&self) -> &DeltaSnapshot {
         &self.delta

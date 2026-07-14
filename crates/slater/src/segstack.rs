@@ -468,20 +468,39 @@ impl CoreStack {
     /// tombstone drops it entirely); born ids carrying the label are added. `ids` is not
     /// re-sorted here (the caller sorts/dedups after the delta overlay).
     pub fn fold_label_scan(&self, ids: &mut Vec<u64>, label: &str) -> Result<()> {
-        if self.segments.is_empty() {
+        let Some((touched, carriers)) = self.label_scan_overlay(label)? else {
             return Ok(());
+        };
+        let touched_set: std::collections::HashSet<u64> = touched.iter().copied().collect();
+        ids.retain(|id| !touched_set.contains(id));
+        ids.extend(carriers);
+        Ok(())
+    }
+
+    /// The stack's effect on a base label scan, split into its two parts so a **streaming**
+    /// anchor merge can consume them without ever holding the base id list:
+    ///
+    /// * `touched` — the ascending, deduped ids every segment carries a row for. Their base
+    ///   membership is overridden, so the merge must **exclude** them from the base column
+    ///   sweep (the eager [`fold_label_scan`](Self::fold_label_scan) `retain`s them out).
+    /// * `carriers` — the subset of `touched` whose *effective* row is live and carries
+    ///   `label` (segments hold full label sets, so an override can add or drop a label). These
+    ///   are the ids the fold re-adds.
+    ///
+    /// Returns `None` when no segment changes any node's membership in `label` (the resident
+    /// `membership_touches` gate) — the base scan is then already exact, exactly as the eager
+    /// fold's early return. A segment with an *unknown* touch set reports `true`, so correctness
+    /// never depends on the gate. `None` is also returned for a singleton stack.
+    pub fn label_scan_overlay(&self, label: &str) -> Result<Option<(Vec<u64>, Vec<u64>)>> {
+        if self.segments.is_empty() {
+            return Ok(None);
         }
-        // Skip the whole fold when no segment changes any node's membership in `label`: every
-        // touched id keeps its base membership, so the base scan is already exact. This gate is
-        // resident (`membership_touches` reads the manifest) — it avoids decoding a node block
-        // per segment for the common property-only-patch workload. A segment with an *unknown*
-        // touch set (`None`) reports `true`, so correctness never depends on the gate.
         if !self
             .segments
             .iter()
             .any(|seg| seg.manifest.membership_touches(label))
         {
-            return Ok(());
+            return Ok(None);
         }
         let mut touched: Vec<u64> = Vec::new();
         for seg in &self.segments {
@@ -489,16 +508,15 @@ impl CoreStack {
         }
         touched.sort_unstable();
         touched.dedup();
-        let touched_set: std::collections::HashSet<u64> = touched.iter().copied().collect();
-        ids.retain(|id| !touched_set.contains(id));
-        for id in touched {
+        let mut carriers: Vec<u64> = Vec::new();
+        for &id in &touched {
             if let Some(row) = self.resolve_node_row(id)? {
                 if !row.tombstoned && row.labels.iter().any(|l| l == label) {
-                    ids.push(id);
+                    carriers.push(id);
                 }
             }
         }
-        Ok(())
+        Ok(Some((touched, carriers)))
     }
 }
 
