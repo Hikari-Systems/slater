@@ -32,6 +32,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -42,6 +43,10 @@ use crate::generation::RelEndpointSide;
 use crate::parser::ast::*;
 use crate::plan::{choose_node_scan, index_for, is_id_anchored, maybe_rel_type_scan, NodeScan};
 use crate::read_view::ReadView;
+use crate::rwindex::{
+    self, DeltaVector, EnsureCtx, RwIndexCache, RwIndexConfig, RwLookup, SharedIndex,
+    TouchedJournal,
+};
 use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::ids::{EdgeId, NodeId, Value};
@@ -1121,77 +1126,128 @@ pub fn vector_levels(
     cache: &BlockCache,
     desc: &VectorIndexDesc,
 ) -> Result<VectorLevels> {
-    let delta = gen.delta();
-    let stack = gen.core_stack();
-    if delta.is_empty() && stack.is_singleton() {
+    if gen.delta().is_empty() && gen.core_stack().is_singleton() {
         return Ok(VectorLevels::default());
     }
-
-    // A deleted node takes its embedding with it, and its tombstone already suppresses it on
-    // every arm — it needs no vector removal on top. Applied to both levels' candidates.
-    let dead = |id: u64| -> Result<bool> {
-        Ok(delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
-    };
-    // The index is scoped to a label, and a write can add one (`SET n:Label`), so resolve the
-    // *effective* label set rather than trusting the base's. It is a property of the node, not
-    // of a level, so both levels ask the same question.
-    let indexed = |id: u64| -> Result<bool> {
-        Ok(node_label_ids_par(gen, cache, id)?
-            .into_iter()
-            .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label)))
-    };
-
-    // ── the segments level: what the core segments say, with the delta *not* applied ──────
-    let mut segments = VectorLevel::default();
-    if !stack.is_singleton() {
-        // Candidates: exactly the ids the segments' sidecars name for this index. A segment
-        // with no `vec.meta` contributes nothing at all.
-        let mut ids = Vec::new();
-        for seg in stack.segments() {
-            if let Some(v) = &seg.vectors {
-                ids.extend_from_slice(v.ids(&desc.label, &desc.property));
-                ids.extend_from_slice(v.removals(&desc.label, &desc.property));
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        for id in ids {
-            if dead(id)? || !indexed(id)? {
-                continue;
-            }
-            match segment_says(gen, id, desc)? {
-                LevelSays::Vector(v) => segments.entries.push(graph_format::vectors::VectorEntry {
-                    node_id: id,
-                    vector: v,
-                }),
-                LevelSays::Gone => segments.removed.push(id),
-                LevelSays::Nothing => {}
-            }
-        }
-    }
-
-    // ── the delta level: what the write delta itself says ─────────────────────────────────
-    let mut level = VectorLevel::default();
-    if !delta.is_empty() {
-        for id in delta.node_dense_ids() {
-            if dead(id)? || !indexed(id)? {
-                continue;
-            }
-            match delta_says(gen, id, desc) {
-                LevelSays::Vector(v) => level.entries.push(graph_format::vectors::VectorEntry {
-                    node_id: id,
-                    vector: v,
-                }),
-                LevelSays::Gone => level.removed.push(id),
-                LevelSays::Nothing => {}
-            }
-        }
-    }
-
     Ok(VectorLevels {
-        delta: level,
-        segments,
+        delta: delta_level(gen, cache, desc)?,
+        segments: segment_level(gen, cache, desc)?,
     })
+}
+
+/// Is node `id` deleted anywhere above the base? A deleted node takes its embedding with it,
+/// and its tombstone already suppresses it on every arm — it needs no vector removal on top.
+fn vector_dead(gen: &dyn ReadView, id: u64) -> Result<bool> {
+    let stack = gen.core_stack();
+    Ok(gen.delta().is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
+}
+
+/// Does node `id` **effectively** carry the index's label? The index is scoped to a label, and
+/// a write can add one (`SET n:Label`) or take one away, so this resolves the effective label
+/// set rather than trusting the base's. It is a property of the node, not of a level, so every
+/// level asks the same question.
+fn vector_indexed(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    id: u64,
+    desc: &VectorIndexDesc,
+) -> Result<bool> {
+    Ok(node_label_ids_par(gen, cache, id)?
+        .into_iter()
+        .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label)))
+}
+
+/// **The one definition of what the write delta says about one node's embedding.**
+///
+/// The RW-index ([`crate::rwindex`]) is an incrementally-maintained cache of exactly this
+/// function over the delta's touched ids, and [`delta_level`] below is the same function
+/// applied to all of them at once. They must not drift: the index's `superseded` set is what
+/// suppresses the base and segment arms, so a disagreement is a duplicate or a missing node in
+/// the merged top-k, not a slow query. One definition, two callers.
+pub(crate) fn delta_vector_for(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    id: u64,
+    desc: &VectorIndexDesc,
+) -> Result<DeltaVector> {
+    if vector_dead(gen, id)? || !vector_indexed(gen, cache, id, desc)? {
+        return Ok(DeltaVector::Silent);
+    }
+    Ok(match delta_says(gen, id, desc) {
+        LevelSays::Vector(v) => DeltaVector::Set(v),
+        LevelSays::Gone => DeltaVector::Gone,
+        LevelSays::Nothing => DeltaVector::Silent,
+    })
+}
+
+/// The delta level, brute-forced: [`delta_vector_for`] over every node the delta touched.
+///
+/// This is the O(delta) walk — a label resolve (which reads a block) and a vector clone per
+/// touched node, on **every query** — that the RW-index exists to replace. It stays as the
+/// fallback (`vectorQuery.rwIndex.enabled = false`, a delta below `minVectors` or above
+/// `maxVectors`, a query whose epoch the index has already run past), and as the consolidation
+/// dump's view, which wants entries rather than a graph.
+pub fn delta_level(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    desc: &VectorIndexDesc,
+) -> Result<VectorLevel> {
+    let mut level = VectorLevel::default();
+    if gen.delta().is_empty() {
+        return Ok(level);
+    }
+    for id in gen.delta().node_dense_ids() {
+        match delta_vector_for(gen, cache, id, desc)? {
+            DeltaVector::Set(v) => level.entries.push(graph_format::vectors::VectorEntry {
+                node_id: id,
+                vector: v,
+            }),
+            DeltaVector::Gone => level.removed.push(id),
+            DeltaVector::Silent => {}
+        }
+    }
+    Ok(level)
+}
+
+/// The segments level: what the core segments say, with the delta deliberately **not** applied.
+///
+/// Candidates are exactly the ids the segments' `vec.meta` sidecars name for this index — a
+/// large segment that embedded three nodes contributes three candidates, not its row count, and
+/// a segment with no sidecar contributes nothing at all. Unaffected by the RW-index: this level
+/// is bounded by the sidecars, not by the delta.
+pub fn segment_level(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    desc: &VectorIndexDesc,
+) -> Result<VectorLevel> {
+    let mut segments = VectorLevel::default();
+    let stack = gen.core_stack();
+    if stack.is_singleton() {
+        return Ok(segments);
+    }
+    let mut ids = Vec::new();
+    for seg in stack.segments() {
+        if let Some(v) = &seg.vectors {
+            ids.extend_from_slice(v.ids(&desc.label, &desc.property));
+            ids.extend_from_slice(v.removals(&desc.label, &desc.property));
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        if vector_dead(gen, id)? || !vector_indexed(gen, cache, id, desc)? {
+            continue;
+        }
+        match segment_says(gen, id, desc)? {
+            LevelSays::Vector(v) => segments.entries.push(graph_format::vectors::VectorEntry {
+                node_id: id,
+                vector: v,
+            }),
+            LevelSays::Gone => segments.removed.push(id),
+            LevelSays::Nothing => {}
+        }
+    }
+    Ok(segments)
 }
 
 /// What the **write delta** says about node `id`'s embedding — the delta alone, with no core
@@ -2268,6 +2324,20 @@ impl GlobalIntermediateBudget {
 
 // ── Engine ─────────────────────────────────────────────────────────────────
 
+/// Everything the delta's RW-index arm needs, carried as one unit so the epoch cannot get
+/// separated from the index it cuts.
+pub struct RwArm<'g> {
+    /// Per-generation index holder (see [`crate::rwindex::RwIndexCache`]).
+    indexes: &'g RwIndexCache,
+    /// The writer's per-epoch touched-id journal — how an index catches up without re-walking
+    /// the whole delta.
+    journal: Arc<TouchedJournal>,
+    /// The epoch of the delta snapshot this query pinned. The index is used **only** at
+    /// exactly this cut.
+    epoch: u64,
+    cfg: RwIndexConfig,
+}
+
 /// Per-query execution context over one generation and its block cache.
 pub struct Engine<'g, V: ReadView> {
     gen: &'g V,
@@ -2275,6 +2345,10 @@ pub struct Engine<'g, V: ReadView> {
     /// The vector-index pool, needed only by the `AnnMode::Vamana` arm. The
     /// brute-force arm and all non-vector queries leave it `None`.
     vec_cache: Option<&'g VectorIndexCache>,
+    /// The FreshDiskANN RW-index over the write delta ([`crate::rwindex`]) — the delta arm of
+    /// `db.idx.vector.queryNodes`. `None` on a read-only estate (no writable layer): the delta
+    /// is then empty and there is nothing for it to index.
+    rw: Option<RwArm<'g>>,
     params: HashMap<String, Val>,
     /// The subset of `params` that can key an index, projected to `Value` once so
     /// the planner can resolve `$param` predicates without re-converting per call
@@ -2370,6 +2444,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             gen,
             cache,
             vec_cache: None,
+            rw: None,
             params: HashMap::new(),
             plan_params: HashMap::new(),
             max_rows: usize::MAX,
@@ -2414,6 +2489,29 @@ impl<'g, V: ReadView> Engine<'g, V> {
     pub fn with_vector_cache(mut self, vec_cache: &'g VectorIndexCache, beam_width: usize) -> Self {
         self.vec_cache = Some(vec_cache);
         self.beam_width = beam_width.max(1);
+        self
+    }
+
+    /// Supply the RW-index arm: the per-generation index holder, the writer's touched-id
+    /// journal, and **the epoch of the delta snapshot this engine is reading**.
+    ///
+    /// The epoch must come from the *same* atomic read as the delta (`DeltaWriter::
+    /// delta_snapshot_at`). If it does not, the index can be advanced past the delta the query
+    /// is actually overlaying — extra nodes, mismatched suppression, no error. See
+    /// [`crate::rwindex`].
+    pub fn with_rw_index(
+        mut self,
+        indexes: &'g RwIndexCache,
+        journal: Arc<TouchedJournal>,
+        epoch: u64,
+        cfg: RwIndexConfig,
+    ) -> Self {
+        self.rw = Some(RwArm {
+            indexes,
+            journal,
+            epoch,
+            cfg,
+        });
         self
     }
 
@@ -2569,6 +2667,47 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// [`vector_levels`].
     pub(crate) fn vector_levels(&self, desc: &VectorIndexDesc) -> Result<VectorLevels> {
         vector_levels(self.gen, self.cache, desc)
+    }
+
+    pub(crate) fn segment_level(&self, desc: &VectorIndexDesc) -> Result<VectorLevel> {
+        segment_level(self.gen, self.cache, desc)
+    }
+
+    pub(crate) fn delta_level(&self, desc: &VectorIndexDesc) -> Result<VectorLevel> {
+        delta_level(self.gen, self.cache, desc)
+    }
+
+    /// The RW-index for `desc`, advanced to **this query's delta epoch**, or `None` to
+    /// brute-force the delta arm.
+    ///
+    /// The index is a pure function of the query's *own* pinned snapshot: every id the journal
+    /// reports as changed is re-resolved through [`delta_vector_for`] against `self.gen`. That
+    /// is what makes it impossible for the index to describe a delta the query is not reading —
+    /// and the returned epoch is carried back so the caller can re-check it under the read guard
+    /// (another query may advance the index between here and there).
+    fn rw_delta_index(&self, desc: &VectorIndexDesc) -> Result<Option<(SharedIndex, u64)>> {
+        let Some(arm) = &self.rw else {
+            return Ok(None);
+        };
+        // An empty delta has nothing to index, and a read-only estate must pay nothing.
+        if self.gen.delta().is_empty() {
+            return Ok(None);
+        }
+        let lookup = arm.indexes.ensure(
+            EnsureCtx {
+                gen: self.gen.uuid(),
+                desc,
+                epoch: arm.epoch,
+                cfg: &arm.cfg,
+                journal: &arm.journal,
+            },
+            || self.gen.delta().node_dense_ids(),
+            |id| delta_vector_for(self.gen, self.cache, id, desc),
+        )?;
+        Ok(match lookup {
+            RwLookup::Ready(ix) => Some((ix, arm.epoch)),
+            RwLookup::BruteForce => None,
+        })
     }
 
     pub(crate) fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
@@ -5509,22 +5648,55 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
         // The levels above the base carry vectors the sealed base index cannot: a node
         // embedded since the build has no entry in it at all, and a node *re*-embedded
-        // since the build has a stale one. Brute-forced exactly — the levels are bounded
-        // by `memtableBytes` and `maxUpperSegments`, so they are small by construction. Two
-        // properties fall out of that: a freshly-written vector gets **exact** recall, and
-        // the base's own recall is untouched.
+        // since the build has a stale one.
         //
         // Kept as *separate levels* rather than one flattened overlay, because each level has
         // a different set of levels above it and therefore a different suppression set (see
-        // `VectorLevels`). Built per query rather than cached, which is what keeps the
-        // Σ-over-levels pinning trap closed by construction: the vector pool's resident
-        // matrices are charged to the budget but never evicted, so a cached per-level matrix
-        // would grow the pinned set without bound as segments accumulate. Building costs
-        // O(vectors touched), the same order as the brute-force scan it feeds.
-        let levels = self.vector_levels(&desc)?;
-        // Everything *newer* than the segments, and everything newer than the base.
-        let above_segments = levels.delta.superseded();
-        let above_base = levels.superseded();
+        // `VectorLevels`).
+        //
+        // The **segments** level is still gathered and brute-forced exactly: it is bounded by
+        // the `vec.meta` sidecars (a segment that embedded three nodes contributes three
+        // candidates), so it is small by construction, and a freshly-flushed vector gets exact
+        // recall for free.
+        let segments = self.segment_level(&desc)?;
+
+        // The **delta** level is served by the FreshDiskANN RW-index (`crate::rwindex`) — an
+        // in-memory Vamana over the fresh set, advanced to this query's delta epoch and read
+        // at exactly that cut. It replaces what used to be an O(delta) `ResidentMatrix`
+        // allocate-and-normalise on the hot path of *every single query* — ~300 MB at 768 dim
+        // over a 10⁵-vector overlay.
+        //
+        // Caching a matrix per level instead was never an option: the vector pool charges
+        // `matrix_bytes` to its budget and never evicts it, so a per-level matrix would grow
+        // the pinned set without bound as segments accumulate (the Σ-over-levels pinning trap,
+        // D63). The RW-index is not in that pool at all — it is derived state bounded by the
+        // delta, with its own `maxVectors` valve.
+        //
+        // `RwLookup::BruteForce` (kill switch off, delta below `minVectors` or above
+        // `maxVectors`, or an index another query has already advanced *past* our epoch) falls
+        // back to exactly the gather-and-scan that shipped before: the same answer, a
+        // different cost.
+        let rw_ix = self.rw_delta_index(&desc)?;
+        let rw = rw_ix
+            .as_ref()
+            .and_then(|(ix, epoch)| rwindex::read_at_epoch(ix, *epoch));
+        // Only when the index is not serving do we pay for the delta walk.
+        let brute_delta = match &rw {
+            Some(_) => None,
+            None => Some(self.delta_level(&desc)?),
+        };
+
+        // Everything *newer* than the segments — the delta's suppression set, from whichever
+        // arm is serving it. The RW-index maintains it incrementally, so the fast path never
+        // re-walks the delta to compute it.
+        let owned_above_segments = brute_delta.as_ref().map(|l| l.superseded());
+        let above_segments: &HashSet<u64> = match (&owned_above_segments, &rw) {
+            (Some(s), _) => s,
+            (None, Some(ix)) => ix.superseded(),
+            (None, None) => unreachable!("one of the two delta arms is always present"),
+        };
+        let above_base_segments = segments.superseded();
+
         let matrix_of = |entries: Vec<VectorEntry>| -> Result<Option<vector::ResidentMatrix>> {
             if entries.is_empty() {
                 return Ok(None);
@@ -5533,8 +5705,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 dim, metric, entries,
             )?))
         };
-        let segments_matrix = matrix_of(levels.segments.entries)?;
-        let delta_matrix = matrix_of(levels.delta.entries)?;
+        let segments_matrix = matrix_of(segments.entries)?;
+        let delta_matrix = match brute_delta {
+            Some(l) => matrix_of(l.entries)?,
+            None => None,
+        };
 
         // A vector index is built over the **base** generation and is immutable, so a
         // node deleted since the build is still in it. The delta/stack tombstones are
@@ -5554,13 +5729,21 @@ impl<'g, V: ReadView> Engine<'g, V> {
             Ok(delta.is_tombstoned(id)
                 || (!stack.is_singleton() && stack.is_node_tombstoned(id)?))
         };
-        let live_fn =
-            |id: u64| -> Result<bool> { Ok(!above_base.contains(&id) && !tombstoned(id)?) };
+        // `above_base` = everything either level above the base supersedes. Tested as two set
+        // probes rather than a materialised union, so the delta's half can stay borrowed from
+        // the RW-index instead of being cloned per query.
+        let live_fn = |id: u64| -> Result<bool> {
+            Ok(!above_base_segments.contains(&id)
+                && !above_segments.contains(&id)
+                && !tombstoned(id)?)
+        };
         let segments_live_fn =
             |id: u64| -> Result<bool> { Ok(!above_segments.contains(&id) && !tombstoned(id)?) };
-        // `vector_levels` already dropped the tombstoned candidates, so this is defence in
-        // depth rather than load-bearing — but the delta *is* a scanned level like any other,
-        // and it keeps the three arms uniform for the day it gets an index of its own.
+        // Nothing sits above the delta, so its only suppression is the tombstone. Both delta
+        // arms already drop tombstoned nodes as they are built (`delta_vector_for` resolves
+        // them to `Silent`), so this is defence in depth — but the delta *is* a scanned level
+        // like any other, and the RW-index needs a `live` gate anyway to keep a suppressed node
+        // a navigable waypoint rather than pruning it from the walk.
         let delta_live_fn = |id: u64| -> Result<bool> { Ok(!tombstoned(id)?) };
         // A pure-core generation with an empty delta can have no tombstones and no overlay,
         // so the read-only estate pays nothing at all for this.
@@ -5652,10 +5835,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     self.vamana_knn(vc, *medoid, metric, &query, k, live)?
                 }
             };
-            // Fold the levels above the base in. Each level is scanned exactly (no ANN), and
-            // each has already suppressed — in its own scan — every node a *newer* level
-            // supersedes, so the merge is a straight scored fold. See `vector::merge_topk`
-            // for why it must not dedup here instead.
+            // Fold the levels above the base in. Each level has already suppressed — in its own
+            // scan/walk — every node a *newer* level supersedes, so the merge is a straight
+            // scored fold. See `vector::merge_topk` for why it must not dedup here instead.
             let scan = |m: &Option<vector::ResidentMatrix>,
                         live: vector::LivePredicate|
              -> Result<Vec<vector::Neighbour>> {
@@ -5671,11 +5853,32 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     ),
                 }
             };
-            let neighbours = if segments_matrix.is_none() && delta_matrix.is_none() {
+            // The delta arm: the RW-index's beam walk, or the gathered brute force. The
+            // **exact** scorer is the same `vector::distance` every other arm re-ranks with
+            // (D32/D29), so all three levels' scores are on one scale and `merge_topk`
+            // interleaves them correctly rather than silently.
+            let fresh = match &rw {
+                Some(ix) => ix
+                    .graph()
+                    .search(
+                        &query,
+                        k,
+                        self.beam_width,
+                        |v| vector::distance(metric, &query, v) as f32,
+                        delta_live_fn,
+                    )?
+                    .into_iter()
+                    .map(|h| vector::Neighbour {
+                        node_id: h.node_id,
+                        score: h.exact as f64,
+                    })
+                    .collect(),
+                None => scan(&delta_matrix, &delta_live_fn)?,
+            };
+            let neighbours = if segments_matrix.is_none() && fresh.is_empty() {
                 neighbours
             } else {
                 let segs = scan(&segments_matrix, &segments_live_fn)?;
-                let fresh = scan(&delta_matrix, &delta_live_fn)?;
                 vector::merge_topk([neighbours, segs, fresh], k)
             };
             // A node id can reach the merged top-k from at most one level: the level that
@@ -17746,6 +17949,355 @@ mod tests {
             "a node born in the delta with an embedding must be KNN-visible; got {born:?}"
         );
         assert!(born[0].1.abs() < 1e-6, "…at distance ~0, got {}", born[0].1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── The RW-index over the delta (HIK-112) ────────────────────────────────────────────
+    //
+    // These drive a **real** `DeltaWriter` (real WAL, real seal), because the two properties
+    // that matter are lifecycle properties: an index rebuilt from a replayed delta must answer
+    // what the delta says, and no vector may go missing across a seal. A hand-built `Memtable`
+    // cannot express either.
+
+    /// A `RwIndexConfig` with the floors removed, so the tiny fixtures below actually take the
+    /// index path instead of silently falling back to the brute force (which would make every
+    /// assertion here vacuous — the fallback is the *old* code, and it passes by construction).
+    #[cfg(test)]
+    fn rw_cfg_no_floor() -> crate::rwindex::RwIndexConfig {
+        crate::rwindex::RwIndexConfig {
+            enabled: true,
+            min_vectors: 0,
+            max_vectors: 1 << 20,
+        }
+    }
+
+    /// The fixture's business-key resolver: Alice/Bob/Carol are core dense ids 0/1/2, and any
+    /// other name is a delta-born node.
+    #[cfg(test)]
+    fn basic_resolve(op: &slater_delta::WalOp) -> slater_delta::OpResolution {
+        use slater_delta::{OpResolution, WalOp};
+        let value = match op {
+            WalOp::UpsertNode { value, .. }
+            | WalOp::DeleteNode { value, .. }
+            | WalOp::RemoveNodeProps { value, .. }
+            | WalOp::ReplaceNode { value, .. }
+            | WalOp::SetNodeLabels { value, .. } => value,
+            _ => return OpResolution::Node(None),
+        };
+        OpResolution::Node(match value {
+            Value::Str(s) if s == "Alice" => Some(0),
+            Value::Str(s) if s == "Bob" => Some(1),
+            Value::Str(s) if s == "Carol" => Some(2),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
+    fn upsert_vec(name: &str, v: Vec<f32>) -> slater_delta::WalOp {
+        slater_delta::WalOp::UpsertNode {
+            label: "Person".into(),
+            key: "name".into(),
+            value: Value::Str(name.into()),
+            patches: vec![("embedding".into(), Value::Vector(v))],
+        }
+    }
+
+    /// The KNN top-`k` a query must produce, derived **independently** of the index: a plain
+    /// scan of the effective (id, vector) set with `vector::distance`, in the D26 total order.
+    /// This is the ground truth every RW-index test below is measured against — never "the
+    /// index agrees with the brute-force walk", which is the parity test that would pass even
+    /// if both shared a misunderstanding.
+    #[cfg(test)]
+    fn expected_topk(live: &[(u64, Vec<f32>)], q: &[f32], k: usize) -> Vec<(i64, f64)> {
+        let mut scored: Vec<(f64, u64)> = live
+            .iter()
+            .map(|(id, v)| {
+                (
+                    vector::distance(graph_format::manifest::Metric::Cosine, q, v),
+                    *id,
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored
+            .into_iter()
+            .take(k)
+            .map(|(s, id)| (id as i64, s))
+            .collect()
+    }
+
+    /// Run the KNN with the RW-index arm wired, and report whether the index actually served
+    /// the delta (rather than falling back), so a test cannot pass vacuously.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn knn_with_rw(
+        gen: &Generation,
+        cache: &BlockCache,
+        writer: &crate::delta_writer::DeltaWriter,
+        rw: &crate::rwindex::RwIndexCache,
+        q: &str,
+        k: usize,
+    ) -> (Vec<(i64, f64)>, bool) {
+        use crate::read_view::MergedView;
+        // The delta and its epoch, in ONE atomic read — the pair the index is cut at.
+        let published = writer.delta_snapshot_at();
+        let epoch = published.epoch;
+        let view = MergedView::new(gen, published.delta);
+        let ast = parser::parse(&format!(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', {k}, vecf32({q})) \
+             YIELD node, score RETURN id(node) AS id, score"
+        ))
+        .unwrap();
+        let rows = Engine::new(&view, cache)
+            .with_rw_index(rw, writer.touched_journal(), epoch, rw_cfg_no_floor())
+            .run(&ast)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Val::Int(i), Val::Float(s)) => (*i, *s),
+                other => panic!("unexpected KNN row {other:?}"),
+            })
+            .collect();
+        // Did the index serve it? It serves iff it stands at exactly the query's epoch.
+        let served = rw.index_epoch(gen.uuid(), "Person", "embedding") == Some(epoch);
+        (rows, served)
+    }
+
+    /// **The RW-index is a cache of the delta; the delta is the durable thing.** Nothing is
+    /// persisted, so the recovery story is: replay the WAL, rebuild the index from the replayed
+    /// delta.
+    ///
+    /// Drives the *real* WAL: write embeddings (a re-embed of a core node, two born nodes, and
+    /// a `REMOVE n.embedding` that un-embeds one), drop the writer without any clean shutdown,
+    /// reopen (which replays), and assert the KNN answers what a brute force over the
+    /// **replayed** delta says — not what the pre-crash query happened to return. Truth is the
+    /// state on disk, not the state in the dead process's memory.
+    #[test]
+    fn rw_index_rebuilds_from_wal_replay() {
+        use crate::delta_writer::DeltaWriter;
+        use crate::rwindex::RwIndexCache;
+        use slater_delta::WalOp;
+
+        let (root, graph, _) = testgen::write_basic("exec_rw_replay");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let wal = root.join("wal_rw_replay");
+        let _ = std::fs::remove_dir_all(&wal);
+        let core_n = gen.node_count();
+
+        let open = || {
+            DeltaWriter::open(
+                &wal,
+                &graph,
+                gen.uuid(),
+                gen.node_count(),
+                gen.edge_count(),
+                basic_resolve,
+            )
+            .unwrap()
+        };
+
+        {
+            let w = open();
+            // Alice (core id 0) is re-embedded onto the +z axis.
+            w.write(
+                upsert_vec("Alice", vec![0.0, 0.0, 1.0]),
+                basic_resolve(&upsert_vec("Alice", vec![])),
+            )
+            .unwrap();
+            // Two delta-born Persons (synthetic ids core_n, core_n + 1).
+            w.write(
+                upsert_vec("Zoe", vec![1.0, 0.0, 0.0]),
+                slater_delta::OpResolution::Node(None),
+            )
+            .unwrap();
+            w.write(
+                upsert_vec("Yan", vec![0.0, 1.0, 0.0]),
+                slater_delta::OpResolution::Node(None),
+            )
+            .unwrap();
+            // Bob (core id 1) is UN-embedded. Absence cannot express this (D12 keeps an indexed
+            // embedding out of the props record), so it rides its own channel — and if the
+            // rebuilt index loses it, Bob's *stale base vector* silently starts scoring again.
+            w.write(
+                WalOp::RemoveNodeProps {
+                    label: "Person".into(),
+                    key: "name".into(),
+                    value: Value::Str("Bob".into()),
+                    props: vec!["embedding".into()],
+                },
+                slater_delta::OpResolution::Node(Some(1)),
+            )
+            .unwrap();
+            // No flush, no clean close: just drop it. The WAL is fsynced per commit.
+        }
+
+        // Reopen — `DeltaWriter::open` replays the WAL dir into a fresh memtable — and rebuild
+        // the index from the replayed delta. A brand-new `RwIndexCache`: nothing survived.
+        let w = open();
+        let rw = RwIndexCache::new();
+
+        // The effective live set after the replay, derived by hand from the writes above:
+        //   0 Alice → the delta's new vector      (the base's [0.1,0.2,0.3] is superseded)
+        //   1 Bob   → GONE                        (un-embedded; the base's [0.2,0.1,0.0] must
+        //                                          NOT come back)
+        //   2 Carol → the base's [0.9,0.8,0.7]    (the delta says nothing about her)
+        //   3 Zoe, 4 Yan → born, from the delta
+        let live: Vec<(u64, Vec<f32>)> = vec![
+            (0, vec![0.0, 0.0, 1.0]),
+            (2, vec![0.9, 0.8, 0.7]),
+            (core_n, vec![1.0, 0.0, 0.0]),
+            (core_n + 1, vec![0.0, 1.0, 0.0]),
+        ];
+
+        for q in [
+            (vec![0.0f32, 0.0, 1.0], "[0.0, 0.0, 1.0]"),
+            (vec![1.0, 0.0, 0.0], "[1.0, 0.0, 0.0]"),
+            // Bob's OLD (base) vector. He is un-embedded, so he must not come back AT ALL —
+            // let alone lead, which is what a lost removal would do.
+            (vec![0.2, 0.1, 0.0], "[0.2, 0.1, 0.0]"),
+        ] {
+            let (got, served) = knn_with_rw(&gen, &cache, &w, &rw, q.1, 5);
+            assert!(
+                served,
+                "the RW-index must have served the query, not fallen back"
+            );
+            let want = expected_topk(&live, &q.0, 5);
+            assert_eq!(
+                got.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                want.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                "query {} — the index rebuilt from the replayed WAL must answer what the \
+                 delta on disk says; got {got:?}, want {want:?}",
+                q.1
+            );
+            for (g, e) in got.iter().zip(&want) {
+                assert!((g.1 - e.1).abs() < 1e-5, "score {g:?} vs {e:?}");
+            }
+            assert!(
+                !got.iter().any(|(id, _)| *id == 1),
+                "Bob was un-embedded; his stale BASE vector must not score. Got {got:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **No vector goes missing across a seal.**
+    ///
+    /// `flush_to_l0` moves the whole active memtable into a sealed L0 level and resets the
+    /// memtable. HIK-112 warns that an index tied to the *active memtable* alone would be
+    /// cleared here, while the L0's core segment is not yet published — and the vectors in it
+    /// would vanish from KNN with nothing to say so.
+    ///
+    /// This index is over `mem ⊕ L0`, which a seal does not change, so the seal journals an
+    /// empty touched set and the index is not touched at all. The test proves the *observable*:
+    /// the same ids, at the same scores, before and after. The mutation that matters is a
+    /// clear-on-seal — the **born** nodes below have no base entry at all, so if the delta arm
+    /// lost them they would disappear outright rather than merely re-rank.
+    #[test]
+    fn rw_index_ladder_survives_a_seal() {
+        use crate::delta_writer::DeltaWriter;
+        use crate::rwindex::RwIndexCache;
+
+        let (root, graph, _) = testgen::write_basic("exec_rw_seal");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let wal = root.join("wal_rw_seal");
+        let _ = std::fs::remove_dir_all(&wal);
+        let core_n = gen.node_count();
+
+        let w = DeltaWriter::open(
+            &wal,
+            &graph,
+            gen.uuid(),
+            gen.node_count(),
+            gen.edge_count(),
+            basic_resolve,
+        )
+        .unwrap();
+        let rw = RwIndexCache::new();
+
+        // Eight born Persons on a fan of directions in the x–y plane, plus a re-embed of Alice.
+        let born: Vec<(u64, Vec<f32>)> = (0..8u64)
+            .map(|i| {
+                let a = i as f32 * 0.19;
+                (core_n + i, vec![a.cos(), a.sin(), 0.0])
+            })
+            .collect();
+        for (i, (_, v)) in born.iter().enumerate() {
+            w.write(
+                upsert_vec(&format!("N{i}"), v.clone()),
+                slater_delta::OpResolution::Node(None),
+            )
+            .unwrap();
+        }
+        w.write(
+            upsert_vec("Alice", vec![0.0, 0.0, 1.0]),
+            slater_delta::OpResolution::Node(Some(0)),
+        )
+        .unwrap();
+
+        let mut live: Vec<(u64, Vec<f32>)> = born.clone();
+        live.push((0, vec![0.0, 0.0, 1.0])); // Alice, re-embedded
+        live.push((1, vec![0.2, 0.1, 0.0])); // Bob, from the base (the delta never touches him)
+        live.push((2, vec![0.9, 0.8, 0.7])); // Carol, from the base
+
+        let q = "[1.0, 0.15, 0.0]";
+        let qv = vec![1.0f32, 0.15, 0.0];
+        let want = expected_topk(&live, &qv, 6);
+
+        let (before, served) = knn_with_rw(&gen, &cache, &w, &rw, q, 6);
+        assert!(served, "the RW-index must serve the pre-seal query");
+        assert_eq!(
+            before.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            want.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            "pre-seal: got {before:?}, want {want:?}"
+        );
+
+        // ── SEAL ──────────────────────────────────────────────────────────────────────────
+        assert!(w.flush_to_l0().unwrap(), "the memtable had writes to seal");
+        assert_eq!(w.l0_len(), 1, "the writes are in a sealed L0 level now");
+        assert!(
+            w.snapshot().is_empty(),
+            "…and the ACTIVE memtable really is empty — without this the test would not \
+             actually cross the seal, and would pass whatever the index did"
+        );
+        // The seal published a new epoch, so the index has to advance across it.
+        assert!(
+            w.delta_snapshot_at().epoch > 1,
+            "the seal must have bumped the epoch"
+        );
+
+        let (after, served) = knn_with_rw(&gen, &cache, &w, &rw, q, 6);
+        assert!(
+            served,
+            "the RW-index must still serve after the seal — a journal gap here would silently \
+             force a rebuild, which is correct but hides the bug this test exists for"
+        );
+        assert_eq!(
+            after.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            want.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            "A VECTOR WENT MISSING ACROSS THE SEAL. Before {before:?}, after {after:?}, \
+             truth {want:?}"
+        );
+        for (a, b) in after.iter().zip(&before) {
+            assert!(
+                (a.1 - b.1).abs() < 1e-9,
+                "score moved across the seal: {a:?} vs {b:?}"
+            );
+        }
+
+        // And the born nodes — the ones with no base entry, which a cleared index would lose
+        // outright — are still there.
+        let born_ids: Vec<i64> = after
+            .iter()
+            .map(|(i, _)| *i)
+            .filter(|i| *i >= core_n as i64)
+            .collect();
+        assert!(
+            born_ids.len() >= 4,
+            "the delta-born embeddings must survive the seal; got {after:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

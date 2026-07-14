@@ -75,6 +75,8 @@ use slater_delta::{
     WalRecord, WalSink,
 };
 
+use crate::rwindex::TouchedJournal;
+
 /// Block target size + zstd level for an off-heap L0 segment's payload sections. Small
 /// blocks (as for range indexes) keep a cold point read's one-time decode cheap; a delta
 /// is small relative to the core anyway.
@@ -181,6 +183,30 @@ pub struct Frozen {
     pub consumed_l0: Vec<PathBuf>,
 }
 
+/// The atomic read pair: the delta a query overlays, and the epoch that delta *is*.
+///
+/// They travel together on purpose. A query that pins them separately can hold a snapshot
+/// from before a commit and an epoch from after it, and anything derived from the epoch
+/// (today: the result-cache key, and the `crate::rwindex` RW-index cut) then describes a
+/// delta the query is not reading.
+#[derive(Clone)]
+pub struct Published {
+    pub delta: DeltaSnapshot,
+    pub epoch: u64,
+}
+
+/// What a publish tells the RW-index's touched-id journal.
+enum Journal {
+    /// These dense node ids changed. **Empty** for a structural change that leaves `mem ⊕ L0`
+    /// unchanged (a seal, a compaction) — the epoch still bumps, so the journal must still be
+    /// able to answer for it.
+    Touched(Vec<u64>),
+    /// Every dense id in the delta was **rebased** against a new core (a consolidation). No id
+    /// recorded before this point means what it used to, so the journal is wiped: an index
+    /// that tried to advance across it would re-resolve the wrong nodes.
+    Rebased,
+}
+
 /// Serialised writer state — reached only under the `Mutex`, never by readers.
 struct WriterInner {
     dir: PathBuf,
@@ -220,14 +246,27 @@ pub struct DeltaWriter {
     core_uuid: RwLock<GenId>,
     /// Single-writer serialisation of every mutation.
     inner: Mutex<WriterInner>,
-    /// The published immutable read snapshot: the active memtable **and** the sealed L0
-    /// levels, folded atomically (readers clone the whole [`DeltaSnapshot`], so a flush
-    /// that moves data from the memtable into a new L0 level can never split a read's
-    /// view — see [`Self::republish`]).
-    published: RwLock<DeltaSnapshot>,
+    /// The published immutable read snapshot **and the epoch it was published at**: the active
+    /// memtable, the sealed L0 levels, and the epoch, all folded atomically (readers clone the
+    /// whole [`Published`], so a flush that moves data from the memtable into a new L0 level
+    /// can never split a read's view — see [`Self::republish`]).
+    ///
+    /// The epoch lives *inside* the lock, not merely in [`Self::epoch`], because a reader that
+    /// keys anything on the `(snapshot, epoch)` pair must take both in one shot. Reading them
+    /// as two loads lets a commit land between, yielding a snapshot **older** than the epoch —
+    /// which for the RW-index (`crate::rwindex`) means an index advanced past the delta the
+    /// query is actually reading: extra nodes, wrong suppression, silently. See
+    /// [`Self::delta_snapshot_at`].
+    published: RwLock<Published>,
     /// Bumps on every published change; folded into the result-cache key so an
     /// overlaid result is invalidated by the next write (see `server::result_key`).
+    /// Kept beside [`Published::epoch`] (and always equal to it) so [`Self::epoch`] stays a
+    /// lock-free atomic load for the callers that want only the number.
     epoch: AtomicU64,
+    /// Which dense node ids each published epoch touched — the writer's *entire* contribution
+    /// to the RW-index (`crate::rwindex`), and deliberately so: it publishes what it knows
+    /// (ids) and nothing it does not (labels, vectors, index descriptors, a `ReadView`).
+    touched: Arc<TouchedJournal>,
     /// Set for the whole duration of a consolidation (freeze → build → swap →
     /// retire). While set, [`Self::flush_to_l0`]/[`Self::compact_l0`] are no-ops: a
     /// flush/compaction between freeze and retire would add an L0 segment that retire
@@ -361,8 +400,14 @@ impl DeltaWriter {
                 off_heap,
                 block_cache: cache,
             }),
-            published: RwLock::new(published),
+            published: RwLock::new(Published {
+                delta: published,
+                epoch: 1,
+            }),
             epoch: AtomicU64::new(1),
+            // Epoch 1 is the open state: nothing has been touched yet, so there is no entry
+            // for it, and an index built at epoch 1 needs none.
+            touched: Arc::new(TouchedJournal::new(1)),
             consolidating: AtomicBool::new(false),
         })
     }
@@ -402,14 +447,30 @@ impl DeltaWriter {
     /// writer contention. Used by the writer's single-memtable diagnostics and tests; a
     /// read overlay wants [`Self::delta_snapshot`] (which also carries the L0 levels).
     pub fn snapshot(&self) -> Arc<Memtable> {
-        read_lock(&self.published).active_memtable().clone()
+        read_lock(&self.published).delta.active_memtable().clone()
     }
 
     /// The full published delta — the active memtable **and** every sealed L0 level,
     /// folded atomically. A query pins this for its whole life; the read overlay
     /// (`server::delta_for_read`) builds its `MergedView` from it.
     pub fn delta_snapshot(&self) -> DeltaSnapshot {
+        read_lock(&self.published).delta.clone()
+    }
+
+    /// The delta **and the epoch it is**, taken in one shot.
+    ///
+    /// Two separate loads (`delta_snapshot()` then `epoch()`) let a commit land between them,
+    /// handing the caller a snapshot from *before* the write and an epoch from *after* it.
+    /// Anything keyed on the pair then describes a delta the caller is not reading — for the
+    /// RW-index that is an index advanced past the query's own snapshot, which is a wrong
+    /// top-k with nothing to say so. Every read overlay must come through here.
+    pub fn delta_snapshot_at(&self) -> Published {
         read_lock(&self.published).clone()
+    }
+
+    /// The per-epoch touched-id journal the RW-index advances from (`crate::rwindex`).
+    pub fn touched_journal(&self) -> Arc<TouchedJournal> {
+        self.touched.clone()
     }
 
     /// The synthetic dense id of a delta-born node with this business identity that is
@@ -424,6 +485,7 @@ impl DeltaWriter {
         value: &Value,
     ) -> Option<u64> {
         read_lock(&self.published)
+            .delta
             .l0_levels()
             .iter()
             .find_map(|m| m.born_synthetic_for_identity(label, key, value))
@@ -437,19 +499,46 @@ impl DeltaWriter {
     /// `execute_write` plant the tombstone's `by_dense` mapping, suppressing a node
     /// already flushed to an L0 level on read.
     pub fn born_synthetic_in_delta(&self, label: &str, key: &str, value: &Value) -> Option<u64> {
-        read_lock(&self.published).born_synthetic_for_identity(label, key, value)
+        read_lock(&self.published)
+            .delta
+            .born_synthetic_for_identity(label, key, value)
     }
 
-    /// Publish `mem ⊕ l0` as one atomic [`DeltaSnapshot`], so a lock-free reader never
-    /// observes a half-applied flush (data in neither or both of the memtable and a new
-    /// L0 level). Called under the writer lock after every state change.
+    /// Publish `mem ⊕ l0` as one atomic [`Published`] pair — snapshot **and** epoch — so a
+    /// lock-free reader never observes a half-applied flush (data in neither or both of the
+    /// memtable and a new L0 level), nor an epoch that does not name the delta beside it.
+    /// Called under the writer lock after every state change.
+    ///
+    /// `touched` is the dense node ids this epoch changed, journaled **before** the pair is
+    /// published, so a reader that sees epoch `E` can always resolve the ids for `E` (see
+    /// [`crate::rwindex`], rule 2). A structural change that leaves `mem ⊕ L0` unchanged — a
+    /// seal, a compaction — passes an **empty** slice, not nothing: the epoch still bumps, so
+    /// the journal must still be able to answer for it.
     ///
     /// Part of every caller's *install* phase: the snapshot is fully built before the
     /// guard is taken, and the guard only ever sees a move-assign, so publishing cannot
     /// panic (and cannot publish a half-built delta).
-    fn republish(&self, inner: &WriterInner) {
-        let published = published_snapshot(&inner.mem, &inner.l0);
-        *write_lock(&self.published) = published;
+    fn republish(&self, inner: &WriterInner, journal: Journal) {
+        let delta = published_snapshot(&inner.mem, &inner.l0);
+        let epoch = self.epoch.load(Ordering::Acquire) + 1;
+        // The journal is settled BEFORE the pair is published. That order is the whole
+        // guarantee: a reader that can see epoch `E` can already resolve the ids for `E`, and
+        // — for a `Reset` — can no longer resolve anything below it. Publishing first would
+        // open a window in which a reader sees the new epoch beside a journal that still
+        // claims to cover the ids a rebase just invalidated, and advances a stale index across
+        // a consolidation. Silently.
+        match journal {
+            Journal::Touched(ids) => self.touched.record(epoch, ids),
+            Journal::Rebased => {
+                self.touched.reset(epoch);
+                self.touched.record(epoch, Vec::new());
+            }
+        }
+        // Bump the atomic *under* the write guard, so a reader that reads the atomic without
+        // the guard and then takes the guard cannot see the new epoch beside the old delta.
+        let mut g = write_lock(&self.published);
+        self.epoch.store(epoch, Ordering::Release);
+        *g = Published { delta, epoch };
     }
 
     /// The current delta epoch (monotonic; bumps on every published write).
@@ -485,12 +574,12 @@ impl DeltaWriter {
         inner.seq = seq;
 
         // --- install: moves only. Publish the new delta (active memtable ⊕ unchanged L0
-        //     levels), then bump the epoch so readers keying on it see the new state
-        //     (publish-before-bump: an observer that reads the higher epoch also sees the
-        //     swapped-in snapshot).
+        //     levels) together with its epoch and the ids it touched, all in one guarded
+        //     store — an observer that reads the higher epoch also sees the swapped-in
+        //     snapshot, and the journal for that epoch is already recorded.
         inner.mem = Arc::new(mem);
-        self.republish(&inner);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let touched = touched_node_ids(&inner.mem, std::iter::once((&rec.op, resolved)));
+        self.republish(&inner, Journal::Touched(touched));
         Ok(seq)
     }
 
@@ -539,11 +628,11 @@ impl DeltaWriter {
             .sink
             .append_batch(&recs, last)
             .context("append+commit WAL batch")?;
-        // 4. Install (moves only) + one publish + epoch bump for the batch
-        //    (publish-before-bump, as in `write`).
+        // 4. Install (moves only) + one guarded publish of (snapshot, epoch, touched) for the
+        //    whole batch, as in `write`.
         inner.mem = Arc::new(mem);
-        self.republish(&inner);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let touched = touched_node_ids(&inner.mem, ops.iter().map(|(o, r)| (o, *r)));
+        self.republish(&inner, Journal::Touched(touched));
         Ok(last)
     }
 
@@ -666,8 +755,16 @@ impl DeltaWriter {
         }
 
         // 5. Publish the reset memtable + grown L0 stack atomically.
-        self.republish(&inner);
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        //
+        //    **The RW-index needs no update across a seal, and that is not an oversight.**
+        //    The flushed writes moved from `mem` into `l0[0]`, and both are inside the very
+        //    snapshot published here; the delta arm resolves through `DeltaSnapshot::node_patch`,
+        //    which folds `mem ⊕ every L0` newest-wins. A seal therefore does not change what
+        //    the delta says about a single node id — so an index over `mem ⊕ L0` is still
+        //    exactly right, and the journal entry for this epoch is deliberately **empty**.
+        //    (It must still be recorded: the epoch bumped, and an index at the previous epoch
+        //    has to be able to advance across it. See `crate::rwindex`.)
+        self.republish(&inner, Journal::Touched(Vec::new()));
         Ok(true)
     }
 
@@ -792,11 +889,13 @@ impl DeltaWriter {
 
         // Publish the collapsed stack, then delete the consumed files (durable in the
         // merged segment) — publish-before-delete so a reader never loses the data.
-        self.republish(&inner);
+        //
+        // As with a seal, the RW-index is untouched: a compaction merges L0 levels, and
+        // `mem ⊕ L0` folds to the same thing before and after. Empty journal entry.
+        self.republish(&inner, Journal::Touched(Vec::new()));
         for p in &consumed {
             remove_if_present(p)?;
         }
-        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
 
@@ -878,9 +977,14 @@ impl DeltaWriter {
         inner.l0.clear();
         inner.seq = replay.last_seq;
         inner.mem = Arc::new(mem);
-        self.republish(&inner);
+        // `Rebased`: every dense id in the delta has just been re-resolved against the new
+        // core, so no id recorded before this point means what it used to. An RW-index that
+        // tried to advance across a retire would re-resolve the *wrong nodes*. (The index cache
+        // is also keyed by `GenId` and this retire is always paired with a generation swap, so
+        // it would rebuild anyway — this is the belt to that pair of braces, and it is what
+        // makes the writer correct on its own terms rather than by someone else's discipline.)
+        self.republish(&inner, Journal::Rebased);
         *write_lock(&self.core_uuid) = new_core_uuid;
-        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -896,9 +1000,13 @@ impl DeltaWriter {
     /// the epoch bump invalidates any delta-overlaid result-cache entry keyed on the old set.
     pub fn rebind_core_uuid(&self, new_core_uuid: GenId) {
         // Serialise against an in-flight write so a mutation never straddles the rebind.
-        let _inner = lock_writer(&self.inner);
+        let inner = lock_writer(&self.inner);
+        // Republish rather than bump the epoch on its own: the published pair carries the
+        // epoch now (see `Published`), and letting the atomic run ahead of it would hand a
+        // reader an epoch that does not name the delta beside it. The delta itself is
+        // untouched — a T3 compaction preserves every dense id — so the journal entry is empty.
+        self.republish(&inner, Journal::Touched(Vec::new()));
         *write_lock(&self.core_uuid) = new_core_uuid;
-        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Number of distinct node identities currently carrying a delta (diagnostics).
@@ -931,13 +1039,65 @@ impl DeltaWriter {
     /// little sooner (safe).
     pub fn delta_entity_count(&self) -> usize {
         let s = read_lock(&self.published);
-        s.node_delta_count() + s.edge_delta_count()
+        s.delta.node_delta_count() + s.delta.edge_delta_count()
     }
 
     /// The directory holding this graph's WAL segments.
     pub fn wal_dir(&self) -> PathBuf {
         lock_writer(&self.inner).dir.clone()
     }
+}
+
+/// The dense node ids a batch of committed ops touched — the journal's payload, and the only
+/// vector-adjacent thing the writer computes.
+///
+/// A node op names its node by **business identity**; its dense id is either the caller's
+/// resolved core id, or — for a delta-born node — the synthetic id the memtable allocated when
+/// it applied the op, which is why this runs against the **post-apply** memtable.
+///
+/// Edge ops are deliberately absent: an edge carries no embedding, and deleting a node (which
+/// does silently kill its incident edges) changes no *other* node's vector.
+///
+/// The list may repeat an id (touched by several ops in the batch); the reader re-resolves each
+/// against one snapshot, so a repeat is idempotent.
+fn touched_node_ids<'a>(
+    mem: &Memtable,
+    ops: impl Iterator<Item = (&'a WalOp, OpResolution)>,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    for (op, res) in ops {
+        let identity = match op {
+            WalOp::UpsertNode {
+                label, key, value, ..
+            }
+            | WalOp::DeleteNode { label, key, value }
+            | WalOp::RemoveNodeProps {
+                label, key, value, ..
+            }
+            | WalOp::ReplaceNode {
+                label, key, value, ..
+            }
+            | WalOp::SetNodeLabels {
+                label, key, value, ..
+            } => (label, key, value),
+            // Edge ops touch no node's embedding.
+            _ => continue,
+        };
+        let id = match res {
+            OpResolution::Node(Some(id)) => Some(id),
+            // Delta-born: the memtable allocated the synthetic id as it applied the op.
+            OpResolution::Node(None) => {
+                mem.born_synthetic_for_identity(identity.0, identity.1, identity.2)
+            }
+            // A node op resolved as an edge is a writer bug the memtable's `apply` already
+            // shouts about (`unreachable!`); nothing to journal either way.
+            OpResolution::Edge { .. } => None,
+        };
+        // A `None` here is a **no-op tombstone**: a business key present in neither the core
+        // nor the delta. It changed nothing, so there is nothing to re-resolve.
+        out.extend(id);
+    }
+    out
 }
 
 /// Every `*.wal` segment file currently under `dir` (unordered). A missing

@@ -67,6 +67,7 @@ pub mod nodelabels;
 pub mod plane;
 pub mod postings;
 pub mod pq;
+pub mod rwvamana;
 pub mod segindex;
 pub mod segmanifest;
 pub mod segment;

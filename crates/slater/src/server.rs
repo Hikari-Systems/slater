@@ -63,6 +63,7 @@ use crate::generation::Generation;
 use crate::introspect;
 use crate::parser;
 use crate::read_view::{MergedView, ReadView};
+use crate::rwindex::{RwIndexCache, TouchedJournal};
 use slater_delta::{DeltaSnapshot, Memtable, OpResolution, WalOp};
 
 /// PackStream structure tags for the graph types (Bolt `Node`/`Relationship`).
@@ -1672,6 +1673,12 @@ struct ConnCtx {
     /// Vamana block LRU, with its own `vector_cache_bytes` budget. Shared across
     /// connections; the `AnnMode::Vamana` arm of the executor reads through it.
     vector_cache: Arc<VectorIndexCache>,
+    /// The FreshDiskANN RW-indexes over the write delta, one per `(generation, label,
+    /// property)` (`crate::rwindex`). **Not** part of `vector_cache`'s budget: it is derived
+    /// state bounded by the delta, with its own `vectorQuery.rwIndex.maxVectors` valve.
+    rw_indexes: Arc<RwIndexCache>,
+    /// Safety valves for the above (`vectorQuery.rwIndex.*`).
+    rw_index_cfg: crate::rwindex::RwIndexConfig,
     /// The result LRU (third cache pool): caches whole executed results keyed by
     /// `(generation, normalised query + params)`, shared across connections.
     result_cache: Arc<ResultCache<QueryResult>>,
@@ -2704,6 +2711,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         graphs,
         cache,
         vector_cache,
+        rw_indexes: Arc::new(RwIndexCache::new()),
+        rw_index_cfg: cfg.vector_query.rw_index.into(),
         result_cache,
         max_rows: cfg.query.max_rows as usize,
         timeout_ms: cfg.query.timeout_ms,
@@ -3978,9 +3987,12 @@ fn resolve_business_keys_batch(
 /// `reloadStrategy = exit` in practice, so this guard is defence in depth.
 fn delta_for_read(writer: &Arc<DeltaWriter>, gen: &Arc<Generation>) -> ReadOverlay {
     if writer.core_uuid() == gen.uuid() {
+        // ONE atomic read of the (snapshot, epoch) pair — see `ReadOverlay`.
+        let published = writer.delta_snapshot_at();
         ReadOverlay {
-            delta: writer.delta_snapshot(),
-            epoch: writer.epoch(),
+            delta: published.delta,
+            epoch: published.epoch,
+            journal: Some(writer.touched_journal()),
         }
     } else {
         warn!(
@@ -5464,11 +5476,19 @@ async fn execute_consolidate(
 }
 
 /// The writable-layer overlay a read runs under: the delta snapshot pinned for the
-/// query's whole life and the epoch that keys its cached result. `empty()` is the
-/// read-only path (no delta, epoch 0), behaviourally identical to reading the core.
+/// query's whole life, the epoch that keys its cached result **and cuts the RW-index**, and
+/// the writer's touched-id journal the index advances from. `empty()` is the read-only path
+/// (no delta, epoch 0, no journal), behaviourally identical to reading the core.
+///
+/// The delta and the epoch are taken in **one** atomic read (`DeltaWriter::delta_snapshot_at`).
+/// Two separate loads let a commit land between them, handing the query a snapshot from before
+/// the write and an epoch from after it — and an RW-index cut at that epoch then describes a
+/// delta the query is not reading. See `crate::rwindex`.
 struct ReadOverlay {
     delta: DeltaSnapshot,
     epoch: u64,
+    /// `None` on the read-only path — there is no writer, hence no journal, hence no index.
+    journal: Option<Arc<TouchedJournal>>,
 }
 
 impl ReadOverlay {
@@ -5476,6 +5496,7 @@ impl ReadOverlay {
         Self {
             delta: DeltaSnapshot::empty(),
             epoch: 0,
+            journal: None,
         }
     }
 }
@@ -5492,9 +5513,12 @@ async fn run_query(
     let ReadOverlay {
         delta,
         epoch: delta_epoch,
+        journal: rw_journal,
     } = overlay;
     let cache = ctx.cache.clone();
     let vector_cache = ctx.vector_cache.clone();
+    let rw_indexes = ctx.rw_indexes.clone();
+    let rw_cfg = ctx.rw_index_cfg;
     let result_cache = ctx.result_cache.clone();
     let key =
         ResultKey::with_delta_epoch(gen.uuid(), delta_epoch, result_query_key(query, &params));
@@ -5559,6 +5583,12 @@ async fn run_query(
                         .with_max_shortest_path_explore(max_shortest_path_explore)
                         .with_adj_stream(adj_stream_threshold, adj_stream_chunk)
                         .with_fanout_pool(fanout_pool.clone());
+                    // The RW-index arm of the delta's KNN. The epoch is the one taken with the
+                    // snapshot above, in the same atomic read — the index is cut at exactly it.
+                    if let Some(journal) = rw_journal {
+                        engine =
+                            engine.with_rw_index(rw_indexes.as_ref(), journal, delta_epoch, rw_cfg);
+                    }
                     if timeout_ms > 0 {
                         engine = engine
                             .with_deadline(Instant::now() + Duration::from_millis(timeout_ms));
@@ -14205,6 +14235,8 @@ mod tests {
             graphs,
             cache: Arc::new(BlockCache::new(1 << 20)),
             vector_cache: Arc::new(VectorIndexCache::new(1 << 20)),
+            rw_indexes: Arc::new(RwIndexCache::new()),
+            rw_index_cfg: crate::rwindex::RwIndexConfig::default(),
             result_cache: Arc::new(ResultCache::new(1 << 20)),
             max_rows: 100_000,
             timeout_ms: 0,
@@ -14393,6 +14425,8 @@ mod tests {
             graphs,
             cache,
             vector_cache,
+            rw_indexes: Arc::new(RwIndexCache::new()),
+            rw_index_cfg: crate::rwindex::RwIndexConfig::default(),
             result_cache,
             max_rows: 100_000,
             timeout_ms: 0,
@@ -14491,6 +14525,8 @@ mod tests {
             graphs,
             cache: Arc::new(BlockCache::new(1 << 20)),
             vector_cache: Arc::new(VectorIndexCache::new(1 << 20)),
+            rw_indexes: Arc::new(RwIndexCache::new()),
+            rw_index_cfg: crate::rwindex::RwIndexConfig::default(),
             result_cache: Arc::new(ResultCache::new(1 << 20)),
             max_rows: 100_000,
             timeout_ms: 0,
