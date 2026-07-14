@@ -69,10 +69,14 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
 
+use crate::blockfile::record_range_in_block;
 use crate::crypto::BlockCipher;
+use crate::ids::BlockId;
 use crate::manifest::Metric;
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
-use crate::vamana::{robust_prune_over, PointSet, VamanaIndex, VamanaReader, VamanaWriter};
+use crate::vamana::{
+    decode_node, robust_prune_over, PointSet, VamanaIndex, VamanaNode, VamanaReader, VamanaWriter,
+};
 
 /// The scalar shape of one delete-consolidation pass.
 #[derive(Debug, Clone, Copy)]
@@ -97,20 +101,32 @@ pub struct ConsolidateOpts {
     /// `.pq` codebook's own `dim`. (Equal to the vector dim except for dot, which carries an
     /// extra subspace for the norm augmentation.)
     pub space_dim: usize,
-    /// LRU capacity, in **records**. Mandatory, not an optimisation: `|C| ≤ R·(R+1)` and
-    /// robust-prune walks the whole pool once per chosen neighbour, so an uncached pass
-    /// would re-read the same records hundreds of times. See [`recommended_cache_records`].
+    /// LRU capacity, in **decoded records**. Mandatory, not an optimisation: `|C| ≤ R·(R+1)`
+    /// and robust-prune walks the whole pool once per chosen neighbour, so an uncached pass
+    /// would re-decode (and re-[`ann_point`]) the same records hundreds of times. See
+    /// [`recommended_cache_records`] and [`CachedPoints`].
     pub cache_records: usize,
+    /// LRU capacity, in **decompressed blocks**. Also mandatory, and for a different reason:
+    /// a `.vamana` read inflates a whole block to yield one record, so without this tier the
+    /// pass would inflate every block once *per record it holds* (~40x at a 256 KiB block and
+    /// a 768-dim vector). Costs `cache_blocks x block_bytes` resident — see [`CachedPoints`].
+    pub cache_blocks: usize,
 }
 
-/// The LRU capacity a pass over out-degree `r` wants: enough to hold a whole candidate pool
-/// (`|C| ≤ r·(r+1)`) plus slack, so one `robust_prune_over` never evicts a record it is
-/// still walking. Sizing below this is *correct* but re-reads the pool on every iteration.
+/// The record-LRU capacity a pass over out-degree `r` wants: enough to hold a whole candidate
+/// pool (`|C| ≤ r·(r+1)`) plus slack, so one `robust_prune_over` never evicts a record it is
+/// still walking. Sizing below this is *correct* but re-decodes the pool on every iteration.
 pub fn recommended_cache_records(r: usize) -> usize {
     r.saturating_mul(r.saturating_add(1))
         .saturating_add(64)
         .max(1024)
 }
+
+/// The block-LRU capacity a pass wants. The sequential emit walk needs only one block resident
+/// to stop re-inflating it per record; the rest is headroom for the splice's neighbour reads,
+/// which land in *nearby* blocks because the layout is BFS-from-medoid. Bounded and small: at
+/// the 256 KiB `vector_block_size` the builder uses, this is 16 MiB.
+pub const RECOMMENDED_CACHE_BLOCKS: usize = 64;
 
 /// What one pass did. `patched + unchanged == records`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +141,14 @@ pub struct ConsolidateStats {
     pub patched: u64,
     /// Records emitted byte-for-byte unchanged.
     pub unchanged: u64,
+    /// Record reads served by the record LRU.
     pub cache_hits: u64,
+    /// Record reads that had to be decoded (they may still have hit the block LRU).
     pub cache_misses: u64,
+    /// Blocks actually read and inflated — **the pass's real IO**. Must stay close to the
+    /// file's block count; a pass that reads one block per *record* is inflating the whole
+    /// file tens of times over. See [`CachedPoints`].
+    pub blocks_read: u64,
 }
 
 // ── The disk point set ─────────────────────────────────────────────────────────
@@ -145,21 +167,21 @@ struct CachedNode {
     nbrs: Vec<VamanaIndex>,
 }
 
-/// An exact LRU over decoded records, keyed by layout ordinal.
+/// An exact LRU, keyed by `K`.
 ///
 /// Hand-rolled: the workspace has no LRU crate, and `graph-format` forbids `unsafe`, so the
 /// usual intrusive-list trick is out. A monotonic touch counter into a `BTreeMap` gives an
 /// exact LRU in O(log n) per touch with no unsafe and no eviction scan.
-struct Lru {
+struct Lru<K: Copy + Eq + std::hash::Hash + Ord, V> {
     capacity: usize,
-    /// ordinal → (last-touch tick, record)
-    map: HashMap<VamanaIndex, (u64, Rc<CachedNode>)>,
-    /// last-touch tick → ordinal (the eviction order; the first key is the LRU victim)
-    order: BTreeMap<u64, VamanaIndex>,
+    /// key → (last-touch tick, value)
+    map: HashMap<K, (u64, Rc<V>)>,
+    /// last-touch tick → key (the eviction order; the first key is the LRU victim)
+    order: BTreeMap<u64, K>,
     tick: u64,
 }
 
-impl Lru {
+impl<K: Copy + Eq + std::hash::Hash + Ord, V> Lru<K, V> {
     fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -169,50 +191,67 @@ impl Lru {
         }
     }
 
-    fn get(&mut self, i: VamanaIndex) -> Option<Rc<CachedNode>> {
-        let (old_tick, node) = self.map.get(&i).map(|(t, n)| (*t, n.clone()))?;
+    fn get(&mut self, k: K) -> Option<Rc<V>> {
+        let (old_tick, v) = self.map.get(&k).map(|(t, v)| (*t, v.clone()))?;
         self.order.remove(&old_tick);
         self.tick += 1;
-        self.order.insert(self.tick, i);
-        self.map.insert(i, (self.tick, node.clone()));
-        Some(node)
+        self.order.insert(self.tick, k);
+        self.map.insert(k, (self.tick, v.clone()));
+        Some(v)
     }
 
-    fn put(&mut self, i: VamanaIndex, node: Rc<CachedNode>) {
-        if let Some((old_tick, _)) = self.map.remove(&i) {
+    fn put(&mut self, k: K, v: Rc<V>) {
+        if let Some((old_tick, _)) = self.map.remove(&k) {
             self.order.remove(&old_tick);
         }
         while self.map.len() >= self.capacity {
-            // `pop_first` on the tick order is the least-recently-used record.
+            // `pop_first` on the tick order is the least-recently-used entry.
             let Some((_, victim)) = self.order.pop_first() else {
                 break;
             };
             self.map.remove(&victim);
         }
         self.tick += 1;
-        self.order.insert(self.tick, i);
-        self.map.insert(i, (self.tick, node));
+        self.order.insert(self.tick, k);
+        self.map.insert(k, (self.tick, v));
     }
 }
 
-/// A [`PointSet`] over a `.vamana` on disk, behind the LRU.
+/// A [`PointSet`] over a `.vamana` on disk, behind **two** LRU tiers.
 ///
 /// The whole pass reads records through this one seam — the sequential emit walk, the
-/// splice's dead-neighbour lookups, and robust-prune's distances alike — so a record read
-/// once is paid for once. Layout order is BFS-from-medoid, so a node's neighbours are
-/// *nearby in the file* and the LRU hits hard.
+/// splice's dead-neighbour lookups, and robust-prune's distances alike. Both tiers are load
+/// bearing, and they defend against different amplifications:
 ///
-/// Not `Sync` (the cache is a `RefCell`): the pass is a single sequential walk, by design —
-/// it is the sequential read order that makes the layout locality pay.
+/// * **Records** ([`ConsolidateOpts::cache_records`]) — `|C| ≤ R·(R+1)` and robust-prune walks
+///   the whole pool once per neighbour it chooses, so one patched node takes O(r·|C|) distances
+///   over a pool that has to fit in the tier. Without it every distance would re-decode the
+///   record *and* re-run [`ann_point`] (which, for cosine, normalises) — hundreds of times per
+///   record.
+///
+/// * **Blocks** ([`ConsolidateOpts::cache_blocks`]) — and this is the one that is easy to miss.
+///   `VamanaReader::node` is an *uncached* read: it decrypts and **inflates the whole block** to
+///   hand back one record. A record cache does not help it at all — each record is a distinct
+///   key and misses exactly once — so a record-only cache inflates every block once *per record
+///   it holds*. At a 256 KiB block and a 768-dim vector that is ~40 records to a block, i.e. it
+///   would inflate a 370 GB file about **forty times over**, in the one pass whose whole reason
+///   to exist is being cheaper than a rebuild. The block tier makes the sequential walk pay for
+///   each block exactly once; layout order is BFS-from-medoid, so the splice's neighbour reads
+///   land in nearby blocks and hit it too.
+///
+/// Not `Sync` (the caches are `RefCell`s): the pass is a single sequential walk, by design — it
+/// is the sequential read order that makes the layout locality pay.
 pub struct CachedPoints<'a> {
     reader: &'a VamanaReader,
     metric: Metric,
     max_norm: f64,
     space_dim: usize,
     records: usize,
-    cache: RefCell<Lru>,
+    cache: RefCell<Lru<VamanaIndex, CachedNode>>,
+    blocks: RefCell<Lru<u32, Vec<u8>>>,
     hits: Cell<u64>,
     misses: Cell<u64>,
+    blocks_read: Cell<u64>,
 }
 
 impl<'a> CachedPoints<'a> {
@@ -224,19 +263,38 @@ impl<'a> CachedPoints<'a> {
             space_dim: opts.space_dim,
             records: reader.len() as usize,
             cache: RefCell::new(Lru::new(opts.cache_records)),
+            blocks: RefCell::new(Lru::new(opts.cache_blocks)),
             hits: Cell::new(0),
             misses: Cell::new(0),
+            blocks_read: Cell::new(0),
         }
     }
 
-    /// Record reads that the LRU served.
+    /// Record reads the record tier served.
     pub fn hits(&self) -> u64 {
         self.hits.get()
     }
 
-    /// Record reads that went to the block file — the pass's real IO.
+    /// Record reads that had to be decoded (they may still have hit the block tier).
     pub fn misses(&self) -> u64 {
         self.misses.get()
+    }
+
+    /// Blocks actually read and inflated — **the pass's real IO**. A correct pass reads each
+    /// block a handful of times, never once per record.
+    pub fn blocks_read(&self) -> u64 {
+        self.blocks_read.get()
+    }
+
+    /// One decompressed block, through the block tier.
+    fn block(&self, block: u32) -> Result<Rc<Vec<u8>>> {
+        if let Some(b) = self.blocks.borrow_mut().get(block) {
+            return Ok(b);
+        }
+        self.blocks_read.set(self.blocks_read.get() + 1);
+        let raw = Rc::new(self.reader.inner().read_block(BlockId(block))?);
+        self.blocks.borrow_mut().put(block, raw.clone());
+        Ok(raw)
     }
 
     fn node(&self, i: VamanaIndex) -> Result<Rc<CachedNode>> {
@@ -245,10 +303,15 @@ impl<'a> CachedPoints<'a> {
             return Ok(n);
         }
         self.misses.set(self.misses.get() + 1);
-        let rec = self
-            .reader
-            .node(i)
-            .with_context(|| format!("read .vamana record {i}"))?;
+        // Slice the record out of a block held decompressed, rather than `VamanaReader::node`,
+        // which inflates the whole block to yield one record. See the struct doc.
+        let rec = (|| -> Result<VamanaNode> {
+            let loc = self.reader.inner().locate(i as u64)?;
+            let raw = self.block(loc.block.0)?;
+            let range = record_range_in_block(&raw, loc.slot)?;
+            decode_node(&raw[range])
+        })()
+        .with_context(|| format!("read .vamana record {i}"))?;
         // A neighbour ordinal is untrusted on-disk data. Reject a forged one here, once, with
         // a message that names the record — rather than letting it index a `dead[]` slice out
         // of bounds (a panic) deep inside the splice.
@@ -438,6 +501,7 @@ pub fn consolidate_deletes(
 
     stats.cache_hits = points.hits();
     stats.cache_misses = points.misses();
+    stats.blocks_read = points.blocks_read();
     Ok(stats)
 }
 
@@ -538,6 +602,7 @@ pub fn consolidate_index_files(
         // from the file rather than re-deriving it from the MANIFEST.
         space_dim: pq.codebook.params.dim as usize,
         cache_records: recommended_cache_records(cfg.r),
+        cache_blocks: RECOMMENDED_CACHE_BLOCKS,
     };
 
     let mut vw = VamanaWriter::create_with_cipher(
@@ -664,6 +729,7 @@ mod tests {
                 max_norm: 1.0,
                 space_dim: self.raw[0].len(),
                 cache_records,
+                cache_blocks: RECOMMENDED_CACHE_BLOCKS,
             }
         }
 
@@ -779,6 +845,7 @@ mod tests {
             max_norm: 0.0,
             space_dim: 2,
             cache_records: 64,
+            cache_blocks: 8,
         };
         let out = dir.join("out.vamana");
         let reader = VamanaReader::open_with_cipher(&path, None).unwrap();
@@ -837,6 +904,7 @@ mod tests {
             max_norm: 0.0,
             space_dim: 2,
             cache_records: 64,
+            cache_blocks: 8,
         };
         let out = dir.join("out.vamana");
         let reader = VamanaReader::open_with_cipher(&path, None).unwrap();
@@ -940,6 +1008,7 @@ mod tests {
             max_norm: 0.0,
             space_dim: 2,
             cache_records: 64,
+            cache_blocks: 8,
         };
         let reader = VamanaReader::open_with_cipher(&path, None).unwrap();
         let mut vw =
@@ -1155,6 +1224,7 @@ mod tests {
                 max_norm: 0.0,
                 space_dim: 2,
                 cache_records: 8,
+                cache_blocks: 8,
             },
             &mut vw,
         )
@@ -1164,6 +1234,50 @@ mod tests {
             "{err:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The pass's own IO.** A `.vamana` read decrypts and inflates a **whole block** to hand
+    /// back one record, so a cache at the *record* tier alone does not bound the pass's IO at
+    /// all: every record is a distinct key and misses exactly once, and every one of those
+    /// misses inflates a whole block. A pass with no block tier therefore inflates each block
+    /// once *per record it holds* — ~40x over at a 256 KiB block and a 768-dim vector, in the
+    /// one pass whose entire reason to exist is being cheaper than a full rebuild. Recall and
+    /// every structural invariant would look perfect throughout.
+    ///
+    /// So: the blocks actually inflated must stay in the neighbourhood of the file's **block**
+    /// count, and nowhere near its **record** count.
+    #[test]
+    fn the_pass_inflates_each_block_a_few_times_not_once_per_record() {
+        let f = build_fixture("blockio", 400, 16, 12);
+        let blocks = VamanaReader::open_with_cipher(&f.vamana, None)
+            .unwrap()
+            .inner()
+            .num_blocks() as u64;
+        let records = f.n as u64;
+        assert!(
+            records > blocks * 4,
+            "the fixture must pack several records per block ({records} records in {blocks} \
+             blocks) or this test proves nothing"
+        );
+
+        let mut rng = Lcg(0xb10c_0000_0000_0001);
+        let dead: Vec<bool> = (0..f.n).map(|_| rng.next_f64() < 0.3).collect();
+        let (_, stats) = f.run("blockio", &dead);
+
+        // Every record is decoded at least once (the sequential emit walk), so the record tier
+        // misses ~n times. That is expected and fine. What must NOT be ~n is the block reads.
+        assert!(
+            stats.cache_misses >= records,
+            "the emit walk must touch every record"
+        );
+        assert!(
+            stats.blocks_read < records / 4,
+            "the pass inflated {} blocks for {records} records (the file has {blocks} blocks) \
+             — it is re-inflating a block per record, which is the ~40x amplification the \
+             block tier exists to prevent",
+            stats.blocks_read
+        );
+        let _ = std::fs::remove_dir_all(&f.dir);
     }
 
     /// The LRU's eviction order really is least-recently-used, and a re-touch renews an entry.
