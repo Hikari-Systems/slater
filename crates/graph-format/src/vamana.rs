@@ -167,11 +167,25 @@ impl Expanded<'_> {
 
     /// Begin a fresh search. O(1) for the stamped arm, O(visited) for the set.
     ///
-    /// The stamped arm starts at `gen = 0` over a zeroed buffer, so the first `begin`
-    /// moves to `1` and no node is ever spuriously "seen" on the first search.
-    pub fn begin(&mut self) {
+    /// Called by [`greedy_search_over`] itself, so a caller cannot forget it. That is
+    /// deliberate: the stamped arm starts at `gen = 0` over a **zeroed** buffer, so
+    /// searching without a `begin` would read *every* node as already-expanded, expand
+    /// nothing, and hand robust-prune an empty candidate pool — a silently degraded
+    /// graph with no error and no panic. The scratch is purely an allocation-reuse
+    /// vehicle; making it own its own reset removes the landmine.
+    fn begin(&mut self) {
         match self {
-            Expanded::Stamps { gen, .. } => *gen = gen.wrapping_add(1),
+            Expanded::Stamps { buf, gen } => {
+                *gen = gen.wrapping_add(1);
+                // On wrap, `gen` collides with the zeroed buffer and every node reads
+                // as seen. Not hypothetical: the RW index runs one search per vector
+                // insert for the lifetime of the process, so a long-lived writer
+                // reaches 2^32 searches in weeks. Re-zero and skip 0.
+                if *gen == 0 {
+                    buf.fill(0);
+                    *gen = 1;
+                }
+            }
             Expanded::Set(s) => s.clear(),
         }
     }
@@ -193,6 +207,8 @@ where
     A: AdjRead + ?Sized,
     P: PointSet + ?Sized,
 {
+    // Own the reset rather than trusting the caller to have done it — see `begin`.
+    expanded.begin();
     let mut beam: Vec<(f64, VamanaIndex)> = vec![(points.dist(start, p)?, start)];
     let mut visited = Vec::new();
     let mut nbrs: Vec<VamanaIndex> = Vec::new();
@@ -402,7 +418,6 @@ pub fn build_vamana(vectors: &[Vec<f32>], r: usize, alpha: f32) -> Result<Vamana
             l_build,
         };
         for &p in &order {
-            expanded.begin();
             insert_point(
                 p as VamanaIndex,
                 &mut adjacency,
@@ -863,19 +878,22 @@ mod tests {
         let forward: Vec<VamanaIndex> = vec![0, 1, 2, 3]; // walk 0 → 3
         let backward: Vec<VamanaIndex> = vec![3, 2, 1, 0]; // walk 3 → 0
 
-        // A reused buffer, generation bumped between searches: the second search must
-        // not see the first's stamps.
+        // A reused buffer across two searches. `greedy_search_over` resets the scratch
+        // itself, so a stale stamp from the first search must not leak into the second.
         let mut stamps = vec![0u32; n];
         let mut ex = Expanded::Stamps {
             buf: &mut stamps,
             gen: 0,
         };
-        ex.begin();
         let a = greedy_search_over(0, 3, &adjacency, &points, l, &mut ex).unwrap();
-        ex.begin();
         let b = greedy_search_over(3, 0, &adjacency, &points, l, &mut ex).unwrap();
 
-        assert_eq!(a, forward);
+        assert_eq!(
+            a, forward,
+            "the FIRST search over a zeroed stamp buffer must expand the whole path — \
+             if the generation still matched the zeroed buffer, every node would read as \
+             already-expanded and this would come back empty"
+        );
         assert_eq!(
             b, backward,
             "a bumped generation must isolate the reused scratch buffer — a stale stamp \
@@ -886,12 +904,51 @@ mod tests {
         // with index size) must satisfy the same contract. Asserted against the same
         // hand-derived truth, not against the `Stamps` arm.
         let mut ex = Expanded::Set(HashSet::new());
-        ex.begin();
         let a = greedy_search_over(0, 3, &adjacency, &points, l, &mut ex).unwrap();
-        ex.begin();
         let b = greedy_search_over(3, 0, &adjacency, &points, l, &mut ex).unwrap();
         assert_eq!(a, forward);
-        assert_eq!(b, backward, "Expanded::Set must clear on begin()");
+        assert_eq!(b, backward, "Expanded::Set must reset per search");
+    }
+
+    /// The stamp generation is a `u32` bumped once per search, and the RW index runs one
+    /// search per vector insert for the whole life of the process — so a long-lived
+    /// writer really does reach 2^32 searches. On wrap, a naive `gen` returns to `0`,
+    /// which is exactly what a *zeroed* stamp buffer holds: every node would read as
+    /// already-expanded, the search would expand nothing, and robust-prune would be
+    /// handed an empty candidate pool. Silently degraded graph, no error, no panic.
+    ///
+    /// Drive the counter right up to the wrap and check the search still works.
+    #[test]
+    fn expanded_stamp_generation_survives_a_u32_wrap() {
+        let vectors = vec![
+            vec![0.0f32, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            vec![3.0, 0.0],
+        ];
+        let adjacency: Vec<Vec<u32>> = vec![vec![1], vec![0, 2], vec![1, 3], vec![2]];
+        let points = SlabPoints(&vectors);
+
+        // Park the generation one short of wrapping, and dirty the buffer with stamps
+        // that a naive wrap-to-zero would collide with.
+        let mut stamps = vec![0u32; vectors.len()];
+        let mut ex = Expanded::Stamps {
+            buf: &mut stamps,
+            gen: u32::MAX,
+        };
+
+        // This search wraps the generation. It must still expand the whole path.
+        let visited = greedy_search_over(0, 3, &adjacency, &points, 8, &mut ex).unwrap();
+        assert_eq!(
+            visited,
+            vec![0, 1, 2, 3],
+            "the search across the generation wrap expanded nothing — the wrapped \
+             generation collided with the zeroed stamp buffer"
+        );
+
+        // And the search *after* the wrap must still be isolated from it.
+        let visited = greedy_search_over(3, 0, &adjacency, &points, 8, &mut ex).unwrap();
+        assert_eq!(visited, vec![3, 2, 1, 0]);
     }
 
     #[test]
