@@ -46,7 +46,7 @@ use graph_format::manifest::{
     RangeIndexDesc, VectorIndexDesc,
 };
 use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
-use graph_format::pq::{train_codebooks, PqParams, PqWriter};
+use graph_format::pq::{normalise, train_codebooks, PqParams, PqWriter};
 use graph_format::topology::{write_csr, write_csr_with_cipher, Edge, TopologyReader};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
@@ -1999,7 +1999,7 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
     let raw: Vec<Vec<f32>> = (0..f.n)
         .map(|_| {
             let v: Vec<f32> = (0..f.dim).map(|_| (next() as f32) - 0.5).collect();
-            unit(&v)
+            normalise(&v)
         })
         .collect();
 
@@ -2157,17 +2157,4 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
     .unwrap();
 
     (root, graph, raw)
-}
-
-/// L2-normalise a vector to unit length (the cosine space the Vamana path uses).
-fn unit(v: &[f32]) -> Vec<f32> {
-    let n: f64 = v
-        .iter()
-        .map(|&x| (x as f64) * (x as f64))
-        .sum::<f64>()
-        .sqrt();
-    if n == 0.0 {
-        return v.to_vec();
-    }
-    v.iter().map(|&x| (x as f64 / n) as f32).collect()
 }

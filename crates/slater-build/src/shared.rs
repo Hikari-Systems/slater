@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::manifest::{AnnMode, Metric, VectorIndexDesc};
-use graph_format::pq::{train_codebooks, PqParams, PqWriter};
+use graph_format::pq::{normalise, train_codebooks, PqParams, PqWriter};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::wire::{read_uvarint, write_uvarint};
@@ -383,20 +383,6 @@ fn vamana_eligible(pi: &PendingIndex, opts: &BuildOptions) -> bool {
     true
 }
 
-/// L2-normalise a vector to unit length (cosine path — D29). A zero vector is left
-/// as-is (its cosine to anything is defined as 0 elsewhere).
-fn normalise(v: &[f32]) -> Vec<f32> {
-    let norm: f64 = v
-        .iter()
-        .map(|&x| (x as f64) * (x as f64))
-        .sum::<f64>()
-        .sqrt();
-    if norm == 0.0 {
-        return v.to_vec();
-    }
-    v.iter().map(|&x| (x as f64 / norm) as f32).collect()
-}
-
 /// Build the Vamana graph + PQ codes for one above-threshold index and write its
 /// `vector/<l>.<p>.vamana` + `.pq` files. Returns the MANIFEST descriptor and the
 /// `(rel_path, block_size)` of each file written, for the inventory.
@@ -412,7 +398,8 @@ fn build_vamana_index(
     opts: &BuildOptions,
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<(VectorIndexDesc, Vec<(String, u32)>)> {
-    // Normalise once; both the graph build and PQ training work in this space.
+    // Normalise once; both the graph build and PQ training work in this space. The one
+    // definition of that space lives in `graph_format::pq` (D29) — see its invariant.
     let normed: Vec<Vec<f32>> = entries.iter().map(|(_, v)| normalise(v)).collect();
 
     let graph = build_vamana(&normed, opts.vamana_r as usize, opts.vamana_alpha)
