@@ -502,9 +502,15 @@ impl RwIndexCache {
 
         // Fast path: already exactly at our epoch. Taken under a *read* guard, so concurrent
         // queries at the same epoch do not serialise on a writer lock they do not need.
+        //
+        // The `min_vectors` gate is applied HERE too, not only on the build path below. It is a
+        // *recall* floor, not just a speed heuristic: a Vamana graph over a handful of vectors
+        // has genuinely worse recall than a linear scan, so serving a stamped-but-tiny index
+        // would be a silent recall regression — and without this check the second query at an
+        // epoch whose first query built-then-declined the index would do exactly that.
         {
             let g = read_lock(&ix);
-            if g.refused {
+            if g.refused || (g.epoch == Some(epoch) && g.live_count() < cfg.min_vectors) {
                 return Ok(RwLookup::BruteForce);
             }
             if g.epoch == Some(epoch) {
@@ -925,6 +931,17 @@ mod tests {
             max_vectors: 1000,
         };
         let small = [(1u64, DeltaVector::Set(vec![1.0, 0.0]))];
+        assert!(matches!(
+            cache
+                .ensure(ctx(g, &d, 1, &cfg, &j), || vec![1], table(&small))
+                .unwrap(),
+            RwLookup::BruteForce
+        ));
+
+        // A SECOND query at the same (below-floor) epoch must ALSO brute-force. The first query
+        // built the index and stamped it at epoch 1, so this exercises the *fast* path — which
+        // had, before the fix, no `min_vectors` gate and would have served the tiny (low-recall)
+        // index the first query correctly declined.
         assert!(matches!(
             cache
                 .ensure(ctx(g, &d, 1, &cfg, &j), || vec![1], table(&small))
