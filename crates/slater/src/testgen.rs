@@ -1143,6 +1143,142 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
     (root, graph)
 }
 
+/// A **dense-reltype chain** fixture (HIK-104) for the streaming `RelTypeScan` test: `n`
+/// `:N` nodes (label id 0), each carrying `name = "node{i:04}"`, joined into a single chain
+/// by one relationship type `T` (id 0) — edge `i -> i+1` for `i` in `0..n-1`. Every node but
+/// the last is a **source** endpoint and every node but the first a **target**, so the
+/// endpoint postings are *dense* (stored as their sparse complement — the 733 MB-class case)
+/// and a `RelTypeScan` drives from ~all `n` nodes. Carries the endpoint postings + manifest
+/// counts so `has_reltype_postings()` is true. No indexes.
+pub fn write_rel_chain(tag: &str, n: u64) -> (PathBuf, String) {
+    assert!(n >= 2, "chain needs at least two nodes");
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_000c);
+    let graph = "relchain".to_string();
+    let root = std::env::temp_dir().join(format!("slater_relchn_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for i in 0..n {
+        np.append(&[(0, Value::Str(format!("node{i:04}")))])
+            .unwrap();
+    }
+    np.finish().unwrap();
+
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..n {
+        nl.append(&[0]).unwrap(); // all :N
+    }
+    nl.finish().unwrap();
+
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..n - 1 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    let edges: Vec<Edge> = (0..n - 1)
+        .map(|i| Edge {
+            src: NodeId(i),
+            dst: NodeId(i + 1),
+            reltype: 0,
+            edge: EdgeId(i),
+        })
+        .collect();
+    write_csr(dir.join("topology.csr.blk"), n, &edges, BLOCK, LEVEL).unwrap();
+
+    let (reltype_source_counts, reltype_target_counts) =
+        graph_format::postings::write_reltype_endpoint_postings(
+            dir.join("reltype_src.post"),
+            dir.join("reltype_tgt.post"),
+            1,
+            &edges,
+            BLOCK,
+            LEVEL,
+            None,
+        )
+        .unwrap();
+
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+        "reltype_src.post",
+        "reltype_tgt.post",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: n,
+        edge_count: n - 1,
+        labels: vec!["N".into()],
+        reltypes: vec!["T".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        reltype_source_counts,
+        reltype_target_counts,
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        hub_degrees: None,
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+    (root, graph)
+}
+
 /// A tiny **diamond** fixture for the GQL shortest-path-selector tests (PR 3). Five
 /// `:N` nodes joined by a single relationship type `R`:
 /// ```text

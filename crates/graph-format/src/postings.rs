@@ -107,21 +107,84 @@ pub fn encode_endpoint_posting(ids: &[u64]) -> Vec<u8> {
     encode_posting_from_ascending(ids.len() as u64, universe, ids.iter().copied())
 }
 
-/// Decode one reltype's endpoint posting back into ascending node ids.
-pub fn decode_endpoint_posting(rec: &[u8]) -> Result<Vec<u64>> {
+/// A **lazy, resumable** ascending cursor over one endpoint posting record — the streaming
+/// counterpart of [`decode_endpoint_posting`], which expands the whole (up to node-count)
+/// id list into a `Vec<u64>` before the first id. It holds only the compressed Elias–Fano
+/// structure ([`EfMono`], a few bits per id) plus a cursor, so a *dense* reltype whose
+/// expanded posting is ~733 MB stays a few tens of MB resident and yields ids one at a time.
+/// The anchor k-way merge drains it window-by-window, so a pushed `LIMIT` stops the walk.
+///
+/// Yields exactly the sequence [`decode_endpoint_posting`] returns (which is now defined in
+/// terms of this cursor), for both `POST_EF` and the dense `POST_EF_COMPLEMENT` form.
+pub struct EndpointPostingIter {
+    ef: EfMono,
+    /// `false`: `ef` is EF over the present ids; `i` is the next set index.
+    /// `true`: `ef` is EF over the *absent* ids; walk `n` over `0..=universe`, skipping the
+    /// complement members, with `i` the next complement index.
+    complement: bool,
+    universe: u64,
+    i: usize,
+    n: u64,
+}
+
+impl Iterator for EndpointPostingIter {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        if !self.complement {
+            if self.i < self.ef.len() {
+                let v = self.ef.value_at(self.i);
+                self.i += 1;
+                return Some(v);
+            }
+            return None;
+        }
+        // Complement form: emit ascending ids in `0..=universe` not present in `ef`. `ef` is
+        // ascending, so a single forward cursor over it suffices — no membership probe.
+        while self.n <= self.universe {
+            let cur = self.n;
+            self.n += 1;
+            if self.i < self.ef.len() && self.ef.value_at(self.i) == cur {
+                self.i += 1; // cur is absent from the set (it is in the complement) — skip it
+                continue;
+            }
+            return Some(cur);
+        }
+        None
+    }
+}
+
+/// A lazy ascending cursor over one endpoint posting record (see [`EndpointPostingIter`]).
+pub fn endpoint_posting_cursor(rec: &[u8]) -> Result<EndpointPostingIter> {
     let (&tag, mut body) = rec
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty endpoint posting record"))?;
     match tag {
-        POST_EF => Ok(EfMono::deserialize(body)?.iter().collect()),
+        POST_EF => Ok(EndpointPostingIter {
+            ef: EfMono::deserialize(body)?,
+            complement: false,
+            universe: 0,
+            i: 0,
+            n: 0,
+        }),
         POST_EF_COMPLEMENT => {
             let universe = read_uvarint(&mut body)?;
-            let comp: Vec<u64> = EfMono::deserialize(body)?.iter().collect();
-            // set = [0, universe] \ complement.
-            Ok(complement_from_ascending(comp.into_iter(), universe))
+            Ok(EndpointPostingIter {
+                ef: EfMono::deserialize(body)?,
+                complement: true,
+                universe,
+                i: 0,
+                n: 0,
+            })
         }
         _ => bail!("unknown endpoint posting tag {tag}"),
     }
+}
+
+/// Decode one reltype's endpoint posting back into ascending node ids. Defined in terms of
+/// [`endpoint_posting_cursor`] so the eager and lazy readers cannot drift.
+pub fn decode_endpoint_posting(rec: &[u8]) -> Result<Vec<u64>> {
+    Ok(endpoint_posting_cursor(rec)?.collect())
 }
 
 /// One dense bit plane per reltype over the node id space: bit `n` of plane `t`

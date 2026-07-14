@@ -31,7 +31,9 @@ use graph_format::isam::IsamReader;
 use graph_format::manifest::AnnMode;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
-use graph_format::postings::decode_endpoint_posting;
+use graph_format::postings::{
+    decode_endpoint_posting, endpoint_posting_cursor, EndpointPostingIter,
+};
 use graph_format::pq::{PqReader, ResidentPq};
 use graph_format::store::fs::FsObjectStore;
 use graph_format::store::{join_key, FileIntegrity, ObjectStore};
@@ -887,6 +889,50 @@ impl Generation {
             }
         }
         Ok(set.into_iter().collect())
+    }
+
+    /// A **lazy** ascending cursor per base endpoint posting selected by
+    /// (`reltype_ids`, `side`) — the streaming counterpart of
+    /// [`collect_endpoint_nodes_for_reltypes`](Self::collect_endpoint_nodes_for_reltypes),
+    /// which expands every posting into one `Vec<u64>` (733 MB for a dense reltype) before
+    /// the first id. Each cursor owns only the compressed Elias–Fano posting and yields ids
+    /// one window at a time, so the anchor merge stays bounded and a pushed `LIMIT` stops the
+    /// walk. Each cursor is individually ascending+distinct; different (reltype, side) cursors
+    /// may overlap, so the caller's k-way merge dedups. An empty/absent posting contributes no
+    /// cursor.
+    pub fn endpoint_posting_cursors(
+        &self,
+        reltype_ids: &[u32],
+        side: RelEndpointSide,
+    ) -> Result<Vec<EndpointPostingIter>> {
+        let (Some(src), Some(tgt)) = (&self.reltype_src_post, &self.reltype_tgt_post) else {
+            bail!("generation has no reltype endpoint postings");
+        };
+        let mut cursors = Vec::new();
+        let mut push = |reader: &BlockFileReader, t: u32| -> Result<()> {
+            if (t as u64) < reader.total_records() {
+                cursors.push(endpoint_posting_cursor(
+                    &reader.read_record_global(t as u64)?,
+                )?);
+            }
+            Ok(())
+        };
+        for &t in reltype_ids {
+            if matches!(side, RelEndpointSide::Source | RelEndpointSide::Either) {
+                push(src, t)?;
+            }
+            if matches!(side, RelEndpointSide::Target | RelEndpointSide::Either) {
+                push(tgt, t)?;
+            }
+        }
+        Ok(cursors)
+    }
+
+    /// Number of records in the base node-label column — the dense id range a base label scan
+    /// sweeps (`0..len`). Ids at or above this are not in the base column (they are born in a
+    /// segment or the delta) and are supplied by the overlay sources of the anchor merge.
+    pub fn node_label_column_len(&self) -> u64 {
+        self.node_labels.inner().total_records()
     }
 
     /// Dense node ids carrying `label_id`, ascending — re-derived on demand by a
