@@ -1152,7 +1152,7 @@ fn select_compaction_run(sizes: &[u64]) -> Option<(usize, usize)> {
         let len = j - i;
         if len >= 2 {
             // `>=` so a later (older) run of equal length wins the tie → oldest-first.
-            let take = best.map_or(true, |(bs, be)| len >= be - bs);
+            let take = best.is_none_or(|(bs, be)| len >= be - bs);
             if take {
                 best = Some((i, j));
             }
@@ -1186,7 +1186,7 @@ fn select_compaction_run_in_stack(sizes: &[u64], off_heap: &[bool]) -> Option<(u
             let (s, e) = (span_start + s, span_start + e);
             // `>=` so a later (older) span's equal-length run wins the tie → oldest-first,
             // matching `select_compaction_run`'s within-span tie-break.
-            if best.map_or(true, |(bs, be)| e - s >= be - bs) {
+            if best.is_none_or(|(bs, be)| e - s >= be - bs) {
                 best = Some((s, e));
             }
         }

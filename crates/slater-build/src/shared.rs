@@ -261,7 +261,7 @@ impl SortRecord for PendingVector {
     fn decode(r: &mut &[u8]) -> Result<Self> {
         let seq = read_uvarint(r)?;
         let id = read_uvarint(r)?;
-        if r.len() % 4 != 0 {
+        if !r.len().is_multiple_of(4) {
             bail!(
                 "PendingVector record has a truncated f32 tail ({} bytes)",
                 r.len()
@@ -372,7 +372,7 @@ fn vamana_eligible(pi: &PendingIndex, opts: &BuildOptions) -> bool {
         );
         return false;
     }
-    if pi.dim % opts.pq_subspaces != 0 {
+    if !pi.dim.is_multiple_of(opts.pq_subspaces) {
         eprintln!(
             "note: vector index {}.{} dim {} is not divisible by --pq-subspaces {}; \
              building brute-force",

@@ -101,7 +101,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// on an odd length or a non-hex digit — keys and salts arrive from operators.
 pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         bail!("hex string has an odd number of digits");
     }
     let mut out = Vec::with_capacity(s.len() / 2);

@@ -53,7 +53,7 @@ impl PqParams {
         if subspaces == 0 || dim == 0 {
             bail!("PQ requires non-zero dim and subspaces");
         }
-        if dim % subspaces != 0 {
+        if !dim.is_multiple_of(subspaces) {
             bail!("PQ subspaces ({subspaces}) must divide dim ({dim})");
         }
         if !(1..=8).contains(&bits) {

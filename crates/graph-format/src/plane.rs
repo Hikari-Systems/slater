@@ -156,7 +156,7 @@ pub(crate) fn build_sample(highs: &[u64], m: usize) -> Vec<u32> {
     for (wi, &w) in highs.iter().enumerate() {
         let mut ww = w;
         while ww != 0 {
-            if ones % SELECT_SAMPLE == 0 {
+            if ones.is_multiple_of(SELECT_SAMPLE) {
                 sample.push((wi * 64 + ww.trailing_zeros() as usize) as u32);
             }
             ones += 1;

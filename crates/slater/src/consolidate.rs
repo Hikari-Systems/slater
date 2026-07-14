@@ -327,7 +327,7 @@ fn node_identity(
                     )
                 })?;
                 let lid = view.label_id(label).unwrap_or(u32::MAX);
-                if best.as_ref().map_or(true, |(bid, ..)| lid < *bid) {
+                if best.as_ref().is_none_or(|(bid, ..)| lid < *bid) {
                     best = Some((lid, label.clone(), ri.property.clone(), value));
                 }
             }

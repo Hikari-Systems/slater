@@ -4792,7 +4792,7 @@ fn execute_write_batch(
         for &ri in &order {
             if distinct
                 .last()
-                .map_or(true, |last| !last.cmp_key(&key_values[ri]).is_eq())
+                .is_none_or(|last| !last.cmp_key(&key_values[ri]).is_eq())
             {
                 distinct.push(&key_values[ri]);
             }

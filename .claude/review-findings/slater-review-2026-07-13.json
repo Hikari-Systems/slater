@@ -1,0 +1,495 @@
+{
+  "counts": {
+    "reviewers": 19,
+    "findings_filed": 72,
+    "findings_survived": 69,
+    "seeds_total": 6,
+    "seeds_survived": 6
+  },
+  "themes": [
+    {
+      "theme": "Query semantics decided by substring text scans",
+      "why": "ORDER BY direction, DISTINCT, single-flight race detection and diagnostics failure buckets all branch on whole-clause/message text (`contains(\"desc\")`, `has_keyword(\"distinct\")`, `contains(\"already in progress\")`) instead of parsed tokens or typed errors — the exact anti-pattern CONTRIBUTING.md forbids. A common field name (`n.description`), a string literal, or a routine message reword silently corrupts results or misclassifies failures with no error surface."
+    },
+    {
+      "theme": "Untrusted-byte decode hardening",
+      "why": "Nearly every on-disk and wire decoder preallocates a Vec/HashMap from an attacker-influenced length prefix, recurses without a depth bound, or inflates zstd without an output cap. Within the project's own data-dir/S3 threat model (and, for PackStream, an authenticated network client) a single crafted record aborts or OOM-kills the whole process. graph-format — the crate that parses all of it — is also the one crate that does not `forbid(unsafe_code)`."
+    },
+    {
+      "theme": "Blocking and serializing work on the async reactor",
+      "why": "Write execution (ISAM resolve + WAL fsync + S3 round-trips), argon2id auth, the TLS handshake, and query parsing all run inline on tokio worker threads instead of spawn_blocking, and every block-cache hit serializes on one global mutex. One slow or hostile operation stalls unrelated connections; the read path already uses spawn_blocking, so this is an asymmetric regression against the stated design."
+    },
+    {
+      "theme": "Bounded-memory invariant leaks",
+      "why": "The product headline is 'serves graphs bigger than RAM' under 100-200MB limits, but many paths escape the budgets: full-id-space Vecs for AllNodes/LabelScan defeat LIMIT and maxIntermediate, shortest-path/BFS/algo traversals under-charge or don't charge at all, the lazy degree column never evicts when the TTL sweep is off, dump and vector-index build accumulate the whole graph resident, and per-query index-sized scratch arrays scale with cardinality not work."
+    },
+    {
+      "theme": "Faults escalate to permanent or silent degradation",
+      "why": "Poisoned std mutexes turn one panic into a permanent per-graph write outage; compact_l0's unreachable! on a mixed-format L0 stack poisons the writer after a supported config flip; the generation guard races consolidation's swap and orphans the delta while reporting a false failure; and guard_sweep's unconditional acl.reload() adopts re-read bytes without re-verifying the stamp. Transient or recoverable events become sticky, silent, or invariant-violating."
+    },
+    {
+      "theme": "Durability and write-path integrity gaps",
+      "why": "New WAL segment files are fdatasync'd but their parent directory entry is never fsynced, so acked writes can vanish on power loss; dump drops all but one label per node and emits unquoted identifiers; overlay 0-match MERGE creates duplicate nodes for one business key; delete_node leaves phantom entries; and integer arithmetic wraps silently in release."
+    }
+  ],
+  "ranked": [
+    {
+      "rank": 1,
+      "title": "ORDER BY direction detected by substring, so keys containing \"desc\" sort descending",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater/src/parser.rs",
+      "line": 1924,
+      "confidence": "CONFIRMED",
+      "what": "lower_sort_item picks ASC/DESC via `pair.as_str().to_lowercase().contains(\"desc\")` over the whole sort item instead of reading the captured kw_asc/kw_desc token, so any sort expression whose text contains \"desc\" is silently ordered descending.",
+      "impact": "`ORDER BY n.description` (an extremely common field name), a `descriptor` variable, or a `'...desc...'` literal reverses sort order with no error or warning — silent wrong results in core query semantics.",
+      "fix": "Iterate `pair.into_inner()` and choose Desc only when a child rule is `Rule::kw_desc`; default Asc. Never substring-match the expression text."
+    },
+    {
+      "rank": 2,
+      "title": "DISTINCT detected by whole-clause text scan yields spurious de-duplication",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater/src/parser.rs",
+      "line": 3089,
+      "confidence": "CONFIRMED",
+      "what": "has_keyword(pair,\"distinct\") tokenizes the entire RETURN/WITH/function text and matches a standalone \"distinct\", so a string literal, alias, or property named `distinct` turns the projection into RETURN DISTINCT.",
+      "impact": "`RETURN n.name AS distinct` or `RETURN n.name, 'these are distinct' AS note` silently de-duplicates rows the user never asked to dedup, changing result cardinality with no error.",
+      "fix": "Detect DISTINCT from the captured `Rule::kw_distinct` child token in the clause's direct children, not a substring scan; same for the function DISTINCT flag."
+    },
+    {
+      "rank": 3,
+      "title": "dump drops all but one label per node → silent data loss on the documented round-trip",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater/src/dump.rs",
+      "line": 427,
+      "confidence": "CONFIRMED",
+      "what": "emit_node picks a single identity label and emits `MERGE (n:<label> ...)`, discarding the full label list; a node [Person, Employee] is dumped as only :Person.",
+      "impact": "Rebuilding a dump via slater-build loses every non-identity label on multi-label nodes, silently breaking the module's stated dump→build→generation round-trip guarantee. The sibling consolidate.rs already emits all labels correctly.",
+      "fix": "Emit all labels, identity first, e.g. `MERGE (n:Person:Employee {key: v})` (the build MERGE dialect already accepts this), mirroring consolidate.rs::emit_node."
+    },
+    {
+      "rank": 4,
+      "title": "WAL segment creation never fsyncs the parent directory — acked writes lost on power loss",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater-delta/src/wal.rs",
+      "line": 546,
+      "confidence": "CONFIRMED",
+      "what": "WalSink::create/commit/seal fdatasync the segment file's own data but never open+fsync the parent directory, so a newly created segment's directory entry is not durable.",
+      "impact": "After create+first-commit+Bolt-ACK, a power loss before dir metadata writeback leaves the segment file absent on restart; replay finds nothing and the acknowledged write is silently lost — violating the WAL's own 'acknowledged implies durable' contract. The L0 path already fsyncs its dir.",
+      "fix": "After create (and seal) open the parent dir and sync_all(), mirroring l0.rs/common::fsync_dir; prefer sync_all() over sync_data() on the first commit."
+    },
+    {
+      "rank": 5,
+      "title": "rand() only ever returns values in [0.5, 0.75)",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater/src/exec.rs",
+      "line": 9455,
+      "confidence": "CONFIRMED",
+      "what": "random_f64() takes the low 64 bits of a v4 UUID, which include the fixed RFC-4122 variant bits; after `>> 11` the two top mantissa bits are always 1 then 0, so rand() is confined to [0.5, 0.75).",
+      "impact": "Any sampling, `ORDER BY rand()`, jitter, or probability filter is badly skewed; `WHERE rand() < 0.1` never matches. Silent wrong results for a documented builtin; the existing test only checks 0..1 and never catches it.",
+      "fix": "Draw the 53 mantissa bits from bits excluding the version/variant fields (or use the rand crate) and divide by 2^53; add a test asserting empirical mean ≈ 0.5 and min < 0.5."
+    },
+    {
+      "rank": 6,
+      "title": "Unbounded parser/lowering recursion aborts the whole process (query-text DoS)",
+      "category": "security",
+      "severity": "high",
+      "file": "crates/slater/src/parser.rs",
+      "line": 683,
+      "confidence": "CONFIRMED",
+      "what": "Neither the pest parse nor the recursive AST lowering imposes a nesting-depth limit, so a deeply nested query overflows the (2 MiB tokio worker) stack; a Rust stack overflow is an uncatchable abort.",
+      "impact": "A single authenticated client sending a few-KB query (`RETURN` + ~5000 nested parens) aborts the entire process — reproduced at depth 200 on a 2 MiB stack — dropping every other tenant's connection. No catch_unwind can mitigate an abort.",
+      "fix": "Thread a depth counter through lower_* (and/or reject inputs whose paren/bracket nesting exceeds a bound before parsing), erroring past a fixed limit (~256); optionally cap post-auth query length below 64 MiB."
+    },
+    {
+      "rank": 7,
+      "title": "PackStream decode amplifies a 64 MB message into ~2 GB of PsValue nodes",
+      "category": "security",
+      "severity": "high",
+      "file": "crates/slater/src/bolt/packstream.rs",
+      "line": 337,
+      "confidence": "CONFIRMED",
+      "what": "Per-container pre-allocation is bounded by remaining bytes, but nothing bounds the total decoded node count; a list header with count ≈64M followed by 64 MiB of Null bytes yields ~64M×32B PsValue nodes.",
+      "impact": "One authenticated RUN materialises ~2 GB (or triggers an allocator abort under a cgroup limit, killing the whole process) against a server targeting 100-200 MB. A few concurrent connections OOM it.",
+      "fix": "Thread a running budget (total nodes and/or estimated bytes) through Decoder that read_value decrements per element, bailing when exhausted — bound the structure, not just each container."
+    },
+    {
+      "rank": 8,
+      "title": "compact_l0 panics via unreachable! on a mixed-format L0 stack, poisoning the writer mutex",
+      "category": "correctness",
+      "severity": "high",
+      "file": "crates/slater/src/delta_writer.rs",
+      "line": 657,
+      "confidence": "CONFIRMED",
+      "what": "In resident mode compact_l0 calls resident_memtable() on every level in the selected run, which hits `unreachable!` for any level reloaded off-heap (a directory segment), panicking while holding the single-writer mutex.",
+      "impact": "Flipping the runtime `delta.offHeapL0` flag off (a supported action; format reloads by path.is_dir()) leaves a mixed stack; an ordinary write-triggered compaction then panics under lock, poisoning it. Every subsequent write/freeze/flush panics — permanent per-graph write outage that recurs on restart. The off-heap branch already bails gracefully; the resident branch does not.",
+      "fix": "In the resident branch return Ok(false) on any off-heap level in the run (like the off-heap branch), or fold a mixed run through the format-agnostic SegmentData path instead of gating on inner.off_heap."
+    },
+    {
+      "rank": 9,
+      "title": "Write execution runs inline on the async reactor, not spawn_blocking",
+      "category": "performance",
+      "severity": "high",
+      "file": "crates/slater/src/server.rs",
+      "line": 3221,
+      "confidence": "CONFIRMED",
+      "what": "RUN write arms call execute_write/execute_create/execute_edge_write synchronously inside async handle_request, blocking a tokio worker on ISAM block decompression, adjacency materialization and WAL append+fsync (and S3/GCS round-trips) — unlike the read path, which uses spawn_blocking.",
+      "impact": "One slow write (cold ISAM block, S3 GET, fsync latency) stalls every other connection scheduled on that worker; a handful of concurrent writes can hang all workers, defeating availability. Contradicts the module doc's spawn_blocking design.",
+      "fix": "Move execute_write/create/edge_write and their resolve/adjacency helpers into a spawn_blocking closure and await the JoinHandle; keep only parse/authorize classification on the reactor."
+    },
+    {
+      "rank": 10,
+      "title": "argon2id runs synchronously on the tokio reactor (auth DoS)",
+      "category": "security",
+      "severity": "high",
+      "file": "crates/slater/src/server.rs",
+      "line": 3003,
+      "confidence": "CONFIRMED",
+      "what": "authenticate() is a synchronous fn calling argon2id verify (~19 MiB, tens of ms) directly from async handle_request on a reactor worker; unknown principals still run a full constant-time verify, and there is no lockout/rate-limit.",
+      "impact": "Unauthenticated clients flooding LOGON attempts wedge reactor workers (bounded only by connection caps), starving all connections. Masked by a handshake-only health probe. Asymmetric with query execution, which is on spawn_blocking.",
+      "fix": "Run verify_password inside spawn_blocking, gate concurrent pre-auth verifies behind a small semaphore, and add an auth-attempt rate limit / backoff."
+    },
+    {
+      "rank": 11,
+      "title": "TLS handshake has no timeout and holds a global connection permit — slow-loris pool exhaustion",
+      "category": "security",
+      "severity": "high",
+      "file": "crates/slater/src/server.rs",
+      "line": 2789,
+      "confidence": "CONFIRMED",
+      "what": "serve_conn awaits acceptor.accept(sock) with no timeout while already holding a global conn_limit permit; the pre-auth semaphore and login_deadline are only armed later in handle_connection, which never runs until TLS completes.",
+      "impact": "With TLS on, an attacker opens max_connections sockets, completes TCP, then stalls/trickles the ClientHello; each holds a global slot forever, the accept loop stops draining the kernel queue, and the server refuses all new connections. The plaintext path is protected; TLS is not.",
+      "fix": "Wrap acceptor.accept(sock) in timeout_at(login_deadline), or acquire the pre-auth permit and arm the deadline around the TLS handshake so a stalled handshake is torn down and its slot released."
+    },
+    {
+      "rank": 12,
+      "title": "zstd block decompression is unbounded (capacity hint + zip-bomb)",
+      "category": "security",
+      "severity": "high",
+      "file": "crates/graph-format/src/codec.rs",
+      "line": 23,
+      "confidence": "CONFIRMED",
+      "what": "decompress() pre-allocates from an attacker-influenced raw_len hint and then copy_decode()s with no output cap; plane/degree/isam callers pass unvalidated on-disk lengths.",
+      "impact": "For a plaintext (no-key) generation — a supported mode whose manifest an attacker with data-dir/S3 write access can re-forge — a small crafted ZstdDense/ISAM block forces a giant allocation or inflates a few-KB body to many GB, OOM/abort-killing a node run under a 100-200 MB limit. Encrypted images are protected by AEAD.",
+      "fix": "Add decompress_bounded(comp, expected_len) that caps output at the exact expected raw length and rejects overflow; clamp the with_capacity hint; have plane/degree/isam pass their known raw length as a hard limit."
+    },
+    {
+      "rank": 13,
+      "title": "AllNodes/LabelScan anchor scans eagerly materialise the full id space, defeating LIMIT and the memory budget",
+      "category": "performance",
+      "severity": "high",
+      "file": "crates/slater/src/exec.rs",
+      "line": 6331,
+      "confidence": "CONFIRMED",
+      "what": "scan_candidates collects the entire `(0..node_count)` range (AllNodes) or every matching id (LabelScan, generation.rs:890) into one Vec before any row is produced; a pushed LIMIT only shortens the later row loop and the Vec is never charged to maxIntermediate.",
+      "impact": "`MATCH (n) RETURN n LIMIT 10` or `MATCH (n:Entity) ... LIMIT 10` on the 91.6M-node graph spikes RSS by a ~733 MB Vec<u64> up front — a trivial query breaks the core bounded-memory invariant.",
+      "fix": "Make candidate generation lazy/streaming (a cap-aware bounded window with per-batch tombstone suppression) so a pushed cap and maxIntermediate both bound it."
+    },
+    {
+      "rank": 14,
+      "title": "On-disk decoders preallocate Vecs from untrusted length prefixes (process-abort DoS)",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/graph-format/src/topology.rs",
+      "line": 306,
+      "confidence": "CONFIRMED",
+      "what": "A recurring pattern across decoders: `Vec::with_capacity(count)` from a uvarint/u32 read straight off disk before validating it against remaining bytes. Same defect at segindex.rs:98 (r_ids), nodelabels.rs:258 + hubdegree/histogram, vamana.rs:383, pq.rs:442 (also a u32 product overflow), l0_offheap.rs:239, isam.rs:441 (plaintext footer, even for encrypted indexes), and EF deserialize (plane.rs:482) which validates byte length but not the high-bitmap one-bit count → OOB select1 panic.",
+      "impact": "Within the documented data-dir/S3-write threat model (no-key or verifyIntegrity=false configs), a single corrupted/forged record forces a multi-GB allocation or a capacity-overflow/allocator abort that kills the whole process — on paths reached during ordinary scans and generation open. Sibling decoders (r_keycol, wire read_value's list arm, r_props) already clamp by remaining bytes.",
+      "fix": "Clamp every count to bytes-remaining before with_capacity (each element ≥1 byte), use checked_mul as usize for products, and for EF verify highs.count_ones()==m at decode; re-validate PqParams through PqParams::new."
+    },
+    {
+      "rank": 15,
+      "title": "Unbounded recursion in the property-value wire decoder → stack-overflow process abort",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/graph-format/src/wire.rs",
+      "line": 206,
+      "confidence": "CONFIRMED",
+      "what": "read_value/skip_value recurse once per nested TAG_LIST with no depth bound; the forged-length guard doesn't help because each nested list claims length 1.",
+      "impact": "A corrupt/tampered property-value block of ~500K nested `05 01` pairs (~1 MiB) overflows the stack and aborts the whole server (a hard abort, not catchable), on the on-disk decode path. The identical bug in packstream.rs was already fixed with a MAX_DEPTH=256 guard that was never ported here.",
+      "fix": "Thread an explicit depth counter through read_value/skip_value with a hard cap (~64) and bail past it, mirroring the packstream fix."
+    },
+    {
+      "rank": 16,
+      "title": "Background generation guard races a consolidation/flush/compaction swap, orphaning the delta",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater/src/server.rs",
+      "line": 537,
+      "confidence": "CONFIRMED",
+      "what": "consolidate_graph publishes `current` then calls swap_if_changed, but the always-running guard_sweep can swap the new generation in first, so the op's own swap returns Ok(None) and the whole operation errors despite a successful build; retire/rebind never runs.",
+      "impact": "With reloadStrategy=swap + delta.enabled, a guard poll landing in the publish window reports a false failure to the client, leaves the frozen delta bound to the old core_uuid, permanently wedges future consolidation, and creates latent dense-id collision risk (reads are shielded by delta_for_read's fail-safe). flush_segment/compact_segments share the window.",
+      "fix": "Have the guard skip graphs where writer.is_consolidating(), or make swap_if_changed idempotent — accept an expected GenId and return Some(expected) when on_disk already equals it."
+    },
+    {
+      "rank": 17,
+      "title": "guard_sweep adopts acl.json via unconditional reload() after a swap — stamp TOCTOU",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/slater/src/acl.rs",
+      "line": 221,
+      "confidence": "CONFIRMED",
+      "what": "swap_if_changed hashes acl.json and checks it against the new generation's stamp (read #1); guard_sweep then calls the unconditional acl.reload() (server.rs:1377), a second read that adopts whatever is on disk with no stamp check and advances mtime so poll_checked never reverts it.",
+      "impact": "An attacker with write access to acl.json (but not generation-rebuild) who wins the narrow in-process window between the two reads gets a self-granting ACL adopted persistently, regressing the documented 'stamp enforced on every hot-reload' invariant. Window is sub-ms (I/O-free), so exploitability is narrow.",
+      "fix": "Replace acl.reload() with acl.reload_checked(|d| graphs.acl_digest_acceptable(d)) so the bytes actually adopted are re-verified against every served stamp under the write lock."
+    },
+    {
+      "rank": 18,
+      "title": "Lock poisoning converts one panic into permanent silent unavailability",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater/src/delta_writer.rs",
+      "line": 1,
+      "confidence": "CONFIRMED",
+      "what": "All Mutex/RwLock acquisitions use .expect()/.unwrap() with no catch_unwind, no parking_lot, and release profile does not set panic=\"abort\", so std locks poison on a panic-while-held. The background-task supervisor only warn!s on JoinError and never un-poisons.",
+      "impact": "A panic inside the write_batch critical section permanently poisons the writer/published lock for that graph; all subsequent writes (and republish-dependent reads) for it panic until process restart — contradicting the 'one bad query can't take the server down' claim. Blast radius is per-graph write path (read decode runs outside the cache lock).",
+      "fix": "Wrap panic-prone critical sections in catch_unwind (or migrate to parking_lot locks that don't poison), and have the supervisor recover/rebuild a poisoned writer instead of only logging."
+    },
+    {
+      "rank": 19,
+      "title": "Integer arithmetic and sum() overflow wrap silently in release",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater/src/exec.rs",
+      "line": 9331,
+      "confidence": "CONFIRMED",
+      "what": "sum(), arith() Int paths, Expr::Neg, and slater-scalar eval_binop use unchecked +,-,*,neg on i64; release sets no overflow-checks, so overflow wraps silently (and panics in debug/test).",
+      "impact": "`RETURN sum(n.big)` over an i64 total exceeding i64::MAX wraps to garbage in production (FalkorDB promotes to double), and `RETURN 9223372036854775807 + 1` returns i64::MIN in release but panics a debug/test build — a build/query parity hazard since slater-scalar shares the path.",
+      "fix": "Use checked_add/sub/mul/neg and either promote to f64 on overflow or return a clear error; keep query arith() and slater-scalar identical."
+    },
+    {
+      "rank": 20,
+      "title": "delete_node with resolved=None creates a phantom stored entry, defeating the empty-delta fast path",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater-delta/src/memtable.rs",
+      "line": 553,
+      "confidence": "CONFIRMED",
+      "what": "A tombstone of a business key that exists nowhere still or_insert_with a NodeEntry into self.nodes with no by_dense/born mapping, so is_empty() returns false and node_delta_count() over-counts. delete_edge guards this exact case via born_endpoint_dense; delete_node does not.",
+      "impact": "One DELETE of a non-existent node on an otherwise-unwritten graph makes is_empty() false, so every read abandons the zero-cost overlay fast path and runs the full DeltaSnapshot fold (OOM-risk at 91M scale), and flush-size accounting is skewed. Reads stay correct; only optimization gating breaks.",
+      "fix": "Resolve the dense id first and only insert into self.nodes/charge bytes when Some, mirroring delete_edge's born_endpoint_dense guard."
+    },
+    {
+      "rank": 21,
+      "title": "Fixed multi-hop chains enforce no cross-hop relationship uniqueness",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater/src/exec.rs",
+      "line": 5897,
+      "confidence": "CONFIRMED",
+      "what": "expand_chain's fixed-hop arm tracks no used-edge set across hops (only varlen's Trail mode does), so one relationship can be traversed twice within a MATCH pattern.",
+      "impact": "`MATCH (a)-[r1]-(b)-[r2]-(c)` bounces back over the same undirected edge, emitting spurious rows (c=a, r1==r2) and inflating count(*), diverging from openCypher/FalkorDB relationship-isomorphism semantics.",
+      "fix": "Thread a per-walk used-edge set through expand_chain/walk_merge_hop/par_walk and skip a hop whose edge id is already bound, matching varlen's Trail discipline (or document the homomorphic divergence)."
+    },
+    {
+      "rank": 22,
+      "title": "Overlay 0-match node MERGE is not idempotent — duplicate nodes for one business key",
+      "category": "correctness",
+      "severity": "medium",
+      "file": "crates/slater-build/src/overlay.rs",
+      "line": 179,
+      "confidence": "CONFIRMED",
+      "what": "Each node MERGE whose match resolves to nothing unconditionally pushes a new created node with no dedup against other created nodes, because the base-node scan predates resolution and never sees the growing `created` set.",
+      "impact": "Two MERGEs on the same absent key (e.g. splitting SET props across statements) synthesise two nodes with the same id, violating MERGE idempotency and business-key uniqueness and corrupting any range index on that key. Untested; reachable via ordinary overlay patches.",
+      "fix": "Track created (label_gid,key_gid,vkey) in a HashMap during resolution and fold a second 0-match MERGE's SET props onto the already-created node."
+    },
+    {
+      "rank": 23,
+      "title": "algo.BFS (and the algo.* family) is unbounded and cannot be interrupted",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/slater/src/exec.rs",
+      "line": 4274,
+      "confidence": "CONFIRMED",
+      "what": "The algo.BFS loop grows visited/nodes/edges over the whole reachable subgraph with no self.charge() and no check_deadline() inside the loop; the same gap exists across the build_view-backed algo.* procedures. any_shortest_path/select_paths, by contrast, check the deadline and cap exploration.",
+      "impact": "`CALL algo.BFS(src, 0, null)` (maxLevel≤0 = unlimited) on a large connected store materialises tens of millions of Val nodes/rels, ignoring maxIntermediate and the query timeout — a single request can OOM or wedge the server uninterruptibly.",
+      "fix": "Call self.check_deadline()? each iteration (or every N pops) and self.charge(1)? per pushed node/edge, mirroring any_shortest_path; apply the same to the algo.* family."
+    },
+    {
+      "rank": 24,
+      "title": "Merge-path sort records under-count resident heap, so dedup/resolve sorters blow past --max-memory",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/slater-build/src/merge_build.rs",
+      "line": 797,
+      "confidence": "CONFIRMED",
+      "what": "NodeMergeRec::size_hint counts a flat 16 bytes per SET prop and EndpointRef::size_hint a flat 24, ignoring the SetExprI expression-tree heap and string-key Value heap, and neither overrides resident_hint — so ExtSorter budgets a fraction of the bytes actually held.",
+      "impact": "A CASE/BinOp/Func SET tree (~300-500B) counted as 16 lets each in-RAM buffer fill ~20-30x its accounted size before spilling; with several buffers in flight peak RSS reaches several × --max-memory → OOM on a box sized to the budget. EndpointRef has the same defect for long string business keys.",
+      "fix": "Implement resident_hint/heap-aware size_hint that walks the SetExprI tree (Box/String/Vec) and adds Value string/list heap, mirroring EdgeFinal/Payload."
+    },
+    {
+      "rank": 25,
+      "title": "Vector-index entries are accumulated fully resident and unaccounted by the memory budget",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/slater-build/src/build_external.rs",
+      "line": 2203,
+      "confidence": "CONFIRMED",
+      "what": "gather_node_vectors pushes every (final_id, vec) into pending[idx].entries with no bound and no MemoryBudget reservation, so the whole vector set for each declared index is held in RAM before write_vector_indexes runs.",
+      "impact": "A --pk build declaring a vector index over embeddings on tens of millions of nodes at dim 768 accumulates nodes×dim×4 (tens of GB) fully resident, independent of --max-memory — the build OOMs. Unlike every other sink, this reserves nothing from the accountant DECISIONS.md D58 calls the single arbiter.",
+      "fix": "Spill vector entries to an ExtSorter/bucket keyed by index+final_id, or reserve their footprint against `mem` and stream them into the vector writer."
+    },
+    {
+      "rank": 26,
+      "title": "dump buffers the entire node + edge result set and the whole output in RAM",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/slater/src/dump.rs",
+      "line": 347,
+      "confidence": "CONFIRMED",
+      "what": "dump_graph runs `MATCH (n) RETURN n` and `MATCH (a)-[r]->(b) RETURN a,r,b` through run_pull (PULL n:-1, materialising every row into a Vec) and accumulates the whole generated Cypher into an in-memory Vec<u8>.",
+      "impact": "Both the row vector and output buffer are O(graph); exporting a large deployment (the product's 1.5B-edge headline) OOMs the dump process long before a graph the server serves out-of-core can be exported. Confined to the offline CLI, not the serving path.",
+      "fix": "PULL in bounded batches (or a cursor), write each MERGE straight to the output writer, and keep atomicity via temp-file + rename rather than a full in-RAM buffer."
+    },
+    {
+      "rank": 27,
+      "title": "Un-quoted identifiers in dump output allow Cypher injection into the rebuild",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/slater/src/dump.rs",
+      "line": 501,
+      "confidence": "CONFIRMED",
+      "what": "Property keys (and labels/reltypes) are interpolated raw into emitted Cypher with no backtick-quoting; property keys are arbitrary strings over Bolt (labels/reltypes are separately constrained by the build grammar).",
+      "impact": "A write-grant user who stores a property key like `` `x` = 'v'; MERGE (m:Owned {id:'atk'}) SET m.a ``  splices an independent statement into the rebuilt script (the build splitter breaks on top-level `;`), a cross-privilege stored injection executed when an operator runs dump→rebuild. Benign keys with spaces also break the round-trip. Impact bounded to CREATE/MERGE/SET/index (no DELETE/RCE).",
+      "fix": "Backtick-quote and escape every identifier (label, reltype, property key, index prop) on emission, mirroring the build parser's unquote_key contract."
+    },
+    {
+      "rank": 28,
+      "title": "Every block-cache HIT serialises on one global Mutex + BTreeMap LRU rewrite",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/graph-format/src/blockcache.rs",
+      "line": 242,
+      "confidence": "CONFIRMED",
+      "what": "get_or_try_insert takes the single global Inner mutex on every hit and touch_get does order.remove + order.insert (two O(log n) BTreeMap ops) to re-tick the LRU; loads run outside the lock but hits do not, and one Arc<BlockCache> is shared across every graph and connection.",
+      "impact": "With the working set resident, N query/rayon threads doing adjacency traversal all serialise on one core's critical section, capping aggregate hit throughput regardless of core count — the opposite of 'serve bigger than RAM under concurrent load'.",
+      "fix": "Shrink the hit-path critical section: shard the cache by key hash, or switch to CLOCK/second-chance with an atomic 'referenced' bit so a hit flips a bit and skips the BTreeMap rewrite."
+    },
+    {
+      "rank": 29,
+      "title": "Write-path helpers allocate throwaway 64 KiB block caches per row and fully materialise hub adjacency",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/slater/src/server.rs",
+      "line": 3752,
+      "confidence": "CONFIRMED",
+      "what": "node_has_relationships (called once per row in execute_write_batch's DELETE loop) and find_core_edge_id each build a fresh BlockCache::new(1<<16) + MergedView + Engine and fully materialise the node's adjacency Vec just to answer is_empty()/find one edge — escaping the shared block-cache budget.",
+      "impact": "A batched DELETE or relationship MERGE touching a high-degree hub re-decompresses the same adjacency blocks cold N times, none counted against the shared budget, allocating a full (potentially millions-of-entries) Vec per row on the reactor thread. Redundant CPU/I-O on the hot commit path.",
+      "fix": "Add an existence/short-circuit adjacency probe (stop at the first live edge) and build one MergedView+Engine over the shared ctx.cache before the batch loop instead of per call."
+    },
+    {
+      "rank": 30,
+      "title": "Lazy dense-degree column has no eviction path when the idle-TTL sweep is disabled",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/slater/src/config.rs",
+      "line": 503,
+      "confidence": "CONFIRMED",
+      "what": "The chunk-lazy degree column (default residency) can only be freed by the idle-TTL sweep, which is not spawned when cacheTtlMs≤0; unlike the block/vector/result pools it has no budget-pressure eviction.",
+      "impact": "An operator setting cacheTtlMs=0 (a documented disable value) with the default degreeColumn=lazy has the column fault in every ~164 KB chunk and never reclaim it, silently pinning ~733 MB on 91.6M nodes — 'lazy' degrades to 'pinned' with no cap, contradicting the bounded-RSS headline.",
+      "fix": "Decouple the degree-column sweep from cacheTtlMs, or when cacheTtlMs≤0 force pinned semantics (and log it) or give the lazy column its own byte budget with pressure eviction; at minimum warn at boot."
+    },
+    {
+      "rank": 31,
+      "title": "S3 verify_file silently downgrades a manifest SHA-256 to a length-only check",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/graph-format/src/store/s3.rs",
+      "line": 410,
+      "confidence": "CONFIRMED",
+      "what": "When the manifest records a SHA-256 but the S3 object carries no server-stored SHA-256 (e.g. uploaded with S3's default CRC64-NVME), the (Some,None) arm falls back to a byte-length completeness check with no warning instead of failing closed.",
+      "impact": "An attacker with bucket-write (but not the MAC'd manifest or master key) overwrites a plaintext block with same-length malicious bytes lacking a checksum-sha256; verify passes on size alone and serves tampered content the manifest claimed a digest for. Encrypted deployments still fail at the AEAD tag (detection just deferred).",
+      "fix": "When expected.sha256 is Some but the object has no stored SHA-256, bail! (fail closed); only fall back to size when the manifest itself has no SHA-256."
+    },
+    {
+      "rank": 32,
+      "title": "Direct dump ingest copies edge endpoints without bounds-checking against node_count",
+      "category": "security",
+      "severity": "medium",
+      "file": "crates/slater-build/src/direct_ingest.rs",
+      "line": 81,
+      "confidence": "CONFIRMED",
+      "what": "ingest_dump copies src/dst provisional ids verbatim from a binary consolidation dump with no check that they are < node_count (or reltype < reltypes.len()) before appending EdgeRec.",
+      "impact": "A truncated/tampered/hand-crafted dump under --input-format=slater-dump with an out-of-range endpoint panics with an index-out-of-bounds in clustering (Permutation::Table::final_of / BandSpill), aborting the offline build on untrusted bytes. Crash-only (bounds-checked, no memory unsafety); requires local file access + explicit flag.",
+      "fix": "In for_each_edge validate src/dst < node_count and reltype < reltypes.len() and bail! with context before appending the EdgeRec."
+    },
+    {
+      "rank": 33,
+      "title": "Additional resource-scaling and bounded-memory findings (perf)",
+      "category": "performance",
+      "severity": "medium",
+      "file": "crates/graph-format/src/vamana.rs",
+      "line": 434,
+      "confidence": "CONFIRMED",
+      "what": "A cluster of real but lower-blast-radius scaling defects: beam_search allocates a per-query bool array sized to the whole index (vamana.rs:434); the degree-column hot path stamps a shared atomic + reads the clock on every lookup (degree_column.rs:155); republish deep-clones the whole memtable on every single-statement write (delta_writer.rs:864); chunk::decode_message_capped re-parses the whole buffer on each partial read, O(n²) (chunk.rs:53); T3 merge_segment materialises the entire run in RAM (merge_segment.rs:138); effective_adj is recomputed per hub edge-delete, O(D²) (flush_segment.rs:267); greedy_search_build reallocs an n-sized visited array per node, O(n²) (vamana.rs:178); SegmentReader.record_bytes to_vec defeats the zero-copy BlockRecord (segment.rs:691); AllShortest/ShortestK BFS under-charges (charge(1) per depth-proportional branch clone, exec.rs:3704); path selectors with two unbound endpoints run |srcs|×|dsts| searches (exec.rs:3520).",
+      "impact": "Each scales per-query or maintenance memory/CPU with index/graph size rather than the actual work, adding latency, allocator pressure, and (for the BFS under-charge and T3/effective_adj cases) OOM/tail-latency risk under concurrent or hub-heavy load at the project's flagship scale.",
+      "fix": "Reuse generation-stamped scratch buffers; stamp last_used coarsely/on-fault; publish via structural sharing (imbl) or route writes through batch; keep a resumable chunk cursor; stream the T3 merge like merge_run; memoize effective_adj per source; decode from borrowed slices; charge shortest-path branches proportional to clone size; reject/charge two-free-endpoint selectors."
+    },
+    {
+      "rank": 34,
+      "title": "Low-severity correctness, robustness, and quality items (folded)",
+      "category": "quality",
+      "severity": "low",
+      "file": "crates/slater/src/exec.rs",
+      "line": 8593,
+      "confidence": "CONFIRMED",
+      "what": "A batch of confirmed low-risk items: varlen_bounds coerces an inverted range `*5..3` to *5..5 instead of empty (exec.rs:8593); DISCARD ignores its `n` and clears the whole buffer (server.rs:3314); maxPreAuthConnections<maxConnections is documented but never validated (config.rs:248); the cron field parser can u32-overflow on a huge step (cron_window.rs:74); queries_in_flight decrement is asymmetric and its cited consumer was deleted (diag.rs:245); u8 overflow in Proposal::covers on the attacker-controlled range byte (handshake.rs:51); L0Reader hot reads .expect() on decode/IO faults instead of returning Result (l0_offheap.rs:937); StatementReader recurses per empty statement (only crash-free by current LLVM tail-call elimination, parser.rs:98); take_statement uses from_utf8_lossy, silently corrupting non-UTF-8 values (parser.rs:110); dedup flush emits a duplicate label for a redundant identity label, over-counting count(:Label) (merge_build.rs:1071); run_blocking turns a panicking backend future into an isolated panic instead of an Err (asyncbridge.rs:64); S3 open trusts a possibly-negative content_length where GCS guards it (s3.rs:256); the DecodedBlockCache LRU under-counts Str key heap (isam.rs:245); concurrent misses can transiently exceed the block-cache byte budget (blockcache.rs:247); WalSink.highest_appended and the ArcSwap doc comment are dead/stale (wal.rs:540, memtable.rs:1); the interner double-allocates first-seen names (interner.rs:37); and error/failure classification keys on message substrings against the typed-errors standard (server.rs:4649 single-flight/from_query_error, diag.rs:226 on_query_err) — plus graph-format and slater-scalar don't forbid(unsafe_code) unlike sibling crates.",
+      "impact": "Individually minor: narrow edge-case wrong results, degraded observability, isolated single-connection/single-build failures, small allocation churn, or preventive gaps with no live defect. Collectively they erode robustness and the codebase's own typed-error / bounded-memory / unsafe-forbid conventions.",
+      "fix": "Address opportunistically: return empty on inverted ranges; honour DISCARD n; validate the pre-auth invariant at boot; use checked arithmetic; balance the in-flight counter; return Result from L0 reads; make StatementReader iterative; use from_utf8().context()?; skip the identity label in the union; return Err on panicked backend tasks; guard negative content_length; classify on typed errors (thiserror + downcast_ref); and add `unsafe_code = \"forbid\"` to graph-format and slater-scalar."
+    }
+  ],
+  "seed_verdicts": [
+    {
+      "title": "argon2id runs synchronously on the tokio reactor (auth DoS)",
+      "file": "crates/slater/src/server.rs",
+      "line": 3003,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "high",
+      "verify_reasoning": "Every concrete assertion checks out against the current tree. server.rs:3003 `fn authenticate` is a synchronous fn; it calls ctx.acl.snapshot().verify → acl.rs verify_hash → Argon2::default().verify_password (argon2id, ~19 MiB / m=19456,t=2,p=1, memory-hard, tens of ms). It is invoked directly (not via spawn_blocking) from async handle_request (server.rs:3042) in both the Hello (scheme present) and Logon branches near lines 3054/3066. serve_conn is spawned via tokio::spawn at line 2701 and awaits handle_request on a reactor worker thread. The asymmetry is real: query execution is on spawn_blocking (server.rs:4813; module doc line 19). Config defaults match exactly: max_pre_auth_connections=4096, max_connections_per_ip=1024, max_connections=16384 (config.rs:709/712, tests 1221/1222). Unknown principals still run a full constant-time argon2 verify (acl.rs:70 comment), so garbage creds incur full cost; record_auth_failure only increments a diag counter with no lockout/rate-limit/auth-attempt cap. No semaphore or spawn_blocking guards the argon2 path. The finding is accurate on file, function, line anchors, call sites, spawn site, and config defaults, with no existing mitigation. Corrected severity high (not critical): it is an unauthenticated reactor-wedging DoS masked by the handshake-only health probe, but bounded by connection caps and carries no confidentiality/integrity impact."
+    },
+    {
+      "title": "Block cache global mutex on the hit path (read-path contention)",
+      "file": "crates/graph-format/src/blockcache.rs",
+      "line": 1,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "medium",
+      "verify_reasoning": "The finding's mechanism matches the current source exactly.\n\n`crates/graph-format/src/blockcache.rs`:\n- `BlockCache` wraps `inner: Mutex<Inner>` (line 210); `Inner` holds `map: HashMap<BlockKey, Entry>` + `order: BTreeMap<u64, BlockKey>` LRU (lines 122-129). Single global mutex, no sharding.\n- Miss path loads OUTSIDE the lock: `get_or_try_insert` (lines 237-253) does `touch_get` under lock, releases, runs `load()` unlocked (line 247), then re-locks to `insert` with Arc dedup on concurrent load. Docstring at 233-236 states this. CONFIRMED.\n- HIT path takes the global lock and does two O(log n) BTreeMap ops: line 242 locks, `touch_get` (lines 139-151) does `order.remove(&old_tick)` (144) + `order.insert(new_tick, ...)` (146) — exactly two BTreeMap mutations under the mutex to re-tick. CONFIRMED.\n\nHot-path usage confirmed: `BlockCache::record` (lines 258-274) calls `get_or_try_insert` for every record access; `segment.rs:690` and `slater-delta/l0_offheap.rs:929` route per-record reads through it. The runtime cache (`crates/slater/src/cache.rs`) is a single `Arc<GfBlockCache>` shared across all Bolt tasks (lines 92-111, \"safe to share across Bolt tasks\", `gf()` hands out clones of the one instance so the delta L0 segments share the same lock domain). So under rayon intra-query fan-out and N Bolt connections, every record hit contends on one mutex. The proposed fix (shard 16-64 ways, or CLOCK/SIEVE with a relaxed atomic ref-bit on hits) is the standard remedy and applies cleanly.\n\nMinor overstatement to note: the critical section is short — only the two BTreeMap ops; the pread/decompress (`load`) and the post-fetch record slicing (`record_range_in_block`, line 268) both run outside the lock. So it is \"one lock acquisition per record access\" rather than \"the entire read path held under lock.\" The lock-acquisition-per-record contention is real, but each hold is a couple of in-memory BTreeMap ops, which caps the achievable throughput ceiling but is not a long-held lock. The specific load-test rps figures (2989→1837) are prior evidence I cannot reproduce from source, but the architectural claim they support is accurate.\n\nNo mitigation exists in the tree today (no shard array, no atomic ref-bit fast path, no RwLock — it is a plain Mutex, and even a read would need &mut to re-tick)."
+    },
+    {
+      "title": "Lock poisoning converts one panic into permanent silent unavailability",
+      "file": "crates/slater/src/delta_writer.rs",
+      "line": 1,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "medium",
+      "verify_reasoning": "Every concrete assertion checks out against current source. delta_writer.rs uses .expect(...) on all Mutex/RwLock acquisitions (e.g. lines 399/426 hold self.inner.lock() across WAL append+fsync+mem.apply+republish); cache.rs uses .lock().unwrap() throughout (lines 334, 352, 361, ...); no catch_unwind/AssertUnwindSafe/set_hook anywhere; no parking_lot in any Cargo.toml; [profile.release] (Cargo.toml:99-103) does NOT set panic=\"abort\" so std locks poison on a panic-while-held. The README/DOCKERHUB \"one bad query can't take the server down\" claim is real (README.md:66, DOCKERHUB.md:35). The poisoning-is-permanent mechanism is genuine and reachable: a panic inside the write_batch critical section permanently poisons the writer lock for that graph, and the background-task supervisor (server.rs:4476-4578) only warn!s on JoinError without ever un-poisoning. Two nuances temper the claim without refuting it: (1) \"every subsequent query panics\" is overbroad — the block-cache lock is held only for the brief LRU map op, with block decode/decompress happening OUTSIDE the lock, so a read-query panic during decode kills just that one connection without poisoning; the immutable read path for read-only graphs largely survives. (2) Real exposure is per-graph on the write path (delta inner mutex / published RwLock), not the whole server. So the finding holds factually but its blast radius is narrower than stated."
+    },
+    {
+      "title": "graph-format (and slater-scalar) do not set unsafe_code=forbid",
+      "file": "crates/graph-format/src/lib.rs",
+      "line": 1,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "low",
+      "verify_reasoning": "Direct inspection confirms both crates lack the lint. crates/graph-format/Cargo.toml and crates/slater-scalar/Cargo.toml have no [lints.rust] section and no unsafe_code setting, while three sibling crates set it: crates/slater/Cargo.toml:61, crates/slater-build/Cargo.toml:69, crates/slater-delta/Cargo.toml:25 (all unsafe_code = \"forbid\"). There is no [workspace.lints] table in the root Cargo.toml and neither crate uses lints.workspace = true, so no inheritance covers them. Grep of both crates' src trees finds no unsafe today, matching the claim. graph-format's own docs confirm it is the on-disk byte-layout owner that parses untrusted generations off disk/S3, so the untrusted-input framing is correct. The fix is genuinely one line per crate (add [lints.rust] unsafe_code = \"forbid\"). This is a defense-in-depth hardening gap rather than an exploitable defect: no unsafe exists to exploit; the value is a compile-time tripwire against a future unsafe block landing in the byte parser without review. Hence low severity."
+    },
+    {
+      "title": "Fresh 64KiB BlockCache allocated per DELETE conformance check, escaping the global budget",
+      "file": "crates/slater/src/server.rs",
+      "line": 3752,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "low",
+      "verify_reasoning": "The code matches the claim exactly. In crates/slater/src/server.rs, node_has_relationships (fn at 3745) builds `let cache = BlockCache::new(1 << 16);` at line 3752, a local 64 KiB cache dropped on return. It is invoked on the plain-DELETE conformance path at lines 3836 and 4274, both immediately preceding delete_has_relationships_error(), so it does run per non-DETACH DELETE check. It is a separate instance from the shared budgeted cache built once at line 2416 (Arc::new(BlockCache::new(cfg.cache.block_cache_bytes))), so faulted blocks neither warm the shared cache nor count against the configured block-cache budget. All concrete assertions hold. What the finding overstates is impact/severity: the escaping memory is bounded to 64 KiB and freed at end of scope (no accumulation/leak), writes are serialized through the group-commit writer so only a bounded few can coexist, and the same ephemeral-cache pattern is used intentionally at find_core_edge_id (line 4333, identical 1<<16) — a deliberate 'keep the serialized write path off the shared read cache' choice, not an accounting leak. Real behavior, negligible consequence."
+    },
+    {
+      "title": "memtable.rs comment says ArcSwap but the snapshot is a RwLock<DeltaSnapshot>",
+      "file": "crates/slater-delta/src/memtable.rs",
+      "line": 1,
+      "verdict": "CONFIRMED",
+      "corrected_severity": "low",
+      "verify_reasoning": "memtable.rs:11 comment states the DeltaSnapshot is published \"via an ArcSwap in the server,\" but the actual publish site (crates/slater/src/delta_writer.rs:187, constructed line 292) is `published: RwLock<DeltaSnapshot>`, and the module doc there also describes a RwLock. Neither the slater nor slater-delta crate declares an arc-swap dependency (grep empty); arc-swap appears in Cargo.lock only transitively for unrelated crates. The same stale ArcSwap wording is also duplicated in slater-delta/Cargo.toml:23-24. The claim is accurate on substance; only the phrase \"no arc-swap dependency\" is slightly loose since arc-swap exists as a transitive lock entry. This is comment/doc drift with no runtime impact."
+    }
+  ]
+}

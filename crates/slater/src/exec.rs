@@ -512,7 +512,7 @@ fn for_each_adj_overlaid(
         }
         // Segment/delta-born edges are small and uncompressed; apply the same reltype filter
         // in the fold rather than in the (already-materialised) fragment.
-        let rt_keep = |a: &topology::Adj| reltypes.map_or(true, |rts| rts.contains(&a.reltype));
+        let rt_keep = |a: &topology::Adj| reltypes.is_none_or(|rts| rts.contains(&a.reltype));
         // 2. Surviving segment-born edges (delta filter applies, as they sit in the list).
         for a in &seg_born {
             if rt_keep(a) && delta_keep(a) {
@@ -674,7 +674,7 @@ fn neighbours_par(
     let mut take = |outgoing: bool| -> Result<()> {
         // Push the reltype set into the decode so a typed expand skips non-matching runs.
         for a in read_adj_overlaid_filtered(gen, cache, node, outgoing, type_ids)? {
-            if type_ids.map_or(true, |ids| ids.contains(&a.reltype)) {
+            if type_ids.is_none_or(|ids| ids.contains(&a.reltype)) {
                 out.push(a.neighbour.0);
             }
         }
@@ -3643,7 +3643,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
             if matches.is_empty() && m.optional {
                 let mut r = row.clone();
-                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                r.extend(std::iter::repeat_n(Val::Null, new_vars.len()));
                 out_rows.push(r);
             } else {
                 for b in matches {
@@ -3730,7 +3730,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
             if matches.is_empty() && m.optional {
                 let mut r = row.clone();
-                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                r.extend(std::iter::repeat_n(Val::Null, new_vars.len()));
                 out_rows.push(r);
             } else {
                 for b in matches {
@@ -3861,7 +3861,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
 
             if matches.is_empty() && m.optional {
                 let mut r = row.clone();
-                r.extend(std::iter::repeat(Val::Null).take(new_vars.len()));
+                r.extend(std::iter::repeat_n(Val::Null, new_vars.len()));
                 out_rows.push(r);
             } else {
                 for b in matches {
@@ -5574,7 +5574,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if pattern.rels.iter().any(|(r, _)| r.var_length.is_some()) {
             return None;
         }
-        let unbound = |v: Option<&String>| v.map_or(true, |name| !binding.contains_key(name));
+        let unbound = |v: Option<&String>| v.is_none_or(|name| !binding.contains_key(name));
         if !unbound(pattern.start.var.as_ref()) {
             return None;
         }

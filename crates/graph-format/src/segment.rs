@@ -437,7 +437,7 @@ impl SegmentWriter {
     /// Append a node full-row record. Nodes **must** be pushed in ascending dense-id order.
     pub fn push_node(&mut self, dense: u64, row: &NodeRow) -> Result<()> {
         debug_assert!(
-            self.node_keys.last().map_or(true, |&p| dense > p),
+            self.node_keys.last().is_none_or(|&p| dense > p),
             "segment nodes must be pushed in ascending dense-id order"
         );
         self.node.append_record(&encode_node(row))?;
@@ -448,7 +448,7 @@ impl SegmentWriter {
     /// Append a node's outgoing adjacency fragment. Nodes **must** be pushed in ascending
     /// src-id order.
     pub fn push_adj_out(&mut self, node: u64, edges: &[AdjEdge]) -> Result<()> {
-        debug_assert!(self.adj_out_keys.last().map_or(true, |&p| node > p));
+        debug_assert!(self.adj_out_keys.last().is_none_or(|&p| node > p));
         self.adj_out.append_record(&encode_adj(edges))?;
         self.adj_out_keys.push(node);
         Ok(())
@@ -457,7 +457,7 @@ impl SegmentWriter {
     /// Append a node's incoming adjacency fragment. Nodes **must** be pushed in ascending
     /// dst-id order.
     pub fn push_adj_in(&mut self, node: u64, edges: &[AdjEdge]) -> Result<()> {
-        debug_assert!(self.adj_in_keys.last().map_or(true, |&p| node > p));
+        debug_assert!(self.adj_in_keys.last().is_none_or(|&p| node > p));
         self.adj_in.append_record(&encode_adj(edges))?;
         self.adj_in_keys.push(node);
         Ok(())
@@ -465,7 +465,7 @@ impl SegmentWriter {
 
     /// Append an edge full-row record. Edges **must** be pushed in ascending edge-id order.
     pub fn push_edge(&mut self, edge_id: u64, row: &EdgeRow) -> Result<()> {
-        debug_assert!(self.edge_keys.last().map_or(true, |&p| edge_id > p));
+        debug_assert!(self.edge_keys.last().is_none_or(|&p| edge_id > p));
         self.edge.append_record(&encode_edge(row))?;
         self.edge_keys.push(edge_id);
         Ok(())

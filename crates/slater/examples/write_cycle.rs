@@ -220,7 +220,7 @@ fn main() {
             slow.push((nbatches, sz, d.as_millis()));
         }
         added += sz;
-        if nbatches % 20 == 0 || added >= add_total {
+        if nbatches.is_multiple_of(20) || added >= add_total {
             println!("  +{added}/{add_total} ({nbatches} batches, last size {sz} in {d:?})");
         }
     }
