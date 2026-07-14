@@ -52,6 +52,8 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
        crates/slater/benches crates/slater/tests \
     && echo '' > crates/graph-format/src/lib.rs \
     && echo 'fn main() {}' > crates/graph-format/benches/codec.rs \
+    && echo 'fn main() {}' > crates/graph-format/benches/blockcache.rs \
+    && echo 'fn main() {}' > crates/graph-format/benches/decodedblockcache.rs \
     && echo '' > crates/slater-scalar/src/lib.rs \
     && echo '' > crates/slater-delta/src/lib.rs \
     && echo 'fn main() {}' > crates/slater-build/src/main.rs \
