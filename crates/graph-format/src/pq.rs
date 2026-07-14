@@ -237,6 +237,18 @@ pub fn ann_point(metric: Metric, v: &[f32], max_norm: f64, space_dim: usize) -> 
                     v.len()
                 );
             }
+            // `M` must be finite. It is `max‖x‖` accumulated in f64 and stored as an f32,
+            // and a vector of large-but-perfectly-legal f32 components (1024 dimensions of
+            // 3e38, say) overflows f32 to `+inf`. Every augmentation would then be `inf`,
+            // every squared-L2 between two points `inf − inf` = **NaN** — and a NaN is
+            // *ordered* by `total_cmp`, not rejected, so the graph build would silently
+            // produce garbage. Refuse loudly instead.
+            if !max_norm.is_finite() {
+                bail!(
+                    "the dot/MIPS augmentation needs a finite max norm, got {max_norm}: the \
+                     indexed vectors' magnitudes overflow f32"
+                );
+            }
             let mut out = v.to_vec();
             out.resize(space_dim, 0.0);
             let norm = l2_norm(v);
@@ -969,6 +981,46 @@ mod tests {
         let p = ann_point(Metric::Dot, &v, m_stored, 6).unwrap();
         assert!(p.iter().all(|x| x.is_finite()), "got {p:?}");
         assert_eq!(p[4], 0.0, "the argmax vector's augmentation is exactly 0");
+    }
+
+    /// An `M` that overflows f32 must be **refused**, not propagated. `M` is `max‖x‖` in
+    /// f64 but is stored as an f32, and a vector of large-but-legal f32 components
+    /// overflows it to `+inf` — after which every augmented point is `inf`, every pairwise
+    /// squared-L2 is `inf − inf` = **NaN**, and `total_cmp` *orders* NaNs rather than
+    /// rejecting them. The graph build would run to completion over garbage geometry and
+    /// report nothing wrong.
+    #[test]
+    fn dot_augmentation_refuses_a_max_norm_that_overflows_f32() {
+        // 1024 dimensions of 3e38 — every component a finite, legal f32.
+        let v = vec![3.0e38f32; 1024];
+        assert!(v.iter().all(|x| x.is_finite()), "premise: legal f32 input");
+        let m = l2_norm(&v);
+        assert!(
+            m.is_finite(),
+            "the f64 norm is fine — it is the f32 that is not"
+        );
+        assert!(
+            (m as f32).is_infinite(),
+            "premise: this norm really does overflow f32"
+        );
+
+        let err = ann_point(Metric::Dot, &v, m as f32 as f64, 1024 + 128).unwrap_err();
+        assert!(
+            err.to_string().contains("finite max norm"),
+            "expected a refusal, got: {err}"
+        );
+
+        // And the failure it prevents: an infinite M silently yields NaN geometry.
+        let bad = {
+            let mut out = v.clone();
+            out.resize(1024 + 128, 0.0);
+            out[1024] = (f64::INFINITY - m * m).max(0.0).sqrt() as f32;
+            out
+        };
+        assert!(
+            sq_l2(&bad, &bad).is_nan() || bad[1024].is_infinite(),
+            "premise: this is what an unguarded infinite M produces"
+        );
     }
 
     /// Deterministic synthetic clusters: `clusters` blobs of `per` points in

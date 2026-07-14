@@ -166,6 +166,8 @@ fn validate_vamana_index(
     pq: &ResidentPq,
     desc: &VectorIndexDesc,
     medoid: u64,
+    pq_subspaces: u32,
+    pq_bits: u32,
 ) -> Result<()> {
     let records = reader.len();
     if pq.len() as u64 != records {
@@ -181,6 +183,27 @@ fn validate_vamana_index(
             "vector index {stem} is inconsistent: the MANIFEST declares {} records but the \
              .vamana holds {records} (`count` is the record count, holes included)",
             desc.count
+        );
+    }
+    // 4. The codebook must be in the ANN space the MANIFEST's metric implies.
+    //
+    // The read path derives the query transform from `desc.metric` and the *codebook's*
+    // dimension (`ann_query`). Those two are the only inputs, and if they disagree the
+    // search still runs: a `dot` descriptor over a codebook trained in cosine/L2 space
+    // (dim, not dim + dsub) makes `ann_query` a no-op, so the beam navigates by plain
+    // squared-L2 while the re-rank scores by inner product. Wrong neighbours, plausible
+    // scores, no error anywhere. Tie the file back to the descriptor so the space cannot
+    // drift — the invariant `graph_format::pq`'s DESIGN note states, enforced.
+    let expected = graph_format::pq::ann_pq_params(desc.metric, desc.dim, pq_subspaces, pq_bits)
+        .with_context(|| format!("vector index {stem} has invalid PQ parameters"))?;
+    if pq.codebook.params != expected {
+        bail!(
+            "vector index {stem} declares metric {:?} over dim {} with {pq_subspaces}×{pq_bits}-bit \
+             PQ, which is the ANN space {expected:?} — but its .pq codebook is {:?}. The build and \
+             the read path would navigate in different spaces.",
+            desc.metric,
+            desc.dim,
+            pq.codebook.params
         );
     }
     if records == 0 {
@@ -496,7 +519,13 @@ impl Generation {
         // stay brute-force over `vectors.f32.blk` and open nothing extra.
         let mut vamana_indexes = HashMap::new();
         for (ord, vi) in manifest.vector_indexes.iter().enumerate() {
-            let AnnMode::Vamana { medoid, .. } = vi.mode else {
+            let AnnMode::Vamana {
+                medoid,
+                pq_subspaces,
+                pq_bits,
+                ..
+            } = vi.mode
+            else {
                 continue;
             };
             let stem = format!("vector/{}.{}", vi.label, vi.property);
@@ -514,7 +543,7 @@ impl Generation {
                 pq.load_resident()
                     .with_context(|| format!("load resident PQ codes for {stem}.pq"))?,
             );
-            validate_vamana_index(&stem, &reader, &resident, vi, medoid)?;
+            validate_vamana_index(&stem, &reader, &resident, vi, medoid, pq_subspaces, pq_bits)?;
             vamana_indexes.insert(
                 (vi.label.clone(), vi.property.clone()),
                 VamanaIndex {
@@ -1770,11 +1799,163 @@ mod tests {
         manifest.write_to_dir(&dir).unwrap();
 
         let err = Generation::open(&root, &graph).err().unwrap();
+        // Asserted over the whole chain (`{:#}`), not just the outermost layer: the version
+        // is now checked inside `Manifest::read_from_dir`, *before* the strict parse, so the
+        // refusal is nested under the "read MANIFEST for generation …" context. It has to be
+        // there — the `Manifest` struct is schema-locked to the current version, so a
+        // manifest one bump behind fails inside serde on a field name and the check down
+        // here would never run at all (see `manifest::parse_manifest`).
         assert!(
-            err.to_string().contains("format version"),
+            format!("{err:#}").contains("format version"),
             "unexpected error: {err:#}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── The Vamana open-time guards ──────────────────────────────────────────────
+    //
+    // Each of these is a *silent* failure if it is not caught: the index still opens, every
+    // query still returns rows, and the rows are wrong (or empty). They are checked at open
+    // because that is where one `pread` buys certainty.
+
+    /// Write a `.vamana` + `.pq` pair and hand back what `validate_vamana_index` takes.
+    /// `orphan_medoid` writes record 0 with no out-edges; `pq_records` short-writes the
+    /// `.pq` so the two files can be made to disagree.
+    #[allow(clippy::type_complexity)]
+    fn vamana_pair(
+        tag: &str,
+        metric: graph_format::manifest::Metric,
+        subspaces: u32,
+        orphan_medoid: bool,
+        pq_records: usize,
+    ) -> (
+        PathBuf,
+        graph_format::vamana::VamanaReader,
+        ResidentPq,
+        VectorIndexDesc,
+    ) {
+        use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqWriter};
+        use graph_format::vamana::{VamanaReader, VamanaWriter};
+
+        let dim = 4usize;
+        let n = 6usize;
+        let dir = std::env::temp_dir().join(format!("slater_vamval_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw: Vec<Vec<f32>> = (0..n)
+            .map(|i| (0..dim).map(|d| (i + d) as f32 + 1.0).collect())
+            .collect();
+
+        let mut vw = VamanaWriter::create_with_cipher(dir.join("x.vamana"), 4096, 3, None).unwrap();
+        for (i, v) in raw.iter().enumerate() {
+            let nbrs: Vec<u32> = if i == 0 && orphan_medoid {
+                vec![]
+            } else {
+                (0..n as u32).filter(|&j| j != i as u32).collect()
+            };
+            vw.append(v, &nbrs).unwrap();
+        }
+        vw.finish().unwrap();
+
+        let params = ann_pq_params(metric, dim as u32, subspaces, 4).unwrap();
+        let max_norm = raw.iter().map(|v| l2_norm(v)).fold(0.0f64, f64::max);
+        let points: Vec<Vec<f32>> = raw
+            .iter()
+            .map(|v| ann_point(metric, v, max_norm, params.dim as usize).unwrap())
+            .collect();
+        let cb = train_codebooks(&points, params, 5).unwrap();
+        let mut pw = PqWriter::create_with_cipher(dir.join("x.pq"), &cb, 4096, 3, None).unwrap();
+        for p in points.iter().take(pq_records) {
+            pw.append_codes(0, &cb.encode(p).unwrap()).unwrap();
+        }
+        pw.finish().unwrap();
+
+        let reader = VamanaReader::open_with_cipher(dir.join("x.vamana"), None).unwrap();
+        let resident = PqReader::open_with_cipher(dir.join("x.pq"), None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let desc = VectorIndexDesc {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: dim as u32,
+            metric,
+            count: n as u64,
+            first_record: 0,
+            mode: AnnMode::Vamana {
+                r: 8,
+                alpha: 1.2,
+                medoid: 0,
+                pq_subspaces: subspaces,
+                pq_bits: 4,
+                live_count: n as u64,
+                max_norm: max_norm as f32,
+            },
+        };
+        (dir, reader, resident, desc)
+    }
+
+    /// **The medoid trap.** A *deleted* medoid is fine — a hole is still a waypoint. A
+    /// medoid with no *out-edges* is not: every beam search enters there, expands it, finds
+    /// nothing to push onto the beam, and terminates having seen exactly one node. Recall
+    /// for the entire index goes to zero, with no error and no panic. S5's delete-splice is
+    /// what could do this; refusing it here is what stops it being served.
+    #[test]
+    fn an_orphaned_medoid_is_refused_rather_than_served() {
+        use graph_format::manifest::Metric;
+        let (dir, reader, pq, desc) = vamana_pair("orphan", Metric::Cosine, 2, true, 6);
+        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
+            .expect_err("an index whose entry point has no out-edges must not open");
+        assert!(
+            err.to_string().contains("orphaned medoid"),
+            "unexpected: {err:#}"
+        );
+
+        // The same index with the medoid's edges intact opens fine — the guard is not
+        // simply rejecting everything.
+        let (dir2, reader2, pq2, desc2) = vamana_pair("ok", Metric::Cosine, 2, false, 6);
+        validate_vamana_index("x", &reader2, &pq2, &desc2, 0, 2, 4).unwrap();
+        // An out-of-range medoid is refused too: the beam search indexes the resident codes
+        // with it directly, so it is a panic on an ordinary query.
+        let err = validate_vamana_index("x", &reader2, &pq2, &desc2, 99, 2, 4).unwrap_err();
+        assert!(err.to_string().contains("medoid"), "unexpected: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The `.pq` is the *only* layout→id map since v8. If it and the `.vamana` disagree on
+    /// record count, every ordinal past the shorter of them maps to the wrong node — or
+    /// panics the emit closure.
+    #[test]
+    fn a_pq_and_vamana_record_count_disagreement_is_refused() {
+        use graph_format::manifest::Metric;
+        let (dir, reader, pq, desc) = vamana_pair("short", Metric::Cosine, 2, false, 4);
+        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4).unwrap_err();
+        assert!(err.to_string().contains("lockstep"), "unexpected: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read path derives its query transform from `desc.metric` and the codebook's
+    /// dimension, and from nothing else. A `dot` descriptor over a codebook trained in
+    /// cosine space makes `ann_query` a no-op: the beam then navigates by plain squared-L2
+    /// while the re-rank scores by inner product. Wrong neighbours, plausible scores, no
+    /// error. Tie the codebook back to the descriptor so the build and the read path cannot
+    /// end up in different spaces.
+    #[test]
+    fn a_codebook_in_the_wrong_ann_space_for_the_metric_is_refused() {
+        use graph_format::manifest::Metric;
+        // Files built honestly for cosine (codebook dim = 4)...
+        let (dir, reader, pq, mut desc) = vamana_pair("space", Metric::Cosine, 2, false, 6);
+        assert_eq!(pq.codebook.params.dim, 4);
+        // ...but the MANIFEST claims dot, whose ANN space is dim + dsub = 6 over 3 subspaces.
+        desc.metric = Metric::Dot;
+        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
+            .expect_err("a codebook in the wrong space for the declared metric must not open");
+        assert!(
+            err.to_string().contains("different spaces"),
+            "unexpected: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

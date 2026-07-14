@@ -424,9 +424,7 @@ impl Manifest {
         let path = dir.as_ref().join("MANIFEST.json");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let m: Manifest =
-            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        Ok(m)
+        parse_manifest(&text).with_context(|| format!("parse {}", path.display()))
     }
 
     /// Read and parse `MANIFEST.json` for the generation rooted at `base_key`
@@ -436,14 +434,87 @@ impl Manifest {
         let bytes = store
             .read_all(&key)
             .with_context(|| format!("read {key}"))?;
-        let m: Manifest = serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
-        Ok(m)
+        let text = std::str::from_utf8(&bytes).with_context(|| format!("parse {key}"))?;
+        parse_manifest(text).with_context(|| format!("parse {key}"))
     }
+}
+
+/// Parse a MANIFEST document, **checking its format version first**.
+///
+/// The `Manifest` struct is schema-locked to the *current* `FORMAT_VERSION`: every field
+/// added by a version bump is a required field. So a manifest from an older version does
+/// not fail with "wrong version" — it fails inside serde, on whichever field happens to be
+/// new, with a message naming a Rust struct field (`missing field 'live_count'`). The
+/// reader's actual version gate then never runs, because the parse died before it.
+///
+/// That is precisely backwards at the one moment it matters: a format bump is exactly when
+/// every existing generation on disk must be refused, and refused *legibly* — "rebuild
+/// required", not a serde field name. So read the version out first. It is the one field
+/// whose meaning is stable across versions, which is the entire point of having it.
+fn parse_manifest(text: &str) -> Result<Manifest> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct VersionProbe {
+        format_version: u32,
+    }
+    // A document too broken to yield even a version falls through to the full parse, whose
+    // error is the more useful one there.
+    if let Ok(p) = serde_json::from_str::<VersionProbe>(text) {
+        if p.format_version != crate::FORMAT_VERSION {
+            anyhow::bail!(
+                "MANIFEST is on-disk format version {}, but this build understands version {}. \
+                 Slater has no backwards compatibility: the generation must be rebuilt.",
+                p.format_version,
+                crate::FORMAT_VERSION
+            );
+        }
+    }
+    Ok(serde_json::from_str(text)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A format bump makes every *new* `AnnMode::Vamana` field a required field, so an
+    /// older manifest carrying a Vamana index does not fail with "wrong version" — it
+    /// fails inside serde on a field name (`missing field 'live_count'`), and the reader's
+    /// version gate never runs, because the parse died before reaching it. That is exactly
+    /// backwards at the one moment it matters: a bump is *when* every generation on disk
+    /// must be refused, and refused legibly.
+    ///
+    /// The input here is a real one: it is what a v7 generation with an ANN index looks
+    /// like on disk right now.
+    #[test]
+    fn an_older_manifest_is_refused_on_its_version_not_on_a_serde_field() {
+        let v7 = r#"{
+            "magic":"SLATER01","formatVersion":7,
+            "buildUuid":"00000000-0000-0000-0000-000000000001","graph":"docs",
+            "createdUnix":1700000000,"contentHash":"abc","blockSizes":{},
+            "codec":"zstd","zstdLevel":3,"compressionProfile":"",
+            "nodeCount":10,"edgeCount":0,
+            "labels":["Doc"],"reltypes":[],"propertyKeys":["embedding"],
+            "rangeIndexes":[],
+            "vectorIndexes":[{"label":"Doc","property":"embedding","dim":8,
+              "metric":"cosine","count":10,"firstRecord":0,
+              "mode":{"kind":"vamana","r":24,"alpha":1.2,"medoid":0,
+                      "pq_subspaces":8,"pq_bits":8}}],
+            "reltypeSourceCounts":[],"reltypeTargetCounts":[],"reltypeEdgeCounts":[],
+            "reltypeSelfLoopCounts":[],"labelNodeCounts":[],"firstLabelCounts":[],
+            "srcLabelReltypeCounts":[],"reltypeTgtLabelCounts":[],
+            "schemaTripleCounts":[],"propertyHistograms":[],"files":[]
+        }"#;
+        let err = parse_manifest(v7).unwrap_err().to_string();
+        assert!(
+            err.contains("format version 7") && err.contains("rebuilt"),
+            "an old manifest must be refused on its version, with a rebuild instruction. \
+             Got: {err}"
+        );
+        assert!(
+            !err.contains("missing field"),
+            "the operator must not be shown a serde field name. Got: {err}"
+        );
+    }
 
     fn sample() -> Manifest {
         let files = vec![FileEntry {

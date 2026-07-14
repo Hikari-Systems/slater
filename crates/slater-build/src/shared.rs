@@ -410,6 +410,20 @@ fn build_vamana_index(
         .iter()
         .map(|(_, v)| l2_norm(v))
         .fold(0.0f64, f64::max);
+    // M is recorded in the MANIFEST as an f32, and a vector of large-but-legal f32
+    // components (1024 dimensions of 3e38) has a norm that overflows f32 to `+inf`. That
+    // is not merely a dot-index problem: `serde_json` serialises a non-finite float as
+    // `null`, so the manifest of *any* metric would fail to read back — the build would
+    // "succeed" and publish a generation the server cannot open. Refuse it here, where the
+    // message can say why.
+    if (max_norm as f32).is_infinite() {
+        bail!(
+            "vector index {}.{} has a maximum vector norm ({max_norm:e}) that overflows f32; \
+             its magnitudes are too large to index",
+            pi.label,
+            pi.property
+        );
+    }
     let points: Vec<Vec<f32>> = entries
         .iter()
         .map(|(_, v)| ann_point(pi.metric, v, max_norm, space_dim))
