@@ -2158,6 +2158,23 @@ pub fn write_vamana(tag: &str, f: &VamanaFixture) -> (PathBuf, String, Vec<Vec<f
     (root, graph, raw)
 }
 
+/// [`write_vamana_holed`], then **delete-consolidated** (`graph_format::vamana_delete`) — the
+/// FreshVamana `Delete` pass patches the holes out of the adjacency before the generation is
+/// sealed, so no reachable node names one.
+///
+/// The point of the fixture pair is that the *only* difference between it and
+/// [`write_vamana_holed`] is the pass: same vectors, same graph, same holes, same queries. So
+/// the IO a query pays on the two can be compared directly, which is the only way to show the
+/// pass does what it exists to do — a recall assertion cannot, because recall looks fine while
+/// IO quietly doubles.
+pub fn write_vamana_holed_consolidated(
+    tag: &str,
+    f: &VamanaFixture,
+    hole: impl Fn(u64, bool) -> bool,
+) -> (PathBuf, String, Vec<Vec<f32>>, u64) {
+    write_vamana_inner(tag, f, hole, true)
+}
+
 /// Build a synthetic generation whose single `(:Doc, embedding)` vector index is an
 /// above-threshold **Vamana/PQ** index of `n` unit vectors, mirroring exactly what
 /// `slater-build` writes (graph build → BFS layout → PQ codes in the same order).
@@ -2177,6 +2194,15 @@ pub fn write_vamana_holed(
     tag: &str,
     f: &VamanaFixture,
     hole: impl Fn(u64, bool) -> bool,
+) -> (PathBuf, String, Vec<Vec<f32>>, u64) {
+    write_vamana_inner(tag, f, hole, false)
+}
+
+fn write_vamana_inner(
+    tag: &str,
+    f: &VamanaFixture,
+    hole: impl Fn(u64, bool) -> bool,
+    consolidate: bool,
 ) -> (PathBuf, String, Vec<Vec<f32>>, u64) {
     let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0003);
     let graph = "docs".to_string();
@@ -2274,6 +2300,43 @@ pub fn write_vamana_holed(
             .unwrap();
     }
     pw.finish().unwrap();
+
+    // FreshVamana's `Delete` (S5): patch the holes out of the adjacency, so no reachable node
+    // names one and the dead records cost zero query IO. Runs over the files just written and
+    // replaces them, *before* the inventory is hashed — so the generation is self-consistent
+    // either way and the only difference between the two fixtures is the pass itself.
+    if consolidate {
+        let vam = dir.join("vector/Doc.embedding.vamana");
+        let pq = dir.join("vector/Doc.embedding.pq");
+        let vam_tmp = dir.join("vector/Doc.embedding.vamana.tmp");
+        let pq_tmp = dir.join("vector/Doc.embedding.pq.tmp");
+        let stats = graph_format::vamana_delete::consolidate_index_files(
+            &vam,
+            &pq,
+            &vam_tmp,
+            &pq_tmp,
+            &graph_format::vamana_delete::ConsolidateIndex {
+                medoid: medoid_new,
+                r: f.r as usize,
+                alpha: f.alpha,
+                metric: Metric::Cosine,
+                max_norm: 1.0,
+                // The `.pq` written above already names every hole; nothing extra to tombstone.
+                tombstoned: &[],
+                vamana_block_bytes: f.vector_block_size,
+                pq_block_bytes: BLOCK,
+                zstd_level: LEVEL,
+                cipher: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stats.live, live_count,
+            "the pass must not change what is live"
+        );
+        std::fs::rename(&vam_tmp, &vam).unwrap();
+        std::fs::rename(&pq_tmp, &pq).unwrap();
+    }
 
     // Inventory + manifest.
     let mut block_sizes = BTreeMap::new();
