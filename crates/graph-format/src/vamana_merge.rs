@@ -173,8 +173,27 @@ pub fn streaming_merge(
         "a .vamana with {base_count} records exceeds the u32 layout-ordinal space"
     );
 
+    // A pre-existing hole must stay a hole. The caller composes `HOLE` through for it
+    // (`compose_final_ids`), and handing a dead record a *live* id would resurrect whatever
+    // stale geometry the hole still carries — with a plausible score and no error. Reject that
+    // composition bug here, at the boundary, rather than emit a silently-wrong index.
+    for i in 0..base_count {
+        if base_pq.is_hole(i) {
+            ensure!(
+                inputs.base_final_ids[i] == HOLE,
+                "base layout ordinal {i} is a pre-existing hole, but base_final_ids assigns it a \
+                 live id ({}) — a hole cannot be relabelled live; its geometry is stale",
+                inputs.base_final_ids[i]
+            );
+        }
+    }
+
     let dead: Vec<bool> = inputs.base_final_ids.iter().map(|&id| id == HOLE).collect();
-    let any_dead = dead.iter().any(|&d| d);
+    // A *new* delete is a base_final_id that went `HOLE` on a record the base still held live.
+    // The base's *pre-existing* holes already have cleaned adjacency (S5 is their only producer,
+    // and it — like this pass — leaves no reachable node naming a hole), so they are not graph
+    // work: only new deletes are.
+    let any_new_dead = (0..base_count).any(|i| dead[i] && !base_pq.is_hole(i));
     let base_live = dead.iter().filter(|&&d| !d).count() as u64;
     let mut stats = MergeStats {
         base_records: base_count as u64,
@@ -185,10 +204,13 @@ pub fn streaming_merge(
         vamana_carried: false,
     };
 
-    // ── Fast path: a pure permutation. No hole to splice out, no vector to weave in, so the
-    // graph is byte-identical — carry the `.vamana` by reference and only relabel the `.pq`.
-    // This is where the BLAKE3-unchanged thesis is delivered.
-    if !any_dead && inputs.inserts.is_empty() {
+    // ── Fast path: a pure permutation. No *new* hole to splice out, no vector to weave in, so
+    // the graph geometry is byte-identical — carry the `.vamana` by reference and only relabel
+    // the `.pq` (pre-existing holes stay `HOLE`, with their codes carried). This is where the
+    // BLAKE3-unchanged thesis is delivered, and it must keep firing after the first
+    // consolidation — a base accumulates holes, and every later pure-permute consolidation must
+    // still carry, or the payoff evaporates.
+    if !any_new_dead && inputs.inserts.is_empty() {
         carry_vamana_file(vamana_in, vamana_out)?;
         write_pq(&base_pq, inputs.base_final_ids, &[], &[], params, pq_out)?;
         stats.vamana_carried = true;
@@ -213,11 +235,13 @@ pub fn streaming_merge(
 
     // ── Stage 1: deletes. Reuse S5 verbatim, into a scratch `.vamana` beside the output. The
     // pass preserves every ordinal (holes, not compaction), so `dead`, `base_final_ids` and
-    // `base_pq` stay in lockstep with the patched file. Skipped entirely when nothing is dead.
+    // `base_pq` stay in lockstep with the patched file. Skipped when there is no *new* delete —
+    // pre-existing holes already have cleaned adjacency, so re-running the pass over them is a
+    // no-op that would only cost the O(N) rewrite it exists to avoid.
     let scratch = vamana_out.with_extension("streaming-merge-scratch");
     let _ = fs::remove_file(&scratch);
     let deleted_reader;
-    let cur_reader: &VamanaReader = if any_dead {
+    let cur_reader: &VamanaReader = if any_new_dead {
         let opts = ConsolidateOpts {
             medoid: params.medoid,
             r: params.r,
@@ -960,6 +984,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The payoff must survive **repeated** consolidation. A base accumulates holes, so if the
+    /// fast path only fired on a hole-free base, only the *first* consolidation of a fresh index
+    /// would carry by reference. Here: merge #1 deletes (rewrites), then merge #2 is a pure
+    /// permutation over the *holed* output — it must still carry the `.vamana` byte-identically.
+    #[test]
+    fn a_pure_permutation_over_a_holed_base_still_carries_by_reference() {
+        let dir = scratch("holed_carry");
+        let vectors = unit_vectors(16, 150, 0x51a7_0000_0000_0006);
+        let ids: Vec<u64> = (0..vectors.len() as u64).map(|i| 1000 + i).collect();
+        let base = build_base(&dir, "base", &vectors, &ids, 12, Metric::Cosine);
+        let params = params_for(&base);
+
+        // Merge #1: delete a handful (slow path → holed output).
+        let victims = [7u32, 33, 88, 120];
+        let ids1: Vec<u64> = base
+            .layout_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                if victims.contains(&(i as u32)) {
+                    HOLE
+                } else {
+                    id
+                }
+            })
+            .collect();
+        let v1 = dir.join("g1.vamana");
+        let p1 = dir.join("g1.pq");
+        let s1 = streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &ids1,
+                inserts: &[],
+            },
+            &params,
+            &v1,
+            &p1,
+        )
+        .unwrap();
+        assert!(!s1.vamana_carried, "merge #1 has new deletes → rewrites");
+
+        // Record top-10 on the holed generation.
+        let query = {
+            let mut q = base.layout_raw[2].clone();
+            q[0] += 0.05;
+            normalise(&q)
+        };
+        let before = knn(&v1, &p1, &query, base.metric, base.medoid, 10, 64);
+
+        // Merge #2: a pure permutation over the holed base — holes stay HOLE, everything else
+        // relabels. No new delete, no insert.
+        let pq1 = PqReader::open_with_cipher(&p1, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let ids2: Vec<u64> = (0..pq1.len())
+            .map(|i| {
+                if pq1.is_hole(i) {
+                    HOLE
+                } else {
+                    pq1.node_ids[i] + 500_000
+                }
+            })
+            .collect();
+        let v2 = dir.join("g2.vamana");
+        let p2 = dir.join("g2.pq");
+        let s2 = streaming_merge(
+            &v1,
+            &p1,
+            &MergeInputs {
+                base_final_ids: &ids2,
+                inserts: &[],
+            },
+            &params,
+            &v2,
+            &p2,
+        )
+        .unwrap();
+        assert!(
+            s2.vamana_carried,
+            "a pure permutation over a holed base must STILL carry by reference — the payoff \
+             cannot be one-shot"
+        );
+        assert_eq!(
+            blake3_of(&v2),
+            blake3_of(&v1),
+            "the carried .vamana over a holed base must be BLAKE3-identical"
+        );
+        let after = knn(&v2, &p2, &query, base.metric, base.medoid, 10, 64);
+        let expected: Vec<(u64, f32)> = before.iter().map(|(id, s)| (id + 500_000, *s)).collect();
+        assert_eq!(
+            after, expected,
+            "node identity preserved through the second consolidation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A composition bug that hands a pre-existing hole a *live* id would resurrect stale
+    /// geometry with no error. It must be refused at the boundary.
+    #[test]
+    fn assigning_a_live_id_to_a_pre_existing_hole_is_refused() {
+        let dir = scratch("hole_resurrect");
+        let vectors = unit_vectors(16, 80, 0x51a7_0000_0000_0007);
+        let ids: Vec<u64> = (0..vectors.len() as u64).map(|i| 1000 + i).collect();
+        let base = build_base(&dir, "base", &vectors, &ids, 12, Metric::Cosine);
+        let params = params_for(&base);
+
+        // Make a holed generation.
+        let ids1: Vec<u64> = base
+            .layout_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| if i == 10 { HOLE } else { id })
+            .collect();
+        let v1 = dir.join("g1.vamana");
+        let p1 = dir.join("g1.pq");
+        streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &ids1,
+                inserts: &[],
+            },
+            &params,
+            &v1,
+            &p1,
+        )
+        .unwrap();
+
+        // Now try to relabel that hole (ordinal 10) live — must be refused.
+        let pq1 = PqReader::open_with_cipher(&p1, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let hole_ord = (0..pq1.len()).find(|&i| pq1.is_hole(i)).unwrap();
+        let mut bad: Vec<u64> = (0..pq1.len())
+            .map(|i| {
+                if pq1.is_hole(i) {
+                    HOLE
+                } else {
+                    pq1.node_ids[i]
+                }
+            })
+            .collect();
+        bad[hole_ord] = 777_777; // resurrect the hole — the bug
+        let err = streaming_merge(
+            &v1,
+            &p1,
+            &MergeInputs {
+                base_final_ids: &bad,
+                inserts: &[],
+            },
+            &params,
+            &dir.join("g2.vamana"),
+            &dir.join("g2.pq"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pre-existing hole"),
+            "expected a hole-resurrection refusal, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Recall over the **live set** after a batch of inserts + deletes, and the Δ nearest-to-self
     /// property. Truth is brute force over the live set (independently derived), not another
     /// index. The nearest-to-self assertion is what catches a broken back-link: a Δ node that no
@@ -1049,6 +1238,31 @@ mod tests {
             recall >= 0.8,
             "recall@{k} over the live set was {recall:.3}, want ≥ 0.8"
         );
+
+        // S5's invariant must survive the *insert* path too: after a delete+insert merge, no
+        // reachable node — live base, medoid, or a Δ node — may name a hole. This is the
+        // assertion that catches a missing hole-filter in `merge_insert` (greedy search returns
+        // dead waypoints, and an unfiltered prune would link a live Δ node straight at a hole).
+        {
+            let out_pq = PqReader::open_with_cipher(&pout, None)
+                .unwrap()
+                .load_resident()
+                .unwrap();
+            let out_v = VamanaReader::open_with_cipher(&vout, None).unwrap();
+            for i in 0..out_pq.len() {
+                let reachable = !out_pq.is_hole(i) || i as u32 == base.medoid;
+                if !reachable {
+                    continue;
+                }
+                for &nb in &out_v.node(i as u32).unwrap().neighbours {
+                    assert!(
+                        !out_pq.is_hole(nb as usize),
+                        "reachable ordinal {i} names hole {nb} after a delete+insert merge — the \
+                         insert hole-filter regressed S5's no_live_node_references_a_hole"
+                    );
+                }
+            }
+        }
 
         // Δ nearest-to-self: each inserted node is top-1 for its own vector (catches a broken
         // back-link — an unreachable Δ node would not come back at all).
