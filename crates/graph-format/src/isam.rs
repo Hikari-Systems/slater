@@ -16,11 +16,12 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -268,116 +269,314 @@ fn value_heap_bytes(v: &Value) -> usize {
     }
 }
 
+/// Cache key for one decoded leaf block: the index's per-generation ordinal `sub`
+/// and the block index within that index.
+type DbcKey = (u32, u32);
+
+/// Smallest byte budget a shard may own. Sharding buys parallelism with utilisation
+/// (a fixed sub-budget can evict while a sibling shard is under-filled), and that
+/// trade is only worth making when a shard still holds a useful number of blocks.
+/// Below `shards × MIN_SHARD_BYTES` the cache stays a single shard — which is also
+/// exactly the old single-eviction-domain bound for a small/test cache. (Mirrors
+/// `blockcache::BlockCache`; the default range-index budget is 16 MiB, so a real
+/// cache lands at ≤4 shards.)
+const MIN_SHARD_BYTES: usize = 4 << 20;
+
+/// Upper bound on shards. A hit takes a *read* lock, so same-shard hits do not
+/// exclude each other; the shard count only spreads the lock word and counters over
+/// cachelines, and the relief is near-flat well before this.
+const MAX_SHARDS: usize = 32;
+
+/// One cached decoded block. `referenced` is an atomic because a hit sets it through
+/// a **shared** read guard — that is the whole point: a hit mutates no shared
+/// structure (no LRU re-tick) and blocks no other hit.
 struct DbcEntry {
     value: DecodedBlock,
+    /// Resident byte estimate (`decoded_bytes`, incl. Str/List/Vector key heap — the
+    /// HIK-101 accounting). Stored once at insert; the budget sums these.
     bytes: usize,
-    tick: u64,
+    /// CLOCK's second-chance bit: set by a hit, cleared (as a reprieve) by the
+    /// eviction hand. Deliberately **false on insert** — a block loaded and never
+    /// touched again is the right first victim; a block read again earns its bit.
+    /// (Its own insert's sweep cannot evict it regardless, see `evict_to_budget`.)
+    referenced: AtomicBool,
 }
 
-struct DbcInner {
-    map: HashMap<(u32, u32), DbcEntry>,
-    /// `tick → key`, ascending — the front is least-recently-used.
-    order: BTreeMap<u64, (u32, u32)>,
-    tick: u64,
+struct ShardInner {
+    map: HashMap<DbcKey, DbcEntry>,
+    /// CLOCK ring: every live key, exactly once (`ring.len() == map.len()` is an
+    /// invariant). Order is insertion-relative, not recency — recency lives in the
+    /// `referenced` bits.
+    ring: Vec<DbcKey>,
+    /// The sweep hand: an index into `ring`, normalised at the top of every sweep step.
+    hand: usize,
     bytes: usize,
     budget: usize,
 }
 
-/// A byte-budgeted LRU of **decoded** ISAM leaf blocks, keyed by `(sub, block)` where
-/// `sub` is the index's per-generation ordinal. One instance is shared across a
-/// generation's range readers.
+impl ShardInner {
+    /// Sweep the hand until the shard is back within budget, evicting the first entry
+    /// found with a clear `referenced` bit and clearing (reprieving) set bits on the
+    /// way. `protect` — the key this sweep's insert just added — is never the victim:
+    /// it is by definition the most recently used entry, and evicting it would turn a
+    /// tiny-budget sequential scan into one decompress+decode per *record*.
+    ///
+    /// Terminates: each step either clears a bit (at most `ring.len()` before every
+    /// bit is clear), skips `protect` (at most once per revolution), or evicts
+    /// (shrinking the ring toward the `> 1` floor).
+    fn evict_to_budget(&mut self, protect: DbcKey) -> u64 {
+        let mut evicted = 0;
+        // Keep at least one entry resident so a single block larger than the whole
+        // budget is still returnable (and still cached).
+        while self.bytes > self.budget && self.ring.len() > 1 {
+            if self.hand >= self.ring.len() {
+                self.hand = 0;
+            }
+            let key = self.ring[self.hand];
+            if key == protect {
+                self.hand += 1;
+                continue;
+            }
+            if self.map[&key]
+                .referenced
+                .swap(false, AtomicOrdering::Relaxed)
+            {
+                // Second chance: it was read since the hand last passed.
+                self.hand += 1;
+                continue;
+            }
+            self.ring.remove(self.hand);
+            if let Some(e) = self.map.remove(&key) {
+                self.bytes -= e.bytes;
+            }
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Insert `value` for `key` (or return the existing entry if a concurrent load
+    /// beat us to it), then sweep back within budget. Returns the canonical `Arc` and
+    /// the number of entries evicted.
+    fn insert(&mut self, key: DbcKey, value: DecodedBlock, bytes: usize) -> (DecodedBlock, u64) {
+        if let Some(existing) = self.map.get(&key) {
+            existing.referenced.store(true, AtomicOrdering::Relaxed);
+            return (existing.value.clone(), 0);
+        }
+        // Place the new entry *just behind* the hand, so it gets a full revolution
+        // before the hand considers it — the standard CLOCK insertion point.
+        let at = self.hand.min(self.ring.len());
+        self.ring.insert(at, key);
+        self.hand = at + 1;
+        self.map.insert(
+            key,
+            DbcEntry {
+                value: value.clone(),
+                bytes,
+                referenced: AtomicBool::new(false),
+            },
+        );
+        self.bytes += bytes;
+        let evicted = self.evict_to_budget(key);
+        (value, evicted)
+    }
+}
+
+/// A point-in-time snapshot of the cache counters (for metrics/tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbcMetrics {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// One lock domain. `align(64)` keeps two shards' lock words and counters off the
+/// same cacheline — sharding is pointless if the shards false-share.
+#[repr(align(64))]
+struct Shard {
+    inner: RwLock<ShardInner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// A byte-budgeted **CLOCK** cache of **decoded** ISAM leaf blocks, keyed by
+/// `(sub, block)` where `sub` is the index's per-generation ordinal. One instance is
+/// shared across a generation's range readers, safe to hit concurrently.
 ///
 /// This caches decoded entries, not raw bytes: an ISAM leaf can hold tens of thousands
 /// of `(key, id)` pairs, so decoding it on *every* probe (as a raw-byte cache would
 /// still force) dominates a point lookup. Decoding once and holding the sorted `Vec`
 /// lets a repeated equality/range probe **binary-search** the cached block — O(log n)
-/// instead of O(n) — which is the bulk-write-resolve / indexed-seek hot path. Modelled
-/// on `blockcache::BlockCache` (same LRU shape); loads run outside the lock.
+/// instead of O(n) — which is the bulk-write-resolve / indexed-seek hot path.
+///
+/// # Concurrency: a hit must not serialise (HIK-106)
+///
+/// In steady state the working set is resident and essentially every probe is a hit,
+/// and every query/rayon thread shares one cache. A hit path on one exclusive lock
+/// therefore caps aggregate hit throughput at one core's worth no matter how many
+/// cores are seeking (it gets *worse* with more cores). So, mirroring
+/// [`crate::blockcache::BlockCache`]:
+///
+/// * **A hit takes a shared read lock and mutates nothing** but the entry's own
+///   `referenced` atomic. That rules out a strict LRU (re-ticking an order needs
+///   exclusive access by construction); eviction is instead **CLOCK** (second-chance),
+///   the classic buffer-pool LRU approximation, which keeps the property the workload
+///   needs — a hot block survives a cold sequential scan.
+/// * **The map is sharded** by key hash, each shard a `#[repr(align(64))]` lock
+///   domain, so the lock word and counters spread over cachelines.
+///
+/// The byte budget stays a **hard, global** bound (a product guarantee): each shard
+/// owns a hard sub-budget of `budget / shards` and trims itself back inside it in the
+/// same critical section that grew it, so `Σ shard_bytes ≤ budget` always. A cache too
+/// small to give every shard [`MIN_SHARD_BYTES`] stays single-sharded — exactly the
+/// old single-eviction-domain bound.
 pub struct DecodedBlockCache {
-    inner: Mutex<DbcInner>,
+    shards: Vec<Shard>,
+    /// `shards.len() - 1`; `shards.len()` is always a power of two.
+    mask: usize,
+}
+
+/// Shard selector: a splitmix64 finaliser over the packed `(sub, block)` key. The
+/// inner `HashMap`s do their own (SipHash) hashing; this only has to spread keys,
+/// including the common ascending-block-index case within one index.
+fn shard_hash(key: &DbcKey) -> u64 {
+    let mut x = ((key.0 as u64) << 32) | (key.1 as u64);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 impl DecodedBlockCache {
-    /// Create a cache with the given byte budget (clamped to at least 1).
+    /// Create a cache with the given byte budget (clamped to at least 1). The shard
+    /// count is derived from the machine's parallelism and the budget: a cache too
+    /// small to give every shard [`MIN_SHARD_BYTES`] stays single-sharded.
     pub fn new(budget_bytes: usize) -> Self {
+        let budget = budget_bytes.max(1);
+        let by_cpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_mul(2)
+            .next_power_of_two()
+            .min(MAX_SHARDS);
+        let mut by_budget = 1;
+        while by_budget * 2 * MIN_SHARD_BYTES <= budget && by_budget < MAX_SHARDS {
+            by_budget *= 2;
+        }
+        Self::with_shards(budget, by_cpu.min(by_budget))
+    }
+
+    /// Create a cache with an explicit shard count (rounded up to a power of two and
+    /// capped at [`MAX_SHARDS`]). For tests and benchmarks that need a deterministic
+    /// number of eviction domains; production callers want [`DecodedBlockCache::new`].
+    pub fn with_shards(budget_bytes: usize, shards: usize) -> Self {
+        let budget = budget_bytes.max(1);
+        let mut shards = shards.max(1).next_power_of_two().min(MAX_SHARDS);
+        // A shard must own at least one byte, or the sub-budgets would round *up* and
+        // their sum would exceed the caller's budget.
+        while shards > 1 && budget / shards == 0 {
+            shards /= 2;
+        }
+        let per_shard = budget / shards;
         Self {
-            inner: Mutex::new(DbcInner {
-                map: HashMap::new(),
-                order: BTreeMap::new(),
-                tick: 0,
-                bytes: 0,
-                budget: budget_bytes.max(1),
-            }),
+            shards: (0..shards)
+                .map(|_| Shard {
+                    inner: RwLock::new(ShardInner {
+                        map: HashMap::new(),
+                        ring: Vec::new(),
+                        hand: 0,
+                        bytes: 0,
+                        budget: per_shard,
+                    }),
+                    hits: AtomicU64::new(0),
+                    misses: AtomicU64::new(0),
+                    evictions: AtomicU64::new(0),
+                })
+                .collect(),
+            mask: shards - 1,
         }
     }
 
-    /// Fetch decoded block `(sub, block)`, decoding it with `load` on a miss. `load`
-    /// runs **outside** the lock so a slow decompress+decode never serialises other
-    /// readers; a concurrent duplicate load deduplicates to the first insert's `Arc`.
-    fn get_or_load(
+    #[inline]
+    fn shard(&self, key: &DbcKey) -> &Shard {
+        &self.shards[(shard_hash(key) as usize) & self.mask]
+    }
+
+    /// Number of independent eviction domains (lock shards).
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Fetch decoded block `(sub, block)`, decoding it with `load` on a miss.
+    ///
+    /// A **hit** takes only the shard's *read* lock: it clones an `Arc`, sets the
+    /// entry's CLOCK bit, and mutates nothing shared — so concurrent hits (the steady
+    /// state) run in parallel instead of queueing behind one another.
+    ///
+    /// A **miss** runs `load` **outside** every lock, so a slow decompress+decode never
+    /// serialises other readers; if two readers miss the same key at once they both
+    /// load and the second insert deduplicates to the first's `Arc`.
+    pub fn get_or_load(
         &self,
         sub: u32,
         block: u32,
         load: impl FnOnce() -> Result<Vec<(Value, u64)>>,
     ) -> Result<DecodedBlock> {
         let key = (sub, block);
-        {
-            let mut g = self.inner.lock().unwrap();
-            if let Some(v) = g.touch_get(&key) {
-                return Ok(v);
-            }
+        let shard = self.shard(&key);
+        if let Some(entry) = shard.inner.read().unwrap().map.get(&key) {
+            entry.referenced.store(true, AtomicOrdering::Relaxed);
+            let value = entry.value.clone();
+            shard.hits.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(value);
         }
+        shard.misses.fetch_add(1, AtomicOrdering::Relaxed);
         let value: DecodedBlock = Arc::new(load()?);
         let bytes = decoded_bytes(&value);
-        let mut g = self.inner.lock().unwrap();
-        Ok(g.insert(key, value, bytes))
-    }
-}
-
-impl DbcInner {
-    fn next_tick(&mut self) -> u64 {
-        let t = self.tick;
-        self.tick += 1;
-        t
+        let (canonical, evicted) = shard.inner.write().unwrap().insert(key, value, bytes);
+        if evicted > 0 {
+            shard.evictions.fetch_add(evicted, AtomicOrdering::Relaxed);
+        }
+        Ok(canonical)
     }
 
-    fn touch_get(&mut self, key: &(u32, u32)) -> Option<DecodedBlock> {
-        let (value, old_tick) = {
-            let e = self.map.get(key)?;
-            (e.value.clone(), e.tick)
+    /// Counter snapshot, summed across shards. Not a consistent snapshot across the
+    /// three counters (read shard by shard without a global lock) — these are metrics,
+    /// not invariants.
+    pub fn metrics(&self) -> DbcMetrics {
+        let mut m = DbcMetrics {
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         };
-        self.order.remove(&old_tick);
-        let new_tick = self.next_tick();
-        self.order.insert(new_tick, *key);
-        self.map.get_mut(key).unwrap().tick = new_tick;
-        Some(value)
+        for shard in &self.shards {
+            m.hits += shard.hits.load(AtomicOrdering::Relaxed);
+            m.misses += shard.misses.load(AtomicOrdering::Relaxed);
+            m.evictions += shard.evictions.load(AtomicOrdering::Relaxed);
+        }
+        m
     }
 
-    /// Insert (or return an existing concurrent load), then evict LRU until within
-    /// budget, keeping at least one entry so a block larger than the budget is returnable.
-    fn insert(&mut self, key: (u32, u32), value: DecodedBlock, bytes: usize) -> DecodedBlock {
-        if let Some(existing) = self.touch_get(&key) {
-            return existing;
-        }
-        let tick = self.next_tick();
-        self.order.insert(tick, key);
-        self.map.insert(
-            key,
-            DbcEntry {
-                value: value.clone(),
-                bytes,
-                tick,
-            },
-        );
-        self.bytes += bytes;
-        while self.bytes > self.budget && self.order.len() > 1 {
-            let (&lru_tick, &lru_key) = self.order.iter().next().unwrap();
-            self.order.remove(&lru_tick);
-            if let Some(e) = self.map.remove(&lru_key) {
-                self.bytes -= e.bytes;
-            }
-        }
-        value
+    /// Current number of cached blocks (sum across shards).
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.inner.read().unwrap().map.len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Current resident byte usage (sum of cached block sizes). Never exceeds the
+    /// configured budget: each shard trims itself back inside its sub-budget in the
+    /// same critical section that grew it (bar the deliberate keep-at-least-one
+    /// oversized-block floor).
+    pub fn bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.inner.read().unwrap().bytes)
+            .sum()
     }
 }
 
@@ -936,12 +1135,313 @@ mod tests {
             let _ = r2.lookup_eq(&Value::Int(i as i64)).unwrap();
         }
         assert_eq!(
-            fresh.inner.lock().unwrap().map.len(),
+            fresh.len(),
             plain.num_blocks(),
             "every block decoded exactly once and retained"
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- HIK-106: sharded CLOCK DecodedBlockCache ----
+
+    fn ints(n: u64) -> Vec<(Value, u64)> {
+        (0..n).map(|i| (Value::Int(i as i64), i)).collect()
+    }
+
+    /// A cache too small to give each shard `MIN_SHARD_BYTES` must stay a single
+    /// eviction domain — a small/test cache keeps exactly the old bound, with no
+    /// per-shard keep-one floor to multiply.
+    #[test]
+    fn a_small_budget_stays_single_sharded() {
+        assert_eq!(DecodedBlockCache::new(1).shard_count(), 1);
+        assert_eq!(DecodedBlockCache::new(1 << 20).shard_count(), 1);
+        assert_eq!(DecodedBlockCache::new(MIN_SHARD_BYTES).shard_count(), 1);
+        // Big enough for two shards of MIN_SHARD_BYTES (given >= 1 cpu).
+        assert!(DecodedBlockCache::new(64 << 20).shard_count() >= 2);
+    }
+
+    /// CLOCK's core promise, and what keeps the miss rate honest: a block read again
+    /// survives; the one that was not is the victim. (This is the strict-LRU victim
+    /// choice too — the property the cache is *for*.)
+    #[test]
+    fn a_referenced_block_outlives_an_unreferenced_one() {
+        // Two ~one-int blocks fit; a third forces a sweep. `size_of::<(Value,u64)>()`
+        // is the per-entry footprint; give budget for two, plus slack for the Vec.
+        let one = decoded_bytes(&ints(1));
+        let cache = DecodedBlockCache::with_shards(one * 2, 1);
+        let load = |fill: u64| move || Ok(vec![(Value::Int(fill as i64), fill)]);
+
+        cache.get_or_load(0, 0, load(0)).unwrap();
+        cache.get_or_load(0, 1, load(1)).unwrap();
+        assert_eq!(cache.len(), 2);
+        // Read block 0 again — now block 1 is the only unreferenced entry.
+        cache.get_or_load(0, 0, load(0)).unwrap();
+        // Over budget → the sweep must take block 1.
+        cache.get_or_load(0, 2, load(2)).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.metrics().evictions, 1);
+        let mut reloaded_1 = false;
+        cache
+            .get_or_load(0, 1, || {
+                reloaded_1 = true;
+                Ok(vec![(Value::Int(1), 1)])
+            })
+            .unwrap();
+        assert!(reloaded_1, "the unreferenced block should be the victim");
+        assert!(cache.bytes() <= one * 2);
+    }
+
+    /// The block a miss just decoded must not be evicted by that same miss's sweep: a
+    /// strictly-ascending scan through a budget that holds ~one block would otherwise
+    /// re-decode the block once per record it contains (the exact ISAM bulk-resolve
+    /// pathology). Walk every leaf in order and require the in-block re-probes to hit.
+    /// The block a miss just decoded must not be evicted by that same miss's sweep. A
+    /// budget that holds ~one block: inserting a second must sweep out the *first*, not
+    /// the freshly-inserted second — otherwise a strictly-ascending scan through a tiny
+    /// budget would re-decode the block it just built once per record (the ISAM
+    /// bulk-resolve pathology). Driven at the cache API so the eviction choice is exact.
+    #[test]
+    fn a_just_loaded_block_survives_its_own_insert_sweep() {
+        let one = decoded_bytes(&ints(4)); // a multi-record block's footprint
+                                           // Big enough for one block, too small for two: every new block forces a sweep.
+        let cache = DecodedBlockCache::with_shards(one + one / 2, 1);
+        let load = |b: u64| {
+            move || {
+                Ok((0..4u64)
+                    .map(|i| (Value::Int(i as i64), b * 4 + i))
+                    .collect())
+            }
+        };
+
+        cache.get_or_load(0, 0, load(0)).unwrap();
+        cache.get_or_load(0, 1, load(1)).unwrap(); // over budget → sweep
+        assert_eq!(cache.len(), 1, "only one block fits");
+        assert_eq!(cache.metrics().evictions, 1);
+
+        // Block 1 (the block the sweeping insert just added) must be the survivor.
+        let mut reloaded_1 = false;
+        cache
+            .get_or_load(0, 1, || {
+                reloaded_1 = true;
+                Ok(vec![(Value::Int(0), 0)])
+            })
+            .unwrap();
+        assert!(
+            !reloaded_1,
+            "the just-inserted block must survive its own insert's sweep"
+        );
+        // …and block 0 (the older one) is correctly the victim.
+        let mut reloaded_0 = false;
+        cache
+            .get_or_load(0, 0, || {
+                reloaded_0 = true;
+                Ok(vec![(Value::Int(0), 0)])
+            })
+            .unwrap();
+        assert!(reloaded_0, "the older block should have been evicted");
+        assert!(cache.bytes() <= (one + one / 2).max(one));
+    }
+
+    /// The whole-scan flavour of the same guarantee, through the real ISAM path: a
+    /// budget generous enough to hold the leaves keeps every in-block re-probe a hit
+    /// (no re-decode), and results stay correct.
+    #[test]
+    fn ascending_scan_reuses_cached_leaves() {
+        let path = tmp("dbc_scan_window");
+        write_isam(&path, ints(600), 64, 3).unwrap();
+        let reader = IsamReader::open(&path).unwrap();
+        let num_blocks = reader.num_blocks() as u64;
+        assert!(num_blocks > 1 && num_blocks < 600);
+
+        let cache = Arc::new(DecodedBlockCache::new(1 << 20)); // holds them all
+        let cached = IsamReader::open(&path)
+            .unwrap()
+            .with_block_cache(cache.clone(), 0);
+        for i in 0..600u64 {
+            assert_eq!(cached.lookup_eq(&Value::Int(i as i64)).unwrap(), vec![i]);
+        }
+        let m = cache.metrics();
+        // Each leaf decoded exactly once; the rest of the 600 probes hit warm leaves.
+        assert_eq!(m.misses, num_blocks, "each leaf decoded once");
+        assert!(m.hits >= 600 - num_blocks, "in-block re-probes must hit");
+        assert_eq!(cache.len() as u64, num_blocks);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The HIK-101 heap accounting must survive the rewrite: a block of long `Str` keys
+    /// counts its heap, so a string-keyed cache honours its byte budget instead of
+    /// wildly overshooting it (the old `size_of_val`-only estimate).
+    #[test]
+    fn str_key_heap_is_counted_in_the_budget() {
+        let big = |b: u32| {
+            move || {
+                Ok((0..10u64)
+                    .map(|i| (Value::Str("x".repeat(4096)), b as u64 * 10 + i))
+                    .collect())
+            }
+        };
+        // Budget in the fixed-struct-only world would hold dozens of these; with heap
+        // counted it holds ~one, so the resident bytes stay bounded.
+        let cache = DecodedBlockCache::with_shards(64 * 1024, 1);
+        for b in 0..32u32 {
+            cache.get_or_load(0, b, big(b)).unwrap();
+        }
+        assert!(
+            cache.bytes() <= 64 * 1024,
+            "heap-aware budget must hold: {} > 65536",
+            cache.bytes()
+        );
+        assert!(cache.metrics().evictions > 0, "heap pressure must evict");
+        // And it really counted the heap, not just the struct.
+        let strs: Vec<(Value, u64)> = (0..10).map(|i| (Value::Str("x".repeat(4096)), i)).collect();
+        assert!(decoded_bytes(&strs) > std::mem::size_of_val(strs.as_slice()));
+    }
+
+    /// The byte budget is a product guarantee, so it must hold while N threads hammer
+    /// the cache — not just single-threaded. Sharding is what could break it (each
+    /// shard evicts independently), so force many shards and check the *global* sum,
+    /// both continuously during the load and at rest.
+    #[test]
+    fn concurrent_load_never_exceeds_the_byte_budget() {
+        const BUDGET: usize = 64 * 1024;
+        let cache = Arc::new(DecodedBlockCache::with_shards(BUDGET, 16));
+        assert_eq!(cache.shard_count(), 16);
+        // Each block is 8 ints ≈ small, working set far larger than the budget so
+        // eviction runs constantly.
+        let block = |b: u32| {
+            move || {
+                Ok((0..8u64)
+                    .map(|i| (Value::Int(i as i64), b as u64))
+                    .collect())
+            }
+        };
+
+        let threads: Vec<_> = (0..8u32)
+            .map(|t| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    for i in 0..4000u32 {
+                        let key_block = i % 600;
+                        cache
+                            .get_or_load(t % 3, key_block, block(key_block))
+                            .unwrap();
+                        if i % 64 == 0 {
+                            assert!(
+                                cache.bytes() <= BUDGET,
+                                "over budget mid-flight: {} > {BUDGET}",
+                                cache.bytes()
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert!(
+            cache.bytes() <= BUDGET,
+            "over budget at rest: {} > {BUDGET}",
+            cache.bytes()
+        );
+        let m = cache.metrics();
+        assert_eq!(m.hits + m.misses, 8 * 4000, "every access is counted once");
+        assert!(m.evictions > 0);
+    }
+
+    /// Two readers missing the same key at once must converge on one `Arc` (the second
+    /// insert deduplicates), so the block is never double-counted in `bytes`.
+    #[test]
+    fn concurrent_duplicate_loads_deduplicate() {
+        let cache = Arc::new(DecodedBlockCache::new(1 << 20));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_load(7, 2, || {
+                            Ok((0..100u64).map(|i| (Value::Int(i as i64), i)).collect())
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        let arcs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for a in &arcs {
+            assert!(Arc::ptr_eq(a, &arcs[0]), "all readers share one block");
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.bytes(),
+            decoded_bytes(&arcs[0]),
+            "counted exactly once"
+        );
+    }
+
+    /// The regression test for the finding itself: with the hit path on one global
+    /// exclusive lock (the pre-HIK-106 shape) adding threads *reduces* aggregate hit
+    /// throughput. It must now scale. The 1.2× bar is far below the multiple the
+    /// sharded read-lock path achieves and far above the ~0.2× a global mutex managed,
+    /// so it discriminates even on a busy machine.
+    #[test]
+    fn concurrent_hits_scale_with_threads() {
+        const THREADS: usize = 4;
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) < THREADS {
+            return; // not enough cores to say anything
+        }
+        const BLOCKS: u32 = 256;
+        let cache = Arc::new(DecodedBlockCache::new(64 << 20));
+        for b in 0..BLOCKS {
+            cache
+                .get_or_load(0, b, || {
+                    Ok((0..64u64).map(|i| (Value::Int(i as i64), i)).collect())
+                })
+                .unwrap();
+        }
+
+        let rate = |n: usize| -> f64 {
+            const PER_THREAD: u64 = 200_000;
+            let barrier = Arc::new(std::sync::Barrier::new(n));
+            let handles: Vec<_> = (0..n)
+                .map(|w| {
+                    let cache = cache.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let start = std::time::Instant::now();
+                        for i in 0..PER_THREAD {
+                            let b = (w as u64 * 37 + i * 7) % BLOCKS as u64;
+                            let v = cache
+                                .get_or_load(0, b as u32, || unreachable!("resident"))
+                                .unwrap();
+                            std::hint::black_box(v.len());
+                        }
+                        start.elapsed()
+                    })
+                })
+                .collect();
+            let slowest = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .max()
+                .unwrap();
+            (n as u64 * PER_THREAD) as f64 / slowest.as_secs_f64()
+        };
+
+        let one = rate(1);
+        let many = rate(THREADS);
+        assert!(
+            many >= one * 1.2,
+            "hits must scale with cores: 1 thread {one:.0}/s, {THREADS} threads \
+             {many:.0}/s (ratio {:.2}×)",
+            many / one
+        );
     }
 
     #[test]
