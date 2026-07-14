@@ -68,7 +68,7 @@
 //! more".
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -537,6 +537,17 @@ pub struct WalSink {
     dir: PathBuf,
     path: PathBuf,
     file: BufWriter<File>,
+    /// Logical length of the segment as of the last **completed** `commit` — the
+    /// offset a failed/aborted batch is rolled back to (HIK-105). Frames appended past
+    /// this offset carry no commit marker yet; if their batch never reaches a commit
+    /// they must be truncated away, or the *next* batch's commit marker would
+    /// retro-commit them on replay (replay's committed prefix is "every frame up to
+    /// the last commit marker").
+    committed_len: u64,
+    /// Logical length of everything written into the segment so far, committed or not.
+    /// Tracked in-process (not `fstat`-ed) so the group-commit ack path stays
+    /// syscall-light; `commit`/`truncate_to` keep it in step with the file.
+    cur_len: u64,
 }
 
 impl WalSink {
@@ -582,6 +593,10 @@ impl WalSink {
             dir: dir.to_path_buf(),
             path,
             file,
+            // The magic is flushed above; it is the first thing every batch is
+            // rolled back *to* (a rollback never eats the header).
+            committed_len: WAL_MAGIC.len() as u64,
+            cur_len: WAL_MAGIC.len() as u64,
         })
     }
 
@@ -596,26 +611,118 @@ impl WalSink {
     }
 
     /// Buffer one record frame (not yet durable — durability comes from `commit`).
+    ///
+    /// On any write error the partially-written batch is rolled back to the last
+    /// committed offset (HIK-105) before the error is returned, so a failed append
+    /// never leaves orphan frames for a later commit to retro-commit. Prefer
+    /// [`WalSink::append_batch`] for the whole-batch path: it additionally covers a
+    /// mid-batch **panic** via a scope guard, which append+commit as separate calls
+    /// cannot.
     pub fn append(&mut self, rec: &WalRecord) -> Result<()> {
-        let mut payload = Vec::new();
-        rec.encode_payload(&mut payload);
-        write_frame(&mut self.file, &payload)?;
+        if let Err(e) = self.write_record_frame(rec) {
+            self.truncate_to(self.committed_len)
+                .context("roll back WAL batch after a failed append")?;
+            return Err(e);
+        }
         Ok(())
     }
 
     /// Close the current batch: write the commit marker, flush, and fsync. Returns
     /// only once the batch is durable — the Bolt ack barrier. `committed_seq` is the
     /// highest sequence number the batch makes durable.
+    ///
+    /// A failure while writing/flushing the commit marker rolls the batch back to the
+    /// last committed offset, so a torn commit frame cannot linger for the next
+    /// commit to absorb.
     pub fn commit(&mut self, committed_seq: Seq) -> Result<()> {
+        if let Err(e) = self.write_commit_frame(committed_seq) {
+            self.truncate_to(self.committed_len)
+                .context("roll back WAL batch after a failed commit")?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Append every record in `recs` then commit them under one fsync, **atomically**:
+    /// if any frame fails to write, the commit fsync fails, *or the thread unwinds
+    /// mid-batch*, the segment is truncated back to its pre-batch offset so a partial
+    /// batch leaves no frames behind. This is the whole-batch equivalent of
+    /// append×N + commit and is what [`crate`]'s writer uses on the ack path.
+    ///
+    /// Atomicity on both the `Err` and the unwind paths comes from a stack-local RAII
+    /// [`Rollback`] guard (not a `Drop` on `WalSink` — the sink outlives a mid-batch
+    /// panic inside the long-lived writer, so its own `Drop` would never run). The
+    /// guard mirrors HIK-95's "prepare then install (moves only)" shape: all fallible
+    /// work runs armed, and success is a single disarming move that cannot unwind.
+    pub fn append_batch(&mut self, recs: &[WalRecord], committed_seq: Seq) -> Result<()> {
+        // Self-heal: if a *previous* aborted batch left an orphan tail whose rollback
+        // truncate itself failed (a rare double I/O fault), re-establish the committed
+        // floor before appending, so this batch's commit can never retro-commit it.
+        // Normally a no-op (`cur_len == committed_len` after every clean commit).
+        if self.cur_len != self.committed_len {
+            self.truncate_to(self.committed_len)
+                .context("re-establish committed WAL floor before batch")?;
+        }
+        let mut batch = Rollback::arm(self);
+        for rec in recs {
+            batch.sink.write_record_frame(rec)?;
+        }
+        batch.sink.write_commit_frame(committed_seq)?;
+        batch.disarm();
+        Ok(())
+    }
+
+    /// Encode + write one record frame into the buffer, advancing `cur_len`. Raw: no
+    /// rollback of its own (the caller owns batch atomicity).
+    fn write_record_frame(&mut self, rec: &WalRecord) -> Result<()> {
+        #[cfg(test)]
+        maybe_inject_write_fault()?;
+        let mut payload = Vec::new();
+        rec.encode_payload(&mut payload);
+        write_frame(&mut self.file, &payload)?;
+        self.cur_len += frame_len(payload.len());
+        Ok(())
+    }
+
+    /// Write the commit marker, flush and fsync — the durability point. Raw: no
+    /// rollback of its own. On success `committed_len` advances to the new tip.
+    fn write_commit_frame(&mut self, committed_seq: Seq) -> Result<()> {
         let mut payload = Vec::with_capacity(4);
         payload.push(KIND_COMMIT);
         write_uvarint(&mut payload, committed_seq.0);
         write_frame(&mut self.file, &payload)?;
+        self.cur_len += frame_len(payload.len());
         self.file.flush().context("flush WAL buffer")?;
         self.file
             .get_ref()
             .sync_data()
             .context("fsync WAL segment")?;
+        // The fsync landed: everything up to here is now durable and becomes the
+        // rollback floor for any later batch.
+        self.committed_len = self.cur_len;
+        Ok(())
+    }
+
+    /// Rewind the segment to `off` (the last committed offset), discarding any
+    /// uncommitted frames a failed/aborted batch left behind. Durable: the shrink is
+    /// `sync_data`-ed so replay after a crash-during-rollback cannot see the dropped
+    /// tail either. Truncation shrinks the *existing* file, so it changes no directory
+    /// entry and needs no dir fsync — it composes with HIK-71's create/seal dir-fsyncs
+    /// without adding one to this path.
+    fn truncate_to(&mut self, off: u64) -> Result<()> {
+        // Flush first so the BufWriter holds no bytes it would later replay past the
+        // truncation point; then shrink and re-seat the OS file position at `off`.
+        self.file
+            .flush()
+            .context("flush WAL buffer before rollback truncate")?;
+        let mut file = self.file.get_ref();
+        file.set_len(off)
+            .context("truncate WAL segment on rollback")?;
+        file.seek(SeekFrom::Start(off))
+            .context("seek WAL segment after rollback truncate")?;
+        file.sync_data()
+            .context("fsync WAL segment after rollback truncate")?;
+        self.cur_len = off;
         Ok(())
     }
 
@@ -657,6 +764,45 @@ thread_local! {
     /// *that the directory is synced* on create/seal (a real power-loss test is out of
     /// reach in-process). Thread-local, so parallel tests can't perturb each other.
     static DIR_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test seam (HIK-105): when `Some(n)`, the *n*-th following record-frame write on
+    /// this thread returns an injected `io::Error` (`Some(0)` = the very next write),
+    /// then resets to `None`. Lets a test force a batch to fail **part-way through** so
+    /// the rollback is exercised on real prior frames. Thread-local for test isolation.
+    static FAIL_WRITE_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// As `FAIL_WRITE_AFTER`, but `panic!`s instead of returning `Err` — exercises the
+    /// rollback guard on the **unwind** path.
+    static PANIC_WRITE_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fire any armed record-frame-write fault seam (test-only). A counter of `Some(0)`
+/// trips now; `Some(n)` counts down. Kept out of `write_record_frame`'s body so the
+/// production build has no seam at all.
+#[cfg(test)]
+fn maybe_inject_write_fault() -> Result<()> {
+    let trip = |cell: &'static std::thread::LocalKey<std::cell::Cell<Option<u64>>>| {
+        cell.with(|c| match c.get() {
+            Some(0) => {
+                c.set(None);
+                true
+            }
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    };
+    if trip(&FAIL_WRITE_AFTER) {
+        return Err(anyhow::Error::new(std::io::Error::other(
+            "injected WAL record-frame write fault",
+        )));
+    }
+    if trip(&PANIC_WRITE_AFTER) {
+        panic!("injected WAL record-frame write panic");
+    }
+    Ok(())
 }
 
 /// An immutable, sealed WAL segment — the unit the object-store shipping tier
@@ -788,6 +934,53 @@ fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<()> {
     w.write_all(&crc.to_le_bytes())?;
     w.write_all(payload)?;
     Ok(())
+}
+
+/// On-disk size of a frame carrying a `payload_len`-byte payload: `len:u32 ‖ crc:u32
+/// ‖ payload`. Keeps [`WalSink::cur_len`] in step with [`write_frame`] without an
+/// `fstat` on the ack path.
+fn frame_len(payload_len: usize) -> u64 {
+    8 + payload_len as u64
+}
+
+/// RAII rollback guard for [`WalSink::append_batch`] (HIK-105). While armed, dropping
+/// it truncates the sink back to the offset captured at batch start — covering **both**
+/// the `Err` path (a `?` early-return unwinds through this `Drop`) and a mid-batch
+/// **panic**, with no `catch_unwind`. It deliberately lives on the *stack* of the
+/// batch call, not as a `Drop` on `WalSink`: the sink is owned by the long-lived
+/// writer and survives a panic (HIK-95), so its own `Drop` would never run for the
+/// unwind we must cover. `disarm` cancels the rollback once the commit fsync lands.
+struct Rollback<'a> {
+    sink: &'a mut WalSink,
+    /// Offset to rewind to on drop; `None` once the batch has durably committed.
+    rollback_to: Option<u64>,
+}
+
+impl<'a> Rollback<'a> {
+    fn arm(sink: &'a mut WalSink) -> Self {
+        let rollback_to = Some(sink.committed_len);
+        Rollback { sink, rollback_to }
+    }
+
+    /// The batch committed durably — cancel the rollback (the disarming "install" move,
+    /// which cannot unwind).
+    fn disarm(&mut self) {
+        self.rollback_to = None;
+    }
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if let Some(off) = self.rollback_to {
+            // Err or unwind before disarm: rewind so the partial batch leaves nothing a
+            // later commit could retro-commit. The rollback is best-effort here because
+            // `Drop` cannot propagate — but the orphan frames carry *no* commit marker,
+            // so replay drops them even if this truncate fails, and the next
+            // `append_batch` re-establishes the floor before it writes. So a failed
+            // rollback degrades to "harmless orphan tail", never to a resurrected write.
+            let _ = self.sink.truncate_to(off);
+        }
+    }
 }
 
 fn write_str(buf: &mut Vec<u8>, s: &str) {
@@ -1120,6 +1313,100 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("the io::Error must be preserved in the chain");
         assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// Regression (HIK-105), `Err` path: a batch that fails **part-way through** must
+    /// leave no frames behind — not even the frames it wrote *before* the failing one.
+    /// A following *successful* batch (whose commit marker would otherwise retro-commit
+    /// the orphans) must replay to exactly the two good writes. Pre-fix (guard's
+    /// truncate neutered) the orphan `seq 2` frame comes back as committed.
+    #[test]
+    fn failed_mid_batch_append_leaves_no_frames_err_path() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_rollerr_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        // A three-record batch that will fail on its *second* record frame.
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+            upsert(4, "L", "k", Value::Int(4), &[]),
+        ];
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            // A clean committed batch first, so the rollback floor is past the magic.
+            sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                .unwrap();
+
+            // Fail the doomed batch on its 2nd record write (one frame already buffered).
+            FAIL_WRITE_AFTER.with(|c| c.set(Some(1)));
+            let err = sink
+                .append_batch(&doomed, Seq(4))
+                .expect_err("the injected fault must fail the batch mid-way");
+            // Branch on the error *type*, never its text (coding standard).
+            assert!(
+                err.downcast_ref::<std::io::Error>().is_some(),
+                "the injected io::Error must be preserved in the chain: {err:#}"
+            );
+            FAIL_WRITE_AFTER.with(|c| assert_eq!(c.get(), None, "seam must be consumed"));
+
+            // A *successful* batch to the same segment. Its commit marker is exactly
+            // what would retro-commit the doomed batch's orphan frame(s) pre-fix.
+            sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+                .unwrap();
+        }
+
+        let replay = replay_dir(&dir).unwrap();
+        // The failed batch is ABSENT: only the two acknowledged writes survive.
+        assert_eq!(replay.records, vec![good0, survivor]);
+        assert_eq!(replay.last_seq, Seq(5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (HIK-105), **unwind** path: a *panic* mid-batch must roll the segment
+    /// back via the scope guard's `Drop` (no `catch_unwind` in the writer). The sink
+    /// survives the panic — as it does inside the long-lived writer — and a following
+    /// successful batch must not resurrect the orphan frames.
+    #[test]
+    fn failed_mid_batch_append_leaves_no_frames_unwind_path() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_rollpanic_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+            upsert(4, "L", "k", Value::Int(4), &[]),
+        ];
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+
+        let mut sink = WalSink::create(&dir, 0).unwrap();
+        sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+            .unwrap();
+
+        // Panic on the doomed batch's 2nd record write. Drive it through `append_batch`
+        // and catch the unwind *here* so the test can inspect the after-state; the
+        // rollback runs during the unwind, inside the guard's `Drop`.
+        PANIC_WRITE_AFTER.with(|c| c.set(Some(1)));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sink.append_batch(&doomed, Seq(4));
+        }));
+        assert!(
+            res.is_err(),
+            "the injected panic must unwind out of append_batch"
+        );
+        PANIC_WRITE_AFTER.with(|c| assert_eq!(c.get(), None, "seam must be consumed"));
+
+        // Sink survived the panic; a following good batch must not retro-commit orphans.
+        sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+            .unwrap();
+        drop(sink);
+
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![good0, survivor]);
+        assert_eq!(replay.last_seq, Seq(5));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
