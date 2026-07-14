@@ -1538,6 +1538,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![],
             label_membership_touch: None,
             mac: None,

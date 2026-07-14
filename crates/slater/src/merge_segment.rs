@@ -53,10 +53,11 @@ use graph_format::ids::{Generation as GenId, Value};
 use graph_format::manifest::EncryptionHeader;
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
-    DirtyIndex, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
+    DirtyIndex, DirtyVector, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
+use graph_format::segvectors::{write_vector_fragments, VectorSpec};
 
 use crate::flush_segment::{inventory, SEG_BLOCK_BYTES, SEG_ZSTD_LEVEL};
 use crate::segstack::LoadedSegment;
@@ -210,6 +211,19 @@ pub fn write_merge_segment(
         .with_context(|| format!("write merged index fragments at {}", inp.seg_dir.display()))?;
     }
 
+    // ── vector sidecar: fold the embed/un-embed id sets oldest→newest. ──────────────────────
+    let vec_specs = fold_vectors(inputs, &node_rows, &within_run_node);
+    write_vector_fragments(inp.seg_dir, &vec_specs)
+        .with_context(|| format!("write merged vector sidecar at {}", inp.seg_dir.display()))?;
+    let dirty_vectors: Vec<DirtyVector> = vec_specs
+        .iter()
+        .filter(|s| !s.ids.is_empty() || !s.removals.is_empty())
+        .map(|s| DirtyVector {
+            label: s.label.clone(),
+            property: s.prop.clone(),
+        })
+        .collect();
+
     // ── posting fragments: union the per-reltype driving sets (a superset stays correct) ────
     let posting_specs = fold_postings(inputs);
     if !posting_specs.is_empty() {
@@ -307,6 +321,7 @@ pub fn write_merge_segment(
         hub_degree_in_deltas,
         marginals_exact,
         dirty_indexes,
+        dirty_vectors,
         label_membership_touch: label_membership_touch.map(|s| s.into_iter().collect()),
         mac: None,
         files,
@@ -380,6 +395,65 @@ fn fold_adjacency(
         frags.insert(node, frag);
     }
     Ok(frags)
+}
+
+/// Fold the run's vector sidecars into merged [`VectorSpec`]s — the vector twin of
+/// [`fold_index`], and the same shape: replay the inputs oldest→newest so the newest wins.
+///
+/// A **removal** drops the id from the live set. It is then *carried* into the merged
+/// segment's own removals only if the id lives **below the run** — an id born within the
+/// run has no lower layer left to suppress once the run is folded into one segment, so its
+/// removal is reclaimed (exactly `fold_index`'s rule).
+///
+/// An id that is both removed by an older input and re-embedded by a newer one ends up in
+/// **both** lists, which is correct and not a contradiction: the read fold applies a
+/// segment's removals *before* adding its ids, so the re-embed wins, and the carried
+/// removal still suppresses the stale vector on the level below.
+///
+/// No vector is copied here: the merged node row already carries the embedding, so a live
+/// id is all that needs recording (that is why this needs no `Result` — there is nothing to
+/// read back and nothing to fail).
+fn fold_vectors(
+    inputs: &[&LoadedSegment],
+    node_rows: &BTreeMap<u64, NodeRow>,
+    within_run_node: &impl Fn(u64) -> bool,
+) -> Vec<VectorSpec> {
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    for seg in inputs {
+        if let Some(v) = &seg.vectors {
+            for s in v.specs() {
+                pairs.insert((s.label.clone(), s.prop.clone()));
+            }
+        }
+    }
+
+    let mut specs = Vec::new();
+    for (label, prop) in &pairs {
+        let mut live: BTreeSet<u64> = BTreeSet::new();
+        let mut removals: BTreeSet<u64> = BTreeSet::new();
+        for seg in inputs {
+            let Some(v) = &seg.vectors else { continue };
+            for &id in v.removals(label, prop) {
+                live.remove(&id);
+                if !within_run_node(id) {
+                    removals.insert(id);
+                }
+            }
+            for &id in v.ids(label, prop) {
+                live.insert(id);
+            }
+        }
+        // A node the run also deleted takes its embedding with it — its row is gone from the
+        // merged segment, so a live id pointing at it would dangle.
+        live.retain(|id| node_rows.get(id).is_some_and(|r| !r.tombstoned));
+        specs.push(VectorSpec {
+            label: label.clone(),
+            prop: prop.clone(),
+            ids: live.into_iter().collect(),
+            removals: removals.into_iter().collect(),
+        });
+    }
+    specs
 }
 
 /// Fold the run's index fragments into merged [`IndexSpec`]s. Per `(label, prop)`, replay the

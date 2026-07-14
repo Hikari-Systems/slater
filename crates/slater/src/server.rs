@@ -8749,6 +8749,214 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The **T3 merge** fold. Two segments, each touching the same vector index: the older
+    /// re-embeds a node, the newer removes another's embedding. Folding them into one segment
+    /// must preserve both — and must carry the *removal* forward, since the removed node's
+    /// vector still sits in the base below the run and would otherwise resurface the moment
+    /// the segment that suppressed it was merged away.
+    #[test]
+    fn a_segment_merge_folds_vector_embeds_and_removals() {
+        let (root, graph, _) = testgen::write_basic("vec_merge_t3");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get(&graph).unwrap();
+            let writer = graphs.writer(&graph).unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let knn = |graphs: &Graphs, q: &str| -> Vec<i64> {
+            let gen = graphs.get(&graph).unwrap();
+            let snap = DeltaSnapshot::from_memtable(graphs.writer(&graph).unwrap().snapshot());
+            let view = MergedView::new(gen.as_ref(), snap);
+            let ast = parser::parse(&format!(
+                "CALL db.idx.vector.queryNodes('Person', 'embedding', 5, vecf32({q})) \
+                 YIELD node, score RETURN id(node) AS id"
+            ))
+            .unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(i) => i,
+                    ref o => panic!("unexpected KNN row {o:?}"),
+                })
+                .collect()
+        };
+
+        // Segment 0: re-embed Alice (0).
+        write(
+            &graphs,
+            "MATCH (n:Person {name:'Alice'}) SET n.embedding = vecf32([0.0, 0.0, 1.0])",
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("first flush");
+
+        // Segment 1: remove Bob (1)'s embedding.
+        write(&graphs, "MATCH (n:Person {name:'Bob'}) REMOVE n.embedding");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("second flush");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 2);
+
+        let before = knn(&graphs, "[0.0, 0.0, 1.0]");
+        assert_eq!(before[0], 0, "Alice's re-embed leads");
+        assert!(
+            !before.contains(&1),
+            "Bob's embedding is removed: {before:?}"
+        );
+
+        // Fold the two segments into one.
+        graphs
+            .compact_graph_segments(&graph, &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(
+            graphs.get(&graph).unwrap().stack().segments().len(),
+            1,
+            "the run folded into a single segment"
+        );
+
+        let after = knn(&graphs, "[0.0, 0.0, 1.0]");
+        assert_eq!(
+            after, before,
+            "the merged segment must read identically to the run it replaced — Alice's \
+             re-embed kept, and Bob's removal still suppressing the base vector below the run"
+        );
+        assert!(
+            !after.contains(&1),
+            "the removal must be carried into the merged segment, or Bob's base vector \
+             resurfaces the moment the segment that suppressed it is folded away; got {after:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A written embedding survives a T2 flush, and a **removed** one stays removed.
+    ///
+    /// The removal is the sharp half, and it needs its own channel on disk. An indexed
+    /// embedding is routed out of the column store (D12), so a node's property record never
+    /// held one — which makes a flushed row that lacks an embedding ambiguous: `REMOVE
+    /// n.embedding` and an unrelated `SET n.age = 99` produce byte-identical rows, and both
+    /// read back as `Null`. Value absence cannot express a removal. Without the segment's
+    /// `vec.meta` sidecar (and the delta's `NodeDelta` before a flush), the node's stale base
+    /// vector goes on scoring forever and `REMOVE n.embedding` silently does nothing to KNN.
+    #[test]
+    fn a_flush_carries_a_written_vector_and_a_removed_one_stays_removed() {
+        let (root, graph, _) = testgen::write_basic("vec_flush_removal");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let write = |graphs: &Graphs, q: &str| {
+            let gen = graphs.get(&graph).unwrap();
+            let writer = graphs.writer(&graph).unwrap();
+            match parser::parse_statement(q).unwrap() {
+                parser::ast::Statement::Write(w) => {
+                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                }
+                _ => panic!("expected a write: {q}"),
+            }
+        };
+        let knn = |graphs: &Graphs, q: &str| -> Vec<i64> {
+            let gen = graphs.get(&graph).unwrap();
+            let snap = DeltaSnapshot::from_memtable(graphs.writer(&graph).unwrap().snapshot());
+            let view = MergedView::new(gen.as_ref(), snap);
+            let ast = parser::parse(&format!(
+                "CALL db.idx.vector.queryNodes('Person', 'embedding', 5, vecf32({q})) \
+                 YIELD node, score RETURN id(node) AS id"
+            ))
+            .unwrap();
+            let res = Engine::new(&view, &cache).run(&ast).unwrap();
+            res.rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(i) => i,
+                    ref o => panic!("unexpected KNN row {o:?}"),
+                })
+                .collect()
+        };
+
+        // Alice (0) starts in the base index at [0.1, 0.2, 0.3].
+        assert_eq!(
+            knn(&graphs, "[0.1, 0.2, 0.3]")[0],
+            0,
+            "Alice leads on her own vector"
+        );
+
+        // Re-embed her, then flush the delta into a core segment. The embedding rides the
+        // node row into the segment — `Value::Vector` is a first-class wire type — so it is
+        // still exactly ranked with the delta now empty.
+        write(
+            &graphs,
+            "MATCH (n:Person {name:'Alice'}) SET n.embedding = vecf32([0.0, 0.0, 1.0])",
+        );
+        assert_eq!(
+            knn(&graphs, "[0.0, 0.0, 1.0]")[0],
+            0,
+            "visible from the delta"
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("a non-empty delta flushes");
+        assert_eq!(
+            graphs.get(&graph).unwrap().stack().segments().len(),
+            1,
+            "the write is now in a segment, not the delta"
+        );
+        assert_eq!(
+            knn(&graphs, "[0.0, 0.0, 1.0]")[0],
+            0,
+            "the vector must survive the flush and still lead"
+        );
+
+        // Now remove it. She must leave the index entirely — including for a query aimed at
+        // the vector the *base* still holds for her, which is what would resurface.
+        write(
+            &graphs,
+            "MATCH (n:Person {name:'Alice'}) REMOVE n.embedding",
+        );
+        let after = knn(&graphs, "[0.1, 0.2, 0.3]");
+        assert!(
+            !after.contains(&0),
+            "a removed embedding must take the node out of the index — the stale base vector \
+             must not resurface; got {after:?}"
+        );
+        assert_eq!(
+            after.len(),
+            2,
+            "the other two Person embeddings remain: {after:?}"
+        );
+
+        // The removal must also survive its own flush (the sidecar, not the row, carries it).
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the removal flushes");
+        let after_flush = knn(&graphs, "[0.1, 0.2, 0.3]");
+        assert!(
+            !after_flush.contains(&0),
+            "the removal must survive being flushed into a segment; got {after_flush:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.

@@ -33,6 +33,7 @@ use graph_format::segindex::SegmentIndexReader;
 use graph_format::segmanifest::SegmentManifest;
 use graph_format::segment::{EdgeRow, NodeRow, SegmentReader};
 use graph_format::segpostings::SegmentPostingsReader;
+use graph_format::segvectors::SegmentVectorReader;
 use graph_format::setmanifest::SetManifest;
 use graph_format::store::{join_key, ObjectStore};
 
@@ -55,6 +56,9 @@ pub struct LoadedSegment {
     pub reader: SegmentReader,
     pub index: Option<SegmentIndexReader>,
     pub postings: Option<SegmentPostingsReader>,
+    /// Which nodes this segment embeds / un-embeds, per vector index. `None` ⇒ the segment
+    /// touched no embedding, so the level below keeps its vectors untouched.
+    pub vectors: Option<SegmentVectorReader>,
 }
 
 impl std::fmt::Debug for LoadedSegment {
@@ -187,12 +191,15 @@ impl CoreStack {
                 .with_context(|| format!("open segment {uuid} index fragments"))?;
             let postings = SegmentPostingsReader::open_if_present_via(store, &prefix)
                 .with_context(|| format!("open segment {uuid} posting fragments"))?;
+            let vectors = SegmentVectorReader::open_if_present_via(store, &prefix)
+                .with_context(|| format!("open segment {uuid} vector sidecar"))?;
 
             segments.push(LoadedSegment {
                 manifest,
                 reader,
                 index,
                 postings,
+                vectors,
             });
         }
 
@@ -630,6 +637,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![],
             label_membership_touch: None,
             mac: None,

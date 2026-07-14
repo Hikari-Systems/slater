@@ -986,57 +986,131 @@ fn suppress_indexed_vector(
     Ok(v)
 }
 
-/// Every `(node_id, vector)` the levels **above the base** hold for a vector index — the
-/// delta's property patches and the core segments' full rows, folded newest-wins.
+/// What the levels **above the base** say about a vector index — the write-visibility
+/// primitive the base's sealed, immutable index cannot provide.
+pub struct VectorOverlay {
+    /// `(node_id, vector)` for every node a level above the base embeds or re-embeds. Its
+    /// base entry, if any, is stale and must be suppressed.
+    pub entries: Vec<graph_format::vectors::VectorEntry>,
+    /// Nodes whose embedding a level above the base **removed** (`REMOVE n.embedding`, or a
+    /// `SET n = {…}` that dropped it). Their base entry must be suppressed with *nothing*
+    /// put in its place — the node is simply no longer in the index.
+    pub removed: Vec<u64>,
+}
+
+impl VectorOverlay {
+    /// Every node whose base entry this overlay invalidates — re-embedded or un-embedded.
+    /// The base arm must suppress these in its **scan**, not in the merge afterwards.
+    pub fn superseded(&self) -> HashSet<u64> {
+        self.entries
+            .iter()
+            .map(|e| e.node_id)
+            .chain(self.removed.iter().copied())
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Fold the delta and the core segments into a [`VectorOverlay`] for one vector index.
 ///
-/// This is the write-visibility primitive the base's sealed, immutable index cannot
-/// provide. Two consumers, and they must agree or a vector goes missing: the KNN path
-/// unions it with the base's own arm, and the consolidation dump carries it so a rebuild
-/// does not drop a freshly-written embedding on the floor.
+/// Two consumers, and they must agree or a vector goes missing: the KNN path unions this
+/// with the base's own arm, and the consolidation dump carries it so a rebuild does not drop
+/// a freshly-written embedding on the floor.
 ///
-/// Newest-wins comes for free from [`node_prop_raw`] (delta patch over segment row over
-/// base record), so a re-embedded node yields its *new* vector here and its base entry is
-/// suppressed by the caller. Tombstoned and mislabelled nodes are dropped. Cost is
-/// O(touched nodes), not O(graph) — the candidate set is the delta plus the segments'
-/// rows, both bounded by `memtableBytes` and `maxUpperSegments`.
+/// # Why removals need their own channel
+/// An indexed embedding is routed **out** of the column store (D12), so a node's property
+/// record never held one — which means "this row has no embedding" is ambiguous. A node
+/// whose embedding was `REMOVE`d and a node merely flushed for an unrelated reason
+/// (`SET n.age = 99`) produce byte-identical rows, and both read back as `Null`. Value
+/// absence therefore cannot express a removal, and without an explicit record the removed
+/// node's stale base vector keeps scoring forever. The delta says so via `NodeDelta`; a
+/// segment says so via its `vec.meta` sidecar ([`graph_format::segvectors`]).
+///
+/// # Cost
+/// O(vectors touched), not O(graph) and not O(segment): the candidate set is the delta's
+/// touched nodes plus exactly the ids the segments' sidecars name, so a large segment that
+/// embedded three nodes contributes three candidates, not its whole row count. Newest-wins
+/// then comes for free from [`node_prop_raw`] (delta patch over segment row over base).
 pub fn overlay_index_vectors(
     gen: &dyn ReadView,
     cache: &BlockCache,
     desc: &VectorIndexDesc,
-) -> Result<Vec<graph_format::vectors::VectorEntry>> {
+) -> Result<VectorOverlay> {
     let delta = gen.delta();
     let stack = gen.core_stack();
     if delta.is_empty() && stack.is_singleton() {
-        return Ok(Vec::new());
+        return Ok(VectorOverlay {
+            entries: Vec::new(),
+            removed: Vec::new(),
+        });
     }
+
+    // Candidates: every node the delta touched, plus exactly the ids the segments' sidecars
+    // name for this index. A segment with no `vec.meta` contributes nothing at all.
     let mut ids = delta.node_dense_ids();
     for seg in stack.segments() {
-        ids.extend(seg.reader.node_ids());
+        if let Some(v) = &seg.vectors {
+            ids.extend_from_slice(v.ids(&desc.label, &desc.property));
+            ids.extend_from_slice(v.removals(&desc.label, &desc.property));
+        }
     }
     ids.sort_unstable();
     ids.dedup();
 
-    let mut out = Vec::new();
+    let mut entries = Vec::new();
+    let mut removed = Vec::new();
     for id in ids {
+        // A deleted node takes its embedding with it, and its tombstone already suppresses
+        // it on every arm — it needs no vector removal on top.
         if delta.is_tombstoned(id) || (!stack.is_singleton() && stack.is_node_tombstoned(id)?) {
             continue;
         }
-        // The index is scoped to a label, and a delta write can add one (`SET n:Label`),
-        // so resolve the effective label set rather than trusting the base's.
+        // The index is scoped to a label, and a write can add one (`SET n:Label`), so
+        // resolve the effective label set rather than trusting the base's.
         let labelled = node_label_ids_par(gen, cache, id)?
             .into_iter()
             .any(|l| gen.label_name(l).is_some_and(|n| n == desc.label));
         if !labelled {
             continue;
         }
-        if let Val::Vector(v) = node_prop_raw(gen, cache, id, &desc.property)? {
-            out.push(graph_format::vectors::VectorEntry {
+        match node_prop_raw(gen, cache, id, &desc.property)? {
+            // The winning level carries an embedding: it supersedes whatever is below.
+            Val::Vector(v) => entries.push(graph_format::vectors::VectorEntry {
                 node_id: id,
                 vector: v,
-            });
+            }),
+            // No embedding at the winning level. That is only a *removal* if some level
+            // above the base says so — otherwise this node simply never had one, or still
+            // has the base's (which a column read cannot see, per D12).
+            _ if removes_vector(gen, id, desc) => removed.push(id),
+            _ => {}
         }
     }
-    Ok(out)
+    Ok(VectorOverlay { entries, removed })
+}
+
+/// Whether a level above the base **removed** node `id`'s embedding for `desc`. See
+/// [`overlay_index_vectors`] — value absence cannot answer this, so ask the levels.
+fn removes_vector(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> bool {
+    if let Some(nd) = gen.delta().node_patch(id) {
+        // A replace-all that re-set the embedding is not a removal — but it took the
+        // `Val::Vector` arm above, so reaching here means it really is gone.
+        if nd.replaced || nd.removed.contains(&desc.property) {
+            return true;
+        }
+    }
+    // Newest segment first: a later re-embed would have been caught above, so a segment that
+    // names this id in its removals is the last word on it.
+    gen.core_stack().segments().iter().rev().any(|seg| {
+        seg.vectors.as_ref().is_some_and(|v| {
+            v.removals(&desc.label, &desc.property)
+                .binary_search(&id)
+                .is_ok()
+        })
+    })
 }
 
 /// Thread-safe read of node `id`'s value for property `key` (or `Null` if absent),
@@ -2350,7 +2424,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// (cache lookup + zstd decode) gather in parallel, preserving record order.
     /// Every `(node_id, vector)` the delta and the core segments hold for `desc` — see
     /// the free fn [`overlay_index_vectors`].
-    pub(crate) fn overlay_index_vectors(&self, desc: &VectorIndexDesc) -> Result<Vec<VectorEntry>> {
+    pub(crate) fn overlay_index_vectors(&self, desc: &VectorIndexDesc) -> Result<VectorOverlay> {
         overlay_index_vectors(self.gen, self.cache, desc)
     }
 
@@ -5303,11 +5377,15 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // the pinned set without bound as segments accumulate. Building costs O(overlay),
         // the same order as the brute-force scan it feeds.
         let overlay = self.overlay_index_vectors(&desc)?;
-        let superseded: HashSet<u64> = overlay.iter().map(|e| e.node_id).collect();
-        let overlay_matrix = if overlay.is_empty() {
+        let superseded = overlay.superseded();
+        let overlay_matrix = if overlay.entries.is_empty() {
             None
         } else {
-            Some(vector::ResidentMatrix::from_entries(dim, metric, overlay)?)
+            Some(vector::ResidentMatrix::from_entries(
+                dim,
+                metric,
+                overlay.entries,
+            )?)
         };
 
         // A vector index is built over the **base** generation and is immutable, so a
@@ -10992,6 +11070,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![
                 DirtyIndex {
                     label: "Person".into(),
@@ -12307,6 +12386,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![],
             label_membership_touch: None,
             mac: None,
@@ -12473,6 +12553,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![],
             label_membership_touch: None,
             mac: None,

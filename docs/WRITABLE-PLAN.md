@@ -114,8 +114,15 @@ Cases layered into `MergedView`'s method bodies over the phases:
 - **Topology / new edges** (Phase 3) — concatenate the core CSR record with an
   in-memory adjacency delta keyed by the resolved current-core dense id (resolve
   each endpoint's business key once via ISAM, cache for the delta's lifetime).
-- **Vectors** — out of scope for the delta; served from the core (the write grammar
-  rejects `vecf32`).
+- ~~**Vectors** — out of scope for the delta; served from the core (the write grammar
+  rejects `vecf32`).~~ **Superseded (D63).** Embeddings are writable and span the whole
+  ladder: `SET n.embedding = vecf32([…])` lands in the delta, is immediately KNN-visible
+  with *exact* rank, survives a T2 flush and a T3 merge, and is carried through a
+  consolidation. `REMOVE n.embedding` takes the node out of the index for good. The one
+  thing a row cannot express is a *removal* — an indexed embedding was never in the props
+  record (D12), so a row that lacks one is ambiguous — hence the `vec.meta` sidecar. Note
+  the *text* `MERGE` dump still cannot carry an embedding and refuses a vector-carrying
+  graph outright; consolidation takes the binary path.
 
 **Cache correctness:** the block cache is safe (core blocks immutable, keyed on core
 uuid). The *result* cache keys on `gen.uuid()` only, so a delta mutation without a

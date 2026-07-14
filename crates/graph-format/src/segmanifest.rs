@@ -59,6 +59,20 @@ pub struct DirtyIndex {
     pub fragment: String,
 }
 
+/// One `(label, property)` **vector** index whose membership this segment changes — a
+/// per-index dirty bit, the vector twin of [`DirtyIndex`].
+///
+/// It names no fragment file, because there is no fragment: the embeddings themselves are
+/// already in the segment's node rows (`Value::Vector` is a first-class wire type), so the
+/// segment carries only the *id lists* — which nodes it embeds, and which it un-embeds —
+/// in one shared `vec.meta` sidecar. See [`crate::segvectors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirtyVector {
+    pub label: String,
+    pub property: String,
+}
+
 /// The `SEGMENT.json` manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,6 +129,13 @@ pub struct SegmentManifest {
     /// only for these. Empty ⇒ the segment touched no indexed property.
     #[serde(default)]
     pub dirty_indexes: Vec<DirtyIndex>,
+
+    /// Vector indexes whose membership this segment changes — it embeds a node, re-embeds
+    /// one, or removes one's embedding. A KNN read consults the segment's `vec.meta`
+    /// sidecar ([`crate::segvectors`]) only for these. Empty ⇒ the segment touched no
+    /// embedding, and the base's vectors stand unaltered.
+    #[serde(default)]
+    pub dirty_vectors: Vec<DirtyVector>,
 
     /// The set of labels whose **node membership** this segment changes relative to the base:
     /// a node gains or loses the label, is born carrying it, or is tombstoned while carrying
@@ -335,6 +356,7 @@ mod tests {
             hub_degree_out_deltas: vec![],
             hub_degree_in_deltas: vec![],
             marginals_exact: true,
+            dirty_vectors: vec![],
             dirty_indexes: vec![DirtyIndex {
                 label: "Person".into(),
                 property: "age".into(),
@@ -409,6 +431,14 @@ mod tests {
         check("node_band", &|m| m.node_band = (0, 1));
         check("edge_count_delta", &|m| m.edge_count_delta = 999);
         check("dirty index", &|m| m.dirty_indexes.clear());
+        // A forged `dirty_vectors` would let an attacker hide a segment's vector sidecar and
+        // silently resurrect an embedding the user removed.
+        check("dirty vector", &|m| {
+            m.dirty_vectors.push(DirtyVector {
+                label: "Person".into(),
+                property: "embedding".into(),
+            })
+        });
         check("file hash", &|m| m.files[0].blake3 = "zz".into());
         check("base uuid", &|m| m.base = uuid(999));
     }
@@ -453,6 +483,9 @@ mod tests {
         assert!(back.label_node_deltas.is_empty());
         assert!(!back.marginals_exact);
         assert!(back.dirty_indexes.is_empty());
+        // Absent ⇒ the segment touched no embedding, so the base's vectors stand. That is the
+        // safe default: a wrong `true` here would suppress live vectors.
+        assert!(back.dirty_vectors.is_empty());
         // Absent ⇒ unknown ⇒ the reader must not skip (membership_touches is true).
         assert!(back.label_membership_touch.is_none());
         assert!(back.membership_touches("anything"));

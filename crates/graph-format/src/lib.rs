@@ -65,6 +65,7 @@ pub mod segindex;
 pub mod segmanifest;
 pub mod segment;
 pub mod segpostings;
+pub mod segvectors;
 pub mod setmanifest;
 pub mod store;
 pub mod topology;

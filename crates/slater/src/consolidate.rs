@@ -37,7 +37,7 @@
 //! serialises byte-identically — the property the consolidation golden gate rests
 //! on.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -324,8 +324,12 @@ pub fn serialise_binary_dump<V: ReadView>(
         // and the base is the whole index, so the overlay drives the suppression and the
         // base still streams straight through — folding both into one map would put every
         // vector in the graph through a per-node insert to override a handful of them.
+        //
+        // `superseded` covers a **removal** as well as a re-embed: a node whose embedding was
+        // taken away has no overlay entry to overwrite the base's with, so without
+        // suppressing it here the rebuild would quietly restore the vector the user deleted.
         let overlay = engine.overlay_index_vectors(desc)?;
-        let superseded: HashSet<u64> = overlay.iter().map(|e| e.node_id).collect();
+        let superseded = overlay.superseded();
         let push = |node_id: u64, vector: Vec<f32>, vectors: &mut Vec<_>| {
             // A node the delta or a segment deleted takes its embedding with it.
             if combined_tombs.binary_search(&node_id).is_ok() {
@@ -339,7 +343,7 @@ pub fn serialise_binary_dump<V: ReadView>(
             }
             push(e.node_id, e.vector, &mut vectors);
         }
-        for e in overlay {
+        for e in overlay.entries {
             push(e.node_id, e.vector, &mut vectors);
         }
         vector_indexes.push(DumpVectorIndex {

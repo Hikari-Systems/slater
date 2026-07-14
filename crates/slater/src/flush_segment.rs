@@ -72,10 +72,11 @@ use graph_format::ids::{Generation as GenId, NodeId, Value};
 use graph_format::manifest::{EncryptionHeader, FileEntry};
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
-    DirtyIndex, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
+    DirtyIndex, DirtyVector, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
+use graph_format::segvectors::{write_vector_fragments, VectorSpec};
 use slater_delta::l0_offheap::SegmentData;
 use slater_delta::NodeDelta;
 
@@ -508,6 +509,58 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         .with_context(|| format!("write index fragments at {}", inp.seg_dir.display()))?;
     }
 
+    // ── vector sidecar: which nodes this segment embeds, and which it un-embeds. ──────────
+    //
+    // Read from the *deltas*, not the rows, and that is the whole point. An indexed
+    // embedding is routed out of the column store (D12), so a base node's row never held
+    // one — which makes a flushed row that lacks an embedding ambiguous: `REMOVE
+    // n.embedding` and an unrelated `SET n.age = 99` produce byte-identical rows. Only the
+    // `NodeDelta` distinguishes them, and only here, while we still have it. Without this
+    // the removed node's stale base vector keeps scoring forever.
+    //
+    // The embeddings themselves need no fragment — `Value::Vector` is a first-class wire
+    // type, so a written vector is already in the node's row (see `segvectors`).
+    let vector_indexes = &inp.core.manifest().vector_indexes;
+    let mut vec_specs: Vec<VectorSpec> = Vec::new();
+    for vi in vector_indexes {
+        let mut spec = VectorSpec {
+            label: vi.label.clone(),
+            prop: vi.property.clone(),
+            ids: Vec::new(),
+            removals: Vec::new(),
+        };
+        for (dense, label, _key, _key_value, nd) in &data.nodes {
+            if label != &vi.label || nd.tombstoned {
+                // A tombstoned node is suppressed by its tombstone, not by a vector removal.
+                continue;
+            }
+            if matches!(nd.patches.get(&vi.property), Some(Value::Vector(_))) {
+                spec.ids.push(*dense);
+            } else if nd.replaced || nd.removed.contains(&vi.property) {
+                // The node's embedding is gone. Note a `replaced` node that re-set the
+                // embedding took the branch above, so this really is a removal.
+                spec.removals.push(*dense);
+            }
+            // Otherwise the delta says nothing about this node's embedding, and the level
+            // below it (base or older segment) keeps whatever it had.
+        }
+        spec.ids.sort_unstable();
+        spec.ids.dedup();
+        spec.removals.sort_unstable();
+        spec.removals.dedup();
+        vec_specs.push(spec);
+    }
+    write_vector_fragments(inp.seg_dir, &vec_specs)
+        .with_context(|| format!("write vector sidecar at {}", inp.seg_dir.display()))?;
+    let dirty_vectors: Vec<DirtyVector> = vec_specs
+        .iter()
+        .filter(|s| !s.ids.is_empty() || !s.removals.is_empty())
+        .map(|s| DirtyVector {
+            label: s.label.clone(),
+            property: s.prop.clone(),
+        })
+        .collect();
+
     // ── posting fragments: per reltype, ascending-distinct born src/tgt endpoint ids. Only a
     // live born edge drives a scan; a delete removes nothing from the (additive) base postings
     // — a stale driving hit is filtered by the adjacency removal above at read time. ─────────
@@ -658,6 +711,7 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         hub_degree_in_deltas,
         marginals_exact: true,
         dirty_indexes,
+        dirty_vectors,
         // Authoritative and exact: the flush materialises every node row, so it knows precisely
         // which labels changed membership (empty ⇒ a pure property/edge patch the label scan
         // can skip).

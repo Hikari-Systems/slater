@@ -1510,3 +1510,59 @@ Resolving the node id in `emit` also fixed a **D26 violation**: the Vamana arm b
 ties on the *layout index* (BFS-from-medoid order, arbitrary w.r.t. node id) while brute force
 broke them on the node id, so the two arms disagreed at the `k` boundary. Both now tie-break on
 ascending node id.
+
+### D63 — Embeddings are writable, and the vector store spans the ladder
+D62 closed the two silent holes in the *read-only* vector path. This makes an embedding a
+first-class **writable** value: `SET n.embedding = vecf32([…])` lands in the delta, is
+immediately KNN-visible with exact rank, survives a T2 flush and a T3 merge, and is carried
+through a consolidation. Three things are worth recording, because two of them are traps and
+one is a piece of work that turned out not to exist.
+
+**The write path was already there; only the parser gate was not.** Every layer below the
+parser is generic over `Value`, and `Value::Vector` is a first-class wire type — so a vector
+already rode `WalOp::UpsertNode.patches`, the WAL's `TAG_VECTOR`, `NodeDelta.patches`, both
+L0 formats and `SegmentData` without a single special case, and `value_size` already budgeted
+it at 4 bytes/f32. The only thing rejecting a vector write was `ensure_constant`. So this
+adds **no** vector storage to the delta: lowering constant-folds `vecf32([<literals>])` to a
+`Value::Vector` literal and the existing plumbing carries it. A second, `ResidentMatrix`-shaped
+copy in the memtable — the obvious design — would have stored every embedding **twice** and
+forced a format change in both L0 paths for nothing. The same fact makes the T2 flush free:
+a flushed embedding is already in the segment's `node.blk` row, so a "vector fragment" would
+be a second copy of every vector on disk. The segments carry **id lists only**.
+
+**D12 must be enforced on the way out, not the way in.** An *indexed* embedding is routed out
+of the column store at build time, so `RETURN n.embedding` reads `Null` from the core — not
+by a guard, but because the value is simply not in the props record. A delta-written vector
+*is* in the property map (that map is what carries it through the WAL, the L0, the flush and
+the rebuild), so reproducing the behaviour means suppressing it at the *read* accessors —
+`node_prop_par` (now a wrapper over an unsuppressed `node_prop_raw` the vector paths use) and
+the whole-map read. Otherwise one query answers `Null` for a core-resident node and a vector
+for a freshly-written one: the same graph, two answers, decided by which level the node
+happens to live on. That suppression does double duty — the consolidation dumper walks node
+properties through the same fold, so an indexed vector can never land back in the rebuilt
+column store.
+
+**Absence cannot express a removal — this is the sharp one.** Because an indexed embedding was
+never in the props record, a row that *lacks* one is ambiguous: `REMOVE n.embedding` and an
+unrelated `SET n.age = 99` produce **byte-identical** rows, and both read back as `Null`. So a
+removal cannot be inferred from the data at any level. It needs its own channel: the delta says
+so via `NodeDelta.removed`/`replaced`, and a segment says so via a new `vec.meta` sidecar
+(`segvectors`) listing, per `(label, property)`, the ids it embeds and the ids it **un-embeds**.
+Without it, `REMOVE n.embedding` silently does nothing to KNN — the node's stale base vector
+goes on scoring forever, and a consolidation would faithfully rebuild the vector the user
+deleted. The `ids` half is an optimisation (KNN enumerates O(vectors), not O(segment)); the
+`removals` half is a correctness requirement. The T3 merge carries a removal forward whenever
+the id lives *below* the run, exactly as `fold_index` does — reclaiming it would resurface the
+base vector the moment the segment that suppressed it was folded away.
+
+**Cross-level KNN: suppress in the scan, not in the merge.** `apply_vector_call` searches the
+base (Vamana or brute force), brute-forces the overlay, and folds both through `merge_topk`.
+A node the overlay supersedes — re-embedded *or* un-embedded — must be dropped during the
+**base's scan**, via the `LivePredicate` that already suppresses tombstones. Dropping it after
+the fact is too late: `TopK` does not dedup by node id, so the stale entry would return the
+node twice at two different scores, and worse, could occupy one of the `k` slots and evict a
+live candidate — the k-th neighbour goes *missing*, not merely misordered. The overlay matrix
+is built per query rather than cached, which closes the Σ-over-levels pinning trap by
+construction: the vector pool's resident matrices are charged to the budget but **never
+evicted**, so a cached per-level matrix would grow the pinned set without bound as segments
+accumulate. Building costs O(overlay) — the same order as the scan it feeds.
