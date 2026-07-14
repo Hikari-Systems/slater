@@ -5288,15 +5288,43 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let first_record = desc.first_record;
         let count = desc.count;
         let mode = desc.mode.clone();
+        let desc = desc.clone();
+
+        // The levels above the base carry vectors the sealed base index cannot: a node
+        // embedded since the build has no entry in it at all, and a node *re*-embedded
+        // since the build has a stale one. Brute-forced exactly — the overlay is bounded
+        // by `memtableBytes` and `maxUpperSegments`, so it is small by construction. Two
+        // properties fall out of that: a freshly-written vector gets **exact** recall, and
+        // the base's own recall is untouched.
+        //
+        // Built per query rather than cached, which is what keeps the Σ-over-levels
+        // pinning trap closed by construction: the vector pool's resident matrices are
+        // charged to the budget but never evicted, so a cached per-level matrix would grow
+        // the pinned set without bound as segments accumulate. Building costs O(overlay),
+        // the same order as the brute-force scan it feeds.
+        let overlay = self.overlay_index_vectors(&desc)?;
+        let superseded: HashSet<u64> = overlay.iter().map(|e| e.node_id).collect();
+        let overlay_matrix = if overlay.is_empty() {
+            None
+        } else {
+            Some(vector::ResidentMatrix::from_entries(dim, metric, overlay)?)
+        };
 
         // A vector index is built over the **base** generation and is immutable, so a
         // node deleted since the build is still in it. The delta/stack tombstones are
         // the only place that delete can take effect on this path — without this the
         // KNN arms would hand back a deleted node as a live `Val::Node` (every other
         // read path already suppresses them; see `suppress_tombstoned_in_place`).
+        //
+        // A node the overlay re-embedded is suppressed here for the same reason: its base
+        // vector is stale. It must lose in the base's *scan*, not in the merge afterwards
+        // — `merge_topk` cannot drop it late without risking the k-th slot (see there).
         let delta = self.gen.delta();
         let stack = self.gen.core_stack();
         let live_fn = |id: u64| -> Result<bool> {
+            if superseded.contains(&id) {
+                return Ok(false);
+            }
             if delta.is_tombstoned(id) {
                 return Ok(false);
             }
@@ -5305,8 +5333,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
             Ok(true)
         };
-        // A pure-core generation with an empty delta can have no tombstones, so the
-        // read-only estate pays nothing at all for this.
+        // A pure-core generation with an empty delta can have no tombstones and no overlay,
+        // so the read-only estate pays nothing at all for this.
         let live: Option<vector::LivePredicate> = if delta.is_empty() && stack.is_singleton() {
             None
         } else {
@@ -5393,6 +5421,26 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 },
                 AnnMode::Vamana { medoid, .. } => {
                     self.vamana_knn(vc, *medoid, metric, &query, k, live)?
+                }
+            };
+            // Fold the levels above the base in. The overlay is scanned exactly (no ANN),
+            // and the base arm has already suppressed every node it supersedes, so the
+            // merge is a straight scored fold — see `vector::merge_topk` for why it must
+            // not dedup here instead.
+            let neighbours = match &overlay_matrix {
+                None => neighbours,
+                Some(m) => {
+                    let fresh = vector::brute_force_knn_matrix_par(
+                        self.fanout_pool.as_deref(),
+                        m,
+                        &query,
+                        k,
+                        KNN_PAR_MIN,
+                        // `overlay_index_vectors` already dropped tombstoned nodes, and
+                        // nothing supersedes the newest level.
+                        None,
+                    )?;
+                    vector::merge_topk([neighbours, fresh], k)
                 }
             };
             for nb in neighbours {
@@ -17337,6 +17385,114 @@ mod tests {
             vec![0, 1],
             "the two live Person embeddings remain, still exact-ranked"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A vector written to the delta is immediately KNN-visible, with **exact** rank (the
+    /// overlay is brute-forced, not approximated).
+    ///
+    /// The sharp part is the re-embed. A node whose vector a newer level supersedes still
+    /// sits in the sealed base index with its *stale* vector, and `TopK` does not dedup by
+    /// node id — so a merge that did not suppress the base entry would return that node
+    /// **twice**, at two different scores, and the stale copy could take one of the `k`
+    /// slots and evict a live candidate. Both the "appears once" and the "old vector no
+    /// longer matches" assertions below fail if the suppression is dropped.
+    #[test]
+    fn a_delta_written_vector_is_knn_visible_and_supersedes_the_base() {
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph, _) = testgen::write_basic("exec_knn_delta_write");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        let knn = |view: &MergedView, q: &str| -> Vec<(i64, f64)> {
+            let ast = parser::parse(&format!(
+                "CALL db.idx.vector.queryNodes('Person', 'embedding', 5, vecf32({q})) \
+                 YIELD node, score RETURN id(node) AS id, score"
+            ))
+            .unwrap();
+            Engine::new(view, &cache)
+                .run(&ast)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    (Val::Int(i), Val::Float(s)) => (*i, *s),
+                    other => panic!("unexpected KNN row {other:?}"),
+                })
+                .collect()
+        };
+
+        // Alice (0)'s original embedding, from the fixture.
+        let base = MergedView::read_only(&gen);
+        let old = knn(&base, "[0.1, 0.2, 0.3]");
+        assert_eq!(old[0].0, 0, "Alice is the exact match for her own vector");
+        assert!(old[0].1.abs() < 1e-6, "…at distance ~0");
+
+        // Re-embed Alice onto a vector orthogonal to her old one, and add a brand-new
+        // node carrying an embedding of its own.
+        // Seeded with the core's counts, so a born node's synthetic id cannot collide
+        // with a core dense id (`Memtable::new()` bases both at 0 — fine for a
+        // patch-only delta, wrong the moment a node is born).
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Alice".into()),
+            Some(0),
+            [("embedding".to_string(), Value::Vector(vec![0.0, 0.0, 1.0]))],
+        );
+        mem.upsert_node(
+            "Person",
+            "name",
+            Value::Str("Zoe".into()),
+            None, // delta-born: no core row at all
+            [("embedding".to_string(), Value::Vector(vec![1.0, 0.0, 0.0]))],
+        );
+        let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+
+        // Alice's NEW vector: she is now the exact match, and appears exactly once.
+        let fresh = knn(&view, "[0.0, 0.0, 1.0]");
+        assert_eq!(
+            fresh[0].0, 0,
+            "the delta's vector must win over the base's stale one"
+        );
+        assert!(
+            fresh[0].1.abs() < 1e-6,
+            "…at distance ~0, got {}",
+            fresh[0].1
+        );
+        assert_eq!(
+            fresh.iter().filter(|(id, _)| *id == 0).count(),
+            1,
+            "Alice must appear exactly once — the base's stale entry has to be suppressed \
+             in the scan, not merged away afterwards; got {fresh:?}"
+        );
+
+        // Her OLD vector must no longer be an exact match for her — proof the stale base
+        // entry is genuinely gone from the candidate set rather than merely outranked.
+        let stale = knn(&view, "[0.1, 0.2, 0.3]");
+        let alice = stale
+            .iter()
+            .find(|(id, _)| *id == 0)
+            .expect("Alice is still live, just re-embedded");
+        assert!(
+            alice.1 > 1e-3,
+            "Alice's stale base vector must not still be scoring ~0 against her old query; \
+             got {alice:?}"
+        );
+
+        // The delta-born node is visible, exactly ranked, on its own vector. Its synthetic
+        // id is the first past the core's dense range.
+        let zoe = gen.node_count() as i64;
+        let born = knn(&view, "[1.0, 0.0, 0.0]");
+        assert_eq!(
+            born[0].0, zoe,
+            "a node born in the delta with an embedding must be KNN-visible; got {born:?}"
+        );
+        assert!(born[0].1.abs() < 1e-6, "…at distance ~0, got {}", born[0].1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

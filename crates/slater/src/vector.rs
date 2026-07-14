@@ -325,6 +325,29 @@ impl TopK {
     }
 }
 
+/// Fold each level's neighbours into one global top-`k`.
+///
+/// This is the only *scored* merge in the tree. The core stack's folds resolve rows
+/// first-hit-wins and union id sets — neither carries a score, so neither can decide
+/// which of two nodes is nearer. [`TopK`] already enforces the D26 total order (distance
+/// ascending, node id ascending on a tie) and is what the parallel brute-force arm uses
+/// to fold its per-worker partials, so feeding it each level's neighbours yields exactly
+/// the global top-`k`, tie-break included. Both arms score on the same scale — the exact
+/// metric distance (D32) — so base and overlay results are directly comparable.
+///
+/// **Does not dedup by node id, deliberately.** A node whose vector a newer level
+/// supersedes has to be suppressed during the *older* level's scan, via its
+/// `LivePredicate` — not merged away afterwards. Dropping the loser here would be too
+/// late: the stale entry could already have taken one of the `k` slots and evicted a live
+/// candidate, so the k-th neighbour would be missing rather than merely misordered.
+pub fn merge_topk(levels: impl IntoIterator<Item = Vec<Neighbour>>, k: usize) -> Vec<Neighbour> {
+    let mut merged = TopK::new(k);
+    for nb in levels.into_iter().flatten() {
+        merged.push(nb.node_id, nb.score);
+    }
+    merged.into_sorted()
+}
+
 /// Brute-force `k`-nearest-neighbour scan over a vector index group.
 ///
 /// Every entry must have the same dimensionality as `query` (the store is
