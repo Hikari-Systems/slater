@@ -248,6 +248,22 @@ pub fn ingest_dump(
             property: vi.property.clone(),
             dim: vi.dim,
             metric: metric_token(vi.metric).to_string(),
+            // A carried Vamana index (HIK-117): keep the base references and build params,
+            // resolving the `layout → dump-id` sidecar to an absolute path under the dump dir
+            // (the only place the merge can find it later — `write_vector_indexes` has no
+            // dump-dir handle). The base `.vamana`/`.pq` stay data-dir-relative.
+            carry: vi.carry.as_ref().map(|c| crate::model::VectorCarry {
+                base_vamana: c.base_vamana.clone(),
+                base_pq: c.base_pq.clone(),
+                carry_map_path: dump_dir.join(&c.carry_map_file),
+                base_records: c.base_records,
+                r: c.r,
+                alpha: c.alpha,
+                medoid: c.medoid,
+                max_norm: c.max_norm,
+                pq_subspaces: c.pq_subspaces,
+                pq_bits: c.pq_bits,
+            }),
         })
         .collect();
 

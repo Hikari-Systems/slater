@@ -702,6 +702,7 @@ fn parse_vector_index(pair: Pair<Rule>, order: ArgOrder) -> Result<Statement> {
         property,
         dim,
         metric,
+        carry: None,
     }))
 }
 

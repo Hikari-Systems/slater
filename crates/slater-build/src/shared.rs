@@ -19,9 +19,11 @@ use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::manifest::{AnnMode, Metric, VectorIndexDesc};
 use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqWriter};
 use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
+use graph_format::vamana_merge::{compose_final_ids, streaming_merge, MergeInputs, MergeParams};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::wire::{read_uvarint, write_uvarint};
 
+use crate::cluster::Permutation;
 use crate::model::VectorIndexStmt;
 
 /// Tunables for one build (all have sensible defaults in the CLI).
@@ -234,6 +236,10 @@ pub(crate) struct PendingIndex {
     pub(crate) metric: Metric,
     /// Number of `(node_id, vector)` entries pushed into this index's sorter.
     pub(crate) count: u64,
+    /// Present iff this index is **carried by reference** (HIK-117): the sorter then holds
+    /// only the Δ (the `streaming_merge` inserts), never the base — the base graph is folded
+    /// in from the referenced files rather than rebuilt.
+    pub(crate) carry: Option<crate::model::VectorCarry>,
 }
 
 /// One gathered vector, spilled to and merged back from the per-index sorter.
@@ -308,6 +314,8 @@ pub(crate) fn write_vector_indexes(
     opts: &BuildOptions,
     cipher: Option<Arc<BlockCipher>>,
     block_sizes: &mut BTreeMap<String, u32>,
+    perm: &Permutation,
+    data_dir: &Path,
 ) -> Result<(Vec<VectorIndexDesc>, Vec<String>)> {
     fs::create_dir_all(tmp_dir.join("vector"))
         .with_context(|| format!("create {}", tmp_dir.join("vector").display()))?;
@@ -321,6 +329,28 @@ pub(crate) fn write_vector_indexes(
         cipher.clone(),
     )?;
     for (pi, sorter) in pending.iter().zip(sorters) {
+        // ── Carried arm (HIK-117), checked FIRST — before the cardinality routing. A carried
+        // index's sorter holds only the Δ (the base is folded in by reference), so `pi.count`
+        // is the *insert* count and could be tiny or zero; routing on it would wrongly demote a
+        // carried graph to brute-force over a handful of vectors.
+        if let Some(carry) = &pi.carry {
+            let (desc, files) = carry_vamana_index(
+                tmp_dir,
+                pi,
+                carry,
+                sorter,
+                opts,
+                cipher.clone(),
+                perm,
+                data_dir,
+            )?;
+            for (name, block) in &files {
+                vector_files.push(name.clone());
+                block_sizes.insert(name.clone(), *block);
+            }
+            vector_indexes.push(desc);
+            continue;
+        }
         let count = pi.count;
         if count >= opts.ann_threshold && vamana_eligible(pi, opts) {
             // Disk-native Vamana/PQ path. The in-memory graph build needs the whole
@@ -507,6 +537,153 @@ fn build_vamana_index(
     ))
 }
 
+/// Carry a Vamana index through a consolidation **by reference** (HIK-117): fold this
+/// build's Δ into the referenced base with `streaming_merge`, writing a fresh
+/// `vector/<l>.<p>.vamana` + `.pq` pair — instead of the `O(N·R·L)` from-scratch
+/// [`build_vamana_index`].
+///
+/// # The one composition that must be exactly right
+/// The `.vamana` graph is carried, only the `.pq` id column is rewritten, so a wrong
+/// `layout → new-id` map makes every KNN point at the wrong node with a plausible score and
+/// **no error**. The map is `layout_to_dump_id ∘ perm.final_of` — the dump's compacted
+/// dump-ids composed with this build's provisional→final permutation ([`compose_final_ids`],
+/// `HOLE` carried through). `perm.final_of` is **old → new** (`cluster.rs::Permutation::Table`
+/// holds `final_of_prov[prov] = final`); under `ClusterMode::None` it is the identity, so the
+/// map is the dump-id column unchanged. The Δ inserts arrive from the sorter already keyed by
+/// **final** id (the emit gather applied `perm.final_of` when it routed them), so they sit in
+/// the same id space as `base_final_ids` with no further composition.
+///
+/// When the Δ is empty and there is no new delete, `streaming_merge` hard-links the base
+/// `.vamana` byte-identically (`stats.vamana_carried`) — the whole point of the slice.
+#[allow(clippy::too_many_arguments)]
+fn carry_vamana_index(
+    tmp_dir: &Path,
+    pi: &PendingIndex,
+    carry: &crate::model::VectorCarry,
+    sorter: ExtSorter<PendingVector>,
+    opts: &BuildOptions,
+    cipher: Option<Arc<BlockCipher>>,
+    perm: &Permutation,
+    data_dir: &Path,
+) -> Result<(VectorIndexDesc, Vec<(String, u32)>)> {
+    // The `layout → dump-id` table, composed through this build's permutation into final ids.
+    let layout_to_dump_id = read_carry_map(&carry.carry_map_path, carry.base_records)
+        .with_context(|| {
+            format!(
+                "read carry map for vector index {}.{}",
+                pi.label, pi.property
+            )
+        })?;
+    let base_final_ids = compose_final_ids(&layout_to_dump_id, |id| perm.final_of(id));
+
+    // The Δ inserts: the sorter holds *only* the delta for a carried index, already in scan
+    // order and keyed by final id.
+    let inserts: Vec<(u64, Vec<f32>)> = sorter
+        .sorted()?
+        .map(|r| r.map(|e| (e.id, e.vec)))
+        .collect::<Result<_>>()?;
+
+    let base_vamana = data_dir.join(&carry.base_vamana);
+    let base_pq = data_dir.join(&carry.base_pq);
+    let vam_rel = format!("vector/{}.{}.vamana", pi.label, pi.property);
+    let pq_rel = format!("vector/{}.{}.pq", pi.label, pi.property);
+    let vam_out = tmp_dir.join(&vam_rel);
+    let pq_out = tmp_dir.join(&pq_rel);
+
+    let params = MergeParams {
+        medoid: carry.medoid as graph_format::vamana::VamanaIndex,
+        r: carry.r as usize,
+        alpha: carry.alpha,
+        // Search-list width for an insert's greedy search — the build default (wider than R),
+        // mirroring the base's build-time L; the base's exact L is not per-index state.
+        l_build: ((carry.r as usize) * 2).max(64),
+        metric: pi.metric,
+        max_norm: carry.max_norm as f64,
+        // The `.vamana` uses `vector_block_size`, the `.pq` uses `block_size` — matching
+        // `build_vamana_index` so a carried index is byte-shaped like a freshly built one.
+        vamana_block_bytes: opts.vector_block_size,
+        pq_block_bytes: opts.block_size,
+        zstd_level: opts.zstd_level,
+        cipher,
+    };
+    let stats = streaming_merge(
+        &base_vamana,
+        &base_pq,
+        &MergeInputs {
+            base_final_ids: &base_final_ids,
+            inserts: &inserts,
+        },
+        &params,
+        &vam_out,
+        &pq_out,
+    )
+    .with_context(|| {
+        format!(
+            "carry vector index {}.{} through consolidation ({} inserts, base {})",
+            pi.label,
+            pi.property,
+            inserts.len(),
+            base_vamana.display()
+        )
+    })?;
+
+    let desc = VectorIndexDesc {
+        label: pi.label.clone(),
+        property: pi.property.clone(),
+        dim: pi.dim,
+        metric: pi.metric,
+        // `count` is the record count (holes included) that bounds a layout ordinal; the
+        // carried graph keeps every ordinal (holes, not compaction).
+        count: stats.out_records,
+        first_record: 0,
+        mode: AnnMode::Vamana {
+            r: carry.r,
+            alpha: carry.alpha,
+            // The medoid ordinal is carried: the layout is preserved (holes not compaction,
+            // inserts appended past the base), so the base entry point stays valid.
+            medoid: carry.medoid,
+            pq_subspaces: carry.pq_subspaces,
+            pq_bits: carry.pq_bits,
+            live_count: stats.live,
+            max_norm: carry.max_norm,
+        },
+    };
+    Ok((
+        desc,
+        vec![
+            (vam_rel, opts.vector_block_size as u32),
+            (pq_rel, opts.block_size as u32),
+        ],
+    ))
+}
+
+/// Read a carried index's raw-`u64`-LE `layout → dump-id` sidecar (`HOLE` for a dead ordinal).
+/// `expected` is the base record count; a mismatch is a corrupt dump and is refused, since the
+/// table indexes the base `.vamana` by position.
+fn read_carry_map(path: &Path, expected: u64) -> Result<Vec<u64>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read carry map sidecar {}", path.display()))?;
+    if bytes.len() % 8 != 0 {
+        bail!(
+            "carry map {} has {} bytes, not a whole number of u64s",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let n = (bytes.len() / 8) as u64;
+    if n != expected {
+        bail!(
+            "carry map {} holds {n} ids but the dump declares {expected} base records — they \
+             index the base .vamana by position",
+            path.display()
+        );
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
 pub(crate) fn parse_metric(s: &str) -> Result<Metric> {
     match s.to_ascii_lowercase().as_str() {
         "cosine" => Ok(Metric::Cosine),
@@ -543,6 +720,7 @@ pub(crate) fn load_vector_sidecar(path: &Path) -> Result<Vec<VectorIndexStmt>> {
             property: s.property,
             dim: s.dim,
             metric: s.metric,
+            carry: None,
         })
         .collect())
 }
@@ -651,10 +829,21 @@ mod vector_gather_tests {
             dim,
             metric: Metric::Cosine,
             count: entries.len() as u64,
+            carry: None,
         }];
         let opts = BuildOptions::default(); // ann_threshold 50_000 ⇒ brute-force arm
         let mut block_sizes = BTreeMap::new();
-        write_vector_indexes(dir, &pending, vec![sorter], &opts, None, &mut block_sizes).unwrap();
+        write_vector_indexes(
+            dir,
+            &pending,
+            vec![sorter],
+            &opts,
+            None,
+            &mut block_sizes,
+            &Permutation::Identity,
+            dir,
+        )
+        .unwrap();
         std::fs::read(dir.join("vectors.f32.blk")).unwrap()
     }
 

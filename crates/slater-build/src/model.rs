@@ -157,4 +157,26 @@ pub struct VectorIndexStmt {
     pub dim: u32,
     /// Raw metric token from the dump (e.g. `"cosine"`); normalised by the builder.
     pub metric: String,
+    /// Present iff this index is **carried by reference** from a consolidation dump (HIK-117):
+    /// the builder folds the Δ into the referenced base graph with `streaming_merge` rather
+    /// than rebuilding it from scratch. `None` for a Cypher build or a brute-force dump index.
+    #[serde(default)]
+    pub carry: Option<VectorCarry>,
+}
+
+/// The builder-side view of a carried Vamana index (from `graph_format::consolidate_dump::DumpVectorCarry`).
+/// `base_vamana`/`base_pq` are **data-dir-relative** (joined with `--data-dir` at merge time);
+/// `carry_map_path` is the already-resolved absolute path to the `layout → dump-id` sidecar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorCarry {
+    pub base_vamana: String,
+    pub base_pq: String,
+    pub carry_map_path: std::path::PathBuf,
+    pub base_records: u64,
+    pub r: u32,
+    pub alpha: f32,
+    pub medoid: u64,
+    pub max_norm: f32,
+    pub pq_subspaces: u32,
+    pub pq_bits: u32,
 }

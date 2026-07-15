@@ -824,6 +824,7 @@ pub fn build_external(
         graph,
         opts,
         generation,
+        data_dir,
         &graph_dir,
         &tmp_dir,
         &final_dir,
@@ -852,6 +853,7 @@ fn build_inner(
     graph: &str,
     opts: &BuildOptions,
     generation: Generation,
+    data_dir: &Path,
     graph_dir: &Path,
     tmp_dir: &Path,
     final_dir: &Path,
@@ -1521,6 +1523,7 @@ fn build_inner(
             dim: vi.dim,
             metric: parse_metric(&vi.metric)?,
             count: 0,
+            carry: vi.carry.clone(),
         });
         vector_sorters.push(ExtSorter::<PendingVector>::new(
             scratch_dir,
@@ -2106,6 +2109,8 @@ fn build_inner(
         opts,
         cipher.clone(),
         &mut block_sizes,
+        &perm,
+        data_dir,
     )?;
     drop(emit_vec_g);
 
