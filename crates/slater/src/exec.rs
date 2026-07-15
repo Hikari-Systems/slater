@@ -49,10 +49,12 @@ use crate::rwindex::{
 };
 use crate::temporal::{self, TKind};
 use crate::vector;
+use graph_format::blockfile::BlockFileReader;
 use graph_format::ids::{EdgeId, NodeId, Value};
 use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
 use graph_format::postings::EndpointPostingIter;
-use graph_format::pq::AdcTable;
+use graph_format::pq::{AdcTable, ResidentPq};
+use graph_format::segvamana::SegmentVamanaIndex;
 use graph_format::vamana::{self, beam_search};
 use graph_format::vectors::{self, VectorEntry};
 use graph_format::{columns, nodelabels, topology};
@@ -2359,6 +2361,10 @@ pub struct Engine<'g, V: ReadView> {
     deadline: Option<Instant>,
     /// Beam-search list size `L` for the Vamana arm (config `vectorQuery.beamWidth`).
     beam_width: usize,
+    /// Beam-search list size `L` for the **per-segment** read-only temp indexes (HIK-113,
+    /// config `vectorQuery.tempBeamWidth`). Temp indexes are small and a heavily-superseded
+    /// level can under-return, so a wider `L` here is cheap insurance. `0` ⇒ use `beam_width`.
+    temp_beam_width: usize,
     /// Query-wide intermediate-element budget (config `query.maxIntermediate`);
     /// 0 disables. Charged by every operation that materialises a collection
     /// (comprehensions, UNWIND, list concat, aggregate buffers, varlen paths), so
@@ -2450,6 +2456,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             max_rows: usize::MAX,
             deadline: None,
             beam_width: 64,
+            temp_beam_width: 0,
             max_intermediate: 0,
             budget_used: Cell::new(0),
             max_scan: 0,
@@ -2490,6 +2497,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
         self.vec_cache = Some(vec_cache);
         self.beam_width = beam_width.max(1);
         self
+    }
+
+    /// Set the per-segment temp-index beam width (`vectorQuery.tempBeamWidth`). `0` leaves it
+    /// tracking `beam_width`.
+    pub fn with_temp_beam_width(mut self, temp_beam_width: usize) -> Self {
+        self.temp_beam_width = temp_beam_width;
+        self
+    }
+
+    /// The beam width the per-segment temp indexes search at — `tempBeamWidth` if configured,
+    /// else the base `beam_width`.
+    fn temp_beam_width(&self) -> usize {
+        if self.temp_beam_width == 0 {
+            self.beam_width
+        } else {
+            self.temp_beam_width
+        }
     }
 
     /// Supply the RW-index arm: the per-generation index holder, the writer's touched-id
@@ -5654,11 +5678,27 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // a different set of levels above it and therefore a different suppression set (see
         // `VectorLevels`).
         //
-        // The **segments** level is still gathered and brute-forced exactly: it is bounded by
-        // the `vec.meta` sidecars (a segment that embedded three nodes contributes three
-        // candidates), so it is small by construction, and a freshly-flushed vector gets exact
-        // recall for free.
-        let segments = self.segment_level(&desc)?;
+        // The **segments** level is served *per segment* (HIK-113): a segment whose live
+        // embedded set crossed the floor at flush/merge carries its own sealed Vamana index and
+        // is beam-searched; a smaller (or pre-feature) segment is brute-forced over its own
+        // sidecar ids. Each segment suppresses everything *newer* (the delta ∪ every newer
+        // segment) in its own scan — `superseded_above` — folded once per query in
+        // [`Self::segments_knn`] inside the per-row loop below.
+        //
+        // The base's suppression set is the **raw sidecar union** over every segment (every id
+        // any segment embeds or removes): the base sits below all of them, and a base entry any
+        // segment supersedes must lose in the base's own scan. Read straight from the sidecars —
+        // no row reads, no new IO (the same id lists the fold reads).
+        let mut above_base_segments: HashSet<u64> = HashSet::new();
+        if !self.gen.core_stack().is_singleton() {
+            for seg in self.gen.core_stack().segments() {
+                if let Some(v) = &seg.vectors {
+                    above_base_segments.extend(v.ids(&desc.label, &desc.property).iter().copied());
+                    above_base_segments
+                        .extend(v.removals(&desc.label, &desc.property).iter().copied());
+                }
+            }
+        }
 
         // The **delta** level is served by the FreshDiskANN RW-index (`crate::rwindex`) — an
         // in-memory Vamana over the fresh set, advanced to this query's delta epoch and read
@@ -5695,8 +5735,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
             (None, Some(ix)) => ix.superseded(),
             (None, None) => unreachable!("one of the two delta arms is always present"),
         };
-        let above_base_segments = segments.superseded();
-
         let matrix_of = |entries: Vec<VectorEntry>| -> Result<Option<vector::ResidentMatrix>> {
             if entries.is_empty() {
                 return Ok(None);
@@ -5705,7 +5743,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 dim, metric, entries,
             )?))
         };
-        let segments_matrix = matrix_of(segments.entries)?;
         let delta_matrix = match brute_delta {
             Some(l) => matrix_of(l.entries)?,
             None => None,
@@ -5737,8 +5774,6 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 && !above_segments.contains(&id)
                 && !tombstoned(id)?)
         };
-        let segments_live_fn =
-            |id: u64| -> Result<bool> { Ok(!above_segments.contains(&id) && !tombstoned(id)?) };
         // Nothing sits above the delta, so its only suppression is the tombstone. Both delta
         // arms already drop tombstoned nodes as they are built (`delta_vector_for` resolves
         // them to `Silent`), so this is defence in depth — but the delta *is* a scanned level
@@ -5875,10 +5910,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     .collect(),
                 None => scan(&delta_matrix, &delta_live_fn)?,
             };
-            let neighbours = if segments_matrix.is_none() && fresh.is_empty() {
+            // The **segments** level: one beam per sealed segment, brute force per unsealed one,
+            // each suppressed by everything newer than it (`superseded_above`).
+            let segs = self.segments_knn(&desc, &query, k, above_segments, &tombstoned)?;
+            let neighbours = if segs.is_empty() && fresh.is_empty() {
                 neighbours
             } else {
-                let segs = scan(&segments_matrix, &segments_live_fn)?;
                 vector::merge_topk([neighbours, segs, fresh], k)
             };
             // A node id can reach the merged top-k from at most one level: the level that
@@ -5947,29 +5984,63 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let index = self.gen.vamana_index(label, property).ok_or_else(|| {
             anyhow::anyhow!("Vamana index files for (:{label} {{{property}}}) are not open")
         })?;
-        let resident = &index.pq;
+        // The base's index is keyed in the pool by the generation uuid; `None`-live means every
+        // node is live (a pure-core estate with no overlay).
+        self.beam_over_index(
+            pool,
+            self.gen.uuid(),
+            index.ord,
+            index.reader.inner(),
+            &index.pq,
+            medoid,
+            metric,
+            query,
+            k,
+            self.beam_width,
+            |id| match live {
+                Some(f) => f(id),
+                None => Ok(true),
+            },
+        )
+    }
+
+    /// One beam search over a sealed Vamana/PQ index — the base's or a **segment's** (HIK-113).
+    /// The only differences between the two callers are which files back it (`reader`/`resident`/
+    /// `medoid`), the pool key (`gen_id` — a generation uuid for the base, a **segment uuid** for
+    /// a segment; the two spaces cannot collide), and the beam width. Everything the search
+    /// itself does — PQ-estimated navigation, one coalesced block read per expansion, the exact
+    /// re-rank under the true metric, the `HOLE` + `live` suppression that keeps a dead node a
+    /// navigable waypoint, the D26 node-id tie-break — is identical, so it lives here once.
+    #[allow(clippy::too_many_arguments)]
+    fn beam_over_index(
+        &self,
+        pool: &VectorIndexCache,
+        gen_id: graph_format::ids::Generation,
+        ord: u32,
+        reader: &BlockFileReader,
+        resident: &ResidentPq,
+        medoid: u64,
+        metric: graph_format::manifest::Metric,
+        query: &[f32],
+        k: usize,
+        beam_width: usize,
+        live: impl Fn(u64) -> Result<bool>,
+    ) -> Result<Vec<vector::Neighbour>> {
         // The **record** count, holes included — a hole is a legal, navigable neighbour, so
-        // this (never the live count) is what bounds-checks a neighbour ordinal. Using the
-        // live count here would reject valid ordinals and silently cut recall.
+        // this (never the live count) bounds-checks a neighbour ordinal. Using the live count
+        // here would reject valid ordinals and silently cut recall.
         let n = resident.len();
         if n == 0 || k == 0 {
             return Ok(Vec::new());
         }
-
-        // PQ navigates in the ANN space the codebook was trained in — normalised for
-        // cosine (D29), raw for L2, norm-augmented for dot/MIPS. The *same* transform the
-        // builder applied to the stored points, from the one definition in `graph_format::pq`;
-        // an arm that disagreed here would navigate by a quantity it does not rank by.
+        // PQ navigates in the ANN space the codebook was trained in — the same transform the
+        // builder applied, from the one definition in `graph_format::pq`.
         let qn = graph_format::pq::ann_query(metric, query, resident.codebook.params.dim as usize)?;
         let adc = AdcTable::new(&resident.codebook, &qn)?;
-
-        let gen_id = self.gen.uuid();
-        let reader = index.reader.inner();
-        let ord = index.ord;
         let hits = beam_search(
             vamana::BeamParams {
                 medoid: medoid as u32,
-                beam_width: self.beam_width,
+                beam_width,
                 k,
                 num_nodes: n,
             },
@@ -5980,29 +6051,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let node = vamana::decode_node(&rec)?;
                 Ok((node.vector, node.neighbours))
             },
-            // Exact re-rank: the **raw** query against the **raw** stored vector, under the
-            // true metric — the same `distance` the brute-force arm scores with, so the two
-            // arms' scores are on one scale and `merge_topk` interleaves them correctly. The
-            // ANN space above is navigation only; it never reaches a score.
             |v| vector::distance(metric, query, v) as f32,
-            // The layout index → dense node id mapping, and the two liveness gates: a dead
-            // node is still expanded (it stays a navigational waypoint) but is not emitted.
-            //
-            //  * `HOLE` — the record is tombstoned *in the index itself* (v8). The `.pq`
-            //    node-id column is the only layout→id map, so this is the whole
-            //    delete-in-the-base story.
-            //  * `live` — the node is tombstoned in the delta/stack above the base.
-            //
-            // Resolving the node id here also gives `beam_search` the key it needs to
-            // tie-break on node id (D26) rather than on the arbitrary BFS layout index.
             |i| {
                 let node_id = resident.node_ids[i as usize];
                 if node_id == graph_format::pq::HOLE {
                     return Ok(None);
                 }
-                match live {
-                    Some(f) if !f(node_id)? => Ok(None),
-                    _ => Ok(Some(node_id)),
+                if live(node_id)? {
+                    Ok(Some(node_id))
+                } else {
+                    Ok(None)
                 }
             },
         )?;
@@ -6013,6 +6071,141 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 score: h.exact as f64,
             })
             .collect())
+    }
+
+    /// The **segments** level of a KNN read (HIK-113): every core segment, folded
+    /// **newest → oldest**, each contributing its live embeddings suppressed by everything above
+    /// it — the delta (`above_segments`) plus every *newer* segment. A segment that sealed a
+    /// Vamana index is beam-searched; one that did not (below the floor, or pre-feature, or a
+    /// deleted/corrupt pair) is brute-forced over its own sidecar ids. `None` sealed index ⇒
+    /// brute force is the whole compatibility story.
+    ///
+    /// The accumulator `acc` is exactly `superseded_above(i)` at segment `i`: it starts at the
+    /// delta's suppression set and grows by each visited (newer) segment's `ids ∪ removals`.
+    /// Because every older segment suppresses an id a newer one touched, a node reaches the
+    /// merged top-k from at most one segment (the newest that still holds it live) — which is
+    /// what keeps `merge_topk`'s no-dedup fold correct.
+    fn segments_knn(
+        &self,
+        desc: &VectorIndexDesc,
+        query: &[f32],
+        k: usize,
+        above_segments: &HashSet<u64>,
+        tombstoned: &impl Fn(u64) -> Result<bool>,
+    ) -> Result<Vec<vector::Neighbour>> {
+        let stack = self.gen.core_stack();
+        if stack.is_singleton() {
+            return Ok(Vec::new());
+        }
+        let (label, property) = (desc.label.as_str(), desc.property.as_str());
+        let segs = stack.segments();
+        let mut acc: HashSet<u64> = above_segments.clone();
+        let mut out: Vec<vector::Neighbour> = Vec::new();
+        // Newest → oldest: `segs` is oldest→newest, so iterate in reverse.
+        for seg in segs.iter().rev() {
+            let Some(sidecar) = &seg.vectors else {
+                continue;
+            };
+            let ids = sidecar.ids(label, property);
+            let removals = sidecar.removals(label, property);
+            if ids.is_empty() && removals.is_empty() {
+                continue;
+            }
+            // This segment's live gate: suppress everything newer (`acc`), the tombstoned, and
+            // any node that no longer effectively carries the index's label. `acc` is read here
+            // and only extended *after* the segment is processed, so the two never overlap.
+            let live = |id: u64| -> Result<bool> {
+                Ok(!acc.contains(&id)
+                    && !tombstoned(id)?
+                    && vector_indexed(self.gen, self.cache, id, desc)?)
+            };
+            match seg
+                .vector_graph
+                .as_ref()
+                .and_then(|g| g.get(label, property))
+            {
+                Some(ix) => out.extend(self.segment_vamana_knn(
+                    seg.manifest.segment_uuid,
+                    ix,
+                    desc.metric,
+                    query,
+                    k,
+                    live,
+                )?),
+                None => {
+                    // Brute force this segment's *own* embeddings (its rows carry the vector).
+                    // Apply the live gate while gathering — a brute force has no navigation, so a
+                    // suppressed node is simply excluded (no waypoint to preserve), and
+                    // pre-filtering keeps the gathered set the exact live set the scan ranks.
+                    let mut entries: Vec<VectorEntry> = Vec::new();
+                    for &id in ids {
+                        if !live(id)? {
+                            continue;
+                        }
+                        if let Some(row) = seg.reader.node_row(id)? {
+                            if row.tombstoned {
+                                continue;
+                            }
+                            if let Some((_, Value::Vector(v))) =
+                                row.props.iter().find(|(k, _)| k == &desc.property)
+                            {
+                                entries.push(VectorEntry {
+                                    node_id: id,
+                                    vector: v.clone(),
+                                });
+                            }
+                        }
+                    }
+                    if !entries.is_empty() {
+                        out.extend(vector::brute_force_knn_par(
+                            self.fanout_pool.as_deref(),
+                            &entries,
+                            query,
+                            k,
+                            desc.metric,
+                            KNN_PAR_MIN,
+                            None,
+                        )?);
+                    }
+                }
+            }
+            // `acc` is only read through `live` above (a shared borrow NLL ends at its last use),
+            // so it is free to grow here: fold this segment's touched ids into the suppression
+            // set for every older segment.
+            acc.extend(ids.iter().copied());
+            acc.extend(removals.iter().copied());
+        }
+        Ok(out)
+    }
+
+    /// A beam search over one segment's sealed Vamana index, keyed in the vector-index pool by
+    /// the **segment uuid** (in the `gen` slot) + the segment-local ordinal. See
+    /// [`Self::beam_over_index`].
+    fn segment_vamana_knn(
+        &self,
+        seg_uuid: graph_format::ids::Generation,
+        ix: &SegmentVamanaIndex,
+        metric: graph_format::manifest::Metric,
+        query: &[f32],
+        k: usize,
+        live: impl Fn(u64) -> Result<bool>,
+    ) -> Result<Vec<vector::Neighbour>> {
+        let pool = self.vec_cache.ok_or_else(|| {
+            anyhow::anyhow!("vector-index cache is not configured; cannot serve a segment index")
+        })?;
+        self.beam_over_index(
+            pool,
+            seg_uuid,
+            ix.ord,
+            ix.reader.inner(),
+            &ix.pq,
+            ix.medoid,
+            metric,
+            query,
+            k,
+            self.temp_beam_width(),
+            live,
+        )
     }
 
     /// Evaluate an expression that must produce a query vector: a `vecf32([...])`

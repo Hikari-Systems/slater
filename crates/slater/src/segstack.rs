@@ -33,6 +33,7 @@ use graph_format::segindex::SegmentIndexReader;
 use graph_format::segmanifest::SegmentManifest;
 use graph_format::segment::{EdgeRow, NodeRow, SegmentReader};
 use graph_format::segpostings::SegmentPostingsReader;
+use graph_format::segvamana::SegmentVamanaSet;
 use graph_format::segvectors::SegmentVectorReader;
 use graph_format::setmanifest::SetManifest;
 use graph_format::store::{join_key, ObjectStore};
@@ -59,6 +60,12 @@ pub struct LoadedSegment {
     /// Which nodes this segment embeds / un-embeds, per vector index. `None` ⇒ the segment
     /// touched no embedding, so the level below keeps its vectors untouched.
     pub vectors: Option<SegmentVectorReader>,
+    /// This segment's **sealed, read-only Vamana indexes** (HIK-113), one per `(label,
+    /// property)` whose live embedded set crossed the floor at flush/merge. `None` ⇒ the
+    /// segment sealed nothing, so a KNN read brute-forces its sidecar ids (the additive
+    /// compatibility path). Opened only for the `DirtyVector`s the manifest marks
+    /// `graph = Some`.
+    pub vector_graph: Option<SegmentVamanaSet>,
 }
 
 impl std::fmt::Debug for LoadedSegment {
@@ -193,6 +200,13 @@ impl CoreStack {
                 .with_context(|| format!("open segment {uuid} posting fragments"))?;
             let vectors = SegmentVectorReader::open_if_present_via(store, &prefix)
                 .with_context(|| format!("open segment {uuid} vector sidecar"))?;
+            let vector_graph = SegmentVamanaSet::open_if_present_via(
+                store,
+                &prefix,
+                &manifest.dirty_vectors,
+                cipher.clone(),
+            )
+            .with_context(|| format!("open segment {uuid} sealed vector indexes"))?;
 
             segments.push(LoadedSegment {
                 manifest,
@@ -200,6 +214,7 @@ impl CoreStack {
                 index,
                 postings,
                 vectors,
+                vector_graph,
             });
         }
 

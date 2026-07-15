@@ -1157,6 +1157,41 @@ mod tests {
     }
 
     #[test]
+    fn segment_pqs_are_bounded_across_segments_and_unpin_reclaims_on_retirement() {
+        // HIK-113: each core segment pins its resident PQ under its own `(segment uuid, ord)`
+        // key (segment uuids are globally unique, so they never collide with a base
+        // generation's key). Two properties the pinning trap depends on:
+        //  1. the pinned set stays bounded — Σ over segments, no more;
+        //  2. retiring a segment hands its bytes back. `evict_to_budget` never reclaims
+        //     `pinned_bytes`, so without the `unpin` at retirement every merge leaks forever.
+        // A large budget keeps every block/pin resident, so `bytes()` is exactly the pinned sum.
+        let cache = VectorIndexCache::new(1 << 30);
+        let per = small_pq(100, 8).resident_bytes();
+        let segs: Vec<GenId> = (0..8).map(|i| gen(1000 + i)).collect();
+        for s in &segs {
+            cache.pin(*s, 0, small_pq(100, 8));
+        }
+        assert_eq!(
+            cache.bytes(),
+            8 * per,
+            "eight segments' pinned PQ and nothing else — bounded by Σ-over-segments"
+        );
+
+        // Retire one (exactly what the swap's `unpin_retired_segment_pqs` does per index).
+        cache.unpin(segs[3], 0);
+        assert_eq!(
+            cache.bytes(),
+            7 * per,
+            "the retired segment's pinned bytes were reclaimed, not leaked — mutation-check: \
+             drop the unpin and this stays 8×per"
+        );
+        // Re-pinning a still-live segment is idempotent accounting (a swap re-pins the kept
+        // segments); it must replace, never double-charge.
+        cache.pin(segs[0], 0, small_pq(100, 8));
+        assert_eq!(cache.bytes(), 7 * per, "re-pin replaces, does not add");
+    }
+
+    #[test]
     fn vector_index_cache_evict_expired_keeps_pinned_pq() {
         let cache = VectorIndexCache::new(1 << 20);
         let g = gen(61);

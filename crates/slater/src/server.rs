@@ -484,10 +484,17 @@ impl Graphs {
         for vi in new_gen.vamana_indexes() {
             vector_cache.pin(new_gen.uuid(), vi.ord, vi.pq.clone());
         }
+        // Sealed segment indexes (HIK-113): pin the new generation's before the swap.
+        pin_segment_pqs(new_gen.as_ref(), vector_cache);
         *slot.write().unwrap() = new_gen.clone();
         // Free the retired generation's whole resident set — pinned PQ codes *and*
         // lazily-built brute-force matrices — so it does not linger past the swap.
         vector_cache.unpin_generation(live.uuid());
+        // The base `unpin_generation` is keyed by the *generation* uuid; a segment's PQ is
+        // keyed by the *segment* uuid, so unpin the retired segments explicitly or every T3
+        // merge leaks their pinned bytes (the pinning trap — segment retirement funnels
+        // through this swap on both the merge and the set-swap paths).
+        unpin_retired_segment_pqs(&live, &new_gen, vector_cache);
         Ok(Some(new_gen.uuid()))
     }
 
@@ -976,6 +983,7 @@ impl Graphs {
                 seg_dir: &seg_dir,
                 seg_uuid,
                 base_uuid: core.base_uuid(),
+                base: core.as_ref(),
                 cipher,
                 master_key: self.master_key.as_deref(),
                 encryption_header,
@@ -1709,6 +1717,9 @@ struct ConnCtx {
     fanout_pool: Option<Arc<rayon::ThreadPool>>,
     /// Beam-search list size for the Vamana arm (`vectorQuery.beamWidth`).
     beam_width: usize,
+    /// Beam-search list size for the per-segment read-only temp indexes
+    /// (`vectorQuery.tempBeamWidth`, HIK-113).
+    temp_beam_width: usize,
     /// `bind:port`, reported as the address in `SHOW DATABASES` rows.
     bind_addr: String,
     /// Graph flagged as the home database in `SHOW DATABASES` (`config.defaultGraph`);
@@ -2623,6 +2634,56 @@ pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
 // drive the real production wiring in-process over an ephemeral loopback port
 // and sample its own RSS — rather than asserting on a mock. See D34.
 
+/// Pin every sealed **segment** index's resident PQ codes (HIK-113) into the vector-index
+/// pool, keyed by the **segment uuid** + segment-local ordinal (segment uuids are globally
+/// unique, so they never collide with a base generation's key). Returns the count pinned.
+///
+/// Idempotent: re-pinning the same `(seg_uuid, ord)` replaces its byte accounting. Only the PQ
+/// codes are pinned (bounded — ~m bytes per vector); the `.vamana` blocks read the evictable
+/// LRU, and a `ResidentMatrix` is deliberately never installed for a segment (the Σ-over-
+/// segments pinning trap: pinned bytes are charged to the budget but never reclaimed by
+/// eviction, so an unbounded pinned set would grow the budget without bound — see `cache.rs`).
+fn pin_segment_pqs(gen: &Generation, cache: &VectorIndexCache) -> usize {
+    let mut n = 0;
+    for seg in gen.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                cache.pin(seg.manifest.segment_uuid, ix.ord, ix.pq.clone());
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Unpin the PQ codes of every sealed segment index the retiring generation `old` carried that
+/// the newly-served `new` does **not** — the concrete gap the pinning trap warns about (HIK-113).
+///
+/// `unpin_generation` frees only the base generation's pinned set (keyed by the *generation*
+/// uuid); a segment's PQ is keyed by the *segment* uuid, so without this call every T3 merge (or
+/// any swap that drops a segment) would leak the retired segment's pinned bytes forever. A
+/// segment carried by **both** generations (e.g. one a merge left untouched) keeps its pin — the
+/// new generation re-pinned it, and its uuid is in `kept`.
+fn unpin_retired_segment_pqs(old: &Generation, new: &Generation, cache: &VectorIndexCache) {
+    let mut kept: HashSet<(u128, u32)> = HashSet::new();
+    for seg in new.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                kept.insert((seg.manifest.segment_uuid.0.as_u128(), ix.ord));
+            }
+        }
+    }
+    for seg in old.stack().segments() {
+        if let Some(vg) = &seg.vector_graph {
+            for ix in vg.iter() {
+                if !kept.contains(&(seg.manifest.segment_uuid.0.as_u128(), ix.ord)) {
+                    cache.unpin(seg.manifest.segment_uuid, ix.ord);
+                }
+            }
+        }
+    }
+}
+
 /// Serve on an already-bound listener. Factored out of [`serve`] so a caller can
 /// bind the port itself — notably the bounded-RSS integration test, which binds
 /// an ephemeral `127.0.0.1:0` loopback port, learns its address, and then drives
@@ -2674,6 +2735,8 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
             vector_cache.pin(gen.uuid(), vi.ord, vi.pq.clone());
             pinned += 1;
         }
+        // Sealed segment indexes (HIK-113) pin their resident PQ under the segment uuid.
+        pinned += pin_segment_pqs(gen.as_ref(), &vector_cache);
     }
     if pinned > 0 {
         info!(
@@ -2726,6 +2789,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         adj_stream_chunk: cfg.query.adj_stream_chunk,
         fanout_pool: build_fanout_pool(cfg.query.max_fanout),
         beam_width: cfg.vector_query.beam_width as usize,
+        temp_beam_width: cfg.vector_query.temp_beam_width as usize,
         bind_addr: format!("{}:{}", cfg.server.bind, cfg.server.port),
         default_graph: Some(cfg.default_graph.clone()).filter(|g| !g.is_empty()),
         use_selection: RwLock::new(HashMap::new()),
@@ -2857,6 +2921,7 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
     let cache = ctx.cache.clone();
     let vector_cache = ctx.vector_cache.clone();
     let beam_width = ctx.beam_width;
+    let temp_beam_width = ctx.temp_beam_width;
     let max_rows = ctx.max_rows;
     let max_intermediate = ctx.max_intermediate;
     let max_scan = ctx.max_scan;
@@ -2874,6 +2939,7 @@ async fn warm_cache(warming_query: &str, ctx: &Arc<ConnCtx>) {
             let g_start = Instant::now();
             let mut engine = Engine::new(gen.as_ref(), cache.as_ref())
                 .with_vector_cache(vector_cache.as_ref(), beam_width)
+                .with_temp_beam_width(temp_beam_width)
                 .with_max_rows(max_rows)
                 .with_max_intermediate(max_intermediate)
                 .with_max_scan(max_scan)
@@ -5535,6 +5601,7 @@ async fn run_query(
     let adj_stream_chunk = ctx.adj_stream_chunk;
     let fanout_pool = ctx.fanout_pool.clone();
     let beam_width = ctx.beam_width;
+    let temp_beam_width = ctx.temp_beam_width;
     let graph_name = gen.graph().to_string();
     // Gate all per-query instrumentation on the info level being active OR
     // load-test diagnostics being enabled: when both are off, we take no
@@ -5575,6 +5642,7 @@ async fn run_query(
                 None => {
                     let mut engine = Engine::new(&view, cache.as_ref())
                         .with_vector_cache(vector_cache.as_ref(), beam_width)
+                        .with_temp_beam_width(temp_beam_width)
                         .with_params(params)
                         .with_max_rows(max_rows)
                         .with_max_intermediate(max_intermediate)
@@ -8873,6 +8941,214 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// End-to-end (HIK-113): a flush whose live embedded set crosses the floor seals a
+    /// per-segment Vamana; the KNN read beam-searches it (recall ≥ 0.9 vs an exact brute force
+    /// over the live set); a T3 merge rebuilds it and — crucially — **frees the retired
+    /// segments' pinned PQ** (the pinning trap: `bytes()` must not grow); and a segment whose
+    /// sealed files are **deleted** falls back to an exact brute force. One heavy test because
+    /// the seal only fires above the ~2000-vector floor.
+    #[test]
+    fn sealed_segment_index_recall_merge_unpin_and_missing_sidecar_fallback() {
+        // Deterministic unit vectors (negative components ⇒ must re-embed via a bound param).
+        fn xorshift(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let dim = 16usize;
+        let n = 2_100usize; // just over SEGMENT_INDEX_MIN_VECTORS (2000)
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let vecs: Vec<Vec<f32>> = (0..n)
+            .map(|_| {
+                let v: Vec<f32> = (0..dim)
+                    .map(|_| (xorshift(&mut st) % 2000) as f32 / 1000.0 - 1.0)
+                    .collect();
+                let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                v.iter().map(|x| x / nrm).collect()
+            })
+            .collect();
+
+        let (root, graph) = testgen::write_vector_docs("vec_seg_sealed", &vecs);
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(4 << 20);
+        let vc = VectorIndexCache::new(64 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // Re-embed every doc onto its own vector (delta), then flush — the segment's live
+        // embedded set is all `n`, which seals a Vamana. Do it twice ⇒ two sealed segments.
+        let reembed_all = |graphs: &Graphs| {
+            for (i, v) in vecs.iter().enumerate() {
+                embed_param(graphs, &graph, &format!("d{i:02}"), v);
+            }
+        };
+        reembed_all(&graphs);
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("first sealing flush");
+        let bytes_1seg = vc.bytes();
+        assert!(
+            bytes_1seg > 0,
+            "the sealed segment's PQ must be pinned after the flush"
+        );
+
+        // Recall of the sealed beam vs an exact brute force over the live set — the base index
+        // is brute-force (n < ann_threshold) but every id is superseded by the segment, so the
+        // answer comes from the sealed segment beam. Assert against independently-derived truth.
+        let knn = |q: &[f32], k: usize| -> Vec<u64> {
+            let gen = graphs.get(&graph).unwrap();
+            let snap = DeltaSnapshot::from_memtable(graphs.writer(&graph).unwrap().snapshot());
+            let view = MergedView::new(gen.as_ref(), snap);
+            let parts: Vec<String> = q.iter().map(|x| format!("{x:?}")).collect();
+            let ast = parser::parse(&format!(
+                "CALL db.idx.vector.queryNodes('Doc', 'embedding', {k}, vecf32([{}])) \
+                 YIELD node, score RETURN id(node) AS id",
+                parts.join(", ")
+            ))
+            .unwrap();
+            let res = Engine::new(&view, &cache)
+                .with_vector_cache(&vc, 64)
+                .with_temp_beam_width(128)
+                .run(&ast)
+                .unwrap();
+            res.rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(i) => i as u64,
+                    ref o => panic!("unexpected KNN row {o:?}"),
+                })
+                .collect()
+        };
+        let cosine = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for (x, y) in a.iter().zip(b) {
+                d += *x as f64 * *y as f64;
+                na += *x as f64 * *x as f64;
+                nb += *y as f64 * *y as f64;
+            }
+            (1.0 - d / (na.sqrt() * nb.sqrt())) as f32
+        };
+        let brute = |q: &[f32], k: usize| -> Vec<u64> {
+            let mut s: Vec<(f32, u64)> = vecs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (cosine(q, v), i as u64))
+                .collect();
+            s.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            s.into_iter().take(k).map(|(_, i)| i).collect()
+        };
+        let k = 10;
+        // NB: no KNN query yet — a query would build the base brute matrix and page `.vamana`
+        // blocks into the pool, and `bytes()` counts those too. The pinned-set leak check below
+        // measures `bytes()` at points where only the pinned segment PQ is resident.
+
+        // A second sealing flush ⇒ two segments pinned.
+        reembed_all(&graphs);
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("second sealing flush");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 2);
+        let bytes_2seg = vc.bytes();
+        assert!(
+            bytes_2seg > bytes_1seg,
+            "two sealed segments pin more than one ({bytes_2seg} vs {bytes_1seg})"
+        );
+
+        // Merge the two into one. The retired inputs' pinned PQ must be freed — `bytes()` must
+        // NOT grow (mutation-check: drop `unpin_retired_segment_pqs` and `bytes()` would hold
+        // all three segments' PQ, i.e. exceed `bytes_2seg`).
+        graphs
+            .compact_graph_segments(&graph, &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 1);
+        let bytes_merged = vc.bytes();
+        assert!(
+            bytes_merged <= bytes_1seg + (bytes_1seg / 4),
+            "after a 2→1 merge the pinned set must be ~one segment ({bytes_merged}), not the \
+             two retired segments plus the merged one — the retired PQ leaked (bytes_1seg \
+             {bytes_1seg}, bytes_2seg {bytes_2seg})"
+        );
+        // Recall of the merged sealed beam vs an exact brute force over the live set. The base
+        // index is brute-force, but every id is superseded by the segment, so the answer comes
+        // from the sealed segment beam. Truth is independently derived (brute here), never a
+        // second implementation.
+        let mut total = 0.0f64;
+        let qn = 10;
+        for qi in 0..qn {
+            let q = &vecs[(qi * 197) % n];
+            let got: std::collections::HashSet<u64> = knn(q, k).into_iter().collect();
+            let want = brute(q, k);
+            total += want.iter().filter(|id| got.contains(id)).count() as f64 / k as f64;
+        }
+        let recall = total / qn as f64;
+        assert!(
+            recall >= 0.9,
+            "merged sealed segment beam recall@{k} was {recall:.3} (vs exact brute over the live \
+             set)"
+        );
+
+        // Delete the merged segment's sealed files: the opener must fall back to `None` ⇒ an
+        // exact brute force over the sidecar ids. Reopen the graph so the deletion takes effect.
+        let seg_uuid = graphs.get(&graph).unwrap().stack().segments()[0]
+            .manifest
+            .segment_uuid;
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.0.to_string());
+        let mut deleted = 0;
+        for e in std::fs::read_dir(&seg_dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            if name.ends_with(".vamana") || name.ends_with(".pq") {
+                std::fs::remove_file(&p).unwrap();
+                deleted += 1;
+            }
+        }
+        assert!(deleted >= 2, "expected the sealed .vamana + .pq to delete");
+        let vc2 = VectorIndexCache::new(64 << 20);
+        let mut graphs2 = Graphs::open_all(&root, None).unwrap();
+        graphs2
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let knn2 = |q: &[f32], k: usize| -> Vec<u64> {
+            let gen = graphs2.get(&graph).unwrap();
+            let snap = DeltaSnapshot::from_memtable(graphs2.writer(&graph).unwrap().snapshot());
+            let view = MergedView::new(gen.as_ref(), snap);
+            let parts: Vec<String> = q.iter().map(|x| format!("{x:?}")).collect();
+            let ast = parser::parse(&format!(
+                "CALL db.idx.vector.queryNodes('Doc', 'embedding', {k}, vecf32([{}])) \
+                 YIELD node, score RETURN id(node) AS id",
+                parts.join(", ")
+            ))
+            .unwrap();
+            let res = Engine::new(&view, &cache)
+                .with_vector_cache(&vc2, 64)
+                .run(&ast)
+                .unwrap();
+            res.rows
+                .iter()
+                .map(|r| match r[0] {
+                    Val::Int(i) => i as u64,
+                    ref o => panic!("unexpected KNN row {o:?}"),
+                })
+                .collect()
+        };
+        // The brute fallback is exact: it must recover the brute-force top-k exactly.
+        let got: Vec<u64> = knn2(&vecs[0], k);
+        let want = brute(&vecs[0], k);
+        assert_eq!(
+            got, want,
+            "a segment whose sealed files were deleted must fall back to an EXACT brute force"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A written embedding survives a T2 flush, and a **removed** one stays removed.
     ///
     /// The removal is the sharp half, and it needs its own channel on disk. An indexed
@@ -9142,6 +9418,72 @@ mod tests {
             got.iter().any(|(id, _)| *id == 2),
             "the k-th live neighbour (d02) must still be there — a stale duplicate that reaches \
              the merge evicts it, silently; got {got:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The hazard extended to **three core segment levels** (HIK-113): node 7 is re-embedded in
+    /// three successive flushes, so three different segments each hold a stale-or-live vector for
+    /// the same node id. The per-segment fold's `superseded_above` must suppress the two older
+    /// copies in their own scans (each older segment sees a newer one that touched node 7), so
+    /// node 7 reaches the merge from exactly the newest segment and only once. If any older
+    /// level leaks its copy, it takes a `k` slot and the k-th live neighbour (d02) vanishes.
+    ///
+    /// The stale copies (0.05, 0.1) and the base copy (0.0) are all *closer* to the query than
+    /// the live one (0.5): a farther stale copy could never win a slot and would prove nothing.
+    #[test]
+    fn knn_suppresses_a_stale_vector_across_three_segment_levels() {
+        let base: Vec<Vec<f32>> = [0.2, 0.3, 0.55, 0.9, 0.95, 1.0, 1.05, 0.0]
+            .iter()
+            .map(|d| at_distance(*d))
+            .collect();
+        let (root, graph) = testgen::write_vector_docs("vec_three_seg_hazard", &base);
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // Three flushes, each re-embedding node 7 to a different vector — three segment levels.
+        for d in [0.05, 0.1, 0.5] {
+            vwrite(&graphs, &graph, &set_embedding("d07", &at_distance(d)));
+            graphs
+                .flush_graph_to_segment(&graph, &vc, &root)
+                .unwrap()
+                .expect("each re-embed flushes into its own segment");
+        }
+        assert_eq!(
+            graphs.get(&graph).unwrap().stack().segments().len(),
+            3,
+            "three flushes ⇒ three segment levels"
+        );
+
+        let got = vknn(&graphs, &graph, &cache, &VQ, 4);
+        let want_ids = [0u64, 1, 7, 2];
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            want_ids.to_vec(),
+            "top-4 over the newest-wins set {{d00:0.2, d01:0.3, d07:0.5, d02:0.55}}; got {got:?}"
+        );
+        let seven = got.iter().find(|(id, _)| *id == 7).unwrap();
+        assert!(
+            (seven.1 - 0.5).abs() < 1e-5,
+            "node 7 must score the NEWEST segment's 0.5, not an older segment's 0.05/0.1 nor the \
+             base's 0.0; got {}",
+            seven.1
+        );
+        assert_eq!(
+            got.iter().filter(|(id, _)| *id == 7).count(),
+            1,
+            "node 7 is embedded at three segment levels + the base; only the newest may emit it \
+             — a duplicate means an older level failed to suppress; got {got:?}"
+        );
+        assert!(
+            got.iter().any(|(id, _)| *id == 2),
+            "the k-th live neighbour (d02) must survive — a leaked stale copy would evict it; \
+             got {got:?}"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -14248,6 +14590,7 @@ mod tests {
             adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
+            temp_beam_width: 128,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: Some("people".to_string()),
             use_selection: RwLock::new(HashMap::new()),
@@ -14438,6 +14781,7 @@ mod tests {
             adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
+            temp_beam_width: 128,
             bind_addr: "127.0.0.1:7687".to_string(),
             default_graph: None,
             use_selection: RwLock::new(HashMap::new()),
@@ -14538,6 +14882,7 @@ mod tests {
             adj_stream_chunk: 8192,
             fanout_pool: None,
             beam_width: 64,
+            temp_beam_width: 128,
             bind_addr: "127.0.0.1:7687".to_string(),
             // A default is configured but must NOT be silently served for queries.
             default_graph: Some("people".to_string()),

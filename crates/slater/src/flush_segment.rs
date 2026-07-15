@@ -69,13 +69,14 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use graph_format::crypto::BlockCipher;
 use graph_format::ids::{Generation as GenId, NodeId, Value};
-use graph_format::manifest::{EncryptionHeader, FileEntry};
+use graph_format::manifest::{AnnMode, EncryptionHeader, FileEntry};
 use graph_format::segindex::{write_index_fragments, IndexSpec};
 use graph_format::segmanifest::{
     DirtyIndex, DirtyVector, SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION,
 };
 use graph_format::segment::{AdjEdge, EdgeRow, NodeRow, SegmentWriter};
 use graph_format::segpostings::{write_posting_fragments, PostingSpec};
+use graph_format::segvamana::{seal_segment_index, SealedVamanaMeta};
 use graph_format::segvectors::{write_vector_fragments, VectorSpec};
 use slater_delta::l0_offheap::SegmentData;
 use slater_delta::NodeDelta;
@@ -537,6 +538,10 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         .map(|n| (n.id, n.labels.as_slice()))
         .collect();
     let mut vec_specs: Vec<VectorSpec> = Vec::new();
+    // The sealed read-only Vamana index per `(label, property)`, aligned with `vec_specs`
+    // (HIK-113). `None` ⇒ the segment's live embedded set stayed below the floor (or the base's
+    // norms overflow), so this level is brute-forced from the sidecar ids.
+    let mut vec_metas: Vec<Option<SealedVamanaMeta>> = Vec::new();
     for vi in vector_indexes {
         let mut spec = VectorSpec {
             label: vi.label.clone(),
@@ -544,6 +549,10 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             ids: Vec::new(),
             removals: Vec::new(),
         };
+        // The segment's **own** `(id, vector)` for every id it embeds — gathered from the same
+        // `Value::Vector` patch that puts the id in `spec.ids`, so the sealed index and the
+        // sidecar name exactly the same set. De-duped by id (last patch wins) via the map.
+        let mut entries: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
         for (dense, _label, _key, _key_value, nd) in &data.nodes {
             if nd.tombstoned {
                 // A tombstoned node is suppressed by its tombstone, not by a vector removal.
@@ -555,8 +564,9 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             if !labelled {
                 continue;
             }
-            if matches!(nd.patches.get(&vi.property), Some(Value::Vector(_))) {
+            if let Some(Value::Vector(v)) = nd.patches.get(&vi.property) {
                 spec.ids.push(*dense);
+                entries.insert(*dense, v.clone());
             } else if nd.patches.contains_key(&vi.property)
                 || nd.replaced
                 || nd.removed.contains(&vi.property)
@@ -580,16 +590,47 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         spec.ids.dedup();
         spec.removals.sort_unstable();
         spec.removals.dedup();
+
+        // Seal a read-only Vamana over this segment's own embeddings when the live set crosses
+        // the floor. Reuse the base's codebook (and its `max_norm`) when the base has a Vamana
+        // index for this `(label, property)`; a brute-force base has none, so the sealer trains
+        // one. Below the floor the sealer writes nothing and returns `None` (brute-force
+        // fallback). Read from the deltas here — this is the one place the flush still has them.
+        let entries: Vec<(u64, Vec<f32>)> = entries.into_iter().collect();
+        let base = inp
+            .core
+            .vamana_index(&vi.label, &vi.property)
+            .and_then(|bi| match &vi.mode {
+                AnnMode::Vamana { max_norm, .. } => Some((&bi.pq.codebook, *max_norm as f64)),
+                _ => None,
+            });
+        let meta = seal_segment_index(
+            inp.seg_dir,
+            &vi.label,
+            &vi.property,
+            &entries,
+            vi.metric,
+            vi.dim,
+            base,
+            inp.cipher.clone(),
+            SEG_BLOCK_BYTES,
+            SEG_ZSTD_LEVEL,
+        )
+        .with_context(|| format!("seal segment vector index {}.{}", vi.label, vi.property))?;
+
         vec_specs.push(spec);
+        vec_metas.push(meta);
     }
     write_vector_fragments(inp.seg_dir, &vec_specs)
         .with_context(|| format!("write vector sidecar at {}", inp.seg_dir.display()))?;
     let dirty_vectors: Vec<DirtyVector> = vec_specs
         .iter()
-        .filter(|s| !s.ids.is_empty() || !s.removals.is_empty())
-        .map(|s| DirtyVector {
+        .zip(&vec_metas)
+        .filter(|(s, meta)| !s.ids.is_empty() || !s.removals.is_empty() || meta.is_some())
+        .map(|(s, meta)| DirtyVector {
             label: s.label.clone(),
             property: s.prop.clone(),
+            graph: *meta,
         })
         .collect();
 
