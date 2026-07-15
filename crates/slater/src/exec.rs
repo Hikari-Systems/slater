@@ -1172,8 +1172,28 @@ pub(crate) fn delta_vector_for(
     id: u64,
     desc: &VectorIndexDesc,
 ) -> Result<DeltaVector> {
-    if vector_dead(gen, id)? || !vector_indexed(gen, cache, id, desc)? {
+    if vector_dead(gen, id)? {
         return Ok(DeltaVector::Silent);
+    }
+    if !vector_indexed(gen, cache, id, desc)? {
+        // The node is not in the index's scope. Two ways to get here and they are *not* the
+        // same fact: a node that simply never carried the index's label has nothing below to
+        // supersede (`Silent` — the base's vector, if any, is another node's business); but a
+        // node whose effective label set dropped the label **because this delta removed it**
+        // (`REMOVE n:Label`) has *left* a scope it was in, so the vector some level below still
+        // holds must be suppressed — `Gone` (superseded **in**), exactly as a value removal is.
+        // The index is scope-defined by the label, so leaving the label leaves the index. D12
+        // routes an indexed embedding out of the row, so absence cannot express this; the
+        // delta's `labels_removed` is the channel (the segment's is its sidecar — `segment_level`).
+        let left_scope = gen
+            .delta()
+            .node_patch(id)
+            .is_some_and(|nd| nd.labels_removed.contains(&desc.label));
+        return Ok(if left_scope {
+            DeltaVector::Gone
+        } else {
+            DeltaVector::Silent
+        });
     }
     Ok(match delta_says(gen, id, desc) {
         LevelSays::Vector(v) => DeltaVector::Set(v),
@@ -1237,7 +1257,21 @@ pub fn segment_level(
     ids.sort_unstable();
     ids.dedup();
     for id in ids {
-        if vector_dead(gen, id)? || !vector_indexed(gen, cache, id, desc)? {
+        if vector_dead(gen, id)? {
+            // A deleted node takes its embedding with it; its tombstone already suppresses it.
+            continue;
+        }
+        if !vector_indexed(gen, cache, id, desc)? {
+            // A candidate the sidecars name — so a level at or below still physically holds a
+            // vector for it — is no longer in the index's scope (its effective label set
+            // dropped the label). It must supersede that vector, not vanish: this is the same
+            // silent hole as a value removal, one step over. A `continue` here (the old code)
+            // swallows the sidecar's own removal, so a *consolidation* — which reads this fold,
+            // not the raw sidecar union the KNN read path uses — resurfaces the vector. The
+            // delta is not consulted here (it may be empty post-flush; the fact lives in the
+            // node's effective label set), so any out-of-scope candidate is a removal. The
+            // candidate set is the sidecar ids ∪ removals, so this stays O(vectors touched).
+            segments.removed.push(id);
             continue;
         }
         match segment_says(gen, id, desc)? {

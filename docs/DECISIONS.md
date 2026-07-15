@@ -1566,3 +1566,58 @@ is built per query rather than cached, which closes the Σ-over-levels pinning t
 construction: the vector pool's resident matrices are charged to the budget but **never
 evicted**, so a cached per-level matrix would grow the pinned set without bound as segments
 accumulate. Building costs O(overlay) — the same order as the scan it feeds.
+
+### D64 — A vector index is scoped by label, so `REMOVE n:Label` un-indexes the node (but keeps its value)
+A vector index is scoped to a `(label, property)` pair, and membership on the read path is the
+node's **effective label set** — a write that *adds* the label (`SET n:Doc`) admits the node to
+the `(:Doc, embedding)` index, and D63 made that work. This closes the symmetric hole on the
+*remove* side: `REMOVE n:Doc` **takes the node out of** the `(:Doc, embedding)` index, because
+it left the scope that defines the index. It does **not** delete the embedding value.
+
+**Why scope, not value.** Removal-by-label and removal-by-value are different facts and must
+stay distinguishable, because they diverge at a consolidation. `REMOVE n.embedding` destroys
+the value: the vector is gone, and if the node is later re-added to scope it comes back empty.
+`REMOVE n:Doc` only narrows the node's label set: the embedding is still on the node, so a later
+`SET n:Doc` (or another indexed label on the same property) puts it **back in scope with the
+same vector** — the un-remove. Choosing "un-embed the value" instead would make a re-label
+silently lossy and would couple two orthogonal operations. Scope-in / scope-out is the only
+reading that is symmetric with the `SET n:Doc` admit and composes with multi-label nodes.
+
+**Why it spans three folds, and absence still cannot express it (the D63 shape).** An indexed
+embedding is routed out of the column store (D12), so a row that lost the label cannot *say* the
+node left the index — its embedding was never in the row to begin with. The fact needs an
+explicit channel at every rung, or the answer depends on **which level the node lives on** —
+exactly the failure D63 exists to close:
+- **Delta fold** (`exec::delta_vector_for`) — a node whose effective label set no longer carries
+  the index's label *because this delta removed it* (`NodeDelta.labels_removed`) resolves to
+  `Gone` (superseded **in**), not `Silent`. A node that merely never carried the label stays
+  `Silent` — the two are different questions and were being conflated (the `rwindex::apply`
+  doc-comment said so outright, and was wrong).
+- **T2 flush** (`flush_segment`) — the effective-label loop (HIK-111 Finding 1) already keys
+  membership on the effective set; a node that *was* in scope and now is not lands in the
+  `vec.meta` `removals` sidecar, the one channel a flushed row cannot express.
+- **T3 merge** (`merge_segment::fold_vectors`) — **no new code**: a label-removal is written as
+  an ordinary removal by the flush, and the existing "carry a below-run removal" rule folds it
+  forward verbatim. Reclaiming it (an id born within the run) is correct — nothing below to
+  suppress.
+- **Segment level** (`exec::segment_level`, read by the consolidation dump) — a sidecar-named
+  candidate no longer in scope resolves to a removal rather than being dropped on the floor.
+  This is the half a delta-only fix misses: after a flush the delta is empty and the removal
+  lives in the sidecar; the KNN read path suppresses it through the raw sidecar union, but a
+  **consolidation** reads this fold, and a swallowed removal resurfaces the vector — only on
+  consolidation, silently.
+
+After a consolidation a node not `:Doc` at consolidation time is simply out of `(:Doc,embedding)`
+scope, so the rebuild does not index it. It stays gone **for the right reason (scope)**, not
+because the value was destroyed — and a node still in scope carries its vector through, unchanged.
+
+**Known limitation — the un-remove is delta-scoped.** `REMOVE n:Doc` then `SET n:Doc` restores
+the node at its original vector *while both live in the delta* (the delta's superseded set is
+recomputed from `labels_removed`, so re-adding the label stops superseding). Once the removal has
+been **flushed** into a segment sidecar, a later `SET n:Doc` does **not** bring the vector back:
+the base arm's suppression is the *raw* sidecar union (`above_base_segments`), which cannot tell a
+label-removal (should un-suppress on re-label) from a value-removal (must stay suppressed — the
+value is gone), and D12 means the delta cannot reconstruct the buried base vector to re-emit it.
+Restoring across a flush needs the sidecar to record the removal *kind*, a `segvectors` format
+change out of this ticket's scope. This is strictly better than before — pre-fix the un-remove
+"worked" across a flush only because the removal itself never took effect.
