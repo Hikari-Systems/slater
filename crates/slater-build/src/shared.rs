@@ -881,3 +881,466 @@ mod vector_gather_tests {
         let _ = std::fs::remove_dir_all(&small_dir);
     }
 }
+
+/// HIK-117: the **carried arm** of `write_vector_indexes`, at the real call site. These are the
+/// server/dump/builder-level lift of HIK-115's in-crate proof: a consolidation carries the
+/// `.vamana` by reference and rewrites only the `.pq` id column, so a wrong
+/// `layout_to_dump_id ∘ perm.final_of` composition makes every KNN point at the wrong node with
+/// a plausible score and no error. The tests attack that composition directly, with a
+/// **non-monotone** permutation, and pin the BLAKE3-carried fast path.
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use graph_format::consolidate_dump::DumpWriter;
+    use graph_format::membudget::MemoryBudget;
+    use graph_format::pq::{ann_query, normalise, AdcTable, PqReader, HOLE};
+    use graph_format::vamana::{beam_search, BeamParams, VamanaReader};
+    use std::path::PathBuf;
+
+    /// A tiny deterministic LCG (graph-format's own `Lcg` is `pub(crate)`), so the fixtures
+    /// are reproducible without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next_f64(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("slater_carry_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn unit_vectors(dim: usize, n: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = Rng(seed);
+        (0..n)
+            .map(|_| {
+                let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+                normalise(&v)
+            })
+            .collect()
+    }
+
+    /// Carry-by-reference is proven by **byte-identity** of the `.vamana` (a hard-link, or a
+    /// byte copy on cross-device) — strictly at least as strong as the BLAKE3 the ticket names.
+    fn same_bytes(a: &Path, b: &Path) -> bool {
+        std::fs::read(a).unwrap() == std::fs::read(b).unwrap()
+    }
+
+    fn cosine(q: &[f32], v: &[f32]) -> f64 {
+        let (mut dot, mut nq, mut nv) = (0.0f64, 0.0f64, 0.0f64);
+        for (x, y) in q.iter().zip(v) {
+            dot += *x as f64 * *y as f64;
+            nq += *x as f64 * *x as f64;
+            nv += *y as f64 * *y as f64;
+        }
+        if nq == 0.0 || nv == 0.0 {
+            1.0
+        } else {
+            1.0 - dot / (nq.sqrt() * nv.sqrt())
+        }
+    }
+
+    /// KNN over an on-disk `.vamana`+`.pq`, mirroring `exec::vamana_knn`.
+    fn knn(vamana: &Path, pq: &Path, query: &[f32], medoid: u32, k: usize) -> Vec<(u64, f32)> {
+        let reader = VamanaReader::open_with_cipher(vamana, None).unwrap();
+        let resident = PqReader::open_with_cipher(pq, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let n = resident.len();
+        let space_dim = resident.codebook.params.dim as usize;
+        let qn = ann_query(Metric::Cosine, query, space_dim).unwrap();
+        let adc = AdcTable::new(&resident.codebook, &qn).unwrap();
+        beam_search(
+            BeamParams {
+                medoid,
+                beam_width: 96,
+                k,
+                num_nodes: n,
+            },
+            |i| adc.estimate(resident.codes_of(i as usize)),
+            |i| {
+                let node = reader.node(i)?;
+                Ok((node.vector, node.neighbours))
+            },
+            |v| cosine(query, v) as f32,
+            |i| {
+                let id = resident.node_ids[i as usize];
+                Ok(if id == HOLE { None } else { Some(id) })
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(|h| (h.node_id, h.exact))
+        .collect()
+    }
+
+    fn brute(live: &[(u64, Vec<f32>)], query: &[f32], k: usize) -> Vec<u64> {
+        let mut s: Vec<(f64, u64)> = live.iter().map(|(id, v)| (cosine(query, v), *id)).collect();
+        s.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        s.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    /// Options with an ANN threshold low enough to build a Vamana index over the fixture.
+    fn opts() -> BuildOptions {
+        BuildOptions {
+            ann_threshold: 10,
+            vamana_r: 16,
+            vamana_alpha: 1.2,
+            pq_subspaces: 4,
+            pq_bits: 8,
+            ..BuildOptions::default()
+        }
+    }
+
+    /// Build a base `.vamana`/`.pq` for `(label, property)` under
+    /// `data_dir/graph/base_uuid/vector/`, exactly as a fresh build would, returning
+    /// `(desc, base_dir_rel, base_pq_node_ids_in_layout_order)`.
+    fn build_base(
+        data_dir: &Path,
+        entries: &[(u64, Vec<f32>)],
+        dim: u32,
+    ) -> (VectorIndexDesc, String, Vec<u64>) {
+        let base_rel = "g/base";
+        let base_dir = data_dir.join(base_rel);
+        std::fs::create_dir_all(base_dir.join("vector")).unwrap();
+        let pi = PendingIndex {
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim,
+            metric: Metric::Cosine,
+            count: entries.len() as u64,
+            carry: None,
+        };
+        let (desc, _files) = build_vamana_index(&base_dir, &pi, entries, &opts(), None).unwrap();
+        let pq = PqReader::open_with_cipher(&base_dir.join("vector/Doc.emb.pq"), None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        (desc, base_rel.to_string(), pq.node_ids.clone())
+    }
+
+    fn carry_for(
+        data_dir: &Path,
+        dump_dir: &Path,
+        base_rel: &str,
+        desc: &VectorIndexDesc,
+        layout_to_dump_id: &[u64],
+    ) -> crate::model::VectorCarry {
+        let (r, alpha, medoid, max_norm, pq_subspaces, pq_bits) = match desc.mode {
+            AnnMode::Vamana {
+                r,
+                alpha,
+                medoid,
+                max_norm,
+                pq_subspaces,
+                pq_bits,
+                ..
+            } => (r, alpha, medoid, max_norm, pq_subspaces, pq_bits),
+            _ => unreachable!("fixture builds Vamana"),
+        };
+        let _ = data_dir;
+        let mut dw = DumpWriter::create(dump_dir).unwrap();
+        let map_file = dw.write_vector_carry("Doc.emb", layout_to_dump_id).unwrap();
+        crate::model::VectorCarry {
+            base_vamana: format!("{base_rel}/vector/Doc.emb.vamana"),
+            base_pq: format!("{base_rel}/vector/Doc.emb.pq"),
+            carry_map_path: dump_dir.join(&map_file),
+            base_records: layout_to_dump_id.len() as u64,
+            r,
+            alpha,
+            medoid,
+            max_norm,
+            pq_subspaces,
+            pq_bits,
+        }
+    }
+
+    /// Run the carried arm through the real `write_vector_indexes`, returning the emitted
+    /// out-dir and the desc.
+    fn run_carry(
+        data_dir: &Path,
+        out_dir: &Path,
+        carry: crate::model::VectorCarry,
+        delta: &[(u64, Vec<f32>)],
+        perm: &Permutation,
+    ) -> VectorIndexDesc {
+        std::fs::create_dir_all(out_dir.join("vector")).unwrap();
+        let budget = MemoryBudget::new(1 << 20);
+        let mut sorter = ExtSorter::<PendingVector>::new(
+            out_dir,
+            budget.reserve_now("t", 1 << 16, 1).unwrap(),
+            3,
+        )
+        .unwrap();
+        for (seq, (id, v)) in delta.iter().enumerate() {
+            sorter
+                .push(PendingVector {
+                    seq: seq as u64,
+                    id: *id,
+                    vec: v.clone(),
+                })
+                .unwrap();
+        }
+        let pending = vec![PendingIndex {
+            label: "Doc".into(),
+            property: "emb".into(),
+            dim: carry_dim(&carry, delta),
+            metric: Metric::Cosine,
+            count: delta.len() as u64,
+            carry: Some(carry),
+        }];
+        let mut block_sizes = BTreeMap::new();
+        let (descs, _files) = write_vector_indexes(
+            out_dir,
+            &pending,
+            vec![sorter],
+            &opts(),
+            None,
+            &mut block_sizes,
+            perm,
+            data_dir,
+        )
+        .unwrap();
+        descs.into_iter().next().unwrap()
+    }
+
+    fn carry_dim(_c: &crate::model::VectorCarry, delta: &[(u64, Vec<f32>)]) -> u32 {
+        delta.first().map(|(_, v)| v.len() as u32).unwrap_or(24)
+    }
+
+    /// **The killer, at the builder arm.** A pure-permutation carry: the `.vamana` must be
+    /// BLAKE3-identical to the base (fast path), the `.pq` id column must be exactly
+    /// `layout_to_dump_id ∘ perm.final_of` with a **non-monotone** perm, and KNN must return
+    /// the same nodes by their *permuted* ids with identical scores.
+    #[test]
+    fn pure_permutation_carries_vamana_and_composes_ids() {
+        let data_dir = scratch("pure");
+        let dim = 24usize;
+        let vectors = unit_vectors(dim, 120, 0x0117_0000_0000_0001);
+        // dump ids 0..N (the builder's provisional id space), deliberately not the layout order.
+        let entries: Vec<(u64, Vec<f32>)> = vectors
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v))
+            .collect();
+        let (desc, base_rel, layout_ids) = build_base(&data_dir, &entries, dim as u32);
+        let base_vamana = data_dir.join(&base_rel).join("vector/Doc.emb.vamana");
+        let base_pq = data_dir.join(&base_rel).join("vector/Doc.emb.pq");
+        let medoid = match desc.mode {
+            AnnMode::Vamana { medoid, .. } => medoid as u32,
+            _ => unreachable!(),
+        };
+
+        // Query near entry 3; record base KNN.
+        let query = {
+            let mut q = vectors[3].clone();
+            q[0] += 0.05;
+            normalise(&q)
+        };
+        let before = knn(&base_vamana, &base_pq, &query, medoid, 10);
+        assert_eq!(before.len(), 10);
+
+        // A NON-MONOTONE perm over the dump-id space (a reversal is non-monotone), so a
+        // backwards or applied-twice composition cannot pass.
+        let n = entries.len() as u64;
+        let table: Vec<u32> = (0..n).map(|i| (n - 1 - i) as u32).collect();
+        let perm = Permutation::Table(table.clone());
+        let layout_to_dump_id = layout_ids.clone(); // no deletes: every ordinal is live
+
+        let dump_dir = data_dir.join("dump");
+        std::fs::create_dir_all(&dump_dir).unwrap();
+        let carry = carry_for(&data_dir, &dump_dir, &base_rel, &desc, &layout_to_dump_id);
+        let out_dir = data_dir.join("out");
+        let out_desc = run_carry(&data_dir, &out_dir, carry, &[], &perm);
+
+        let out_vamana = out_dir.join("vector/Doc.emb.vamana");
+        let out_pq_path = out_dir.join("vector/Doc.emb.pq");
+        assert!(
+            same_bytes(&out_vamana, &base_vamana),
+            "a pure-permutation carry must leave the .vamana byte-identical (the whole thesis)"
+        );
+        assert_eq!(out_desc.count, n, "record count preserved");
+
+        // The composition, asserted directly on the emitted id column.
+        let out_pq = PqReader::open_with_cipher(&out_pq_path, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let expected: Vec<u64> = layout_to_dump_id
+            .iter()
+            .map(|&d| perm.final_of(d))
+            .collect();
+        assert_eq!(
+            out_pq.node_ids, expected,
+            "the .pq id column is the composition"
+        );
+
+        // KNN returns the same nodes under the permuted ids, same scores.
+        let after = knn(&out_vamana, &out_pq_path, &query, medoid, 10);
+        let want: Vec<(u64, f32)> = before
+            .iter()
+            .map(|(id, s)| (perm.final_of(*id), *s))
+            .collect();
+        assert_eq!(after, want);
+        assert_ne!(after[0].0, before[0].0, "ids genuinely moved");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// The `ClusterMode::None` identity path (`final_id == dump_id`): still carries by
+    /// reference, and the id column is the dump-id column unchanged.
+    #[test]
+    fn identity_perm_carries_and_leaves_ids_unchanged() {
+        let data_dir = scratch("identity");
+        let dim = 24usize;
+        let vectors = unit_vectors(dim, 80, 0x0117_0000_0000_0002);
+        let entries: Vec<(u64, Vec<f32>)> = vectors
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v))
+            .collect();
+        let (desc, base_rel, layout_ids) = build_base(&data_dir, &entries, dim as u32);
+        let base_vamana = data_dir.join(&base_rel).join("vector/Doc.emb.vamana");
+
+        let dump_dir = data_dir.join("dump");
+        std::fs::create_dir_all(&dump_dir).unwrap();
+        let carry = carry_for(&data_dir, &dump_dir, &base_rel, &desc, &layout_ids);
+        let out_dir = data_dir.join("out");
+        run_carry(&data_dir, &out_dir, carry, &[], &Permutation::Identity);
+
+        assert!(
+            same_bytes(&out_dir.join("vector/Doc.emb.vamana"), &base_vamana),
+            "identity carry is byte-identical too"
+        );
+        let out_pq = PqReader::open_with_cipher(&out_dir.join("vector/Doc.emb.pq"), None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        assert_eq!(
+            out_pq.node_ids, layout_ids,
+            "identity perm leaves the dump-id column unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Delete + Δ re-embed through the carried arm: the fast path must **not** fire, KNN over
+    /// the live set (independently-derived truth) must be correct under the permuted ids, and a
+    /// deleted node must never come back — even queried by its own vector.
+    #[test]
+    fn delete_and_delta_carry_is_correct_and_not_fast_path() {
+        let data_dir = scratch("delta");
+        let dim = 32usize;
+        let all = unit_vectors(dim, 220, 0x0117_0000_0000_0003);
+        let base_n = 180usize;
+        let base_vecs = &all[..base_n];
+        let delta_vecs = &all[base_n..];
+        let entries: Vec<(u64, Vec<f32>)> = base_vecs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v))
+            .collect();
+        let (desc, base_rel, layout_ids) = build_base(&data_dir, &entries, dim as u32);
+        let base_vamana = data_dir.join(&base_rel).join("vector/Doc.emb.vamana");
+        let medoid = match desc.mode {
+            AnnMode::Vamana { medoid, .. } => medoid as u32,
+            _ => unreachable!(),
+        };
+
+        // Delete 20 base dump-ids; a reversal perm over the base-id space for the survivors.
+        let n = base_n as u64;
+        let table: Vec<u32> = (0..n).map(|i| (n - 1 - i) as u32).collect();
+        let perm = Permutation::Table(table);
+        let mut rng = Rng(0xdead_0000_0000_0001);
+        let mut dead = std::collections::HashSet::new();
+        while dead.len() < 20 {
+            dead.insert((rng.next_f64() * n as f64) as u64 % n);
+        }
+        // layout_to_dump_id: HOLE for a deleted dump-id, else the dump-id (compact identity here).
+        let layout_to_dump_id: Vec<u64> = layout_ids
+            .iter()
+            .map(|&d| if dead.contains(&d) { HOLE } else { d })
+            .collect();
+
+        // Δ: 40 fresh vectors with ids past the base, keyed by their *final* id (perm applied,
+        // as the emit gather would): the merge takes them as inserts in this space.
+        let delta: Vec<(u64, Vec<f32>)> = delta_vecs
+            .iter()
+            .enumerate()
+            .map(|(k, v)| (10_000 + k as u64, v.clone()))
+            .collect();
+
+        let dump_dir = data_dir.join("dump");
+        std::fs::create_dir_all(&dump_dir).unwrap();
+        let carry = carry_for(&data_dir, &dump_dir, &base_rel, &desc, &layout_to_dump_id);
+        let out_dir = data_dir.join("out");
+        let out_desc = run_carry(&data_dir, &out_dir, carry, &delta, &perm);
+        let out_vamana = out_dir.join("vector/Doc.emb.vamana");
+        let out_pq = out_dir.join("vector/Doc.emb.pq");
+
+        assert!(
+            !same_bytes(&out_vamana, &base_vamana),
+            "a delete+Δ merge must rewrite the .vamana, not carry it"
+        );
+        assert_eq!(
+            out_desc.live_count(),
+            (base_n - dead.len() + delta.len()) as u64,
+            "live_count = surviving base + Δ"
+        );
+
+        // The live set (surviving base under the perm + Δ), the independently-derived truth.
+        let mut live: Vec<(u64, Vec<f32>)> = Vec::new();
+        for (i, &d) in layout_ids.iter().enumerate() {
+            if !dead.contains(&d) {
+                // recover the raw base vector for dump id d
+                live.push((perm.final_of(d), base_vecs[d as usize].clone()));
+            }
+            let _ = i;
+        }
+        for (id, v) in &delta {
+            live.push((*id, v.clone()));
+        }
+
+        let k = 10;
+        let mut total = 0.0f64;
+        for q in 0..20 {
+            let mut query = live[(q * 7) % live.len()].1.clone();
+            query[0] += 0.02;
+            let query = normalise(&query);
+            let got: std::collections::HashSet<u64> = knn(&out_vamana, &out_pq, &query, medoid, k)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let truth = brute(&live, &query, k);
+            total += truth.iter().filter(|id| got.contains(id)).count() as f64 / k as f64;
+        }
+        let recall = total / 20.0;
+        assert!(
+            recall >= 0.8,
+            "recall@{k} over the live set was {recall:.3}, want ≥ 0.8"
+        );
+
+        // A deleted node never comes back — query by its own vector. KNN returns *final* ids, so
+        // the deleted node is its permuted id `final_of(d)` (checking the raw dump-id `d` would
+        // be a false positive: a surviving node legitimately holds *some other* node's dump-id as
+        // its final id under a non-identity perm).
+        for &d in dead.iter().take(5) {
+            let hits = knn(&out_vamana, &out_pq, &base_vecs[d as usize], medoid, 10);
+            let permuted = perm.final_of(d);
+            assert!(
+                !hits.iter().any(|(id, _)| *id == permuted),
+                "deleted node (dump-id {d}, final {permuted}) was returned"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}

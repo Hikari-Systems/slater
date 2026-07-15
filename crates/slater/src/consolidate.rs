@@ -1374,4 +1374,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
     }
+
+    /// HIK-117, the server side of the carry. A Vamana base **carries by reference**: the dump
+    /// must NOT stream the base vectors back out (`vectors.blk` empty — the ~370 GB read gone),
+    /// it must emit a carry record referencing the base `.vamana`/`.pq` with the base build
+    /// params, and the `layout → dump-id` sidecar must map the survivors and `HOLE` the dead.
+    #[test]
+    fn binary_dump_carries_a_vamana_index_by_reference() {
+        use graph_format::consolidate_dump::DumpReader;
+        use graph_format::pq::HOLE;
+
+        let fix = testgen::VamanaFixture {
+            n: 300,
+            dim: 32,
+            r: 24,
+            alpha: 1.2,
+            pq_subspaces: 8,
+            pq_bits: 8,
+            vector_block_size: 8192,
+        };
+        let (root, graph, _raw) = testgen::write_vamana("bindump_carry", &fix);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        // The base's layout → dump-id column, straight from the open index.
+        let base_ids = gen
+            .vamana_index("Doc", "embedding")
+            .unwrap()
+            .pq
+            .node_ids
+            .clone();
+        assert_eq!(base_ids.len(), fix.n);
+
+        // ── Case 1: pure permutation (empty delta). Carry with no holes; every ordinal maps to
+        // its own dump id (no tombstones ⇒ compaction is the identity). No vector is streamed.
+        {
+            let merged = MergedView::read_only(&gen);
+            let dir = dump_dir("carry_pure");
+            let _ = std::fs::remove_dir_all(&dir);
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+            let r = DumpReader::open(&dir).unwrap();
+            assert_eq!(
+                r.vector_count(),
+                0,
+                "no vector may be streamed for a carried index"
+            );
+            let vi = &r.meta().vector_indexes[0];
+            let carry = vi.carry.as_ref().expect("a Vamana index must carry");
+            assert_eq!(
+                carry.base_vamana,
+                format!("{graph}/{}/vector/Doc.embedding.vamana", gen.base_uuid())
+            );
+            assert_eq!(carry.base_records, fix.n as u64);
+            assert_eq!(carry.r, fix.r);
+            let map = r
+                .read_vector_carry(&carry.carry_map_file, carry.base_records)
+                .unwrap();
+            assert_eq!(
+                map, base_ids,
+                "no delta ⇒ layout → dump-id is the base id column"
+            );
+            assert!(!map.contains(&HOLE));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ── Case 2: delete one node (dense id 0). Its ordinal must go HOLE; every survivor
+        // compacts down by the one tombstone below it. Still no vector streamed.
+        {
+            let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+            mem.delete_node("Doc", "id", Value::Int(0), Some(0));
+            let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let dir = dump_dir("carry_delete");
+            let _ = std::fs::remove_dir_all(&dir);
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+            let r = DumpReader::open(&dir).unwrap();
+            assert_eq!(
+                r.vector_count(),
+                0,
+                "a delete carries too — no base vector streamed"
+            );
+            let carry = r.meta().vector_indexes[0].carry.as_ref().unwrap();
+            let map = r
+                .read_vector_carry(&carry.carry_map_file, carry.base_records)
+                .unwrap();
+            for (i, (&dump_id, &base_id)) in map.iter().zip(&base_ids).enumerate() {
+                if base_id == 0 {
+                    assert_eq!(
+                        dump_id, HOLE,
+                        "the deleted node's ordinal {i} must be a hole"
+                    );
+                } else {
+                    // one tombstone (id 0) sorts below every survivor, so each shifts down by 1.
+                    assert_eq!(
+                        dump_id,
+                        base_id - 1,
+                        "survivor at ordinal {i} compacts by 1"
+                    );
+                }
+            }
+            assert_eq!(map.iter().filter(|&&x| x == HOLE).count(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

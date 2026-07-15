@@ -13692,16 +13692,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The **Vamana** arm of the same gate, which is the one that would silently ship
-    /// zeros. A Vamana index's full vectors live in its `.vamana` blocks and are *not* in
-    /// `vectors.f32.blk` at all — its `first_record` is recorded as a meaningless `0` (D31)
-    /// — so a carry-through that read the brute-force store for it would find an empty
-    /// group, rebuild an index with no rows, and still exit 0.
-    ///
-    /// The rebuild re-routes by cardinality against its *own* `ann_threshold` (the default
-    /// 50k, since `run_builder` passes no override), so these 400 vectors come back as a
-    /// brute-force index. That is correct, and it is also what makes the assertion sharp:
-    /// the vectors have to survive a Vamana→brute-force transcode to score at all.
+    /// The **Vamana** arm of the same gate — and, since HIK-117, the server-level proof of
+    /// **carry-by-reference**. A Vamana index's full vectors live in its `.vamana` blocks; the
+    /// consolidation no longer streams them back out (the ~370 GB read at scale) and no longer
+    /// rebuilds the graph from zero. Instead the dump carries a reference to the base
+    /// `.vamana`/`.pq` plus a `layout → new-id` map, and the builder folds the (here empty) Δ in
+    /// with `streaming_merge`. With no deletes and no Δ that is the pure-permutation fast path,
+    /// so the new generation's `.vamana` is **byte-identical** to the base's — the whole thesis
+    /// of the FreshDiskANN write ladder, asserted end-to-end through the dump and the forked
+    /// builder, not just the in-crate primitive.
     #[test]
     #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
     fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
@@ -13766,6 +13765,13 @@ mod tests {
             "the fixture must actually be a Vamana index, else this proves nothing"
         );
         assert_eq!(desc0.count, n as u64);
+        // Snapshot the base `.vamana` bytes *before* the consolidation, to prove afterward that
+        // carry-by-reference left the graph file untouched (the pure-permutation fast path).
+        let base_vamana = data
+            .join("docs")
+            .join(gen0.base_uuid().to_string())
+            .join("vector/Doc.embedding.vamana");
+        let base_bytes = std::fs::read(&base_vamana).expect("base .vamana must exist");
 
         graphs
             .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
@@ -13785,6 +13791,26 @@ mod tests {
             "every vector must be carried out of the .vamana blocks — a 0 here is the \
              'read the wrong store' bug, which is silent by construction"
         );
+        // Carry-by-reference: the index stays Vamana (not rebuilt as brute-force), and its
+        // `.vamana` is byte-identical to the base — the graph was carried, not reconstructed.
+        assert!(
+            matches!(vidx[0].mode, AnnMode::Vamana { .. }),
+            "a carried Vamana base must stay Vamana, not be rebuilt as brute-force"
+        );
+        let new_vamana = data
+            .join("docs")
+            .join(gen1.base_uuid().to_string())
+            .join("vector/Doc.embedding.vamana");
+        assert_ne!(
+            new_vamana, base_vamana,
+            "the consolidation must publish a new generation"
+        );
+        assert_eq!(
+            std::fs::read(&new_vamana).unwrap(),
+            base_bytes,
+            "a pure-permutation consolidation must carry the .vamana byte-identically — this is \
+             the BLAKE3-unchanged thesis at the server level"
+        );
 
         // The data has to be the real thing, not zeros: query with node 7's own embedding
         // and it must come back first, at distance ~0. (`--cluster none` ⇒ dense id == i.)
@@ -13796,8 +13822,13 @@ mod tests {
             probe.join(", ")
         ))
         .unwrap();
-        let res = Engine::new(&view, &cache).run(&ast).unwrap();
-        assert_eq!(res.rows.len(), 1, "the rebuilt index must return a hit");
+        // The carried index is Vamana, so serving KNN needs the vector-index cache the
+        // consolidation pinned it into (a brute-force rebuild would not have).
+        let res = Engine::new(&view, &cache)
+            .with_vector_cache(&vc, 96)
+            .run(&ast)
+            .unwrap();
+        assert_eq!(res.rows.len(), 1, "the carried index must return a hit");
         assert!(
             matches!(res.rows[0][0], Val::Int(7)),
             "a node's own embedding must be its own nearest neighbour, got {:?}",
