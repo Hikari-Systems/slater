@@ -79,6 +79,7 @@ pub mod store;
 pub mod topology;
 pub mod vamana;
 pub mod vamana_delete;
+pub mod vamana_merge;
 pub mod vectors;
 pub mod wire;
 

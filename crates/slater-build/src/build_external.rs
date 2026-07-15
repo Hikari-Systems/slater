@@ -3299,6 +3299,35 @@ mod tests {
     use graph_format::pq::{ann_query, AdcTable, PqReader};
     use graph_format::vamana::{beam_search, BeamParams, VamanaReader};
 
+    /// The carried-index id remap, at its real call site: `Permutation::final_of` is the
+    /// closure `graph_format::vamana_merge::compose_final_ids` composes with. A direction bug
+    /// or a mishandled sentinel here silently points every KNN result at the wrong node, so it
+    /// is pinned against a hand-built, non-monotone, non-involution permutation. (The exhaustive
+    /// composition test lives beside `compose_final_ids` in graph-format; this guards that the
+    /// builder feeds it `perm.final_of` — old → new — and not its inverse.)
+    #[test]
+    fn carried_final_ids_composes_old_to_new_via_perm() {
+        // perm: prov(old) → final(new). Deliberately NOT monotone and NOT an involution, so
+        // final_of(x) != x and final_of(final_of(x)) != x — an "applied twice" or "wrong
+        // direction" bug cannot coincidentally pass.
+        //   old 0 → 3, 1 → 0, 2 → 4, 3 → 1, 4 → 2
+        let perm = Permutation::Table(vec![3, 0, 4, 1, 2]);
+        // layout ordinal → base dump id (its old dense id). Ordinal 2 is a tombstone.
+        let layout_to_dump_id = vec![4u64, 1, graph_format::pq::HOLE, 0, 3];
+
+        let got = graph_format::vamana_merge::compose_final_ids(&layout_to_dump_id, |id| {
+            perm.final_of(id)
+        });
+
+        // Hand-composed: final_of(4)=2, final_of(1)=0, HOLE→HOLE, final_of(0)=3, final_of(3)=1.
+        assert_eq!(got, vec![2, 0, graph_format::pq::HOLE, 3, 1]);
+        // Identity permutation (ClusterMode::None) is free: layout_to_dump_id passes through.
+        let id_out = graph_format::vamana_merge::compose_final_ids(&layout_to_dump_id, |id| {
+            Permutation::Identity.final_of(id)
+        });
+        assert_eq!(id_out, layout_to_dump_id);
+    }
+
     /// A deterministic LCG so the synthetic dump is reproducible without a `rand`
     /// dependency (mirrors graph-format's training RNG).
     struct Lcg(u64);
