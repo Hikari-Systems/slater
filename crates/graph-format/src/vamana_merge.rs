@@ -60,8 +60,8 @@ use crate::crypto::BlockCipher;
 use crate::manifest::Metric;
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
 use crate::vamana::{
-    greedy_search_over, robust_prune_over, AdjRead, AdjWrite, Expanded, PointSet, VamanaIndex,
-    VamanaReader, VamanaWriter,
+    decode_node, greedy_search_over, robust_prune_over, AdjRead, AdjWrite, Expanded, PointSet,
+    VamanaIndex, VamanaReader, VamanaWriter,
 };
 use crate::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
@@ -310,16 +310,7 @@ pub fn streaming_merge(
         params.cipher.clone(),
     )
     .with_context(|| format!("create {}", vamana_out.display()))?;
-    let mut nbrs_buf: Vec<VamanaIndex> = Vec::new();
-    for i in 0..base_count {
-        let raw = cur_reader.node(i as u32)?.vector;
-        adj.neighbours_into(i as u32, &mut nbrs_buf)?;
-        vw.append(&raw, &nbrs_buf)?;
-    }
-    for (k, (_, raw)) in inputs.inserts.iter().enumerate() {
-        adj.neighbours_into((base_count + k) as u32, &mut nbrs_buf)?;
-        vw.append(raw, &nbrs_buf)?;
-    }
+    emit_merged(cur_reader, base_count, inputs.inserts, &adj, &mut vw)?;
     vw.finish()?;
 
     let delta_ids: Vec<u64> = inputs.inserts.iter().map(|(id, _)| *id).collect();
@@ -334,6 +325,59 @@ pub fn streaming_merge(
 
     let _ = fs::remove_file(&scratch);
     Ok(stats)
+}
+
+/// Emit the merged `.vamana`: one sequential pass over the carried base, then the Δ records.
+///
+/// The base sweep decompresses each block **once** via [`BlockFileReader::for_each_record`]
+/// (with bounded read-ahead) and takes BOTH the raw vector and the base-adjacency fallback from
+/// that single [`decode_node`]. This is HIK-119's fix: the old loop read each base record with
+/// `cur_reader.node(i)` — a full-block zstd inflate per record — *and* `neighbours_into` re-read
+/// the same record's block a second time, so scanning `0..N` re-inflated each block
+/// `O(records/block)` times (measured ~20–24× too slow at the builder's real params).
+///
+/// The output is content-identical to that old per-record emit: `for_each_record` visits records
+/// `0..base_count` in ascending order (so `global` is the layout ordinal), the dirty overlay wins
+/// for a back-linked / delete-spliced base node exactly as `neighbours_into` chose it, an
+/// untouched node falls back to its own on-disk neighbours, and the forged-neighbour-ordinal
+/// bounds check `base_neighbours` performed is preserved. Holes are emitted like any other base
+/// record; their `.pq` id (written separately by [`write_pq`]) is `HOLE`.
+fn emit_merged(
+    cur_reader: &VamanaReader,
+    base_count: usize,
+    inserts: &[(u64, Vec<f32>)],
+    adj: &MergeAdj,
+    vw: &mut VamanaWriter,
+) -> Result<()> {
+    let total = base_count + inserts.len();
+    let mut nbrs_buf: Vec<VamanaIndex> = Vec::new();
+    cur_reader.inner().for_each_record(|global, rec| {
+        let node = decode_node(rec)?;
+        nbrs_buf.clear();
+        if let Some(v) = adj.dirty_neighbours(global as u32) {
+            nbrs_buf.extend_from_slice(v);
+        } else {
+            // A neighbour ordinal is untrusted on-disk data — keep the bounds check
+            // `base_neighbours` did (a forged one must not index out of bounds downstream).
+            for &nb in &node.neighbours {
+                ensure!(
+                    (nb as usize) < total,
+                    ".vamana record {global} names neighbour ordinal {nb}, but the merged graph \
+                     holds only {total} records"
+                );
+            }
+            nbrs_buf.extend_from_slice(&node.neighbours);
+        }
+        vw.append(&node.vector, &nbrs_buf)?;
+        Ok(())
+    })?;
+    // The Δ-insert emit is O(Δ): each reads its own edges from the in-memory `delta_adj` slab
+    // (`neighbours_into` for an index ≥ base_count touches no disk), so it has no amplification.
+    for (k, (_, raw)) in inserts.iter().enumerate() {
+        adj.neighbours_into((base_count + k) as VamanaIndex, &mut nbrs_buf)?;
+        vw.append(raw, &nbrs_buf)?;
+    }
+    Ok(())
 }
 
 /// Carry a `.vamana` by reference: hard-link the base file to `out`, byte-identically. Falls
@@ -470,6 +514,15 @@ struct MergeAdj<'a> {
 }
 
 impl MergeAdj<'_> {
+    /// The dirty-overlay adjacency for base ordinal `i` — the back-linked / delete-spliced
+    /// edges an insert pass patched in — or `None` if the record is untouched. Lets the emit
+    /// consult the overlay without going through the disk-reading `neighbours_into`, so the emit
+    /// can pair it with a record it already decoded once in a block sweep. Only meaningful for a
+    /// base ordinal (`i < base_count`); a Δ index's edges live in `delta_adj`, not here.
+    fn dirty_neighbours(&self, i: VamanaIndex) -> Option<&[VamanaIndex]> {
+        self.dirty.get(&i).map(|v| v.as_slice())
+    }
+
     fn base_neighbours(&self, i: VamanaIndex) -> Result<Vec<VamanaIndex>> {
         if let Some(v) = self.base_cache.borrow().get(&i) {
             return Ok(v.clone());
@@ -1381,6 +1434,321 @@ mod tests {
         );
         // The dirty overlay (back-linked base records) is O(Δ·R), nowhere near N.
         assert!(adj.dirty.len() <= 3 * (base.r + 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reproduce `streaming_merge`'s delete stage independently: run [`consolidate_deletes`]
+    /// with the *same* opts into our own scratch. For a delete-only merge there is no insert
+    /// back-linking, so the emit's dirty overlay is empty and it must reproduce each post-delete
+    /// record verbatim — vector and neighbours, holes included. This is the independently-derived
+    /// truth for HIK-119's decompress-once emit (no cross-impl "old == new"): the carried records
+    /// are produced by the shared delete primitive, and the emit's contract is to copy them
+    /// through faithfully at the right ordinal.
+    fn post_delete_reader(dir: &Path, base: &Base, dead: &[bool]) -> VamanaReader {
+        let base_pq = PqReader::open_with_cipher(&base.ppath, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let space_dim = base_pq.codebook.params.dim as usize;
+        let params = params_for(base);
+        let opts = ConsolidateOpts {
+            medoid: params.medoid,
+            r: params.r,
+            alpha: params.alpha,
+            metric: params.metric,
+            max_norm: params.max_norm,
+            space_dim,
+            cache_records: recommended_cache_records(params.r),
+            cache_blocks: RECOMMENDED_CACHE_BLOCKS,
+        };
+        let truth = dir.join("truth_cur.vamana");
+        let reader = VamanaReader::open_with_cipher(&base.vpath, None).unwrap();
+        let mut vw = VamanaWriter::create_with_cipher(&truth, BLOCK, LEVEL, None).unwrap();
+        consolidate_deletes(&reader, dead, &opts, &mut vw).unwrap();
+        vw.finish().unwrap();
+        VamanaReader::open_with_cipher(&truth, None).unwrap()
+    }
+
+    /// **HIK-119 output-identity, delete-only.** A base spanning several blocks, a scatter of
+    /// deletes (some adjacent, to force splices). The decompress-once emit must produce a
+    /// `.vamana` whose every record — vector AND adjacency, holes included — is identical to the
+    /// carried post-delete records. Exercises the base-fallback branch, the per-ordinal vector
+    /// pairing (an off-by-one between `global` and its record would surface here), and holes.
+    #[test]
+    fn emit_delete_only_is_content_identical_to_carried_records() {
+        let dir = scratch("emit_delete_only");
+        let vectors = unit_vectors(24, 200, 0x51a7_0000_0000_0008);
+        let ids: Vec<u64> = (0..vectors.len() as u64).map(|i| 1000 + i).collect();
+        let base = build_base(&dir, "base", &vectors, &ids, 16, Metric::Cosine);
+        let params = params_for(&base);
+
+        let victims = [3u32, 4, 5, 50, 51, 120, 199];
+        let base_final_ids: Vec<u64> = base
+            .layout_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                if victims.contains(&(i as u32)) {
+                    HOLE
+                } else {
+                    id + 7
+                }
+            })
+            .collect();
+        let dead: Vec<bool> = base_final_ids.iter().map(|&id| id == HOLE).collect();
+
+        let truth = post_delete_reader(&dir, &base, &dead);
+
+        let vout = dir.join("out.vamana");
+        let pout = dir.join("out.pq");
+        let stats = streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &base_final_ids,
+                inserts: &[],
+            },
+            &params,
+            &vout,
+            &pout,
+        )
+        .unwrap();
+        assert!(!stats.vamana_carried, "a delete merge rewrites the .vamana");
+
+        let got = VamanaReader::open_with_cipher(&vout, None).unwrap();
+        assert_eq!(got.len(), truth.len(), "record count must be preserved");
+        assert!(
+            got.len() >= 100,
+            "fixture must span several blocks to be meaningful"
+        );
+        for i in 0..truth.len() as u32 {
+            let e = truth.node(i).unwrap();
+            let g = got.node(i).unwrap();
+            assert_eq!(
+                g.vector, e.vector,
+                "record {i} vector diverged from the carried base"
+            );
+            assert_eq!(
+                g.neighbours, e.neighbours,
+                "record {i} adjacency diverged from the carried base"
+            );
+        }
+        // The writer is deterministic and the record byte-stream + block params are identical, so
+        // the emitted file is byte-identical to the carried post-delete records.
+        assert_eq!(
+            blake3_of(&vout),
+            blake3_of(&dir.join("truth_cur.vamana")),
+            "delete-only emit must be BLAKE3-identical to the carried post-delete records"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **HIK-119 output-identity, delete + insert (the real slow path).** Reconstruct the carried
+    /// post-delete reader, then drive the *same* insert sequence (`merge_insert` in order over a
+    /// fresh `MergeAdj`, mirroring `streaming_merge`) to obtain the known dirty overlay and Δ
+    /// adjacency. Build the expected `(vector, neighbours)` list directly from that overlay + the
+    /// carried reader + Δ, and assert the merge's output matches it record-for-record. This is the
+    /// branch the fix most endangers: a dirty (back-linked) base node must take the overlay, an
+    /// untouched one its own on-disk neighbours.
+    #[test]
+    fn emit_delete_and_insert_is_content_identical_to_overlay_truth() {
+        let dir = scratch("emit_del_ins");
+        let base_n = 220usize;
+        let dim = 24usize;
+        let all = unit_vectors(dim, base_n + 15, 0x51a7_0000_0000_0009);
+        let base_vecs = &all[..base_n];
+        let delta_vecs = &all[base_n..];
+        let ids: Vec<u64> = (0..base_n as u64).map(|i| 1000 + i).collect();
+        let base = build_base(&dir, "base", base_vecs, &ids, 16, Metric::Cosine);
+        let params = params_for(&base);
+
+        let victims = [10u32, 11, 60, 130, 219];
+        let base_final_ids: Vec<u64> = base
+            .layout_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                if victims.contains(&(i as u32)) {
+                    HOLE
+                } else {
+                    id + 3
+                }
+            })
+            .collect();
+        let dead: Vec<bool> = base_final_ids.iter().map(|&id| id == HOLE).collect();
+        let inserts: Vec<(u64, Vec<f32>)> = delta_vecs
+            .iter()
+            .enumerate()
+            .map(|(k, v)| (900_000 + k as u64, v.clone()))
+            .collect();
+
+        // Independently reconstruct the emit's inputs: the carried post-delete reader, then the
+        // insert overlay produced by the same primitive in the same order.
+        let cur = post_delete_reader(&dir, &base, &dead);
+        let base_pq = PqReader::open_with_cipher(&base.ppath, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let space_dim = base_pq.codebook.params.dim as usize;
+        let delta_ann: Vec<Vec<f32>> = inserts
+            .iter()
+            .map(|(_, v)| ann_point(params.metric, v, params.max_norm, space_dim).unwrap())
+            .collect();
+        let points = MergePoints {
+            reader: &cur,
+            base_count: base_n,
+            metric: params.metric,
+            max_norm: params.max_norm,
+            space_dim,
+            delta_ann: &delta_ann,
+            cache: RefCell::new(HashMap::new()),
+        };
+        let mut adj = MergeAdj {
+            reader: &cur,
+            base_count: base_n,
+            dirty: HashMap::new(),
+            delta_adj: vec![Vec::new(); inserts.len()],
+            base_cache: RefCell::new(HashMap::new()),
+        };
+        let mut expanded = Expanded::Set(Default::default());
+        for k in 0..inserts.len() {
+            merge_insert(
+                (base_n + k) as VamanaIndex,
+                &mut adj,
+                &points,
+                &dead,
+                &params,
+                &mut expanded,
+            )
+            .unwrap();
+        }
+        // Expected list: base records take the overlay if dirty, else their carried neighbours;
+        // Δ records take their own slab adjacency.
+        let mut expected: Vec<(Vec<f32>, Vec<VamanaIndex>)> = Vec::new();
+        for i in 0..base_n as u32 {
+            let node = cur.node(i).unwrap();
+            let nbrs = match adj.dirty.get(&i) {
+                Some(v) => v.clone(),
+                None => node.neighbours.clone(),
+            };
+            expected.push((node.vector, nbrs));
+        }
+        for (k, (_, raw)) in inserts.iter().enumerate() {
+            expected.push((raw.clone(), adj.delta_adj[k].clone()));
+        }
+        // Prove the overlay is non-trivial, or the dirty branch would go untested.
+        assert!(
+            !adj.dirty.is_empty(),
+            "the insert back-links must dirty some base records"
+        );
+
+        // Run the merge under test and compare.
+        let vout = dir.join("out.vamana");
+        let pout = dir.join("out.pq");
+        streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &base_final_ids,
+                inserts: &inserts,
+            },
+            &params,
+            &vout,
+            &pout,
+        )
+        .unwrap();
+        let got = VamanaReader::open_with_cipher(&vout, None).unwrap();
+        assert_eq!(got.len() as usize, expected.len(), "output record count");
+        for (i, (vec, nbrs)) in expected.iter().enumerate() {
+            let g = got.node(i as u32).unwrap();
+            assert_eq!(
+                &g.vector, vec,
+                "record {i} vector diverged from overlay truth"
+            );
+            assert_eq!(
+                &g.neighbours, nbrs,
+                "record {i} adjacency diverged from overlay truth"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **HIK-119 anti-amplification guard.** The emit must decode each block *once*, not
+    /// re-inflate a whole block per record. Drives `emit_merged` directly over a `VamanaReader`
+    /// backed by a read-counting source, and asserts the emit issues ~one block read per block —
+    /// far fewer than the per-record `node(i)` path, which reads one block per record. A
+    /// regression to per-record reads would make the two counts equal and trip this.
+    #[test]
+    fn emit_reads_each_block_once_not_once_per_record() {
+        use crate::store::fs::FileObject;
+        use crate::store::RandomReadAt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingSource {
+            inner: FileObject,
+            reads: AtomicU64,
+        }
+        impl RandomReadAt for CountingSource {
+            fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.inner.read_exact_at(buf, offset)
+            }
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+        }
+
+        let dir = scratch("emit_guard");
+        let vectors = unit_vectors(24, 240, 0x51a7_0000_0000_000a);
+        let ids: Vec<u64> = (0..vectors.len() as u64).map(|i| 1000 + i).collect();
+        let base = build_base(&dir, "base", &vectors, &ids, 16, Metric::Cosine);
+
+        let src = Arc::new(CountingSource {
+            inner: FileObject::open(&base.vpath).unwrap(),
+            reads: AtomicU64::new(0),
+        });
+        let reader = VamanaReader::open_src(src.clone(), None).unwrap();
+        let n = reader.len() as usize;
+        assert!(n >= 200, "fixture must span several blocks");
+
+        // The emit path: untouched base records (empty dirty overlay) — the amplification-prone
+        // fallback branch — swept via `for_each_record`.
+        let adj = MergeAdj {
+            reader: &reader,
+            base_count: n,
+            dirty: HashMap::new(),
+            delta_adj: Vec::new(),
+            base_cache: RefCell::new(HashMap::new()),
+        };
+        let vout = dir.join("guard.out.vamana");
+        let mut vw = VamanaWriter::create_with_cipher(&vout, BLOCK, LEVEL, None).unwrap();
+        let before = src.reads.load(Ordering::Relaxed);
+        emit_merged(&reader, n, &[], &adj, &mut vw).unwrap();
+        vw.finish().unwrap();
+        let emit_reads = src.reads.load(Ordering::Relaxed) - before;
+
+        // The old per-record pattern, over the same source, for a mutation-check baseline: one
+        // block read per record.
+        let before_pr = src.reads.load(Ordering::Relaxed);
+        for i in 0..n as u32 {
+            let _ = reader.node(i).unwrap();
+        }
+        let perrec_reads = src.reads.load(Ordering::Relaxed) - before_pr;
+
+        assert_eq!(
+            perrec_reads, n as u64,
+            "the per-record node() path reads exactly one block per record ({n})"
+        );
+        assert!(
+            emit_reads * 4 <= n as u64,
+            "emit read {emit_reads} blocks for {n} records — with ~27 records/block it should be \
+             ~9; a value near {n} means the per-record amplification regressed"
+        );
+        assert!(
+            emit_reads * 8 < perrec_reads,
+            "emit ({emit_reads} reads) must decode each block once, far below the per-record path \
+             ({perrec_reads})"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
