@@ -307,6 +307,7 @@ impl SortRecord for PendingVector {
 /// resident `Vec`. The brute-force arm streams straight from the merge into the
 /// writer (peak resident bounded by the reservation, not the set size); the Vamana
 /// arm has to collect the group resident because its v1 graph build is in-memory.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_vector_indexes(
     tmp_dir: &Path,
     pending: &[PendingIndex],
@@ -1020,7 +1021,7 @@ mod carry_tests {
             carry: None,
         };
         let (desc, _files) = build_vamana_index(&base_dir, &pi, entries, &opts(), None).unwrap();
-        let pq = PqReader::open_with_cipher(&base_dir.join("vector/Doc.emb.pq"), None)
+        let pq = PqReader::open_with_cipher(base_dir.join("vector/Doc.emb.pq"), None)
             .unwrap()
             .load_resident()
             .unwrap();
@@ -1221,7 +1222,7 @@ mod carry_tests {
             same_bytes(&out_dir.join("vector/Doc.emb.vamana"), &base_vamana),
             "identity carry is byte-identical too"
         );
-        let out_pq = PqReader::open_with_cipher(&out_dir.join("vector/Doc.emb.pq"), None)
+        let out_pq = PqReader::open_with_cipher(out_dir.join("vector/Doc.emb.pq"), None)
             .unwrap()
             .load_resident()
             .unwrap();
