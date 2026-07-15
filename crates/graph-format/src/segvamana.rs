@@ -76,7 +76,7 @@ pub struct SealedVamanaMeta {
 /// codebook always has valid parameters (`1` divides everything).
 fn pick_subspaces(dim: u32) -> u32 {
     for s in [16u32, 8, 4, 2, 1] {
-        if dim % s == 0 {
+        if dim.is_multiple_of(s) {
             return s;
         }
     }
@@ -248,7 +248,7 @@ impl SegmentVamanaSet {
             // describes. Treat it as "no index" (brute force), never a wrong search.
             if pq.len() as u64 != reader.len()
                 || reader.len() != meta.count
-                || (reader.len() > 0 && meta.medoid >= reader.len())
+                || (!reader.is_empty() && meta.medoid >= reader.len())
             {
                 continue;
             }

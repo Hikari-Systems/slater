@@ -6130,7 +6130,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     desc.metric,
                     query,
                     k,
-                    &live,
+                    live,
                 )?),
                 None => {
                     // Brute force this segment's *own* embeddings (its rows carry the vector).
