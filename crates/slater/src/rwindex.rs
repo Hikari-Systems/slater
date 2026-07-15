@@ -319,11 +319,21 @@ impl RwVectorIndex {
     /// | [`DeltaVector::Gone`]   | remove (the slot stays a waypoint)        | **in** |
     /// | [`DeltaVector::Silent`] | remove                                    | **out** |
     ///
-    /// `Silent` must *remove* — a node can leave the index without being deleted at all
-    /// (`REMOVE n:Label` un-indexes it, a tombstone kills it). Leaving it in the graph would
-    /// keep emitting a node the delta no longer embeds; leaving it in `superseded` would
-    /// suppress the base's perfectly good vector for a node the delta has nothing to say
-    /// about. Both are silent wrong answers.
+    /// `Gone` vs `Silent` is the *sharp* distinction, and it is decided upstream by
+    /// [`exec::delta_vector_for`]:
+    /// * `Gone` — the delta **took the node out of the index**: `REMOVE n.embedding`, a
+    ///   `SET n = {…}` that dropped it, an overwrite with a non-vector, **or `REMOVE n:Label`
+    ///   leaving the index's scope** (HIK-116). The node had a place in the index and lost it,
+    ///   so the vector a level below still holds must be suppressed — superseded **in**.
+    /// * `Silent` — the delta has **nothing to say** about a node's membership: it never
+    ///   carried the label, or it was only patched on an unrelated property. Leaving it in
+    ///   `superseded` would suppress the base's perfectly good vector for a node the delta was
+    ///   never about — superseded **out**.
+    ///
+    /// Both remove from the graph (a suppressed node stays a navigable waypoint, never an
+    /// emitted hit); the two differ only in `superseded`. Getting the split wrong is silent
+    /// either way — a `Gone` misfiled as `Silent` leaves a de-labelled node scoring at its
+    /// stale vector (the HIK-116 bug); the reverse hides a live base vector.
     fn apply(&mut self, id: u64, says: DeltaVector) -> Result<()> {
         match says {
             DeltaVector::Set(v) => {

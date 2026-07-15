@@ -562,6 +562,18 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 .get(dense)
                 .is_some_and(|ls| ls.iter().any(|l| l == &vi.label));
             if !labelled {
+                // The node is not (effectively) in this index's scope. If this delta is what
+                // took it out — `REMOVE n:Doc` dropped the index's label — the node *left* a
+                // scope it was in, so the base/lower vector it still carries must be superseded:
+                // record a removal. The row cannot express this (D12 routed the embedding out),
+                // and without it the stale base vector resurfaces the moment the delta is
+                // retired at the flush — the write silently undone by a background job. This is
+                // the remove-direction twin of keying membership on the effective label set for
+                // the *add* direction (HIK-111 Finding 1). A node that simply never carried the
+                // label contributes nothing.
+                if nd.labels_removed.contains(&vi.label) {
+                    spec.removals.push(*dense);
+                }
                 continue;
             }
             if let Some(Value::Vector(v)) = nd.patches.get(&vi.property) {
