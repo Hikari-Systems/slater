@@ -1251,7 +1251,8 @@ pub fn segment_level(
     for seg in stack.segments() {
         if let Some(v) = &seg.vectors {
             ids.extend_from_slice(v.ids(&desc.label, &desc.property));
-            ids.extend_from_slice(v.removals(&desc.label, &desc.property));
+            ids.extend_from_slice(v.label_removals(&desc.label, &desc.property));
+            ids.extend_from_slice(v.value_removals(&desc.label, &desc.property));
         }
     }
     ids.sort_unstable();
@@ -1334,9 +1335,16 @@ fn segment_says(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> Result<L
     }
     // Newest segment first: a later re-embed would have been caught by the row read above, so a
     // segment that names this id in its removals is the last word on it.
+    //
+    // Only a **value** removal makes it `Gone` here (HIK-118). The caller reaches `segment_says`
+    // only for a node that is *currently in scope* (`vector_indexed`), so a `label_removal` that
+    // names this id has already been un-done by a re-label — the node left and came back, and its
+    // base/older vector is the live one again. A value removal is different: the value is gone, so
+    // it stays `Gone` regardless of labels. Treating a re-labelled node's stale `label_removal` as
+    // `Gone` would drop its vector on a *consolidation* only, silently.
     let removed = stack.segments().iter().rev().any(|seg| {
         seg.vectors.as_ref().is_some_and(|v| {
-            v.removals(&desc.label, &desc.property)
+            v.value_removals(&desc.label, &desc.property)
                 .binary_search(&id)
                 .is_ok()
         })
@@ -5719,17 +5727,30 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // segment) in its own scan — `superseded_above` — folded once per query in
         // [`Self::segments_knn`] inside the per-row loop below.
         //
-        // The base's suppression set is the **raw sidecar union** over every segment (every id
-        // any segment embeds or removes): the base sits below all of them, and a base entry any
-        // segment supersedes must lose in the base's own scan. Read straight from the sidecars —
-        // no row reads, no new IO (the same id lists the fold reads).
+        // The base's suppression set is the sidecar union over every segment: the base sits below
+        // all of them, and a base entry any segment supersedes must lose in the base's own scan.
+        // A re-embed (`ids`) and a **value** removal always suppress. A **label** removal is
+        // suppressed *conditionally* (HIK-118): it means the node left the index's scope, but a
+        // later `SET n:Doc` (in the delta or a newer segment) puts it back — and then the base's
+        // vector is the live one and must score again. So a `label_removal` id suppresses the base
+        // only while the node is **not** currently in scope. `vector_indexed` resolves the
+        // effective label set (the same resolve the fold uses), built once per query here — not
+        // per row — and reuses the label reads already on the hot path.
         let mut above_base_segments: HashSet<u64> = HashSet::new();
         if !self.gen.core_stack().is_singleton() {
             for seg in self.gen.core_stack().segments() {
                 if let Some(v) = &seg.vectors {
                     above_base_segments.extend(v.ids(&desc.label, &desc.property).iter().copied());
-                    above_base_segments
-                        .extend(v.removals(&desc.label, &desc.property).iter().copied());
+                    above_base_segments.extend(
+                        v.value_removals(&desc.label, &desc.property)
+                            .iter()
+                            .copied(),
+                    );
+                    for &id in v.label_removals(&desc.label, &desc.property) {
+                        if !vector_indexed(self.gen, self.cache, id, &desc)? {
+                            above_base_segments.insert(id);
+                        }
+                    }
                 }
             }
         }
@@ -6141,8 +6162,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 continue;
             };
             let ids = sidecar.ids(label, property);
-            let removals = sidecar.removals(label, property);
-            if ids.is_empty() && removals.is_empty() {
+            let label_removals = sidecar.label_removals(label, property);
+            let value_removals = sidecar.value_removals(label, property);
+            if ids.is_empty() && label_removals.is_empty() && value_removals.is_empty() {
                 continue;
             }
             // This segment's live gate: suppress everything newer (`acc`), the tombstoned, and
@@ -6205,9 +6227,20 @@ impl<'g, V: ReadView> Engine<'g, V> {
             }
             // `acc` is only read through `live` above (a shared borrow NLL ends at its last use),
             // so it is free to grow here: fold this segment's touched ids into the suppression
-            // set for every older segment.
+            // set for every older segment. A re-embed (`ids`) and a **value** removal always
+            // suppress an older level's entry. A **label** removal is conditional (HIK-118): if
+            // the node is back in scope, an *older segment* may still hold its live vector (the
+            // re-label did not move it), and that vector must surface — so a re-labelled id does
+            // not enter `acc`. When it is still out of scope, the `live` gate's `vector_indexed`
+            // check would exclude it anyway; adding it to `acc` keeps the suppression explicit and
+            // costs nothing.
             acc.extend(ids.iter().copied());
-            acc.extend(removals.iter().copied());
+            acc.extend(value_removals.iter().copied());
+            for &id in label_removals {
+                if !vector_indexed(self.gen, self.cache, id, desc)? {
+                    acc.insert(id);
+                }
+            }
         }
         Ok(out)
     }

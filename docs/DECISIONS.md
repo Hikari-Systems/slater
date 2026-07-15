@@ -1611,13 +1611,59 @@ After a consolidation a node not `:Doc` at consolidation time is simply out of `
 scope, so the rebuild does not index it. It stays gone **for the right reason (scope)**, not
 because the value was destroyed — and a node still in scope carries its vector through, unchanged.
 
-**Known limitation — the un-remove is delta-scoped.** `REMOVE n:Doc` then `SET n:Doc` restores
-the node at its original vector *while both live in the delta* (the delta's superseded set is
-recomputed from `labels_removed`, so re-adding the label stops superseding). Once the removal has
-been **flushed** into a segment sidecar, a later `SET n:Doc` does **not** bring the vector back:
-the base arm's suppression is the *raw* sidecar union (`above_base_segments`), which cannot tell a
-label-removal (should un-suppress on re-label) from a value-removal (must stay suppressed — the
-value is gone), and D12 means the delta cannot reconstruct the buried base vector to re-emit it.
-Restoring across a flush needs the sidecar to record the removal *kind*, a `segvectors` format
-change out of this ticket's scope. This is strictly better than before — pre-fix the un-remove
-"worked" across a flush only because the removal itself never took effect.
+**The un-remove across a flush — resolved by D65.** `REMOVE n:Doc` then `SET n:Doc` restores the
+node at its original vector *while both live in the delta* (the delta's superseded set is
+recomputed from `labels_removed`, so re-adding the label stops superseding). Restoring it *across a
+flush* — once the removal has been folded into a segment sidecar — needs the sidecar to record the
+removal **kind**, so the read side can un-suppress a scope-removal on a re-label while keeping a
+value-removal suppressed. That is a `segvectors` format change and is done in **D65** (HIK-118); it
+was HIK-116's one documented gap.
+
+### D65 — The vector sidecar records the removal *kind*, so a flushed un-remove restores the vector
+D64 removes a node from a `(:Doc, embedding)` index two different ways, and they must stay
+distinguishable *on disk*: `REMOVE n:Doc` is a **scope** removal (the value survives; re-adding the
+label should bring the vector back), and `REMOVE n.embedding` is a **value** removal (the value is
+gone; no label can restore it). Within the delta these are already distinct — the delta re-derives
+its suppression set from `labels_removed`, so a re-label stops superseding (D64). But once a removal
+is folded into a segment `vec.meta` sidecar the delta is retired, and a **flat** "removed id" cannot
+say which kind it was. The read side then has to guess, and either choice is silently wrong: treat
+every flushed removal as un-suppressible and a genuine `REMOVE n.embedding` resurfaces on a later
+`SET n:Doc`; treat every one as permanent (the HIK-116 resting point) and a re-label fails to
+restore a vector the user never deleted. And D12 means the delta cannot reconstruct the buried base
+vector to re-emit it, so "just re-write it on re-label" is not available.
+
+**The fix — split the sidecar's removals by kind (`segvectors` format v2, HIK-118).** `VectorSpec`
+carries two lists instead of one: `label_removals` (scope left — **un-suppressible** when the node's
+effective label set regains the index label) and `value_removals` (value gone — **permanent**).
+`VEC_MAGIC` `SLSEGVE1`→`SLSEGVE2`; a v1 sidecar shares the `SLSEGVE` prefix, so decode refuses it
+with a legible "older on-disk format … rebuild the store" rather than misreading its two-list body.
+Zero legacy installs (no back-compat), but the file is on-disk, so it is refused, not misread.
+
+**The read rule is one line, applied at every rung: a label-removal suppresses only while the node
+is *not currently in scope*.** The node's effective label set is the arbiter, resolved the same way
+the fold already resolves it (`vector_indexed` / `node_label_ids_par`), so the rungs cannot disagree
+(the HIK-111 failure class):
+- **Flush** (`flush_segment`) — the out-of-scope arm lands the node in `label_removals`; the
+  value-loss arm (`REMOVE n.embedding`, a dropping replace, a non-vector overwrite) in
+  `value_removals`.
+- **Base arm** (`exec.rs`, `above_base_segments`) — `ids` and `value_removals` always suppress the
+  base's entry; a `label_removals` id suppresses **only when `!vector_indexed`**. So a re-labelled
+  node (its `SET n:Doc` in the delta or a newer segment) is not suppressed, and its base vector
+  scores again. Built once per query, not per row.
+- **Per-segment arm** (`exec.rs`, `segments_knn` accumulator) — same rule for the suppression set an
+  older segment inherits: a re-labelled id does **not** enter the accumulator, so an *older segment*
+  that still holds its live vector surfaces it. (The base arm covers a base-held vector; this covers
+  a segment-held one.)
+- **Segment level** (`exec::segment_says`, read by the consolidation dump) — the removal→`Gone`
+  verdict consults **`value_removals` only**; a `label_removals` id reaching here has already been
+  re-labelled (the caller's `vector_indexed` gate let it through), so its base vector carries through
+  the consolidation. A kind-blind check drops it on consolidation *only*, silently — the D63 "which
+  level does the node live on" trap.
+- **T3 merge** (`merge_segment::fold_vectors`) — carries **both** lists forward preserving kind
+  (carry-below-run / reclaim-within-run per list); when a fold lands an id in both, **value
+  dominates** and the id is dropped from `label_removals`, keeping the two lists disjoint.
+
+**Why value dominates.** A value removal is a strict statement about the data (the embedding is
+gone); a label removal is a statement about scope (the node stepped out). If both are on record for
+one id, the value is genuinely absent — there is nothing for a re-label to restore — so `value`
+wins wherever they meet. This keeps the two lists disjoint, which the read rule assumes.

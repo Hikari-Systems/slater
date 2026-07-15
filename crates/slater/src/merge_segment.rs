@@ -273,7 +273,11 @@ pub fn write_merge_segment(
         } else {
             None
         };
-        if !spec.ids.is_empty() || !spec.removals.is_empty() || meta.is_some() {
+        if !spec.ids.is_empty()
+            || !spec.label_removals.is_empty()
+            || !spec.value_removals.is_empty()
+            || meta.is_some()
+        {
             dirty_vectors.push(DirtyVector {
                 label: spec.label.clone(),
                 property: spec.prop.clone(),
@@ -458,15 +462,23 @@ fn fold_adjacency(
 /// Fold the run's vector sidecars into merged [`VectorSpec`]s — the vector twin of
 /// [`fold_index`], and the same shape: replay the inputs oldest→newest so the newest wins.
 ///
-/// A **removal** drops the id from the live set. It is then *carried* into the merged
-/// segment's own removals only if the id lives **below the run** — an id born within the
-/// run has no lower layer left to suppress once the run is folded into one segment, so its
-/// removal is reclaimed (exactly `fold_index`'s rule).
+/// A **removal** (of either kind — HIK-118) drops the id from the live set. It is then
+/// *carried* into the merged segment's own removals only if the id lives **below the run** — an
+/// id born within the run has no lower layer left to suppress once the run is folded into one
+/// segment, so its removal is reclaimed (exactly `fold_index`'s rule).
 ///
-/// An id that is both removed by an older input and re-embedded by a newer one ends up in
-/// **both** lists, which is correct and not a contradiction: the read fold applies a
-/// segment's removals *before* adding its ids, so the re-embed wins, and the carried
-/// removal still suppresses the stale vector on the level below.
+/// The **kind** is carried forward too — a `label_removal` stays a `label_removal`, a
+/// `value_removal` stays a `value_removal` — because the read side treats them differently: a
+/// re-label un-suppresses the first but never the second. Getting this wrong would either
+/// resurrect a genuinely-deleted vector (label-treating a value removal) or make a re-label fail
+/// to restore the vector across a merge (value-treating a label removal). When the fold lands an
+/// id in **both** lists (one input value-removed it, an older one label-removed it), **value
+/// dominates** — the value is gone — so the id is dropped from `label_removals`.
+///
+/// An id that is both removed by an older input and re-embedded by a newer one ends up in a
+/// removal list **and** `ids`, which is correct and not a contradiction: the read fold applies a
+/// segment's removals *before* adding its ids, so the re-embed wins, and the carried removal
+/// still suppresses the stale vector on the level below.
 ///
 /// No vector is copied here: the merged node row already carries the embedding, so a live
 /// id is all that needs recording (that is why this needs no `Result` — there is nothing to
@@ -488,13 +500,20 @@ fn fold_vectors(
     let mut specs = Vec::new();
     for (label, prop) in &pairs {
         let mut live: BTreeSet<u64> = BTreeSet::new();
-        let mut removals: BTreeSet<u64> = BTreeSet::new();
+        let mut label_removals: BTreeSet<u64> = BTreeSet::new();
+        let mut value_removals: BTreeSet<u64> = BTreeSet::new();
         for seg in inputs {
             let Some(v) = &seg.vectors else { continue };
-            for &id in v.removals(label, prop) {
+            for &id in v.label_removals(label, prop) {
                 live.remove(&id);
                 if !within_run_node(id) {
-                    removals.insert(id);
+                    label_removals.insert(id);
+                }
+            }
+            for &id in v.value_removals(label, prop) {
+                live.remove(&id);
+                if !within_run_node(id) {
+                    value_removals.insert(id);
                 }
             }
             for &id in v.ids(label, prop) {
@@ -504,11 +523,16 @@ fn fold_vectors(
         // A node the run also deleted takes its embedding with it — its row is gone from the
         // merged segment, so a live id pointing at it would dangle.
         live.retain(|id| node_rows.get(id).is_some_and(|r| !r.tombstoned));
+        // Value dominates a label removal for the same id (the value is genuinely gone), so the
+        // two lists stay disjoint — the invariant the read side relies on for the "value stays
+        // suppressed regardless of labels" rule.
+        label_removals.retain(|id| !value_removals.contains(id));
         specs.push(VectorSpec {
             label: label.clone(),
             prop: prop.clone(),
             ids: live.into_iter().collect(),
-            removals: removals.into_iter().collect(),
+            label_removals: label_removals.into_iter().collect(),
+            value_removals: value_removals.into_iter().collect(),
         });
     }
     specs

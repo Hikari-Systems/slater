@@ -23,13 +23,29 @@
 //!
 //! So: `ids` is an optimisation, `removals` is a correctness requirement.
 //!
+//! # Removal *kind* — why there are two removal lists
+//! A removal is recorded for one of two reasons that need **opposite** treatment on a later
+//! `SET n:Doc`, and a flat "removed id" cannot tell them apart:
+//!
+//!   * **label-removal** — the node left the index's *scope* (`REMOVE n:Doc` dropped the
+//!     index's label). The embedding *value* is untouched (D64), so re-adding the label must
+//!     **un-suppress** the id and let its base/lower vector score again.
+//!   * **value-removal** — the embedding *value* is gone (`REMOVE n.embedding`, a `SET n = {…}`
+//!     replace that dropped it, or a non-vector overwrite). It must stay suppressed **regardless
+//!     of labels** — there is no value to restore.
+//!
+//! So the sidecar keeps them apart: `label_removals` is un-suppressible on re-label,
+//! `value_removals` is permanent (HIK-118). When an id appears in both (a below-run fold can
+//! produce it), **value dominates** — the value is genuinely gone.
+//!
 //! # `vec.meta`
 //! ```text
 //! MAGIC(8) ‖ crc32c(body)(4) ‖ body
 //! body = version:uvarint ‖ count:uvarint
-//!        ‖ count × ( label:str ‖ prop:str ‖ ids:u64-list ‖ removals:u64-list )
+//!        ‖ count × ( label:str ‖ prop:str ‖ ids:u64-list ‖ label_removals:u64-list
+//!                    ‖ value_removals:u64-list )
 //! ```
-//! Both id lists are ascending, de-duplicated and delta-varint encoded (the `segindex` /
+//! Every id list is ascending, de-duplicated and delta-varint encoded (the `segindex` /
 //! postings encoding). Absent `vec.meta` ⇒ a segment that touched no embedding;
 //! [`SegmentVectorReader::open_if_present`] returns `None` and the fold leaves the base's
 //! vectors alone.
@@ -45,10 +61,14 @@ use anyhow::{bail, Context, Result};
 use crate::store::{join_key, ObjectStore};
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
-/// Magic at the head of `vec.meta`.
-const VEC_MAGIC: &[u8; 8] = b"SLSEGVE1";
-/// Vector-sidecar format version.
-const VEC_VERSION: u64 = 1;
+/// Magic at the head of `vec.meta`. The trailing digit is the format version, so an older
+/// sidecar shares the [`VEC_MAGIC_PREFIX`] and can be refused with a legible "rebuild" error
+/// rather than a generic bad-magic (there are zero legacy installs, but the file is on-disk).
+const VEC_MAGIC: &[u8; 8] = b"SLSEGVE2";
+/// The version-independent prefix of [`VEC_MAGIC`] — a `vec.meta` from any build starts with it.
+const VEC_MAGIC_PREFIX: &[u8; 7] = b"SLSEGVE";
+/// Vector-sidecar format version. Bumped to 2 for the removal-kind split (HIK-118).
+const VEC_VERSION: u64 = 2;
 
 /// One `(label, prop)` vector index a segment touches.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,10 +78,16 @@ pub struct VectorSpec {
     /// Ascending, de-duplicated dense node ids this segment carries an embedding for — the
     /// vector itself lives in the node's row, not here.
     pub ids: Vec<u64>,
-    /// Ascending, de-duplicated dense node ids whose embedding this segment **removes**
-    /// (`REMOVE n.embedding`, or a `SET n = {…}` replace that dropped it). Their base — or
-    /// older-segment — vector must be suppressed with nothing put in its place.
-    pub removals: Vec<u64>,
+    /// Ascending, de-duplicated dense node ids the node left the index's **scope** for
+    /// (`REMOVE n:Doc` dropped the index's label). Their base — or older-segment — vector must
+    /// be suppressed *while the node stays out of scope*; a later `SET n:Doc` un-suppresses it
+    /// (the value was never destroyed — D64/HIK-118). See the module docs.
+    pub label_removals: Vec<u64>,
+    /// Ascending, de-duplicated dense node ids whose embedding **value** this segment removes
+    /// (`REMOVE n.embedding`, a `SET n = {…}` replace that dropped it, or a non-vector
+    /// overwrite). Their base — or older-segment — vector must be suppressed **permanently**,
+    /// with nothing put in its place: there is no value to bring back.
+    pub value_removals: Vec<u64>,
 }
 
 fn w_str(buf: &mut Vec<u8>, s: &str) {
@@ -116,7 +142,10 @@ fn encode(specs: &[VectorSpec]) -> Result<Vec<u8>> {
     for spec in specs {
         // The reader merge-suppresses by binary search, so an unsorted or duplicated list
         // would silently fail to suppress rather than error at read time.
-        if !ascending_distinct(&spec.ids) || !ascending_distinct(&spec.removals) {
+        if !ascending_distinct(&spec.ids)
+            || !ascending_distinct(&spec.label_removals)
+            || !ascending_distinct(&spec.value_removals)
+        {
             bail!(
                 "segvectors ids/removals for ({}, {}) must be ascending and de-duplicated",
                 spec.label,
@@ -126,7 +155,8 @@ fn encode(specs: &[VectorSpec]) -> Result<Vec<u8>> {
         w_str(&mut body, &spec.label);
         w_str(&mut body, &spec.prop);
         w_ids(&mut body, &spec.ids);
-        w_ids(&mut body, &spec.removals);
+        w_ids(&mut body, &spec.label_removals);
+        w_ids(&mut body, &spec.value_removals);
     }
     let crc = crc32c::crc32c(&body);
     let mut out = Vec::with_capacity(body.len() + 12);
@@ -137,7 +167,21 @@ fn encode(specs: &[VectorSpec]) -> Result<Vec<u8>> {
 }
 
 fn decode(bytes: &[u8]) -> Result<Vec<VectorSpec>> {
-    if bytes.len() < 12 || &bytes[..8] != VEC_MAGIC {
+    if bytes.len() < 12 {
+        bail!("segvectors: vec.meta too short");
+    }
+    if &bytes[..8] != VEC_MAGIC {
+        // A `vec.meta` from an older build shares the version-independent prefix; report it as an
+        // out-of-date format that a rebuild fixes, rather than as an unrecognisable file. Zero
+        // legacy installs exist, but the file is on-disk and must be refused legibly, not misread.
+        if &bytes[..7] == VEC_MAGIC_PREFIX {
+            bail!(
+                "segvectors: vec.meta is an older on-disk format (magic {:?}); this build reads \
+                 only {:?} — rebuild the store",
+                String::from_utf8_lossy(&bytes[..8]),
+                String::from_utf8_lossy(VEC_MAGIC),
+            );
+        }
         bail!("segvectors: bad magic in vec.meta");
     }
     let want = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -158,12 +202,14 @@ fn decode(bytes: &[u8]) -> Result<Vec<VectorSpec>> {
         let label = r_str(&mut r)?;
         let prop = r_str(&mut r)?;
         let ids = r_ids(&mut r)?;
-        let removals = r_ids(&mut r)?;
+        let label_removals = r_ids(&mut r)?;
+        let value_removals = r_ids(&mut r)?;
         out.push(VectorSpec {
             label,
             prop,
             ids,
-            removals,
+            label_removals,
+            value_removals,
         });
     }
     Ok(out)
@@ -179,7 +225,9 @@ fn decode(bytes: &[u8]) -> Result<Vec<VectorSpec>> {
 pub fn write_vector_fragments(dir: impl AsRef<Path>, specs: &[VectorSpec]) -> Result<()> {
     let specs: Vec<VectorSpec> = specs
         .iter()
-        .filter(|s| !s.ids.is_empty() || !s.removals.is_empty())
+        .filter(|s| {
+            !s.ids.is_empty() || !s.label_removals.is_empty() || !s.value_removals.is_empty()
+        })
         .cloned()
         .collect();
     if specs.is_empty() {
@@ -236,9 +284,16 @@ impl SegmentVectorReader {
         self.find(label, prop).map_or(&[], |s| &s.ids)
     }
 
-    /// The dense node ids whose embedding this segment removes, ascending.
-    pub fn removals(&self, label: &str, prop: &str) -> &[u64] {
-        self.find(label, prop).map_or(&[], |s| &s.removals)
+    /// The dense node ids this segment removes from the index's **scope** (`REMOVE n:Doc`),
+    /// ascending. Un-suppressible on re-label — the value is retained (HIK-118).
+    pub fn label_removals(&self, label: &str, prop: &str) -> &[u64] {
+        self.find(label, prop).map_or(&[], |s| &s.label_removals)
+    }
+
+    /// The dense node ids whose embedding **value** this segment removes (`REMOVE n.embedding`
+    /// and friends), ascending. Permanent — there is no value to bring back (HIK-118).
+    pub fn value_removals(&self, label: &str, prop: &str) -> &[u64] {
+        self.find(label, prop).map_or(&[], |s| &s.value_removals)
     }
 
     /// Every spec this segment carries — the T3 merge folds these.
@@ -259,21 +314,27 @@ mod tests {
         d
     }
 
-    fn spec(label: &str, ids: &[u64], removals: &[u64]) -> VectorSpec {
+    fn spec(
+        label: &str,
+        ids: &[u64],
+        label_removals: &[u64],
+        value_removals: &[u64],
+    ) -> VectorSpec {
         VectorSpec {
             label: label.into(),
             prop: "embedding".into(),
             ids: ids.to_vec(),
-            removals: removals.to_vec(),
+            label_removals: label_removals.to_vec(),
+            value_removals: value_removals.to_vec(),
         }
     }
 
     #[test]
-    fn round_trips_ids_and_removals() {
+    fn round_trips_ids_and_both_removal_kinds() {
         let dir = tmp("roundtrip");
         let specs = vec![
-            spec("Person", &[1, 5, 900_000], &[2, 7]),
-            spec("Doc", &[], &[42]),
+            spec("Person", &[1, 5, 900_000], &[2, 7], &[3]),
+            spec("Doc", &[], &[42], &[]),
         ];
         write_vector_fragments(&dir, &specs).unwrap();
 
@@ -281,10 +342,13 @@ mod tests {
             .unwrap()
             .expect("sidecar written");
         assert_eq!(r.ids("Person", "embedding"), &[1, 5, 900_000]);
-        assert_eq!(r.removals("Person", "embedding"), &[2, 7]);
-        // A removal-only spec is legal — that is the whole point of the sidecar.
+        assert_eq!(r.label_removals("Person", "embedding"), &[2, 7]);
+        assert_eq!(r.value_removals("Person", "embedding"), &[3]);
+        // A removal-only spec is legal — that is the whole point of the sidecar. Here a pure
+        // label-removal (the HIK-118 shape: scope left, value retained).
         assert_eq!(r.ids("Doc", "embedding"), &[] as &[u64]);
-        assert_eq!(r.removals("Doc", "embedding"), &[42]);
+        assert_eq!(r.label_removals("Doc", "embedding"), &[42]);
+        assert_eq!(r.value_removals("Doc", "embedding"), &[] as &[u64]);
         // An index the segment never touched reads as empty, not as an error.
         assert_eq!(r.ids("Person", "other"), &[] as &[u64]);
     }
@@ -295,7 +359,7 @@ mod tests {
     fn writes_nothing_when_there_is_nothing_to_say() {
         let dir = tmp("empty");
         write_vector_fragments(&dir, &[]).unwrap();
-        write_vector_fragments(&dir, &[spec("Person", &[], &[])]).unwrap();
+        write_vector_fragments(&dir, &[spec("Person", &[], &[], &[])]).unwrap();
         assert!(!dir.join("vec.meta").exists());
         assert!(SegmentVectorReader::open_if_present(&dir)
             .unwrap()
@@ -307,7 +371,12 @@ mod tests {
     #[test]
     fn refuses_unsorted_or_duplicated_ids() {
         let dir = tmp("unsorted");
-        for bad in [spec("P", &[5, 1], &[]), spec("P", &[], &[3, 3])] {
+        // Each list is checked independently: ids, then label_removals, then value_removals.
+        for bad in [
+            spec("P", &[5, 1], &[], &[]),
+            spec("P", &[], &[3, 3], &[]),
+            spec("P", &[], &[], &[9, 2]),
+        ] {
             let e = write_vector_fragments(&dir, &[bad]).unwrap_err();
             assert!(
                 e.to_string().contains("ascending and de-duplicated"),
@@ -318,7 +387,7 @@ mod tests {
 
     #[test]
     fn rejects_a_corrupt_sidecar() {
-        let specs = vec![spec("Person", &[1, 2], &[3])];
+        let specs = vec![spec("Person", &[1, 2], &[3], &[4])];
         let good = encode(&specs).unwrap();
 
         let mut bad_magic = good.clone();
@@ -334,6 +403,33 @@ mod tests {
         assert!(decode(&bad_crc).unwrap_err().to_string().contains("crc"));
 
         assert_eq!(decode(&good).unwrap(), specs);
+    }
+
+    /// An older-format `vec.meta` (the v1 magic `SLSEGVE1`, pre-HIK-118) shares the version
+    /// prefix, so decode must refuse it with a legible "older on-disk format … rebuild" error —
+    /// not silently misread its two-list body as this build's three-list one, and not report a
+    /// generic bad-magic. There are zero legacy installs, but the file is on-disk.
+    #[test]
+    fn refuses_an_older_format_sidecar_legibly() {
+        let specs = vec![spec("Person", &[1, 2], &[3], &[4])];
+        let mut v1 = encode(&specs).unwrap();
+        // Rewrite the magic's version digit to the previous format's.
+        v1[7] = b'1';
+        // Re-stamp the crc so the magic check (not the crc) is what rejects it.
+        let crc = crc32c::crc32c(&v1[12..]);
+        v1[8..12].copy_from_slice(&crc.to_le_bytes());
+        let e = decode(&v1).unwrap_err().to_string();
+        assert!(
+            e.contains("older on-disk format") && e.contains("rebuild"),
+            "expected a legible rebuild error, got: {e}"
+        );
+        // A file that is not a vec.meta at all still reports the generic bad-magic.
+        let mut alien = encode(&specs).unwrap();
+        alien[..7].copy_from_slice(b"NOTAVEC");
+        assert!(decode(&alien)
+            .unwrap_err()
+            .to_string()
+            .contains("bad magic"));
     }
 
     /// A forged length must run the buffer dry and error, not attempt a huge allocation.

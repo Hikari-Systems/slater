@@ -10118,6 +10118,256 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **The headline (HIK-118).** The un-remove across a **flush**: `REMOVE n:Doc` → flush →
+    /// `SET n:Doc` restores the node at its *original base vector*. HIK-116 made this work while
+    /// the removal lived in the delta; once the removal is flushed to a segment sidecar, the flat
+    /// removal could not tell a scope-removal (should un-suppress on re-label) from a value-removal
+    /// (permanent), so a re-label silently failed to restore the vector. The sidecar now records
+    /// the removal **kind**, so a `label_removal` un-suppresses when the node re-enters scope.
+    ///
+    /// Truth is hand-derived: d00 is the query's exact match (cosine distance 0.0), so its return
+    /// is unambiguous — a leading hit at distance 0.0 *is* the original base vector (nothing
+    /// re-set the value; a base-indexed embedding reads `Null` via `RETURN`, so re-entering scope
+    /// is the only observable channel — D12/D64).
+    #[test]
+    fn re_adding_the_index_label_restores_the_vector_across_a_flush() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) =
+            testgen::write_vector_docs_keyed("vec_unremove_across_flush", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let top =
+            |g: &Graphs| -> Option<(u64, f64)> { vknn(g, &graph, &cache, &VQ, 3).first().copied() };
+
+        assert_eq!(top(&graphs), Some((0, 0.0)), "d00 leads at distance 0.0");
+
+        // Leave scope, then flush so the removal lands in a segment sidecar (the delta is retired).
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the label removal flushes into a segment sidecar");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 1);
+        assert!(
+            !vknn(&graphs, &graph, &cache, &VQ, 3)
+                .iter()
+                .any(|(id, _)| *id == 0),
+            "d00 is out of the :Doc index while unlabelled, and the removal is now flushed"
+        );
+
+        // Re-enter scope. The removal is a *label* removal in the sidecar, so re-adding the label
+        // must un-suppress d00 and bring back its original base vector — the whole point of D65.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) SET n:Doc");
+        let restored =
+            top(&graphs).expect("d00 is back in the :Doc index after a flushed un-remove");
+        assert_eq!(restored.0, 0, "d00 back in the :Doc index across the flush");
+        assert!(
+            restored.1.abs() < 1e-5,
+            "…at its original base vector (distance 0.0), got {}",
+            restored.1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A **value** removal is permanent — `REMOVE n.embedding` destroys the value, and no amount
+    /// of label churn brings it back (there is nothing to bring back). Flush it, then re-enter and
+    /// leave scope: the node stays out. This is the guard that the kind split did not turn *every*
+    /// flushed removal into an un-suppressible one — a value removal must ignore the re-label the
+    /// label removal honours.
+    #[test]
+    fn a_value_removal_stays_gone_across_a_flush_and_label_churn() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) =
+            testgen::write_vector_docs_keyed("vec_value_removal_permanent", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![0, 1, 2]);
+
+        // Destroy the value, then flush it into a segment as a *value* removal.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Keyed {name:'d00'}) REMOVE n.embedding",
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the value removal flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "gone once the value is removed + flushed"
+        );
+
+        // Churn the label: leave scope, then re-enter. A *label* removal would resurface here; a
+        // value removal must not — the value is genuinely gone.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) SET n:Doc");
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "a flushed value removal stays gone regardless of later label churn"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The removal **kind** must survive a T3 merge and a consolidation, not just a flush. Drive
+    /// `REMOVE n:Doc` → flush → `SET n:Doc` → flush (two segments) → **merge** → **consolidate**,
+    /// and assert d00 carries its original vector through every rung. The re-label is flushed into
+    /// the newer segment, and the older segment's `label_removal` must fold forward *as a label
+    /// removal* (not a value removal) so the merged segment and the consolidation dump both let
+    /// the re-labelled node keep its base vector.
+    #[test]
+    fn the_re_label_kind_survives_a_merge_and_a_consolidation() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) =
+            testgen::write_vector_docs_keyed("vec_relabel_merge_consolidate", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let top =
+            |g: &Graphs| -> Option<(u64, f64)> { vknn(g, &graph, &cache, &VQ, 3).first().copied() };
+
+        // Segment 1: the label removal.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("segment 1 — the label removal");
+        // Segment 2: the re-label (a separate segment so a compaction has a run to fold).
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) SET n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("segment 2 — the re-label");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 2);
+        assert_eq!(
+            top(&graphs),
+            Some((0, 0.0)),
+            "d00 is back at its base vector with the re-label in a newer segment"
+        );
+
+        // Merge the run: the older segment's label_removal must carry forward *as a label removal*.
+        graphs
+            .compact_graph_segments(&graph, &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(
+            graphs.get(&graph).unwrap().stack().segments().len(),
+            1,
+            "the run folded into one segment"
+        );
+        assert_eq!(
+            top(&graphs),
+            Some((0, 0.0)),
+            "d00 keeps its base vector across the merge (kind preserved)"
+        );
+
+        // Consolidate: the dump reads the level fold, so a kind-blind merge would drop d00 here.
+        let dumped = dump_vectors(&graphs, &graph, &cache, &root.join("_dump"));
+        let dumped_ids: Vec<u64> = dumped.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            dumped_ids,
+            vec![0, 1, 2],
+            "d00 is in :Doc scope at consolidation, so the rebuild indexes it — got {dumped_ids:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The re-label must restore a vector that lives in an **older segment**, not just one in the
+    /// base — the case that exercises the per-segment suppression accumulator (`segments_knn`), a
+    /// site the base-arm fix does not cover. d02 is re-embedded into segment 1 at distance 0.05
+    /// (its live vector is now in a segment, not the base); segment 2 then drops its `:Doc` label,
+    /// and the delta re-adds it. A kind-blind accumulator would fold segment 2's removal forward
+    /// and suppress d02 in segment 1's own scan, dropping it from the results even though it is
+    /// back in scope. The kind-aware accumulator un-suppresses the re-labelled id, so segment 1
+    /// still surfaces its 0.05 vector.
+    #[test]
+    fn a_re_label_restores_a_vector_held_in_an_older_segment() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) =
+            testgen::write_vector_docs_keyed("vec_relabel_older_segment", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![0, 1, 2]);
+
+        // Segment 1: re-embed d02 with a *closer* vector (0.05). Its live embedding now lives in a
+        // segment, above its stale base 0.4.
+        let d02_close = at_distance(0.05);
+        let parts: Vec<String> = d02_close.iter().map(|x| format!("{x:?}")).collect();
+        vwrite(
+            &graphs,
+            &graph,
+            &format!(
+                "MATCH (n:Keyed {{name:'d02'}}) SET n.embedding = vecf32([{}])",
+                parts.join(", ")
+            ),
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("segment 1 — d02 re-embedded into a segment");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 2, 1],
+            "d02 now leads d01 — its segment vector (0.05) beats d01's base (0.2)"
+        );
+
+        // Segment 2: drop d02's :Doc label (a label removal in a newer segment than its vector).
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d02'}) REMOVE n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("segment 2 — d02's label removal");
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1],
+            "d02 out of scope while unlabelled"
+        );
+
+        // Re-enter scope from the delta. d02's live vector is in segment 1, *older* than segment
+        // 2's removal — the per-segment accumulator must un-suppress it so segment 1 surfaces 0.05.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d02'}) SET n:Doc");
+        let restored = vknn(&graphs, &graph, &cache, &VQ, 3);
+        let d02 = restored.iter().find(|(id, _)| *id == 2);
+        assert!(
+            d02.is_some_and(|(_, s)| (s - 0.05).abs() < 1e-3),
+            "d02 restored at its segment-1 vector (0.05), got {restored:?}"
+        );
+        assert_eq!(
+            restored.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 2, 1],
+            "and it leads d01 again — the older-segment vector, not the base"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.
