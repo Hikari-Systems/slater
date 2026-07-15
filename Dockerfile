@@ -42,6 +42,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # git CLI), synthesise stub sources for every workspace crate, and build once so
 # the heavy dependency graph (tokio, rustls/aws-lc-rs, zstd, argon2, …) is cached
 # in its own layer. Editing `crates/*/src` afterwards only recompiles our code.
+#
+# INVARIANT: the stub list below must name a file for EVERY [[bench]], [[test]]
+# and [[bin]] declared in the crates' Cargo.toml — cargo parses the manifest at
+# this layer and fails ("can't find <target>") if a declared target has no source.
+# Adding a bench/test/bin means adding its stub here. This layer only runs on a
+# TAG release, so a gap stays invisible on branch CI until release day.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
@@ -67,6 +73,11 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
     && echo 'fn main() {}' > crates/slater/benches/delta_overlay.rs \
     && echo 'fn main() {}' > crates/slater/benches/segment_read_amp.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_rwindex.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_recall.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_insert.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_delete_io.rs \
+    && echo 'fn main() {}' > crates/slater/benches/streaming_merge.rs \
     && echo '' > crates/slater/tests/dump_roundtrip.rs \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \

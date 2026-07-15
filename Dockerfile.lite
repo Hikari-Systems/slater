@@ -38,6 +38,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # synthesise stub sources for every workspace crate, and build just `slater` once
 # so its dependency graph is cached in its own layer. No `--features`, so the AWS
 # and Google SDKs are never pulled in.
+#
+# INVARIANT: the stub list below must name a file for EVERY [[bench]], [[test]]
+# and [[bin]] declared in the crates' Cargo.toml — cargo parses the manifest at
+# this layer and fails ("can't find <target>") if a declared target has no source.
+# Keep this in step with Dockerfile's list. This layer only runs on a TAG release,
+# so a gap stays invisible on branch CI until release day.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml
@@ -63,6 +69,11 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo 'fn main() {}' > crates/slater/benches/vector_knn.rs \
     && echo 'fn main() {}' > crates/slater/benches/delta_overlay.rs \
     && echo 'fn main() {}' > crates/slater/benches/segment_read_amp.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_rwindex.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_recall.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_insert.rs \
+    && echo 'fn main() {}' > crates/slater/benches/vector_delete_io.rs \
+    && echo 'fn main() {}' > crates/slater/benches/streaming_merge.rs \
     && echo '' > crates/slater/tests/dump_roundtrip.rs \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
