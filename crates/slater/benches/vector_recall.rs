@@ -5,13 +5,12 @@
 //! an **exact brute force over the live set** — recomputed independently with
 //! `slater::vector::distance`, never "index A agrees with index B" (the house rule). The rungs:
 //!
-//!   * **delta**        — the in-memory `RwVamana` over the write delta (HIK-112);
-//!   * **base**         — the on-disk `build_vamana` + PQ index (navigated by the PQ estimate,
-//!                        re-ranked exact), the state a freshly-built core serves;
-//!   * **consolidated** — the base after a delete-consolidation spliced holes out of adjacency
-//!                        (HIK-114);
-//!   * **merged**       — the base after a streaming merge folded in a batch of inserts
-//!                        (HIK-115/119).
+//! * **delta** — the in-memory `RwVamana` over the write delta (HIK-112);
+//! * **base** — the on-disk `build_vamana` + PQ index (navigated by the PQ estimate, re-ranked
+//!   exact), the state a freshly-built core serves;
+//! * **consolidated** — the base after a delete-consolidation spliced holes out of adjacency
+//!   (HIK-114);
+//! * **merged** — the base after a streaming merge folded in a batch of inserts (HIK-115/119).
 //!
 //! For **each of cosine / L2 / dot**, over vectors with **unequal norms** — on unit vectors the
 //! three metrics coincide and a per-metric comparison proves nothing. Data is a low-rank

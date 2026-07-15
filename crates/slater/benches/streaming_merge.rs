@@ -119,10 +119,9 @@ fn main() {
     }
     let fast_med = median(fast);
     eprintln!(
-        "fast path (hard-link):  {:.2} ms  → {:.0} MiB/s effective ({}‑independent, carries the .vamana by reference)",
+        "fast path (hard-link):  {:.2} ms  → {:.0} MiB/s effective (size-independent, carries the .vamana by reference)",
         fast_med * 1e3,
         mib / fast_med,
-        "size"
     );
 
     // Slow path — median MiB/s over reps (decode-once sequential rewrite, Δ=1).

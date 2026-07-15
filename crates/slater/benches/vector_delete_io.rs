@@ -43,6 +43,7 @@ const DEAD_FRACS: &[f64] = &[0.0, 0.25, 0.50, 0.67, 0.80];
 const BEAM_LADDER: &[usize] = &[16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512];
 
 /// Average (recall, fetches/query) over the query set for one on-disk index at beam `L`.
+#[allow(clippy::too_many_arguments)]
 fn measure(
     vamana: &Path,
     pq: &Path,

@@ -151,8 +151,7 @@ fn run_once(fx: &Fixture, cache: &BlockCache, rw: &RwIndexCache, cfg: RwIndexCon
     let view = MergedView::new(&fx.gen, published.delta);
     let engine =
         Engine::new(&view, cache).with_rw_index(rw, fx.writer.touched_journal(), epoch, cfg);
-    let n = engine.run(&fx.query).unwrap().rows.len();
-    n
+    engine.run(&fx.query).unwrap().rows.len()
 }
 
 fn bench_rwindex(c: &mut Criterion) {
