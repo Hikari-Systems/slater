@@ -60,8 +60,8 @@ use crate::crypto::BlockCipher;
 use crate::manifest::Metric;
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
 use crate::vamana::{
-    greedy_search_over, robust_prune_over, AdjRead, AdjWrite, Expanded, PointSet, VamanaIndex,
-    VamanaReader, VamanaWriter,
+    decode_node, greedy_search_over, robust_prune_over, AdjRead, AdjWrite, Expanded, PointSet,
+    VamanaIndex, VamanaReader, VamanaWriter,
 };
 use crate::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
@@ -310,16 +310,7 @@ pub fn streaming_merge(
         params.cipher.clone(),
     )
     .with_context(|| format!("create {}", vamana_out.display()))?;
-    let mut nbrs_buf: Vec<VamanaIndex> = Vec::new();
-    for i in 0..base_count {
-        let raw = cur_reader.node(i as u32)?.vector;
-        adj.neighbours_into(i as u32, &mut nbrs_buf)?;
-        vw.append(&raw, &nbrs_buf)?;
-    }
-    for (k, (_, raw)) in inputs.inserts.iter().enumerate() {
-        adj.neighbours_into((base_count + k) as u32, &mut nbrs_buf)?;
-        vw.append(raw, &nbrs_buf)?;
-    }
+    emit_merged(cur_reader, base_count, inputs.inserts, &adj, &mut vw)?;
     vw.finish()?;
 
     let delta_ids: Vec<u64> = inputs.inserts.iter().map(|(id, _)| *id).collect();
@@ -334,6 +325,59 @@ pub fn streaming_merge(
 
     let _ = fs::remove_file(&scratch);
     Ok(stats)
+}
+
+/// Emit the merged `.vamana`: one sequential pass over the carried base, then the Δ records.
+///
+/// The base sweep decompresses each block **once** via [`BlockFileReader::for_each_record`]
+/// (with bounded read-ahead) and takes BOTH the raw vector and the base-adjacency fallback from
+/// that single [`decode_node`]. This is HIK-119's fix: the old loop read each base record with
+/// `cur_reader.node(i)` — a full-block zstd inflate per record — *and* `neighbours_into` re-read
+/// the same record's block a second time, so scanning `0..N` re-inflated each block
+/// `O(records/block)` times (measured ~20–24× too slow at the builder's real params).
+///
+/// The output is content-identical to that old per-record emit: `for_each_record` visits records
+/// `0..base_count` in ascending order (so `global` is the layout ordinal), the dirty overlay wins
+/// for a back-linked / delete-spliced base node exactly as `neighbours_into` chose it, an
+/// untouched node falls back to its own on-disk neighbours, and the forged-neighbour-ordinal
+/// bounds check `base_neighbours` performed is preserved. Holes are emitted like any other base
+/// record; their `.pq` id (written separately by [`write_pq`]) is `HOLE`.
+fn emit_merged(
+    cur_reader: &VamanaReader,
+    base_count: usize,
+    inserts: &[(u64, Vec<f32>)],
+    adj: &MergeAdj,
+    vw: &mut VamanaWriter,
+) -> Result<()> {
+    let total = base_count + inserts.len();
+    let mut nbrs_buf: Vec<VamanaIndex> = Vec::new();
+    cur_reader.inner().for_each_record(|global, rec| {
+        let node = decode_node(rec)?;
+        nbrs_buf.clear();
+        if let Some(v) = adj.dirty_neighbours(global as u32) {
+            nbrs_buf.extend_from_slice(v);
+        } else {
+            // A neighbour ordinal is untrusted on-disk data — keep the bounds check
+            // `base_neighbours` did (a forged one must not index out of bounds downstream).
+            for &nb in &node.neighbours {
+                ensure!(
+                    (nb as usize) < total,
+                    ".vamana record {global} names neighbour ordinal {nb}, but the merged graph \
+                     holds only {total} records"
+                );
+            }
+            nbrs_buf.extend_from_slice(&node.neighbours);
+        }
+        vw.append(&node.vector, &nbrs_buf)?;
+        Ok(())
+    })?;
+    // The Δ-insert emit is O(Δ): each reads its own edges from the in-memory `delta_adj` slab
+    // (`neighbours_into` for an index ≥ base_count touches no disk), so it has no amplification.
+    for (k, (_, raw)) in inserts.iter().enumerate() {
+        adj.neighbours_into((base_count + k) as VamanaIndex, &mut nbrs_buf)?;
+        vw.append(raw, &nbrs_buf)?;
+    }
+    Ok(())
 }
 
 /// Carry a `.vamana` by reference: hard-link the base file to `out`, byte-identically. Falls
@@ -470,6 +514,15 @@ struct MergeAdj<'a> {
 }
 
 impl MergeAdj<'_> {
+    /// The dirty-overlay adjacency for base ordinal `i` — the back-linked / delete-spliced
+    /// edges an insert pass patched in — or `None` if the record is untouched. Lets the emit
+    /// consult the overlay without going through the disk-reading `neighbours_into`, so the emit
+    /// can pair it with a record it already decoded once in a block sweep. Only meaningful for a
+    /// base ordinal (`i < base_count`); a Δ index's edges live in `delta_adj`, not here.
+    fn dirty_neighbours(&self, i: VamanaIndex) -> Option<&[VamanaIndex]> {
+        self.dirty.get(&i).map(|v| v.as_slice())
+    }
+
     fn base_neighbours(&self, i: VamanaIndex) -> Result<Vec<VamanaIndex>> {
         if let Some(v) = self.base_cache.borrow().get(&i) {
             return Ok(v.clone());
