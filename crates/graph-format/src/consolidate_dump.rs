@@ -64,7 +64,12 @@ pub const DUMP_MAGIC: &str = "SLDUMP01";
 
 /// Dump-format version. Bumped on any incompatible change to the record or meta
 /// layout; the builder refuses a dump whose version it does not understand.
-pub const DUMP_VERSION: u32 = 2;
+///
+/// v3 (HIK-117): a Vamana vector index can be **carried by reference** — its base
+/// `.vamana`/`.pq` are referenced (not re-dumped) and only a `layout → new-id` map plus
+/// the Δ vectors travel, so the builder folds writes in with `streaming_merge` instead
+/// of rebuilding the graph from zero. See [`DumpVectorCarry`].
+pub const DUMP_VERSION: u32 = 3;
 
 /// zstd level for the transient dump files. Low: the dump is written once and read
 /// once, so build/parse CPU dominates any saved bytes.
@@ -91,14 +96,57 @@ pub struct DumpRangeIndex {
 
 /// A vector index to recreate on the rebuilt generation. The ANN parameters (`R`,
 /// `alpha`, PQ subspaces/bits, the ANN threshold) are *build* options, not per-index
-/// state, so the rebuild re-derives them exactly as a fresh build would — only the
+/// state, so a *fresh* rebuild re-derives them exactly as a fresh build would — only the
 /// declaration travels.
+///
+/// A **carried** Vamana index ([`carry`](Self::carry) is `Some`) is different: its graph
+/// is not re-dumped and not rebuilt. The base's build params travel in the [`DumpVectorCarry`]
+/// (they are per-index state that a fresh build would re-derive *differently* — see
+/// [`AnnMode::Vamana::max_norm`](crate::manifest::AnnMode)), and the builder runs
+/// `streaming_merge` over the referenced base rather than `build_vamana_index`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DumpVectorIndex {
     pub label: String,
     pub property: String,
     pub dim: u32,
     pub metric: Metric,
+    /// Present iff this index is carried by reference (a Vamana base folded via
+    /// `streaming_merge`); `None` for a brute-force index or a from-scratch rebuild.
+    #[serde(default)]
+    pub carry: Option<DumpVectorCarry>,
+}
+
+/// Everything the builder needs to carry a Vamana index by reference instead of
+/// rebuilding it — the header of a `streaming_merge` (HIK-115/S6). Small scalars only;
+/// the `layout → dump-id` table is a **binary sidecar** ([`carry_map_file`](Self::carry_map_file)),
+/// never inlined into `meta.json` (at 91.6M nodes it is ~733 MB of `u64`s).
+///
+/// # The paths are references, on purpose
+/// [`base_vamana`](Self::base_vamana) / [`base_pq`](Self::base_pq) are **data-dir-relative**
+/// (`<graph>/<base_uuid>/vector/<l>.<p>.{vamana,pq}`); the builder joins them with its own
+/// `--data-dir`. The `.vamana` holds the full raw vectors (the ~370 GB the carry exists to
+/// avoid re-reading), so `streaming_merge` **hard-links** it — the base and the new
+/// generation live under the same `data_dir`, and the old generation keeps serving until
+/// the swap, so the referenced files are alive for the whole build.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DumpVectorCarry {
+    /// Data-dir-relative path to the base `.vamana`.
+    pub base_vamana: String,
+    /// Data-dir-relative path to the base `.pq`.
+    pub base_pq: String,
+    /// Dump-relative filename of the raw-`u64`-LE `layout → dump-id` sidecar (`HOLE` for a
+    /// tombstoned/superseded/deleted ordinal), one entry per base `.vamana` record.
+    pub carry_map_file: String,
+    /// Base record count = the sidecar's entry count; the builder validates the two agree.
+    pub base_records: u64,
+    /// Carried base build params (`AnnMode::Vamana`) — re-deriving them from the survivors
+    /// would silently move the ANN space (see the `max_norm` note on `AnnMode::Vamana`).
+    pub r: u32,
+    pub alpha: f32,
+    pub medoid: u64,
+    pub max_norm: f32,
+    pub pq_subspaces: u32,
+    pub pq_bits: u32,
 }
 
 /// The dump's `meta.json`: everything the builder needs that is not in the
@@ -288,6 +336,29 @@ impl DumpWriter {
         Ok(())
     }
 
+    /// Write a carried Vamana index's `layout → dump-id` table to a binary sidecar in the
+    /// dump directory and return its dump-relative filename (for [`DumpVectorCarry::carry_map_file`]).
+    ///
+    /// Raw little-endian `u64`, one per base `.vamana` record, `HOLE` ([`crate::pq::HOLE`])
+    /// for a tombstoned/superseded/deleted ordinal. Not put in `meta.json`: at scale this is
+    /// hundreds of MB, which JSON would both bloat and read back slowly. `stem` is the index's
+    /// `label.property`; the filename is sanitised so an odd label cannot escape the dir.
+    pub fn write_vector_carry(&mut self, stem: &str, layout_to_dump_id: &[u64]) -> Result<String> {
+        let safe: String = stem
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let file = format!("carry.{safe}.ids");
+        let mut buf: Vec<u8> = Vec::with_capacity(layout_to_dump_id.len() * 8);
+        for &id in layout_to_dump_id {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        let path = self.dir.join(&file);
+        std::fs::write(&path, &buf)
+            .with_context(|| format!("write vector carry sidecar {}", path.display()))?;
+        Ok(file)
+    }
+
     /// Number of nodes / edges / vectors appended so far.
     pub fn node_count(&self) -> u64 {
         self.node_count
@@ -335,6 +406,7 @@ impl DumpWriter {
 /// Reader over a consolidation dump directory. Opens the metadata eagerly (small)
 /// and streams the node / edge block files on demand.
 pub struct DumpReader {
+    dir: PathBuf,
     meta: DumpMeta,
     nodes: BlockFileReader,
     edges: BlockFileReader,
@@ -381,6 +453,7 @@ impl DumpReader {
         }
         let vectors = BlockFileReader::open(dir.join(VECTORS_FILE))?;
         Ok(Self {
+            dir: dir.to_path_buf(),
             meta,
             nodes,
             edges,
@@ -390,6 +463,36 @@ impl DumpReader {
 
     pub fn meta(&self) -> &DumpMeta {
         &self.meta
+    }
+
+    /// Read a carried Vamana index's `layout → dump-id` sidecar back as a `Vec<u64>`
+    /// (`HOLE` for a tombstoned/superseded/deleted ordinal). `expected` is the base record
+    /// count from [`DumpVectorCarry::base_records`]; a length mismatch is a corrupt dump and
+    /// is refused rather than silently truncated — the table indexes the base `.vamana` by
+    /// position, so a wrong length would misalign every id.
+    pub fn read_vector_carry(&self, file: &str, expected: u64) -> Result<Vec<u64>> {
+        let path = self.dir.join(file);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read vector carry sidecar {}", path.display()))?;
+        if bytes.len() % 8 != 0 {
+            bail!(
+                "vector carry sidecar {} has {} bytes, not a whole number of u64s",
+                path.display(),
+                bytes.len()
+            );
+        }
+        let n = bytes.len() / 8;
+        if n as u64 != expected {
+            bail!(
+                "vector carry sidecar {} holds {n} ids but the carry declares {expected} base \
+                 records — they index the base .vamana by position",
+                path.display()
+            );
+        }
+        Ok(bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect())
     }
 
     /// Stream every node record in id order, handing the callback the raw
@@ -569,6 +672,60 @@ mod tests {
             Err(e) => e,
         };
         assert!(format!("{err:#}").contains("not a consolidation dump"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A carried Vamana index round-trips through the dump: the `DumpVectorCarry` scalars
+    /// survive `meta.json`, and the `layout → dump-id` sidecar reads back exactly — holes
+    /// included, and only for the length the carry declares.
+    #[test]
+    fn vector_carry_roundtrips() {
+        use crate::pq::HOLE;
+        let dir = tmp("carry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = DumpWriter::create(&dir).unwrap();
+        w.append_node(&[0], &[(0, Value::Str("x".into()))]).unwrap();
+        let layout = vec![7u64, HOLE, 3, 0, HOLE, 5];
+        let map_file = w.write_vector_carry("Doc.embedding", &layout).unwrap();
+        let carry = DumpVectorCarry {
+            base_vamana: "g/base/vector/Doc.embedding.vamana".into(),
+            base_pq: "g/base/vector/Doc.embedding.pq".into(),
+            carry_map_file: map_file,
+            base_records: layout.len() as u64,
+            r: 32,
+            alpha: 1.2,
+            medoid: 0,
+            max_norm: 2.5,
+            pq_subspaces: 8,
+            pq_bits: 8,
+        };
+        w.finish(
+            vec!["Doc".into()],
+            vec![],
+            vec!["embedding".into()],
+            vec![],
+            vec![DumpVectorIndex {
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: 16,
+                metric: Metric::Cosine,
+                carry: Some(carry.clone()),
+            }],
+        )
+        .unwrap();
+
+        let r = DumpReader::open(&dir).unwrap();
+        let got = &r.meta().vector_indexes[0];
+        assert_eq!(got.carry.as_ref(), Some(&carry));
+        let back = r
+            .read_vector_carry(&carry.carry_map_file, carry.base_records)
+            .unwrap();
+        assert_eq!(back, layout);
+        // A wrong declared length is refused, not silently truncated.
+        let err = r
+            .read_vector_carry(&carry.carry_map_file, carry.base_records + 1)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("index the base .vamana by position"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

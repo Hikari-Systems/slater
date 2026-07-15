@@ -42,11 +42,12 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use graph_format::consolidate_dump::{DumpRangeIndex, DumpVectorIndex, DumpWriter};
+use graph_format::consolidate_dump::{
+    DumpRangeIndex, DumpVectorCarry, DumpVectorIndex, DumpWriter,
+};
 use graph_format::ids::Value;
-use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
+use graph_format::manifest::{AnnMode, EntityKind};
 use graph_format::pq::HOLE;
-use graph_format::vectors::VectorEntry;
 
 use crate::exec::{val_to_value, Engine, NamedProps};
 use crate::read_view::ReadView;
@@ -343,12 +344,88 @@ pub fn serialise_binary_dump<V: ReadView>(
             }
             vectors.push((compact_id(&combined_tombs, node_id), key_id, vector));
         };
-        for e in read_index_vectors(engine, view, desc)? {
-            if superseded.contains(&e.node_id) {
-                continue;
+
+        // A Vamana index is **carried by reference** (HIK-117): its base `.vamana`/`.pq`
+        // hold the whole graph and its raw vectors (the ~370 GB read this branch exists to
+        // *not* do), so instead of streaming every base vector back out we hand the builder a
+        // `layout → new-id` map and let `streaming_merge` fold the Δ into the referenced base.
+        // A brute-force index has no graph to carry, so it keeps streaming its base vectors.
+        let carry = match desc.mode {
+            AnnMode::Vamana {
+                r,
+                alpha,
+                medoid,
+                pq_subspaces,
+                pq_bits,
+                max_norm,
+                ..
+            } => {
+                let index = view
+                    .vamana_index(&desc.label, &desc.property)
+                    .with_context(|| {
+                        format!(
+                            "Vamana index files for (:{} {{{}}}) are not open; cannot carry the \
+                             graph through consolidation",
+                            desc.label, desc.property
+                        )
+                    })?;
+                // One entry per base layout ordinal. `index.pq.node_ids[i]` is the base's
+                // previous-gen dense id for record `i`; compact it into this consolidation's
+                // dump-id space, or `HOLE` it when the record is dead. A HOLE here becomes a
+                // hole through `compose_final_ids ∘ streaming_merge`, so its stale geometry is
+                // never returned. The three HOLE causes: a pre-existing hole (already dead in
+                // the base), a node the delta/segment tombstoned, and a node whose embedding
+                // was re-embedded or removed since the base (`superseded`) — a re-embed's *new*
+                // vector arrives below as a Δ insert; a removal is a net delete.
+                let mut layout_to_dump_id: Vec<u64> = Vec::with_capacity(index.pq.node_ids.len());
+                for &node_id in &index.pq.node_ids {
+                    let mapped = if node_id == HOLE
+                        || combined_tombs.binary_search(&node_id).is_ok()
+                        || superseded.contains(&node_id)
+                    {
+                        HOLE
+                    } else {
+                        compact_id(&combined_tombs, node_id)
+                    };
+                    layout_to_dump_id.push(mapped);
+                }
+                let stem = format!("{}.{}", desc.label, desc.property);
+                let carry_map_file = w.write_vector_carry(&stem, &layout_to_dump_id)?;
+                // Data-dir-relative references to the base files (the builder joins with its
+                // own `--data-dir`), matching the generation store's `graph/base_uuid` layout.
+                let base = view.core_generation();
+                let (graph, base_uuid) = (base.graph(), base.base_uuid());
+                Some(DumpVectorCarry {
+                    base_vamana: format!("{graph}/{base_uuid}/vector/{stem}.vamana"),
+                    base_pq: format!("{graph}/{base_uuid}/vector/{stem}.pq"),
+                    carry_map_file,
+                    base_records: layout_to_dump_id.len() as u64,
+                    r,
+                    alpha,
+                    medoid,
+                    max_norm,
+                    pq_subspaces,
+                    pq_bits,
+                })
             }
-            push(e.node_id, e.vector, &mut vectors);
-        }
+            AnnMode::BruteForce => {
+                // A brute-force index's full-precision base vectors live in `vectors.f32.blk`
+                // at `[first_record, first_record + count)` — there is no graph to carry, so
+                // they stream straight back out. (A Vamana base is *never* read here — that is
+                // the ~370 GB read the carry above exists to eliminate.)
+                for e in engine.vector_group(desc.first_record, desc.count)? {
+                    if superseded.contains(&e.node_id) {
+                        continue;
+                    }
+                    push(e.node_id, e.vector, &mut vectors);
+                }
+                None
+            }
+        };
+        // The Δ (delta + segment overlay) vectors ride `vectors.blk` in both arms: for a
+        // carried Vamana index they become the `streaming_merge` insert set (routed to the
+        // index through the builder's normal node-vector gather, keyed by final id); for a
+        // brute-force index they are appended straight into the store.
         for e in levels.into_effective_entries() {
             push(e.node_id, e.vector, &mut vectors);
         }
@@ -357,6 +434,7 @@ pub fn serialise_binary_dump<V: ReadView>(
             property: desc.property.clone(),
             dim: desc.dim,
             metric: desc.metric,
+            carry,
         });
     }
     vectors.sort_by_key(|(id, key, _)| (*id, *key));
@@ -373,65 +451,6 @@ pub fn serialise_binary_dump<V: ReadView>(
     )
     .context("finish binary consolidation dump")?;
     Ok(())
-}
-
-/// Every `(node_id, vector)` a vector index holds, read back out of the core.
-///
-/// The two arms keep their vectors in **different files**, and that is the whole trap
-/// here (D31): a brute-force index's full-precision vectors live in `vectors.f32.blk`
-/// at `[first_record, first_record + count)`, while a Vamana index's live in its own
-/// `.vamana` blocks and are *not* in `vectors.f32.blk` at all — its `first_record` is
-/// recorded as a meaningless `0`. Reading the wrong store for the mode yields an empty
-/// group and hence a silently vector-less rebuild, which is exactly the failure this
-/// path exists to prevent.
-///
-/// Two v8 details govern the Vamana arm here:
-///
-/// * The `.vamana` record carries **no node id** — it is pure geometry. The `.pq` node-id
-///   column is the single layout→id map, so the id for record `i` is `index.pq.node_ids[i]`.
-/// * A record whose id is [`HOLE`] is a **tombstone** and must be skipped: carrying it
-///   forward would resurrect a deleted vector, which no other read path would ever surface.
-///   `desc.count` is the *record* count (holes included), so the loop runs over all of them
-///   and filters; the survivors are what the rebuild re-indexes.
-///
-/// The vectors themselves are stored **raw** since v8, so nothing is lost in the round-trip.
-/// (Before v8 they were stored L2-normalised and their magnitudes were gone for good —
-/// harmless only because Vamana was cosine-only and cosine is scale-invariant. It is no
-/// longer cosine-only, and it no longer loses them.)
-fn read_index_vectors<V: ReadView>(
-    engine: &Engine<'_, V>,
-    view: &V,
-    desc: &VectorIndexDesc,
-) -> Result<Vec<VectorEntry>> {
-    match desc.mode {
-        AnnMode::BruteForce => engine.vector_group(desc.first_record, desc.count),
-        AnnMode::Vamana { .. } => {
-            let index = view
-                .vamana_index(&desc.label, &desc.property)
-                .with_context(|| {
-                    format!(
-                        "Vamana index files for (:{} {{{}}}) are not open; \
-                         cannot carry its vectors through consolidation",
-                        desc.label, desc.property
-                    )
-                })?;
-            // Driven off the `.pq` id column, not `desc.count`: it is the map, and the open
-            // path has already refused the generation if the two files' record counts
-            // disagree. Indexing it by a manifest count instead would be an unchecked
-            // subscript on an untrusted number.
-            let mut out = Vec::with_capacity(index.pq.live_count());
-            for (i, &node_id) in index.pq.node_ids.iter().enumerate() {
-                if node_id == HOLE {
-                    continue;
-                }
-                out.push(VectorEntry {
-                    node_id,
-                    vector: index.reader.node(i as u32)?.vector,
-                });
-            }
-            Ok(out)
-        }
-    }
 }
 
 /// `CREATE INDEX …;` for every range index, so the rebuilt generation carries the
@@ -1354,5 +1373,108 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// HIK-117, the server side of the carry. A Vamana base **carries by reference**: the dump
+    /// must NOT stream the base vectors back out (`vectors.blk` empty — the ~370 GB read gone),
+    /// it must emit a carry record referencing the base `.vamana`/`.pq` with the base build
+    /// params, and the `layout → dump-id` sidecar must map the survivors and `HOLE` the dead.
+    #[test]
+    fn binary_dump_carries_a_vamana_index_by_reference() {
+        use graph_format::consolidate_dump::DumpReader;
+        use graph_format::pq::HOLE;
+
+        let fix = testgen::VamanaFixture {
+            n: 300,
+            dim: 32,
+            r: 24,
+            alpha: 1.2,
+            pq_subspaces: 8,
+            pq_bits: 8,
+            vector_block_size: 8192,
+        };
+        let (root, graph, _raw) = testgen::write_vamana("bindump_carry", &fix);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        // The base's layout → dump-id column, straight from the open index.
+        let base_ids = gen
+            .vamana_index("Doc", "embedding")
+            .unwrap()
+            .pq
+            .node_ids
+            .clone();
+        assert_eq!(base_ids.len(), fix.n);
+
+        // ── Case 1: pure permutation (empty delta). Carry with no holes; every ordinal maps to
+        // its own dump id (no tombstones ⇒ compaction is the identity). No vector is streamed.
+        {
+            let merged = MergedView::read_only(&gen);
+            let dir = dump_dir("carry_pure");
+            let _ = std::fs::remove_dir_all(&dir);
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+            let r = DumpReader::open(&dir).unwrap();
+            assert_eq!(
+                r.vector_count(),
+                0,
+                "no vector may be streamed for a carried index"
+            );
+            let vi = &r.meta().vector_indexes[0];
+            let carry = vi.carry.as_ref().expect("a Vamana index must carry");
+            assert_eq!(
+                carry.base_vamana,
+                format!("{graph}/{}/vector/Doc.embedding.vamana", gen.base_uuid())
+            );
+            assert_eq!(carry.base_records, fix.n as u64);
+            assert_eq!(carry.r, fix.r);
+            let map = r
+                .read_vector_carry(&carry.carry_map_file, carry.base_records)
+                .unwrap();
+            assert_eq!(
+                map, base_ids,
+                "no delta ⇒ layout → dump-id is the base id column"
+            );
+            assert!(!map.contains(&HOLE));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ── Case 2: delete one node (dense id 0). Its ordinal must go HOLE; every survivor
+        // compacts down by the one tombstone below it. Still no vector streamed.
+        {
+            let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+            mem.delete_node("Doc", "id", Value::Int(0), Some(0));
+            let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+            let dir = dump_dir("carry_delete");
+            let _ = std::fs::remove_dir_all(&dir);
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+            let r = DumpReader::open(&dir).unwrap();
+            assert_eq!(
+                r.vector_count(),
+                0,
+                "a delete carries too — no base vector streamed"
+            );
+            let carry = r.meta().vector_indexes[0].carry.as_ref().unwrap();
+            let map = r
+                .read_vector_carry(&carry.carry_map_file, carry.base_records)
+                .unwrap();
+            for (i, (&dump_id, &base_id)) in map.iter().zip(&base_ids).enumerate() {
+                if base_id == 0 {
+                    assert_eq!(
+                        dump_id, HOLE,
+                        "the deleted node's ordinal {i} must be a hole"
+                    );
+                } else {
+                    // one tombstone (id 0) sorts below every survivor, so each shifts down by 1.
+                    assert_eq!(
+                        dump_id,
+                        base_id - 1,
+                        "survivor at ordinal {i} compacts by 1"
+                    );
+                }
+            }
+            assert_eq!(map.iter().filter(|&&x| x == HOLE).count(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
