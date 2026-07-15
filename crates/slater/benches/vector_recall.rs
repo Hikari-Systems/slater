@@ -14,8 +14,10 @@
 //!                        (HIK-115/119).
 //!
 //! For **each of cosine / L2 / dot**, over vectors with **unequal norms** — on unit vectors the
-//! three metrics coincide and a per-metric comparison proves nothing (see
-//! `vecbench::random_vectors_unequal_norms`).
+//! three metrics coincide and a per-metric comparison proves nothing. Data is a low-rank
+//! **manifold** (`vecbench::ManifoldModel`), not uniform-random: real embeddings live on such a
+//! manifold, which is what makes their kNN both meaningful and navigable (uniform-random high-dim
+//! vectors are near-orthogonal and equidistant, so *no* ANN graph recalls well on them).
 //!
 //! The engine-level "delta+segments" *merged read* is not a distinct index kind — a core segment
 //! is itself a small on-disk vamana, so its recall is the **base** rung's, and the merged top-k
@@ -29,8 +31,8 @@ use graph_format::manifest::Metric;
 use graph_format::rwvamana::RwVamana;
 
 use slater::vecbench::{
-    beam_topk_disk, consolidate_opts, exact_topk, layout, merge_params, merge_to,
-    random_vectors_unequal_norms, recall_at_k, write_disk_index, write_pq, DiskIndex, VecFixture,
+    beam_topk_disk, consolidate_opts, exact_topk, layout, merge_params, merge_to, recall_at_k,
+    write_disk_index, write_pq, DiskIndex, ManifoldModel, VecFixture,
 };
 use slater::vector::distance;
 
@@ -39,16 +41,13 @@ const K: usize = 10;
 const BEAM: usize = 64;
 const N_BASE: usize = 3_000;
 const N_QUERIES: usize = 60;
+/// Intrinsic (latent) dimensionality of the representative manifold — mirrors a real embedding's
+/// effective rank, well below the ambient 768.
+const N_LATENT: usize = 48;
 /// Fraction of the base marked dead for the consolidation rung.
 const DEAD_FRAC: f64 = 0.5;
-/// New vectors folded in for the merge rung.
+/// New vectors folded in for the merge rung (on the SAME manifold model).
 const N_INSERT: usize = 500;
-
-fn queries(seed: u64) -> Vec<Vec<f32>> {
-    // Fresh out-of-set query vectors (unequal norms too), so a query's nearest is not trivially
-    // itself.
-    random_vectors_unequal_norms(N_QUERIES, DIM, seed)
-}
 
 fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
@@ -131,9 +130,15 @@ fn recall_consolidated(
     mean(&rs)
 }
 
-fn recall_merged(dir: &std::path::Path, fx: &VecFixture, base: &DiskIndex, qs: &[Vec<f32>]) -> f64 {
-    // A batch of new vectors, keyed by fresh dump ids after the base.
-    let ins_raw = random_vectors_unequal_norms(N_INSERT, DIM, 0xADD ^ fx.metric as u64);
+fn recall_merged(
+    dir: &std::path::Path,
+    fx: &VecFixture,
+    base: &DiskIndex,
+    qs: &[Vec<f32>],
+    model: &ManifoldModel,
+) -> f64 {
+    // A batch of new vectors on the SAME manifold model, keyed by fresh dump ids after the base.
+    let ins_raw = model.sample(N_INSERT, 0xADD ^ fx.metric as u64);
     let inserts: Vec<(u64, Vec<f32>)> = ins_raw
         .iter()
         .enumerate()
@@ -182,7 +187,8 @@ fn main() {
 
     eprintln!("\n=== recall@{K} across the write ladder (approx vs exact brute force over the LIVE set) ===");
     eprintln!(
-        "dim={DIM}, base N={N_BASE}, beam L={BEAM}, {N_QUERIES} out-of-set queries, unequal norms\n"
+        "dim={DIM}, base N={N_BASE}, beam L={BEAM}, {N_QUERIES} held-out manifold queries \
+         (latent {N_LATENT}, unequal norms)\n"
     );
     eprintln!(
         "{:<8}  {:>10}  {:>10}  {:>12}  {:>10}",
@@ -190,15 +196,19 @@ fn main() {
     );
 
     for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
-        let raw = random_vectors_unequal_norms(N_BASE, DIM, 0x1234 ^ metric as u64);
-        let qs = queries(0x9999 ^ metric as u64);
+        // Representative fixture: index vectors + held-out queries sampled from ONE manifold model,
+        // so a query has a genuine neighbourhood among the index points (uniform-random high-dim
+        // vectors have no meaningful kNN and would make recall noise).
+        let model = ManifoldModel::new(DIM, N_LATENT, 0x1234 ^ metric as u64);
+        let raw = model.sample(N_BASE, 0xA1 ^ metric as u64);
+        let qs = model.sample(N_QUERIES, 0x9999 ^ metric as u64);
 
         let r_delta = recall_delta(metric, &raw, &qs);
         let fx = VecFixture::build(metric, raw).unwrap();
         let r_base = recall_base(&fx, &qs);
         let base = write_disk_index(&dir, "base", &fx, None).unwrap();
         let r_cons = recall_consolidated(&dir, &fx, &base, &qs);
-        let r_merged = recall_merged(&dir, &fx, &base, &qs);
+        let r_merged = recall_merged(&dir, &fx, &base, &qs, &model);
 
         eprintln!(
             "{:<8}  {:>10.3}  {:>10.3}  {:>12.3}  {:>10.3}",

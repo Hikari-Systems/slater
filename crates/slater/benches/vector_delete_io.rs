@@ -26,14 +26,16 @@ use std::path::Path;
 use graph_format::manifest::Metric;
 
 use slater::vecbench::{
-    beam_topk_disk, consolidate_opts, consolidate_to, exact_topk, layout,
-    random_vectors_unequal_norms, recall_at_k, write_disk_index, write_pq, VecFixture,
+    beam_topk_disk, consolidate_opts, consolidate_to, exact_topk, layout, recall_at_k,
+    write_disk_index, write_pq, ManifoldModel, VecFixture,
 };
 
 const DIM: usize = 768;
 const K: usize = 10;
 const N_TOTAL: usize = 6_000;
 const N_QUERIES: usize = 40;
+/// Intrinsic (latent) dimensionality of the representative manifold fixture.
+const N_LATENT: usize = 48;
 const RECALL_TARGET: f64 = 0.90;
 /// Dead fractions to sweep.
 const DEAD_FRACS: &[f64] = &[0.0, 0.25, 0.50, 0.67, 0.80];
@@ -103,10 +105,13 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("slater_deleteio_{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok();
 
-    // One base fixture; the dead mask varies per fraction over the same vectors.
-    let raw = random_vectors_unequal_norms(N_TOTAL, DIM, 0xDE1E7E);
+    // One base fixture; the dead mask varies per fraction over the same vectors. Representative
+    // manifold data + held-out queries on the same model (uniform-random high-dim vectors have no
+    // meaningful kNN, so the iso-recall target would be unreachable and the reads meaningless).
+    let model = ManifoldModel::new(DIM, N_LATENT, 0xDE1E7E);
+    let raw = model.sample(N_TOTAL, 0xC0DE);
     let fx = VecFixture::build(Metric::Cosine, raw).unwrap();
-    let qs = random_vectors_unequal_norms(N_QUERIES, DIM, 0x0071C5);
+    let qs = model.sample(N_QUERIES, 0x0071C5);
     let base = write_disk_index(&dir, "base", &fx, None).unwrap();
     let (order, _) = layout(&fx);
 

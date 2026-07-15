@@ -63,17 +63,72 @@ impl SplitMix64 {
     }
 }
 
-/// `n` random dim-`d` vectors with **deliberately unequal norms** — each vector is scaled by a
-/// random factor in `[0.25, 4.0)`. On unit vectors cosine, L2 and dot coincide and a per-metric
-/// recall comparison proves nothing; unequal norms pull the three metrics genuinely apart.
+/// `n` uniform-random dim-`d` vectors with **deliberately unequal norms** (a per-vector scale in
+/// `[0.5, 2.0)`). Used where only *throughput* or *IO structure* matters, not recall:
+/// uniform-random high-dim vectors are near-orthogonal and equidistant (the curse of
+/// dimensionality), so their recall@10 is ill-defined and **no** ANN graph scores well on them —
+/// use [`ClusterModel`] for anything that measures recall.
 pub fn random_vectors_unequal_norms(n: usize, d: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = SplitMix64(seed);
     (0..n)
         .map(|_| {
-            let scale = 0.25 + (rng.next_f32() * 0.5 + 0.5) * 3.75; // ~[0.25, 4.0)
+            let scale = 0.5 + (rng.next_f32() * 0.5 + 0.5) * 1.5; // ~[0.5, 2.0), a moderate 4× spread
             (0..d).map(|_| rng.next_f32() * scale).collect()
         })
         .collect()
+}
+
+/// A synthetic **low-rank manifold** — the representative stand-in for real embeddings. Real
+/// embeddings do not fill their 768-dim box (uniform-random data does, which is why its kNN is
+/// meaningless); they live on a continuous ~50-dim manifold, which is what makes their kNN both
+/// **meaningful** (real neighbourhoods) and **navigable** (a connected surface a greedy graph
+/// walk can traverse — unlike isolated tight clusters, which fragment the proximity graph into
+/// disconnected components a beam search can never cross). A model is a random `latent`×`d` basis;
+/// a sample is a random latent-space point lifted through it, with a per-point norm scale so
+/// cosine / L2 / dot genuinely diverge. Index vectors and held-out queries are both
+/// [`sample`](ManifoldModel::sample)d from the **same** model — how SIFT/GloVe-style ANN
+/// benchmarks hold out queries from the training distribution.
+pub struct ManifoldModel {
+    /// `basis[l]` is a random dim-`d` vector; a sample is `Σ_l coeff_l · basis[l]`.
+    pub basis: Vec<Vec<f32>>,
+    pub d: usize,
+}
+
+impl ManifoldModel {
+    /// A model with `latent` random basis vectors in dim `d` (the intrinsic dimensionality; ~48
+    /// mirrors a real embedding's effective rank).
+    pub fn new(d: usize, latent: usize, seed: u64) -> Self {
+        let mut rng = SplitMix64(seed);
+        let basis = (0..latent)
+            .map(|_| (0..d).map(|_| rng.next_f32()).collect())
+            .collect();
+        Self { basis, d }
+    }
+
+    /// `n` vectors: each a random latent point (`coeff_l ∈ [-1,1)`) lifted through the basis and
+    /// scaled by a per-point factor in `[0.5, 2.0)` (unequal norms). Points near in latent space
+    /// are near in output space — a genuine, navigable neighbourhood structure.
+    pub fn sample(&self, n: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = SplitMix64(seed);
+        let latent = self.basis.len();
+        (0..n)
+            .map(|_| {
+                let coeffs: Vec<f32> = (0..latent).map(|_| rng.next_f32()).collect();
+                let scale = 0.5 + (rng.next_f32() * 0.5 + 0.5) * 1.5; // ~[0.5, 2.0), a moderate 4× spread
+                let mut out = vec![0.0f32; self.d];
+                for (l, &c) in coeffs.iter().enumerate() {
+                    let b = &self.basis[l];
+                    for (o, &bv) in out.iter_mut().zip(b.iter()) {
+                        *o += c * bv;
+                    }
+                }
+                for o in out.iter_mut() {
+                    *o *= scale;
+                }
+                out
+            })
+            .collect()
+    }
 }
 
 /// The ANN-space bundle for one metric over a raw vector set: the mapped points, the trained
@@ -390,7 +445,11 @@ mod tests {
     /// mapping compiles but tanks recall.
     #[test]
     fn disk_and_inmem_agree_and_recall_is_high() {
-        let raw = random_vectors_unequal_norms(400, 64, 0xF00D);
+        // Manifold data + held-out queries (the representative path) — uniform-random high-dim
+        // vectors have no meaningful kNN structure, so recall there proves nothing.
+        let model = ManifoldModel::new(768, 48, 0xC0FFEE);
+        let raw = model.sample(2000, 0xF00D);
+        let qs = model.sample(20, 0xBEEF);
         let fx = VecFixture::build(Metric::Cosine, raw).unwrap();
         let dir = std::env::temp_dir().join(format!("slater_vecbench_{}", std::process::id()));
         let disk = write_disk_index(&dir, "t", &fx, None).unwrap();
@@ -398,9 +457,8 @@ mod tests {
         let live: Vec<u64> = (0..fx.raw.len() as u64).collect();
         let mut inmem_sum = 0.0;
         let mut disk_sum = 0.0;
-        let reps = 20;
-        for s in 0..reps {
-            let q = &fx.raw[(s * 7) % fx.raw.len()];
+        let reps = qs.len();
+        for q in &qs {
             let exact = exact_topk(Metric::Cosine, &fx.raw, &live, q, 10);
             inmem_sum += recall_at_k(&fx.beam_topk_inmem(q, 10, 64).unwrap(), &exact);
             disk_sum += recall_at_k(
