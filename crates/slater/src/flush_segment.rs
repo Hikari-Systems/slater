@@ -547,7 +547,8 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             label: vi.label.clone(),
             prop: vi.property.clone(),
             ids: Vec::new(),
-            removals: Vec::new(),
+            label_removals: Vec::new(),
+            value_removals: Vec::new(),
         };
         // The segment's **own** `(id, vector)` for every id it embeds — gathered from the same
         // `Value::Vector` patch that puts the id in `spec.ids`, so the sealed index and the
@@ -565,14 +566,19 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 // The node is not (effectively) in this index's scope. If this delta is what
                 // took it out — `REMOVE n:Doc` dropped the index's label — the node *left* a
                 // scope it was in, so the base/lower vector it still carries must be superseded:
-                // record a removal. The row cannot express this (D12 routed the embedding out),
-                // and without it the stale base vector resurfaces the moment the delta is
+                // record a **label** removal. The row cannot express this (D12 routed the embedding
+                // out), and without it the stale base vector resurfaces the moment the delta is
                 // retired at the flush — the write silently undone by a background job. This is
                 // the remove-direction twin of keying membership on the effective label set for
                 // the *add* direction (HIK-111 Finding 1). A node that simply never carried the
                 // label contributes nothing.
+                //
+                // It is a **label** removal, not a value one, and the distinction is load-bearing
+                // (HIK-118): the embedding value is untouched (D64), so a later `SET n:Doc` must be
+                // able to un-suppress this id and score its base vector again. `value_removals`
+                // (below) would suppress it permanently.
                 if nd.labels_removed.contains(&vi.label) {
-                    spec.removals.push(*dense);
+                    spec.label_removals.push(*dense);
                 }
                 continue;
             }
@@ -592,16 +598,20 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 // takes the same position on all three (`exec::delta_says`), so the flush must
                 // not lose one of them: the flushed row would say `embedding = 5` while nothing
                 // suppressed the base, and the stale base vector would resurface *at the
-                // flush* — the write silently undone by a background job.
-                spec.removals.push(*dense);
+                // flush* — the write silently undone by a background job. This is a **value**
+                // removal (the value is gone): it stays suppressed regardless of any later label
+                // churn (HIK-118), unlike the `label_removals` above.
+                spec.value_removals.push(*dense);
             }
             // Otherwise the delta says nothing about this node's embedding, and the level
             // below it (base or older segment) keeps whatever it had.
         }
         spec.ids.sort_unstable();
         spec.ids.dedup();
-        spec.removals.sort_unstable();
-        spec.removals.dedup();
+        spec.label_removals.sort_unstable();
+        spec.label_removals.dedup();
+        spec.value_removals.sort_unstable();
+        spec.value_removals.dedup();
 
         // Seal a read-only Vamana over this segment's own embeddings when the live set crosses
         // the floor. Reuse the base's codebook (and its `max_norm`) when the base has a Vamana
@@ -638,7 +648,12 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
     let dirty_vectors: Vec<DirtyVector> = vec_specs
         .iter()
         .zip(&vec_metas)
-        .filter(|(s, meta)| !s.ids.is_empty() || !s.removals.is_empty() || meta.is_some())
+        .filter(|(s, meta)| {
+            !s.ids.is_empty()
+                || !s.label_removals.is_empty()
+                || !s.value_removals.is_empty()
+                || meta.is_some()
+        })
         .map(|(s, meta)| DirtyVector {
             label: s.label.clone(),
             property: s.prop.clone(),
