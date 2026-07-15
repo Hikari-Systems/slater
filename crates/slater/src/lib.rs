@@ -56,3 +56,10 @@ pub mod testgen;
 // build stacked fixtures without shipping the code in a normal build.
 #[cfg(any(test, feature = "testkit"))]
 pub mod benchkit;
+
+// Shared Vamana + PQ plumbing for the FreshDiskANN performance suite (HIK-120): the on-disk
+// index lifecycle (ANN-space map → build → write → beam-search → consolidate → merge) reused by
+// the vector_recall / vector_delete_io / streaming_merge benches. Gated `pub` under `testkit`
+// like `testgen` / `benchkit`.
+#[cfg(any(test, feature = "testkit"))]
+pub mod vecbench;

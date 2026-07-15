@@ -115,3 +115,47 @@ required-features = ["testkit"]
 [[test]]
 name = "object_store_readamp"
 required-features = ["testkit"]
+
+# ── FreshDiskANN vector write-ladder performance suite (HIK-120) ──────────────────────────────
+# All five drive the vector primitives (rwvamana / vamana / vamana_merge / vamana_delete / the
+# RW-index CALL path) at dim 768; deterministic splitmix64 fixtures; release (criterion). See
+# docs/PERF-REPORT.md for the synthesised numbers + 91.6M extrapolations.
+
+# 1. RW-index kill-switch A/B: KNN latency ON (graph walk) vs OFF (per-query delta brute force)
+# swept over delta size, end-to-end through `db.idx.vector.queryNodes`. Run:
+# `cargo bench -p slater --features testkit --bench vector_rwindex`.
+[[bench]]
+name = "vector_rwindex"
+harness = false
+required-features = ["testkit"]
+
+# 2. recall@10 vs exact brute force over the live set, per metric (cosine/L2/dot, unequal norms),
+# at the ladder's index kinds (delta RwVamana / base vamana / consolidated / merged). Prints
+# recall, not timing. Run: `cargo bench -p slater --features testkit --bench vector_recall`.
+[[bench]]
+name = "vector_recall"
+harness = false
+required-features = ["testkit"]
+
+# 3. ms/insert for one `RwVamana` insert (dim 768, R=32, L=64). Confirms ~2 ms/insert. Run:
+# `cargo bench -p slater --features testkit --bench vector_insert`.
+[[bench]]
+name = "vector_insert"
+harness = false
+required-features = ["testkit"]
+
+# 4. block/node-fetch reads per KNN query, lazy (holes) vs consolidated, at iso-recall (fixed
+# recall target, per-variant beam width). Sweeps dead fraction. Prints reads/query, not timing.
+# Run: `cargo bench -p slater --features testkit --bench vector_delete_io`.
+[[bench]]
+name = "vector_delete_io"
+harness = false
+required-features = ["testkit"]
+
+# 5. StreamingMerge rewrite throughput: fast path (hard-link, ~instant) vs slow path (decode-once
+# sequential rewrite, MiB/s, post-HIK-119). Run:
+# `cargo bench -p slater --features testkit --bench streaming_merge`.
+[[bench]]
+name = "streaming_merge"
+harness = false
+required-features = ["testkit"]
