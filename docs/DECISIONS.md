@@ -1610,3 +1610,14 @@ exactly the failure D63 exists to close:
 After a consolidation a node not `:Doc` at consolidation time is simply out of `(:Doc,embedding)`
 scope, so the rebuild does not index it. It stays gone **for the right reason (scope)**, not
 because the value was destroyed — and a node still in scope carries its vector through, unchanged.
+
+**Known limitation — the un-remove is delta-scoped.** `REMOVE n:Doc` then `SET n:Doc` restores
+the node at its original vector *while both live in the delta* (the delta's superseded set is
+recomputed from `labels_removed`, so re-adding the label stops superseding). Once the removal has
+been **flushed** into a segment sidecar, a later `SET n:Doc` does **not** bring the vector back:
+the base arm's suppression is the *raw* sidecar union (`above_base_segments`), which cannot tell a
+label-removal (should un-suppress on re-label) from a value-removal (must stay suppressed — the
+value is gone), and D12 means the delta cannot reconstruct the buried base vector to re-emit it.
+Restoring across a flush needs the sidecar to record the removal *kind*, a `segvectors` format
+change out of this ticket's scope. This is strictly better than before — pre-fix the un-remove
+"worked" across a flush only because the removal itself never took effect.
