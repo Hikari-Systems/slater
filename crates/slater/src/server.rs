@@ -9814,6 +9814,310 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ── HIK-116: a label removal takes a node out of that label's vector index ──────────────
+
+    /// Run a read query over the merged view and return its rows.
+    fn vread(graphs: &Graphs, graph: &str, cache: &BlockCache, q: &str) -> Vec<Vec<Val>> {
+        let gen = graphs.get(graph).unwrap();
+        let snap = DeltaSnapshot::from_memtable(graphs.writer(graph).unwrap().snapshot());
+        let view = MergedView::new(gen.as_ref(), snap);
+        let ast = parser::parse(q).unwrap();
+        let rows = Engine::new(&view, cache).run(&ast).unwrap().rows;
+        rows
+    }
+
+    /// `count(:Doc)` over the merged view.
+    fn doc_count(graphs: &Graphs, graph: &str, cache: &BlockCache) -> i64 {
+        match vread(graphs, graph, cache, "MATCH (n:Doc) RETURN count(n) AS c")[0][0] {
+            Val::Int(c) => c,
+            ref o => panic!("count(:Doc) is not an int: {o:?}"),
+        }
+    }
+
+    /// The dumped `(node_id, vector)` set of the consolidation view — what a rebuild indexes.
+    fn dump_vectors(
+        graphs: &Graphs,
+        graph: &str,
+        cache: &BlockCache,
+        dump: &std::path::Path,
+    ) -> Vec<(u64, Vec<f32>)> {
+        let gen = graphs.get(graph).unwrap();
+        let snap = DeltaSnapshot::from_memtable(graphs.writer(graph).unwrap().snapshot());
+        let view = MergedView::new(gen.as_ref(), snap);
+        std::fs::create_dir_all(dump).unwrap();
+        crate::consolidate::serialise_binary_dump(&Engine::new(&view, cache), &view, dump).unwrap();
+        let reader = graph_format::consolidate_dump::DumpReader::open(dump).unwrap();
+        let mut out: Vec<(u64, Vec<f32>)> = Vec::new();
+        reader
+            .for_each_vector(|node_id, _key_id, v| {
+                out.push((node_id, v.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
+    /// **The bug (HIK-116).** A vector index is scoped to a `(label, property)` pair. A write
+    /// that drops the label (`REMOVE n:Doc`) must take the node out of the `(:Doc, embedding)`
+    /// index — scope-symmetric with `SET n:Doc` admitting it — and keep it out across the whole
+    /// write ladder: delta → T2 flush → T3 merge → consolidation. It must not delete the
+    /// embedding *value*.
+    ///
+    /// The node is `:Doc:Keyed`: the vector index is on `:Doc` but the business key (the write's
+    /// anchor) is on `:Keyed`, so the write drops the very label the index is scoped to while
+    /// still addressing the node. An indexed embedding is routed out of the row (D12), so a
+    /// flushed row that lost the label cannot *say* so — the removal rides an explicit channel
+    /// at each rung (the delta's `labels_removed`, then the segment sidecar, then the merged
+    /// sidecar, then the consolidation `superseded` set), exactly as a value removal does (D63).
+    /// Miss any one rung and the answer depends on *which level the node happens to live on*.
+    ///
+    /// d00 is the query's exact match (cosine distance 0.0), so a resurfaced base vector does
+    /// not merely reorder the results — it leads them. The assertion bites at every rung.
+    #[test]
+    fn removing_the_index_label_evicts_a_node_across_the_whole_ladder() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4, 0.6]
+            .iter()
+            .map(|d| at_distance(*d))
+            .collect();
+        let (root, graph) =
+            testgen::write_vector_docs_keyed("vec_label_removal_ladder", &base, "Keyed");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 4)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+
+        assert_eq!(
+            ids(&graphs),
+            vec![0, 1, 2, 3],
+            "base order: 0.0, 0.2, 0.4, 0.6"
+        );
+        assert_eq!(doc_count(&graphs, &graph, &cache), 4);
+
+        // Drop the :Doc label from d00 — anchored on :Keyed, the index is on :Doc. The value
+        // is untouched.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+
+        // Rung 1 — the delta. count(:Doc) and labels(n) already drop (the symptom); the fix is
+        // that KNN drops with them rather than leaving d00 the top hit at its stale base vector.
+        assert_eq!(doc_count(&graphs, &graph, &cache), 3, "count(:Doc) dropped");
+        assert!(
+            !ids(&graphs).contains(&0),
+            "d00 left the :Doc index at the delta; got {:?}",
+            ids(&graphs)
+        );
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2, 3],
+            "the other three :Doc nodes remain"
+        );
+
+        // Rung 2 — the T2 flush. The removal must ride the segment sidecar; the row cannot
+        // express it (D12). Put a second, unrelated flush after it so a compaction has a run.
+        // The business key is on :Keyed, so re-embeds anchor there, not on :Doc.
+        let keyed_embed = |name: &str, v: &[f32]| {
+            let parts: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+            format!(
+                "MATCH (n:Keyed {{name:'{name}'}}) SET n.embedding = vecf32([{}])",
+                parts.join(", ")
+            )
+        };
+        vwrite(&graphs, &graph, &keyed_embed("d01", &at_distance(0.15)));
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the label removal + re-embed flush");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 1);
+        vwrite(&graphs, &graph, &keyed_embed("d02", &at_distance(0.35)));
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("a second segment to fold");
+        assert_eq!(graphs.get(&graph).unwrap().stack().segments().len(), 2);
+        assert!(
+            !ids(&graphs).contains(&0),
+            "d00 must stay gone once flushed into a segment; got {:?}",
+            ids(&graphs)
+        );
+
+        // Rung 3 — the T3 merge. Fold the two segments; the below-run removal must be carried
+        // into the merged sidecar, or d00's base vector resurfaces the moment the segment that
+        // suppressed it is folded away.
+        graphs
+            .compact_graph_segments(&graph, &vc, &root, 0, 2)
+            .unwrap();
+        assert_eq!(
+            graphs.get(&graph).unwrap().stack().segments().len(),
+            1,
+            "the run folded into one segment"
+        );
+        assert!(
+            !ids(&graphs).contains(&0),
+            "d00 must stay gone across the merge; got {:?}",
+            ids(&graphs)
+        );
+
+        // Rung 4 — the consolidation dump. This reads the level fold (not the raw sidecar union
+        // the KNN read path uses), so a segment-level removal that the fold swallowed would
+        // resurface *only here*. A node out of :Doc scope must not be indexed by the rebuild.
+        let dumped = dump_vectors(&graphs, &graph, &cache, &root.join("_dump"));
+        let dumped_ids: Vec<u64> = dumped.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !dumped_ids.contains(&0),
+            "d00 is out of :Doc scope, so the rebuild must not index it — got {dumped_ids:?}"
+        );
+        assert_eq!(
+            dumped_ids,
+            vec![1, 2, 3],
+            "every still-:Doc node keeps exactly one vector; got {dumped_ids:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The un-remove.** `REMOVE n:Doc` then `SET n:Doc` puts the node back in the index at its
+    /// *original* embedding — the value was never deleted, only the label scope changed. This is
+    /// how "the value is retained" is observable: a base-indexed embedding reads back `Null`
+    /// through `RETURN n.embedding` (D12 routes it out of the row), so the vector's survival is
+    /// shown by re-entering scope and finding the same base vector still there.
+    #[test]
+    fn re_adding_the_index_label_restores_the_original_vector() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("vec_label_unremove", &base, "Keyed");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let _ = &wal;
+
+        let top =
+            |g: &Graphs| -> Option<(u64, f64)> { vknn(g, &graph, &cache, &VQ, 3).first().copied() };
+        assert_eq!(top(&graphs), Some((0, 0.0)), "d00 leads at distance 0.0");
+
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+        assert!(
+            !vknn(&graphs, &graph, &cache, &VQ, 3)
+                .iter()
+                .any(|(id, _)| *id == 0),
+            "d00 is out of the index while unlabelled"
+        );
+
+        // Put the label back. Nothing re-set the embedding, so the value that comes back is the
+        // base one — d00 leads at distance 0.0 again.
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) SET n:Doc");
+        let restored = top(&graphs).expect("d00 is back in the index");
+        assert_eq!(restored.0, 0, "d00 back in the :Doc index");
+        assert!(
+            restored.1.abs() < 1e-5,
+            "…at its original base vector (distance 0.0), got {}",
+            restored.1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Removing an **unrelated** label must not evict a node from a different label's vector
+    /// index. The node is `:Doc:Keyed`; dropping `:Keyed` leaves it `:Doc`, so it stays in the
+    /// `(:Doc, embedding)` index — through the delta *and* through a flush (the flush must not
+    /// mistake an in-scope node for a removed one).
+    #[test]
+    fn removing_an_unrelated_label_keeps_the_node_in_the_index() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("vec_unrelated_label", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let leads = |g: &Graphs| -> bool {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .first()
+                .is_some_and(|(id, s)| *id == 0 && s.abs() < 1e-5)
+        };
+        assert!(leads(&graphs), "d00 leads at distance 0.0");
+
+        // Drop the non-index label. d00 is still :Doc.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Keyed {name:'d00'}) REMOVE n:Keyed",
+        );
+        assert!(
+            leads(&graphs),
+            "removing :Keyed must not evict d00 from the :Doc index (delta)"
+        );
+        assert_eq!(
+            doc_count(&graphs, &graph, &cache),
+            3,
+            ":Doc membership is unchanged"
+        );
+
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the unrelated label drop flushes");
+        assert!(
+            leads(&graphs),
+            "removing :Keyed must not evict d00 from the :Doc index (flushed)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A node whose embedding is removed by **value** *and* whose index label is removed must be
+    /// gone (either reason suffices), and must not double-count or resurface across a flush. It
+    /// is a legal, if odd, combination and the two removal channels must compose cleanly.
+    #[test]
+    fn value_removal_and_label_removal_compose() {
+        let base: Vec<Vec<f32>> = [0.0, 0.2, 0.4].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("vec_value_and_label", &base, "Keyed");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&root.join("_wal")), &root, None)
+            .unwrap();
+        let ids = |g: &Graphs| -> Vec<u64> {
+            vknn(g, &graph, &cache, &VQ, 3)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&graphs), vec![0, 1, 2]);
+
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Keyed {name:'d00'}) REMOVE n.embedding",
+        );
+        vwrite(&graphs, &graph, "MATCH (n:Keyed {name:'d00'}) REMOVE n:Doc");
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "gone via both channels, exactly once"
+        );
+
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the combined removal flushes");
+        assert_eq!(
+            ids(&graphs),
+            vec![1, 2],
+            "still gone once flushed — the two removals must not resurface each other"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Phase 4 slice 4.1: a births-only delta folds into an upper core segment (the
     /// O(delta) T2 flush), the base is preserved, and every born entity reads back from
     /// the segment (index seek, count, traversal) with an empty delta — surviving a reopen.
