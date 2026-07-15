@@ -51,7 +51,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 - **A drop-in for the graph** — speaks Bolt, so any standard neo4j driver (JS, Python, Go…) works unchanged. It's Cypher (plus a slice of ISO GQL, reads and writes); nothing new to learn.
 - **Live, durable writes** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE` over nodes and edges, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
-- **Vector search built in** — disk-native approximate-nearest-neighbour (cosine KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline.
+- **Vector search built in** — disk-native approximate-nearest-neighbour (cosine, L2, or dot KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline, and embeddings are writable in place — no offline rebuild to add or change a vector.
 - **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas.
 
 ## Features
@@ -68,7 +68,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 | **Rich Cypher query surface** | A broad read surface: `MATCH`/`WHERE`/`WITH`/`UNION`, `CALL {…}` subqueries, 70+ functions & aggregations, temporal & geospatial values, and regex. |
 | **Live, durable writes** | An opt-in single-writer LSM layer over the immutable core (`delta.enabled`): business-key `MERGE` / `SET` / `DELETE` / `CREATE` / `REMOVE` over nodes and relationships, batched write-`UNWIND` (one `fsync` per batch), and `CALL slater.consolidate()` — group-committed, `fsync`-durable, and folded back into a fresh core by consolidation. The read path is byte-identical when the delta is empty. |
 | **ISO GQL, read and write** | Speaks a subset of **ISO GQL** (ISO/IEC 39075) over the same Bolt connection — quantified paths, path restrictors, shortest-path selectors, label/type boolean expressions, `FOR`, `CAST`, an optional `GQL`/`CYPHER` dialect prefix — and, with the writable layer on, GQL's data-modifying statements (`INSERT` / `SET` / `REMOVE` / `[DETACH] DELETE`) lower onto the same durable write path. Cypher and GQL, reads and writes, in one engine. |
-| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. |
+| **Vectors + graph in one engine** | Disk-native ANN vector search (Vamana + PQ; cosine / L2 / dot) for embeddings/RAG, plus graph algorithms (PageRank, BFS, betweenness, WCC…) — bounded memory even with millions of vectors. Embeddings are **writable** (a FreshDiskANN-style write ladder): insert / update / delete a vector, KNN-visible at once, folded into the base without a rebuild. |
 | **Safe on network storage** | Every file is BLAKE3 content-hashed and verified on open; torn or half-copied images are refused, not served. Designed for NFS/remote volumes (no mmap surprises). |
 | **Pluggable storage backends** | Serve the same generation format from a local filesystem, an S3 (S3-compatible) bucket, **or** a Google Cloud Storage bucket — publish once, fan out to stateless replicas — with an optional local-SSD cache tier in front of the object store. See [Storage backends](#storage-backends-filesystem--s3--gcs). |
 
@@ -238,14 +238,15 @@ complicate.
   predicate falls back to a label sweep or full scan, with the executor re-checking
   every predicate either way.
 
-### Vector search (Vamana + PQ)
+### Vector search (Vamana + PQ) — cosine, L2 and dot, read *and* write
 
-Vector KNN (`db.idx.vector.queryNodes`) has two execution paths, chosen per index
-at build time by the `--ann-threshold` (default 50 000 vectors):
+Vector KNN (`db.idx.vector.queryNodes`) runs over **cosine, L2, or dot-product (MIPS)**
+indexes. The base index is built offline with two execution paths, chosen per index by
+the `--ann-threshold` (default 50 000 vectors):
 
 * **Below the threshold — brute force.** The full `f32` vectors live in
-  `vectors.f32.blk`; a query scans the index's group and computes exact cosine
-  distances. Simple and exact; fine when the vector set is small.
+  `vectors.f32.blk`; a query scans the index's group and computes the exact distance in
+  the index's metric. Simple and exact; fine when the vector set is small.
 * **At or above the threshold — Vamana + PQ**, the disk-native ANN path that keeps
   resident memory bounded regardless of how many vectors there are:
   * **[Vamana](https://arxiv.org/pdf/2401.11324)** is the graph index from the
@@ -264,6 +265,20 @@ at build time by the `--ann-threshold` (default 50 000 vectors):
     beam search scores candidates from RAM and only the chosen few full vectors are
     read from disk. That resident PQ set is what the `cache.vectorCacheBytes` pool
     pins.
+
+**Writable embeddings — the vector write ladder ([FreshDiskANN](https://arxiv.org/abs/2105.09613)-style).**
+An indexed embedding is a first-class writable value. `SET n.embedding = vecf32([…])` (and `REMOVE`) lands in the
+write delta and is **immediately KNN-visible with exact rank**, then survives a segment
+flush, a merge, and a consolidation. A query merges up to three levels — the sealed base
+index, a sealed per-segment index, and an in-memory **RW-index** (a live mutable Vamana
+over the write delta) — so latency stays flat as writes accumulate rather than growing
+with the count of pending writes. A delete leaves a *hole*: the node stops being returned
+but stays a navigational waypoint until a background **delete-consolidation** splices it
+out of the graph, so deletes stop costing query IO. And because the on-disk graph
+addresses its neighbours by layout position rather than node id, `CALL slater.consolidate()`
+carries the Vamana **by reference** — hard-linked, byte-identical — and rewrites only a
+small id column, folding vector writes into the base **without** the O(N·R·L) graph
+rebuild. Measured numbers, with caveats, are in the [performance report](docs/PERF-REPORT.md).
 
 ## Storage backends (filesystem / S3 / GCS)
 
@@ -930,6 +945,32 @@ ANN threshold) where the others use an approximate resident HNSW — so slater's
 exact (recall 1.0). A SIMD distance kernel + a resident, pre-normalised vector matrix
 took Concept from ~23 → ~2.9 ms and Chunk from ~10 → ~2.4 ms, so slater now beats
 Neo4j and LadybugDB and is within ~1.4× of Memgraph, trailing only FalkorDB — while exact.
+
+### Vector write ladder — insert / update / delete without a rebuild
+
+The tables above are cross-engine *read* comparisons. The vector **write** path (the
+[FreshDiskANN](https://arxiv.org/abs/2105.09613)-style write ladder over the static Vamana
+base) has no cross-engine counterpart — no other engine here does disk-native, *writable*
+ANN — so the numbers below are single-engine **component** benchmarks over a synthetic,
+embedding-like fixture (a low-rank manifold, dim 768, unequal norms), committed under
+[`crates/slater/benches/`](crates/slater/benches) and written up in full — with the
+methodology and every caveat — in [`docs/PERF-REPORT.md`](docs/PERF-REPORT.md). Recall is
+always measured against an **exact brute force over the live set**, never one index against
+another. Scale here is representative and extrapolated only where the metric is size-linear.
+
+| property | measured | why it matters |
+|---|---|---|
+| **KNN latency vs pending writes** | RW-index **~1.5–2 ms, flat** to 50k pending; the pre-index brute-forced overlay **1.9 → 115 ms** (linear in delta) — **61× at 50k** | query latency does **not** degrade as writes pile up between consolidations |
+| **Embedding insert** | **~1.5–2 ms** per vector into the live index | a write is KNN-visible at once; the delta-rebuild budget is ≈ 2 ms × the delta cap |
+| **Delete IO at iso-recall** | **2.9× fewer** node-fetches per query at 67 % deleted, **5.2×** at 80 % (recall ≥ 0.90) | a consolidated graph pays no read tax for deleted vectors |
+| **Consolidation, pure permutation** | **O(1)** — the `.vamana` is hard-linked byte-identical, only the id column is rewritten | folding vector writes into the base skips the O(N·R·L) rebuild |
+| **Recall across the ladder** | consolidated ≥ base for cosine, L2 and dot | the write ladder **preserves** recall at every rung |
+
+The one figure that wants the dedicated perf box is the *slow-path* consolidation rewrite
+throughput — when a consolidation carries deletes or new vectors rather than a pure
+permutation, it is a sequential recompress bound by single-thread zstd and local disk, so
+the absolute MiB/s is environment-specific (the report shows the shape and explains the
+environmental range).
 
 ### Latency (median ms) — graph ≫ RAM (Wikidata 91.6M / 1.5B)
 
