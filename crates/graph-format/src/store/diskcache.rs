@@ -1271,6 +1271,88 @@ mod tests {
         drop(unpark);
     }
 
+    /// The charge reconciles to exactly zero once the writer drains, across a mix
+    /// of admitted and shed puts at varied sizes — and the queue still admits
+    /// afterwards.
+    ///
+    /// This is the test for the `Drop`-guard accounting. A charge released by an
+    /// explicit decrement instead would leak on the shed path, and a leaked charge
+    /// is worse than a leaked byte: it permanently shrinks the admission window,
+    /// and enough of them wedge the queue shut for the life of the process —
+    /// silently disabling the disk cache rather than crashing. Nothing else here
+    /// would notice that, because a wedged queue looks exactly like a working one
+    /// that is simply always full.
+    #[test]
+    fn queue_charge_reconciles_to_zero_after_drain() {
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, 1 << 20).unwrap();
+        // Mix of admitted and shed puts, varied sizes, then drain.
+        for i in 0..500u64 {
+            let len = if i % 3 == 0 { 4 << 10 } else { 64 << 10 };
+            cache.put_async("g/u/f.blk", i * (1 << 20), &vec![5u8; len]);
+        }
+        cache.flush();
+        assert_eq!(
+            cache.queued_bytes(),
+            0,
+            "every charge must be released once the queue drains"
+        );
+
+        // ...and the window really did reopen, rather than the counter merely
+        // reading zero on a queue that no longer admits anything.
+        cache.put_async("g/u/f.blk", 999 << 20, &vec![5u8; 4 << 10]);
+        cache.flush();
+        assert_eq!(cache.queued_bytes(), 0, "queue wedged after drain");
+        assert!(
+            dir_bytes(dir.path()) > 0,
+            "the post-drain put must have landed on disk"
+        );
+    }
+
+    /// When the *count* bound binds before the byte budget, the charge taken by a
+    /// put whose `try_send` then bounces must still be released.
+    ///
+    /// This path is reachable in production, not a contrivance: the byte budget
+    /// admits `budget / block_size` messages, so at a small block size it admits
+    /// more than `WRITE_QUEUE_DEPTH` (8 MiB of 4 KiB blocks = 2048 > 1024) and the
+    /// count bound is what rejects the message — *after* `put_async` has already
+    /// charged for it. If that charge were released by an explicit decrement on
+    /// the success path rather than by the payload's `Drop`, it would leak on
+    /// exactly this path and the counter would run away from reality while the
+    /// queue held a constant 1024 messages.
+    #[test]
+    fn charge_is_released_when_the_count_bound_bounces_a_put() {
+        const PAYLOAD: usize = 4 << 10;
+        // Deliberately far above what the channel can hold (1024 x 4 KiB = 4 MiB),
+        // so the count bound — not the byte budget — is what rejects.
+        let budget: u64 = 64 << 20;
+
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, budget).unwrap();
+        let unpark = park_writer(&cache);
+
+        let bytes = vec![3u8; PAYLOAD];
+        for i in 0..4000u64 {
+            cache.put_async("g/u/f.blk", i * PAYLOAD as u64, &bytes);
+        }
+
+        // The queue physically cannot hold more than WRITE_QUEUE_DEPTH messages,
+        // so the counter must not claim more than that many payloads' worth. A
+        // leak on the bounce path would show up here as the counter climbing
+        // toward the full 16 MiB of puts offered.
+        let ceiling = (WRITE_QUEUE_DEPTH as u64 + 1) * PAYLOAD as u64;
+        assert!(
+            cache.queued_bytes() <= ceiling,
+            "charge leaked on the try_send bounce path: {} queued, but the channel \
+             holds at most {WRITE_QUEUE_DEPTH} x {PAYLOAD}B = {ceiling}",
+            cache.queued_bytes(),
+        );
+
+        drop(unpark);
+        cache.flush();
+        assert_eq!(cache.queued_bytes(), 0, "charge leaked after drain");
+    }
+
     /// Minimal self-cleaning temp directory (no external dev-dep): a unique dir
     /// under the system temp root, removed on drop. The unique suffix is derived
     /// from a process-wide counter + the thread id (no wall clock / RNG, which the
