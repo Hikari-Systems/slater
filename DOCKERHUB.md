@@ -371,6 +371,12 @@ cache file with a checksum verified on every read.
 > **Must be a real writable volume, never `tmpfs`.** tmpfs is RAM and would break
 > the bounded-memory guarantee. Size the cache **≫ `blockCacheBytes`**.
 
+Its RAM cost is only the index that tracks the cached blocks plus the
+write-behind queue, which is bounded at `blockCacheBytes / 8` (8 MiB by default)
+and sheds under pressure instead of growing. Both count against the RSS ceiling;
+neither needs configuring — enabling the disk tier does not change how you size
+the container.
+
 Add to the S3 `docker run` above: a writable cache volume and the two flags —
 
 ```bash

@@ -37,6 +37,13 @@
 //! disk I/O and the channel sheds under pressure (a dropped write just re-fetches
 //! later) rather than stalling queries.
 //!
+//! The queue is bounded in **bytes**, not messages ([`write_behind_budget`]). The
+//! producer is a concurrent read-ahead batch and the consumer is one thread doing
+//! an fsync per block, so the queue sits at its bound for the whole of any cold
+//! scan — which makes that bound a permanent RSS term, and a message count is not
+//! a statement about memory. This tier's whole RAM cost is therefore the LRU index
+//! plus this queue, both of which count against the configured ceiling.
+//!
 //! ## Self-heal
 //!
 //! Each cache file carries a CRC-32 of its payload, verified on every read; a
@@ -49,6 +56,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -62,11 +70,59 @@ use super::{ObjectStore, RandomReadAt};
 const MAGIC: &[u8; 4] = b"SDC1";
 const VERSION: u8 = 1;
 
-/// Bound on the write-behind channel. Past this many queued writes the query
-/// thread drops the write (the block is simply re-fetched on its next miss)
-/// rather than blocking on disk — the channel is a relief valve, not a queue we
-/// guarantee to drain.
+/// Secondary bound on the write-behind channel, in **messages**. The real bound
+/// is the byte budget (see [`write_behind_budget`] and [`DiskCache::put_async`]);
+/// this only backstops the message kinds the byte budget does not charge —
+/// `Delete`/`Flush` carry no payload, so a self-heal delete storm would otherwise
+/// queue unbounded. It is deliberately far looser than the byte budget, which at
+/// any realistic block size admits tens of writes, not a thousand.
 const WRITE_QUEUE_DEPTH: usize = 1024;
+
+/// RAM budget for the write-behind queue: the cap on **bytes** of block payload
+/// queued but not yet written. Derived, never a standalone default —
+/// `block_cache_bytes / 8`, floored by `disk_cache_bytes`.
+///
+/// Why anchor to the *block cache*: the queue is a staging copy of the very
+/// blocks that pool budgets, it is the only other RAM this tier holds, and it is
+/// already counted in the documented RSS envelope — so the queue scales with the
+/// operator's declared appetite for block RAM instead of being a second number
+/// they must discover. At the 64 MiB default that is 8 MiB: ~12% on top of an
+/// already-accounted pool, a rounding error against the envelope, against the
+/// ~256 MB (1024 × 256 KiB) a count-bounded queue could hold.
+///
+/// Why also floor by the *disk* budget: queueing more bytes than the disk tier
+/// can hold is pointless work — those blocks would evict each other on landing.
+/// Binds only when `diskCacheBytes` is set very small.
+///
+/// This bounds payload bytes, not total queue footprint: the writer additionally
+/// holds one dequeued payload plus its `encode` copy, and each message carries its
+/// key and name. Those are a per-message constant against a 256 KiB payload, not a
+/// term worth modelling.
+pub fn write_behind_budget(block_cache_bytes: u64, disk_cache_bytes: u64) -> u64 {
+    (block_cache_bytes / 8).min(disk_cache_bytes)
+}
+
+/// A block payload queued for the writer, charged against the queue's byte budget
+/// for exactly as long as it is alive.
+///
+/// The charge is released in `Drop`, never by an explicit decrement at the point
+/// of use. That is what makes the accounting self-reconciling on *every* path the
+/// payload can leave the queue by: the writer wrote it, `try_send` bounced it back
+/// to the producer, the writer panicked holding it, or the receiver was dropped at
+/// shutdown with messages still queued. A leaked charge is not a leaked byte — it
+/// would permanently shrink the admission window, and enough of them would wedge
+/// the queue shut for the life of the process.
+struct QueuedPayload {
+    bytes: Vec<u8>,
+    queued_bytes: Arc<AtomicU64>,
+}
+
+impl Drop for QueuedPayload {
+    fn drop(&mut self) {
+        self.queued_bytes
+            .fetch_sub(self.bytes.len() as u64, Ordering::AcqRel);
+    }
+}
 
 /// A request to the background writer thread.
 enum Req {
@@ -75,7 +131,7 @@ enum Req {
         name: String,
         key: String,
         offset: u64,
-        payload: Vec<u8>,
+        payload: QueuedPayload,
     },
     /// Delete a cache file whose entry the reader already removed from the index
     /// after a CRC/parse failure (self-heal).
@@ -158,14 +214,24 @@ pub struct DiskCache {
     index: Arc<Mutex<Lru>>,
     writer_tx: SyncSender<Req>,
     writer: Mutex<Option<JoinHandle<()>>>,
+    /// Bytes of block payload currently queued for the writer, and the cap they
+    /// are admitted against. See [`DiskCache::put_async`].
+    queued_bytes: Arc<AtomicU64>,
+    queue_budget_bytes: u64,
 }
 
 impl DiskCache {
-    /// Open (creating `dir` if needed) a disk cache bounded to `budget_bytes` and
-    /// spawn its background writer thread.
+    /// Open (creating `dir` if needed) a disk cache bounded to `budget_bytes` on
+    /// disk and `queue_budget_bytes` in RAM, and spawn its background writer
+    /// thread.
     ///
     /// `dir` must be a **real writable volume — never tmpfs**, which is RAM and
     /// would defeat the bounded-RSS guarantee.
+    ///
+    /// `queue_budget_bytes` caps the write-behind queue — the one unbounded RAM
+    /// cost this tier used to have. Callers derive it with [`write_behind_budget`]
+    /// rather than picking a number; it is a parameter, not an internal default,
+    /// so that a caller cannot acquire the queue's RAM without naming its budget.
     ///
     /// Cache files already present in `dir` (e.g. from a previous run) are
     /// **adopted** into the index by [`adopt_existing`] before the writer starts:
@@ -173,13 +239,18 @@ impl DiskCache {
     /// evictable. They cannot be left unindexed — nothing else would ever reclaim
     /// them, since a new generation mints new file names (see [`cache_name`]) and
     /// the writer only unlinks names the index gave it.
-    pub fn open(dir: impl AsRef<Path>, budget_bytes: u64) -> Result<Arc<Self>> {
+    pub fn open(
+        dir: impl AsRef<Path>,
+        budget_bytes: u64,
+        queue_budget_bytes: u64,
+    ) -> Result<Arc<Self>> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)
             .with_context(|| format!("create disk-cache dir {}", dir.display()))?;
         // Seed the index *before* spawning the writer, so adoption cannot race a
         // Write/Delete (the channel does not exist yet).
         let index = Arc::new(Mutex::new(adopt_existing(&dir, budget_bytes)));
+        let queued_bytes = Arc::new(AtomicU64::new(0));
         let (writer_tx, writer_rx) = sync_channel::<Req>(WRITE_QUEUE_DEPTH);
         let writer = {
             let dir = dir.clone();
@@ -194,6 +265,8 @@ impl DiskCache {
             index,
             writer_tx,
             writer: Mutex::new(Some(writer)),
+            queued_bytes,
+            queue_budget_bytes,
         }))
     }
 
@@ -226,20 +299,58 @@ impl DiskCache {
     }
 
     /// Enqueue `bytes` to be written into the cache for `(key, offset)`. Never
-    /// blocks: if the write-behind channel is full the write is dropped (the block
-    /// re-fetches on its next miss). A key too long for the file header is also
-    /// silently skipped (object keys are short generation paths in practice).
+    /// blocks: the write is **shed** (dropped — the block re-fetches on its next
+    /// miss) if it does not fit the queue's byte budget, or if the channel is full.
+    /// A key too long for the file header is also silently skipped (object keys are
+    /// short generation paths in practice).
+    ///
+    /// Admission is byte-based, because message count says nothing about memory:
+    /// the producer is a concurrent read-ahead batch (see
+    /// [`CachingRandomReadAt::read_ranges`]) and the consumer is one thread doing
+    /// an fsync per block, so on any cold scan the queue sits *at* whatever bound
+    /// it has. A count bound of 1024 therefore parks 1024 × up-to-256 KiB ≈ 256 MB
+    /// of payload — an order of magnitude over the whole documented RSS envelope,
+    /// charged against no budget at all.
+    ///
+    /// The check-and-charge is a single CAS (`fetch_update`), so concurrent
+    /// producers cannot both observe room and both take it. A payload larger than
+    /// the entire budget is admitted when the queue is *empty*, so an
+    /// over-sized block is never permanently shut out — that keeps the bound at
+    /// `budget + one payload` without inventing a minimum-size floor.
     pub fn put_async(&self, key: &str, offset: u64, bytes: &[u8]) {
         if key.len() > u16::MAX as usize {
             return;
         }
-        let name = cache_name(key, offset, bytes.len() as u64);
+        let len = bytes.len() as u64;
+        if self
+            .queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                (q == 0 || q + len <= self.queue_budget_bytes).then_some(q + len)
+            })
+            .is_err()
+        {
+            return; // Shed: over budget. The cache is advisory; a miss refetches.
+        }
+        // The charge is now live and owned by the payload — every path out of
+        // here, including a `try_send` that bounces the message straight back,
+        // drops it and releases the charge.
+        let payload = QueuedPayload {
+            bytes: bytes.to_vec(),
+            queued_bytes: self.queued_bytes.clone(),
+        };
+        let name = cache_name(key, offset, len);
         let _ = self.writer_tx.try_send(Req::Write {
             name,
             key: key.to_string(),
             offset,
-            payload: bytes.to_vec(),
+            payload,
         });
+    }
+
+    /// Bytes of block payload currently queued for the writer (test/observability
+    /// hook for the budget above).
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued_bytes.load(Ordering::Acquire)
     }
 
     /// Drain the write-behind queue up to this call and wait for the writer to
@@ -487,7 +598,7 @@ fn writer_loop(dir: PathBuf, budget_bytes: u64, index: Arc<Mutex<Lru>>, rx: Rece
                 offset,
                 payload,
             } => {
-                let encoded = encode(&key, offset, &payload);
+                let encoded = encode(&key, offset, &payload.bytes);
                 tmp_seq += 1;
                 match write_file(&dir, &name, &encoded, tmp_seq) {
                     Ok(()) => {
@@ -657,10 +768,31 @@ mod tests {
     use crate::store::mem::MemObjectStore;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Write-behind budget for tests that are not about the budget: comfortably
+    /// above anything they queue (they `put_async` + `flush` a block at a time),
+    /// so shedding never perturbs what they actually assert.
+    const TEST_QUEUE_BUDGET: u64 = 64 << 20;
+
+    /// Park the writer thread indefinitely, and return the handle that unparks it
+    /// on drop.
+    ///
+    /// No production hook needed: the writer answers `Req::Flush(ack)` with
+    /// `ack.send(())`, so an ack channel of capacity **0** (a rendezvous) blocks it
+    /// until someone receives — and nobody does. Channel FIFO is what makes this
+    /// airtight rather than timing-dependent: the `Flush` is queued before any
+    /// `Write` under test, so the writer provably cannot consume a `Write` while
+    /// parked here. No sleeps, no polling.
+    #[must_use]
+    fn park_writer(cache: &DiskCache) -> Receiver<()> {
+        let (ack, unpark) = sync_channel::<()>(0);
+        cache.writer_tx.send(Req::Flush(ack)).unwrap();
+        unpark
+    }
+
     /// Build a cache in a fresh temp dir; returns (cache, dir-guard).
     fn temp_cache(budget: u64) -> (Arc<DiskCache>, tempdir::Guard) {
         let dir = tempdir::Guard::new();
-        let cache = DiskCache::open(dir.path(), budget).unwrap();
+        let cache = DiskCache::open(dir.path(), budget, TEST_QUEUE_BUDGET).unwrap();
         (cache, dir)
     }
 
@@ -790,7 +922,7 @@ mod tests {
 
         // Run 1 warms the cache to its budget, then the process exits.
         {
-            let cache = DiskCache::open(dir.path(), budget).unwrap();
+            let cache = DiskCache::open(dir.path(), budget, TEST_QUEUE_BUDGET).unwrap();
             for i in 0..4 {
                 cache.put_async(gen1, (i * block) as u64, &vec![1u8; block]);
                 cache.flush();
@@ -806,7 +938,7 @@ mod tests {
         // Run 2: same volume, new generation. Run 1's files must be adopted and
         // evicted to make room, not stranded alongside run 2's.
         {
-            let cache = DiskCache::open(dir.path(), budget).unwrap();
+            let cache = DiskCache::open(dir.path(), budget, TEST_QUEUE_BUDGET).unwrap();
             for i in 0..4 {
                 cache.put_async(gen2, (i * block) as u64, &vec![2u8; block]);
                 cache.flush();
@@ -827,11 +959,11 @@ mod tests {
         let key = "g/u/f.blk";
         let bytes = vec![9u8; 1024];
         {
-            let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+            let cache = DiskCache::open(dir.path(), 1 << 20, TEST_QUEUE_BUDGET).unwrap();
             cache.put_async(key, 0, &bytes);
             cache.flush();
         }
-        let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+        let cache = DiskCache::open(dir.path(), 1 << 20, TEST_QUEUE_BUDGET).unwrap();
         assert_eq!(
             cache.get(key, 0, bytes.len() as u64).as_deref(),
             Some(&bytes[..]),
@@ -856,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(&shard).unwrap();
         std::fs::write(shard.join("README"), b"hello").unwrap();
 
-        drop(DiskCache::open(dir.path(), 0).unwrap());
+        drop(DiskCache::open(dir.path(), 0, TEST_QUEUE_BUDGET).unwrap());
 
         assert_eq!(std::fs::read(&loose).unwrap(), b"important");
         assert_eq!(std::fs::read(other.join("thing.bin")).unwrap(), b"payload");
@@ -875,7 +1007,7 @@ mod tests {
         let tmp = shard.join(format!("{name}.tmp7"));
         std::fs::write(&tmp, b"half-written").unwrap();
 
-        drop(DiskCache::open(dir.path(), 1 << 20).unwrap());
+        drop(DiskCache::open(dir.path(), 1 << 20, TEST_QUEUE_BUDGET).unwrap());
 
         assert!(!tmp.exists(), "orphaned temp file reclaimed on open");
     }
@@ -891,7 +1023,7 @@ mod tests {
         let entry = block + 23 + key.len();
         let dir = tempdir::Guard::new();
         {
-            let cache = DiskCache::open(dir.path(), (entry * 4) as u64).unwrap();
+            let cache = DiskCache::open(dir.path(), (entry * 4) as u64, TEST_QUEUE_BUDGET).unwrap();
             for i in 0..4 {
                 cache.put_async(key, (i * block) as u64, &vec![3u8; block]);
                 cache.flush();
@@ -903,7 +1035,7 @@ mod tests {
             "starts over the new budget"
         );
 
-        let cache = DiskCache::open(dir.path(), smaller).unwrap();
+        let cache = DiskCache::open(dir.path(), smaller, TEST_QUEUE_BUDGET).unwrap();
         let after = dir_bytes(dir.path());
         assert!(
             after <= smaller,
@@ -952,7 +1084,7 @@ mod tests {
     #[test]
     fn second_read_served_from_disk_not_inner() {
         let dir = tempdir::Guard::new();
-        let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+        let cache = DiskCache::open(dir.path(), 1 << 20, TEST_QUEUE_BUDGET).unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
         let mem = MemObjectStore::new();
         let key = "g/u/topology.csr.blk";
@@ -989,7 +1121,7 @@ mod tests {
     #[test]
     fn read_ranges_mixes_hits_and_misses() {
         let dir = tempdir::Guard::new();
-        let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+        let cache = DiskCache::open(dir.path(), 1 << 20, TEST_QUEUE_BUDGET).unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
         let mem = MemObjectStore::new();
         let key = "g/u/f.blk";
@@ -1024,6 +1156,201 @@ mod tests {
             2,
             "only the two misses hit the inner store"
         );
+    }
+
+    /// The queue's bound is on **bytes**, and holds at *any* payload size.
+    ///
+    /// Varying the payload size is the entire point of this test, not a
+    /// thoroughness flourish: the bug being fixed was a bound on message *count*,
+    /// and a count bound satisfies any assertion that only varies how many
+    /// messages are queued. Pinning one size would let `WRITE_QUEUE_DEPTH` alone
+    /// pass. 4 KiB and 256 KiB (the default sealed block size) differ 64×, so a
+    /// count bound cannot satisfy both against one byte cap.
+    #[test]
+    fn write_behind_queue_is_byte_bounded() {
+        const CAP: u64 = 1 << 20;
+
+        for payload_len in [4usize << 10, 256usize << 10] {
+            let dir = tempdir::Guard::new();
+            // Disk budget deliberately huge: this test bounds RAM, and an
+            // eviction-driven disk budget must not be what limits the queue.
+            let cache = DiskCache::open(dir.path(), 1 << 30, CAP).unwrap();
+            let unpark = park_writer(&cache);
+
+            let bytes = vec![7u8; payload_len];
+            // Far more than the cap admits at either size, and — the pre-fix
+            // failure mode — under WRITE_QUEUE_DEPTH, so the count bound is not
+            // what stops us. Pre-fix these queue 4 MB / 250 MB respectively.
+            for i in 0..1000u64 {
+                cache.put_async("g/u/f.blk", i * payload_len as u64, &bytes);
+                assert!(
+                    cache.queued_bytes() <= CAP + payload_len as u64,
+                    "queue over budget at {payload_len}B payloads after {i} puts: \
+                     {} queued > cap {CAP} + one payload",
+                    cache.queued_bytes(),
+                );
+            }
+
+            // The shed is not a no-op that happens to keep the counter down: the
+            // queue really is holding ~a capful, i.e. we admitted until full and
+            // then stopped, rather than never admitting at all.
+            assert!(
+                cache.queued_bytes() > CAP - payload_len as u64,
+                "queue should be full, not empty, at {payload_len}B payloads: {} queued",
+                cache.queued_bytes(),
+            );
+
+            // Unpark *before* the cache drops: `Drop` sends `Shutdown` and joins
+            // the writer, which would hang forever against a parked writer.
+            drop(unpark);
+        }
+    }
+
+    /// A payload bigger than the whole budget is still admitted into an empty
+    /// queue, so an oversized block is never permanently shut out (which is what
+    /// a bare `q + len <= cap` test would do). This is why the bound is
+    /// `cap + one payload` and not `cap` — stated here rather than left as a
+    /// surprise for whoever tightens the assertion above.
+    #[test]
+    fn oversized_payload_admitted_when_queue_empty() {
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, 1024).unwrap();
+        let unpark = park_writer(&cache);
+
+        let big = vec![1u8; 64 << 10];
+        cache.put_async("g/u/f.blk", 0, &big);
+        assert_eq!(
+            cache.queued_bytes(),
+            big.len() as u64,
+            "an over-cap payload must be admitted into an empty queue"
+        );
+
+        // ...but only into an *empty* one: the next put finds it non-empty and
+        // over budget, and sheds.
+        cache.put_async("g/u/f.blk", 1 << 20, &big);
+        assert_eq!(
+            cache.queued_bytes(),
+            big.len() as u64,
+            "a second over-cap payload must shed, not stack"
+        );
+
+        drop(unpark);
+    }
+
+    /// Concurrent producers cannot both observe room and both take it. The real
+    /// producer is a concurrent read-ahead batch, so a read-then-write admission
+    /// (rather than the CAS this asserts) would overshoot by up to one payload
+    /// per racing thread — unbounded in the thread count, which is exactly the
+    /// property the bound exists to deny.
+    #[test]
+    fn byte_budget_holds_under_concurrent_producers() {
+        const CAP: u64 = 256 << 10;
+        const PAYLOAD: usize = 32 << 10;
+
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, CAP).unwrap();
+        let unpark = park_writer(&cache);
+
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let cache = &cache;
+                s.spawn(move || {
+                    let bytes = vec![t as u8; PAYLOAD];
+                    for i in 0..100u64 {
+                        cache.put_async("g/u/f.blk", t * 1000 + i, &bytes);
+                        assert!(
+                            cache.queued_bytes() <= CAP + PAYLOAD as u64,
+                            "queue over budget under concurrent producers: {} queued",
+                            cache.queued_bytes(),
+                        );
+                    }
+                });
+            }
+        });
+
+        drop(unpark);
+    }
+
+    /// The charge reconciles to exactly zero once the writer drains, across a mix
+    /// of admitted and shed puts at varied sizes — and the queue still admits
+    /// afterwards.
+    ///
+    /// This is the test for the `Drop`-guard accounting. A charge released by an
+    /// explicit decrement instead would leak on the shed path, and a leaked charge
+    /// is worse than a leaked byte: it permanently shrinks the admission window,
+    /// and enough of them wedge the queue shut for the life of the process —
+    /// silently disabling the disk cache rather than crashing. Nothing else here
+    /// would notice that, because a wedged queue looks exactly like a working one
+    /// that is simply always full.
+    #[test]
+    fn queue_charge_reconciles_to_zero_after_drain() {
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, 1 << 20).unwrap();
+        // Mix of admitted and shed puts, varied sizes, then drain.
+        for i in 0..500u64 {
+            let len = if i % 3 == 0 { 4 << 10 } else { 64 << 10 };
+            cache.put_async("g/u/f.blk", i * (1 << 20), &vec![5u8; len]);
+        }
+        cache.flush();
+        assert_eq!(
+            cache.queued_bytes(),
+            0,
+            "every charge must be released once the queue drains"
+        );
+
+        // ...and the window really did reopen, rather than the counter merely
+        // reading zero on a queue that no longer admits anything.
+        cache.put_async("g/u/f.blk", 999 << 20, &vec![5u8; 4 << 10]);
+        cache.flush();
+        assert_eq!(cache.queued_bytes(), 0, "queue wedged after drain");
+        assert!(
+            dir_bytes(dir.path()) > 0,
+            "the post-drain put must have landed on disk"
+        );
+    }
+
+    /// When the *count* bound binds before the byte budget, the charge taken by a
+    /// put whose `try_send` then bounces must still be released.
+    ///
+    /// This path is reachable in production, not a contrivance: the byte budget
+    /// admits `budget / block_size` messages, so at a small block size it admits
+    /// more than `WRITE_QUEUE_DEPTH` (8 MiB of 4 KiB blocks = 2048 > 1024) and the
+    /// count bound is what rejects the message — *after* `put_async` has already
+    /// charged for it. If that charge were released by an explicit decrement on
+    /// the success path rather than by the payload's `Drop`, it would leak on
+    /// exactly this path and the counter would run away from reality while the
+    /// queue held a constant 1024 messages.
+    #[test]
+    fn charge_is_released_when_the_count_bound_bounces_a_put() {
+        const PAYLOAD: usize = 4 << 10;
+        // Deliberately far above what the channel can hold (1024 x 4 KiB = 4 MiB),
+        // so the count bound — not the byte budget — is what rejects.
+        let budget: u64 = 64 << 20;
+
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, budget).unwrap();
+        let unpark = park_writer(&cache);
+
+        let bytes = vec![3u8; PAYLOAD];
+        for i in 0..4000u64 {
+            cache.put_async("g/u/f.blk", i * PAYLOAD as u64, &bytes);
+        }
+
+        // The queue physically cannot hold more than WRITE_QUEUE_DEPTH messages,
+        // so the counter must not claim more than that many payloads' worth. A
+        // leak on the bounce path would show up here as the counter climbing
+        // toward the full 16 MiB of puts offered.
+        let ceiling = (WRITE_QUEUE_DEPTH as u64 + 1) * PAYLOAD as u64;
+        assert!(
+            cache.queued_bytes() <= ceiling,
+            "charge leaked on the try_send bounce path: {} queued, but the channel \
+             holds at most {WRITE_QUEUE_DEPTH} x {PAYLOAD}B = {ceiling}",
+            cache.queued_bytes(),
+        );
+
+        drop(unpark);
+        cache.flush();
+        assert_eq!(cache.queued_bytes(), 0, "charge leaked after drain");
     }
 
     /// Minimal self-cleaning temp directory (no external dev-dep): a unique dir

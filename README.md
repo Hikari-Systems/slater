@@ -415,6 +415,12 @@ enabled by setting `dataBackend.<s3|gcs>.diskCacheBytes > 0` and a writable
   is RAM and would defeat the bounded-RSS guarantee). The in-memory index that
   tracks it costs a little RAM (~tens of bytes per cached block), which counts
   against your RSS ceiling — size the directory ≫ the in-memory block cache.
+* The tier's other RAM cost is the **write-behind queue**, which stages blocks on
+  their way to disk. It is bounded at `blockCacheBytes / 8` (floored by
+  `diskCacheBytes`) — 8 MiB at the default — and sheds rather than grows, so a
+  cold scan cannot inflate it; a shed block simply refetches on its next miss.
+  It needs no configuration: it scales with `blockCacheBytes`, so the disk tier
+  adds no new number to the RSS budget beyond its index.
 
 ## Mounts
 
@@ -462,7 +468,7 @@ overrides (double underscore for nesting; keys match the camelCase config).
 | `dataBackend.s3.awsAccessKey` | `dataBackend__s3__awsAccessKey` | _(empty)_ | **Preferred** way to supply the S3 access key id. Empty ⇒ fall back to the standard AWS credential chain (`AWS_ACCESS_KEY_ID` env, shared profile, or instance role). |
 | `dataBackend.s3.awsSecretKey` | `dataBackend__s3__awsSecretKey` | _(empty)_ | **Preferred** way to supply the S3 secret access key, paired with `awsAccessKey`. Empty ⇒ AWS chain. |
 | `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional session token for temporary (STS) credentials; only used when `awsAccessKey`/`awsSecretKey` are set. |
-| `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index counts against the RSS ceiling. |
+| `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index and the write-behind queue (bounded at `blockCacheBytes / 8`) count against the RSS ceiling. |
 | `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Directory for the disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
 | `dataBackend.gcs.bucket` | `dataBackend__gcs__bucket` | _(empty)_ | GCS bucket name (required when `kind=gcs`). |
 | `dataBackend.gcs.prefix` | `dataBackend__gcs__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
