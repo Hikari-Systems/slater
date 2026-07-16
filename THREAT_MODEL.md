@@ -63,8 +63,10 @@ in place.
   user's resolved grant, into the next user's session. Independently: `PULL` serves rows only to
   an authenticated session, and **every** `RUN` re-checks `can_read` against the live ACL for the
   currently-authenticated user, including inside an explicit transaction. A `BEGIN`-time
-  authorisation is therefore never load-bearing for a later statement, which is what makes an ACL
-  revocation take effect **mid-transaction** rather than only at the transaction's end.
+  authorisation is therefore never load-bearing for a later statement: once a reload is adopted
+  (which the stamp rule above governs — the ACL refreshes at `LOGON` and at generation swap, not
+  on an arbitrary file edit), a withdrawn grant stops serving reads on the **next statement**,
+  including inside a transaction opened while the grant still stood.
 
 ## New protections
 
