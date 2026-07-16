@@ -14201,6 +14201,195 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Read `n.embedding` for a `:Doc` fixture node through the *column* path (D12 applies:
+    /// an in-scope node's embedding reads back `Null`, an out-of-scope node's reads verbatim).
+    /// `None` is `Null`.
+    fn vread_embedding(
+        graphs: &Graphs,
+        graph: &str,
+        cache: &BlockCache,
+        name: &str,
+    ) -> Option<Vec<f32>> {
+        let gen = graphs.get(graph).unwrap();
+        let snap = DeltaSnapshot::from_memtable(graphs.writer(graph).unwrap().snapshot());
+        let view = MergedView::new(gen.as_ref(), snap);
+        let ast = parser::parse(&format!(
+            "MATCH (n:Key {{name:'{name}'}}) RETURN n.embedding AS e"
+        ))
+        .unwrap();
+        let res = Engine::new(&view, cache).run(&ast).unwrap();
+        assert_eq!(res.rows.len(), 1, "the fixture node must still exist");
+        match &res.rows[0][0] {
+            Val::Null => None,
+            Val::Vector(v) => Some(v.clone()),
+            other => panic!("unexpected n.embedding {other:?}"),
+        }
+    }
+
+    /// **HIK-122.** A label removal is *conditional* suppression, not a delete: HIK-118 makes
+    /// the KNN path promise that a later `SET n:Doc` puts the node back in scope and re-scores
+    /// its vector. A consolidation running while the node is out of scope must keep that
+    /// promise. It used not to — and only a consolidation could show it, so the loss was
+    /// timing-dependent.
+    ///
+    /// The exact review repro: re-embed → `REMOVE n:Doc` → **consolidate** → `SET n:Doc`.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        // d00 starts far from the query (0.9); the write below moves it to an exact match (0.0),
+        // so a stale base vector could never be mistaken for the carried one.
+        let base: Vec<Vec<f32>> = [0.9, 0.3, 0.55].iter().map(|d| at_distance(*d)).collect();
+        // The business key rides a *second* label, so the node can leave the vector index's
+        // scope (`:Doc`) and still be addressable by a write (`:Key`).
+        let (root, graph) = testgen::write_vector_docs_keyed("hik122_consolidate", &base, "Key");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        let v1 = at_distance(0.0);
+
+        // 1. Re-embed d00, flushed into its own segment (sidecar `ids=[0]`). Anchored on the
+        //    business-key label, which is where the `name` range index lives.
+        let mut params = HashMap::new();
+        params.insert(
+            "v".to_string(),
+            Val::List(v1.iter().map(|x| Val::Float(*x as f64)).collect()),
+        );
+        vwrite_params(
+            &graphs,
+            &graph,
+            "MATCH (n:Key {name:'d00'}) SET n.embedding = vecf32($v)",
+            &params,
+        );
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the re-embed flushes into a segment");
+
+        // 2. Take d00 out of the index's scope, flushed into a second segment (sidecar
+        //    `label_removals=[0]`).
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the label removal flushes into a segment");
+        assert!(
+            !vknn(&graphs, &graph, &cache, &VQ, 3)
+                .iter()
+                .any(|(id, _)| *id == 0),
+            "out of scope: d00 must not be returned by KNN while it lacks :Doc"
+        );
+
+        // 3. A background consolidation, run while d00 is out of scope.
+        graphs
+            .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+        assert_eq!(
+            graphs.get(&graph).unwrap().manifest().vector_indexes.len(),
+            1,
+            "the vector index must survive the consolidation"
+        );
+        // Out of scope, the embedding is a plain column value and reads back verbatim — this is
+        // the canonical out-of-scope representation a fresh build would also produce, and the
+        // proof the rebuild did not simply throw the vector away.
+        assert_eq!(
+            vread_embedding(&graphs, &graph, &cache, "d00"),
+            Some(v1.clone()),
+            "the consolidation must carry the out-of-scope node's embedding into the new \
+             generation, not delete it"
+        );
+
+        // 4. Put d00 back in scope. HIK-118's promise: its vector scores again.
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) SET n:Doc");
+
+        let got = vknn(&graphs, &graph, &cache, &VQ, 3);
+        let d00 = got.iter().find(|(id, _)| *id == 0).unwrap_or_else(|| {
+            panic!(
+                "HIK-122: `SET n:Doc` must put d00 back in the index with the embedding it had \
+                 before the consolidation — the consolidation destroyed it; got {got:?}"
+            )
+        });
+        assert!(
+            d00.1.abs() < 1e-5,
+            "d00 must score its re-embedded vector (an exact match, ~0), not the base's stale \
+             0.9; got {}",
+            d00.1
+        );
+        // And back in scope the column read is suppressed again (D12), so the vector is served
+        // by exactly one arm — the index — not two.
+        assert_eq!(
+            vread_embedding(&graphs, &graph, &cache, "d00"),
+            None,
+            "back in scope, D12 suppresses the column read: the KNN path serves the embedding"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The **base-index** arm of HIK-122, and the harder one: nothing re-embeds d00, so its
+    /// only copy is the one D12 routed *out* of the column store into the sealed base index.
+    /// `REMOVE n:Doc` takes it out of scope; the fold supersedes its base entry; and the
+    /// consolidation's property walk cannot rescue it, because the props record never held it.
+    /// Every copy is then gone — this arm really does destroy the vector, not merely hide it.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let base: Vec<Vec<f32>> = [0.0, 0.3, 0.55].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("hik122_base_index", &base, "Key");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // d00 leads on the base index and nothing ever re-embeds it.
+        assert_eq!(
+            vknn(&graphs, &graph, &cache, &VQ, 1)[0].0,
+            0,
+            "d00 is the exact match on the base index"
+        );
+
+        // Out of scope, flushed to a segment (sidecar `label_removals=[0]`).
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the label removal flushes into a segment");
+
+        // A consolidation while out of scope.
+        graphs
+            .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+
+        // Back in scope. HIK-118: "a later `SET n:Doc` must be able to un-suppress this id and
+        // score its base vector again" — the consolidation must not have made that a lie.
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) SET n:Doc");
+        let got = vknn(&graphs, &graph, &cache, &VQ, 3);
+        let d00 = got.iter().find(|(id, _)| *id == 0).unwrap_or_else(|| {
+            panic!(
+                "HIK-122: the consolidation destroyed d00's base-index embedding — its only \
+                 copy — so `SET n:Doc` can never bring it back; got {got:?}"
+            )
+        });
+        assert!(
+            d00.1.abs() < 1e-5,
+            "d00 must score its original base vector (an exact match, ~0); got {}",
+            d00.1
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A wrong-width embedding must be refused at the write. Both KNN arms hard-error on a
     /// dim mismatch, and a bad row would otherwise ride the flush into a segment and the
     /// rebuild into the next generation before anyone noticed.
