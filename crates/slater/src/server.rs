@@ -2586,6 +2586,10 @@ pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
                     let cache = graph_format::store::diskcache::DiskCache::open(
                         &s.disk_cache_dir,
                         s.disk_cache_bytes as u64,
+                        graph_format::store::diskcache::write_behind_budget(
+                            cfg.cache.block_cache_bytes as u64,
+                            s.disk_cache_bytes as u64,
+                        ),
                     )
                     .context("open S3 disk cache")?;
                     Ok(Arc::new(
@@ -2632,6 +2636,10 @@ pub(crate) fn build_store(cfg: &AppConfig) -> Result<Arc<dyn ObjectStore>> {
                     let cache = graph_format::store::diskcache::DiskCache::open(
                         &g.disk_cache_dir,
                         g.disk_cache_bytes as u64,
+                        graph_format::store::diskcache::write_behind_budget(
+                            cfg.cache.block_cache_bytes as u64,
+                            g.disk_cache_bytes as u64,
+                        ),
                     )
                     .context("open GCS disk cache")?;
                     Ok(Arc::new(

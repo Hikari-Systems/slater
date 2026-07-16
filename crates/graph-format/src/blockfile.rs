@@ -916,27 +916,11 @@ impl BlockFileReader {
     pub fn read_record(&self, loc: RecordLoc) -> Result<Vec<u8>> {
         let raw = self.read_block(loc.block)?;
         let (offsets, data) = parse_block(&raw)?;
-        let slot = loc.slot as usize;
-        if slot + 1 >= offsets.len() {
-            bail!(
-                "record slot {} out of range in block {}",
-                loc.slot,
-                loc.block.0
-            );
-        }
-        let start = offsets[slot] as usize;
-        let end = offsets[slot + 1] as usize;
-        // A corrupt offset table (esp. on the un-checksummed Raw path) could have
-        // `start > end` or `end > data.len()`; validate before slicing so it errors rather
-        // than panicking the caller.
-        if start > end || end > data.len() {
-            bail!(
-                "record slot {} range {start}..{end} out of block data ({} B)",
-                loc.slot,
-                data.len()
-            );
-        }
-        Ok(data[start..end].to_vec())
+        // `parse_block` validates the offset table against `data`; `record_from_block` re-checks
+        // the slot is in range. This used to re-implement both checks inline — one copy now.
+        let rec = record_from_block(&offsets, data, loc.slot)
+            .with_context(|| format!("block {}", loc.block.0))?;
+        Ok(rec.to_vec())
     }
 
     /// Read-ahead window: how many blocks a whole-file scan fetches concurrently.
@@ -1042,9 +1026,73 @@ impl BlockFileReader {
     }
 }
 
+/// What [`check_offset_table`] labels itself as in a [`DecodeRejected`].
+const OFFSET_TABLE: &str = "block";
+
+/// Reject a slot-offset table that is not a partition of the `data_len`-byte data region.
+///
+/// [`BlockFileWriter::take_raw_block`] is the format's *only* block constructor, and it emits
+/// exactly one shape: `cur_offsets` starts as `[0]` and every `add` pushes `cur_data.len()`,
+/// so a legitimate table always starts at 0, never decreases, and ends at exactly the data
+/// length. Nothing in the decode path pads that region — `decode_stored` unseals to the exact
+/// plaintext, zstd decompresses to the directory's `raw_len`, and the `Raw` codec asserts the
+/// stored length matches — so this is the encoder's whole contract, not an approximation of it.
+///
+/// It is checked **here**, once, because [`parse_block`] hands `(offsets, data)` to four callers
+/// that then index the table by hand (`pq.rs`'s `load_resident`, `merge_build.rs`'s `next_raw`,
+/// `extsort.rs`'s run reader, and [`read_record`]) — and a bad entry in any of them is a slice
+/// out of bounds, i.e. a **panic at generation open**, not a recoverable error. Validating at the
+/// single parse point makes `start <= end <= data.len()` true *by construction* for every table
+/// `parse_block` returns, so those callers cannot reintroduce the bug by forgetting: monotonicity
+/// gives `offsets[i] <= offsets[i+1]`, and the terminal `== data_len` caps the whole run.
+///
+/// [`read_record`]: BlockFileReader::read_record
+/// [`BlockFileWriter::take_raw_block`]: BlockFileWriter
+fn check_offset_table(offsets: &[u32], data_len: usize) -> Result<()> {
+    let reject = |reason, slot: usize, start: u32, end: u32| {
+        Err(DecodeRejected::BlockOffsetTable {
+            what: OFFSET_TABLE,
+            reason,
+            slot,
+            start,
+            end,
+            data_len,
+        }
+        .into())
+    };
+    // `parse_block` always reads `count + 1` entries, so the table is never empty; guard anyway
+    // rather than index a slice whose construction this function does not own.
+    let Some((&last, head)) = offsets.split_last() else {
+        return reject("empty table", 0, 0, 0);
+    };
+    if offsets[0] != 0 {
+        return reject("first slot does not start at 0", 0, offsets[0], last);
+    }
+    for (slot, pair) in offsets.windows(2).enumerate() {
+        let (start, end) = (pair[0], pair[1]);
+        if start > end {
+            return reject("offsets decrease", slot, start, end);
+        }
+    }
+    // Caps the run: the table is monotone by here, so every `end` is now `<= last == data_len`.
+    if last as usize != data_len {
+        return reject(
+            "last slot does not end at the data length",
+            head.len(),
+            last,
+            last,
+        );
+    }
+    Ok(())
+}
+
 /// Parse a decompressed block into its `(count+1)` slot offsets and the record
 /// data region. Exposed so callers that already hold a cached decompressed block
 /// can slice records without a second decode.
+///
+/// The returned table is validated against the data region (see [`check_offset_table`]), so a
+/// caller may slice `data[offsets[i]..offsets[i+1]]` for any `i < offsets.len() - 1` without
+/// re-checking. [`record_from_block`] is still the tidier way to say that.
 pub fn parse_block(raw: &[u8]) -> Result<(Vec<u32>, &[u8])> {
     let mut r = raw;
     let count = r.read_u32::<LittleEndian>()? as usize;
@@ -1062,7 +1110,9 @@ pub fn parse_block(raw: &[u8]) -> Result<(Vec<u32>, &[u8])> {
     for _ in 0..=count {
         offsets.push(r.read_u32::<LittleEndian>()?);
     }
-    Ok((offsets, &raw[header_len..]))
+    let data = &raw[header_len..];
+    check_offset_table(&offsets, data.len())?;
+    Ok((offsets, data))
 }
 
 /// Slice the `slot`-th record out of an already-parsed block.
@@ -1319,6 +1369,82 @@ mod tests {
         let offsets = [0u32, 50]; // end 50 > data len 10
         let data = [0u8; 10];
         assert!(record_from_block(&offsets, &data, 0).is_err());
+    }
+
+    /// Assemble a block image by hand: `count ‖ offsets ‖ data`. The writer can only ever
+    /// emit well-formed tables, so a forged image is the only way to reach the rejections
+    /// below.
+    fn raw_block(offsets: &[u32], data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&((offsets.len() - 1) as u32).to_le_bytes());
+        for o in offsets {
+            b.extend_from_slice(&o.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b
+    }
+
+    fn rejects_offset_table(offsets: &[u32], data: &[u8]) -> String {
+        let err = parse_block(&raw_block(offsets, data))
+            .expect_err("forged offset table must be refused");
+        // Branch on the error *type*, never its text (CONTRIBUTING.md).
+        match err.downcast_ref::<DecodeRejected>() {
+            Some(DecodeRejected::BlockOffsetTable { reason, .. }) => reason.to_string(),
+            other => panic!("expected DecodeRejected::BlockOffsetTable, got {other:?}"),
+        }
+    }
+
+    /// `parse_block` hands `(offsets, data)` to callers that index the table by hand
+    /// (`pq.rs`'s `load_resident`, `merge_build.rs`'s `next_raw`, `extsort.rs`'s run reader),
+    /// so an unvalidated entry is a **slice-out-of-bounds panic at generation open**, not a
+    /// recoverable error. Validating here makes `start <= end <= data.len()` true by
+    /// construction for all of them. HIK-128.
+    #[test]
+    fn forged_offset_table_is_refused_at_parse() {
+        let data = [7u8; 9];
+        // An offset running past the end of the data region.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 6, 999], &data),
+            "last slot does not end at the data length"
+        );
+        // `start > end` — the slice that panics with "start > end" rather than an index
+        // overrun. Slot 0 is deliberately well-formed, so this is the monotonicity check
+        // firing and not an earlier one.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 2, 9], &data),
+            "offsets decrease"
+        );
+        // A table that does not start at 0 leaves a prefix of the data unreachable.
+        assert_eq!(
+            rejects_offset_table(&[1, 3, 6, 9], &data),
+            "first slot does not start at 0"
+        );
+        // A terminal that stops short is equally not a partition of the region.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 6, 8], &data),
+            "last slot does not end at the data length"
+        );
+    }
+
+    /// The guard must not be a no-op: a well-formed table still parses, and every slot still
+    /// slices back to the exact bytes the writer put in it.
+    #[test]
+    fn well_formed_offset_table_still_parses() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+        let block = raw_block(&[0, 3, 6, 9], &data);
+        let (offsets, out) = parse_block(&block).unwrap();
+        assert_eq!(offsets, vec![0, 3, 6, 9]);
+        assert_eq!(out, &data);
+        assert_eq!(record_from_block(&offsets, out, 0).unwrap(), &[1, 2, 3]);
+        assert_eq!(record_from_block(&offsets, out, 2).unwrap(), &[7, 8, 9]);
+        // Empty records are legal (`start == end`) and must not be read as a decrease.
+        let block = raw_block(&[0, 0, 9], &data);
+        let (offsets, out) = parse_block(&block).unwrap();
+        assert_eq!(record_from_block(&offsets, out, 0).unwrap(), b"");
+        assert_eq!(record_from_block(&offsets, out, 1).unwrap(), &data);
+        // A single-record block, and the degenerate empty block.
+        assert!(parse_block(&raw_block(&[0, 9], &data)).is_ok());
+        assert!(parse_block(&raw_block(&[0], &[])).is_ok());
     }
 
     #[test]
