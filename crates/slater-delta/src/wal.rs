@@ -693,6 +693,8 @@ impl WalSink {
         write_frame(&mut self.file, &payload)?;
         self.cur_len += frame_len(payload.len());
         self.file.flush().context("flush WAL buffer")?;
+        #[cfg(test)]
+        maybe_inject_commit_fsync_fault()?;
         self.file
             .get_ref()
             .sync_data()
@@ -715,6 +717,15 @@ impl WalSink {
         self.file
             .flush()
             .context("flush WAL buffer before rollback truncate")?;
+        // Seam (test-only) for the rollback repair failing on a dying disk. It fires
+        // *before* `set_len` deliberately: the modelled fault is "the truncate never
+        // became durable", and in-process there is no way to make a page-cache-visible
+        // `set_len` un-happen. A real fault at the `sync_data` below leaves the shrink
+        // in the page cache but not on the platter, so the crash that follows restores
+        // the pre-truncate bytes — which is exactly the state failing here produces,
+        // and the only state replay-after-crash can observe.
+        #[cfg(test)]
+        maybe_inject_truncate_fsync_fault()?;
         let mut file = self.file.get_ref();
         file.set_len(off)
             .context("truncate WAL segment on rollback")?;
@@ -774,33 +785,71 @@ thread_local! {
     /// As `FAIL_WRITE_AFTER`, but `panic!`s instead of returning `Err` — exercises the
     /// rollback guard on the **unwind** path.
     static PANIC_WRITE_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// Test seam (HIK-130): when `Some(n)`, the *n*-th following **commit-path fsync**
+    /// on this thread returns an injected `io::Error`, then resets to `None`. The
+    /// record-frame seam above cannot reach this arm — it fires only inside
+    /// `write_record_frame` — which is why the marker-ordering hazard went untested.
+    static FAIL_COMMIT_FSYNC_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// Test seam (HIK-130): as above, but for [`WalSink::truncate_to`]'s own fsync —
+    /// the rollback repair. Arming both drives the compound fault (a dying disk failing
+    /// the commit fsync *and* the rollback that tries to undo it).
+    static FAIL_TRUNCATE_FSYNC_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// Fire any armed record-frame-write fault seam (test-only). A counter of `Some(0)`
-/// trips now; `Some(n)` counts down. Kept out of `write_record_frame`'s body so the
-/// production build has no seam at all.
+/// Trip an armed fault counter (test-only): `Some(0)` fires now and disarms; `Some(n)`
+/// counts down; `None` never fires.
+#[cfg(test)]
+fn trip_fault(cell: &'static std::thread::LocalKey<std::cell::Cell<Option<u64>>>) -> bool {
+    cell.with(|c| match c.get() {
+        Some(0) => {
+            c.set(None);
+            true
+        }
+        Some(n) => {
+            c.set(Some(n - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// Fire any armed record-frame-write fault seam (test-only). Kept out of
+/// `write_record_frame`'s body so the production build has no seam at all.
 #[cfg(test)]
 fn maybe_inject_write_fault() -> Result<()> {
-    let trip = |cell: &'static std::thread::LocalKey<std::cell::Cell<Option<u64>>>| {
-        cell.with(|c| match c.get() {
-            Some(0) => {
-                c.set(None);
-                true
-            }
-            Some(n) => {
-                c.set(Some(n - 1));
-                false
-            }
-            None => false,
-        })
-    };
-    if trip(&FAIL_WRITE_AFTER) {
+    if trip_fault(&FAIL_WRITE_AFTER) {
         return Err(anyhow::Error::new(std::io::Error::other(
             "injected WAL record-frame write fault",
         )));
     }
-    if trip(&PANIC_WRITE_AFTER) {
+    if trip_fault(&PANIC_WRITE_AFTER) {
         panic!("injected WAL record-frame write panic");
+    }
+    Ok(())
+}
+
+/// Fire any armed commit-fsync fault seam (test-only). Called where the *real*
+/// `sync_data` would be, so an injected failure leaves exactly the on-disk state a
+/// failed fsync leaves: whatever the preceding flush already handed to the OS.
+#[cfg(test)]
+fn maybe_inject_commit_fsync_fault() -> Result<()> {
+    if trip_fault(&FAIL_COMMIT_FSYNC_AFTER) {
+        return Err(anyhow::Error::new(std::io::Error::other(
+            "injected WAL commit fsync fault",
+        )));
+    }
+    Ok(())
+}
+
+/// Fire any armed rollback-truncate-fsync fault seam (test-only).
+#[cfg(test)]
+fn maybe_inject_truncate_fsync_fault() -> Result<()> {
+    if trip_fault(&FAIL_TRUNCATE_FSYNC_AFTER) {
+        return Err(anyhow::Error::new(std::io::Error::other(
+            "injected WAL rollback truncate fsync fault",
+        )));
     }
     Ok(())
 }
@@ -1406,6 +1455,75 @@ mod tests {
         let replay = replay_dir(&dir).unwrap();
         assert_eq!(replay.records, vec![good0, survivor]);
         assert_eq!(replay.last_seq, Seq(5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (HIK-130), **commit-fsync** path: the batch is never acked (the commit
+    /// fsync fails), its rollback repair also fails (same dying disk), and the process
+    /// dies before any later `append_batch` could self-heal. Replay must **not** commit
+    /// it — an unacked batch coming back is precisely the failure a WAL exists to
+    /// prevent.
+    ///
+    /// This is the arm the HIK-105 seam could not reach: `maybe_inject_write_fault` fires
+    /// only inside `write_record_frame`, so both rollback tests above exercise the arm
+    /// that was already correct. Pre-fix (marker flushed to the OS *before* the fsync it
+    /// gates on) this test fails with the doomed batch's three records resurrected.
+    ///
+    /// The three legs are all load-bearing — see `compound_fault_legs_are_each_load_bearing`,
+    /// which pins that removing any one of them lets the existing defences win.
+    #[test]
+    fn unacked_batch_is_not_retro_committed_when_commit_fsync_and_rollback_both_fail() {
+        let dir =
+            std::env::temp_dir().join(format!("slater_wal_retrocommit_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+            upsert(4, "L", "k", Value::Int(4), &[]),
+        ];
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            // A clean committed batch first, so the rollback floor is past the magic and
+            // the retro-commit has something to be distinguished from.
+            sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                .unwrap();
+
+            // Leg 1: the commit fsync fails — the client never gets an ack.
+            FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
+            // Leg 2: the rollback guard's own repair fails too (correlated, not p² — one
+            // dying disk fails both).
+            FAIL_TRUNCATE_FSYNC_AFTER.with(|c| c.set(Some(0)));
+
+            let err = sink
+                .append_batch(&doomed, Seq(4))
+                .expect_err("the injected commit fsync fault must fail the batch");
+            // Branch on the error *type*, never its text (coding standard).
+            assert!(
+                err.downcast_ref::<std::io::Error>().is_some(),
+                "the injected io::Error must be preserved in the chain: {err:#}"
+            );
+            FAIL_COMMIT_FSYNC_AFTER
+                .with(|c| assert_eq!(c.get(), None, "commit seam must be consumed"));
+            FAIL_TRUNCATE_FSYNC_AFTER
+                .with(|c| assert_eq!(c.get(), None, "truncate seam must be consumed"));
+
+            // Leg 3: the process dies here. No further `append_batch`, so the self-heal at
+            // the top of `append_batch` never runs — dropping the sink is the crash.
+        }
+
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(
+            replay.records,
+            vec![good0],
+            "an unacked batch must never be replayed as committed"
+        );
+        assert_eq!(
+            replay.last_seq,
+            Seq(1),
+            "last_seq must not advance to an unacked batch's seq"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
