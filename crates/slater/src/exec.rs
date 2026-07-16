@@ -1235,10 +1235,18 @@ pub(crate) fn delta_vector_for(
             .delta()
             .node_patch(id)
             .is_some_and(|nd| nd.labels_removed.contains(&desc.label));
-        return Ok(if left_scope {
-            DeltaVector::OutOfScope
-        } else {
-            DeltaVector::Silent
+        if !left_scope {
+            return Ok(DeltaVector::Silent);
+        }
+        // Leaving the scope is not the only thing this delta may have done. Ask what it says
+        // about the *value* too, because one write can do both — `MATCH (n) SET n = {name:'x'}
+        // REMOVE n:Doc` drops the embedding *and* the label — and a deletion is the stronger
+        // fact: `OutOfScope` promises the value survives, so filing a deleted one under it
+        // would have the consolidation rescue the vector the user just threw away, back into
+        // the column store, where `RETURN n.embedding` would then hand it out again.
+        return Ok(match delta_says(gen, id, desc) {
+            LevelSays::Gone => DeltaVector::Gone,
+            LevelSays::Vector(_) | LevelSays::Nothing => DeltaVector::OutOfScope,
         });
     }
     Ok(match delta_says(gen, id, desc) {
@@ -2829,8 +2837,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
         segment_level(self.gen, self.cache, desc)
     }
 
-    /// Node `id`'s full-precision embedding as the **sealed base index** holds it, or `None` if
-    /// the base does not index this node.
+    /// The full-precision embeddings the **sealed base index** holds for `wanted`, keyed by node
+    /// id. Ids the base does not index are simply absent.
     ///
     /// The one read that recovers a vector D12 routed *out* of the props record: for a node that
     /// was in the index's scope at build time, this is the only copy in the generation, and no
@@ -2838,44 +2846,53 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// back into the column store (HIK-122); nothing on the query path does, because the KNN arms
     /// scan the index rather than probe it by id.
     ///
-    /// Cost is per call and deliberately not amortised — the caller's candidate set is bounded by
-    /// the sidecars (O(vectors touched)), so this is a handful of records, not a scan of the
-    /// index. A caller with a large candidate set should fold the group once instead.
-    pub(crate) fn base_index_vector(
+    /// **Batched on purpose.** Neither arm can seek by node id — the brute-force store is in
+    /// build-scan order and the `.pq` layout map is unsorted — so a probe is a scan of the index,
+    /// and probing per candidate would make a bulk `REMOVE n:Doc` quadratic (candidates × index)
+    /// at consolidation time. One pass per index serves the whole set, and an empty `wanted`
+    /// (overwhelmingly the common case) reads nothing at all.
+    pub(crate) fn base_index_vectors(
         &self,
         desc: &VectorIndexDesc,
-        id: u64,
-    ) -> Result<Option<Vec<f32>>> {
+        wanted: &HashSet<u64>,
+    ) -> Result<HashMap<u64, Vec<f32>>> {
+        let mut out = HashMap::new();
+        if wanted.is_empty() {
+            return Ok(out);
+        }
         match desc.mode {
             // `vectors.f32.blk` holds the group at `[first_record, first_record + count)`, in
-            // build-scan order — *not* sorted by node id, so this is a linear probe.
+            // build-scan order.
             AnnMode::BruteForce => {
                 for r in desc.first_record..desc.first_record + desc.count {
                     let e = read_vector(self.gen, self.cache, r)?;
-                    if e.node_id == id {
-                        return Ok(Some(e.vector));
+                    if wanted.contains(&e.node_id) {
+                        out.insert(e.node_id, e.vector);
                     }
                 }
-                Ok(None)
             }
             // The `.pq` side table is the layout→id map (v8: the `.vamana` record is pure
             // geometry), and the `.vamana` record's stored vector is **raw** — the ANN-space
             // transform is a navigation device applied at search time, never at rest — so it
-            // is the embedding the user wrote.
+            // is the embedding the user wrote. `node_ids` is already resident, so only the
+            // matching records are read.
             AnnMode::Vamana { .. } => {
                 let Some(ix) = self.gen.vamana_index(&desc.label, &desc.property) else {
-                    return Ok(None);
+                    return Ok(out);
                 };
-                let Some(ord) = ix.pq.node_ids.iter().position(|n| *n == id) else {
-                    return Ok(None);
-                };
-                Ok(Some(
-                    ix.reader
+                for (ord, node_id) in ix.pq.node_ids.iter().enumerate() {
+                    if !wanted.contains(node_id) {
+                        continue;
+                    }
+                    let v = ix
+                        .reader
                         .node(ord as graph_format::vamana::VamanaIndex)?
-                        .vector,
-                ))
+                        .vector;
+                    out.insert(*node_id, v);
+                }
             }
         }
+        Ok(out)
     }
 
     pub(crate) fn delta_level(&self, desc: &VectorIndexDesc) -> Result<VectorLevel> {

@@ -14329,6 +14329,71 @@ mod tests {
             None,
             "back in scope, D12 suppresses the column read: the KNN path serves the embedding"
         );
+
+        // The fold says `Set(v)` for d00 now, from a *column* value no delta patch names. A
+        // flush must carry that across: the sidecar is what decides whether the fold's candidate
+        // set ever sees the node, so a flush that does not name it would silently undo the
+        // re-label — KNN-visible before, gone after, with nothing in between to blame.
+        graphs
+            .flush_graph_to_segment(&graph, &vc, &root)
+            .unwrap()
+            .expect("the re-label flushes into a segment");
+        let after_flush = vknn(&graphs, &graph, &cache, &VQ, 3);
+        assert!(
+            after_flush.iter().any(|(id, s)| *id == 0 && s.abs() < 1e-5),
+            "a flush must not lose the re-labelled node's embedding — the fold resolved it to \
+             the column vector, so the sidecar has to name it too; got {after_flush:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// One write can leave the index's scope **and** delete the embedding —
+    /// `SET n = {…} REMOVE n:Doc`. The de-labelling says "retain, the value is untouched"; the
+    /// replace says "the value is gone". The deletion is the stronger fact, and mixing them up
+    /// is silent in the dangerous direction: the consolidation would rescue the vector the user
+    /// just threw away back into the column store, where `RETURN n.embedding` hands it out again.
+    #[test]
+    #[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+    fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation() {
+        let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+        let base: Vec<Vec<f32>> = [0.0, 0.3, 0.55].iter().map(|d| at_distance(*d)).collect();
+        let (root, graph) = testgen::write_vector_docs_keyed("hik122_gone_and_out", &base, "Key");
+        let wal = root.join("_wal");
+        let cache = BlockCache::new(1 << 20);
+        let vc = VectorIndexCache::new(1 << 20);
+        let mut graphs = Graphs::open_all(&root, None).unwrap();
+        graphs
+            .enable_writable_layer(&delta_cfg(&wal), &root, None)
+            .unwrap();
+
+        // Delete d00's embedding *and* take it out of scope, in one delta.
+        vwrite(
+            &graphs,
+            &graph,
+            "MATCH (n:Key {name:'d00'}) REMOVE n.embedding",
+        );
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
+
+        graphs
+            .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
+                run_builder(&bin, d, g, dd)
+            })
+            .unwrap();
+
+        assert_eq!(
+            vread_embedding(&graphs, &graph, &cache, "d00"),
+            None,
+            "the embedding was deleted: the consolidation must not resurrect it into the \
+             column store just because the node also left the index's scope"
+        );
+        // And it stays gone once the node is back in scope.
+        vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) SET n:Doc");
+        let got = vknn(&graphs, &graph, &cache, &VQ, 3);
+        assert!(
+            !got.iter().any(|(id, _)| *id == 0),
+            "d00's embedding was deleted; re-labelling must not bring it back — a deletion is \
+             not a scope change; got {got:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

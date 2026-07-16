@@ -37,7 +37,7 @@
 //! serialises byte-identically — the property the consolidation golden gate rests
 //! on.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -260,21 +260,25 @@ pub fn serialise_binary_dump<V: ReadView>(
     // Nothing in the dump would ever see that vector, and the rebuild would drop it — silently,
     // exit 0, index intact, one node quietly un-embedded.
     //
-    // Bounded by the sidecars (O(vectors touched)), not by the graph or by the index.
+    // The candidate set is bounded by the sidecars (O(vectors touched)), and the base index is
+    // read at most once per index — never per candidate (see `base_index_vectors`).
     let mut rescued: BTreeMap<u64, Vec<(String, Vec<f32>)>> = BTreeMap::new();
     for (desc, lv) in manifest.vector_indexes.iter().zip(&levels) {
+        let mut wanted: HashSet<u64> = HashSet::new();
         for id in lv.out_of_scope() {
-            // A row that already carries the embedding needs no rescue — and must not be given
-            // a second, staler copy from the base index on top of it.
+            // A row that already carries the embedding needs no rescue — the property walk will
+            // write it out — and must not be given a second, staler copy from the base index on
+            // top of it.
             if matches!(engine.node_prop_raw(id, &desc.property)?, Val::Vector(_)) {
                 continue;
             }
-            if let Some(v) = engine.base_index_vector(desc, id)? {
-                rescued
-                    .entry(id)
-                    .or_default()
-                    .push((desc.property.clone(), v));
-            }
+            wanted.insert(id);
+        }
+        for (id, v) in engine.base_index_vectors(desc, &wanted)? {
+            rescued
+                .entry(id)
+                .or_default()
+                .push((desc.property.clone(), v));
         }
     }
 
