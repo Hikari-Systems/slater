@@ -319,9 +319,21 @@ fn is_tmp_name(s: &str) -> bool {
 /// is caught by [`decode`] on its first read and self-heals to a miss, exactly as
 /// a file this run wrote would.
 ///
-/// Best-effort by construction: an unreadable directory or entry is skipped, not
-/// fatal. Under-counting only forfeits some warmth, and the cache is an
-/// optimisation — failing `open` over it would take the whole store down.
+/// Best-effort by construction: an unreadable directory or entry is skipped
+/// rather than failing `open`, since the cache is an optimisation and taking the
+/// whole store down over it would be worse. Be precise about the cost, though — a
+/// skipped entry is an *unindexed* one, i.e. the very bug this function exists to
+/// fix, reappearing for that shard. A persistent EIO/EACCES on the cache volume
+/// can still strand files; but a cache volume erroring on `read_dir` is already a
+/// fault the operator has to fix.
+///
+/// Cost: linear, ~2.6 µs/file measured warm — 121 ms for 40k files (≈ a 10 GiB
+/// cache at the 256 KiB default block size), 1.06 s for 400k (≈ 100 GiB), times a
+/// cold-page-cache multiplier. This is on the startup path, so it is a real
+/// budget; at the documented deployment size it is noise next to the S3
+/// round-trips the adopted files save. A far larger cache would justify
+/// parallelising the walk — 256 independent shards make that trivial if it is
+/// ever needed.
 fn adopt_existing(dir: &Path, budget_bytes: u64) -> Lru {
     // (mtime, name, size), sorted so insertion order is oldest-first. The mtime
     // is only a sort key: a coarse or skewed filesystem clock costs eviction
