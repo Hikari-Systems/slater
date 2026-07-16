@@ -241,7 +241,12 @@ impl EfChunk {
     /// *wraps* in release, handing the degree-sum count fast path a garbage degree (`4294967293`)
     /// that it sums into a wrong k-hop count. So the subtraction saturates to `0` and reports —
     /// see [`report_non_monotone`] for why the report is needed and what it does not fix.
-    /// The healthy path is unchanged: one compare it already made, no new loads, no branch taken.
+    ///
+    /// The healthy path grows by a compare, a never-taken branch and the saturating `cmov`
+    /// (measured: `sub` becomes `cmp/jb/xor/sub/cmovae`); no new loads, and the rate-limiter state
+    /// is touched only on the corrupt path. That is noise against the cache-missing `select₁`
+    /// above it, which is why this is spelled with `saturating_sub` for clarity rather than an
+    /// early `return 0` — the latter does codegen to a bare `cmp/jb/sub`, if this ever measures.
     #[inline]
     pub fn degree_at(&self, slot: usize) -> u32 {
         let p0 = self.select1(slot);
