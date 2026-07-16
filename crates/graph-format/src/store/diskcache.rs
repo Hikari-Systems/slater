@@ -1158,6 +1158,119 @@ mod tests {
         );
     }
 
+    /// The queue's bound is on **bytes**, and holds at *any* payload size.
+    ///
+    /// Varying the payload size is the entire point of this test, not a
+    /// thoroughness flourish: the bug being fixed was a bound on message *count*,
+    /// and a count bound satisfies any assertion that only varies how many
+    /// messages are queued. Pinning one size would let `WRITE_QUEUE_DEPTH` alone
+    /// pass. 4 KiB and 256 KiB (the default sealed block size) differ 64×, so a
+    /// count bound cannot satisfy both against one byte cap.
+    #[test]
+    fn write_behind_queue_is_byte_bounded() {
+        const CAP: u64 = 1 << 20;
+
+        for payload_len in [4usize << 10, 256usize << 10] {
+            let dir = tempdir::Guard::new();
+            // Disk budget deliberately huge: this test bounds RAM, and an
+            // eviction-driven disk budget must not be what limits the queue.
+            let cache = DiskCache::open(dir.path(), 1 << 30, CAP).unwrap();
+            let unpark = park_writer(&cache);
+
+            let bytes = vec![7u8; payload_len];
+            // Far more than the cap admits at either size, and — the pre-fix
+            // failure mode — under WRITE_QUEUE_DEPTH, so the count bound is not
+            // what stops us. Pre-fix these queue 4 MB / 250 MB respectively.
+            for i in 0..1000u64 {
+                cache.put_async("g/u/f.blk", i * payload_len as u64, &bytes);
+                assert!(
+                    cache.queued_bytes() <= CAP + payload_len as u64,
+                    "queue over budget at {payload_len}B payloads after {i} puts: \
+                     {} queued > cap {CAP} + one payload",
+                    cache.queued_bytes(),
+                );
+            }
+
+            // The shed is not a no-op that happens to keep the counter down: the
+            // queue really is holding ~a capful, i.e. we admitted until full and
+            // then stopped, rather than never admitting at all.
+            assert!(
+                cache.queued_bytes() > CAP - payload_len as u64,
+                "queue should be full, not empty, at {payload_len}B payloads: {} queued",
+                cache.queued_bytes(),
+            );
+
+            // Unpark *before* the cache drops: `Drop` sends `Shutdown` and joins
+            // the writer, which would hang forever against a parked writer.
+            drop(unpark);
+        }
+    }
+
+    /// A payload bigger than the whole budget is still admitted into an empty
+    /// queue, so an oversized block is never permanently shut out (which is what
+    /// a bare `q + len <= cap` test would do). This is why the bound is
+    /// `cap + one payload` and not `cap` — stated here rather than left as a
+    /// surprise for whoever tightens the assertion above.
+    #[test]
+    fn oversized_payload_admitted_when_queue_empty() {
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, 1024).unwrap();
+        let unpark = park_writer(&cache);
+
+        let big = vec![1u8; 64 << 10];
+        cache.put_async("g/u/f.blk", 0, &big);
+        assert_eq!(
+            cache.queued_bytes(),
+            big.len() as u64,
+            "an over-cap payload must be admitted into an empty queue"
+        );
+
+        // ...but only into an *empty* one: the next put finds it non-empty and
+        // over budget, and sheds.
+        cache.put_async("g/u/f.blk", 1 << 20, &big);
+        assert_eq!(
+            cache.queued_bytes(),
+            big.len() as u64,
+            "a second over-cap payload must shed, not stack"
+        );
+
+        drop(unpark);
+    }
+
+    /// Concurrent producers cannot both observe room and both take it. The real
+    /// producer is a concurrent read-ahead batch, so a read-then-write admission
+    /// (rather than the CAS this asserts) would overshoot by up to one payload
+    /// per racing thread — unbounded in the thread count, which is exactly the
+    /// property the bound exists to deny.
+    #[test]
+    fn byte_budget_holds_under_concurrent_producers() {
+        const CAP: u64 = 256 << 10;
+        const PAYLOAD: usize = 32 << 10;
+
+        let dir = tempdir::Guard::new();
+        let cache = DiskCache::open(dir.path(), 1 << 30, CAP).unwrap();
+        let unpark = park_writer(&cache);
+
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let cache = &cache;
+                s.spawn(move || {
+                    let bytes = vec![t as u8; PAYLOAD];
+                    for i in 0..100u64 {
+                        cache.put_async("g/u/f.blk", t * 1000 + i, &bytes);
+                        assert!(
+                            cache.queued_bytes() <= CAP + PAYLOAD as u64,
+                            "queue over budget under concurrent producers: {} queued",
+                            cache.queued_bytes(),
+                        );
+                    }
+                });
+            }
+        });
+
+        drop(unpark);
+    }
+
     /// Minimal self-cleaning temp directory (no external dev-dep): a unique dir
     /// under the system temp root, removed on drop. The unique suffix is derived
     /// from a process-wide counter + the thread id (no wall clock / RNG, which the
