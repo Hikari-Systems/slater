@@ -50,6 +50,14 @@ use crate::shared::{
 
 const DUMP_VERTEX: &str = "__DumpVertex__";
 const DUMP_ID: &str = "__dump_id__";
+
+/// True for the internal `(:__DumpVertex__)(<pk>)` index — a build artifact of the
+/// dump_id-style import, not a user index, so it is dropped from the generation.
+/// Both conjuncts must hold: a user index that merely shares the pk *property*
+/// (e.g. `(:Person)(id)` under `--pk id`) is a real index and must survive.
+fn is_internal_dump_index(r: &RangeIndexStmt, pk_field: &str) -> bool {
+    r.label_or_type == DUMP_VERTEX && r.property == pk_field
+}
 /// Bigger blocks for the transient buckets — fewer, fatter blocks, all deleted at
 /// the end of the build.
 const BUCKET_BLOCK: usize = 1 << 20;
@@ -377,7 +385,7 @@ fn process_shard(
                 uedge_count += 1;
             }
             Statement::RangeIndex(r) => {
-                if r.label_or_type != DUMP_VERTEX && r.property != pk_field {
+                if !is_internal_dump_index(&r, pk_field) {
                     rstmts.push(r);
                 }
             }
@@ -487,7 +495,7 @@ fn process_shard_merge(
                 edge_count += 1;
             }
             Statement::RangeIndex(r) => {
-                if r.label_or_type != DUMP_VERTEX && r.property != DUMP_ID {
+                if !is_internal_dump_index(&r, DUMP_ID) {
                     rstmts.push(r);
                 }
             }

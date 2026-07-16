@@ -13,6 +13,7 @@ use std::process::Command;
 
 use graph_format::columns::PropsReader;
 use graph_format::ids::{NodeId, Value};
+use graph_format::isam::IsamReader;
 use graph_format::manifest::Manifest;
 use graph_format::topology::TopologyReader;
 
@@ -109,6 +110,93 @@ fn pk_field_import_with_custom_field() {
             "since"
         ),
         Some(&Value::Int(2020))
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+// A user index ON the pk property, alongside the internal DumpVertex index over the
+// same property. Under `--pk id` these differ only by label, which is exactly what the
+// DumpVertex filter must discriminate on.
+const INDEX_DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.id);
+CREATE INDEX FOR (n:Person) ON (n.id);
+CREATE INDEX FOR (n:Person) ON (n.name);
+CREATE (:Person {id: 10, name: 'Alice'});
+CREATE (:Person {id: 11, name: 'Bob'});
+"#;
+
+/// A user range index on the pk property must survive `--pk <field>` — while the
+/// internal `(:__DumpVertex__)(<pk>)` index is still dropped. Regression: the filter
+/// was `label != DUMP_VERTEX && property != pk_field`, whose De Morgan dual dropped
+/// *every* index on the pk property, silently degrading `WHERE n.id = …` to a label
+/// scan. Note `--pk id` is load-bearing here: under the default `--pk __dump_id__` the
+/// first conjunct alone carries the filter and the buggy predicate passes this test.
+#[test]
+fn pk_field_import_keeps_user_index_on_pk_property() {
+    let work = unique_dir("index");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, INDEX_DUMP).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "pkidx",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--pk",
+            "id",
+            "--cluster",
+            "none",
+        ])
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "pk build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("pkidx");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+
+    // The user index on the pk property survives...
+    let person_id = m
+        .range_indexes
+        .iter()
+        .find(|ri| ri.label_or_type == "Person" && ri.property == "id")
+        .expect("user range index on the pk property :Person(id) must be built");
+    // ...and is a real, populated index, not just a manifest entry.
+    let isam = IsamReader::open(gen_dir.join(format!("range/{}.isam", person_id.name))).unwrap();
+    let hits = isam.lookup_eq(&Value::Int(10)).unwrap();
+    assert_eq!(hits.len(), 1, ":Person(id) index must resolve id=10");
+    let np = PropsReader::open(gen_dir.join("node_props.blk")).unwrap();
+    assert_eq!(
+        prop(&np.props(hits[0]).unwrap(), &m.property_keys, "name"),
+        Some(&Value::Str("Alice".into())),
+        ":Person(id) index must point at the node holding id=10"
+    );
+
+    // An index on a non-pk property is unaffected.
+    assert!(
+        m.range_indexes
+            .iter()
+            .any(|ri| ri.label_or_type == "Person" && ri.property == "name"),
+        ":Person(name) index must be built"
+    );
+
+    // The filter still does its actual job: the internal DumpVertex index is dropped.
+    assert!(
+        !m.range_indexes
+            .iter()
+            .any(|ri| ri.label_or_type == "__DumpVertex__"),
+        "internal (:__DumpVertex__)(id) index must NOT be built, got: {:?}",
+        m.range_indexes
     );
 
     let _ = std::fs::remove_dir_all(&work);
