@@ -426,10 +426,60 @@ pub struct DurationParts {
     pub seconds: i64,
 }
 
+/// A `duration(…)` the engine cannot represent as a `time_t`.
+///
+/// Carried as a typed error so callers classify it by *type*
+/// (`err.downcast_ref::<DurationOutOfRange>()`), never by matching the message
+/// text (house rule; `slater_scalar::ArithmeticOverflow` is the same shape on
+/// integer arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DurationOutOfRange {
+    /// `duration({years: 1e400})` — the literal parses to `f64` `INFINITY`
+    /// (`parse::<f64>` never errors on overflow), and `NaN` can arrive the same
+    /// way. Both saturate on an `as` cast, so they are rejected up front.
+    #[error("duration component `{0}` is not a finite number")]
+    NonFinite(&'static str),
+    /// Finite, but with no whole `i64` counterpart — e.g. `duration({years:
+    /// 1e19})`, which is past `i64::MAX`.
+    #[error("duration component `{0}` is too large to represent")]
+    Component(&'static str),
+    /// The components are individually representable but their fold is not.
+    #[error("duration is outside the representable range")]
+    Overflow,
+}
+
+/// A user-supplied `f64` duration component as a whole `i64`, or `None` if it
+/// has no `i64` counterpart.
+///
+/// Rust's float→int `as` cast **saturates**: `1e19 as i64` is `i64::MAX`, and so
+/// is `f64::INFINITY as i64`. That turns an absurd request into a
+/// plausible-looking number which the arithmetic downstream then wraps — the
+/// shape of this module's past bug — so every cast of a user-supplied float goes
+/// through here instead.
+fn whole_i64(v: f64) -> Option<i64> {
+    if !v.is_finite() {
+        return None;
+    }
+    let t = v.trunc();
+    // 2^63 is exactly representable as an f64; `i64::MAX` is not (it rounds *up*
+    // to 2^63), so a bound spelled `i64::MAX as f64` would wrongly admit 2^63
+    // itself. `-2^63` is exactly `i64::MIN`, hence the asymmetric comparison.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if t >= LIMIT || t < -LIMIT {
+        return None;
+    }
+    Some(t as i64)
+}
+
 /// `duration_from_epoch_utc`: fold component amounts (calendar years/months by
 /// the calendar, everything else as fixed seconds) into the `time_t` of
 /// *epoch + duration*. Fractional years/months use FalkorDB's 365.25 / 30.44
-/// averages; the final cast to seconds truncates (matching the C `(time_t)`).
+/// averages; the final conversion to seconds truncates (matching the C
+/// `(time_t)`).
+///
+/// Every component is user-supplied and unbounded, so anything unrepresentable
+/// is a clean [`DurationOutOfRange`] rather than a saturated cast followed by
+/// wrapping arithmetic.
 pub fn duration_to_timet(
     years: f64,
     months: f64,
@@ -438,13 +488,30 @@ pub fn duration_to_timet(
     hours: f64,
     minutes: f64,
     seconds: f64,
-) -> i64 {
-    let years_int = years.trunc() as i64;
-    let months_int = months.trunc() as i64;
+) -> Result<i64, DurationOutOfRange> {
+    for (name, v) in [
+        ("years", years),
+        ("months", months),
+        ("weeks", weeks),
+        ("days", days),
+        ("hours", hours),
+        ("minutes", minutes),
+        ("seconds", seconds),
+    ] {
+        if !v.is_finite() {
+            return Err(DurationOutOfRange::NonFinite(name));
+        }
+    }
+    let years_int = whole_i64(years).ok_or(DurationOutOfRange::Component("years"))?;
+    let months_int = whole_i64(months).ok_or(DurationOutOfRange::Component("months"))?;
 
     // 1970-01-01 + whole years + whole months, by the calendar.
-    let total_months = years_int * 12 + months_int;
-    let base_date = add_calendar_months(epoch_date(), total_months);
+    let total_months = years_int
+        .checked_mul(12)
+        .and_then(|m| m.checked_add(months_int))
+        .ok_or(DurationOutOfRange::Overflow)?;
+    let base_date =
+        add_calendar_months(epoch_date(), total_months).ok_or(DurationOutOfRange::Overflow)?;
     let base_time = date_to_secs(base_date);
 
     let extra_days = (years - years_int as f64) * 365.25 + (months - months_int as f64) * 30.44;
@@ -454,7 +521,13 @@ pub fn duration_to_timet(
     total_seconds += minutes * SECONDS_IN_MINUTE as f64;
     total_seconds += seconds;
 
-    base_time + total_seconds as i64
+    // The seconds side is the same trap one fold down: `days: 1e18` is a
+    // perfectly representable component but 8.64e22 seconds, which saturates to
+    // `i64::MAX` and then overflows the add whenever `base_time` is non-zero.
+    let offset = whole_i64(total_seconds).ok_or(DurationOutOfRange::Overflow)?;
+    base_time
+        .checked_add(offset)
+        .ok_or(DurationOutOfRange::Overflow)
 }
 
 /// `duration_from_time_t_utc`: decompose an absolute `time_t` back into
@@ -470,7 +543,11 @@ pub fn duration_components(secs: i64) -> DurationParts {
         month_diff += 12;
     }
 
-    let anchor = add_calendar_months(epoch_date(), year_diff * 12 + month_diff);
+    // `year_diff`/`month_diff` are read straight back out of a real
+    // `NaiveDateTime`, so the anchor is always in range; the fallback only
+    // satisfies the type.
+    let anchor =
+        add_calendar_months(epoch_date(), year_diff * 12 + month_diff).unwrap_or_else(epoch_date);
     let anchor_time = date_to_secs(anchor);
 
     let mut delta = secs - anchor_time;
@@ -492,8 +569,23 @@ pub fn duration_components(secs: i64) -> DurationParts {
 }
 
 /// `duration('P…')` — FalkorDB `_parse_duration` (integer designators only),
-/// then encode to a `time_t`. `None` on a malformed string.
-pub fn duration_from_string(s: &str) -> Option<i64> {
+/// then encode to a `time_t`.
+///
+/// `Ok(None)` is a malformed string (→ Cypher `null`, FalkorDB's behaviour);
+/// `Err` is a well-formed string naming a duration we cannot represent, e.g.
+/// `duration('P9999999999999999999Y')`. The two are distinct: a `null` for the
+/// second would be another way of quietly not answering the question.
+pub fn duration_from_string(s: &str) -> Result<Option<i64>, DurationOutOfRange> {
+    let Some((years, months, weeks, days, hours, minutes, seconds)) = parse_duration_parts(s)
+    else {
+        return Ok(None);
+    };
+    duration_to_timet(years, months, weeks, days, hours, minutes, seconds).map(Some)
+}
+
+/// The `P…` designator scan itself. `None` on a malformed string.
+#[allow(clippy::type_complexity)]
+fn parse_duration_parts(s: &str) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
     let mut bytes = s.bytes().peekable();
     if bytes.next() != Some(b'P') {
         return None;
@@ -534,9 +626,7 @@ pub fn duration_from_string(s: &str) -> Option<i64> {
         }
         i += 1;
     }
-    Some(duration_to_timet(
-        years, months, weeks, days, hours, minutes, seconds,
-    ))
+    Some((years, months, weeks, days, hours, minutes, seconds))
 }
 
 // ── Arithmetic (FalkorDB temporal_arithmetic.c) ───────────────────────────────
@@ -585,7 +675,12 @@ pub fn add_duration(kind: TKind, secs: i64, dur_secs: i64, sub: bool) -> i64 {
 /// `duration ± duration` — component-wise (FalkorDB `_AddDurations` /
 /// `_SubDurations`), re-encoded through the `time_t` (which normalises any
 /// overflow, e.g. 66 minutes → 1h6m).
-pub fn add_durations(a: i64, b: i64, sub: bool) -> i64 {
+///
+/// Both operands decode back out of a stored `time_t`, so every component is
+/// already bounded by chrono's calendar and the re-encode cannot realistically
+/// fail — but it is fallible, so the error is propagated rather than assumed
+/// away.
+pub fn add_durations(a: i64, b: i64, sub: bool) -> Result<i64, DurationOutOfRange> {
     let x = duration_components(a);
     let y = duration_components(b);
     let s = if sub { -1 } else { 1 };
@@ -602,9 +697,17 @@ pub fn add_durations(a: i64, b: i64, sub: bool) -> i64 {
 
 /// 1970-01-01 + a signed number of calendar months (chrono's `Months` is
 /// unsigned; first-of-month so no day-clamping ever occurs).
-fn add_calendar_months(d: NaiveDate, months: i64) -> NaiveDate {
-    let total = (d.year() as i64) * 12 + d.month0() as i64 + months;
-    let y = total.div_euclid(12) as i32;
+///
+/// `None` if the result falls outside chrono's proleptic-Gregorian range. This
+/// used to end in `div_euclid(12) as i32` — another saturating cast — behind an
+/// `unwrap_or_else(epoch_date)`, so an out-of-calendar duration answered *the
+/// epoch* rather than failing.
+fn add_calendar_months(d: NaiveDate, months: i64) -> Option<NaiveDate> {
+    let total = (d.year() as i64)
+        .checked_mul(12)?
+        .checked_add(d.month0() as i64)?
+        .checked_add(months)?;
+    let y = i32::try_from(total.div_euclid(12)).ok()?;
     let m = (total.rem_euclid(12) + 1) as u32;
-    NaiveDate::from_ymd_opt(y, m, d.day()).unwrap_or_else(epoch_date)
+    NaiveDate::from_ymd_opt(y, m, d.day())
 }

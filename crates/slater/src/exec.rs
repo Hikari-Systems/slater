@@ -9400,7 +9400,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             },
             "duration" => match a0(0) {
                 Val::Null => Val::Null,
-                Val::Str(s) => temporal::duration_from_string(&s)
+                Val::Str(s) => temporal::duration_from_string(&s)?
                     .map(Val::Duration)
                     .unwrap_or(Val::Null),
                 Val::Map(m) => build_duration(&m)?,
@@ -10461,7 +10461,7 @@ fn temporal_arith(op: BinOp, a: &Val, b: &Val) -> Result<Val> {
     match op {
         BinOp::Add => match (a, b) {
             (Val::Duration(x), Val::Duration(y)) => {
-                Ok(Val::Duration(temporal::add_durations(*x, *y, false)))
+                Ok(Val::Duration(temporal::add_durations(*x, *y, false)?))
             }
             // temporal + duration (either order)
             (Val::Duration(d), t) | (t, Val::Duration(d)) if temporal_kind(t).is_some() => {
@@ -10475,7 +10475,7 @@ fn temporal_arith(op: BinOp, a: &Val, b: &Val) -> Result<Val> {
         },
         BinOp::Sub => match (a, b) {
             (Val::Duration(x), Val::Duration(y)) => {
-                Ok(Val::Duration(temporal::add_durations(*x, *y, true)))
+                Ok(Val::Duration(temporal::add_durations(*x, *y, true)?))
             }
             // temporal - duration only (duration - temporal is invalid)
             (t, Val::Duration(d)) if temporal_kind(t).is_some() => {
@@ -10676,7 +10676,7 @@ fn build_duration(m: &[(String, Val)]) -> Result<Val> {
         hours.unwrap_or(0.0),
         minutes.unwrap_or(0.0),
         seconds.unwrap_or(0.0),
-    )))
+    )?))
 }
 
 /// The Cypher source spelling of a binary operator, for error messages.
