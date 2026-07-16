@@ -81,6 +81,11 @@ impl ChunkKind {
     }
 }
 
+/// Running count of non-monotone pairs [`report_non_monotone`] has seen, process-wide. Drives the
+/// report's rate limit, and lets a test assert the report path actually fired without standing up
+/// a `tracing` subscriber (the crate has no subscriber and no dev-dep for one).
+static NON_MONOTONE_SEEN: AtomicU64 = AtomicU64::new(0);
+
 /// Report a non-monotone cumulative pair seen by [`EfChunk::degree_at`] — i.e. a degree chunk
 /// whose bytes cannot have come from this crate's encoder.
 ///
@@ -104,8 +109,7 @@ impl ChunkKind {
 #[cold]
 #[inline(never)]
 fn report_non_monotone(slot: usize, v0: u64, v1: u64) {
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = NON_MONOTONE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
         warn!(
             slot,
@@ -1044,9 +1048,26 @@ mod tests {
         );
 
         let chunk = EfChunk::deserialize(&body).expect("the forged record is legal and accepted");
+
         // c[0] = 3, c[1] = 0 — non-monotone. Pre-fix: debug panics here, release returns
         // 4294967293.
+        let before = NON_MONOTONE_SEEN.load(Ordering::Relaxed);
         assert_eq!(chunk.degree_at(0), 0, "must saturate, not underflow");
+
+        // The saturation must also be *reported*. A `0` degree is indistinguishable from an
+        // isolated node, so a silent saturation is the failure mode this ticket exists to avoid —
+        // without this assertion, deleting the report call still passes the test above. Counting
+        // the reports is what lets us check that with no subscriber in the crate; this test is the
+        // only one that decodes a non-monotone chunk, so the process-wide counter is stable here.
+        assert_eq!(
+            NON_MONOTONE_SEEN.load(Ordering::Relaxed) - before,
+            1,
+            "the saturation must be reported, not silent"
+        );
+
+        // The healthy slots of the same chunk still answer normally — the report is not a
+        // poison pill for the whole chunk.
+        assert_eq!(chunk.degree_at(2), 0, "monotone slot still decodes");
     }
 
     /// Wire-biased opts (`margin = 1.0`): always prices zstd, lets it win on any size gain.
