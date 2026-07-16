@@ -19396,6 +19396,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The **Vamana arm** of the HIK-122 rescue read. The consolidation tests exercise this
+    /// through the real builder, but a fixture small enough to run there is always below
+    /// `ann_threshold` and so always brute-force — this is the only place the other arm is
+    /// reached, and it has to return the *raw* embedding the user wrote, not the ANN-space
+    /// point the graph navigates on (`build_vamana_index` transforms for search and stores raw;
+    /// a rescue that returned the transformed point would write a silently wrong vector into
+    /// the rebuilt column store).
+    #[test]
+    fn base_index_vectors_reads_raw_embeddings_from_a_vamana_index() {
+        let fix = testgen::VamanaFixture {
+            n: 200,
+            dim: 16,
+            r: 12,
+            alpha: 1.2,
+            pq_subspaces: 4,
+            pq_bits: 8,
+            vector_block_size: 4096,
+        };
+        let (root, graph, raw) = testgen::write_vamana("exec_rescue_vamana", &fix);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let desc = gen.manifest().vector_indexes[0].clone();
+        assert!(
+            matches!(desc.mode, AnnMode::Vamana { .. }),
+            "the fixture must be above the ANN threshold, or this test proves nothing"
+        );
+
+        // A scattered handful, plus an id the index does not hold.
+        let wanted: HashSet<u64> = [3u64, 7, 101, 199, 5_000].into_iter().collect();
+        let got = engine.base_index_vectors(&desc, &wanted).unwrap();
+
+        assert_eq!(
+            got.len(),
+            4,
+            "every wanted id the base indexes must come back, and only those: id 5000 is not \
+             in the index"
+        );
+        for id in [3u64, 7, 101, 199] {
+            assert_eq!(
+                got.get(&id),
+                Some(&raw[id as usize]),
+                "node {id}'s rescued vector must be the raw embedding, byte-for-byte"
+            );
+        }
+        // An empty request must not read the index at all — the common case is no candidates.
+        assert!(engine
+            .base_index_vectors(&desc, &HashSet::new())
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The headline M7 test: a synthetic index far above the ANN threshold **and**
     /// far larger than the vector cache budget. The Vamana/PQ arm recovers most of
     /// the brute-force top-k while the vector-index pool stays bounded (resident PQ
