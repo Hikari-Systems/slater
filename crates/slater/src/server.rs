@@ -2407,6 +2407,30 @@ struct Session {
     login_deadline: Option<TokioInstant>,
 }
 
+impl Session {
+    /// Drop every piece of session state that belongs to **the authenticated user**,
+    /// as opposed to the connection (HIK-123).
+    ///
+    /// A Bolt connection outlives the identity on it: `LOGOFF` and a bare re-`LOGON`
+    /// both hand the same socket to a new principal. Anything scoped to the *old*
+    /// principal — rows their grants let them read, a graph their grants resolved — is
+    /// their data, and must not survive into the next principal's session. `RESET`
+    /// wants the identical clear for its own reason (abandon the stream).
+    ///
+    /// **Invariant: this is the only place that clears user-scoped state, and every
+    /// identity transition calls it.** The bug this fixes was three transitions
+    /// (`RESET` / `LOGOFF` / re-`LOGON`) agreeing on what to clear in only one of
+    /// them: `LOGOFF` zeroed `user` and left `pending` (the prior user's rows, drained
+    /// by the next `PULL`) and `tx_graph` (the prior user's graph, reused by the next
+    /// `RUN` without an ACL check). A field added to [`Session`] and cleared on only
+    /// some of those paths reintroduces exactly that leak — so if it is scoped to the
+    /// user's identity rather than to the connection, clear it **here**.
+    fn clear_user_state(&mut self) {
+        self.pending = None;
+        self.tx_graph = None;
+    }
+}
+
 // ── Framing over an async stream ──────────────────────────────────────────────
 
 /// A write on the pre-auth path ran past the login deadline. Typed (HIK-103) so the
@@ -3377,8 +3401,7 @@ where
             message::Request::Goodbye => break,
             message::Request::Reset => {
                 sess.failed = false;
-                sess.pending = None;
-                sess.tx_graph = None;
+                sess.clear_user_state();
                 framed.write_message(&message::success(vec![])).await?;
                 framed.flush().await?;
                 continue;
@@ -3460,6 +3483,15 @@ async fn authenticate(
     match verified {
         Ok(true) => {
             sess.auth_failures = 0;
+            // A LOGON is an identity transition even without a preceding LOGOFF (see the
+            // deadline note above: re-auth / token rotation is explicitly allowed), so the
+            // outgoing principal's state goes here too — otherwise `A LOGON → RUN →
+            // B LOGON` leaks exactly what fixing LOGOFF alone would close (HIK-123).
+            // Unconditional, not `if principal != old`: re-authenticating as the *same*
+            // name may still pick up a hot-reloaded ACL that revoked the grant which
+            // resolved `tx_graph`, and Bolt only permits LOGON from READY, where a
+            // caller has no stream left to lose.
+            sess.clear_user_state();
             sess.user = Some(principal);
             Ok(())
         }
@@ -3573,8 +3605,11 @@ async fn handle_request(
             Ok(vec![message::success(vec![])])
         }
 
+        // De-authenticating hands this connection back to whoever LOGONs next, so the
+        // prior user's buffered rows and open-transaction graph go with them (HIK-123).
         Request::Logoff => {
             sess.user = None;
+            sess.clear_user_state();
             Ok(vec![message::success(vec![])])
         }
 
@@ -3676,7 +3711,22 @@ async fn handle_request(
             // RUN carries no `db`; otherwise resolve from the RUN's `db`, else the
             // user's sticky `USE` selection, else their single readable graph.
             let graph = match &sess.tx_graph {
-                Some(g) => g.clone(),
+                // The graph was resolved and ACL-checked at BEGIN — but that check was
+                // made for whoever was authenticated *then*, against the ACL as it read
+                // *then*. Neither is guaranteed to still hold: the ACL hot-reloads (a
+                // grant can be revoked mid-transaction), and the session's principal can
+                // change under an open transaction. Re-check per RUN rather than trust
+                // the BEGIN-time decision — a read must never be served on a grant the
+                // current user does not currently hold (HIK-123).
+                Some(g) => {
+                    if !ctx.acl.snapshot().can_read(&user, g) {
+                        return Err(Failure::new(
+                            CODE_FORBIDDEN,
+                            format!("user '{user}' has no read grant on graph '{g}'"),
+                        ));
+                    }
+                    g.clone()
+                }
                 None => {
                     let g = ctx.select_graph(&extra, &user, sticky.as_deref())?;
                     // If this query named the graph explicitly (e.g. Memgraph Lab puts
@@ -3811,6 +3861,13 @@ async fn handle_request(
         }
 
         Request::Pull(meta) => {
+            // Rows are only ever served to an authenticated session — the same bar RUN
+            // sets. Defence in depth for HIK-123: this is the check whose absence turned a
+            // stale buffer into a cross-user read, so it holds even if some future path
+            // leaves `pending` behind across an identity change.
+            if sess.user.is_none() {
+                return Err(Failure::unauthorized("not authenticated; send LOGON first"));
+            }
             let pending = sess
                 .pending
                 .as_mut()
@@ -15304,6 +15361,9 @@ mod tests {
         /// the ctx has a `DeltaWriter` and the RUN write arms are reachable.
         writable: bool,
         load_test_diagnostics: bool,
+        /// Replace the single-user fixture ACL with one the test writes itself — for the
+        /// multi-user grant checks, where "user B holds no read grant" is the point.
+        acl_json: Option<serde_json::Value>,
     }
 
     impl Default for TestLimits {
@@ -15321,6 +15381,7 @@ mod tests {
                 max_concurrent_writes: 4,     // as in prod
                 writable: false,              // read-only unless a test asks for writes
                 load_test_diagnostics: false, // diagnostics off by default, as in prod
+                acl_json: None,               // the single-user fixture ACL
             }
         }
     }
@@ -15331,7 +15392,14 @@ mod tests {
 
     fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<ConnCtx>) {
         let (root, _graph, _) = testgen::write_basic(tag);
-        let acl_path = write_acl(&root);
+        let acl_path = match &limits.acl_json {
+            Some(json) => {
+                let path = root.join("acl.json");
+                std::fs::write(&path, json.to_string()).unwrap();
+                path
+            }
+            None => write_acl(&root),
+        };
         let acl = Arc::new(AclHandle::load(&acl_path).unwrap());
         let mut graphs = Graphs::open_all(&root, None).unwrap();
         if limits.writable {
@@ -15741,6 +15809,33 @@ mod tests {
             PsValue::Struct {
                 tag: message::tag::DISCARD,
                 fields: vec![PsValue::Map(vec![("n".into(), PsValue::Int(n))])],
+            }
+        }
+
+        fn logoff() -> PsValue {
+            PsValue::Struct {
+                tag: message::tag::LOGOFF,
+                fields: vec![],
+            }
+        }
+
+        /// A RUN that names no `db` — the shape that resolves through `tx_graph`.
+        fn run_no_db(query: &str) -> PsValue {
+            PsValue::Struct {
+                tag: message::tag::RUN,
+                fields: vec![
+                    PsValue::str(query),
+                    PsValue::Map(vec![]),
+                    PsValue::Map(vec![]),
+                ],
+            }
+        }
+
+        /// A BEGIN naming its target graph, which `Request::Begin` resolves into `tx_graph`.
+        fn begin_db(graph: &str) -> PsValue {
+            PsValue::Struct {
+                tag: message::tag::BEGIN,
+                fields: vec![PsValue::Map(vec![("db".into(), PsValue::str(graph))])],
             }
         }
 
@@ -16503,6 +16598,222 @@ mod tests {
     /// The bound is calibrated against a *measured* verify on this machine and build
     /// profile rather than a hard-coded millisecond count, so it neither flakes on a slow
     /// box nor passes vacuously on a fast one.
+    // ── HIK-123: session state must not outlive the identity it belongs to ──────────
+    //
+    // A Bolt connection can carry more than one principal (LOGOFF→LOGON, or a bare
+    // re-LOGON). Every one of these drives a *real socket* through the actual message
+    // loop, because the bug lived in the handlers' bookkeeping, not in a helper.
+
+    /// An ACL with a reader on the fixture graph and a second user who holds no grant
+    /// at all — the "next user on the pooled connection".
+    fn two_user_acl_json() -> serde_json::Value {
+        serde_json::json!({
+            "users": {
+                // A: may read the fixture graph.
+                "reporting": {
+                    "passwordArgon2id": hash_password("pw").unwrap(),
+                    "grants": { "people": ["read"] }
+                },
+                // B: authenticates fine, but is granted nothing anywhere.
+                "intruder": {
+                    "passwordArgon2id": hash_password("pw2").unwrap(),
+                    "grants": {}
+                }
+            }
+        })
+    }
+
+    fn two_user_ctx(tag: &str) -> (std::path::PathBuf, Arc<ConnCtx>) {
+        build_ctx_limited(
+            tag,
+            TestLimits {
+                acl_json: Some(two_user_acl_json()),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// (a) The cross-user read: A's buffered rows must not be drainable by B.
+    ///
+    /// Before the fix, LOGOFF cleared only `sess.user`, so `sess.pending` still held A's
+    /// rows and `Request::Pull` handed them to B without ever looking at `sess.user`.
+    #[tokio::test]
+    async fn logoff_does_not_leave_the_prior_users_rows_for_the_next_user() {
+        let (root, ctx) = two_user_ctx("server_hik123_pending");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+
+        // A authenticates and RUNs, buffering rows it never pulls.
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // A leaves; B takes the same connection.
+        c.send(Client::logoff()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("intruder", "pw2")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // B pulls. Any RECORD here is A's data on B's session.
+        c.send(Client::pull_all()).await;
+        let (tag, _) = c.recv().await;
+        assert_ne!(
+            tag,
+            message::tag::RECORD,
+            "PULL after LOGOFF/LOGON returned the previous user's buffered rows"
+        );
+        assert_eq!(
+            tag,
+            message::tag::FAILURE,
+            "a PULL with no RUN of its own must fail, not succeed silently"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same leak reached without a LOGOFF at all — `authenticate` deliberately
+    /// permits re-LOGON on an authenticated session (token rotation), so the identity
+    /// can change while `pending` survives. Fixing only the LOGOFF handler leaves this
+    /// path open; it is why the clear lives in `authenticate` too.
+    #[tokio::test]
+    async fn a_bare_relogon_does_not_inherit_the_prior_users_rows() {
+        let (root, ctx) = two_user_ctx("server_hik123_relogon");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::run("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // No LOGOFF — B simply LOGONs over A.
+        c.send(Client::logon("intruder", "pw2")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        c.send(Client::pull_all()).await;
+        let (tag, _) = c.recv().await;
+        assert_ne!(
+            tag,
+            message::tag::RECORD,
+            "a re-LOGON inherited the previous user's buffered rows"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (b) The read-ACL bypass: A's open-transaction graph must not carry B's RUN.
+    ///
+    /// B holds no read grant on `people`, so the *only* way B's db-less RUN can be
+    /// served is the `tx_graph` arm short-circuiting `select_graph`/`can_read`. Before
+    /// the fix it did exactly that and returned A's graph.
+    #[tokio::test]
+    async fn logoff_does_not_leave_the_prior_users_transaction_graph_for_the_next_user() {
+        let (root, ctx) = two_user_ctx("server_hik123_tx_graph");
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+
+        // A opens a transaction naming the graph → sess.tx_graph = Some("people").
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::begin_db("people")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // A leaves mid-transaction; B takes the connection.
+        c.send(Client::logoff()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("intruder", "pw2")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // B runs a db-less query. It must be refused on B's own (empty) grants.
+        c.send(Client::run_no_db("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(
+            tag,
+            message::tag::FAILURE,
+            "a db-less RUN was served from the prior user's transaction graph"
+        );
+        assert_eq!(
+            fields[0].get("code").and_then(PsValue::as_str),
+            Some(CODE_FORBIDDEN),
+            "the refusal must be an authorization failure on B's grants"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `tx_graph` arm re-checks the ACL per RUN, not once at BEGIN — so a grant
+    /// revoked by an ACL hot-reload stops being served *inside* an open transaction,
+    /// with no identity change involved. Independent of the LOGOFF clear: this one
+    /// survives a correct session-state handoff.
+    #[tokio::test]
+    async fn a_grant_revoked_mid_transaction_stops_serving_reads() {
+        let (root, ctx) = two_user_ctx("server_hik123_revoke");
+        let acl_path = root.join("acl.json");
+        // Hold the handle so the test can drive the reload itself: `snapshot()` does not
+        // poll, and hanging the assertion on mtime-granularity polling would make it flaky
+        // (or, worse, pass against a stale ACL for the wrong reason).
+        let acl = ctx.acl.clone();
+        let addr = spawn_server(ctx).await;
+        let mut c = Client::connect(addr).await;
+
+        c.send(Client::hello()).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::logon("reporting", "pw")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::begin_db("people")).await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+        // In-transaction RUN is served while the grant stands.
+        c.send(Client::run_no_db("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+        c.send(Client::pull_all()).await;
+        assert_eq!(c.recv().await.0, message::tag::RECORD);
+        while c.recv().await.0 == message::tag::RECORD {}
+
+        // The operator revokes the read grant, and the hot-reload picks it up.
+        std::fs::write(
+            &acl_path,
+            serde_json::json!({
+                "users": {
+                    "reporting": {
+                        "passwordArgon2id": hash_password("pw").unwrap(),
+                        "grants": {}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(acl.reload(), "the revoked ACL must install");
+        assert!(
+            !acl.snapshot().can_read("reporting", "people"),
+            "precondition: the grant is gone from the live ACL"
+        );
+
+        // The next RUN in the *same* transaction must not ride the BEGIN-time decision.
+        c.send(Client::run_no_db("MATCH (n:Person) RETURN n.name AS name"))
+            .await;
+        let (tag, fields) = c.recv().await;
+        assert_eq!(
+            tag,
+            message::tag::FAILURE,
+            "a read was served on a grant revoked mid-transaction"
+        );
+        assert_eq!(
+            fields[0].get("code").and_then(PsValue::as_str),
+            Some(CODE_FORBIDDEN)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn concurrent_logons_do_not_block_the_reactor() {
         const FLOOD: usize = 8;
