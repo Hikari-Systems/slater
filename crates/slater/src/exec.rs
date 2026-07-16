@@ -13549,6 +13549,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A `duration(…)` the engine cannot represent is a clean, typed query error
+    /// — end to end, through both spellings any authenticated client can send.
+    ///
+    /// `duration_to_timet` did `years.trunc() as i64`, and Rust's float→int `as`
+    /// cast **saturates**: `1e19` became `i64::MAX` rather than erroring, and the
+    /// `years_int * 12` on the next line then overflowed. Debug (overflow-checks
+    /// on by default) panicked inside query execution, with no `catch_unwind` on
+    /// the query path. Release (overflow-checks off by default — the profile that
+    /// *ships*) wrapped to `-12` months and cheerfully **returned a duration of
+    /// minus one year** for a request of ten quintillion years.
+    ///
+    /// That asymmetry is why these assertions have to hold under `--release`
+    /// too: in debug the pre-fix code fails loudly for the wrong reason, so a
+    /// debug-only test would look like it was doing its job while the silent
+    /// wrong answer shipped. Every case below is asserted on the *answer* — an
+    /// `Ok` is a failure, whatever it contains — not on the absence of a panic.
+    #[test]
+    fn absurd_duration_components_error_rather_than_wrapping_to_minus_one_year() {
+        let (root, graph, _) = testgen::write_basic("exec_duration_overflow");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let run = |q: &str| engine.run(&parser::parse(q).unwrap());
+
+        // Classified by error *type*, never by message text (house rule).
+        let bad = |q: &str| match run(q) {
+            Ok(res) => panic!(
+                "`{q}` must be a query error, but answered {}",
+                res.rows[0][0].to_display()
+            ),
+            Err(e) => assert!(
+                e.downcast_ref::<temporal::DurationOutOfRange>().is_some(),
+                "expected a typed DurationOutOfRange from `{q}`, got: {e}"
+            ),
+        };
+
+        // The reported reproductions — the string form (the `duration()` Str
+        // arm) and the map form (`build_duration`). Pre-fix, in release, the
+        // first two answered `P-1Y`.
+        bad("RETURN duration('P9999999999999999999Y')");
+        bad("RETURN duration({years: 1e19})");
+        bad("RETURN toString(duration({years: 1e19}))");
+        // `1e400` parses to f64 INFINITY (`parse::<f64>` never errors on
+        // overflow), and `INFINITY as i64` saturates to `i64::MAX` identically.
+        bad("RETURN duration({years: 1e400})");
+        // Negative extremes: `-1e19` saturated to `i64::MIN`, which wraps too.
+        bad("RETURN duration({years: -1e19})");
+        bad("RETURN duration({years: -1e400})");
+        bad("RETURN duration('P-9999999999999999999Y')");
+        // `i64::MAX` as an integer literal: `as f64` rounds it *up* to 2^63,
+        // which has no i64 counterpart at all.
+        bad("RETURN duration({years: 9223372036854775807})");
+        // Not just `years` — every component is user-supplied.
+        bad("RETURN duration({months: 1e19})");
+        bad("RETURN duration({days: 1e400})");
+        bad("RETURN duration({seconds: 1e19})");
+        // The seconds fold one line down, where representable components make an
+        // unrepresentable `time_t` — and `base_time` is non-zero here, which is
+        // what overflowed the add.
+        bad("RETURN duration({years: 1, days: 1e18})");
+        // A duration whose `time_t` leaves chrono's calendar: it decoded back as
+        // ~1e14 *days*, so `localdatetime(…) + it` overflowed the `* 86_400`.
+        // Refused at construction now, which is the only gate `Val::Duration`
+        // has.
+        bad("RETURN duration({days: 100000000000000})");
+        bad("RETURN localdatetime({year:2000}) + duration({days: 100000000000000})");
+        // `duration ± duration` re-encodes through the same fold.
+        bad("RETURN duration({years: 1e19}) + duration({years: 1})");
+        bad("RETURN duration({years: 1}) - duration({years: 1e19})");
+
+        // Only the unrepresentable is refused: ordinary durations, a value just
+        // inside the boundary, and a malformed string (→ NULL, FalkorDB parity)
+        // are all unchanged.
+        let res = run("RETURN toString(duration('P1Y2M3DT4H5M6S')) AS d").unwrap();
+        assert_eq!(render(&res.rows[0][0]), "'P1Y2M3DT4H5M6S'");
+        let res = run("RETURN toString(duration({years: 100000})) AS d").unwrap();
+        assert_eq!(render(&res.rows[0][0]), "'P100000Y'");
+        let res = run("RETURN duration('not a duration') AS d").unwrap();
+        assert!(matches!(res.rows[0][0], Val::Null));
+        let res = run("RETURN duration(null) AS d").unwrap();
+        assert!(matches!(res.rows[0][0], Val::Null));
+
+        // The engine is still usable after the failed queries.
+        let res = run("RETURN 1 + 1 AS v").unwrap();
+        assert!(matches!(res.rows[0][0], Val::Int(2)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An extreme negative list index / slice bound is out of range, not a crash.
     ///
     /// Same bug class as the rest of HIK-73, found by sweeping the file for
