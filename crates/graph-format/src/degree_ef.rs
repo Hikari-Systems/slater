@@ -958,6 +958,44 @@ mod tests {
         );
     }
 
+    /// A forged chunk whose *low bits* decode non-monotone must not underflow `degree_at`.
+    ///
+    /// `hi` is forced non-decreasing by the bitmap's structure, but the lows are arbitrary disk
+    /// bytes — so a same-bucket pair with `low1 < low0` decodes `v1 < v0` and `v1 - v0`
+    /// underflows. **Debug panics; release wraps and returns `4294967293`, which the degree-sum
+    /// count fast path sums into a wrong k-hop count with no error** — so, exactly as for
+    /// `rejects_forged_ef_low_bits_width` above, this must hold under `cargo test --release`
+    /// too: a debug-only pass proves the panic and says nothing about the silent path that ships.
+    ///
+    /// Every existing check passes on this record by construction — the body is exactly `need`
+    /// bytes, `ones == m`, and `ℓ = 2` is a legal width — so it is genuinely ACCEPTED and the
+    /// subtraction is really reached. (If this ever starts failing with a decode `Err`, the forge
+    /// has drifted and the test has stopped proving anything.)
+    #[test]
+    fn non_monotone_ef_lows_saturate_rather_than_underflow() {
+        // n=4 (m=5 cumulative elements), ℓ=2, one high word.
+        let (n, l, nwords) = (4u32, 2u8, 1u32);
+        let mut body = Vec::new();
+        body.extend_from_slice(&n.to_le_bytes());
+        body.push(l);
+        body.extend_from_slice(&nwords.to_le_bytes());
+        // Lows: 5 × 2 bits, LSB-first → low[0] = 3, low[1..5] = 0.
+        body.extend_from_slice(&[0b0000_0011, 0]);
+        // Highs: all m=5 one-bits at positions 0..5, so every hi_i = 0 and every element shares
+        // a bucket — the case where the lows alone decide order.
+        body.extend_from_slice(&0b1_1111u64.to_le_bytes());
+        assert_eq!(
+            body.len(),
+            19,
+            "9 header + 2 low + 8 high — the exact `need`"
+        );
+
+        let chunk = EfChunk::deserialize(&body).expect("the forged record is legal and accepted");
+        // c[0] = 3, c[1] = 0 — non-monotone. Pre-fix: debug panics here, release returns
+        // 4294967293.
+        assert_eq!(chunk.degree_at(0), 0, "must saturate, not underflow");
+    }
+
     /// Wire-biased opts (`margin = 1.0`): always prices zstd, lets it win on any size gain.
     fn wire_opts() -> DegreeCodecOpts {
         DegreeCodecOpts {
