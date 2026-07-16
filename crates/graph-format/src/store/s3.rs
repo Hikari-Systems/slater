@@ -544,7 +544,7 @@ impl ObjectStore for S3ObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_verify, VerifyPlan};
+    use super::{checked_content_length, plan_verify, VerifyPlan};
 
     // Regression for HIK-97: when the manifest recorded a SHA-256 but the object
     // carries none server-stored, `verify_file` must NOT downgrade to a byte-length
