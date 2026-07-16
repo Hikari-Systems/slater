@@ -463,9 +463,10 @@ fn whole_i64(v: f64) -> Option<i64> {
     let t = v.trunc();
     // 2^63 is exactly representable as an f64; `i64::MAX` is not (it rounds *up*
     // to 2^63), so a bound spelled `i64::MAX as f64` would wrongly admit 2^63
-    // itself. `-2^63` is exactly `i64::MIN`, hence the asymmetric comparison.
+    // itself — which is precisely the input that used to answer `P-1Y`. The
+    // range is half-open for the same reason: `-2^63` *is* exactly `i64::MIN`.
     const LIMIT: f64 = 9_223_372_036_854_775_808.0; // 2^63
-    if t >= LIMIT || t < -LIMIT {
+    if !(-LIMIT..LIMIT).contains(&t) {
         return None;
     }
     Some(t as i64)
