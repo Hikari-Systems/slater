@@ -63,6 +63,22 @@ pub enum DecodeRejected {
     /// *wrong values with no error* — the case that matters.
     #[error("{what}: low-bits width {l} is outside the valid range 0..=63")]
     EfLowBitsWidth { what: &'static str, l: u8 },
+    /// A block's slot-offset table is not a partition of the block's data region.
+    /// [`crate::blockfile::parse_block`] hands the table straight to callers that slice
+    /// `data[offsets[i]..offsets[i+1]]` by hand, so a non-monotone or overrunning entry is a
+    /// slice-out-of-bounds *panic* at generation open where a recoverable error is available.
+    #[error(
+        "{what}: slot-offset table is not a partition of the {data_len}-byte data region \
+         ({reason}: slot {slot} spans {start}..{end})"
+    )]
+    BlockOffsetTable {
+        what: &'static str,
+        reason: &'static str,
+        slot: usize,
+        start: u32,
+        end: u32,
+        data_len: usize,
+    },
     /// A run-length record's element count is above what the format could ever store.
     #[error("{what}: declares {n} elements, above the {max}-element ceiling")]
     TooManyElements {

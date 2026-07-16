@@ -36,7 +36,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
+use crate::blockfile::{parse_block, record_from_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::manifest::Metric;
 use crate::wire::{capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint};
@@ -708,7 +708,10 @@ impl PqReader {
                     global += 1;
                     continue;
                 }
-                let rec = &data[offsets[slot] as usize..offsets[slot + 1] as usize];
+                // `parse_block` has already validated the table against `data`, so this cannot
+                // fail — but say it through the shared slicing path rather than re-deriving the
+                // bounds by hand, which is how this site came to skip the check in the first place.
+                let rec = record_from_block(&offsets, data, slot as u32)?;
                 let mut rr = rec;
                 node_ids.push(read_uvarint(&mut rr)?);
                 if rr.len() != m {
@@ -733,6 +736,148 @@ impl PqReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::blockfile::BlockCodec;
+    use crate::wire::DecodeRejected;
+
+    /// A 4-dim / 2-subspace / 1-bit codebook: `subspaces*k*dsub = 8` centroids.
+    fn tiny_codebook() -> Codebook {
+        Codebook {
+            params: PqParams::new(4, 2, 1).unwrap(),
+            centroids: (0..8).map(|i| i as f32).collect(),
+        }
+    }
+
+    /// Byte image of the codebook record, exactly as [`PqWriter::create_with_cipher`]
+    /// lays record 0 out. Hand-written because the forging test below needs the `Raw`
+    /// codec, which `PqWriter` does not expose; if the header layout ever diverges,
+    /// `PqReader::open` stops parsing it and this test fails loudly rather than rotting.
+    fn codebook_record(cb: &Codebook) -> Vec<u8> {
+        let mut hdr = Vec::new();
+        let p = cb.params;
+        write_uvarint(&mut hdr, p.dim as u64);
+        write_uvarint(&mut hdr, p.subspaces as u64);
+        write_uvarint(&mut hdr, p.dsub as u64);
+        write_uvarint(&mut hdr, p.k as u64);
+        for x in &cb.centroids {
+            hdr.write_f32::<LittleEndian>(*x).unwrap();
+        }
+        hdr
+    }
+
+    /// Offset of the slot-offset table of the block starting at `off`, and the block's
+    /// total length. The image is self-describing (`count ‖ offsets ‖ data`), so this
+    /// walks it without needing the file's private directory.
+    fn block_table(bytes: &[u8], off: usize) -> (usize, usize) {
+        let count = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        let table = off + 4;
+        let last = table + count * 4;
+        let data_len = u32::from_le_bytes(bytes[last..last + 4].try_into().unwrap()) as usize;
+        (table, 4 + (count + 1) * 4 + data_len)
+    }
+
+    /// Write a `.pq` whose block 0 is the codebook alone and whose block 1 holds three
+    /// code records, then rewrite block 1's offset table to `bad` and hand the result to
+    /// `load_resident`. `Raw` + no cipher means blocks are stored verbatim, so the patch
+    /// is a byte poke rather than a re-seal (the validated table is post-decode, so the
+    /// codec is irrelevant to what is under test).
+    fn load_resident_with_forged_offsets(name: &str, bad: &[u32]) -> anyhow::Error {
+        let path = std::env::temp_dir().join(format!("slater_pq_{}_{name}", std::process::id()));
+        let cb = tiny_codebook();
+        let hdr = codebook_record(&cb);
+        // `append_record` flushes once `cur_data.len() >= target`: the 36-byte header trips
+        // it immediately (block 0), while the three 3-byte code records do not (block 1).
+        let mut w = crate::blockfile::BlockFileWriter::create_with_codec(
+            &path,
+            20,
+            BlockCodec::Raw,
+            0,
+            None,
+        )
+        .unwrap();
+        w.append_record(&hdr).unwrap();
+        for id in 1..=3u64 {
+            let mut rec = Vec::new();
+            write_uvarint(&mut rec, id);
+            rec.extend_from_slice(&[0u8, 1]); // m = 2 codes
+            w.append_record(&rec).unwrap();
+        }
+        assert_eq!(
+            w.finish().unwrap(),
+            2,
+            "expected a codebook block + one code block"
+        );
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (_, len0) = block_table(&bytes, 8); // MAGIC(8) ‖ block_0 ‖ block_1 ‖ …
+        let (table1, _) = block_table(&bytes, 8 + len0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[8 + len0..12 + len0].try_into().unwrap()),
+            3,
+            "block 1 must hold the three code records"
+        );
+        for (i, o) in bad.iter().enumerate() {
+            bytes[table1 + i * 4..table1 + i * 4 + 4].copy_from_slice(&o.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Opening still works: it reads record 0 out of the untouched block 0. The forged
+        // block is only reached by the resident load — which is the reported hazard.
+        let r = PqReader::open_with_cipher(&path, None).expect("open reads only block 0");
+        let err = r
+            .load_resident()
+            .expect_err("a forged offset table must be refused, not panicked on");
+        let _ = std::fs::remove_file(&path);
+        err
+    }
+
+    /// **HIK-128.** `load_resident` used to slice `data[offsets[slot]..offsets[slot+1]]`
+    /// straight off an unvalidated on-disk table, so a corrupt/forged `.pq` block panicked
+    /// (slice out of bounds / `start > end`) at generation open where a clean error was
+    /// available. Both records preceding the forged slot are well-formed, so pre-fix these
+    /// reach the bad slice and panic rather than erroring earlier for another reason.
+    #[test]
+    fn forged_pq_offsets_error_not_panic() {
+        // (a) an offset past the end of the data region.
+        let err = load_resident_with_forged_offsets("overrun", &[0, 3, 6, 999]);
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::BlockOffsetTable { .. })
+            ),
+            "expected a typed BlockOffsetTable rejection, got: {err:#}"
+        );
+        // (b) `start > end`.
+        let err = load_resident_with_forged_offsets("decrease", &[0, 3, 2, 9]);
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::BlockOffsetTable { .. })
+            ),
+            "expected a typed BlockOffsetTable rejection, got: {err:#}"
+        );
+    }
+
+    /// The guard is not a no-op: an untampered `.pq` written the same way still loads, and
+    /// returns exactly the records that went in.
+    #[test]
+    fn well_formed_pq_still_loads() {
+        let path = std::env::temp_dir().join(format!("slater_pq_{}_ok", std::process::id()));
+        let cb = tiny_codebook();
+        let mut w = PqWriter::create_with_cipher(&path, &cb, 20, 0, None).unwrap();
+        w.append_codes(7, &[0, 1]).unwrap();
+        w.append_codes(9, &[1, 0]).unwrap();
+        w.finish().unwrap();
+
+        let rp = PqReader::open_with_cipher(&path, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        assert_eq!(rp.node_ids, vec![7, 9]);
+        assert_eq!(rp.codes_of(0), &[0, 1]);
+        assert_eq!(rp.codes_of(1), &[1, 0]);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// The 3-4-5 triangle: `|(3,4)| = 5`, so the unit vector is exactly `(0.6, 0.8)`
     /// — both are exactly representable in f32, so this is an equality, not an epsilon.
