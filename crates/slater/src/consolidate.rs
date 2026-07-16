@@ -37,7 +37,7 @@
 //! serialises byte-identically — the property the consolidation golden gate rests
 //! on.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::Path;
 
@@ -49,7 +49,7 @@ use graph_format::ids::Value;
 use graph_format::manifest::{AnnMode, EntityKind};
 use graph_format::pq::HOLE;
 
-use crate::exec::{val_to_value, Engine, NamedProps};
+use crate::exec::{val_to_value, Engine, NamedProps, Val, VectorLevels};
 use crate::read_view::ReadView;
 
 /// Serialise `engine`'s view to a business-key `MERGE` dump on `out`. The engine
@@ -229,6 +229,55 @@ pub fn serialise_binary_dump<V: ReadView>(
     // `delta.effective_tombstoned_ids()` (the stack contributes nothing).
     let mut combined_tombs: Vec<u64> = Vec::new();
 
+    // ── the vector levels, folded once, up front ─────────────────────────────────────────
+    //
+    // Aligned with `manifest.vector_indexes`. The emit itself is further down (it needs
+    // `combined_tombs`, which the node loop builds), but the **rescue set** has to be known
+    // *before* the node loop: it injects properties into the rows that loop writes.
+    let levels: Vec<VectorLevels> = manifest
+        .vector_indexes
+        .iter()
+        .map(|desc| engine.vector_levels(desc))
+        .collect::<Result<_>>()?;
+
+    // HIK-122: the embeddings this rebuild has to **move** from the base index into the column
+    // store, keyed by old dense id.
+    //
+    // A node some level took out of the index's scope (`REMOVE n:Doc`) keeps its embedding —
+    // that is the whole point of the sidecar's `label_removals` channel, and HIK-118 promises a
+    // later `SET n:Doc` will score it again. But the rebuilt base index must not hold it: the
+    // base arm's `live` gate does not re-check scope (`exec.rs`, `live_fn`), so the base index
+    // is trusted to contain only in-scope nodes, and the builder's own vector gather agrees —
+    // it drops any dump vector whose node lacks the index's label. So the vector's place in the
+    // new generation is the column store, exactly where a *fresh* build of the same logical
+    // graph puts it (`build_external`'s pass 1 only routes an embedding out of the row for a
+    // node that carries an index's label).
+    //
+    // Where a level above the base carries the vector inline, the property walk below already
+    // does this — the row holds it, and `suppress_indexed_vectors_named` leaves an out-of-scope
+    // node's embedding alone. The rescue is for the case the walk *cannot* reach: a node whose
+    // only copy is the one D12 routed out of the props record into the sealed base index.
+    // Nothing in the dump would ever see that vector, and the rebuild would drop it — silently,
+    // exit 0, index intact, one node quietly un-embedded.
+    //
+    // Bounded by the sidecars (O(vectors touched)), not by the graph or by the index.
+    let mut rescued: BTreeMap<u64, Vec<(String, Vec<f32>)>> = BTreeMap::new();
+    for (desc, lv) in manifest.vector_indexes.iter().zip(&levels) {
+        for id in lv.out_of_scope() {
+            // A row that already carries the embedding needs no rescue — and must not be given
+            // a second, staler copy from the base index on top of it.
+            if matches!(engine.node_prop_raw(id, &desc.property)?, Val::Vector(_)) {
+                continue;
+            }
+            if let Some(v) = engine.base_index_vector(desc, id)? {
+                rescued
+                    .entry(id)
+                    .or_default()
+                    .push((desc.property.clone(), v));
+            }
+        }
+    }
+
     // Nodes in ascending compacted-id order (tombstoned ids elided). The append
     // position is the new dense id, matching `compact_id`.
     let mut label_ids: Vec<u32> = Vec::new();
@@ -246,8 +295,15 @@ pub fn serialise_binary_dump<V: ReadView>(
             continue;
         }
         // Fast path: a base node neither the delta NOR a segment touches — byte-copy its raw
-        // label + property records straight from the base store.
-        if old < core_nodes && delta.node_patch(old).is_none() && seg_row.is_none() {
+        // label + property records straight from the base store. A rescued node is never here:
+        // it is out of scope only because a delta patch or a segment sidecar said so, and both
+        // fail this gate — but the `rescued` probe keeps that reasoning honest rather than
+        // assumed, since a byte-copy would silently drop the injected embedding.
+        if old < core_nodes
+            && delta.node_patch(old).is_none()
+            && seg_row.is_none()
+            && !rescued.contains_key(&old)
+        {
             let lb = engine.raw_node_labels(old)?;
             let pb = engine.raw_node_props(old)?;
             w.append_node_raw(&lb, &pb)?;
@@ -255,7 +311,14 @@ pub fn serialise_binary_dump<V: ReadView>(
         }
         // Slow path: born, delta-patched, or segment-overridden — decode through the stack,
         // overlay the delta, and re-intern.
-        let (lnames, props) = engine.node_record(old)?;
+        let (lnames, mut props) = engine.node_record(old)?;
+        // HIK-122: the base index's copy of a de-labelled node's embedding, moved into the row
+        // so it survives as a column value. `node_record` cannot have produced one (D12 kept it
+        // out of the props record), and the node is out of scope, so nothing suppresses it on
+        // the way back out.
+        if let Some(vs) = rescued.get(&old) {
+            props.extend(vs.iter().map(|(k, v)| (k.clone(), Val::Vector(v.clone()))));
+        }
         label_ids.clear();
         for l in &lnames {
             label_ids.push(labels.intern(l));
@@ -315,7 +378,7 @@ pub fn serialise_binary_dump<V: ReadView>(
     // `append_vector` requires (and the builder merge-joins against).
     let mut vector_indexes: Vec<DumpVectorIndex> = Vec::new();
     let mut vectors: Vec<(u64, u32, Vec<f32>)> = Vec::new(); // (new_id, key_id, vector)
-    for desc in &manifest.vector_indexes {
+    for (desc, levels) in manifest.vector_indexes.iter().zip(levels) {
         let key_id = keys.intern(&desc.property);
         // The sealed base index, then the levels above it (delta patches and segment rows)
         // folded newest-wins: a node re-embedded since the build must carry its *new*
@@ -327,15 +390,17 @@ pub fn serialise_binary_dump<V: ReadView>(
         // base still streams straight through — folding both into one map would put every
         // vector in the graph through a per-node insert to override a handful of them.
         //
-        // `superseded` covers a **removal** as well as a re-embed: a node whose embedding was
-        // taken away has no entry above the base to overwrite it with, so without suppressing
-        // it here the rebuild would quietly restore the vector the user deleted.
+        // `superseded` covers a **removal** and a **de-labelling** as well as a re-embed: a node
+        // whose embedding was taken away, or that left the index's scope, has no entry above the
+        // base to overwrite it with, so without suppressing it here the rebuild would quietly
+        // restore a vector the user deleted or index a node that is not in scope. The two are
+        // not the same fact — a de-labelled node's *value* survives, and `rescued` above has
+        // already moved it into the column store (HIK-122) — but both must lose their base entry.
         //
         // The levels are flattened newest-wins for the dump (a rebuild wants one vector per
         // node, not a scan of each level) — but from the *same* `VectorLevels` the KNN path
         // reads, so the two consumers cannot disagree about which level wins. A disagreement
         // would drop a vector on the floor, and only on consolidation.
-        let levels = engine.vector_levels(desc)?;
         let superseded = levels.superseded();
         let push = |node_id: u64, vector: Vec<f32>, vectors: &mut Vec<_>| {
             // A node the delta or a segment deleted takes its embedding with it.
