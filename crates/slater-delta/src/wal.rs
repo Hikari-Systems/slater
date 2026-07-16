@@ -686,6 +686,25 @@ impl WalSink {
 
     /// Write the commit marker, flush and fsync — the durability point. Raw: no
     /// rollback of its own. On success `committed_len` advances to the new tip.
+    ///
+    /// # On failure the marker is already in the file (HIK-130)
+    ///
+    /// The `flush` below hands the marker to the OS *before* the `sync_data` that gates
+    /// on it, so an fsync failure returns `Err` with the marker sitting in the file. It
+    /// cannot be otherwise: `sync_data` makes *written* bytes durable, so there is no
+    /// ordering in which the marker is fsynced without first reaching the OS. Reordering
+    /// this (fsync the records first, then write+fsync the marker) does **not** close the
+    /// window — that was measured under HIK-130 — because the marker still reaches the OS
+    /// before its own fsync, and the OS may write that page back at any moment.
+    ///
+    /// So a failed commit fsync leaves the batch's durability **indeterminate**, which is
+    /// what an I/O error means everywhere: the write may or may not have landed. The
+    /// contract this upholds is the one the module header states — *acknowledged implies
+    /// durable* — and **not** its converse. Two mechanisms clear the marker in practice
+    /// ([`Rollback::drop`] and `append_batch`'s self-heal); if both fail *and* the process
+    /// dies first, replay may honour the marker. What is guaranteed even then is
+    /// **atomicity**: the batch returns whole or not at all, because a lost record page
+    /// fails its CRC and stops replay short of this marker.
     fn write_commit_frame(&mut self, committed_seq: Seq) -> Result<()> {
         let mut payload = Vec::with_capacity(4);
         payload.push(KIND_COMMIT);
@@ -693,6 +712,8 @@ impl WalSink {
         write_frame(&mut self.file, &payload)?;
         self.cur_len += frame_len(payload.len());
         self.file.flush().context("flush WAL buffer")?;
+        #[cfg(test)]
+        maybe_inject_commit_fsync_fault()?;
         self.file
             .get_ref()
             .sync_data()
@@ -715,6 +736,15 @@ impl WalSink {
         self.file
             .flush()
             .context("flush WAL buffer before rollback truncate")?;
+        // Seam (test-only) for the rollback repair failing on a dying disk. It fires
+        // *before* `set_len` deliberately: the modelled fault is "the truncate never
+        // became durable", and in-process there is no way to make a page-cache-visible
+        // `set_len` un-happen. A real fault at the `sync_data` below leaves the shrink
+        // in the page cache but not on the platter, so the crash that follows restores
+        // the pre-truncate bytes — which is exactly the state failing here produces,
+        // and the only state replay-after-crash can observe.
+        #[cfg(test)]
+        maybe_inject_truncate_fsync_fault()?;
         let mut file = self.file.get_ref();
         file.set_len(off)
             .context("truncate WAL segment on rollback")?;
@@ -774,33 +804,71 @@ thread_local! {
     /// As `FAIL_WRITE_AFTER`, but `panic!`s instead of returning `Err` — exercises the
     /// rollback guard on the **unwind** path.
     static PANIC_WRITE_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// Test seam (HIK-130): when `Some(n)`, the *n*-th following **commit-path fsync**
+    /// on this thread returns an injected `io::Error`, then resets to `None`. The
+    /// record-frame seam above cannot reach this arm — it fires only inside
+    /// `write_record_frame` — which is why the marker-ordering hazard went untested.
+    static FAIL_COMMIT_FSYNC_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+
+    /// Test seam (HIK-130): as above, but for [`WalSink::truncate_to`]'s own fsync —
+    /// the rollback repair. Arming both drives the compound fault (a dying disk failing
+    /// the commit fsync *and* the rollback that tries to undo it).
+    static FAIL_TRUNCATE_FSYNC_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// Fire any armed record-frame-write fault seam (test-only). A counter of `Some(0)`
-/// trips now; `Some(n)` counts down. Kept out of `write_record_frame`'s body so the
-/// production build has no seam at all.
+/// Trip an armed fault counter (test-only): `Some(0)` fires now and disarms; `Some(n)`
+/// counts down; `None` never fires.
+#[cfg(test)]
+fn trip_fault(cell: &'static std::thread::LocalKey<std::cell::Cell<Option<u64>>>) -> bool {
+    cell.with(|c| match c.get() {
+        Some(0) => {
+            c.set(None);
+            true
+        }
+        Some(n) => {
+            c.set(Some(n - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// Fire any armed record-frame-write fault seam (test-only). Kept out of
+/// `write_record_frame`'s body so the production build has no seam at all.
 #[cfg(test)]
 fn maybe_inject_write_fault() -> Result<()> {
-    let trip = |cell: &'static std::thread::LocalKey<std::cell::Cell<Option<u64>>>| {
-        cell.with(|c| match c.get() {
-            Some(0) => {
-                c.set(None);
-                true
-            }
-            Some(n) => {
-                c.set(Some(n - 1));
-                false
-            }
-            None => false,
-        })
-    };
-    if trip(&FAIL_WRITE_AFTER) {
+    if trip_fault(&FAIL_WRITE_AFTER) {
         return Err(anyhow::Error::new(std::io::Error::other(
             "injected WAL record-frame write fault",
         )));
     }
-    if trip(&PANIC_WRITE_AFTER) {
+    if trip_fault(&PANIC_WRITE_AFTER) {
         panic!("injected WAL record-frame write panic");
+    }
+    Ok(())
+}
+
+/// Fire any armed commit-fsync fault seam (test-only). Called where the *real*
+/// `sync_data` would be, so an injected failure leaves exactly the on-disk state a
+/// failed fsync leaves: whatever the preceding flush already handed to the OS.
+#[cfg(test)]
+fn maybe_inject_commit_fsync_fault() -> Result<()> {
+    if trip_fault(&FAIL_COMMIT_FSYNC_AFTER) {
+        return Err(anyhow::Error::new(std::io::Error::other(
+            "injected WAL commit fsync fault",
+        )));
+    }
+    Ok(())
+}
+
+/// Fire any armed rollback-truncate-fsync fault seam (test-only).
+#[cfg(test)]
+fn maybe_inject_truncate_fsync_fault() -> Result<()> {
+    if trip_fault(&FAIL_TRUNCATE_FSYNC_AFTER) {
+        return Err(anyhow::Error::new(std::io::Error::other(
+            "injected WAL rollback truncate fsync fault",
+        )));
     }
     Ok(())
 }
@@ -973,12 +1041,34 @@ impl Drop for Rollback<'_> {
     fn drop(&mut self) {
         if let Some(off) = self.rollback_to {
             // Err or unwind before disarm: rewind so the partial batch leaves nothing a
-            // later commit could retro-commit. The rollback is best-effort here because
-            // `Drop` cannot propagate — but the orphan frames carry *no* commit marker,
-            // so replay drops them even if this truncate fails, and the next
-            // `append_batch` re-establishes the floor before it writes. So a failed
-            // rollback degrades to "harmless orphan tail", never to a resurrected write.
-            let _ = self.sink.truncate_to(off);
+            // later commit could retro-commit. Best-effort — `Drop` cannot propagate.
+            //
+            // This truncate is **load-bearing**, and the reason is *not* the one this
+            // comment used to give (HIK-130). It claimed the orphan frames "carry no
+            // commit marker, so replay drops them even if this truncate fails". That is
+            // true only when the fault hit a *record* write. A fault in the commit fsync
+            // leaves the marker in the file (see `write_commit_frame`), so orphan frames
+            // *can* carry one, and `replay_bytes` honours a marker unconditionally.
+            //
+            // What actually holds: this truncate and `append_batch`'s self-heal are the
+            // two things that clear such a marker. If this fails, the tail is not
+            // "harmless" — it is a live marker that the next `append_batch` must (and
+            // does) truncate. Only if this fails *and* the process dies before any later
+            // batch can replay honour it, retro-committing a batch that was never acked.
+            // That residue is irreducible: a failed fsync means indeterminate, not
+            // not-durable. Hence the warn — a silent failure here is the trigger for the
+            // one window we cannot close in code.
+            if let Err(e) = self.sink.truncate_to(off) {
+                tracing::warn!(
+                    error = ?e,
+                    segment = self.sink.segment,
+                    rollback_to = off,
+                    "WAL rollback truncate failed; an un-acked batch's frames remain in \
+                     the segment. The next append_batch re-establishes the committed \
+                     floor, but if this process dies first, replay may honour the \
+                     batch's commit marker (HIK-130)."
+                );
+            }
         }
     }
 }
@@ -1407,6 +1497,199 @@ mod tests {
         assert_eq!(replay.records, vec![good0, survivor]);
         assert_eq!(replay.last_seq, Seq(5));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failing rollback truncate now logs (HIK-130), and `Rollback::drop` also runs
+    /// **during unwind** — where a panicking logger would escalate to a double-panic
+    /// abort. This drives exactly that pair (panic mid-batch *and* the truncate failing,
+    /// so the `warn!` fires inside a `Drop` on the unwind path) and pins that the unwind
+    /// still completes normally.
+    #[test]
+    fn failed_rollback_truncate_logs_without_aborting_the_unwind() {
+        let dir =
+            std::env::temp_dir().join(format!("slater_wal_warnunwind_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+        ];
+
+        let mut sink = WalSink::create(&dir, 0).unwrap();
+        sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+            .unwrap();
+
+        // Panic on the 2nd record write, and fail the guard's truncate too, so the
+        // warn! runs while unwinding.
+        PANIC_WRITE_AFTER.with(|c| c.set(Some(1)));
+        FAIL_TRUNCATE_FSYNC_AFTER.with(|c| c.set(Some(0)));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sink.append_batch(&doomed, Seq(3));
+        }));
+        assert!(
+            res.is_err(),
+            "the injected panic must unwind out of append_batch"
+        );
+        FAIL_TRUNCATE_FSYNC_AFTER
+            .with(|c| assert_eq!(c.get(), None, "the truncate seam must have been consumed"));
+
+        // Reaching here at all is the assertion: the unwind was not turned into an abort.
+        // And the self-heal still repairs the orphan tail on the next batch.
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+        sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+            .unwrap();
+        drop(sink);
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![good0, survivor]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Characterisation (HIK-130) of the one window the code cannot close: commit fsync
+    /// fails **and** the rollback repair fails **and** the process dies before any later
+    /// `append_batch` self-heals. The un-acked batch's commit marker survives in the
+    /// segment and replay honours it.
+    ///
+    /// **This documents behaviour, it does not bless it.** The batch's durability after a
+    /// failed fsync is *indeterminate* — an I/O error means "may or may not have landed".
+    /// No write ordering fixes this: `sync_data` makes *written* bytes durable, so the
+    /// marker is necessarily in the file before the fsync that gates on it, and the OS may
+    /// write that page back regardless. Reordering to fsync the records first was tried
+    /// under HIK-130 and measured **ineffective** — this exact test still fails with it.
+    ///
+    /// This is the arm the HIK-105 seam could not reach: `maybe_inject_write_fault` fires
+    /// only inside `write_record_frame`, so both rollback tests above exercise the arm
+    /// that was already correct.
+    ///
+    /// What this test *pins* is the invariant that does hold and is worth protecting —
+    /// **atomicity**: the batch comes back whole or not at all, never as a partial prefix,
+    /// with `last_seq` agreeing with the records. Writing the marker before the records
+    /// reached the file would break exactly that, and this would catch it.
+    ///
+    /// All three legs are required — see `compound_fault_legs_are_each_load_bearing`.
+    #[test]
+    fn unacked_batch_survives_only_whole_when_commit_fsync_and_rollback_both_fail() {
+        let dir =
+            std::env::temp_dir().join(format!("slater_wal_retrocommit_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+            upsert(4, "L", "k", Value::Int(4), &[]),
+        ];
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            // A clean committed batch first, so the rollback floor is past the magic and
+            // a retro-commit is distinguishable from the committed prefix.
+            sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                .unwrap();
+
+            // Leg 1: the commit fsync fails — the client never gets an ack.
+            FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
+            // Leg 2: the rollback guard's own repair fails too (correlated, not p² — one
+            // dying disk fails both).
+            FAIL_TRUNCATE_FSYNC_AFTER.with(|c| c.set(Some(0)));
+
+            let err = sink
+                .append_batch(&doomed, Seq(4))
+                .expect_err("the injected commit fsync fault must fail the batch");
+            // Branch on the error *type*, never its text (coding standard).
+            assert!(
+                err.downcast_ref::<std::io::Error>().is_some(),
+                "the injected io::Error must be preserved in the chain: {err:#}"
+            );
+            FAIL_COMMIT_FSYNC_AFTER
+                .with(|c| assert_eq!(c.get(), None, "commit seam must be consumed"));
+            FAIL_TRUNCATE_FSYNC_AFTER
+                .with(|c| assert_eq!(c.get(), None, "truncate seam must be consumed"));
+
+            // Leg 3: the process dies here. No further `append_batch`, so the self-heal at
+            // the top of `append_batch` never runs — dropping the sink is the crash.
+        }
+
+        let replay = replay_dir(&dir).unwrap();
+        let mut whole = vec![good0.clone()];
+        whole.extend(doomed.iter().cloned());
+        assert!(
+            replay.records == vec![good0] || replay.records == whole,
+            "the batch must replay whole or not at all, never partially: {:?}",
+            replay.records
+        );
+        // Whichever way it lands, `last_seq` must agree with the records replayed.
+        let expected_seq = replay.records.last().map(|r| r.seq).unwrap_or(Seq(0));
+        assert_eq!(
+            replay.last_seq, expected_seq,
+            "last_seq must match the records actually replayed"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Companion to the test above: the compound fault needs **all three** legs, and each
+    /// is pinned here by removing it and showing an existing defence wins. Without this,
+    /// the characterisation above would prove only that *some* fault resurrects a batch —
+    /// it would not distinguish a genuinely narrow window from a seam that simply breaks
+    /// the WAL. These are the two mechanisms that make the window narrow, and they are
+    /// what the `Rollback::drop` comment should have cited all along (HIK-130).
+    #[test]
+    fn compound_fault_legs_are_each_load_bearing() {
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+        ];
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+
+        // --- Leg 2 removed: the commit fsync fails but the rollback repair SUCCEEDS.
+        // `Rollback::drop` truncates the marker away, so replay is clean regardless of
+        // the write ordering.
+        {
+            let dir = std::env::temp_dir().join(format!("slater_wal_leg2_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            {
+                let mut sink = WalSink::create(&dir, 0).unwrap();
+                sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                    .unwrap();
+                FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
+                // No truncate fault armed — the guard's repair lands.
+                sink.append_batch(&doomed, Seq(3))
+                    .expect_err("the injected commit fsync fault must fail the batch");
+            }
+            let replay = replay_dir(&dir).unwrap();
+            assert_eq!(
+                replay.records,
+                vec![good0.clone()],
+                "a successful rollback truncate alone is enough to drop the batch"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // --- Leg 3 removed: both fsyncs fail, but the process SURVIVES and a later batch
+        // arrives. `append_batch`'s self-heal re-establishes the floor and truncates the
+        // orphan tail before writing, so the doomed batch still never commits.
+        {
+            let dir = std::env::temp_dir().join(format!("slater_wal_leg3_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            {
+                let mut sink = WalSink::create(&dir, 0).unwrap();
+                sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                    .unwrap();
+                FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
+                FAIL_TRUNCATE_FSYNC_AFTER.with(|c| c.set(Some(0)));
+                sink.append_batch(&doomed, Seq(3))
+                    .expect_err("the injected commit fsync fault must fail the batch");
+                // The process did not die: a later batch self-heals the orphan tail.
+                sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+                    .unwrap();
+            }
+            let replay = replay_dir(&dir).unwrap();
+            assert_eq!(
+                replay.records,
+                vec![good0, survivor],
+                "the self-heal on the next batch must drop the orphan tail"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

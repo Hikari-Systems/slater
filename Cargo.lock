@@ -3292,6 +3292,7 @@ dependencies = [
  "graph-format",
  "serde",
  "slater-scalar",
+ "tracing",
 ]
 
 [[package]]
