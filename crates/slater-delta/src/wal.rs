@@ -1499,6 +1499,51 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A failing rollback truncate now logs (HIK-130), and `Rollback::drop` also runs
+    /// **during unwind** — where a panicking logger would escalate to a double-panic
+    /// abort. This drives exactly that pair (panic mid-batch *and* the truncate failing,
+    /// so the `warn!` fires inside a `Drop` on the unwind path) and pins that the unwind
+    /// still completes normally.
+    #[test]
+    fn failed_rollback_truncate_logs_without_aborting_the_unwind() {
+        let dir =
+            std::env::temp_dir().join(format!("slater_wal_warnunwind_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+        ];
+
+        let mut sink = WalSink::create(&dir, 0).unwrap();
+        sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+            .unwrap();
+
+        // Panic on the 2nd record write, and fail the guard's truncate too, so the
+        // warn! runs while unwinding.
+        PANIC_WRITE_AFTER.with(|c| c.set(Some(1)));
+        FAIL_TRUNCATE_FSYNC_AFTER.with(|c| c.set(Some(0)));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sink.append_batch(&doomed, Seq(3));
+        }));
+        assert!(
+            res.is_err(),
+            "the injected panic must unwind out of append_batch"
+        );
+        FAIL_TRUNCATE_FSYNC_AFTER
+            .with(|c| assert_eq!(c.get(), None, "the truncate seam must have been consumed"));
+
+        // Reaching here at all is the assertion: the unwind was not turned into an abort.
+        // And the self-heal still repairs the orphan tail on the next batch.
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+        sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+            .unwrap();
+        drop(sink);
+        let replay = replay_dir(&dir).unwrap();
+        assert_eq!(replay.records, vec![good0, survivor]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Characterisation (HIK-130) of the one window the code cannot close: commit fsync
     /// fails **and** the rollback repair fails **and** the process dies before any later
     /// `append_batch` self-heals. The un-acked batch's commit marker survives in the
