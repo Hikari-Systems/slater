@@ -97,6 +97,39 @@ authenticated principals over Bolt).
   itself is not reproducible against the emulator through slater's API — hence the unit tests pin
   that specific arm.)
 
+## Closed — session state outlived the identity it belonged to (2026-07-16, HIK-123)
+
+- [x] **✅ FIXED — `LOGOFF` left the prior user's rows and transaction graph on the connection.**
+  A Bolt connection outlives the principal on it: `LOGOFF` → `LOGON` (and a bare re-`LOGON`,
+  which `authenticate` permits for token rotation) hand the same socket to a new user. `LOGOFF`
+  cleared only `sess.user` and left two pieces of the previous user's state behind:
+
+  * `sess.pending` — their buffered result rows. `Request::Pull` drained it with no `sess.user`
+    check, so the next user on the connection **received the previous user's query results**.
+  * `sess.tx_graph` — the graph their `BEGIN {db:…}` resolved. The `Some(g)` arm of `RUN`'s
+    graph resolution returned it without calling `select_graph`/`can_read`, so a db-less `RUN`
+    by the next user **read that graph with no grant of their own** — a read-ACL bypass. (The
+    write path was unaffected: `authorize_statement` re-checks `can_write` independently.)
+
+  Reachable on any pooled/shared connection, and directly by a client chaining credentials.
+
+  **Fix:** the cause was three identity transitions (`RESET`, `LOGOFF`, re-`LOGON`) agreeing on
+  what to clear in only one of them — `RESET` was correct and the other two drifted from it.
+  `Session::clear_user_state()` is now the single owner of user-scoped session state and every
+  transition calls it, so a field added to `Session` cannot be cleared on one path and forgotten
+  on another. Two independent checks close the same doors: `PULL` requires an authenticated
+  session, and the `tx_graph` arm re-checks `can_read` **per RUN** rather than trusting the
+  BEGIN-time decision — the ACL hot-reloads, so that arm also served reads on grants **revoked
+  mid-transaction**, with no identity change involved.
+
+  **Tests:** `logoff_does_not_leave_the_prior_users_rows_for_the_next_user` and
+  `logoff_does_not_leave_the_prior_users_transaction_graph_for_the_next_user` (the two attacks,
+  each over one socket with two users); `a_bare_relogon_does_not_inherit_the_prior_users_rows`
+  (the no-LOGOFF path); `a_grant_revoked_mid_transaction_stops_serving_reads` (the revocation
+  bug). All four were confirmed to fail against the unfixed handlers — the leak tests receive
+  `RECORD`s of the prior user's rows, the ACL tests are served `SUCCESS` where a `FAILURE` is
+  required.
+
 ## Status at a glance
 
 **5 done · 1 in progress · 3 open** (as of 2026-06-12)
