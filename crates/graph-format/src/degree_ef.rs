@@ -32,7 +32,10 @@
 //! sits at position `high[i] + i`. Cost ≈ `m·(2 + ℓ)` bits, within ~½ bit/element of the
 //! information-theoretic floor, with O(1) random access.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{bail, Result};
+use tracing::warn;
 
 use crate::codec;
 use crate::plane::{self, build_sample, low_bits, read_low, write_low};
@@ -75,6 +78,44 @@ impl ChunkKind {
             4 => Self::Rle,
             _ => bail!("unknown degree-chunk codec tag {b}"),
         })
+    }
+}
+
+/// Report a non-monotone cumulative pair seen by [`EfChunk::degree_at`] — i.e. a degree chunk
+/// whose bytes cannot have come from this crate's encoder.
+///
+/// **Why this exists.** `degree_at` saturates to `0` rather than underflowing, and a `0` degree
+/// is indistinguishable from a legitimately isolated node — of which a real graph has many. So
+/// without a signal here, a corrupt chunk is *perfectly silent*, which is a worse operational
+/// failure mode than the absurd `4294967293` it replaces: absurd numbers get noticed, zeros do
+/// not. This does **not** make the resulting k-hop count correct — the count fast path still sums
+/// the `0` and still returns a wrong answer with no error. It only makes that wrong answer
+/// *attributable* when someone comes to explain it.
+///
+/// **Why the rate limit.** `degree_at` is the count fast path's inner loop (millions of scattered
+/// lookups) and a corrupt chunk stays resident, so it is re-read on every one of them: an
+/// unlimited `warn!` would turn a wrong count into a log flood — a second incident on top of the
+/// first. Reporting on power-of-two occurrences bounds the whole `u64` range to ~64 lines while
+/// still conveying magnitude (the running count is in the message), which "log once" discards.
+///
+/// **Why the state is `static` and not a field.** The counter is touched *only* on the corrupt
+/// path, so the healthy loop never loads it. A per-chunk flag would instead grow every `EfChunk`,
+/// cost a `Clone` impl (`AtomicBool: !Clone`), and buy nothing this doesn't.
+#[cold]
+#[inline(never)]
+fn report_non_monotone(slot: usize, v0: u64, v1: u64) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        warn!(
+            slot,
+            c_slot = v0,
+            c_slot_plus_1 = v1,
+            occurrences = n,
+            "corrupt degree chunk: cumulative sequence is not monotone; degree forced to 0. \
+             Counts over this chunk are wrong — the generation's degree column should be \
+             rebuilt or refetched"
+        );
     }
 }
 
@@ -188,13 +229,25 @@ impl EfChunk {
     /// sampled `select₁` and a cheap next-set-bit step, not two full scans. This is the degree-
     /// sum count fast path's inner loop (millions of scattered lookups), so halving the select
     /// work matters.
+    ///
+    /// **Total on non-monotone input.** `c` is monotone for any record this crate *encoded*, but
+    /// the lows are arbitrary bytes off disk and nothing validates them: `hi` is forced
+    /// non-decreasing by the bitmap's structure, so a forged/corrupt same-bucket pair with
+    /// `low[slot+1] < low[slot]` decodes `v1 < v0`. A bare `v1 - v0` then panics in debug and
+    /// *wraps* in release, handing the degree-sum count fast path a garbage degree (`4294967293`)
+    /// that it sums into a wrong k-hop count. So the subtraction saturates to `0` and reports —
+    /// see [`report_non_monotone`] for why the report is needed and what it does not fix.
+    /// The healthy path is unchanged: one compare it already made, no new loads, no branch taken.
     #[inline]
     pub fn degree_at(&self, slot: usize) -> u32 {
         let p0 = self.select1(slot);
         let p1 = self.next_one_after(p0);
         let v0 = (((p0 - slot) as u64) << self.l) | self.low(slot);
         let v1 = (((p1 - (slot + 1)) as u64) << self.l) | self.low(slot + 1);
-        (v1 - v0) as u32
+        if v1 < v0 {
+            report_non_monotone(slot, v0, v1);
+        }
+        v1.saturating_sub(v0) as u32
     }
 
     /// Serialised size in bytes (header + lows + highs), for codec selection without

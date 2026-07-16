@@ -15,6 +15,12 @@ unsafe_code = "forbid"
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+# This crate reports problems by returning them. The one exception is `EfChunk::degree_at`
+# (the degree-sum count fast path's inner loop): it cannot return a `Result`, so a corrupt
+# non-monotone chunk needs a channel of its own to be reported on rather than saturating
+# silently. See `degree_ef::report_non_monotone`. `tracing` is a facade — this crate installs
+# no subscriber, and it is already in the binaries' tree via `slater` / `slater-build`.
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
