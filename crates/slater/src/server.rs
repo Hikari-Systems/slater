@@ -3898,6 +3898,12 @@ async fn handle_request(
         }
 
         Request::Discard(meta) => {
+            // Authenticated-only, on the same reasoning as PULL (HIK-123). DISCARD streams
+            // no rows, but its completion metadata reports the buffer's size — the result's
+            // cardinality is not an unauthenticated session's to learn either.
+            if sess.user.is_none() {
+                return Err(Failure::unauthorized("not authenticated; send LOGON first"));
+            }
             // DISCARD honours its `n` exactly as PULL does — it just drops the rows
             // instead of streaming them. `n < 0` (the default) discards everything;
             // a positive `n` discards up to `n` and leaves `has_more` set if the
@@ -16586,18 +16592,6 @@ mod tests {
         }
     }
 
-    /// HIK-90 regression: argon2id must not run on the reactor.
-    ///
-    /// `#[tokio::test]` is a **current-thread** runtime — the one place a blocked reactor
-    /// is directly observable. Spawned tasks only advance when the test yields, and a
-    /// single `yield_now()` gives every ready task exactly one poll. If the verify runs
-    /// inline (the bug), that one trip through the scheduler costs `FLOOD × one verify`
-    /// — the whole server is deaf for that long. With the verify handed to a blocking
-    /// thread, the poll parks immediately and the reactor comes straight back.
-    ///
-    /// The bound is calibrated against a *measured* verify on this machine and build
-    /// profile rather than a hard-coded millisecond count, so it neither flakes on a slow
-    /// box nor passes vacuously on a fast one.
     // ── HIK-123: session state must not outlive the identity it belongs to ──────────
     //
     // A Bolt connection can carry more than one principal (LOGOFF→LOGON, or a bare
@@ -16814,6 +16808,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// HIK-90 regression: argon2id must not run on the reactor.
+    ///
+    /// `#[tokio::test]` is a **current-thread** runtime — the one place a blocked reactor
+    /// is directly observable. Spawned tasks only advance when the test yields, and a
+    /// single `yield_now()` gives every ready task exactly one poll. If the verify runs
+    /// inline (the bug), that one trip through the scheduler costs `FLOOD × one verify`
+    /// — the whole server is deaf for that long. With the verify handed to a blocking
+    /// thread, the poll parks immediately and the reactor comes straight back.
+    ///
+    /// The bound is calibrated against a *measured* verify on this machine and build
+    /// profile rather than a hard-coded millisecond count, so it neither flakes on a slow
+    /// box nor passes vacuously on a fast one.
     #[tokio::test]
     async fn concurrent_logons_do_not_block_the_reactor() {
         const FLOOD: usize = 8;

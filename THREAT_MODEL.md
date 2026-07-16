@@ -54,6 +54,17 @@ in place.
   specifically: an encrypted image's AEAD tag already catches any block tamper on read (detection
   is merely deferred to first touch), whereas a plaintext image has no other content-authenticity
   check on this path.
+- **Session state is scoped to the authenticated principal, and reads are authorised per
+  statement (HIK-123).** A Bolt connection outlives the identity on it — `LOGOFF` → `LOGON`, or a
+  bare re-`LOGON` (token rotation), hand the same socket to a new user, and pooled drivers share
+  connections by design. Everything scoped to the *previous* principal (buffered result rows, the
+  graph an open transaction resolved) is dropped at every one of those transitions, through the
+  single `Session::clear_user_state()` — so a connection cannot carry one user's data, or one
+  user's resolved grant, into the next user's session. Independently: `PULL` serves rows only to
+  an authenticated session, and **every** `RUN` re-checks `can_read` against the live ACL for the
+  currently-authenticated user, including inside an explicit transaction. A `BEGIN`-time
+  authorisation is therefore never load-bearing for a later statement, which is what makes an ACL
+  revocation take effect **mid-transaction** rather than only at the transaction's end.
 
 ## New protections
 
