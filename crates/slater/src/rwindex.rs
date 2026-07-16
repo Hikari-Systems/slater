@@ -84,9 +84,16 @@ pub enum DeltaVector {
     /// dropped it, an overwrite with a non-vector). It supersedes the levels below with
     /// *nothing* — which is why absence cannot express it and it needs its own state (D12).
     Gone,
+    /// The delta took the node **out of the index's scope** (`REMOVE n:Label`) without touching
+    /// the embedding value. Identical to [`Self::Gone`] for *this* module — a scan must suppress
+    /// the levels below either way, and the node is not in the index — but the two are different
+    /// facts about the vector, and a consolidation must tell them apart or it destroys a vector
+    /// HIK-118 promised a later `SET n:Label` would restore (HIK-122). See
+    /// [`exec::VectorLevel::out_of_scope`](crate::exec::VectorLevel::out_of_scope).
+    OutOfScope,
     /// The delta says nothing about this node's embedding, *or* the node is tombstoned, *or*
-    /// it does not carry the index's label. It contributes nothing and supersedes nothing —
-    /// whatever a lower level holds still stands.
+    /// it does not carry the index's label and never did. It contributes nothing and supersedes
+    /// nothing — whatever a lower level holds still stands.
     Silent,
 }
 
@@ -315,32 +322,37 @@ impl RwVectorIndex {
     ///
     /// | the delta says | the graph | `superseded` |
     /// |---|---|---|
-    /// | [`DeltaVector::Set`]    | insert (delete-then-insert on a re-embed) | **in** |
-    /// | [`DeltaVector::Gone`]   | remove (the slot stays a waypoint)        | **in** |
-    /// | [`DeltaVector::Silent`] | remove                                    | **out** |
+    /// | the delta says              | the graph                                 | `superseded` |
+    /// |---|---|---|
+    /// | [`DeltaVector::Set`]        | insert (delete-then-insert on a re-embed) | **in** |
+    /// | [`DeltaVector::Gone`]       | remove (the slot stays a waypoint)        | **in** |
+    /// | [`DeltaVector::OutOfScope`] | remove (the slot stays a waypoint)        | **in** |
+    /// | [`DeltaVector::Silent`]     | remove                                    | **out** |
     ///
-    /// `Gone` vs `Silent` is the *sharp* distinction, and it is decided upstream by
+    /// `Gone`/`OutOfScope` vs `Silent` is the *sharp* distinction, and it is decided upstream by
     /// [`exec::delta_vector_for`]:
-    /// * `Gone` — the delta **took the node out of the index**: `REMOVE n.embedding`, a
-    ///   `SET n = {…}` that dropped it, an overwrite with a non-vector, **or `REMOVE n:Label`
-    ///   leaving the index's scope** (HIK-116). The node had a place in the index and lost it,
-    ///   so the vector a level below still holds must be suppressed — superseded **in**.
+    /// * `Gone` — the delta **took the embedding away**: `REMOVE n.embedding`, a `SET n = {…}`
+    ///   that dropped it, an overwrite with a non-vector. The node had a place in the index and
+    ///   lost it, so the vector a level below still holds must be suppressed — superseded **in**.
+    /// * `OutOfScope` — `REMOVE n:Label` left the index's scope (HIK-116). Same suppression, for
+    ///   the same reason; the value is untouched, which only a consolidation cares about
+    ///   (HIK-122), so this module folds it exactly like `Gone`.
     /// * `Silent` — the delta has **nothing to say** about a node's membership: it never
     ///   carried the label, or it was only patched on an unrelated property. Leaving it in
     ///   `superseded` would suppress the base's perfectly good vector for a node the delta was
     ///   never about — superseded **out**.
     ///
-    /// Both remove from the graph (a suppressed node stays a navigable waypoint, never an
-    /// emitted hit); the two differ only in `superseded`. Getting the split wrong is silent
-    /// either way — a `Gone` misfiled as `Silent` leaves a de-labelled node scoring at its
-    /// stale vector (the HIK-116 bug); the reverse hides a live base vector.
+    /// All three non-`Set` states remove from the graph (a suppressed node stays a navigable
+    /// waypoint, never an emitted hit); they differ only in `superseded`. Getting the split
+    /// wrong is silent either way — a `Gone` misfiled as `Silent` leaves a de-labelled node
+    /// scoring at its stale vector (the HIK-116 bug); the reverse hides a live base vector.
     fn apply(&mut self, id: u64, says: DeltaVector) -> Result<()> {
         match says {
             DeltaVector::Set(v) => {
                 self.graph.insert(id, &v)?;
                 self.superseded.insert(id);
             }
-            DeltaVector::Gone => {
+            DeltaVector::Gone | DeltaVector::OutOfScope => {
                 self.graph.remove(id);
                 self.superseded.insert(id);
             }

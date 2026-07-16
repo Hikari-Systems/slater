@@ -537,6 +537,14 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
         .iter()
         .map(|n| (n.id, n.labels.as_slice()))
         .collect();
+    // The rows this segment is about to write. Needed because an embedding can reach a segment
+    // *without* a delta patch naming it: a node that was out of the index's scope carried its
+    // embedding as an ordinary column value, and `read_base_node_row` propagates it into the
+    // flushed row. See the `labels_added` arm below.
+    let effective_rows: BTreeMap<u64, &[(String, Value)]> = seg_nodes
+        .iter()
+        .map(|n| (n.id, n.props.as_slice()))
+        .collect();
     let mut vec_specs: Vec<VectorSpec> = Vec::new();
     // The sealed read-only Vamana index per `(label, property)`, aligned with `vec_specs`
     // (HIK-113). `None` ⇒ the segment's live embedded set stayed below the floor (or the base's
@@ -602,6 +610,33 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
                 // removal (the value is gone): it stays suppressed regardless of any later label
                 // churn (HIK-118), unlike the `label_removals` above.
                 spec.value_removals.push(*dense);
+            } else if nd.labels_added.contains(&vi.label) {
+                // `SET n:Doc` brought the node **into** the index's scope — the mirror of the
+                // `label_removals` arm above, and it has to be recorded for the same reason
+                // (HIK-122).
+                //
+                // While the node was out of scope its embedding was an ordinary *column* value:
+                // D12 only routes an embedding out of the row for a node that carries an index's
+                // label, so an out-of-scope node's vector lives in the props record, and
+                // `read_base_node_row` has already propagated it into the row this flush writes.
+                // The row therefore *has* the vector — but the sidecar is what decides whether
+                // anyone looks (the fold's candidate set is the sidecar ids ∪ removals), and no
+                // level below holds an index entry for it either, because the base index only
+                // ever indexes nodes that were in scope at build time.
+                //
+                // Leave it unnamed and the vector is reachable by **no query at all**: KNN never
+                // sees it, and `suppress_indexed_vector` starts answering `Null` for the column
+                // read the moment the label lands. `exec::delta_vector_for` resolves this same
+                // node to `Set(v)` before the flush, so failing to name it here would also mean
+                // the flush *changes the answer* — KNN-visible before, gone after.
+                if let Some(Value::Vector(v)) = effective_rows
+                    .get(dense)
+                    .and_then(|p| p.iter().find(|(k, _)| k == &vi.property))
+                    .map(|(_, v)| v)
+                {
+                    spec.ids.push(*dense);
+                    entries.insert(*dense, v.clone());
+                }
             }
             // Otherwise the delta says nothing about this node's embedding, and the level
             // below it (base or older segment) keeps whatever it had.
