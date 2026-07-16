@@ -36,7 +36,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::blockfile::{parse_block, BlockFileReader, BlockFileWriter};
+use crate::blockfile::{parse_block, record_from_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::manifest::Metric;
 use crate::wire::{capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint};
@@ -708,7 +708,10 @@ impl PqReader {
                     global += 1;
                     continue;
                 }
-                let rec = &data[offsets[slot] as usize..offsets[slot + 1] as usize];
+                // `parse_block` has already validated the table against `data`, so this cannot
+                // fail — but say it through the shared slicing path rather than re-deriving the
+                // bounds by hand, which is how this site came to skip the check in the first place.
+                let rec = record_from_block(&offsets, data, slot as u32)?;
                 let mut rr = rec;
                 node_ids.push(read_uvarint(&mut rr)?);
                 if rr.len() != m {
