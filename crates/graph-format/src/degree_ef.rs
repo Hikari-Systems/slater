@@ -229,6 +229,9 @@ impl EfChunk {
         }
         let n = u32::from_le_bytes(body[0..4].try_into().unwrap());
         let l = body[4];
+        // Same invariant, same reasoning as `plane::EfMono::deserialize`: `l` is attacker-
+        // controlled and every later shift by it is silently masked in release.
+        plane::check_low_bits("ef degree chunk", l)?;
         let nwords = u32::from_le_bytes(body[5..9].try_into().unwrap()) as usize;
         let m = n as usize + 1;
         let low_bytes = (m * l as usize).div_ceil(8);
@@ -885,6 +888,74 @@ mod tests {
         let mut bad = good.clone();
         bad.pop();
         assert!(decode_chunk(&bad).is_err());
+    }
+
+    /// An [`EfChunk`] body for `n` degrees at low-bits width `l`, made deliberately
+    /// **self-consistent**: the low plane is sized to `(m·l)/8` bytes and the high bitmap holds
+    /// exactly `m = n+1` one-bits, so the decoder's `body.len() != need` check and its
+    /// `ones == m` invariant both pass and `l` is the only thing left to catch.
+    fn forged_ef_chunk_body(n: u32, l: u8) -> Vec<u8> {
+        let m = n as usize + 1;
+        let nwords = m.div_ceil(64).max(1);
+        let mut highs = vec![0u64; nwords];
+        for i in 0..m {
+            highs[i / 64] |= 1u64 << (i % 64);
+        }
+        let low_bytes = (m * l as usize).div_ceil(8);
+        let mut body = Vec::new();
+        body.extend_from_slice(&n.to_le_bytes());
+        body.push(l);
+        body.extend_from_slice(&(nwords as u32).to_le_bytes());
+        body.resize(body.len() + low_bytes, 0);
+        for w in &highs {
+            body.extend_from_slice(&w.to_le_bytes());
+        }
+        body
+    }
+
+    /// A forged degree chunk whose low-bits width `ℓ` is outside `0..=63` must be rejected at
+    /// decode, cleanly.
+    ///
+    /// Without the bound the record decodes *successfully* and `degree_at` then evaluates
+    /// `hi << 100`. Debug panics; **release masks it to `100 & 63 = 36`, colliding the high and
+    /// low bits, so `v1 - v0` yields a wrong degree and the degree-sum count fast path returns
+    /// a wrong k-hop count with no error.** That silent case is the one that matters, so this
+    /// must hold under `cargo test --release` too.
+    #[test]
+    fn rejects_forged_ef_low_bits_width() {
+        let forged = forged_ef_chunk_body(8, 100);
+        let err = EfChunk::deserialize(&forged)
+            .map(|_| ())
+            .expect_err("l=100 must error, not mis-decode");
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::EfLowBitsWidth { l: 100, .. })
+            ),
+            "expected a typed EfLowBitsWidth rejection, got: {err}"
+        );
+
+        // Same through the public record path, tag included.
+        let mut rec = vec![ChunkKind::Ef as u8];
+        rec.extend_from_slice(&forged);
+        assert!(
+            decode_chunk(&rec).is_err(),
+            "l=100 must error via decode_chunk"
+        );
+
+        // 64 is the first rejected width — `1u64 << 64` overflows exactly as 100 does, so a
+        // `l <= 64` bound would let it through.
+        assert!(EfChunk::deserialize(&forged_ef_chunk_body(8, 64)).is_err());
+
+        // The bound must not reject a legal width. A chunk of `u32` degrees can't reach ℓ=63,
+        // but ℓ=0 (the all-zero / all-small cumulative sum) is routine and must decode.
+        let narrow = EfChunk::encode(&[0, 1, 0, 2]);
+        assert_eq!(narrow.l, 0);
+        let rt = EfChunk::deserialize(&narrow.serialize()).expect("ℓ=0 is legal and must decode");
+        assert_eq!(
+            (0..4).map(|s| rt.degree_at(s)).collect::<Vec<_>>(),
+            vec![0, 1, 0, 2]
+        );
     }
 
     /// Wire-biased opts (`margin = 1.0`): always prices zstd, lets it win on any size gain.
