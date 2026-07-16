@@ -13557,16 +13557,18 @@ mod tests {
     /// `years_int * 12` on the next line then overflowed. Debug (overflow-checks
     /// on by default) panicked inside query execution, with no `catch_unwind` on
     /// the query path. Release (overflow-checks off by default — the profile that
-    /// *ships*) wrapped to `-12` months and cheerfully **returned a duration of
-    /// minus one year** for a request of ten quintillion years.
+    /// *ships*) wrapped and answered silently.
     ///
     /// That asymmetry is why these assertions have to hold under `--release`
     /// too: in debug the pre-fix code fails loudly for the wrong reason, so a
     /// debug-only test would look like it was doing its job while the silent
-    /// wrong answer shipped. Every case below is asserted on the *answer* — an
-    /// `Ok` is a failure, whatever it contains — not on the absence of a panic.
+    /// wrong answer shipped. Every case is asserted on the *answer* — any `Ok` is
+    /// a failure, whatever it contains — and never on "not the known-wrong
+    /// value", which is a trap here: the silent release answers vary by input
+    /// (see `temporal::tests::ten_quintillion_years_is_rejected_not_silently_wrapped`),
+    /// so a test pinned to one of them passes against the unfixed code.
     #[test]
-    fn absurd_duration_components_error_rather_than_wrapping_to_minus_one_year() {
+    fn absurd_duration_components_are_a_typed_error_not_a_silent_wrap() {
         let (root, graph, _) = testgen::write_basic("exec_duration_overflow");
         let gen = Generation::open(&root, &graph).unwrap();
         let cache = BlockCache::new(1 << 20);
@@ -13586,8 +13588,10 @@ mod tests {
         };
 
         // The reported reproductions — the string form (the `duration()` Str
-        // arm) and the map form (`build_duration`). Pre-fix, in release, the
-        // first two answered `P-1Y`.
+        // arm) and the map form (`build_duration`). Pre-fix in release both
+        // answered `P106751991166935DT15H30M7S` (measured, not the `P-1Y` the
+        // report predicted — the `extra_days` residue dominates the wrapped
+        // `-12` months).
         bad("RETURN duration('P9999999999999999999Y')");
         bad("RETURN duration({years: 1e19})");
         bad("RETURN toString(duration({years: 1e19}))");
@@ -13599,7 +13603,10 @@ mod tests {
         bad("RETURN duration({years: -1e400})");
         bad("RETURN duration('P-9999999999999999999Y')");
         // `i64::MAX` as an integer literal: `as f64` rounds it *up* to 2^63,
-        // which has no i64 counterpart at all.
+        // which has no i64 counterpart at all. This is the **actual** minus-one-
+        // year input — it is the only spelling that both saturates the cast and
+        // leaves a zero fractional residue, so pre-fix in release it really did
+        // answer `P-1Y` (verified: secs = -31_536_000 against v0.23.1).
         bad("RETURN duration({years: 9223372036854775807})");
         // Not just `years` — every component is user-supplied.
         bad("RETURN duration({months: 1e19})");

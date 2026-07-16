@@ -802,12 +802,27 @@ mod tests {
 
     /// The reported case, at the level the cast lives.
     ///
-    /// Pre-fix this returned `-31_536_000` in release (`i64::MAX * 12` wraps to
-    /// `-12` months → epoch minus one year) and panicked in debug.
+    /// Pre-fix, in **debug**, all of these panicked at the `years_int * 12`
+    /// (`attempt to multiply with overflow`). In **release** — overflow-checks
+    /// off, the profile that ships — they returned a silent wrong answer, but
+    /// *not* the `P-1Y` the report predicted: `total_months` does wrap to `-12`,
+    /// yet for `1e19` the `extra_days` residue `(years - years_int as f64)`
+    /// dominates and the result was `9223372036823239807`
+    /// (`P106751991166935DT15H30M7S`), measured against v0.23.1. `P-1Y` needs a
+    /// zero residue, i.e. `years` exactly `2^63` — see `two_to_the_63` below.
+    /// Hence every assertion here is on `Err`, never on "not the wrong value":
+    /// the latter passes against the unfixed code.
     #[test]
-    fn ten_quintillion_years_is_not_minus_one_year() {
+    fn ten_quintillion_years_is_rejected_not_silently_wrapped() {
         assert_eq!(
             duration_to_timet(1e19, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            Err(DurationOutOfRange::Component("years"))
+        );
+        // The one input that really did answer `P-1Y` (-31_536_000) in release:
+        // `i64::MAX as f64` rounds *up* to 2^63, which saturates the cast *and*
+        // leaves a zero fractional residue.
+        assert_eq!(
+            duration_to_timet(i64::MAX as f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             Err(DurationOutOfRange::Component("years"))
         );
         // A year count that survives the cast but overflows the ×12 fold.
