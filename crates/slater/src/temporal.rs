@@ -598,7 +598,6 @@ pub fn duration_from_string(s: &str) -> Result<Option<i64>, DurationOutOfRange> 
 }
 
 /// The `P…` designator scan itself. `None` on a malformed string.
-#[allow(clippy::type_complexity)]
 fn parse_duration_parts(s: &str) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
     let mut bytes = s.bytes().peekable();
     if bytes.next() != Some(b'P') {
@@ -816,11 +815,23 @@ mod tests {
             duration_to_timet(9e18, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             Err(DurationOutOfRange::Overflow)
         );
-        // …and one that survives the fold but leaves chrono's calendar.
-        assert_eq!(
-            duration_to_timet(1e9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-            Err(DurationOutOfRange::Overflow)
-        );
+        // …and one that survives the fold but leaves chrono's calendar. This
+        // needs no overflow at all to go wrong: pre-fix, `add_calendar_months`
+        // ran `div_euclid(12) as i32` into a `from_ymd_opt(…).unwrap_or_else(
+        // epoch_date)`, so *every* year count past chrono's 262143 silently
+        // returned a duration of **zero** (verified against v0.23.1:
+        // `duration({years: 300000})` → `secs=0` → `"P"`). The cap is the
+        // duration that lands on chrono's last year (`NaiveDate::MAX` is
+        // +262142-12-31) — and a duration counts from 1970, so it is 260172
+        // years, not 262142.
+        assert!(duration_to_timet(260_172.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0).is_ok());
+        for absurd in [260_173.0, 300_000.0, 1e9] {
+            assert_eq!(
+                duration_to_timet(absurd, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                Err(DurationOutOfRange::Overflow),
+                "{absurd} years must not be a silent zero",
+            );
+        }
         // The seconds fold: representable component, unrepresentable seconds.
         // `base_time` is non-zero here, which is what made the add overflow.
         assert_eq!(
