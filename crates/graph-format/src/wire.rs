@@ -57,6 +57,12 @@ pub enum DecodeRejected {
         declared: usize,
         found: usize,
     },
+    /// An Elias–Fano header's low-bits width `ℓ` is outside the `0..=63` a legitimate encoder
+    /// can produce. Unchecked, `value_at`/`degree_at` shift a `u64` left by `ℓ`: in debug that
+    /// panics, but in release Rust masks the shift to `ℓ & 63` and the decoder silently returns
+    /// *wrong values with no error* — the case that matters.
+    #[error("{what}: low-bits width {l} is outside the valid range 0..=63")]
+    EfLowBitsWidth { what: &'static str, l: u8 },
     /// A run-length record's element count is above what the format could ever store.
     #[error("{what}: declares {n} elements, above the {max}-element ceiling")]
     TooManyElements {

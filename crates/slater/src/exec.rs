@@ -1004,22 +1004,40 @@ pub struct VectorLevel {
     /// that dropped it, or an overwrite with a non-vector value. Every level below must be
     /// suppressed with *nothing* put in its place: the node is simply no longer in the index.
     pub removed: Vec<u64>,
+    /// Nodes this level took **out of the index's scope** (`REMOVE n:Label`) while leaving the
+    /// embedding *value* untouched (D64). Every level below is suppressed exactly as `removed`
+    /// suppresses it — the node is not in the index — but the two are **not** the same fact,
+    /// and a consolidation is where the difference bites (HIK-122).
+    ///
+    /// A `removed` node's vector is gone because the user deleted it. An `out_of_scope` node's
+    /// vector is *retained*: HIK-118 promises that a later `SET n:Label` puts the node back in
+    /// scope and scores it again, and `flush_segment` records a **label** removal rather than a
+    /// value one precisely to keep that promise across a flush. A consolidation that treats the
+    /// two alike destroys the vector and makes the promise a lie — so it must *move* these
+    /// vectors to the column store (the canonical out-of-scope representation, and the one a
+    /// fresh build produces), not drop them. See [`VectorLevels::out_of_scope`].
+    pub out_of_scope: Vec<u64>,
 }
 
 impl VectorLevel {
-    /// Every node whose *lower*-level entry this level invalidates — re-embedded or
-    /// un-embedded. A lower level must suppress these in its **scan**, not in the merge
-    /// afterwards (see [`vector::merge_topk`]).
+    /// Every node whose *lower*-level entry this level invalidates — re-embedded, un-embedded,
+    /// or taken out of scope. A lower level must suppress these in its **scan**, not in the
+    /// merge afterwards (see [`vector::merge_topk`]).
+    ///
+    /// All three channels suppress; only [`Self::removed`] *deletes*. A caller that acts on the
+    /// suppression (a scan) wants this; a caller that acts on the deletion (a consolidation)
+    /// must ask the channels apart.
     pub fn superseded(&self) -> HashSet<u64> {
         self.entries
             .iter()
             .map(|e| e.node_id)
             .chain(self.removed.iter().copied())
+            .chain(self.out_of_scope.iter().copied())
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.removed.is_empty()
+        self.entries.is_empty() && self.removed.is_empty() && self.out_of_scope.is_empty()
     }
 }
 
@@ -1065,6 +1083,29 @@ impl VectorLevels {
 
     pub fn is_empty(&self) -> bool {
         self.delta.is_empty() && self.segments.is_empty()
+    }
+
+    /// Every node some level above the base took **out of the index's scope** without deleting
+    /// its embedding, and that no level has since put back (a re-embed or a value removal is
+    /// the newer, winning fact about it).
+    ///
+    /// The consolidation's rescue set (HIK-122). These nodes must not be in the rebuilt index —
+    /// the base arm's `live` gate does not re-check scope, so the base index is trusted to hold
+    /// only in-scope nodes — but their vectors must survive as **column** values. Where a level
+    /// carries the vector inline, the dump's property walk already does that; where it does not,
+    /// the only copy is the one D12 routed out of the props record into the base index, and the
+    /// consolidation has to move it back.
+    pub fn out_of_scope(&self) -> HashSet<u64> {
+        let newer = self.delta.superseded();
+        let mut s: HashSet<u64> = self
+            .segments
+            .out_of_scope
+            .iter()
+            .copied()
+            .filter(|id| !newer.contains(id))
+            .collect();
+        s.extend(self.delta.out_of_scope.iter().copied());
+        s
     }
 
     /// The levels flattened newest-wins into the effective `(node_id, vector)` set above the
@@ -1181,24 +1222,61 @@ pub(crate) fn delta_vector_for(
         // supersede (`Silent` — the base's vector, if any, is another node's business); but a
         // node whose effective label set dropped the label **because this delta removed it**
         // (`REMOVE n:Label`) has *left* a scope it was in, so the vector some level below still
-        // holds must be suppressed — `Gone` (superseded **in**), exactly as a value removal is.
-        // The index is scope-defined by the label, so leaving the label leaves the index. D12
-        // routes an indexed embedding out of the row, so absence cannot express this; the
-        // delta's `labels_removed` is the channel (the segment's is its sidecar — `segment_level`).
+        // holds must be suppressed — `OutOfScope` (superseded **in**), exactly as a value
+        // removal is. The index is scope-defined by the label, so leaving the label leaves the
+        // index. D12 routes an indexed embedding out of the row, so absence cannot express this;
+        // the delta's `labels_removed` is the channel (the segment's is its sidecar —
+        // `segment_level`).
+        //
+        // It is `OutOfScope` and not `Gone` because the embedding *value* is untouched (D64):
+        // every scan treats the two alike, but a consolidation must not delete this vector
+        // (HIK-122) — it has to move it to the column store.
         let left_scope = gen
             .delta()
             .node_patch(id)
             .is_some_and(|nd| nd.labels_removed.contains(&desc.label));
-        return Ok(if left_scope {
-            DeltaVector::Gone
-        } else {
-            DeltaVector::Silent
+        if !left_scope {
+            return Ok(DeltaVector::Silent);
+        }
+        // Leaving the scope is not the only thing this delta may have done. Ask what it says
+        // about the *value* too, because one write can do both — `MATCH (n) SET n = {name:'x'}
+        // REMOVE n:Doc` drops the embedding *and* the label — and a deletion is the stronger
+        // fact: `OutOfScope` promises the value survives, so filing a deleted one under it
+        // would have the consolidation rescue the vector the user just threw away, back into
+        // the column store, where `RETURN n.embedding` would then hand it out again.
+        return Ok(match delta_says(gen, id, desc) {
+            LevelSays::Gone => DeltaVector::Gone,
+            LevelSays::Vector(_) | LevelSays::Nothing => DeltaVector::OutOfScope,
         });
     }
     Ok(match delta_says(gen, id, desc) {
         LevelSays::Vector(v) => DeltaVector::Set(v),
         LevelSays::Gone => DeltaVector::Gone,
-        LevelSays::Nothing => DeltaVector::Silent,
+        // The delta says nothing about the *value* — but it may still have changed the node's
+        // membership. `SET n:Label` moves a node **into** the index's scope, and while it was
+        // out of scope its embedding was an ordinary column value (that is the canonical
+        // out-of-scope form: D12 only routes an embedding out of the row for a node that is
+        // *in* scope at build time, and the base index only ever holds in-scope nodes). So no
+        // level below has an entry for it, and nothing would ever score it again — while
+        // `suppress_indexed_vector` starts answering `Null` for the column read the moment the
+        // label lands. The vector would be reachable by no query at all.
+        //
+        // Materialise it here, which is the mirror of the `left_scope` arm above: entering the
+        // scope is the delta's own fact about this node's membership, so the delta is the level
+        // that must carry the vector. `node_prop_raw` is the *unsuppressed* read — the value
+        // really is in the column store — and `Silent` still covers the ordinary case of a node
+        // that has no embedding at all.
+        LevelSays::Nothing => {
+            let entered_scope = gen
+                .delta()
+                .node_patch(id)
+                .is_some_and(|nd| nd.labels_added.contains(&desc.label));
+            match entered_scope.then(|| node_prop_raw(gen, cache, id, &desc.property)) {
+                Some(Ok(Val::Vector(v))) => DeltaVector::Set(v),
+                Some(Err(e)) => return Err(e),
+                _ => DeltaVector::Silent,
+            }
+        }
     })
 }
 
@@ -1225,6 +1303,7 @@ pub fn delta_level(
                 vector: v,
             }),
             DeltaVector::Gone => level.removed.push(id),
+            DeltaVector::OutOfScope => level.out_of_scope.push(id),
             DeltaVector::Silent => {}
         }
     }
@@ -1270,9 +1349,25 @@ pub fn segment_level(
             // swallows the sidecar's own removal, so a *consolidation* — which reads this fold,
             // not the raw sidecar union the KNN read path uses — resurfaces the vector. The
             // delta is not consulted here (it may be empty post-flush; the fact lives in the
-            // node's effective label set), so any out-of-scope candidate is a removal. The
-            // candidate set is the sidecar ids ∪ removals, so this stays O(vectors touched).
-            segments.removed.push(id);
+            // node's effective label set), so any out-of-scope candidate has left the scope.
+            // The candidate set is the sidecar ids ∪ removals, so this stays O(vectors touched).
+            //
+            // `out_of_scope`, not `removed` (HIK-122): the sidecar's `label_removals` channel
+            // exists precisely because the embedding *value* survives a de-labelling (D64), and
+            // filing it as a deletion is what let a consolidation destroy it. `segment_says` is
+            // still asked, because a value removal at this level is the newer, winning fact and
+            // really is a deletion — the node left the scope *and* the user deleted the vector.
+            match segment_says(gen, id, desc)? {
+                // The value is gone on its own account, labels aside. A real deletion.
+                LevelSays::Gone => segments.removed.push(id),
+                // `Vector` — the level's row carries the embedding inline, so the dump's
+                // property walk already lands it in the column store (the node is out of scope,
+                // so `suppress_indexed_vectors_named` leaves it alone). `Nothing` — no level
+                // above the base holds it, so the only copy is the one D12 routed *out* of the
+                // props record into the base index, and the consolidation must move it back.
+                // Either way the node is not in the index and every level below is suppressed.
+                LevelSays::Vector(_) | LevelSays::Nothing => segments.out_of_scope.push(id),
+            }
             continue;
         }
         match segment_says(gen, id, desc)? {
@@ -1336,12 +1431,15 @@ fn segment_says(gen: &dyn ReadView, id: u64, desc: &VectorIndexDesc) -> Result<L
     // Newest segment first: a later re-embed would have been caught by the row read above, so a
     // segment that names this id in its removals is the last word on it.
     //
-    // Only a **value** removal makes it `Gone` here (HIK-118). The caller reaches `segment_says`
-    // only for a node that is *currently in scope* (`vector_indexed`), so a `label_removal` that
-    // names this id has already been un-done by a re-label — the node left and came back, and its
-    // base/older vector is the live one again. A value removal is different: the value is gone, so
-    // it stays `Gone` regardless of labels. Treating a re-labelled node's stale `label_removal` as
-    // `Gone` would drop its vector on a *consolidation* only, silently.
+    // Only a **value** removal makes it `Gone` here (HIK-118) — this function is about the
+    // embedding *value*, and says nothing about scope. For a node that is currently **in** scope
+    // (`vector_indexed`), a `label_removal` naming this id has already been un-done by a
+    // re-label — the node left and came back, and its base/older vector is the live one again.
+    // For a node currently **out** of scope, the caller (`segment_level`) has already decided
+    // that from the effective label set and only wants to know whether the value itself survived.
+    // A value removal is different from both: the value is gone, so it stays `Gone` regardless of
+    // labels. Treating a `label_removal` as `Gone` would drop the vector on a *consolidation*
+    // only, silently — which is exactly HIK-122.
     let removed = stack.segments().iter().rev().any(|seg| {
         seg.vectors.as_ref().is_some_and(|v| {
             v.value_removals(&desc.label, &desc.property)
@@ -2739,6 +2837,64 @@ impl<'g, V: ReadView> Engine<'g, V> {
         segment_level(self.gen, self.cache, desc)
     }
 
+    /// The full-precision embeddings the **sealed base index** holds for `wanted`, keyed by node
+    /// id. Ids the base does not index are simply absent.
+    ///
+    /// The one read that recovers a vector D12 routed *out* of the props record: for a node that
+    /// was in the index's scope at build time, this is the only copy in the generation, and no
+    /// column read can see it. The consolidation needs it to move a de-labelled node's embedding
+    /// back into the column store (HIK-122); nothing on the query path does, because the KNN arms
+    /// scan the index rather than probe it by id.
+    ///
+    /// **Batched on purpose.** Neither arm can seek by node id — the brute-force store is in
+    /// build-scan order and the `.pq` layout map is unsorted — so a probe is a scan of the index,
+    /// and probing per candidate would make a bulk `REMOVE n:Doc` quadratic (candidates × index)
+    /// at consolidation time. One pass per index serves the whole set, and an empty `wanted`
+    /// (overwhelmingly the common case) reads nothing at all.
+    pub(crate) fn base_index_vectors(
+        &self,
+        desc: &VectorIndexDesc,
+        wanted: &HashSet<u64>,
+    ) -> Result<HashMap<u64, Vec<f32>>> {
+        let mut out = HashMap::new();
+        if wanted.is_empty() {
+            return Ok(out);
+        }
+        match desc.mode {
+            // `vectors.f32.blk` holds the group at `[first_record, first_record + count)`, in
+            // build-scan order.
+            AnnMode::BruteForce => {
+                for r in desc.first_record..desc.first_record + desc.count {
+                    let e = read_vector(self.gen, self.cache, r)?;
+                    if wanted.contains(&e.node_id) {
+                        out.insert(e.node_id, e.vector);
+                    }
+                }
+            }
+            // The `.pq` side table is the layout→id map (v8: the `.vamana` record is pure
+            // geometry), and the `.vamana` record's stored vector is **raw** — the ANN-space
+            // transform is a navigation device applied at search time, never at rest — so it
+            // is the embedding the user wrote. `node_ids` is already resident, so only the
+            // matching records are read.
+            AnnMode::Vamana { .. } => {
+                let Some(ix) = self.gen.vamana_index(&desc.label, &desc.property) else {
+                    return Ok(out);
+                };
+                for (ord, node_id) in ix.pq.node_ids.iter().enumerate() {
+                    if !wanted.contains(node_id) {
+                        continue;
+                    }
+                    let v = ix
+                        .reader
+                        .node(ord as graph_format::vamana::VamanaIndex)?
+                        .vector;
+                    out.insert(*node_id, v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn delta_level(&self, desc: &VectorIndexDesc) -> Result<VectorLevel> {
         delta_level(self.gen, self.cache, desc)
     }
@@ -2792,6 +2948,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // values of the others (root cause 5): a single-property read no longer
         // allocates a `Vec<(u32, Value)>` nor decodes every other value.
         node_prop_par(self.gen, self.cache, id, key)
+    }
+
+    /// The value actually stored at the winning level for `(id, key)`, with **no** D12
+    /// suppression — see [`node_prop_raw`]. The vector paths want the embedding itself; every
+    /// other read wants [`Self::node_prop`].
+    pub(crate) fn node_prop_raw(&self, id: u64, key: &str) -> Result<Val> {
+        node_prop_raw(self.gen, self.cache, id, key)
     }
 
     fn edge_prop(&self, id: u64, key: &str) -> Result<Val> {
@@ -19326,6 +19489,59 @@ mod tests {
         );
         let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
         assert_eq!(names, vec!["Alice"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The **Vamana arm** of the HIK-122 rescue read. The consolidation tests exercise this
+    /// through the real builder, but a fixture small enough to run there is always below
+    /// `ann_threshold` and so always brute-force — this is the only place the other arm is
+    /// reached, and it has to return the *raw* embedding the user wrote, not the ANN-space
+    /// point the graph navigates on (`build_vamana_index` transforms for search and stores raw;
+    /// a rescue that returned the transformed point would write a silently wrong vector into
+    /// the rebuilt column store).
+    #[test]
+    fn base_index_vectors_reads_raw_embeddings_from_a_vamana_index() {
+        let fix = testgen::VamanaFixture {
+            n: 200,
+            dim: 16,
+            r: 12,
+            alpha: 1.2,
+            pq_subspaces: 4,
+            pq_bits: 8,
+            vector_block_size: 4096,
+        };
+        let (root, graph, raw) = testgen::write_vamana("exec_rescue_vamana", &fix);
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let engine = Engine::new(&gen, &cache);
+        let desc = gen.manifest().vector_indexes[0].clone();
+        assert!(
+            matches!(desc.mode, AnnMode::Vamana { .. }),
+            "the fixture must be above the ANN threshold, or this test proves nothing"
+        );
+
+        // A scattered handful, plus an id the index does not hold.
+        let wanted: HashSet<u64> = [3u64, 7, 101, 199, 5_000].into_iter().collect();
+        let got = engine.base_index_vectors(&desc, &wanted).unwrap();
+
+        assert_eq!(
+            got.len(),
+            4,
+            "every wanted id the base indexes must come back, and only those: id 5000 is not \
+             in the index"
+        );
+        for id in [3u64, 7, 101, 199] {
+            assert_eq!(
+                got.get(&id),
+                Some(&raw[id as usize]),
+                "node {id}'s rescued vector must be the raw embedding, byte-for-byte"
+            );
+        }
+        // An empty request must not read the index at all — the common case is no candidates.
+        assert!(engine
+            .base_index_vectors(&desc, &HashSet::new())
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

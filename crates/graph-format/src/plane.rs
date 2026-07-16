@@ -122,6 +122,28 @@ pub(crate) fn low_bits(universe: u64, m: u64) -> u8 {
     }
 }
 
+/// The largest low-bits width `ℓ` an Elias–Fano header may declare — see [`check_low_bits`].
+pub(crate) const MAX_LOW_BITS: u8 = 63;
+
+/// Reject an on-disk low-bits width `ℓ` outside what [`low_bits`] can ever produce.
+///
+/// `low_bits` yields `(universe / m).ilog2()`, at most **63** for a `u64` universe, or 0 for the
+/// degenerate all-small case — so `0..=63` is the entire legal domain, and `ℓ ≥ 64` can only come
+/// from a corrupt or forged record. It has to be caught here, once at decode, because every later
+/// use of `ℓ` is a shift that a release build does not fail on: `value_at`/`degree_at` compute
+/// `hi << ℓ` and [`read_low`] computes `(1 << ℓ) - 1`, and Rust masks an over-wide shift to
+/// `ℓ & 63` rather than trapping. A forged `ℓ = 100` record would decode "fine" and then serve
+/// silently wrong values — worse than the debug panic. `ℓ == 0` is legitimate (an empty `lows`
+/// plane) and passes: that is why this bound is not the `1..=64` of [`BitPacked`]'s `width`,
+/// whose zero means something else.
+#[inline]
+pub(crate) fn check_low_bits(what: &'static str, l: u8) -> Result<()> {
+    if l > MAX_LOW_BITS {
+        return Err(DecodeRejected::EfLowBitsWidth { what, l }.into());
+    }
+    Ok(())
+}
+
 /// Write `l` bits of `v` (LSB-first) at bit offset `bitoff` into `lows`. Build-time only, so a
 /// simple bit-by-bit loop is fine.
 pub(crate) fn write_low(lows: &mut [u8], bitoff: usize, v: u64, l: u8) {
@@ -501,6 +523,9 @@ impl EfMono {
         }
         let m = u32::from_le_bytes(body[0..4].try_into().unwrap());
         let l = body[4];
+        // `l` comes straight off disk and drives every subsequent shift, so bound it before the
+        // length arithmetic that derives `low_bytes` from it.
+        check_low_bits("ef-mono plane", l)?;
         let nwords = u32::from_le_bytes(body[5..9].try_into().unwrap()) as usize;
         let low_bytes = (m as usize * l as usize).div_ceil(8);
         let high_bytes = nwords * 8;
@@ -1244,5 +1269,75 @@ mod tests {
         );
         assert!(decode_plane(&[]).is_err(), "empty record must error");
         assert!(decode_plane(&[99]).is_err(), "unknown tag must error");
+    }
+
+    /// An [`EfMono`] body with the given `m` and low-bits width `l`, made deliberately
+    /// **self-consistent**: the low plane is sized to `(m·l)/8` bytes and the high bitmap holds
+    /// exactly `m` one-bits, so both of the decoder's existing checks (the `body.len() != need`
+    /// equality and the `ones == m` invariant) pass and `l` is the only thing left to catch.
+    fn forged_ef_body(m: u32, l: u8) -> Vec<u8> {
+        let nwords = (m as usize).div_ceil(64).max(1);
+        let mut highs = vec![0u64; nwords];
+        for i in 0..m as usize {
+            highs[i / 64] |= 1u64 << (i % 64);
+        }
+        let low_bytes = (m as usize * l as usize).div_ceil(8);
+        let mut body = Vec::new();
+        body.extend_from_slice(&m.to_le_bytes());
+        body.push(l);
+        body.extend_from_slice(&(nwords as u32).to_le_bytes());
+        body.resize(body.len() + low_bytes, 0);
+        for w in &highs {
+            body.extend_from_slice(&w.to_le_bytes());
+        }
+        body
+    }
+
+    /// A forged EF record whose low-bits width `ℓ` is outside `0..=63` must be rejected at
+    /// decode, cleanly.
+    ///
+    /// Without the bound this record decodes *successfully* — its shape and its one-bit count
+    /// are both consistent — and then `value_at` evaluates `hi << 100`. Debug panics; **release
+    /// masks the shift to `100 & 63 = 36` and silently serves wrong values**, which is the case
+    /// that matters, so this assertion must hold under `cargo test --release` too.
+    #[test]
+    fn rejects_forged_ef_low_bits_width() {
+        let forged = forged_ef_body(8, 100);
+        let err = EfMono::deserialize(&forged)
+            .map(|_| ())
+            .expect_err("l=100 must error, not mis-decode");
+        assert!(
+            matches!(
+                err.downcast_ref::<DecodeRejected>(),
+                Some(DecodeRejected::EfLowBitsWidth { l: 100, .. })
+            ),
+            "expected a typed EfLowBitsWidth rejection, got: {err}"
+        );
+
+        // Same through the public record path, tag included.
+        let mut rec = vec![PlaneKind::Ef as u8];
+        rec.extend_from_slice(&forged);
+        assert!(
+            decode_plane(&rec).is_err(),
+            "l=100 must error via decode_plane"
+        );
+
+        // 64 is the first rejected width, and it is rejected for the same reason 100 is —
+        // `1u64 << 64` overflows just as surely. A `l <= 64` bound would miss this.
+        assert!(EfMono::deserialize(&forged_ef_body(8, 64)).is_err());
+
+        // The bound must not reject *legal* widths at either end. `ℓ = 63` is reachable
+        // (universe/m = u64::MAX), so `l < 63` would be an off-by-one that breaks a real plane.
+        let wide = EfMono::encode(&[u64::MAX]);
+        assert_eq!(wide.l, 63, "one u64::MAX element is the ℓ=63 corner");
+        let rt = EfMono::deserialize(&wide.serialize()).expect("ℓ=63 is legal and must decode");
+        assert_eq!(rt.value_at(0), u64::MAX, "ℓ=63 must still decode exactly");
+
+        // And `ℓ = 0` is the legitimate degenerate plane (empty lows) — unlike `BitPacked`,
+        // whose `width` bound starts at 1.
+        let narrow = EfMono::encode(&[0, 1, 2, 3]);
+        assert_eq!(narrow.l, 0);
+        let rt = EfMono::deserialize(&narrow.serialize()).expect("ℓ=0 is legal and must decode");
+        assert_eq!(rt.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     }
 }
