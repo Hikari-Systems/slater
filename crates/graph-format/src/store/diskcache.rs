@@ -91,9 +91,9 @@ enum Req {
 /// on-disk byte footprint and a recency tick; eviction pops the lowest tick.
 ///
 /// The name is `blake3(key‖offset‖len)` hex — derivable from the lookup key — so
-/// the index keys *are* the file names and a lookup never touches disk. The index
-/// starts empty (cold) on open; restart-warmth (rebuilding it from cache-file
-/// headers) is a deliberate follow-up, not v1.
+/// the index keys *are* the file names and a lookup never touches disk. On open
+/// the index is seeded from the cache directory (see [`adopt_existing`]): the
+/// index must account for *everything* on disk, or the budget bounds nothing.
 #[derive(Default)]
 struct Lru {
     tick: u64,
@@ -165,14 +165,21 @@ impl DiskCache {
     /// spawn its background writer thread.
     ///
     /// `dir` must be a **real writable volume — never tmpfs**, which is RAM and
-    /// would defeat the bounded-RSS guarantee. The in-memory index starts cold;
-    /// any files already present in `dir` (e.g. from a previous run) are ignored
-    /// until overwritten, and aged out by the LRU as new writes land.
+    /// would defeat the bounded-RSS guarantee.
+    ///
+    /// Cache files already present in `dir` (e.g. from a previous run) are
+    /// **adopted** into the index by [`adopt_existing`] before the writer starts:
+    /// they stay warm across a restart, count against `budget_bytes`, and are
+    /// evictable. They cannot be left unindexed — nothing else would ever reclaim
+    /// them, since a new generation mints new file names (see [`cache_name`]) and
+    /// the writer only unlinks names the index gave it.
     pub fn open(dir: impl AsRef<Path>, budget_bytes: u64) -> Result<Arc<Self>> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)
             .with_context(|| format!("create disk-cache dir {}", dir.display()))?;
-        let index = Arc::new(Mutex::new(Lru::default()));
+        // Seed the index *before* spawning the writer, so adoption cannot race a
+        // Write/Delete (the channel does not exist yet).
+        let index = Arc::new(Mutex::new(adopt_existing(&dir, budget_bytes)));
         let (writer_tx, writer_rx) = sync_channel::<Req>(WRITE_QUEUE_DEPTH);
         let writer = {
             let dir = dir.clone();
@@ -266,9 +273,145 @@ fn file_path_in(dir: &Path, name: &str) -> PathBuf {
     dir.join(&name[..2]).join(name)
 }
 
+/// Is `s` a shard directory name (two lowercase hex chars)?
+fn is_shard_name(s: &str) -> bool {
+    s.len() == 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Is `s` a cache-file name — i.e. the exact shape [`cache_name`] mints (64
+/// lowercase hex chars of blake3)? Deliberately strict: anything else in the
+/// directory is not ours to touch.
+fn is_cache_name(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Is `s` a `<cache_name>.tmp<seq>` scratch file from [`write_file`]? Such a file
+/// is an interrupted write (we crashed between create and rename); it is
+/// unambiguously ours and can never be adopted, so the scan unlinks it.
+fn is_tmp_name(s: &str) -> bool {
+    match s.split_once(".tmp") {
+        Some((stem, seq)) => {
+            is_cache_name(stem) && !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Seed an [`Lru`] from the cache files already in `dir`, then trim it to
+/// `budget_bytes`.
+///
+/// Adoption (rather than purging the directory) is the whole point: a restart
+/// keeps its warm cache, which is what the tier exists for. But adoption is also
+/// what makes the budget *real* — an unindexed file is one the LRU can never
+/// evict, because file names embed the generation UUID, so a new generation never
+/// overwrites the old names and every restart would otherwise strand another
+/// `budget_bytes` worth of files until the volume filled (ENOSPC, after which
+/// `write_file` fails silently).
+///
+/// Recency: `Lru::tick` is a counter, not a clock, so adopted files are inserted
+/// in mtime order — oldest first. They therefore sort among themselves by age,
+/// and anything *this* run writes is hotter than everything adopted. That bias is
+/// intended: this run's writes are known-live, while adopted files may belong to
+/// a dead generation and should be the first to go.
+///
+/// Adoption is by name and size only — no header parse, which would cost a read
+/// per file for no correctness gain. A corrupt, torn, or truncated adopted file
+/// is caught by [`decode`] on its first read and self-heals to a miss, exactly as
+/// a file this run wrote would.
+///
+/// Best-effort by construction: an unreadable directory or entry is skipped
+/// rather than failing `open`, since the cache is an optimisation and taking the
+/// whole store down over it would be worse. Be precise about the cost, though — a
+/// skipped entry is an *unindexed* one, i.e. the very bug this function exists to
+/// fix, reappearing for that shard. A persistent EIO/EACCES on the cache volume
+/// can still strand files; but a cache volume erroring on `read_dir` is already a
+/// fault the operator has to fix.
+///
+/// Cost: linear, ~2.6 µs/file measured warm — 121 ms for 40k files (≈ a 10 GiB
+/// cache at the 256 KiB default block size), 1.06 s for 400k (≈ 100 GiB), times a
+/// cold-page-cache multiplier. This is on the startup path, so it is a real
+/// budget; at the documented deployment size it is noise next to the S3
+/// round-trips the adopted files save. A far larger cache would justify
+/// parallelising the walk — 256 independent shards make that trivial if it is
+/// ever needed.
+fn adopt_existing(dir: &Path, budget_bytes: u64) -> Lru {
+    // (mtime, name, size), sorted so insertion order is oldest-first. The mtime
+    // is only a sort key: a coarse or skewed filesystem clock costs eviction
+    // precision, never correctness, and the tuple ties break on name for a
+    // deterministic order.
+    let mut found: Vec<(u64, String, u64)> = Vec::new();
+    let Ok(shards) = fs::read_dir(dir) else {
+        return Lru::default();
+    };
+    for shard in shards.flatten() {
+        // Only descend into our own shard dirs; a foreign file or directory at
+        // the top level is left strictly alone.
+        let shard_name = shard.file_name();
+        let Some(shard_name) = shard_name.to_str() else {
+            continue;
+        };
+        if !is_shard_name(shard_name) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            // `file_type` reads the dirent (no follow), so a symlink is neither
+            // adopted nor unlinked — we only ever manage regular files we wrote.
+            let Ok(ft) = f.file_type() else { continue };
+            if !ft.is_file() {
+                continue;
+            }
+            let name = f.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if is_tmp_name(name) {
+                let _ = fs::remove_file(f.path());
+                continue;
+            }
+            // A cache file must sit in the shard its own name selects, or
+            // `file_path_in` would never look for it there again.
+            if !is_cache_name(name) || &name[..2] != shard_name {
+                continue;
+            }
+            let Ok(md) = f.metadata() else { continue };
+            found.push((mtime_key(&md), name.to_string(), md.len()));
+        }
+    }
+    found.sort_unstable();
+
+    let mut lru = Lru::default();
+    for (_, name, size) in found {
+        lru.insert(&name, size);
+    }
+    // Trim here, not on the next write: the directory can already be over budget
+    // (an operator shrank `diskCacheBytes`, or a previous run predates this
+    // accounting), and a cache that only comes under budget once traffic arrives
+    // is one that can ENOSPC before it does.
+    while lru.total_bytes > budget_bytes {
+        let Some(victim) = lru.pop_coldest() else {
+            break;
+        };
+        let _ = fs::remove_file(file_path_in(dir, &victim));
+    }
+    lru
+}
+
+/// Sort key for adoption recency: mtime as nanos since the epoch. Files whose
+/// mtime is unavailable or pre-epoch sort oldest (evicted first) — an unusable
+/// timestamp is not a reason to treat a file as hot.
+fn mtime_key(md: &fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 /// Cache-file name: `blake3(key‖offset_le‖len_le)` hex. Stable per block (block
 /// reads are always at a fixed `(offset, comp_len)`), and the key embeds the
-/// generation UUID so a generation swap orphans old entries (they age out).
+/// generation UUID so a generation swap orphans old entries — which is exactly
+/// why [`adopt_existing`] must index them on open: nothing else can reclaim them.
 fn cache_name(key: &str, offset: u64, len: u64) -> String {
     let mut h = blake3::Hasher::new();
     h.update(key.as_bytes());
@@ -521,6 +664,26 @@ mod tests {
         (cache, dir)
     }
 
+    /// Total bytes of every file under `dir` — the cache's real on-disk
+    /// footprint, which is what `diskCacheBytes` is supposed to bound. Measured
+    /// from the filesystem, deliberately not from the LRU's own accounting (the
+    /// bug under test is precisely the two disagreeing).
+    fn dir_bytes(dir: &Path) -> u64 {
+        let mut total = 0;
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        for e in rd.flatten() {
+            let md = e.metadata().unwrap();
+            if md.is_dir() {
+                total += dir_bytes(&e.path());
+            } else {
+                total += md.len();
+            }
+        }
+        total
+    }
+
     #[test]
     fn put_then_get_round_trips() {
         let (cache, _g) = temp_cache(1 << 20);
@@ -608,6 +771,145 @@ mod tests {
             cache.get(key, 0, bytes.len() as u64).is_none(),
             "still a miss"
         );
+    }
+
+    /// The HIK-124 regression: a restart onto a *new generation* must not double
+    /// the on-disk footprint.
+    ///
+    /// The different keys between the runs are the whole point. Block keys embed
+    /// the generation uuid, so run 2 mints names run 1 never wrote, and nothing
+    /// run 1 left behind is ever renamed over. A version of this test that reused
+    /// one key would pass against the broken code.
+    #[test]
+    fn restart_on_new_generation_stays_within_budget() {
+        let block = 4096usize;
+        let (gen1, gen2) = ("g/aaaa/f.blk", "g/bbbb/f.blk"); // equal length → equal entry size
+        let entry = block + 23 + gen1.len();
+        let budget = (entry * 4) as u64;
+        let dir = tempdir::Guard::new();
+
+        // Run 1 warms the cache to its budget, then the process exits.
+        {
+            let cache = DiskCache::open(dir.path(), budget).unwrap();
+            for i in 0..4 {
+                cache.put_async(gen1, (i * block) as u64, &vec![1u8; block]);
+                cache.flush();
+            }
+        }
+        let after_run1 = dir_bytes(dir.path());
+        assert!(after_run1 > 0, "run 1 warmed the cache");
+        assert!(
+            after_run1 <= budget,
+            "run 1 within budget: {after_run1} > {budget}"
+        );
+
+        // Run 2: same volume, new generation. Run 1's files must be adopted and
+        // evicted to make room, not stranded alongside run 2's.
+        {
+            let cache = DiskCache::open(dir.path(), budget).unwrap();
+            for i in 0..4 {
+                cache.put_async(gen2, (i * block) as u64, &vec![2u8; block]);
+                cache.flush();
+            }
+        }
+        let after_run2 = dir_bytes(dir.path());
+        assert!(
+            after_run2 <= budget,
+            "restart onto a new generation stayed within budget: {after_run2} > {budget}"
+        );
+    }
+
+    /// Adoption, not purging: the tier's whole point is that a restart keeps its
+    /// warm cache, so a block written by the previous run still serves.
+    #[test]
+    fn restart_serves_entries_from_the_previous_run() {
+        let dir = tempdir::Guard::new();
+        let key = "g/u/f.blk";
+        let bytes = vec![9u8; 1024];
+        {
+            let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+            cache.put_async(key, 0, &bytes);
+            cache.flush();
+        }
+        let cache = DiskCache::open(dir.path(), 1 << 20).unwrap();
+        assert_eq!(
+            cache.get(key, 0, bytes.len() as u64).as_deref(),
+            Some(&bytes[..]),
+            "previous run's block served after restart"
+        );
+    }
+
+    /// The cache dir is a real volume an operator may have pointed at something
+    /// else. Adoption must never touch what it did not write — even under a
+    /// budget of 0, which trims every entry the cache does own.
+    #[test]
+    fn adoption_leaves_foreign_files_alone() {
+        let dir = tempdir::Guard::new();
+        let loose = dir.path().join("notes.txt");
+        std::fs::write(&loose, b"important").unwrap();
+        // A directory that is not a two-hex-char shard.
+        let other = dir.path().join("zz");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("thing.bin"), b"payload").unwrap();
+        // A non-cache-shaped file *inside* a well-formed shard dir.
+        let shard = dir.path().join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("README"), b"hello").unwrap();
+
+        drop(DiskCache::open(dir.path(), 0).unwrap());
+
+        assert_eq!(std::fs::read(&loose).unwrap(), b"important");
+        assert_eq!(std::fs::read(other.join("thing.bin")).unwrap(), b"payload");
+        assert_eq!(std::fs::read(shard.join("README")).unwrap(), b"hello");
+    }
+
+    /// A crash between `write_file`'s create and its rename orphans a
+    /// `<name>.tmp<seq>` file. It can never be adopted (it is not a cache name),
+    /// so if the scan did not reclaim it, it would leak for the volume's life.
+    #[test]
+    fn adoption_removes_orphaned_temp_files() {
+        let dir = tempdir::Guard::new();
+        let name = cache_name("g/u/f.blk", 0, 10);
+        let shard = dir.path().join(&name[..2]);
+        std::fs::create_dir_all(&shard).unwrap();
+        let tmp = shard.join(format!("{name}.tmp7"));
+        std::fs::write(&tmp, b"half-written").unwrap();
+
+        drop(DiskCache::open(dir.path(), 1 << 20).unwrap());
+
+        assert!(!tmp.exists(), "orphaned temp file reclaimed on open");
+    }
+
+    /// A dir that is *already* over budget on open (the operator shrank
+    /// `diskCacheBytes`, or the run that wrote it predates this accounting) must
+    /// be trimmed at open. Waiting for the next write to trigger the trim is a
+    /// cache that can ENOSPC before any traffic arrives.
+    #[test]
+    fn adoption_trims_a_dir_that_is_already_over_budget() {
+        let block = 4096usize;
+        let key = "g/u/f.blk";
+        let entry = block + 23 + key.len();
+        let dir = tempdir::Guard::new();
+        {
+            let cache = DiskCache::open(dir.path(), (entry * 4) as u64).unwrap();
+            for i in 0..4 {
+                cache.put_async(key, (i * block) as u64, &vec![3u8; block]);
+                cache.flush();
+            }
+        }
+        let smaller = (entry * 2) as u64;
+        assert!(
+            dir_bytes(dir.path()) > smaller,
+            "starts over the new budget"
+        );
+
+        let cache = DiskCache::open(dir.path(), smaller).unwrap();
+        let after = dir_bytes(dir.path());
+        assert!(
+            after <= smaller,
+            "trimmed to the new budget on open: {after} > {smaller}"
+        );
+        drop(cache);
     }
 
     /// An [`ObjectStore`] that counts positional reads reaching the inner store,
