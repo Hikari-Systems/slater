@@ -1371,6 +1371,82 @@ mod tests {
         assert!(record_from_block(&offsets, &data, 0).is_err());
     }
 
+    /// Assemble a block image by hand: `count ‖ offsets ‖ data`. The writer can only ever
+    /// emit well-formed tables, so a forged image is the only way to reach the rejections
+    /// below.
+    fn raw_block(offsets: &[u32], data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&((offsets.len() - 1) as u32).to_le_bytes());
+        for o in offsets {
+            b.extend_from_slice(&o.to_le_bytes());
+        }
+        b.extend_from_slice(data);
+        b
+    }
+
+    fn rejects_offset_table(offsets: &[u32], data: &[u8]) -> String {
+        let err = parse_block(&raw_block(offsets, data))
+            .expect_err("forged offset table must be refused");
+        // Branch on the error *type*, never its text (CONTRIBUTING.md).
+        match err.downcast_ref::<DecodeRejected>() {
+            Some(DecodeRejected::BlockOffsetTable { reason, .. }) => reason.to_string(),
+            other => panic!("expected DecodeRejected::BlockOffsetTable, got {other:?}"),
+        }
+    }
+
+    /// `parse_block` hands `(offsets, data)` to callers that index the table by hand
+    /// (`pq.rs`'s `load_resident`, `merge_build.rs`'s `next_raw`, `extsort.rs`'s run reader),
+    /// so an unvalidated entry is a **slice-out-of-bounds panic at generation open**, not a
+    /// recoverable error. Validating here makes `start <= end <= data.len()` true by
+    /// construction for all of them. HIK-128.
+    #[test]
+    fn forged_offset_table_is_refused_at_parse() {
+        let data = [7u8; 9];
+        // An offset running past the end of the data region.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 6, 999], &data),
+            "last slot does not end at the data length"
+        );
+        // `start > end` — the slice that panics with "start > end" rather than an index
+        // overrun. Slot 0 is deliberately well-formed, so this is the monotonicity check
+        // firing and not an earlier one.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 2, 9], &data),
+            "offsets decrease"
+        );
+        // A table that does not start at 0 leaves a prefix of the data unreachable.
+        assert_eq!(
+            rejects_offset_table(&[1, 3, 6, 9], &data),
+            "first slot does not start at 0"
+        );
+        // A terminal that stops short is equally not a partition of the region.
+        assert_eq!(
+            rejects_offset_table(&[0, 3, 6, 8], &data),
+            "last slot does not end at the data length"
+        );
+    }
+
+    /// The guard must not be a no-op: a well-formed table still parses, and every slot still
+    /// slices back to the exact bytes the writer put in it.
+    #[test]
+    fn well_formed_offset_table_still_parses() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9];
+        let block = raw_block(&[0, 3, 6, 9], &data);
+        let (offsets, out) = parse_block(&block).unwrap();
+        assert_eq!(offsets, vec![0, 3, 6, 9]);
+        assert_eq!(out, &data);
+        assert_eq!(record_from_block(&offsets, out, 0).unwrap(), &[1, 2, 3]);
+        assert_eq!(record_from_block(&offsets, out, 2).unwrap(), &[7, 8, 9]);
+        // Empty records are legal (`start == end`) and must not be read as a decrease.
+        let block = raw_block(&[0, 0, 9], &data);
+        let (offsets, out) = parse_block(&block).unwrap();
+        assert_eq!(record_from_block(&offsets, out, 0).unwrap(), b"");
+        assert_eq!(record_from_block(&offsets, out, 1).unwrap(), &data);
+        // A single-record block, and the degenerate empty block.
+        assert!(parse_block(&raw_block(&[0, 9], &data)).is_ok());
+        assert!(parse_block(&raw_block(&[0], &[])).is_ok());
+    }
+
     #[test]
     fn raw_codec_roundtrips_and_skips_compression() {
         // Raw blocks are stored verbatim: comp_len == raw_len for every block, and the
