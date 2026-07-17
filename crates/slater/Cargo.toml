@@ -168,3 +168,14 @@ required-features = ["testkit"]
 name = "mips_recall"
 harness = false
 required-features = ["testkit"]
+
+# 7. HIK-137 phase-1 SPIKE: a bench-only IP-native (MIPS) navigator — an IP proximity graph
+# (top-R-by-IP / s-Delaunay selection, highest-norm entry) walked by EXACT inner product (no PQ,
+# no augmentation) — measured against the same deliverable-1 brute-force IP ground truth as bench
+# 6, on all three norm distributions, beside the current augmented base index and an angular-seed
+# variant. Throwaway measurement (no ladder/manifest/format touched). Run:
+# `cargo bench -p slater --features testkit --bench ipnsw_spike`.
+[[bench]]
+name = "ipnsw_spike"
+harness = false
+required-features = ["testkit"]
