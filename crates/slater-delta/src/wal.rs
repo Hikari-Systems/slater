@@ -967,6 +967,15 @@ fn replay_bytes(bytes: &[u8], out: &mut Replay) -> Result<()> {
         }
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
+        // A zero-filled page is a torn tail, not a frame. `crc32c(&[]) == 0`, so
+        // `len=0, crc=0` is the one shape whose checksum is self-consistent by accident
+        // and sails through the CRC gate below — leaving `read_u8` to bail on the empty
+        // payload, which propagates out of `replay_dir` and wedges startup with every
+        // committed record still intact on disk. The writer never emits a 0-length frame
+        // (every payload carries a kind byte), so this can only be padding.
+        if len == 0 {
+            break;
+        }
         let body_start = pos + 8;
         let body_end = match body_start.checked_add(len) {
             Some(end) if end <= bytes.len() => end,
@@ -1320,6 +1329,39 @@ mod tests {
         fs::write(&path, truncated).unwrap();
 
         let replay = replay_segment(&path).unwrap();
+        assert_eq!(replay.records, vec![r0]);
+        assert_eq!(replay.last_seq, Seq(1));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A zero-filled tail must replay as a torn tail, not wedge the directory.
+    ///
+    /// `crc32c(&[]) == 0`, so a page of zeros decodes as `len=0, crc=0` and *passes*
+    /// the CRC check — the one frame shape whose checksum is self-consistent by
+    /// accident. Replay then reads a frame kind out of the empty payload and errors,
+    /// which propagates out of `replay_dir` and fails the whole graph's startup. A
+    /// filesystem that pads a partial block with zeros on a crash (or any short write
+    /// landing on fresh extent) produces exactly these bytes.
+    #[test]
+    fn zero_filled_tail_replays_as_torn_tail() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_zerotail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let r0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let path;
+        {
+            let mut sink = WalSink::create(&dir, 0).unwrap();
+            sink.append(&r0).unwrap();
+            sink.commit(Seq(1)).unwrap();
+            path = sink.path().to_path_buf();
+        }
+        // Pad the committed segment with a page of zeros, as a crash mid-extend would.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0u8; 4096]);
+        fs::write(&path, &bytes).unwrap();
+
+        // Pre-fix this is `Err("WAL byte truncated")` — a clean restart cannot open the
+        // graph at all, even though every committed record is intact on disk.
+        let replay = replay_segment(&path).expect("a zero tail must not wedge replay");
         assert_eq!(replay.records, vec![r0]);
         assert_eq!(replay.last_seq, Seq(1));
         fs::remove_dir_all(&dir).ok();
