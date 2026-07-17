@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use graph_format::integrity::{crc32c_base64, hash_bytes};
-use graph_format::store::diskcache::{CachingObjectStore, DiskCache};
+use graph_format::store::diskcache::{write_behind_budget, CachingObjectStore, DiskCache};
 use graph_format::store::gcs::{GcsConfig, GcsObjectStore};
 use graph_format::store::{FileIntegrity, ObjectStore, RandomReadAt};
 
@@ -238,7 +238,15 @@ fn disk_cache_absorbs_warm_reads_over_gcs() {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&cache_dir);
-    let cache = DiskCache::open(&cache_dir, 64 << 20).expect("open disk cache");
+    // Queue budget derived the way the server derives it, rather than picked —
+    // this test is about GCS round-tripping, not shedding, so all that matters is
+    // that it sits far above the handful of blocks the test queues.
+    let cache = DiskCache::open(
+        &cache_dir,
+        64 << 20,
+        write_behind_budget(64 << 20, 64 << 20),
+    )
+    .expect("open disk cache");
 
     let reads = Arc::new(AtomicUsize::new(0));
     let store = CachingObjectStore::new(

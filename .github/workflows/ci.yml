@@ -65,6 +65,13 @@ jobs:
       - name: Clippy (bench-codec)
         run: cargo clippy -p slater-build --all-targets --features bench-codec,s3 -- -D warnings
 
+      # `testkit` gates slater's benches and several integration tests behind a
+      # `required-features` flag, so the `--all-targets` lint above never compiles
+      # them — they can rot silently, the same shape as the s3/gcs hole (HIK-138
+      # audit). Lint them explicitly.
+      - name: Clippy (slater testkit targets)
+        run: cargo clippy -p slater --all-targets --features testkit -- -D warnings
+
   # ── Build: the whole workspace must compile against the committed lockfile ──
   build:
     runs-on: ubuntu-latest
@@ -86,3 +93,47 @@ jobs:
 
       - name: Build the workspace
         run: cargo build --workspace --locked
+
+  # ── Store backends: compile + run the feature-gated s3/gcs code that the
+  #    default build never touches (HIK-138). Whole modules under
+  #    `graph-format/src/store/{s3,gcs}.rs` and every `tests/{s3_minio,gcs_*}.rs`
+  #    file are `#[cfg(feature = …)]`, so a plain `cargo test` / `cargo clippy`
+  #    neither builds nor lints them — which is how two disk-cache bugs *and* a
+  #    non-compiling gcs test shipped unnoticed. The integration tests self-skip
+  #    without a live MinIO/GCS endpoint (they gate on the SLATER_{S3,GCS}_TEST_*
+  #    env vars), so this job needs no cloud credentials: its purpose is to keep
+  #    the gated source and test modules building and lint-clean on every commit.
+  #    Each backend is exercised alone and together, so a feature that only
+  #    compiles alongside the other is still caught.
+  store-backends:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [s3, gcs, "s3,gcs"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # rustls' aws-lc-rs backend (pulled by the s3 SDK) needs a C toolchain +
+      # libclang, same as the build job and the Dockerfile builder stage.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (graph-format, ${{ matrix.features }})
+        run: cargo clippy -p graph-format --all-targets --features ${{ matrix.features }} --locked -- -D warnings
+
+      # Compiles the gated lib unit tests and the tests/{s3_minio,gcs_*}.rs
+      # integration files — a non-compiling gated test is now a red build — and
+      # runs everything that doesn't need a live endpoint; the cloud tests self-skip.
+      - name: Test (graph-format, ${{ matrix.features }})
+        run: cargo test -p graph-format --features ${{ matrix.features }} --locked

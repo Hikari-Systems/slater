@@ -27,11 +27,16 @@
 //! ```
 #![cfg(feature = "testkit")]
 
+// Only the s3/gcs arms below use the shared harness, so gate it with them — under
+// `testkit` alone (no backend) it is dead code, which `clippy -D warnings` rejects.
+#[cfg(any(feature = "s3", feature = "gcs"))]
 use graph_format::store::ObjectStore;
+#[cfg(any(feature = "s3", feature = "gcs"))]
 use slater::benchkit;
 
 /// The four read shapes and a depth-4 stacked set, served once from the local fs and once
 /// through `store` (mirrored in): the base + segment block-miss counts must match shape-for-shape.
+#[cfg(any(feature = "s3", feature = "gcs"))]
 fn assert_readamp_parity(store: &dyn ObjectStore, tag: &str) {
     let n: u64 = 4_000;
     let anchor = n / 3;
