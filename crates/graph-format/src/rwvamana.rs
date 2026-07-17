@@ -90,7 +90,7 @@ use anyhow::{bail, Result};
 use wide::f32x8;
 
 use crate::manifest::Metric;
-use crate::pq::normalise_into;
+use crate::pq::{normalise_into, require_finite};
 use crate::vamana::{
     beam_search, insert_point, BeamParams, Expanded, InsertParams, SearchHit, VamanaIndex,
 };
@@ -296,6 +296,10 @@ impl RwVamana {
                 self.points.dim
             );
         }
+        // A distinct entry point (the delta write path): a NaN/±inf here poisons the resident
+        // data buffer *immediately*, before any consolidation, and no downstream guard catches
+        // it (the `max_norm2.max(norm2)` below silently drops a NaN). Reject up front (HIK-134).
+        require_finite(vector)?;
         // Delete-then-insert. Order matters only for clarity — the new slot is appended
         // below, so it cannot be the one we just killed.
         if let Some(old) = self.slot_of.remove(&node_id) {
@@ -867,5 +871,33 @@ mod tests {
             .search(&q, 1, 8, |v| cosine(&q, v), always_live)
             .unwrap_err();
         assert!(err.to_string().contains("dimension"), "{err}");
+    }
+
+    #[test]
+    fn rw_index_rejects_a_nonfinite_component() {
+        // The delta write path is a distinct entry point (HIK-134): a NaN/±inf here poisons the
+        // resident buffer immediately, and `max_norm2.max(norm2)` silently drops the NaN so no
+        // later guard catches it. Assert the *typed* finiteness error, and that the insert did
+        // not partially mutate the index (a clean insert afterwards still works).
+        let mut rw = RwVamana::new(3, Metric::Cosine);
+        for bad in [
+            [f32::NAN, 0.0, 0.0],
+            [0.0, f32::INFINITY, 0.0],
+            [0.0, 0.0, f32::NEG_INFINITY],
+        ] {
+            let err = rw.insert(1, &bad).unwrap_err();
+            assert!(
+                err.downcast_ref::<crate::pq::NonFiniteEmbedding>()
+                    .is_some(),
+                "must be the typed finiteness error, got: {err}"
+            );
+        }
+        assert!(rw.is_empty(), "a rejected insert must not add a slot");
+        rw.insert(1, &[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            rw.live_count(),
+            1,
+            "a finite insert still works after rejection"
+        );
     }
 }
