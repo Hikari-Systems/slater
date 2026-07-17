@@ -159,3 +159,12 @@ required-features = ["testkit"]
 name = "streaming_merge"
 harness = false
 required-features = ["testkit"]
+
+# 6. MIPS (Dot) recall@10 vs INDEPENDENT exact brute-force inner-product ground truth, on a
+# reproducible fixture whose norm distribution is the MIPS stressor (log-normal / heavy-tailed
+# Pareto / legacy uniform control). The deliverable-1 yardstick for HIK-137. Prints recall + the
+# fixture's norm spread. Run: `cargo bench -p slater --features testkit --bench mips_recall`.
+[[bench]]
+name = "mips_recall"
+harness = false
+required-features = ["testkit"]

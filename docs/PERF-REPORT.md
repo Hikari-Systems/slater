@@ -70,11 +70,16 @@ meaningful and navigable. (Uniform-random high-dim vectors are near-orthogonal a
 
 The ladder **preserves** recall: consolidated ≥ base for every metric (splicing holes out of
 adjacency reconnects the live neighbourhood), delta (exact-navigated RwVamana) is highest, merged is
-within ~0.06 of base. The three metrics diverge exactly as intended — dot is far lower because
-maximum-inner-product search is intrinsically harder (a high-norm vector is "near" everything,
-distorting the navigable graph); even RwVamana's *exact-distance* navigation only reaches 0.43,
-confirming this is a property of dot-product kNN, not of the index. Recall is a function of graph
-quality, not vector count, so these hold at scale.
+within ~0.06 of base. The three metrics diverge exactly as intended — dot is far lower (0.315–0.497)
+because maximum-inner-product search is harder to navigate (a high-norm vector is "near" everything,
+distorting the navigable graph). The "exact-distance" delta rung (RwVamana) reaching only ~0.43 tells
+us **PQ quantization is not the dominant term** — dropping it buys about +0.08 — but it does *not*
+show the loss is intrinsic to dot-product kNN: that baseline is not metric-exact for dot either. It
+still navigates via the norm-augmentation MIPS→L2 reduction (`RwVamana::dist` computes `base + d*d`
+on the augment-coordinate difference, `crates/graph-format/src/rwvamana.rs`:186), so the augmentation
+reduction is not ruled out as the cause. Whether a MIPS-native navigator (e.g. ip-NSW) recalls better
+on this same fixture is **unmeasured** — tracked in HIK-137. For cosine and L2, recall is a function
+of graph quality, not vector count, so those hold at scale.
 
 **Scope note (honest).** The engine-level "delta+segments" *merged read* is not a distinct index
 kind — a core segment is itself a small on-disk vamana, so its recall is the **base** rung's, and
