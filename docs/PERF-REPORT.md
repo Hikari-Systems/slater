@@ -66,26 +66,28 @@ meaningful and navigable. (Uniform-random high-dim vectors are near-orthogonal a
 |---|---|---|---|---|
 | Cosine | 0.990 | 0.910 | 0.960 | 0.890 |
 | L2 | 0.927 | 0.788 | 0.875 | 0.758 |
-| Dot (augmentation-reduction) | 0.433 | 0.353 | 0.497 | 0.315 |
+| Dot | 0.997 | 0.353 | 0.497 | 0.315 |
 
 The ladder **preserves** recall: consolidated ≥ base for every metric (splicing holes out of
 adjacency reconnects the live neighbourhood), delta (exact-navigated RwVamana) is highest, merged is
 within ~0.06 of base. Cosine and L2 recall is a function of graph quality, not vector count, so those
 hold at scale.
 
-Dot is far lower in that table (0.315–0.497), and the cause is now **measured**, not conjectured. The
-"exact-distance" delta rung (RwVamana) reaching only ~0.43 already told us **PQ quantization is not
-the dominant term** — dropping it buys about +0.08 — and that the loss is *not* intrinsic to
-dot-product kNN: that baseline is not metric-exact for dot either. It still navigates via the
-norm-augmentation MIPS→L2 reduction (`RwVamana::dist` computes `base + d*d` on the augment-coordinate
-difference, `crates/graph-format/src/rwvamana.rs`:186), the same reduction the base/consolidated/merged
-rungs use — so the augmentation reduction, not the metric, was under suspicion. HIK-137 built the
-missing measurement: an **IP-native (ip-NSW) navigator** — inner-product closeness, top-R-by-IP
-neighbour selection, highest-norm entry, and a raw-vector-trained IP-ADC codebook — benched on a
-purpose-built MIPS fixture with wide norm spreads (`crates/slater/benches/ipnsw_ladder_e2e.rs`, dim
-256, N 2000, three norm distributions), scored against an **independent brute-force inner-product**
-ground truth (never index-vs-index). On that fixture the augmentation-reduction path reproduces the
-floor, and the IP-native ladder lifts it to near-exact, holding across every rung:
+Dot needs a word, because as of HIK-137 the four columns no longer share a navigation. The **delta**
+rung (RwVamana) is now **IP-native**: `RwVamana::dist` descends on `−⟨a,b⟩` — the raw inner product,
+no norm augmentation (`crates/graph-format/src/rwvamana.rs`:199) — so it reaches **0.997** here,
+near-exact. The **base / consolidated / merged** rungs in *this* bench are still the
+augmentation-reduction `build_vamana`+PQ path, so they sit at the **0.315–0.497** floor. That split is
+the HIK-137 finding in one row: the low dot recall was a property of the **augmentation-reduction
+navigation, not of dot-product kNN** — hold the fixture fixed, swap the navigator, and the delta jumps
+**0.43 → 0.997**. (The delta reaching this *without* PQ also confirms **PQ quantization was never the
+dominant term**.) The full IP-native ladder — every rung, not just the delta — is measured separately
+with a dedicated **IP-native (ip-NSW) navigator** (inner-product closeness, top-R-by-IP neighbour
+selection, highest-norm entry, and a raw-vector-trained IP-ADC codebook) on a purpose-built MIPS
+fixture with wide norm spreads (`crates/slater/benches/ipnsw_ladder_e2e.rs`, dim 256, N 2000, three
+norm distributions), scored against an **independent brute-force inner-product** ground truth (never
+index-vs-index). On that fixture the augmentation-reduction path reproduces the floor, and the
+IP-native ladder lifts it to near-exact, holding across every rung:
 
 | norm spread (max/med) | augmentation-reduction base | IP-native base (T3) | delta (T0) | segment (T2) | merge (T4b) | delete (T4a) |
 |---|---|---|---|---|---|---|
