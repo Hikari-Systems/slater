@@ -227,15 +227,20 @@ impl ManifoldModel {
     /// `n` MIPS index vectors: a **unit manifold direction** (navigable neighbourhood structure)
     /// times a norm drawn independently from `norm_dist`. Decoupling direction from norm is what
     /// makes this stress MIPS — the norm distribution, not the direction, decides the true top-k.
+    ///
+    /// Directions and norms are drawn from **two separate streams** (`seed` and `seed ^ K`), so for
+    /// a fixed `seed` the *directions are identical across every `norm_dist`* — the norm draw (which
+    /// consumes a distribution-dependent number of RNG values: Box–Muller takes two, inverse-CDF one)
+    /// can never perturb the direction stream. That makes a cross-distribution recall comparison a
+    /// genuinely controlled experiment: only the norm spread varies.
     pub fn sample_mips(&self, n: usize, seed: u64, norm_dist: NormDist) -> Vec<Vec<f32>> {
-        // One stream: direction draws and the norm draw interleave per point, so the fixture is a
-        // single deterministic function of (model, seed, norm_dist).
-        let mut rng = SplitMix64(seed);
+        let mut dir_rng = SplitMix64(seed);
+        let mut norm_rng = SplitMix64(seed ^ 0x4D49_5053_4E52_4D00); // "MIPSNRM" — the norm stream
         (0..n)
             .map(|_| {
-                let mut v = self.lift(&mut rng);
+                let mut v = self.lift(&mut dir_rng);
                 let unit = l2_norm(&v).max(f64::MIN_POSITIVE) as f32;
-                let norm = norm_dist.draw(&mut rng) as f32;
+                let norm = norm_dist.draw(&mut norm_rng) as f32;
                 let scale = norm / unit;
                 for x in v.iter_mut() {
                     *x *= scale;
@@ -655,6 +660,35 @@ mod tests {
                 exact_topk(Metric::Dot, &b, &live, q, 10),
                 "same fixture must give identical exact IP top-k"
             );
+        }
+    }
+
+    /// The controlled-experiment invariant: for a fixed seed, every `NormDist` shares the *same*
+    /// directions (only the norm scaling differs), so a cross-distribution recall gap is
+    /// attributable to the norm spread alone. Guards the two-stream split in `sample_mips` — a
+    /// regression to a single interleaved stream would make the norm draw perturb the directions.
+    #[test]
+    fn mips_directions_are_shared_across_norm_dists() {
+        let model = ManifoldModel::new(256, 32, 0x317_2517);
+        let a = model.sample_mips(300, 0x1A5E, NormDist::Uniform4x);
+        let b = model.sample_mips(
+            300,
+            0x1A5E,
+            NormDist::Pareto {
+                x_m: 1.0,
+                alpha: 1.6,
+            },
+        );
+        for (va, vb) in a.iter().zip(&b) {
+            // Same direction ⇒ the normalised vectors match (norms differ, direction does not).
+            let na = l2_norm(va).max(f64::MIN_POSITIVE) as f32;
+            let nb = l2_norm(vb).max(f64::MIN_POSITIVE) as f32;
+            for (x, y) in va.iter().zip(vb) {
+                assert!(
+                    (x / na - y / nb).abs() < 1e-5,
+                    "directions must be shared across norm distributions"
+                );
+            }
         }
     }
 

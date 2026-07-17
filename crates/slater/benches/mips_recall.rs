@@ -11,7 +11,9 @@
 //! separates Dot from cosine/L2 and so **under-stresses** MIPS. Here we decouple the two: every
 //! index vector is a **unit manifold direction** (navigable structure preserved) times a norm drawn
 //! **independently** from a chosen distribution. The norm distribution — not the direction — then
-//! decides the true top-k, which is exactly the MIPS regime.
+//! decides the true top-k, which is exactly the MIPS regime. Directions and norms come from
+//! separate RNG streams (`ManifoldModel::sample_mips`), so for a fixed seed the three distributions
+//! share the *same* directions and any recall gap is attributable to the norm spread alone.
 //!
 //! Three norm distributions, hardest last:
 //!   * **uniform-4x** (control) — the legacy `[0.5, 2.0)` spread; MIPS barely distinct from L2 here.
