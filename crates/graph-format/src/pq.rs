@@ -39,7 +39,9 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::blockfile::{parse_block, record_from_block, BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
 use crate::manifest::Metric;
-use crate::wire::{capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint};
+use crate::wire::{
+    capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint, DecodeRejected,
+};
 
 /// PQ structural parameters, recorded so the store is self-describing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,6 +691,10 @@ impl PqReader {
     /// Reads block-by-block so each block is decompressed exactly once.
     pub fn load_resident(&self) -> Result<ResidentPq> {
         let m = self.codebook.params.subspaces as usize;
+        // Validated against the manifest descriptor by `generation.rs`, and re-derived
+        // through `PqParams::new` when the header was parsed — so `k` is a trustworthy
+        // bound to check the untrusted code bytes against.
+        let k = self.codebook.params.k;
         let total = self.inner.total_records();
         // `total` is the block directory's record count — an on-disk number, not a count
         // backed by a buffer we hold, and `n * m` would wrap. Reserve a bounded prefix and
@@ -719,6 +725,21 @@ impl PqReader {
                 }
                 let mut buf = vec![0u8; m];
                 rr.read_exact(&mut buf)?;
+                // The count above says there are `m` bytes; it says nothing about their
+                // *values*. Each is a centroid index that `AdcTable::estimate` uses to index
+                // an `m * k` table with no bounds branch — deliberately, the scoring loop is
+                // hot — so `c >= k` is an out-of-bounds panic inside beam search, on the
+                // query path. Validate here, the sole point where these bytes enter memory,
+                // so the resident structure carries the invariant and the loop stays
+                // branch-free (HIK-133).
+                if let Some(&c) = buf.iter().find(|&&c| u32::from(c) >= k) {
+                    return Err(DecodeRejected::PqCodeOutOfRange {
+                        what: "PQ code record",
+                        code: c,
+                        k,
+                    }
+                    .into());
+                }
                 codes.extend_from_slice(&buf);
                 global += 1;
             }
@@ -856,6 +877,93 @@ mod tests {
             ),
             "expected a typed BlockOffsetTable rejection, got: {err:#}"
         );
+    }
+
+    /// Write a `.pq` whose block 0 is the codebook and whose block 1 holds one code record
+    /// per entry of `codes`, each record laid out exactly as [`PqWriter::append_codes`] does
+    /// (`uvarint(node_id) ‖ m × u8`). Built through `BlockFileWriter` rather than `PqWriter`
+    /// so the record bytes are hand-placed: this is a *forged image*, and it must not depend
+    /// on what the writer would or would not have emitted.
+    fn write_pq_with_code_records(name: &str, codes: &[[u8; 2]]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("slater_pq_{}_{name}", std::process::id()));
+        let hdr = codebook_record(&tiny_codebook());
+        let mut w = crate::blockfile::BlockFileWriter::create_with_codec(
+            &path,
+            20,
+            BlockCodec::Raw,
+            0,
+            None,
+        )
+        .unwrap();
+        w.append_record(&hdr).unwrap();
+        for (i, c) in codes.iter().enumerate() {
+            let mut rec = Vec::new();
+            write_uvarint(&mut rec, (i + 1) as u64);
+            rec.extend_from_slice(c);
+            w.append_record(&rec).unwrap();
+        }
+        w.finish().unwrap();
+        path
+    }
+
+    /// **HIK-133.** `load_resident` checked only the *count* of a record's code bytes
+    /// (`rr.len() != m`), never their *values*. A code byte is a centroid index, and
+    /// [`AdcTable::estimate`] uses it to index an `m * k` table with no bounds branch — so
+    /// any `c >= k` reads out of bounds and panics *inside query execution* (the
+    /// `segvamana` beam search), not merely at open.
+    ///
+    /// **The non-default `bits` is load-bearing.** `pq_bits` defaults to 8 ⇒ `k = 256` ⇒
+    /// every `u8` is a valid index and no failing input exists at all. `tiny_codebook` is
+    /// `bits = 1` ⇒ `k = 2`, which is what makes 200 out of range.
+    ///
+    /// The record is deliberately **correctly sized** (`m = 2` bytes): a wrong-length record
+    /// would trip the pre-existing `rr.len() != m` count check and fail pre-fix for the
+    /// wrong reason, pinning nothing about the value check this test exists for.
+    #[test]
+    fn forged_pq_code_byte_above_k_errors_not_panics() {
+        let p = tiny_codebook().params;
+        assert_eq!(
+            (p.subspaces, p.k),
+            (2, 2),
+            "premise: non-default bits ⇒ k = 2, so a code byte of 200 is out of range \
+             (at the default k = 256 it would be perfectly valid)"
+        );
+
+        let path = write_pq_with_code_records("code_oob", &[[0, 1], [0, 200]]);
+        // Opening still works: it reads record 0 out of the untouched codebook block. The
+        // bad byte is only reached by the resident load.
+        let r = PqReader::open_with_cipher(&path, None).expect("open reads only block 0");
+        let err = r
+            .load_resident()
+            .expect_err("a code byte >= k must be refused, not carried into the scoring loop");
+        let _ = std::fs::remove_file(&path);
+
+        match err.downcast_ref::<DecodeRejected>() {
+            Some(DecodeRejected::PqCodeOutOfRange { code, k, .. }) => {
+                assert_eq!(
+                    (*code, *k),
+                    (200, 2),
+                    "the rejection must name the offending byte and the bound it broke"
+                );
+            }
+            _ => panic!("expected a typed PqCodeOutOfRange rejection, got: {err:#}"),
+        }
+    }
+
+    /// The premise of the guard above: an out-of-range code byte really does panic in the
+    /// scoring loop, so rejecting it at load is not defending against nothing. `estimate`
+    /// stays branch-free by design — the invariant is upheld upstream, not here.
+    ///
+    /// This is a plain slice bounds check, not the `debug_assert_eq!` on `codes.len()` above
+    /// it, so it panics in **release** as well — the hazard is not a debug-only one.
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn estimate_panics_on_a_code_byte_above_k() {
+        let cb = tiny_codebook(); // dim 4, m 2, k 2 ⇒ a 4-entry ADC table
+        let adc = AdcTable::new(&cb, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        // Correctly sized (m = 2), so the length `debug_assert` is satisfied and this is
+        // purely the *value* going out of range.
+        adc.estimate(&[0, 200]);
     }
 
     /// The guard is not a no-op: an untampered `.pq` written the same way still loads, and

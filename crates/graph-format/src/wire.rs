@@ -79,6 +79,18 @@ pub enum DecodeRejected {
         end: u32,
         data_len: usize,
     },
+    /// A PQ code byte is not a valid centroid index for its codebook (`c >= k`).
+    /// [`crate::pq::AdcTable::estimate`] uses the byte to index an `m * k` table with no
+    /// bounds branch — that is deliberate, the hot scoring loop stays branch-free — so an
+    /// out-of-range one is a slice-out-of-bounds *panic* inside beam search, on the **query**
+    /// path rather than at open. The default `bits = 8` gives `k = 256` and makes every `u8`
+    /// valid, so this is only reachable on a graph built with a non-default `--pq-bits`.
+    #[error("{what}: code byte {code} is not a valid centroid index (k = {k})")]
+    PqCodeOutOfRange {
+        what: &'static str,
+        code: u8,
+        k: u32,
+    },
     /// A run-length record's element count is above what the format could ever store.
     #[error("{what}: declares {n} elements, above the {max}-element ceiling")]
     TooManyElements {
