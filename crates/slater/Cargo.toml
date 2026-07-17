@@ -190,3 +190,14 @@ required-features = ["testkit"]
 name = "ipnsw_pq_checkpoint"
 harness = false
 required-features = ["testkit"]
+
+# 9. HIK-137 phase-2 base-build END TO END: the production IP-native base rung written to disk
+# (build_vamana_ip + raw .vamana + IP codebook .pq) and read back through the real
+# VamanaReader/PqReader + beam_search with AdcTable::new_ip — the same machinery the server's
+# InnerProduct read path uses — beside the augmented on-disk base index (the current production Dot
+# path). Recall@10 vs the deliverable-1 brute-force IP ground truth on all three distributions. Run:
+# `cargo bench -p slater --features testkit --bench ipnsw_base_e2e`.
+[[bench]]
+name = "ipnsw_base_e2e"
+harness = false
+required-features = ["testkit"]

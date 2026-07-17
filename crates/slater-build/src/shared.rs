@@ -16,9 +16,9 @@ use anyhow::{bail, Context, Result};
 
 use graph_format::crypto::BlockCipher;
 use graph_format::extsort::{ExtSorter, SortRecord};
-use graph_format::manifest::{AnnMode, Metric, VectorIndexDesc};
-use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqWriter};
-use graph_format::vamana::{bfs_order, build_vamana, VamanaWriter};
+use graph_format::manifest::{AnnMode, AnnNav, Metric, VectorIndexDesc};
+use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqParams, PqWriter};
+use graph_format::vamana::{bfs_order, build_vamana, build_vamana_ip, VamanaWriter};
 use graph_format::vamana_merge::{compose_final_ids, streaming_merge, MergeInputs, MergeParams};
 use graph_format::vectors::VectorStoreWriter;
 use graph_format::wire::{read_uvarint, write_uvarint};
@@ -433,10 +433,28 @@ fn build_vamana_index(
     //
     // The **stored** vectors stay raw (below): the space is a navigation device, and the
     // exact re-rank scores the raw vector with the true metric.
-    let params = ann_pq_params(pi.metric, pi.dim, opts.pq_subspaces, opts.pq_bits)?;
+    // HIK-137: Dot is built **IP-native** (raw inner product, no norm augmentation) — the graph via
+    // `build_vamana_ip` and the codebook trained on the raw vectors over plain `PqParams`. Cosine
+    // and L2 are untouched: they keep the augmented/`ann_point` L2-reduced ANN space. The branch is
+    // on the metric alone; everything below reads `is_ip`/`nav`.
+    let is_ip = pi.metric == Metric::Dot;
+    let nav = if is_ip {
+        AnnNav::InnerProduct
+    } else {
+        AnnNav::Augmented
+    };
+    let params = if is_ip {
+        // No augmentation subspace: the codebook is dim-`dim`/`subspaces`-wide, trained on the raw
+        // vectors, and `AdcTable::new_ip` reads the raw query against it.
+        PqParams::new(pi.dim, opts.pq_subspaces, opts.pq_bits)?
+    } else {
+        ann_pq_params(pi.metric, pi.dim, opts.pq_subspaces, opts.pq_bits)?
+    };
     let space_dim = params.dim as usize;
     // M = max‖x‖ over the indexed set — the dot/MIPS augmentation constant. Computed over
-    // *every* entry, which is what makes `M² − ‖x‖² ≥ 0` hold for all of them.
+    // *every* entry, which is what makes `M² − ‖x‖² ≥ 0` hold for all of them. For the IP-native
+    // Dot path it is **inert** (nothing augments), but still recorded in the manifest (§9 #3) and
+    // still screened for f32 overflow below, which is a whole-manifest concern for every metric.
     let max_norm = entries
         .iter()
         .map(|(_, v)| l2_norm(v))
@@ -455,13 +473,23 @@ fn build_vamana_index(
             pi.property
         );
     }
-    let points: Vec<Vec<f32>> = entries
-        .iter()
-        .map(|(_, v)| ann_point(pi.metric, v, max_norm, space_dim))
-        .collect::<Result<_>>()?;
+    // The navigation-space points the graph is built over and the codebook is trained on. IP-native
+    // Dot uses the **raw** vectors (no augmentation); cosine/L2 use the `ann_point` L2-reduced map.
+    let points: Vec<Vec<f32>> = if is_ip {
+        entries.iter().map(|(_, v)| v.clone()).collect()
+    } else {
+        entries
+            .iter()
+            .map(|(_, v)| ann_point(pi.metric, v, max_norm, space_dim))
+            .collect::<Result<_>>()?
+    };
 
-    let graph = build_vamana(&points, opts.vamana_r as usize, opts.vamana_alpha)
-        .with_context(|| format!("build Vamana graph for {}.{}", pi.label, pi.property))?;
+    let graph = if is_ip {
+        build_vamana_ip(&points, opts.vamana_r as usize)
+    } else {
+        build_vamana(&points, opts.vamana_r as usize, opts.vamana_alpha)
+    }
+    .with_context(|| format!("build Vamana graph for {}.{}", pi.label, pi.property))?;
     let order = bfs_order(&graph);
     // old (build) index → new (storage/layout) index.
     let mut new_of = vec![0u32; order.len()];
@@ -527,6 +555,7 @@ fn build_vamana_index(
             // A freshly built index has no holes: the builder only ever sees live vectors.
             live_count: entries.len() as u64,
             max_norm: max_norm as f32,
+            nav,
         },
     };
     Ok((
@@ -647,6 +676,12 @@ fn carry_vamana_index(
             pq_bits: carry.pq_bits,
             live_count: stats.live,
             max_norm: carry.max_norm,
+            // HIK-137 phase 2 is base-rung only: the ladder (consolidate/merge) is not yet
+            // IP-integrated, and the consolidation choke point in `slater::consolidate` REFUSES to
+            // carry an `InnerProduct` base (it would fold augmented Δ inserts into an IP graph and
+            // mis-navigate). So this re-emit only ever sees an augmented base — phase 3 threads the
+            // real `nav` through the carry when it makes the ladder IP-native.
+            nav: AnnNav::Augmented,
         },
     };
     Ok((

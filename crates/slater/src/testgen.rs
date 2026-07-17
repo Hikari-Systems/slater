@@ -2408,6 +2408,7 @@ fn write_vamana_inner(
                 // The fixture's vectors are already unit length, so M = 1; a cosine index
                 // never reads it anyway.
                 max_norm: 1.0,
+                nav: graph_format::manifest::AnnNav::Augmented,
             },
         }],
         reltype_source_counts: vec![],

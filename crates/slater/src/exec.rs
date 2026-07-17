@@ -51,7 +51,7 @@ use crate::temporal::{self, TKind};
 use crate::vector;
 use graph_format::blockfile::BlockFileReader;
 use graph_format::ids::{EdgeId, NodeId, Value};
-use graph_format::manifest::{AnnMode, EntityKind, VectorIndexDesc};
+use graph_format::manifest::{AnnMode, AnnNav, EntityKind, VectorIndexDesc};
 use graph_format::postings::EndpointPostingIter;
 use graph_format::pq::{AdcTable, ResidentPq};
 use graph_format::segvamana::SegmentVamanaIndex;
@@ -6084,8 +6084,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         live,
                     )?,
                 },
-                AnnMode::Vamana { medoid, .. } => {
-                    self.vamana_knn(vc, *medoid, metric, &query, k, live)?
+                AnnMode::Vamana { medoid, nav, .. } => {
+                    self.vamana_knn(vc, *medoid, *nav, metric, &query, k, live)?
                 }
             };
             // Fold the levels above the base in. Each level has already suppressed — in its own
@@ -6190,6 +6190,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         &self,
         vc: &VectorCallClause,
         medoid: u64,
+        nav: AnnNav,
         metric: graph_format::manifest::Metric,
         query: &[f32],
         k: usize,
@@ -6211,6 +6212,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             index.reader.inner(),
             &index.pq,
             medoid,
+            nav,
             metric,
             query,
             k,
@@ -6238,6 +6240,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
         reader: &BlockFileReader,
         resident: &ResidentPq,
         medoid: u64,
+        nav: AnnNav,
         metric: graph_format::manifest::Metric,
         query: &[f32],
         k: usize,
@@ -6251,10 +6254,21 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if n == 0 || k == 0 {
             return Ok(Vec::new());
         }
-        // PQ navigates in the ANN space the codebook was trained in — the same transform the
-        // builder applied, from the one definition in `graph_format::pq`.
-        let qn = graph_format::pq::ann_query(metric, query, resident.codebook.params.dim as usize)?;
-        let adc = AdcTable::new(&resident.codebook, &qn)?;
+        // PQ navigates in the space the codebook was trained in. HIK-137: an `InnerProduct` index
+        // was trained on the RAW vectors and is navigated by the IP-ADC estimate (−⟨q, x̂⟩) with the
+        // raw query — NO `ann_query` augmentation. `Augmented` (cosine/L2/legacy-Dot) is unchanged:
+        // it maps the query into the L2-reduced ANN space and navigates by squared-L2 ADC.
+        let adc = match nav {
+            AnnNav::InnerProduct => AdcTable::new_ip(&resident.codebook, query)?,
+            AnnNav::Augmented => {
+                let qn = graph_format::pq::ann_query(
+                    metric,
+                    query,
+                    resident.codebook.params.dim as usize,
+                )?;
+                AdcTable::new(&resident.codebook, &qn)?
+            }
+        };
         let hits = beam_search(
             vamana::BeamParams {
                 medoid: medoid as u32,
@@ -6430,6 +6444,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
             ix.reader.inner(),
             &ix.pq,
             ix.medoid,
+            // Segments are produced by the ladder, which is not IP-native until HIK-137 phase 3, so
+            // a phase-2 segment is always augmented. (A Dot base build produces no segments.)
+            AnnNav::Augmented,
             metric,
             query,
             k,

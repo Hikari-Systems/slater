@@ -166,6 +166,7 @@ fn validate_vamana_index(
     pq: &ResidentPq,
     desc: &VectorIndexDesc,
     medoid: u64,
+    nav: graph_format::manifest::AnnNav,
     pq_subspaces: u32,
     pq_bits: u32,
 ) -> Result<()> {
@@ -185,22 +186,31 @@ fn validate_vamana_index(
             desc.count
         );
     }
-    // 4. The codebook must be in the ANN space the MANIFEST's metric implies.
+    // 4. The codebook must be in the space the MANIFEST's (metric, nav) pair implies.
     //
-    // The read path derives the query transform from `desc.metric` and the *codebook's*
-    // dimension (`ann_query`). Those two are the only inputs, and if they disagree the
-    // search still runs: a `dot` descriptor over a codebook trained in cosine/L2 space
-    // (dim, not dim + dsub) makes `ann_query` a no-op, so the beam navigates by plain
-    // squared-L2 while the re-rank scores by inner product. Wrong neighbours, plausible
-    // scores, no error anywhere. Tie the file back to the descriptor so the space cannot
-    // drift — the invariant `graph_format::pq`'s DESIGN note states, enforced.
-    let expected = graph_format::pq::ann_pq_params(desc.metric, desc.dim, pq_subspaces, pq_bits)
-        .with_context(|| format!("vector index {stem} has invalid PQ parameters"))?;
+    // The read path derives the query transform from the descriptor and the *codebook's*
+    // dimension. Those are the only inputs, and if they disagree the search still runs with
+    // wrong neighbours, plausible scores, and no error anywhere. Tie the file back to the
+    // descriptor so the space cannot drift — the invariant `graph_format::pq`'s DESIGN note
+    // states, enforced. HIK-137: an `InnerProduct` (IP-native) index is trained on the RAW
+    // vectors over plain `PqParams` (dim, not the dot augmentation's dim + dsub); an `Augmented`
+    // index is in the metric's L2-reduced ANN space (`ann_pq_params`). Checking against the wrong
+    // one would reject a valid IP index — or, worse, accept an augmented codebook under an
+    // `InnerProduct` label (the beam would then navigate by IP-ADC over an augmented codebook).
+    let expected = match nav {
+        graph_format::manifest::AnnNav::InnerProduct => {
+            graph_format::pq::PqParams::new(desc.dim, pq_subspaces, pq_bits)
+        }
+        graph_format::manifest::AnnNav::Augmented => {
+            graph_format::pq::ann_pq_params(desc.metric, desc.dim, pq_subspaces, pq_bits)
+        }
+    }
+    .with_context(|| format!("vector index {stem} has invalid PQ parameters"))?;
     if pq.codebook.params != expected {
         bail!(
-            "vector index {stem} declares metric {:?} over dim {} with {pq_subspaces}×{pq_bits}-bit \
-             PQ, which is the ANN space {expected:?} — but its .pq codebook is {:?}. The build and \
-             the read path would navigate in different spaces.",
+            "vector index {stem} declares metric {:?} / nav {nav:?} over dim {} with \
+             {pq_subspaces}×{pq_bits}-bit PQ, which is the space {expected:?} — but its .pq codebook \
+             is {:?}. The build and the read path would navigate in different spaces.",
             desc.metric,
             desc.dim,
             pq.codebook.params
@@ -523,6 +533,7 @@ impl Generation {
                 medoid,
                 pq_subspaces,
                 pq_bits,
+                nav,
                 ..
             } = vi.mode
             else {
@@ -543,7 +554,16 @@ impl Generation {
                 pq.load_resident()
                     .with_context(|| format!("load resident PQ codes for {stem}.pq"))?,
             );
-            validate_vamana_index(&stem, &reader, &resident, vi, medoid, pq_subspaces, pq_bits)?;
+            validate_vamana_index(
+                &stem,
+                &reader,
+                &resident,
+                vi,
+                medoid,
+                nav,
+                pq_subspaces,
+                pq_bits,
+            )?;
             vamana_indexes.insert(
                 (vi.label.clone(), vi.property.clone()),
                 VamanaIndex {
@@ -1890,6 +1910,7 @@ mod tests {
                 pq_bits: 4,
                 live_count: n as u64,
                 max_norm: max_norm as f32,
+                nav: graph_format::manifest::AnnNav::Augmented,
             },
         };
         (dir, reader, resident, desc)

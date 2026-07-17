@@ -20,6 +20,42 @@ pub enum EntityKind {
     Edge,
 }
 
+/// How a Vamana graph was constructed and is navigated — the HIK-137 MIPS discriminator.
+///
+/// **Additive-optional** (`#[serde(default)]`, like [`VectorIndexDesc::first_record`]): a manifest
+/// written before this field existed has no `nav` key and parses to [`AnnNav::Augmented`], so the
+/// entire live cosine/L2 estate keeps working and is **not** force-rebuilt. The field is serialised
+/// only when it is *not* `Augmented` (see [`AnnMode::Vamana::nav`]), so every existing cosine/L2
+/// (and pre-HIK-137 augmented-Dot) manifest is byte-identical to before.
+///
+/// A reader dispatches on this: an `Augmented` index is navigated through the L2-reduced ANN space
+/// ([`crate::pq::ann_point`]/[`crate::pq::ann_query`]/[`crate::pq::AdcTable::new`]); an
+/// `InnerProduct` index is navigated natively over raw inner product
+/// ([`crate::vamana::build_vamana_ip`]/[`crate::pq::AdcTable::new_ip`]). Mistaking one for the other
+/// silently mis-navigates, which is exactly what this field exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnNav {
+    /// The graph was built and the codebook trained in the metric's **L2-reduced ANN space**
+    /// (`ann_point`): unit vectors for cosine, raw for L2, norm-augmented for Dot/MIPS. The default
+    /// for every manifest that predates HIK-137. Navigated by [`crate::pq::AdcTable::new`].
+    #[default]
+    Augmented,
+    /// **IP-native (MIPS)** — the graph was built over raw inner product
+    /// ([`crate::vamana::build_vamana_ip`]) and the codebook trained on the **raw** vectors, with
+    /// no norm augmentation. Navigated by [`crate::pq::AdcTable::new_ip`]. Only ever valid for
+    /// [`Metric::Dot`]. Introduced by HIK-137 phase 2.
+    InnerProduct,
+}
+
+impl AnnNav {
+    /// Whether this is the (default) augmented navigation — used by `skip_serializing_if` so a
+    /// cosine/L2/augmented-Dot manifest omits the `nav` key entirely and stays byte-identical.
+    pub fn is_augmented(&self) -> bool {
+        matches!(self, AnnNav::Augmented)
+    }
+}
+
 /// How a vector index is built and therefore which read path the server takes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -72,6 +108,13 @@ pub enum AnnMode {
         /// different (smaller) constant and silently place the new point in a different
         /// space from the rest of the graph.
         max_norm: f32,
+        /// How this graph is navigated — the HIK-137 MIPS discriminator (see [`AnnNav`]).
+        /// **Additive-optional**: absent in every pre-HIK-137 manifest ⇒ [`AnnNav::Augmented`], so
+        /// the live estate is not force-rebuilt; serialised only when [`AnnNav::InnerProduct`], so
+        /// existing cosine/L2/augmented-Dot manifests are byte-identical. For an `InnerProduct`
+        /// index, `max_norm` above is an **inert recorded field** (no augmentation uses it).
+        #[serde(default, skip_serializing_if = "AnnNav::is_augmented")]
+        nav: AnnNav,
     },
 }
 
@@ -514,6 +557,87 @@ mod tests {
             !err.contains("missing field"),
             "the operator must not be shown a serde field name. Got: {err}"
         );
+    }
+
+    /// HIK-137 additive-optional discriminator: a **current-version** manifest whose Vamana mode
+    /// has **no `nav` key** — i.e. every generation built before HIK-137, including the live
+    /// cosine/L2 estate and any pre-HIK-137 Dot index — must still parse, with `nav` defaulting to
+    /// `Augmented`. This is the "estate is NOT force-rebuilt" guarantee, tested explicitly.
+    #[test]
+    fn a_pre_hik137_manifest_without_nav_parses_as_augmented() {
+        let json = format!(
+            r#"{{
+            "magic":"SLATER01","formatVersion":{ver},
+            "buildUuid":"00000000-0000-0000-0000-000000000001","graph":"docs",
+            "createdUnix":1700000000,"contentHash":"abc","blockSizes":{{}},
+            "codec":"zstd","zstdLevel":3,"compressionProfile":"",
+            "nodeCount":10,"edgeCount":0,
+            "labels":["Doc"],"reltypes":[],"propertyKeys":["embedding"],
+            "rangeIndexes":[],
+            "vectorIndexes":[{{"label":"Doc","property":"embedding","dim":8,
+              "metric":"dot","count":10,"firstRecord":0,
+              "mode":{{"kind":"vamana","r":24,"alpha":1.2,"medoid":0,
+                      "pq_subspaces":8,"pq_bits":8,"live_count":10,"max_norm":3.5}}}}],
+            "reltypeSourceCounts":[],"reltypeTargetCounts":[],"reltypeEdgeCounts":[],
+            "reltypeSelfLoopCounts":[],"labelNodeCounts":[],"firstLabelCounts":[],
+            "srcLabelReltypeCounts":[],"reltypeTgtLabelCounts":[],
+            "schemaTripleCounts":[],"propertyHistograms":[],"files":[]
+        }}"#,
+            ver = crate::FORMAT_VERSION
+        );
+        let m =
+            parse_manifest(&json).expect("a pre-HIK-137 manifest (no nav key) must still parse");
+        match m.vector_indexes[0].mode {
+            AnnMode::Vamana { nav, max_norm, .. } => {
+                assert_eq!(
+                    nav,
+                    AnnNav::Augmented,
+                    "an absent nav key must default to Augmented"
+                );
+                assert_eq!(max_norm, 3.5, "the recorded max_norm must survive");
+            }
+            _ => panic!("expected a Vamana mode"),
+        }
+    }
+
+    /// The discriminator round-trips, and — critically — an `Augmented` index **omits** the `nav`
+    /// key on serialize (so existing cosine/L2/augmented-Dot manifests are byte-identical to
+    /// before), while an `InnerProduct` index emits `"nav":"inner_product"`.
+    #[test]
+    fn nav_discriminator_roundtrips_and_augmented_omits_the_key() {
+        let augmented = AnnMode::Vamana {
+            r: 32,
+            alpha: 1.2,
+            medoid: 0,
+            pq_subspaces: 16,
+            pq_bits: 8,
+            live_count: 10,
+            max_norm: 2.0,
+            nav: AnnNav::Augmented,
+        };
+        let js = serde_json::to_string(&augmented).unwrap();
+        assert!(
+            !js.contains("nav"),
+            "an Augmented index must omit the nav key so old manifests stay byte-identical: {js}"
+        );
+        assert_eq!(augmented, serde_json::from_str(&js).unwrap());
+
+        let ip = AnnMode::Vamana {
+            r: 32,
+            alpha: 1.2,
+            medoid: 0,
+            pq_subspaces: 16,
+            pq_bits: 8,
+            live_count: 10,
+            max_norm: 2.0,
+            nav: AnnNav::InnerProduct,
+        };
+        let js = serde_json::to_string(&ip).unwrap();
+        assert!(
+            js.contains(r#""nav":"inner_product""#),
+            "an InnerProduct index must record nav so the reader dispatches to the IP navigator: {js}"
+        );
+        assert_eq!(ip, serde_json::from_str(&js).unwrap());
     }
 
     fn sample() -> Manifest {

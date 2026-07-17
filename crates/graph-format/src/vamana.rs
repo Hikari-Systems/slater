@@ -46,7 +46,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::crypto::BlockCipher;
-use crate::pq::{sq_l2, Lcg};
+use crate::pq::{l2_norm, sq_l2, Lcg};
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// A `(0..count)` index into a Vamana graph — a node's position in the file.
@@ -458,6 +458,196 @@ fn compute_medoid(vectors: &[Vec<f32>]) -> usize {
         .unwrap()
 }
 
+// ── IP-native (MIPS) build — HIK-137 phase 2, Dot only ───────────────────────────
+//
+// Inner product is **not** a metric (no triangle inequality), so `build_vamana`'s two load-
+// bearing choices are unsound for a Dot index navigated by raw IP: robust-prune's α-domination
+// test assumes a metric, and the centroid medoid is the wrong entry (a high-norm vector, not the
+// mean, is the natural IP hub). The augmentation path sidesteps this by *reducing* MIPS to L2
+// (`ann_point`), but that reduction is exactly what cost recall (HIK-137: 0.40 on MIPS-hard
+// data). [`build_vamana_ip`] instead builds the graph natively over inner product:
+//
+//   * **Closeness = inner product, maximised** — `dist(a,b) = −⟨a,b⟩` (`IpSlabPoints`), so the
+//     min-based `greedy_search_over` descends towards the strongest-IP node, over the **raw**
+//     vectors with no augmentation.
+//   * **Neighbour selection = top-R by IP** (s-Delaunay, [`ip_prune_over`]) — keep the R strongest
+//     inner products, replacing the unsound α-domination. No `alpha`.
+//   * **Entry = highest-norm node** ([`highest_norm_entry`]) — the natural IP hub.
+//
+// This is the productionised form of the HIK-137 phase-1 spike (measured 0.998/0.998/1.000 exact-
+// IP graph recall) and phase-2 checkpoint (0.994/0.997/1.000 with the IP-ADC PQ estimate). It is
+// a **Dot-only alternate path**: cosine/L2 continue through [`build_vamana`] unchanged.
+
+/// The IP build's point set over a resident slab: `dist(a,b) = −⟨a,b⟩` so **minimising** the
+/// distance **maximises** the inner product — the raw MIPS closeness, no norm augmentation.
+pub struct IpSlabPoints<'a>(pub &'a [Vec<f32>]);
+
+impl PointSet for IpSlabPoints<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
+        let (x, y) = (&self.0[a as usize], &self.0[b as usize]);
+        let ip: f64 = x.iter().zip(y).map(|(p, q)| *p as f64 * *q as f64).sum();
+        Ok(-ip)
+    }
+}
+
+/// The IP-appropriate entry point: the **highest-L2-norm** node. Under inner product a high-norm
+/// vector scores well against almost every query, so it is the natural hub to descend from — unlike
+/// the centroid medoid, which is the wrong entry for MIPS. Ties break by ascending index.
+pub fn highest_norm_entry(vectors: &[Vec<f32>]) -> VamanaIndex {
+    (0..vectors.len())
+        .max_by(|&a, &b| {
+            l2_norm(&vectors[a])
+                .total_cmp(&l2_norm(&vectors[b]))
+                .then(b.cmp(&a)) // ascending-index tie-break: prefer the smaller index
+        })
+        .unwrap() as VamanaIndex
+}
+
+/// **s-Delaunay neighbour selection**: from `candidates`, keep the `r` with the strongest inner
+/// product to `p` (smallest `−⟨·,p⟩`). Replaces [`robust_prune_over`]'s domination test, which is
+/// unsound over IP. Ties break by ascending index for determinism.
+pub fn ip_prune_over<P>(
+    p: VamanaIndex,
+    candidates: &[VamanaIndex],
+    r: usize,
+    points: &P,
+) -> Result<Vec<VamanaIndex>>
+where
+    P: PointSet + ?Sized,
+{
+    let mut pool: Vec<(f64, VamanaIndex)> = Vec::with_capacity(candidates.len());
+    for &c in candidates {
+        if c == p {
+            continue;
+        }
+        pool.push((points.dist(c, p)?, c));
+    }
+    pool.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    pool.truncate(r);
+    Ok(pool.into_iter().map(|(_, c)| c).collect())
+}
+
+/// One IP-native insertion: greedy-search from `entry` towards `p`, set `p`'s out-neighbours to the
+/// top-R by IP over the touched set (∪ p's current neighbours), then make those edges symmetric —
+/// re-selecting top-R for any neighbour that overflows `r`. The IP twin of [`insert_point`].
+fn insert_point_ip<G, P>(
+    p: VamanaIndex,
+    graph: &mut G,
+    points: &P,
+    entry: VamanaIndex,
+    r: usize,
+    l_build: usize,
+    expanded: &mut Expanded,
+) -> Result<()>
+where
+    G: AdjWrite + ?Sized,
+    P: PointSet + ?Sized,
+{
+    let visited = greedy_search_over(entry, p, &*graph, points, l_build, expanded)?;
+    let mut cands: Vec<VamanaIndex> = visited;
+    let mut cur: Vec<VamanaIndex> = Vec::new();
+    graph.neighbours_into(p, &mut cur)?;
+    cands.extend_from_slice(&cur);
+    cands.sort_unstable();
+    cands.dedup();
+    cands.retain(|&c| c != p);
+
+    let pruned = ip_prune_over(p, &cands, r, points)?;
+    graph.set_neighbours(p, pruned.clone())?;
+
+    let mut nbrs_j: Vec<VamanaIndex> = Vec::new();
+    for &j in &pruned {
+        graph.neighbours_into(j, &mut nbrs_j)?;
+        if !nbrs_j.contains(&p) {
+            nbrs_j.push(p);
+            if nbrs_j.len() > r {
+                nbrs_j = ip_prune_over(j, &nbrs_j, r, points)?;
+            }
+            graph.set_neighbours(j, std::mem::take(&mut nbrs_j))?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a single-layer **IP-native** Vamana graph over the **raw** `vectors` (no augmentation),
+/// for a [`crate::manifest::Metric::Dot`] index. Neighbour selection is top-R by inner product and
+/// the entry is the highest-norm node; see the module note above. `r` bounds out-degree.
+/// Deterministic (fixed LCG seed + Fisher–Yates order, like [`build_vamana`]).
+///
+/// Output is an input to the generation content hash — see `build_vamana_ip_adjacency_is_golden`.
+/// Cosine/L2 must NOT call this: it navigates by raw inner product, which is only the intended
+/// closeness for Dot.
+pub fn build_vamana_ip(vectors: &[Vec<f32>], r: usize) -> Result<VamanaGraph> {
+    let n = vectors.len();
+    if n == 0 {
+        bail!("cannot build a Vamana graph over zero vectors");
+    }
+    let r = r.max(1);
+    // The entry (highest-norm) is recorded as the graph's `medoid` field — it is simply "the fixed
+    // beam entry point", and for an IP index that is the highest-norm node, not the centroid.
+    let entry = highest_norm_entry(vectors);
+
+    // Trivially small index: a complete graph (capped at R) is already navigable.
+    if n <= r + 1 {
+        let adjacency = (0..n)
+            .map(|i| (0..n).filter(|&j| j != i).map(|j| j as u32).collect())
+            .collect();
+        return Ok(VamanaGraph {
+            adjacency,
+            medoid: entry,
+        });
+    }
+
+    // A distinct seed constant from `build_vamana`'s, so the two builds' RNG streams never alias
+    // (they are different algorithms; sharing a seed would be a coincidence, not an invariant).
+    let mut rng = Lcg(0x5111_a7e1_1b1b_0002);
+    let mut adjacency: Vec<Vec<u32>> = (0..n)
+        .map(|i| {
+            let mut nbrs = Vec::with_capacity(r);
+            while nbrs.len() < r {
+                let j = rng.next_below(n);
+                if j != i && !nbrs.contains(&(j as u32)) {
+                    nbrs.push(j as u32);
+                }
+            }
+            nbrs
+        })
+        .collect();
+
+    let l_build = (r * 2).max(64);
+    let points = IpSlabPoints(vectors);
+    let mut stamps = vec![0u32; n];
+    let mut expanded = Expanded::Stamps {
+        buf: &mut stamps,
+        gen: 0,
+    };
+
+    // Two passes — there is no α short/long-edge split for IP, so both run the same top-R rule; the
+    // second pass just lets earlier-inserted nodes see the neighbourhoods later insertions created.
+    for _ in 0..2 {
+        let order = random_permutation(n, &mut rng);
+        for &p in &order {
+            insert_point_ip(
+                p as VamanaIndex,
+                &mut adjacency,
+                &points,
+                entry,
+                r,
+                l_build,
+                &mut expanded,
+            )?;
+        }
+    }
+
+    Ok(VamanaGraph {
+        adjacency,
+        medoid: entry,
+    })
+}
+
 fn random_permutation(n: usize, rng: &mut Lcg) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
     // Fisher–Yates with the deterministic LCG.
@@ -828,6 +1018,134 @@ mod tests {
             "build_vamana adjacency changed — see the doc comment; this is not a test to \
              re-baseline casually"
         );
+    }
+
+    /// `n` **raw** (un-normalised) vectors with a deliberately wide norm spread — the MIPS
+    /// stressor. A unit manifold direction times a per-vector scale in `[0.25, 8.25)` (a ~33×
+    /// spread, heavier than the recall-masking 4× uniform), so inner product genuinely diverges
+    /// from cosine/L2 and the highest-norm entry is well-separated. Deterministic.
+    fn mips_vectors(dim: usize, n: usize) -> Vec<Vec<f32>> {
+        let mut rng = Lcg(0x0DD_B411_5EED_0137);
+        (0..n)
+            .map(|_| {
+                let dir: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+                let unit = normalise(&dir);
+                let scale = 0.25 + (rng.next_f64() as f32) * 8.0;
+                unit.iter().map(|x| x * scale).collect()
+            })
+            .collect()
+    }
+
+    fn ip_f64(a: &[f32], b: &[f32]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+    }
+
+    /// Brute-force inner-product top-k — independently-derived MIPS truth (argmax ⟨q,x⟩).
+    fn brute_force_ip_topk(vectors: &[Vec<f32>], query: &[f32], k: usize) -> Vec<usize> {
+        let mut scored: Vec<(f64, usize)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (-ip_f64(query, v), i))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    /// `build_vamana_ip`'s output is an input to the generation content hash, so — exactly like
+    /// [`build_vamana_adjacency_is_golden`] — it must be byte-stable across refactors. This pins
+    /// the **IP** adjacency (a different construction: top-R-by-IP selection, highest-norm entry,
+    /// its own LCG seed), not the L2 one. If it fails, the IP construction order changed: the LCG
+    /// seed, the Fisher–Yates order, the candidate sort/dedup, the beam's stable sort, or the
+    /// top-R tie-break. None of those are safe to change.
+    #[test]
+    fn build_vamana_ip_adjacency_is_golden() {
+        let vectors = mips_vectors(16, 200);
+        let g = build_vamana_ip(&vectors, 24).unwrap();
+        // The entry is the highest-norm node, recorded in `medoid`.
+        assert_eq!(g.medoid, highest_norm_entry(&vectors));
+        assert_eq!(
+            adjacency_digest(&g),
+            "2b0930818cb536f7de155bc0c40a8a2005a2ec1e96b92ebf2c4beb8e5bfc84c8",
+            "build_vamana_ip adjacency changed — see the doc comment; this is not a test to \
+             re-baseline casually"
+        );
+    }
+
+    /// The IP-native graph must actually navigate to the true inner-product top-k — the whole
+    /// point of the phase-2 rebuild. An **exact-IP** beam over `build_vamana_ip` must recall the
+    /// brute-force IP top-10 far better than the same beam over the L2 `build_vamana` (which is the
+    /// wrong graph for MIPS). Truth is independent brute force, never index-vs-index; the two
+    /// arms differ only in the graph they walk.
+    #[test]
+    fn build_vamana_ip_navigates_to_the_true_inner_product_topk() {
+        let dim = 16;
+        let vectors = mips_vectors(dim, 400);
+        let queries = mips_vectors(dim, 40);
+        let (r, k, beam) = (24usize, 10usize, 48usize);
+
+        let ip_graph = build_vamana_ip(&vectors, r).unwrap();
+        let l2_graph = build_vamana(&vectors, r, 1.2).unwrap();
+
+        // An exact-IP beam over a given graph (estimate == exact == −⟨q,x⟩, no PQ).
+        let walk = |g: &VamanaGraph, q: &[f32]| -> Vec<u64> {
+            beam_search(
+                BeamParams {
+                    medoid: g.medoid,
+                    beam_width: beam,
+                    k,
+                    num_nodes: vectors.len(),
+                },
+                |i| -ip_f64(q, &vectors[i as usize]) as f32,
+                |i| Ok((vectors[i as usize].clone(), g.adjacency[i as usize].clone())),
+                |v| -ip_f64(q, v) as f32,
+                |i| Ok(Some(i as u64)),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| h.node_id)
+            .collect()
+        };
+
+        let (mut ip_hits, mut l2_hits, mut total) = (0usize, 0usize, 0usize);
+        for q in &queries {
+            let truth = brute_force_ip_topk(&vectors, q, k);
+            let ip_got = walk(&ip_graph, q);
+            let l2_got = walk(&l2_graph, q);
+            for t in &truth {
+                total += 1;
+                if ip_got.contains(&(*t as u64)) {
+                    ip_hits += 1;
+                }
+                if l2_got.contains(&(*t as u64)) {
+                    l2_hits += 1;
+                }
+            }
+        }
+        let ip_recall = ip_hits as f64 / total as f64;
+        let l2_recall = l2_hits as f64 / total as f64;
+        // The real recall-lift story (augmented baseline vs IP-ADC across all three norm
+        // distributions at dim=256) is the `mips_recall`/`ipnsw_*` benches' job; here the point is
+        // that the IP-native graph genuinely reaches the true IP top-k, and is never worse than the
+        // L2 graph on MIPS data (at this small dim/N the L2 graph is still fairly navigable, so the
+        // gap is modest — it craters only on the heavy-tailed high-dim bench fixture).
+        assert!(
+            ip_recall > 0.95,
+            "IP-native graph must reach the true IP top-k: recall {ip_recall:.3}"
+        );
+        assert!(
+            ip_recall >= l2_recall,
+            "IP-native graph ({ip_recall:.3}) must be at least as good as the L2 graph \
+             ({l2_recall:.3}) on MIPS-hard data"
+        );
+    }
+
+    /// Determinism: same vectors ⇒ same IP graph (the content-hash contract).
+    #[test]
+    fn build_vamana_ip_is_deterministic() {
+        let vectors = mips_vectors(16, 150);
+        let a = build_vamana_ip(&vectors, 24).unwrap();
+        let b = build_vamana_ip(&vectors, 24).unwrap();
+        assert_eq!(adjacency_digest(&a), adjacency_digest(&b));
     }
 
     #[test]

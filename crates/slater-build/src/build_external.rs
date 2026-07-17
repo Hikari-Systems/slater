@@ -3308,7 +3308,7 @@ fn compute_graph_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graph_format::manifest::{AnnMode, Manifest, Metric};
+    use graph_format::manifest::{AnnMode, AnnNav, Manifest, Metric};
     use graph_format::pq::{ann_query, AdcTable, PqReader};
     use graph_format::vamana::{beam_search, BeamParams, VamanaReader};
 
@@ -3600,15 +3600,28 @@ mod tests {
             let manifest = Manifest::read_from_dir(&outcome.dir).unwrap();
             let desc = &manifest.vector_indexes[0];
             assert_eq!(desc.metric, metric);
-            let (medoid, live_count) = match desc.mode {
+            let (medoid, live_count, nav) = match desc.mode {
                 AnnMode::Vamana {
-                    medoid, live_count, ..
-                } => (medoid, live_count),
+                    medoid,
+                    live_count,
+                    nav,
+                    ..
+                } => (medoid, live_count, nav),
                 AnnMode::BruteForce => panic!(
                     "{token} is above the ANN threshold and must now build Vamana, \
                      not fall back to brute force"
                 ),
             };
+            // HIK-137: Dot now builds IP-native (nav = InnerProduct); cosine/L2 stay Augmented.
+            if metric == Metric::Dot {
+                assert_eq!(
+                    nav,
+                    AnnNav::InnerProduct,
+                    "a Dot index must build IP-native after HIK-137"
+                );
+            } else {
+                assert_eq!(nav, AnnNav::Augmented, "cosine/L2 must stay augmented");
+            }
             // Freshly built ⇒ no holes.
             assert_eq!(desc.count, n as u64);
             assert_eq!(live_count, n as u64);
@@ -3638,10 +3651,18 @@ mod tests {
             let mut recall_sum = 0.0f64;
             for qi in 0..queries {
                 let query = &vectors[(qi * 23) % n];
-                // The query goes into the ANN space for navigation; the exact re-rank
-                // scores the raw query against the raw stored vector.
-                let qa = ann_query(metric, query, resident.codebook.params.dim as usize).unwrap();
-                let adc = AdcTable::new(&resident.codebook, &qa).unwrap();
+                // The query goes into the navigator's space; the exact re-rank scores the raw query
+                // against the raw stored vector. HIK-137: an IP-native (Dot) index navigates by the
+                // IP-ADC estimate over the raw codebook (no `ann_query`); cosine/L2 map the query
+                // into the L2-reduced ANN space. This mirrors the server's `beam_over_index`.
+                let adc = match nav {
+                    AnnNav::InnerProduct => AdcTable::new_ip(&resident.codebook, query).unwrap(),
+                    AnnNav::Augmented => {
+                        let qa = ann_query(metric, query, resident.codebook.params.dim as usize)
+                            .unwrap();
+                        AdcTable::new(&resident.codebook, &qa).unwrap()
+                    }
+                };
                 let hits = beam_search(
                     BeamParams {
                         medoid: medoid as u32,

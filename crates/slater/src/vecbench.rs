@@ -28,8 +28,8 @@ use graph_format::pq::{
     PqReader, PqWriter, ResidentPq, HOLE,
 };
 use graph_format::vamana::{
-    beam_search, bfs_order, build_vamana, greedy_search_over, BeamParams, Expanded, PointSet,
-    VamanaGraph, VamanaIndex, VamanaReader, VamanaWriter,
+    beam_search, bfs_order, build_vamana, build_vamana_ip, greedy_search_over, BeamParams,
+    Expanded, PointSet, VamanaGraph, VamanaIndex, VamanaReader, VamanaWriter,
 };
 use graph_format::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
@@ -858,6 +858,96 @@ pub fn ip_walk_topk_pq(
         |i| Ok((raw[i as usize].clone(), graph.adjacency[i as usize].clone())),
         |v| distance(Metric::Dot, q, v) as f32,
         |i| Ok(Some(i as u64)),
+    )?;
+    Ok(hits.into_iter().map(|h| h.node_id).collect())
+}
+
+/// Build and write a full **on-disk IP-native (MIPS) base index** — the production base-rung path,
+/// end to end: [`build_vamana_ip`] over the raw vectors, BFS-from-entry layout, `.vamana` holding
+/// the **raw** vectors + block-relative adjacency, and `.pq` holding the IP codebook (trained on
+/// raw) + per-vector codes in the same layout. Read back by [`beam_topk_disk_ip`]. This exercises
+/// the real `VamanaWriter`/`PqWriter`/`VamanaReader`/`PqReader` + resident-PQ machinery the server
+/// uses, so the measured recall is a faithful end-to-end base-rung number.
+pub fn write_ip_disk_index(
+    dir: &Path,
+    tag: &str,
+    raw: &[Vec<f32>],
+    r: usize,
+    subspaces: u32,
+    bits: u32,
+    iters: usize,
+) -> Result<DiskIndex> {
+    std::fs::create_dir_all(dir).ok();
+    let graph = build_vamana_ip(raw, r)?;
+    let order = bfs_order(&graph);
+    let mut new_of = vec![0u32; order.len()];
+    for (newi, &old) in order.iter().enumerate() {
+        new_of[old as usize] = newi as u32;
+    }
+
+    let vpath = dir.join(format!("{tag}.vamana"));
+    let mut vw = VamanaWriter::create_with_cipher(&vpath, BLOCK, ZSTD, None)?;
+    for &old in &order {
+        let nbrs: Vec<VamanaIndex> = graph.adjacency[old as usize]
+            .iter()
+            .map(|&n| new_of[n as usize])
+            .collect();
+        vw.append(&raw[old as usize], &nbrs)?;
+    }
+    vw.finish()?;
+
+    // The IP codebook is trained on the raw vectors (no augmentation), matching the base build.
+    let pq = build_ip_pq(raw, subspaces, bits, iters)?;
+    let ppath = dir.join(format!("{tag}.pq"));
+    let mut pw = PqWriter::create_with_cipher(&ppath, &pq.codebook, BLOCK, ZSTD, None)?;
+    for &old in &order {
+        pw.append_codes(old as u64, &pq.codes[old as usize])?;
+    }
+    pw.finish()?;
+
+    Ok(DiskIndex {
+        vamana: vpath,
+        pq: ppath,
+        medoid: new_of[graph.medoid as usize],
+        layout_dump_ids: order.iter().map(|&o| o as u64).collect(),
+    })
+}
+
+/// Beam-search an **on-disk IP-native** index: navigate by the IP-ADC estimate
+/// ([`AdcTable::new_ip`] over the resident raw codebook — NO `ann_query`) and re-rank by exact
+/// `distance(Dot)`. Mirrors the server's `beam_over_index` `InnerProduct` arm. Returns dump ids.
+pub fn beam_topk_disk_ip(
+    vamana: &Path,
+    pq: &Path,
+    medoid: VamanaIndex,
+    q_raw: &[f32],
+    k: usize,
+    beam: usize,
+) -> Result<Vec<u64>> {
+    let reader = VamanaReader::open_with_cipher(vamana, None)?;
+    let resident: ResidentPq = PqReader::open_with_cipher(pq, None)?.load_resident()?;
+    let adc = AdcTable::new_ip(&resident.codebook, q_raw)?;
+    let n = reader.len() as usize;
+    let hits = beam_search(
+        BeamParams {
+            medoid,
+            beam_width: beam,
+            k,
+            num_nodes: n,
+        },
+        |i| adc.estimate(resident.codes_of(i as usize)),
+        |i| {
+            let node = reader.node(i)?;
+            Ok((node.vector, node.neighbours))
+        },
+        |v| distance(Metric::Dot, q_raw, v) as f32,
+        |i| {
+            Ok(if resident.is_hole(i as usize) {
+                None
+            } else {
+                Some(resident.node_ids[i as usize])
+            })
+        },
     )?;
     Ok(hits.into_iter().map(|h| h.node_id).collect())
 }
