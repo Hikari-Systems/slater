@@ -179,3 +179,14 @@ required-features = ["testkit"]
 name = "ipnsw_spike"
 harness = false
 required-features = ["testkit"]
+
+# 8. HIK-137 phase-2 CHECKPOINT: PQ-under-IP. Navigates the same IP-native graph as bench 7, but by
+# the IP-ADC PQ estimate (`AdcTable::new_ip`, codebook trained on RAW vectors, no augmentation)
+# instead of exact IP — the last recall unknown before the FORMAT_VERSION work. Measured against
+# the deliverable-1 brute-force IP ground truth on all three distributions, beside the augmented
+# baseline and the exact-IP graph ceiling. Run:
+# `cargo bench -p slater --features testkit --bench ipnsw_pq_checkpoint`.
+[[bench]]
+name = "ipnsw_pq_checkpoint"
+harness = false
+required-features = ["testkit"]

@@ -394,6 +394,50 @@ impl AdcTable {
         Ok(Self { table, m, k })
     }
 
+    /// Build the table for an **inner-product (MIPS)** index (`Metric::Dot`, IP-native path).
+    ///
+    /// Where [`Self::new`] tabulates squared-L2 (the augmented / cosine / L2 reduction), this
+    /// tabulates the **negated per-subspace inner product** `−⟨q_s, centroid(s,c)⟩`. Because a
+    /// PQ code reconstructs `x ≈ x̂ = ⊕_s centroid(s, code_s)`, summing those entries over a
+    /// candidate's codes gives `estimate(codes) = −⟨q, x̂⟩` — an *estimate of* `distance(Dot) =
+    /// −⟨q,x⟩`. So the SAME min-based [`Self::estimate`] and the SAME min-based
+    /// [`crate::vamana::beam_search`] descend towards the strongest estimated inner product, with
+    /// **no norm augmentation** anywhere (the codebook is trained on the raw vectors, and `query`
+    /// is the raw query — both `dim`-long, no extra augmentation subspace).
+    ///
+    /// This is the productionised form of the HIK-137 phase-2 PQ-under-IP checkpoint: it is the
+    /// only PQ estimator an IP-native Dot index uses. It never touches the cosine/L2/augmented
+    /// path ([`Self::new`]), which is unchanged.
+    pub fn new_ip(codebook: &Codebook, query: &[f32]) -> Result<Self> {
+        if query.len() != codebook.params.dim as usize {
+            bail!(
+                "IP query dim {} does not match codebook dim {}",
+                query.len(),
+                codebook.params.dim
+            );
+        }
+        let m = codebook.params.subspaces as usize;
+        let dsub = codebook.params.dsub as usize;
+        let k = codebook.params.k as usize;
+        let mut table = vec![0.0f32; m * k];
+        for s in 0..m {
+            let sub = &query[s * dsub..(s + 1) * dsub];
+            for c in 0..k {
+                // Negated inner product, so `estimate` (a sum) yields −⟨q, x̂⟩ = an estimate of
+                // `distance(Dot)`; a smaller value is a stronger inner product, matching the
+                // min-based beam.
+                let cent = codebook.centroid(s, c);
+                let ip: f64 = sub
+                    .iter()
+                    .zip(cent)
+                    .map(|(x, y)| *x as f64 * *y as f64)
+                    .sum();
+                table[s * k + c] = -ip as f32;
+            }
+        }
+        Ok(Self { table, m, k })
+    }
+
     /// Estimated squared-L2 distance of the vector with these `m` codes.
     pub fn estimate(&self, codes: &[u8]) -> f32 {
         debug_assert_eq!(codes.len(), self.m);
@@ -1487,6 +1531,46 @@ mod tests {
             best < 20,
             "ADC argmin {best} should be in the query cluster"
         );
+    }
+
+    /// The IP-ADC estimate (`AdcTable::new_ip`) must equal the **negated inner product of the
+    /// query with the PQ reconstruction**, `−⟨q, x̂⟩`, for every candidate — that identity is the
+    /// whole basis of navigating an inner-product index by the same min-based beam. Computed
+    /// against an independent reconstruction, per subspace, never against `AdcTable::new`.
+    #[test]
+    fn ip_adc_estimates_the_reconstruction_inner_product() {
+        let dim = 16;
+        let data = clustered(dim, 5, 12);
+        let params = PqParams::new(dim as u32, 4, 4).unwrap();
+        let dsub = params.dsub as usize;
+        let cb = train_codebooks(&data, params, 25).unwrap();
+        let codes: Vec<Vec<u8>> = data.iter().map(|v| cb.encode(v).unwrap()).collect();
+
+        let query = &data[3];
+        let adc = AdcTable::new_ip(&cb, query).unwrap();
+        for (i, code) in codes.iter().enumerate() {
+            // Independent reference: reconstruct x̂ from the codes (subspace centroids) and dot it
+            // with the query, then negate.
+            let mut recon_ip = 0.0f64;
+            for (s, &c) in code.iter().enumerate() {
+                let cent = cb.centroid(s, c as usize);
+                let qsub = &query[s * dsub..(s + 1) * dsub];
+                recon_ip += qsub
+                    .iter()
+                    .zip(cent)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum::<f64>();
+            }
+            let est = adc.estimate(code) as f64;
+            assert!(
+                (est - (-recon_ip)).abs() < 1e-3,
+                "row {i}: IP-ADC estimate {est} must equal -recon-IP {}",
+                -recon_ip
+            );
+        }
+        // The equality above proves orientation too: `estimate = −⟨q, x̂⟩` is strictly decreasing
+        // in the reconstruction inner product, so the min-based beam descends towards the
+        // strongest estimated IP — exactly what an inner-product index needs.
     }
 
     #[test]
