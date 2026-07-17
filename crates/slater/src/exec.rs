@@ -6446,14 +6446,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             Val::Vector(v) => Ok(v),
             Val::List(xs) => xs
                 .iter()
-                .map(|x| {
-                    x.as_num().map(|f| f as f32).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "query vector elements must be numbers, got {}",
-                            x.to_display()
-                        )
-                    })
-                })
+                .enumerate()
+                .map(|(i, x)| embed_component(i, x, "query vector"))
                 .collect(),
             other => bail!(
                 "query vector must be a vecf32([...]) literal or numeric list, got {}",
@@ -9413,14 +9407,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 Val::Vector(v) => Val::Vector(v),
                 Val::List(xs) => Val::Vector(
                     xs.iter()
-                        .map(|x| {
-                            x.as_num().map(|f| f as f32).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "vecf32() elements must be numbers, got {}",
-                                    x.to_display()
-                                )
-                            })
-                        })
+                        .enumerate()
+                        .map(|(i, x)| embed_component(i, x, "vecf32()"))
                         .collect::<Result<_>>()?,
                 ),
                 Val::Null => Val::Null,
@@ -9432,7 +9420,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // Cosine similarity of two vectors, in [-1, 1] (higher = more similar).
             // Complements the KNN `score`, which is the distance `1 - similarity`
             // (D26). Accepts vectors or numeric lists.
-            "similarity" | "vec.cosinesimilarity" => match (as_vector(&a0(0)), as_vector(&a0(1))) {
+            "similarity" | "vec.cosinesimilarity" => match (as_vector(&a0(0))?, as_vector(&a0(1))?)
+            {
                 (Some(a), Some(b)) if a.len() == b.len() => {
                     Val::Float(vector::cosine_similarity(&a, &b))
                 }
@@ -9453,10 +9442,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 if matches!(x, Val::Null) || matches!(y, Val::Null) {
                     Val::Null
                 } else {
-                    let a = as_vector(&x).ok_or_else(|| {
+                    let a = as_vector(&x)?.ok_or_else(|| {
                         anyhow::anyhow!("{n}() needs vectors, got {}", x.to_display())
                     })?;
-                    let b = as_vector(&y).ok_or_else(|| {
+                    let b = as_vector(&y)?.ok_or_else(|| {
                         anyhow::anyhow!("{n}() needs vectors, got {}", y.to_display())
                     })?;
                     if a.len() != b.len() {
@@ -11323,13 +11312,36 @@ fn type_name(v: &Val) -> &'static str {
     }
 }
 
-/// Coerce a value to a vector for the similarity functions: a `Vector` directly,
-/// or a list of numbers (the shape an inlined literal / `$param` takes).
-fn as_vector(v: &Val) -> Option<Vec<f32>> {
+/// Extract one embedding component from a query value: it must be a number (the
+/// `vecf32`/`queryNodes` type rule) **and** finite. A `NaN`/`±inf` component survives
+/// `f64::max`, collapses the norm augmentation to `0.0` while riding verbatim into the
+/// raw coordinates, and is *ordered largest* by `total_cmp` — so it silently poisons the
+/// index and the KNN order. The finiteness decision goes through the one shared gate
+/// (`graph_format::pq::finite_f32`) so no ingest/query site can drift (HIK-134). The
+/// typed [`graph_format::pq::NonFiniteEmbedding`] propagates as the `anyhow` root, so
+/// callers branch on the type, never the message.
+fn embed_component(index: usize, x: &Val, ctx: &str) -> Result<f32> {
+    let f = x
+        .as_num()
+        .ok_or_else(|| anyhow::anyhow!("{ctx} elements must be numbers, got {}", x.to_display()))?;
+    Ok(graph_format::pq::finite_f32(index, f as f32)?)
+}
+
+/// Coerce a value to a vector for the similarity functions: a `Vector` directly, or a
+/// list of numbers (the shape an inlined literal / `$param` takes). `Ok(None)` is *not a
+/// vector* (a non-list, non-vector value — the caller decides NULL vs type error);
+/// `Err` is a list carrying a non-finite component, rejected through the shared gate so
+/// this stays on the same finiteness path as every other ingest site (HIK-134).
+fn as_vector(v: &Val) -> Result<Option<Vec<f32>>> {
     match v {
-        Val::Vector(xs) => Some(xs.clone()),
-        Val::List(xs) => xs.iter().map(|x| x.as_num().map(|f| f as f32)).collect(),
-        _ => None,
+        Val::Vector(xs) => Ok(Some(xs.clone())),
+        Val::List(xs) => xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| embed_component(i, x, "vector"))
+            .collect::<Result<Vec<f32>>>()
+            .map(Some),
+        _ => Ok(None),
     }
 }
 
@@ -18273,6 +18285,102 @@ mod tests {
         let res = engine.run(&ast).unwrap();
         assert_eq!(res.rows.len(), 1);
         assert!(matches!(res.rows[0][0], Val::Int(2)), "Carol is nearest");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Did this run fail with the typed [`graph_format::pq::NonFiniteEmbedding`]?
+    /// Classified by *type*, never by message text (house rule) — a NaN that merely
+    /// trips some unrelated arity/type check would not satisfy this.
+    fn rejected_nonfinite(r: Result<QueryResult>) -> bool {
+        r.err().is_some_and(|e| {
+            e.downcast_ref::<graph_format::pq::NonFiniteEmbedding>()
+                .is_some()
+        })
+    }
+
+    #[test]
+    fn vecf32_rejects_a_nonfinite_component_at_write_ingest() {
+        // The organic HIK-134 reproduction: log(-1.0) → NaN by slater's FalkorDB IEEE
+        // semantics. vecf32 must reject it with a TYPED finiteness error *before* it becomes
+        // a Vector that `SET n.embedding = …` would write into the index. Pre-fix this
+        // returned Ok(a NaN-bearing Vector); a NaN slipping an arity check would not match
+        // the typed error asserted here.
+        let (root, graph, _) = testgen::write_basic("exec_vecf32_write_nan");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let ast = parser::parse("RETURN vecf32([log(-1.0), 0.2, 0.3]) AS v").unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a NaN vecf32 component must be a typed finiteness error"
+        );
+        // Index uncorrupted: a subsequent clean KNN over the same fixture still returns the
+        // reference nearest neighbour (the rejected write never touched the index).
+        let ok = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, vecf32([0.1, 0.2, 0.3])) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        let res = Engine::new(&gen, &cache).run(&ok).unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(0)),
+            "nearest is Alice (exact match) — index uncorrupted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vecf32_rejects_an_infinite_literal_via_the_parse_fold() {
+        // vecf32([1e400, …]) — the f64 literal is finite but `as f32` saturates to +inf. The
+        // parse-time constant fold must NOT bake it into a Vector literal (which would skip
+        // the runtime gate); the runtime vecf32 gate then rejects it. Covers `±inf` *and* the
+        // fold-bypass entry point in one shot.
+        let (root, graph, _) = testgen::write_basic("exec_vecf32_inf_literal");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let ast = parser::parse("RETURN vecf32([1e400, 0.2, 0.3]) AS v").unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a +inf vecf32 component must be a typed finiteness error"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn query_vector_nonfinite_is_rejected_against_a_clean_index() {
+        // The load-bearing case (HIK-134): a NaN QUERY needs no write at all. Against the
+        // clean fixture index, both the inline vecf32() form and a `$param` numeric-list form
+        // (the distinct `eval_query_vector` gate) must be rejected with the typed finiteness
+        // error — NOT answered with a `total_cmp`-ordered garbage result set.
+        let (root, graph, _) = testgen::write_basic("exec_query_vec_nan");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Form A: inline vecf32([log(-1.0), …]) → the vecf32 ingest gate.
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, vecf32([log(-1.0), 0.2, 0.3])) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a clean index + vecf32(NaN) query must be a typed error, not a garbage result"
+        );
+
+        // Form B: a $param list carrying a NaN → the eval_query_vector List arm.
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            Val::List(vec![Val::Float(f64::NAN), Val::Float(0.2), Val::Float(0.3)]),
+        );
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, $q) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).with_params(params).run(&ast)),
+            "a clean index + $param NaN query must be a typed error, not a garbage result"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
