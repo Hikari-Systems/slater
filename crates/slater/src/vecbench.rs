@@ -52,14 +52,74 @@ pub const ZSTD: i32 = 3;
 /// fixtures are stable run-to-run without an `rand` dependency.
 pub struct SplitMix64(pub u64);
 impl SplitMix64 {
-    pub fn next_f32(&mut self) -> f32 {
+    /// The raw splitmix64 step — one 64-bit draw, advancing state.
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
+        z ^ (z >> 31)
+    }
+
+    /// A signed unit sample in `[-1, 1)` (24-bit mantissa). The suite's historical stream — kept
+    /// bit-identical (this is just [`Self::next_u64`] refactored out of the body).
+    pub fn next_f32(&mut self) -> f32 {
+        let z = self.next_u64();
         let unit = (z >> 40) as f32 / (1u32 << 24) as f32;
         unit * 2.0 - 1.0
+    }
+
+    /// A uniform double in `[0, 1)` (53-bit mantissa). For inverse-CDF norm draws.
+    pub fn next_unit(&mut self) -> f64 {
+        let z = self.next_u64();
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// A standard-normal draw (Box–Muller). Used to build log-normal norms.
+    pub fn next_normal(&mut self) -> f64 {
+        // Guard u1 away from 0 so ln is finite; both draws advance the shared stream.
+        let u1 = self.next_unit().max(f64::MIN_POSITIVE);
+        let u2 = self.next_unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// A **norm distribution** to impose on manifold *directions*. MIPS is about *norms*: a vector's
+/// direction governs its cosine/L2 neighbourhood (and how navigable the proximity graph is), while
+/// its **norm** governs inner product. Decoupling the two — a manifold direction times an
+/// independently-drawn norm — is what lets a fixture stress MIPS specifically, rather than the
+/// gentle ~4× scale the legacy [`ManifoldModel::sample`] folds into direction.
+#[derive(Clone, Copy, Debug)]
+pub enum NormDist {
+    /// The legacy fixture's spread: a per-vector uniform scale in `[0.5, 2.0)` — a gentle ~4×
+    /// range. The control: MIPS is barely distinct from cosine/L2 here, which is the whole
+    /// under-stressing complaint.
+    Uniform4x,
+    /// **Realistic embedding-like.** Log-normal norms, `exp(ln(median) + σ·Z)`, `Z ~ N(0,1)`. A
+    /// moderate right-skew (σ≈0.35 ⇒ bulk spread ~2–3×, a thin upper tail) mimicking the norm
+    /// spread of real *un-normalized* transformer embeddings.
+    LogNormal { median: f64, sigma: f64 },
+    /// **Adversarial heavy-tailed.** Pareto (power-law) norms, `x_m·(1−U)^(−1/α)`. With a small α
+    /// (≈1.6) a handful of vectors carry 10–50× the norm; a high-norm vector has high IP with
+    /// almost *every* query, so the true MIPS top-k is dominated by norm regardless of direction —
+    /// the navigation hazard a cosine/L2-clustered graph cannot reach.
+    Pareto { x_m: f64, alpha: f64 },
+}
+
+impl NormDist {
+    /// Draw one norm from the shared deterministic stream.
+    pub fn draw(&self, rng: &mut SplitMix64) -> f64 {
+        match *self {
+            NormDist::Uniform4x => 0.5 + rng.next_unit() * 1.5, // [0.5, 2.0)
+            NormDist::LogNormal { median, sigma } => {
+                (median.ln() + sigma * rng.next_normal()).exp()
+            }
+            NormDist::Pareto { x_m, alpha } => {
+                // Inverse-CDF: U~[0,1) ⇒ x_m·(1−U)^(−1/α). Clamp 1−U off 0 so the tail is finite.
+                let tail = (1.0 - rng.next_unit()).max(f64::MIN_POSITIVE);
+                x_m * tail.powf(-1.0 / alpha)
+            }
+        }
     }
 }
 
@@ -128,6 +188,87 @@ impl ManifoldModel {
                 out
             })
             .collect()
+    }
+
+    /// One raw latent lift (a manifold *direction* before any norm scaling): `Σ_l coeff_l·basis[l]`
+    /// with `coeff_l ∈ [-1,1)`, drawn from the shared stream. Kept private so the two public
+    /// samplers share the exact lift.
+    fn lift(&self, rng: &mut SplitMix64) -> Vec<f32> {
+        let latent = self.basis.len();
+        let coeffs: Vec<f32> = (0..latent).map(|_| rng.next_f32()).collect();
+        let mut out = vec![0.0f32; self.d];
+        for (l, &c) in coeffs.iter().enumerate() {
+            let b = &self.basis[l];
+            for (o, &bv) in out.iter_mut().zip(b.iter()) {
+                *o += c * bv;
+            }
+        }
+        out
+    }
+
+    /// `n` **unit-norm** manifold directions. Used for MIPS queries (a query's norm is a positive
+    /// scalar that scales every inner product equally, so it does not change the argmax top-k — a
+    /// unit query keeps the ground truth about the *database* norms) and as the direction factor
+    /// for [`sample_mips`](Self::sample_mips).
+    pub fn sample_dir(&self, n: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = SplitMix64(seed);
+        (0..n)
+            .map(|_| {
+                let mut v = self.lift(&mut rng);
+                let norm = l2_norm(&v).max(f64::MIN_POSITIVE) as f32;
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// `n` MIPS index vectors: a **unit manifold direction** (navigable neighbourhood structure)
+    /// times a norm drawn independently from `norm_dist`. Decoupling direction from norm is what
+    /// makes this stress MIPS — the norm distribution, not the direction, decides the true top-k.
+    pub fn sample_mips(&self, n: usize, seed: u64, norm_dist: NormDist) -> Vec<Vec<f32>> {
+        // One stream: direction draws and the norm draw interleave per point, so the fixture is a
+        // single deterministic function of (model, seed, norm_dist).
+        let mut rng = SplitMix64(seed);
+        (0..n)
+            .map(|_| {
+                let mut v = self.lift(&mut rng);
+                let unit = l2_norm(&v).max(f64::MIN_POSITIVE) as f32;
+                let norm = norm_dist.draw(&mut rng) as f32;
+                let scale = norm / unit;
+                for x in v.iter_mut() {
+                    *x *= scale;
+                }
+                v
+            })
+            .collect()
+    }
+}
+
+/// Summary of a vector set's L2-norm spread — the property that makes a fixture MIPS-hard. Reports
+/// the min/median/p99/max and the max/median ratio (the "how much does the biggest norm dominate"
+/// number that a wide/heavy-tailed distribution inflates).
+pub struct NormStats {
+    pub min: f64,
+    pub median: f64,
+    pub p99: f64,
+    pub max: f64,
+    pub max_over_median: f64,
+}
+
+/// Compute [`NormStats`] over a raw vector set.
+pub fn norm_stats(raw: &[Vec<f32>]) -> NormStats {
+    let mut norms: Vec<f64> = raw.iter().map(|v| l2_norm(v)).collect();
+    norms.sort_by(f64::total_cmp);
+    let at = |q: f64| norms[((norms.len() as f64 * q) as usize).min(norms.len() - 1)];
+    let median = at(0.5);
+    NormStats {
+        min: norms[0],
+        median,
+        p99: at(0.99),
+        max: *norms.last().unwrap(),
+        max_over_median: norms.last().unwrap() / median.max(f64::MIN_POSITIVE),
     }
 }
 
@@ -488,5 +629,76 @@ mod tests {
             disk_sum / reps as f64
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The MIPS fixture and its ground truth are a deterministic function of (model, seed,
+    /// distribution): the *same* seeds ⇒ bit-identical vectors ⇒ bit-identical exact IP top-k. This
+    /// is the reproducibility contract deliverable 1 rests on.
+    #[test]
+    fn mips_fixture_and_ground_truth_are_deterministic() {
+        let nd = NormDist::Pareto {
+            x_m: 1.0,
+            alpha: 1.6,
+        };
+        let m1 = ManifoldModel::new(256, 32, 0x317_2517);
+        let m2 = ManifoldModel::new(256, 32, 0x317_2517);
+        let a = m1.sample_mips(500, 0x1A5E, nd);
+        let b = m2.sample_mips(500, 0x1A5E, nd);
+        assert_eq!(a, b, "same seed must give bit-identical MIPS vectors");
+
+        let qs = m1.sample_dir(20, 0x9CE5);
+        let live: Vec<u64> = (0..a.len() as u64).collect();
+        for q in &qs {
+            // The ground-truth path (brute-force IP argmax) is reproducible run-to-run.
+            assert_eq!(
+                exact_topk(Metric::Dot, &a, &live, q, 10),
+                exact_topk(Metric::Dot, &b, &live, q, 10),
+                "same fixture must give identical exact IP top-k"
+            );
+        }
+    }
+
+    /// The whole point of the fixture: the MIPS-hard norm distributions genuinely spread norms far
+    /// wider than the legacy ~4× uniform. A wider max/median ratio is what makes IP diverge from
+    /// cosine/L2 and stresses navigation. Ordering: uniform < lognormal < pareto.
+    #[test]
+    fn norm_distributions_are_progressively_heavier_tailed() {
+        let model = ManifoldModel::new(256, 32, 0x317_2517);
+        let uni = norm_stats(&model.sample_mips(2000, 0x1A5E, NormDist::Uniform4x));
+        let logn = norm_stats(&model.sample_mips(
+            2000,
+            0x1A5E,
+            NormDist::LogNormal {
+                median: 1.0,
+                sigma: 0.35,
+            },
+        ));
+        let par = norm_stats(&model.sample_mips(
+            2000,
+            0x1A5E,
+            NormDist::Pareto {
+                x_m: 1.0,
+                alpha: 1.6,
+            },
+        ));
+        // Legacy uniform is a tight ~4× box; the realistic and adversarial ones are strictly wider,
+        // with the heavy-tailed Pareto the widest by a large margin.
+        assert!(
+            uni.max_over_median < 3.0,
+            "uniform-4x should stay tight, got {}",
+            uni.max_over_median
+        );
+        assert!(
+            logn.max_over_median > uni.max_over_median,
+            "lognormal ({}) must spread wider than uniform ({})",
+            logn.max_over_median,
+            uni.max_over_median
+        );
+        assert!(
+            par.max_over_median > 20.0 && par.max_over_median > logn.max_over_median * 3.0,
+            "pareto ({}) must be heavy-tailed vs lognormal ({})",
+            par.max_over_median,
+            logn.max_over_median
+        );
     }
 }
