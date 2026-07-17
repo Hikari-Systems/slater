@@ -17,6 +17,9 @@ slater-scalar.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 crc32c.workspace = true
+# Only for the WAL rollback guard's `Drop`, which cannot propagate an error: a failed
+# rollback truncate must not be silent (HIK-130).
+tracing.workspace = true
 
 [lints.rust]
 # slater-delta contains no `unsafe`: the memtable is a plain owned map published

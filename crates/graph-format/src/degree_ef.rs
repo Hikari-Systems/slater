@@ -32,7 +32,10 @@
 //! sits at position `high[i] + i`. Cost ≈ `m·(2 + ℓ)` bits, within ~½ bit/element of the
 //! information-theoretic floor, with O(1) random access.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{bail, Result};
+use tracing::warn;
 
 use crate::codec;
 use crate::plane::{self, build_sample, low_bits, read_low, write_low};
@@ -75,6 +78,48 @@ impl ChunkKind {
             4 => Self::Rle,
             _ => bail!("unknown degree-chunk codec tag {b}"),
         })
+    }
+}
+
+/// Running count of non-monotone pairs [`report_non_monotone`] has seen, process-wide. Drives the
+/// report's rate limit, and lets a test assert the report path actually fired without standing up
+/// a `tracing` subscriber (the crate has no subscriber and no dev-dep for one).
+static NON_MONOTONE_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Report a non-monotone cumulative pair seen by [`EfChunk::degree_at`] — i.e. a degree chunk
+/// whose bytes cannot have come from this crate's encoder.
+///
+/// **Why this exists.** `degree_at` saturates to `0` rather than underflowing, and a `0` degree
+/// is indistinguishable from a legitimately isolated node — of which a real graph has many. So
+/// without a signal here, a corrupt chunk is *perfectly silent*, which is a worse operational
+/// failure mode than the absurd `4294967293` it replaces: absurd numbers get noticed, zeros do
+/// not. This does **not** make the resulting k-hop count correct — the count fast path still sums
+/// the `0` and still returns a wrong answer with no error. It only makes that wrong answer
+/// *attributable* when someone comes to explain it.
+///
+/// **Why the rate limit.** `degree_at` is the count fast path's inner loop (millions of scattered
+/// lookups) and a corrupt chunk stays resident, so it is re-read on every one of them: an
+/// unlimited `warn!` would turn a wrong count into a log flood — a second incident on top of the
+/// first. Reporting on power-of-two occurrences bounds the whole `u64` range to ~64 lines while
+/// still conveying magnitude (the running count is in the message), which "log once" discards.
+///
+/// **Why the state is `static` and not a field.** The counter is touched *only* on the corrupt
+/// path, so the healthy loop never loads it. A per-chunk flag would instead grow every `EfChunk`,
+/// cost a `Clone` impl (`AtomicBool: !Clone`), and buy nothing this doesn't.
+#[cold]
+#[inline(never)]
+fn report_non_monotone(slot: usize, v0: u64, v1: u64) {
+    let n = NON_MONOTONE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        warn!(
+            slot,
+            c_slot = v0,
+            c_slot_plus_1 = v1,
+            occurrences = n,
+            "corrupt degree chunk: cumulative sequence is not monotone; degree forced to 0. \
+             Counts over this chunk are wrong — the generation's degree column should be \
+             rebuilt or refetched"
+        );
     }
 }
 
@@ -188,13 +233,30 @@ impl EfChunk {
     /// sampled `select₁` and a cheap next-set-bit step, not two full scans. This is the degree-
     /// sum count fast path's inner loop (millions of scattered lookups), so halving the select
     /// work matters.
+    ///
+    /// **Total on non-monotone input.** `c` is monotone for any record this crate *encoded*, but
+    /// the lows are arbitrary bytes off disk and nothing validates them: `hi` is forced
+    /// non-decreasing by the bitmap's structure, so a forged/corrupt same-bucket pair with
+    /// `low[slot+1] < low[slot]` decodes `v1 < v0`. A bare `v1 - v0` then panics in debug and
+    /// *wraps* in release, handing the degree-sum count fast path a garbage degree (`4294967293`)
+    /// that it sums into a wrong k-hop count. So the subtraction saturates to `0` and reports —
+    /// see [`report_non_monotone`] for why the report is needed and what it does not fix.
+    ///
+    /// The healthy path grows by a compare, a never-taken branch and the saturating `cmov`
+    /// (measured: `sub` becomes `cmp/jb/xor/sub/cmovae`); no new loads, and the rate-limiter state
+    /// is touched only on the corrupt path. That is noise against the cache-missing `select₁`
+    /// above it, which is why this is spelled with `saturating_sub` for clarity rather than an
+    /// early `return 0` — the latter does codegen to a bare `cmp/jb/sub`, if this ever measures.
     #[inline]
     pub fn degree_at(&self, slot: usize) -> u32 {
         let p0 = self.select1(slot);
         let p1 = self.next_one_after(p0);
         let v0 = (((p0 - slot) as u64) << self.l) | self.low(slot);
         let v1 = (((p1 - (slot + 1)) as u64) << self.l) | self.low(slot + 1);
-        (v1 - v0) as u32
+        if v1 < v0 {
+            report_non_monotone(slot, v0, v1);
+        }
+        v1.saturating_sub(v0) as u32
     }
 
     /// Serialised size in bytes (header + lows + highs), for codec selection without
@@ -956,6 +1018,61 @@ mod tests {
             (0..4).map(|s| rt.degree_at(s)).collect::<Vec<_>>(),
             vec![0, 1, 0, 2]
         );
+    }
+
+    /// A forged chunk whose *low bits* decode non-monotone must not underflow `degree_at`.
+    ///
+    /// `hi` is forced non-decreasing by the bitmap's structure, but the lows are arbitrary disk
+    /// bytes — so a same-bucket pair with `low1 < low0` decodes `v1 < v0` and `v1 - v0`
+    /// underflows. **Debug panics; release wraps and returns `4294967293`, which the degree-sum
+    /// count fast path sums into a wrong k-hop count with no error** — so, exactly as for
+    /// `rejects_forged_ef_low_bits_width` above, this must hold under `cargo test --release`
+    /// too: a debug-only pass proves the panic and says nothing about the silent path that ships.
+    ///
+    /// Every existing check passes on this record by construction — the body is exactly `need`
+    /// bytes, `ones == m`, and `ℓ = 2` is a legal width — so it is genuinely ACCEPTED and the
+    /// subtraction is really reached. (If this ever starts failing with a decode `Err`, the forge
+    /// has drifted and the test has stopped proving anything.)
+    #[test]
+    fn non_monotone_ef_lows_saturate_rather_than_underflow() {
+        // n=4 (m=5 cumulative elements), ℓ=2, one high word.
+        let (n, l, nwords) = (4u32, 2u8, 1u32);
+        let mut body = Vec::new();
+        body.extend_from_slice(&n.to_le_bytes());
+        body.push(l);
+        body.extend_from_slice(&nwords.to_le_bytes());
+        // Lows: 5 × 2 bits, LSB-first → low[0] = 3, low[1..5] = 0.
+        body.extend_from_slice(&[0b0000_0011, 0]);
+        // Highs: all m=5 one-bits at positions 0..5, so every hi_i = 0 and every element shares
+        // a bucket — the case where the lows alone decide order.
+        body.extend_from_slice(&0b1_1111u64.to_le_bytes());
+        assert_eq!(
+            body.len(),
+            19,
+            "9 header + 2 low + 8 high — the exact `need`"
+        );
+
+        let chunk = EfChunk::deserialize(&body).expect("the forged record is legal and accepted");
+
+        // c[0] = 3, c[1] = 0 — non-monotone. Pre-fix: debug panics here, release returns
+        // 4294967293.
+        let before = NON_MONOTONE_SEEN.load(Ordering::Relaxed);
+        assert_eq!(chunk.degree_at(0), 0, "must saturate, not underflow");
+
+        // The saturation must also be *reported*. A `0` degree is indistinguishable from an
+        // isolated node, so a silent saturation is the failure mode this ticket exists to avoid —
+        // without this assertion, deleting the report call still passes the test above. Counting
+        // the reports is what lets us check that with no subscriber in the crate; this test is the
+        // only one that decodes a non-monotone chunk, so the process-wide counter is stable here.
+        assert_eq!(
+            NON_MONOTONE_SEEN.load(Ordering::Relaxed) - before,
+            1,
+            "the saturation must be reported, not silent"
+        );
+
+        // The healthy slots of the same chunk still answer normally — the report is not a
+        // poison pill for the whole chunk.
+        assert_eq!(chunk.degree_at(2), 0, "monotone slot still decodes");
     }
 
     /// Wire-biased opts (`margin = 1.0`): always prices zstd, lets it win on any size gain.
