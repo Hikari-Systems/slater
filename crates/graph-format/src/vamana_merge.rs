@@ -57,11 +57,11 @@ use std::sync::Arc;
 use anyhow::{ensure, Context, Result};
 
 use crate::crypto::BlockCipher;
-use crate::manifest::Metric;
+use crate::manifest::{AnnNav, Metric};
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
 use crate::vamana::{
-    decode_node, greedy_search_over, robust_prune_over, AdjRead, AdjWrite, Expanded, PointSet,
-    VamanaIndex, VamanaReader, VamanaWriter,
+    decode_node, greedy_search_over, ip_prune_over, robust_prune_over, AdjRead, AdjWrite, Expanded,
+    PointSet, VamanaIndex, VamanaReader, VamanaWriter,
 };
 use crate::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
@@ -83,11 +83,17 @@ pub struct MergeParams {
     pub alpha: f32,
     /// Search-list width during an insert's greedy search (wider than `R` for candidates).
     pub l_build: usize,
-    /// The index metric. With `max_norm` it defines the ANN space ([`ann_point`]).
+    /// The index metric. With `max_norm` it defines the ANN space ([`ann_point`]) for an
+    /// `Augmented` index.
     pub metric: Metric,
     /// `M = max‖x‖` over the base indexed set (the dot/MIPS augmentation constant), from the
-    /// base MANIFEST. Read only for [`Metric::Dot`].
+    /// base MANIFEST. Read only for an `Augmented` [`Metric::Dot`] index; inert for `InnerProduct`.
     pub max_norm: f64,
+    /// How the base graph is navigated (HIK-137). For [`AnnNav::InnerProduct`] the insert-weave and
+    /// the delete re-prune both measure raw inner product and select top-R by IP ([`ip_prune_over`]),
+    /// and the Δ vectors are encoded raw (no augmentation) — the carried graph stays in the same
+    /// IP-native space it was built in. [`AnnNav::Augmented`] keeps the L2-reduced ANN space.
+    pub nav: AnnNav,
     /// Target block size for the output `.vamana`.
     pub vamana_block_bytes: usize,
     /// Target block size for the output `.pq`.
@@ -248,6 +254,7 @@ pub fn streaming_merge(
             alpha: params.alpha,
             metric: params.metric,
             max_norm: params.max_norm,
+            nav: params.nav,
             space_dim,
             cache_records: recommended_cache_records(params.r),
             cache_blocks: RECOMMENDED_CACHE_BLOCKS,
@@ -271,16 +278,25 @@ pub fn streaming_merge(
     debug_assert_eq!(cur_reader.len() as usize, base_count);
 
     // ── Stage 2: inserts. Weave each Δ point into the carried graph.
-    let delta_ann: Vec<Vec<f32>> = inputs
-        .inserts
-        .iter()
-        .map(|(_, v)| ann_point(params.metric, v, params.max_norm, space_dim))
-        .collect::<Result<_>>()?;
+    // For an IP-native base the "ANN point" *is* the raw vector — the graph, the codebook and the
+    // distance all live in raw space, no augmentation. `delta_ann` therefore holds raw vectors for
+    // IP (so `write_pq`'s `codebook.encode` and `MergePoints`' distance both see the right space).
+    let is_ip = params.nav == AnnNav::InnerProduct;
+    let delta_ann: Vec<Vec<f32>> = if is_ip {
+        inputs.inserts.iter().map(|(_, v)| v.clone()).collect()
+    } else {
+        inputs
+            .inserts
+            .iter()
+            .map(|(_, v)| ann_point(params.metric, v, params.max_norm, space_dim))
+            .collect::<Result<_>>()?
+    };
     let points = MergePoints {
         reader: cur_reader,
         base_count,
         metric: params.metric,
         max_norm: params.max_norm,
+        is_ip,
         space_dim,
         delta_ann: &delta_ann,
         cache: RefCell::new(HashMap::new()),
@@ -471,13 +487,17 @@ struct MergePoints<'a> {
     base_count: usize,
     metric: Metric,
     max_norm: f64,
+    /// IP-native (HIK-137): the "ANN point" is the raw vector and distance is raw `−⟨a,b⟩`.
+    is_ip: bool,
     space_dim: usize,
     delta_ann: &'a [Vec<f32>],
     cache: RefCell<HashMap<VamanaIndex, Vec<f32>>>,
 }
 
 impl MergePoints<'_> {
-    /// The ANN-space vector for index `i` (a base ordinal or a Δ index `≥ base_count`).
+    /// The distance-space vector for index `i` (a base ordinal or a Δ index `≥ base_count`) — the
+    /// raw vector for IP-native, the L2-reduced ANN point otherwise. `delta_ann` already carries the
+    /// right space (raw for IP), so a Δ index needs no transform either way.
     fn ann(&self, i: VamanaIndex) -> Result<Vec<f32>> {
         let iu = i as usize;
         if iu >= self.base_count {
@@ -487,9 +507,13 @@ impl MergePoints<'_> {
             return Ok(v.clone());
         }
         let raw = self.reader.node(i)?.vector;
-        let ann = ann_point(self.metric, &raw, self.max_norm, self.space_dim)?;
-        self.cache.borrow_mut().insert(i, ann.clone());
-        Ok(ann)
+        let pt = if self.is_ip {
+            raw
+        } else {
+            ann_point(self.metric, &raw, self.max_norm, self.space_dim)?
+        };
+        self.cache.borrow_mut().insert(i, pt.clone());
+        Ok(pt)
     }
 }
 
@@ -498,7 +522,14 @@ impl PointSet for MergePoints<'_> {
         self.base_count + self.delta_ann.len()
     }
     fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
-        Ok(sq_l2(&self.ann(a)?, &self.ann(b)?))
+        let (va, vb) = (self.ann(a)?, self.ann(b)?);
+        if self.is_ip {
+            // Raw inner product, maximised ⇒ minimise `−⟨a,b⟩`.
+            let ip: f64 = va.iter().zip(&vb).map(|(x, y)| *x as f64 * *y as f64).sum();
+            Ok(-ip)
+        } else {
+            Ok(sq_l2(&va, &vb))
+        }
     }
 }
 
@@ -591,13 +622,24 @@ fn merge_insert(
     let base_count = adj.base_count;
     let is_dead = |c: VamanaIndex| (c as usize) < base_count && dead[c as usize];
 
+    let is_ip = points.is_ip;
+    // Top-R by inner product for an IP-native base (α-domination is unsound over IP); robust prune
+    // otherwise. Same rule for the node's own edges and every back-link re-prune.
+    let prune = |q: VamanaIndex, pool: &[VamanaIndex]| -> Result<Vec<VamanaIndex>> {
+        if is_ip {
+            ip_prune_over(q, pool, params.r, points)
+        } else {
+            robust_prune_over(q, pool, params.alpha, params.r, points)
+        }
+    };
+
     let visited = greedy_search_over(params.medoid, p, adj, points, params.l_build, expanded)?;
     let mut cands: Vec<VamanaIndex> = visited;
     cands.retain(|&c| c != p && !is_dead(c));
     cands.sort_unstable();
     cands.dedup();
 
-    let pruned = robust_prune_over(p, &cands, params.alpha, params.r, points)?;
+    let pruned = prune(p, &cands)?;
     adj.set_neighbours(p, pruned.clone())?;
 
     let mut nbrs_j: Vec<VamanaIndex> = Vec::new();
@@ -609,7 +651,7 @@ fn merge_insert(
             changed = true;
         }
         if nbrs_j.len() > params.r {
-            nbrs_j = robust_prune_over(j, &nbrs_j, params.alpha, params.r, points)?;
+            nbrs_j = prune(j, &nbrs_j)?;
             changed = true;
         }
         if changed {
@@ -809,6 +851,7 @@ mod tests {
             l_build: (base.r * 2).max(64),
             metric: base.metric,
             max_norm: base.max_norm,
+            nav: AnnNav::Augmented,
             vamana_block_bytes: BLOCK,
             pq_block_bytes: BLOCK,
             zstd_level: LEVEL,
@@ -1399,6 +1442,7 @@ mod tests {
             base_count: n,
             metric: base.metric,
             max_norm: base.max_norm,
+            is_ip: false,
             space_dim: 16,
             delta_ann: &delta_ann,
             cache: RefCell::new(HashMap::new()),
@@ -1457,6 +1501,7 @@ mod tests {
             alpha: params.alpha,
             metric: params.metric,
             max_norm: params.max_norm,
+            nav: params.nav,
             space_dim,
             cache_records: recommended_cache_records(params.r),
             cache_blocks: RECOMMENDED_CACHE_BLOCKS,
@@ -1599,6 +1644,7 @@ mod tests {
             base_count: base_n,
             metric: params.metric,
             max_norm: params.max_norm,
+            is_ip: params.nav == AnnNav::InnerProduct,
             space_dim,
             delta_ann: &delta_ann,
             cache: RefCell::new(HashMap::new()),

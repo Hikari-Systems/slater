@@ -2321,6 +2321,7 @@ fn write_vamana_inner(
                 alpha: f.alpha,
                 metric: Metric::Cosine,
                 max_norm: 1.0,
+                nav: graph_format::manifest::AnnNav::Augmented,
                 // The `.pq` written above already names every hole; nothing extra to tombstone.
                 tombstoned: &[],
                 vamana_block_bytes: f.vector_block_size,

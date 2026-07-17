@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::columns::encode_props_record_into;
 use crate::ids::Value;
-use crate::manifest::{EntityKind, Metric};
+use crate::manifest::{AnnNav, EntityKind, Metric};
 use crate::nodelabels::encode_labels_record_into;
 use crate::wire::{read_uvarint, write_uvarint};
 
@@ -147,6 +147,12 @@ pub struct DumpVectorCarry {
     pub max_norm: f32,
     pub pq_subspaces: u32,
     pub pq_bits: u32,
+    /// How the carried base graph is navigated (HIK-137). **Additive-optional**: absent on a
+    /// pre-HIK-137 dump ⇒ [`AnnNav::Augmented`]. Threaded so a merged/consolidated IP-native base
+    /// re-emits a manifest that still carries `nav: inner_product` — a Dot base must not silently
+    /// become augmented across a consolidation.
+    #[serde(default, skip_serializing_if = "AnnNav::is_augmented")]
+    pub nav: AnnNav,
 }
 
 /// The dump's `meta.json`: everything the builder needs that is not in the
@@ -698,6 +704,7 @@ mod tests {
             max_norm: 2.5,
             pq_subspaces: 8,
             pq_bits: 8,
+            nav: AnnNav::InnerProduct,
         };
         w.finish(
             vec!["Doc".into()],

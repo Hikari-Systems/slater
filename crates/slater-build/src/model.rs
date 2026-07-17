@@ -179,4 +179,8 @@ pub struct VectorCarry {
     pub max_norm: f32,
     pub pq_subspaces: u32,
     pub pq_bits: u32,
+    /// How the carried base graph is navigated (HIK-137) — `inner_product` for an IP-native Dot
+    /// base. Additive-optional so a pre-HIK-137 dump defaults to `Augmented`.
+    #[serde(default)]
+    pub nav: graph_format::manifest::AnnNav,
 }

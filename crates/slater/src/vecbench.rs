@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use graph_format::manifest::Metric;
+use graph_format::manifest::{AnnNav, Metric};
 use graph_format::pq::{
     ann_point, ann_pq_params, ann_query, l2_norm, train_codebooks, AdcTable, Codebook, PqParams,
     PqReader, PqWriter, ResidentPq, HOLE,
@@ -287,6 +287,11 @@ pub struct VecFixture {
     pub raw: Vec<Vec<f32>>,
     pub space_dim: usize,
     pub max_norm: f64,
+    /// How this fixture's graph is navigated. `VecFixture::build` is the **augmented** lifecycle
+    /// (`ann_point`), so this is always [`AnnNav::Augmented`]; it is a field so the `merge_params`/
+    /// `consolidate_opts` helpers stamp the discriminator the ladder now requires. IP-native ladder
+    /// paths are driven by the dedicated `write_ip_disk_index` + `*_ip` helpers.
+    pub nav: AnnNav,
     pub params: PqParams,
     pub codebook: Codebook,
     /// `codes[i]` = `codebook.encode(ann_point(raw[i]))`, input order.
@@ -320,6 +325,7 @@ impl VecFixture {
             raw,
             space_dim,
             max_norm,
+            nav: AnnNav::Augmented,
             params,
             codebook,
             codes,
@@ -519,6 +525,7 @@ pub fn consolidate_opts(fx: &VecFixture, medoid: VamanaIndex) -> ConsolidateOpts
         alpha: VAMANA_ALPHA,
         metric: fx.metric,
         max_norm: fx.max_norm,
+        nav: fx.nav,
         space_dim: fx.space_dim,
         cache_records: recommended_cache_records(VAMANA_R),
         cache_blocks: RECOMMENDED_CACHE_BLOCKS,
@@ -553,6 +560,7 @@ pub fn merge_params(fx: &VecFixture, medoid: VamanaIndex) -> MergeParams {
         l_build: (VAMANA_R * 2).max(64),
         metric: fx.metric,
         max_norm: fx.max_norm,
+        nav: fx.nav,
         vamana_block_bytes: BLOCK,
         pq_block_bytes: BLOCK,
         zstd_level: ZSTD,

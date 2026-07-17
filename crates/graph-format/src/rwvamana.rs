@@ -32,22 +32,22 @@
 //!   right there in RAM, so there is no PQ (the set is bounded — PQ would buy nothing but
 //!   error). The D26 tie-break (ascending node id) and the exact re-rank come free.
 //!
-//! # The ANN space, and why `dist` computes the dot augmentation on the fly
+//! # The construction space (cosine/L2 augmented; dot is IP-native — HIK-137)
 //!
-//! Robust prune's domination test is only sound over a true metric, so the graph is built in
-//! the metric's **ANN space** ([`crate::pq::ann_point`]): cosine ⇒ unit vectors (D29), L2 ⇒
-//! identity, dot ⇒ the MIPS norm-augmentation `[x, √(M² − ‖x‖²)]` with `M = max‖x‖` over the
-//! indexed set.
+//! Robust prune's domination test is only sound over a true metric, so a **cosine or L2** graph
+//! is built in the metric's **ANN space** ([`crate::pq::ann_point`]): cosine ⇒ unit vectors
+//! (D29), L2 ⇒ identity. Those two arms are unchanged.
 //!
-//! That `M` is a property of the *whole set*, and this set **moves**. Materialising the
-//! augmented coordinate at insert time — as the offline builder does, where `M` is known up
-//! front — would leave every earlier row's augmentation stale the moment a longer vector
-//! arrives, with no error and no panic: just a graph built in a space that no longer exists.
-//! So the rows here store the **raw** vector (cosine excepted, which is scale-free), plus a
-//! cached `‖x‖²`, and [`PointSet::dist`] reconstructs the augmentation from the *current* `M`
-//! on every call. O(1) extra per distance, and `M` may grow freely.
+//! **Dot is built IP-native** (HIK-137 phase 3), exactly as the offline base build is
+//! ([`crate::vamana::build_vamana_ip`]): closeness is the **raw** inner product, so
+//! [`PointSet::dist`] returns `−⟨a,b⟩` with no norm augmentation, an insert selects the top-R by
+//! IP ([`crate::vamana::insert_point_ip`] / `ip_prune_over`) instead of the α-domination robust
+//! prune, and the entry point is the **highest-norm** row (the natural IP hub), tracked
+//! incrementally as rows arrive. This retires the whole `max_norm`/augmentation machinery for Dot
+//! — there is no moving `M` to keep coherent — which is what makes the old `max_norm`-carry
+//! distortion (a growing `M` staling earlier rows' augmentation) *moot* rather than merely bounded.
 //!
-//! Adjacency chosen under an older, smaller `M` stays valid — it is a navigational structure,
+//! Adjacency chosen while the graph was smaller stays valid — it is a navigational structure,
 //! not an answer — and every emitted score comes from the caller's **exact** re-rank of the
 //! raw vector under the true metric, so the scores this arm feeds `slater`'s `merge_topk` are
 //! on the same scale as every other arm's (the D29/HIK-109 invariant).
@@ -78,11 +78,12 @@
 //! # Navigating by the exact score is the same walk
 //!
 //! [`beam_search`] wants an `estimate` for navigation and an `exact` for ranking; here they
-//! are the same closure. That is not a shortcut, it is an identity: for a *fixed* query, the
-//! exact distance is **monotone** in the ANN-space squared-L2 under all three metrics —
-//! cosine (`‖q̂ − x̂‖² = 2 − 2cos` vs `1 − cos`), L2 (identical), dot
-//! (`‖q′ − x′‖² = ‖q‖² + M² − 2⟨q, x⟩` vs `−⟨q, x⟩`). Ranking by one *is* ranking by the
-//! other, so the beam expands exactly the nodes an ANN-space estimate would have expanded.
+//! are the same closure. That is not a shortcut, it is an identity: for a *fixed* query the
+//! exact distance and the construction-space distance induce the **same order** on candidates —
+//! cosine (`‖q̂ − x̂‖² = 2 − 2cos` vs `1 − cos`), L2 (identical), dot (both are the raw
+//! `−⟨q, x⟩` — the IP-native build measures exactly what the caller re-ranks with). Ranking by
+//! one *is* ranking by the other, so the beam expands exactly the nodes the construction-space
+//! estimate would have expanded.
 
 use std::collections::HashMap;
 
@@ -92,7 +93,8 @@ use wide::f32x8;
 use crate::manifest::Metric;
 use crate::pq::{normalise_into, require_finite};
 use crate::vamana::{
-    beam_search, insert_point, BeamParams, Expanded, InsertParams, SearchHit, VamanaIndex,
+    beam_search, insert_point, insert_point_ip, BeamParams, Expanded, InsertParams, SearchHit,
+    VamanaIndex,
 };
 
 /// Out-degree bound `R`. FreshDiskANN's RW index is small and fully resident, so a modest
@@ -110,13 +112,12 @@ struct Points {
     metric: Metric,
     dim: usize,
     /// Row-major `slots × dim` in **point space**: unit-normalised for cosine (D29), raw for
-    /// L2 and dot. Never the dot *augmented* row — see the module doc.
+    /// L2 and dot. For dot the row is the raw vector and the IP build measures `−⟨a,b⟩` over it
+    /// directly — there is no augmented row (HIK-137).
     data: Vec<f32>,
-    /// `‖x‖²` of the raw vector, per slot. Read only by [`Metric::Dot`]'s augmentation.
+    /// `‖x‖²` of the raw vector, per slot. Doubles as the slot count ([`PointSet::len`]) and,
+    /// for [`Metric::Dot`], selects the highest-norm IP entry point ([`RwVamana::medoid`]).
     norm2: Vec<f64>,
-    /// `M²` where `M = max‖x‖` over every vector ever inserted (dead slots included — a dead
-    /// slot is still navigated through, so its augmentation must stay coherent).
-    max_norm2: f64,
 }
 
 /// Squared-L2 between two rows, f32 SIMD with a scalar tail.
@@ -161,13 +162,25 @@ impl Points {
         &self.data[i * self.dim..(i + 1) * self.dim]
     }
 
-    /// The dot/MIPS augmented coordinate `√(M² − ‖x‖²)` for slot `i`, from the **current** `M`.
-    /// Clamped at zero: `M` is the maximum, so the difference is `≥ 0` in exact arithmetic, but
-    /// an f32 round-trip can put it a hair below and a `NaN` coordinate is *ordered* by
-    /// `total_cmp`, not rejected.
+    /// Raw inner product `⟨row(a), row(b)⟩`, f32 SIMD with a scalar tail — the IP-native Dot
+    /// closeness. Same navigation-only f32 trade as [`l2_sq_simd`] (every reported score is the
+    /// caller's exact f64 re-rank).
     #[inline]
-    fn augment(&self, i: VamanaIndex) -> f64 {
-        (self.max_norm2 - self.norm2[i as usize]).max(0.0).sqrt()
+    fn ip(&self, a: VamanaIndex, b: VamanaIndex) -> f64 {
+        let (x, y) = (self.row(a), self.row(b));
+        let mut acc = f32x8::ZERO;
+        let mut xr = x.chunks_exact(8);
+        let mut yr = y.chunks_exact(8);
+        for (xc, yc) in xr.by_ref().zip(yr.by_ref()) {
+            let xv = f32x8::from(<[f32; 8]>::try_from(xc).unwrap());
+            let yv = f32x8::from(<[f32; 8]>::try_from(yc).unwrap());
+            acc = xv.mul_add(yv, acc);
+        }
+        let mut sum = acc.reduce_add();
+        for (p, q) in xr.remainder().iter().zip(yr.remainder()) {
+            sum += p * q;
+        }
+        sum as f64
     }
 }
 
@@ -177,17 +190,13 @@ impl crate::vamana::PointSet for Points {
     }
 
     fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
-        let base = l2_sq_simd(self.row(a), self.row(b));
         Ok(match self.metric {
             // Cosine rows are unit vectors and L2 rows are the metric's own space, so the
             // stored squared-L2 *is* the ANN-space distance.
-            Metric::Cosine | Metric::L2 => base,
-            // Dot: the augmented coordinate is the only difference between the raw row and
-            // the ANN-space point, and it contributes exactly one squared term.
-            Metric::Dot => {
-                let d = self.augment(a) - self.augment(b);
-                base + d * d
-            }
+            Metric::Cosine | Metric::L2 => l2_sq_simd(self.row(a), self.row(b)),
+            // Dot: IP-native (HIK-137). Closeness is the raw inner product, maximised, so the
+            // min-based Vamana primitives descend on `−⟨a,b⟩`. No norm augmentation.
+            Metric::Dot => -self.ip(a, b),
         })
     }
 }
@@ -208,8 +217,10 @@ pub struct RwVamana {
     /// Live node id → its slot. The *only* place a node id maps to a slot, so a re-embed
     /// cannot leave two live slots for one id.
     slot_of: HashMap<u64, VamanaIndex>,
-    /// The beam's entry point. Recomputed as the set grows (see [`Self::maybe_remedoid`]).
-    /// May be a dead slot — a dead slot is a perfectly good waypoint.
+    /// The beam's entry point. For cosine/L2 it is recomputed as the centroid-closest slot as
+    /// the set grows ([`Self::maybe_remedoid`]); for dot it is the **highest-norm** slot, the
+    /// natural IP hub, tracked incrementally on every insert (HIK-137). May be a dead slot — a
+    /// dead slot is a perfectly good waypoint.
     medoid: VamanaIndex,
     /// Running sum of the point-space rows, for the medoid recompute. Over *every* slot,
     /// dead included: an entry point does not have to be live, and tracking live-only would
@@ -234,7 +245,6 @@ impl RwVamana {
                 dim,
                 data: Vec::new(),
                 norm2: Vec::new(),
-                max_norm2: 0.0,
             },
             adjacency: Vec::new(),
             node_id: Vec::new(),
@@ -298,7 +308,8 @@ impl RwVamana {
         }
         // A distinct entry point (the delta write path): a NaN/±inf here poisons the resident
         // data buffer *immediately*, before any consolidation, and no downstream guard catches
-        // it (the `max_norm2.max(norm2)` below silently drops a NaN). Reject up front (HIK-134).
+        // it (`highest_norm` selection and the IP dot silently order a NaN by `total_cmp`).
+        // Reject up front (HIK-134).
         require_finite(vector)?;
         // Delete-then-insert. Order matters only for clarity — the new slot is appended
         // below, so it cannot be the one we just killed.
@@ -315,7 +326,6 @@ impl RwVamana {
             Metric::L2 | Metric::Dot => self.points.data.extend_from_slice(vector),
         }
         self.points.norm2.push(norm2);
-        self.points.max_norm2 = self.points.max_norm2.max(norm2);
         self.node_id.push(node_id);
         self.dead.push(false);
         self.adjacency.push(Vec::new());
@@ -332,25 +342,37 @@ impl RwVamana {
         }
 
         self.stamps.resize(self.node_id.len(), 0);
-        let params = InsertParams {
-            medoid: self.medoid,
-            alpha: RW_ALPHA,
-            r: RW_R,
-            l_build: RW_L_BUILD,
-        };
         // Three disjoint field borrows: `&mut adjacency`, `&points`, `&mut stamps`. This split
         // is the whole reason `Points` is its own struct.
         let mut expanded = Expanded::Stamps {
             buf: &mut self.stamps,
             gen: self.stamp_gen,
         };
-        let res = insert_point(
-            slot,
-            &mut self.adjacency,
-            &self.points,
-            params,
-            &mut expanded,
-        );
+        // Dot is IP-native: weave the point in by the top-R-by-IP rule (HIK-137). Cosine/L2 keep
+        // the α-domination robust-prune insert (`Points::dist` gives the right space for each).
+        let res = match self.points.metric {
+            Metric::Dot => insert_point_ip(
+                slot,
+                &mut self.adjacency,
+                &self.points,
+                self.medoid,
+                RW_R,
+                RW_L_BUILD,
+                &mut expanded,
+            ),
+            Metric::Cosine | Metric::L2 => insert_point(
+                slot,
+                &mut self.adjacency,
+                &self.points,
+                InsertParams {
+                    medoid: self.medoid,
+                    alpha: RW_ALPHA,
+                    r: RW_R,
+                    l_build: RW_L_BUILD,
+                },
+                &mut expanded,
+            ),
+        };
         // Carry the generation forward, so the next insert does not re-read this search's
         // stamps as its own. (`Expanded` bumps it internally; it is by-value, so read it back.)
         if let Expanded::Stamps { gen, .. } = &expanded {
@@ -358,7 +380,17 @@ impl RwVamana {
         }
         res?;
 
-        self.maybe_remedoid();
+        // Entry point: dot rides the highest-norm hub, tracked incrementally (the just-inserted
+        // slot becomes the entry iff it is strictly the longest — ties keep the earliest, which
+        // matches the offline `highest_norm_entry`). Cosine/L2 use the centroid remedoid.
+        match self.points.metric {
+            Metric::Dot => {
+                if self.points.norm2[slot as usize] > self.points.norm2[self.medoid as usize] {
+                    self.medoid = slot;
+                }
+            }
+            Metric::Cosine | Metric::L2 => self.maybe_remedoid(),
+        }
         Ok(())
     }
 
@@ -724,22 +756,16 @@ mod tests {
         );
     }
 
-    /// The dot/MIPS arm, and the one thing about it that is *this* module's problem: `M =
-    /// max‖x‖` **moves** as vectors arrive.
+    /// The dot/MIPS arm is **IP-native** (HIK-137): the graph is built over raw inner product
+    /// with no norm augmentation, so the moving-`M` hazard that used to threaten this arm cannot
+    /// exist — there is no `M`. This test pins the two things that must instead hold: (a) MIPS
+    /// recall against an independent brute-force IP truth, and (b) the entry point rides the
+    /// **highest-norm** row.
     ///
-    /// The vectors go in with norms ramping 1 → 8, in ascending order, so at the moment each
-    /// row is stored the running `M` is that row's *own* norm — i.e. an augmentation
-    /// materialised at insert time would be `√(M² − ‖x‖²) = 0` for every single one, and the
-    /// graph would be built in a space where the augmented coordinate carries no information
-    /// at all. Recomputing it from the current `M` on every distance is what keeps the space
-    /// coherent, and MIPS recall is the only thing that can observe the difference.
-    ///
-    /// (A *large-norm outlier* — one vector 40× the rest — is a different animal: the
-    /// augmentation correctly places it ~`M` away from the whole cloud, and no bounded-degree
-    /// proximity graph reaches an isolated point well. That is inherent to Vamana over MIPS,
-    /// not to the mutability here, and the offline builder has it too.)
+    /// The vectors go in with norms ramping 1 → 8 in ascending insert order, so the highest-norm
+    /// row is the last-inserted slot — the incremental entry-point tracking must land there.
     #[test]
-    fn rw_index_dot_augmentation_tracks_a_growing_max_norm() {
+    fn rw_index_dot_is_ip_native_and_enters_at_the_highest_norm() {
         let dim = 8;
         let n = 400;
         let mut rw = RwVamana::new(dim, Metric::Dot);
@@ -748,7 +774,7 @@ mod tests {
             .iter()
             .enumerate()
         {
-            // Norms ramp 1 → 8 in insert order, so `M` grows on very nearly every insert.
+            // Norms ramp 1 → 8 in insert order, so the last-inserted row is the longest.
             let scale = 1.0 + 7.0 * (i as f32) / (n as f32);
             let nrm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
             let scaled: Vec<f32> = v.iter().map(|x| x * scale / nrm).collect();
@@ -756,6 +782,16 @@ mod tests {
             live.push((i as u64, scaled));
         }
 
+        // (b) The IP entry point is the highest-norm slot — here the last one inserted.
+        assert_eq!(
+            rw.medoid,
+            (n - 1) as VamanaIndex,
+            "the dot entry point must ride the highest-norm row, not a centroid medoid"
+        );
+
+        // (a) Recall@k vs the independent brute-force IP top-k. The bar is high: IP-native
+        // construction recovers essentially all of it on this benign norm spread, so a regression
+        // to the old augmented build (which craters on MIPS-hard data) shows up immediately.
         let k = 5;
         let queries = unit_vectors(dim, 20, 0xfeed_0000_0000_0001);
         let mut total = 0.0f64;
@@ -768,7 +804,44 @@ mod tests {
         let recall = total / queries.len() as f64;
         assert!(
             recall >= 0.9,
-            "MIPS recall@{k} was {recall:.3} — the norm augmentation is not tracking max‖x‖"
+            "IP-native MIPS recall@{k} was {recall:.3} — the dot delta graph is not navigating by raw IP"
+        );
+    }
+
+    /// A MIPS-hard delta: one heavy-norm outlier plus a cloud, exactly the shape that craters an
+    /// augmented (L2-reduced) build. IP-native construction must still recover the true IP top-k.
+    /// This is the delta twin of the base build's adversarial (Pareto) fixture.
+    #[test]
+    fn rw_index_dot_ip_native_survives_a_heavy_norm_outlier() {
+        let dim = 16;
+        let n = 600;
+        let mut rw = RwVamana::new(dim, Metric::Dot);
+        let mut live: Vec<(u64, Vec<f32>)> = Vec::new();
+        for (i, v) in unit_vectors(dim, n, 0xa5a5_0f0f_1234_5678)
+            .iter()
+            .enumerate()
+        {
+            // Most rows are unit-ish; every 97th is a ~30× outlier — a high-norm vector is "near"
+            // almost every query under IP, the navigation hazard the augmented build fails.
+            let scale = if i % 97 == 0 { 30.0 } else { 1.0 };
+            let nrm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+            let scaled: Vec<f32> = v.iter().map(|x| x * scale / nrm).collect();
+            rw.insert(i as u64, &scaled).unwrap();
+            live.push((i as u64, scaled));
+        }
+        let k = 10;
+        let queries = unit_vectors(dim, 30, 0x1357_9bdf_0000_0002);
+        let mut total = 0.0f64;
+        for q in &queries {
+            let hits = rw.search(q, k, 64, |v| neg_dot(q, v), always_live).unwrap();
+            let got: std::collections::HashSet<u64> = hits.iter().map(|h| h.node_id).collect();
+            let want = brute(&live, q, k, neg_dot);
+            total += want.iter().filter(|id| got.contains(id)).count() as f64 / k as f64;
+        }
+        let recall = total / queries.len() as f64;
+        assert!(
+            recall >= 0.9,
+            "IP-native MIPS recall@{k} on a heavy-norm-outlier delta was {recall:.3}"
         );
     }
 

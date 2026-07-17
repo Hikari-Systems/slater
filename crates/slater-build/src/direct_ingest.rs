@@ -263,6 +263,7 @@ pub fn ingest_dump(
                 max_norm: c.max_norm,
                 pq_subspaces: c.pq_subspaces,
                 pq_bits: c.pq_bits,
+                nav: c.nav,
             }),
         })
         .collect();
