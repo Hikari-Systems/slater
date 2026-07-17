@@ -263,6 +263,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
                 // No holes in the fixture; the vectors are unit length, so M = 1.
                 live_count: N as u64,
                 max_norm: 1.0,
+                nav: graph_format::manifest::AnnNav::Augmented,
             },
         }],
         reltype_source_counts: vec![],

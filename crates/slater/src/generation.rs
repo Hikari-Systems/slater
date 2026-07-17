@@ -160,12 +160,14 @@ pub struct VamanaIndex {
 ///    Recall for the entire index goes to zero, with no error and no panic. This is the
 ///    invariant a delete-splice must preserve (see `AnnMode::Vamana::medoid`); here is
 ///    where a violation is caught.
+#[allow(clippy::too_many_arguments)]
 fn validate_vamana_index(
     stem: &str,
     reader: &VamanaReader,
     pq: &ResidentPq,
     desc: &VectorIndexDesc,
     medoid: u64,
+    nav: graph_format::manifest::AnnNav,
     pq_subspaces: u32,
     pq_bits: u32,
 ) -> Result<()> {
@@ -185,22 +187,31 @@ fn validate_vamana_index(
             desc.count
         );
     }
-    // 4. The codebook must be in the ANN space the MANIFEST's metric implies.
+    // 4. The codebook must be in the space the MANIFEST's (metric, nav) pair implies.
     //
-    // The read path derives the query transform from `desc.metric` and the *codebook's*
-    // dimension (`ann_query`). Those two are the only inputs, and if they disagree the
-    // search still runs: a `dot` descriptor over a codebook trained in cosine/L2 space
-    // (dim, not dim + dsub) makes `ann_query` a no-op, so the beam navigates by plain
-    // squared-L2 while the re-rank scores by inner product. Wrong neighbours, plausible
-    // scores, no error anywhere. Tie the file back to the descriptor so the space cannot
-    // drift — the invariant `graph_format::pq`'s DESIGN note states, enforced.
-    let expected = graph_format::pq::ann_pq_params(desc.metric, desc.dim, pq_subspaces, pq_bits)
-        .with_context(|| format!("vector index {stem} has invalid PQ parameters"))?;
+    // The read path derives the query transform from the descriptor and the *codebook's*
+    // dimension. Those are the only inputs, and if they disagree the search still runs with
+    // wrong neighbours, plausible scores, and no error anywhere. Tie the file back to the
+    // descriptor so the space cannot drift — the invariant `graph_format::pq`'s DESIGN note
+    // states, enforced. HIK-137: an `InnerProduct` (IP-native) index is trained on the RAW
+    // vectors over plain `PqParams` (dim, not the dot augmentation's dim + dsub); an `Augmented`
+    // index is in the metric's L2-reduced ANN space (`ann_pq_params`). Checking against the wrong
+    // one would reject a valid IP index — or, worse, accept an augmented codebook under an
+    // `InnerProduct` label (the beam would then navigate by IP-ADC over an augmented codebook).
+    let expected = match nav {
+        graph_format::manifest::AnnNav::InnerProduct => {
+            graph_format::pq::PqParams::new(desc.dim, pq_subspaces, pq_bits)
+        }
+        graph_format::manifest::AnnNav::Augmented => {
+            graph_format::pq::ann_pq_params(desc.metric, desc.dim, pq_subspaces, pq_bits)
+        }
+    }
+    .with_context(|| format!("vector index {stem} has invalid PQ parameters"))?;
     if pq.codebook.params != expected {
         bail!(
-            "vector index {stem} declares metric {:?} over dim {} with {pq_subspaces}×{pq_bits}-bit \
-             PQ, which is the ANN space {expected:?} — but its .pq codebook is {:?}. The build and \
-             the read path would navigate in different spaces.",
+            "vector index {stem} declares metric {:?} / nav {nav:?} over dim {} with \
+             {pq_subspaces}×{pq_bits}-bit PQ, which is the space {expected:?} — but its .pq codebook \
+             is {:?}. The build and the read path would navigate in different spaces.",
             desc.metric,
             desc.dim,
             pq.codebook.params
@@ -523,6 +534,7 @@ impl Generation {
                 medoid,
                 pq_subspaces,
                 pq_bits,
+                nav,
                 ..
             } = vi.mode
             else {
@@ -543,7 +555,16 @@ impl Generation {
                 pq.load_resident()
                     .with_context(|| format!("load resident PQ codes for {stem}.pq"))?,
             );
-            validate_vamana_index(&stem, &reader, &resident, vi, medoid, pq_subspaces, pq_bits)?;
+            validate_vamana_index(
+                &stem,
+                &reader,
+                &resident,
+                vi,
+                medoid,
+                nav,
+                pq_subspaces,
+                pq_bits,
+            )?;
             vamana_indexes.insert(
                 (vi.label.clone(), vi.property.clone()),
                 VamanaIndex {
@@ -1890,6 +1911,7 @@ mod tests {
                 pq_bits: 4,
                 live_count: n as u64,
                 max_norm: max_norm as f32,
+                nav: graph_format::manifest::AnnNav::Augmented,
             },
         };
         (dir, reader, resident, desc)
@@ -1904,8 +1926,17 @@ mod tests {
     fn an_orphaned_medoid_is_refused_rather_than_served() {
         use graph_format::manifest::Metric;
         let (dir, reader, pq, desc) = vamana_pair("orphan", Metric::Cosine, 2, true, 6);
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
-            .expect_err("an index whose entry point has no out-edges must not open");
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .expect_err("an index whose entry point has no out-edges must not open");
         assert!(
             err.to_string().contains("orphaned medoid"),
             "unexpected: {err:#}"
@@ -1914,10 +1945,30 @@ mod tests {
         // The same index with the medoid's edges intact opens fine — the guard is not
         // simply rejecting everything.
         let (dir2, reader2, pq2, desc2) = vamana_pair("ok", Metric::Cosine, 2, false, 6);
-        validate_vamana_index("x", &reader2, &pq2, &desc2, 0, 2, 4).unwrap();
+        validate_vamana_index(
+            "x",
+            &reader2,
+            &pq2,
+            &desc2,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap();
         // An out-of-range medoid is refused too: the beam search indexes the resident codes
         // with it directly, so it is a panic on an ordinary query.
-        let err = validate_vamana_index("x", &reader2, &pq2, &desc2, 99, 2, 4).unwrap_err();
+        let err = validate_vamana_index(
+            "x",
+            &reader2,
+            &pq2,
+            &desc2,
+            99,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("medoid"), "unexpected: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -1930,7 +1981,17 @@ mod tests {
     fn a_pq_and_vamana_record_count_disagreement_is_refused() {
         use graph_format::manifest::Metric;
         let (dir, reader, pq, desc) = vamana_pair("short", Metric::Cosine, 2, false, 4);
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4).unwrap_err();
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("lockstep"), "unexpected: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1949,12 +2010,143 @@ mod tests {
         assert_eq!(pq.codebook.params.dim, 4);
         // ...but the MANIFEST claims dot, whose ANN space is dim + dsub = 6 over 3 subspaces.
         desc.metric = Metric::Dot;
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
-            .expect_err("a codebook in the wrong space for the declared metric must not open");
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .expect_err("a codebook in the wrong space for the declared metric must not open");
         assert!(
             err.to_string().contains("different spaces"),
             "unexpected: {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HIK-137: the reader must **dispatch on `nav`, or refuse legibly**. A genuine IP-native index
+    /// (raw codebook, plain `PqParams`) validates as `InnerProduct`; the *same* raw codebook
+    /// validated as `Augmented`, and an augmented Dot codebook validated as `InnerProduct`, are both
+    /// refused for the space mismatch — so a Dot index built the old (augmented) way can never be
+    /// mis-navigated by the IP-ADC read path, and vice versa.
+    #[test]
+    fn ip_native_index_validates_and_a_space_nav_mismatch_is_refused() {
+        use graph_format::manifest::{AnnMode, AnnNav, Metric, VectorIndexDesc};
+        use graph_format::pq::{
+            ann_point, ann_pq_params, l2_norm, train_codebooks, PqParams, PqWriter,
+        };
+        use graph_format::vamana::{VamanaReader, VamanaWriter};
+
+        let (dim, n, subspaces, bits) = (4usize, 6usize, 2u32, 4u32);
+        let dir = std::env::temp_dir().join(format!("slater_ipval_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw: Vec<Vec<f32>> = (0..n)
+            .map(|i| (0..dim).map(|d| (i + d) as f32 + 1.0).collect())
+            .collect();
+
+        // A `.vamana` over the raw vectors, complete adjacency (no orphan medoid).
+        let mut vw = VamanaWriter::create_with_cipher(dir.join("x.vamana"), 4096, 3, None).unwrap();
+        for (i, v) in raw.iter().enumerate() {
+            let nbrs: Vec<u32> = (0..n as u32).filter(|&j| j != i as u32).collect();
+            vw.append(v, &nbrs).unwrap();
+        }
+        vw.finish().unwrap();
+        let reader = VamanaReader::open_with_cipher(dir.join("x.vamana"), None).unwrap();
+
+        let mk_desc = |nav| VectorIndexDesc {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: dim as u32,
+            metric: Metric::Dot,
+            count: n as u64,
+            first_record: 0,
+            mode: AnnMode::Vamana {
+                r: 8,
+                alpha: 1.2,
+                medoid: 0,
+                pq_subspaces: subspaces,
+                pq_bits: bits,
+                live_count: n as u64,
+                max_norm: 1.0,
+                nav,
+            },
+        };
+        let write_pq = |name: &str, cb: &graph_format::pq::Codebook, encoded: &[Vec<f32>]| {
+            let mut pw = PqWriter::create_with_cipher(dir.join(name), cb, 4096, 3, None).unwrap();
+            for p in encoded {
+                pw.append_codes(0, &cb.encode(p).unwrap()).unwrap();
+            }
+            pw.finish().unwrap();
+            PqReader::open_with_cipher(dir.join(name), None)
+                .unwrap()
+                .load_resident()
+                .unwrap()
+        };
+
+        // (1) A genuine IP-native codebook: plain PqParams over the RAW vectors.
+        let ip_cb =
+            train_codebooks(&raw, PqParams::new(dim as u32, subspaces, bits).unwrap(), 5).unwrap();
+        let ip_pq = write_pq("ip.pq", &ip_cb, &raw);
+        validate_vamana_index(
+            "x",
+            &reader,
+            &ip_pq,
+            &mk_desc(AnnNav::InnerProduct),
+            0,
+            AnnNav::InnerProduct,
+            subspaces,
+            bits,
+        )
+        .expect("a raw codebook under InnerProduct must validate");
+        // The SAME raw codebook validated as Augmented (Dot) expects the augmented space
+        // (dim + dsub), so it is refused — no silent mis-navigation.
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &ip_pq,
+            &mk_desc(AnnNav::Augmented),
+            0,
+            AnnNav::Augmented,
+            subspaces,
+            bits,
+        )
+        .expect_err("a raw codebook under Augmented must be refused");
+        assert!(
+            err.to_string().contains("different spaces"),
+            "unexpected: {err:#}"
+        );
+
+        // (2) An augmented Dot codebook validated as InnerProduct must ALSO be refused: the IP-ADC
+        // read path must never navigate an augmented codebook.
+        let aug_params = ann_pq_params(Metric::Dot, dim as u32, subspaces, bits).unwrap();
+        let max_norm = raw.iter().map(|v| l2_norm(v)).fold(0.0f64, f64::max);
+        let aug_points: Vec<Vec<f32>> = raw
+            .iter()
+            .map(|v| ann_point(Metric::Dot, v, max_norm, aug_params.dim as usize).unwrap())
+            .collect();
+        let aug_cb = train_codebooks(&aug_points, aug_params, 5).unwrap();
+        let aug_pq = write_pq("aug.pq", &aug_cb, &aug_points);
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &aug_pq,
+            &mk_desc(AnnNav::InnerProduct),
+            0,
+            AnnNav::InnerProduct,
+            subspaces,
+            bits,
+        )
+        .expect_err("an augmented codebook under InnerProduct must be refused");
+        assert!(
+            err.to_string().contains("different spaces"),
+            "unexpected: {err:#}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
