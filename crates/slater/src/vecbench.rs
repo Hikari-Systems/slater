@@ -28,8 +28,8 @@ use graph_format::pq::{
     PqReader, PqWriter, ResidentPq, HOLE,
 };
 use graph_format::vamana::{
-    beam_search, bfs_order, build_vamana, BeamParams, VamanaGraph, VamanaIndex, VamanaReader,
-    VamanaWriter,
+    beam_search, bfs_order, build_vamana, greedy_search_over, BeamParams, Expanded, PointSet,
+    VamanaGraph, VamanaIndex, VamanaReader, VamanaWriter,
 };
 use graph_format::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
@@ -581,6 +581,342 @@ pub fn merge_to(
     Ok((vout, pout, stats))
 }
 
+// ── HIK-137 phase-1 SPIKE: a bench-only IP-native (MIPS) navigator ───────────────
+//
+// **Throwaway measurement code, not a production path.** The production Dot index
+// (`ann_point`/`ann_query`/`max_norm` augmentation + PQ, driven by [`VecFixture`] above)
+// is left EXACTLY as is. Everything in this section is a *parallel* navigator that never
+// touches the augmentation path, the manifest, the ladder, or the on-disk format — it
+// exists solely to answer one question against the D1 ground truth: **can an IP-native
+// GRAPH navigate to the true inner-product top-k?** (phase-1 gate for HIK-137).
+//
+// The three departures from the augmented Vamana above, per the MIPS design:
+//   * **Closeness = inner product, maximised.** Navigation is by `distance(Dot,·) = -⟨a,b⟩`
+//     over the **raw** vectors — no augmentation. The min-based Vamana primitives
+//     (`greedy_search_over`, `beam_search`) work unchanged when fed negated IP, and reusing
+//     the *same* `distance(Dot)` the D1 truth uses guarantees the orientation agrees.
+//   * **Neighbour selection = top-R by IP (s-Delaunay).** Robust-prune's α-domination test
+//     is unsound over inner product (no triangle inequality — the very reason augmentation
+//     was chosen for the production path), so it is REPLACED by [`ip_top_r`]: from the
+//     candidate pool, keep the R strongest-IP neighbours. No α.
+//   * **IP-appropriate entry.** The walk enters at the **highest-norm** node, not the L2
+//     centroid/medoid (which is wrong for MIPS — a high-norm vector is "near" everything
+//     under IP, so it is the natural hub).
+//
+// The walk navigates by **exact resident IP** (estimate == exact, no PQ — mirrors RwVamana),
+// which isolates *graph* recall from *PQ-estimate* recall. A high number here means the graph
+// works and PQ is the only remaining risk; a low number means the graph itself is the problem.
+
+/// Inner product of two f32 vectors as f64 — the raw MIPS closeness, un-augmented.
+pub fn ip(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+}
+
+/// An IP "point set" for the Vamana construction seam: `dist(a,b) = distance(Dot) = -⟨a,b⟩`,
+/// so **minimising** it **maximises** inner product. This is what lets the audited min-based
+/// `greedy_search_over` build a graph that descends towards the strongest-IP node — with **no
+/// augmentation and no PQ** anywhere in the path.
+pub struct IpPoints<'a>(pub &'a [Vec<f32>]);
+
+impl PointSet for IpPoints<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
+        Ok(distance(
+            Metric::Dot,
+            &self.0[a as usize],
+            &self.0[b as usize],
+        ))
+    }
+}
+
+/// The IP-appropriate entry point (design §3, T0 row): the **highest-norm** node. Under inner
+/// product a high-norm vector scores well against almost every query, so it is the natural hub
+/// to descend from — unlike the L2 centroid/medoid, which is the wrong entry for MIPS.
+pub fn highest_norm_node(raw: &[Vec<f32>]) -> VamanaIndex {
+    (0..raw.len())
+        .max_by(|&a, &b| l2_norm(&raw[a]).total_cmp(&l2_norm(&raw[b])))
+        .unwrap() as VamanaIndex
+}
+
+/// **s-Delaunay neighbour selection (design §2.3).** From `candidates`, keep the `r` with the
+/// strongest inner product to `p` (smallest `distance(Dot)`). This REPLACES robust-prune's
+/// domination test, which is unsound over IP. Ties break by ascending index for determinism.
+pub fn ip_top_r<P: PointSet + ?Sized>(
+    p: VamanaIndex,
+    candidates: &[VamanaIndex],
+    r: usize,
+    points: &P,
+) -> Result<Vec<VamanaIndex>> {
+    let mut pool: Vec<(f64, VamanaIndex)> = Vec::with_capacity(candidates.len());
+    for &c in candidates {
+        if c == p {
+            continue;
+        }
+        pool.push((points.dist(c, p)?, c));
+    }
+    pool.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    pool.truncate(r);
+    Ok(pool.into_iter().map(|(_, c)| c).collect())
+}
+
+/// A deterministic Fisher–Yates permutation over `0..n` from the shared stream.
+fn ip_permutation(n: usize, rng: &mut SplitMix64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
+}
+
+/// One IP-native insertion: greedy-search from `entry` towards `p`, then set `p`'s
+/// out-neighbours to the top-R by IP over the touched set (∪ p's current neighbours), and make
+/// those edges symmetric — re-selecting top-R for any neighbour that overflows `r`.
+#[allow(clippy::too_many_arguments)]
+fn ip_insert(
+    p: VamanaIndex,
+    graph: &mut Vec<Vec<VamanaIndex>>,
+    points: &IpPoints,
+    entry: VamanaIndex,
+    r: usize,
+    l_build: usize,
+    expanded: &mut Expanded,
+) -> Result<()> {
+    let visited = greedy_search_over(entry, p, &*graph, points, l_build, expanded)?;
+    let mut cands: Vec<VamanaIndex> = visited;
+    cands.extend_from_slice(&graph[p as usize]);
+    cands.sort_unstable();
+    cands.dedup();
+    cands.retain(|&c| c != p);
+
+    let pruned = ip_top_r(p, &cands, r, points)?;
+    graph[p as usize] = pruned.clone();
+
+    for &j in &pruned {
+        if !graph[j as usize].contains(&p) {
+            graph[j as usize].push(p);
+            if graph[j as usize].len() > r {
+                let nbrs = std::mem::take(&mut graph[j as usize]);
+                graph[j as usize] = ip_top_r(j, &nbrs, r, points)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An IP-native proximity graph: bounded-degree adjacency over the **raw** vectors, plus the
+/// highest-norm entry. Built by [`build_ip_graph`]; walked by [`ip_walk_topk`] /
+/// [`ip_walk_seeded`]. Bench-only.
+pub struct IpGraph {
+    pub adjacency: Vec<Vec<VamanaIndex>>,
+    /// The fixed IP entry point: the highest-norm node (design §3).
+    pub entry: VamanaIndex,
+}
+
+/// Build the IP-native graph over `raw`: a random R-regular seed graph, then two incremental
+/// passes that greedy-search from the highest-norm entry and select neighbours by **top-R IP**
+/// (`ip_top_r`, s-Delaunay) — no α-domination, no augmentation, no PQ. Deterministic in `seed`.
+/// `l_build` is the construction search-list width (wider than `r` for better candidates).
+pub fn build_ip_graph(raw: &[Vec<f32>], r: usize, l_build: usize, seed: u64) -> Result<IpGraph> {
+    let n = raw.len();
+    assert!(n > 0, "cannot build an IP graph over zero vectors");
+    let r = r.max(1);
+    let entry = highest_norm_node(raw);
+
+    // Trivially small: a complete graph (capped at R) is already navigable.
+    if n <= r + 1 {
+        let adjacency = (0..n)
+            .map(|i| (0..n).filter(|&j| j != i).map(|j| j as u32).collect())
+            .collect();
+        return Ok(IpGraph { adjacency, entry });
+    }
+
+    let mut rng = SplitMix64(seed);
+    let mut adjacency: Vec<Vec<VamanaIndex>> = (0..n)
+        .map(|i| {
+            let mut nbrs = Vec::with_capacity(r);
+            while nbrs.len() < r {
+                let j = (rng.next_u64() % n as u64) as VamanaIndex;
+                if j != i as VamanaIndex && !nbrs.contains(&j) {
+                    nbrs.push(j);
+                }
+            }
+            nbrs
+        })
+        .collect();
+
+    let points = IpPoints(raw);
+    let mut stamps = vec![0u32; n];
+    let mut expanded = Expanded::Stamps {
+        buf: &mut stamps,
+        gen: 0,
+    };
+
+    // Two passes, each over a fresh deterministic permutation — both use top-R-by-IP (there is
+    // no α short/long-edge split for IP, so both passes run the same rule; the second pass just
+    // lets earlier-inserted nodes see the neighbourhoods that later insertions created).
+    for _ in 0..2 {
+        let order = ip_permutation(n, &mut rng);
+        for &p in &order {
+            ip_insert(
+                p as VamanaIndex,
+                &mut adjacency,
+                &points,
+                entry,
+                r,
+                l_build,
+                &mut expanded,
+            )?;
+        }
+    }
+
+    Ok(IpGraph { adjacency, entry })
+}
+
+/// Walk the IP-native graph for the inner-product top-`k`, from the highest-norm entry.
+/// **Navigation and re-rank are both EXACT resident IP** (`distance(Dot)`, no PQ estimate) —
+/// mirroring RwVamana's estimate==exact — so this measures the *graph's* reach, not PQ error.
+/// Returns dump ids (input indices) best-first. Reuses the audited [`beam_search`].
+pub fn ip_walk_topk(
+    graph: &IpGraph,
+    raw: &[Vec<f32>],
+    q: &[f32],
+    k: usize,
+    beam: usize,
+) -> Result<Vec<u64>> {
+    let n = raw.len();
+    let hits = beam_search(
+        BeamParams {
+            medoid: graph.entry,
+            beam_width: beam,
+            k,
+            num_nodes: n,
+        },
+        |i| distance(Metric::Dot, q, &raw[i as usize]) as f32, // estimate == exact IP, no PQ
+        |i| Ok((raw[i as usize].clone(), graph.adjacency[i as usize].clone())),
+        |v| distance(Metric::Dot, q, v) as f32,
+        |i| Ok(Some(i as u64)),
+    )?;
+    Ok(hits.into_iter().map(|h| h.node_id).collect())
+}
+
+/// The **angular-seed** variant (design §2.1 option D / §2.2): descend the IP graph on exact IP,
+/// but start the beam from a set of `seeds` (indices) rather than the single highest-norm entry.
+/// A greedy IP walk from one hub can miss the direction-relevant region when a few extreme-norm
+/// vectors dominate every score (the Pareto hazard); seeding the beam from an angular (cosine)
+/// neighbourhood of the query plants the walk near the right *directions* first, then the exact-IP
+/// descent picks the true winners out of that region. Navigation and re-rank are still exact IP.
+///
+/// A faithful re-implementation of [`beam_search`]'s greedy loop that accepts an initial beam;
+/// [`ip_walk_seeded_matches_beam_search_single_seed`] pins it to the audited `beam_search` when
+/// the seed set is just the entry, so the only behavioural difference is the starting frontier.
+pub fn ip_walk_seeded(
+    graph: &IpGraph,
+    raw: &[Vec<f32>],
+    seeds: &[VamanaIndex],
+    q: &[f32],
+    k: usize,
+    beam: usize,
+) -> Result<Vec<u64>> {
+    use std::collections::HashSet;
+    let n = raw.len();
+    let beam_width = beam.max(k).max(1);
+    let est = |i: VamanaIndex| distance(Metric::Dot, q, &raw[i as usize]) as f32;
+
+    let mut frontier: Vec<(f32, VamanaIndex)> = Vec::new();
+    for &s in seeds {
+        if (s as usize) < n && !frontier.iter().any(|(_, i)| *i == s) {
+            frontier.push((est(s), s));
+        }
+    }
+    if frontier.is_empty() {
+        frontier.push((est(graph.entry), graph.entry));
+    }
+    frontier.sort_by(|a, b| a.0.total_cmp(&b.0));
+    frontier.truncate(beam_width);
+
+    let mut expanded: HashSet<VamanaIndex> = HashSet::new();
+    let mut hits: Vec<(f32, u64)> = Vec::new();
+    while let Some((_, cur)) = frontier
+        .iter()
+        .copied()
+        .filter(|(_, i)| !expanded.contains(i))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+    {
+        expanded.insert(cur);
+        hits.push((
+            distance(Metric::Dot, q, &raw[cur as usize]) as f32,
+            cur as u64,
+        ));
+        for &nb in &graph.adjacency[cur as usize] {
+            if (nb as usize) < n
+                && !expanded.contains(&nb)
+                && !frontier.iter().any(|(_, i)| *i == nb)
+            {
+                frontier.push((est(nb), nb));
+            }
+        }
+        frontier.sort_by(|a, b| a.0.total_cmp(&b.0));
+        frontier.truncate(beam_width);
+    }
+    hits.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    hits.truncate(k);
+    Ok(hits.into_iter().map(|(_, id)| id).collect())
+}
+
+/// A cosine proximity graph over the **unit directions** of `raw`, for the angular-seed variant.
+/// `build_vamana` over normalised vectors is a sound metric graph (cosine ⇒ unit vectors ⇒
+/// squared-L2 = 2−2cos, so robust-prune's triangle test is valid here — unlike over IP).
+pub struct AngularGraph {
+    pub dirs: Vec<Vec<f32>>,
+    pub graph: VamanaGraph,
+}
+
+/// Build the cosine seed graph: normalise every raw vector to a unit direction, then a standard
+/// (sound) Vamana over those directions.
+pub fn build_angular_graph(raw: &[Vec<f32>], r: usize, alpha: f32) -> Result<AngularGraph> {
+    let dirs: Vec<Vec<f32>> = raw
+        .iter()
+        .map(|v| {
+            let nrm = l2_norm(v).max(f64::MIN_POSITIVE) as f32;
+            v.iter().map(|x| x / nrm).collect()
+        })
+        .collect();
+    let graph = build_vamana(&dirs, r, alpha)?;
+    Ok(AngularGraph { dirs, graph })
+}
+
+/// The top-`m` angular (cosine) neighbours of `q` from the seed graph, by an **exact-cosine**
+/// beam walk (no PQ) — the seed set for [`ip_walk_seeded`]. Returns indices.
+pub fn angular_seeds(
+    ang: &AngularGraph,
+    q: &[f32],
+    m: usize,
+    beam: usize,
+) -> Result<Vec<VamanaIndex>> {
+    let n = ang.dirs.len();
+    let hits = beam_search(
+        BeamParams {
+            medoid: ang.graph.medoid,
+            beam_width: beam,
+            k: m,
+            num_nodes: n,
+        },
+        |i| distance(Metric::Cosine, q, &ang.dirs[i as usize]) as f32,
+        |i| {
+            Ok((
+                ang.dirs[i as usize].clone(),
+                ang.graph.adjacency[i as usize].clone(),
+            ))
+        },
+        |v| distance(Metric::Cosine, q, v) as f32,
+        |i| Ok(Some(i as u64)),
+    )?;
+    Ok(hits.into_iter().map(|h| h.node_id as VamanaIndex).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +1025,190 @@ mod tests {
                     "directions must be shared across norm distributions"
                 );
             }
+        }
+    }
+
+    // ── HIK-137 phase-1 spike: IP-native navigator ──────────────────────────────
+
+    /// `ip_top_r` keeps the strongest-IP candidates, and nothing else. Truth is hand-derived:
+    /// with `p` a unit vector along +x, the candidate with the largest x-component has the
+    /// largest inner product and must be selected first; a low-IP candidate must be dropped
+    /// when `r` is small. This guards the s-Delaunay rule against a sign/ordering flip.
+    #[test]
+    fn ip_top_r_keeps_strongest_inner_product() {
+        // p = index 0 (along +x). Candidates ordered by descending IP with p: 1 > 2 > 3.
+        let raw = vec![
+            vec![1.0f32, 0.0], // 0 = p
+            vec![3.0, 0.0],    // 1: IP 3.0
+            vec![1.0, 0.0],    // 2: IP 1.0
+            vec![0.1, 0.0],    // 3: IP 0.1
+        ];
+        let points = IpPoints(&raw);
+        let sel = ip_top_r(0, &[1, 2, 3], 2, &points).unwrap();
+        assert_eq!(
+            sel,
+            vec![1, 2],
+            "top-R must keep the two strongest-IP, drop the weakest"
+        );
+    }
+
+    /// The IP-appropriate entry is the highest-norm node (design §3), not the centroid.
+    #[test]
+    fn highest_norm_node_picks_the_biggest_vector() {
+        let raw = vec![vec![1.0f32, 0.0], vec![0.0, 5.0], vec![2.0, 2.0]];
+        assert_eq!(
+            highest_norm_node(&raw),
+            1,
+            "index 1 has the largest L2 norm"
+        );
+    }
+
+    /// The IP graph is a deterministic function of (raw, r, l_build, seed): same inputs ⇒
+    /// bit-identical adjacency and entry. This is the reproducibility contract the spike's
+    /// recall number rests on (run the bench twice ⇒ identical).
+    #[test]
+    fn ip_graph_is_deterministic() {
+        let model = ManifoldModel::new(64, 16, 0xABCD);
+        let raw = model.sample_mips(
+            400,
+            0x1234,
+            NormDist::Pareto {
+                x_m: 1.0,
+                alpha: 1.6,
+            },
+        );
+        let g1 = build_ip_graph(&raw, 32, 64, 0xBEEF).unwrap();
+        let g2 = build_ip_graph(&raw, 32, 64, 0xBEEF).unwrap();
+        assert_eq!(g1.entry, g2.entry);
+        assert_eq!(
+            g1.adjacency, g2.adjacency,
+            "same seed must give identical IP adjacency"
+        );
+        // Degree is bounded by R.
+        for nbrs in &g1.adjacency {
+            assert!(nbrs.len() <= 32, "degree {} exceeds R", nbrs.len());
+        }
+    }
+
+    /// `ip_walk_seeded` seeded with just the entry must reproduce `ip_walk_topk` (which is the
+    /// audited `beam_search`). This pins the hand-written multi-seed beam to the reference
+    /// implementation: the ONLY intended behavioural difference is the starting frontier, so if
+    /// this ever diverges the custom loop has a bug, not the seeding.
+    #[test]
+    fn ip_walk_seeded_matches_beam_search_single_seed() {
+        let model = ManifoldModel::new(128, 16, 0x11);
+        let raw = model.sample_mips(
+            500,
+            0x22,
+            NormDist::LogNormal {
+                median: 1.0,
+                sigma: 0.35,
+            },
+        );
+        let qs = model.sample_dir(15, 0x33);
+        let g = build_ip_graph(&raw, 32, 64, 0x44).unwrap();
+        for q in &qs {
+            let a = ip_walk_topk(&g, &raw, q, 10, 64).unwrap();
+            let b = ip_walk_seeded(&g, &raw, &[g.entry], q, 10, 64).unwrap();
+            assert_eq!(
+                a, b,
+                "single-seed ip_walk_seeded must equal the audited beam_search walk"
+            );
+        }
+    }
+
+    /// The headline spike claim, in miniature and with an independent truth: on the
+    /// adversarial Pareto fixture the IP-native graph walk (exact IP) recovers materially more
+    /// of the true IP top-k than the current augmented base index does. Both are measured
+    /// against the *same* brute-force `exact_topk(Dot)` — never against each other.
+    #[test]
+    fn ip_native_walk_beats_augmented_on_pareto() {
+        let model = ManifoldModel::new(256, 32, 0x317_2517);
+        let raw = model.sample_mips(
+            2000,
+            0x1A5E,
+            NormDist::Pareto {
+                x_m: 1.0,
+                alpha: 1.6,
+            },
+        );
+        let qs = model.sample_dir(50, 0x9CE5);
+        let live: Vec<u64> = (0..raw.len() as u64).collect();
+
+        let fx = VecFixture::build(Metric::Dot, raw.clone()).unwrap();
+        let g = build_ip_graph(&raw, VAMANA_R, (VAMANA_R * 2).max(64), 0x1D_9250).unwrap();
+
+        let (mut aug, mut ipn) = (0.0f64, 0.0f64);
+        for q in &qs {
+            let truth = exact_topk(Metric::Dot, &raw, &live, q, 10);
+            aug += recall_at_k(&fx.beam_topk_inmem(q, 10, 64).unwrap(), &truth);
+            ipn += recall_at_k(&ip_walk_topk(&g, &raw, q, 10, 64).unwrap(), &truth);
+        }
+        let (aug, ipn) = (aug / qs.len() as f64, ipn / qs.len() as f64);
+        assert!(
+            ipn > aug + 0.2,
+            "IP-native walk ({ipn:.3}) must materially beat augmented ({aug:.3}) on Pareto"
+        );
+    }
+
+    /// **Adversarial probe — is the highest-norm ENTRY doing the work, not the graph?** The spike
+    /// reports near-perfect recall; the sharpest way that could be an artefact is that the entry
+    /// (highest-norm node) is itself a top-k member for most queries, so "starting on a winner"
+    /// flatters the number. Break it: re-run the exact-IP walk from the *worst* possible entry —
+    /// the **lowest-norm** node, which is in almost no query's IP top-k — via `ip_walk_seeded`. If
+    /// recall stays high from there, the GRAPH is navigating, not the entry. Prints the diagnostic
+    /// (fraction of queries whose true top-10 contains each entry) with `--nocapture`.
+    #[test]
+    fn ip_recall_survives_a_worst_case_entry_so_the_graph_not_the_entry_navigates() {
+        let model = ManifoldModel::new(256, 32, 0x317_2517);
+        let qs = model.sample_dir(100, 0x9CE5);
+        let live: Vec<u64> = (0..2000u64).collect();
+        for nd in [
+            NormDist::LogNormal {
+                median: 1.0,
+                sigma: 0.35,
+            },
+            NormDist::Pareto {
+                x_m: 1.0,
+                alpha: 1.6,
+            },
+        ] {
+            let raw = model.sample_mips(2000, 0x1A5E, nd);
+            let g = build_ip_graph(&raw, VAMANA_R, (VAMANA_R * 2).max(64), 0x1D_9250).unwrap();
+            let hi = g.entry;
+            let lo = (0..raw.len())
+                .min_by(|&a, &b| l2_norm(&raw[a]).total_cmp(&l2_norm(&raw[b])))
+                .unwrap() as VamanaIndex;
+
+            let (mut r_hi, mut r_lo, mut hi_in, mut lo_in) = (0.0f64, 0.0f64, 0usize, 0usize);
+            for q in &qs {
+                let truth = exact_topk(Metric::Dot, &raw, &live, q, 10);
+                r_hi += recall_at_k(&ip_walk_seeded(&g, &raw, &[hi], q, 10, 64).unwrap(), &truth);
+                r_lo += recall_at_k(&ip_walk_seeded(&g, &raw, &[lo], q, 10, 64).unwrap(), &truth);
+                if truth.contains(&(hi as u64)) {
+                    hi_in += 1;
+                }
+                if truth.contains(&(lo as u64)) {
+                    lo_in += 1;
+                }
+            }
+            let n = qs.len() as f64;
+            eprintln!(
+                "[adversarial] {nd:?}: recall hi-norm-entry={:.3} (entry in top10 {}% of queries) | \
+                 recall LOW-norm-entry={:.3} (entry in top10 {}% of queries)",
+                r_hi / n,
+                (hi_in as f64 / n * 100.0) as u32,
+                r_lo / n,
+                (lo_in as f64 / n * 100.0) as u32,
+            );
+            // The graph, not the entry: even from the lowest-norm node (in almost no top-k), the
+            // exact-IP walk still recovers the overwhelming majority of the true IP top-k.
+            assert!(
+                r_lo / n > 0.9,
+                "recall from the worst-case (lowest-norm) entry was {:.3} — if this were low, the \
+                 entry point, not the graph, would have been carrying the headline number",
+                r_lo / n
+            );
         }
     }
 
