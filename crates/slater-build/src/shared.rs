@@ -1073,7 +1073,7 @@ mod carry_tests {
         desc: &VectorIndexDesc,
         layout_to_dump_id: &[u64],
     ) -> crate::model::VectorCarry {
-        let (r, alpha, medoid, max_norm, pq_subspaces, pq_bits) = match desc.mode {
+        let (r, alpha, medoid, max_norm, pq_subspaces, pq_bits, nav) = match desc.mode {
             AnnMode::Vamana {
                 r,
                 alpha,
@@ -1081,8 +1081,9 @@ mod carry_tests {
                 max_norm,
                 pq_subspaces,
                 pq_bits,
+                nav,
                 ..
-            } => (r, alpha, medoid, max_norm, pq_subspaces, pq_bits),
+            } => (r, alpha, medoid, max_norm, pq_subspaces, pq_bits, nav),
             _ => unreachable!("fixture builds Vamana"),
         };
         let _ = data_dir;
@@ -1099,6 +1100,7 @@ mod carry_tests {
             max_norm,
             pq_subspaces,
             pq_bits,
+            nav,
         }
     }
 

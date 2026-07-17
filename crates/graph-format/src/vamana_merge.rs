@@ -919,6 +919,253 @@ mod tests {
             .to_string()
     }
 
+    // ── HIK-137 IP-native merge/delete (T4a/T4b) ──────────────────────────────────
+    use crate::pq::PqParams;
+    use crate::vamana::build_vamana_ip;
+
+    /// MIPS-hard vectors: unit directions, every 89th scaled ~25× (a high-norm hub — "near" every
+    /// query under IP, the navigation hazard the augmented build fails). Deterministic.
+    fn mips_vectors(dim: usize, n: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = Lcg(seed);
+        (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
+                let u = normalise(&v);
+                let scale = if i % 89 == 0 { 25.0 } else { 1.0 };
+                u.iter().map(|x| x * scale).collect()
+            })
+            .collect()
+    }
+
+    /// Build an **IP-native** Vamana base (`build_vamana_ip` + raw codebook), laid out
+    /// BFS-from-entry, exactly as the offline base build and the sealed segment do for Dot.
+    fn build_ip_base(
+        dir: &Path,
+        tag: &str,
+        vectors: &[Vec<f32>],
+        node_ids: &[u64],
+        r: usize,
+    ) -> Base {
+        let dim = vectors[0].len();
+        let params = PqParams::new(dim as u32, 4, 8).unwrap();
+        let g = build_vamana_ip(vectors, r).unwrap();
+        let order = bfs_order(&g);
+        let mut new_of = vec![0u32; order.len()];
+        for (ni, &old) in order.iter().enumerate() {
+            new_of[old as usize] = ni as u32;
+        }
+        let medoid = new_of[g.medoid as usize];
+
+        let vpath = dir.join(format!("{tag}.vamana"));
+        let ppath = dir.join(format!("{tag}.pq"));
+        let mut vw = VamanaWriter::create_with_cipher(&vpath, BLOCK, LEVEL, None).unwrap();
+        let mut layout_raw = Vec::with_capacity(order.len());
+        let mut layout_ids = Vec::with_capacity(order.len());
+        for &old in &order {
+            let nbrs: Vec<u32> = g.adjacency[old as usize]
+                .iter()
+                .map(|&j| new_of[j as usize])
+                .collect();
+            vw.append(&vectors[old as usize], &nbrs).unwrap();
+            layout_raw.push(vectors[old as usize].clone());
+            layout_ids.push(node_ids[old as usize]);
+        }
+        vw.finish().unwrap();
+
+        // The codebook is trained on the RAW vectors (no augmentation) — the IP-native `.pq`.
+        let cb = train_codebooks(vectors, params, 15).unwrap();
+        let mut pw = PqWriter::create_with_cipher(&ppath, &cb, BLOCK, LEVEL, None).unwrap();
+        for &old in &order {
+            pw.append_codes(
+                node_ids[old as usize],
+                &cb.encode(&vectors[old as usize]).unwrap(),
+            )
+            .unwrap();
+        }
+        pw.finish().unwrap();
+
+        Base {
+            vpath,
+            ppath,
+            medoid,
+            r,
+            metric: Metric::Dot,
+            max_norm: 0.0,
+            layout_raw,
+            layout_ids,
+        }
+    }
+
+    fn ip_params_for(base: &Base) -> MergeParams {
+        MergeParams {
+            medoid: base.medoid,
+            r: base.r,
+            alpha: 1.2,
+            l_build: (base.r * 2).max(64),
+            metric: Metric::Dot,
+            max_norm: 0.0,
+            nav: AnnNav::InnerProduct,
+            vamana_block_bytes: BLOCK,
+            pq_block_bytes: BLOCK,
+            zstd_level: LEVEL,
+            cipher: None,
+        }
+    }
+
+    /// IP knn read-back: navigate by the IP-ADC estimate (`AdcTable::new_ip`, raw query, no
+    /// `ann_query`) + exact-IP re-rank, mirroring the server's `InnerProduct` read path.
+    fn knn_ip(
+        vamana: &Path,
+        pq: &Path,
+        query: &[f32],
+        medoid: VamanaIndex,
+        k: usize,
+        beam: usize,
+    ) -> Vec<u64> {
+        let reader = VamanaReader::open_with_cipher(vamana, None).unwrap();
+        let resident = PqReader::open_with_cipher(pq, None)
+            .unwrap()
+            .load_resident()
+            .unwrap();
+        let n = resident.len();
+        let adc = AdcTable::new_ip(&resident.codebook, query).unwrap();
+        let hits = beam_search(
+            BeamParams {
+                medoid,
+                beam_width: beam,
+                k,
+                num_nodes: n,
+            },
+            |i| adc.estimate(resident.codes_of(i as usize)),
+            |i| {
+                let node = reader.node(i)?;
+                Ok((node.vector, node.neighbours))
+            },
+            |v| exact_dist(Metric::Dot, query, v) as f32,
+            |i| {
+                let id = resident.node_ids[i as usize];
+                Ok(if id == HOLE { None } else { Some(id) })
+            },
+        )
+        .unwrap();
+        hits.iter().map(|h| h.node_id).collect()
+    }
+
+    fn ip_recall(approx: &[u64], truth: &[u64]) -> f64 {
+        let got: std::collections::HashSet<u64> = approx.iter().copied().collect();
+        truth.iter().filter(|id| got.contains(id)).count() as f64 / truth.len() as f64
+    }
+
+    /// **T4b — IP insert-weave.** An IP-native base over the first 70% with the last 30% woven in by
+    /// the IP `merge_insert`; served over the whole set, recall vs an independent brute-force IP
+    /// truth must clear the bar. An augmented insert-weave (α-prune, L2-reduced) would crater on the
+    /// high-norm hubs.
+    #[test]
+    fn ip_streaming_merge_weaves_inserts_and_holds_ip_recall() {
+        let dir = scratch("ip_merge_insert");
+        let dim = 32;
+        let n = 800;
+        let vectors = mips_vectors(dim, n, 0x1937_0000_0000_0011);
+        let ids: Vec<u64> = (0..n as u64).map(|i| 700 + i * 3).collect();
+        let split = n * 7 / 10;
+        let base = build_ip_base(&dir, "base", &vectors[..split], &ids[..split], 32);
+
+        let base_final_ids = base.layout_ids.clone();
+        let inserts: Vec<(u64, Vec<f32>)> =
+            (split..n).map(|i| (ids[i], vectors[i].clone())).collect();
+        let vout = dir.join("out.vamana");
+        let pout = dir.join("out.pq");
+        let stats = streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &base_final_ids,
+                inserts: &inserts,
+            },
+            &ip_params_for(&base),
+            &vout,
+            &pout,
+        )
+        .unwrap();
+        assert!(
+            !stats.vamana_carried,
+            "an insert merge must weave, not carry"
+        );
+        assert_eq!(stats.inserted, (n - split) as u64);
+
+        let live: Vec<(u64, Vec<f32>)> = ids.iter().copied().zip(vectors.iter().cloned()).collect();
+        let queries = mips_vectors(dim, 25, 0x1937_0000_0000_0099);
+        let mut total = 0.0;
+        for q in &queries {
+            let got = knn_ip(&vout, &pout, q, base.medoid, 10, 64);
+            total += ip_recall(&got, &brute_force(&live, q, Metric::Dot, 10));
+        }
+        let recall = total / queries.len() as f64;
+        assert!(recall >= 0.9, "IP merge-insert recall@10 was {recall:.3}");
+    }
+
+    /// **T4a — IP delete re-prune (+ T4c holes).** An IP-native base with 25% of nodes tombstoned to
+    /// `HOLE`; the IP `consolidate_deletes` re-prune (top-R-by-IP) splices the survivors. Recall over
+    /// the live set must hold, and no deleted id may ever be returned (hole suppression).
+    #[test]
+    fn ip_streaming_merge_delete_reprune_holds_ip_recall() {
+        let dir = scratch("ip_merge_delete");
+        let dim = 32;
+        let n = 800;
+        let vectors = mips_vectors(dim, n, 0x2b1e_0000_0000_0022);
+        let ids: Vec<u64> = (0..n as u64).map(|i| 500 + i * 5).collect();
+        let base = build_ip_base(&dir, "base", &vectors, &ids, 32);
+
+        // Delete every 4th dense id → HOLE in the id column.
+        let deleted = |id: u64| (id - 500) % 20 == 0; // 5% of a strided space, interior
+        let base_final_ids: Vec<u64> = base
+            .layout_ids
+            .iter()
+            .map(|&id| if deleted(id) { HOLE } else { id })
+            .collect();
+        let n_dead = base_final_ids.iter().filter(|&&id| id == HOLE).count();
+        assert!(n_dead > 0, "the test must actually delete something");
+
+        let vout = dir.join("out.vamana");
+        let pout = dir.join("out.pq");
+        let stats = streaming_merge(
+            &base.vpath,
+            &base.ppath,
+            &MergeInputs {
+                base_final_ids: &base_final_ids,
+                inserts: &[],
+            },
+            &ip_params_for(&base),
+            &vout,
+            &pout,
+        )
+        .unwrap();
+        assert!(
+            !stats.vamana_carried,
+            "a delete merge must splice, not carry"
+        );
+        assert_eq!(stats.live, (n - n_dead) as u64);
+
+        let live: Vec<(u64, Vec<f32>)> = ids
+            .iter()
+            .copied()
+            .zip(vectors.iter().cloned())
+            .filter(|(id, _)| !deleted(*id))
+            .collect();
+        let queries = mips_vectors(dim, 25, 0x2b1e_0000_0000_0088);
+        let mut total = 0.0;
+        for q in &queries {
+            let got = knn_ip(&vout, &pout, q, base.medoid, 10, 64);
+            assert!(
+                got.iter().all(|&id| !deleted(id)),
+                "a deleted (HOLE) id was returned: {got:?}"
+            );
+            total += ip_recall(&got, &brute_force(&live, q, Metric::Dot, 10));
+        }
+        let recall = total / queries.len() as f64;
+        assert!(recall >= 0.9, "IP delete-reprune recall@10 was {recall:.3}");
+    }
+
     /// **The killer test.** A consolidation permutes every dense id but must not touch the
     /// graph: after a pure-permutation merge the KNN must return the *same nodes* (by their new
     /// business ids) with the *same scores*, and the `.vamana` file must be **BLAKE3-unchanged**
