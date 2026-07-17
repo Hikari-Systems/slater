@@ -1581,13 +1581,22 @@ fn fold_vecf32(e: &mut Expr) {
     };
     let mut xs = Vec::with_capacity(items.len());
     for it in items {
-        match it {
-            Expr::Literal(Value::Float(f)) => xs.push(*f as f32),
-            Expr::Literal(Value::Int(i)) => xs.push(*i as f32),
+        let c = match it {
+            Expr::Literal(Value::Float(f)) => *f as f32,
+            Expr::Literal(Value::Int(i)) => *i as f32,
             // A non-numeric element is a user error, but it is not this function's to
             // report: leave the call intact and let evaluation name the bad element.
             _ => return,
+        };
+        // A non-finite folded component — e.g. `vecf32([1e400])`, where the `f64` literal
+        // is finite but `as f32` saturates to `+inf` — must NOT become a `Vector` literal
+        // here, or it would enter an embedding without ever meeting the runtime finiteness
+        // gate. Leave the call intact so evaluation rejects it through the one shared path
+        // (HIK-134). This is the parse-time counterpart of the `vecf32()` ingest gate.
+        if !c.is_finite() {
+            return;
         }
+        xs.push(c);
     }
     *e = Expr::Literal(Value::Vector(xs));
 }

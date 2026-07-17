@@ -4162,7 +4162,7 @@ fn coerce_vecf32(v: Value, what: &str) -> std::result::Result<Value, Failure> {
         }
     };
     let mut out = Vec::with_capacity(items.len());
-    for x in items {
+    for (i, x) in items.into_iter().enumerate() {
         let n = match x {
             Value::Float(f) => f,
             Value::Int(i) => i as f64,
@@ -4176,7 +4176,12 @@ fn coerce_vecf32(v: Value, what: &str) -> std::result::Result<Value, Failure> {
                 ))
             }
         };
-        out.push(n as f32);
+        // The Bolt front door: a driver can send a `NaN`/`±inf` `Float64` directly (no
+        // `log()` needed). Reject it here through the one shared finiteness gate so a
+        // non-finite component never enters an embedding via the wire (HIK-134).
+        let c = graph_format::pq::finite_f32(i, n as f32)
+            .map_err(|e| Failure::new(CODE_REQUEST, format!("{what}: {e}")))?;
+        out.push(c);
     }
     Ok(Value::Vector(out))
 }

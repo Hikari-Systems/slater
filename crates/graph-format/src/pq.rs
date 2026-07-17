@@ -134,6 +134,48 @@ pub(crate) fn sq_l2(a: &[f32], b: &[f32]) -> f64 {
     acc
 }
 
+/// A non-finite (`NaN` or `±inf`) f32 was about to enter an embedding — at write, at
+/// query, into the RW delta index, or (as a read backstop) out of a codebook on disk.
+///
+/// This is not a nuisance: `f64::max` **returns the non-NaN operand**, so a NaN never
+/// raises `max_norm` and every `is_infinite` overflow guard is structurally blind to it;
+/// the augment coord `(M²−NaN).max(0.0).sqrt()` collapses to `0.0` while the NaN survives
+/// verbatim in the copied raw coordinates, poisoning the k-means centroids and the exact
+/// re-rank (a NaN is *ordered largest* by `total_cmp`, not rejected). So it has to be
+/// refused at the boundary where an untrusted value first becomes vector data. Typed so
+/// callers branch on the type, not the message text (house rule; HIK-134).
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error(
+    "embedding component {index} is not finite ({value}); NaN and ±inf are not valid vector data"
+)]
+pub struct NonFiniteEmbedding {
+    pub index: usize,
+    pub value: f32,
+}
+
+/// The single finiteness gate shared by every embedding ingest, query, and read site
+/// (HIK-134). Returns the value unchanged when finite, a typed [`NonFiniteEmbedding`]
+/// otherwise. It **rejects, never coerces** — a silent `NaN`→0 or clamp would hide the
+/// corrupt input this whole invariant exists to catch.
+pub fn finite_f32(index: usize, value: f32) -> Result<f32, NonFiniteEmbedding> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(NonFiniteEmbedding { index, value })
+    }
+}
+
+/// Reject any non-finite component of `v` — the slice-level counterpart of
+/// [`finite_f32`], for the graph-format entry points that receive an already-materialised
+/// `&[f32]` (the RW-index insert, the query transform, the augmentation, and the on-disk
+/// codebook). Errors on the first offending component.
+pub fn require_finite(v: &[f32]) -> Result<(), NonFiniteEmbedding> {
+    for (i, &x) in v.iter().enumerate() {
+        finite_f32(i, x)?;
+    }
+    Ok(())
+}
+
 /// The L2 norm `|v|`, accumulated in f64. The f64 accumulation is not incidental:
 /// see [`normalise`].
 pub fn l2_norm(v: &[f32]) -> f64 {
@@ -228,6 +270,11 @@ pub fn normalise_into(v: &[f32], out: &mut Vec<f32>) {
 /// which is that vector's true augmentation anyway. Without the clamp it is a `NaN`
 /// coordinate, and a `NaN` is *ordered*, not rejected, by `total_cmp`.
 pub fn ann_point(metric: Metric, v: &[f32], max_norm: f64, space_dim: usize) -> Result<Vec<f32>> {
+    // Train-time backstop: the primary gate is at ingest, but a build reading vectors from a
+    // dump (or a past-poisoned column) must not fold a non-finite component into the codebook.
+    // The `max_norm`/`is_infinite` asserts below screen f32 *overflow* of M; they are
+    // structurally blind to a per-component NaN, which survives verbatim into `v.to_vec()`.
+    require_finite(v)?;
     match metric {
         Metric::Cosine => Ok(normalise(v)),
         Metric::L2 => Ok(v.to_vec()),
@@ -267,6 +314,11 @@ pub fn ann_point(metric: Metric, v: &[f32], max_norm: f64, space_dim: usize) -> 
 /// not `√(M² − ‖q‖²)`. That is what makes the augmentation work (it kills the cross term),
 /// and it is why the read path never needs `M`.
 pub fn ann_query(metric: Metric, q: &[f32], space_dim: usize) -> Result<Vec<f32>> {
+    // The sharpest case (HIK-134): a NaN/±inf query needs no write at all and would return
+    // `total_cmp`-ordered garbage against a completely clean index. Gate the query vector here
+    // — the one transform the read path performs — so every metric (cosine/L2/dot) is covered,
+    // including a Bolt-sent `Vector` param that bypassed the `vecf32`/`eval_query_vector` gate.
+    require_finite(q)?;
     match metric {
         Metric::Cosine => Ok(normalise(q)),
         Metric::L2 => Ok(q.to_vec()),
@@ -677,6 +729,11 @@ impl PqReader {
         for _ in 0..n {
             centroids.push(r.read_f32::<LittleEndian>()?);
         }
+        // Read backstop (HIK-134): the ingest gate keeps a live build's centroids finite, but a
+        // bit-rotted image or a codebook trained by a *past* build (before the gate existed) can
+        // still carry a NaN/±inf centroid, which a query would then score by `total_cmp`. Refuse it
+        // at open rather than serve silent garbage. The primary fix is at ingest; this is defence.
+        require_finite(&centroids)?;
         Ok(Self {
             inner,
             codebook: Codebook { params, centroids },

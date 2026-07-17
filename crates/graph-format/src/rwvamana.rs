@@ -90,7 +90,7 @@ use anyhow::{bail, Result};
 use wide::f32x8;
 
 use crate::manifest::Metric;
-use crate::pq::normalise_into;
+use crate::pq::{normalise_into, require_finite};
 use crate::vamana::{
     beam_search, insert_point, BeamParams, Expanded, InsertParams, SearchHit, VamanaIndex,
 };
@@ -296,6 +296,10 @@ impl RwVamana {
                 self.points.dim
             );
         }
+        // A distinct entry point (the delta write path): a NaN/±inf here poisons the resident
+        // data buffer *immediately*, before any consolidation, and no downstream guard catches
+        // it (the `max_norm2.max(norm2)` below silently drops a NaN). Reject up front (HIK-134).
+        require_finite(vector)?;
         // Delete-then-insert. Order matters only for clarity — the new slot is appended
         // below, so it cannot be the one we just killed.
         if let Some(old) = self.slot_of.remove(&node_id) {

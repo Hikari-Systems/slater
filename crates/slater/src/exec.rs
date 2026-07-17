@@ -6446,14 +6446,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             Val::Vector(v) => Ok(v),
             Val::List(xs) => xs
                 .iter()
-                .map(|x| {
-                    x.as_num().map(|f| f as f32).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "query vector elements must be numbers, got {}",
-                            x.to_display()
-                        )
-                    })
-                })
+                .enumerate()
+                .map(|(i, x)| embed_component(i, x, "query vector"))
                 .collect(),
             other => bail!(
                 "query vector must be a vecf32([...]) literal or numeric list, got {}",
@@ -9413,14 +9407,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 Val::Vector(v) => Val::Vector(v),
                 Val::List(xs) => Val::Vector(
                     xs.iter()
-                        .map(|x| {
-                            x.as_num().map(|f| f as f32).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "vecf32() elements must be numbers, got {}",
-                                    x.to_display()
-                                )
-                            })
-                        })
+                        .enumerate()
+                        .map(|(i, x)| embed_component(i, x, "vecf32()"))
                         .collect::<Result<_>>()?,
                 ),
                 Val::Null => Val::Null,
@@ -9432,7 +9420,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // Cosine similarity of two vectors, in [-1, 1] (higher = more similar).
             // Complements the KNN `score`, which is the distance `1 - similarity`
             // (D26). Accepts vectors or numeric lists.
-            "similarity" | "vec.cosinesimilarity" => match (as_vector(&a0(0)), as_vector(&a0(1))) {
+            "similarity" | "vec.cosinesimilarity" => match (as_vector(&a0(0))?, as_vector(&a0(1))?)
+            {
                 (Some(a), Some(b)) if a.len() == b.len() => {
                     Val::Float(vector::cosine_similarity(&a, &b))
                 }
@@ -9453,10 +9442,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 if matches!(x, Val::Null) || matches!(y, Val::Null) {
                     Val::Null
                 } else {
-                    let a = as_vector(&x).ok_or_else(|| {
+                    let a = as_vector(&x)?.ok_or_else(|| {
                         anyhow::anyhow!("{n}() needs vectors, got {}", x.to_display())
                     })?;
-                    let b = as_vector(&y).ok_or_else(|| {
+                    let b = as_vector(&y)?.ok_or_else(|| {
                         anyhow::anyhow!("{n}() needs vectors, got {}", y.to_display())
                     })?;
                     if a.len() != b.len() {
@@ -11323,13 +11312,36 @@ fn type_name(v: &Val) -> &'static str {
     }
 }
 
-/// Coerce a value to a vector for the similarity functions: a `Vector` directly,
-/// or a list of numbers (the shape an inlined literal / `$param` takes).
-fn as_vector(v: &Val) -> Option<Vec<f32>> {
+/// Extract one embedding component from a query value: it must be a number (the
+/// `vecf32`/`queryNodes` type rule) **and** finite. A `NaN`/`±inf` component survives
+/// `f64::max`, collapses the norm augmentation to `0.0` while riding verbatim into the
+/// raw coordinates, and is *ordered largest* by `total_cmp` — so it silently poisons the
+/// index and the KNN order. The finiteness decision goes through the one shared gate
+/// (`graph_format::pq::finite_f32`) so no ingest/query site can drift (HIK-134). The
+/// typed [`graph_format::pq::NonFiniteEmbedding`] propagates as the `anyhow` root, so
+/// callers branch on the type, never the message.
+fn embed_component(index: usize, x: &Val, ctx: &str) -> Result<f32> {
+    let f = x
+        .as_num()
+        .ok_or_else(|| anyhow::anyhow!("{ctx} elements must be numbers, got {}", x.to_display()))?;
+    Ok(graph_format::pq::finite_f32(index, f as f32)?)
+}
+
+/// Coerce a value to a vector for the similarity functions: a `Vector` directly, or a
+/// list of numbers (the shape an inlined literal / `$param` takes). `Ok(None)` is *not a
+/// vector* (a non-list, non-vector value — the caller decides NULL vs type error);
+/// `Err` is a list carrying a non-finite component, rejected through the shared gate so
+/// this stays on the same finiteness path as every other ingest site (HIK-134).
+fn as_vector(v: &Val) -> Result<Option<Vec<f32>>> {
     match v {
-        Val::Vector(xs) => Some(xs.clone()),
-        Val::List(xs) => xs.iter().map(|x| x.as_num().map(|f| f as f32)).collect(),
-        _ => None,
+        Val::Vector(xs) => Ok(Some(xs.clone())),
+        Val::List(xs) => xs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| embed_component(i, x, "vector"))
+            .collect::<Result<Vec<f32>>>()
+            .map(Some),
+        _ => Ok(None),
     }
 }
 
