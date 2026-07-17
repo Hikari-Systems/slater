@@ -35,12 +35,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::BlockCipher;
-use crate::manifest::Metric;
+use crate::manifest::{AnnNav, Metric};
 use crate::pq::{
-    ann_point, ann_pq_params, l2_norm, train_codebooks, Codebook, PqReader, PqWriter, ResidentPq,
+    ann_point, ann_pq_params, l2_norm, train_codebooks, Codebook, PqParams, PqReader, PqWriter,
+    ResidentPq,
 };
 use crate::store::{join_key, ObjectStore};
-use crate::vamana::{bfs_order, build_vamana, VamanaReader, VamanaWriter};
+use crate::vamana::{bfs_order, build_vamana, build_vamana_ip, VamanaReader, VamanaWriter};
 
 /// Below this many **live** embedded vectors a segment seals no Vamana graph — a proximity
 /// graph over a handful of points has genuinely worse recall than a linear scan, and building
@@ -70,6 +71,12 @@ pub struct SealedVamanaMeta {
     /// cross-checks both at open. A freshly sealed segment has no holes, so it also equals the
     /// live count.
     pub count: u64,
+    /// How this segment's graph is navigated — the HIK-137 MIPS discriminator. **Additive-optional**:
+    /// absent on every pre-HIK-137 segment manifest ⇒ [`AnnNav::Augmented`], and omitted from the
+    /// serialised form when `Augmented` so existing segments stay byte-identical. A Dot segment seals
+    /// IP-native (`InnerProduct`); the read path dispatches on it exactly as the base does.
+    #[serde(default, skip_serializing_if = "AnnNav::is_augmented")]
+    pub nav: AnnNav,
 }
 
 /// Pick the largest PQ subspace count in `{16,8,4,2,1}` that divides `dim`, so a fresh-trained
@@ -113,16 +120,33 @@ pub fn seal_segment_index(
         return Ok(None);
     }
 
-    // Resolve the codebook + PQ params + the max-norm the ANN space is built against. Reuse the
-    // base's when we can (keeps k-means off this path); otherwise train one over the segment's
-    // own vectors. Either way the graph and the codes live in the same ANN space — the read
-    // path maps the query into it through `ann_query`.
-    let (codebook, max_norm) = match base {
+    // HIK-137: a **Dot** segment seals IP-native — raw inner-product closeness (`build_vamana_ip`),
+    // a codebook trained on the **raw** vectors (plain `PqParams`, no augmentation subspace), and the
+    // highest-norm entry — identical to the offline base build. Cosine/L2 keep the L2-reduced ANN
+    // space (`ann_point`). `is_ip` gates every fork below and rides `nav` onto the segment manifest so
+    // the read path dispatches to `AdcTable::new_ip` or refuses, never mis-navigates.
+    let is_ip = metric == Metric::Dot;
+    let nav = if is_ip {
+        AnnNav::InnerProduct
+    } else {
+        AnnNav::Augmented
+    };
+
+    // Resolve the codebook + PQ params + the max-norm the (augmented) space is built against. Reuse
+    // the base's when we can (keeps k-means off this path) — but only when its width matches this
+    // segment's space (an IP segment must not encode raw points against an augmented base codebook,
+    // nor vice versa); otherwise train one over the segment's own vectors.
+    let base_reusable = base.filter(|(cb, _)| (cb.params.dim == dim) == is_ip);
+    let (codebook, max_norm) = match base_reusable {
         Some((cb, mn)) => (cb.clone(), mn),
         None => {
             let subspaces = pick_subspaces(dim);
-            let params = ann_pq_params(metric, dim, subspaces, 8)?;
-            let space_dim = params.dim as usize;
+            let params = if is_ip {
+                // No augmentation subspace: the codebook is dim-wide, trained on the raw vectors.
+                PqParams::new(dim, subspaces, 8)?
+            } else {
+                ann_pq_params(metric, dim, subspaces, 8)?
+            };
             let mn = entries
                 .iter()
                 .map(|(_, v)| l2_norm(v))
@@ -130,14 +154,19 @@ pub fn seal_segment_index(
             // A norm that overflows f32 makes the dot augmentation NaN (see `ann_point`) and
             // would poison a `serde_json` manifest for *any* metric. Decline rather than seal a
             // graph the reader cannot open — the brute-force fallback still answers exactly.
-            if (mn as f32).is_infinite() {
+            // (Inert for the IP-native path — nothing augments — but a cheap, honest screen.)
+            if !is_ip && (mn as f32).is_infinite() {
                 return Ok(None);
             }
-            let points: Vec<Vec<f32>> = entries
-                .iter()
-                .map(|(_, v)| ann_point(metric, v, mn, space_dim))
-                .collect::<Result<_>>()?;
-            let cb = train_codebooks(&points, params, SEG_PQ_ITERS).with_context(|| {
+            let train_points: Vec<Vec<f32>> = if is_ip {
+                entries.iter().map(|(_, v)| v.clone()).collect()
+            } else {
+                entries
+                    .iter()
+                    .map(|(_, v)| ann_point(metric, v, mn, params.dim as usize))
+                    .collect::<Result<_>>()?
+            };
+            let cb = train_codebooks(&train_points, params, SEG_PQ_ITERS).with_context(|| {
                 format!("train PQ codebooks for segment index {label}.{property}")
             })?;
             (cb, mn)
@@ -145,15 +174,24 @@ pub fn seal_segment_index(
     };
     let space_dim = codebook.params.dim as usize;
 
-    // The ANN-space points: the graph build and the PQ codes both work in this space.
-    let points: Vec<Vec<f32>> = entries
-        .iter()
-        .map(|(_, v)| ann_point(metric, v, max_norm, space_dim))
-        .collect::<Result<_>>()
-        .with_context(|| format!("map segment index {label}.{property} into ANN space"))?;
+    // The build/encode points: raw for IP-native Dot, the L2-reduced ANN map for cosine/L2. The
+    // graph build and the PQ codes both work over this same set.
+    let points: Vec<Vec<f32>> = if is_ip {
+        entries.iter().map(|(_, v)| v.clone()).collect()
+    } else {
+        entries
+            .iter()
+            .map(|(_, v)| ann_point(metric, v, max_norm, space_dim))
+            .collect::<Result<_>>()
+            .with_context(|| format!("map segment index {label}.{property} into ANN space"))?
+    };
 
-    let graph = build_vamana(&points, SEG_VAMANA_R, SEG_VAMANA_ALPHA)
-        .with_context(|| format!("build Vamana graph for segment index {label}.{property}"))?;
+    let graph = if is_ip {
+        build_vamana_ip(&points, SEG_VAMANA_R)
+    } else {
+        build_vamana(&points, SEG_VAMANA_R, SEG_VAMANA_ALPHA)
+    }
+    .with_context(|| format!("build Vamana graph for segment index {label}.{property}"))?;
     let order = bfs_order(&graph);
     // old (build) index → new (storage/layout) index.
     let mut new_of = vec![0u32; order.len()];
@@ -189,6 +227,7 @@ pub fn seal_segment_index(
     Ok(Some(SealedVamanaMeta {
         medoid: medoid_new as u64,
         count: entries.len() as u64,
+        nav,
     }))
 }
 
@@ -200,6 +239,10 @@ pub fn seal_segment_index(
 pub struct SegmentVamanaIndex {
     pub ord: u32,
     pub medoid: u64,
+    /// How this segment's graph is navigated (HIK-137). Carried from [`SealedVamanaMeta::nav`] so
+    /// the read path dispatches to the IP navigator for a Dot segment, or the augmented one, never
+    /// mis-navigating one as the other.
+    pub nav: AnnNav,
     pub reader: VamanaReader,
     pub pq: Arc<ResidentPq>,
 }
@@ -257,6 +300,7 @@ impl SegmentVamanaSet {
                 SegmentVamanaIndex {
                     ord,
                     medoid: meta.medoid,
+                    nav: meta.nav,
                     reader,
                     pq: Arc::new(pq),
                 },
@@ -396,6 +440,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A **Dot** segment seals IP-native (HIK-137): the meta carries `nav: InnerProduct`, the graph
+    /// is built over raw inner product, and it is navigated by `AdcTable::new_ip`. Recall is measured
+    /// on a MIPS-hard fixture (a heavy-norm outlier every 97th vector) against an independent
+    /// brute-force IP truth — the shape that craters an augmented segment.
+    #[test]
+    fn dot_segment_seals_ip_native_and_recovers_the_ip_topk() {
+        use crate::pq::AdcTable;
+        let dir = tmp("ip_recall");
+        let dim = 16;
+        // MIPS-hard: mostly unit-norm, every 97th a ~30× outlier (near every query under IP).
+        let raw = rand_vectors(dim, 3_000, 0x15ee_d001);
+        let entries: Vec<(u64, Vec<f32>)> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, v))| {
+                let scale = if i.is_multiple_of(97) { 30.0 } else { 1.0 };
+                let nrm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+                (id, v.iter().map(|x| x * scale / nrm).collect())
+            })
+            .collect();
+        let meta = seal_segment_index(
+            &dir,
+            "Doc",
+            "emb",
+            &entries,
+            Metric::Dot,
+            dim as u32,
+            None,
+            None,
+            4096,
+            3,
+        )
+        .unwrap()
+        .expect("above the floor ⇒ sealed");
+        assert_eq!(
+            meta.nav,
+            AnnNav::InnerProduct,
+            "a Dot segment must seal IP-native"
+        );
+
+        let dv = vec![DirtyVector {
+            label: "Doc".into(),
+            property: "emb".into(),
+            graph: Some(meta),
+        }];
+        let store = FsObjectStore::new(dir.parent().unwrap());
+        let prefix = dir.file_name().unwrap().to_str().unwrap();
+        let set = SegmentVamanaSet::open_if_present_via(&store, prefix, &dv, None)
+            .unwrap()
+            .expect("a sealed index opens");
+        let ix = set.get("Doc", "emb").unwrap();
+        assert_eq!(
+            ix.nav,
+            AnnNav::InnerProduct,
+            "the opened index must carry the IP nav so the reader dispatches"
+        );
+
+        let neg_dot = |a: &[f32], b: &[f32]| -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let brute_ip = |q: &[f32], k: usize| {
+            let mut s: Vec<(f32, u64)> =
+                entries.iter().map(|(id, v)| (neg_dot(q, v), *id)).collect();
+            s.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            s.into_iter().take(k).map(|(_, id)| id).collect::<Vec<_>>()
+        };
+
+        let queries = rand_vectors(dim, 30, 0xfeed_0002);
+        let k = 10;
+        let mut total = 0.0f64;
+        for (_, q) in &queries {
+            // IP-native serve: raw query into `AdcTable::new_ip` (no `ann_query`), exact-IP re-rank.
+            let adc = AdcTable::new_ip(&ix.pq.codebook, q).unwrap();
+            let hits = beam_search(
+                BeamParams {
+                    medoid: ix.medoid as u32,
+                    beam_width: 64,
+                    k,
+                    num_nodes: ix.pq.len(),
+                },
+                |i| adc.estimate(ix.pq.codes_of(i as usize)),
+                |i| {
+                    let node = decode_node(&ix.reader.node(i).map(|n| encode_back(&n)).unwrap())?;
+                    Ok((node.vector, node.neighbours))
+                },
+                |v| neg_dot(q, v),
+                |i| Ok(Some(ix.pq.node_ids[i as usize])),
+            )
+            .unwrap();
+            let got: std::collections::HashSet<u64> = hits.iter().map(|h| h.node_id).collect();
+            let want = brute_ip(q, k);
+            total += want.iter().filter(|id| got.contains(id)).count() as f64 / k as f64;
+        }
+        let recall = total / queries.len() as f64;
+        assert!(
+            recall >= 0.9,
+            "IP-native segment recall@{k} was {recall:.3}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The beam's `fetch` in this test reads through the uncached `VamanaReader::node`; re-encode
     // the decoded node so the closure's `decode_node` has bytes to chew (the production path
     // reads raw block bytes through the cache). Keeps the test honest about the on-disk format.
@@ -449,6 +592,7 @@ mod tests {
             graph: Some(SealedVamanaMeta {
                 medoid: 0,
                 count: 3_000,
+                nav: AnnNav::Augmented,
             }),
         }];
         let store = FsObjectStore::new(dir.parent().unwrap());

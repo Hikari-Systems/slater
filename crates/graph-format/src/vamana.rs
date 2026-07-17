@@ -533,7 +533,10 @@ where
 /// One IP-native insertion: greedy-search from `entry` towards `p`, set `p`'s out-neighbours to the
 /// top-R by IP over the touched set (∪ p's current neighbours), then make those edges symmetric —
 /// re-selecting top-R for any neighbour that overflows `r`. The IP twin of [`insert_point`].
-fn insert_point_ip<G, P>(
+///
+/// `pub(crate)` so the mutable T0 arm ([`crate::rwvamana`]) can weave a live Dot delta point into
+/// its resident graph with the same IP rule the offline build uses.
+pub(crate) fn insert_point_ip<G, P>(
     p: VamanaIndex,
     graph: &mut G,
     points: &P,

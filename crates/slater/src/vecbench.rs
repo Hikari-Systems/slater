@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use graph_format::manifest::Metric;
+use graph_format::manifest::{AnnNav, Metric};
 use graph_format::pq::{
     ann_point, ann_pq_params, ann_query, l2_norm, train_codebooks, AdcTable, Codebook, PqParams,
     PqReader, PqWriter, ResidentPq, HOLE,
@@ -35,6 +35,9 @@ use graph_format::vamana_delete::{
     consolidate_deletes, recommended_cache_records, ConsolidateOpts, RECOMMENDED_CACHE_BLOCKS,
 };
 use graph_format::vamana_merge::{streaming_merge, MergeInputs, MergeParams, MergeStats};
+
+use graph_format::rwvamana::RwVamana;
+use graph_format::segvamana::seal_segment_index;
 
 use crate::vector::distance;
 
@@ -287,6 +290,11 @@ pub struct VecFixture {
     pub raw: Vec<Vec<f32>>,
     pub space_dim: usize,
     pub max_norm: f64,
+    /// How this fixture's graph is navigated. `VecFixture::build` is the **augmented** lifecycle
+    /// (`ann_point`), so this is always [`AnnNav::Augmented`]; it is a field so the `merge_params`/
+    /// `consolidate_opts` helpers stamp the discriminator the ladder now requires. IP-native ladder
+    /// paths are driven by the dedicated `write_ip_disk_index` + `*_ip` helpers.
+    pub nav: AnnNav,
     pub params: PqParams,
     pub codebook: Codebook,
     /// `codes[i]` = `codebook.encode(ann_point(raw[i]))`, input order.
@@ -320,6 +328,7 @@ impl VecFixture {
             raw,
             space_dim,
             max_norm,
+            nav: AnnNav::Augmented,
             params,
             codebook,
             codes,
@@ -519,6 +528,7 @@ pub fn consolidate_opts(fx: &VecFixture, medoid: VamanaIndex) -> ConsolidateOpts
         alpha: VAMANA_ALPHA,
         metric: fx.metric,
         max_norm: fx.max_norm,
+        nav: fx.nav,
         space_dim: fx.space_dim,
         cache_records: recommended_cache_records(VAMANA_R),
         cache_blocks: RECOMMENDED_CACHE_BLOCKS,
@@ -553,6 +563,7 @@ pub fn merge_params(fx: &VecFixture, medoid: VamanaIndex) -> MergeParams {
         l_build: (VAMANA_R * 2).max(64),
         metric: fx.metric,
         max_norm: fx.max_norm,
+        nav: fx.nav,
         vamana_block_bytes: BLOCK,
         pq_block_bytes: BLOCK,
         zstd_level: ZSTD,
@@ -950,6 +961,95 @@ pub fn beam_topk_disk_ip(
         },
     )?;
     Ok(hits.into_iter().map(|h| h.node_id).collect())
+}
+
+// ── HIK-137 phase-3 ladder rungs: end-to-end IP-native helpers ────────────────────
+
+/// **T0 (RwVamana delta) end to end.** Build an IP-native mutable delta over `raw` (dump id = input
+/// index) **once**, then beam-search each of `queries` by exact inner product — the delta arm's real
+/// construction (IP top-R prune, highest-norm entry) *and* search path for a Dot index. No PQ (the
+/// delta is exact). Returns one top-k id list per query.
+pub fn rw_topk_ip_batch(
+    raw: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    k: usize,
+    beam: usize,
+) -> Result<Vec<Vec<u64>>> {
+    let mut rw = RwVamana::new(raw[0].len(), Metric::Dot);
+    for (i, v) in raw.iter().enumerate() {
+        rw.insert(i as u64, v)?;
+    }
+    queries
+        .iter()
+        .map(|q| {
+            let hits = rw.search(
+                q,
+                k,
+                beam,
+                |v| distance(Metric::Dot, q, v) as f32,
+                |_| Ok(true),
+            )?;
+            Ok(hits.into_iter().map(|h| h.node_id).collect())
+        })
+        .collect()
+}
+
+/// **T2 (per-segment temp index) end to end.** Seal an IP-native Dot segment over `raw` **once**
+/// through the real `seal_segment_index`, then beam-search the sealed `.vamana`/`.pq` for each of
+/// `queries` by the IP-ADC estimate (the segment serve path). Returns one top-k id list per query
+/// and the sealed `nav` (which must be `InnerProduct`).
+pub fn seal_ip_topk_batch(
+    dir: &Path,
+    tag: &str,
+    raw: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    k: usize,
+    beam: usize,
+) -> Result<(Vec<Vec<u64>>, AnnNav)> {
+    let entries: Vec<(u64, Vec<f32>)> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, v.clone()))
+        .collect();
+    let meta = seal_segment_index(
+        dir,
+        "L",
+        tag,
+        &entries,
+        Metric::Dot,
+        raw[0].len() as u32,
+        None,
+        None,
+        BLOCK,
+        ZSTD,
+    )?
+    .expect("segment above the floor seals");
+    let vam = dir.join(format!("vec.L.{tag}.vamana"));
+    let pq = dir.join(format!("vec.L.{tag}.pq"));
+    let ids = queries
+        .iter()
+        .map(|q| beam_topk_disk_ip(&vam, &pq, meta.medoid as VamanaIndex, q, k, beam))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((ids, meta.nav))
+}
+
+/// A [`MergeParams`] for an **IP-native** streaming merge (`nav = InnerProduct`) at the builder's
+/// shape — drives the T4a delete re-prune + T4b insert-weave over an IP base through [`merge_to`].
+pub fn ip_merge_params(medoid: VamanaIndex, r: usize) -> MergeParams {
+    MergeParams {
+        medoid,
+        r,
+        alpha: VAMANA_ALPHA,
+        l_build: (r * 2).max(64),
+        metric: Metric::Dot,
+        // Inert for IP-native (nothing augments); the graph, codebook and distance are all raw.
+        max_norm: 0.0,
+        nav: AnnNav::InnerProduct,
+        vamana_block_bytes: BLOCK,
+        pq_block_bytes: BLOCK,
+        zstd_level: ZSTD,
+        cipher: None,
+    }
 }
 
 /// The **angular-seed** variant (design §2.1 option D / §2.2): descend the IP graph on exact IP,

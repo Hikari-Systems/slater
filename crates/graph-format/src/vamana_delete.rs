@@ -72,10 +72,11 @@ use anyhow::{bail, ensure, Context, Result};
 use crate::blockfile::record_range_in_block;
 use crate::crypto::BlockCipher;
 use crate::ids::BlockId;
-use crate::manifest::Metric;
+use crate::manifest::{AnnNav, Metric};
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
 use crate::vamana::{
-    decode_node, robust_prune_over, PointSet, VamanaIndex, VamanaNode, VamanaReader, VamanaWriter,
+    decode_node, ip_prune_over, robust_prune_over, PointSet, VamanaIndex, VamanaNode, VamanaReader,
+    VamanaWriter,
 };
 
 /// The scalar shape of one delete-consolidation pass.
@@ -98,9 +99,14 @@ pub struct ConsolidateOpts {
     /// MANIFEST. Read only for [`Metric::Dot`].
     pub max_norm: f64,
     /// The dimension of the ANN space — [`crate::pq::ann_pq_params`]'s `dim`, i.e. the
-    /// `.pq` codebook's own `dim`. (Equal to the vector dim except for dot, which carries an
-    /// extra subspace for the norm augmentation.)
+    /// `.pq` codebook's own `dim`. (Equal to the vector dim except for an *augmented* dot index,
+    /// which carries an extra subspace for the norm augmentation. An IP-native dot index is
+    /// dim-wide, like cosine/L2.)
     pub space_dim: usize,
+    /// How the graph is navigated (HIK-137). For [`AnnNav::InnerProduct`] the re-prune measures raw
+    /// inner product ([`ip_prune_over`], no `ann_point`), so the splice is spliced in the same
+    /// IP-native space the graph was built in; [`AnnNav::Augmented`] keeps the L2-reduced ANN space.
+    pub nav: AnnNav,
     /// LRU capacity, in **decoded records**. Mandatory, not an optimisation: `|C| ≤ R·(R+1)`
     /// and robust-prune walks the whole pool once per chosen neighbour, so an uncached pass
     /// would re-decode (and re-[`ann_point`]) the same records hundreds of times. See
@@ -246,6 +252,8 @@ pub struct CachedPoints<'a> {
     metric: Metric,
     max_norm: f64,
     space_dim: usize,
+    /// IP-native (HIK-137): distance is raw `−⟨a,b⟩` over the stored vectors, no `ann_point`.
+    is_ip: bool,
     records: usize,
     cache: RefCell<Lru<VamanaIndex, CachedNode>>,
     blocks: RefCell<Lru<u32, Vec<u8>>>,
@@ -261,6 +269,7 @@ impl<'a> CachedPoints<'a> {
             metric: opts.metric,
             max_norm: opts.max_norm,
             space_dim: opts.space_dim,
+            is_ip: opts.nav == AnnNav::InnerProduct,
             records: reader.len() as usize,
             cache: RefCell::new(Lru::new(opts.cache_records)),
             blocks: RefCell::new(Lru::new(opts.cache_blocks)),
@@ -323,8 +332,14 @@ impl<'a> CachedPoints<'a> {
                 self.records
             );
         }
-        let ann = ann_point(self.metric, &rec.vector, self.max_norm, self.space_dim)
-            .with_context(|| format!("map .vamana record {i} into the ANN space"))?;
+        // IP-native: distance is measured over the raw vector directly, so the augmented `ann`
+        // column is unused (kept empty to avoid the alloc + a wrong-space `ann_point` on Dot).
+        let ann = if self.is_ip {
+            Vec::new()
+        } else {
+            ann_point(self.metric, &rec.vector, self.max_norm, self.space_dim)
+                .with_context(|| format!("map .vamana record {i} into the ANN space"))?
+        };
         let node = Rc::new(CachedNode {
             raw: rec.vector,
             ann,
@@ -343,7 +358,18 @@ impl PointSet for CachedPoints<'_> {
     fn dist(&self, a: VamanaIndex, b: VamanaIndex) -> Result<f64> {
         let va = self.node(a)?;
         let vb = self.node(b)?;
-        Ok(sq_l2(&va.ann, &vb.ann))
+        if self.is_ip {
+            // Raw inner product, maximised ⇒ minimise `−⟨a,b⟩` (the IP-native closeness).
+            let ip: f64 = va
+                .raw
+                .iter()
+                .zip(&vb.raw)
+                .map(|(x, y)| *x as f64 * *y as f64)
+                .sum();
+            Ok(-ip)
+        } else {
+            Ok(sq_l2(&va.ann, &vb.ann))
+        }
     }
 }
 
@@ -479,7 +505,13 @@ pub fn consolidate_deletes(
         }
 
         let cands = splice_candidates(p, &node.nbrs, dead, &points, opts.r)?;
-        let pruned = robust_prune_over(p, &cands, opts.alpha, opts.r, &points)?;
+        // IP-native re-prune keeps the top-R by inner product (the s-Delaunay rule the graph was
+        // built with); α-domination is unsound over IP. Cosine/L2 keep robust prune.
+        let pruned = if opts.nav == AnnNav::InnerProduct {
+            ip_prune_over(p, &cands, opts.r, &points)?
+        } else {
+            robust_prune_over(p, &cands, opts.alpha, opts.r, &points)?
+        };
         if pruned.is_empty() && p == medoid {
             // The entry point can reach no live record — every node reachable from it is
             // dead. Emitting this would orphan the medoid: every search would expand exactly
@@ -537,6 +569,8 @@ pub struct ConsolidateIndex<'a> {
     pub metric: Metric,
     /// `AnnMode::Vamana::max_norm`.
     pub max_norm: f64,
+    /// `AnnMode::Vamana::nav` (HIK-137) — selects the IP-native re-prune for a Dot index.
+    pub nav: AnnNav,
     /// **Additional** dead layout ordinals, beyond the holes the `.pq` already names. The
     /// union of the two is the dead set. (A caller that has already marked its deletes as
     /// holes passes an empty slice.)
@@ -597,6 +631,7 @@ pub fn consolidate_index_files(
         alpha: cfg.alpha,
         metric: cfg.metric,
         max_norm: cfg.max_norm,
+        nav: cfg.nav,
         // The codebook's own dimension is the ANN space's dimension, by construction
         // (`ann_pq_params`) — and it is the one the graph was actually built in, so read it
         // from the file rather than re-deriving it from the MANIFEST.
@@ -727,6 +762,7 @@ mod tests {
                 alpha: 1.2,
                 metric: Metric::Cosine,
                 max_norm: 1.0,
+                nav: AnnNav::Augmented,
                 space_dim: self.raw[0].len(),
                 cache_records,
                 cache_blocks: RECOMMENDED_CACHE_BLOCKS,
@@ -843,6 +879,7 @@ mod tests {
             alpha: 1.2,
             metric: Metric::L2,
             max_norm: 0.0,
+            nav: AnnNav::Augmented,
             space_dim: 2,
             cache_records: 64,
             cache_blocks: 8,
@@ -902,6 +939,7 @@ mod tests {
             alpha: 1.2,
             metric: Metric::L2,
             max_norm: 0.0,
+            nav: AnnNav::Augmented,
             space_dim: 2,
             cache_records: 64,
             cache_blocks: 8,
@@ -1006,6 +1044,7 @@ mod tests {
             alpha: 1.2,
             metric: Metric::L2,
             max_norm: 0.0,
+            nav: AnnNav::Augmented,
             space_dim: 2,
             cache_records: 64,
             cache_blocks: 8,
@@ -1136,6 +1175,7 @@ mod tests {
                 alpha: 1.2,
                 metric: Metric::Cosine,
                 max_norm: 1.0,
+                nav: AnnNav::Augmented,
                 tombstoned: &tombstoned,
                 vamana_block_bytes: BLOCK,
                 pq_block_bytes: BLOCK,
@@ -1222,6 +1262,7 @@ mod tests {
                 alpha: 1.2,
                 metric: Metric::L2,
                 max_norm: 0.0,
+                nav: AnnNav::Augmented,
                 space_dim: 2,
                 cache_records: 8,
                 cache_blocks: 8,

@@ -201,3 +201,13 @@ required-features = ["testkit"]
 name = "ipnsw_base_e2e"
 harness = false
 required-features = ["testkit"]
+
+# 9. HIK-137 phase-3 LADDER: recall@10 for every IP-native ladder rung — T0 (RwVamana delta), T2
+# (sealed segment), T4b (streaming-merge inserts), T4a (delete re-prune / holes) — end to end
+# through the real writers/readers, vs the deliverable-1 brute-force IP ground truth on all three
+# norm distributions. The proof that the ladder PRESERVES the base rung's recall for Dot. Run:
+# `cargo bench -p slater --features testkit --bench ipnsw_ladder_e2e`.
+[[bench]]
+name = "ipnsw_ladder_e2e"
+harness = false
+required-features = ["testkit"]

@@ -629,6 +629,10 @@ fn carry_vamana_index(
         l_build: ((carry.r as usize) * 2).max(64),
         metric: pi.metric,
         max_norm: carry.max_norm as f64,
+        // HIK-137: carry the base's navigation discriminator so an IP-native base is folded by the
+        // IP insert-weave + IP delete re-prune (and its Δ encoded raw), never spliced with augmented
+        // edges. An augmented base stays augmented.
+        nav: carry.nav,
         // The `.vamana` uses `vector_block_size`, the `.pq` uses `block_size` — matching
         // `build_vamana_index` so a carried index is byte-shaped like a freshly built one.
         vamana_block_bytes: opts.vector_block_size,
@@ -676,12 +680,11 @@ fn carry_vamana_index(
             pq_bits: carry.pq_bits,
             live_count: stats.live,
             max_norm: carry.max_norm,
-            // HIK-137 phase 2 is base-rung only: the ladder (consolidate/merge) is not yet
-            // IP-integrated, and the consolidation choke point in `slater::consolidate` REFUSES to
-            // carry an `InnerProduct` base (it would fold augmented Δ inserts into an IP graph and
-            // mis-navigate). So this re-emit only ever sees an augmented base — phase 3 threads the
-            // real `nav` through the carry when it makes the ladder IP-native.
-            nav: AnnNav::Augmented,
+            // HIK-137 phase 3: the carried base's navigation discriminator is preserved through the
+            // consolidation. An IP-native base folds a Δ with the IP insert-weave + IP delete re-prune
+            // (`streaming_merge`/`consolidate_deletes` above, gated on this `nav`) and re-emits
+            // `nav: inner_product`, so a Dot base stays IP-native across every consolidation.
+            nav: carry.nav,
         },
     };
     Ok((
@@ -1070,7 +1073,7 @@ mod carry_tests {
         desc: &VectorIndexDesc,
         layout_to_dump_id: &[u64],
     ) -> crate::model::VectorCarry {
-        let (r, alpha, medoid, max_norm, pq_subspaces, pq_bits) = match desc.mode {
+        let (r, alpha, medoid, max_norm, pq_subspaces, pq_bits, nav) = match desc.mode {
             AnnMode::Vamana {
                 r,
                 alpha,
@@ -1078,8 +1081,9 @@ mod carry_tests {
                 max_norm,
                 pq_subspaces,
                 pq_bits,
+                nav,
                 ..
-            } => (r, alpha, medoid, max_norm, pq_subspaces, pq_bits),
+            } => (r, alpha, medoid, max_norm, pq_subspaces, pq_bits, nav),
             _ => unreachable!("fixture builds Vamana"),
         };
         let _ = data_dir;
@@ -1096,6 +1100,7 @@ mod carry_tests {
             max_norm,
             pq_subspaces,
             pq_bits,
+            nav,
         }
     }
 
@@ -1219,6 +1224,15 @@ mod carry_tests {
             out_pq.node_ids, expected,
             "the .pq id column is the composition"
         );
+
+        // HIK-137: the carry re-emits the base's navigation discriminator rather than hardcoding
+        // one — a cosine base stays `Augmented` (this fixture), and an IP base would stay
+        // `InnerProduct`. A carry that reverted the discriminator would mis-navigate the survivor.
+        let (in_nav, out_nav) = match (&desc.mode, &out_desc.mode) {
+            (AnnMode::Vamana { nav: a, .. }, AnnMode::Vamana { nav: b, .. }) => (*a, *b),
+            _ => unreachable!("both are Vamana"),
+        };
+        assert_eq!(out_nav, in_nav, "the carry preserves the nav discriminator");
 
         // KNN returns the same nodes under the permuted ids, same scores.
         let after = knn(&out_vamana, &out_pq_path, &query, medoid, 10);

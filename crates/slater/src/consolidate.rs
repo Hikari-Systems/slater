@@ -430,21 +430,11 @@ pub fn serialise_binary_dump<V: ReadView>(
                 nav,
                 ..
             } => {
-                // HIK-137 phase 2 ships the IP-native Dot BASE build + read only. Folding a Δ into
-                // an `InnerProduct` base still runs the augmented insert path (`rwvamana`/
-                // `streaming_merge` are not yet IP-native — that is phase 3), which would splice
-                // augmented-space edges into a raw-IP graph and silently mis-navigate. Refuse it
-                // legibly instead of carrying a corrupt graph. (Cosine/L2/augmented-Dot are
-                // unaffected: they are `Augmented`.)
-                if nav == graph_format::manifest::AnnNav::InnerProduct {
-                    anyhow::bail!(
-                        "vector index (:{} {{{}}}) is IP-native (MIPS) but consolidation/merge is \
-                         not yet IP-integrated (HIK-137 phase 3); refusing to fold updates into it \
-                         rather than mis-navigate. Rebuild the base to apply changes for now.",
-                        desc.label,
-                        desc.property
-                    );
-                }
+                // HIK-137 phase 3: an `InnerProduct` base is now folded IP-native. The `nav` is
+                // carried on the `DumpVectorCarry` below, so `streaming_merge` weaves Δ inserts with
+                // the IP prune + IP delete re-prune and re-emits `nav: inner_product`. The `.vamana`
+                // is id-free geometry, so carry-by-reference of the base is metric-agnostic — only
+                // the re-prune/insert-weave read the discriminator.
                 let index = view
                     .vamana_index(&desc.label, &desc.property)
                     .with_context(|| {
@@ -491,6 +481,7 @@ pub fn serialise_binary_dump<V: ReadView>(
                     max_norm,
                     pq_subspaces,
                     pq_bits,
+                    nav,
                 })
             }
             AnnMode::BruteForce => {

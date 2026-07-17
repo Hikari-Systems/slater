@@ -6445,9 +6445,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
             ix.reader.inner(),
             &ix.pq,
             ix.medoid,
-            // Segments are produced by the ladder, which is not IP-native until HIK-137 phase 3, so
-            // a phase-2 segment is always augmented. (A Dot base build produces no segments.)
-            AnnNav::Augmented,
+            // HIK-137 phase 3: a Dot segment seals IP-native and carries `nav: InnerProduct` on its
+            // `SealedVamanaMeta`; dispatch on it so the segment beam navigates by the IP-ADC estimate,
+            // exactly as the base does. A cosine/L2 (or legacy) segment is `Augmented`.
+            ix.nav,
             metric,
             query,
             k,
