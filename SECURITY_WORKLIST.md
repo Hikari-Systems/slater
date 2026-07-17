@@ -130,6 +130,44 @@ authenticated principals over Bolt).
   `RECORD`s of the prior user's rows, the ACL tests are served `SUCCESS` where a `FAILURE` is
   required.
 
+## Closed — a forged `nav` discriminator could mis-navigate a cosine/L2 index (2026-07-17, HIK-137)
+
+- [x] **✅ FIXED — `nav: inner_product` on a non-Dot index was navigated by the IP navigator, not
+  refused.** HIK-137 added an IP-native (MIPS) vector navigator, selected by an additive-optional
+  `nav` discriminator on the manifest / `SealedVamanaMeta` / `DumpVectorCarry`. The read path
+  dispatched on `nav` alone: `InnerProduct` → `AdcTable::new_ip` (raw inner-product ADC), `Augmented`
+  → the L2-reduced ADC. The `(metric, nav)` pair was **not** cross-checked. The generation-open
+  validator (`validate_vamana_index`) does tie the `.pq` codebook back to the declared space, but
+  that check cannot catch this case: an `InnerProduct` codebook is `PqParams::new(dim, …)`, and a
+  **cosine or L2** codebook has the *identical* width (`ann_pq_params` only augments for `Dot`), so a
+  forged/bit-rotted `nav: inner_product` on a cosine/L2 index passes the width check and is then
+  navigated by inner product over a graph built for angular/Euclidean closeness — **wrong neighbours,
+  plausible scores, no error**. On a **plaintext** image the manifest's own fields are unauthenticated
+  (`THREAT_MODEL.md` limitation 2) and `content_hash` covers the *inventory files*, not the manifest
+  JSON, so a same-length `nav` flip survives every integrity check. `nav == InnerProduct` is only ever
+  *produced* for `Metric::Dot` (`build_vamana_ip` and the segment seal both gate on it), so the forged
+  pairing is unreachable through any legitimate build.
+
+  **Fix:** a typed invariant `AnnNav::check_metric(metric)` (returning `NavMetricMismatch`, so callers
+  branch on the error *type*, not its text — house rule) refuses `InnerProduct` on any non-`Dot`
+  index. It is enforced at two read sites: `validate_vamana_index` (base index, fail-fast at generation
+  open, matching the file's "refuse to serve on any mismatch" doctrine) and the shared `beam_over_index`
+  navigator (fail-closed at query time — this is the *only* point where a sealed **segment**'s `nav`
+  meets the metric, since `SegmentVamanaSet::open_if_present_via` never sees the metric, which lives in
+  the base descriptor). `Augmented` always passes for every metric, and a legitimate `Dot` +
+  `InnerProduct` IP index passes — only the forged pairing is refused. No format-version bump; cosine
+  and L2 navigation are byte-for-byte unchanged.
+
+  **Tests (red-first, verified failing before the guard):**
+  `generation::tests::a_forged_inner_product_nav_on_a_cosine_or_l2_index_is_refused` builds an honest
+  cosine and an honest L2 index, asserts the codebook width *equals* the raw IP width (so the space
+  check is provably blind), forges `nav: inner_product`, and asserts `validate_vamana_index` refuses
+  with a downcastable `NavMetricMismatch` — while a genuine `Augmented` cosine index still opens.
+  `manifest::tests::inner_product_nav_is_only_valid_for_a_dot_index` pins the invariant matrix, and
+  `manifest::tests::an_unknown_nav_value_is_refused_not_defaulted` proves a garbage `nav` *value*
+  (not merely an absent key) is rejected by serde rather than defaulting to `Augmented`. Complements
+  the existing on-disk-decode refusals — finite centroids and in-range PQ code bytes (HIK-133/134).
+
 ## Status at a glance
 
 **5 done · 1 in progress · 3 open** (as of 2026-06-12)
