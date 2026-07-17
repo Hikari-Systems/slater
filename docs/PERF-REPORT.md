@@ -17,7 +17,7 @@ not.
 | # | Feature (ticket) | Claim | Measured | 91.6 M / 370 GB extrapolation |
 |---|---|---|---|---|
 | 1 | RW-index removes per-query overlay brute force (HIK-112) | ON flat, OFF linear in delta | ON **1.2–2.0 ms** flat across 1k→50k; OFF **1.9→114.7 ms** (linear, ~2.3 ms/1k); **61× at 50k** | delta bounded by `maxVectors` (50k) ⇒ ON stays ~2 ms; OFF unusable |
-| 2 | Recall preserved across the ladder, per metric (HIK-114/115/119) | recall@10 held at each rung | cosine **0.91–0.99**, L2 **0.76–0.93**, dot **0.32–0.50**; consolidated ≥ base every metric | recall is size-stable (graph quality, not count) |
+| 2 | Recall preserved across the ladder, per metric (HIK-114/115/119/137) | recall@10 held at each rung | cosine **0.91–0.99**, L2 **0.76–0.93**, dot **0.32–0.50** augmentation-reduction → **~0.99** IP-native ladder (HIK-137); consolidated ≥ base every metric | recall is size-stable (graph quality, not count) |
 | 3 | Insert cost (HIK-112) | ~2 ms/insert | **1.54 ms** @2k, **1.68 ms** @5k amortized (climbs with N) | delta rebuild ≈ 2 ms × `maxVectors` ≈ **~100 s** at 50k |
 | 4 | Delete-consolidation cuts read IO at iso-recall (HIK-114) | ~3–4× fewer reads at 67 % dead | **2.94× at 67 %**, 1.98× at 50 %, **5.20× at 80 %** (recall ≥ 0.90) | ratio is fraction-driven, size-independent |
 | 5 | StreamingMerge fast vs slow path (HIK-115/119) | hard-link ~instant; rewrite decode-once | fast **9.7 ms / ~7.7 GiB/s eff.**; slow **108–114 MiB/s** | fast path O(1); slow @110 MiB/s: 1 pass ≈ **58 min**, 2 passes ≈ **117 min** for 370 GB |
@@ -66,20 +66,42 @@ meaningful and navigable. (Uniform-random high-dim vectors are near-orthogonal a
 |---|---|---|---|---|
 | Cosine | 0.990 | 0.910 | 0.960 | 0.890 |
 | L2 | 0.927 | 0.788 | 0.875 | 0.758 |
-| Dot | 0.433 | 0.353 | 0.497 | 0.315 |
+| Dot (augmentation-reduction) | 0.433 | 0.353 | 0.497 | 0.315 |
 
 The ladder **preserves** recall: consolidated ≥ base for every metric (splicing holes out of
 adjacency reconnects the live neighbourhood), delta (exact-navigated RwVamana) is highest, merged is
-within ~0.06 of base. The three metrics diverge exactly as intended — dot is far lower (0.315–0.497)
-because maximum-inner-product search is harder to navigate (a high-norm vector is "near" everything,
-distorting the navigable graph). The "exact-distance" delta rung (RwVamana) reaching only ~0.43 tells
-us **PQ quantization is not the dominant term** — dropping it buys about +0.08 — but it does *not*
-show the loss is intrinsic to dot-product kNN: that baseline is not metric-exact for dot either. It
-still navigates via the norm-augmentation MIPS→L2 reduction (`RwVamana::dist` computes `base + d*d`
-on the augment-coordinate difference, `crates/graph-format/src/rwvamana.rs`:186), so the augmentation
-reduction is not ruled out as the cause. Whether a MIPS-native navigator (e.g. ip-NSW) recalls better
-on this same fixture is **unmeasured** — tracked in HIK-137. For cosine and L2, recall is a function
-of graph quality, not vector count, so those hold at scale.
+within ~0.06 of base. Cosine and L2 recall is a function of graph quality, not vector count, so those
+hold at scale.
+
+Dot is far lower in that table (0.315–0.497), and the cause is now **measured**, not conjectured. The
+"exact-distance" delta rung (RwVamana) reaching only ~0.43 already told us **PQ quantization is not
+the dominant term** — dropping it buys about +0.08 — and that the loss is *not* intrinsic to
+dot-product kNN: that baseline is not metric-exact for dot either. It still navigates via the
+norm-augmentation MIPS→L2 reduction (`RwVamana::dist` computes `base + d*d` on the augment-coordinate
+difference, `crates/graph-format/src/rwvamana.rs`:186), the same reduction the base/consolidated/merged
+rungs use — so the augmentation reduction, not the metric, was under suspicion. HIK-137 built the
+missing measurement: an **IP-native (ip-NSW) navigator** — inner-product closeness, top-R-by-IP
+neighbour selection, highest-norm entry, and a raw-vector-trained IP-ADC codebook — benched on a
+purpose-built MIPS fixture with wide norm spreads (`crates/slater/benches/ipnsw_ladder_e2e.rs`, dim
+256, N 2000, three norm distributions), scored against an **independent brute-force inner-product**
+ground truth (never index-vs-index). On that fixture the augmentation-reduction path reproduces the
+floor, and the IP-native ladder lifts it to near-exact, holding across every rung:
+
+| norm spread (max/med) | augmentation-reduction base | IP-native base (T3) | delta (T0) | segment (T2) | merge (T4b) | delete (T4a) |
+|---|---|---|---|---|---|---|
+| uniform-4× (1.6) | 0.868 | 0.994 | 0.999 | 0.994 | 0.961 | 0.992 |
+| lognormal, realistic (3.8) | 0.407 | 0.997 | 1.000 | 0.997 | 0.953 | 0.996 |
+| Pareto, adversarial (81.8) | 0.395 | 1.000 | 1.000 | 1.000 | 0.971 | 1.000 |
+
+So the low dot recall was a property of the **augmentation-reduction navigation, not of dot-product
+kNN** — an IP-native graph that navigates on raw inner product fixes it (0.407 → 0.997 realistic,
+0.395 → 1.000 adversarial), and the ladder's consolidated-≥-base property now holds for dot too. T4b
+(the incremental single-pass merge-weave) sits ~0.03–0.04 below base — the honest cost of weaving
+25 % of the set in one pass rather than a full rebuild, still ~2.4× the augmented number and above
+0.95. *Measured on the D1 microbench fixture (deterministic, two runs bit-identical); absolute recall
+will be lower at 91.6 M, but the comparison is fair — the augmentation-reduction arm gets ~0.40 on the
+identical fixture and beam. The production ladder ships this IP-native path for Dot (HIK-137 phases
+2–3, additive-optional `nav` discriminator, no format rebuild); cosine/L2 navigation is unchanged.*
 
 **Scope note (honest).** The engine-level "delta+segments" *merged read* is not a distinct index
 kind — a core segment is itself a small on-disk vamana, so its recall is the **base** rung's, and

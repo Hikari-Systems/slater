@@ -6255,6 +6255,14 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if n == 0 || k == 0 {
             return Ok(Vec::new());
         }
+        // The shared (base + sealed-segment) navigator choke: refuse an `InnerProduct` discriminator
+        // on a non-Dot index before dispatching. The base index is also checked at generation open
+        // (`validate_vamana_index`), but a sealed **segment** carries its own `nav` and has no
+        // open-time metric context (`SegmentVamanaSet::open_if_present_via` never sees the metric —
+        // it lives in the base descriptor), so a forged `nav: inner_product` on a cosine/L2 segment
+        // would otherwise reach `AdcTable::new_ip` here and mis-navigate. Fail closed instead
+        // (HIK-137 phase 4).
+        nav.check_metric(metric, "vector index navigation")?;
         // PQ navigates in the space the codebook was trained in. HIK-137: an `InnerProduct` index
         // was trained on the RAW vectors and is navigated by the IP-ADC estimate (−⟨q, x̂⟩) with the
         // raw query — NO `ann_query` augmentation. `Augmented` (cosine/L2/legacy-Dot) is unchanged:

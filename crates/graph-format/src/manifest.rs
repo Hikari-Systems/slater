@@ -48,11 +48,47 @@ pub enum AnnNav {
     InnerProduct,
 }
 
+/// The `(metric, nav)` pair is inconsistent: an `InnerProduct` (IP-native) discriminator was
+/// found on a non-`Dot` index. Typed so a reader can branch on the *kind* of rejection rather than
+/// its message text (house rule; the [`crate::pq::NonFiniteEmbedding`]/[`crate::wire::DecodeRejected`]
+/// family).
+///
+/// This is the on-disk field the codebook-space check **cannot** catch: an `InnerProduct` codebook is
+/// trained on the raw vectors over `PqParams::new(dim, …)`, and a **cosine or L2** codebook has the
+/// *identical* width (`ann_pq_params` reduces to `PqParams::new(dim, …)` for both — only `Dot`
+/// augments), so a forged/bit-rotted `nav: inner_product` on a cosine/L2 index passes the width check
+/// and would then be navigated by `AdcTable::new_ip` — silently mis-navigating. `nav == InnerProduct`
+/// is only ever *produced* for [`Metric::Dot`] (`build_vamana_ip`/segment seal both gate on it), so
+/// this refuses forged state and never a legitimate index.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{what}: nav=inner_product (IP-native MIPS navigation) is only valid for a Dot index, but the \
+     declared metric is {metric:?} — refusing rather than mis-navigate a {metric:?} graph by inner \
+     product"
+)]
+pub struct NavMetricMismatch {
+    pub what: &'static str,
+    pub metric: Metric,
+}
+
 impl AnnNav {
     /// Whether this is the (default) augmented navigation — used by `skip_serializing_if` so a
     /// cosine/L2/augmented-Dot manifest omits the `nav` key entirely and stays byte-identical.
     pub fn is_augmented(&self) -> bool {
         matches!(self, AnnNav::Augmented)
+    }
+
+    /// Enforce the `(metric, nav)` invariant: [`AnnNav::InnerProduct`] is only valid for
+    /// [`Metric::Dot`]. Every reader that is about to dispatch on `nav` (the base-index open
+    /// validator and the shared beam navigator, which also covers sealed segments) calls this first,
+    /// so a forged/corrupted `nav: inner_product` on a cosine/L2 index is **refused**, never walked
+    /// by the IP navigator. `Augmented` always passes (cosine/L2/legacy-Dot); a legitimate IP index
+    /// is `Dot` + `InnerProduct` and passes. See [`NavMetricMismatch`].
+    pub fn check_metric(self, metric: Metric, what: &'static str) -> Result<(), NavMetricMismatch> {
+        if matches!(self, AnnNav::InnerProduct) && metric != Metric::Dot {
+            return Err(NavMetricMismatch { what, metric });
+        }
+        Ok(())
     }
 }
 
@@ -638,6 +674,60 @@ mod tests {
             "an InnerProduct index must record nav so the reader dispatches to the IP navigator: {js}"
         );
         assert_eq!(ip, serde_json::from_str(&js).unwrap());
+    }
+
+    /// The `(metric, nav)` invariant (HIK-137 phase 4). `InnerProduct` is only valid for `Dot`; a
+    /// forged/corrupted `nav: inner_product` on a cosine/L2 index must be refused, because the
+    /// codebook-width check cannot catch it (cosine/L2 augmented codebooks share the raw IP width).
+    #[test]
+    fn inner_product_nav_is_only_valid_for_a_dot_index() {
+        // The legitimate IP index: Dot + InnerProduct passes.
+        AnnNav::InnerProduct
+            .check_metric(Metric::Dot, "x")
+            .expect("Dot + InnerProduct is the legitimate IP index");
+        // Augmented always passes for every metric — cosine/L2/legacy-Dot are untouched.
+        for m in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            AnnNav::Augmented
+                .check_metric(m, "x")
+                .expect("Augmented navigation is valid for every metric");
+        }
+        // The forged pairs the codebook-width check cannot see: refuse, with the metric on the
+        // typed error so a caller can branch on the *kind* of rejection, not the message text.
+        for m in [Metric::Cosine, Metric::L2] {
+            let err = AnnNav::InnerProduct
+                .check_metric(m, "vec.Doc.embedding")
+                .expect_err("nav=inner_product on a non-Dot index must be refused");
+            assert_eq!(err.metric, m);
+            assert_eq!(err.what, "vec.Doc.embedding");
+        }
+    }
+
+    /// An unknown/garbage `nav` *value* (not merely an absent key) is rejected by serde — the enum
+    /// has no `#[serde(other)]` catch-all, so a corrupted discriminator can never fall through to a
+    /// default that mis-navigates. (`#[serde(default)]` only supplies a value when the key is
+    /// **absent**; a present-but-invalid value still fails deserialization.)
+    #[test]
+    fn an_unknown_nav_value_is_refused_not_defaulted() {
+        // Serialize a legitimate IP index, then corrupt *only* the nav string, so every other field
+        // stays correctly named and the parse can fail for exactly one reason: the bad discriminator.
+        let ip = AnnMode::Vamana {
+            r: 32,
+            alpha: 1.2,
+            medoid: 0,
+            pq_subspaces: 16,
+            pq_bits: 8,
+            live_count: 10,
+            max_norm: 2.0,
+            nav: AnnNav::InnerProduct,
+        };
+        let js = serde_json::to_string(&ip).unwrap();
+        assert!(js.contains(r#""nav":"inner_product""#));
+        let corrupted = js.replace(r#""nav":"inner_product""#, r#""nav":"quaternion""#);
+        let parsed: Result<AnnMode, _> = serde_json::from_str(&corrupted);
+        assert!(
+            parsed.is_err(),
+            "a nav value outside the known variants must be refused, not defaulted to Augmented: {corrupted}"
+        );
     }
 
     fn sample() -> Manifest {

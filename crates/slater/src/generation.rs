@@ -187,7 +187,15 @@ fn validate_vamana_index(
             desc.count
         );
     }
-    // 4. The codebook must be in the space the MANIFEST's (metric, nav) pair implies.
+    // 4a. The (metric, nav) pair must be self-consistent BEFORE the codebook-space check, because
+    // that check cannot catch a forged `nav: inner_product` on a cosine/L2 index: an `InnerProduct`
+    // codebook is `PqParams::new(dim, …)`, and cosine/L2 augmented codebooks have the *identical*
+    // width (only Dot augments), so the space check below passes and the beam would then navigate a
+    // cosine/L2 graph by IP-ADC — silently mis-navigating. `nav == InnerProduct` is only ever
+    // produced for Dot, so refuse the mismatch here rather than serve it (HIK-137 phase 4).
+    nav.check_metric(desc.metric, "vector index")
+        .with_context(|| format!("vector index {stem}"))?;
+    // 4b. The codebook must be in the space the MANIFEST's (metric, nav) pair implies.
     //
     // The read path derives the query transform from the descriptor and the *codebook's*
     // dimension. Those are the only inputs, and if they disagree the search still runs with
@@ -2147,6 +2155,56 @@ mod tests {
             "unexpected: {err:#}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HIK-137 phase 4: the hole the space check (above) **cannot** close. For cosine and L2 the
+    /// ANN codebook is `PqParams::new(dim, …)` — the *same width* as a raw IP codebook (only Dot
+    /// augments) — so a forged/bit-rotted `nav: inner_product` on a cosine/L2 index passes the
+    /// space check and would then be navigated by `AdcTable::new_ip`, silently mis-navigating a
+    /// cosine/L2 graph by inner product. `validate_vamana_index` must refuse the `(metric, nav)`
+    /// mismatch outright, with the typed `NavMetricMismatch` a caller can branch on.
+    #[test]
+    fn a_forged_inner_product_nav_on_a_cosine_or_l2_index_is_refused() {
+        use graph_format::manifest::{AnnNav, Metric, NavMetricMismatch};
+        for metric in [Metric::Cosine, Metric::L2] {
+            let tag = format!("navmix_{metric:?}");
+            // Built honestly for cosine/L2 — the codebook width equals a raw IP codebook's.
+            let (dir, reader, pq, desc) = vamana_pair(&tag, metric, 2, false, 6);
+            // Sanity: pre-guard, the codebook-space check alone would pass — a cosine/L2 codebook
+            // *is* PqParams::new(dim, …), which is exactly what InnerProduct expects. So without the
+            // (metric, nav) guard this whole call returns Ok — the mis-navigation hole.
+            assert_eq!(
+                pq.codebook.params,
+                graph_format::pq::PqParams::new(desc.dim, 2, 4).unwrap(),
+                "a {metric:?} codebook shares the raw IP codebook width — the space check is blind here"
+            );
+            let err = validate_vamana_index(
+                "x",
+                &reader,
+                &pq,
+                &desc,
+                0,
+                AnnNav::InnerProduct, // forged: this index is cosine/L2, not Dot
+                2,
+                4,
+            )
+            .expect_err(
+                "nav=inner_product on a cosine/L2 index must be refused, not mis-navigated",
+            );
+            // Typed, not message-matched (house rule): a caller branches on the kind of rejection.
+            let typed = err
+                .downcast_ref::<NavMetricMismatch>()
+                .unwrap_or_else(|| panic!("expected a typed NavMetricMismatch, got: {err:#}"));
+            assert_eq!(typed.metric, metric);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The guard rejects only the *forged* pairing — a genuine cosine index with no nav
+        // (Augmented) still opens, so this is not blanket rejection.
+        let (dir, reader, pq, desc) = vamana_pair("navmix_ok", Metric::Cosine, 2, false, 6);
+        validate_vamana_index("x", &reader, &pq, &desc, 0, AnnNav::Augmented, 2, 4)
+            .expect("a cosine index navigated Augmented must still open");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

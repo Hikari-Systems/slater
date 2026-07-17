@@ -136,6 +136,18 @@ encryption implies.
      stamp tamper-proof.
 2. **Plaintext images have no manifest authenticity.** With no master key there is no MAC;
    such images are guarded only by the copy-completeness hash. Use `--encrypt` for authenticity.
+   Because the manifest's *own* fields are unauthenticated in a plaintext image, the reader
+   applies **read-side, defence-in-depth validation** to any on-disk field that could
+   mis-*execute* rather than merely mis-report — a forged value must be refused, not silently
+   acted on. The vector-index `nav` discriminator (HIK-137) is the current example: `nav:
+   inner_product` selects the IP-native (MIPS) navigator, and on a cosine/L2 index the codebook
+   width alone cannot distinguish a forged discriminator from a legitimate one (only `Dot`
+   augments the codebook), so `AnnNav::check_metric` refuses `nav == inner_product` on any
+   non-`Dot` index — at generation open (`validate_vamana_index`) and again at the shared beam
+   navigator (which also covers sealed segments, whose `nav` has no open-time metric context).
+   This joins the existing on-disk-decode refusals (finite centroids and in-range PQ code bytes,
+   HIK-133/134). None is a substitute for `--encrypt`; each closes a *silent-mis-navigation*
+   path that a same-length plaintext tamper would otherwise reach.
 3. **Runtime trust boundary for `acl.json`.** The stamp is now re-verified on every
    hot-reload (see "Threat policed" above), so a post-build edit that diverges from the
    served stamp is refused rather than adopted. Two residuals remain by design: (a) for an
