@@ -18288,6 +18288,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Did this run fail with the typed [`graph_format::pq::NonFiniteEmbedding`]?
+    /// Classified by *type*, never by message text (house rule) — a NaN that merely
+    /// trips some unrelated arity/type check would not satisfy this.
+    fn rejected_nonfinite(r: Result<QueryResult>) -> bool {
+        r.err().is_some_and(|e| {
+            e.downcast_ref::<graph_format::pq::NonFiniteEmbedding>()
+                .is_some()
+        })
+    }
+
+    #[test]
+    fn vecf32_rejects_a_nonfinite_component_at_write_ingest() {
+        // The organic HIK-134 reproduction: log(-1.0) → NaN by slater's FalkorDB IEEE
+        // semantics. vecf32 must reject it with a TYPED finiteness error *before* it becomes
+        // a Vector that `SET n.embedding = …` would write into the index. Pre-fix this
+        // returned Ok(a NaN-bearing Vector); a NaN slipping an arity check would not match
+        // the typed error asserted here.
+        let (root, graph, _) = testgen::write_basic("exec_vecf32_write_nan");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let ast = parser::parse("RETURN vecf32([log(-1.0), 0.2, 0.3]) AS v").unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a NaN vecf32 component must be a typed finiteness error"
+        );
+        // Index uncorrupted: a subsequent clean KNN over the same fixture still returns the
+        // reference nearest neighbour (the rejected write never touched the index).
+        let ok = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, vecf32([0.1, 0.2, 0.3])) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        let res = Engine::new(&gen, &cache).run(&ok).unwrap();
+        assert!(
+            matches!(res.rows[0][0], Val::Int(0)),
+            "nearest is Alice (exact match) — index uncorrupted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vecf32_rejects_an_infinite_literal_via_the_parse_fold() {
+        // vecf32([1e400, …]) — the f64 literal is finite but `as f32` saturates to +inf. The
+        // parse-time constant fold must NOT bake it into a Vector literal (which would skip
+        // the runtime gate); the runtime vecf32 gate then rejects it. Covers `±inf` *and* the
+        // fold-bypass entry point in one shot.
+        let (root, graph, _) = testgen::write_basic("exec_vecf32_inf_literal");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+        let ast = parser::parse("RETURN vecf32([1e400, 0.2, 0.3]) AS v").unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a +inf vecf32 component must be a typed finiteness error"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn query_vector_nonfinite_is_rejected_against_a_clean_index() {
+        // The load-bearing case (HIK-134): a NaN QUERY needs no write at all. Against the
+        // clean fixture index, both the inline vecf32() form and a `$param` numeric-list form
+        // (the distinct `eval_query_vector` gate) must be rejected with the typed finiteness
+        // error — NOT answered with a `total_cmp`-ordered garbage result set.
+        let (root, graph, _) = testgen::write_basic("exec_query_vec_nan");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let cache = BlockCache::new(1 << 20);
+
+        // Form A: inline vecf32([log(-1.0), …]) → the vecf32 ingest gate.
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, vecf32([log(-1.0), 0.2, 0.3])) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).run(&ast)),
+            "a clean index + vecf32(NaN) query must be a typed error, not a garbage result"
+        );
+
+        // Form B: a $param list carrying a NaN → the eval_query_vector List arm.
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            Val::List(vec![Val::Float(f64::NAN), Val::Float(0.2), Val::Float(0.3)]),
+        );
+        let ast = parser::parse(
+            "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, $q) \
+             YIELD node, score RETURN id(node) AS id",
+        )
+        .unwrap();
+        assert!(
+            rejected_nonfinite(Engine::new(&gen, &cache).with_params(params).run(&ast)),
+            "a clean index + $param NaN query must be a typed error, not a garbage result"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn vector_knn_reads_route_through_the_block_cache() {
         let (root, graph, _) = testgen::write_basic("exec_knn_cache");

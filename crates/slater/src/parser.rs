@@ -4289,6 +4289,21 @@ mod tests {
         );
     }
 
+    /// A folded component that is non-finite must NOT become a stored `Vector` literal
+    /// (HIK-134): `vecf32([1e400])` has a finite `f64` literal that saturates to `+inf` on
+    /// the `as f32` cast, and baking it into a literal would slip a non-finite embedding into
+    /// the index behind the runtime gate. The fold declines, so the value stays a non-constant
+    /// call and the write is rejected synchronously at lowering (before any storage or ack) —
+    /// contrast `folds_a_literal_vecf32_write_to_a_vector_literal`, which folds a finite one.
+    #[test]
+    fn a_nonfinite_vecf32_literal_write_is_rejected_not_folded() {
+        let e = write_err("MERGE (n:Doc {id: 1}) SET n.embedding = vecf32([1e400, 0.5, 0.5])");
+        assert!(
+            e.contains("must be a literal or a parameter"),
+            "a +inf literal write must be rejected, not folded into a stored vector; got: {e}"
+        );
+    }
+
     /// `vecf32($p)` cannot fold (the parameter is bound per execution), so it must
     /// survive lowering as a call — and `ensure_constant` must admit that one shape.
     #[test]

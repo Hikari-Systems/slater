@@ -872,4 +872,32 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("dimension"), "{err}");
     }
+
+    #[test]
+    fn rw_index_rejects_a_nonfinite_component() {
+        // The delta write path is a distinct entry point (HIK-134): a NaN/±inf here poisons the
+        // resident buffer immediately, and `max_norm2.max(norm2)` silently drops the NaN so no
+        // later guard catches it. Assert the *typed* finiteness error, and that the insert did
+        // not partially mutate the index (a clean insert afterwards still works).
+        let mut rw = RwVamana::new(3, Metric::Cosine);
+        for bad in [
+            [f32::NAN, 0.0, 0.0],
+            [0.0, f32::INFINITY, 0.0],
+            [0.0, 0.0, f32::NEG_INFINITY],
+        ] {
+            let err = rw.insert(1, &bad).unwrap_err();
+            assert!(
+                err.downcast_ref::<crate::pq::NonFiniteEmbedding>()
+                    .is_some(),
+                "must be the typed finiteness error, got: {err}"
+            );
+        }
+        assert!(rw.is_empty(), "a rejected insert must not add a slot");
+        rw.insert(1, &[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            rw.live_count(),
+            1,
+            "a finite insert still works after rejection"
+        );
+    }
 }

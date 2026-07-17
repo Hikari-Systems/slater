@@ -1333,6 +1333,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finite_gate_rejects_nan_and_both_infinities() {
+        // The one shared decision function: finite passes through unchanged; NaN and ±inf are
+        // typed errors carrying the offending index (HIK-134). It rejects, never coerces.
+        assert_eq!(finite_f32(0, 1.5).unwrap(), 1.5);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(finite_f32(2, bad).unwrap_err().index, 2);
+        }
+        assert!(require_finite(&[1.0, 2.0, 3.0]).is_ok());
+        assert_eq!(require_finite(&[1.0, f32::NAN, 3.0]).unwrap_err().index, 1);
+    }
+
+    #[test]
+    fn ann_query_rejects_a_nonfinite_query_for_every_metric() {
+        // The sharpest case: a NaN/±inf QUERY needs no write and would otherwise return
+        // `total_cmp`-ordered garbage against a clean index. The query transform is the one
+        // read-path transform, so gating it here covers every metric.
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let space_dim = match metric {
+                Metric::Dot => 6, // room for the augmentation
+                _ => 4,
+            };
+            for bad in [
+                vec![f32::NAN, 0.2, 0.3, 0.4],
+                vec![0.1, f32::INFINITY, 0.3, 0.4],
+                vec![0.1, 0.2, 0.3, f32::NEG_INFINITY],
+            ] {
+                let err = ann_query(metric, &bad, space_dim).unwrap_err();
+                assert!(
+                    err.downcast_ref::<NonFiniteEmbedding>().is_some(),
+                    "{metric:?}: must be the typed finiteness error, got: {err}"
+                );
+            }
+            // A finite query of the same shape still transforms cleanly.
+            assert!(ann_query(metric, &[0.1, 0.2, 0.3, 0.4], space_dim).is_ok());
+        }
+    }
+
+    #[test]
+    fn ann_point_rejects_a_nonfinite_component_before_augmentation() {
+        // Train-time backstop: distinct from the max-norm overflow guard, which is blind to a
+        // per-component NaN (it survives `f64::max` and rides verbatim into `v.to_vec()`).
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let space_dim = if metric == Metric::Dot { 6 } else { 4 };
+            let err = ann_point(metric, &[f32::NAN, 0.2, 0.3, 0.4], 1.0, space_dim).unwrap_err();
+            assert!(
+                err.downcast_ref::<NonFiniteEmbedding>().is_some(),
+                "{metric:?}: must be the typed finiteness error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_src_rejects_a_codebook_with_a_nonfinite_centroid() {
+        // Read backstop: a bit-rotted image, or a codebook trained by a *past* build before
+        // the ingest gate existed, can carry a NaN centroid that a query would score by
+        // `total_cmp`. `open` must refuse it rather than serve silent garbage.
+        let dim = 8;
+        let data = clustered(dim, 3, 8);
+        let params = PqParams::new(dim as u32, 2, 4).unwrap();
+        let mut cb = train_codebooks(&data, params, 15).unwrap();
+        cb.centroids[0] = f32::NAN; // poison one centroid
+
+        let path =
+            std::env::temp_dir().join(format!("slater_pq_{}_{}", std::process::id(), "nanc"));
+        let mut w = PqWriter::create_with_cipher(&path, &cb, 4096, 3, None).unwrap();
+        w.append_codes(0, &cb.encode(&data[0]).unwrap()).unwrap();
+        w.finish().unwrap();
+
+        let err = PqReader::open_with_cipher(&path, None).err().unwrap();
+        assert!(
+            err.downcast_ref::<NonFiniteEmbedding>().is_some(),
+            "open must reject a non-finite centroid, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Deterministic synthetic clusters: `clusters` blobs of `per` points in
     /// `dim` dimensions, each blob centred at a distinct corner, lightly jittered.
     fn clustered(dim: usize, clusters: usize, per: usize) -> Vec<Vec<f32>> {
