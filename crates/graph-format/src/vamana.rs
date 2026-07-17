@@ -1139,6 +1139,26 @@ mod tests {
         );
     }
 
+    /// The IP build must not silently *be* the L2 build. On the same MIPS-hard fixture the two
+    /// produce different adjacency (different entry, different selection rule), so a refactor that
+    /// accidentally routed Dot back through `build_vamana` would be caught — not hidden behind a
+    /// golden that pins whatever it was handed.
+    #[test]
+    fn build_vamana_ip_differs_from_the_l2_build() {
+        let vectors = mips_vectors(16, 200);
+        let ip = build_vamana_ip(&vectors, 24).unwrap();
+        let l2 = build_vamana(&vectors, 24, 1.2).unwrap();
+        assert_ne!(
+            ip.medoid, l2.medoid,
+            "the IP entry (highest-norm) must differ from the L2 centroid medoid on MIPS data"
+        );
+        assert_ne!(
+            adjacency_digest(&ip),
+            adjacency_digest(&l2),
+            "the IP-native graph must be genuinely different from the L2 graph"
+        );
+    }
+
     /// Determinism: same vectors ⇒ same IP graph (the content-hash contract).
     #[test]
     fn build_vamana_ip_is_deterministic() {

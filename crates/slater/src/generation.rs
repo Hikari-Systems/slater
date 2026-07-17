@@ -2028,6 +2028,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// HIK-137: the reader must **dispatch on `nav`, or refuse legibly**. A genuine IP-native index
+    /// (raw codebook, plain `PqParams`) validates as `InnerProduct`; the *same* raw codebook
+    /// validated as `Augmented`, and an augmented Dot codebook validated as `InnerProduct`, are both
+    /// refused for the space mismatch — so a Dot index built the old (augmented) way can never be
+    /// mis-navigated by the IP-ADC read path, and vice versa.
+    #[test]
+    fn ip_native_index_validates_and_a_space_nav_mismatch_is_refused() {
+        use graph_format::manifest::{AnnMode, AnnNav, Metric, VectorIndexDesc};
+        use graph_format::pq::{
+            ann_point, ann_pq_params, l2_norm, train_codebooks, PqParams, PqWriter,
+        };
+        use graph_format::vamana::{VamanaReader, VamanaWriter};
+
+        let (dim, n, subspaces, bits) = (4usize, 6usize, 2u32, 4u32);
+        let dir = std::env::temp_dir().join(format!("slater_ipval_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw: Vec<Vec<f32>> = (0..n)
+            .map(|i| (0..dim).map(|d| (i + d) as f32 + 1.0).collect())
+            .collect();
+
+        // A `.vamana` over the raw vectors, complete adjacency (no orphan medoid).
+        let mut vw = VamanaWriter::create_with_cipher(dir.join("x.vamana"), 4096, 3, None).unwrap();
+        for (i, v) in raw.iter().enumerate() {
+            let nbrs: Vec<u32> = (0..n as u32).filter(|&j| j != i as u32).collect();
+            vw.append(v, &nbrs).unwrap();
+        }
+        vw.finish().unwrap();
+        let reader = VamanaReader::open_with_cipher(dir.join("x.vamana"), None).unwrap();
+
+        let mk_desc = |nav| VectorIndexDesc {
+            label: "Doc".into(),
+            property: "embedding".into(),
+            dim: dim as u32,
+            metric: Metric::Dot,
+            count: n as u64,
+            first_record: 0,
+            mode: AnnMode::Vamana {
+                r: 8,
+                alpha: 1.2,
+                medoid: 0,
+                pq_subspaces: subspaces,
+                pq_bits: bits,
+                live_count: n as u64,
+                max_norm: 1.0,
+                nav,
+            },
+        };
+        let write_pq = |name: &str, cb: &graph_format::pq::Codebook, encoded: &[Vec<f32>]| {
+            let mut pw = PqWriter::create_with_cipher(dir.join(name), cb, 4096, 3, None).unwrap();
+            for p in encoded {
+                pw.append_codes(0, &cb.encode(p).unwrap()).unwrap();
+            }
+            pw.finish().unwrap();
+            PqReader::open_with_cipher(dir.join(name), None)
+                .unwrap()
+                .load_resident()
+                .unwrap()
+        };
+
+        // (1) A genuine IP-native codebook: plain PqParams over the RAW vectors.
+        let ip_cb =
+            train_codebooks(&raw, PqParams::new(dim as u32, subspaces, bits).unwrap(), 5).unwrap();
+        let ip_pq = write_pq("ip.pq", &ip_cb, &raw);
+        validate_vamana_index(
+            "x",
+            &reader,
+            &ip_pq,
+            &mk_desc(AnnNav::InnerProduct),
+            0,
+            AnnNav::InnerProduct,
+            subspaces,
+            bits,
+        )
+        .expect("a raw codebook under InnerProduct must validate");
+        // The SAME raw codebook validated as Augmented (Dot) expects the augmented space
+        // (dim + dsub), so it is refused — no silent mis-navigation.
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &ip_pq,
+            &mk_desc(AnnNav::Augmented),
+            0,
+            AnnNav::Augmented,
+            subspaces,
+            bits,
+        )
+        .expect_err("a raw codebook under Augmented must be refused");
+        assert!(
+            err.to_string().contains("different spaces"),
+            "unexpected: {err:#}"
+        );
+
+        // (2) An augmented Dot codebook validated as InnerProduct must ALSO be refused: the IP-ADC
+        // read path must never navigate an augmented codebook.
+        let aug_params = ann_pq_params(Metric::Dot, dim as u32, subspaces, bits).unwrap();
+        let max_norm = raw.iter().map(|v| l2_norm(v)).fold(0.0f64, f64::max);
+        let aug_points: Vec<Vec<f32>> = raw
+            .iter()
+            .map(|v| ann_point(Metric::Dot, v, max_norm, aug_params.dim as usize).unwrap())
+            .collect();
+        let aug_cb = train_codebooks(&aug_points, aug_params, 5).unwrap();
+        let aug_pq = write_pq("aug.pq", &aug_cb, &aug_points);
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &aug_pq,
+            &mk_desc(AnnNav::InnerProduct),
+            0,
+            AnnNav::InnerProduct,
+            subspaces,
+            bits,
+        )
+        .expect_err("an augmented codebook under InnerProduct must be refused");
+        assert!(
+            err.to_string().contains("different spaces"),
+            "unexpected: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rejects_missing_current() {
         let root = std::env::temp_dir().join(format!("slater_gen_missing_{}", std::process::id()));
