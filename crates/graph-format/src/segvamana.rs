@@ -450,12 +450,12 @@ mod tests {
         let dir = tmp("ip_recall");
         let dim = 16;
         // MIPS-hard: mostly unit-norm, every 97th a ~30× outlier (near every query under IP).
-        let raw = rand_vectors(dim, 3_000, 0x15eed_0001);
+        let raw = rand_vectors(dim, 3_000, 0x15ee_d001);
         let entries: Vec<(u64, Vec<f32>)> = raw
             .into_iter()
             .enumerate()
             .map(|(i, (id, v))| {
-                let scale = if i % 97 == 0 { 30.0 } else { 1.0 };
+                let scale = if i.is_multiple_of(97) { 30.0 } else { 1.0 };
                 let nrm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
                 (id, v.iter().map(|x| x * scale / nrm).collect())
             })

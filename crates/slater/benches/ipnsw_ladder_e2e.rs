@@ -111,7 +111,7 @@ fn measure(dir: &std::path::Path, name: &str, raw: &[Vec<f32>], qs: &[Vec<f32>])
         PQ_ITERS,
     )
     .unwrap();
-    let is_deleted = |id: u64| id % 4 == 0;
+    let is_deleted = |id: u64| id.is_multiple_of(4);
     let t4a_final_ids: Vec<u64> = t4a_base
         .layout_dump_ids
         .iter()

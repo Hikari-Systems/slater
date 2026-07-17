@@ -931,7 +931,7 @@ mod tests {
             .map(|i| {
                 let v: Vec<f32> = (0..dim).map(|_| (rng.next_f64() as f32) - 0.5).collect();
                 let u = normalise(&v);
-                let scale = if i % 89 == 0 { 25.0 } else { 1.0 };
+                let scale = if i.is_multiple_of(89) { 25.0 } else { 1.0 };
                 u.iter().map(|x| x * scale).collect()
             })
             .collect()
@@ -1117,7 +1117,7 @@ mod tests {
         let base = build_ip_base(&dir, "base", &vectors, &ids, 32);
 
         // Delete every 4th dense id → HOLE in the id column.
-        let deleted = |id: u64| (id - 500) % 20 == 0; // 5% of a strided space, interior
+        let deleted = |id: u64| (id - 500).is_multiple_of(20); // 5% of a strided space, interior
         let base_final_ids: Vec<u64> = base
             .layout_ids
             .iter()

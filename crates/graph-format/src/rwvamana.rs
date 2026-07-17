@@ -823,7 +823,7 @@ mod tests {
         {
             // Most rows are unit-ish; every 97th is a ~30× outlier — a high-norm vector is "near"
             // almost every query under IP, the navigation hazard the augmented build fails.
-            let scale = if i % 97 == 0 { 30.0 } else { 1.0 };
+            let scale = if i.is_multiple_of(97) { 30.0 } else { 1.0 };
             let nrm = (v.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
             let scaled: Vec<f32> = v.iter().map(|x| x * scale / nrm).collect();
             rw.insert(i as u64, &scaled).unwrap();

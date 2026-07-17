@@ -1225,6 +1225,15 @@ mod carry_tests {
             "the .pq id column is the composition"
         );
 
+        // HIK-137: the carry re-emits the base's navigation discriminator rather than hardcoding
+        // one — a cosine base stays `Augmented` (this fixture), and an IP base would stay
+        // `InnerProduct`. A carry that reverted the discriminator would mis-navigate the survivor.
+        let (in_nav, out_nav) = match (&desc.mode, &out_desc.mode) {
+            (AnnMode::Vamana { nav: a, .. }, AnnMode::Vamana { nav: b, .. }) => (*a, *b),
+            _ => unreachable!("both are Vamana"),
+        };
+        assert_eq!(out_nav, in_nav, "the carry preserves the nav discriminator");
+
         // KNN returns the same nodes under the permuted ids, same scores.
         let after = knn(&out_vamana, &out_pq_path, &query, medoid, 10);
         let want: Vec<(u64, f32)> = before
