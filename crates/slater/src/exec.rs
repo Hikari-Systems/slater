@@ -6186,6 +6186,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// (coalesced by block), re-ranking the beam by the **exact** metric distance so
     /// the returned `score` matches the brute-force contract (D32). The resident set
     /// is PQ codes only — never a full in-memory graph.
+    #[allow(clippy::too_many_arguments)]
     fn vamana_knn(
         &self,
         vc: &VectorCallClause,

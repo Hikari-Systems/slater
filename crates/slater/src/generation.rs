@@ -160,6 +160,7 @@ pub struct VamanaIndex {
 ///    Recall for the entire index goes to zero, with no error and no panic. This is the
 ///    invariant a delete-splice must preserve (see `AnnMode::Vamana::medoid`); here is
 ///    where a violation is caught.
+#[allow(clippy::too_many_arguments)]
 fn validate_vamana_index(
     stem: &str,
     reader: &VamanaReader,
@@ -1925,8 +1926,17 @@ mod tests {
     fn an_orphaned_medoid_is_refused_rather_than_served() {
         use graph_format::manifest::Metric;
         let (dir, reader, pq, desc) = vamana_pair("orphan", Metric::Cosine, 2, true, 6);
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
-            .expect_err("an index whose entry point has no out-edges must not open");
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .expect_err("an index whose entry point has no out-edges must not open");
         assert!(
             err.to_string().contains("orphaned medoid"),
             "unexpected: {err:#}"
@@ -1935,10 +1945,30 @@ mod tests {
         // The same index with the medoid's edges intact opens fine — the guard is not
         // simply rejecting everything.
         let (dir2, reader2, pq2, desc2) = vamana_pair("ok", Metric::Cosine, 2, false, 6);
-        validate_vamana_index("x", &reader2, &pq2, &desc2, 0, 2, 4).unwrap();
+        validate_vamana_index(
+            "x",
+            &reader2,
+            &pq2,
+            &desc2,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap();
         // An out-of-range medoid is refused too: the beam search indexes the resident codes
         // with it directly, so it is a panic on an ordinary query.
-        let err = validate_vamana_index("x", &reader2, &pq2, &desc2, 99, 2, 4).unwrap_err();
+        let err = validate_vamana_index(
+            "x",
+            &reader2,
+            &pq2,
+            &desc2,
+            99,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("medoid"), "unexpected: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -1951,7 +1981,17 @@ mod tests {
     fn a_pq_and_vamana_record_count_disagreement_is_refused() {
         use graph_format::manifest::Metric;
         let (dir, reader, pq, desc) = vamana_pair("short", Metric::Cosine, 2, false, 4);
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4).unwrap_err();
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("lockstep"), "unexpected: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1970,8 +2010,17 @@ mod tests {
         assert_eq!(pq.codebook.params.dim, 4);
         // ...but the MANIFEST claims dot, whose ANN space is dim + dsub = 6 over 3 subspaces.
         desc.metric = Metric::Dot;
-        let err = validate_vamana_index("x", &reader, &pq, &desc, 0, 2, 4)
-            .expect_err("a codebook in the wrong space for the declared metric must not open");
+        let err = validate_vamana_index(
+            "x",
+            &reader,
+            &pq,
+            &desc,
+            0,
+            graph_format::manifest::AnnNav::Augmented,
+            2,
+            4,
+        )
+        .expect_err("a codebook in the wrong space for the declared metric must not open");
         assert!(
             err.to_string().contains("different spaces"),
             "unexpected: {err:#}"
