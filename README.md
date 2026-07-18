@@ -17,7 +17,7 @@
 | [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
 | [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
 | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
-| [Performance](#performance) | [License](#license) | **[📖 Full manual (`docs/manual/`)](docs/manual/README.md)** |
+| [Performance](#performance) | [License](#license) | [📖 Full manual](docs/manual/README.md) |
 
 ## Why Slater exists
 
