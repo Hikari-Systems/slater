@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/Hikari-Systems/slater?sort=semver)](https://github.com/Hikari-Systems/slater/releases/latest)
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.24.0`** — [all releases](https://github.com/Hikari-Systems/slater/releases).
+**Current version: `v0.24.1`** — [all releases](https://github.com/Hikari-Systems/slater/releases).
 
 > **In one line:** Slater serves **graphs that don't fit in memory** — hundreds of millions of nodes and billions of edges in low hundreds of MB of RAM — over standard **Bolt**, so any neo4j driver just works, with disk-native vector search sitting next to the graph, and it takes **live, durable writes** without giving that up. Resident memory is set by a cache budget you choose, **not** by the size of the graph.
 

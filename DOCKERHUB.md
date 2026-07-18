@@ -3,7 +3,7 @@
 **A low-memory, Bolt-speaking graph + vector engine that serves graphs bigger than RAM — and takes live, durable writes.**
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, README.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.24.0`** — [all releases](https://github.com/Hikari-Systems/slater/releases).
+**Current version: `v0.24.1`** — [all releases](https://github.com/Hikari-Systems/slater/releases).
 
 Slater serves a graph over the **Bolt protocol** (port `7687`), so any standard
 **neo4j driver** (JavaScript, Python, Go, Java, …) or `cypher-shell` can query it.
