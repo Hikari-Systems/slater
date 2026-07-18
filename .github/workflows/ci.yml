@@ -1,9 +1,10 @@
 name: ci
 
-# Fast feedback on every push and pull request: formatting must be clean and the
-# whole workspace must compile. The heavier test suite runs in `release.yml` as
-# the publish gate; this workflow is the per-commit signal behind the README's
-# build badge.
+# Fast feedback on every push and pull request: formatting and clippy must be
+# clean, the whole workspace must compile, and the fast test suite must pass.
+# `release.yml` re-runs the same `cargo test --workspace` as its publish gate and
+# adds the tag-only heavy work (fuzzing, multi-arch images, release binaries);
+# this workflow is the per-commit signal behind the README's build badge.
 on:
   push:
   pull_request:
@@ -93,6 +94,34 @@ jobs:
 
       - name: Build the workspace
         run: cargo build --workspace --locked
+
+  # ── Test: the fast suite, per-commit ───────────────────────────────────────
+  # `cargo test --workspace` — the exact command `release.yml` runs as its publish
+  # gate. The heavy tests (large-graph builds, live S3/GCS, the real slater-build
+  # binary) are `#[ignore]`d or env-gated, so only the ~1450 fast unit/integration
+  # tests run here. This suite used to run *only* on a tag, so a change that
+  # compiled and linted clean but broke a unit test could merge green and surface
+  # only at release; running it on every commit closes that gap.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see the
+      # build job and the Dockerfile builder stage).
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test suite
+        run: cargo test --workspace --locked
 
   # ── Store backends: compile + run the feature-gated s3/gcs code that the
   #    default build never touches (HIK-138). Whole modules under
