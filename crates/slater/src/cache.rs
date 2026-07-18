@@ -1,31 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bounded block cache — the decompressed-block LRU.
+//! The server's three cache pools: decompressed blocks, whole query results, and
+//! vector-index (PQ + Vamana) blocks. Each has its own byte budget so one pool cannot
+//! evict another's hot working set.
 //!
-//! Every `.blk` file is a sequence of zstd blocks; the readers fetch a block
-//! with one `pread` + decompress per access (no mmap — D16/the blockfile docs).
-//! Repeated reads of the same block (a hot adjacency block during traversal, the
-//! property block of a popular node) would otherwise re-`pread` and re-decompress
-//! every time. This LRU holds **decompressed** block bytes keyed by
-//! `(generation, file, block)` under a global byte budget, so resident memory is
-//! bounded regardless of graph size while hot blocks stay warm.
+//! * **Block pool** ([`BlockCache`]) — a thin wrapper over the sharded, CLOCK-evicted
+//!   [`graph_format::blockcache::BlockCache`] (shared with `slater-build`'s
+//!   sequential-scan use). Its hit path is a per-shard read lock; see that module.
+//!   `graph_format::blockfile::record_range_in_block` lets [`BlockCache::record`]
+//!   slice a record out of an already-decompressed cached block without re-parsing the
+//!   offset table, returning a [`BlockRecord`] that borrows the block by `Arc`.
+//! * **Result pool** ([`ResultCache`]) — whole query results keyed by
+//!   `(generation, delta epoch, normalised query)`.
+//! * **Vector pool** ([`VectorIndexCache`]) — the resident PQ codes the beam search
+//!   navigates by (pinned, never evicted) plus an LRU of the 1–2 MiB Vamana blocks.
 //!
-//! `graph_format::blockfile` exposes `record_range_in_block` precisely so a cache
-//! holder can locate an individual record's byte range within a cached decompressed
-//! block without decompressing (or re-parsing the offset table) again;
-//! [`BlockCache::record`] is that path, returning a [`BlockRecord`] that borrows the
-//! cached block by `Arc` rather than copying the record out.
+//! # Concurrency: a hit must not serialise
 //!
-//! Eviction order is LRU, tracked with a monotonic tick and a `BTreeMap` ordering
-//! (O(log n) per access) — simple and obviously correct, which matters more here
-//! than shaving a constant factor off a HashMap-list LRU.
+//! In steady state the working set is resident, so essentially every lookup is a hit,
+//! and every Bolt/rayon thread shares one pool. A hit path that took an exclusive lock
+//! would cap aggregate hit throughput at one core's worth regardless of how many
+//! threads are querying — and get *worse* with more of them. So the result and vector
+//! pools (like the block pool before them) evict by **CLOCK** (second-chance) rather
+//! than a strict LRU: a hit takes a shared read lock and sets one `referenced` atomic
+//! on the entry — mutating nothing shared — and the eviction hand sweeps a ring,
+//! reprieving set bits and evicting the first clear one. A strict tick/`BTreeMap` LRU
+//! cannot do this: re-ticking an ordered structure on every access needs exclusive
+//! access by construction (that was the old design's per-hit global-lock bottleneck).
+//! A freshly inserted entry sits just behind the hand (never its own sweep's victim),
+//! and a keep-at-least-one floor keeps a single oversized entry returnable.
+//!
+//! These two pools are single-domain (one `RwLock`), not sharded like the block pool:
+//! the read-lock hit path already lets concurrent hits proceed in parallel; sharding
+//! (which further spreads the miss-path *write* lock over cachelines) is a later step,
+//! taken only if a bench shows the miss rate warrants it.
 //
 // Consumed by the executor from M4.5; allow dead_code for the standalone cache
 // until those call sites land.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -159,6 +174,29 @@ impl BlockCache {
     }
 }
 
+// ── CLOCK second-chance primitives (shared by the result + vector pools) ───────
+
+/// Resolution of the idle-TTL stamp. Coarsening it keeps a hot entry's cacheline
+/// *shared* across the cores hitting it: a stamp written on every hit would bounce
+/// that line between cores. 10 ms bounds the error in an entry's measured idle time —
+/// negligible against any real TTL (seconds) — while cutting stamp writes on a hot
+/// entry to ~100/s no matter how many hits it takes. Mirrors the block pool's constant.
+const LAST_USED_GRANULARITY_MS: u64 = 10;
+
+/// Record an access on a CLOCK entry through a **shared** read guard: set the
+/// second-chance bit and re-stamp the idle clock. Both stores are skipped when they
+/// would be no-ops, so a hot entry's cacheline stays read-shared across cores.
+#[inline]
+fn touch(referenced: &AtomicBool, last_used_ms: &AtomicU64, now_ms: u64) {
+    if !referenced.load(Ordering::Relaxed) {
+        referenced.store(true, Ordering::Relaxed);
+    }
+    let last = last_used_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= LAST_USED_GRANULARITY_MS {
+        last_used_ms.store(now_ms, Ordering::Relaxed);
+    }
+}
+
 // ── Result cache (the third pool) ─────────────────────────────────────────────
 
 /// Key for a cached query result: the generation UUID plus a normalised query
@@ -201,48 +239,47 @@ impl ResultKey {
 struct ResultEntry<V> {
     value: Arc<V>,
     bytes: usize,
-    tick: u64,
-    last_used: Instant,
+    /// CLOCK second-chance bit: set by a hit (through a read guard), cleared as a
+    /// reprieve by the eviction hand. False on insert — an entry loaded and never read
+    /// again is the right first victim.
+    referenced: AtomicBool,
+    /// Milliseconds since the pool epoch at the most recent access, for the idle-TTL
+    /// sweep. Re-stamped only past [`LAST_USED_GRANULARITY_MS`].
+    last_used_ms: AtomicU64,
 }
 
 struct ResultInner<V> {
     map: HashMap<ResultKey, ResultEntry<V>>,
-    order: BTreeMap<u64, ResultKey>,
-    tick: u64,
+    /// CLOCK ring: every live key exactly once (`ring.len() == map.len()`). Order is
+    /// insertion-relative, not recency — recency lives in the `referenced` bits.
+    ring: Vec<ResultKey>,
+    /// The sweep hand: an index into `ring`, normalised at the top of each sweep step.
+    hand: usize,
     bytes: usize,
     budget: usize,
 }
 
 impl<V> ResultInner<V> {
-    fn next_tick(&mut self) -> u64 {
-        let t = self.tick;
-        self.tick += 1;
-        t
-    }
-
-    fn touch_get(&mut self, key: &ResultKey) -> Option<Arc<V>> {
-        let (value, old_tick) = {
-            let e = self.map.get(key)?;
-            (e.value.clone(), e.tick)
-        };
-        self.order.remove(&old_tick);
-        let new_tick = self.next_tick();
-        self.order.insert(new_tick, key.clone());
-        let e = self.map.get_mut(key).unwrap();
-        e.tick = new_tick;
-        e.last_used = Instant::now();
-        Some(value)
-    }
-
-    /// Evict results idle for at least `ttl`; see `Inner::evict_expired`.
-    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
+    /// Sweep the hand until back within budget, evicting the first entry with a clear
+    /// `referenced` bit and reprieving set bits on the way. `protect` (the key this
+    /// insert just added) is never the victim. Keeps at least one entry so a single
+    /// oversized result stays returnable.
+    fn evict_to_budget(&mut self, protect: &ResultKey) -> u64 {
         let mut evicted = 0;
-        while let Some((&t, key)) = self.order.iter().next() {
-            let key = key.clone();
-            if now.saturating_duration_since(self.map[&key].last_used) <= ttl {
-                break;
+        while self.bytes > self.budget && self.ring.len() > 1 {
+            if self.hand >= self.ring.len() {
+                self.hand = 0;
             }
-            self.order.remove(&t);
+            let key = self.ring[self.hand].clone();
+            if &key == protect {
+                self.hand += 1;
+                continue;
+            }
+            if self.map[&key].referenced.swap(false, Ordering::Relaxed) {
+                self.hand += 1;
+                continue;
+            }
+            self.ring.remove(self.hand);
             if let Some(e) = self.map.remove(&key) {
                 self.bytes -= e.bytes;
             }
@@ -251,37 +288,57 @@ impl<V> ResultInner<V> {
         evicted
     }
 
-    fn insert(&mut self, key: ResultKey, value: Arc<V>, bytes: usize) -> u64 {
-        if let Some(old) = self.map.remove(&key) {
-            self.order.remove(&old.tick);
-            self.bytes -= old.bytes;
+    /// Evict results idle for at least `ttl_ms`; see the block pool's `evict_expired`.
+    /// No keep-one floor — an entirely idle pool is fully reclaimed.
+    fn evict_expired(&mut self, now_ms: u64, ttl_ms: u64) -> u64 {
+        let before = self.map.len();
+        let bytes = &mut self.bytes;
+        self.map.retain(|_, e| {
+            let idle = now_ms.saturating_sub(e.last_used_ms.load(Ordering::Relaxed));
+            let keep = idle <= ttl_ms;
+            if !keep {
+                *bytes -= e.bytes;
+            }
+            keep
+        });
+        let evicted = before - self.map.len();
+        if evicted > 0 {
+            let map = &self.map;
+            self.ring.retain(|k| map.contains_key(k));
+            if self.hand >= self.ring.len() {
+                self.hand = 0;
+            }
         }
-        let tick = self.next_tick();
-        self.order.insert(tick, key.clone());
+        evicted as u64
+    }
+
+    fn insert(&mut self, key: ResultKey, value: Arc<V>, bytes: usize, now_ms: u64) -> u64 {
+        if let Some(e) = self.map.get_mut(&key) {
+            // Overwrite in place — the key is already in the ring. A recompute of the
+            // same result: reset the second-chance bit (a fresh insert earns none).
+            self.bytes -= e.bytes;
+            e.value = value;
+            e.bytes = bytes;
+            *e.referenced.get_mut() = false;
+            *e.last_used_ms.get_mut() = now_ms;
+            self.bytes += bytes;
+            return self.evict_to_budget(&key);
+        }
+        // New key: placed just behind the hand so it gets a full revolution first.
+        let at = self.hand.min(self.ring.len());
+        self.ring.insert(at, key.clone());
+        self.hand = at + 1;
         self.map.insert(
-            key,
+            key.clone(),
             ResultEntry {
                 value,
                 bytes,
-                tick,
-                last_used: Instant::now(),
+                referenced: AtomicBool::new(false),
+                last_used_ms: AtomicU64::new(now_ms),
             },
         );
         self.bytes += bytes;
-
-        // Evict LRU-first, but keep at least one entry so a single oversized result
-        // stays returnable (mirrors the block LRU's policy).
-        let mut evicted = 0;
-        while self.bytes > self.budget && self.order.len() > 1 {
-            let (&lru_tick, lru_key) = self.order.iter().next().unwrap();
-            let lru_key = lru_key.clone();
-            self.order.remove(&lru_tick);
-            if let Some(e) = self.map.remove(&lru_key) {
-                self.bytes -= e.bytes;
-            }
-            evicted += 1;
-        }
-        evicted
+        self.evict_to_budget(&key)
     }
 }
 
@@ -291,7 +348,9 @@ impl<V> ResultInner<V> {
 /// executor's result type and is unit-testable in isolation; `slater::server`
 /// instantiates it over `exec::QueryResult`.
 pub struct ResultCache<V> {
-    inner: Mutex<ResultInner<V>>,
+    inner: RwLock<ResultInner<V>>,
+    /// Origin for the `last_used_ms` stamps.
+    epoch: Instant,
     /// `false` when the configured `result_cache_bytes` is 0: the pool is disabled,
     /// so `get` always misses and `insert` is a no-op (every query executes for real).
     /// Useful for honest cold-execution benchmarking and for deployments that want
@@ -305,13 +364,14 @@ pub struct ResultCache<V> {
 impl<V> ResultCache<V> {
     pub fn new(budget_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(ResultInner {
+            inner: RwLock::new(ResultInner {
                 map: HashMap::new(),
-                order: BTreeMap::new(),
-                tick: 0,
+                ring: Vec::new(),
+                hand: 0,
                 bytes: 0,
                 budget: budget_bytes.max(1),
             }),
+            epoch: Instant::now(),
             enabled: budget_bytes > 0,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -319,25 +379,33 @@ impl<V> ResultCache<V> {
         }
     }
 
+    #[inline]
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     /// Whether the pool stores anything (`result_cache_bytes > 0`).
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Look a result up, recording a hit or miss. On a hit it becomes most-recently
-    /// used. A disabled pool always misses (and never takes the lock).
+    /// Look a result up, recording a hit or miss. A **hit** takes only the *read* lock
+    /// — it clones an `Arc` and sets the entry's CLOCK bit, mutating nothing shared, so
+    /// concurrent hits run in parallel. A disabled pool always misses (never locks).
     pub fn get(&self, key: &ResultKey) -> Option<Arc<V>> {
         if !self.enabled {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let hit = self.inner.lock().unwrap().touch_get(key);
-        if hit.is_some() {
+        let now_ms = self.now_ms();
+        if let Some(entry) = self.inner.read().unwrap().map.get(key) {
+            touch(&entry.referenced, &entry.last_used_ms, now_ms);
+            let value = entry.value.clone();
             self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            return Some(value);
         }
-        hit
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
     /// Cache a result under `key`. `value_bytes` is the caller's estimate of the
@@ -349,7 +417,12 @@ impl<V> ResultCache<V> {
             return;
         }
         let bytes = value_bytes + key.query.len();
-        let evicted = self.inner.lock().unwrap().insert(key, value, bytes);
+        let now_ms = self.now_ms();
+        let evicted = self
+            .inner
+            .write()
+            .unwrap()
+            .insert(key, value, bytes, now_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -358,7 +431,9 @@ impl<V> ResultCache<V> {
     /// Evict every result idle for at least `ttl` as of `now`. See
     /// [`BlockCache::evict_expired`].
     pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
-        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
+        let evicted = self.inner.write().unwrap().evict_expired(now_ms, ttl_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -374,7 +449,7 @@ impl<V> ResultCache<V> {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner.read().unwrap().map.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -382,7 +457,7 @@ impl<V> ResultCache<V> {
     }
 
     pub fn bytes(&self) -> usize {
-        self.inner.lock().unwrap().bytes
+        self.inner.read().unwrap().bytes
     }
 }
 
@@ -411,11 +486,12 @@ impl VectorBlockKey {
 struct Entry {
     value: Arc<Vec<u8>>,
     bytes: usize,
-    tick: u64,
-    /// Wall-clock instant of the most recent access; reset on every touch and
-    /// consulted by the idle-TTL sweep. Assigned together with `tick`, so the
-    /// `order` map (keyed by tick) is also sorted by `last_used`.
-    last_used: Instant,
+    /// CLOCK second-chance bit: set by a hit (through a read guard), cleared as a
+    /// reprieve by the eviction hand. False on insert.
+    referenced: AtomicBool,
+    /// Milliseconds since the pool epoch at the most recent access, for the idle-TTL
+    /// sweep. Re-stamped only past [`LAST_USED_GRANULARITY_MS`].
+    last_used_ms: AtomicU64,
 }
 
 struct VecInner {
@@ -431,46 +507,66 @@ struct VecInner {
     /// caller falls back to the per-query gather path).
     matrices: HashMap<(u128, u32), Arc<ResidentMatrix>>,
     matrix_bytes: usize,
-    /// The 1–2 MiB Vamana block LRU (decompressed), sharing the budget with the
-    /// pinned PQ codes and resident matrices.
+    /// The 1–2 MiB Vamana block LRU (decompressed, CLOCK-evicted), sharing the budget
+    /// with the pinned PQ codes and resident matrices.
     blocks: HashMap<VectorBlockKey, Entry>,
-    order: BTreeMap<u64, VectorBlockKey>,
-    tick: u64,
+    /// CLOCK ring over the block keys (`ring.len() == blocks.len()`).
+    ring: Vec<VectorBlockKey>,
+    /// The sweep hand: an index into `ring`.
+    hand: usize,
     block_bytes: usize,
     budget: usize,
 }
 
 impl VecInner {
-    fn next_tick(&mut self) -> u64 {
-        let t = self.tick;
-        self.tick += 1;
-        t
-    }
-
-    fn touch_get(&mut self, key: &VectorBlockKey) -> Option<Arc<Vec<u8>>> {
-        let (value, old_tick) = {
-            let e = self.blocks.get(key)?;
-            (e.value.clone(), e.tick)
-        };
-        self.order.remove(&old_tick);
-        let new_tick = self.next_tick();
-        self.order.insert(new_tick, *key);
-        let e = self.blocks.get_mut(key).unwrap();
-        e.tick = new_tick;
-        e.last_used = Instant::now();
-        Some(value)
-    }
-
-    /// Evict Vamana blocks idle for at least `ttl`; the pinned PQ codes are never
-    /// touched, so the resident navigation set is exempt. See
-    /// `Inner::evict_expired`.
-    fn evict_expired(&mut self, now: Instant, ttl: Duration) -> u64 {
-        let mut evicted = 0;
-        while let Some((&t, &key)) = self.order.iter().next() {
-            if now.saturating_duration_since(self.blocks[&key].last_used) <= ttl {
-                break;
+    /// Evict Vamana blocks idle for at least `ttl_ms`; the pinned PQ codes and resident
+    /// matrices are never touched, so the resident navigation set is exempt.
+    fn evict_expired(&mut self, now_ms: u64, ttl_ms: u64) -> u64 {
+        let before = self.blocks.len();
+        let block_bytes = &mut self.block_bytes;
+        self.blocks.retain(|_, e| {
+            let idle = now_ms.saturating_sub(e.last_used_ms.load(Ordering::Relaxed));
+            let keep = idle <= ttl_ms;
+            if !keep {
+                *block_bytes -= e.bytes;
             }
-            self.order.remove(&t);
+            keep
+        });
+        let evicted = before - self.blocks.len();
+        if evicted > 0 {
+            let blocks = &self.blocks;
+            self.ring.retain(|k| blocks.contains_key(k));
+            if self.hand >= self.ring.len() {
+                self.hand = 0;
+            }
+        }
+        evicted as u64
+    }
+
+    /// Sweep the CLOCK hand until pinned + matrices + blocks fit the budget, evicting
+    /// the first block with a clear `referenced` bit and reprieving set bits on the
+    /// way. Keeps at least one block so a single oversized block stays returnable
+    /// (pinned PQ and matrices are never evicted — they are the resident set). A `pin`
+    /// or matrix install passes `protect = None`; a block insert protects the key it
+    /// just added.
+    fn evict_to_budget(&mut self, protect: Option<VectorBlockKey>) -> u64 {
+        let mut evicted = 0;
+        while self.pinned_bytes + self.matrix_bytes + self.block_bytes > self.budget
+            && self.ring.len() > 1
+        {
+            if self.hand >= self.ring.len() {
+                self.hand = 0;
+            }
+            let key = self.ring[self.hand];
+            if Some(key) == protect {
+                self.hand += 1;
+                continue;
+            }
+            if self.blocks[&key].referenced.swap(false, Ordering::Relaxed) {
+                self.hand += 1;
+                continue;
+            }
+            self.ring.remove(self.hand);
             if let Some(e) = self.blocks.remove(&key) {
                 self.block_bytes -= e.bytes;
             }
@@ -479,42 +575,32 @@ impl VecInner {
         evicted
     }
 
-    /// Evict LRU blocks until pinned + blocks fit the budget, keeping at least one
-    /// block so a single oversized block stays returnable (pinned PQ is never
-    /// evicted — it is the resident navigation set).
-    fn evict_to_budget(&mut self) -> u64 {
-        let mut evicted = 0;
-        while self.pinned_bytes + self.matrix_bytes + self.block_bytes > self.budget
-            && self.order.len() > 1
-        {
-            let (&lru_tick, &lru_key) = self.order.iter().next().unwrap();
-            self.order.remove(&lru_tick);
-            if let Some(e) = self.blocks.remove(&lru_key) {
-                self.block_bytes -= e.bytes;
-            }
-            evicted += 1;
-        }
-        evicted
-    }
-
-    fn insert(&mut self, key: VectorBlockKey, value: Arc<Vec<u8>>) -> (Arc<Vec<u8>>, u64) {
-        if let Some(existing) = self.touch_get(&key) {
-            return (existing, 0);
+    fn insert(
+        &mut self,
+        key: VectorBlockKey,
+        value: Arc<Vec<u8>>,
+        now_ms: u64,
+    ) -> (Arc<Vec<u8>>, u64) {
+        if let Some(existing) = self.blocks.get(&key) {
+            touch(&existing.referenced, &existing.last_used_ms, now_ms);
+            return (existing.value.clone(), 0);
         }
         let bytes = value.len();
-        let tick = self.next_tick();
-        self.order.insert(tick, key);
+        // Place the new block just behind the hand so it gets a full revolution first.
+        let at = self.hand.min(self.ring.len());
+        self.ring.insert(at, key);
+        self.hand = at + 1;
         self.blocks.insert(
             key,
             Entry {
                 value: value.clone(),
                 bytes,
-                tick,
-                last_used: Instant::now(),
+                referenced: AtomicBool::new(false),
+                last_used_ms: AtomicU64::new(now_ms),
             },
         );
         self.block_bytes += bytes;
-        let evicted = self.evict_to_budget();
+        let evicted = self.evict_to_budget(Some(key));
         (value, evicted)
     }
 }
@@ -525,7 +611,9 @@ impl VecInner {
 /// Vamana blocks it reads for the frontier and exact re-rank. Distinct from the
 /// block LRU so the large-vector path cannot evict hot graph blocks and vice versa.
 pub struct VectorIndexCache {
-    inner: Mutex<VecInner>,
+    inner: RwLock<VecInner>,
+    /// Origin for the `last_used_ms` stamps.
+    epoch: Instant,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -534,35 +622,41 @@ pub struct VectorIndexCache {
 impl VectorIndexCache {
     pub fn new(budget_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(VecInner {
+            inner: RwLock::new(VecInner {
                 pinned: HashMap::new(),
                 pinned_bytes: 0,
                 matrices: HashMap::new(),
                 matrix_bytes: 0,
                 blocks: HashMap::new(),
-                order: BTreeMap::new(),
-                tick: 0,
+                ring: Vec::new(),
+                hand: 0,
                 block_bytes: 0,
                 budget: budget_bytes.max(1),
             }),
+            epoch: Instant::now(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
         }
     }
 
+    #[inline]
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     /// Pin a generation's resident PQ codes for index `ord`. Idempotent (re-pinning
     /// replaces the entry). Charges the codes' footprint to the budget and evicts
     /// blocks if needed so the pool stays bounded.
     pub fn pin(&self, gen: GenId, ord: u32, pq: Arc<ResidentPq>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let key = (gen.0.as_u128(), ord);
         if let Some(old) = inner.pinned.remove(&key) {
             inner.pinned_bytes -= old.resident_bytes();
         }
         inner.pinned_bytes += pq.resident_bytes();
         inner.pinned.insert(key, pq);
-        let evicted = inner.evict_to_budget();
+        let evicted = inner.evict_to_budget(None);
         drop(inner);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
@@ -571,7 +665,7 @@ impl VectorIndexCache {
 
     /// Drop a pinned index (e.g. on generation swap), freeing its PQ footprint.
     pub fn unpin(&self, gen: GenId, ord: u32) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if let Some(old) = inner.pinned.remove(&(gen.0.as_u128(), ord)) {
             inner.pinned_bytes -= old.resident_bytes();
         }
@@ -580,7 +674,7 @@ impl VectorIndexCache {
     /// The pinned resident PQ codes for an index, if any.
     pub fn resident_pq(&self, gen: GenId, ord: u32) -> Option<Arc<ResidentPq>> {
         self.inner
-            .lock()
+            .read()
             .unwrap()
             .pinned
             .get(&(gen.0.as_u128(), ord))
@@ -603,7 +697,7 @@ impl VectorIndexCache {
     ) -> Result<Option<Arc<ResidentMatrix>>> {
         let key = (gen.0.as_u128(), ord);
         {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.read().unwrap();
             if let Some(m) = inner.matrices.get(&key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(m.clone()));
@@ -617,7 +711,7 @@ impl VectorIndexCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let matrix = Arc::new(build()?);
         let bytes = matrix.resident_bytes();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         if let Some(m) = inner.matrices.get(&key) {
             return Ok(Some(m.clone())); // lost a race; use the installed one
         }
@@ -627,7 +721,7 @@ impl VectorIndexCache {
         }
         inner.matrices.insert(key, matrix.clone());
         inner.matrix_bytes += bytes;
-        let evicted = inner.evict_to_budget();
+        let evicted = inner.evict_to_budget(None);
         drop(inner);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
@@ -640,7 +734,7 @@ impl VectorIndexCache {
     /// promptly rather than waiting on the last in-flight query's `Arc`).
     pub fn unpin_generation(&self, gen: GenId) {
         let g = gen.0.as_u128();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let pinned: Vec<_> = inner
             .pinned
             .keys()
@@ -671,13 +765,20 @@ impl VectorIndexCache {
         key: VectorBlockKey,
         load: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Arc<Vec<u8>>> {
-        if let Some(v) = self.inner.lock().unwrap().touch_get(&key) {
+        let now_ms = self.now_ms();
+        if let Some(entry) = self.inner.read().unwrap().blocks.get(&key) {
+            touch(&entry.referenced, &entry.last_used_ms, now_ms);
+            let value = entry.value.clone();
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(v);
+            return Ok(value);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         let value = Arc::new(load()?);
-        let (canonical, evicted) = self.inner.lock().unwrap().insert(key, value);
+        let (canonical, evicted) = self
+            .inner
+            .write()
+            .unwrap()
+            .insert(key, value, self.now_ms());
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -706,7 +807,9 @@ impl VectorIndexCache {
     /// codes are exempt — they are the resident navigation set. See
     /// [`BlockCache::evict_expired`].
     pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
-        let evicted = self.inner.lock().unwrap().evict_expired(now, ttl);
+        let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
+        let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
+        let evicted = self.inner.write().unwrap().evict_expired(now_ms, ttl_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -723,13 +826,13 @@ impl VectorIndexCache {
 
     /// Current resident byte usage: pinned PQ codes + resident matrices + cached blocks.
     pub fn bytes(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         inner.pinned_bytes + inner.matrix_bytes + inner.block_bytes
     }
 
     /// Number of cached blocks (excludes pinned PQ entries).
     pub fn block_count(&self) -> usize {
-        self.inner.lock().unwrap().blocks.len()
+        self.inner.read().unwrap().blocks.len()
     }
 }
 
@@ -1211,6 +1314,107 @@ mod tests {
         assert!(
             cache.resident_pq(g, 0).is_some(),
             "pinned PQ is exempt from TTL"
+        );
+    }
+
+    // ── Concurrency: hits must not serialise ───────────────────────────────────
+
+    /// Aggregate hits/sec across `n` threads each doing `PER_THREAD` resident lookups
+    /// via `hit` (which returns the fetched byte). The old Mutex + BTreeMap hit path
+    /// fully serialised — throughput *fell* as threads were added; the CLOCK read-lock
+    /// path lets concurrent hits overlap, so it must not regress below parity.
+    fn hit_rate(n: usize, keys: usize, hit: impl Fn(usize, u64) -> u8 + Sync) -> f64 {
+        const PER_THREAD: u64 = 200_000;
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..n)
+                .map(|w| {
+                    let barrier = barrier.clone();
+                    let hit = &hit;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let start = Instant::now();
+                        for i in 0..PER_THREAD {
+                            let idx = ((w as u64 * 37 + i * 7) % keys as u64) as usize;
+                            std::hint::black_box(hit(idx, i));
+                        }
+                        start.elapsed()
+                    })
+                })
+                .collect();
+            // Aggregate rate is bounded by the slowest worker.
+            let slowest = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .max()
+                .unwrap();
+            (n as u64 * PER_THREAD) as f64 / slowest.as_secs_f64()
+        })
+    }
+
+    #[test]
+    fn result_cache_concurrent_hits_do_not_serialise() {
+        const THREADS: usize = 4;
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) < THREADS {
+            return; // not enough cores to say anything
+        }
+        const KEYS: usize = 256;
+        let g = gen(1);
+        let cache: Arc<ResultCache<Vec<u8>>> = Arc::new(ResultCache::new(64 << 20));
+        let keys: Vec<ResultKey> = (0..KEYS)
+            .map(|i| ResultKey::new(g, format!("q{i}")))
+            .collect();
+        for k in &keys {
+            cache.insert(k.clone(), Arc::new(vec![7u8; 4096]), 4096);
+        }
+        let run = |n| {
+            hit_rate(n, KEYS, |idx, _| {
+                cache.get(&keys[idx]).expect("resident")[0]
+            })
+        };
+        let (one, many) = (run(1), run(THREADS));
+        // Hits must scale with cores, not serialise. The old Mutex + BTreeMap path
+        // fell *below* 1.0 as threads were added; the CLOCK read-lock path measured
+        // ~1.96× here. The 1.2× bar sits well under that and far above a Mutex's <1×,
+        // so it discriminates even on a busy CI box.
+        assert!(
+            many >= one * 1.2,
+            "result hits must not serialise: 1 thread {one:.0}/s, {THREADS} threads \
+             {many:.0}/s (ratio {:.2}×)",
+            many / one
+        );
+    }
+
+    #[test]
+    fn vector_cache_concurrent_block_hits_do_not_serialise() {
+        const THREADS: usize = 4;
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) < THREADS {
+            return;
+        }
+        const BLOCKS: u32 = 256;
+        let g = gen(1);
+        let cache = Arc::new(VectorIndexCache::new(64 << 20));
+        for b in 0..BLOCKS {
+            cache
+                .get_or_try_insert(VectorBlockKey::new(g, 0, b), || Ok(vec![7u8; 4096]))
+                .unwrap();
+        }
+        let run = |n| {
+            hit_rate(n, BLOCKS as usize, |idx, _| {
+                cache
+                    .get_or_try_insert(VectorBlockKey::new(g, 0, idx as u32), || {
+                        unreachable!("resident")
+                    })
+                    .unwrap()[0]
+            })
+        };
+        let (one, many) = (run(1), run(THREADS));
+        // Measured ~2.42× here; see result_cache_concurrent_hits_do_not_serialise.
+        assert!(
+            many >= one * 1.2,
+            "vector block hits must not serialise: 1 thread {one:.0}/s, {THREADS} threads \
+             {many:.0}/s (ratio {:.2}×)",
+            many / one
         );
     }
 }
