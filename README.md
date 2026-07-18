@@ -17,8 +17,8 @@
 | [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
 | [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
 | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
-| [Performance](#performance) | [License](#license) |
-| **[📖 Full manual (`docs/manual/`)](docs/manual/README.md)** |
+| [Performance](#performance) | [License](#license) | **[📖 Full manual (`docs/manual/`)](docs/manual/README.md)** |
+
 ## Why Slater exists
 
 A **graph database** stores data as *things* (nodes) and the *relationships between them* (edges), with the relationships as first-class citizens. That's what you want when your questions are about connections rather than rows — "who's within three hops of this account?", "what's the full dependency chain behind this build?", "which accounts share a device, an address, and a card?" — the queries that become a swamp of recursive joins in SQL but fall out naturally in a graph.
