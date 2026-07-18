@@ -258,15 +258,20 @@ impl<'a> Decoder<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
+        // `checked_add` so a wire-supplied length near usize::MAX cannot wrap past the
+        // bound and then index out of the buffer. Unreachable on the supported 64-bit
+        // targets (`pos` and `n` both sit far below usize::MAX), but the guarantee then
+        // survives a hypothetical 32-bit port — an overflowing length reads as "past
+        // the end", the same error as a genuinely short buffer.
+        let Some(end) = self.pos.checked_add(n).filter(|&e| e <= self.buf.len()) else {
             bail!(
                 "packstream: unexpected end of input (need {n} at {}, have {})",
                 self.pos,
                 self.buf.len()
             );
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        };
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
 
@@ -468,6 +473,23 @@ mod tests {
         // `0xB?` tiny-struct is ≤15 fields, but the u32 list path above is the
         // unbounded one; also check a u16 list length with no body.
         assert!(from_slice(&[0xD5, 0xFF, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn take_length_near_usize_max_errors_without_overflowing() {
+        // Belt-and-braces for a hypothetical 32-bit port: a wire-supplied length near
+        // usize::MAX must not wrap `pos + n` past the buffer bound (which would then
+        // index out of bounds). `take` uses checked_add, so it bails cleanly. With
+        // `pos` advanced to 1, the old `self.pos + n` would overflow — a debug-build
+        // panic — instead of returning this error.
+        let mut dec = Decoder::new(&[0x01, 0x02, 0x03]);
+        assert!(dec.take(1).is_ok());
+        assert!(
+            dec.take(usize::MAX).is_err(),
+            "an overflowing length must error, not wrap/panic"
+        );
+        // A plain short read past the end still errors identically.
+        assert!(dec.take(999).is_err());
     }
 
     #[test]
