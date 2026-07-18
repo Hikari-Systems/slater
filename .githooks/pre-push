@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Pre-push gate: a version-tag push must match the version recorded in the repo.
+#
+# git tags sort *lexically*, so `git tag` lists v0.1 first and buries the newest
+# tag mid-list — tools (and AIs) that read the raw tag order routinely mis-report
+# the version as v0.1. The authoritative version therefore lives as a literal in
+# these files: the "Current version: `vX.Y.Z`" line in README.md and DOCKERHUB.md,
+# and Cargo.toml. This hook refuses to push a `vX.Y.Z` tag unless ALL already say
+# X.Y.Z *at the tagged commit*, forcing the bump to land in the same release the
+# tag names.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass in a pinch:      git push --no-verify
+set -euo pipefail
+
+# "Current version: `vX.Y.Z`" line from a markdown doc at a given commit.
+doc_ver() {     # $1 = commit-ish, $2 = path
+  git show "$1:$2" 2>/dev/null \
+    | grep -oE 'Current version: `v[0-9]+\.[0-9]+\.[0-9]+`' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+cargo_ver() {   # $1 = commit-ish
+  git show "$1:Cargo.toml" 2>/dev/null \
+    | grep -m1 -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+fail=0
+# git feeds one "<local ref> <local sha> <remote ref> <remote sha>" line per ref.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/tags/v[0-9]*) ;;
+    *) continue ;;
+  esac
+  tag="${remote_ref#refs/tags/}"
+  tag_ver="${tag#v}"
+  # Only enforce fully-numeric vX.Y.Z release tags (ignore rc/date/name tags).
+  [[ "$tag_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+
+  # Resolve the tag to the commit it releases and read the files as of that commit.
+  commit="$(git rev-parse -q --verify "${tag}^{commit}" 2>/dev/null || true)"
+  [ -n "$commit" ] || commit="$local_sha"
+  rv="$(doc_ver "$commit" README.md)"
+  dv="$(doc_ver "$commit" DOCKERHUB.md)"
+  cv="$(cargo_ver "$commit")"
+
+  if [ "$rv" != "$tag_ver" ] || [ "$dv" != "$tag_ver" ] || [ "$cv" != "$tag_ver" ]; then
+    echo "✗ pre-push: version tag '$tag' does not match the repo's recorded version." >&2
+    echo "    tag:          $tag_ver" >&2
+    echo "    README.md:    ${rv:-<not found>}   (line: 'Current version: \`v…\`')" >&2
+    echo "    DOCKERHUB.md: ${dv:-<not found>}   (line: 'Current version: \`v…\`')" >&2
+    echo "    Cargo.toml:   ${cv:-<not found>}" >&2
+    echo "  Bump ALL to $tag_ver in the commit the tag points at, then re-tag and re-push." >&2
+    echo "  (bypass once with: git push --no-verify)" >&2
+    fail=1
+  fi
+done
+
+exit $fail

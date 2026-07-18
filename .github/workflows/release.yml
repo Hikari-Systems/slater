@@ -56,6 +56,27 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # git tags sort lexically (v0.1 before v0.24.0), so tools that read the raw
+      # tag order mis-report the version. The authoritative version is a literal in
+      # the README + DOCKERHUB.md ("Current version: `vX.Y.Z`") and in Cargo.toml.
+      # Fail the release if any drifts from the tag — this is the non-bypassable
+      # backstop to the local .githooks/pre-push gate (which `--no-verify` and an
+      # unset hooksPath skip).
+      - name: Version tag matches README + DOCKERHUB + Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          ver="${tag#v}"
+          doc_ver() { grep -oE 'Current version: `v[0-9]+\.[0-9]+\.[0-9]+`' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true; }
+          readme="$(doc_ver README.md)"
+          docker="$(doc_ver DOCKERHUB.md)"
+          cargo="$(grep -m1 -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+          echo "tag=$ver  README=${readme:-<none>}  DOCKERHUB=${docker:-<none>}  Cargo.toml=${cargo:-<none>}"
+          if [ "$ver" != "$readme" ] || [ "$ver" != "$docker" ] || [ "$ver" != "$cargo" ]; then
+            echo "::error::version mismatch — tag $ver, README ${readme:-<none>}, DOCKERHUB ${docker:-<none>}, Cargo.toml ${cargo:-<none>}. Bump the 'Current version' line in README.md and DOCKERHUB.md, and Cargo.toml, to $ver before tagging."
+            exit 1
+          fi
+
       # rustls' aws-lc-rs backend needs a C toolchain + libclang to build (see
       # the Dockerfile builder stage).
       - name: Install build dependencies
