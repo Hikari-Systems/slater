@@ -127,24 +127,38 @@ pub fn eval_pure(name: &str, args: &[Value]) -> Result<Option<Value>> {
         "tostringlist" => to_type_list(&a0(0), "tostring")?,
 
         // ── conversions ─────────────────────────────────────────────────────
-        // `toString` and the `*OrNull` variant coincide here (the renderer never
-        // errors). `toInteger`/`toFloat`/`toBoolean` already NULL on a failed
-        // coercion, so their `*OrNull` forms are aliases.
+        // `toString` and its `*OrNull` variant coincide here (the renderer never
+        // errors). `toFloat`/`toBoolean` NULL on a failed coercion, so their
+        // `*OrNull` forms are aliases. `toInteger` is the exception: an
+        // out-of-range/non-finite *float* is a real number it cannot represent —
+        // a hard error for `toInteger`, a NULL for `toIntegerOrNull` (see below).
         "tostring" | "tostringornull" => match a0(0) {
             Value::Null => Value::Null,
             v => Value::Str(display(&v)),
         },
-        "tointeger" | "tointegerornull" => match a0(0) {
-            Value::Int(i) => Value::Int(i),
-            Value::Float(f) => Value::Int(f as i64),
-            Value::Str(s) => s
-                .trim()
-                .parse::<i64>()
-                .map(Value::Int)
-                .unwrap_or(Value::Null),
-            Value::Bool(b) => Value::Int(b as i64),
-            _ => Value::Null,
-        },
+        "tointeger" | "tointegerornull" => {
+            let or_null = n == "tointegerornull";
+            match a0(0) {
+                Value::Int(i) => Value::Int(i),
+                // A finite in-range float truncates toward zero; a non-finite or
+                // out-of-i64-range one is unrepresentable — error for `toInteger`,
+                // NULL for `…OrNull`. (Deliberately *not* symmetric with the string
+                // arm: a malformed string was never an integer, so it is NULL for
+                // both spellings — Cypher semantics we must not change.)
+                Value::Float(f) => match f64_to_i64_checked(f) {
+                    Ok(i) => Value::Int(i),
+                    Err(_) if or_null => Value::Null,
+                    Err(e) => return Err(e),
+                },
+                Value::Str(s) => s
+                    .trim()
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .unwrap_or(Value::Null),
+                Value::Bool(b) => Value::Int(b as i64),
+                _ => Value::Null,
+            }
+        }
         "tofloat" | "tofloatornull" => match a0(0) {
             Value::Int(i) => Value::Float(i as f64),
             Value::Float(f) => Value::Float(f),
@@ -602,11 +616,26 @@ fn dedup_vals(xs: &mut Vec<Value>) {
     });
 }
 
+/// Truncate a float to `i64`, erroring instead of silently saturating. Plain `f as i64`
+/// clamps out-of-range values (`1e19 → i64::MAX`, `-1e19 → i64::MIN`) and maps `NaN → 0`
+/// — every one a wrong answer with no signal. The bounds are the exact f64 window that
+/// truncates back into range: `i64::MIN` (-2^63) is representable, but `i64::MAX` is not
+/// (it rounds up to 2^63), so the upper bound is the *exclusive* 2^63.
+fn f64_to_i64_checked(f: f64) -> Result<i64> {
+    let min = i64::MIN as f64; // -2^63, exact
+    let max = -min; //  2^63, exclusive upper bound
+    if f.is_finite() && f >= min && f < max {
+        Ok(f as i64)
+    } else {
+        bail!("integer conversion out of range: {f}");
+    }
+}
+
 /// A mandatory integer argument (FalkorDB `SI_GET_NUMERIC`, so a float truncates).
 fn num_i64(v: Option<&Value>) -> Result<i64> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
-        Some(Value::Float(f)) => Ok(*f as i64),
+        Some(Value::Float(f)) => f64_to_i64_checked(*f),
         _ => bail!("expected an integer index argument"),
     }
 }
@@ -862,6 +891,47 @@ mod tests {
         assert_eq!(ev("tointeger", &[s("x")]), Value::Null);
         assert_eq!(ev("tofloat", &[Value::Int(3)]), Value::Float(3.0));
         assert_eq!(ev("toboolean", &[s("TRUE")]), Value::Bool(true));
+    }
+
+    #[test]
+    fn tointeger_out_of_range_errors_rather_than_saturating() {
+        // In-range floats truncate toward zero (unchanged).
+        assert_eq!(ev("tointeger", &[Value::Float(2.9)]), Value::Int(2));
+        assert_eq!(ev("tointeger", &[Value::Float(-2.9)]), Value::Int(-2));
+
+        // Out-of-range / non-finite floats used to silently saturate
+        // (1e19 → i64::MAX, NaN → 0). `toInteger` now errors instead.
+        for bad in [
+            1e19_f64,
+            -1e19_f64,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(
+                eval_pure("tointeger", &[Value::Float(bad)]).is_err(),
+                "toInteger({bad}) must error, not saturate"
+            );
+            // …while `toIntegerOrNull` absorbs the same failure as NULL.
+            assert_eq!(
+                ev("tointegerornull", &[Value::Float(bad)]),
+                Value::Null,
+                "toIntegerOrNull({bad}) must be NULL"
+            );
+        }
+
+        // The string arm is unchanged: a malformed string is NULL for both spellings
+        // (Cypher semantics), deliberately asymmetric with the float overflow above.
+        assert_eq!(ev("tointeger", &[s("abc")]), Value::Null);
+        assert_eq!(ev("tointegerornull", &[s("abc")]), Value::Null);
+
+        // The `num_i64` index-argument path (list.remove/insert/…) is guarded too: a
+        // saturating index would otherwise clamp to i64::MAX silently.
+        let xs = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        assert!(
+            eval_pure("list.remove", &[xs, Value::Float(1e19)]).is_err(),
+            "an out-of-range list index must error"
+        );
     }
 
     #[test]

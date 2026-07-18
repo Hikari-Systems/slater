@@ -103,6 +103,12 @@ const CODE_SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
 const CODE_ACCESS_MODE: &str = "Neo.ClientError.Statement.AccessMode";
 const CODE_EXECUTION: &str = "Neo.ClientError.Statement.ExecutionFailed";
 const CODE_REQUEST: &str = "Neo.ClientError.Request.Invalid";
+/// A lost `begin_consolidation` single-flight race — another flush/consolidation already
+/// holds the exclusive claim. A `TransientError` (not a `ClientError`): the operation is
+/// benign and retriable, and Neo4j-aware drivers auto-retry that class. Carried as the
+/// `Failure::code` so callers branch on this *typed discriminant*, not on message text —
+/// see [`is_already_in_progress`] and [`spawn_auto_consolidation`].
+const CODE_CONSOLIDATION_IN_PROGRESS: &str = "Neo.TransientError.General.ConsolidationInProgress";
 
 // ── Graph registry ──────────────────────────────────────────────────────────
 
@@ -5526,7 +5532,7 @@ fn spawn_auto_consolidation(ctx: Arc<ConnCtx>, graph: String) {
     tokio::spawn(async move {
         match execute_consolidate(&ctx, &graph).await {
             Ok(_) => info!(graph = %graph, "auto-consolidation folded the delta into a fresh core"),
-            Err(e) if e.message.contains("already in progress") => {
+            Err(e) if e.code == CODE_CONSOLIDATION_IN_PROGRESS => {
                 debug!(graph = %graph, "auto-consolidation skipped: one is already running")
             }
             Err(e) => warn!(graph = %graph, error = %e.message, "auto-consolidation failed"),
@@ -5590,7 +5596,17 @@ async fn execute_consolidate(
     })
     .await
     .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation task failed: {e}")))?
-    .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation failed: {e:#}")))?;
+    .map_err(|e| {
+        // Classify a lost single-flight race here, where the typed `ConsolidationInProgress`
+        // cause is still intact — `{e:#}` below flattens it to a string. Callers then branch
+        // on the resulting `code`, never on the message text.
+        let code = if is_already_in_progress(&e) {
+            CODE_CONSOLIDATION_IN_PROGRESS
+        } else {
+            CODE_EXECUTION
+        };
+        Failure::new(code, format!("consolidation failed: {e:#}"))
+    })?;
 
     // T4 GC (Phase 7 slice 7.2): a retarget collapses the served set to a singleton, orphaning
     // the whole prior set + every one of its segments. Reclaim them when GC is enabled — a
@@ -15578,6 +15594,34 @@ mod tests {
             !writer.snapshot().is_empty(),
             "the delta must survive a failed consolidation"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A lost `begin_consolidation` single-flight race surfaces as the typed
+    /// `CODE_CONSOLIDATION_IN_PROGRESS` code, so `spawn_auto_consolidation` can classify
+    /// it debug-not-warn by branching on the *type* rather than matching message text (the
+    /// substring `.contains("already in progress")` it replaced would false-positive on any
+    /// unrelated error that merely mentioned the phrase).
+    #[tokio::test]
+    async fn execute_consolidate_reports_a_lost_race_by_typed_code() {
+        let (root, ctx) =
+            build_writable_ctx("bolt_consolidate_race", "/nonexistent/slater-build-xyz");
+        write_alice_age_99(&ctx);
+        // Hold the exclusive claim first, so the trigger below loses the single-flight race.
+        let writer = ctx.graphs.writer("people").unwrap();
+        assert!(
+            writer.begin_consolidation(),
+            "the test must win the claim first"
+        );
+
+        let err = execute_consolidate(&ctx, "people").await.unwrap_err();
+        assert_eq!(
+            err.code, CODE_CONSOLIDATION_IN_PROGRESS,
+            "a lost race must classify by typed code, got {}: {}",
+            err.code, err.message
+        );
+
+        writer.end_consolidation();
         std::fs::remove_dir_all(&root).ok();
     }
 
