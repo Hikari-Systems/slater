@@ -30,6 +30,14 @@ graph, and reads stay byte-identical when no writes are pending.
 
 ---
 
+## Documentation
+
+This page covers running the image. The **complete user manual** — a
+feature-by-feature guide to the query language, the build toolchain, vector
+search, the writable layer, storage, configuration, security, and tuning — lives
+in the repository at
+**[`docs/manual/`](https://github.com/Hikari-Systems/slater/tree/main/docs/manual)**.
+
 ## Features
 
 | Feature | What it means for you |

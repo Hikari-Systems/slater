@@ -18,6 +18,7 @@
 | [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
 | [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
 | [Performance](#performance) | [License](#license) |
+| **[📖 Full manual (`docs/manual/`)](docs/manual/README.md)** |
 ## Why Slater exists
 
 A **graph database** stores data as *things* (nodes) and the *relationships between them* (edges), with the relationships as first-class citizens. That's what you want when your questions are about connections rather than rows — "who's within three hops of this account?", "what's the full dependency chain behind this build?", "which accounts share a device, an address, and a card?" — the queries that become a swamp of recursive joins in SQL but fall out naturally in a graph.
@@ -94,6 +95,28 @@ two ways: write to it live over Bolt (see [The writable layer](#the-writable-lay
 or build a new generation offline and atomically swap the `current` pointer, which
 the running server picks up via its generation guard (see
 [Generation guard](#generation-guard)).
+
+## Documentation
+
+The complete **user manual** lives in **[`docs/manual/`](docs/manual/README.md)** —
+a feature-by-feature guide that explains, for every capability, what it is, why it
+exists, and how to use it, with worked examples you can run against a bundled
+sample graph. Start there for anything beyond this overview.
+
+- **New here?** [Quickstart](docs/manual/02-quickstart.md) builds and serves a
+  graph in five steps.
+- **Writing queries?** [Querying](docs/manual/07-querying.md),
+  [Functions & expressions](docs/manual/08-functions-and-expressions.md),
+  [Procedures & algorithms](docs/manual/09-procedures-and-algorithms.md),
+  [Vector search](docs/manual/10-vector-search.md),
+  [Writing data](docs/manual/11-writing-data.md).
+- **Building graphs?** [Building graphs](docs/manual/05-building-graphs.md) and the
+  [Build CLI reference](docs/manual/06-build-cli-reference.md).
+- **Operating Slater?** [Deployment](docs/manual/13-deployment.md),
+  [Storage](docs/manual/12-storage.md),
+  [Configuration reference](docs/manual/14-configuration-reference.md),
+  [Security](docs/manual/15-security.md),
+  [Performance tuning](docs/manual/16-performance-tuning.md).
 
 ## Running with Docker
 
@@ -445,72 +468,7 @@ Config is loaded by the house-standard layered loader: the baked-in `config.json
 then `/sandbox/config.json` deep-merged over it, then `KEY__sub` environment
 overrides (double underscore for nesting; keys match the camelCase config).
 
-| Key | Env override | Default | Meaning |
-| --- | --- | --- | --- |
-| `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
-| `server.port` | `server__port` | `7687` | Bolt port. |
-| `server.maxConnections` | `server__maxConnections` | 16384 | Global concurrent-connection cap (0 ⇒ unlimited). A permit is taken **before `accept()`**, so at capacity back-pressure lands in the kernel listen backlog instead of the heap — this is what keeps resident memory bounded under adversarial connection load. |
-| `server.maxPreAuthConnections` | `server__maxPreAuthConnections` | 4096 | Cap on connections not yet past `LOGON` (0 ⇒ unlimited). Smaller than `maxConnections` so an anonymous flood cannot starve authenticated readers. |
-| `server.maxConnectionsPerIp` | `server__maxConnectionsPerIp` | 1024 | Per-source concurrent-connection cap (0 ⇒ unlimited); keyed on the /32 for IPv4 and the /64 for IPv6. |
-| `server.maxPreAuthBytes` | `server__maxPreAuthBytes` | 65536 | Largest Bolt message accepted **before `LOGON`** (only `HELLO`/`LOGON` arrive then — a few hundred bytes). Ratchets up to `maxMessageBytes` on successful auth, back down on `LOGOFF`. |
-| `server.maxMessageBytes` | `server__maxMessageBytes` | 67108864 | Largest Bolt message accepted from an **authenticated** reader (64 MiB). |
-| `server.loginTimeoutMs` | `server__loginTimeoutMs` | 10000 | Deadline for an unauthenticated peer to finish TLS handshake → Bolt handshake → `LOGON` (0 ⇒ none); armed at `accept()`, so it bounds the whole pre-auth window as one budget and closes the slow-loris a byte cap alone leaves open. |
-| `server.idleTimeoutMs` | `server__idleTimeoutMs` | 0 | Idle read timeout for an **authenticated** connection (0 ⇒ none, the default — pooled drivers legitimately hold idle connections). |
-| `server.tlsHandshakeTimeoutMs` | `server__tlsHandshakeTimeoutMs` | 5000 | Deadline for the **TLS handshake** alone, on top of `loginTimeoutMs` — whichever lands first wins (0 ⇒ none, not recommended). A handshake is a 2-RTT machine exchange, so it warrants a tighter bound than a login window; and unlike `loginTimeoutMs` it must never lapse, because a peer stalled mid-ClientHello holds a connection slot while sitting behind every guard that lives after the handshake. |
-| `server.maxConcurrentAuth` | `server__maxConcurrentAuth` | 4 | Cap on argon2id password verifies running **at once** (0 ⇒ unlimited, not recommended). Each verify costs ~19 MiB and tens of ms; it runs on a blocking thread, never on the reactor, and this bounds how much of the blocking pool (shared with query execution) a `LOGON` flood can take. Even 4 sustains ~100 logins/s. |
-| `server.maxAuthFailures` | `server__maxAuthFailures` | 3 | Failed `LOGON`s one connection may make before the server closes it (0 ⇒ unlimited). Per *connection*, never per account, so it cannot be used to lock a user out. |
-| `server.maxConcurrentWrites` | `server__maxConcurrentWrites` | 4 | Cap on write statements **executing at once** (0 ⇒ unlimited, not recommended). A write resolves business keys against the core (`pread` + decompress, a round trip on S3/GCS) and then appends to the WAL and fsyncs, so it runs on a blocking thread, never on the reactor. Every mutation of one graph is serialised behind that graph's single writer lock, so permits beyond a handful only park blocking-pool threads on a mutex — and that pool is the one query execution shares. |
-| `dataBackend.kind` | `dataBackend__kind` | `fs` | Storage backend: `fs` (local filesystem), `s3` (object store), or `gcs` (Google Cloud Storage). See [Storage backends](#storage-backends-filesystem--s3--gcs). |
-| `dataBackend.fs.dir` | `dataBackend__fs__dir` | `/data` | Root holding `<graph>/<generation>/` for the `fs` backend (and the local area the at-rest key file must stay outside of). |
-| `dataBackend.verifyIntegrity` | `dataBackend__verifyIntegrity` | `true` | Verify each generation file against the manifest at open. `fs` re-hashes every file; object stores compare the store's own checksum (one metadata request) and fall back to a body re-hash when the object carries none — never to a length-only check. See the [backend table](#storage-backends-filesystem--s3--gcs). |
-| `dataBackend.s3.bucket` | `dataBackend__s3__bucket` | _(empty)_ | S3 bucket name (required when `kind=s3`). |
-| `dataBackend.s3.region` | `dataBackend__s3__region` | _(empty)_ | AWS region (e.g. `eu-west-2`); empty ⇒ resolved from the environment. |
-| `dataBackend.s3.endpoint` | `dataBackend__s3__endpoint` | _(empty)_ | Custom endpoint URL for an S3-compatible store (MinIO, localstack); empty ⇒ standard AWS endpoint. |
-| `dataBackend.s3.prefix` | `dataBackend__s3__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
-| `dataBackend.s3.pathStyle` | `dataBackend__s3__pathStyle` | `false` | Path-style addressing (`endpoint/bucket/key`); required by most S3-compatible servers. |
-| `dataBackend.s3.awsAccessKey` | `dataBackend__s3__awsAccessKey` | _(empty)_ | **Preferred** way to supply the S3 access key id. Empty ⇒ fall back to the standard AWS credential chain (`AWS_ACCESS_KEY_ID` env, shared profile, or instance role). |
-| `dataBackend.s3.awsSecretKey` | `dataBackend__s3__awsSecretKey` | _(empty)_ | **Preferred** way to supply the S3 secret access key, paired with `awsAccessKey`. Empty ⇒ AWS chain. |
-| `dataBackend.s3.awsSessionToken` | `dataBackend__s3__awsSessionToken` | _(empty)_ | Optional session token for temporary (STS) credentials; only used when `awsAccessKey`/`awsSecretKey` are set. |
-| `dataBackend.s3.diskCacheBytes` | `dataBackend__s3__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier). `0` ⇒ disabled. When `> 0`, `diskCacheDir` is required. Size it ≫ `blockCacheBytes`; the in-memory index and the write-behind queue (bounded at `blockCacheBytes / 8`) count against the RSS ceiling. |
-| `dataBackend.s3.diskCacheDir` | `dataBackend__s3__diskCacheDir` | _(empty)_ | Directory for the disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
-| `dataBackend.gcs.bucket` | `dataBackend__gcs__bucket` | _(empty)_ | GCS bucket name (required when `kind=gcs`). |
-| `dataBackend.gcs.prefix` | `dataBackend__gcs__prefix` | _(empty)_ | Key prefix every generation key is joined under; empty ⇒ bucket root. |
-| `dataBackend.gcs.endpoint` | `dataBackend__gcs__endpoint` | _(empty)_ | Custom endpoint URL for a GCS emulator (`fake-gcs-server`); empty ⇒ standard GCS endpoint. |
-| `dataBackend.gcs.credentialsPath` | `dataBackend__gcs__credentialsPath` | _(empty)_ | Path to a **service-account JSON key file**. Empty ⇒ Application Default Credentials (Workload Identity / GCE metadata / `gcloud`). |
-| `dataBackend.gcs.credentialsJson` | `dataBackend__gcs__credentialsJson` | _(empty)_ | Inline service-account JSON key; takes precedence over `credentialsPath`. Empty ⇒ `credentialsPath`, else ADC. |
-| `dataBackend.gcs.anonymous` | `dataBackend__gcs__anonymous` | `false` | Use unauthenticated access — a local GCS emulator (`fake-gcs-server`) **only**, never against real GCS. Overrides every other credential source. |
-| `dataBackend.gcs.diskCacheBytes` | `dataBackend__gcs__diskCacheBytes` | `0` | Byte budget for the **local-disk block cache** (second tier), identical to the S3 setting. `0` ⇒ disabled; when `> 0`, `diskCacheDir` is required. |
-| `dataBackend.gcs.diskCacheDir` | `dataBackend__gcs__diskCacheDir` | _(empty)_ | Directory for the GCS disk cache (used iff `diskCacheBytes > 0`). Must be a **real writable volume — never `tmpfs`**. |
-| `aclPath` | `aclPath` | `/config/acl.json` | JSON ACL (users → per-graph read grants). |
-| `requireAclStamp` | `requireAclStamp` | `true` | Refuse a generation with no `aclBlake3` stamp (closes the stamp-strip downgrade); build images with `--acl`. A generation with no manifest MAC is always refused when a master key is configured — that check has no off switch. |
-| `cache.blockCacheBytes` | `cache__blockCacheBytes` | 64 MiB | Decompressed block LRU budget. |
-| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | 64 MiB | Vector pool budget: resident brute-force kNN matrix (pre-normalised, no-gather scan) + resident PQ + Vamana-block LRU. kNN falls back to the block-cache gather path for any group that does not fit. |
-| `cache.resultCacheBytes` | `cache__resultCacheBytes` | 16 MiB | Result LRU budget. |
-| `cache.cacheTtlMs` | `cache__cacheTtlMs` | 1800000 (30 min) | Idle TTL: a cached entry untouched this long is reclaimed by a background sweep, freeing memory below the budgets when the working set goes quiet. `0` or negative disables the sweep. |
-| `cache.degreeColumn` | `cache__degreeColumn` | `lazy` | Residency of the dense per-node degree column (backs the degree-sum `count(endpoint)` fast path): `lazy` faults per-id chunks on touch and reclaims them under memory pressure (see `degreeColumnBytes`) as well as on the idle sweep; `pinned` holds the whole column resident and ignores the budget. |
-| `cache.degreeColumnBytes` | `cache__degreeColumnBytes` | 256 MiB | Byte budget for the `lazy` degree column, enforced **on the fault path**: once resident chunks exceed it, the coldest are evicted (CLOCK) before the next chunk is admitted, so the column stays bounded even when `cacheTtlMs ≤ 0` disables the idle sweep. `0` ⇒ uncapped (not recommended). Ignored under `pinned`. |
-| `tls.cert` / `tls.key` | `tls__cert` / `tls__key` | _(empty)_ | PEM material; both set ⇒ `bolt+s`. Empty ⇒ plaintext (loopback dev). |
-| `encryption.keyFile` | `encryption__keyFile` | _(empty)_ | File holding the hex at-rest master key. Must live **outside** `dataBackend.fs.dir` and any attacker-writable path (server refuses to start if it resolves inside it); see `THREAT_MODEL.md` "Trust boundary". |
-| `encryption.keyEnv` | `encryption__keyEnv` | _(empty)_ | Env var holding the hex at-rest master key. |
-| `query.maxRows` | `query__maxRows` | 100000 | Per-query row cap. |
-| `query.timeoutMs` | `query__timeoutMs` | 30000 | Per-query wall-clock deadline (0 ⇒ none). |
-| `query.maxIntermediate` | `query__maxIntermediate` | 1000000 | Per-query intermediate-element budget (0 ⇒ none); ~48 B/element, so the default bounds one query at ≈48 MB. |
-| `query.maxIntermediateGlobal` | `query__maxIntermediateGlobal` | 8000000 | Server-wide ceiling on the sum of all in-flight queries' intermediate elements (0 ⇒ none). Bounds the aggregate so `N` concurrent heavy queries can't multiply the per-query budget into an OOM; ~48 B/element ⇒ ≈384 MB. |
-| `vectorQuery.beamWidth` | `vectorQuery__beamWidth` | 64 | Vamana beam-search list size. |
-| `generationPollMs` | `generationPollMs` | 5000 | How often to poll each graph's `current`. |
-| `reloadStrategy` | `reloadStrategy` | `exit` | `exit` or `swap` on a generation change. |
-| `delta.enabled` | `delta__enabled` | `false` | Master switch for the writable layer. Off ⇒ every query serves the pure immutable core (no WAL opened) and write statements are refused. |
-| `delta.walDir` | `delta__walDir` | `wal` | Directory holding per-graph WAL segments (the durability floor). A relative path resolves under the data dir; one graph's segments live under `<walDir>/<graph>/`. Must be a **durable local volume — never `tmpfs`** or ephemeral instance storage. |
-| `delta.memtableBytes` | `delta__memtableBytes` | 64 MiB | Byte budget for a graph's in-RAM active memtable before it flushes to an immutable L0 delta segment (bounds resident memtable RAM). |
-| `delta.deltaCorePercent` | `delta__deltaCorePercent` | `0` (off) | Auto-consolidation threshold as a **percent of the core's entity count**: once the delta's changed-entity count reaches this fraction, a background consolidation folds it into a fresh core. A rebuild is O(core), so keep it rare (typical opt-in 5–25); `0` ⇒ only manual / scheduled consolidation. |
-| `delta.consolidateWindow` | `delta__consolidateWindow` | _(empty)_ | Off-peak cron window (server-local, hour granularity, `min hour dom mon dow`) gating the `deltaCorePercent` auto-consolidation. Empty ⇒ fire whenever due. Example: `0 1-5 * * *` = 01:00–05:59 daily. |
-| `delta.deltaHardBytes` | `delta__deltaHardBytes` | `0` (off) | Hard cap on total resident delta bytes: a write past it **throttles** (waits for a draining consolidation) — the OOM backstop. Set well above the `deltaCorePercent` working set. |
-| `cacheWarmingQuery` | `cacheWarmingQuery` | _(empty)_ | Cypher query run once at boot against every served graph, results discarded — faults the blocks needed to answer it into the block/vector cache so the first matching client query is served warm. Empty ⇒ disabled. A parse error is logged and warming is skipped; a per-graph execution error is logged and that graph skipped (the query need not be valid against every graph). Bounded by the same `query.*` limits and `query.timeoutMs` as a real query. |
-
-The writable layer carries a handful of further advanced knobs for tuning
-compaction (`delta.l0CompactionTrigger`, `delta.segmentFlushBytes`,
-`delta.maxUpperSegments`, `delta.offHeapL0`, `delta.segmentGcGraceSecs`); their
-defaults are sensible and they are documented in `docs/WRITABLE-PLAN.md`.
+Every configuration knob — its camelCase key, the `KEY__sub` environment override, its default, and what it does — is tabulated in the **[Configuration reference](docs/manual/14-configuration-reference.md)**. The most-tuned knobs are the cache budgets (`cache.*`), the query guards (`query.*`), the connection caps (`server.*`), the storage backend (`dataBackend.*`), and the writable layer (`delta.*`).
 
 **Resident memory** is approximately
 `blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead
@@ -673,162 +631,7 @@ with a warning on stderr. Exit status is `0` on success, `1` on error.
 
 ## Worked example
 
-Build a small graph, serve it, and query it with the neo4j **JavaScript** and
-**Python** drivers.
-
-### 1. Build a generation
-
-`people.cypher` (primitive-Cypher dump dialect — what `slater-build` consumes):
-
-```cypher
-CREATE (:Person {name: 'Alice', age: 30, embedding: vecf32([0.1, 0.2, 0.3])});
-CREATE (:Person {name: 'Bob',   age: 25, embedding: vecf32([0.2, 0.1, 0.0])});
-CREATE (:Person {name: 'Carol', age: 40, embedding: vecf32([0.9, 0.8, 0.7])});
-CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob'});
-CREATE INDEX FOR (p:Person) ON (p.name);
-CALL db.idx.vector.createNodeIndex('Person', 'embedding', 3, 'COSINE');
-```
-
-First mint a password hash and write the `acl.json` — it has to exist
-*before* the build, because `slater-build --acl` stamps the file's BLAKE3
-digest into the manifest and the server refuses a generation whose stamp
-doesn't match the live ACL (`requireAclStamp` is on by default):
-
-```sh
-slater hash-password 'pw'   # prints a $argon2id$… string — copy it
-```
-
-`acl.json` (next to `config.json`), granting the `myuser` user **read**
-on the `people` graph:
-
-```json
-{
-  "users": {
-    "myuser": {
-      "passwordArgon2id": "$argon2id$v=19$m=19456,t=2,p=1$…paste the hash here…",
-      "grants": {
-        "people": ["read"]
-      }
-    }
-  }
-}
-```
-
-Now build the generation, stamping that ACL into the manifest:
-
-```sh
-slater-build \
-  --input people.cypher \
-  --graph people \
-  --data-dir ./data \
-  --acl ./acl.json
-# prints the new generation UUID + content hash; writes ./data/people/<uuid>/
-# and ./data/people/current
-```
-
-Then start the server:
-
-```sh
-slater    # looks for configuration options in ./config.json (default fs dir ./data, port 7687)
-```
-
-### 2. Connect with the neo4j JavaScript driver
-
-```js
-import neo4j from 'neo4j-driver';
-
-// Use 'bolt://' for plaintext dev, 'bolt+s://' when TLS is configured.
-const driver = neo4j.driver('bolt://localhost:7687',
-  neo4j.auth.basic('myuser', 'pw'));
-const session = driver.session({ database: 'people' });
-
-// A plain MATCH … RETURN.
-const r1 = await session.run(
-  'MATCH (p:Person) WHERE p.age >= $min RETURN p.name AS name ORDER BY name',
-  { min: 28 });
-console.log(r1.records.map(rec => rec.get('name')));   // [ 'Alice', 'Carol' ]
-
-// A cosine-KNN query (the one permitted procedure).
-const r2 = await session.run(
-  `CALL db.idx.vector.queryNodes('Person', 'embedding', 2, vecf32([0.1, 0.2, 0.3]))
-   YIELD node, score RETURN node.name AS name, score ORDER BY score`);
-console.log(r2.records.map(rec => [rec.get('name'), rec.get('score')]));
-
-await session.close();
-await driver.close();
-```
-
-### 3. Connect with the neo4j Python driver
-
-```python
-from neo4j import GraphDatabase
-
-# 'bolt://' plaintext for dev, 'bolt+s://' once TLS is configured.
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("myuser", "pw"))
-
-with driver.session(database="people") as session:
-    # A plain MATCH … RETURN.
-    rows = session.run(
-        "MATCH (p:Person) WHERE p.age >= $min RETURN p.name AS name ORDER BY name",
-        min=28)
-    print([r["name"] for r in rows])            # ['Alice', 'Carol']
-
-    # A cosine-KNN query.
-    knn = session.run(
-        "CALL db.idx.vector.queryNodes('Person', 'embedding', 2, "
-        "vecf32([0.1, 0.2, 0.3])) "
-        "YIELD node, score RETURN node.name AS name, score ORDER BY score")
-    print([(r["name"], r["score"]) for r in knn])
-
-driver.close()
-```
-
-The KNN `score` is the **cosine distance** (ascending — nearest first).
-
-### 4. Write to the graph (opt-in)
-
-Writes are off until you enable the delta layer and grant `write`. Give `myuser`
-both grants in `acl.json` — a writer needs `read` too, because resolving a business
-key to write it is itself a read:
-
-```json
-"grants": { "people": ["read", "write"] }
-```
-
-Rebuild the generation so the manifest stamps the updated ACL
-(`slater-build … --acl ./acl.json`), then start the server with the writable layer
-on and a durable WAL directory:
-
-```sh
-delta__enabled=true delta__walDir=./wal slater
-```
-
-Now correct, insert and retract over the *same* Bolt session — no rebuild:
-
-```js
-// Upsert a node by its business key, then set a property.
-await session.run(
-  "MERGE (p:Person {name: 'Dave'}) SET p.age = 33");
-
-// Batch many rows into one group-committed, fsync-durable write.
-await session.run(
-  `UNWIND $rows AS r MERGE (p:Person {name: r.name}) SET p.age = r.age`,
-  { rows: [ { name: 'Erin', age: 28 }, { name: 'Frank', age: 52 } ] });
-
-// Read it straight back — the delta overlays the immutable core.
-const r = await session.run(
-  "MATCH (p:Person {name: 'Dave'}) RETURN p.age AS age");
-console.log(r.records[0].get('age'));   // 33
-
-// Fold the accumulated delta back into a fresh immutable core (optional;
-// also runs automatically per delta.deltaCorePercent / delta.consolidateWindow).
-await session.run('CALL slater.consolidate()');
-```
-
-`SUCCESS` on a write returns only after the `fsync` that makes it durable. The
-write grammar is business-key `MERGE` / `MATCH … SET` / `DELETE` (plus `CREATE`,
-`REMOVE`, detach delete and relationship writes) — enough to correct, insert,
-upsert and retract, addressed by the identity property your data already carries.
+A complete, runnable walkthrough — build a graph, serve it, connect with the neo4j **JavaScript** and **Python** drivers, and write to it — is in the manual's **[Quickstart](docs/manual/02-quickstart.md)** and **[Writing data](docs/manual/11-writing-data.md)** pages, using the bundled sample graph in [`docs/manual/examples/`](docs/manual/examples/).
 
 ## Development
 
