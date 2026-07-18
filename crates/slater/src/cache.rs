@@ -1352,7 +1352,16 @@ mod tests {
         })
     }
 
+    // Wall-clock thread-scaling assertions: they measure aggregate hit throughput at
+    // 1 vs. 4 threads, which is only meaningful on a quiet machine. Under the CI `test`
+    // job the whole 900+ test binary runs concurrently and saturates the shared
+    // runner's cores during the measurement, so the ratio is noisy (a sibling once
+    // passed at 2.4× and failed below 1.2× in the same run). `#[ignore]`d like the
+    // repo's other environment-sensitive tests — run on demand with
+    // `cargo test -p slater --lib -- --ignored concurrent`. The pools' *correctness*
+    // (eviction, budget, TTL, hit/miss) is covered by the non-flaky tests above.
     #[test]
+    #[ignore = "perf scaling; flaky under the loaded CI harness — run with --ignored"]
     fn result_cache_concurrent_hits_do_not_serialise() {
         const THREADS: usize = 4;
         if std::thread::available_parallelism().map_or(1, |n| n.get()) < THREADS {
@@ -1386,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf scaling; flaky under the loaded CI harness — run with --ignored"]
     fn vector_cache_concurrent_block_hits_do_not_serialise() {
         const THREADS: usize = 4;
         if std::thread::available_parallelism().map_or(1, |n| n.get()) < THREADS {
