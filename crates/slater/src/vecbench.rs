@@ -557,6 +557,7 @@ pub fn consolidate_to(
 /// The `MergeParams` for a streaming merge at the builder's shape.
 pub fn merge_params(fx: &VecFixture, medoid: VamanaIndex) -> MergeParams {
     MergeParams {
+        stem: "vector/bench.embedding".to_string(),
         medoid,
         r: VAMANA_R,
         alpha: VAMANA_ALPHA,
@@ -1037,6 +1038,7 @@ pub fn seal_ip_topk_batch(
 /// shape — drives the T4a delete re-prune + T4b insert-weave over an IP base through [`merge_to`].
 pub fn ip_merge_params(medoid: VamanaIndex, r: usize) -> MergeParams {
     MergeParams {
+        stem: "vector/bench.embedding".to_string(),
         medoid,
         r,
         alpha: VAMANA_ALPHA,

@@ -26,7 +26,7 @@ use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::wire::{capacity_hint, checked_span, read_uvarint, write_uvarint};
 
 /// One stored vector and the dense node it belongs to.
@@ -57,7 +57,7 @@ impl VectorStoreWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -112,7 +112,7 @@ impl VectorStoreReader {
     /// Open the store, supplying the per-generation cipher for an encrypted file.
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -121,7 +121,7 @@ impl VectorStoreReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileReader::open_src(src, cipher)?,

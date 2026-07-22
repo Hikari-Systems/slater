@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use graph_format::crypto::BlockCipher;
+use graph_format::crypto::{file_cipher, BlockCipher};
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::manifest::{AnnMode, AnnNav, Metric, VectorIndexDesc};
 use graph_format::pq::{ann_point, ann_pq_params, l2_norm, train_codebooks, PqParams, PqWriter};
@@ -332,7 +332,7 @@ pub(crate) fn write_vector_indexes(
         tmp_dir.join("vectors.f32.blk"),
         opts.vector_block_size,
         opts.zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, "vectors.f32.blk"),
     )?;
     for (pi, sorter) in pending.iter().zip(sorters) {
         // ── Carried arm (HIK-117), checked FIRST — before the cardinality routing. A carried
@@ -509,7 +509,7 @@ fn build_vamana_index(
         tmp_dir.join(&vam_rel),
         opts.vector_block_size,
         opts.zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, &vam_rel),
     )?;
     for &old in &order {
         let nbrs: Vec<u32> = graph.adjacency[old as usize]
@@ -534,7 +534,7 @@ fn build_vamana_index(
         &codebook,
         opts.block_size,
         opts.zstd_level,
-        cipher,
+        file_cipher(&cipher, &pq_rel),
     )?;
     for &old in &order {
         let codes = codebook.encode(&points[old as usize])?;
@@ -644,6 +644,9 @@ fn carry_vamana_index(
         pq_block_bytes: opts.block_size,
         zstd_level: opts.zstd_level,
         cipher,
+        // HIK-140: the pair's store-relative stem — the same one the served generation
+        // opens them under (`generation.rs`'s `vector/{label}.{property}`).
+        stem: format!("vector/{}.{}", pi.label, pi.property),
     };
     let stats = streaming_merge(
         &base_vamana,

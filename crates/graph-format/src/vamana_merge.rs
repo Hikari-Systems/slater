@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 
-use crate::crypto::BlockCipher;
+use crate::crypto::{BlockCipher, FileCipher};
 use crate::manifest::{AnnNav, Metric};
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
 use crate::vamana::{
@@ -99,7 +99,33 @@ pub struct MergeParams {
     /// Target block size for the output `.pq`.
     pub pq_block_bytes: usize,
     pub zstd_level: i32,
+    /// The **generation** cipher for the output pair, or `None` for a plaintext index.
+    ///
+    /// HIK-140: blocks are sealed per file, so this is not used directly — it derives a
+    /// per-file subkey from [`MergeParams::stem`]. It is also handed to the *base* pair,
+    /// which is only correct while the base and the output share a generation key; see
+    /// the note on `stem`.
     pub cipher: Option<Arc<BlockCipher>>,
+    /// Store-relative stem shared by the pair, without the `.vamana` / `.pq` suffix —
+    /// `vector/{label}.{property}` for a generation, `vec.{label}.{property}` for a
+    /// segment. Writer and reader must agree on it byte-for-byte (HIK-140).
+    ///
+    /// The base pair is opened under the *same* stem and the *same* cipher. That is
+    /// exactly today's behaviour: `cipher` has always been the output generation's, and a
+    /// consolidation mints a fresh salt, so carrying an **encrypted** base by reference
+    /// has never worked (it fails the tag check on the base's first block, and did so
+    /// before this change too). Fixing that needs the base generation's salt threaded
+    /// into the carry record — out of scope here, and unchanged by it.
+    pub stem: String,
+}
+
+impl MergeParams {
+    /// The per-file cipher for `{stem}{suffix}`.
+    fn file_cipher(&self, suffix: &str) -> Option<Arc<FileCipher>> {
+        self.cipher
+            .as_ref()
+            .map(|c| Arc::new(c.for_file(&format!("{}{suffix}", self.stem))))
+    }
 }
 
 /// The two data inputs to a merge: the rewritten id column and the new vectors.
@@ -152,9 +178,9 @@ pub fn streaming_merge(
     vamana_out: &Path,
     pq_out: &Path,
 ) -> Result<MergeStats> {
-    let reader = VamanaReader::open_with_cipher(vamana_in, params.cipher.clone())
+    let reader = VamanaReader::open_with_cipher(vamana_in, params.file_cipher(".vamana"))
         .with_context(|| format!("open {}", vamana_in.display()))?;
-    let base_pq = PqReader::open_with_cipher(pq_in, params.cipher.clone())
+    let base_pq = PqReader::open_with_cipher(pq_in, params.file_cipher(".pq"))
         .with_context(|| format!("open {}", pq_in.display()))?
         .load_resident()
         .with_context(|| format!("load {}", pq_in.display()))?;
@@ -263,14 +289,15 @@ pub fn streaming_merge(
             &scratch,
             params.vamana_block_bytes,
             params.zstd_level,
-            params.cipher.clone(),
+            params.file_cipher(".vamana.merge-scratch"),
         )
         .with_context(|| format!("create scratch {}", scratch.display()))?;
         consolidate_deletes(&reader, &dead, &opts, &mut vw)
             .context("delete half of the streaming merge")?;
         vw.finish()?;
-        deleted_reader = VamanaReader::open_with_cipher(&scratch, params.cipher.clone())
-            .with_context(|| format!("re-open scratch {}", scratch.display()))?;
+        deleted_reader =
+            VamanaReader::open_with_cipher(&scratch, params.file_cipher(".vamana.merge-scratch"))
+                .with_context(|| format!("re-open scratch {}", scratch.display()))?;
         &deleted_reader
     } else {
         &reader
@@ -323,7 +350,7 @@ pub fn streaming_merge(
         vamana_out,
         params.vamana_block_bytes,
         params.zstd_level,
-        params.cipher.clone(),
+        params.file_cipher(".vamana"),
     )
     .with_context(|| format!("create {}", vamana_out.display()))?;
     emit_merged(cur_reader, base_count, inputs.inserts, &adj, &mut vw)?;
@@ -436,7 +463,7 @@ fn write_pq(
         &base_pq.codebook,
         params.pq_block_bytes,
         params.zstd_level,
-        params.cipher.clone(),
+        params.file_cipher(".pq"),
     )
     .with_context(|| format!("create {}", pq_out.display()))?;
     for (i, &id) in base_final_ids.iter().enumerate() {
@@ -845,6 +872,7 @@ mod tests {
 
     fn params_for(base: &Base) -> MergeParams {
         MergeParams {
+            stem: "vector/Doc.embedding".to_string(),
             medoid: base.medoid,
             r: base.r,
             alpha: 1.2,
@@ -998,6 +1026,7 @@ mod tests {
 
     fn ip_params_for(base: &Base) -> MergeParams {
         MergeParams {
+            stem: "vector/Doc.embedding".to_string(),
             medoid: base.medoid,
             r: base.r,
             alpha: 1.2,

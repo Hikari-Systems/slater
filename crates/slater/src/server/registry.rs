@@ -648,6 +648,7 @@ impl Graphs {
                     aead: graph_format::crypto::AEAD_NAME.to_string(),
                     kdf: graph_format::crypto::KDF_NAME.to_string(),
                     salt_hex: graph_format::crypto::hex_encode(&salt),
+                    aad_scheme: graph_format::crypto::AAD_SCHEME.to_string(),
                 };
                 let cipher =
                     std::sync::Arc::new(graph_format::crypto::BlockCipher::from_master(key, &salt));
@@ -828,6 +829,7 @@ impl Graphs {
                     aead: graph_format::crypto::AEAD_NAME.to_string(),
                     kdf: graph_format::crypto::KDF_NAME.to_string(),
                     salt_hex: graph_format::crypto::hex_encode(&salt),
+                    aad_scheme: graph_format::crypto::AAD_SCHEME.to_string(),
                 };
                 let cipher =
                     std::sync::Arc::new(graph_format::crypto::BlockCipher::from_master(key, &salt));

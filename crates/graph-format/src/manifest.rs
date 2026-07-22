@@ -269,6 +269,15 @@ pub struct EncryptionHeader {
     pub kdf: String,
     /// KDF salt (hex). Per generation.
     pub salt_hex: String,
+    /// How each block's AEAD associated data is derived — `file-block-v1` binds the
+    /// block to its file (a per-file subkey) and to its ordinal within that file
+    /// (HIK-140).
+    ///
+    /// Deliberately **not** `#[serde(default)]`: an encrypted image written before the
+    /// binding existed must fail to parse with a readable error rather than open with
+    /// its blocks unbound and relocatable. Enforced again at cipher-derivation time by
+    /// [`crypto::check_aad_scheme`](crate::crypto::check_aad_scheme).
+    pub aad_scheme: String,
 }
 
 /// One file in the generation inventory.
@@ -868,6 +877,7 @@ mod tests {
         check("acl_blake3", &|m| m.acl_blake3 = Some("deadbeef".into()));
         check("encryption header", &|m| {
             m.encryption = Some(EncryptionHeader {
+                aad_scheme: crate::crypto::AAD_SCHEME.to_string(),
                 aead: "x".into(),
                 kdf: "y".into(),
                 salt_hex: "00".into(),

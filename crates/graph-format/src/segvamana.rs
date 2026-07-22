@@ -34,7 +34,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::BlockCipher;
+use crate::crypto::{file_cipher, BlockCipher};
 use crate::manifest::{AnnNav, Metric};
 use crate::pq::{
     ann_point, ann_pq_params, l2_norm, train_codebooks, Codebook, PqParams, PqReader, PqWriter,
@@ -201,9 +201,16 @@ pub fn seal_segment_index(
     let medoid_new = new_of[graph.medoid as usize];
 
     // `.vamana`: **raw** vectors + remapped adjacency, in layout order, id-free (v8).
-    let vam_path = dir.as_ref().join(format!("vec.{label}.{property}.vamana"));
-    let mut vw =
-        VamanaWriter::create_with_cipher(&vam_path, block_bytes, zstd_level, cipher.clone())?;
+    // HIK-140: `vec.{label}.{property}.{vamana,pq}` is both the file name and the AEAD
+    // binding name — the same string the reader derives from the segment manifest below.
+    let vam_name = format!("vec.{label}.{property}.vamana");
+    let vam_path = dir.as_ref().join(&vam_name);
+    let mut vw = VamanaWriter::create_with_cipher(
+        &vam_path,
+        block_bytes,
+        zstd_level,
+        file_cipher(&cipher, &vam_name),
+    )?;
     for &old in &order {
         let nbrs: Vec<u32> = graph.adjacency[old as usize]
             .iter()
@@ -215,9 +222,15 @@ pub fn seal_segment_index(
 
     // `.pq`: the codebook + per-vector codes (ANN space) + the layout→id map (dense node id),
     // in the same layout order. Freshly sealed ⇒ no holes.
-    let pq_path = dir.as_ref().join(format!("vec.{label}.{property}.pq"));
-    let mut pw =
-        PqWriter::create_with_cipher(&pq_path, &codebook, block_bytes, zstd_level, cipher)?;
+    let pq_name = format!("vec.{label}.{property}.pq");
+    let pq_path = dir.as_ref().join(&pq_name);
+    let mut pw = PqWriter::create_with_cipher(
+        &pq_path,
+        &codebook,
+        block_bytes,
+        zstd_level,
+        file_cipher(&cipher, &pq_name),
+    )?;
     for &old in &order {
         let codes = codebook.encode(&points[old as usize])?;
         pw.append_codes(entries[old as usize].0, &codes)?;
@@ -270,18 +283,22 @@ impl SegmentVamanaSet {
         for dv in dirty_vectors {
             let Some(meta) = dv.graph else { continue };
             let stem = format!("vec.{}.{}", dv.label, dv.property);
-            let vam_key = join_key(prefix, &format!("{stem}.vamana"));
-            let pq_key = join_key(prefix, &format!("{stem}.pq"));
+            let (vam_name, pq_name) = (format!("{stem}.vamana"), format!("{stem}.pq"));
+            let vam_key = join_key(prefix, &vam_name);
+            let pq_key = join_key(prefix, &pq_name);
             // Declared, but the files are gone/half-written: fall back to brute force rather
             // than error. That is what makes the sidecar's absence meaningful either way.
             if !store.exists(&vam_key)? || !store.exists(&pq_key)? {
                 continue;
             }
-            let reader = match VamanaReader::open_src(store.open(&vam_key)?, cipher.clone()) {
+            let reader = match VamanaReader::open_src(
+                store.open(&vam_key)?,
+                file_cipher(&cipher, &vam_name),
+            ) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let pq = match PqReader::open_src(store.open(&pq_key)?, cipher.clone())
+            let pq = match PqReader::open_src(store.open(&pq_key)?, file_cipher(&cipher, &pq_name))
                 .and_then(|r| r.load_resident())
             {
                 Ok(p) => p,

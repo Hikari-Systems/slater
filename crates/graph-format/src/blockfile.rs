@@ -40,7 +40,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::codec;
-use crate::crypto::{BlockCipher, NONCE_LEN};
+use crate::crypto::{BlockCipher, FileCipher, NONCE_LEN};
 use crate::ids::BlockId;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
@@ -270,7 +270,8 @@ fn seal_block(
     raw: &[u8],
     codec: BlockCodec,
     level: i32,
-    cipher: Option<&BlockCipher>,
+    cipher: Option<&FileCipher>,
+    ordinal: usize,
 ) -> Result<(Vec<u8>, Option<[u8; NONCE_LEN]>)> {
     let comp = match codec {
         BlockCodec::Zstd => codec::compress(raw, level)?,
@@ -281,7 +282,7 @@ fn seal_block(
     match cipher {
         Some(cipher) => {
             let nonce = BlockCipher::random_nonce();
-            let sealed = cipher.encrypt(&nonce, &comp)?;
+            let sealed = cipher.seal(ordinal as u64, &nonce, &comp)?;
             Ok((sealed, Some(nonce)))
         }
         None => Ok((comp, None)),
@@ -300,7 +301,7 @@ pub struct BlockFileWriter {
     cur_data: Vec<u8>,
     /// When set, each compressed block is sealed with this cipher under a fresh
     /// per-block nonce before it is written.
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
     /// Index of the next block to *submit* for sealing. Not `dir.len()`: blocks are
     /// sealed out of order, so `dir` lags behind by whatever is in flight.
     next_block: usize,
@@ -328,7 +329,7 @@ impl BlockFileWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Self::create_inner(
             path,
@@ -349,7 +350,7 @@ impl BlockFileWriter {
         target_block_bytes: usize,
         codec: BlockCodec,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Self::create_inner(path, target_block_bytes, codec, zstd_level, cipher)
     }
@@ -379,7 +380,7 @@ impl BlockFileWriter {
         target_block_bytes: usize,
         codec: BlockCodec,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let f = File::create(path.as_ref())
             .with_context(|| format!("create block file {}", path.as_ref().display()))?;
@@ -482,7 +483,8 @@ impl BlockFileWriter {
 
         let Some(state) = self.seal.as_ref().map(Arc::clone) else {
             // Inline: the original single-threaded behaviour.
-            let (stored, nonce) = seal_block(&raw, self.codec, self.level, self.cipher.as_deref())?;
+            let (stored, nonce) =
+                seal_block(&raw, self.codec, self.level, self.cipher.as_deref(), idx)?;
             return self.write_sealed(Sealed {
                 stored,
                 raw_len: raw.len() as u32,
@@ -502,7 +504,7 @@ impl BlockFileWriter {
         let st = Arc::clone(&state);
         let submitted = seal_pool().send(Box::new(move || {
             let raw_len = raw.len() as u32;
-            match seal_block(&raw, codec, level, cipher.as_deref()) {
+            match seal_block(&raw, codec, level, cipher.as_deref(), idx) {
                 Ok((stored, nonce)) => {
                     st.done.lock().unwrap().insert(
                         idx,
@@ -613,7 +615,22 @@ impl BlockFileWriter {
 ///
 /// Revisit only if the concat stops being 1% of the build, or lands on a filesystem
 /// with reflink (XFS/btrfs), where `copy_file_range` would make it O(1) outright.
-pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Result<u64> {
+///
+/// # Encrypted inputs (HIK-140)
+///
+/// A sealed block is bound to its **ordinal** within its file, and this splice changes
+/// every ordinal past the first input. So for an encrypted concat the verbatim copy is
+/// not available: `cipher` must be the output file's [`FileCipher`], every input must
+/// already be sealed under that same cipher (write the parts with the *output* file's
+/// name), and each block is opened at its part-local ordinal and re-sealed — under a
+/// fresh nonce — at its global one. That costs one XChaCha20 pass over the bytes in each
+/// direction; it is paid only when the generation is encrypted, and the plaintext path
+/// below is untouched (still `copy_file_range`).
+pub fn concat_block_files(
+    out_path: impl AsRef<Path>,
+    inputs: &[PathBuf],
+    cipher: Option<&FileCipher>,
+) -> Result<u64> {
     if inputs.is_empty() {
         bail!("concat_block_files: no inputs");
     }
@@ -623,6 +640,14 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
     // flag matters, since it sets the directory-entry width (nonce).
     let (_, encrypted) = magic_kind(&magic)
         .ok_or_else(|| anyhow!("concat_block_files: bad magic in {}", inputs[0].display()))?;
+    if encrypted != cipher.is_some() {
+        bail!(
+            "concat_block_files: {} is {}encrypted but {}a cipher was supplied",
+            inputs[0].display(),
+            if encrypted { "" } else { "not " },
+            if cipher.is_some() { "" } else { "no " }
+        );
+    }
     let magic_len = magic.len() as u64;
 
     let mut out = File::create(out_path.as_ref())
@@ -651,36 +676,68 @@ pub fn concat_block_files(out_path: impl AsRef<Path>, inputs: &[PathBuf]) -> Res
         let dir_len = fr.read_u64::<LittleEndian>()?;
         let blocks = fr.read_u64::<LittleEndian>()?;
 
-        // Copy the block region [8, dir_offset) verbatim, tracking where it lands.
+        // Plaintext: copy the block region [8, dir_offset) verbatim, tracking where it
+        // lands. (Encrypted inputs re-seal block-by-block below, so they must not be
+        // bulk-copied.)
         let blocks_base_out = out_pos;
         let region = dir_offset - magic_len;
-        f.seek(SeekFrom::Start(magic_len))?;
-        let copied = std::io::copy(&mut (&f).take(region), &mut out)
-            .with_context(|| format!("copy blocks of {}", inp.display()))?;
-        if copied != region {
-            bail!(
-                "concat_block_files: short copy of {} ({copied} of {region})",
-                inp.display()
-            );
+        if cipher.is_none() {
+            f.seek(SeekFrom::Start(magic_len))?;
+            let copied = std::io::copy(&mut (&f).take(region), &mut out)
+                .with_context(|| format!("copy blocks of {}", inp.display()))?;
+            if copied != region {
+                bail!(
+                    "concat_block_files: short copy of {} ({copied} of {region})",
+                    inp.display()
+                );
+            }
+            out_pos += region;
         }
-        out_pos += region;
 
         // Rewrite each directory entry's offset into the output's coordinate space.
         let mut db = vec![0u8; dir_len as usize];
         f.read_exact_at(&mut db, dir_offset)?;
         let mut dr = &db[..];
-        for _ in 0..blocks {
+        for local in 0..blocks {
             let offset = dr.read_u64::<LittleEndian>()?;
             let comp_len = dr.read_u32::<LittleEndian>()?;
             let raw_len = dr.read_u32::<LittleEndian>()?;
             let rec_count = dr.read_u32::<LittleEndian>()?;
-            dir_bytes.write_u64::<LittleEndian>(blocks_base_out + (offset - magic_len))?;
+            let mut nonce = [0u8; NONCE_LEN];
+            if encrypted {
+                dr.read_exact(&mut nonce)?;
+            }
+            let out_offset = match cipher {
+                // Verbatim: the block kept its bytes, so its offset just shifts.
+                None => blocks_base_out + (offset - magic_len),
+                // Sealed: open at the part-local ordinal, re-seal at the global one.
+                // Same length either way, so the output offsets still march linearly.
+                Some(c) => {
+                    codec::check_stored_len(comp_len as usize)?;
+                    let mut stored = vec![0u8; comp_len as usize];
+                    f.read_exact_at(&mut stored, offset)
+                        .with_context(|| format!("read block {local} of {}", inp.display()))?;
+                    let body = c.open(local, &nonce, &stored).with_context(|| {
+                        format!(
+                            "open block {local} of {} for re-sealing (was it sealed under \
+                             the output file's name?)",
+                            inp.display()
+                        )
+                    })?;
+                    nonce = BlockCipher::random_nonce();
+                    let resealed = c.seal(block_count, &nonce, &body)?;
+                    debug_assert_eq!(resealed.len(), stored.len());
+                    let at = out_pos;
+                    out.write_all(&resealed)?;
+                    out_pos += resealed.len() as u64;
+                    at
+                }
+            };
+            dir_bytes.write_u64::<LittleEndian>(out_offset)?;
             dir_bytes.write_u32::<LittleEndian>(comp_len)?;
             dir_bytes.write_u32::<LittleEndian>(raw_len)?;
             dir_bytes.write_u32::<LittleEndian>(rec_count)?;
             if encrypted {
-                let mut nonce = [0u8; NONCE_LEN];
-                dr.read_exact(&mut nonce)?;
                 dir_bytes.write_all(&nonce)?;
             }
             block_count += 1;
@@ -710,7 +767,7 @@ pub struct BlockFileReader {
     block_start: Vec<u64>,
     /// Per-generation cipher, set iff the file is encrypted. Refused at open if
     /// the file is encrypted and no key was supplied (absent-key refusal).
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
     /// Block-body codec, from the file magic. [`BlockCodec::Raw`] skips the zstd
     /// decompress on every block read (bare `pread` + slice).
     codec: BlockCodec,
@@ -730,7 +787,7 @@ impl BlockFileReader {
     /// [`open_src`]: BlockFileReader::open_src
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(FileObject::open(path.as_ref())?);
         Self::open_src(src, cipher)
@@ -740,7 +797,7 @@ impl BlockFileReader {
     /// object), validating the magic and loading the block directory.
     /// An encrypted file requires `cipher = Some(..)`; an encrypted file opened
     /// without a key is refused with a clear error rather than returning garbage.
-    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
+    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<FileCipher>>) -> Result<Self> {
         let len = src.len();
         if len < BLOCKFILE_MAGIC.len() as u64 + FOOTER_LEN {
             bail!("block file too short to be valid");
@@ -871,9 +928,9 @@ impl BlockFileReader {
     /// Decrypt-then-decompress a block's stored (on-disk) bytes into its raw form.
     /// An encrypted file's stored bytes are the compressed block sealed with the
     /// AEAD, so we unseal before inflating.
-    fn decode_stored(&self, e: &DirEntry, stored: Vec<u8>) -> Result<Vec<u8>> {
+    fn decode_stored(&self, ordinal: usize, e: &DirEntry, stored: Vec<u8>) -> Result<Vec<u8>> {
         let comp = match (&self.cipher, &e.nonce) {
-            (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
+            (Some(cipher), Some(nonce)) => cipher.open(ordinal as u64, nonce, &stored)?,
             _ => stored,
         };
         // Raw blocks are stored verbatim (the unseal above already yielded the raw
@@ -909,7 +966,7 @@ impl BlockFileReader {
         codec::check_stored_len(e.comp_len as usize)?;
         let mut stored = vec![0u8; e.comp_len as usize];
         self.src.read_exact_at(&mut stored, e.offset)?;
-        self.decode_stored(e, stored)
+        self.decode_stored(block.index(), e, stored)
     }
 
     /// Read a single record by location (decompresses its block, copies the slot).
@@ -959,7 +1016,7 @@ impl BlockFileReader {
             let stored_batch = self.src.read_ranges(&ranges)?;
             for (k, stored) in stored_batch.into_iter().enumerate() {
                 let idx = bi + k;
-                let raw = self.decode_stored(&self.dir[idx], stored)?;
+                let raw = self.decode_stored(idx, &self.dir[idx], stored)?;
                 f(idx, &raw)?;
             }
             bi = hi;
@@ -1166,13 +1223,14 @@ pub fn record_range_in_block(raw: &[u8], slot: u32) -> Result<std::ops::Range<us
 mod tests {
     use super::*;
 
-    // TEMPORARY (red observation, HIK-140): the pre-fix shims. `for_file` does not exist
-    // yet, so a file cipher *is* the generation cipher — which is exactly the bug.
+    use crate::crypto::file_cipher as bind;
+
     fn gen_cipher(master: &[u8], salt: &[u8]) -> Arc<BlockCipher> {
         Arc::new(BlockCipher::from_master(master, salt))
     }
-    fn file_cipher(c: &Arc<BlockCipher>, _name: &str) -> Arc<BlockCipher> {
-        c.clone()
+    /// A file cipher for `name`, for the tests that hold a generation cipher directly.
+    fn file_cipher(c: &Arc<BlockCipher>, name: &str) -> Arc<FileCipher> {
+        bind(&Some(c.clone()), name).unwrap()
     }
 
     // HIK-80: the block-file footer is plaintext even for an encrypted file, and `dir_len` — an
@@ -1232,7 +1290,7 @@ mod tests {
             parts.push(p);
         }
         let out = tmp("concat");
-        let total = concat_block_files(&out, &parts).unwrap();
+        let total = concat_block_files(&out, &parts, None).unwrap();
         assert_eq!(total, expected.len() as u64);
 
         let r = BlockFileReader::open(&out).unwrap();
@@ -1344,10 +1402,15 @@ mod tests {
     fn encrypted_records_roundtrip_across_blocks() {
         use crate::crypto::BlockCipher;
         let path = tmp("enc_many");
-        let cipher = Arc::new(BlockCipher::from_master(b"master-key", &[7u8; 32]));
+        let cipher = gen_cipher(b"master-key", &[7u8; 32]);
         // Small target forces multiple blocks, each with its own nonce.
-        let mut w =
-            BlockFileWriter::create_with_cipher(&path, 1024, 3, Some(cipher.clone())).unwrap();
+        let mut w = BlockFileWriter::create_with_cipher(
+            &path,
+            1024,
+            3,
+            Some(file_cipher(&cipher, "enc_many")),
+        )
+        .unwrap();
         let mut locs = Vec::new();
         let mut expected = Vec::new();
         for i in 0..500u32 {
@@ -1359,7 +1422,8 @@ mod tests {
         assert!(nblocks > 1, "small target should span multiple blocks");
 
         // The right key reads every record back.
-        let r = BlockFileReader::open_with_cipher(&path, Some(cipher)).unwrap();
+        let r = BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "enc_many")))
+            .unwrap();
         assert_eq!(r.num_blocks() as u64, nblocks);
         for (loc, want) in locs.iter().zip(&expected) {
             assert_eq!(&r.read_record(*loc).unwrap(), want);
@@ -1490,13 +1554,13 @@ mod tests {
     fn raw_encrypted_roundtrips() {
         use crate::crypto::BlockCipher;
         let path = tmp("raw_enc");
-        let cipher = Arc::new(BlockCipher::from_master(b"master-key", &[9u8; 32]));
+        let cipher = gen_cipher(b"master-key", &[9u8; 32]);
         let mut w = BlockFileWriter::create_with_codec(
             &path,
             1024,
             BlockCodec::Raw,
             3,
-            Some(cipher.clone()),
+            Some(file_cipher(&cipher, "raw_enc")),
         )
         .unwrap();
         let mut locs = Vec::new();
@@ -1509,7 +1573,8 @@ mod tests {
         let nblocks = w.finish().unwrap();
         assert!(nblocks > 1);
 
-        let r = BlockFileReader::open_with_cipher(&path, Some(cipher)).unwrap();
+        let r = BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "raw_enc")))
+            .unwrap();
         assert_eq!(r.codec, BlockCodec::Raw);
         // Sealed raw block counts ciphertext = raw + 16-byte tag.
         for e in &r.dir {
@@ -1527,8 +1592,14 @@ mod tests {
     fn encrypted_block_bytes_are_not_plaintext_on_disk() {
         use crate::crypto::BlockCipher;
         let path = tmp("enc_ondisk");
-        let cipher = Arc::new(BlockCipher::from_master(b"k", &[1u8; 32]));
-        let mut w = BlockFileWriter::create_with_cipher(&path, 4096, 3, Some(cipher)).unwrap();
+        let cipher = gen_cipher(b"k", &[1u8; 32]);
+        let mut w = BlockFileWriter::create_with_cipher(
+            &path,
+            4096,
+            3,
+            Some(file_cipher(&cipher, "enc_ondisk")),
+        )
+        .unwrap();
         let marker = b"PLAINTEXT-MARKER-camelid-camelid";
         w.append_record(marker).unwrap();
         w.finish().unwrap();
@@ -1544,9 +1615,14 @@ mod tests {
     fn wrong_key_and_absent_key_are_refused() {
         use crate::crypto::BlockCipher;
         let path = tmp("enc_refuse");
-        let right = Arc::new(BlockCipher::from_master(b"right", &[3u8; 32]));
-        let mut w =
-            BlockFileWriter::create_with_cipher(&path, 4096, 3, Some(right.clone())).unwrap();
+        let right = gen_cipher(b"right", &[3u8; 32]);
+        let mut w = BlockFileWriter::create_with_cipher(
+            &path,
+            4096,
+            3,
+            Some(file_cipher(&right, "enc_refuse")),
+        )
+        .unwrap();
         w.append_record(b"sensitive payload here").unwrap();
         w.finish().unwrap();
 
@@ -1559,8 +1635,9 @@ mod tests {
 
         // Wrong key: opens (the directory is plaintext) but a block read fails
         // cleanly at the AEAD tag check.
-        let wrong = Arc::new(BlockCipher::from_master(b"wrong", &[3u8; 32]));
-        let r = BlockFileReader::open_with_cipher(&path, Some(wrong)).unwrap();
+        let wrong = gen_cipher(b"wrong", &[3u8; 32]);
+        let r = BlockFileReader::open_with_cipher(&path, Some(file_cipher(&wrong, "enc_refuse")))
+            .unwrap();
         let err = r.read_record_global(0).unwrap_err();
         assert!(err.to_string().contains("wrong key"));
         let _ = std::fs::remove_file(&path);
@@ -1651,13 +1728,13 @@ mod tests {
     #[test]
     fn concat_preserves_encrypted_records_and_their_nonces() {
         use crate::crypto::BlockCipher;
-        let cipher = Arc::new(BlockCipher::from_master(b"concat key", &[7u8; 32]));
+        let cipher = gen_cipher(b"concat key", &[7u8; 32]);
+        let fc = file_cipher(&cipher, "topology.csr.blk");
         let mut parts = Vec::new();
         let mut expected: Vec<Vec<u8>> = Vec::new();
         for pi in 0..3u32 {
             let p = tmp(&format!("enc_part{pi}"));
-            let mut w =
-                BlockFileWriter::create_with_cipher(&p, 512, 3, Some(cipher.clone())).unwrap();
+            let mut w = BlockFileWriter::create_with_cipher(&p, 512, 3, Some(fc.clone())).unwrap();
             for i in 0..150u32 {
                 let rec = format!("e{pi}-{i}-{}", "y".repeat((i % 40) as usize)).into_bytes();
                 w.append_record(&rec).unwrap();
@@ -1667,10 +1744,12 @@ mod tests {
             parts.push(p);
         }
         let out = tmp("enc_concat");
-        let total = concat_block_files(&out, &parts).unwrap();
+        // The parts were sealed under the *output* file's cipher, and the concat re-seals
+        // each block at its corrected global ordinal (HIK-140).
+        let total = concat_block_files(&out, &parts, Some(&fc)).unwrap();
         assert_eq!(total, expected.len() as u64);
 
-        let r = BlockFileReader::open_with_cipher(&out, Some(cipher)).unwrap();
+        let r = BlockFileReader::open_with_cipher(&out, Some(fc.clone())).unwrap();
         assert_eq!(r.total_records(), expected.len() as u64);
         for (i, want) in expected.iter().enumerate() {
             assert_eq!(&r.read_record_global(i as u64).unwrap(), want, "record {i}");
@@ -1802,8 +1881,10 @@ mod tests {
         let mut w = BlockFileWriter::create(&path, 4096, 3).unwrap();
         w.append_record(b"plain record").unwrap();
         w.finish().unwrap();
-        let cipher = Arc::new(BlockCipher::from_master(b"unused", &[9u8; 32]));
-        let r = BlockFileReader::open_with_cipher(&path, Some(cipher)).unwrap();
+        let cipher = gen_cipher(b"unused", &[9u8; 32]);
+        let r =
+            BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "plain_with_key")))
+                .unwrap();
         assert_eq!(&r.read_record_global(0).unwrap(), b"plain record");
         let _ = std::fs::remove_file(&path);
     }

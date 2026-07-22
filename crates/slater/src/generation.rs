@@ -23,7 +23,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use graph_format::blockfile::BlockFileReader;
 use graph_format::columns::PropsReader;
-use graph_format::crypto::{self, BlockCipher};
+use graph_format::crypto::{self, file_cipher, BlockCipher};
 use graph_format::histogram::decode_histogram;
 use graph_format::ids::Generation as GenId;
 use graph_format::ids::Value;
@@ -419,10 +419,24 @@ impl Generation {
         let open_blk = |name: &str| -> Result<Arc<dyn graph_format::store::RandomReadAt>> {
             store.open(&join_key(&base, name))
         };
-        let node_props = PropsReader::open_src(open_blk("node_props.blk")?, cipher.clone())?;
-        let node_labels = NodeLabelsReader::open_src(open_blk("node_labels.blk")?, cipher.clone())?;
-        let edge_props = PropsReader::open_src(open_blk("edge_props.blk")?, cipher.clone())?;
-        let topology = TopologyReader::open_src(open_blk("topology.csr.blk")?, cipher.clone())?;
+        // HIK-140: each store is opened under a subkey bound to its store-relative name —
+        // the same string `open_blk` builds the key from, so reader and writer cannot drift.
+        let node_props = PropsReader::open_src(
+            open_blk("node_props.blk")?,
+            file_cipher(&cipher, "node_props.blk"),
+        )?;
+        let node_labels = NodeLabelsReader::open_src(
+            open_blk("node_labels.blk")?,
+            file_cipher(&cipher, "node_labels.blk"),
+        )?;
+        let edge_props = PropsReader::open_src(
+            open_blk("edge_props.blk")?,
+            file_cipher(&cipher, "edge_props.blk"),
+        )?;
+        let topology = TopologyReader::open_src(
+            open_blk("topology.csr.blk")?,
+            file_cipher(&cipher, "topology.csr.blk"),
+        )?;
         // Endpoint postings (format v2+). Gate on existence so a hand-built
         // fixture without them still opens; the format-version check already
         // fences real generations.
@@ -431,7 +445,7 @@ impl Generation {
             if store.exists(&key)? {
                 Ok(Some(BlockFileReader::open_src(
                     store.open(&key)?,
-                    cipher.clone(),
+                    file_cipher(&cipher, name),
                 )?))
             } else {
                 Ok(None)
@@ -439,7 +453,10 @@ impl Generation {
         };
         let reltype_src_post = open_post("reltype_src.post")?;
         let reltype_tgt_post = open_post("reltype_tgt.post")?;
-        let vectors = VectorStoreReader::open_src(open_blk("vectors.f32.blk")?, cipher.clone())?;
+        let vectors = VectorStoreReader::open_src(
+            open_blk("vectors.f32.blk")?,
+            file_cipher(&cipher, "vectors.f32.blk"),
+        )?;
 
         // One decoded-leaf-block cache shared across this generation's range readers
         // (built only when a positive budget is supplied — the server path; every other
@@ -458,9 +475,11 @@ impl Generation {
             .par_iter()
             .enumerate()
             .map(|(ordinal, ri)| -> Result<(String, IsamReader)> {
-                let key = join_key(&base, &format!("range/{}.isam", ri.name));
-                let mut reader = IsamReader::open_src(store.open(&key)?, cipher.clone())
-                    .with_context(|| format!("open range index {key}"))?;
+                let rel = format!("range/{}.isam", ri.name);
+                let key = join_key(&base, &rel);
+                let mut reader =
+                    IsamReader::open_src(store.open(&key)?, file_cipher(&cipher, &rel))
+                        .with_context(|| format!("open range index {key}"))?;
                 if let Some(cache) = &range_cache {
                     reader = reader.with_block_cache(cache.clone(), ordinal as u32);
                 }
@@ -474,8 +493,11 @@ impl Generation {
         let mut prop_histograms = HashMap::new();
         let hist_key = join_key(&base, "prop_hist.blk");
         if store.exists(&hist_key)? && !manifest.property_histograms.is_empty() {
-            let reader = BlockFileReader::open_src(store.open(&hist_key)?, cipher.clone())
-                .with_context(|| format!("open histogram store {hist_key}"))?;
+            let reader = BlockFileReader::open_src(
+                store.open(&hist_key)?,
+                file_cipher(&cipher, "prop_hist.blk"),
+            )
+            .with_context(|| format!("open histogram store {hist_key}"))?;
             for (i, d) in manifest.property_histograms.iter().enumerate() {
                 let rec = reader.read_record_global(i as u64).with_context(|| {
                     format!("read histogram record {i} for index {}", d.index_name)
@@ -495,8 +517,11 @@ impl Generation {
         let hub_key = join_key(&base, "hub_degrees.blk");
         if let Some(desc) = &manifest.hub_degrees {
             if store.exists(&hub_key)? {
-                let reader = BlockFileReader::open_src(store.open(&hub_key)?, cipher.clone())
-                    .with_context(|| format!("open hub-degree sidecar {hub_key}"))?;
+                let reader = BlockFileReader::open_src(
+                    store.open(&hub_key)?,
+                    file_cipher(&cipher, "hub_degrees.blk"),
+                )
+                .with_context(|| format!("open hub-degree sidecar {hub_key}"))?;
                 hub_out_degrees = graph_format::hubdegree::decode_hub_list(
                     &reader.read_record_global(0).context("read hub out-list")?,
                 )?;
@@ -518,8 +543,11 @@ impl Generation {
         let mut degree_column = None;
         let nd_key = join_key(&base, "node_degrees.blk");
         if store.exists(&nd_key)? {
-            let reader = BlockFileReader::open_src(store.open(&nd_key)?, cipher.clone())
-                .with_context(|| format!("open node-degree column {nd_key}"))?;
+            let reader = BlockFileReader::open_src(
+                store.open(&nd_key)?,
+                file_cipher(&cipher, "node_degrees.blk"),
+            )
+            .with_context(|| format!("open node-degree column {nd_key}"))?;
             degree_column = Some(
                 crate::degree_column::DegreeColumn::open(
                     reader,
@@ -549,14 +577,15 @@ impl Generation {
                 continue;
             };
             let stem = format!("vector/{}.{}", vi.label, vi.property);
+            let (vam_rel, pq_rel) = (format!("{stem}.vamana"), format!("{stem}.pq"));
             let reader = VamanaReader::open_src(
-                store.open(&join_key(&base, &format!("{stem}.vamana")))?,
-                cipher.clone(),
+                store.open(&join_key(&base, &vam_rel))?,
+                file_cipher(&cipher, &vam_rel),
             )
             .with_context(|| format!("open Vamana store {stem}.vamana"))?;
             let pq = PqReader::open_src(
-                store.open(&join_key(&base, &format!("{stem}.pq")))?,
-                cipher.clone(),
+                store.open(&join_key(&base, &pq_rel))?,
+                file_cipher(&cipher, &pq_rel),
             )
             .with_context(|| format!("open PQ store {stem}.pq"))?;
             let resident = Arc::new(
@@ -1121,6 +1150,11 @@ fn derive_cipher(
              (set config.encryption.keyEnv or keyFile)"
         )
     })?;
+    // HIK-140: refuse an image whose blocks were not sealed under this build's AAD
+    // scheme. Checked by type, so the caller can tell "rebuild the image" apart from a
+    // wrong key or a corrupt block.
+    crypto::check_aad_scheme(&header.aad_scheme)
+        .with_context(|| format!("generation {uuid} of graph {graph}"))?;
     let salt = crypto::hex_decode(&header.salt_hex)
         .with_context(|| format!("decode encryption salt for generation {uuid}"))?;
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
@@ -1276,6 +1310,7 @@ mod tests {
                         aead: crypto::AEAD_NAME.to_string(),
                         kdf: crypto::KDF_NAME.to_string(),
                         salt_hex: crypto::hex_encode(&salt),
+                        aad_scheme: crypto::AAD_SCHEME.to_string(),
                     };
                     (
                         Some(Arc::new(BlockCipher::from_master(key, &salt))),
@@ -1291,7 +1326,7 @@ mod tests {
             dir.join("node_props.blk"),
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, "node_props.blk"),
         )
         .unwrap();
         np.append(&[(0, Value::Str("Alice".into())), (1, Value::Int(30))])
@@ -1305,7 +1340,7 @@ mod tests {
             dir.join("node_labels.blk"),
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, "node_labels.blk"),
         )
         .unwrap();
         nl.append(&[0]).unwrap(); // Person
@@ -1318,7 +1353,7 @@ mod tests {
             dir.join("edge_props.blk"),
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, "edge_props.blk"),
         )
         .unwrap();
         ep.append(&[(1, Value::Int(2020))]).unwrap(); // since: 2020
@@ -1346,7 +1381,7 @@ mod tests {
             &edges,
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, "topology.csr.blk"),
         )
         .unwrap();
 
@@ -1369,7 +1404,7 @@ mod tests {
             dir.join("vectors.f32.blk"),
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, "vectors.f32.blk"),
         )
         .unwrap();
         vw.append(0, &[0.1, 0.2, 0.3]).unwrap();
@@ -1385,7 +1420,7 @@ mod tests {
             ],
             BLOCK,
             LEVEL,
-            cipher.clone(),
+            file_cipher(&cipher, &format!("range/{range_name}.isam")),
         )
         .unwrap();
 

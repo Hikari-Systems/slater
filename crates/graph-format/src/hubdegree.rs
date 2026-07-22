@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::blockfile::BlockFileWriter;
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// Default degree floor at/above which a node is recorded in the sidecar. Chosen well
@@ -76,7 +76,7 @@ pub fn write_hub_degrees(
     in_hubs: &[(u64, u32)],
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<()> {
     let mut w = BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
     w.append_record(&encode_hub_list(out_hubs))?;

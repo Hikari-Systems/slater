@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::crypto::BlockCipher;
+use crate::crypto::{file_cipher, BlockCipher};
 use crate::ids::Value;
 use crate::isam::{write_isam_with_cipher, IsamReader};
 use crate::store::{join_key, ObjectStore};
@@ -167,6 +167,8 @@ pub fn write_index_fragments(
     cipher: Option<Arc<BlockCipher>>,
 ) -> Result<()> {
     let dir = dir.as_ref();
+    // HIK-140: each fragment is sealed under its own per-file subkey, derived from the
+    // same `isam_name(k)` the reader derives from.
     for (k, spec) in specs.iter().enumerate() {
         if !spec.removals.windows(2).all(|w| w[0] < w[1]) {
             bail!(
@@ -175,12 +177,13 @@ pub fn write_index_fragments(
                 spec.prop
             );
         }
+        let name = isam_name(k);
         write_isam_with_cipher(
-            dir.join(isam_name(k)),
+            dir.join(&name),
             spec.entries.clone(),
             target_block_bytes,
             zstd_level,
-            cipher.clone(),
+            file_cipher(&cipher, &name),
         )
         .with_context(|| format!("write index fragment {k} ({}, {})", spec.label, spec.prop))?;
     }
@@ -284,7 +287,8 @@ impl SegmentIndexReader {
         };
         let mut fragments = Vec::new();
         for (k, (label, prop, removals, fence)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
-            let isam = IsamReader::open_with_cipher(dir.join(isam_name(k)), cipher.clone())
+            let name = isam_name(k);
+            let isam = IsamReader::open_with_cipher(dir.join(&name), file_cipher(&cipher, &name))
                 .with_context(|| format!("open index fragment {k} ({label}, {prop})"))?;
             fragments.push(Fragment {
                 label,
@@ -314,9 +318,10 @@ impl SegmentIndexReader {
             .with_context(|| format!("read {meta_key}"))?;
         let mut fragments = Vec::new();
         for (k, (label, prop, removals, fence)) in decode_idx_meta(&meta)?.into_iter().enumerate() {
+            let name = isam_name(k);
             let isam = IsamReader::open_src(
-                store.open(&join_key(prefix, &isam_name(k)))?,
-                cipher.clone(),
+                store.open(&join_key(prefix, &name))?,
+                file_cipher(&cipher, &name),
             )
             .with_context(|| format!("open index fragment {k} ({label}, {prop})"))?;
             fragments.push(Fragment {

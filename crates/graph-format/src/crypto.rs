@@ -46,9 +46,11 @@
 //     and the MAC key, but nothing can reach a copy the optimizer spilled to an
 //     unnamed stack slot or left in a register.
 
+use std::sync::Arc;
+
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -70,6 +72,16 @@ const KDF_CONTEXT: &str = "slater generation block key v1";
 /// Distinct from [`KDF_CONTEXT`] so the MAC key and per-block keys are
 /// domain-separated — neither can ever collide with the other.
 const MAC_KDF_CONTEXT: &str = "slater manifest mac v1";
+
+/// BLAKE3 derive-key context for the **per-file** block subkey (HIK-140). A third
+/// domain alongside [`KDF_CONTEXT`] / [`MAC_KDF_CONTEXT`].
+const FILE_KDF_CONTEXT: &str = "slater generation file key v1";
+
+/// The associated-data scheme this build seals blocks under, recorded in the
+/// MANIFEST `EncryptionHeader.aadScheme`. A generation that does not name exactly
+/// this scheme is refused (see [`AadSchemeRejected`]) — there is no legacy mode, so
+/// an image sealed without AAD binding fails closed rather than opening unbound.
+pub const AAD_SCHEME: &str = "file-block-v1";
 
 /// Generate a fresh per-generation random salt.
 pub fn random_salt() -> [u8; SALT_LEN] {
@@ -166,18 +178,44 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A per-generation block cipher. Cheap to construct from a derived key; holds no
-/// per-block state, so a single instance is shared (behind an `Arc`) across every
-/// reader and the writer for one generation.
+/// Derive a **per-file** block subkey from the per-generation key and the file's
+/// store-relative name (HIK-140): `BLAKE3::derive_key(FILE_KDF_CONTEXT, gen_key ‖ name)`.
+///
+/// The name is fed as its raw bytes with no separator, which is unambiguous here
+/// because the generation key is fixed-width (32 bytes) and leads.
+///
+/// Wiped on drop via [`Zeroizing`], and the hasher/XOF — which retain the generation
+/// key verbatim — are wiped explicitly, exactly like [`derive_key`].
+fn derive_file_key(gen_key: &[u8; KEY_LEN], name: &str) -> Zeroizing<[u8; KEY_LEN]> {
+    let mut h = blake3::Hasher::new_derive_key(FILE_KDF_CONTEXT);
+    h.update(gen_key);
+    h.update(name.as_bytes());
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    xof.zeroize();
+    h.zeroize();
+    out
+}
+
+/// A per-generation block key. It **cannot seal or open anything**: the only thing it
+/// does is derive a [`FileCipher`] for one named file (HIK-140). Splitting the types
+/// this way is what makes "the writer and the reader bound this block to different
+/// files" a compile error at every call site rather than a silent runtime mismatch.
+///
+/// Cheap to clone-derive from (one BLAKE3 compression), so one `FileCipher` per file is
+/// the intended usage.
 pub struct BlockCipher {
-    aead: XChaCha20Poly1305,
+    /// The per-generation subkey. Held (rather than folded straight into an AEAD) so
+    /// [`for_file`](BlockCipher::for_file) can derive from it; wiped on drop.
+    key: Zeroizing<[u8; KEY_LEN]>,
 }
 
 impl BlockCipher {
     /// Build a cipher from an already-derived 32-byte block key.
     pub fn from_key(key: &[u8; KEY_LEN]) -> Self {
         Self {
-            aead: XChaCha20Poly1305::new(Key::from_slice(key)),
+            key: Zeroizing::new(*key),
         }
     }
 
@@ -187,6 +225,16 @@ impl BlockCipher {
         Self::from_key(&derive_key(master_key, salt))
     }
 
+    /// The cipher for one file of this generation, named by its **store-relative**
+    /// name inside the generation/segment directory (`node_props.blk`,
+    /// `range/title.isam`, `vector/Doc.embedding.pq`, …). Writer and reader must pass
+    /// byte-identical names; a mismatch fails closed at the first block read.
+    pub fn for_file(&self, name: &str) -> FileCipher {
+        FileCipher {
+            aead: XChaCha20Poly1305::new(Key::from_slice(&*derive_file_key(&self.key, name))),
+        }
+    }
+
     /// A fresh random nonce for the next block to be sealed.
     pub fn random_nonce() -> [u8; NONCE_LEN] {
         // `generate_nonce` draws straight from the OS RNG and returns the bytes, so
@@ -194,21 +242,65 @@ impl BlockCipher {
         // for static analysis to mistake for a hard-coded nonce.
         XChaCha20Poly1305::generate_nonce(&mut OsRng).into()
     }
+}
 
-    /// Seal a (compressed) block. The returned ciphertext is `plaintext.len()` +
-    /// the 16-byte Poly1305 tag.
-    pub fn encrypt(&self, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+/// The cipher for one file of one generation — the only thing that can seal or open a
+/// block. Every seal additionally binds the block's **ordinal** within that file as
+/// associated data, so a sealed block cannot be moved to another offset, another
+/// ordinal, or another file and still verify (HIK-140).
+///
+/// Holds no per-block state, so a single instance is shared (behind an `Arc`) across
+/// every reader and writer of that one file.
+pub struct FileCipher {
+    aead: XChaCha20Poly1305,
+}
+
+/// Reserved block ordinal for a container's single out-of-band header block — the ISAM
+/// top level. Distinct from every leaf ordinal (a file would need 2^64 blocks to reach
+/// it), so a leaf can never be presented as the top level.
+pub const HEADER_ORDINAL: u64 = u64::MAX;
+
+impl FileCipher {
+    /// The associated data a block at `ordinal` is sealed under. The file identity is
+    /// already in the key, so the AAD carries the position alone.
+    fn aad(ordinal: u64) -> [u8; 8] {
+        ordinal.to_le_bytes()
+    }
+
+    /// Seal a (compressed) block that lives at `ordinal` in this file. The returned
+    /// ciphertext is `plaintext.len()` + the 16-byte Poly1305 tag — the AAD is
+    /// authenticated, not stored, so nothing on disk grows.
+    pub fn seal(&self, ordinal: u64, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let aad = Self::aad(ordinal);
         self.aead
-            .encrypt(XNonce::from_slice(nonce), plaintext)
+            .encrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("AEAD encryption failed"))
     }
 
-    /// Open a sealed block. Fails with a clear error — never a panic or garbage —
-    /// when the key is wrong or the block has been tampered with (the Poly1305
-    /// tag does not verify).
-    pub fn decrypt(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    /// Open a sealed block claimed to live at `ordinal` in this file. Fails with a
+    /// typed error — never a panic or garbage — when the key is wrong, the block was
+    /// tampered with, or the block was sealed for a different file or ordinal.
+    pub fn open(
+        &self,
+        ordinal: u64,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let aad = Self::aad(ordinal);
         self.aead
-            .decrypt(XNonce::from_slice(nonce), ciphertext)
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| AeadRejected::TagMismatch.into())
     }
 }
@@ -226,6 +318,40 @@ pub enum AeadRejected {
          for a different file or block ordinal"
     )]
     TagMismatch,
+}
+
+/// An encrypted image whose `aadScheme` this build does not implement. A **type**, so
+/// the server can tell "rebuild this image" apart from every other open failure.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "encrypted image declares aadScheme {got:?}, but this build seals blocks under \
+     {AAD_SCHEME:?}; the image predates per-file/per-ordinal AEAD binding and must be \
+     rebuilt (it cannot be opened safely)"
+)]
+pub struct AadSchemeRejected {
+    pub got: String,
+}
+
+/// Bind an optional generation cipher to one named file (HIK-140). The idiom at every
+/// reader/writer construction site: `file_cipher(&cipher, "node_props.blk")`.
+///
+/// `name` must be the file's **store-relative** name inside the generation or segment
+/// directory (`node_props.blk`, `range/title.isam`, `vector/Doc.embedding.pq`, …), and
+/// must be byte-identical on the writing and the reading side.
+pub fn file_cipher(cipher: &Option<Arc<BlockCipher>>, name: &str) -> Option<Arc<FileCipher>> {
+    cipher.as_ref().map(|c| Arc::new(c.for_file(name)))
+}
+
+/// Refuse an encryption header whose AAD scheme is not the one this build seals under.
+pub fn check_aad_scheme(got: &str) -> Result<()> {
+    if got == AAD_SCHEME {
+        Ok(())
+    } else {
+        Err(AadSchemeRejected {
+            got: got.to_string(),
+        }
+        .into())
+    }
 }
 
 #[cfg(test)]
@@ -297,17 +423,17 @@ mod tests {
 
     #[test]
     fn encrypt_then_decrypt_roundtrips() {
-        let cipher = BlockCipher::from_master(b"master", &random_salt());
+        let cipher = BlockCipher::from_master(b"master", &random_salt()).for_file("node_props.blk");
         let nonce = BlockCipher::random_nonce();
         let plaintext = b"the quick brown fox compresses well well well".repeat(8);
-        let sealed = cipher.encrypt(&nonce, &plaintext).unwrap();
+        let sealed = cipher.seal(7, &nonce, &plaintext).unwrap();
         assert_eq!(
             sealed.len(),
             plaintext.len() + 16,
-            "ciphertext carries a tag"
+            "ciphertext carries a tag, and the AAD adds nothing on disk"
         );
         assert_ne!(sealed, plaintext);
-        assert_eq!(cipher.decrypt(&nonce, &sealed).unwrap(), plaintext);
+        assert_eq!(cipher.open(7, &nonce, &sealed).unwrap(), plaintext);
     }
 
     #[test]
@@ -315,20 +441,94 @@ mod tests {
         let salt = random_salt();
         let nonce = BlockCipher::random_nonce();
         let sealed = BlockCipher::from_master(b"right", &salt)
-            .encrypt(&nonce, b"payload")
+            .for_file("node_props.blk")
+            .seal(0, &nonce, b"payload")
             .unwrap();
         let err = BlockCipher::from_master(b"wrong", &salt)
-            .decrypt(&nonce, &sealed)
+            .for_file("node_props.blk")
+            .open(0, &nonce, &sealed)
             .unwrap_err();
-        assert!(err.to_string().contains("wrong key"));
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch)
+        );
     }
 
     #[test]
     fn tampered_ciphertext_refuses_cleanly() {
-        let cipher = BlockCipher::from_master(b"master", &random_salt());
+        let cipher = BlockCipher::from_master(b"master", &random_salt()).for_file("edge_props.blk");
         let nonce = BlockCipher::random_nonce();
-        let mut sealed = cipher.encrypt(&nonce, b"payload bytes here").unwrap();
+        let mut sealed = cipher.seal(0, &nonce, b"payload bytes here").unwrap();
         sealed[0] ^= 0xff; // flip a bit
-        assert!(cipher.decrypt(&nonce, &sealed).is_err());
+        assert!(cipher.open(0, &nonce, &sealed).is_err());
+    }
+
+    /// HIK-140: a block is bound to (file, ordinal). Neither may drift.
+    #[test]
+    fn a_sealed_block_opens_only_at_its_own_file_and_ordinal() {
+        let gen = BlockCipher::from_master(b"master", &random_salt());
+        let nonce = BlockCipher::random_nonce();
+        let msg = b"the block body";
+        let sealed = gen.for_file("node_props.blk").seal(3, &nonce, msg).unwrap();
+
+        // Its own (file, ordinal): opens.
+        assert_eq!(
+            gen.for_file("node_props.blk")
+                .open(3, &nonce, &sealed)
+                .unwrap(),
+            msg
+        );
+        // Same file, another ordinal: refused.
+        assert_eq!(
+            gen.for_file("node_props.blk")
+                .open(4, &nonce, &sealed)
+                .unwrap_err()
+                .downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch)
+        );
+        // Same ordinal, another file of the same generation: refused.
+        assert_eq!(
+            gen.for_file("edge_props.blk")
+                .open(3, &nonce, &sealed)
+                .unwrap_err()
+                .downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch)
+        );
+        // The reserved header ordinal is not reachable by a leaf either.
+        assert!(gen
+            .for_file("node_props.blk")
+            .open(HEADER_ORDINAL, &nonce, &sealed)
+            .is_err());
+    }
+
+    #[test]
+    fn file_key_is_deterministic_and_name_sensitive_and_domain_separated() {
+        let master = b"super-secret-master-key";
+        let salt = [3u8; SALT_LEN];
+        let gen_key = derive_key(master, &salt);
+        let k1 = derive_file_key(&gen_key, "node_props.blk");
+        assert_eq!(k1, derive_file_key(&gen_key, "node_props.blk"));
+        assert_ne!(k1, derive_file_key(&gen_key, "edge_props.blk"));
+        // One character of the name is enough, including a prefix-only difference:
+        // the fixed-width generation key leads, so no name is another's prefix-shift.
+        assert_ne!(
+            derive_file_key(&gen_key, "range/ab.isam"),
+            derive_file_key(&gen_key, "range/a.isam")
+        );
+        // Domain-separated from the generation key itself and from the MAC key.
+        assert_ne!(*k1, *gen_key);
+        assert_ne!(*k1, *derive_manifest_mac_key(master));
+    }
+
+    #[test]
+    fn aad_scheme_is_checked_by_type() {
+        assert!(check_aad_scheme(AAD_SCHEME).is_ok());
+        let err = check_aad_scheme("none").unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<AadSchemeRejected>(),
+            Some(&AadSchemeRejected {
+                got: "none".to_string()
+            })
+        );
     }
 }

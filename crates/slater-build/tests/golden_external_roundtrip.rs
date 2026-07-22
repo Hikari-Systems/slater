@@ -358,10 +358,17 @@ fn external_encrypted_build_then_reopen_with_key() {
     // `--cluster none` ⇒ dense id == dump id, so positional lookups are valid.
     let key = crypto::hex_decode(key_hex).unwrap();
     let salt = crypto::hex_decode(&header.salt_hex).unwrap();
-    let cipher = Arc::new(BlockCipher::from_master(&key, &salt));
+    let cipher = Some(Arc::new(BlockCipher::from_master(&key, &salt)));
+    // HIK-140: the generation must declare the AAD scheme this build seals under, and
+    // every store below is opened under a subkey bound to its store-relative name — this
+    // is the end-to-end check that the builder and the reader agree on those names.
+    assert_eq!(header.aad_scheme, crypto::AAD_SCHEME);
 
-    let np = PropsReader::open_with_cipher(gen_dir.join("node_props.blk"), Some(cipher.clone()))
-        .unwrap();
+    let np = PropsReader::open_with_cipher(
+        gen_dir.join("node_props.blk"),
+        crypto::file_cipher(&cipher, "node_props.blk"),
+    )
+    .unwrap();
     assert_eq!(np.len(), 3);
     assert_eq!(
         prop(&np.props(0).unwrap(), &m.property_keys, "title"),
@@ -372,14 +379,18 @@ fn external_encrypted_build_then_reopen_with_key() {
         Some(&Value::Str("Second; with semicolon and 'quote'".into()))
     );
 
-    let nl =
-        NodeLabelsReader::open_with_cipher(gen_dir.join("node_labels.blk"), Some(cipher.clone()))
-            .unwrap();
+    let nl = NodeLabelsReader::open_with_cipher(
+        gen_dir.join("node_labels.blk"),
+        crypto::file_cipher(&cipher, "node_labels.blk"),
+    )
+    .unwrap();
     assert_eq!(nl.labels(2).unwrap().len(), 1);
 
-    let topo =
-        TopologyReader::open_with_cipher(gen_dir.join("topology.csr.blk"), Some(cipher.clone()))
-            .unwrap();
+    let topo = TopologyReader::open_with_cipher(
+        gen_dir.join("topology.csr.blk"),
+        crypto::file_cipher(&cipher, "topology.csr.blk"),
+    )
+    .unwrap();
     assert_eq!(topo.node_count(), 3);
     assert_eq!(
         topo.outgoing(NodeId(0)).unwrap()[0].neighbour.0,
@@ -387,17 +398,20 @@ fn external_encrypted_build_then_reopen_with_key() {
         "Chunk 0 -MENTIONS-> Concept 2"
     );
 
-    let vs =
-        VectorStoreReader::open_with_cipher(gen_dir.join("vectors.f32.blk"), Some(cipher.clone()))
-            .unwrap();
+    let vs = VectorStoreReader::open_with_cipher(
+        gen_dir.join("vectors.f32.blk"),
+        crypto::file_cipher(&cipher, "vectors.f32.blk"),
+    )
+    .unwrap();
     let vi = &m.vector_indexes[0];
     let group = vs.group(vi.first_record, vi.count).unwrap();
     assert_eq!(group[0].vector, vec![1.0, 0.0, 0.0]);
 
     let ri = &m.range_indexes[0];
+    let isam_rel = format!("range/{}.isam", ri.name);
     let isam = IsamReader::open_with_cipher(
-        gen_dir.join(format!("range/{}.isam", ri.name)),
-        Some(cipher),
+        gen_dir.join(&isam_rel),
+        crypto::file_cipher(&cipher, &isam_rel),
     )
     .unwrap();
     assert_eq!(

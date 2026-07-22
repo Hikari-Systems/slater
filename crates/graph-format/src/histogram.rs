@@ -29,7 +29,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::blockfile::BlockFileWriter;
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::ids::Value;
 use crate::isam::IsamReader;
 use crate::wire::{capacity_for, read_uvarint, read_value, write_uvarint, write_value};
@@ -76,7 +76,7 @@ pub fn decode_histogram(rec: &[u8]) -> Result<Vec<(Value, u64)>> {
 /// `max_distinct` distinct keys. The caller logs the skip.
 pub fn derive_histogram_from_isam(
     isam_path: impl AsRef<Path>,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
     max_distinct: u64,
 ) -> Result<Option<Vec<(Value, u64)>>> {
     if max_distinct == 0 {
@@ -99,7 +99,7 @@ pub fn write_property_histograms(
     records: &[Vec<u8>],
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<()> {
     let mut w = BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
     for rec in records {

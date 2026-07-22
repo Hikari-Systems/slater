@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use graph_format::columns::PropsWriter;
-use graph_format::crypto::{self, BlockCipher};
+use graph_format::crypto::{self, file_cipher, BlockCipher};
 use graph_format::histogram::{
     derive_histogram_from_isam, encode_histogram, write_property_histograms,
 };
@@ -583,6 +583,7 @@ pub fn write_indexed_people_at_keyed(
                     aead: crypto::AEAD_NAME.to_string(),
                     kdf: crypto::KDF_NAME.to_string(),
                     salt_hex: crypto::hex_encode(&salt),
+                    aad_scheme: crypto::AAD_SCHEME.to_string(),
                 };
                 (
                     Some(Arc::new(BlockCipher::from_master(key, &salt))),
@@ -593,9 +594,13 @@ pub fn write_indexed_people_at_keyed(
         };
 
     // node_props.blk — name(0) + age(1) on every node.
-    let mut np =
-        PropsWriter::create_with_cipher(dir.join("node_props.blk"), BLOCK, LEVEL, cipher.clone())
-            .unwrap();
+    let mut np = PropsWriter::create_with_cipher(
+        dir.join("node_props.blk"),
+        BLOCK,
+        LEVEL,
+        file_cipher(&cipher, "node_props.blk"),
+    )
+    .unwrap();
     for (name, age) in [("Alice", ages[0]), ("Bob", ages[1]), ("Carol", ages[2])] {
         np.append(&[(0, Value::Str(name.into())), (1, Value::Int(age))])
             .unwrap();
@@ -607,7 +612,7 @@ pub fn write_indexed_people_at_keyed(
         dir.join("node_labels.blk"),
         BLOCK,
         LEVEL,
-        cipher.clone(),
+        file_cipher(&cipher, "node_labels.blk"),
     )
     .unwrap();
     for _ in 0..3 {
@@ -616,9 +621,13 @@ pub fn write_indexed_people_at_keyed(
     nl.finish().unwrap();
 
     // edge_props.blk — e0 carries since(2).
-    let mut ep =
-        PropsWriter::create_with_cipher(dir.join("edge_props.blk"), BLOCK, LEVEL, cipher.clone())
-            .unwrap();
+    let mut ep = PropsWriter::create_with_cipher(
+        dir.join("edge_props.blk"),
+        BLOCK,
+        LEVEL,
+        file_cipher(&cipher, "edge_props.blk"),
+    )
+    .unwrap();
     ep.append(&[(2, Value::Int(2020))]).unwrap();
     ep.finish().unwrap();
 
@@ -635,7 +644,7 @@ pub fn write_indexed_people_at_keyed(
         &edges,
         BLOCK,
         LEVEL,
-        cipher.clone(),
+        file_cipher(&cipher, "topology.csr.blk"),
     )
     .unwrap();
 
@@ -644,7 +653,7 @@ pub fn write_indexed_people_at_keyed(
         dir.join("vectors.f32.blk"),
         BLOCK,
         LEVEL,
-        cipher.clone(),
+        file_cipher(&cipher, "vectors.f32.blk"),
     )
     .unwrap()
     .finish()
@@ -660,7 +669,7 @@ pub fn write_indexed_people_at_keyed(
         ],
         BLOCK,
         LEVEL,
-        cipher.clone(),
+        file_cipher(&cipher, "range/node_Person_name.isam"),
     )
     .unwrap();
 
@@ -2328,6 +2337,7 @@ fn write_vamana_inner(
                 pq_block_bytes: BLOCK,
                 zstd_level: LEVEL,
                 cipher: None,
+                stem: "vector/Doc.embedding".to_string(),
             },
         )
         .unwrap();

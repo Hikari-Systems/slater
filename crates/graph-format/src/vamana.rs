@@ -45,7 +45,7 @@ use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::pq::{l2_norm, sq_l2, Lcg};
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
@@ -720,7 +720,7 @@ impl VamanaWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -772,7 +772,7 @@ pub struct VamanaReader {
 impl VamanaReader {
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -781,7 +781,7 @@ impl VamanaReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileReader::open_src(src, cipher)?,
