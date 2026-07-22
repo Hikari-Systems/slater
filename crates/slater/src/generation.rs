@@ -621,9 +621,11 @@ impl Generation {
                     r,
                     &set,
                     vi,
-                    master_key,
                     &stem,
-                    verify_integrity,
+                    CarriedGraphOpen {
+                        master_key,
+                        verify_integrity,
+                    },
                 )?,
                 None => (
                     store.open(&join_key(&base, &vam_rel))?,
@@ -1209,6 +1211,20 @@ fn derive_cipher(
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
 }
 
+/// A block source plus the per-file cipher its blocks were sealed under.
+type SealedSource = (
+    Arc<dyn graph_format::store::RandomReadAt>,
+    Option<Arc<graph_format::crypto::FileCipher>>,
+);
+
+/// The opener's policy inputs for a carried artifact — grouped so the signature stays
+/// readable and the two booleans-shaped arguments cannot be transposed.
+#[derive(Clone, Copy)]
+struct CarriedGraphOpen<'a> {
+    master_key: Option<&'a [u8]>,
+    verify_integrity: bool,
+}
+
 /// Open a carried vector-graph artifact (HIK-145) and return its source plus the per-file
 /// cipher its blocks were sealed under.
 ///
@@ -1232,13 +1248,13 @@ fn open_carried_graph(
     r: &graph_format::vecmanifest::VectorArtifactRef,
     set: &graph_format::setmanifest::SetManifest,
     vi: &graph_format::manifest::VectorIndexDesc,
-    master_key: Option<&[u8]>,
     stem: &str,
-    verify_integrity: bool,
-) -> Result<(
-    Arc<dyn graph_format::store::RandomReadAt>,
-    Option<Arc<graph_format::crypto::FileCipher>>,
-)> {
+    open: CarriedGraphOpen<'_>,
+) -> Result<SealedSource> {
+    let CarriedGraphOpen {
+        master_key,
+        verify_integrity,
+    } = open;
     use graph_format::vecmanifest::VectorIndexManifest;
 
     let m = VectorIndexManifest::read_via(store, graph, r.uuid)
