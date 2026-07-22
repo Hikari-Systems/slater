@@ -286,6 +286,7 @@ impl SegmentManifest {
     /// nested in it).** Their iteration order is unspecified and randomised per process,
     /// so the same manifest would MAC differently on each run and verification would fail
     /// at random. Use a `BTreeMap` or an order-stable `Vec`.
+    #[cfg(test)]
     fn mac_message(&self) -> Result<Vec<u8>> {
         crate::crypto::mac_message(self)
     }

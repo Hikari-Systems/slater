@@ -19,10 +19,22 @@
 //! segments and diverging (set uuid ≠ base uuid) sets arrive in later phases.
 //!
 //! # Integrity
-//! The set manifest is a small pointer; the *data* it points at (the base generation,
-//! and later each segment) is authenticated by that image's own `MANIFEST`/`SEGMENT`
-//! MAC + per-block AEAD + the server's ACL stamp on open. A `mac` field is reserved
-//! for authenticating the set pointer itself; wiring it is a later hardening step.
+//! The *data* this manifest points at (the base generation, and each segment) is
+//! authenticated by that image's own `MANIFEST`/`SEGMENT` MAC + per-block AEAD + the
+//! server's ACL stamp on open. Those authenticate the **parts**; this manifest's own
+//! [`mac`](SetManifest::mac) authenticates the **composition** — which base, which
+//! segments, in which order (HIK-144). Both are needed: without the set MAC an attacker
+//! who can write to the data directory can serve a different graph out of pieces that
+//! each verify perfectly, forging nothing.
+//!
+//! Under a configured master key the set MAC is **required**, not optional: an absent
+//! `sets/<uuid>.json`, an unsealed one, or one whose MAC does not verify are all
+//! refusals, and so is a sealed manifest found under a uuid other than the one it
+//! declares. A plaintext (unkeyed) deployment configures no key and carries no MAC.
+//!
+//! What this does **not** stop is a rollback: `current` is an unauthenticated pointer,
+//! so an attacker with write access can still repoint it at an older set that was
+//! genuinely published (and sealed) at some earlier time. See `THREAT_MODEL.md`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

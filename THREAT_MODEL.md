@@ -41,10 +41,10 @@ meant to have.
 | Configuration | Checked at open | An attacker with write access to `/data` **can** | …and **cannot** |
 | --- | --- | --- | --- |
 | **Plaintext** — no `--encrypt`, no key on the server | Per-file BLAKE3 (or the object store's server-computed checksum), then `content_hash` over the file inventory | Rewrite any block file, recompute its hash, and update the inventory + `content_hash` in `MANIFEST.json` — the tampered image opens and serves. Strip or re-stamp `aclBlake3` the same way. Read every byte: nothing is encrypted | Pass off a **half-copied, truncated or bit-rotted** generation: the file hashes will not match and the server refuses at open. That is a real guard against an interrupted publish — it is not a guard against a deliberate one |
-| **Encrypted, manifest MAC absent** — an image whose `mac` was stripped (or that some other tool produced) | The keyed server checks MAC *presence* before anything else | Nothing: a server holding a master key **refuses outright** to serve a MAC-less generation, at boot and at every generation swap. This is not a config knob — there is no legitimate keyed-but-unauthenticated deployment, so there is no flag to flip. A server with **no** key cannot open an encrypted image at all (block decryption needs the key) | Downgrade an authenticated deployment to an unauthenticated one by deleting a field |
-| **Encrypted + manifest MAC** — `--encrypt` at build, the same key on the server (this is what `--encrypt` always produces) | Keyed-BLAKE3 MAC over the whole manifest **first**, then the per-file hashes it now vouches for; then per-block Poly1305 on every block actually read | Delete files, delete the generation, or roll the `current` pointer back to an **older generation that was validly built under the same key** — availability and freshness are not protected. Nothing binds a generation to "the newest one" | Forge or alter *any* manifest field — file inventory, `content_hash`, encryption header, `aclBlake3` — or strip the MAC, or rewrite a block's bytes (the Poly1305 tag fails when that block is first touched), or read plaintext. This is the only configuration where "integrity" means **authenticity** |
+| **Encrypted, a MAC absent** — an image with the `mac` stripped from any of its three sealed documents (or produced by some other tool) | MAC *presence* is required on the generation `MANIFEST.json`, on every sealed segment's `SEGMENT.json`, and on the `sets/<uuid>.json` pointer, before anything else | Nothing: with a master key configured, **every** open path — the server at boot and at each swap, the one-shot `slater query`, consolidation, the benchmark harnesses — refuses a MAC-less document, because the policy is enforced where the key and the document meet rather than in any one caller. Not a config knob: there is no legitimate keyed-but-unauthenticated deployment, so there is no flag to flip. A server with **no** key cannot open an encrypted image at all (block decryption needs the key) | Downgrade an authenticated deployment to an unauthenticated one by deleting a field — including by deleting the set manifest outright, which under a key is a refusal, not a silent fallback to "base only" |
+| **Encrypted + MACs** — `--encrypt` at build, the same key on the server (this is what `--encrypt` always produces) | Keyed-BLAKE3 MAC over the set pointer and over the whole manifest **first**, then the per-file hashes they now vouch for; then per-block Poly1305 on every block actually read | Delete files, delete the generation, or roll the `current` pointer back to an **older set that was validly published under the same key** — availability and freshness are not protected. Nothing binds a set to "the newest one" | Forge or alter *any* manifest field — file inventory, `content_hash`, encryption header, `aclBlake3` — or strip a MAC, or rewrite a block's bytes (the Poly1305 tag fails when that block is first touched), or **recompose** an image from authentic parts: repointing the set at another base, dropping/adding/reordering segments, or swapping a generation directory under the base uuid are all refused, because the set pointer's MAC covers the composition and the parts are bound back to it. Or read plaintext. This is the only configuration where "integrity" means **authenticity** |
 
-Two caveats that change the answers above:
+Three caveats that change the answers above:
 
 - **`dataBackend.verifyIntegrity: false`** turns off the open-time file comparison (it is on
   by default). In the plaintext row that leaves no integrity check at open at all — only the
@@ -63,10 +63,11 @@ Two caveats that change the answers above:
   image nothing does. Publish by writing a **new** generation directory and flipping
   `current` — never by editing a served one.
 
-- **"Refuses to serve" is the server's policy.** The MAC-presence and ACL-stamp refusals live
-  in the server's graph registry, applied at boot and at every swap. The one-shot `slater
-  query` CLI opens a generation directly: it verifies a MAC that is *present*, but does not
-  enforce that one exists. Treat the row above as describing the served deployment.
+- **The ACL-stamp refusal is the server's policy; the MAC refusals are not.** `requireAclStamp`
+  and the ACL-stamp comparison live in the server's graph registry, applied at boot and at
+  every swap, so the rows above describe the served deployment on that point. The MAC
+  refusals are not policy in that sense: since HIK-144 they are enforced inside the open
+  itself, so `slater query` and every other opener refuse exactly what the server refuses.
 
 Two places where the writable layer (`delta.enabled`, off by default) is weaker than the
 core: a sealed segment's `SEGMENT.json` MAC is verified when present, but a keyed server does
@@ -168,13 +169,28 @@ encryption implies.
 1. **Downgrade / strip — closed.** Because the authentication fields are optional in the
    manifest format, an attacker who can rewrite the manifest could *delete* `mac`/`aclBlake3`
    to silence the checks. Both strips are refused:
-   - **MAC strip: structurally closed, no off switch.** A server configured with a master key
-     unconditionally refuses any generation whose manifest lacks a MAC. This is deliberately
-     not a config flag: `slater-build` seals a MAC whenever it has the key (and refuses a key
-     without `--encrypt`), so a MAC-less generation on a keyed server is either a strip attack
-     or a plaintext image that does not need the key in the first place. There is no
+   - **MAC strip: structurally closed, no off switch.** With a master key configured, *any*
+     open refuses a document that lacks a MAC — the generation `MANIFEST.json`, a sealed
+     segment's `SEGMENT.json`, or the `sets/<uuid>.json` pointer. This is deliberately not a
+     config flag: `slater-build` seals every one of them whenever it has the key (and refuses
+     a key without `--encrypt`), so a MAC-less document on a keyed server is either a strip
+     attack or a plaintext image that does not need the key in the first place. There is no
      legitimate keyed-but-unauthenticated deployment — and therefore no knob an attacker with
      config access could flip to reopen the downgrade. Plaintext deployments configure no key.
+
+     The refusal is **one implementation** (`crypto::authenticate`, over the `MacSealed`
+     trait) applied at open, not a rule each caller restates: it had previously been written
+     out only in the server's registry, so `slater query` opened images the server refused
+     (HIK-144). Enforcing it where the key and the document meet is what makes "no off
+     switch" a property of the format rather than of one call path.
+   - **Recomposition: closed.** MACs on the parts do not authenticate the *composition* of
+     the parts. The `sets/<uuid>.json` pointer names the base generation and the ordered
+     segment stack, so it is sealed under its own MAC domain, and three bindings tie the
+     named parts back to it: the base generation's `MANIFEST.build_uuid` must equal the set's
+     `base`, each segment's own uuid/bands/`content_hash` must equal the set's reference to
+     it, and a set manifest found under a uuid other than the one it declares is refused. An
+     attacker with write access therefore cannot serve a different graph assembled out of
+     pieces that each verify perfectly — which, before HIK-144, they could.
    - **Stamp strip: closed under encryption; defence-in-depth in plaintext.**
      `requireAclStamp` (default **on**) refuses any generation with no `aclBlake3` stamp. It
      remains a flag (unlike the MAC) because disabling it is the documented escape from the
@@ -226,7 +242,9 @@ encryption implies.
    served generation was *built with the key*, not that it is the *newest* such build. An
    attacker with write access to `/data` can repoint a graph's `current` at an **older,
    still-validly-signed** generation; the swap re-verifies its MAC, content hash, and ACL
-   stamp, all of which an authentic old image passes. This is only exploitable if old
+   stamp, all of which an authentic old image passes. Sealing the set pointer (HIK-144)
+   does **not** close this: the set MAC proves a composition was published under the key, and
+   an old set was; `current` itself is a bare uuid with nothing to authenticate. This is only exploitable if old
    generations are retained on disk **and** the old image's `aclBlake3` still matches the
    live `acl.json` (else the stamp check refuses the rollback). Mitigation, if rollback is a
    concern for your deployment: prune superseded generations, or adopt a monotonic, MAC-covered

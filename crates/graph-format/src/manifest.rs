@@ -502,6 +502,7 @@ impl Manifest {
     ///
     /// The tag carries [`crate::FORMAT_VERSION`], not a hand-maintained scheme string, so
     /// the MAC scheme cannot drift from the on-disk format version.
+    #[cfg(test)]
     fn mac_message(&self) -> Result<Vec<u8>> {
         crate::crypto::mac_message(self)
     }

@@ -118,9 +118,15 @@ impl CoreStack {
     }
 
     /// Load the upper segments a set declares. Reads each `SEGMENT.json`, authenticates it
-    /// (content hash, marginals, and MAC when a key is configured and the segment carries
-    /// one), derives its block cipher, and opens its readers through `store` under
-    /// `<graph>/segments/<uuid>/`. Returns a singleton stack when the set has no segments.
+    /// (content hash, marginals, and — when a master key is configured — a **required**
+    /// MAC, plus agreement with the set's own reference to it), derives its block cipher,
+    /// and opens its readers through `store` under `<graph>/segments/<uuid>/`. Returns a
+    /// singleton stack when the set has no segments.
+    ///
+    /// The caller is expected to have authenticated `set` itself first
+    /// (`Generation::open_with_store_opts_cached` does): a segment list that has not been
+    /// authenticated names whatever an attacker chose, and per-segment MACs cannot detect
+    /// that (HIK-144).
     ///
     /// `cache_budget` sizes the shared block cache that pages every segment's sections
     /// (`None`/`0` ⇒ [`DEFAULT_SEGMENT_CACHE_BYTES`]); one cache is built and shared across
@@ -714,8 +720,7 @@ mod tests {
 
         let store = FsObjectStore::new(&root);
         let err = CoreStack::load(&store, graph, &set, 3, 2, Some(key), true, None)
-            .err()
-            .expect("a MAC-stripped segment must not load under a key");
+            .expect_err("a MAC-stripped segment must not load under a key");
         assert!(
             err.chain().any(|e| matches!(
                 e.downcast_ref::<MacRejected>(),
