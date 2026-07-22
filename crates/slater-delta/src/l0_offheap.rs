@@ -53,6 +53,8 @@ const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 const META_MAGIC_SEALED: &[u8; 8] = b"SLL0OFFE";
 /// How a refusal names an off-heap segment's meta to an operator.
 const META_SUBJECT: &str = "off-heap L0 segment meta";
+/// How a refusal names one of an off-heap segment's four block sections.
+const SECTION_SUBJECT: &str = "off-heap L0 segment section";
 
 /// The four block-section file names, in a single place so the writer, the reader and the
 /// per-file subkey derivation can never disagree about them.
@@ -889,11 +891,26 @@ impl L0Reader {
         }
 
         let open_section = |name: &str| -> Result<BlockFileReader> {
-            BlockFileReader::open_with_cipher(
+            let rdr = BlockFileReader::open_with_cipher(
                 dir.join(name),
                 bind(cipher, &l0_name(&dir, Some(name))?),
             )
-            .with_context(|| format!("open L0 section {dir:?}/{name}"))
+            .with_context(|| format!("open L0 section {dir:?}/{name}"))?;
+            // `BlockFileReader` refuses a sealed file with no key on its own, but it
+            // *ignores* a key handed to a plaintext file — correct for a generation, whose
+            // manifest MAC enumerates its files, and wrong here: this segment has no
+            // manifest, so a plaintext `node.blk` dropped into a sealed segment directory
+            // would otherwise be read straight into the memtable. The meta is framed and
+            // catches its own substitution; the sections must catch theirs (HIK-146).
+            // (The other direction — a sealed section with no key — `open_with_cipher`
+            // already refuses, so only this one is left to close.)
+            if cipher.is_some() && !rdr.is_encrypted() {
+                return Err(crate::seal::DeltaSealRejected::Unsealed {
+                    subject: SECTION_SUBJECT,
+                }
+                .into());
+            }
+            Ok(rdr)
         };
         Ok(Self {
             node_rdr: open_section(SECTION_FILES[0])?,
@@ -1787,5 +1804,35 @@ mod tests {
         assert!(folded.is_tombstoned(7));
         assert_eq!(folded.born_count(), 2);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// HIK-146: a **plaintext block section** substituted into a sealed off-heap segment
+    /// is refused. The meta is framed and catches its own substitution, but the four
+    /// sections are `BlockFileReader`s, which ignore a key handed to a plaintext file —
+    /// right for a generation (its manifest MAC enumerates the files), wrong for a
+    /// segment that has no manifest at all.
+    #[test]
+    fn a_plaintext_section_in_a_sealed_offheap_segment_is_refused() {
+        let base = std::env::temp_dir().join(format!("slater_l0off_strip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let k: DeltaCipher = Arc::new(graph_format::crypto::delta_cipher(b"a master key", "g"));
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let sealed = base.join("000001.l0");
+        let plain = base.join("000002.l0");
+        let data = populate().to_segment_data();
+        write_segment(&data, &sealed, 1, 4096, 3, Some(&k)).unwrap();
+        write_segment(&data, &plain, 2, 4096, 3, None).unwrap();
+        assert!(L0Reader::open(&sealed, cache.clone(), Some(&k)).is_ok());
+
+        std::fs::copy(plain.join("node.blk"), sealed.join("node.blk")).unwrap();
+        let e = L0Reader::open(&sealed, cache, Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<crate::seal::DeltaSealRejected>(),
+            Some(&crate::seal::DeltaSealRejected::Unsealed {
+                subject: SECTION_SUBJECT
+            })
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

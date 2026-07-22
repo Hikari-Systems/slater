@@ -168,6 +168,11 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
 /// and `master="a", graph="bc"` would collide). The preimage length-prefixes the master
 /// key: `LE64(master.len()) ‖ master ‖ graph`.
 ///
+/// The consequence to know: on a keyed deployment, **renaming a graph orphans its live
+/// delta** — the WAL and L0 segments under the old name no longer open, and the graph comes
+/// up on its core alone. The core is unaffected (its key is salt-derived, not name-derived).
+/// Consolidate before renaming.
+///
 /// Wiped on drop via [`Zeroizing`], and the hasher/XOF wiped explicitly, like [`derive_key`].
 pub fn derive_delta_key(master_key: &[u8], graph: &str) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(DELTA_KDF_CONTEXT);
@@ -654,6 +659,37 @@ mod tests {
         assert_eq!(hex_decode("  000FA5FF10 ").unwrap(), bytes); // trims + upper-case
         assert!(hex_decode("abc").is_err()); // odd length
         assert!(hex_decode("zz").is_err()); // non-hex
+    }
+
+    /// HIK-146: the delta key is domain-separated from every other subkey, bound to the
+    /// graph, and its preimage is unambiguous despite two variable-length inputs.
+    #[test]
+    fn delta_key_is_domain_separated_graph_bound_and_unambiguous() {
+        let master = b"super-secret-master-key";
+        assert_eq!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(master, "g")
+        );
+        assert_ne!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(master, "h")
+        );
+        assert_ne!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(b"other-master", "g")
+        );
+        // Domain separation from the other three KDF contexts, under the same master key.
+        assert_ne!(
+            *derive_delta_key(master, ""),
+            *derive_manifest_mac_key(master)
+        );
+        assert_ne!(
+            *derive_delta_key(master, ""),
+            *derive_key(master, &[0u8; SALT_LEN])
+        );
+        // Unambiguous concatenation: splitting the same bytes differently between the
+        // master key and the graph name must not collide.
+        assert_ne!(*derive_delta_key(b"ab", "c"), *derive_delta_key(b"a", "bc"));
     }
 
     #[test]

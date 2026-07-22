@@ -929,6 +929,18 @@ impl BlockFileReader {
         })
     }
 
+    /// Whether the file this reader opened is AEAD-sealed.
+    ///
+    /// [`open_src`](Self::open_src) refuses an encrypted file with no key, but a
+    /// **plaintext** file simply ignores any key it was handed — which is right for a
+    /// generation, where the manifest MAC enumerates the files and catches a substituted
+    /// one. A container with no manifest (the off-heap L0 segment, HIK-146) has no such
+    /// backstop, so it asks this and refuses a plaintext section under a configured key
+    /// itself.
+    pub fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
     /// Number of blocks in the file.
     pub fn num_blocks(&self) -> usize {
         self.dir.len()
