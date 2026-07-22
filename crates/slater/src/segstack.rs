@@ -673,6 +673,49 @@ mod tests {
         m
     }
 
+    /// HIK-144 gap 2: `SEGMENT.json` used to be verified only *when present*, so stripping
+    /// the field downgraded a sealed segment to an unauthenticated one — the same strip the
+    /// generation manifest refuses. Under a key, a segment with no MAC must not load.
+    #[test]
+    fn keyed_load_refuses_a_mac_stripped_segment() {
+        use graph_format::crypto::MacRejected;
+        let key = b"at-rest-master-key";
+        let (root, graph) = (tmp("segstrip"), "g");
+        let (base, seg) = (gid(1), gid(2));
+        let mut m = write_segment(&root, graph, seg, base, (3, 4), (2, 3));
+
+        // Seal the segment honestly, then strip the field — the attack.
+        m.seal_mac(key).unwrap();
+        let seg_dir = root.join(graph).join("segments").join(seg.to_string());
+        m.write_to_dir(&seg_dir).unwrap();
+        let mut stripped = m.clone();
+        stripped.mac = None;
+        stripped.write_to_dir(&seg_dir).unwrap();
+
+        let mut set = SetManifest::singleton(base, 0);
+        set.set_uuid = gid(3);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        set.seal_mac(key).unwrap();
+
+        let store = FsObjectStore::new(&root);
+        let err = CoreStack::load(&store, graph, &set, 3, 2, Some(key), true, None)
+            .err()
+            .expect("a MAC-stripped segment must not load under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+
+        // The honestly sealed segment still loads — this is not blanket rejection.
+        m.write_to_dir(&seg_dir).unwrap();
+        CoreStack::load(&store, graph, &set, 3, 2, Some(key), true, None)
+            .expect("a sealed segment must still load");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn singleton_stack_short_circuits() {
         let s = CoreStack::singleton(3, 2);

@@ -437,6 +437,27 @@ pub struct Manifest {
     pub files: Vec<FileEntry>,
 }
 
+/// The generation manifest is one of the three MAC-sealed documents; the sealing,
+/// verification and require-when-keyed policy all live once in
+/// [`crypto`](crate::crypto) (HIK-144). Only the namespace, the operator-facing label
+/// and the canonical body are this type's own.
+impl crate::crypto::MacSealed for Manifest {
+    const DOMAIN: crate::crypto::MacDomain = crate::crypto::MacDomain::Manifest;
+    const SUBJECT: &'static str = "MANIFEST.json";
+
+    fn stored_mac(&self) -> Option<&str> {
+        self.mac.as_deref()
+    }
+    fn set_mac(&mut self, mac: Option<String>) {
+        self.mac = mac;
+    }
+    fn mac_body(&self) -> Result<Vec<u8>> {
+        let mut canon = self.clone();
+        canon.mac = None;
+        serde_json::to_vec(&canon).context("serialise manifest for MAC")
+    }
+}
+
 impl Manifest {
     /// Recompute the content hash over `files` and compare to `content_hash`.
     /// Returns `Ok(())` only if they match.
@@ -482,39 +503,22 @@ impl Manifest {
     /// The tag carries [`crate::FORMAT_VERSION`], not a hand-maintained scheme string, so
     /// the MAC scheme cannot drift from the on-disk format version.
     fn mac_message(&self) -> Result<Vec<u8>> {
-        let mut canon = self.clone();
-        canon.mac = None;
-        let body = serde_json::to_vec(&canon).context("serialise manifest for MAC")?;
-        Ok(crate::crypto::mac_preimage(
-            crate::crypto::MacDomain::Manifest,
-            &body,
-        ))
+        crate::crypto::mac_message(self)
     }
 
     /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store
     /// it in `mac`. Call this **last** at build time — after every other field
     /// (including `acl_blake3`) is final and immediately before `write_to_dir`.
     pub fn seal_mac(&mut self, master_key: &[u8]) -> Result<()> {
-        let key = crate::crypto::derive_manifest_mac_key(master_key);
-        let mac = crate::crypto::manifest_mac(&key, &self.mac_message()?);
-        self.mac = Some(mac);
-        Ok(())
+        crate::crypto::seal(self, master_key)
     }
 
-    /// Recompute the MAC and compare it to the stored `mac`. `Ok(())` only on a
-    /// match. Errors if `mac` is absent — callers gate on presence first and only
-    /// call this when a MAC is expected.
+    /// Recompute the MAC and compare it to the stored `mac`. `Ok(())` only on a match;
+    /// a typed [`MacRejected`](crate::crypto::MacRejected) otherwise (absent, or
+    /// mismatched). Most callers want [`crypto::authenticate`](crate::crypto::authenticate)
+    /// instead — it carries the require-a-MAC-when-keyed policy as well (HIK-144).
     pub fn verify_mac(&self, master_key: &[u8]) -> Result<()> {
-        let stored = self
-            .mac
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("manifest carries no MAC but one was required"))?;
-        let key = crate::crypto::derive_manifest_mac_key(master_key);
-        let computed = crate::crypto::manifest_mac(&key, &self.mac_message()?);
-        if computed != stored {
-            anyhow::bail!("manifest MAC mismatch — refusing to serve a tampered manifest");
-        }
-        Ok(())
+        crate::crypto::verify(self, master_key)
     }
 
     /// Serialise to pretty JSON.

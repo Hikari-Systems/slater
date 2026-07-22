@@ -2340,12 +2340,93 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_generation_opens_even_with_a_key_configured() {
-        // Encryption is optional: a plaintext generation must keep opening, with
-        // or without a runtime key present (so M2–M5 fixtures keep working).
+    fn plaintext_generation_opens_when_no_key_is_configured() {
+        use graph_format::crypto::MacRejected;
+        // Encryption is optional: a plaintext generation opens on every path when the
+        // deployment configures no master key (so M2–M5 fixtures keep working).
         let (root, graph, _) = write_fixture("plain_with_key");
-        assert!(Generation::open_with_key(&root, &graph, Some(b"ignored")).is_ok());
         assert!(Generation::open(&root, &graph).is_ok());
+
+        // HIK-144: with a key configured, an image carrying no MANIFEST MAC is refused
+        // on *every* path, not just the server's. A MAC-less image under a key is either
+        // a strip attack or a substituted plaintext image; there is no legitimate
+        // keyed-but-unauthenticated deployment (the server has always refused this —
+        // `registry::check_manifest_policy` — and the CLI used to disagree).
+        let err = Generation::open_with_key(&root, &graph, Some(b"ignored"))
+            .err()
+            .expect("a keyed open of an unauthenticated image must be refused");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-144 gap 1: the strip attack the server refuses must also be refused by the
+    /// one-shot CLI (`slater query`), which opens through `open_with_store_opts`. Both
+    /// land in `open_with_store_opts_cached`, so the policy lives there and no caller
+    /// can diverge from it again.
+    #[test]
+    fn keyed_open_refuses_a_mac_stripped_manifest() {
+        use graph_format::crypto::MacRejected;
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_macstrip", Some(key));
+        let dir = root.join(&graph).join(uuid.to_string());
+
+        // The attack: delete the `mac` field from an otherwise intact encrypted image.
+        let mut m = graph_format::manifest::Manifest::read_from_dir(&dir).unwrap();
+        assert!(m.mac.is_some(), "the keyed fixture must be sealed to strip");
+        m.mac = None;
+        m.write_to_dir(&dir).unwrap();
+
+        let err = Generation::open_with_key(&root, &graph, Some(key))
+            .err()
+            .expect("a MAC-stripped image must not open under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type, not by message: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("rebuild"),
+            "and the refusal must be actionable: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-144 gap 3: the set manifest names the base generation and the segment stack —
+    /// the *composition*. Under a key it must itself be authenticated, so an unsealed set
+    /// pointer beside a perfectly valid generation is refused.
+    #[test]
+    fn keyed_open_requires_an_authenticated_set_manifest() {
+        use graph_format::crypto::MacRejected;
+        use graph_format::setmanifest::SetManifest;
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_setunsealed", Some(key));
+
+        // Overwrite the fixture's sealed set with an unsealed one (`mac: None`) — the
+        // set-level strip.
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let set = SetManifest::singleton(GenId(uuid), 0);
+        assert!(set.mac.is_none());
+        std::fs::write(sets.join(format!("{uuid}.json")), set.to_bytes().unwrap()).unwrap();
+
+        let err = Generation::open_with_key(&root, &graph, Some(key))
+            .err()
+            .expect("an unauthenticated set pointer must not open under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

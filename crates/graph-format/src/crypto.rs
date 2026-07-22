@@ -146,14 +146,17 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
 /// one preimage. There is no way to express that here.
 ///
 /// A new variant is a **new** MAC namespace: adding one can never make an existing
-/// document verify under the wrong kind. When the set manifest's reserved `mac` field
-/// ([`crate::setmanifest::SetManifest::mac`]) is wired, it gets its own variant.
+/// document verify under the wrong kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacDomain {
     /// A generation `MANIFEST.json` ([`crate::manifest::Manifest`]).
     Manifest,
     /// A core segment's `SEGMENT.json` ([`crate::segmanifest::SegmentManifest`]).
     SegmentManifest,
+    /// A generation-set pointer, `sets/<uuid>.json`
+    /// ([`crate::setmanifest::SetManifest`]) — the document that authenticates the
+    /// *composition* (which base, which segments), as opposed to the parts (HIK-144).
+    SetManifest,
 }
 
 impl MacDomain {
@@ -164,6 +167,7 @@ impl MacDomain {
         match self {
             MacDomain::Manifest => "slater.manifest",
             MacDomain::SegmentManifest => "slater.segment-manifest",
+            MacDomain::SetManifest => "slater.set-manifest",
         }
     }
 }
@@ -212,6 +216,114 @@ pub fn manifest_mac(key: &[u8; KEY_LEN], msg: &[u8]) -> String {
     let mac = hex_encode(h.finalize().as_bytes());
     h.zeroize();
     mac
+}
+
+/// A MAC-sealed document: a generation `MANIFEST.json`, a segment's `SEGMENT.json`, or a
+/// set manifest. Implementing it is what buys a type the **single** implementation of
+/// sealing, verification and the require-a-MAC-when-keyed policy below — HIK-144 exists
+/// because that policy had been written out twice (once in the server, not at all on the
+/// CLI path) and the two copies disagreed.
+///
+/// A type supplies only what is genuinely its own: its MAC namespace, the label a refusal
+/// names it by, and its canonical body (itself, serialised with `mac` cleared).
+pub trait MacSealed {
+    /// This document's MAC namespace. Distinct per kind, so two kinds can never
+    /// cross-verify under one master key.
+    const DOMAIN: MacDomain;
+    /// How a refusal names this document to an operator (`"MANIFEST.json"`, …).
+    const SUBJECT: &'static str;
+
+    /// The stored MAC, or `None` for an unsealed (plaintext-deployment) document.
+    fn stored_mac(&self) -> Option<&str>;
+    /// Install a freshly computed MAC.
+    fn set_mac(&mut self, mac: Option<String>);
+    /// The canonical bytes to MAC: this document serialised with `mac` cleared. The body
+    /// only — [`mac_message`] adds the domain/version framing.
+    fn mac_body(&self) -> Result<Vec<u8>>;
+}
+
+/// The full framed preimage for a sealed document: its body under its own domain tag.
+pub fn mac_message<T: MacSealed>(doc: &T) -> Result<Vec<u8>> {
+    Ok(mac_preimage(T::DOMAIN, &doc.mac_body()?))
+}
+
+/// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store it.
+/// Call **last**, after every other field is final.
+pub fn seal<T: MacSealed>(doc: &mut T, master_key: &[u8]) -> Result<()> {
+    let key = derive_manifest_mac_key(master_key);
+    let mac = manifest_mac(&key, &mac_message(doc)?);
+    doc.set_mac(Some(mac));
+    Ok(())
+}
+
+/// Recompute the MAC and compare it to the stored one. Errors — typed
+/// ([`MacRejected`]) — when absent or when it does not match.
+pub fn verify<T: MacSealed>(doc: &T, master_key: &[u8]) -> Result<()> {
+    let stored = doc.stored_mac().ok_or(MacRejected::Missing {
+        subject: T::SUBJECT,
+    })?;
+    let key = derive_manifest_mac_key(master_key);
+    let computed = manifest_mac(&key, &mac_message(doc)?);
+    // Constant-time compare: the MAC is public data and a forgery attempt would have to
+    // survive `verify` to matter, but there is no reason to leak the prefix length.
+    if !constant_time_eq(computed.as_bytes(), stored.as_bytes()) {
+        return Err(MacRejected::Mismatch {
+            subject: T::SUBJECT,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// **The** at-rest authentication policy, in one place, for every document kind and every
+/// caller (HIK-144).
+///
+/// * No master key configured — a plaintext deployment. Nothing to verify; the image is
+///   guarded by the copy-completeness hash alone (`THREAT_MODEL.md`).
+/// * A master key configured — the document **must** carry a MAC and it must verify.
+///   Not a policy knob by design: a MAC-less document under a key is either a strip
+///   attack or a substituted plaintext image, and there is no legitimate
+///   keyed-but-unauthenticated deployment, so there is no flag an attacker (or a
+///   mistaken operator) could flip to reopen the downgrade. Plaintext deployments
+///   simply configure no key.
+pub fn authenticate<T: MacSealed>(doc: &T, master_key: Option<&[u8]>) -> Result<()> {
+    match master_key {
+        None => Ok(()),
+        Some(key) => verify(doc, key),
+    }
+}
+
+/// A sealed document that did not authenticate. A **type**, not a message: callers branch
+/// on `downcast_ref::<MacRejected>()`, never on the text (CONTRIBUTING.md).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MacRejected {
+    /// No MAC at all, under a configured master key — the strip downgrade.
+    #[error(
+        "{subject} carries no MAC but a master key is configured — refusing to open an \
+         unauthenticated image; rebuild it with the key (or remove the key for an \
+         all-plaintext deployment)"
+    )]
+    Missing { subject: &'static str },
+    /// A MAC that does not match the document — a tampered or substituted document, or
+    /// the wrong master key.
+    #[error("{subject} MAC mismatch — refusing to open a tampered or substituted image")]
+    Mismatch { subject: &'static str },
+}
+
+/// Byte-string equality whose running time does not depend on *where* the first
+/// difference falls (the length is not secret, so an early return on it is fine).
+/// Hand-rolled rather than pulling in a dependency: the fold has no data-dependent
+/// branch, so there is nothing for a timing side channel to observe about the prefix of
+/// a candidate MAC — which is what would otherwise let a forgery be searched byte by byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Lower-case hex-encode bytes (for the MANIFEST salt field).

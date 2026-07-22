@@ -86,22 +86,66 @@ pub struct SetManifest {
     #[serde(default)]
     pub segments: Vec<SegmentRef>,
     pub created_unix: i64,
-    /// Reserved: keyed-MAC over the canonical manifest, authenticating the set
-    /// pointer. `None` for a plaintext set; verification wiring is a later step.
+    /// Keyed-MAC over the canonical manifest, authenticating the set pointer itself —
+    /// i.e. the **composition**: which base generation, and exactly which segments, in
+    /// which order (HIK-144). `None` for a plaintext (unkeyed) set; under a configured
+    /// master key its absence is refused at open, like every other sealed document.
     ///
-    /// **Nothing computes or checks this today** — this struct is *not* MAC-covered, so the
-    /// pointer (which names the base generation and the segment stack) is currently
-    /// authenticated only indirectly, by each image's own MAC. When it is wired, follow the
-    /// [`crate::manifest::Manifest`] pattern exactly: clear `mac`, serialise to JSON, and
-    /// frame it with [`crypto::mac_preimage`](crate::crypto::mac_preimage) under a **new**
-    /// [`MacDomain`](crate::crypto::MacDomain) variant of its own — never reuse the
-    /// generation or segment domain — and pin the body with a golden test (HIK-142). The
-    /// same rule applies: no `HashMap`/`HashSet` field in a MAC-covered struct.
+    /// Sealed and verified through [`crypto::MacSealed`](crate::crypto::MacSealed), so it
+    /// shares one implementation with `MANIFEST.json` and `SEGMENT.json` and cannot drift
+    /// from them. Its domain is [`MacDomain::SetManifest`](crate::crypto::MacDomain) — its
+    /// own namespace, never the generation's or the segment's.
+    ///
+    /// **Rule (as for every MAC-covered struct): no `HashMap`/`HashSet` field may be added
+    /// here or to [`SegmentRef`].** Iteration order is unspecified and randomised per
+    /// process, so the same manifest would MAC differently on each run. The body shape is
+    /// pinned by `mac_preimage_body_is_pinned_to_a_golden_shape` below.
     #[serde(default)]
     pub mac: Option<String>,
 }
 
+/// The set pointer is the third MAC-sealed document. Sealing, verification and the
+/// require-a-MAC-when-keyed policy live once in [`crypto`](crate::crypto) (HIK-144);
+/// only the namespace, the operator-facing label and the canonical body are this
+/// type's own.
+///
+/// The body is the whole struct with `mac` cleared, so the MAC covers `base`, the full
+/// ordered `segments` list (each ref's uuid, bands and content hash) and `set_uuid` —
+/// which is the point: the parts each carry their own MAC, but only this authenticates
+/// *which parts, together*.
+impl crate::crypto::MacSealed for SetManifest {
+    const DOMAIN: crate::crypto::MacDomain = crate::crypto::MacDomain::SetManifest;
+    const SUBJECT: &'static str = "set manifest (sets/<uuid>.json)";
+
+    fn stored_mac(&self) -> Option<&str> {
+        self.mac.as_deref()
+    }
+    fn set_mac(&mut self, mac: Option<String>) {
+        self.mac = mac;
+    }
+    fn mac_body(&self) -> Result<Vec<u8>> {
+        let mut canon = self.clone();
+        canon.mac = None;
+        serde_json::to_vec(&canon).context("serialise set manifest for MAC")
+    }
+}
+
 impl SetManifest {
+    /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store it in
+    /// `mac`. Call **last**, after `base` and the whole `segments` list are final and
+    /// immediately before the manifest is written/uploaded.
+    pub fn seal_mac(&mut self, master_key: &[u8]) -> Result<()> {
+        crate::crypto::seal(self, master_key)
+    }
+
+    /// Recompute the MAC and compare it to the stored `mac`; typed
+    /// [`MacRejected`](crate::crypto::MacRejected) on absence or mismatch. Openers want
+    /// [`crypto::authenticate`](crate::crypto::authenticate), which also requires the MAC
+    /// to be present when a key is configured.
+    pub fn verify_mac(&self, master_key: &[u8]) -> Result<()> {
+        crate::crypto::verify(self, master_key)
+    }
+
     /// A singleton set over `base` (no upper segments), with the set uuid equal to the
     /// base uuid so `current` keeps naming the generation directory.
     pub fn singleton(base: Generation, created_unix: i64) -> Self {
@@ -157,6 +201,18 @@ impl SetManifest {
         let m: SetManifest =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
         m.validate()?;
+        // Bind the document to the key it was fetched under. Without this a *validly
+        // sealed* set manifest could simply be copied to another set's key: its MAC would
+        // still verify (the MAC covers `set_uuid`, not the location), and `current` — an
+        // unauthenticated pointer — would then name a composition the operator never
+        // published under that name (HIK-144).
+        if m.set_uuid != set_uuid {
+            bail!(
+                "set manifest at {key} declares set uuid {} — refusing a set manifest \
+                 stored under a different uuid",
+                m.set_uuid
+            );
+        }
         Ok(m)
     }
 
