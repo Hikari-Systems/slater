@@ -527,6 +527,34 @@ impl Manifest {
     }
 }
 
+/// Refuse a manifest that declares at-rest encryption but no `aadScheme`, with a message an
+/// operator can act on (HIK-140).
+///
+/// The field is a **required** struct field, so this can never let one through — `serde`
+/// would refuse it a line later. All this adds is the *why*: "missing field `aadScheme`"
+/// does not say that the image's blocks are unbound and that the fix is a rebuild.
+pub(crate) fn probe_aad_scheme(text: &str, what: &str) -> Result<()> {
+    #[derive(Deserialize)]
+    struct EncProbe {
+        encryption: Option<serde_json::Value>,
+    }
+    let Ok(p) = serde_json::from_str::<EncProbe>(text) else {
+        return Ok(()); // too broken to probe; the full parse gives the better error
+    };
+    if let Some(enc) = p.encryption.as_ref().and_then(|e| e.as_object()) {
+        if !enc.contains_key("aadScheme") {
+            anyhow::bail!(
+                "{what} declares at-rest encryption but no `aadScheme`: its blocks were sealed \
+                 without being bound to their file and block ordinal, so a block relocated \
+                 within the image would still decrypt. Slater has no backwards compatibility: \
+                 it must be rebuilt (this build seals under {:?}).",
+                crate::crypto::AAD_SCHEME
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Parse a MANIFEST document, **checking its format version first**.
 ///
 /// The `Manifest` struct is schema-locked to the *current* `FORMAT_VERSION`: every field
@@ -545,6 +573,7 @@ fn parse_manifest(text: &str) -> Result<Manifest> {
     struct VersionProbe {
         format_version: u32,
     }
+    probe_aad_scheme(text, "MANIFEST")?;
     // A document too broken to yield even a version falls through to the full parse, whose
     // error is the more useful one there.
     if let Ok(p) = serde_json::from_str::<VersionProbe>(text) {
@@ -909,9 +938,11 @@ mod tests {
             .unwrap();
         let legacy = serde_json::to_string(&v).unwrap();
         let err = parse_manifest(&legacy).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("aadScheme"), "must name the field: {err:#}");
         assert!(
-            err.to_string().contains("aadScheme"),
-            "the error must name the missing field: {err:#}"
+            msg.contains("rebuilt"),
+            "and must tell the operator what to do: {err:#}"
         );
     }
 
