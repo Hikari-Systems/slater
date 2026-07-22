@@ -47,7 +47,10 @@ meant to have.
 Two caveats that change the answers above:
 
 - **`dataBackend.verifyIntegrity: false`** turns off the open-time file comparison (it is on
-  by default). In the plaintext row that leaves *nothing* checked at open. In the encrypted +
+  by default). In the plaintext row that leaves no integrity check at open at all — only the
+  format's own magic/version validation and the read-side decode refusals of limitation 2,
+  which are about refusing a value that would mis-*execute*, not about detecting a rewrite.
+  In the encrypted +
   MAC row the manifest MAC and per-block AEAD still apply, but one gap opens: a block is
   sealed under a random nonce with **no associated data**, so a valid ciphertext block copied
   from elsewhere in the same generation still decrypts. What refuses that today is the
@@ -58,6 +61,11 @@ Two caveats that change the answers above:
   image the per-block AEAD still catches it on the next read of that block, in a plaintext
   image nothing does. Publish by writing a **new** generation directory and flipping
   `current` — never by editing a served one.
+
+- **"Refuses to serve" is the server's policy.** The MAC-presence and ACL-stamp refusals live
+  in the server's graph registry, applied at boot and at every swap. The one-shot `slater
+  query` CLI opens a generation directly: it verifies a MAC that is *present*, but does not
+  enforce that one exists. Treat the row above as describing the served deployment.
 
 Two places where the writable layer (`delta.enabled`, off by default) is weaker than the
 core: a sealed segment's `SEGMENT.json` MAC is verified when present, but a keyed server does

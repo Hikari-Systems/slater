@@ -56,7 +56,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 - **Live, durable writes** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE` over nodes and edges, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
 - **Vector search built in** — disk-native approximate-nearest-neighbour (cosine, L2, or dot KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline, and embeddings are writable in place — no offline rebuild to add or change a vector.
-- **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas. Configure a master key and the on-disk image is *authenticated* as well as encrypted — its manifest carries a keyed MAC, so an attacker with write access to the data directory but no key cannot make a tampered generation open. Without a key you still get the content hash, which catches a half-copied or corrupted image — but not a deliberate one. [Which configuration buys what](THREAT_MODEL.md#what-integrity-means-in-each-configuration).
+- **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas. Configure a master key and the on-disk image is *authenticated* as well as encrypted — its manifest carries a keyed MAC, so an attacker with write access to the data directory but no key cannot forge a manifest the server will accept. Without a key you still get the content hash, which catches a half-copied or corrupted image — but not a deliberate one. [Which configuration buys what](THREAT_MODEL.md#what-integrity-means-in-each-configuration).
 
 ## Features
 
@@ -345,7 +345,7 @@ What this column checks, on every backend, is that the files **match the manifes
 Whether the manifest itself can be trusted is a separate question, and it is the
 master key that answers it: with a key configured the manifest carries a keyed MAC
 that the server verifies before it trusts any field (including these hashes), so a
-rewritten image is refused; without a key the comparison is unkeyed throughout, and
+manifest rewritten to describe tampered files is refused; without a key the comparison is unkeyed throughout, and
 someone who can write to the data directory can rewrite a file and the manifest
 together. See
 [What integrity means in each configuration](THREAT_MODEL.md#what-integrity-means-in-each-configuration).
