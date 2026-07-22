@@ -15,6 +15,7 @@
 use anyhow::{Context, Result};
 use hs_utils::config::{deser_u16_or_str, deser_u32_or_str};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 /// Local `or_str` deserialisers for the widths `hs-utils` does not ship (`u64`,
 /// `usize`). After `prepare_config` every scalar is a string, so we must accept
@@ -607,8 +608,13 @@ impl EncryptionConfig {
     /// Resolve the at-rest master key (raw bytes) from the configured source.
     /// `keyFile` takes precedence over `keyEnv`; both empty ⇒ `None` (plaintext
     /// generations only). The source holds the key as hex.
-    pub fn load_key(&self) -> Result<Option<Vec<u8>>> {
-        let hex = if !self.key_file.is_empty() {
+    ///
+    /// Both the hex text and the decoded bytes are held in `Zeroizing` so they are
+    /// wiped when dropped (HIK-139) — see the `LIMIT:` note at the top of
+    /// `graph-format/src/crypto.rs` for what that does *not* cover (notably: a key
+    /// arriving via `keyEnv` stays in the process environment regardless).
+    pub fn load_key(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let hex = Zeroizing::new(if !self.key_file.is_empty() {
             std::fs::read_to_string(&self.key_file)
                 .with_context(|| format!("read encryption key file {}", self.key_file))?
         } else if !self.key_env.is_empty() {
@@ -616,9 +622,10 @@ impl EncryptionConfig {
                 .with_context(|| format!("read encryption key env var {}", self.key_env))?
         } else {
             return Ok(None);
-        };
-        let key =
-            graph_format::crypto::hex_decode(&hex).context("decode at-rest master key hex")?;
+        });
+        let key = Zeroizing::new(
+            graph_format::crypto::hex_decode(&hex).context("decode at-rest master key hex")?,
+        );
         if key.is_empty() {
             anyhow::bail!("the configured at-rest master key is empty");
         }

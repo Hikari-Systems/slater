@@ -35,6 +35,8 @@ rayon.workspace = true
 # minutes on a 16k-vector delta rebuild rather than seconds.
 wide.workspace = true
 chacha20poly1305.workspace = true
+# Wipe derived block/MAC subkeys on drop (`Zeroizing`). See `crypto.rs`.
+zeroize.workspace = true
 # SHA-256 (base64) per-file digest baked into the manifest alongside BLAKE3, so
 # the S3 backend can verify integrity from S3's server-computed object checksum
 # via a metadata request (no body read). Computed at build for every generation.

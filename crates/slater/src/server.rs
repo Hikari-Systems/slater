@@ -145,7 +145,9 @@ pub struct Graphs {
     /// Storage backend the generations are read from (local filesystem by
     /// default, or an object store). Retained so the guard can re-open a graph.
     store: Arc<dyn ObjectStore>,
-    master_key: Option<Vec<u8>>,
+    /// At-rest master key, retained for the whole process so the guard can
+    /// re-open a graph. `Zeroizing` wipes it when the registry drops (HIK-139).
+    master_key: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// Run the copy-completeness re-hash when opening (and swapping in) a
     /// generation. Default for the filesystem backend; usually off for S3.
     verify_integrity: bool,

@@ -21,10 +21,36 @@
 // use independent block keys, and losing the salt does not weaken a generation
 // whose master key is held elsewhere.
 
+// DESIGN: key material is wrapped in `Zeroizing<_>`, which wipes the buffer with
+// volatile writes when it drops (HIK-139). This covers the derived per-generation
+// block key, the manifest-MAC subkey, the master key bytes and the hex text they
+// were decoded from. `XChaCha20Poly1305` needs no wrapper: it zeroizes its own key
+// in `Drop` unconditionally (see the LIMIT note below for what it *cannot* cover).
+//
+// LIMIT: this is best-effort defence-in-depth against core dumps / swap / cold-boot
+// disclosure — it is not a guarantee, and two gaps are structural:
+//
+//   * A master key supplied through `encryption.keyEnv` (or slater-build's
+//     `--key-env`) **cannot be wiped**. The value lives in the process environment
+//     block, which the C runtime owns and which is readable from `/proc/self/environ`
+//     for the process's whole life; `std::env::var` only hands us a copy, and
+//     `remove_var` is `unsafe` and process-global-racy. Wiping the copy we were
+//     handed still leaves the original. Use `keyFile` if that matters.
+//   * Growth by reallocation leaves untracked copies in freed heap. `hex_decode`
+//     already pre-sizes its `Vec` with `with_capacity(s.len() / 2)` so *it* never
+//     reallocates, but the `String` read from the key file is built by
+//     `fs::read_to_string`, which grows as it reads. `Zeroizing` wipes only the
+//     final buffer, never the earlier ones the allocator has already reclaimed.
+//   * Wiping reaches only the values we hold. The KDF hashers below are wiped
+//     explicitly (blake3's `zeroize` feature) because they retain the master key
+//     and the MAC key, but nothing can reach a copy the optimizer spilled to an
+//     unnamed stack slot or left in a register.
+
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use zeroize::{Zeroize, Zeroizing};
 
 /// AEAD identifier written into the MANIFEST `EncryptionHeader`.
 pub const AEAD_NAME: &str = "xchacha20poly1305";
@@ -58,12 +84,21 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 
 /// Derive the 32-byte per-generation block key from the runtime master key and
 /// the generation's salt via `BLAKE3::derive_key`.
-pub fn derive_key(master_key: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+///
+/// The subkey is returned in a [`Zeroizing`] so it is wiped when the caller drops
+/// it; deref gives `&[u8; KEY_LEN]` so call sites are otherwise unchanged.
+pub fn derive_key(master_key: &[u8], salt: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(KDF_CONTEXT);
     h.update(master_key);
     h.update(salt);
-    let mut out = [0u8; KEY_LEN];
-    h.finalize_xof().fill(&mut out);
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    // The hasher's block buffer still holds the master key verbatim (it is shorter
+    // than one 64-byte block), and the XOF reader can regenerate the subkey at will.
+    // Wiping only `out` would leave both a frame away, so wipe them too.
+    xof.zeroize();
+    h.zeroize();
     out
 }
 
@@ -73,18 +108,31 @@ pub fn derive_key(master_key: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
 /// the (MAC-covered) encryption header. Salt-free keeps the key reproducible at
 /// verify time from the master key alone. Domain-separated from [`derive_key`] by
 /// its KDF context.
-pub fn derive_manifest_mac_key(master_key: &[u8]) -> [u8; KEY_LEN] {
+///
+/// Wiped on drop via [`Zeroizing`], exactly like [`derive_key`].
+pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(MAC_KDF_CONTEXT);
     h.update(master_key);
-    let mut out = [0u8; KEY_LEN];
-    h.finalize_xof().fill(&mut out);
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    xof.zeroize();
+    h.zeroize();
     out
 }
 
 /// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
 /// 32-byte subkey from [`derive_manifest_mac_key`].
+///
+/// Spelled out as a `Hasher` rather than the one-shot `blake3::keyed_hash` so the
+/// hasher — which holds the MAC key verbatim in its key words — can be wiped after
+/// use; the one-shot's hasher is a local we cannot reach.
 pub fn manifest_mac(key: &[u8; KEY_LEN], msg: &[u8]) -> String {
-    hex_encode(blake3::keyed_hash(key, msg).as_bytes())
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(msg);
+    let mac = hex_encode(h.finalize().as_bytes());
+    h.zeroize();
+    mac
 }
 
 /// Lower-case hex-encode bytes (for the MANIFEST salt field).

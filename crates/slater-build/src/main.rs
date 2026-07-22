@@ -55,6 +55,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::build_external::build_external;
 use crate::cluster::ClusterMode;
@@ -421,14 +422,19 @@ fn parse_size(s: &str) -> std::result::Result<u64, String> {
 /// Resolve the at-rest master key from the CLI flags. Returns `None` unless
 /// `--encrypt` is set; otherwise reads exactly one of `--key-file`/`--key-env`,
 /// trims it, and hex-decodes it into raw key bytes.
-fn resolve_master_key(cli: &Cli) -> Result<Option<Vec<u8>>> {
+///
+/// Both the hex text and the decoded bytes are held in `Zeroizing` so they are
+/// wiped when dropped (HIK-139) — see the `LIMIT:` note at the top of
+/// `graph-format/src/crypto.rs` for what that does *not* cover (notably: a key
+/// arriving via `--key-env` stays in the process environment regardless).
+fn resolve_master_key(cli: &Cli) -> Result<Option<Zeroizing<Vec<u8>>>> {
     if !cli.encrypt {
         if cli.key_file.is_some() || cli.key_env.is_some() {
             anyhow::bail!("--key-file/--key-env given without --encrypt");
         }
         return Ok(None);
     }
-    let hex = match (&cli.key_file, &cli.key_env) {
+    let hex = Zeroizing::new(match (&cli.key_file, &cli.key_env) {
         (Some(_), Some(_)) => anyhow::bail!("give only one of --key-file / --key-env"),
         (Some(path), None) => std::fs::read_to_string(path)
             .with_context(|| format!("read key file {}", path.display()))?,
@@ -436,8 +442,9 @@ fn resolve_master_key(cli: &Cli) -> Result<Option<Vec<u8>>> {
             std::env::var(var).with_context(|| format!("read key env var {var}"))?
         }
         (None, None) => anyhow::bail!("--encrypt requires --key-file or --key-env"),
-    };
-    let key = graph_format::crypto::hex_decode(&hex).context("decode master key hex")?;
+    });
+    let key =
+        Zeroizing::new(graph_format::crypto::hex_decode(&hex).context("decode master key hex")?);
     if key.is_empty() {
         anyhow::bail!("the at-rest master key is empty");
     }
