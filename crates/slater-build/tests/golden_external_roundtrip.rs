@@ -419,6 +419,32 @@ fn external_encrypted_build_then_reopen_with_key() {
         vec![2]
     );
 
+    // HIK-140, the whole-inventory check: **every** file the builder emitted must open —
+    // and read its first block — under a subkey bound to the name the MANIFEST inventory
+    // records for it. A writer that sealed a file under any other string fails here, so a
+    // store added later cannot quietly drift from the reader's name for it.
+    let mut checked = 0;
+    for f in &m.files {
+        let path = gen_dir.join(&f.name);
+        let fc = crypto::file_cipher(&cipher, &f.name);
+        if f.name.ends_with(".isam") {
+            let r = IsamReader::open_with_cipher(&path, fc)
+                .unwrap_or_else(|e| panic!("open {} bound to its inventory name: {e:#}", f.name));
+            if r.num_blocks() > 0 {
+                r.lookup_eq(&Value::Str("Alpha".into())).unwrap();
+            }
+        } else {
+            let r = graph_format::blockfile::BlockFileReader::open_with_cipher(&path, fc)
+                .unwrap_or_else(|e| panic!("open {} bound to its inventory name: {e:#}", f.name));
+            for b in 0..r.num_blocks() {
+                r.read_block(graph_format::ids::BlockId(b as u32))
+                    .unwrap_or_else(|e| panic!("read block {b} of {}: {e:#}", f.name));
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 8, "expected a real inventory, checked {checked}");
+
     // Absent the key, the encrypted store is refused — not silently misread.
     assert!(PropsReader::open(gen_dir.join("node_props.blk")).is_err());
 

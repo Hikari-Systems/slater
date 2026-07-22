@@ -51,11 +51,12 @@ Two caveats that change the answers above:
   format's own magic/version validation and the read-side decode refusals of limitation 2,
   which are about refusing a value that would mis-*execute*, not about detecting a rewrite.
   In the encrypted +
-  MAC row the manifest MAC and per-block AEAD still apply, but one gap opens: a block is
-  sealed under a random nonce with **no associated data**, so a valid ciphertext block copied
-  from elsewhere in the same generation still decrypts. What refuses that today is the
-  open-time file hash — which the MAC makes unforgeable. Leave `verifyIntegrity` on if a
-  data-dir attacker is in your model.
+  MAC row the manifest MAC and per-block AEAD still apply, and since HIK-140 the AEAD also
+  refuses a **relocated** block: every block is sealed under a per-file subkey with its block
+  ordinal as associated data, so a valid ciphertext lifted from another offset, another file
+  of the same generation, or the ISAM top slot no longer decrypts — with `verifyIntegrity`
+  off, and on every read rather than only at open. Leaving `verifyIntegrity` on is still
+  advisable: it turns "wrong on first touch" into "refused at open".
 - **The open-time checks are open-time.** They establish what the image was when the server
   opened it. A file mutated *underneath* a running server is not re-hashed; in an encrypted
   image the per-block AEAD still catches it on the next read of that block, in a plaintext
@@ -78,9 +79,14 @@ the authenticated row above as covering the core generation.
 
 - **At-rest encryption (optional, per block).** With `--encrypt`, each compressed block is
   sealed with XChaCha20-Poly1305 under a per-generation block key = `BLAKE3::derive_key`
-  over (master key ‖ per-generation salt). The salt lives in the manifest; the key never
-  does. A wrong/absent key fails closed (the Poly1305 tag does not verify). This protects
-  **block contents** at rest.
+  over (master key ‖ per-generation salt), further bound to the file it lives in: the block
+  key is `BLAKE3::derive_key("slater generation file key v1", gen_key ‖ store-relative file
+  name)` and the block's **ordinal within that file** is passed as AEAD associated data
+  (HIK-140). The salt lives in the manifest; the key never does. A wrong/absent key fails
+  closed (the Poly1305 tag does not verify), and so does a block presented at the wrong
+  ordinal or in the wrong file. This protects **block contents and block placement** at rest.
+  The manifest's `encryption.aadScheme` records the binding (`file-block-v1`) and is
+  **required**: an encrypted image that predates it does not parse, and must be rebuilt.
 - **Copy-completeness integrity.** Per-file BLAKE3 + a `content_hash` over the file
   inventory let the reader refuse a half-copied generation (e.g. an in-progress rsync onto
   network storage). This proves the files are **complete and self-consistent**, *not* that

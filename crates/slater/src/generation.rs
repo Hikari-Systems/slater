@@ -2305,6 +2305,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// HIK-140: an encrypted image that declares an AAD scheme this build does not
+    /// implement is refused, **by type**, before any block is opened. That is the
+    /// fail-closed path for an image sealed before per-file/per-ordinal binding.
+    #[test]
+    fn encrypted_generation_refuses_an_unknown_aad_scheme() {
+        use graph_format::crypto::AadSchemeRejected;
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_aad", Some(key));
+
+        // Rewrite the header in place (the fixture carries no MANIFEST MAC, so this
+        // reaches `derive_cipher` rather than tripping the MAC first).
+        let dir = root.join(&graph).join(uuid.to_string());
+        let mut m = graph_format::manifest::Manifest::read_from_dir(&dir).unwrap();
+        assert!(m.mac.is_none(), "fixture is unMACed; see the comment above");
+        m.encryption.as_mut().unwrap().aad_scheme = "none".to_string();
+        m.write_to_dir(&dir).unwrap();
+
+        let err = Generation::open_with_key(&root, &graph, Some(key))
+            .err()
+            .unwrap();
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<AadSchemeRejected>().is_some()),
+            "must be refused by type, not by message: {err:#}"
+        );
+        assert!(
+            err.to_string().contains(&graph)
+                || err.chain().any(|e| e.to_string().contains("rebuilt")),
+            "and the message must be actionable: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn plaintext_generation_opens_even_with_a_key_configured() {
         // Encryption is optional: a plaintext generation must keep opening, with

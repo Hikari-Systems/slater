@@ -1400,7 +1400,6 @@ mod tests {
 
     #[test]
     fn encrypted_records_roundtrip_across_blocks() {
-        use crate::crypto::BlockCipher;
         let path = tmp("enc_many");
         let cipher = gen_cipher(b"master-key", &[7u8; 32]);
         // Small target forces multiple blocks, each with its own nonce.
@@ -1552,7 +1551,6 @@ mod tests {
 
     #[test]
     fn raw_encrypted_roundtrips() {
-        use crate::crypto::BlockCipher;
         let path = tmp("raw_enc");
         let cipher = gen_cipher(b"master-key", &[9u8; 32]);
         let mut w = BlockFileWriter::create_with_codec(
@@ -1590,7 +1588,6 @@ mod tests {
 
     #[test]
     fn encrypted_block_bytes_are_not_plaintext_on_disk() {
-        use crate::crypto::BlockCipher;
         let path = tmp("enc_ondisk");
         let cipher = gen_cipher(b"k", &[1u8; 32]);
         let mut w = BlockFileWriter::create_with_cipher(
@@ -1613,7 +1610,6 @@ mod tests {
 
     #[test]
     fn wrong_key_and_absent_key_are_refused() {
-        use crate::crypto::BlockCipher;
         let path = tmp("enc_refuse");
         let right = gen_cipher(b"right", &[3u8; 32]);
         let mut w = BlockFileWriter::create_with_cipher(
@@ -1727,7 +1723,6 @@ mod tests {
     /// the first decrypts to garbage — so the encrypted path gets its own round-trip.
     #[test]
     fn concat_preserves_encrypted_records_and_their_nonces() {
-        use crate::crypto::BlockCipher;
         let cipher = gen_cipher(b"concat key", &[7u8; 32]);
         let fc = file_cipher(&cipher, "topology.csr.blk");
         let mut parts = Vec::new();
@@ -1874,7 +1869,6 @@ mod tests {
 
     #[test]
     fn plaintext_file_opens_with_a_key_present() {
-        use crate::crypto::BlockCipher;
         // A key supplied for a plaintext file is simply ignored — encryption is
         // optional, so a plaintext generation keeps opening even under a key.
         let path = tmp("plain_with_key");

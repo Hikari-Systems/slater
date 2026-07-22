@@ -885,6 +885,36 @@ mod tests {
         });
     }
 
+    /// HIK-140: `aadScheme` is required on an encrypted manifest. An image written
+    /// before per-file/per-ordinal binding existed has no such key, and must fail to
+    /// **parse** rather than open with its blocks unbound and relocatable.
+    #[test]
+    fn an_encrypted_manifest_without_an_aad_scheme_does_not_parse() {
+        let mut m = sample();
+        m.encryption = Some(EncryptionHeader {
+            aead: crate::crypto::AEAD_NAME.into(),
+            kdf: crate::crypto::KDF_NAME.into(),
+            salt_hex: "00".repeat(32),
+            aad_scheme: crate::crypto::AAD_SCHEME.into(),
+        });
+        let json = m.to_json().unwrap();
+        assert!(parse_manifest(&json).is_ok(), "the sealed form parses");
+
+        // Drop the key, exactly as a pre-HIK-140 image would have it.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["encryption"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aadScheme")
+            .unwrap();
+        let legacy = serde_json::to_string(&v).unwrap();
+        let err = parse_manifest(&legacy).unwrap_err();
+        assert!(
+            err.to_string().contains("aadScheme"),
+            "the error must name the missing field: {err:#}"
+        );
+    }
+
     #[test]
     fn mac_rejects_wrong_key() {
         let mut m = sample();
