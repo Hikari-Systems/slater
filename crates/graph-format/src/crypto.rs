@@ -41,12 +41,16 @@
 //     reallocates, but the `String` read from the key file is built by
 //     `fs::read_to_string`, which grows as it reads. `Zeroizing` wipes only the
 //     final buffer, never the earlier ones the allocator has already reclaimed.
+//   * Wiping reaches only the values we hold. The KDF hashers below are wiped
+//     explicitly (blake3's `zeroize` feature) because they retain the master key
+//     and the MAC key, but nothing can reach a copy the optimizer spilled to an
+//     unnamed stack slot or left in a register.
 
 use anyhow::{bail, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// AEAD identifier written into the MANIFEST `EncryptionHeader`.
 pub const AEAD_NAME: &str = "xchacha20poly1305";
@@ -88,7 +92,13 @@ pub fn derive_key(master_key: &[u8], salt: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     h.update(master_key);
     h.update(salt);
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    h.finalize_xof().fill(&mut *out);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    // The hasher's block buffer still holds the master key verbatim (it is shorter
+    // than one 64-byte block), and the XOF reader can regenerate the subkey at will.
+    // Wiping only `out` would leave both a frame away, so wipe them too.
+    xof.zeroize();
+    h.zeroize();
     out
 }
 
@@ -103,14 +113,24 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(MAC_KDF_CONTEXT);
     h.update(master_key);
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    h.finalize_xof().fill(&mut *out);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    xof.zeroize();
+    h.zeroize();
     out
 }
 
 /// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
 /// 32-byte subkey from [`derive_manifest_mac_key`].
+/// Spelled out as a `Hasher` rather than the one-shot `blake3::keyed_hash` so the
+/// hasher — which holds the MAC key verbatim in its key words — can be wiped after
+/// use; the one-shot's hasher is a local we cannot reach.
 pub fn manifest_mac(key: &[u8; KEY_LEN], msg: &[u8]) -> String {
-    hex_encode(blake3::keyed_hash(key, msg).as_bytes())
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(msg);
+    let mac = hex_encode(h.finalize().as_bytes());
+    h.zeroize();
+    mac
 }
 
 /// Lower-case hex-encode bytes (for the MANIFEST salt field).

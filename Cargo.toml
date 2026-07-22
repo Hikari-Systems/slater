@@ -50,7 +50,13 @@ zstd = "0.13"
 # BLAKE3 is a Merkle tree, so a single large file parallelises internally — which is
 # what the publish phase needs: `topology.csr.blk` alone is 71% of a generation's
 # bytes, so fanning out across *files* would leave it on one core.
-blake3 = { version = "1", features = ["rayon"] }
+#
+# `zeroize`: BLAKE3 is also the KDF for the at-rest keys, and a `Hasher` fed the
+# master key keeps it in its 64-byte block buffer (and a keyed hasher keeps the MAC
+# key in its key words) until it drops. The feature adds `Zeroize` impls for
+# `Hasher`/`OutputReader` so `crypto.rs` can wipe that state — otherwise wrapping
+# only the KDF's *output* would leave the same secrets one frame away (HIK-139).
+blake3 = { version = "1", features = ["rayon", "zeroize"] }
 byteorder = "1"
 # Per-frame WAL checksum (slater-delta) — detects a torn crash tail on replay.
 crc32c = "0.6"
