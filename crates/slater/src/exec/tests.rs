@@ -7929,6 +7929,62 @@ fn reverse_traversal_to_bound_node() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// HIK-147 execution guard: a **parameterised** id lookup must do seek-sized work,
+/// not scan-sized work. The plan-level assertions live in `plan.rs`; this one runs
+/// the whole engine and measures the intermediate charge, so a future regression in
+/// either the id-seek walker or the re-root fails the suite instead of merely making
+/// production slow.
+///
+/// The star fixture makes the two plans differ by construction: leading with `m`
+/// scans every node and expands all `2n` LINK edges, whereas seeking the id-anchored
+/// `n` and walking one reverse edge touches exactly one. We assert both the peak
+/// intermediate charge (bounded by a constant, not `n`) and that a budget far below
+/// `n` still completes — the un-rerooted plan blows it, which is precisely the
+/// `query.maxIntermediate` failure reported on the 10M sample.
+#[test]
+fn parameterised_id_lookup_does_seek_sized_work_not_scan_sized() {
+    const N: u64 = 2_000;
+    let (root, graph) = testgen::write_hub("exec_param_id_seek", N);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let params: HashMap<String, Val> = [("x".to_string(), Val::Int(7))].into_iter().collect();
+    let run_with = |budget: u64| {
+        let global = GlobalIntermediateBudget::new(0);
+        let engine = Engine::new(&gen, &cache)
+            .with_max_intermediate(budget)
+            .with_global_budget(&global)
+            .with_params(params.clone());
+        let res = engine.run(
+            &parser::parse("MATCH (m)-[:LINK]->(n) WHERE id(n) = $x RETURN m.name AS nm").unwrap(),
+        );
+        (res, global.peak())
+    };
+
+    // A budget two orders of magnitude below the star's edge count. The seek plan
+    // needs a handful of elements; the scan plan needs ~2n.
+    let (res, peak) = run_with(N / 100);
+    let res = res.expect("a parameterised id lookup must not scan the whole star");
+    let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+    assert_eq!(names, vec!["hub"], "only the hub links to leaf 7");
+    assert!(
+        peak < N / 100,
+        "seek-sized work expected, peak charge was {peak} against {N} leaves"
+    );
+
+    // Same query, unbounded — the answer must not depend on the budget, and the
+    // literal spelling must agree with the parameterised one.
+    let (unbounded, _) = run_with(0);
+    assert_eq!(unbounded.unwrap().rows.len(), 1);
+    let engine = Engine::new(&gen, &cache);
+    let literal = engine
+        .run(&parser::parse("MATCH (m)-[:LINK]->(n) WHERE id(n) = 7 RETURN m.name AS nm").unwrap())
+        .unwrap();
+    assert_eq!(literal.rows.len(), 1);
+    assert_eq!(literal.rows[0][0].to_display(), "hub");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The **Vamana arm** of the HIK-122 rescue read. The consolidation tests exercise this
 /// through the real builder, but a fixture small enough to run there is always below
 /// `ann_threshold` and so always brute-force — this is the only place the other arm is
