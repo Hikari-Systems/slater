@@ -103,7 +103,7 @@ pub fn choose_node_scan(
     // narrowing away a row a disjunction would have kept — which `id_seek_ids`
     // prevents by descending `AND` only (never `OR`).
     if let Some(w) = where_ {
-        if let Some(ids) = id_seek_ids(w, var, gen.node_count()) {
+        if let Some(ids) = id_seek_ids(w, var, gen.node_count(), params) {
             return NodeScan::IdSeek { ids };
         }
     }
@@ -201,10 +201,15 @@ pub(crate) fn maybe_rel_type_scan(
 /// of the true result — a sound candidate set the executor then filters exactly.
 /// A negative or out-of-range id matches no node and is simply dropped (an empty
 /// `Some(vec![])` is a valid "seek that finds nothing", and faster than a scan).
-fn id_seek_ids(expr: &Expr, var: &str, node_count: u64) -> Option<Vec<u64>> {
+fn id_seek_ids(
+    expr: &Expr,
+    var: &str,
+    node_count: u64,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<u64>> {
     let mut ids: Vec<u64> = Vec::new();
     let mut found = false;
-    collect_id_eq(expr, var, &mut ids, &mut found);
+    collect_id_eq(expr, var, params, &mut ids, &mut found);
     if !found {
         return None;
     }
@@ -219,10 +224,10 @@ fn id_seek_ids(expr: &Expr, var: &str, node_count: u64) -> Option<Vec<u64>> {
 /// id-seekable end node (so `MATCH (m)-[r]->(n) WHERE id(n) = X` seeks `n` and
 /// walks the edge backwards instead of scanning every `m`). Cheaper than
 /// [`id_seek_ids`] — no bounds resolution, just "is there an id constraint".
-pub(crate) fn is_id_anchored(where_: &Expr, var: &str) -> bool {
+pub(crate) fn is_id_anchored(where_: &Expr, var: &str, params: &HashMap<String, Value>) -> bool {
     let mut ids = Vec::new();
     let mut found = false;
-    collect_id_eq(where_, var, &mut ids, &mut found);
+    collect_id_eq(where_, var, params, &mut ids, &mut found);
     found
 }
 
@@ -230,16 +235,22 @@ pub(crate) fn is_id_anchored(where_: &Expr, var: &str) -> bool {
 /// that `id(var)` is constrained to. Sets `found` once any `id(var)` equality /
 /// membership conjunct is seen (so a negative-only constraint still yields a
 /// "seek that finds nothing" rather than a fallback scan).
-fn collect_id_eq(expr: &Expr, var: &str, ids: &mut Vec<u64>, found: &mut bool) {
+fn collect_id_eq(
+    expr: &Expr,
+    var: &str,
+    params: &HashMap<String, Value>,
+    ids: &mut Vec<u64>,
+    found: &mut bool,
+) {
     match expr {
         Expr::And(parts) => {
             for p in parts {
-                collect_id_eq(p, var, ids, found);
+                collect_id_eq(p, var, params, ids, found);
             }
         }
         // `id(var) = <int>` / `<int> = id(var)`.
         Expr::Compare(CmpOp::Eq, l, r) => {
-            if let Some(i) = id_eq_operand(l, r, var) {
+            if let Some(i) = id_eq_operand(l, r, var, params) {
                 *found = true;
                 if i >= 0 {
                     ids.push(i as u64);
@@ -249,12 +260,25 @@ fn collect_id_eq(expr: &Expr, var: &str, ids: &mut Vec<u64>, found: &mut bool) {
         // `id(var) IN [<int>, …]` — a seek only when every element is a constant
         // integer (otherwise the full id-set is unknown → fall back to a scan).
         Expr::In(lhs, rhs) if is_id_of(lhs, var) => {
-            if let Expr::List(items) = &**rhs {
-                let consts: Option<Vec<i64>> = items.iter().map(const_int).collect();
-                if let Some(values) = consts {
-                    *found = true;
-                    ids.extend(values.into_iter().filter(|&i| i >= 0).map(|i| i as u64));
-                }
+            let consts: Option<Vec<i64>> = match &**rhs {
+                Expr::List(items) => items.iter().map(|e| const_int(e, params)).collect(),
+                // `id(var) IN $ids` — the whole list arrives as one bound param.
+                // Every element must be an integer, or the id-set is unknown.
+                Expr::Param(name) => match params.get(name) {
+                    Some(Value::List(items)) => items
+                        .iter()
+                        .map(|v| match v {
+                            Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(values) = consts {
+                *found = true;
+                ids.extend(values.into_iter().filter(|&i| i >= 0).map(|i| i as u64));
             }
         }
         _ => {}
@@ -263,23 +287,32 @@ fn collect_id_eq(expr: &Expr, var: &str, ids: &mut Vec<u64>, found: &mut bool) {
 
 /// For an `=` comparison, return the integer if exactly one side is `id(var)` and
 /// the other a constant integer.
-fn id_eq_operand(l: &Expr, r: &Expr, var: &str) -> Option<i64> {
+fn id_eq_operand(l: &Expr, r: &Expr, var: &str, params: &HashMap<String, Value>) -> Option<i64> {
     if is_id_of(l, var) {
-        return const_int(r);
+        return const_int(r, params);
     }
     if is_id_of(r, var) {
-        return const_int(l);
+        return const_int(l, params);
     }
     None
 }
 
-/// Evaluate a constant integer expression: an int literal, or a (possibly nested)
-/// numeric negation of one. Needed because `-1` parses as `Neg(Literal(Int(1)))`,
+/// Evaluate a constant integer expression: an int literal, an integer-bound
+/// `$param`, or a (possibly nested) numeric negation of either. Needed because
+/// `-1` parses as `Neg(Literal(Int(1)))`,
 /// not a negative literal. Overflow (`-i64::MIN`) yields `None` (no seek).
-fn const_int(e: &Expr) -> Option<i64> {
+fn const_int(e: &Expr, params: &HashMap<String, Value>) -> Option<i64> {
     match e {
         Expr::Literal(Value::Int(i)) => Some(*i),
-        Expr::Neg(inner) => const_int(inner).and_then(i64::checked_neg),
+        // `$p` bound to an integer by the RUN message. Drivers parameterise id
+        // lookups, so this arm is the common one in production (HIK-147); an
+        // absent or non-integer binding yields `None` → fallback scan, never a
+        // coercion (a `Float`/`Str` is not a node id) and never a panic.
+        Expr::Param(name) => match params.get(name) {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        },
+        Expr::Neg(inner) => const_int(inner, params).and_then(i64::checked_neg),
         _ => None,
     }
 }
@@ -813,6 +846,196 @@ mod tests {
         let scan = plan_for(&gen, "MATCH (n) WHERE id(n) > 1 RETURN n");
         assert_eq!(scan, NodeScan::AllNodes);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── id() seek pushdown, parameterised (HIK-147) ────────────────────────────
+
+    /// Parse `query` and answer "is the anchor id-anchored under `params`?" — the
+    /// re-root predicate (`exec::traverse::maybe_reroot`) in isolation.
+    fn anchored_with_params(query: &str, var: &str, params: &[(&str, Value)]) -> bool {
+        let q = parser::parse(query).unwrap();
+        let (_, where_) = anchor(&q);
+        let params: HashMap<String, Value> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        is_id_anchored(where_.unwrap(), var, &params)
+    }
+
+    #[test]
+    fn param_id_equality_picks_id_seek() {
+        // The headline case: production drivers send `id(n) = $p`, never a literal.
+        // `with_params` runs before `run`, so the value is in scope at plan time.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_eq_param");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) = $p RETURN n",
+            &[("p", Value::Int(1))],
+        );
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![1] });
+        // Flipped operands must seek too.
+        let flipped = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE $p = id(n) RETURN n",
+            &[("p", Value::Int(2))],
+        );
+        assert_eq!(flipped, NodeScan::IdSeek { ids: vec![2] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_out_of_range_or_negative_seeks_nothing() {
+        // Mirrors `id_out_of_range_seeks_nothing` / `id_negative_seeks_nothing`:
+        // the answer is provably empty, so an empty seek — never an error and
+        // never a fallback scan (a scan would read all 5 nodes to return none).
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_param_bounds");
+        let gen = Generation::open(&root, &graph).unwrap();
+        for v in [Value::Int(999), Value::Int(-1), Value::Int(i64::MIN)] {
+            let scan = plan_for_params(
+                &gen,
+                "MATCH (n) WHERE id(n) = $p RETURN n",
+                &[("p", v.clone())],
+            );
+            assert_eq!(scan, NodeScan::IdSeek { ids: vec![] }, "param {v:?}");
+        }
+        // `-$p` is `Neg(Param)`, and must resolve the same way.
+        let neg = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) = -$p RETURN n",
+            &[("p", Value::Int(1))],
+        );
+        assert_eq!(neg, NodeScan::IdSeek { ids: vec![] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_non_integer_or_absent_falls_back_to_scan() {
+        // A param that is not an integer (or is simply not bound) leaves the id-set
+        // unknown: fall back to the scan, exactly as today, and never panic. No
+        // coercion — `"1"` and `1.0` are not node ids (the property path does not
+        // coerce either).
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_param_bad");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let q = "MATCH (n) WHERE id(n) = $p RETURN n";
+        assert_eq!(plan_for_params(&gen, q, &[]), NodeScan::AllNodes, "absent");
+        for v in [
+            Value::Null,
+            Value::Float(1.0),
+            Value::Str("1".into()),
+            Value::Bool(true),
+            Value::List(vec![Value::Int(1)]),
+        ] {
+            assert_eq!(
+                plan_for_params(&gen, q, &[("p", v.clone())]),
+                NodeScan::AllNodes,
+                "param {v:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_in_list_picks_id_seek() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_in_param");
+        let gen = Generation::open(&root, &graph).unwrap();
+        // Whole list as one param — out-of-range / duplicates dropped, sorted.
+        let whole = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) IN $ids RETURN n",
+            &[(
+                "ids",
+                Value::List(vec![
+                    Value::Int(2),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(99),
+                ]),
+            )],
+        );
+        assert_eq!(whole, NodeScan::IdSeek { ids: vec![0, 2] });
+        // Params as list *elements*, mixed with literals.
+        let mixed = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) IN [$a, 3] RETURN n",
+            &[("a", Value::Int(1))],
+        );
+        assert_eq!(mixed, NodeScan::IdSeek { ids: vec![1, 3] });
+        // An empty list param is a provably-empty seek, like the literal `IN []`.
+        let empty = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) IN $ids RETURN n",
+            &[("ids", Value::List(vec![]))],
+        );
+        assert_eq!(empty, NodeScan::IdSeek { ids: vec![] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_in_list_with_a_non_integer_element_does_not_seek() {
+        // Mirrors `id_in_with_nonliteral_element_does_not_seek`: one unusable
+        // element makes the id-set unknown, so seeking would drop valid rows.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_in_param_bad");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let q = "MATCH (n) WHERE id(n) IN $ids RETURN n";
+        for v in [
+            Value::List(vec![Value::Int(1), Value::Str("2".into())]),
+            Value::List(vec![Value::Int(1), Value::Null]),
+            Value::List(vec![Value::Int(1), Value::List(vec![Value::Int(2)])]),
+            Value::Int(1), // not a list at all
+            Value::Str("1,2".into()),
+        ] {
+            assert_eq!(
+                plan_for_params(&gen, q, &[("ids", v.clone())]),
+                NodeScan::AllNodes,
+                "param {v:?}"
+            );
+        }
+        assert_eq!(plan_for_params(&gen, q, &[]), NodeScan::AllNodes, "absent");
+        // A mixed literal list with an unresolvable param element also bails.
+        assert_eq!(
+            plan_for_params(&gen, "MATCH (n) WHERE id(n) IN [$a, 3] RETURN n", &[]),
+            NodeScan::AllNodes
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_under_or_still_does_not_seek() {
+        // The `OR` soundness guard must survive parameterisation.
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_param_or");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let scan = plan_for_params(
+            &gen,
+            "MATCH (n) WHERE id(n) = $a OR id(n) = $b RETURN n",
+            &[("a", Value::Int(0)), ("b", Value::Int(2))],
+        );
+        assert_eq!(scan, NodeScan::AllNodes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn param_id_anchoring_drives_reroot() {
+        // The second, independent degradation: `is_id_anchored` gates the pattern
+        // re-root, so a parameterised end-node id must report as anchored or the
+        // traversal full-scans the start side.
+        let q = "MATCH (m)-[r]->(n) WHERE id(n) = $x RETURN m";
+        assert!(anchored_with_params(q, "n", &[("x", Value::Int(1))]));
+        assert!(anchored_with_params(q, "n", &[("x", Value::Int(-7))]));
+        // The start side is not anchored, and an unusable param anchors nothing.
+        assert!(!anchored_with_params(q, "m", &[("x", Value::Int(1))]));
+        assert!(!anchored_with_params(q, "n", &[]));
+        assert!(!anchored_with_params(
+            q,
+            "n",
+            &[("x", Value::Str("1".into()))]
+        ));
+        // The IN form anchors too.
+        assert!(anchored_with_params(
+            "MATCH (m)-[r]->(n) WHERE id(n) IN $ids RETURN m",
+            "n",
+            &[("ids", Value::List(vec![Value::Int(1), Value::Int(2)]))],
+        ));
     }
 
     // ── relationship-type scan selection ───────────────────────────────────────
