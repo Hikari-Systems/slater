@@ -62,7 +62,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 
 | Feature | What it means for you |
 |---|---|
-| **Bounded, predictable memory** | Resident memory is capped by three cache budgets *you* set — it does **not** grow with graph size; you tune the performance/RAM trade-off instead of provisioning for the whole graph. A jemalloc allocator with background purge returns freed memory to the OS after heavy query bursts, so resident size falls back toward its idle floor rather than staying pinned at the post-burst high-water mark. |
+| **Bounded, predictable memory** | Resident memory tracks three cache budgets *you* set, to within bounded per-entry and allocator overhead — it does **not** grow with graph size; you tune the performance/RAM trade-off instead of provisioning for the whole graph. A jemalloc allocator with background purge returns freed memory to the OS after heavy query bursts, so resident size falls back toward its idle floor rather than staying pinned at the post-burst high-water mark. |
 | **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
 | **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
 | **Tiny, dependency-light install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:latest-lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
@@ -189,7 +189,9 @@ local (non-Docker) worked example.
   remote/network storage — is refused rather than served.
 * Reads flow through **three bounded cache pools** — a decompressed-block LRU, a
   vector-index pool (resident PQ codes + a Vamana-block LRU), and a result LRU —
-  each with its own byte budget. This is what keeps RSS flat.
+  each with its own byte budget. Each pool weighs what it holds and evicts to stay
+  under its budget, so RSS tracks the budgets to within bounded per-entry and
+  allocator overhead instead of growing with the graph.
 
 ### The writable layer
 
@@ -470,12 +472,16 @@ overrides (double underscore for nesting; keys match the camelCase config).
 
 Every configuration knob — its camelCase key, the `KEY__sub` environment override, its default, and what it does — is tabulated in the **[Configuration reference](docs/manual/14-configuration-reference.md)**. The most-tuned knobs are the cache budgets (`cache.*`), the query guards (`query.*`), the connection caps (`server.*`), the storage backend (`dataBackend.*`), and the writable layer (`delta.*`).
 
-**Resident memory** is approximately
-`blockCacheBytes + vectorCacheBytes + resultCacheBytes` + a small fixed overhead
-(plus up to `degreeColumnBytes` for the `lazy` degree column, once the degree-sum
-`count(endpoint)` fast path is exercised), **independent of graph size** — that is
-the headline guarantee, exercised by the
-`rss_stays_bounded_under_sustained_knn_load` integration test. Per-connection
+**Resident memory** tracks
+`blockCacheBytes + vectorCacheBytes + resultCacheBytes` **to within bounded
+per-entry and allocator overhead** — each pool weighs its own contents (strings and
+containers by allocated capacity) and evicts to stay under budget, but the
+per-entry bookkeeping and the allocator's size-class rounding sit on top of the
+number you set — plus a small fixed overhead (and up to `degreeColumnBytes` for the
+`lazy` degree column, once the degree-sum `count(endpoint)` fast path is
+exercised). It is **independent of graph size** — that is the headline guarantee,
+exercised by the `rss_stays_bounded_under_sustained_knn_load` integration test,
+which holds peak-vs-warm RSS growth well inside the summed budgets. Per-connection
 buffers live *outside* the cache budgets, so the guarantee holds under adversarial
 load only because `server.maxConnections` bounds how many can exist at once.
 

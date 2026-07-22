@@ -273,38 +273,65 @@ pub(crate) fn result_query_key(query: &str, params: &HashMap<String, Val>) -> St
     s
 }
 
-/// A coarse estimate of a result's resident footprint, used to charge it against
-/// the result-cache budget. Exactness is not required — it only needs to grow with
-/// the result so the byte budget bounds memory.
+/// An estimate of a result's resident footprint, used to charge it against the
+/// result-cache budget. Exactness is impossible (allocator size classes and slack
+/// are invisible from here) but it must never *under*-count: the budget is what
+/// bounds RSS, so a value that looks smaller than it is lets the pool overshoot.
+///
+/// Counts the `QueryResult` struct, the `columns`/`rows` `Vec` **capacities**, each
+/// column `String`'s capacity, and each row's `Vec<Val>` capacity plus the heap its
+/// values own. Capacity, not length, throughout — the slack a `String`/`Vec` holds
+/// is resident whether or not it is used.
 pub(crate) fn estimate_result_bytes(r: &QueryResult) -> usize {
-    let cols: usize = r.columns.iter().map(|c| c.len() + 16).sum();
-    let rows: usize = r
-        .rows
-        .iter()
-        .map(|row| row.iter().map(val_bytes).sum::<usize>())
-        .sum();
-    cols + rows + 64
+    let cols: usize = r.columns.capacity() * std::mem::size_of::<String>()
+        + r.columns.iter().map(|c| c.capacity()).sum::<usize>();
+    let rows: usize = r.rows.capacity() * std::mem::size_of::<Vec<Val>>()
+        + r.rows
+            .iter()
+            .map(|row| {
+                // `val_bytes` charges each *occupied* slot plus its heap; the row
+                // `Vec`'s unused capacity is resident too, so charge that slack.
+                row.capacity().saturating_sub(row.len()) * std::mem::size_of::<Val>()
+                    + row.iter().map(val_bytes).sum::<usize>()
+            })
+            .sum::<usize>();
+    std::mem::size_of::<QueryResult>() + cols + rows
 }
 
+/// A single value's resident footprint: its inline enum slot plus the heap it owns.
 pub(crate) fn val_bytes(v: &Val) -> usize {
+    std::mem::size_of::<Val>() + val_heap_bytes(v)
+}
+
+/// Bytes `v` owns on the heap, beyond its own inline `size_of::<Val>()` slot.
+/// Strings, lists, vectors and maps are counted by allocation **capacity**, and
+/// nested containers recurse. Mirrors `value_heap_bytes` in
+/// `graph_format::isam` and `slater_build::merge_build` — same shape, same reason
+/// (HIK-101: a flat/`len`-based charge made a block of long strings look far
+/// smaller than it was and the budget could be badly overshot).
+///
+/// `Node`/`Rel`/`Point` and the temporals own nothing on the heap — they are
+/// plain scalars — so the enum slot already covers them.
+fn val_heap_bytes(v: &Val) -> usize {
+    const SLOT: usize = std::mem::size_of::<Val>();
     match v {
-        Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) => 16,
-        Val::Str(s) => s.len() + 16,
-        Val::List(xs) => 16 + xs.iter().map(val_bytes).sum::<usize>(),
-        Val::Vector(xs) => 16 + xs.len() * 4,
+        Val::Null | Val::Bool(_) | Val::Int(_) | Val::Float(_) => 0,
+        Val::Str(s) => s.capacity(),
+        Val::List(xs) => xs.capacity() * SLOT + xs.iter().map(val_heap_bytes).sum::<usize>(),
+        Val::Vector(xs) => xs.capacity() * std::mem::size_of::<f32>(),
         Val::Map(m) => {
-            16 + m
-                .iter()
-                .map(|(k, x)| k.len() + 16 + val_bytes(x))
-                .sum::<usize>()
+            m.capacity() * std::mem::size_of::<(String, Val)>()
+                + m.iter()
+                    .map(|(k, x)| k.capacity() + val_heap_bytes(x))
+                    .sum::<usize>()
         }
-        Val::Node(_) => 24,
-        Val::Rel { .. } => 40,
+        Val::Node(_) | Val::Rel { .. } | Val::Point { .. } => 0,
         Val::Path { nodes, rels } => {
-            16 + nodes.len() * 24 + rels.iter().map(val_bytes).sum::<usize>()
+            nodes.capacity() * std::mem::size_of::<u64>()
+                + rels.capacity() * SLOT
+                + rels.iter().map(val_heap_bytes).sum::<usize>()
         }
-        Val::Point { .. } => 32,
-        Val::Date(_) | Val::Time(_) | Val::DateTime(_) | Val::Duration(_) => 24,
+        Val::Date(_) | Val::Time(_) | Val::DateTime(_) | Val::Duration(_) => 0,
     }
 }
 

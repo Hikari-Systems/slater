@@ -12510,3 +12510,83 @@ async fn per_ip_cap_rejects_excess_from_one_source() {
         Err(_) => panic!("server neither served nor rejected the per-IP excess"),
     }
 }
+
+/// The result-pool byte estimate must cover the *allocated* footprint of a
+/// result — every `String`'s capacity and every `Vec`'s capacity, including the
+/// nested ones — not just a flat per-value constant (HIK-141).
+///
+/// The bound below is derived from the construction of `r` (we know exactly how
+/// many strings of what length, and how many `Vec` slots, were built), **not**
+/// by running a second estimator over the same data — asserting `impl A == impl
+/// B` would only prove the two agree. It is a floor: the estimate may legally be
+/// larger (allocator slack, per-entry bookkeeping), never smaller.
+#[test]
+fn result_byte_estimate_covers_string_and_container_capacity() {
+    use std::mem::size_of;
+
+    const VAL: usize = size_of::<Val>();
+    const PAIR: usize = size_of::<(String, Val)>();
+    const ROWS: usize = 8;
+    const KEY_A: &str = "a_reasonably_long_map_key";
+    const KEY_B: &str = "another_map_key_here";
+    const COL_A: &str = "a_very_long_column_name_that_is_not_short";
+    const COL_B: &str = "another_long_column_name_for_the_second_column";
+    const VEC_LEN: usize = 32;
+
+    let s = |n: usize| "x".repeat(n); // `repeat` allocates exactly `n` bytes
+
+    let rows: Vec<Vec<Val>> = (0..ROWS)
+        .map(|i| {
+            vec![
+                Val::Str(s(512 + i)),
+                Val::List(vec![
+                    Val::Str(s(256)),
+                    Val::List(vec![Val::Str(s(128)), Val::Int(i as i64)]),
+                    Val::Map(vec![
+                        (KEY_A.to_string(), Val::Str(s(64))),
+                        (KEY_B.to_string(), Val::Vector(vec![0.5f32; VEC_LEN])),
+                    ]),
+                ]),
+            ]
+        })
+        .collect();
+    let r = QueryResult {
+        columns: vec![COL_A.to_string(), COL_B.to_string()],
+        rows,
+    };
+
+    // Per row, counted off the literal above:
+    //   outer row `Vec<Val>`               2 slots
+    //   Str(512+i)                         512+i bytes of `String` heap
+    //   List of 3                          3 slots
+    //     Str(256)                         256
+    //     List of 2                        2 slots + 128
+    //     Map of 2                         2 `(String, Val)` slots
+    //       KEY_A -> Str(64)               KEY_A.len() + 64
+    //       KEY_B -> Vector(VEC_LEN)       KEY_B.len() + VEC_LEN * 4
+    let per_row_fixed = 2 * VAL
+        + 3 * VAL
+        + 256
+        + 2 * VAL
+        + 128
+        + 2 * PAIR
+        + KEY_A.len()
+        + 64
+        + KEY_B.len()
+        + VEC_LEN * size_of::<f32>();
+    let strings: usize = (0..ROWS).map(|i| 512 + i).sum();
+    let floor = size_of::<QueryResult>()
+        + 2 * size_of::<String>()
+        + COL_A.len()
+        + COL_B.len()
+        + ROWS * size_of::<Vec<Val>>()
+        + ROWS * per_row_fixed
+        + strings;
+
+    let est = estimate_result_bytes(&r);
+    assert!(
+        est >= floor,
+        "estimate {est} under-counts the result's allocated footprint; it must be \
+         at least {floor} bytes (summed String/Vec capacities + owning struct sizes)"
+    );
+}

@@ -321,8 +321,9 @@ docker run -d --name slater -p 7687:7687 \
 
 ## Memory & cache behaviour
 
-Resident memory ≈ `blockCacheBytes + vectorCacheBytes + resultCacheBytes` plus a
-small fixed overhead — it does **not** grow with graph size. The three pools are
+Resident memory tracks `blockCacheBytes + vectorCacheBytes + resultCacheBytes`
+to within bounded per-entry and allocator overhead, plus a small fixed overhead
+— it does **not** grow with graph size. The three pools are
 isolated on purpose so a vector-heavy query can't evict hot graph blocks (and
 vice versa); tune the split with the budgets above.
 
