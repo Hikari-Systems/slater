@@ -8442,6 +8442,15 @@ fn carried_vamana_bytes(data: &Path, graph: &str, gen: &Generation) -> Vec<u8> {
     panic!("no carried .vamana found under {}", vecidx.display());
 }
 
+/// Whether two paths are the same inode — i.e. whether the carry hard-linked rather than
+/// copied. `None` when either is missing.
+#[cfg(test)]
+fn same_inode(a: &Path, b: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (a, b) = (std::fs::metadata(a).ok()?, std::fs::metadata(b).ok()?);
+    Some(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
 /// HIK-145: the **encrypted** arm of carry-by-reference — the configuration that had no test
 /// and in which the carry had therefore never worked.
 ///
@@ -8593,6 +8602,72 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     probe(&reopened, "after restart");
     drop(reopened);
 
+    // The optimisation must survive being encrypted: the artifact is a hard link to the
+    // original inode, not a re-sealed 370 GB copy.
+    let vecidx = data.join("docs").join("vecidx");
+    let artifact_dir = std::fs::read_dir(&vecidx)
+        .expect("an encrypted carry must publish a vecidx/ artifact")
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("Doc.embedding.vamana").exists())
+        .expect("the artifact must hold the carried graph file");
+    assert_eq!(
+        same_inode(&artifact_dir.join("Doc.embedding.vamana"), &base_vamana),
+        Some(true),
+        "an encrypted carry must hard-link the base inode, not re-seal its bytes"
+    );
+
+    // ── Test 3 (HIK-144 parity): a MAC-stripped artifact manifest, under a configured key.
+    let json = artifact_dir.join("VECIDX.json");
+    let sealed_json = std::fs::read(&json).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_slice(&sealed_json).unwrap();
+    assert!(
+        doc.get("mac").is_some_and(|m| !m.is_null()),
+        "an encrypted carry must seal its artifact manifest in the first place"
+    );
+    let real_mac = doc["mac"].clone();
+    doc["mac"] = serde_json::Value::Null;
+    std::fs::write(&json, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let err = match Graphs::open_all(&data, Some(&key)) {
+        Ok(_) => panic!("a MAC-stripped carried artifact must be refused under a key"),
+        Err(e) => e,
+    };
+    assert!(
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<graph_format::crypto::MacRejected>(),
+            Some(graph_format::crypto::MacRejected::Missing { .. })
+        )),
+        "must be refused by type, not by chance: {err:#}"
+    );
+
+    // ── Test 4: an artifact sealed under a *different* master key. Everything else in the
+    // image is sealed under the real one, so this isolates the artifact — it must fail
+    // closed with a readable refusal, never decrypt to garbage.
+    doc["mac"] = real_mac;
+    let mut m: graph_format::vecmanifest::VectorIndexManifest =
+        serde_json::from_value(doc).unwrap();
+    m.seal_mac(b"a completely different operator master key")
+        .unwrap();
+    std::fs::write(&json, m.to_bytes().unwrap()).unwrap();
+    let err = match Graphs::open_all(&data, Some(&key)) {
+        Ok(_) => panic!("an artifact sealed under another key must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<graph_format::crypto::MacRejected>(),
+            Some(graph_format::crypto::MacRejected::Mismatch { .. })
+        )),
+        "must be a typed MAC mismatch, not a block-decrypt failure or garbage: {err:#}"
+    );
+
+    // Restored, the image opens again — proving the two refusals above were caused by the
+    // tampering and nothing else.
+    std::fs::write(&json, &sealed_json).unwrap();
+    assert!(
+        Graphs::open_all(&data, Some(&key)).is_ok(),
+        "the untampered image must still open"
+    );
+
     std::fs::remove_dir_all(&work).ok();
 }
 
@@ -8700,19 +8775,28 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
         matches!(vidx[0].mode, AnnMode::Vamana { .. }),
         "a carried Vamana base must stay Vamana, not be rebuilt as brute-force"
     );
-    let new_vamana = data
-        .join("docs")
-        .join(gen1.base_uuid().to_string())
-        .join("vector/Doc.embedding.vamana");
-    assert_ne!(
-        new_vamana, base_vamana,
-        "the consolidation must publish a new generation"
-    );
+    // HIK-145: the carried graph now lives in its own `vecidx/<uuid>/` artifact rather than
+    // inside the new generation's directory — one carry path for plaintext and encrypted
+    // alike, because two structurally different paths are exactly what let the encrypted
+    // arm go untested for the whole life of the feature. What must not regress for an
+    // unencrypted deployment is the *optimisation*: byte-identical, and still a hard link
+    // (the same inode as the base), never a 370 GB copy.
+    let carried = carried_vamana_bytes(&data, "docs", gen1.as_ref());
     assert_eq!(
-        std::fs::read(&new_vamana).unwrap(),
-        base_bytes,
+        carried, base_bytes,
         "a pure-permutation consolidation must carry the .vamana byte-identically — this is \
              the BLAKE3-unchanged thesis at the server level"
+    );
+    let vecidx = data.join("docs").join("vecidx");
+    let artifact_file = std::fs::read_dir(&vecidx)
+        .expect("a carry must publish a vecidx/ artifact")
+        .map(|e| e.unwrap().path().join("Doc.embedding.vamana"))
+        .find(|p| p.exists())
+        .expect("the artifact must hold the carried graph file");
+    assert_eq!(
+        same_inode(&artifact_file, &base_vamana),
+        Some(true),
+        "the plaintext carry must still be a hard link to the base inode, not a copy"
     );
 
     // The data has to be the real thing, not zeros: query with node 7's own embedding
