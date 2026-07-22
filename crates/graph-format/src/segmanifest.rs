@@ -249,7 +249,7 @@ impl SegmentManifest {
     /// `mac` cleared, serialised compactly as JSON. Deterministic (serde fixes field
     /// order; every collection is an order-stable `Vec`).
     ///
-    /// The domain is [`crate::crypto::MAC_DOMAIN_SEGMENT_MANIFEST`] — *different* from the
+    /// The domain is [`crate::crypto::MacDomain::SegmentManifest`] — *different* from the
     /// generation manifest's — so a `SEGMENT.json` and a `MANIFEST.json` can never
     /// cross-verify under the same master key. The tag carries [`crate::FORMAT_VERSION`],
     /// so the MAC scheme cannot drift from the on-disk format version.
@@ -271,7 +271,7 @@ impl SegmentManifest {
         canon.mac = None;
         let body = serde_json::to_vec(&canon).context("serialise segment manifest for MAC")?;
         Ok(crate::crypto::mac_preimage(
-            crate::crypto::MAC_DOMAIN_SEGMENT_MANIFEST,
+            crate::crypto::MacDomain::SegmentManifest,
             &body,
         ))
     }
@@ -581,7 +581,7 @@ mod tests {
         let key = crate::crypto::derive_manifest_mac_key(master);
         let foreign = crate::crypto::manifest_mac(
             &key,
-            &crate::crypto::mac_preimage(crate::crypto::MAC_DOMAIN_MANIFEST, &body),
+            &crate::crypto::mac_preimage(crate::crypto::MacDomain::Manifest, &body),
         );
         assert_ne!(
             Some(foreign),

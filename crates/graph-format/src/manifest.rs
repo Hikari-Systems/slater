@@ -486,7 +486,7 @@ impl Manifest {
         canon.mac = None;
         let body = serde_json::to_vec(&canon).context("serialise manifest for MAC")?;
         Ok(crate::crypto::mac_preimage(
-            crate::crypto::MAC_DOMAIN_MANIFEST,
+            crate::crypto::MacDomain::Manifest,
             &body,
         ))
     }
@@ -1137,11 +1137,11 @@ mod tests {
         let body = b"identical bytes";
         let a = crate::crypto::manifest_mac(
             &key,
-            &crate::crypto::mac_preimage(crate::crypto::MAC_DOMAIN_MANIFEST, body),
+            &crate::crypto::mac_preimage(crate::crypto::MacDomain::Manifest, body),
         );
         let b = crate::crypto::manifest_mac(
             &key,
-            &crate::crypto::mac_preimage(crate::crypto::MAC_DOMAIN_SEGMENT_MANIFEST, body),
+            &crate::crypto::mac_preimage(crate::crypto::MacDomain::SegmentManifest, body),
         );
         assert_ne!(a, b, "the two manifest kinds must be domain-separated");
     }
