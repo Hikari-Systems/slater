@@ -81,8 +81,9 @@ the authenticated row above as covering the core generation.
   sealed with XChaCha20-Poly1305 under a per-generation block key = `BLAKE3::derive_key`
   over (master key ‖ per-generation salt), further bound to the file it lives in: the block
   key is `BLAKE3::derive_key("slater generation file key v1", gen_key ‖ store-relative file
-  name)` and the block's **ordinal within that file** is passed as AEAD associated data
-  (HIK-140). The salt lives in the manifest; the key never does. A wrong/absent key fails
+  name)`, and the AEAD associated data carries the block's **ordinal within that file**
+  together with the `raw_len`/`rec_count` its (plaintext) directory row claims — so a
+  forged directory row cannot re-index a file's records either (HIK-140). The salt lives in the manifest; the key never does. A wrong/absent key fails
   closed (the Poly1305 tag does not verify), and so does a block presented at the wrong
   ordinal or in the wrong file. This protects **block contents and block placement** at rest.
   The manifest's `encryption.aadScheme` records the binding (`file-block-v1`) and is

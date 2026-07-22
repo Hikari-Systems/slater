@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::codec;
-use crate::crypto::{BlockCipher, FileCipher, HEADER_ORDINAL, NONCE_LEN};
+use crate::crypto::{BlockAad, BlockCipher, FileCipher, HEADER_ORDINAL, NONCE_LEN};
 use crate::ids::Value;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
@@ -110,7 +110,10 @@ fn flush_isam_block(
     let (stored, nonce) = match cipher {
         Some(c) => {
             let nonce = BlockCipher::random_nonce();
-            (c.seal(ordinal, &nonce, &comp)?, Some(nonce))
+            (
+                c.seal(BlockAad::position_only(ordinal), &nonce, &comp)?,
+                Some(nonce),
+            )
         }
         None => (comp, None),
     };
@@ -216,7 +219,10 @@ where
     let (stored_top, top_nonce) = match &cipher {
         Some(c) => {
             let nonce = BlockCipher::random_nonce();
-            (c.seal(HEADER_ORDINAL, &nonce, &top_bytes)?, Some(nonce))
+            (
+                c.seal(BlockAad::position_only(HEADER_ORDINAL), &nonce, &top_bytes)?,
+                Some(nonce),
+            )
         }
         None => (top_bytes, None),
     };
@@ -684,7 +690,9 @@ impl IsamReader {
         src.read_exact_at(&mut stored_top, top_offset)?;
         // Unseal the top-level when encrypted (a wrong key is caught here, at open).
         let top_bytes = match (&cipher, &top_nonce) {
-            (Some(c), Some(nonce)) => c.open(HEADER_ORDINAL, nonce, &stored_top)?,
+            (Some(c), Some(nonce)) => {
+                c.open(BlockAad::position_only(HEADER_ORDINAL), nonce, &stored_top)?
+            }
             _ => stored_top,
         };
         let mut tr = &top_bytes[..];
@@ -761,7 +769,9 @@ impl IsamReader {
         let mut stored = vec![0u8; t.comp_len as usize];
         self.src.read_exact_at(&mut stored, t.offset)?;
         let comp = match (&self.cipher, &t.nonce) {
-            (Some(cipher), Some(nonce)) => cipher.open(b as u64, nonce, &stored)?,
+            (Some(cipher), Some(nonce)) => {
+                cipher.open(BlockAad::position_only(b as u64), nonce, &stored)?
+            }
             _ => stored,
         };
         codec::decompress(&comp, t.raw_len as usize)

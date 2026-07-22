@@ -40,7 +40,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::codec;
-use crate::crypto::{BlockCipher, FileCipher, NONCE_LEN};
+use crate::crypto::{BlockAad, BlockCipher, FileCipher, NONCE_LEN};
 use crate::ids::BlockId;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
@@ -272,6 +272,8 @@ fn seal_block(
     level: i32,
     cipher: Option<&FileCipher>,
     ordinal: usize,
+    first_record: u64,
+    rec_count: u32,
 ) -> Result<(Vec<u8>, Option<[u8; NONCE_LEN]>)> {
     let comp = match codec {
         BlockCodec::Zstd => codec::compress(raw, level)?,
@@ -282,7 +284,13 @@ fn seal_block(
     match cipher {
         Some(cipher) => {
             let nonce = BlockCipher::random_nonce();
-            let sealed = cipher.seal(ordinal as u64, &nonce, &comp)?;
+            // The AAD carries the directory row the reader will trust — the block's
+            // position, its raw length and its record count (HIK-140).
+            let sealed = cipher.seal(
+                BlockAad::block(ordinal, first_record, raw.len() as u32, rec_count),
+                &nonce,
+                &comp,
+            )?;
             Ok((sealed, Some(nonce)))
         }
         None => Ok((comp, None)),
@@ -307,6 +315,9 @@ pub struct BlockFileWriter {
     next_block: usize,
     /// Index of the next block to *write*. `dir.len()` always equals this.
     next_write: usize,
+    /// Records in every block submitted so far — the next block's global first-record
+    /// index, which is sealed into its AAD (HIK-140).
+    sealed_records: u64,
     /// In-flight seals, or `None` when sealing runs inline (a single seal worker).
     seal: Option<Arc<SealState>>,
 }
@@ -399,6 +410,7 @@ impl BlockFileWriter {
             cipher,
             next_block: 0,
             next_write: 0,
+            sealed_records: 0,
             seal: (seal_threads() > 1).then(SealState::new),
         })
     }
@@ -480,11 +492,23 @@ impl BlockFileWriter {
         };
         let idx = self.next_block;
         self.next_block += 1;
+        // The block's global first-record index. `flush_block` runs on the appending
+        // thread in block order, so every earlier block's count is already known even
+        // though the *seals* complete out of order (HIK-140).
+        let first_record = self.sealed_records;
+        self.sealed_records += count as u64;
 
         let Some(state) = self.seal.as_ref().map(Arc::clone) else {
             // Inline: the original single-threaded behaviour.
-            let (stored, nonce) =
-                seal_block(&raw, self.codec, self.level, self.cipher.as_deref(), idx)?;
+            let (stored, nonce) = seal_block(
+                &raw,
+                self.codec,
+                self.level,
+                self.cipher.as_deref(),
+                idx,
+                first_record,
+                count,
+            )?;
             return self.write_sealed(Sealed {
                 stored,
                 raw_len: raw.len() as u32,
@@ -504,7 +528,15 @@ impl BlockFileWriter {
         let st = Arc::clone(&state);
         let submitted = seal_pool().send(Box::new(move || {
             let raw_len = raw.len() as u32;
-            match seal_block(&raw, codec, level, cipher.as_deref(), idx) {
+            match seal_block(
+                &raw,
+                codec,
+                level,
+                cipher.as_deref(),
+                idx,
+                first_record,
+                count,
+            ) {
                 Ok((stored, nonce)) => {
                     st.done.lock().unwrap().insert(
                         idx,
@@ -698,6 +730,9 @@ pub fn concat_block_files(
         let mut db = vec![0u8; dir_len as usize];
         f.read_exact_at(&mut db, dir_offset)?;
         let mut dr = &db[..];
+        // The part-local first-record index each block was sealed at; the output's is the
+        // running `total_records` (HIK-140).
+        let mut local_records = 0u64;
         for local in 0..blocks {
             let offset = dr.read_u64::<LittleEndian>()?;
             let comp_len = dr.read_u32::<LittleEndian>()?;
@@ -717,15 +752,25 @@ pub fn concat_block_files(
                     let mut stored = vec![0u8; comp_len as usize];
                     f.read_exact_at(&mut stored, offset)
                         .with_context(|| format!("read block {local} of {}", inp.display()))?;
-                    let body = c.open(local, &nonce, &stored).with_context(|| {
-                        format!(
-                            "open block {local} of {} for re-sealing (was it sealed under \
-                             the output file's name?)",
-                            inp.display()
+                    let body = c
+                        .open(
+                            BlockAad::block(local as usize, local_records, raw_len, rec_count),
+                            &nonce,
+                            &stored,
                         )
-                    })?;
+                        .with_context(|| {
+                            format!(
+                                "open block {local} of {} for re-sealing (was it sealed under \
+                             the output file's name?)",
+                                inp.display()
+                            )
+                        })?;
                     nonce = BlockCipher::random_nonce();
-                    let resealed = c.seal(block_count, &nonce, &body)?;
+                    let resealed = c.seal(
+                        BlockAad::block(block_count as usize, total_records, raw_len, rec_count),
+                        &nonce,
+                        &body,
+                    )?;
                     debug_assert_eq!(resealed.len(), stored.len());
                     let at = out_pos;
                     out.write_all(&resealed)?;
@@ -742,6 +787,7 @@ pub fn concat_block_files(
             }
             block_count += 1;
             total_records += rec_count as u64;
+            local_records += rec_count as u64;
         }
     }
 
@@ -930,7 +976,11 @@ impl BlockFileReader {
     /// AEAD, so we unseal before inflating.
     fn decode_stored(&self, ordinal: usize, e: &DirEntry, stored: Vec<u8>) -> Result<Vec<u8>> {
         let comp = match (&self.cipher, &e.nonce) {
-            (Some(cipher), Some(nonce)) => cipher.open(ordinal as u64, nonce, &stored)?,
+            (Some(cipher), Some(nonce)) => cipher.open(
+                BlockAad::block(ordinal, self.block_start[ordinal], e.raw_len, e.rec_count),
+                nonce,
+                &stored,
+            )?,
             _ => stored,
         };
         // Raw blocks are stored verbatim (the unseal above already yielded the raw
@@ -1764,6 +1814,60 @@ mod tests {
             u64::from_le_bytes(f[8..16].try_into().unwrap()) as usize,
             u64::from_le_bytes(f[16..24].try_into().unwrap()) as usize,
         )
+    }
+
+    /// HIK-140: the block **directory** is plaintext and outside the AEAD, and
+    /// `rec_count` is what `block_start` (and therefore `locate`) is a prefix sum over.
+    /// Forge one and every block still opens — but a global record index resolves to the
+    /// wrong block and slot, which is a silently wrong answer from an attacker who never
+    /// had the key. So the seal binds the directory row's `raw_len` and `rec_count` too.
+    #[test]
+    fn a_forged_rec_count_cannot_reindex_the_records() {
+        use crate::crypto::AeadRejected;
+        let path = tmp("forged_rec_count");
+        let cipher = gen_cipher(b"master-key", &[5u8; 32]);
+        let mut w = BlockFileWriter::create_with_cipher(
+            &path,
+            64, // a handful of records per block
+            3,
+            Some(file_cipher(&cipher, "node_props.blk")),
+        )
+        .unwrap();
+        for i in 0..40u32 {
+            w.append_record(format!("record-{i:04}").as_bytes())
+                .unwrap();
+        }
+        let blocks = w.finish().unwrap();
+        assert!(blocks > 2, "want several blocks, got {blocks}");
+
+        // Read block 0's true record count, then understate it by one in the directory.
+        let truth = {
+            let r = BlockFileReader::open_with_cipher(
+                &path,
+                Some(file_cipher(&cipher, "node_props.blk")),
+            )
+            .unwrap();
+            r.dir[0].rec_count
+        };
+        assert!(truth > 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (dir_offset, _, _) = read_footer(&bytes);
+        let at = dir_offset + 16; // offset(8) ‖ comp_len(4) ‖ raw_len(4) ‖ >rec_count<
+        bytes[at..at + 4].copy_from_slice(&(truth - 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let r =
+            BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "node_props.blk")))
+                .unwrap();
+        let err = r
+            .read_record_global(truth as u64 - 1)
+            .expect_err("a forged rec_count must not silently re-index the records");
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "the directory row must be authenticated by the block's own seal: {err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// HIK-140: a sealed block carries its ordinal as AEAD associated data, so an

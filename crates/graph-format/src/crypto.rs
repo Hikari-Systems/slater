@@ -81,6 +81,10 @@ const FILE_KDF_CONTEXT: &str = "slater generation file key v1";
 /// MANIFEST `EncryptionHeader.aadScheme`. A generation that does not name exactly
 /// this scheme is refused (see [`AadSchemeRejected`]) — there is no legacy mode, so
 /// an image sealed without AAD binding fails closed rather than opening unbound.
+///
+/// `file-block-v1` is: a per-file subkey ([`BlockCipher::for_file`]) plus [`BlockAad`]
+/// — the block's ordinal within its file, and (for a block file, whose directory is
+/// plaintext) the `first_record`/`raw_len`/`rec_count` the reader is about to trust for it.
 pub const AAD_SCHEME: &str = "file-block-v1";
 
 /// Generate a fresh per-generation random salt.
@@ -260,18 +264,73 @@ pub struct FileCipher {
 /// it), so a leaf can never be presented as the top level.
 pub const HEADER_ORDINAL: u64 = u64::MAX;
 
-impl FileCipher {
-    /// The associated data a block at `ordinal` is sealed under. The file identity is
-    /// already in the key, so the AAD carries the position alone.
-    fn aad(ordinal: u64) -> [u8; 8] {
-        ordinal.to_le_bytes()
+/// What a block is sealed *as*: where it sits, and what the container's index claims about
+/// it. The file identity is already in the key, so this carries only the per-block part.
+///
+/// `first_record`/`rec_count`/`raw_len` are here because a block file's directory is
+/// **plaintext and outside the AEAD**, and the reader derives its global-record-index →
+/// `(block, slot)` mapping from it: `block_start` is the prefix sum of `rec_count`, and
+/// `locate` binary-searches that. Binding the ordinal alone does **not** close it — a
+/// forged `rec_count` on block *i* does not make the reader open block *i*, it silently
+/// redirects the lookup to block *i+1*, which then opens perfectly well at its own row.
+/// Binding each block's own *global first record* is what refuses that: the redirected
+/// block is asked for at a start it was not sealed at.
+///
+/// An ISAM index needs none of it: its per-block `raw_len` and location live *inside* the
+/// sealed top level, so they are already authenticated, and its blocks carry no global
+/// record index. Those use [`BlockAad::position_only`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockAad {
+    pub ordinal: u64,
+    /// Global index of this block's first record — `block_start[ordinal]`.
+    pub first_record: u64,
+    pub raw_len: u32,
+    pub rec_count: u32,
+}
+
+impl BlockAad {
+    /// A block-file block: ordinal plus the directory row the reader will trust.
+    pub fn block(ordinal: usize, first_record: u64, raw_len: u32, rec_count: u32) -> Self {
+        Self {
+            ordinal: ordinal as u64,
+            first_record,
+            raw_len,
+            rec_count,
+        }
     }
 
-    /// Seal a (compressed) block that lives at `ordinal` in this file. The returned
+    /// A block whose container authenticates its own index (the ISAM leaf/top levels):
+    /// position alone.
+    pub fn position_only(ordinal: u64) -> Self {
+        Self {
+            ordinal,
+            first_record: 0,
+            raw_len: 0,
+            rec_count: 0,
+        }
+    }
+
+    fn bytes(&self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..8].copy_from_slice(&self.ordinal.to_le_bytes());
+        out[8..16].copy_from_slice(&self.first_record.to_le_bytes());
+        out[16..20].copy_from_slice(&self.raw_len.to_le_bytes());
+        out[20..24].copy_from_slice(&self.rec_count.to_le_bytes());
+        out
+    }
+}
+
+impl FileCipher {
+    /// Seal a (compressed) block that lives at `aad.ordinal` in this file. The returned
     /// ciphertext is `plaintext.len()` + the 16-byte Poly1305 tag — the AAD is
     /// authenticated, not stored, so nothing on disk grows.
-    pub fn seal(&self, ordinal: u64, nonce: &[u8; NONCE_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let aad = Self::aad(ordinal);
+    pub fn seal(
+        &self,
+        aad: BlockAad,
+        nonce: &[u8; NONCE_LEN],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let aad = aad.bytes();
         self.aead
             .encrypt(
                 XNonce::from_slice(nonce),
@@ -283,16 +342,17 @@ impl FileCipher {
             .map_err(|_| anyhow::anyhow!("AEAD encryption failed"))
     }
 
-    /// Open a sealed block claimed to live at `ordinal` in this file. Fails with a
+    /// Open a sealed block claimed to live at `aad.ordinal` in this file, under the index
+    /// row `aad` the container is about to trust. Fails with a
     /// typed error — never a panic or garbage — when the key is wrong, the block was
     /// tampered with, or the block was sealed for a different file or ordinal.
     pub fn open(
         &self,
-        ordinal: u64,
+        aad: BlockAad,
         nonce: &[u8; NONCE_LEN],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        let aad = Self::aad(ordinal);
+        let aad = aad.bytes();
         self.aead
             .decrypt(
                 XNonce::from_slice(nonce),
@@ -426,14 +486,15 @@ mod tests {
         let cipher = BlockCipher::from_master(b"master", &random_salt()).for_file("node_props.blk");
         let nonce = BlockCipher::random_nonce();
         let plaintext = b"the quick brown fox compresses well well well".repeat(8);
-        let sealed = cipher.seal(7, &nonce, &plaintext).unwrap();
+        let aad = BlockAad::block(7, 21, plaintext.len() as u32, 3);
+        let sealed = cipher.seal(aad, &nonce, &plaintext).unwrap();
         assert_eq!(
             sealed.len(),
             plaintext.len() + 16,
             "ciphertext carries a tag, and the AAD adds nothing on disk"
         );
         assert_ne!(sealed, plaintext);
-        assert_eq!(cipher.open(7, &nonce, &sealed).unwrap(), plaintext);
+        assert_eq!(cipher.open(aad, &nonce, &sealed).unwrap(), plaintext);
     }
 
     #[test]
@@ -442,11 +503,11 @@ mod tests {
         let nonce = BlockCipher::random_nonce();
         let sealed = BlockCipher::from_master(b"right", &salt)
             .for_file("node_props.blk")
-            .seal(0, &nonce, b"payload")
+            .seal(BlockAad::position_only(0), &nonce, b"payload")
             .unwrap();
         let err = BlockCipher::from_master(b"wrong", &salt)
             .for_file("node_props.blk")
-            .open(0, &nonce, &sealed)
+            .open(BlockAad::position_only(0), &nonce, &sealed)
             .unwrap_err();
         assert_eq!(
             err.downcast_ref::<AeadRejected>(),
@@ -458,9 +519,12 @@ mod tests {
     fn tampered_ciphertext_refuses_cleanly() {
         let cipher = BlockCipher::from_master(b"master", &random_salt()).for_file("edge_props.blk");
         let nonce = BlockCipher::random_nonce();
-        let mut sealed = cipher.seal(0, &nonce, b"payload bytes here").unwrap();
+        let aad = BlockAad::position_only(0);
+        let mut sealed = cipher.seal(aad, &nonce, b"payload bytes here").unwrap();
         sealed[0] ^= 0xff; // flip a bit
-        assert!(cipher.open(0, &nonce, &sealed).is_err());
+        assert!(cipher
+            .open(BlockAad::position_only(0), &nonce, &sealed)
+            .is_err());
     }
 
     /// HIK-140: a block is bound to (file, ordinal). Neither may drift.
@@ -469,19 +533,23 @@ mod tests {
         let gen = BlockCipher::from_master(b"master", &random_salt());
         let nonce = BlockCipher::random_nonce();
         let msg = b"the block body";
-        let sealed = gen.for_file("node_props.blk").seal(3, &nonce, msg).unwrap();
+        let aad = BlockAad::block(3, 3, msg.len() as u32, 1);
+        let sealed = gen
+            .for_file("node_props.blk")
+            .seal(aad, &nonce, msg)
+            .unwrap();
 
         // Its own (file, ordinal): opens.
         assert_eq!(
             gen.for_file("node_props.blk")
-                .open(3, &nonce, &sealed)
+                .open(aad, &nonce, &sealed)
                 .unwrap(),
             msg
         );
         // Same file, another ordinal: refused.
         assert_eq!(
             gen.for_file("node_props.blk")
-                .open(4, &nonce, &sealed)
+                .open(BlockAad { ordinal: 4, ..aad }, &nonce, &sealed)
                 .unwrap_err()
                 .downcast_ref::<AeadRejected>(),
             Some(&AeadRejected::TagMismatch)
@@ -489,7 +557,7 @@ mod tests {
         // Same ordinal, another file of the same generation: refused.
         assert_eq!(
             gen.for_file("edge_props.blk")
-                .open(3, &nonce, &sealed)
+                .open(aad, &nonce, &sealed)
                 .unwrap_err()
                 .downcast_ref::<AeadRejected>(),
             Some(&AeadRejected::TagMismatch)
@@ -497,7 +565,41 @@ mod tests {
         // The reserved header ordinal is not reachable by a leaf either.
         assert!(gen
             .for_file("node_props.blk")
-            .open(HEADER_ORDINAL, &nonce, &sealed)
+            .open(
+                BlockAad {
+                    ordinal: HEADER_ORDINAL,
+                    ..aad
+                },
+                &nonce,
+                &sealed
+            )
+            .is_err());
+        // …and neither may the directory row the reader is about to trust drift.
+        assert!(gen
+            .for_file("node_props.blk")
+            .open(
+                BlockAad {
+                    rec_count: 2,
+                    ..aad
+                },
+                &nonce,
+                &sealed
+            )
+            .is_err());
+        assert!(gen
+            .for_file("node_props.blk")
+            .open(BlockAad { raw_len: 99, ..aad }, &nonce, &sealed)
+            .is_err());
+        assert!(gen
+            .for_file("node_props.blk")
+            .open(
+                BlockAad {
+                    first_record: 2,
+                    ..aad
+                },
+                &nonce,
+                &sealed
+            )
             .is_err());
     }
 
