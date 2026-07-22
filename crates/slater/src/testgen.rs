@@ -749,6 +749,17 @@ pub fn write_indexed_people_at_keyed(
     }
     manifest.write_to_dir(&dir).unwrap();
 
+    // A keyed fixture also publishes its singleton set manifest, sealed — the builder
+    // does, and under a key a reader refuses both an unsealed set and an absent one
+    // (HIK-144: the implicit-singleton fallback is itself a composition downgrade).
+    if let Some(key) = master_key {
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = graph_format::setmanifest::SetManifest::singleton(GenId(uuid), 0);
+        set.seal_mac(key).unwrap();
+        std::fs::write(sets.join(format!("{uuid}.json")), set.to_bytes().unwrap()).unwrap();
+    }
+
     std::fs::write(
         root.join(&graph).join("current"),
         format!("{}\n", uuid.hyphenated()),

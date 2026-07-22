@@ -350,10 +350,15 @@ fn unstamped_generation_ignored_unless_required() {
     assert!(graphs.verify_manifest_policy().is_err());
 }
 
-/// Re-seal every generation manifest of `graph` with a MAC under `key`, as an
-/// encrypted build would. (The fixture data stays plaintext; the MAC path is
-/// independent of whether blocks are encrypted.)
+/// Re-seal every generation manifest of `graph` with a MAC under `key` — and publish a
+/// sealed singleton set manifest for each — as an encrypted build would. (The fixture
+/// data stays plaintext; the MAC path is independent of whether blocks are encrypted.)
+/// Both documents are needed: under a key HIK-144 requires the *composition* to be
+/// authenticated as well, so a sealed MANIFEST beside an absent or unsealed set is
+/// refused.
 fn reseal_manifest_with_mac(root: &Path, graph: &str, key: &[u8]) {
+    let sets = root.join(graph).join("sets");
+    std::fs::create_dir_all(&sets).unwrap();
     for entry in std::fs::read_dir(root.join(graph)).unwrap() {
         let man = entry.unwrap().path().join("MANIFEST.json");
         if man.exists() {
@@ -361,6 +366,15 @@ fn reseal_manifest_with_mac(root: &Path, graph: &str, key: &[u8]) {
                 serde_json::from_str(&std::fs::read_to_string(&man).unwrap()).unwrap();
             m.seal_mac(key).unwrap();
             std::fs::write(&man, m.to_json().unwrap()).unwrap();
+
+            let uuid = m.build_uuid;
+            let mut set = graph_format::setmanifest::SetManifest::singleton(uuid, 0);
+            set.seal_mac(key).unwrap();
+            std::fs::write(
+                sets.join(format!("{}.json", uuid.0)),
+                set.to_bytes().unwrap(),
+            )
+            .unwrap();
         }
     }
 }
@@ -390,14 +404,27 @@ fn manifest_mac_catches_tamper_through_open() {
 #[test]
 fn keyed_server_refuses_macless_generation_unconditionally() {
     let (root, _g, _) = testgen::write_basic("require_mac");
-    let acl_path = write_acl(&root);
-    // The plaintext fixture carries no MAC; a server configured with a master
-    // key must refuse it (the MAC-strip downgrade guard). This is deliberately
-    // not a policy flag — there is no legitimate keyed-but-unauthenticated
-    // deployment, so there is nothing to configure.
-    let mut graphs = Graphs::open_all(&root, Some(b"master")).unwrap();
-    graphs.set_manifest_policy(Some(acl_path), false);
-    assert!(graphs.verify_manifest_policy().is_err());
+    let _acl_path = write_acl(&root);
+    // The plaintext fixture carries no MAC; a server configured with a master key must
+    // refuse it (the MAC-strip downgrade guard). This is deliberately not a policy flag —
+    // there is no legitimate keyed-but-unauthenticated deployment, so there is nothing to
+    // configure.
+    //
+    // HIK-144 moved *where* that refusal happens: it is now enforced at open, so the
+    // server never even holds an unauthenticated generation, rather than opening it and
+    // rejecting it a step later in `verify_manifest_policy`. Refusing earlier is what
+    // makes every other opener (`slater query`, consolidation, the benchmarks) inherit
+    // the same policy.
+    let err = Graphs::open_all(&root, Some(b"master"))
+        .err()
+        .expect("a keyed server must refuse an unauthenticated generation at open");
+    assert!(
+        err.chain().any(|e| matches!(
+            e.downcast_ref::<graph_format::crypto::MacRejected>(),
+            Some(graph_format::crypto::MacRejected::Missing { .. })
+        )),
+        "must be refused by type: {err:#}"
+    );
 }
 
 /// A `DeltaConfig` with the writable layer on and a throwaway WAL directory.
@@ -11691,9 +11718,13 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 /// Copy `graph`'s live generation directory to a fresh UUID, optionally
 /// truncating `corrupt` (a path relative to the generation dir) in the copy to
 /// simulate a half-rsynced generation, then republish `current` to name the new
-/// UUID. Returns the new UUID. A generation's identity is its `current` pointer
-/// (the recorded MANIFEST `build_uuid` is not re-checked on open), so a
-/// byte-identical copy republished under a new UUID validates and opens cleanly.
+/// UUID. Returns the new UUID.
+///
+/// The copy's MANIFEST is restamped with the new `build_uuid`, because a generation is
+/// no longer identified by its `current` pointer alone: HIK-144 requires the MANIFEST to
+/// agree that it *is* the generation the set names, so that a directory cannot be
+/// swapped underneath an authenticated set. A real publisher (the builder) writes that
+/// field itself; only this hand-rolled copy has to restamp it.
 fn publish_copy_as_new_generation(root: &Path, graph: &str, corrupt: Option<&str>) -> uuid::Uuid {
     let graph_dir = root.join(graph);
     let old = std::fs::read_to_string(graph_dir.join("current")).unwrap();
@@ -11701,6 +11732,13 @@ fn publish_copy_as_new_generation(root: &Path, graph: &str, corrupt: Option<&str
     let src = graph_dir.join(old.trim());
     let dst = graph_dir.join(new_uuid.to_string());
     copy_dir_all(&src, &dst);
+    {
+        let man = dst.join("MANIFEST.json");
+        let mut m: graph_format::manifest::Manifest =
+            serde_json::from_str(&std::fs::read_to_string(&man).unwrap()).unwrap();
+        m.build_uuid = GenId(new_uuid);
+        std::fs::write(&man, m.to_json().unwrap()).unwrap();
+    }
     if let Some(rel) = corrupt {
         let victim = dst.join(rel);
         let mut bytes = std::fs::read(&victim).unwrap();

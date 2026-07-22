@@ -232,6 +232,211 @@ mod tests {
         Generation(uuid::Uuid::from_u128(n))
     }
 
+    /// A fully populated set — a base plus two segments — so the golden preimage below
+    /// pins every field that carries composition.
+    fn golden_set_manifest() -> SetManifest {
+        SetManifest {
+            magic: SET_MAGIC.to_string(),
+            version: SET_VERSION,
+            set_uuid: uuid(0x1234_5678),
+            base: uuid(0x9abc_def0),
+            segments: vec![
+                SegmentRef {
+                    uuid: uuid(0x11),
+                    node_band: (50, 60),
+                    edge_band: (200, 205),
+                    content_hash: "aabb".into(),
+                },
+                SegmentRef {
+                    uuid: uuid(0x22),
+                    node_band: (60, 61),
+                    edge_band: (205, 205),
+                    content_hash: "ccdd".into(),
+                },
+            ],
+            created_unix: 1_700_000_000,
+            mac: None,
+        }
+    }
+
+    /// The exact MAC body for [`golden_set_manifest`]. Changing it invalidates every set
+    /// MAC in existence, so it is pinned rather than recomputed.
+    ///
+    /// Note the field names are **snake_case**: unlike `MANIFEST.json` and `SEGMENT.json`
+    /// this struct carries no `rename_all = "camelCase"`, and the on-disk set format is
+    /// what it is. Renaming for consistency would be a format break, so the golden pins
+    /// the spelling that exists.
+    const GOLDEN_SET_BODY: &str = r#"{"magic":"SLSET01","version":1,"set_uuid":"00000000-0000-0000-0000-000012345678","base":"00000000-0000-0000-0000-00009abcdef0","segments":[{"uuid":"00000000-0000-0000-0000-000000000011","node_band":[50,60],"edge_band":[200,205],"content_hash":"aabb"},{"uuid":"00000000-0000-0000-0000-000000000022","node_band":[60,61],"edge_band":[205,205],"content_hash":"ccdd"}],"created_unix":1700000000,"mac":null}"#;
+
+    /// HIK-144, on HIK-142's framing: pin the set manifest's MAC preimage.
+    #[test]
+    fn mac_preimage_body_is_pinned_to_a_golden_shape() {
+        let pre = crate::crypto::mac_message(&golden_set_manifest()).unwrap();
+
+        let tag = format!("slater.set-manifest.mac.v{}\0", crate::FORMAT_VERSION);
+        assert!(
+            pre.starts_with(tag.as_bytes()),
+            "preimage must open with the versioned domain tag"
+        );
+        let hdr = tag.len();
+        let len = u64::from_le_bytes(pre[hdr..hdr + 8].try_into().unwrap());
+        let body = std::str::from_utf8(&pre[hdr + 8..]).unwrap();
+        assert_eq!(
+            len as usize,
+            body.len(),
+            "length prefix must state the body"
+        );
+        assert_eq!(
+            body, GOLDEN_SET_BODY,
+            "the set MAC preimage body changed — a field was added, reordered or \
+             reformatted. Confirm the change is intended, then re-pin (it invalidates \
+             every existing set MAC)."
+        );
+        // The body must actually carry the composition, or the MAC authenticates nothing
+        // that matters.
+        assert!(
+            body.contains("00000000-0000-0000-0000-00009abcdef0"),
+            "base"
+        );
+        assert!(
+            body.contains("00000000-0000-0000-0000-000000000011"),
+            "seg 1"
+        );
+        assert!(
+            body.contains("00000000-0000-0000-0000-000000000022"),
+            "seg 2"
+        );
+    }
+
+    /// The set manifest is its own MAC namespace: the same body under the generation or
+    /// segment domain must not reproduce its MAC.
+    #[test]
+    fn set_mac_does_not_verify_under_another_domain() {
+        use crate::crypto::MacSealed as _;
+        let master = b"operator master key";
+        let mut m = golden_set_manifest();
+        m.seal_mac(master).unwrap();
+        m.verify_mac(master).unwrap();
+
+        let body = {
+            let mut canon = m.clone();
+            canon.mac = None;
+            canon.mac_body().unwrap()
+        };
+        let key = crate::crypto::derive_manifest_mac_key(master);
+        for foreign_domain in [
+            crate::crypto::MacDomain::Manifest,
+            crate::crypto::MacDomain::SegmentManifest,
+        ] {
+            let foreign = crate::crypto::manifest_mac(
+                &key,
+                &crate::crypto::mac_preimage(foreign_domain, &body),
+            );
+            assert_ne!(
+                Some(foreign),
+                m.mac,
+                "a set MAC must not be reproducible under {foreign_domain:?}"
+            );
+        }
+    }
+
+    /// HIK-144: the MAC covers the *composition*, so every recomposition an attacker
+    /// could attempt against a set pointer must fail verification — not just an edit to
+    /// some incidental field.
+    #[test]
+    fn the_mac_covers_every_part_of_the_composition() {
+        let master = b"operator master key";
+        let mut sealed = golden_set_manifest();
+        sealed.seal_mac(master).unwrap();
+        sealed.verify_mac(master).unwrap();
+
+        // Each recomposition keeps the stolen MAC and changes one thing about *what is
+        // served*: a different base, a dropped segment, a reordered stack (precedence!),
+        // an added segment, and a segment whose contents were swapped underneath it.
+        let mut rolled_back_base = sealed.clone();
+        rolled_back_base.base = uuid(0xdead);
+
+        let mut dropped_segment = sealed.clone();
+        dropped_segment.segments.pop();
+
+        let mut reordered = sealed.clone();
+        reordered.segments.reverse();
+
+        let mut added_segment = sealed.clone();
+        added_segment.segments.push(SegmentRef {
+            uuid: uuid(0x33),
+            node_band: (61, 62),
+            edge_band: (205, 206),
+            content_hash: "eeff".into(),
+        });
+
+        let mut swapped_contents = sealed.clone();
+        swapped_contents.segments[0].content_hash = "0000".into();
+
+        let mut renamed_set = sealed.clone();
+        renamed_set.set_uuid = uuid(0xbeef);
+
+        for (what, tampered) in [
+            ("base rolled back", rolled_back_base),
+            ("segment dropped", dropped_segment),
+            ("stack reordered", reordered),
+            ("segment added", added_segment),
+            ("segment contents swapped", swapped_contents),
+            ("set renamed", renamed_set),
+        ] {
+            let err = tampered
+                .verify_mac(master)
+                .expect_err("recomposition must not verify: {what}");
+            assert!(
+                matches!(
+                    err.downcast_ref::<crate::crypto::MacRejected>(),
+                    Some(crate::crypto::MacRejected::Mismatch { .. })
+                ),
+                "{what}: must be refused by type: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsealed_set_is_rejected_under_a_key_and_fine_without_one() {
+        let plain = golden_set_manifest(); // mac: None — a plaintext deployment's set
+        assert!(
+            crate::crypto::authenticate(&plain, None).is_ok(),
+            "no key configured ⇒ nothing to authenticate"
+        );
+        let err = crate::crypto::authenticate(&plain, Some(b"key"))
+            .expect_err("a key configured ⇒ the MAC is required");
+        assert!(matches!(
+            err.downcast_ref::<crate::crypto::MacRejected>(),
+            Some(crate::crypto::MacRejected::Missing { .. })
+        ));
+    }
+
+    /// A validly sealed set manifest moved to another set's key must be refused: the MAC
+    /// covers `set_uuid`, not the location it is stored at, so only the read path can
+    /// bind the two.
+    #[test]
+    fn a_sealed_set_manifest_cannot_be_moved_to_another_key() {
+        let master = b"operator master key";
+        let mut m = golden_set_manifest();
+        m.seal_mac(master).unwrap();
+
+        let store = MemObjectStore::new();
+        // Stored under a *different* uuid than it declares.
+        let elsewhere = uuid(0x7777);
+        store
+            .put(
+                &SetManifest::key("g", elsewhere),
+                &m.to_bytes().unwrap(),
+                None,
+            )
+            .unwrap();
+
+        let err = SetManifest::read_via(&store, "g", elsewhere)
+            .expect_err("a set manifest stored under a foreign uuid must be refused");
+        assert!(format!("{err:#}").contains("different uuid"), "{err:#}");
+    }
+
     #[test]
     fn singleton_ties_set_to_base() {
         let base = uuid(0x1234);

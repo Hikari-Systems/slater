@@ -249,7 +249,14 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
     // pointer, so `current` only ever names a set whose manifest is fully written.
     // Set uuid == generation uuid in a singleton, so `current` keeps naming the
     // generation directory (nothing that reads `current` changes).
-    let set = graph_format::setmanifest::SetManifest::singleton(inp.generation, now_unix());
+    // Sealed under the same master key as the MANIFEST when the build is keyed (HIK-144):
+    // the set names the base generation, so it is the document that authenticates the
+    // *composition*. A keyed reader refuses a set that carries no MAC, so this seal is
+    // what makes an encrypted build openable at all.
+    let mut set = graph_format::setmanifest::SetManifest::singleton(inp.generation, now_unix());
+    if let Some(key) = inp.encryption_key {
+        set.seal_mac(key)?;
+    }
     let sets_dir = inp.graph_dir.join("sets");
     fs::create_dir_all(&sets_dir).with_context(|| format!("create {}", sets_dir.display()))?;
     let set_path = sets_dir.join(format!("{}.json", inp.generation.0));
@@ -278,6 +285,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
             inp.generation,
             inp.final_dir,
             &manifest.files,
+            &set,
         )
         .with_context(|| format!("upload generation {} to object store", inp.generation.0))?;
     }
@@ -301,6 +309,7 @@ fn upload_generation(
     generation: Generation,
     dir: &Path,
     files: &[graph_format::manifest::FileEntry],
+    set: &graph_format::setmanifest::SetManifest,
 ) -> Result<()> {
     let base = join_key(graph, &generation.0.to_string());
     for fe in files {
@@ -318,7 +327,9 @@ fn upload_generation(
         .context("upload MANIFEST.json")?;
     // The singleton set manifest, then the `current` pointer last — the same
     // publish barrier as the local path (`current` only names a fully-uploaded set).
-    let set = graph_format::setmanifest::SetManifest::singleton(generation, now_unix());
+    // The *same* set the local publish wrote, MAC and all: re-deriving one here would
+    // upload a second document with a different `created_unix`, whose MAC (if it were
+    // sealed at all) would cover different bytes (HIK-144).
     store
         .put(
             &graph_format::setmanifest::SetManifest::key(graph, generation),

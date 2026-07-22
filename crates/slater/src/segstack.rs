@@ -154,16 +154,14 @@ impl CoreStack {
             let manifest = SegmentManifest::read_via(store, graph, uuid)
                 .with_context(|| format!("read SEGMENT.json for segment {uuid} of {graph}"))?;
 
-            // Authenticate the manifest before trusting any field. The keyed MAC (when a key
-            // is configured and the segment carries one) authenticates the content hash, the
-            // file inventory, bands and the encryption header — mirroring the base MANIFEST.
-            if let Some(key) = master_key {
-                if manifest.mac.is_some() {
-                    manifest.verify_mac(key).with_context(|| {
-                        format!("verify SEGMENT.json MAC for segment {uuid} of {graph}")
-                    })?;
-                }
-            }
+            // Authenticate the manifest before trusting any field. Under a configured key
+            // the MAC is **required**, not merely verified-when-present (HIK-144 gap 2:
+            // the optional form let an attacker strip the field and downgrade a sealed
+            // segment). Same `crypto::authenticate` the generation manifest and the set
+            // pointer go through — one implementation of the policy, three documents.
+            crypto::authenticate(&manifest, master_key).with_context(|| {
+                format!("authenticate SEGMENT.json for segment {uuid} of {graph}")
+            })?;
             if verify_integrity {
                 manifest.verify_content_hash().with_context(|| {
                     format!("verify SEGMENT.json content hash for segment {uuid}")
@@ -188,6 +186,23 @@ impl CoreStack {
                     manifest.edge_band,
                     seg_ref.node_band,
                     seg_ref.edge_band
+                );
+            }
+            // HIK-144: the content hash too. Both sides are MAC-covered — the set's copy by
+            // the set MAC, the segment's own by the segment MAC — so requiring them to agree
+            // is what makes the set's authenticated *list* bind the segment *contents*, not
+            // just their names. Without it a set could name a segment uuid whose directory
+            // had been replaced by another validly sealed segment of the same shape.
+            //
+            // An *empty* ref hash (the `#[serde(default)]` of a hand-built fixture) skips
+            // the check, which costs nothing under a key: the field is inside the set MAC,
+            // so an attacker cannot blank it to opt out.
+            if !seg_ref.content_hash.is_empty() && manifest.content_hash != seg_ref.content_hash {
+                bail!(
+                    "segment {uuid} of {graph} has content hash {} but the set names {} — \
+                     refusing a recomposed set",
+                    manifest.content_hash,
+                    seg_ref.content_hash
                 );
             }
 

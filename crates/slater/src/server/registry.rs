@@ -186,18 +186,15 @@ impl Graphs {
             }
             _ => {}
         }
-        // Not configurable by design: a MAC-less generation on a keyed server is
-        // either a strip attack or a plaintext image that doesn't need the key —
-        // there is no legitimate keyed-but-unauthenticated deployment, so there is
-        // no flag an attacker (or a mistaken operator) could flip to reopen the
-        // strip downgrade. Plaintext deployments simply configure no key.
-        if self.master_key.is_some() && m.mac.is_none() {
-            bail!(
-                "graph '{name}' manifest has no MAC but a master key is configured — \
-                 refusing to serve an unauthenticated generation; rebuild with --encrypt \
-                 (or remove the key for an all-plaintext deployment)"
-            );
-        }
+        // The MAC-strip refusal is **not implemented here** (HIK-144). It is
+        // `crypto::authenticate`, enforced at open inside
+        // `Generation::open_with_store_opts_cached` — where the key and the manifest meet —
+        // so every opener inherits it, including `slater query`, which used to bypass this
+        // function entirely. This call is a thin re-assertion at boot/swap over the manifest
+        // the server holds; it can only ever agree with the open-time check, because it is
+        // the same code. Two independent implementations is what created the divergence.
+        graph_format::crypto::authenticate(m, self.master_key_bytes())
+            .with_context(|| format!("authenticate the manifest served for graph '{name}'"))?;
         Ok(())
     }
 
@@ -694,6 +691,12 @@ impl Graphs {
                 graph_format::setmanifest::SegmentRef::from_manifest(&manifest),
             ))
             .collect();
+        // Seal the new composition last, after the segment list is final (HIK-144) — a
+        // keyed reader refuses an unsealed set.
+        if let Some(key) = self.master_key_bytes() {
+            set.seal_mac(key)
+                .with_context(|| format!("seal the flush set for '{name}'"))?;
+        }
         publish_set_and_current(data_dir, name, set_uuid, &set)
             .with_context(|| format!("publish flush set for '{name}'"))?;
 
@@ -880,6 +883,12 @@ impl Graphs {
             ));
         }
         set.segments = refs;
+        // Seal the recomposed set last, after the merged segment has taken the run's
+        // ordinal slot (HIK-144) — a keyed reader refuses an unsealed set.
+        if let Some(key) = self.master_key_bytes() {
+            set.seal_mac(key)
+                .with_context(|| format!("seal the compacted set for '{name}'"))?;
+        }
         publish_set_and_current(data_dir, name, set_uuid, &set)
             .with_context(|| format!("publish compacted set for '{name}'"))?;
 
