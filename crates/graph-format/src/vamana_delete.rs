@@ -70,7 +70,7 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
 
 use crate::blockfile::record_range_in_block;
-use crate::crypto::BlockCipher;
+use crate::crypto::{BlockCipher, FileCipher};
 use crate::ids::BlockId;
 use crate::manifest::{AnnNav, Metric};
 use crate::pq::{ann_point, sq_l2, PqReader, PqWriter, ResidentPq, HOLE};
@@ -578,7 +578,23 @@ pub struct ConsolidateIndex<'a> {
     pub vamana_block_bytes: usize,
     pub pq_block_bytes: usize,
     pub zstd_level: i32,
+    /// The **generation** cipher, or `None` for a plaintext index. Blocks are sealed per
+    /// file (HIK-140), so this derives a per-file subkey from [`ConsolidateIndex::stem`].
     pub cipher: Option<Arc<BlockCipher>>,
+    /// Store-relative stem shared by the pair, without the `.vamana` / `.pq` suffix —
+    /// `vector/{label}.{property}` for a generation, `vec.{label}.{property}` for a
+    /// segment. Writer and reader must agree on it byte-for-byte (HIK-140). Input and
+    /// output are read/written under the same stem and cipher, as before.
+    pub stem: String,
+}
+
+impl ConsolidateIndex<'_> {
+    /// The per-file cipher for `{stem}{suffix}`.
+    fn file_cipher(&self, suffix: &str) -> Option<Arc<FileCipher>> {
+        self.cipher
+            .as_ref()
+            .map(|c| Arc::new(c.for_file(&format!("{}{suffix}", self.stem))))
+    }
 }
 
 /// Run the pass over one index's `.vamana` + `.pq`, writing a new, consistent pair.
@@ -599,9 +615,9 @@ pub fn consolidate_index_files(
     pq_out: &Path,
     cfg: &ConsolidateIndex,
 ) -> Result<ConsolidateStats> {
-    let reader = VamanaReader::open_with_cipher(vamana_in, cfg.cipher.clone())
+    let reader = VamanaReader::open_with_cipher(vamana_in, cfg.file_cipher(".vamana"))
         .with_context(|| format!("open {}", vamana_in.display()))?;
-    let pq = PqReader::open_with_cipher(pq_in, cfg.cipher.clone())
+    let pq = PqReader::open_with_cipher(pq_in, cfg.file_cipher(".pq"))
         .with_context(|| format!("open {}", pq_in.display()))?
         .load_resident()
         .with_context(|| format!("load {}", pq_in.display()))?;
@@ -644,7 +660,7 @@ pub fn consolidate_index_files(
         vamana_out,
         cfg.vamana_block_bytes,
         cfg.zstd_level,
-        cfg.cipher.clone(),
+        cfg.file_cipher(".vamana"),
     )
     .with_context(|| format!("create {}", vamana_out.display()))?;
     let stats = consolidate_deletes(&reader, &dead, &opts, &mut vw)?;
@@ -655,7 +671,7 @@ pub fn consolidate_index_files(
         &pq.codebook,
         cfg.pq_block_bytes,
         cfg.zstd_level,
-        cfg.cipher.clone(),
+        cfg.file_cipher(".pq"),
     )
     .with_context(|| format!("create {}", pq_out.display()))?;
     rewrite_pq_holes(&pq, &dead, &mut pw)?;
@@ -1170,6 +1186,7 @@ mod tests {
             &vam_out,
             &pq_out,
             &ConsolidateIndex {
+                stem: "vector/Doc.embedding".to_string(),
                 medoid: f.medoid,
                 r: f.r,
                 alpha: 1.2,

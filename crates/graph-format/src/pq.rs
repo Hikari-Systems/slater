@@ -37,7 +37,7 @@ use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::blockfile::{parse_block, record_from_block, BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::manifest::Metric;
 use crate::wire::{
     capacity_for, capacity_hint, checked_span, read_uvarint, write_uvarint, DecodeRejected,
@@ -613,7 +613,7 @@ impl PqWriter {
         codebook: &Codebook,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let mut inner =
             BlockFileWriter::create_with_cipher(path, target_block_bytes, zstd_level, cipher)?;
@@ -724,7 +724,7 @@ pub struct PqReader {
 impl PqReader {
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -733,7 +733,7 @@ impl PqReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let inner = BlockFileReader::open_src(src, cipher)?;
         let hdr = inner
@@ -1608,7 +1608,13 @@ mod tests {
         let params = PqParams::new(dim as u32, 2, 4).unwrap();
         let cb = train_codebooks(&data, params, 15).unwrap();
         let codes: Vec<Vec<u8>> = data.iter().map(|v| cb.encode(v).unwrap()).collect();
-        let cipher = Arc::new(BlockCipher::from_master(b"pq-key", &[5u8; 32]));
+        let cipher = crate::crypto::file_cipher(
+            &Some(Arc::new(crate::crypto::BlockCipher::from_master(
+                b"pq-key", &[5u8; 32],
+            ))),
+            "vector/Doc.embedding.pq",
+        )
+        .unwrap();
 
         let path = std::env::temp_dir().join(format!("slater_pq_{}_{}", std::process::id(), "enc"));
         let mut w =

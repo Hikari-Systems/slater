@@ -269,6 +269,15 @@ pub struct EncryptionHeader {
     pub kdf: String,
     /// KDF salt (hex). Per generation.
     pub salt_hex: String,
+    /// How each block's AEAD associated data is derived — `file-block-v1` binds the
+    /// block to its file (a per-file subkey) and to its ordinal within that file
+    /// (HIK-140).
+    ///
+    /// Deliberately **not** `#[serde(default)]`: an encrypted image written before the
+    /// binding existed must fail to parse with a readable error rather than open with
+    /// its blocks unbound and relocatable. Enforced again at cipher-derivation time by
+    /// [`crypto::check_aad_scheme`](crate::crypto::check_aad_scheme).
+    pub aad_scheme: String,
 }
 
 /// One file in the generation inventory.
@@ -518,6 +527,34 @@ impl Manifest {
     }
 }
 
+/// Refuse a manifest that declares at-rest encryption but no `aadScheme`, with a message an
+/// operator can act on (HIK-140).
+///
+/// The field is a **required** struct field, so this can never let one through — `serde`
+/// would refuse it a line later. All this adds is the *why*: "missing field `aadScheme`"
+/// does not say that the image's blocks are unbound and that the fix is a rebuild.
+pub(crate) fn probe_aad_scheme(text: &str, what: &str) -> Result<()> {
+    #[derive(Deserialize)]
+    struct EncProbe {
+        encryption: Option<serde_json::Value>,
+    }
+    let Ok(p) = serde_json::from_str::<EncProbe>(text) else {
+        return Ok(()); // too broken to probe; the full parse gives the better error
+    };
+    if let Some(enc) = p.encryption.as_ref().and_then(|e| e.as_object()) {
+        if !enc.contains_key("aadScheme") {
+            anyhow::bail!(
+                "{what} declares at-rest encryption but no `aadScheme`: its blocks were sealed \
+                 without being bound to their file and block ordinal, so a block relocated \
+                 within the image would still decrypt. Slater has no backwards compatibility: \
+                 it must be rebuilt (this build seals under {:?}).",
+                crate::crypto::AAD_SCHEME
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Parse a MANIFEST document, **checking its format version first**.
 ///
 /// The `Manifest` struct is schema-locked to the *current* `FORMAT_VERSION`: every field
@@ -536,6 +573,7 @@ fn parse_manifest(text: &str) -> Result<Manifest> {
     struct VersionProbe {
         format_version: u32,
     }
+    probe_aad_scheme(text, "MANIFEST")?;
     // A document too broken to yield even a version falls through to the full parse, whose
     // error is the more useful one there.
     if let Ok(p) = serde_json::from_str::<VersionProbe>(text) {
@@ -868,11 +906,44 @@ mod tests {
         check("acl_blake3", &|m| m.acl_blake3 = Some("deadbeef".into()));
         check("encryption header", &|m| {
             m.encryption = Some(EncryptionHeader {
+                aad_scheme: crate::crypto::AAD_SCHEME.to_string(),
                 aead: "x".into(),
                 kdf: "y".into(),
                 salt_hex: "00".into(),
             })
         });
+    }
+
+    /// HIK-140: `aadScheme` is required on an encrypted manifest. An image written
+    /// before per-file/per-ordinal binding existed has no such key, and must fail to
+    /// **parse** rather than open with its blocks unbound and relocatable.
+    #[test]
+    fn an_encrypted_manifest_without_an_aad_scheme_does_not_parse() {
+        let mut m = sample();
+        m.encryption = Some(EncryptionHeader {
+            aead: crate::crypto::AEAD_NAME.into(),
+            kdf: crate::crypto::KDF_NAME.into(),
+            salt_hex: "00".repeat(32),
+            aad_scheme: crate::crypto::AAD_SCHEME.into(),
+        });
+        let json = m.to_json().unwrap();
+        assert!(parse_manifest(&json).is_ok(), "the sealed form parses");
+
+        // Drop the key, exactly as a pre-HIK-140 image would have it.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["encryption"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aadScheme")
+            .unwrap();
+        let legacy = serde_json::to_string(&v).unwrap();
+        let err = parse_manifest(&legacy).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("aadScheme"), "must name the field: {err:#}");
+        assert!(
+            msg.contains("rebuilt"),
+            "and must tell the operator what to do: {err:#}"
+        );
     }
 
     #[test]

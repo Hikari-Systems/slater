@@ -298,6 +298,8 @@ impl SegmentManifest {
         let path = dir.as_ref().join("SEGMENT.json");
         let text =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        crate::manifest::probe_aad_scheme(&text, "SEGMENT.json")
+            .with_context(|| format!("parse {}", path.display()))?;
         let m: SegmentManifest =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         m.validate()?;
@@ -314,6 +316,10 @@ impl SegmentManifest {
         let bytes = store
             .read_all(&key)
             .with_context(|| format!("read {key}"))?;
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            crate::manifest::probe_aad_scheme(text, "SEGMENT.json")
+                .with_context(|| format!("parse {key}"))?;
+        }
         let m: SegmentManifest =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
         m.validate()?;

@@ -54,7 +54,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::blockcache::{BlockCache, BlockRecord};
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::{file_cipher, BlockCipher};
 use crate::ids::Value;
 use crate::plane::{KeyColumn, PlaneCodecOpts};
 use crate::store::{join_key, ObjectStore};
@@ -414,10 +414,18 @@ impl SegmentWriter {
         let tmp = dir.with_extension("tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).with_context(|| format!("create segment tmp dir {tmp:?}"))?;
+        // HIK-140: each section is sealed under its own per-file subkey, derived from the
+        // same `name` that names the file — so the writer and the reader below cannot
+        // disagree about it.
         let mk = |name: &str| -> Result<BlockFileWriter> {
             let p = tmp.join(name);
-            BlockFileWriter::create_with_cipher(&p, target_block_bytes, zstd_level, cipher.clone())
-                .with_context(|| format!("create block file {p:?}"))
+            BlockFileWriter::create_with_cipher(
+                &p,
+                target_block_bytes,
+                zstd_level,
+                file_cipher(&cipher, name),
+            )
+            .with_context(|| format!("create block file {p:?}"))
         };
         Ok(Self {
             node: mk("node.blk")?,
@@ -561,7 +569,7 @@ impl SegmentReader {
             edge_keys,
         } = decode_segment_meta(&meta_bytes).with_context(|| format!("segment {dir:?} meta"))?;
         let open = |name: &str| -> Result<BlockFileReader> {
-            BlockFileReader::open_with_cipher(dir.join(name), cipher.clone())
+            BlockFileReader::open_with_cipher(dir.join(name), file_cipher(&cipher, name))
                 .with_context(|| format!("open {name}"))
         };
         Ok(Self {
@@ -601,8 +609,11 @@ impl SegmentReader {
             edge_keys,
         } = decode_segment_meta(&meta_bytes).with_context(|| format!("segment {prefix} meta"))?;
         let open = |name: &str| -> Result<BlockFileReader> {
-            BlockFileReader::open_src(store.open(&join_key(prefix, name))?, cipher.clone())
-                .with_context(|| format!("open {prefix}/{name}"))
+            BlockFileReader::open_src(
+                store.open(&join_key(prefix, name))?,
+                file_cipher(&cipher, name),
+            )
+            .with_context(|| format!("open {prefix}/{name}"))
         };
         Ok(Self {
             node_rdr: open("node.blk")?,

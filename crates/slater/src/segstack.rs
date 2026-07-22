@@ -573,6 +573,10 @@ fn derive_segment_cipher(
              (set config.encryption.keyEnv or keyFile)"
         )
     })?;
+    // HIK-140: a segment whose blocks were not sealed under this build's AAD scheme is
+    // refused, exactly like a generation (`generation.rs`'s `derive_cipher`).
+    crypto::check_aad_scheme(&header.aad_scheme)
+        .with_context(|| format!("segment {uuid} of {graph}"))?;
     let salt = crypto::hex_decode(&header.salt_hex)
         .with_context(|| format!("decode encryption salt for segment {uuid}"))?;
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))

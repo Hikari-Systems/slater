@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
-use graph_format::crypto::{self, BlockCipher};
+use graph_format::crypto::{self, file_cipher, BlockCipher};
 use graph_format::histogram::{
     derive_histogram_from_isam, encode_histogram, write_property_histograms,
 };
@@ -36,6 +36,7 @@ pub fn derive_cipher(
                 aead: crypto::AEAD_NAME.to_string(),
                 kdf: crypto::KDF_NAME.to_string(),
                 salt_hex: crypto::hex_encode(&salt),
+                aad_scheme: crypto::AAD_SCHEME.to_string(),
             };
             (
                 Some(Arc::new(BlockCipher::from_master(key, &salt))),
@@ -360,8 +361,9 @@ pub fn build_property_histograms(
         if ri.entity != EntityKind::Node {
             continue;
         }
-        let isam_path = tmp_dir.join(format!("range/{}.isam", ri.name));
-        match derive_histogram_from_isam(&isam_path, cipher.clone(), max_distinct)? {
+        let rel = format!("range/{}.isam", ri.name);
+        let isam_path = tmp_dir.join(&rel);
+        match derive_histogram_from_isam(&isam_path, file_cipher(&cipher, &rel), max_distinct)? {
             Some(pairs) => {
                 descs.push(PropertyHistogramDesc {
                     index_name: ri.name.clone(),
@@ -387,7 +389,7 @@ pub fn build_property_histograms(
         &records,
         block_size,
         zstd_level,
-        cipher,
+        file_cipher(&cipher, "prop_hist.blk"),
     )?;
     Ok(descs)
 }

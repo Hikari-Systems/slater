@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter, RecordLoc};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::ids::Value;
 use crate::wire::{capacity_for, read_uvarint, read_value, skip_value, write_uvarint, write_value};
 
@@ -68,7 +68,7 @@ impl PropsWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -126,7 +126,7 @@ impl PropsReader {
     /// encrypted file (`cipher = None` ⇒ plaintext).
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -135,7 +135,7 @@ impl PropsReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileReader::open_src(src, cipher)?,

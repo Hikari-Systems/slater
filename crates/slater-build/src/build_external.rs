@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use graph_format::blockfile::{concat_block_files, BlockFileReader, BlockFileWriter};
 use graph_format::columns::PropsWriter;
-use graph_format::crypto::BlockCipher;
+use graph_format::crypto::{file_cipher, BlockCipher, FileCipher};
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
@@ -1545,7 +1545,7 @@ fn build_inner(
         tmp_dir.join("node_props.blk"),
         opts.block_size,
         opts.zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, "node_props.blk"),
     )?;
     // Choose the label encoding by alphabet: a u64 bitmask (Raw container) when it fits, else
     // varint (zstd). The alphabet is finalised by emit, so this is decided correctly here.
@@ -1553,7 +1553,7 @@ fn build_inner(
         tmp_dir.join("node_labels.blk"),
         opts.block_size,
         opts.zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, "node_labels.blk"),
         labels.names().len(),
     )?;
 
@@ -1704,6 +1704,11 @@ fn build_inner(
     // so `topology.csr.blk` / `edge_props.blk` content hashes change once; the logical
     // content (and the postings / range ISAMs) is identical.
     let emit_topo_g = diag.phase("emit.topology");
+    // HIK-140: every band writer seals under the *output* file's key, so the stitch only
+    // has to correct block ordinals. Derived once — a band worker cannot pick a different
+    // name than the concat and the served reader.
+    let csr_fc = file_cipher(&cipher, "topology.csr.blk");
+    let eprops_fc = file_cipher(&cipher, "edge_props.blk");
     let threads = opts.threads.max(1);
     let band = band_nodes();
     let nbands = node_count.div_ceil(band).max(1) as usize;
@@ -1862,7 +1867,8 @@ fn build_inner(
             range_r,
             rev_spill_r,
             worker_pool_r,
-            cipher_r,
+            csr_fc_r,
+            eprops_fc_r,
             next_r,
             err_r,
         ) = (
@@ -1873,7 +1879,8 @@ fn build_inner(
             &range_mx,
             &rev_spill,
             &worker_pool,
-            &cipher,
+            &csr_fc,
+            &eprops_fc,
             &next,
             &err,
         );
@@ -1908,7 +1915,8 @@ fn build_inner(
                         bands_saturate_pool,
                         opts.block_size,
                         opts.zstd_level,
-                        cipher_r.clone(),
+                        csr_fc_r.clone(),
+                        eprops_fc_r.clone(),
                         diag,
                     );
                     if let Err(e) = res {
@@ -1937,8 +1945,8 @@ fn build_inner(
     {
         let next = AtomicU64::new(0);
         let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let (rev_route_paths_r, worker_pool_r, cipher_r, next_r, err_r) =
-            (&rev_route_paths, &worker_pool, &cipher, &next, &err);
+        let (rev_route_paths_r, worker_pool_r, csr_fc_r, next_r, err_r) =
+            (&rev_route_paths, &worker_pool, &csr_fc, &next, &err);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(move || loop {
@@ -1962,7 +1970,7 @@ fn build_inner(
                         bands_saturate_pool,
                         opts.block_size,
                         opts.zstd_level,
-                        cipher_r.clone(),
+                        csr_fc_r.clone(),
                         diag,
                     );
                     if let Err(e) = res {
@@ -1997,12 +2005,20 @@ fn build_inner(
     let mut csr_parts: Vec<PathBuf> = Vec::with_capacity(nbands * 2);
     csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_fwd", b)));
     csr_parts.extend((0..nbands).map(|b| band_path(scratch_dir, pid, "csr_rev", b)));
-    concat_block_files(tmp_dir.join("topology.csr.blk"), &csr_parts)?;
+    concat_block_files(
+        tmp_dir.join("topology.csr.blk"),
+        &csr_parts,
+        csr_fc.as_deref(),
+    )?;
     diag.set_op("concat edge_props.blk", "", 0);
     let eprops_parts: Vec<PathBuf> = (0..nbands)
         .map(|b| band_path(scratch_dir, pid, "eprops", b))
         .collect();
-    concat_block_files(tmp_dir.join("edge_props.blk"), &eprops_parts)?;
+    concat_block_files(
+        tmp_dir.join("edge_props.blk"),
+        &eprops_parts,
+        eprops_fc.as_deref(),
+    )?;
     diag.set_op("remove band scratch files", "", 0);
     for p in csr_parts.iter().chain(eprops_parts.iter()) {
         let _ = std::fs::remove_file(p);
@@ -2033,7 +2049,7 @@ fn build_inner(
                 &src,
                 opts.block_size,
                 opts.zstd_level,
-                cipher.clone(),
+                file_cipher(&cipher, "reltype_src.post"),
             )?;
             diag.set_op(
                 "write reltype_tgt.post (bit planes)",
@@ -2045,7 +2061,7 @@ fn build_inner(
                 &tgt,
                 opts.block_size,
                 opts.zstd_level,
-                cipher.clone(),
+                file_cipher(&cipher, "reltype_tgt.post"),
             )?;
             (sc, tc)
         }
@@ -2060,7 +2076,7 @@ fn build_inner(
                     .map(|r| r.map(|e| (e.reltype, e.node))),
                 opts.block_size,
                 opts.zstd_level,
-                cipher.clone(),
+                file_cipher(&cipher, "reltype_src.post"),
             )?;
             diag.set_op("drain reltype_tgt.post (k-way merge)", "edges", edge_count);
             let tc = write_endpoint_postings_from_sorted(
@@ -2072,7 +2088,7 @@ fn build_inner(
                     .map(|r| r.map(|e| (e.reltype, e.node))),
                 opts.block_size,
                 opts.zstd_level,
-                cipher.clone(),
+                file_cipher(&cipher, "reltype_tgt.post"),
             )?;
             (sc, tc)
         }
@@ -2135,7 +2151,7 @@ fn build_inner(
             sorter.sorted()?.map(|r| r.map(|re| (re.key, re.id))),
             opts.range_block_size,
             opts.zstd_level,
-            cipher.clone(),
+            file_cipher(&cipher, &rel_path),
         )?;
         block_sizes.insert(rel_path, opts.range_block_size as u32);
         range_indexes.push(RangeIndexDesc {
@@ -2180,7 +2196,7 @@ fn build_inner(
         &hub_in,
         opts.block_size,
         opts.zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, "hub_degrees.blk"),
     )?;
     block_sizes.insert("hub_degrees.blk".into(), opts.block_size as u32);
     let hub_degrees = Some(graph_format::manifest::HubDegreeDesc {
@@ -2205,7 +2221,7 @@ fn build_inner(
             zstd_level: opts.zstd_level,
             zstd_margin: opts.degree_zstd_margin,
         },
-        cipher.clone(),
+        file_cipher(&cipher, "node_degrees.blk"),
     )?;
     block_sizes.insert("node_degrees.blk".into(), opts.block_size as u32);
     drop(emit_deg_g);
@@ -2719,7 +2735,11 @@ fn emit_forward_band(
     saturated: bool,
     block_size: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    // HIK-140: the band files are spliced into `topology.csr.blk` / `edge_props.blk` by
+    // `concat_block_files`, so they are sealed under the **output** files' ciphers — the
+    // concat then only has to re-seal them at their corrected global ordinals.
+    csr_cipher: Option<Arc<FileCipher>>,
+    eprops_cipher: Option<Arc<FileCipher>>,
     diag: &crate::diag::BuildDiag,
 ) -> Result<()> {
     // Load + sort this band's edges by (final_src, final_dst, prov_edge_id). Blocks
@@ -2748,16 +2768,10 @@ fn emit_forward_band(
     }
 
     let mut csr = CsrHalfWriter::create_with_cipher(
-        csr_out,
-        lo,
-        hi,
-        true,
-        block_size,
-        zstd_level,
-        cipher.clone(),
+        csr_out, lo, hi, true, block_size, zstd_level, csr_cipher,
     )?;
     let mut eprops =
-        BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, cipher)?;
+        BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, eprops_cipher)?;
     let mut rev_batch = BandBatcher::new(rev_spill, batch_threshold);
     // Only the sorter sink batches; the plane sink writes a bit per edge in place.
     let batch_cap = match posts {
@@ -2874,7 +2888,7 @@ fn emit_reverse_band(
     saturated: bool,
     block_size: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    csr_cipher: Option<Arc<FileCipher>>,
     diag: &crate::diag::BuildDiag,
 ) -> Result<()> {
     // Inline vs pooled spill for the same reason as the forward band above.
@@ -2891,8 +2905,9 @@ fn emit_reverse_band(
             sorter.push(EdgeRev::decode(&mut s)?)
         })?;
     }
-    let mut csr =
-        CsrHalfWriter::create_with_cipher(csr_out, lo, hi, false, block_size, zstd_level, cipher)?;
+    let mut csr = CsrHalfWriter::create_with_cipher(
+        csr_out, lo, hi, false, block_size, zstd_level, csr_cipher,
+    )?;
     let mut i = 0u64;
     for r in sorter.sorted()? {
         let er = r?;
@@ -3002,8 +3017,12 @@ fn compute_graph_summaries(
     // `>=` floor lists a node; a `floor` of 0 would list every node (allowed, discouraged).
     let hub_floor = hub_degree_floor as u64;
 
-    let topo = TopologyReader::open_with_cipher(topo_path, cipher.clone())?;
-    let labels = NodeLabelsReader::open_with_cipher(labels_path, cipher)?;
+    // HIK-140: these two are the files this build just wrote into `tmp_dir`, so they are
+    // bound to the same store-relative names the served generation will use.
+    let topo =
+        TopologyReader::open_with_cipher(topo_path, file_cipher(&cipher, "topology.csr.blk"))?;
+    let labels =
+        NodeLabelsReader::open_with_cipher(labels_path, file_cipher(&cipher, "node_labels.blk"))?;
 
     // Contiguous node ranges, one per worker. `chunk` also defines the dst-routing
     // bands, so a triple's band is `dst / chunk` and range `j` owns exactly the

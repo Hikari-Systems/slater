@@ -38,7 +38,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockCodec, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::{file_cipher, BlockCipher, FileCipher};
 use crate::plane::EfMono;
 use crate::topology::Edge;
 use crate::wire::{read_uvarint, write_uvarint};
@@ -331,7 +331,7 @@ pub fn write_endpoint_postings_from_planes(
     planes: &EndpointPlanes,
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<Vec<u64>> {
     // Raw container: the EF record is already the compact, queryable form, so a zstd pass would
     // be a ~1.0× tax paid on every fault (see the degree column). `zstd_level` is ignored.
@@ -362,6 +362,11 @@ pub fn write_endpoint_postings_from_planes(
 /// manifest. Offline, in-memory path — mirrors [`crate::topology::write_csr`].
 /// The external (bounded-memory) builder writes the same files via its own
 /// external sort, reusing [`encode_endpoint_posting`].
+///
+/// Takes the **generation** cipher, not a per-file one: it writes two files, and their
+/// store-relative names are fixed by the format, so it binds each side itself rather
+/// than letting a caller hand the same subkey to both (HIK-140). `src_path`/`tgt_path`
+/// must therefore be the generation's `reltype_src.post` / `reltype_tgt.post`.
 pub fn write_reltype_endpoint_postings(
     src_path: impl AsRef<Path>,
     tgt_path: impl AsRef<Path>,
@@ -385,14 +390,14 @@ pub fn write_reltype_endpoint_postings(
         &mut src_buckets,
         target_block_bytes,
         zstd_level,
-        cipher.clone(),
+        file_cipher(&cipher, "reltype_src.post"),
     )?;
     let tgt_counts = write_buckets(
         tgt_path,
         &mut tgt_buckets,
         target_block_bytes,
         zstd_level,
-        cipher,
+        file_cipher(&cipher, "reltype_tgt.post"),
     )?;
     Ok((src_counts, tgt_counts))
 }
@@ -409,7 +414,7 @@ pub fn write_endpoint_postings_from_sorted(
     sorted: impl Iterator<Item = Result<(u32, u64)>>,
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<Vec<u64>> {
     use anyhow::bail;
     let mut counts = Vec::with_capacity(reltype_count as usize);
@@ -464,7 +469,7 @@ fn write_buckets(
     buckets: &mut [Vec<u64>],
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<Vec<u64>> {
     let mut counts = Vec::with_capacity(buckets.len());
     let mut w = BlockFileWriter::create_with_codec(
@@ -759,7 +764,8 @@ mod tests {
         let raw = std::fs::read(&sp).unwrap();
         assert!(!raw.windows(2).any(|w| w == [0x42, 0x42]));
 
-        let sr = BlockFileReader::open_with_cipher(&sp, cipher).unwrap();
+        let sr = BlockFileReader::open_with_cipher(&sp, file_cipher(&cipher, "reltype_src.post"))
+            .unwrap();
         let got = decode_endpoint_posting(&sr.read_record_global(0).unwrap()).unwrap();
         assert_eq!(got, vec![0x4242]);
     }

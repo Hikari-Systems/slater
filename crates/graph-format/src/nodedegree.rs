@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockCodec, BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::degree_ef::{decode_chunk, encode_chunk, DegreeChunk, DegreeCodecOpts};
 use crate::wire::capacity_hint;
 
@@ -49,7 +49,7 @@ pub fn write_node_degrees(
     in_degs: &[u32],
     target_block_bytes: usize,
     codec: DegreeCodecOpts,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<()> {
     if out_degs.len() != in_degs.len() {
         bail!(

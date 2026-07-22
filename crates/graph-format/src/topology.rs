@@ -44,7 +44,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::ids::{EdgeId, NodeId};
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
@@ -344,7 +344,7 @@ pub fn write_csr_with_cipher(
     edges: &[Edge],
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<u64> {
     let n = node_count as usize;
     let mut fwd: Vec<Vec<Adj>> = vec![Vec::new(); n];
@@ -400,7 +400,7 @@ impl CsrStreamWriter {
         node_count: u64,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -498,7 +498,7 @@ impl CsrHalfWriter {
         forward: bool,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -573,7 +573,7 @@ impl TopologyReader {
     /// Open the CSR, supplying the per-generation cipher for an encrypted file.
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -582,7 +582,7 @@ impl TopologyReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let inner = BlockFileReader::open_src(src, cipher)?;
         let total = inner.total_records();
@@ -1018,7 +1018,7 @@ mod tests {
             parts.push(p);
         }
         let out = tmp("csr_band_concat");
-        crate::blockfile::concat_block_files(&out, &parts).unwrap();
+        crate::blockfile::concat_block_files(&out, &parts, None).unwrap();
 
         let r1 = TopologyReader::open(&ref_path).unwrap();
         let r2 = TopologyReader::open(&out).unwrap();

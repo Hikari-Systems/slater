@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::codec;
-use crate::crypto::{BlockCipher, NONCE_LEN};
+use crate::crypto::{BlockAad, BlockCipher, FileCipher, HEADER_ORDINAL, NONCE_LEN};
 use crate::ids::Value;
 use crate::store::fs::FileObject;
 use crate::store::RandomReadAt;
@@ -68,7 +68,7 @@ pub fn write_isam_with_cipher(
     mut entries: Vec<(Value, u64)>,
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<u64> {
     entries.sort_by(|a, b| a.0.cmp_key(&b.0).then(a.1.cmp(&b.1)));
     write_isam_sorted(
@@ -99,16 +99,21 @@ fn flush_isam_block(
     count: u64,
     body: &[u8],
     zstd_level: i32,
-    cipher: &Option<Arc<BlockCipher>>,
+    cipher: &Option<Arc<FileCipher>>,
 ) -> Result<()> {
     let mut raw = Vec::with_capacity(body.len() + 8);
     write_uvarint(&mut raw, count);
     raw.extend_from_slice(body);
     let comp = codec::compress(&raw, zstd_level)?;
+    // The block's ordinal is its index in `tops` — it is about to be pushed there.
+    let ordinal = tops.len() as u64;
     let (stored, nonce) = match cipher {
         Some(c) => {
             let nonce = BlockCipher::random_nonce();
-            (c.encrypt(&nonce, &comp)?, Some(nonce))
+            (
+                c.seal(BlockAad::position_only(ordinal), &nonce, &comp)?,
+                Some(nonce),
+            )
         }
         None => (comp, None),
     };
@@ -135,7 +140,7 @@ pub fn write_isam_sorted<I>(
     entries: I,
     target_block_bytes: usize,
     zstd_level: i32,
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
 ) -> Result<u64>
 where
     I: IntoIterator<Item = Result<(Value, u64)>>,
@@ -208,10 +213,16 @@ where
     }
     // Seal the whole top-level (first keys + per-block nonces) when encrypting so
     // no plaintext key material is left resident on disk.
+    // The top level is sealed under the reserved header ordinal, which no leaf can
+    // reach — so a leaf block cannot be promoted into the top slot by repointing the
+    // (plaintext) footer at it (HIK-140).
     let (stored_top, top_nonce) = match &cipher {
         Some(c) => {
             let nonce = BlockCipher::random_nonce();
-            (c.encrypt(&nonce, &top_bytes)?, Some(nonce))
+            (
+                c.seal(BlockAad::position_only(HEADER_ORDINAL), &nonce, &top_bytes)?,
+                Some(nonce),
+            )
         }
         None => (top_bytes, None),
     };
@@ -585,7 +596,7 @@ pub struct IsamReader {
     src: Arc<dyn RandomReadAt>,
     top: Vec<TopEntry>,
     /// Per-generation cipher, set iff the index is encrypted.
-    cipher: Option<Arc<BlockCipher>>,
+    cipher: Option<Arc<FileCipher>>,
     /// Optional decoded-leaf-block cache (see [`Self::with_block_cache`]). When present,
     /// a leaf is decompressed **and decoded** once and the sorted `(key, id)` `Vec` is
     /// held, so a repeated equality/range probe into the same block (e.g. a bulk-write
@@ -607,7 +618,7 @@ impl IsamReader {
     /// over [`open_src`](IsamReader::open_src) for path-holding callers.
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(FileObject::open(path.as_ref())?);
         Self::open_src(src, cipher)
@@ -617,7 +628,7 @@ impl IsamReader {
     /// object), supplying the per-generation cipher for an encrypted index. An
     /// encrypted index opened without a key is refused with a clear error rather
     /// than returning garbage.
-    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
+    pub fn open_src(src: Arc<dyn RandomReadAt>, cipher: Option<Arc<FileCipher>>) -> Result<Self> {
         let len = src.len();
         if len < ISAM_MAGIC.len() as u64 + FOOTER_LEN {
             bail!("isam too short");
@@ -679,7 +690,9 @@ impl IsamReader {
         src.read_exact_at(&mut stored_top, top_offset)?;
         // Unseal the top-level when encrypted (a wrong key is caught here, at open).
         let top_bytes = match (&cipher, &top_nonce) {
-            (Some(c), Some(nonce)) => c.decrypt(nonce, &stored_top)?,
+            (Some(c), Some(nonce)) => {
+                c.open(BlockAad::position_only(HEADER_ORDINAL), nonce, &stored_top)?
+            }
             _ => stored_top,
         };
         let mut tr = &top_bytes[..];
@@ -756,7 +769,9 @@ impl IsamReader {
         let mut stored = vec![0u8; t.comp_len as usize];
         self.src.read_exact_at(&mut stored, t.offset)?;
         let comp = match (&self.cipher, &t.nonce) {
-            (Some(cipher), Some(nonce)) => cipher.decrypt(nonce, &stored)?,
+            (Some(cipher), Some(nonce)) => {
+                cipher.open(BlockAad::position_only(b as u64), nonce, &stored)?
+            }
             _ => stored,
         };
         codec::decompress(&comp, t.raw_len as usize)
@@ -1618,17 +1633,26 @@ mod tests {
     #[test]
     fn encrypted_index_roundtrips_and_refuses_wrong_or_absent_key() {
         let path = tmp("enc");
-        let cipher = Arc::new(BlockCipher::from_master(b"isam-master", &[5u8; 32]));
+        let cipher = gen_cipher(b"isam-master", &[5u8; 32]);
         let mut entries = Vec::new();
         let sources = ["Fowler-2010", "Whitehead-2024", "Smith-1999"];
         for id in 0..600u64 {
             entries.push((Value::Str(sources[(id % 3) as usize].to_string()), id));
         }
         // Tiny blocks → many encrypted blocks, each with its own nonce.
-        write_isam_with_cipher(&path, entries.clone(), 64, 3, Some(cipher.clone())).unwrap();
+        write_isam_with_cipher(
+            &path,
+            entries.clone(),
+            64,
+            3,
+            Some(file_cipher(&cipher, "range/source.isam")),
+        )
+        .unwrap();
 
         // Right key: lookups match a linear scan.
-        let r = IsamReader::open_with_cipher(&path, Some(cipher)).unwrap();
+        let r =
+            IsamReader::open_with_cipher(&path, Some(file_cipher(&cipher, "range/source.isam")))
+                .unwrap();
         assert!(r.num_blocks() > 1);
         for s in sources {
             let key = Value::Str(s.to_string());
@@ -1646,8 +1670,103 @@ mod tests {
 
         // Wrong key: refused at open — the sealed top-level fails its tag check
         // before any lookup, so a wrong key never even sees the block directory.
-        let wrong = Arc::new(BlockCipher::from_master(b"nope", &[5u8; 32]));
-        assert!(IsamReader::open_with_cipher(&path, Some(wrong)).is_err());
+        let wrong = gen_cipher(b"nope", &[5u8; 32]);
+        assert!(IsamReader::open_with_cipher(
+            &path,
+            Some(file_cipher(&wrong, "range/source.isam"))
+        )
+        .is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn gen_cipher(master: &[u8], salt: &[u8]) -> Arc<BlockCipher> {
+        Arc::new(BlockCipher::from_master(master, salt))
+    }
+    /// A file cipher for `name`, for the tests that hold a generation cipher directly.
+    fn file_cipher(c: &Arc<BlockCipher>, name: &str) -> Arc<FileCipher> {
+        crate::crypto::file_cipher(&Some(c.clone()), name).unwrap()
+    }
+
+    fn isam_of(path: &std::path::Path, name: &str, gen: &Arc<BlockCipher>, tag: u64) {
+        let entries: Vec<(Value, u64)> = (0..600u64)
+            .map(|id| (Value::Int((id + tag * 10_000) as i64), id))
+            .collect();
+        write_isam_with_cipher(path, entries, 64, 3, Some(file_cipher(gen, name))).unwrap();
+    }
+
+    /// HIK-140: an ISAM index is bound to its file name, so a whole index lifted from
+    /// one `range/*.isam` into another of the same generation — same key, same
+    /// structure — does not open. Today the sealed top-level opens under the shared
+    /// per-generation key and the reader silently serves the *wrong index's* postings.
+    #[test]
+    fn isam_refuses_an_index_lifted_from_another_file() {
+        use crate::crypto::AeadRejected;
+        let gen = gen_cipher(b"isam-master", &[6u8; 32]);
+        let a = tmp("lift_isam_a");
+        let b = tmp("lift_isam_b");
+        isam_of(&a, "range/title.isam", &gen, 0);
+        isam_of(&b, "range/author.isam", &gen, 1);
+        std::fs::copy(&a, &b).unwrap();
+
+        let err =
+            match IsamReader::open_with_cipher(&b, Some(file_cipher(&gen, "range/author.isam"))) {
+                Ok(_) => panic!("range/title.isam must not open as range/author.isam"),
+                Err(e) => e,
+            };
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "cross-file substitution must fail in the AEAD: {err:#}"
+        );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// HIK-140: the top-level block is sealed under a reserved ordinal tag, so a *leaf*
+    /// block of the same index cannot be presented as the top level. The footer that
+    /// locates the top level is plaintext, so repointing it needs no key — only the
+    /// leaf's nonce, which is not a secret.
+    #[test]
+    fn isam_refuses_a_leaf_promoted_into_the_top_slot() {
+        use crate::crypto::AeadRejected;
+        let path = tmp("leaf_as_top");
+        let gen = gen_cipher(b"isam-master", &[7u8; 32]);
+        isam_of(&path, "range/title.isam", &gen, 0);
+
+        // Learn leaf 0's location + nonce (an attacker who has seen an earlier copy of
+        // this index knows them; nonces are not secret).
+        let r = IsamReader::open_with_cipher(&path, Some(file_cipher(&gen, "range/title.isam")))
+            .unwrap();
+        assert!(r.num_blocks() > 1);
+        let (leaf_off, leaf_len, leaf_nonce) = {
+            let leaf = &r.top[0];
+            (leaf.offset, leaf.comp_len, leaf.nonce.unwrap())
+        };
+        drop(r);
+
+        // Repoint the plaintext footer at leaf 0, claiming it is the top level.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        let f = n - FOOTER_LEN_ENC as usize;
+        bytes[f..f + 8].copy_from_slice(&leaf_off.to_le_bytes());
+        bytes[f + 8..f + 16].copy_from_slice(&(leaf_len as u64).to_le_bytes());
+        bytes[f + 16..f + 24].copy_from_slice(&1u64.to_le_bytes());
+        bytes[f + 24..f + 24 + NONCE_LEN].copy_from_slice(&leaf_nonce);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = match IsamReader::open_with_cipher(
+            &path,
+            Some(file_cipher(&gen, "range/title.isam")),
+        ) {
+            Ok(_) => panic!("a leaf block must not open as the top level"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "a leaf promoted into the top slot must fail in the AEAD, not later in the \
+             decode of whatever it happens to inflate to: {err:#}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

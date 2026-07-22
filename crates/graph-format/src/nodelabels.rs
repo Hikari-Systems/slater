@@ -31,7 +31,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 
 use crate::blockfile::{BlockCodec, BlockFileReader, BlockFileWriter};
-use crate::crypto::BlockCipher;
+use crate::crypto::FileCipher;
 use crate::wire::{capacity_for, read_uvarint, write_uvarint};
 
 /// Largest label alphabet that fits the `u64` bitmask encoding. At or below this the store
@@ -112,7 +112,7 @@ impl NodeLabelsWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         Ok(Self {
             inner: BlockFileWriter::create_with_cipher(
@@ -133,7 +133,7 @@ impl NodeLabelsWriter {
         path: impl AsRef<Path>,
         target_block_bytes: usize,
         zstd_level: i32,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
         _label_alphabet: usize,
     ) -> Result<Self> {
         // v7: always varint+zstd. The v6 "u64 bitmask in a Raw container" mode (selected for a
@@ -208,7 +208,7 @@ impl NodeLabelsReader {
     /// Open the store, supplying the per-generation cipher for an encrypted file.
     pub fn open_with_cipher(
         path: impl AsRef<Path>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let src = Arc::new(crate::store::fs::FileObject::open(path)?);
         Self::open_src(src, cipher)
@@ -217,7 +217,7 @@ impl NodeLabelsReader {
     /// Open from any positional-read source (local file or remote object).
     pub fn open_src(
         src: Arc<dyn crate::store::RandomReadAt>,
-        cipher: Option<Arc<BlockCipher>>,
+        cipher: Option<Arc<FileCipher>>,
     ) -> Result<Self> {
         let inner = BlockFileReader::open_src(src, cipher)?;
         let bitmask = inner.codec() == BlockCodec::Raw;
