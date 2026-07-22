@@ -819,6 +819,37 @@ impl CarrySource {
             }
             None => (base_gen_header.clone(), format!("{pq_stem}.vamana")),
         };
+        // A carry cannot *change* how the bytes are sealed — it does not rewrite them. So the
+        // base's encryption state and the build's must already agree, or the published image
+        // would not be what the operator asked for:
+        //
+        // * keyed build over a **plaintext** base ⇒ the served "encrypted" generation would
+        //   carry an unencrypted ~370 GB vector graph, silently. Before this ticket that
+        //   combination failed by accident (the reader tried to decrypt plaintext blocks);
+        //   making the carry work must not turn an accidental refusal into a silent
+        //   downgrade. Refuse, and say the index has to be rebuilt rather than carried.
+        // * unkeyed build over an **encrypted** base ⇒ `derive_carry_cipher` below refuses on
+        //   the missing key, which is the same statement from the other side.
+        if master_key.is_some() && vamana_encryption.is_none() {
+            bail!(
+                "vector index {}.{} would be carried by reference out of a plaintext base into \
+                 an encrypted build. A carry never rewrites the graph's bytes, so they would \
+                 stay unencrypted inside an image the operator asked to encrypt. Rebuild the \
+                 index instead of carrying it (build from a full dump, not a consolidation \
+                 dump).",
+                pi.label,
+                pi.property
+            );
+        }
+        if master_key.is_some() && carry.base_gen.is_none() {
+            bail!(
+                "the consolidation dump for vector index {}.{} names no base generation, so \
+                 this keyed build cannot learn which salt the base pair was sealed under. \
+                 Regenerate the dump with a matching server build.",
+                pi.label,
+                pi.property
+            );
+        }
         let vamana_cipher = derive_carry_cipher(
             vamana_encryption.as_ref(),
             master_key,

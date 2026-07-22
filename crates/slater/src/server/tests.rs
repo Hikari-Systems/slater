@@ -8595,11 +8595,93 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
 
     probe(&graphs, "after consolidation");
 
+    // A **second** consolidation, carrying the artifact that the first one produced. This is
+    // the artifact→artifact case: the base `.vamana` is no longer a generation file, so its
+    // salt and its HIK-140 subkey label come from its own manifest and from nowhere else —
+    // and its on-disk name is now `Doc.embedding.vamana` while the label it was sealed under
+    // is still `vector/Doc.embedding.vamana`. If the subkey were inferred from the path this
+    // is the consolidation that would fail.
+    graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("--input")
+                .arg(d)
+                .args(["--input-format", "slater-dump"]);
+            let _ = (g, dd);
+            build_args(&mut cmd);
+            let st = cmd.status().context("spawn builder")?;
+            anyhow::ensure!(st.success(), "second consolidating build failed: {st}");
+            Ok(())
+        })
+        .expect("carrying an already-carried artifact must succeed");
+    assert_eq!(
+        carried_vamana_bytes(&data, "docs", graphs.get("docs").unwrap().as_ref()),
+        base_bytes,
+        "a second carry must still be the original bytes — never re-sealed, never rebuilt"
+    );
+    probe(&graphs, "after a second consolidation");
+
     // Test 2: cold restart. Drop every open handle and re-open the data dir from disk — the
     // carried artifact's salt must round-trip through its own manifest.
     drop(graphs);
     let reopened = Graphs::open_all(&data, Some(&key)).unwrap();
     probe(&reopened, "after restart");
+
+    // Retention: the GC sweep must not reclaim an artifact the live set references. The
+    // *superseded* artifact (the first consolidation's) is genuinely unreferenced and must
+    // go — but it shares an inode with the live one, so the bytes survive regardless.
+    let live_artifacts: Vec<GenId> = graph_format::setmanifest::SetManifest::read_via(
+        &graph_format::store::fs::FsObjectStore::new(data.clone()),
+        "docs",
+        reopened.get("docs").unwrap().uuid(),
+    )
+    .unwrap()
+    .vector_artifacts
+    .iter()
+    .map(|a| a.uuid)
+    .collect();
+    assert_eq!(
+        live_artifacts.len(),
+        1,
+        "the live set must name exactly the artifact the served generation references"
+    );
+    // Two consolidations ⇒ two artifact directories, of which exactly one is live. Assert the
+    // superseded one is actually reclaimed, or "the live one survived" would be vacuously
+    // true of a sweep that does nothing at all.
+    let on_disk: Vec<String> = std::fs::read_dir(data.join("docs").join("vecidx"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "two consolidations must have left a live artifact and a superseded one, got {on_disk:?}"
+    );
+    let rep = reopened.gc_orphan_segments("docs", &data, 0).unwrap();
+    assert_eq!(
+        rep.deleted_vector_artifacts.len(),
+        1,
+        "the sweep must reclaim the superseded artifact — a sweep that reclaims nothing \
+         cannot prove it spares the live one"
+    );
+    assert!(
+        !rep.deleted_vector_artifacts.contains(&live_artifacts[0]),
+        "GC must never reclaim a carried graph the live set references"
+    );
+    assert!(
+        data.join("docs")
+            .join("vecidx")
+            .join(live_artifacts[0].0.to_string())
+            .join("Doc.embedding.vamana")
+            .exists(),
+        "the live carried graph must still be on disk after a sweep"
+    );
+    // …and the graph still serves from it.
+    drop(reopened);
+    let after_gc = Graphs::open_all(&data, Some(&key)).unwrap();
+    probe(&after_gc, "after a GC sweep");
+    drop(after_gc);
+    let reopened = Graphs::open_all(&data, Some(&key)).unwrap();
     drop(reopened);
 
     // The optimisation must survive being encrypted: the artifact is a hard link to the
@@ -8668,6 +8750,98 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
         "the untampered image must still open"
     );
 
+    std::fs::remove_dir_all(&work).ok();
+}
+
+/// HIK-145, found while adversarially reviewing the fix: making the encrypted carry *work*
+/// must not make a **downgrade** work too.
+///
+/// A carry never rewrites the graph's bytes — that is its entire purpose — so it cannot
+/// change how they are sealed. Turning on `--encrypt` over a base whose `.vamana` is
+/// plaintext would therefore publish an "encrypted" generation serving an unencrypted ~370 GB
+/// vector graph, with no error and nothing in the manifest to show it. Before this ticket
+/// that combination failed by accident (the reader tried to decrypt plaintext blocks); the
+/// fix must refuse it deliberately, not inherit the accident and then lose it.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph() {
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_vamana_mixed_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    let (script, _vectors) = vamana_fixture_script(16, 400);
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, &script).unwrap();
+
+    // A **plaintext** base.
+    assert!(
+        std::process::Command::new(&bin)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--pk", "__dump_id__"])
+            .args(["--cluster", "none"])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .status()
+            .expect("spawn slater-build")
+            .success(),
+        "the plaintext fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+
+    // …consolidated by a build that has suddenly been given `--encrypt`.
+    let err = match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd| {
+        let st = std::process::Command::new(&bin)
+            .arg("--input")
+            .arg(d)
+            .args(["--input-format", "slater-dump"])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .arg("--encrypt")
+            .args(["--key-env", "SLATER_HIK145_MIXED_KEY"])
+            .env(
+                "SLATER_HIK145_MIXED_KEY",
+                "0123456789abcdef0123456789abcdef",
+            )
+            .status()
+            .context("spawn builder")?;
+        anyhow::ensure!(
+            st.success(),
+            "keyed build over a plaintext base failed: {st}"
+        );
+        Ok(())
+    }) {
+        Ok(_) => {
+            panic!("a keyed build must not carry a plaintext vector graph into an encrypted image")
+        }
+        Err(e) => e,
+    };
+    // The refusal happens inside the builder, so it reaches the server as a failed build.
+    // Which of the two gates fires is not the property under test — in practice the earlier
+    // one does, because a keyed build authenticating the plaintext base generation's
+    // `MANIFEST.json` already refuses it as MAC-less (HIK-144). What matters, and what is
+    // asserted, is that no downgraded generation is published.
+    let _ = &err;
+
+    // The served generation is unchanged: the failed build published nothing.
+    assert!(
+        graphs.get("docs").unwrap().manifest().encryption.is_none(),
+        "a refused consolidation must leave the plaintext generation serving"
+    );
     std::fs::remove_dir_all(&work).ok();
 }
 
