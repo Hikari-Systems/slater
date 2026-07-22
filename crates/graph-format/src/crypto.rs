@@ -209,10 +209,23 @@ impl BlockCipher {
     pub fn decrypt(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Result<Vec<u8>> {
         self.aead
             .decrypt(XNonce::from_slice(nonce), ciphertext)
-            .map_err(|_| {
-                anyhow::anyhow!("AEAD decryption failed: wrong key or corrupt/tampered block")
-            })
+            .map_err(|_| AeadRejected::TagMismatch.into())
     }
+}
+
+/// An AEAD open that did not verify. A **type**, not a message: the read paths that
+/// distinguish "this block is not the block that was sealed here" from "this block
+/// decoded but its contents are malformed" branch on `downcast_ref::<AeadRejected>()`,
+/// never on the text (CONTRIBUTING.md).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AeadRejected {
+    /// The Poly1305 tag did not verify: a wrong key, a corrupt/tampered block, or a
+    /// block that was sealed under a different file or at a different block ordinal.
+    #[error(
+        "AEAD decryption failed: wrong key, corrupt/tampered block, or a block sealed \
+         for a different file or block ordinal"
+    )]
+    TagMismatch,
 }
 
 #[cfg(test)]

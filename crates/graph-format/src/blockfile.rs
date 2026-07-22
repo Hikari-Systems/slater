@@ -1166,6 +1166,15 @@ pub fn record_range_in_block(raw: &[u8], slot: u32) -> Result<std::ops::Range<us
 mod tests {
     use super::*;
 
+    // TEMPORARY (red observation, HIK-140): the pre-fix shims. `for_file` does not exist
+    // yet, so a file cipher *is* the generation cipher — which is exactly the bug.
+    fn gen_cipher(master: &[u8], salt: &[u8]) -> Arc<BlockCipher> {
+        Arc::new(BlockCipher::from_master(master, salt))
+    }
+    fn file_cipher(c: &Arc<BlockCipher>, _name: &str) -> Arc<BlockCipher> {
+        c.clone()
+    }
+
     // HIK-80: the block-file footer is plaintext even for an encrypted file, and `dir_len` — an
     // on-disk `u64` — sized the directory read buffer directly. Forging it is an allocator abort
     // at generation open. (Not one of the sites the ticket named; found in the sweep.)
@@ -1670,6 +1679,118 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// `(dir_offset, dir_len, block_count)` from a block file's plaintext footer.
+    fn read_footer(bytes: &[u8]) -> (usize, usize, usize) {
+        let n = bytes.len();
+        let f = &bytes[n - FOOTER_LEN as usize..];
+        (
+            u64::from_le_bytes(f[0..8].try_into().unwrap()) as usize,
+            u64::from_le_bytes(f[8..16].try_into().unwrap()) as usize,
+            u64::from_le_bytes(f[16..24].try_into().unwrap()) as usize,
+        )
+    }
+
+    /// HIK-140: a sealed block carries its ordinal as AEAD associated data, so an
+    /// attacker who cannot forge the tag still cannot *move* a block to another
+    /// ordinal in the same file. The move is a directory-entry swap — location,
+    /// lengths and nonce travel with the block, so the tag itself still verifies;
+    /// only the AAD binding refuses it.
+    #[test]
+    fn sealed_block_refuses_to_open_at_another_ordinal() {
+        use crate::crypto::AeadRejected;
+        let path = tmp("relocate_ordinal");
+        let cipher = gen_cipher(b"master-key", &[3u8; 32]);
+        let mut w = BlockFileWriter::create_with_cipher(
+            &path,
+            8, // tiny target ⇒ one record per block
+            3,
+            Some(file_cipher(&cipher, "relocate.blk")),
+        )
+        .unwrap();
+        for i in 0..4u32 {
+            w.append_record(format!("block-payload-{i}").as_bytes())
+                .unwrap();
+        }
+        let nblocks = w.finish().unwrap();
+        assert_eq!(nblocks, 4, "one record per block");
+
+        // Swap directory entries 0 and 1: block 1's ciphertext is now presented as
+        // block 0 (and vice versa), with its own nonce.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (dir_offset, _, count) = read_footer(&bytes);
+        assert_eq!(count, 4);
+        let e = DIR_ENTRY_LEN_ENC;
+        let first: Vec<u8> = bytes[dir_offset..dir_offset + e].to_vec();
+        bytes.copy_within(dir_offset + e..dir_offset + 2 * e, dir_offset);
+        bytes[dir_offset + e..dir_offset + 2 * e].copy_from_slice(&first);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let r =
+            BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "relocate.blk")))
+                .unwrap();
+        let err = r
+            .read_block(BlockId(0))
+            .expect_err("a block sealed at ordinal 1 must not open at ordinal 0");
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "relocation must fail in the AEAD, not later in the decode: {err:#}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// HIK-140: a sealed block is bound to the *file* it was written into, so bytes
+    /// lifted out of one `.blk` and pasted into another `.blk` of the same generation
+    /// — same key, same ordinal — do not open.
+    #[test]
+    fn sealed_block_refuses_to_open_in_another_file() {
+        use crate::crypto::AeadRejected;
+        let gen = gen_cipher(b"master-key", &[4u8; 32]);
+        let a_path = tmp("lift_src");
+        let b_path = tmp("lift_dst");
+        for (path, name, rec) in [
+            (&a_path, "node_props.blk", b"payload-A-0123456789"),
+            (&b_path, "edge_props.blk", b"payload-B-0123456789"),
+        ] {
+            let mut w =
+                BlockFileWriter::create_with_cipher(path, 4096, 3, Some(file_cipher(&gen, name)))
+                    .unwrap();
+            w.append_record(rec).unwrap();
+            assert_eq!(w.finish().unwrap(), 1);
+        }
+
+        // Rebuild `edge_props.blk` around `node_props.blk`'s sealed block 0: same
+        // ordinal, same generation key, same nonce — only the file differs.
+        let a = std::fs::read(&a_path).unwrap();
+        let (a_dir, _, a_count) = read_footer(&a);
+        assert_eq!(a_count, 1);
+        let a_entry = &a[a_dir..a_dir + DIR_ENTRY_LEN_ENC];
+        let a_block = &a[8..a_dir]; // magic(8) .. directory
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&a[0..8]); // same magic (both encrypted, zstd)
+        forged.extend_from_slice(a_block);
+        let dir_off = forged.len() as u64;
+        forged.extend_from_slice(a_entry); // offset 8 is still correct
+        forged.extend_from_slice(&dir_off.to_le_bytes());
+        forged.extend_from_slice(&(DIR_ENTRY_LEN_ENC as u64).to_le_bytes());
+        forged.extend_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&b_path, &forged).unwrap();
+
+        let r =
+            BlockFileReader::open_with_cipher(&b_path, Some(file_cipher(&gen, "edge_props.blk")))
+                .unwrap();
+        let err = r
+            .read_record_global(0)
+            .expect_err("a block sealed for node_props.blk must not open in edge_props.blk");
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "cross-file relocation must fail in the AEAD: {err:#}"
+        );
+        let _ = std::fs::remove_file(&a_path);
+        let _ = std::fs::remove_file(&b_path);
     }
 
     #[test]
