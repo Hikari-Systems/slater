@@ -161,6 +161,26 @@ pub struct SegmentManifest {
     pub files: Vec<FileEntry>,
 }
 
+/// One of the three MAC-sealed documents — the shared sealing/verification/policy code
+/// lives in [`crypto`](crate::crypto) (HIK-144); only the namespace, the label and the
+/// canonical body are this type's own.
+impl crate::crypto::MacSealed for SegmentManifest {
+    const DOMAIN: crate::crypto::MacDomain = crate::crypto::MacDomain::SegmentManifest;
+    const SUBJECT: &'static str = "SEGMENT.json";
+
+    fn stored_mac(&self) -> Option<&str> {
+        self.mac.as_deref()
+    }
+    fn set_mac(&mut self, mac: Option<String>) {
+        self.mac = mac;
+    }
+    fn mac_body(&self) -> Result<Vec<u8>> {
+        let mut canon = self.clone();
+        canon.mac = None;
+        serde_json::to_vec(&canon).context("serialise segment manifest for MAC")
+    }
+}
+
 impl SegmentManifest {
     /// The backend-relative key of `SEGMENT.json` for `segment_uuid` under `graph`.
     pub fn key(graph: &str, segment_uuid: Generation) -> String {
@@ -266,36 +286,23 @@ impl SegmentManifest {
     /// nested in it).** Their iteration order is unspecified and randomised per process,
     /// so the same manifest would MAC differently on each run and verification would fail
     /// at random. Use a `BTreeMap` or an order-stable `Vec`.
+    #[cfg(test)]
     fn mac_message(&self) -> Result<Vec<u8>> {
-        let mut canon = self.clone();
-        canon.mac = None;
-        let body = serde_json::to_vec(&canon).context("serialise segment manifest for MAC")?;
-        Ok(crate::crypto::mac_preimage(
-            crate::crypto::MacDomain::SegmentManifest,
-            &body,
-        ))
+        crate::crypto::mac_message(self)
     }
 
     /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store it in
     /// `mac`. Call **last** — after `content_hash` and every other field is final.
     pub fn seal_mac(&mut self, master_key: &[u8]) -> Result<()> {
-        let key = crate::crypto::derive_manifest_mac_key(master_key);
-        self.mac = Some(crate::crypto::manifest_mac(&key, &self.mac_message()?));
-        Ok(())
+        crate::crypto::seal(self, master_key)
     }
 
-    /// Recompute the MAC and compare it to the stored `mac`. Errors if `mac` is absent
-    /// (callers gate on presence first).
+    /// Recompute the MAC and compare it to the stored `mac`; typed
+    /// [`MacRejected`](crate::crypto::MacRejected) on absence or mismatch. Openers want
+    /// [`crypto::authenticate`](crate::crypto::authenticate), which also requires a MAC
+    /// to be present when a key is configured (HIK-144).
     pub fn verify_mac(&self, master_key: &[u8]) -> Result<()> {
-        let stored = self.mac.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("segment manifest carries no MAC but one was required")
-        })?;
-        let key = crate::crypto::derive_manifest_mac_key(master_key);
-        let computed = crate::crypto::manifest_mac(&key, &self.mac_message()?);
-        if computed != stored {
-            bail!("segment manifest MAC mismatch — refusing to open a tampered segment");
-        }
-        Ok(())
+        crate::crypto::verify(self, master_key)
     }
 
     pub fn to_json(&self) -> Result<String> {

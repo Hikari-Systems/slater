@@ -19,10 +19,22 @@
 //! segments and diverging (set uuid ≠ base uuid) sets arrive in later phases.
 //!
 //! # Integrity
-//! The set manifest is a small pointer; the *data* it points at (the base generation,
-//! and later each segment) is authenticated by that image's own `MANIFEST`/`SEGMENT`
-//! MAC + per-block AEAD + the server's ACL stamp on open. A `mac` field is reserved
-//! for authenticating the set pointer itself; wiring it is a later hardening step.
+//! The *data* this manifest points at (the base generation, and each segment) is
+//! authenticated by that image's own `MANIFEST`/`SEGMENT` MAC + per-block AEAD + the
+//! server's ACL stamp on open. Those authenticate the **parts**; this manifest's own
+//! [`mac`](SetManifest::mac) authenticates the **composition** — which base, which
+//! segments, in which order (HIK-144). Both are needed: without the set MAC an attacker
+//! who can write to the data directory can serve a different graph out of pieces that
+//! each verify perfectly, forging nothing.
+//!
+//! Under a configured master key the set MAC is **required**, not optional: an absent
+//! `sets/<uuid>.json`, an unsealed one, or one whose MAC does not verify are all
+//! refusals, and so is a sealed manifest found under a uuid other than the one it
+//! declares. A plaintext (unkeyed) deployment configures no key and carries no MAC.
+//!
+//! What this does **not** stop is a rollback: `current` is an unauthenticated pointer,
+//! so an attacker with write access can still repoint it at an older set that was
+//! genuinely published (and sealed) at some earlier time. See `THREAT_MODEL.md`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -86,22 +98,66 @@ pub struct SetManifest {
     #[serde(default)]
     pub segments: Vec<SegmentRef>,
     pub created_unix: i64,
-    /// Reserved: keyed-MAC over the canonical manifest, authenticating the set
-    /// pointer. `None` for a plaintext set; verification wiring is a later step.
+    /// Keyed-MAC over the canonical manifest, authenticating the set pointer itself —
+    /// i.e. the **composition**: which base generation, and exactly which segments, in
+    /// which order (HIK-144). `None` for a plaintext (unkeyed) set; under a configured
+    /// master key its absence is refused at open, like every other sealed document.
     ///
-    /// **Nothing computes or checks this today** — this struct is *not* MAC-covered, so the
-    /// pointer (which names the base generation and the segment stack) is currently
-    /// authenticated only indirectly, by each image's own MAC. When it is wired, follow the
-    /// [`crate::manifest::Manifest`] pattern exactly: clear `mac`, serialise to JSON, and
-    /// frame it with [`crypto::mac_preimage`](crate::crypto::mac_preimage) under a **new**
-    /// [`MacDomain`](crate::crypto::MacDomain) variant of its own — never reuse the
-    /// generation or segment domain — and pin the body with a golden test (HIK-142). The
-    /// same rule applies: no `HashMap`/`HashSet` field in a MAC-covered struct.
+    /// Sealed and verified through [`crypto::MacSealed`](crate::crypto::MacSealed), so it
+    /// shares one implementation with `MANIFEST.json` and `SEGMENT.json` and cannot drift
+    /// from them. Its domain is [`MacDomain::SetManifest`](crate::crypto::MacDomain) — its
+    /// own namespace, never the generation's or the segment's.
+    ///
+    /// **Rule (as for every MAC-covered struct): no `HashMap`/`HashSet` field may be added
+    /// here or to [`SegmentRef`].** Iteration order is unspecified and randomised per
+    /// process, so the same manifest would MAC differently on each run. The body shape is
+    /// pinned by `mac_preimage_body_is_pinned_to_a_golden_shape` below.
     #[serde(default)]
     pub mac: Option<String>,
 }
 
+/// The set pointer is the third MAC-sealed document. Sealing, verification and the
+/// require-a-MAC-when-keyed policy live once in [`crypto`](crate::crypto) (HIK-144);
+/// only the namespace, the operator-facing label and the canonical body are this
+/// type's own.
+///
+/// The body is the whole struct with `mac` cleared, so the MAC covers `base`, the full
+/// ordered `segments` list (each ref's uuid, bands and content hash) and `set_uuid` —
+/// which is the point: the parts each carry their own MAC, but only this authenticates
+/// *which parts, together*.
+impl crate::crypto::MacSealed for SetManifest {
+    const DOMAIN: crate::crypto::MacDomain = crate::crypto::MacDomain::SetManifest;
+    const SUBJECT: &'static str = "set manifest (sets/<uuid>.json)";
+
+    fn stored_mac(&self) -> Option<&str> {
+        self.mac.as_deref()
+    }
+    fn set_mac(&mut self, mac: Option<String>) {
+        self.mac = mac;
+    }
+    fn mac_body(&self) -> Result<Vec<u8>> {
+        let mut canon = self.clone();
+        canon.mac = None;
+        serde_json::to_vec(&canon).context("serialise set manifest for MAC")
+    }
+}
+
 impl SetManifest {
+    /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store it in
+    /// `mac`. Call **last**, after `base` and the whole `segments` list are final and
+    /// immediately before the manifest is written/uploaded.
+    pub fn seal_mac(&mut self, master_key: &[u8]) -> Result<()> {
+        crate::crypto::seal(self, master_key)
+    }
+
+    /// Recompute the MAC and compare it to the stored `mac`; typed
+    /// [`MacRejected`](crate::crypto::MacRejected) on absence or mismatch. Openers want
+    /// [`crypto::authenticate`](crate::crypto::authenticate), which also requires the MAC
+    /// to be present when a key is configured.
+    pub fn verify_mac(&self, master_key: &[u8]) -> Result<()> {
+        crate::crypto::verify(self, master_key)
+    }
+
     /// A singleton set over `base` (no upper segments), with the set uuid equal to the
     /// base uuid so `current` keeps naming the generation directory.
     pub fn singleton(base: Generation, created_unix: i64) -> Self {
@@ -157,6 +213,18 @@ impl SetManifest {
         let m: SetManifest =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {key}"))?;
         m.validate()?;
+        // Bind the document to the key it was fetched under. Without this a *validly
+        // sealed* set manifest could simply be copied to another set's key: its MAC would
+        // still verify (the MAC covers `set_uuid`, not the location), and `current` — an
+        // unauthenticated pointer — would then name a composition the operator never
+        // published under that name (HIK-144).
+        if m.set_uuid != set_uuid {
+            bail!(
+                "set manifest at {key} declares set uuid {} — refusing a set manifest \
+                 stored under a different uuid",
+                m.set_uuid
+            );
+        }
         Ok(m)
     }
 
@@ -174,6 +242,211 @@ mod tests {
 
     fn uuid(n: u128) -> Generation {
         Generation(uuid::Uuid::from_u128(n))
+    }
+
+    /// A fully populated set — a base plus two segments — so the golden preimage below
+    /// pins every field that carries composition.
+    fn golden_set_manifest() -> SetManifest {
+        SetManifest {
+            magic: SET_MAGIC.to_string(),
+            version: SET_VERSION,
+            set_uuid: uuid(0x1234_5678),
+            base: uuid(0x9abc_def0),
+            segments: vec![
+                SegmentRef {
+                    uuid: uuid(0x11),
+                    node_band: (50, 60),
+                    edge_band: (200, 205),
+                    content_hash: "aabb".into(),
+                },
+                SegmentRef {
+                    uuid: uuid(0x22),
+                    node_band: (60, 61),
+                    edge_band: (205, 205),
+                    content_hash: "ccdd".into(),
+                },
+            ],
+            created_unix: 1_700_000_000,
+            mac: None,
+        }
+    }
+
+    /// The exact MAC body for [`golden_set_manifest`]. Changing it invalidates every set
+    /// MAC in existence, so it is pinned rather than recomputed.
+    ///
+    /// Note the field names are **snake_case**: unlike `MANIFEST.json` and `SEGMENT.json`
+    /// this struct carries no `rename_all = "camelCase"`, and the on-disk set format is
+    /// what it is. Renaming for consistency would be a format break, so the golden pins
+    /// the spelling that exists.
+    const GOLDEN_SET_BODY: &str = r#"{"magic":"SLSET01","version":1,"set_uuid":"00000000-0000-0000-0000-000012345678","base":"00000000-0000-0000-0000-00009abcdef0","segments":[{"uuid":"00000000-0000-0000-0000-000000000011","node_band":[50,60],"edge_band":[200,205],"content_hash":"aabb"},{"uuid":"00000000-0000-0000-0000-000000000022","node_band":[60,61],"edge_band":[205,205],"content_hash":"ccdd"}],"created_unix":1700000000,"mac":null}"#;
+
+    /// HIK-144, on HIK-142's framing: pin the set manifest's MAC preimage.
+    #[test]
+    fn mac_preimage_body_is_pinned_to_a_golden_shape() {
+        let pre = crate::crypto::mac_message(&golden_set_manifest()).unwrap();
+
+        let tag = format!("slater.set-manifest.mac.v{}\0", crate::FORMAT_VERSION);
+        assert!(
+            pre.starts_with(tag.as_bytes()),
+            "preimage must open with the versioned domain tag"
+        );
+        let hdr = tag.len();
+        let len = u64::from_le_bytes(pre[hdr..hdr + 8].try_into().unwrap());
+        let body = std::str::from_utf8(&pre[hdr + 8..]).unwrap();
+        assert_eq!(
+            len as usize,
+            body.len(),
+            "length prefix must state the body"
+        );
+        assert_eq!(
+            body, GOLDEN_SET_BODY,
+            "the set MAC preimage body changed — a field was added, reordered or \
+             reformatted. Confirm the change is intended, then re-pin (it invalidates \
+             every existing set MAC)."
+        );
+        // The body must actually carry the composition, or the MAC authenticates nothing
+        // that matters.
+        assert!(
+            body.contains("00000000-0000-0000-0000-00009abcdef0"),
+            "base"
+        );
+        assert!(
+            body.contains("00000000-0000-0000-0000-000000000011"),
+            "seg 1"
+        );
+        assert!(
+            body.contains("00000000-0000-0000-0000-000000000022"),
+            "seg 2"
+        );
+    }
+
+    /// The set manifest is its own MAC namespace: the same body under the generation or
+    /// segment domain must not reproduce its MAC.
+    #[test]
+    fn set_mac_does_not_verify_under_another_domain() {
+        use crate::crypto::MacSealed as _;
+        let master = b"operator master key";
+        let mut m = golden_set_manifest();
+        m.seal_mac(master).unwrap();
+        m.verify_mac(master).unwrap();
+
+        let body = {
+            let mut canon = m.clone();
+            canon.mac = None;
+            canon.mac_body().unwrap()
+        };
+        let key = crate::crypto::derive_manifest_mac_key(master);
+        for foreign_domain in [
+            crate::crypto::MacDomain::Manifest,
+            crate::crypto::MacDomain::SegmentManifest,
+        ] {
+            let foreign = crate::crypto::manifest_mac(
+                &key,
+                &crate::crypto::mac_preimage(foreign_domain, &body),
+            );
+            assert_ne!(
+                Some(foreign),
+                m.mac,
+                "a set MAC must not be reproducible under {foreign_domain:?}"
+            );
+        }
+    }
+
+    /// HIK-144: the MAC covers the *composition*, so every recomposition an attacker
+    /// could attempt against a set pointer must fail verification — not just an edit to
+    /// some incidental field.
+    #[test]
+    fn the_mac_covers_every_part_of_the_composition() {
+        let master = b"operator master key";
+        let mut sealed = golden_set_manifest();
+        sealed.seal_mac(master).unwrap();
+        sealed.verify_mac(master).unwrap();
+
+        // Each recomposition keeps the stolen MAC and changes one thing about *what is
+        // served*: a different base, a dropped segment, a reordered stack (precedence!),
+        // an added segment, and a segment whose contents were swapped underneath it.
+        let mut rolled_back_base = sealed.clone();
+        rolled_back_base.base = uuid(0xdead);
+
+        let mut dropped_segment = sealed.clone();
+        dropped_segment.segments.pop();
+
+        let mut reordered = sealed.clone();
+        reordered.segments.reverse();
+
+        let mut added_segment = sealed.clone();
+        added_segment.segments.push(SegmentRef {
+            uuid: uuid(0x33),
+            node_band: (61, 62),
+            edge_band: (205, 206),
+            content_hash: "eeff".into(),
+        });
+
+        let mut swapped_contents = sealed.clone();
+        swapped_contents.segments[0].content_hash = "0000".into();
+
+        let mut renamed_set = sealed.clone();
+        renamed_set.set_uuid = uuid(0xbeef);
+
+        for (what, tampered) in [
+            ("base rolled back", rolled_back_base),
+            ("segment dropped", dropped_segment),
+            ("stack reordered", reordered),
+            ("segment added", added_segment),
+            ("segment contents swapped", swapped_contents),
+            ("set renamed", renamed_set),
+        ] {
+            let err = tampered
+                .verify_mac(master)
+                .expect_err("recomposition must not verify: {what}");
+            assert!(
+                matches!(
+                    err.downcast_ref::<crate::crypto::MacRejected>(),
+                    Some(crate::crypto::MacRejected::Mismatch { .. })
+                ),
+                "{what}: must be refused by type: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsealed_set_is_rejected_under_a_key_and_fine_without_one() {
+        let plain = golden_set_manifest(); // mac: None — a plaintext deployment's set
+        assert!(
+            crate::crypto::authenticate(&plain, None).is_ok(),
+            "no key configured ⇒ nothing to authenticate"
+        );
+        let err = crate::crypto::authenticate(&plain, Some(b"key"))
+            .expect_err("a key configured ⇒ the MAC is required");
+        assert!(matches!(
+            err.downcast_ref::<crate::crypto::MacRejected>(),
+            Some(crate::crypto::MacRejected::Missing { .. })
+        ));
+    }
+
+    /// A validly sealed set manifest moved to another set's key must be refused: the MAC
+    /// covers `set_uuid`, not the location it is stored at, so only the read path can
+    /// bind the two.
+    #[test]
+    fn a_sealed_set_manifest_cannot_be_moved_to_another_key() {
+        let master = b"operator master key";
+        let mut m = golden_set_manifest();
+        m.seal_mac(master).unwrap();
+
+        let store = MemObjectStore::new();
+        // Stored under a *different* uuid than it declares.
+        let elsewhere = uuid(0x7777);
+        store
+            .put(
+                &SetManifest::key("g", elsewhere),
+                &m.to_bytes().unwrap(),
+                None,
+            )
+            .unwrap();
+
+        let err = SetManifest::read_via(&store, "g", elsewhere)
+            .expect_err("a set manifest stored under a foreign uuid must be refused");
+        assert!(format!("{err:#}").contains("different uuid"), "{err:#}");
     }
 
     #[test]

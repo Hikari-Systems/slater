@@ -118,9 +118,15 @@ impl CoreStack {
     }
 
     /// Load the upper segments a set declares. Reads each `SEGMENT.json`, authenticates it
-    /// (content hash, marginals, and MAC when a key is configured and the segment carries
-    /// one), derives its block cipher, and opens its readers through `store` under
-    /// `<graph>/segments/<uuid>/`. Returns a singleton stack when the set has no segments.
+    /// (content hash, marginals, and — when a master key is configured — a **required**
+    /// MAC, plus agreement with the set's own reference to it), derives its block cipher,
+    /// and opens its readers through `store` under `<graph>/segments/<uuid>/`. Returns a
+    /// singleton stack when the set has no segments.
+    ///
+    /// The caller is expected to have authenticated `set` itself first
+    /// (`Generation::open_with_store_opts_cached` does): a segment list that has not been
+    /// authenticated names whatever an attacker chose, and per-segment MACs cannot detect
+    /// that (HIK-144).
     ///
     /// `cache_budget` sizes the shared block cache that pages every segment's sections
     /// (`None`/`0` ⇒ [`DEFAULT_SEGMENT_CACHE_BYTES`]); one cache is built and shared across
@@ -154,16 +160,14 @@ impl CoreStack {
             let manifest = SegmentManifest::read_via(store, graph, uuid)
                 .with_context(|| format!("read SEGMENT.json for segment {uuid} of {graph}"))?;
 
-            // Authenticate the manifest before trusting any field. The keyed MAC (when a key
-            // is configured and the segment carries one) authenticates the content hash, the
-            // file inventory, bands and the encryption header — mirroring the base MANIFEST.
-            if let Some(key) = master_key {
-                if manifest.mac.is_some() {
-                    manifest.verify_mac(key).with_context(|| {
-                        format!("verify SEGMENT.json MAC for segment {uuid} of {graph}")
-                    })?;
-                }
-            }
+            // Authenticate the manifest before trusting any field. Under a configured key
+            // the MAC is **required**, not merely verified-when-present (HIK-144 gap 2:
+            // the optional form let an attacker strip the field and downgrade a sealed
+            // segment). Same `crypto::authenticate` the generation manifest and the set
+            // pointer go through — one implementation of the policy, three documents.
+            crypto::authenticate(&manifest, master_key).with_context(|| {
+                format!("authenticate SEGMENT.json for segment {uuid} of {graph}")
+            })?;
             if verify_integrity {
                 manifest.verify_content_hash().with_context(|| {
                     format!("verify SEGMENT.json content hash for segment {uuid}")
@@ -181,6 +185,18 @@ impl CoreStack {
                     manifest.segment_uuid
                 );
             }
+            // A segment is sealed *against a base*; stacking it over a different one would
+            // fold rows onto ids that mean something else. Both sides are MAC-covered, so
+            // this can only fail on a publisher bug or an unkeyed tamper — but it is one
+            // comparison, and the failure it prevents is silent.
+            if manifest.base != set.base {
+                bail!(
+                    "segment {uuid} of {graph} was sealed over base {} but the set's base is \
+                     {} — refusing to stack a segment over a foreign base",
+                    manifest.base,
+                    set.base
+                );
+            }
             if manifest.node_band != seg_ref.node_band || manifest.edge_band != seg_ref.edge_band {
                 bail!(
                     "segment {uuid} of {graph} bands {:?}/{:?} disagree with the set's {:?}/{:?}",
@@ -188,6 +204,23 @@ impl CoreStack {
                     manifest.edge_band,
                     seg_ref.node_band,
                     seg_ref.edge_band
+                );
+            }
+            // HIK-144: the content hash too. Both sides are MAC-covered — the set's copy by
+            // the set MAC, the segment's own by the segment MAC — so requiring them to agree
+            // is what makes the set's authenticated *list* bind the segment *contents*, not
+            // just their names. Without it a set could name a segment uuid whose directory
+            // had been replaced by another validly sealed segment of the same shape.
+            //
+            // An *empty* ref hash (the `#[serde(default)]` of a hand-built fixture) skips
+            // the check, which costs nothing under a key: the field is inside the set MAC,
+            // so an attacker cannot blank it to opt out.
+            if !seg_ref.content_hash.is_empty() && manifest.content_hash != seg_ref.content_hash {
+                bail!(
+                    "segment {uuid} of {graph} has content hash {} but the set names {} — \
+                     refusing a recomposed set",
+                    manifest.content_hash,
+                    seg_ref.content_hash
                 );
             }
 
@@ -671,6 +704,48 @@ mod tests {
         m.set_content_hash();
         m.write_to_dir(&seg_dir).unwrap();
         m
+    }
+
+    /// HIK-144 gap 2: `SEGMENT.json` used to be verified only *when present*, so stripping
+    /// the field downgraded a sealed segment to an unauthenticated one — the same strip the
+    /// generation manifest refuses. Under a key, a segment with no MAC must not load.
+    #[test]
+    fn keyed_load_refuses_a_mac_stripped_segment() {
+        use graph_format::crypto::MacRejected;
+        let key = b"at-rest-master-key";
+        let (root, graph) = (tmp("segstrip"), "g");
+        let (base, seg) = (gid(1), gid(2));
+        let mut m = write_segment(&root, graph, seg, base, (3, 4), (2, 3));
+
+        // Seal the segment honestly, then strip the field — the attack.
+        m.seal_mac(key).unwrap();
+        let seg_dir = root.join(graph).join("segments").join(seg.to_string());
+        m.write_to_dir(&seg_dir).unwrap();
+        let mut stripped = m.clone();
+        stripped.mac = None;
+        stripped.write_to_dir(&seg_dir).unwrap();
+
+        let mut set = SetManifest::singleton(base, 0);
+        set.set_uuid = gid(3);
+        set.segments = vec![SegmentRef::from_manifest(&m)];
+        set.seal_mac(key).unwrap();
+
+        let store = FsObjectStore::new(&root);
+        let err = CoreStack::load(&store, graph, &set, 3, 2, Some(key), true, None)
+            .expect_err("a MAC-stripped segment must not load under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+
+        // The honestly sealed segment still loads — this is not blanket rejection.
+        m.write_to_dir(&seg_dir).unwrap();
+        CoreStack::load(&store, graph, &set, 3, 2, Some(key), true, None)
+            .expect("a sealed segment must still load");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

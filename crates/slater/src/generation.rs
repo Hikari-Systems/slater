@@ -345,11 +345,30 @@ impl Generation {
         let set = if graph_format::setmanifest::SetManifest::exists_via(store, graph, uuid) {
             graph_format::setmanifest::SetManifest::read_via(store, graph, uuid)
                 .with_context(|| format!("read set manifest for {uuid} of graph {graph}"))?
+        } else if master_key.is_some() {
+            // HIK-144: under a key the implicit-singleton fallback is itself a downgrade —
+            // *deleting* `sets/<uuid>.json` would silently drop every segment the set
+            // names and serve the bare base. A keyed deployment publishes a sealed set
+            // for every generation, so an absent one is refusal, not a fallback. Typed as
+            // the same `Missing` a stripped MAC raises — to a caller it is the identical
+            // failure: a composition that is not authenticated.
+            use graph_format::crypto::MacSealed as _;
+            return Err(graph_format::crypto::MacRejected::Missing {
+                subject: graph_format::setmanifest::SetManifest::SUBJECT,
+            })
+            .with_context(|| format!("graph {graph} has no sets/{uuid}.json"));
         } else {
             // Implicit singleton: `current` names a bare generation, so the uuid *is* the
             // base and there are no segments (fixtures and pre-set images).
             graph_format::setmanifest::SetManifest::singleton(uuid, 0)
         };
+        // HIK-144 gap 3: authenticate the *composition* before anything it names is
+        // trusted. Each part carries its own MAC, but only this binds which base and
+        // which ordered segments are served together. One implementation of the
+        // require-when-keyed policy for all three document kinds
+        // (`crypto::authenticate`), so no opener can diverge from it.
+        graph_format::crypto::authenticate(&set, master_key)
+            .with_context(|| format!("authenticate set manifest {uuid} of graph {graph}"))?;
         let base_uuid = set.base;
         // Backend-relative key prefix for the base generation's files.
         let base = join_key(graph, &base_uuid.to_string());
@@ -382,20 +401,32 @@ impl Generation {
             );
         }
 
-        // Manifest authentication: when a master key is configured and the
-        // manifest carries a MAC, verify it before trusting any other field. This
-        // authenticates content_hash, the file inventory, the encryption header,
-        // and the ACL stamp — so an attacker without the key cannot forge a
-        // manifest that opens. A plaintext image carries no MAC and is guarded
-        // only by the copy-completeness hash below (see THREAT_MODEL.md). The
-        // "require a MAC when absent" downgrade policy lives in the server, which
-        // holds the config flags.
-        if let Some(key) = master_key {
-            if manifest.mac.is_some() {
-                manifest.verify_mac(key).with_context(|| {
-                    format!("verify MANIFEST MAC for generation {uuid} of graph {graph}")
-                })?;
-            }
+        // Manifest authentication (HIK-144: here, not in the server). When a master key
+        // is configured the manifest **must** carry a MAC and it must verify, before any
+        // other field is trusted — that authenticates content_hash, the file inventory,
+        // the encryption header and the ACL stamp, so an attacker without the key can
+        // neither forge a manifest that opens nor strip the MAC to be let through
+        // unauthenticated. A plaintext deployment configures no key and is guarded by the
+        // copy-completeness hash below (see THREAT_MODEL.md).
+        //
+        // This is the single choke point: every generation opener in the tree
+        // (`open`, `open_with_key`, `open_with_store*`, the server, `slater query`,
+        // consolidation, the benchmarks) funnels through this function, so the CLI
+        // cannot diverge from the server the way it did before.
+        graph_format::crypto::authenticate(&manifest, master_key).with_context(|| {
+            format!("authenticate MANIFEST for generation {uuid} of graph {graph}")
+        })?;
+
+        // The set names `base`; the manifest read out of `<graph>/<base>/` must agree that
+        // it *is* that generation. Both statements are MAC-covered, so agreeing pins the
+        // base to the composition: a directory swapped under an authenticated set (or a
+        // set repointed at another authenticated generation) fails here.
+        if manifest.build_uuid != base_uuid {
+            bail!(
+                "generation directory {base_uuid} of graph {graph} holds a MANIFEST built \
+                 as {} — refusing a set whose base does not match the generation it names",
+                manifest.build_uuid
+            );
         }
 
         // Copy-completeness guard: re-hash every inventory file through the store
@@ -1458,7 +1489,7 @@ mod tests {
             .collect();
         let content_hash = graph_format::integrity::content_hash(&inv);
 
-        let manifest = Manifest {
+        let mut manifest = Manifest {
             magic: "SLATER01".into(),
             format_version: FORMAT_VERSION,
             build_uuid: GenId(uuid),
@@ -1508,7 +1539,22 @@ mod tests {
             mac: None,
             files,
         };
+        // A keyed fixture is sealed exactly as the builder seals a real one — MANIFEST
+        // and the singleton set pointer both (HIK-144): under a key, an unsealed image or
+        // an absent set manifest is refused, so an unsealed fixture would only ever
+        // exercise the refusal.
+        if let Some(key) = master_key {
+            manifest.seal_mac(key).unwrap();
+        }
         manifest.write_to_dir(&dir).unwrap();
+
+        if let Some(key) = master_key {
+            let sets = root.join(&graph).join("sets");
+            std::fs::create_dir_all(&sets).unwrap();
+            let mut set = graph_format::setmanifest::SetManifest::singleton(GenId(uuid), 0);
+            set.seal_mac(key).unwrap();
+            std::fs::write(sets.join(format!("{uuid}.json")), set.to_bytes().unwrap()).unwrap();
+        }
 
         // Publish the current pointer.
         std::fs::write(
@@ -2292,15 +2338,22 @@ mod tests {
             "unexpected error: {err:#}"
         );
 
-        // Wrong key: refused while opening a store (the AEAD tag fails). The
-        // sealed ISAM top-level / a block read surfaces a clean error.
+        // Wrong key: refused at the very first sealed document (HIK-144). It used to be
+        // caught later, by an AEAD tag failure on the first block read; now the set
+        // pointer's MAC fails under the wrong subkey and the open stops before a single
+        // ciphertext byte is touched. Typed, so a caller can tell it from corruption.
         let err = Generation::open_with_key(&root, &graph, Some(b"wrong-key"))
             .err()
             .unwrap();
         assert!(
-            err.chain().any(|e| e.to_string().contains("wrong key")),
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<graph_format::crypto::MacRejected>(),
+                Some(graph_format::crypto::MacRejected::Mismatch { .. })
+            )),
             "unexpected error: {err:#}"
         );
+        // (The block AEAD remains the backstop below the manifests — covered directly in
+        // `crypto::tests::decrypt_with_the_wrong_key_fails`.)
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2314,12 +2367,14 @@ mod tests {
         let key = b"at-rest-master-key";
         let (root, graph, uuid) = write_fixture_keyed("enc_aad", Some(key));
 
-        // Rewrite the header in place (the fixture carries no MANIFEST MAC, so this
-        // reaches `derive_cipher` rather than tripping the MAC first).
+        // Rewrite the header in place and **re-seal** — an image built under an older AAD
+        // scheme was sealed honestly by whoever built it, so the MAC must verify for this
+        // test to reach `derive_cipher` at all. (Before HIK-144 the fixture was simply
+        // unMACed and the MAC check was skipped; a keyed open now requires one.)
         let dir = root.join(&graph).join(uuid.to_string());
         let mut m = graph_format::manifest::Manifest::read_from_dir(&dir).unwrap();
-        assert!(m.mac.is_none(), "fixture is unMACed; see the comment above");
         m.encryption.as_mut().unwrap().aad_scheme = "none".to_string();
+        m.seal_mac(key).unwrap();
         m.write_to_dir(&dir).unwrap();
 
         let err = Generation::open_with_key(&root, &graph, Some(key))
@@ -2340,12 +2395,223 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_generation_opens_even_with_a_key_configured() {
-        // Encryption is optional: a plaintext generation must keep opening, with
-        // or without a runtime key present (so M2–M5 fixtures keep working).
+    fn plaintext_generation_opens_when_no_key_is_configured() {
+        use graph_format::crypto::MacRejected;
+        // Encryption is optional: a plaintext generation opens on every path when the
+        // deployment configures no master key (so M2–M5 fixtures keep working).
         let (root, graph, _) = write_fixture("plain_with_key");
-        assert!(Generation::open_with_key(&root, &graph, Some(b"ignored")).is_ok());
         assert!(Generation::open(&root, &graph).is_ok());
+
+        // HIK-144: with a key configured, an image carrying no MANIFEST MAC is refused
+        // on *every* path, not just the server's. A MAC-less image under a key is either
+        // a strip attack or a substituted plaintext image; there is no legitimate
+        // keyed-but-unauthenticated deployment (the server has always refused this —
+        // `registry::check_manifest_policy` — and the CLI used to disagree).
+        let err = Generation::open_with_key(&root, &graph, Some(b"ignored"))
+            .err()
+            .expect("a keyed open of an unauthenticated image must be refused");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-144 gap 1: the strip attack the server refuses must also be refused by the
+    /// one-shot CLI (`slater query`), which opens through `open_with_store_opts`. Both
+    /// land in `open_with_store_opts_cached`, so the policy lives there and no caller
+    /// can diverge from it again.
+    #[test]
+    fn keyed_open_refuses_a_mac_stripped_manifest() {
+        use graph_format::crypto::MacRejected;
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_macstrip", Some(key));
+        let dir = root.join(&graph).join(uuid.to_string());
+
+        // The attack: delete the `mac` field from an otherwise intact encrypted image.
+        let mut m = graph_format::manifest::Manifest::read_from_dir(&dir).unwrap();
+        assert!(m.mac.is_some(), "the keyed fixture must be sealed to strip");
+        m.mac = None;
+        m.write_to_dir(&dir).unwrap();
+
+        let err = Generation::open_with_key(&root, &graph, Some(key))
+            .err()
+            .expect("a MAC-stripped image must not open under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type, not by message: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("rebuild"),
+            "and the refusal must be actionable: {err:#}"
+        );
+
+        // And through the *exact* call `slater query` makes (`query.rs` builds a store from
+        // config and calls `open_with_store_opts`) — the entry point that used to bypass the
+        // server's refusal. It refuses because the policy sits below it, not because this
+        // call site restates it.
+        let store = graph_format::store::fs::FsObjectStore::new(&root);
+        let err = match Generation::open_with_store_opts(&store, &graph, Some(key), true) {
+            Ok(_) => panic!("the CLI open path must refuse exactly what the server refuses"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-144 gap 3: the set manifest names the base generation and the segment stack —
+    /// the *composition*. Under a key it must itself be authenticated, so an unsealed set
+    /// pointer beside a perfectly valid generation is refused.
+    #[test]
+    fn keyed_open_requires_an_authenticated_set_manifest() {
+        use graph_format::crypto::MacRejected;
+        use graph_format::setmanifest::SetManifest;
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_setunsealed", Some(key));
+
+        // Overwrite the fixture's sealed set with an unsealed one (`mac: None`) — the
+        // set-level strip.
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let set = SetManifest::singleton(GenId(uuid), 0);
+        assert!(set.mac.is_none());
+        std::fs::write(sets.join(format!("{uuid}.json")), set.to_bytes().unwrap()).unwrap();
+
+        let err = Generation::open_with_key(&root, &graph, Some(key))
+            .err()
+            .expect("an unauthenticated set pointer must not open under a key");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// HIK-144 gap 3, end to end: MACs on the *parts* do not authenticate the
+    /// *composition*. Every piece here stays byte-for-byte as published and individually
+    /// valid — only the set pointer's list of them is edited — and the open must refuse.
+    #[test]
+    fn keyed_open_refuses_a_recomposed_set() {
+        use graph_format::crypto::MacRejected;
+        use graph_format::manifest::FileEntry;
+        use graph_format::segmanifest::{SegmentManifest, SEGMENT_MAGIC, SEGMENT_MANIFEST_VERSION};
+        use graph_format::segment::{NodeRow, SegmentWriter};
+        use graph_format::setmanifest::{SegmentRef, SetManifest};
+
+        let key = b"at-rest-master-key";
+        let (root, graph, base_uuid) = write_fixture_keyed("enc_recompose", Some(key));
+        let seg_uuid = uuid::Uuid::from_u128(0x5_e600_0000_0000_0000_0000_0000_00a2);
+        let set_uuid = uuid::Uuid::from_u128(0x5_e700_0000_0000_0000_0000_0000_00a3);
+
+        // One sealed segment carrying a born node at dense id 3 (the base has 3 nodes).
+        let seg_dir = root
+            .join(&graph)
+            .join("segments")
+            .join(seg_uuid.to_string());
+        std::fs::create_dir_all(seg_dir.parent().unwrap()).unwrap();
+        let mut w = SegmentWriter::create(&seg_dir, 0x11, 4096, 3).unwrap();
+        w.push_node(
+            3,
+            &NodeRow {
+                labels: vec!["Person".into()],
+                props: vec![("name".into(), Value::Str("Zed".into()))],
+                tombstoned: false,
+            },
+        )
+        .unwrap();
+        w.finish().unwrap();
+        let mut seg = SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: SEGMENT_MANIFEST_VERSION,
+            segment_uuid: GenId(seg_uuid),
+            base: GenId(base_uuid),
+            created_unix: 0,
+            node_band: (3, 4),
+            edge_band: (2, 2),
+            content_hash: String::new(),
+            encryption: None,
+            node_count_delta: 1,
+            edge_count_delta: 0,
+            reltype_edge_deltas: vec![],
+            label_node_deltas: vec![("Person".into(), 1)],
+            hub_degree_out_deltas: vec![],
+            hub_degree_in_deltas: vec![],
+            marginals_exact: true,
+            dirty_vectors: vec![],
+            dirty_indexes: vec![],
+            label_membership_touch: None,
+            mac: None,
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 0,
+                blake3: "aa".into(),
+                sha256: None,
+                crc32c: None,
+            }],
+        };
+        seg.set_content_hash();
+        seg.seal_mac(key).unwrap();
+        seg.write_to_dir(&seg_dir).unwrap();
+
+        // The honestly published set: base + that one segment, sealed, `current` on it.
+        let sets = root.join(&graph).join("sets");
+        std::fs::create_dir_all(&sets).unwrap();
+        let mut set = SetManifest::singleton(GenId(base_uuid), 0);
+        set.set_uuid = GenId(set_uuid);
+        set.segments = vec![SegmentRef::from_manifest(&seg)];
+        set.seal_mac(key).unwrap();
+        let set_path = sets.join(format!("{set_uuid}.json"));
+        std::fs::write(&set_path, set.to_bytes().unwrap()).unwrap();
+        std::fs::write(root.join(&graph).join("current"), set_uuid.to_string()).unwrap();
+
+        // It opens, and the segment is in the stack — the composition is genuine.
+        let gen = Generation::open_with_key(&root, &graph, Some(key)).unwrap();
+        assert_eq!(gen.stack().segments().len(), 1);
+        drop(gen);
+
+        // Now recompose. Each variant keeps every part unmodified and validly sealed —
+        // the attacker forges nothing — and only edits the list that names them.
+        let mut dropped = set.clone();
+        dropped.segments.clear(); // un-apply the flush: the born node disappears
+        let mut rebased = set.clone();
+        rebased.base = GenId(uuid::Uuid::from_u128(0xdead)); // serve a different base
+        for (what, tampered) in [("dropped segment", dropped), ("swapped base", rebased)] {
+            std::fs::write(&set_path, tampered.to_bytes().unwrap()).unwrap();
+            let err = Generation::open_with_key(&root, &graph, Some(key))
+                .err()
+                .unwrap_or_else(|| panic!("{what}: a recomposed set must not open"));
+            assert!(
+                err.chain().any(|e| matches!(
+                    e.downcast_ref::<MacRejected>(),
+                    Some(MacRejected::Mismatch { .. })
+                )),
+                "{what}: must be refused by type: {err:#}"
+            );
+        }
+
+        // Restoring the published set restores service — the refusal is about the edit,
+        // not about the segment being there. (The unkeyed side of the policy is covered by
+        // `opens_a_set_with_an_upper_segment`, over a plaintext fixture: this base is
+        // encrypted, so it cannot open without a key at all.)
+        std::fs::write(&set_path, set.to_bytes().unwrap()).unwrap();
+        let gen = Generation::open_with_key(&root, &graph, Some(key)).unwrap();
+        assert_eq!(gen.stack().segments().len(), 1);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
