@@ -8396,6 +8396,206 @@ fn a_write_rejects_an_embedding_of_the_wrong_dimension() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A deterministic `n × dim` vector fixture plus the `slater-dump` script that creates it as
+/// `(:Doc:__DumpVertex__ {__dump_id__, embedding})`. Shared by the plaintext and encrypted
+/// carry-by-reference tests so both index exactly the same data.
+#[cfg(test)]
+fn vamana_fixture_script(dim: usize, n: usize) -> (String, Vec<Vec<f32>>) {
+    let mut seed: u64 = 0xDEAD_BEEF_1234;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+    };
+    let mut script =
+        format!("CALL db.idx.vector.createNodeIndex('Doc', 'embedding', {dim}, 'cosine');\n");
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let body: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+        script.push_str(&format!(
+            "CREATE (:Doc:__DumpVertex__ {{__dump_id__: {i}, embedding: vecf32([{}])}});\n",
+            body.join(", ")
+        ));
+        vectors.push(v);
+    }
+    (script, vectors)
+}
+
+/// The bytes of the served generation's `Doc.embedding` Vamana graph, wherever it lives —
+/// inside the generation directory (a freshly built or rewritten index) or in its own
+/// `vecidx/<uuid>/` artifact directory (a carried one, HIK-145).
+#[cfg(test)]
+fn carried_vamana_bytes(data: &Path, graph: &str, gen: &Generation) -> Vec<u8> {
+    let rel = "vector/Doc.embedding.vamana";
+    let in_gen = data.join(graph).join(gen.base_uuid().to_string()).join(rel);
+    if in_gen.exists() {
+        return std::fs::read(&in_gen).unwrap();
+    }
+    let vecidx = data.join(graph).join("vecidx");
+    for e in std::fs::read_dir(&vecidx).expect("no in-generation .vamana and no vecidx/ dir") {
+        let d = e.unwrap().path();
+        let f = d.join("Doc.embedding.vamana");
+        if f.exists() {
+            return std::fs::read(&f).unwrap();
+        }
+    }
+    panic!("no carried .vamana found under {}", vecidx.display());
+}
+
+/// HIK-145: the **encrypted** arm of carry-by-reference — the configuration that had no test
+/// and in which the carry had therefore never worked.
+///
+/// Every build mints a fresh per-generation salt, so a `.vamana` hard-linked out of the base
+/// generation into the new one is sealed under the *old* generation's key while the new
+/// generation's manifest declares the *new* salt. Before the fix this fails the Poly1305 tag
+/// on the base's first block inside `streaming_merge` (the build aborts), and — if it got
+/// past that — again at serve time. After the fix the carried graph is its own salt-bearing
+/// artifact and KNN returns the right neighbour.
+///
+/// The second half re-opens the whole data directory from cold (test 2 of the ticket): the
+/// artifact's salt lives on disk in its own manifest, so a restart re-derives the cipher
+/// identically with no in-memory state.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
+    use graph_format::manifest::AnnMode;
+
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_vamana_enc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    // 32 hex chars = a 16-byte master key; the KDF takes any length.
+    let key_hex = "0123456789abcdef0123456789abcdef";
+    let key = graph_format::crypto::hex_decode(key_hex).unwrap();
+
+    let (dim, n) = (16usize, 400usize);
+    let (script, vectors) = vamana_fixture_script(dim, n);
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, &script).unwrap();
+
+    let build_args = |cmd: &mut std::process::Command| {
+        cmd.args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .arg("--encrypt")
+            .args(["--key-env", "SLATER_HIK145_KEY"])
+            .env("SLATER_HIK145_KEY", key_hex);
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(["--input", input.to_str().unwrap()])
+        .args(["--pk", "__dump_id__"])
+        .args(["--cluster", "none"]);
+    build_args(&mut cmd);
+    assert!(
+        cmd.status().expect("spawn slater-build").success(),
+        "the encrypted fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, Some(&key)).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+
+    let gen0 = graphs.get("docs").unwrap();
+    assert!(
+        matches!(
+            gen0.manifest().vector_indexes[0].mode,
+            AnnMode::Vamana { .. }
+        ),
+        "the fixture must actually be a Vamana index, else this proves nothing"
+    );
+    let base_uuid = gen0.base_uuid();
+    let base_vamana = data
+        .join("docs")
+        .join(base_uuid.to_string())
+        .join("vector/Doc.embedding.vamana");
+    let base_bytes = std::fs::read(&base_vamana).expect("base .vamana must exist");
+    drop(gen0);
+
+    graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("--input")
+                .arg(d)
+                .args(["--input-format", "slater-dump"]);
+            let _ = (g, dd);
+            build_args(&mut cmd);
+            let st = cmd.status().context("spawn builder")?;
+            anyhow::ensure!(st.success(), "encrypted consolidating build failed: {st}");
+            Ok(())
+        })
+        .expect("an encrypted carry-by-reference consolidation must succeed");
+
+    // The carried graph must still be the *same bytes* — the carry exists to avoid rewriting
+    // them, and re-sealing under the new generation key would rewrite every one.
+    let carried = graphs.get("docs").unwrap();
+    assert!(
+        matches!(
+            carried.manifest().vector_indexes[0].mode,
+            AnnMode::Vamana { .. }
+        ),
+        "a carried Vamana base must stay Vamana, not be rebuilt as brute-force"
+    );
+    let carried_bytes = carried_vamana_bytes(&data, "docs", carried.as_ref());
+    assert_eq!(
+        carried_bytes, base_bytes,
+        "an encrypted pure-permutation consolidation must carry the .vamana byte-identically"
+    );
+    drop(carried);
+
+    let probe = |graphs: &Graphs, what: &str| {
+        let g = graphs.get("docs").unwrap();
+        let view = MergedView::read_only(g.as_ref());
+        let body: Vec<String> = vectors[7].iter().map(|x| format!("{x:.6}")).collect();
+        let ast = parser::parse(&format!(
+            "CALL db.idx.vector.queryNodes('Doc', 'embedding', 1, vecf32([{}])) \
+             YIELD node, score RETURN id(node) AS id, score",
+            body.join(", ")
+        ))
+        .unwrap();
+        let res = Engine::new(&view, &cache)
+            .with_vector_cache(&vc, 96)
+            .run(&ast)
+            .unwrap_or_else(|e| panic!("{what}: KNN over the carried encrypted index: {e:#}"));
+        assert_eq!(
+            res.rows.len(),
+            1,
+            "{what}: the carried index must return a hit"
+        );
+        assert!(
+            matches!(res.rows[0][0], Val::Int(7)),
+            "{what}: a node's own embedding must be its own nearest neighbour, got {:?}",
+            res.rows[0][0]
+        );
+        let Val::Float(score) = res.rows[0][1] else {
+            panic!("{what}: score should be a float");
+        };
+        assert!(
+            score.abs() < 1e-5,
+            "{what}: an exact match must score ~0; got {score}"
+        );
+    };
+
+    probe(&graphs, "after consolidation");
+
+    // Test 2: cold restart. Drop every open handle and re-open the data dir from disk — the
+    // carried artifact's salt must round-trip through its own manifest.
+    drop(graphs);
+    let reopened = Graphs::open_all(&data, Some(&key)).unwrap();
+    probe(&reopened, "after restart");
+    drop(reopened);
+
+    std::fs::remove_dir_all(&work).ok();
+}
+
 /// The **Vamana** arm of the same gate — and, since HIK-117, the server-level proof of
 /// **carry-by-reference**. A Vamana index's full vectors live in its `.vamana` blocks; the
 /// consolidation no longer streams them back out (the ~370 GB read at scale) and no longer
