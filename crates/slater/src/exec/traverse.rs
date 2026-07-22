@@ -252,8 +252,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
             .start
             .var
             .as_deref()
-            .is_some_and(|v| is_id_anchored(where_, v));
-        if start_anchored || !is_id_anchored(where_, end_var) {
+            .is_some_and(|v| is_id_anchored(where_, v, &self.plan_params));
+        if start_anchored || !is_id_anchored(where_, end_var, &self.plan_params) {
             return None;
         }
         Some(reverse_pattern(pattern))

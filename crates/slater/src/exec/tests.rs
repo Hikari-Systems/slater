@@ -7929,6 +7929,62 @@ fn reverse_traversal_to_bound_node() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// HIK-147 execution guard: a **parameterised** id lookup must do seek-sized work,
+/// not scan-sized work. The plan-level assertions live in `plan.rs`; this one runs
+/// the whole engine and measures the intermediate charge, so a future regression in
+/// either the id-seek walker or the re-root fails the suite instead of merely making
+/// production slow.
+///
+/// The star fixture makes the two plans differ by construction: leading with `m`
+/// scans every node and expands all `2n` LINK edges, whereas seeking the id-anchored
+/// `n` and walking one reverse edge touches exactly one. We assert both the peak
+/// intermediate charge (bounded by a constant, not `n`) and that a budget far below
+/// `n` still completes — the un-rerooted plan blows it, which is precisely the
+/// `query.maxIntermediate` failure reported on the 10M sample.
+#[test]
+fn parameterised_id_lookup_does_seek_sized_work_not_scan_sized() {
+    const N: u64 = 2_000;
+    let (root, graph) = testgen::write_hub("exec_param_id_seek", N);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let params: HashMap<String, Val> = [("x".to_string(), Val::Int(7))].into_iter().collect();
+    let run_with = |budget: u64| {
+        let global = GlobalIntermediateBudget::new(0);
+        let engine = Engine::new(&gen, &cache)
+            .with_max_intermediate(budget)
+            .with_global_budget(&global)
+            .with_params(params.clone());
+        let res = engine.run(
+            &parser::parse("MATCH (m)-[:LINK]->(n) WHERE id(n) = $x RETURN m.name AS nm").unwrap(),
+        );
+        (res, global.peak())
+    };
+
+    // A budget two orders of magnitude below the star's edge count. The seek plan
+    // needs a handful of elements; the scan plan needs ~2n.
+    let (res, peak) = run_with(N / 100);
+    let res = res.expect("a parameterised id lookup must not scan the whole star");
+    let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+    assert_eq!(names, vec!["hub"], "only the hub links to leaf 7");
+    assert!(
+        peak < N / 100,
+        "seek-sized work expected, peak charge was {peak} against {N} leaves"
+    );
+
+    // Same query, unbounded — the answer must not depend on the budget, and the
+    // literal spelling must agree with the parameterised one.
+    let (unbounded, _) = run_with(0);
+    assert_eq!(unbounded.unwrap().rows.len(), 1);
+    let engine = Engine::new(&gen, &cache);
+    let literal = engine
+        .run(&parser::parse("MATCH (m)-[:LINK]->(n) WHERE id(n) = 7 RETURN m.name AS nm").unwrap())
+        .unwrap();
+    assert_eq!(literal.rows.len(), 1);
+    assert_eq!(literal.rows[0][0].to_display(), "hub");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The **Vamana arm** of the HIK-122 rescue read. The consolidation tests exercise this
 /// through the real builder, but a fixture small enough to run there is always below
 /// `ann_threshold` and so always brute-force — this is the only place the other arm is
@@ -10849,4 +10905,121 @@ fn rel_type_scan_concrete_rows() {
         true,
     );
     assert_eq!(rows, vec!["a|b".to_string(), "b|c".to_string()]);
+}
+
+/// HIK-147 adversarial: the parameterised seek must agree with the literal
+/// spelling **exactly**, including on the writable layer, where an `IdSeek` is a
+/// narrowing the un-fixed param path never performed. Two ways this could go
+/// wrong that a plan-level test cannot see: a delta-**born** id sits above the
+/// core's node count (an over-tight bounds check would turn it into a provably-
+/// empty seek and silently lose the row), and a **tombstoned** id is still inside
+/// the scan bound (an unsuppressed seek would resurrect a deleted node that the
+/// old scan path correctly hid).
+#[test]
+fn param_id_seek_agrees_with_the_scan_on_a_written_delta() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    let (root, graph, _) = testgen::write_basic("exec_param_id_delta");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    // Born node (a fresh identity: no `resolved` core id) + a tombstone on core
+    // node 1 (Bob). The synthetic base is the core's node count, so the born id
+    // lands just past the last core id — exactly as the server seeds it at open.
+    let mut mem = Memtable::with_synthetic_base(gen.node_count());
+    mem.upsert_node(
+        "Person",
+        "name",
+        Value::Str("Dave".into()),
+        None,
+        [("name".to_string(), Value::Str("Dave".into()))],
+    );
+    mem.delete_node("Person", "name", Value::Str("Bob".into()), Some(1));
+    let born: Vec<u64> = mem.born_ids_with_label("Person");
+    assert_eq!(born.len(), 1, "one born node");
+    let born_id = born[0];
+    let delta = DeltaSnapshot::from_memtable(Arc::new(mem));
+    let view = MergedView::new(&gen, delta);
+
+    let names = |id: i64| -> Vec<String> {
+        let params: HashMap<String, Val> = [("p".to_string(), Val::Int(id))].into_iter().collect();
+        let engine = Engine::new(&view, &cache).with_params(params);
+        let via_param = engine
+            .run(&parser::parse("MATCH (n) WHERE id(n) = $p RETURN n.name AS nm").unwrap())
+            .unwrap();
+        let engine = Engine::new(&view, &cache);
+        let via_literal = engine
+            .run(
+                &parser::parse(&format!("MATCH (n) WHERE id(n) = {id} RETURN n.name AS nm"))
+                    .unwrap(),
+            )
+            .unwrap();
+        let p: Vec<String> = via_param.rows.iter().map(|r| r[0].to_display()).collect();
+        let l: Vec<String> = via_literal.rows.iter().map(|r| r[0].to_display()).collect();
+        assert_eq!(p, l, "param and literal spellings must agree for id {id}");
+        p
+    };
+
+    assert_eq!(names(0), vec!["Alice"], "an ordinary core node");
+    assert!(names(1).is_empty(), "a tombstoned node must stay deleted");
+    assert_eq!(
+        names(born_id as i64),
+        vec!["Dave"],
+        "a delta-born id is inside the scan bound and must be found"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// HIK-147 adversarial: the re-root the parameterised anchor now unlocks reverses
+/// the pattern, so it must not change *which* rows come back on a fixture where
+/// direction matters (the star fixture is symmetric and would hide a flipped
+/// edge). A chain has exactly one predecessor and one successor per node.
+#[test]
+fn param_id_reroot_preserves_direction_and_multi_hop_results() {
+    let (root, graph) = testgen::write_chain("exec_param_id_reroot_dir", 12);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let both = |q_param: &str, q_lit: &str, id: i64| -> Vec<String> {
+        let params: HashMap<String, Val> = [("x".to_string(), Val::Int(id))].into_iter().collect();
+        let engine = Engine::new(&gen, &cache).with_params(params);
+        let p = engine.run(&parser::parse(q_param).unwrap()).unwrap();
+        let engine = Engine::new(&gen, &cache);
+        let l = engine.run(&parser::parse(q_lit).unwrap()).unwrap();
+        let pv: Vec<String> = p.rows.iter().map(|r| r[0].to_display()).collect();
+        let lv: Vec<String> = l.rows.iter().map(|r| r[0].to_display()).collect();
+        assert_eq!(pv, lv, "param and literal must agree: {q_param}");
+        pv
+    };
+
+    // One hop: only the *predecessor* of n5, never the successor.
+    assert_eq!(
+        both(
+            "MATCH (m)-[:R]->(n) WHERE id(n) = $x RETURN m.name AS nm",
+            "MATCH (m)-[:R]->(n) WHERE id(n) = 5 RETURN m.name AS nm",
+            5,
+        ),
+        vec!["n4"]
+    );
+    // Two hops re-rooted from the far end.
+    assert_eq!(
+        both(
+            "MATCH (a)-[:R]->(b)-[:R]->(c) WHERE id(c) = $x RETURN a.name AS nm",
+            "MATCH (a)-[:R]->(b)-[:R]->(c) WHERE id(c) = 5 RETURN a.name AS nm",
+            5,
+        ),
+        vec!["n3"]
+    );
+    // The reverse spelling of the same pattern must still see the successor.
+    assert_eq!(
+        both(
+            "MATCH (m)<-[:R]-(n) WHERE id(n) = $x RETURN m.name AS nm",
+            "MATCH (m)<-[:R]-(n) WHERE id(n) = 5 RETURN m.name AS nm",
+            5,
+        ),
+        vec!["n6"]
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
