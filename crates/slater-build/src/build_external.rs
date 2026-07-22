@@ -2135,6 +2135,7 @@ fn build_inner(
         &mut block_sizes,
         &perm,
         data_dir,
+        graph,
     )?;
     drop(emit_vec_g);
 

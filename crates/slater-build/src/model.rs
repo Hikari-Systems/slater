@@ -171,6 +171,15 @@ pub struct VectorIndexStmt {
 pub struct VectorCarry {
     pub base_vamana: String,
     pub base_pq: String,
+    /// The base generation whose (authenticated) MANIFEST supplies the salt the base `.pq`
+    /// — and, when [`Self::base_vamana_artifact`] is `None`, the base `.vamana` — was
+    /// sealed under (HIK-145).
+    #[serde(default)]
+    pub base_gen: Option<graph_format::ids::Generation>,
+    /// Set when the base `.vamana` is already a `vecidx/<uuid>/` artifact carried by an
+    /// earlier consolidation; its own manifest holds the salt and AAD subkey label.
+    #[serde(default)]
+    pub base_vamana_artifact: Option<graph_format::ids::Generation>,
     pub carry_map_path: std::path::PathBuf,
     pub base_records: u64,
     pub r: u32,

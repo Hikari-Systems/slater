@@ -569,7 +569,10 @@ pub fn merge_params(fx: &VecFixture, medoid: VamanaIndex) -> MergeParams {
         pq_block_bytes: BLOCK,
         zstd_level: ZSTD,
         cipher: None,
+        base_vamana_cipher: None,
+        base_pq_cipher: None,
     }
+    .with_same_key_base()
 }
 
 /// Run a streaming merge of `base` (its `.vamana`/`.pq`) with `inserts` (new raw vectors keyed by
@@ -1051,7 +1054,10 @@ pub fn ip_merge_params(medoid: VamanaIndex, r: usize) -> MergeParams {
         pq_block_bytes: BLOCK,
         zstd_level: ZSTD,
         cipher: None,
+        base_vamana_cipher: None,
+        base_pq_cipher: None,
     }
+    .with_same_key_base()
 }
 
 /// The **angular-seed** variant (design §2.1 option D / §2.2): descend the IP graph on exact IP,

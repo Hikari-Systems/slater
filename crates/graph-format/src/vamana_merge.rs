@@ -99,32 +99,56 @@ pub struct MergeParams {
     /// Target block size for the output `.pq`.
     pub pq_block_bytes: usize,
     pub zstd_level: i32,
-    /// The **generation** cipher for the output pair, or `None` for a plaintext index.
-    ///
-    /// HIK-140: blocks are sealed per file, so this is not used directly — it derives a
-    /// per-file subkey from [`MergeParams::stem`]. It is also handed to the *base* pair,
-    /// which is only correct while the base and the output share a generation key; see
-    /// the note on `stem`.
+    /// The **output** generation's cipher, or `None` for a plaintext index. Seals every
+    /// file this merge writes: the new `.pq`, the rewritten `.vamana` and the delete
+    /// scratch. HIK-140: blocks are sealed per file, so this is not used directly — it
+    /// derives a per-file subkey from [`MergeParams::stem`].
     pub cipher: Option<Arc<BlockCipher>>,
-    /// Store-relative stem shared by the pair, without the `.vamana` / `.pq` suffix —
-    /// `vector/{label}.{property}` for a generation, `vec.{label}.{property}` for a
-    /// segment. Writer and reader must agree on it byte-for-byte (HIK-140).
-    ///
-    /// The base pair is opened under the *same* stem and the *same* cipher. That is
-    /// exactly today's behaviour: `cipher` has always been the output generation's, and a
-    /// consolidation mints a fresh salt, so carrying an **encrypted** base by reference
-    /// has never worked (it fails the tag check on the base's first block, and did so
-    /// before this change too). Fixing that needs the base generation's salt threaded
-    /// into the carry record — out of scope here, and unchanged by it.
+    /// Store-relative stem shared by the **output** pair, without the `.vamana` / `.pq`
+    /// suffix — `vector/{label}.{property}` for a generation, `vec.{label}.{property}` for
+    /// a segment. Writer and reader must agree on it byte-for-byte (HIK-140).
     pub stem: String,
+    /// Per-file cipher for the **base** `.vamana`, or `None` when the base is plaintext.
+    ///
+    /// Separate from [`MergeParams::cipher`] because the base and the output are separate
+    /// artifacts sealed under separate salts (HIK-145). A consolidation mints a fresh
+    /// generation salt, and a carried `.vamana` keeps the salt it was written under — its
+    /// own artifact manifest records it. Passing the output cipher here is what made
+    /// encrypted carry-by-reference fail its Poly1305 tag on the base's first block.
+    ///
+    /// Already a [`FileCipher`], so the caller supplies the HIK-140 subkey label the base
+    /// was **sealed** under — which is not derivable from the base's current path once the
+    /// file has been promoted into an artifact directory.
+    pub base_vamana_cipher: Option<Arc<FileCipher>>,
+    /// Per-file cipher for the **base** `.pq`. Distinct from
+    /// [`MergeParams::base_vamana_cipher`]: the `.pq` is rewritten by every merge, so it
+    /// always lives in — and is sealed under the key of — the base *generation*, while the
+    /// `.vamana` may have been carried through several generations under an older salt.
+    pub base_pq_cipher: Option<Arc<FileCipher>>,
 }
 
 impl MergeParams {
-    /// The per-file cipher for `{stem}{suffix}`.
+    /// The per-file cipher for `{stem}{suffix}` under the **output** key.
     fn file_cipher(&self, suffix: &str) -> Option<Arc<FileCipher>> {
         self.cipher
             .as_ref()
             .map(|c| Arc::new(c.for_file(&format!("{}{suffix}", self.stem))))
+    }
+
+    /// Fill the base-side ciphers from the output key and stem — i.e. declare that the base
+    /// pair happens to be sealed under the *same* key and names as the output.
+    ///
+    /// That is true for a merge whose base and output are the same artifact (an in-place
+    /// rewrite, a test fixture, a benchmark), and **false** for a consolidation, which mints
+    /// a fresh generation salt. A real carry must set
+    /// [`base_vamana_cipher`](Self::base_vamana_cipher) /
+    /// [`base_pq_cipher`](Self::base_pq_cipher) from the documents that record how the base
+    /// was actually sealed (HIK-145); this helper exists so that assumption has to be
+    /// written down rather than inherited by omission.
+    pub fn with_same_key_base(mut self) -> Self {
+        self.base_vamana_cipher = self.file_cipher(".vamana");
+        self.base_pq_cipher = self.file_cipher(".pq");
+        self
     }
 }
 
@@ -178,9 +202,9 @@ pub fn streaming_merge(
     vamana_out: &Path,
     pq_out: &Path,
 ) -> Result<MergeStats> {
-    let reader = VamanaReader::open_with_cipher(vamana_in, params.file_cipher(".vamana"))
+    let reader = VamanaReader::open_with_cipher(vamana_in, params.base_vamana_cipher.clone())
         .with_context(|| format!("open {}", vamana_in.display()))?;
-    let base_pq = PqReader::open_with_cipher(pq_in, params.file_cipher(".pq"))
+    let base_pq = PqReader::open_with_cipher(pq_in, params.base_pq_cipher.clone())
         .with_context(|| format!("open {}", pq_in.display()))?
         .load_resident()
         .with_context(|| format!("load {}", pq_in.display()))?;
@@ -884,7 +908,10 @@ mod tests {
             pq_block_bytes: BLOCK,
             zstd_level: LEVEL,
             cipher: None,
+            base_vamana_cipher: None,
+            base_pq_cipher: None,
         }
+        .with_same_key_base()
     }
 
     /// KNN over an on-disk `.vamana` + `.pq`, mirroring `exec::vamana_knn`: PQ estimate for
@@ -1038,7 +1065,10 @@ mod tests {
             pq_block_bytes: BLOCK,
             zstd_level: LEVEL,
             cipher: None,
+            base_vamana_cipher: None,
+            base_pq_cipher: None,
         }
+        .with_same_key_base()
     }
 
     /// IP knn read-back: navigate by the IP-ADC estimate (`AdcTable::new_ip`, raw query, no

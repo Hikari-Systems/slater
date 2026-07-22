@@ -311,6 +311,7 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
             },
         ],
         vector_indexes: vec![VectorIndexDesc {
+            carried_graph: None,
             label: "Person".into(),
             property: "embedding".into(),
             dim: 3,
@@ -489,6 +490,7 @@ pub fn write_vector_docs_keyed(
             property: "name".into(),
         }],
         vector_indexes: vec![VectorIndexDesc {
+            carried_graph: None,
             label: "Doc".into(),
             property: "embedding".into(),
             dim: dim as u32,
@@ -2414,6 +2416,7 @@ fn write_vamana_inner(
         property_keys: vec!["embedding".into()],
         range_indexes: vec![],
         vector_indexes: vec![VectorIndexDesc {
+            carried_graph: None,
             label: "Doc".into(),
             property: "embedding".into(),
             dim: f.dim as u32,

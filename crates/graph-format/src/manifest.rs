@@ -230,6 +230,16 @@ pub struct VectorIndexDesc {
     #[serde(default)]
     pub first_record: u64,
     pub mode: AnnMode,
+    /// Set when this index's Vamana **graph** was carried by reference through a
+    /// consolidation (HIK-145): the `.vamana` is *not* in this generation's directory,
+    /// `files[]` or [`Manifest::content_hash`] — it lives in its own salt-bearing
+    /// `vecidx/<uuid>/` artifact, sealed under the key it was originally written with, and
+    /// this names which one. `None` ⇒ the `.vamana` is an ordinary file of this generation.
+    ///
+    /// Only the graph file is carried; the `.pq` layout→id column is rewritten by every
+    /// merge and stays in this generation's inventory either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_graph: Option<crate::vecmanifest::VectorArtifactRef>,
 }
 
 impl VectorIndexDesc {
@@ -829,6 +839,10 @@ mod tests {
             property_keys: vec!["name".into(), "embedding".into()],
             range_indexes: vec![],
             vector_indexes: vec![VectorIndexDesc {
+                carried_graph: Some(crate::vecmanifest::VectorArtifactRef {
+                    uuid: Generation(uuid::Uuid::from_u128(0x5eed)),
+                    content_hash: "cafe".into(),
+                }),
                 label: "Chunk".into(),
                 property: "embedding".into(),
                 dim: 1024,
@@ -1022,6 +1036,7 @@ mod tests {
             }],
             vector_indexes: vec![
                 VectorIndexDesc {
+                    carried_graph: None,
                     label: "Chunk".into(),
                     property: "embedding".into(),
                     dim: 1024,
@@ -1031,6 +1046,7 @@ mod tests {
                     mode: AnnMode::BruteForce,
                 },
                 VectorIndexDesc {
+                    carried_graph: None,
                     label: "Doc".into(),
                     property: "embedding".into(),
                     dim: 768,
