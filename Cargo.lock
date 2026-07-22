@@ -3300,6 +3300,7 @@ dependencies = [
  "graph-format",
  "serde",
  "slater-scalar",
+ "thiserror",
  "tracing",
 ]
 

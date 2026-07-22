@@ -20,9 +20,15 @@
 //!
 //! # On-disk layout
 //! ```text
-//! MAGIC(8 "SLL0SEG1") ‖ crc32c:u32(LE) ‖ body        (crc over body)
-//! body = Memtable::serialise()
+//! MAGIC(8 "SLL0SEG1") ‖ crc32c:u32(LE) ‖ stored      (crc over `stored`)
+//! stored = body                                       (plaintext)
+//!        | nonce(24) ‖ ciphertext(body + 16)          (sealed, MAGIC "SLL0SEGE")
+//! body   = Memtable::serialise()
 //! ```
+//! A segment is one immutable blob written once, so on an encrypted deployment (HIK-146)
+//! it seals whole, under a subkey bound to its own file name — a segment renamed into
+//! another slot fails to open. Sealed and plaintext segments carry different magics and
+//! the key policy is symmetric: either mismatch is refused (see [`crate::seal`]).
 //! The file is written temp-then-`rename` so a reader never observes a torn image;
 //! the crc catches media corruption. Reads load the whole body resident (the delta
 //! is byte-budgeted, so this never grows with core size — an off-heap `pread`
@@ -32,12 +38,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::memtable::Memtable;
+use crate::seal::{bind, frame_blob, l0_name, unframe_blob, DeltaCipher};
 
 /// Magic prefix identifying an L0 segment file.
 const L0_MAGIC: &[u8; 8] = b"SLL0SEG1";
+
+/// Magic prefix identifying a **sealed** L0 segment file (HIK-146).
+const L0_MAGIC_SEALED: &[u8; 8] = b"SLL0SEGE";
+
+/// How a refusal names an L0 segment to an operator.
+const L0_SUBJECT: &str = "L0 delta segment";
 
 /// An opened, immutable L0 delta segment: the reloaded [`Memtable`] it holds answers
 /// the full [`DeltaSnapshot`](crate::memtable::DeltaSnapshot) read surface, so a read
@@ -52,15 +65,17 @@ impl L0Segment {
     /// Write `mem` to `path` as an immutable, content-checked L0 segment. The image is
     /// staged in a sibling `.tmp` file, fsynced, then atomically `rename`d into place,
     /// so a concurrent or later [`Self::open`] never sees a partial file.
-    pub fn write(mem: &Memtable, path: impl AsRef<Path>) -> Result<()> {
+    pub fn write(
+        mem: &Memtable,
+        path: impl AsRef<Path>,
+        cipher: Option<&DeltaCipher>,
+    ) -> Result<()> {
         let path = path.as_ref();
         let body = mem.serialise();
-        let crc = crc32c::crc32c(&body);
-
-        let mut framed = Vec::with_capacity(body.len() + 12);
-        framed.extend_from_slice(L0_MAGIC);
-        framed.extend_from_slice(&crc.to_le_bytes());
-        framed.extend_from_slice(&body);
+        // Sealed under the segment's **final** name, not the staging `.tmp` one: the tmp
+        // file is renamed into place, and the reader derives its subkey from what it opens.
+        let cipher = bind(cipher, &l0_name(path, None)?);
+        let framed = frame_blob(L0_MAGIC, L0_MAGIC_SEALED, cipher.as_deref(), &body)?;
 
         let tmp = path.with_extension("tmp");
         {
@@ -82,24 +97,24 @@ impl L0Segment {
         Ok(())
     }
 
-    /// Open an L0 segment, verifying its magic and checksum and reloading the folded
-    /// [`Memtable`]. A truncated, mis-magicked or corrupted file is a hard error.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    /// Open an L0 segment, verifying its magic against the configured key, then its
+    /// checksum, then (sealed) its AEAD tag, and reloading the folded [`Memtable`]. A
+    /// truncated, mis-magicked, corrupted, unsealed-under-a-key or wrong-key file is a
+    /// hard error.
+    pub fn open(path: impl AsRef<Path>, cipher: Option<&DeltaCipher>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let bytes = std::fs::read(&path).with_context(|| format!("read L0 segment {path:?}"))?;
-        if bytes.len() < 12 {
-            bail!("L0 segment {path:?} too short ({} bytes)", bytes.len());
-        }
-        if &bytes[..8] != L0_MAGIC {
-            bail!("L0 segment {path:?} has bad magic");
-        }
-        let crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let body = &bytes[12..];
-        if crc32c::crc32c(body) != crc {
-            bail!("L0 segment {path:?} failed checksum");
-        }
+        let cipher = bind(cipher, &l0_name(&path, None)?);
+        let body = unframe_blob(
+            L0_MAGIC,
+            L0_MAGIC_SEALED,
+            cipher.as_deref(),
+            &bytes,
+            L0_SUBJECT,
+        )
+        .with_context(|| format!("open L0 segment {path:?}"))?;
         let mem =
-            Memtable::deserialise(body).with_context(|| format!("decode L0 segment {path:?}"))?;
+            Memtable::deserialise(&body).with_context(|| format!("decode L0 segment {path:?}"))?;
         Ok(Self {
             path,
             mem: Arc::new(mem),
@@ -252,8 +267,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("000001.l0");
         let m = populate();
-        L0Segment::write(&m, &path).unwrap();
-        let seg = L0Segment::open(&path).unwrap();
+        L0Segment::write(&m, &path, None).unwrap();
+        let seg = L0Segment::open(&path, None).unwrap();
         assert_reads_match(&m, seg.memtable());
         assert_eq!(seg.path(), path);
         std::fs::remove_dir_all(&dir).ok();
@@ -265,20 +280,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("000001.l0");
-        L0Segment::write(&populate(), &path).unwrap();
+        L0Segment::write(&populate(), &path, None).unwrap();
         // Flip a byte in the body (past magic + crc).
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
         assert!(
-            L0Segment::open(&path).is_err(),
+            L0Segment::open(&path, None).is_err(),
             "checksum catches corruption"
         );
 
         // Bad magic is rejected too.
         std::fs::write(&path, b"XXXXXXXX____body").unwrap();
-        assert!(L0Segment::open(&path).is_err(), "magic mismatch rejected");
+        assert!(
+            L0Segment::open(&path, None).is_err(),
+            "magic mismatch rejected"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -76,6 +76,29 @@ manifest; and the set pointer `sets/<uuid>.json` carries a reserved `mac` field 
 yet sealed or verified. The segment *blocks* are encrypted and AEAD-sealed as usual. Treat
 the authenticated row above as covering the core generation.
 
+**The delta's own artifacts are sealed too (HIK-146).** With the writable layer enabled on a
+keyed deployment, every WAL segment and every L0 spill segment is AEAD-sealed under a
+per-graph delta key = `BLAKE3::derive_key("slater delta key v1", LE64(len) ‖ master key ‖
+graph name)`. There is no salt: the delta owns no manifest to record one in, so the KDF
+context supplies the domain separation and the graph name the identity (a WAL segment moved
+between graphs fails closed). WAL frames are sealed one at a time, on the appending thread
+before the batch fsync — group commit and the sub-millisecond durability floor are unchanged
+— and each frame binds its **ordinal within its segment**, so frames cannot be reordered,
+duplicated or dropped from the middle. An L0 segment seals whole under a subkey bound to its
+own file name. Sealed and plaintext artifacts carry distinct magics, and the policy is
+symmetric: a sealed artifact with no key **and** a plaintext artifact under a configured key
+are both refused, the latter being the strip downgrade that would otherwise let anyone with
+write access to the WAL directory inject writes into an encrypted graph without the key.
+
+**Known gap: the consolidation dump is plaintext.** A consolidation writes the merged
+(core ⊕ delta) view to a scratch binary dump directory (`<data dir>/<graph>/.consolidate.dump`)
+for `slater-build` to ingest, and `graph_format::consolidate_dump` has no cipher support at
+all. That directory therefore holds the **whole graph** in the clear for the duration of the
+rebuild, on a deployment configured for at-rest encryption. It is removed afterwards
+(including on the failure paths), but the window is the length of a full rebuild. Sealing it
+means plumbing a key through the dump format and the builder that reads it, and is tracked
+separately.
+
 ## Existing protections
 
 - **At-rest encryption (optional, per block).** With `--encrypt`, each compressed block is

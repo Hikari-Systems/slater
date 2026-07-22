@@ -38,6 +38,7 @@ pub mod interner;
 pub mod l0;
 pub mod l0_offheap;
 pub mod memtable;
+pub mod seal;
 pub mod wal;
 
 pub use identity::{EdgeIdentity, NodeIdentity};
@@ -47,4 +48,5 @@ pub use memtable::{
     flush_segment_data, DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta,
     OpResolution,
 };
+pub use seal::{DeltaCipher, DeltaSealRejected};
 pub use wal::{replay_dir, replay_segment, Replay, SealedSegment, Seq, WalOp, WalRecord, WalSink};

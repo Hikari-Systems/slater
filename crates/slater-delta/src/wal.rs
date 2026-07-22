@@ -57,9 +57,20 @@
 //! Segment file layout (`<dir>/<segment>.wal`):
 //! ```text
 //! MAGIC(8 "SLWAL001") ‖ frame*                 (frames in append order)
-//! frame  = len:u32(LE) ‖ crc32c:u32(LE) ‖ payload[len]   (crc over payload)
+//! frame  = len:u32(LE) ‖ crc32c:u32(LE) ‖ stored[len]    (crc over `stored`)
+//! stored = payload                                       (plaintext)
+//!        | nonce(24) ‖ ciphertext(payload + 16)          (sealed, MAGIC "SLWALE01")
 //! payload= kind:u8 ‖ ( RECORD: encoded WalRecord | COMMIT: committed_seq:uvarint )
 //! ```
+//! On an encrypted deployment (HIK-146) each frame is sealed **individually**, on the
+//! appending thread, before the batch fsync: group commit, the append contract and the
+//! sub-millisecond durability floor are untouched, because sealing sits exactly where the
+//! CRC already did. Each frame binds its **ordinal within the segment** as associated
+//! data, and the per-file subkey binds the segment file name, so a frame cannot be
+//! reordered, duplicated, dropped from the middle, or moved to another segment or another
+//! graph and still open. The crc stays, over the *stored* bytes: it is the cheap gate that
+//! tells a torn tail (crc fails ⇒ stop, keep the committed prefix) apart from a tampered
+//! one (crc passes, tag fails ⇒ hard error), which one AEAD tag alone cannot.
 //! A batch appends one or more `RECORD` frames then a single `COMMIT` frame and
 //! fsyncs — that fsync is the durability point and the Bolt ack barrier. Replay
 //! keeps records **only up to the last complete `COMMIT`**, so a torn or
@@ -70,13 +81,26 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use graph_format::crypto::FileCipher;
 use graph_format::ids::Value;
 use graph_format::wire::{read_uvarint, read_value, write_uvarint, write_value};
 
+use crate::seal::{bind, open_frame, seal_frame, DeltaCipher, DeltaSealRejected};
+
 /// Segment magic — a quick "is this a Slater WAL segment" sniff.
 const WAL_MAGIC: &[u8; 8] = b"SLWAL001";
+
+/// Segment magic for a **sealed** segment, whose frame payloads are `nonce ‖ ciphertext`
+/// (HIK-146). A distinct magic is what makes the key policy decidable: a sealed segment
+/// with no key configured, and a plaintext segment under a configured key, are both
+/// refused ([`DeltaSealRejected`]).
+const WAL_MAGIC_SEALED: &[u8; 8] = b"SLWALE01";
+
+/// How a refusal names a WAL segment to an operator.
+const WAL_SUBJECT: &str = "WAL segment";
 
 const KIND_RECORD: u8 = 1;
 const KIND_COMMIT: u8 = 2;
@@ -548,17 +572,31 @@ pub struct WalSink {
     /// Tracked in-process (not `fstat`-ed) so the group-commit ack path stays
     /// syscall-light; `commit`/`truncate_to` keep it in step with the file.
     cur_len: u64,
+    /// Frame ordinals matching `committed_len` / `cur_len` — the number of frames written
+    /// up to the last completed commit, and in total. The ordinal is a frame's AEAD
+    /// associated data, so it **must** rewind with the bytes on a rollback: a re-appended
+    /// frame has to be sealed at the ordinal replay will present it at (HIK-146).
+    committed_frames: u64,
+    cur_frames: u64,
+    /// This segment's frame cipher, `None` on a plaintext deployment. Derived once at
+    /// `create` from the delta key and this segment's file name.
+    cipher: Option<Arc<FileCipher>>,
 }
 
 impl WalSink {
     /// Open segment `segment` under `dir`, creating `dir` if needed and writing the
     /// magic header. The magic becomes durable with the first `commit`; the segment's
     /// *directory entry* is made durable here, before any writer can ack against it.
-    pub fn create(dir: impl AsRef<Path>, segment: u64) -> Result<Self> {
+    pub fn create(
+        dir: impl AsRef<Path>,
+        segment: u64,
+        cipher: Option<&DeltaCipher>,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
         let dir_existed = dir.is_dir();
         fs::create_dir_all(dir).with_context(|| format!("create WAL dir {dir:?}"))?;
         let path = segment_path(dir, segment);
+        let cipher = bind(cipher, &crate::seal::wal_name(&segment_file_name(segment)));
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -566,7 +604,12 @@ impl WalSink {
             .open(&path)
             .with_context(|| format!("create WAL segment {path:?}"))?;
         let mut file = BufWriter::new(file);
-        file.write_all(WAL_MAGIC)?;
+        let magic = if cipher.is_some() {
+            WAL_MAGIC_SEALED
+        } else {
+            WAL_MAGIC
+        };
+        file.write_all(magic)?;
         // Push the magic to the file immediately (no fsync — it carries no committed
         // data). A freshly opened segment can otherwise sit 0 bytes on disk until its
         // first commit, and a concurrent/subsequent `replay_dir` would choke on the
@@ -597,6 +640,9 @@ impl WalSink {
             // rolled back *to* (a rollback never eats the header).
             committed_len: WAL_MAGIC.len() as u64,
             cur_len: WAL_MAGIC.len() as u64,
+            committed_frames: 0,
+            cur_frames: 0,
+            cipher,
         })
     }
 
@@ -620,7 +666,7 @@ impl WalSink {
     /// cannot.
     pub fn append(&mut self, rec: &WalRecord) -> Result<()> {
         if let Err(e) = self.write_record_frame(rec) {
-            self.truncate_to(self.committed_len)
+            self.truncate_to(self.committed_len, self.committed_frames)
                 .context("roll back WAL batch after a failed append")?;
             return Err(e);
         }
@@ -636,7 +682,7 @@ impl WalSink {
     /// commit to absorb.
     pub fn commit(&mut self, committed_seq: Seq) -> Result<()> {
         if let Err(e) = self.write_commit_frame(committed_seq) {
-            self.truncate_to(self.committed_len)
+            self.truncate_to(self.committed_len, self.committed_frames)
                 .context("roll back WAL batch after a failed commit")?;
             return Err(e);
         }
@@ -660,7 +706,7 @@ impl WalSink {
         // floor before appending, so this batch's commit can never retro-commit it.
         // Normally a no-op (`cur_len == committed_len` after every clean commit).
         if self.cur_len != self.committed_len {
-            self.truncate_to(self.committed_len)
+            self.truncate_to(self.committed_len, self.committed_frames)
                 .context("re-establish committed WAL floor before batch")?;
         }
         let mut batch = Rollback::arm(self);
@@ -679,8 +725,19 @@ impl WalSink {
         maybe_inject_write_fault()?;
         let mut payload = Vec::new();
         rec.encode_payload(&mut payload);
-        write_frame(&mut self.file, &payload)?;
-        self.cur_len += frame_len(payload.len());
+        self.write_payload(&payload)
+    }
+
+    /// Seal (when keyed) and write one frame, advancing `cur_len` / `cur_frames`. The
+    /// single place a frame reaches the file, so no future frame kind can skip the seal.
+    fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+        let stored = match &self.cipher {
+            None => std::borrow::Cow::Borrowed(payload),
+            Some(c) => std::borrow::Cow::Owned(seal_frame(c, self.cur_frames, payload)?),
+        };
+        write_frame(&mut self.file, &stored)?;
+        self.cur_len += frame_len(stored.len());
+        self.cur_frames += 1;
         Ok(())
     }
 
@@ -709,8 +766,7 @@ impl WalSink {
         let mut payload = Vec::with_capacity(4);
         payload.push(KIND_COMMIT);
         write_uvarint(&mut payload, committed_seq.0);
-        write_frame(&mut self.file, &payload)?;
-        self.cur_len += frame_len(payload.len());
+        self.write_payload(&payload)?;
         self.file.flush().context("flush WAL buffer")?;
         #[cfg(test)]
         maybe_inject_commit_fsync_fault()?;
@@ -721,6 +777,7 @@ impl WalSink {
         // The fsync landed: everything up to here is now durable and becomes the
         // rollback floor for any later batch.
         self.committed_len = self.cur_len;
+        self.committed_frames = self.cur_frames;
         Ok(())
     }
 
@@ -730,7 +787,7 @@ impl WalSink {
     /// tail either. Truncation shrinks the *existing* file, so it changes no directory
     /// entry and needs no dir fsync — it composes with HIK-71's create/seal dir-fsyncs
     /// without adding one to this path.
-    fn truncate_to(&mut self, off: u64) -> Result<()> {
+    fn truncate_to(&mut self, off: u64, frames: u64) -> Result<()> {
         // Flush first so the BufWriter holds no bytes it would later replay past the
         // truncation point; then shrink and re-seat the OS file position at `off`.
         self.file
@@ -753,6 +810,7 @@ impl WalSink {
         file.sync_data()
             .context("fsync WAL segment after rollback truncate")?;
         self.cur_len = off;
+        self.cur_frames = frames;
         Ok(())
     }
 
@@ -889,18 +947,34 @@ pub struct Replay {
     pub last_seq: Seq,
 }
 
+/// A segment's bare file name — also the identity its frame subkey is derived from, so
+/// the writer and replay must agree on it byte for byte.
+fn segment_file_name(segment: u64) -> String {
+    format!("{segment:010}.wal")
+}
+
 /// `<dir>/<segment>.wal`.
 pub fn segment_path(dir: &Path, segment: u64) -> PathBuf {
-    dir.join(format!("{segment:010}.wal"))
+    dir.join(segment_file_name(segment))
 }
 
 /// Replay a single segment file, returning only records up to the last complete
 /// commit marker (a torn/un-fsynced tail is dropped).
-pub fn replay_segment(path: &Path) -> Result<Replay> {
+pub fn replay_segment(path: &Path, cipher: Option<&DeltaCipher>) -> Result<Replay> {
     let bytes = fs::read(path).with_context(|| format!("read WAL segment {path:?}"))?;
     let mut out = Replay::default();
-    replay_bytes(&bytes, &mut out).with_context(|| format!("replay WAL segment {path:?}"))?;
+    replay_bytes(&bytes, segment_cipher(path, cipher)?.as_deref(), &mut out)
+        .with_context(|| format!("replay WAL segment {path:?}"))?;
     Ok(out)
+}
+
+/// The frame cipher for the segment at `path`, bound to its file name — the same
+/// derivation [`WalSink::create`] used to write it.
+fn segment_cipher(path: &Path, cipher: Option<&DeltaCipher>) -> Result<Option<Arc<FileCipher>>> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        bail!("WAL segment path {path:?} has no usable file name");
+    };
+    Ok(bind(cipher, &crate::seal::wal_name(name)))
 }
 
 /// Fuzz/test entry point: replay a single in-memory segment image, exercising the
@@ -911,13 +985,13 @@ pub fn replay_segment(path: &Path) -> Result<Replay> {
 #[doc(hidden)]
 pub fn replay_bytes_for_fuzz(bytes: &[u8]) -> Result<Replay> {
     let mut out = Replay::default();
-    replay_bytes(bytes, &mut out)?;
+    replay_bytes(bytes, None, &mut out)?;
     Ok(out)
 }
 
 /// Replay every `*.wal` segment under `dir` in ascending segment order, folding
 /// their committed records into one ordered stream. Missing dir ⇒ empty replay.
-pub fn replay_dir(dir: &Path) -> Result<Replay> {
+pub fn replay_dir(dir: &Path, cipher: Option<&DeltaCipher>) -> Result<Replay> {
     let mut segments: Vec<(u64, PathBuf)> = Vec::new();
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -941,24 +1015,49 @@ pub fn replay_dir(dir: &Path) -> Result<Replay> {
     let mut out = Replay::default();
     for (_, path) in segments {
         let bytes = fs::read(&path).with_context(|| format!("read WAL segment {path:?}"))?;
-        replay_bytes(&bytes, &mut out).with_context(|| format!("replay WAL segment {path:?}"))?;
+        replay_bytes(&bytes, segment_cipher(&path, cipher)?.as_deref(), &mut out)
+            .with_context(|| format!("replay WAL segment {path:?}"))?;
     }
     Ok(out)
 }
 
 /// Parse `bytes` (one segment image), appending committed records to `out` and
 /// advancing `out.last_seq`. Stops cleanly at the first torn frame.
-fn replay_bytes(bytes: &[u8], out: &mut Replay) -> Result<()> {
+fn replay_bytes(bytes: &[u8], cipher: Option<&FileCipher>, out: &mut Replay) -> Result<()> {
     // A 0-byte segment is a freshly created one whose magic never reached disk (a
     // crash/power-loss between `create` and its flush). It holds no committed record,
     // so it replays to nothing rather than wedging the whole directory.
     if bytes.is_empty() {
         return Ok(());
     }
-    if bytes.len() < WAL_MAGIC.len() || &bytes[..WAL_MAGIC.len()] != WAL_MAGIC {
+    if bytes.len() < WAL_MAGIC.len() {
         bail!("bad or missing WAL magic");
     }
+    // The magic says whether the segment is sealed; the configured key says whether it
+    // must be. Both mismatches fail closed, and the plaintext-under-a-key direction is the
+    // one that matters — it is the strip downgrade (HIK-146).
+    let sealed = match &bytes[..WAL_MAGIC.len()] {
+        m if m == WAL_MAGIC.as_slice() => false,
+        m if m == WAL_MAGIC_SEALED.as_slice() => true,
+        _ => bail!("bad or missing WAL magic"),
+    };
+    match (sealed, cipher) {
+        (true, None) => {
+            return Err(DeltaSealRejected::KeyRequired {
+                subject: WAL_SUBJECT,
+            }
+            .into())
+        }
+        (false, Some(_)) => {
+            return Err(DeltaSealRejected::Unsealed {
+                subject: WAL_SUBJECT,
+            }
+            .into())
+        }
+        _ => {}
+    }
     let mut pos = WAL_MAGIC.len();
+    let mut ordinal: u64 = 0;
     let mut pending: Vec<WalRecord> = Vec::new();
     while pos < bytes.len() {
         // Frame header: len:u32 ‖ crc:u32. A short read here is the crash tail.
@@ -981,13 +1080,27 @@ fn replay_bytes(bytes: &[u8], out: &mut Replay) -> Result<()> {
             Some(end) if end <= bytes.len() => end,
             _ => break, // truncated payload — torn tail
         };
-        let payload = &bytes[body_start..body_end];
-        if crc32c::crc32c(payload) != crc {
+        let stored = &bytes[body_start..body_end];
+        if crc32c::crc32c(stored) != crc {
             break; // torn / corrupt frame — stop, keep what committed before it
         }
         pos = body_end;
 
-        let mut r = payload;
+        // Sealed: the crc just said these bytes are the bytes that were written, so a tag
+        // failure here is **not** a crash tail — it is a wrong key, a tampered frame, or a
+        // frame lifted from another ordinal/segment/graph. Dropping it as if it were torn
+        // would silently discard acked writes and let a forged tail pass as a crash, so it
+        // is a hard error.
+        let payload: std::borrow::Cow<'_, [u8]> = match cipher {
+            None => std::borrow::Cow::Borrowed(stored),
+            Some(c) => std::borrow::Cow::Owned(
+                open_frame(c, ordinal, stored)
+                    .with_context(|| format!("open sealed WAL frame at ordinal {ordinal}"))?,
+            ),
+        };
+        ordinal += 1;
+
+        let mut r = &*payload;
         let kind = read_u8(&mut r)?;
         match kind {
             KIND_RECORD => pending.push(WalRecord::decode_record_body(&mut r)?),
@@ -1029,13 +1142,16 @@ fn frame_len(payload_len: usize) -> u64 {
 /// unwind we must cover. `disarm` cancels the rollback once the commit fsync lands.
 struct Rollback<'a> {
     sink: &'a mut WalSink,
-    /// Offset to rewind to on drop; `None` once the batch has durably committed.
-    rollback_to: Option<u64>,
+    /// `(offset, frame ordinal)` to rewind to on drop; `None` once the batch has durably
+    /// committed. Both, not just the offset: a frame's ordinal is its AEAD associated
+    /// data, so a rollback that rewound the bytes but not the ordinal would seal the next
+    /// frame at an ordinal replay never presents it at (HIK-146).
+    rollback_to: Option<(u64, u64)>,
 }
 
 impl<'a> Rollback<'a> {
     fn arm(sink: &'a mut WalSink) -> Self {
-        let rollback_to = Some(sink.committed_len);
+        let rollback_to = Some((sink.committed_len, sink.committed_frames));
         Rollback { sink, rollback_to }
     }
 
@@ -1048,7 +1164,7 @@ impl<'a> Rollback<'a> {
 
 impl Drop for Rollback<'_> {
     fn drop(&mut self) {
-        if let Some(off) = self.rollback_to {
+        if let Some((off, frames)) = self.rollback_to {
             // Err or unwind before disarm: rewind so the partial batch leaves nothing a
             // later commit could retro-commit. Best-effort — `Drop` cannot propagate.
             //
@@ -1067,7 +1183,7 @@ impl Drop for Rollback<'_> {
             // That residue is irreducible: a failed fsync means indeterminate, not
             // not-durable. Hence the warn — a silent failure here is the trigger for the
             // one window we cannot close in code.
-            if let Err(e) = self.sink.truncate_to(off) {
+            if let Err(e) = self.sink.truncate_to(off, frames) {
                 tracing::warn!(
                     error = ?e,
                     segment = self.sink.segment,
@@ -1130,6 +1246,171 @@ mod tests {
         }
     }
 
+    /// A keyed sink for the HIK-146 tests.
+    fn key() -> DeltaCipher {
+        Arc::new(graph_format::crypto::delta_cipher(b"a master key", "g"))
+    }
+
+    /// HIK-146: a sealed segment round-trips, holds no plaintext, and keeps the crash-tail
+    /// contract — an un-fsynced tail is still dropped, not decrypted into the memtable.
+    #[test]
+    fn sealed_segment_round_trips_and_drops_its_uncommitted_tail() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_sealed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let committed = upsert(
+            1,
+            "L",
+            "MARKER-PLAINTEXT",
+            Value::Str("MARKER-VALUE".into()),
+            &[],
+        );
+        let uncommitted = upsert(2, "L", "k", Value::Int(2), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&committed), Seq(1))
+                .unwrap();
+            // Appended, never committed: no commit marker follows it. Dropping the sink
+            // flushes the buffered frame to disk, which is the crash shape — a record on
+            // disk that no commit fsync ever covered.
+            sink.append(&uncommitted).unwrap();
+        }
+        let bytes = fs::read(segment_path(&dir, 0)).unwrap();
+        assert_eq!(&bytes[..8], WAL_MAGIC_SEALED);
+        for needle in [b"MARKER-PLAINTEXT".as_slice(), b"MARKER-VALUE".as_slice()] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "plaintext user data in a sealed segment"
+            );
+        }
+        let replay = replay_dir(&dir, Some(&k)).unwrap();
+        assert_eq!(replay.records, vec![committed]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a **rollback rewinds the frame ordinal with the bytes.** The ordinal is a
+    /// frame's AEAD associated data, so a batch that rolls back and is followed by a
+    /// successful one must re-seal at the ordinal replay will present the frame at. Rewind
+    /// only the offset and the survivor seals at ordinal 2 while replay opens it at 0 —
+    /// replay then fails closed and the acked write is unreadable.
+    #[test]
+    fn a_rolled_back_sealed_batch_rewinds_the_frame_ordinal() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_sealroll_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+        ];
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                .unwrap();
+            FAIL_WRITE_AFTER.with(|c| c.set(Some(1)));
+            sink.append_batch(&doomed, Seq(3))
+                .expect_err("the injected fault must fail the batch mid-way");
+            sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+                .unwrap();
+        }
+        let replay = replay_dir(&dir, Some(&k)).unwrap();
+        assert_eq!(replay.records, vec![good0, survivor]);
+        assert_eq!(replay.last_seq, Seq(5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a sealed frame cannot be **reordered or duplicated** inside its segment —
+    /// its ordinal is authenticated, so a copied frame fails closed rather than replaying
+    /// the write twice.
+    #[test]
+    fn a_sealed_frame_cannot_be_duplicated_within_its_segment() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(&[upsert(1, "L", "k", Value::Int(1), &[])], Seq(1))
+                .unwrap();
+        }
+        // Duplicate the whole segment body after the magic: frame 0 reappears at ordinal 2.
+        let path = segment_path(&dir, 0);
+        let bytes = fs::read(&path).unwrap();
+        let mut doubled = bytes.clone();
+        doubled.extend_from_slice(&bytes[WAL_MAGIC.len()..]);
+        fs::write(&path, &doubled).unwrap();
+        let e = replay_dir(&dir, Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: the key policy is symmetric and typed at the WAL, exactly as at the L0
+    /// blob — a sealed segment with no key, and a plaintext segment under a key, are both
+    /// refused, and neither is reported as corruption.
+    #[test]
+    fn the_wal_key_policy_is_symmetric_and_typed() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_policy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let rec = upsert(1, "L", "k", Value::Int(1), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&rec), Seq(1))
+                .unwrap();
+            let mut plain = WalSink::create(&dir, 1, None).unwrap();
+            plain
+                .append_batch(std::slice::from_ref(&rec), Seq(1))
+                .unwrap();
+        }
+        let e = replay_segment(&segment_path(&dir, 0), None).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<DeltaSealRejected>(),
+            Some(&DeltaSealRejected::KeyRequired {
+                subject: WAL_SUBJECT
+            })
+        );
+        let e = replay_segment(&segment_path(&dir, 1), Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<DeltaSealRejected>(),
+            Some(&DeltaSealRejected::Unsealed {
+                subject: WAL_SUBJECT
+            })
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a sealed frame is bound to its **segment**, so swapping two segments'
+    /// contents (the numbers decide replay order) fails closed instead of silently
+    /// reordering acked writes.
+    #[test]
+    fn a_sealed_frame_cannot_move_between_segments() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_xseg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        {
+            let mut s0 = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            s0.append_batch(&[upsert(1, "L", "k", Value::Int(1), &[])], Seq(1))
+                .unwrap();
+            let mut s1 = WalSink::create(&dir, 1, Some(&k)).unwrap();
+            s1.append_batch(&[upsert(2, "L", "k", Value::Int(2), &[])], Seq(2))
+                .unwrap();
+        }
+        assert!(replay_dir(&dir, Some(&k)).is_ok());
+        let b0 = fs::read(segment_path(&dir, 0)).unwrap();
+        let b1 = fs::read(segment_path(&dir, 1)).unwrap();
+        fs::write(segment_path(&dir, 0), &b1).unwrap();
+        fs::write(segment_path(&dir, 1), &b0).unwrap();
+        let e = replay_dir(&dir, Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn delete_op_round_trips_through_a_segment() {
         let dir = std::env::temp_dir().join(format!("slater_wal_del_{}", std::process::id()));
@@ -1144,12 +1425,12 @@ mod tests {
             },
         };
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&up).unwrap();
             sink.append(&del).unwrap();
             sink.commit(Seq(2)).unwrap();
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![up, del.clone()]);
         // The decoded op exposes its node business key; an edge op would be `None`.
         assert_eq!(
@@ -1182,12 +1463,12 @@ mod tests {
             },
         };
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&remove).unwrap();
             sink.append(&replace).unwrap();
             sink.commit(Seq(2)).unwrap();
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![remove.clone(), replace.clone()]);
         // Both are node ops — they expose the node business key, not edge keys.
         assert_eq!(
@@ -1228,12 +1509,12 @@ mod tests {
             },
         };
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&create).unwrap();
             sink.append(&delete).unwrap();
             sink.commit(Seq(2)).unwrap();
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![create.clone(), delete.clone()]);
         // An edge op exposes its endpoint keys, not a single node key.
         assert!(create.op.node_key().is_none());
@@ -1271,12 +1552,12 @@ mod tests {
             &[("price", Value::Float(2.5))],
         );
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&r0).unwrap();
             sink.append(&r1).unwrap();
             sink.commit(Seq(2)).unwrap();
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![r0, r1]);
         assert_eq!(replay.last_seq, Seq(2));
         fs::remove_dir_all(&dir).ok();
@@ -1291,13 +1572,13 @@ mod tests {
         let committed = upsert(1, "L", "k", Value::Int(1), &[]);
         let lost = upsert(2, "L", "k", Value::Int(2), &[]);
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&committed).unwrap();
             sink.commit(Seq(1)).unwrap();
             sink.append(&lost).unwrap(); // no commit → not durable
                                          // drop without commit: BufWriter flushes bytes on drop, but no marker.
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![committed]);
         assert_eq!(replay.last_seq, Seq(1));
         fs::remove_dir_all(&dir).ok();
@@ -1313,7 +1594,7 @@ mod tests {
         let path;
         let good_len;
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&r0).unwrap();
             sink.commit(Seq(1)).unwrap();
             good_len = fs::metadata(sink.path()).unwrap().len();
@@ -1328,7 +1609,7 @@ mod tests {
         let truncated = &full[..(good_len as usize + 5).min(full.len())];
         fs::write(&path, truncated).unwrap();
 
-        let replay = replay_segment(&path).unwrap();
+        let replay = replay_segment(&path, None).unwrap();
         assert_eq!(replay.records, vec![r0]);
         assert_eq!(replay.last_seq, Seq(1));
         fs::remove_dir_all(&dir).ok();
@@ -1349,7 +1630,7 @@ mod tests {
         let r0 = upsert(1, "L", "k", Value::Int(1), &[]);
         let path;
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             sink.append(&r0).unwrap();
             sink.commit(Seq(1)).unwrap();
             path = sink.path().to_path_buf();
@@ -1361,7 +1642,7 @@ mod tests {
 
         // Pre-fix this is `Err("WAL byte truncated")` — a clean restart cannot open the
         // graph at all, even though every committed record is intact on disk.
-        let replay = replay_segment(&path).expect("a zero tail must not wedge replay");
+        let replay = replay_segment(&path, None).expect("a zero tail must not wedge replay");
         assert_eq!(replay.records, vec![r0]);
         assert_eq!(replay.last_seq, Seq(1));
         fs::remove_dir_all(&dir).ok();
@@ -1374,16 +1655,16 @@ mod tests {
         let a = upsert(1, "L", "k", Value::Int(1), &[]);
         let b = upsert(2, "L", "k", Value::Int(2), &[]);
         {
-            let mut s0 = WalSink::create(&dir, 0).unwrap();
+            let mut s0 = WalSink::create(&dir, 0, None).unwrap();
             s0.append(&a).unwrap();
             s0.commit(Seq(1)).unwrap();
             s0.seal().unwrap();
-            let mut s1 = WalSink::create(&dir, 1).unwrap();
+            let mut s1 = WalSink::create(&dir, 1, None).unwrap();
             s1.append(&b).unwrap();
             s1.commit(Seq(2)).unwrap();
             s1.seal().unwrap();
         }
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![a, b]);
         assert_eq!(replay.last_seq, Seq(2));
         fs::remove_dir_all(&dir).ok();
@@ -1404,7 +1685,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         let before = DIR_FSYNCS.with(|n| n.get());
-        let mut sink = WalSink::create(&dir, 0).unwrap();
+        let mut sink = WalSink::create(&dir, 0, None).unwrap();
         let after_create = DIR_FSYNCS.with(|n| n.get());
         assert_eq!(
             after_create,
@@ -1426,7 +1707,7 @@ mod tests {
 
         // Rotation into an existing dir: the new segment's entry still needs the dir
         // fsync, but the parent does not — the dir itself is already durable.
-        let next = WalSink::create(&dir, 1).unwrap();
+        let next = WalSink::create(&dir, 1, None).unwrap();
         assert_eq!(DIR_FSYNCS.with(|n| n.get()), after_seal + 1);
         next.seal().unwrap();
 
@@ -1466,7 +1747,7 @@ mod tests {
         ];
         let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             // A clean committed batch first, so the rollback floor is past the magic.
             sink.append_batch(std::slice::from_ref(&good0), Seq(1))
                 .unwrap();
@@ -1489,7 +1770,7 @@ mod tests {
                 .unwrap();
         }
 
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         // The failed batch is ABSENT: only the two acknowledged writes survive.
         assert_eq!(replay.records, vec![good0, survivor]);
         assert_eq!(replay.last_seq, Seq(5));
@@ -1513,7 +1794,7 @@ mod tests {
         ];
         let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
 
-        let mut sink = WalSink::create(&dir, 0).unwrap();
+        let mut sink = WalSink::create(&dir, 0, None).unwrap();
         sink.append_batch(std::slice::from_ref(&good0), Seq(1))
             .unwrap();
 
@@ -1535,7 +1816,7 @@ mod tests {
             .unwrap();
         drop(sink);
 
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![good0, survivor]);
         assert_eq!(replay.last_seq, Seq(5));
         fs::remove_dir_all(&dir).ok();
@@ -1557,7 +1838,7 @@ mod tests {
             upsert(3, "L", "k", Value::Int(3), &[]),
         ];
 
-        let mut sink = WalSink::create(&dir, 0).unwrap();
+        let mut sink = WalSink::create(&dir, 0, None).unwrap();
         sink.append_batch(std::slice::from_ref(&good0), Seq(1))
             .unwrap();
 
@@ -1581,7 +1862,7 @@ mod tests {
         sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
             .unwrap();
         drop(sink);
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert_eq!(replay.records, vec![good0, survivor]);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1621,7 +1902,7 @@ mod tests {
             upsert(4, "L", "k", Value::Int(4), &[]),
         ];
         {
-            let mut sink = WalSink::create(&dir, 0).unwrap();
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
             // A clean committed batch first, so the rollback floor is past the magic and
             // a retro-commit is distinguishable from the committed prefix.
             sink.append_batch(std::slice::from_ref(&good0), Seq(1))
@@ -1650,7 +1931,7 @@ mod tests {
             // the top of `append_batch` never runs — dropping the sink is the crash.
         }
 
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         let mut whole = vec![good0.clone()];
         whole.extend(doomed.iter().cloned());
         assert!(
@@ -1689,7 +1970,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("slater_wal_leg2_{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             {
-                let mut sink = WalSink::create(&dir, 0).unwrap();
+                let mut sink = WalSink::create(&dir, 0, None).unwrap();
                 sink.append_batch(std::slice::from_ref(&good0), Seq(1))
                     .unwrap();
                 FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
@@ -1697,7 +1978,7 @@ mod tests {
                 sink.append_batch(&doomed, Seq(3))
                     .expect_err("the injected commit fsync fault must fail the batch");
             }
-            let replay = replay_dir(&dir).unwrap();
+            let replay = replay_dir(&dir, None).unwrap();
             assert_eq!(
                 replay.records,
                 vec![good0.clone()],
@@ -1713,7 +1994,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("slater_wal_leg3_{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             {
-                let mut sink = WalSink::create(&dir, 0).unwrap();
+                let mut sink = WalSink::create(&dir, 0, None).unwrap();
                 sink.append_batch(std::slice::from_ref(&good0), Seq(1))
                     .unwrap();
                 FAIL_COMMIT_FSYNC_AFTER.with(|c| c.set(Some(0)));
@@ -1724,7 +2005,7 @@ mod tests {
                 sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
                     .unwrap();
             }
-            let replay = replay_dir(&dir).unwrap();
+            let replay = replay_dir(&dir, None).unwrap();
             assert_eq!(
                 replay.records,
                 vec![good0, survivor],
@@ -1738,7 +2019,7 @@ mod tests {
     fn empty_dir_replays_empty() {
         let dir = std::env::temp_dir().join(format!("slater_wal_empty_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert!(replay.records.is_empty());
         assert_eq!(replay.last_seq, Seq(0));
     }
@@ -1749,7 +2030,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         // `create` flushes the magic, so a fresh never-committed segment already has
         // its 8-byte header on disk and replays to nothing (no committed records).
-        let sink = WalSink::create(&dir, 0).unwrap();
+        let sink = WalSink::create(&dir, 0, None).unwrap();
         assert_eq!(
             fs::metadata(sink.path()).unwrap().len(),
             WAL_MAGIC.len() as u64
@@ -1757,7 +2038,7 @@ mod tests {
         // A 0-byte segment (a crash/power-loss between create and its flush) is
         // tolerated: it holds no committed record, so it must not wedge the dir.
         fs::write(segment_path(&dir, 1), b"").unwrap();
-        let replay = replay_dir(&dir).unwrap();
+        let replay = replay_dir(&dir, None).unwrap();
         assert!(replay.records.is_empty());
         assert_eq!(replay.last_seq, Seq(0));
         fs::remove_dir_all(&dir).ok();

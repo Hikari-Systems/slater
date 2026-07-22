@@ -77,6 +77,10 @@ const MAC_KDF_CONTEXT: &str = "slater manifest mac v1";
 /// domain alongside [`KDF_CONTEXT`] / [`MAC_KDF_CONTEXT`].
 const FILE_KDF_CONTEXT: &str = "slater generation file key v1";
 
+/// BLAKE3 derive-key context for the **writable layer's** key — the WAL and the L0 spill
+/// segments (HIK-146). A fourth domain alongside the three above.
+const DELTA_KDF_CONTEXT: &str = "slater delta key v1";
+
 /// The associated-data scheme this build seals blocks under, recorded in the
 /// MANIFEST `EncryptionHeader.aadScheme`. A generation that does not name exactly
 /// this scheme is refused (see [`AadSchemeRejected`]) — there is no legacy mode, so
@@ -135,6 +139,59 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     xof.zeroize();
     h.zeroize();
     out
+}
+
+/// Derive the 32-byte **writable-layer** key for one graph's delta — the WAL segments and
+/// the L0 spill segments (HIK-146).
+///
+/// # Why there is no salt here
+///
+/// A generation's block key is salted because a generation owns a MANIFEST to record the
+/// salt in, beside the data it seals (the owner rule: one salt per *artifact*, in that
+/// artifact's own manifest). The delta has **no manifest**: a WAL segment is created,
+/// appended to and fsynced on the write path, and inventing a salt for it would mean a
+/// second piece of state to write, fsync, ship and keep in step with the segments — for no
+/// gain, since a salt is not secret and buys only cross-generation key separation. So the
+/// delta key is derived from the master key alone, domain-separated from
+/// [`derive_key`] / [`derive_manifest_mac_key`] / [`derive_file_key`] by its KDF context.
+///
+/// # Why the graph name *is* in the preimage
+///
+/// It is identity, not salt state — exactly HIK-140's per-file subkey reasoning one level
+/// up. Without it, one master key gives every graph the same delta key, so a WAL segment
+/// lifted out of graph `a`'s directory and dropped into graph `b`'s (same segment number)
+/// decrypts and replays: `b` silently acquires `a`'s writes. With it, that fails closed at
+/// the first frame.
+///
+/// The master key is operator-supplied and variable-length and the graph name is
+/// variable-length, so a bare concatenation would be ambiguous (`master="ab", graph="c"`
+/// and `master="a", graph="bc"` would collide). The preimage length-prefixes the master
+/// key: `LE64(master.len()) ‖ master ‖ graph`.
+///
+/// The consequence to know: on a keyed deployment, **renaming a graph orphans its live
+/// delta** — the WAL and L0 segments under the old name no longer open, and the graph comes
+/// up on its core alone. The core is unaffected (its key is salt-derived, not name-derived).
+/// Consolidate before renaming.
+///
+/// Wiped on drop via [`Zeroizing`], and the hasher/XOF wiped explicitly, like [`derive_key`].
+pub fn derive_delta_key(master_key: &[u8], graph: &str) -> Zeroizing<[u8; KEY_LEN]> {
+    let mut h = blake3::Hasher::new_derive_key(DELTA_KDF_CONTEXT);
+    h.update(&(master_key.len() as u64).to_le_bytes());
+    h.update(master_key);
+    h.update(graph.as_bytes());
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    let mut xof = h.finalize_xof();
+    xof.fill(&mut *out);
+    xof.zeroize();
+    h.zeroize();
+    out
+}
+
+/// The writable layer's cipher for one graph: [`derive_delta_key`] wrapped in a
+/// [`BlockCipher`], so the delta's artifacts reuse HIK-140's per-file subkey
+/// ([`BlockCipher::for_file`]) and [`BlockAad`] binding unchanged.
+pub fn delta_cipher(master_key: &[u8], graph: &str) -> BlockCipher {
+    BlockCipher::from_key(&derive_delta_key(master_key, graph))
 }
 
 /// Which kind of document a MAC preimage is for — the domain-separation namespace.
@@ -602,6 +659,37 @@ mod tests {
         assert_eq!(hex_decode("  000FA5FF10 ").unwrap(), bytes); // trims + upper-case
         assert!(hex_decode("abc").is_err()); // odd length
         assert!(hex_decode("zz").is_err()); // non-hex
+    }
+
+    /// HIK-146: the delta key is domain-separated from every other subkey, bound to the
+    /// graph, and its preimage is unambiguous despite two variable-length inputs.
+    #[test]
+    fn delta_key_is_domain_separated_graph_bound_and_unambiguous() {
+        let master = b"super-secret-master-key";
+        assert_eq!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(master, "g")
+        );
+        assert_ne!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(master, "h")
+        );
+        assert_ne!(
+            *derive_delta_key(master, "g"),
+            *derive_delta_key(b"other-master", "g")
+        );
+        // Domain separation from the other three KDF contexts, under the same master key.
+        assert_ne!(
+            *derive_delta_key(master, ""),
+            *derive_manifest_mac_key(master)
+        );
+        assert_ne!(
+            *derive_delta_key(master, ""),
+            *derive_key(master, &[0u8; SALT_LEN])
+        );
+        // Unambiguous concatenation: splitting the same bytes differently between the
+        // master key and the graph name must not collide.
+        assert_ne!(*derive_delta_key(b"ab", "c"), *derive_delta_key(b"a", "bc"));
     }
 
     #[test]
