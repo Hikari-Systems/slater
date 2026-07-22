@@ -1045,6 +1045,13 @@ impl Graphs {
                     current,
                 )
                 .with_context(|| format!("read current set for GC of '{name}'"))?;
+                // Authenticate before acting on it: this document decides which segments
+                // are *live*, and everything else is deleted. Acting on an unauthenticated
+                // set here would let a data-dir attacker have the server itself delete the
+                // live stack — the same class of mistake as opening one (HIK-144).
+                graph_format::crypto::authenticate(&set, self.master_key_bytes()).with_context(
+                    || format!("authenticate the current set before GC of '{name}'"),
+                )?;
                 let segs = set.segments.iter().map(|s| s.uuid).collect();
                 (Some(current), segs)
             } else {

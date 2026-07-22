@@ -185,6 +185,18 @@ impl CoreStack {
                     manifest.segment_uuid
                 );
             }
+            // A segment is sealed *against a base*; stacking it over a different one would
+            // fold rows onto ids that mean something else. Both sides are MAC-covered, so
+            // this can only fail on a publisher bug or an unkeyed tamper — but it is one
+            // comparison, and the failure it prevents is silent.
+            if manifest.base != set.base {
+                bail!(
+                    "segment {uuid} of {graph} was sealed over base {} but the set's base is \
+                     {} — refusing to stack a segment over a foreign base",
+                    manifest.base,
+                    set.base
+                );
+            }
             if manifest.node_band != seg_ref.node_band || manifest.edge_band != seg_ref.edge_band {
                 bail!(
                     "segment {uuid} of {graph} bands {:?}/{:?} disagree with the set's {:?}/{:?}",

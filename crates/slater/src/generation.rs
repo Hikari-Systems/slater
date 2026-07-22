@@ -2451,6 +2451,23 @@ mod tests {
             format!("{err:#}").contains("rebuild"),
             "and the refusal must be actionable: {err:#}"
         );
+
+        // And through the *exact* call `slater query` makes (`query.rs` builds a store from
+        // config and calls `open_with_store_opts`) — the entry point that used to bypass the
+        // server's refusal. It refuses because the policy sits below it, not because this
+        // call site restates it.
+        let store = graph_format::store::fs::FsObjectStore::new(&root);
+        let err = match Generation::open_with_store_opts(&store, &graph, Some(key), true) {
+            Ok(_) => panic!("the CLI open path must refuse exactly what the server refuses"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<MacRejected>(),
+                Some(MacRejected::Missing { .. })
+            )),
+            "must be refused by type: {err:#}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
