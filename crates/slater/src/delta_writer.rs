@@ -1413,6 +1413,61 @@ mod tests {
         open_with_flag(dir, cache, true)
     }
 
+    /// HIK-146 (red first): a recognisable marker written on an **encrypted** deployment
+    /// must not be greppable out of anything the delta layer put on disk.
+    const MARKER: &str = "HIK146-PLAINTEXT-MARKER";
+    const KEY: &[u8] = b"a master key, supplied by the operator";
+
+    /// Every regular file under `dir`, recursively.
+    fn all_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                all_files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+
+    /// The files under `dir` whose bytes contain `needle`.
+    fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        all_files(dir, &mut files);
+        files
+            .into_iter()
+            .filter(|p| {
+                std::fs::read(p)
+                    .map(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marker_is_not_greppable_out_of_the_wal_under_a_key() {
+        let dir = tmp("hik146_marker");
+        let _ = std::fs::remove_dir_all(&dir);
+        let w =
+            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        w.write(
+            upsert(
+                "Company",
+                "ticker",
+                Value::Str("A".into()),
+                &[("secret", Value::Str(MARKER.into()))],
+            ),
+            node(10),
+        )
+        .unwrap();
+        let leaks = files_containing(&dir, MARKER);
+        assert!(leaks.is_empty(), "plaintext user data on disk: {leaks:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An off-heap flush writes a **directory** segment whose reads (core patch + a
     /// delta-born node) survive a reopen and match the resident semantics; compaction is a
     /// no-op in off-heap mode.
