@@ -244,13 +244,36 @@ impl SegmentManifest {
         }
     }
 
-    /// The canonical byte string the MAC is computed over: this manifest with `mac`
-    /// cleared, serialised compactly. Deterministic (serde fixes field order; every
-    /// collection is an order-stable `Vec`).
+    /// The canonical byte string the MAC is computed over: a versioned domain tag
+    /// ([`crypto::mac_preimage`](crate::crypto::mac_preimage)) framing this manifest with
+    /// `mac` cleared, serialised compactly as JSON. Deterministic (serde fixes field
+    /// order; every collection is an order-stable `Vec`).
+    ///
+    /// The domain is [`crate::crypto::MAC_DOMAIN_SEGMENT_MANIFEST`] — *different* from the
+    /// generation manifest's — so a `SEGMENT.json` and a `MANIFEST.json` can never
+    /// cross-verify under the same master key. The tag carries [`crate::FORMAT_VERSION`],
+    /// so the MAC scheme cannot drift from the on-disk format version.
+    ///
+    /// # Why JSON, and the rule that keeps it safe
+    ///
+    /// JSON is a fragile *canonicalisation*, but a hand-rolled canonical encoder fails in
+    /// the worse direction: a newly added field silently falls **outside** the MAC, with
+    /// no signal. Serialising the struct picks new fields up automatically, and the
+    /// residual risk is pinned by the golden preimage test below
+    /// (`mac_preimage_body_is_pinned_to_a_golden_shape`).
+    ///
+    /// **Rule: no `HashMap`/`HashSet` field may ever be added to this struct (or any type
+    /// nested in it).** Their iteration order is unspecified and randomised per process,
+    /// so the same manifest would MAC differently on each run and verification would fail
+    /// at random. Use a `BTreeMap` or an order-stable `Vec`.
     fn mac_message(&self) -> Result<Vec<u8>> {
         let mut canon = self.clone();
         canon.mac = None;
-        serde_json::to_vec(&canon).context("serialise segment manifest for MAC")
+        let body = serde_json::to_vec(&canon).context("serialise segment manifest for MAC")?;
+        Ok(crate::crypto::mac_preimage(
+            crate::crypto::MAC_DOMAIN_SEGMENT_MANIFEST,
+            &body,
+        ))
     }
 
     /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store it in
@@ -455,6 +478,116 @@ mod tests {
         });
         check("file hash", &|m| m.files[0].blake3 = "zz".into());
         check("base uuid", &|m| m.base = uuid(999));
+    }
+
+    /// A **fully populated** segment manifest: every `Option` `Some`, every `Vec`
+    /// non-empty, including the nested sealed-Vamana meta and an encryption header with
+    /// HIK-140's required `aadScheme`.
+    fn golden_segment_manifest() -> SegmentManifest {
+        SegmentManifest {
+            magic: SEGMENT_MAGIC.into(),
+            version: 1,
+            segment_uuid: uuid(0x1234_5678),
+            base: uuid(0x9abc_def0),
+            created_unix: 1_700_000_000,
+            node_band: (50, 60),
+            edge_band: (200, 205),
+            content_hash: "aabb".into(),
+            encryption: Some(EncryptionHeader {
+                aead: "xchacha20poly1305".into(),
+                kdf: "blake3-derive-key".into(),
+                salt_hex: "00".repeat(32),
+                aad_scheme: "file-block-v1".into(),
+            }),
+            node_count_delta: 10,
+            edge_count_delta: 5,
+            reltype_edge_deltas: vec![("KNOWS".into(), 3), ("IN".into(), 2)],
+            label_node_deltas: vec![("Person".into(), 8), ("City".into(), -4)],
+            hub_degree_out_deltas: vec![(7, 1000)],
+            hub_degree_in_deltas: vec![(9, -1000)],
+            marginals_exact: true,
+            dirty_indexes: vec![DirtyIndex {
+                label: "Person".into(),
+                property: "age".into(),
+                fragment: "idx_0.isam".into(),
+            }],
+            dirty_vectors: vec![DirtyVector {
+                label: "Doc".into(),
+                property: "embedding".into(),
+                graph: Some(crate::segvamana::SealedVamanaMeta {
+                    medoid: 0,
+                    count: 11,
+                    nav: crate::manifest::AnnNav::InnerProduct,
+                }),
+            }],
+            label_membership_touch: Some(vec!["City".into(), "Person".into()]),
+            mac: Some("this field is cleared before the body is serialised".into()),
+            files: vec![FileEntry {
+                name: "node.blk".into(),
+                bytes: 200,
+                blake3: "cafebabe".into(),
+                sha256: Some("c2hh".into()),
+                crc32c: Some("Y3Jj".into()),
+            }],
+        }
+    }
+
+    /// The canonical JSON body of [`golden_segment_manifest`], pinned byte-for-byte. See
+    /// the twin in `manifest.rs` for why this is a pin rather than a red/green test: it
+    /// exists to fail *later*, when a field is added, reordered or reformatted, so a change
+    /// to a security-load-bearing preimage is deliberate rather than silent.
+    const GOLDEN_SEGMENT_BODY: &str = r#"{"magic":"SLSEG01","version":1,"segmentUuid":"00000000-0000-0000-0000-000012345678","base":"00000000-0000-0000-0000-00009abcdef0","createdUnix":1700000000,"nodeBand":[50,60],"edgeBand":[200,205],"contentHash":"aabb","encryption":{"aead":"xchacha20poly1305","kdf":"blake3-derive-key","saltHex":"0000000000000000000000000000000000000000000000000000000000000000","aadScheme":"file-block-v1"},"nodeCountDelta":10,"edgeCountDelta":5,"reltypeEdgeDeltas":[["KNOWS",3],["IN",2]],"labelNodeDeltas":[["Person",8],["City",-4]],"hubDegreeOutDeltas":[[7,1000]],"hubDegreeInDeltas":[[9,-1000]],"marginalsExact":true,"dirtyIndexes":[{"label":"Person","property":"age","fragment":"idx_0.isam"}],"dirtyVectors":[{"label":"Doc","property":"embedding","graph":{"medoid":0,"count":11,"nav":"inner_product"}}],"labelMembershipTouch":["City","Person"],"mac":null,"files":[{"name":"node.blk","bytes":200,"blake3":"cafebabe","sha256":"c2hh","crc32c":"Y3Jj"}]}"#;
+
+    /// HIK-142: pin the MAC preimage of a fully populated segment manifest.
+    #[test]
+    fn mac_preimage_body_is_pinned_to_a_golden_shape() {
+        let pre = golden_segment_manifest().mac_message().unwrap();
+
+        let tag = format!("slater.segment-manifest.mac.v{}\0", crate::FORMAT_VERSION);
+        assert!(
+            pre.starts_with(tag.as_bytes()),
+            "preimage must open with the versioned domain tag"
+        );
+        let hdr = tag.len();
+        let len = u64::from_le_bytes(pre[hdr..hdr + 8].try_into().unwrap());
+        let body = std::str::from_utf8(&pre[hdr + 8..]).unwrap();
+        assert_eq!(
+            len as usize,
+            body.len(),
+            "length prefix must state the body"
+        );
+        assert_eq!(
+            body, GOLDEN_SEGMENT_BODY,
+            "the segment MAC preimage body changed — a field was added, reordered or \
+             reformatted. Confirm the change is intended, then re-pin (it invalidates \
+             every existing segment MAC)."
+        );
+    }
+
+    /// A segment manifest never verifies under the generation manifest's domain, even for
+    /// the same key and the same body bytes.
+    #[test]
+    fn segment_mac_does_not_verify_under_the_generation_domain() {
+        let master = b"operator master key";
+        let mut m = golden_segment_manifest();
+        m.mac = None;
+        m.seal_mac(master).unwrap();
+        m.verify_mac(master).unwrap();
+
+        // Recompute the same body under the *generation* domain: it must differ.
+        let mut canon = m.clone();
+        canon.mac = None;
+        let body = serde_json::to_vec(&canon).unwrap();
+        let key = crate::crypto::derive_manifest_mac_key(master);
+        let foreign = crate::crypto::manifest_mac(
+            &key,
+            &crate::crypto::mac_preimage(crate::crypto::MAC_DOMAIN_MANIFEST, &body),
+        );
+        assert_ne!(
+            Some(foreign),
+            m.mac,
+            "a segment MAC must not be reproducible under the generation domain"
+        );
     }
 
     #[test]

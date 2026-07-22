@@ -137,6 +137,47 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     out
 }
 
+/// Domain-separation label for the **generation** manifest's MAC preimage
+/// ([`mac_preimage`]).
+pub const MAC_DOMAIN_MANIFEST: &str = "slater.manifest";
+
+/// Domain-separation label for the **segment** manifest's MAC preimage. Distinct from
+/// [`MAC_DOMAIN_MANIFEST`], so a document of one kind can never verify as the other even
+/// if their serialised bodies were somehow made to coincide.
+pub const MAC_DOMAIN_SEGMENT_MANIFEST: &str = "slater.segment-manifest";
+
+/// Frame `body` into the MAC preimage for `domain`:
+///
+/// ```text
+/// "<domain>.mac.v<FORMAT_VERSION>" || 0x00 || (body.len() as u64, LE) || body
+/// ```
+///
+/// Three properties, in the order they matter:
+///
+/// * **Domain separation.** The tag is a *fixed* prefix chosen by the caller, not by the
+///   document, so nothing in `body` can shift the boundary or forge a different domain's
+///   framing. `slater.manifest` and `slater.segment-manifest` are separate namespaces.
+/// * **Version binding.** The version comes from [`crate::FORMAT_VERSION`], never a
+///   hand-maintained `"v1"` string, so the MAC scheme cannot silently drift from the
+///   on-disk format version. A format bump already forces a rebuild, so re-MACing with it
+///   is free.
+/// * **Unambiguous concatenation.** The `u64` length prefix means the body's extent is
+///   stated, not inferred from "everything after the tag" — so no future field appended
+///   *after* the body could be traded against body bytes to produce a second document
+///   with the same preimage.
+///
+/// Neither domain constant may contain a NUL; the `0x00` is the tag/length delimiter.
+pub fn mac_preimage(domain: &str, body: &[u8]) -> Vec<u8> {
+    debug_assert!(!domain.contains('\0'), "a MAC domain must not contain NUL");
+    let tag = format!("{domain}.mac.v{}", crate::FORMAT_VERSION);
+    let mut out = Vec::with_capacity(tag.len() + 1 + 8 + body.len());
+    out.extend_from_slice(tag.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 /// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
 /// 32-byte subkey from [`derive_manifest_mac_key`].
 ///
