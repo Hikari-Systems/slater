@@ -56,7 +56,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 - **Live, durable writes** — an opt-in LSM layer over the immutable core: business-key `MERGE` / `SET` / `DELETE` over nodes and edges, group-committed and `fsync`-durable, folded back into a fresh core by consolidation. Reads don't pay for it.
 - **Deployment by file swap** — build a new content-hashed *generation* offline, atomically flip the `current` pointer, and servers pick it up. Every block is checksummed, so a half-copied image is refused rather than served.
 - **Vector search built in** — disk-native approximate-nearest-neighbour (cosine, L2, or dot KNN) sits right next to your graph, for when this is the retrieval layer behind a RAG pipeline, and embeddings are writable in place — no offline rebuild to add or change a vector.
-- **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas.
+- **Locked down by design** — read and write grants are independent, plus optional at-rest encryption, TLS Bolt, argon2id-hashed ACLs, and a read-only container rootfs for read replicas. Configure a master key and the on-disk image is *authenticated* as well as encrypted — its manifest carries a keyed MAC, so an attacker with write access to the data directory but no key cannot forge a manifest the server will accept. Without a key you still get the content hash, which catches a half-copied or corrupted image — but not a deliberate one. [Which configuration buys what](THREAT_MODEL.md#what-integrity-means-in-each-configuration).
 
 ## Features
 
@@ -64,7 +64,7 @@ The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the p
 |---|---|
 | **Bounded, predictable memory** | Resident memory tracks three cache budgets *you* set, to within bounded per-entry and allocator overhead — it does **not** grow with graph size; you tune the performance/RAM trade-off instead of provisioning for the whole graph. A jemalloc allocator with background purge returns freed memory to the OS after heavy query bursts, so resident size falls back toward its idle floor rather than staying pinned at the post-burst high-water mark. |
 | **Multi-tenant out of the box** | One server hosts many graphs with per-user read grants — multi-database isolation that most graph DBs reserve for a paid/enterprise tier. |
-| **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. |
+| **Encryption at rest & in transit** | Per-block XChaCha20-Poly1305 sealing (the key is never written to disk) plus optional TLS (`bolt+s://`). GDPR-friendly by construction. Encryption is also what buys **authenticated** integrity: the builder seals the manifest with a keyed MAC, and a server holding the key verifies it and refuses to serve a generation whose manifest is forged, altered, or has had its MAC stripped. An unkeyed (plaintext) image is guarded by the unkeyed content hash only — completeness and corruption, not tampering. See [What integrity means in each configuration](THREAT_MODEL.md#what-integrity-means-in-each-configuration). |
 | **Tiny, dependency-light install** | A small stripped binary on a distroless glibc base (no shell/apt) — the multi-arch (amd64/arm64) image pulls at ~22 MB, or ~12 MB for the server-only `slater:latest-lite` tag; pure-Rust TLS, no OpenSSL. Pull and run. |
 | **Built for periodic publish** | Build a graph offline, serve it immutable, then atomically swap in a new version with zero downtime — ideal for data-warehouse / scheduled-refresh workloads. |
 | **Rugged under load** | The server and offline builder both compile with `#![forbid(unsafe_code)]` — the engine's only `unsafe` lives in the audited jemalloc allocator crate. The core is immutable, so reads take no locks and never wait on a writer; a single writer serialises mutations behind the write path alone. No GC pauses, no data races. One bad query can't take the server down. |
@@ -342,6 +342,17 @@ checksum (copied in out-of-band, or uploaded with a different default), the serv
 byte length — a requested integrity check is never silently downgraded to a size
 comparison. Slater-published generations always carry the checksum, so they stay on
 the cheap metadata path.
+
+What this column checks, on every backend, is that the files **match the manifest**.
+Whether the manifest itself can be trusted is a separate question, and it is the
+master key that answers it: with a key configured the manifest carries a keyed MAC
+that the server verifies before it trusts any field (including these hashes), so a
+manifest rewritten to describe tampered files is refused; without a key the comparison is unkeyed throughout, and
+someone who can write to the data directory can rewrite a file and the manifest
+together. See
+[What integrity means in each configuration](THREAT_MODEL.md#what-integrity-means-in-each-configuration).
+The check itself can be turned off with `dataBackend.verifyIntegrity: false`, which
+trades it for a faster open.
 
 ### Filesystem (`fs`)
 

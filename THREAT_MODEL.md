@@ -26,6 +26,54 @@ in place.
   `encryption.keyFile`/`keyEnv` that *name where the master key is read from*, and the
   security flags. This surface is **trusted** (part of the TCB) — see "Trust boundary" below.
 
+## What integrity means in each configuration
+
+"Integrity" is two different properties, and which one you get is decided by a single
+choice: whether a **master key** is configured. The table is the short answer; the
+mechanisms behind each row are detailed in the sections that follow.
+
+The attacker assumed here is the one at-rest encryption exists for: they can **read and
+write every byte under the data directory** (a shared mount, a bucket, a stolen disk,
+a compromised publisher), but they do **not** hold the master key and cannot change the
+server's configuration. The server is assumed to have been started with the key it was
+meant to have.
+
+| Configuration | Checked at open | An attacker with write access to `/data` **can** | …and **cannot** |
+| --- | --- | --- | --- |
+| **Plaintext** — no `--encrypt`, no key on the server | Per-file BLAKE3 (or the object store's server-computed checksum), then `content_hash` over the file inventory | Rewrite any block file, recompute its hash, and update the inventory + `content_hash` in `MANIFEST.json` — the tampered image opens and serves. Strip or re-stamp `aclBlake3` the same way. Read every byte: nothing is encrypted | Pass off a **half-copied, truncated or bit-rotted** generation: the file hashes will not match and the server refuses at open. That is a real guard against an interrupted publish — it is not a guard against a deliberate one |
+| **Encrypted, manifest MAC absent** — an image whose `mac` was stripped (or that some other tool produced) | The keyed server checks MAC *presence* before anything else | Nothing: a server holding a master key **refuses outright** to serve a MAC-less generation, at boot and at every generation swap. This is not a config knob — there is no legitimate keyed-but-unauthenticated deployment, so there is no flag to flip. A server with **no** key cannot open an encrypted image at all (block decryption needs the key) | Downgrade an authenticated deployment to an unauthenticated one by deleting a field |
+| **Encrypted + manifest MAC** — `--encrypt` at build, the same key on the server (this is what `--encrypt` always produces) | Keyed-BLAKE3 MAC over the whole manifest **first**, then the per-file hashes it now vouches for; then per-block Poly1305 on every block actually read | Delete files, delete the generation, or roll the `current` pointer back to an **older generation that was validly built under the same key** — availability and freshness are not protected. Nothing binds a generation to "the newest one" | Forge or alter *any* manifest field — file inventory, `content_hash`, encryption header, `aclBlake3` — or strip the MAC, or rewrite a block's bytes (the Poly1305 tag fails when that block is first touched), or read plaintext. This is the only configuration where "integrity" means **authenticity** |
+
+Two caveats that change the answers above:
+
+- **`dataBackend.verifyIntegrity: false`** turns off the open-time file comparison (it is on
+  by default). In the plaintext row that leaves no integrity check at open at all — only the
+  format's own magic/version validation and the read-side decode refusals of limitation 2,
+  which are about refusing a value that would mis-*execute*, not about detecting a rewrite.
+  In the encrypted +
+  MAC row the manifest MAC and per-block AEAD still apply, but one gap opens: a block is
+  sealed under a random nonce with **no associated data**, so a valid ciphertext block copied
+  from elsewhere in the same generation still decrypts. What refuses that today is the
+  open-time file hash — which the MAC makes unforgeable. Leave `verifyIntegrity` on if a
+  data-dir attacker is in your model.
+- **The open-time checks are open-time.** They establish what the image was when the server
+  opened it. A file mutated *underneath* a running server is not re-hashed; in an encrypted
+  image the per-block AEAD still catches it on the next read of that block, in a plaintext
+  image nothing does. Publish by writing a **new** generation directory and flipping
+  `current` — never by editing a served one.
+
+- **"Refuses to serve" is the server's policy.** The MAC-presence and ACL-stamp refusals live
+  in the server's graph registry, applied at boot and at every swap. The one-shot `slater
+  query` CLI opens a generation directly: it verifies a MAC that is *present*, but does not
+  enforce that one exists. Treat the row above as describing the served deployment.
+
+Two places where the writable layer (`delta.enabled`, off by default) is weaker than the
+core: a sealed segment's `SEGMENT.json` MAC is verified when present, but a keyed server does
+**not** yet refuse a MAC-*less* segment manifest the way it refuses a MAC-less generation
+manifest; and the set pointer `sets/<uuid>.json` carries a reserved `mac` field that is not
+yet sealed or verified. The segment *blocks* are encrypted and AEAD-sealed as usual. Treat
+the authenticated row above as covering the core generation.
+
 ## Existing protections
 
 - **At-rest encryption (optional, per block).** With `--encrypt`, each compressed block is
@@ -37,7 +85,9 @@ in place.
   inventory let the reader refuse a half-copied generation (e.g. an in-progress rsync onto
   network storage). This proves the files are **complete and self-consistent**, *not* that
   they are **authentic** — `content_hash` excludes `MANIFEST.json` itself, so an attacker who
-  rewrites the data files *and* the manifest defeats it (when no key is in play).
+  rewrites the data files *and* the manifest defeats it (when no key is in play). See the
+  table above. The comparison runs at open only, and only when `dataBackend.verifyIntegrity`
+  is left on (the default).
 - **Object-store per-file verify never downgrades a requested content digest (HIK-97 for S3,
   HIK-107 for GCS).** On a network backend (S3/GCS) the per-file check at open compares the
   object's *server-computed* checksum (S3 `x-amz-checksum-sha256`, GCS `crc32c`) to the

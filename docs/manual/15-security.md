@@ -76,9 +76,18 @@ export encryption__keyFile=/secrets/master.key
 
 Supply the key by file (`encryption.keyFile`) or env var (`encryption.keyEnv`);
 the file takes precedence and must live **outside** the data directory (a tripwire
-refuses a key inside it). Independently of encryption, the manifest carries a
-keyed-BLAKE3 **MAC** that authenticates every manifest field when a key is
-configured; a keyed server refuses a MAC-less generation.
+refuses a key inside it).
+
+Encrypting is also what gives you **authenticated** integrity. `slater-build`
+seals the manifest with a keyed-BLAKE3 **MAC** whenever it has the key — and it
+rejects a key without `--encrypt`, so the two travel together. The MAC covers
+every manifest field (the file inventory, the content hash, the encryption header,
+the ACL stamp); a keyed server verifies it at open and at every generation swap,
+and refuses a MAC-less generation outright. A **plaintext** image has no MAC: its
+content hash detects a half-copied or corrupted generation, but not a deliberately
+rewritten one, because whoever rewrites the blocks can rewrite the manifest too.
+The configuration-by-configuration comparison is in
+[`THREAT_MODEL.md`](../../THREAT_MODEL.md#what-integrity-means-in-each-configuration).
 
 ## Resource limits (denial-of-service protection)
 
