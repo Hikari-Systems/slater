@@ -177,9 +177,11 @@ encryption implies.
 7. **Key material is wiped on drop only on a best-effort basis.** The master key bytes, the hex
    text they were read from, and the derived per-generation block key and manifest-MAC subkey are
    all held in `zeroize::Zeroizing`, so their buffers are overwritten with volatile writes when
-   they drop; `XChaCha20Poly1305` likewise zeroizes its copy of the block key in `Drop`. This
+   they drop; `XChaCha20Poly1305` likewise zeroizes its copy of the block key in `Drop`, and the
+   BLAKE3 hashers that *derive* those subkeys are wiped explicitly (they retain the master key in
+   their block buffer and the MAC key in their key words, and BLAKE3 has no `Drop`). This
    narrows — it does not close — exposure of key bytes to a core dump, a swapped page, or
-   cold-boot memory disclosure, and two gaps are structural rather than oversights:
+   cold-boot memory disclosure, and three gaps are structural rather than oversights:
    (a) a key supplied through `encryption.keyEnv` (or `slater-build --key-env`) **cannot be
    wiped** — it lives in the process environment block, readable from `/proc/self/environ` for the
    process's whole life, and `std::env::var` only hands out a copy; use `keyFile` where that
@@ -187,7 +189,9 @@ encryption implies.
    which threat dominates is a deployment judgement); and (b) a buffer that grows by reallocation
    leaves untracked copies in freed heap — `hex_decode` pre-sizes its `Vec` and so never
    reallocates, but `fs::read_to_string` on a `keyFile` grows as it reads, and `Zeroizing` wipes
-   only the final buffer. The server also necessarily holds the key live for its whole run (it is
+   only the final buffer; and (c) wiping reaches only the values the code holds by name — nothing
+   can reach a copy the optimizer spilled to an unnamed stack slot or left in a register.
+   The server also necessarily holds the key live for its whole run (it is
    needed on every generation swap), so this is about *post-drop* residue, not about shortening
    the window in which the key is legitimately resident. Host compromise with read access to live
    process memory remains explicitly out of scope.

@@ -108,6 +108,7 @@ pub fn derive_key(master_key: &[u8], salt: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
 /// the (MAC-covered) encryption header. Salt-free keeps the key reproducible at
 /// verify time from the master key alone. Domain-separated from [`derive_key`] by
 /// its KDF context.
+///
 /// Wiped on drop via [`Zeroizing`], exactly like [`derive_key`].
 pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(MAC_KDF_CONTEXT);
@@ -122,6 +123,7 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
 
 /// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
 /// 32-byte subkey from [`derive_manifest_mac_key`].
+///
 /// Spelled out as a `Hasher` rather than the one-shot `blake3::keyed_hash` so the
 /// hasher — which holds the MAC key verbatim in its key words — can be wiped after
 /// use; the one-shot's hasher is a local we cannot reach.
