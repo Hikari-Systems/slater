@@ -88,6 +88,15 @@ pub struct SetManifest {
     pub created_unix: i64,
     /// Reserved: keyed-MAC over the canonical manifest, authenticating the set
     /// pointer. `None` for a plaintext set; verification wiring is a later step.
+    ///
+    /// **Nothing computes or checks this today** — this struct is *not* MAC-covered, so the
+    /// pointer (which names the base generation and the segment stack) is currently
+    /// authenticated only indirectly, by each image's own MAC. When it is wired, follow the
+    /// [`crate::manifest::Manifest`] pattern exactly: clear `mac`, serialise to JSON, and
+    /// frame it with [`crypto::mac_preimage`](crate::crypto::mac_preimage) under a **new**
+    /// [`MacDomain`](crate::crypto::MacDomain) variant of its own — never reuse the
+    /// generation or segment domain — and pin the body with a golden test (HIK-142). The
+    /// same rule applies: no `HashMap`/`HashSet` field in a MAC-covered struct.
     #[serde(default)]
     pub mac: Option<String>,
 }

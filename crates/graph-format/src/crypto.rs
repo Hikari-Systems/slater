@@ -137,6 +137,69 @@ pub fn derive_manifest_mac_key(master_key: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
     out
 }
 
+/// Which kind of document a MAC preimage is for — the domain-separation namespace.
+///
+/// A closed enum rather than a `&str` **deliberately**: the domain is the one part of the
+/// preimage that must never be influenced by data. If it were a free string, a future
+/// caller could pass a value derived from a document and craft one containing the framing
+/// delimiters, shifting the tag/body boundary and colliding two different documents onto
+/// one preimage. There is no way to express that here.
+///
+/// A new variant is a **new** MAC namespace: adding one can never make an existing
+/// document verify under the wrong kind. When the set manifest's reserved `mac` field
+/// ([`crate::setmanifest::SetManifest::mac`]) is wired, it gets its own variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacDomain {
+    /// A generation `MANIFEST.json` ([`crate::manifest::Manifest`]).
+    Manifest,
+    /// A core segment's `SEGMENT.json` ([`crate::segmanifest::SegmentManifest`]).
+    SegmentManifest,
+}
+
+impl MacDomain {
+    /// The stable on-the-wire label. Never contains the framing delimiter (NUL), which is
+    /// what makes the tag unambiguous; the compiler guarantees it here because these are
+    /// the only two values that exist.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MacDomain::Manifest => "slater.manifest",
+            MacDomain::SegmentManifest => "slater.segment-manifest",
+        }
+    }
+}
+
+/// Frame `body` into the MAC preimage for `domain`:
+///
+/// ```text
+/// "<domain>.mac.v<FORMAT_VERSION>" || 0x00 || (body.len() as u64, LE) || body
+/// ```
+///
+/// Three properties, in the order they matter:
+///
+/// * **Domain separation.** The tag is a *fixed* prefix chosen from a closed set
+///   ([`MacDomain`]) — never from the document — so nothing in `body` can shift the
+///   boundary or forge another domain's framing. A generation manifest and a segment
+///   manifest are separate namespaces and can never cross-verify.
+/// * **Version binding.** The version comes from [`crate::FORMAT_VERSION`], never a
+///   hand-maintained `"v1"` string, so the MAC scheme cannot silently drift from the
+///   on-disk format version. A format bump already forces a rebuild, so re-MACing with it
+///   is free.
+/// * **Unambiguous concatenation.** The `u64` length prefix means the body's extent is
+///   stated, not inferred from "everything after the tag" — so no future field appended
+///   *after* the body could be traded against body bytes to produce a second document
+///   with the same preimage.
+///
+/// The `0x00` is the tag/length delimiter; no [`MacDomain`] label contains one.
+pub fn mac_preimage(domain: MacDomain, body: &[u8]) -> Vec<u8> {
+    let tag = format!("{}.mac.v{}", domain.as_str(), crate::FORMAT_VERSION);
+    let mut out = Vec::with_capacity(tag.len() + 1 + 8 + body.len());
+    out.extend_from_slice(tag.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 /// Compute a keyed-BLAKE3 MAC over `msg` and hex-encode it. The key is the
 /// 32-byte subkey from [`derive_manifest_mac_key`].
 ///
@@ -441,6 +504,35 @@ mod tests {
         assert_ne!(k1, k3, "a different salt derives a different key");
         // A different master key also diverges.
         assert_ne!(k1, derive_key(b"other-master-key", &salt_a));
+    }
+
+    /// HIK-142: the preimage framing is a versioned domain tag, a NUL, the body length,
+    /// then the body — and the tag's version tracks `FORMAT_VERSION` rather than a
+    /// hand-maintained scheme string.
+    #[test]
+    fn mac_preimage_frames_the_body_unambiguously() {
+        let body = b"{\"a\":1}";
+        let pre = mac_preimage(MacDomain::Manifest, body);
+        let tag = format!("slater.manifest.mac.v{}", crate::FORMAT_VERSION);
+        assert!(pre.starts_with(tag.as_bytes()));
+        assert_eq!(pre[tag.len()], 0, "NUL delimits the tag");
+        let len = u64::from_le_bytes(pre[tag.len() + 1..tag.len() + 9].try_into().unwrap());
+        assert_eq!(len as usize, body.len());
+        assert_eq!(&pre[tag.len() + 9..], body);
+
+        // The two domains are separate namespaces, so the same body frames differently —
+        // a SEGMENT.json can never be replayed as a MANIFEST.json.
+        assert_ne!(pre, mac_preimage(MacDomain::SegmentManifest, body));
+        assert_ne!(
+            MacDomain::Manifest.as_str(),
+            MacDomain::SegmentManifest.as_str()
+        );
+        for d in [MacDomain::Manifest, MacDomain::SegmentManifest] {
+            assert!(
+                !d.as_str().contains('\0'),
+                "a domain label must not hold NUL"
+            );
+        }
     }
 
     #[test]

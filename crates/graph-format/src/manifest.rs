@@ -457,15 +457,38 @@ impl Manifest {
         Ok(())
     }
 
-    /// The canonical byte string the MAC is computed over: this manifest with
-    /// `mac` cleared, serialised compactly. Deterministic — serde fixes struct
+    /// The canonical byte string the MAC is computed over: a versioned domain tag
+    /// ([`crypto::mac_preimage`](crate::crypto::mac_preimage)) framing this manifest with
+    /// `mac` cleared, serialised compactly as JSON. Deterministic — serde fixes struct
     /// field order, `block_sizes` is a `BTreeMap`, and every other collection is
     /// an order-stable `Vec` written in a fixed order by the builder. Clearing
     /// `mac` is what lets the same bytes be reproduced at verify time.
+    ///
+    /// # Why JSON, and the rule that keeps it safe
+    ///
+    /// JSON is a fragile *canonicalisation*, but a hand-rolled canonical encoder fails in
+    /// the worse direction: a newly added field silently falls **outside** the MAC, with
+    /// no signal. Serialising the struct picks new fields up automatically, and the
+    /// residual risk is pinned by the golden preimage test below
+    /// (`mac_preimage_body_is_pinned_to_a_golden_shape`) — an added/reordered field, or a
+    /// serde_json number-format change, trips it and forces a deliberate decision.
+    ///
+    /// **Rule: no `HashMap`/`HashSet` field may ever be added to a MAC-covered manifest
+    /// struct** (this one, its nested descriptors, or [`crate::segmanifest::SegmentManifest`]).
+    /// Their iteration order is unspecified and randomised per process, so the same
+    /// manifest would MAC differently on each run and verification would fail at random.
+    /// Use a `BTreeMap` (as `block_sizes` does) or an order-stable `Vec`.
+    ///
+    /// The tag carries [`crate::FORMAT_VERSION`], not a hand-maintained scheme string, so
+    /// the MAC scheme cannot drift from the on-disk format version.
     fn mac_message(&self) -> Result<Vec<u8>> {
         let mut canon = self.clone();
         canon.mac = None;
-        serde_json::to_vec(&canon).context("serialise manifest for MAC")
+        let body = serde_json::to_vec(&canon).context("serialise manifest for MAC")?;
+        Ok(crate::crypto::mac_preimage(
+            crate::crypto::MacDomain::Manifest,
+            &body,
+        ))
     }
 
     /// Compute the keyed-BLAKE3 MAC under the master-key-derived subkey and store
@@ -951,6 +974,176 @@ mod tests {
         let mut m = sample();
         m.seal_mac(b"key A").unwrap();
         assert!(m.verify_mac(b"key B").is_err());
+    }
+
+    /// A **fully populated** manifest: every `Option` `Some`, every `Vec` non-empty, and
+    /// floats present (`alpha`, `maxNorm`) so a serde_json number-format change shows up.
+    ///
+    /// `format_version` is a **literal** `8`, deliberately not [`crate::FORMAT_VERSION`]:
+    /// the golden pins the manifest's *shape*, and a genuine format bump must not force a
+    /// re-pin of the body. (The version binding lives in the preimage tag, which the
+    /// framing assertion below derives from the live constant.)
+    fn golden_manifest() -> Manifest {
+        Manifest {
+            magic: "SLATER01".into(),
+            format_version: 8,
+            build_uuid: Generation(uuid::Uuid::from_u128(0x1234_5678)),
+            graph: "golden".into(),
+            created_unix: 1_700_000_000,
+            content_hash: "aabb".into(),
+            block_sizes: BTreeMap::from([
+                ("node_props.blk".to_string(), 262_144),
+                ("edge_props.blk".to_string(), 65_536),
+            ]),
+            codec: "zstd".into(),
+            zstd_level: 3,
+            compression_profile: "remote".into(),
+            encryption: Some(EncryptionHeader {
+                aead: "xchacha20poly1305".into(),
+                kdf: "blake3-derive-key".into(),
+                salt_hex: "00".repeat(32),
+                aad_scheme: "file-block-v1".into(),
+            }),
+            node_count: 7,
+            edge_count: 9,
+            labels: vec!["Person".into(), "City".into()],
+            reltypes: vec!["KNOWS".into()],
+            property_keys: vec!["name".into(), "embedding".into()],
+            range_indexes: vec![RangeIndexDesc {
+                name: "idx_0".into(),
+                entity: EntityKind::Node,
+                label_or_type: "Person".into(),
+                property: "age".into(),
+            }],
+            vector_indexes: vec![
+                VectorIndexDesc {
+                    label: "Chunk".into(),
+                    property: "embedding".into(),
+                    dim: 1024,
+                    metric: Metric::Cosine,
+                    count: 5,
+                    first_record: 2,
+                    mode: AnnMode::BruteForce,
+                },
+                VectorIndexDesc {
+                    label: "Doc".into(),
+                    property: "embedding".into(),
+                    dim: 768,
+                    metric: Metric::Dot,
+                    count: 11,
+                    first_record: 7,
+                    mode: AnnMode::Vamana {
+                        r: 64,
+                        alpha: 1.2,
+                        medoid: 0,
+                        pq_subspaces: 16,
+                        pq_bits: 8,
+                        live_count: 10,
+                        max_norm: 0.1,
+                        nav: AnnNav::InnerProduct,
+                    },
+                },
+            ],
+            reltype_source_counts: vec![3],
+            reltype_target_counts: vec![4],
+            reltype_edge_counts: vec![9],
+            reltype_self_loop_counts: vec![1],
+            label_node_counts: vec![5, 2],
+            first_label_counts: vec![5, 2],
+            src_label_reltype_counts: vec![(0, 0, 9)],
+            reltype_tgt_label_counts: vec![(0, 1, 9)],
+            schema_triple_counts: vec![(0, 0, 1, 9)],
+            property_histograms: vec![PropertyHistogramDesc {
+                index_name: "idx_0".into(),
+                label: "Person".into(),
+                property: "age".into(),
+                distinct_count: 42,
+            }],
+            hub_degrees: Some(HubDegreeDesc {
+                floor: 1000,
+                out_hubs: 2,
+                in_hubs: 3,
+            }),
+            acl_blake3: Some("deadbeef".into()),
+            mac: Some("this field is cleared before the body is serialised".into()),
+            files: vec![FileEntry {
+                name: "node_props.blk".into(),
+                bytes: 123,
+                blake3: "cafebabe".into(),
+                sha256: Some("c2hh".into()),
+                crc32c: Some("Y3Jj".into()),
+            }],
+        }
+    }
+
+    /// The canonical JSON body of [`golden_manifest`], pinned byte-for-byte.
+    ///
+    /// This is a **pin**, not a bug fix: it cannot be observed failing against unfixed
+    /// code, because there is no bug today. Its job is to fail *later* — when someone adds
+    /// a field, reorders one, changes a `#[serde]` attribute, or serde_json changes how it
+    /// formats a number — so a change to a security-load-bearing preimage is a deliberate
+    /// decision rather than a silent one. Re-pin only after confirming the change is
+    /// intended (and note that it invalidates every existing MAC).
+    const GOLDEN_MANIFEST_BODY: &str = r#"{"magic":"SLATER01","formatVersion":8,"buildUuid":"00000000-0000-0000-0000-000012345678","graph":"golden","createdUnix":1700000000,"contentHash":"aabb","blockSizes":{"edge_props.blk":65536,"node_props.blk":262144},"codec":"zstd","zstdLevel":3,"compressionProfile":"remote","encryption":{"aead":"xchacha20poly1305","kdf":"blake3-derive-key","saltHex":"0000000000000000000000000000000000000000000000000000000000000000","aadScheme":"file-block-v1"},"nodeCount":7,"edgeCount":9,"labels":["Person","City"],"reltypes":["KNOWS"],"propertyKeys":["name","embedding"],"rangeIndexes":[{"name":"idx_0","entity":"node","labelOrType":"Person","property":"age"}],"vectorIndexes":[{"label":"Chunk","property":"embedding","dim":1024,"metric":"cosine","count":5,"firstRecord":2,"mode":{"kind":"brute_force"}},{"label":"Doc","property":"embedding","dim":768,"metric":"dot","count":11,"firstRecord":7,"mode":{"kind":"vamana","r":64,"alpha":1.2,"medoid":0,"pq_subspaces":16,"pq_bits":8,"live_count":10,"max_norm":0.1,"nav":"inner_product"}}],"reltypeSourceCounts":[3],"reltypeTargetCounts":[4],"reltypeEdgeCounts":[9],"reltypeSelfLoopCounts":[1],"labelNodeCounts":[5,2],"firstLabelCounts":[5,2],"srcLabelReltypeCounts":[[0,0,9]],"reltypeTgtLabelCounts":[[0,1,9]],"schemaTripleCounts":[[0,0,1,9]],"propertyHistograms":[{"indexName":"idx_0","label":"Person","property":"age","distinctCount":42}],"hubDegrees":{"floor":1000,"outHubs":2,"inHubs":3},"aclBlake3":"deadbeef","mac":null,"files":[{"name":"node_props.blk","bytes":123,"blake3":"cafebabe","sha256":"c2hh","crc32c":"Y3Jj"}]}"#;
+
+    /// HIK-142: pin the MAC preimage of a fully populated manifest.
+    #[test]
+    fn mac_preimage_body_is_pinned_to_a_golden_shape() {
+        let pre = golden_manifest().mac_message().unwrap();
+
+        // 1. Framing: a versioned domain tag, NUL, then the body length. The version is
+        //    read from the live FORMAT_VERSION, so a format bump moves the whole scheme
+        //    with it and this assertion still holds without a re-pin.
+        let tag = format!("slater.manifest.mac.v{}\0", crate::FORMAT_VERSION);
+        assert!(
+            pre.starts_with(tag.as_bytes()),
+            "preimage must open with the versioned domain tag"
+        );
+        let hdr = tag.len();
+        let len = u64::from_le_bytes(pre[hdr..hdr + 8].try_into().unwrap());
+        let body = std::str::from_utf8(&pre[hdr + 8..]).unwrap();
+        assert_eq!(
+            len as usize,
+            body.len(),
+            "length prefix must state the body"
+        );
+
+        // 2. Body: the canonical JSON, byte-for-byte. String compare, not a hash, so a
+        //    failure shows *which* field moved.
+        assert_eq!(
+            body, GOLDEN_MANIFEST_BODY,
+            "the MAC preimage body changed — a manifest field was added, reordered or \
+             reformatted. Confirm the change is intended, then re-pin (it invalidates \
+             every existing MAC)."
+        );
+    }
+
+    /// The preimage is stable across repeated serialisation of the same value — cheap
+    /// smoke for an order-unstable (`HashMap`-typed) field sneaking into the struct.
+    #[test]
+    fn mac_preimage_is_stable_across_repeated_serialisation() {
+        let m = golden_manifest();
+        let first = m.mac_message().unwrap();
+        for _ in 0..64 {
+            assert_eq!(m.mac_message().unwrap(), first);
+        }
+    }
+
+    /// A generation manifest and a segment manifest are MACed under **different** domains,
+    /// so identical bodies under the same key still produce different MACs.
+    #[test]
+    fn manifest_and_segment_domains_do_not_collide() {
+        let key = crate::crypto::derive_manifest_mac_key(b"master");
+        let body = b"identical bytes";
+        let a = crate::crypto::manifest_mac(
+            &key,
+            &crate::crypto::mac_preimage(crate::crypto::MacDomain::Manifest, body),
+        );
+        let b = crate::crypto::manifest_mac(
+            &key,
+            &crate::crypto::mac_preimage(crate::crypto::MacDomain::SegmentManifest, body),
+        );
+        assert_ne!(a, b, "the two manifest kinds must be domain-separated");
     }
 
     #[test]
