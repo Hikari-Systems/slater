@@ -1223,6 +1223,19 @@ mod carry_tests {
         std::fs::read(a).unwrap() == std::fs::read(b).unwrap()
     }
 
+    /// Where the emitted `.vamana` actually is: inside the generation when the merge rewrote
+    /// it, or inside its own `vecidx/<uuid>/` artifact when it was carried (HIK-145).
+    fn emitted_vamana(data_dir: &Path, out_dir: &Path, desc: &VectorIndexDesc) -> PathBuf {
+        match &desc.carried_graph {
+            Some(r) => data_dir
+                .join("g")
+                .join("vecidx")
+                .join(r.uuid.0.to_string())
+                .join("Doc.emb.vamana"),
+            None => out_dir.join("vector/Doc.emb.vamana"),
+        }
+    }
+
     fn cosine(q: &[f32], v: &[f32]) -> f64 {
         let (mut dot, mut nq, mut nv) = (0.0f64, 0.0f64, 0.0f64);
         for (x, y) in q.iter().zip(v) {
@@ -1457,8 +1470,13 @@ mod carry_tests {
         let out_dir = data_dir.join("out");
         let out_desc = run_carry(&data_dir, &out_dir, carry, &[], &perm);
 
-        let out_vamana = out_dir.join("vector/Doc.emb.vamana");
+        let out_vamana = emitted_vamana(&data_dir, &out_dir, &out_desc);
         let out_pq_path = out_dir.join("vector/Doc.emb.pq");
+        assert!(
+            out_desc.carried_graph.is_some(),
+            "a pure-permutation carry must publish the graph as a referenced artifact, not \
+             as a file of the new generation"
+        );
         assert!(
             same_bytes(&out_vamana, &base_vamana),
             "a pure-permutation carry must leave the .vamana byte-identical (the whole thesis)"
@@ -1519,10 +1537,13 @@ mod carry_tests {
         std::fs::create_dir_all(&dump_dir).unwrap();
         let carry = carry_for(&data_dir, &dump_dir, &base_rel, &desc, &layout_ids);
         let out_dir = data_dir.join("out");
-        run_carry(&data_dir, &out_dir, carry, &[], &Permutation::Identity);
+        let out_desc = run_carry(&data_dir, &out_dir, carry, &[], &Permutation::Identity);
 
         assert!(
-            same_bytes(&out_dir.join("vector/Doc.emb.vamana"), &base_vamana),
+            same_bytes(
+                &emitted_vamana(&data_dir, &out_dir, &out_desc),
+                &base_vamana
+            ),
             "identity carry is byte-identical too"
         );
         let out_pq = PqReader::open_with_cipher(out_dir.join("vector/Doc.emb.pq"), None)
@@ -1591,6 +1612,11 @@ mod carry_tests {
         let out_vamana = out_dir.join("vector/Doc.emb.vamana");
         let out_pq = out_dir.join("vector/Doc.emb.pq");
 
+        assert!(
+            out_desc.carried_graph.is_none(),
+            "a rewritten graph is fresh bytes under this generation's key, so it stays an \
+             ordinary file of the generation — not a referenced artifact"
+        );
         assert!(
             !same_bytes(&out_vamana, &base_vamana),
             "a delete+Δ merge must rewrite the .vamana, not carry it"
