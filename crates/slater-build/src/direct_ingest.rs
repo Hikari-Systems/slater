@@ -255,6 +255,8 @@ pub fn ingest_dump(
             carry: vi.carry.as_ref().map(|c| crate::model::VectorCarry {
                 base_vamana: c.base_vamana.clone(),
                 base_pq: c.base_pq.clone(),
+                base_gen: c.base_gen,
+                base_vamana_artifact: c.base_vamana_artifact,
                 carry_map_path: dump_dir.join(&c.carry_map_file),
                 base_records: c.base_records,
                 r: c.r,

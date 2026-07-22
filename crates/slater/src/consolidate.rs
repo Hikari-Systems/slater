@@ -470,9 +470,20 @@ pub fn serialise_binary_dump<V: ReadView>(
                 // own `--data-dir`), matching the generation store's `graph/base_uuid` layout.
                 let base = view.core_generation();
                 let (graph, base_uuid) = (base.graph(), base.base_uuid());
+                // HIK-145: a `.vamana` already carried by an earlier consolidation lives in
+                // its own salt-bearing `vecidx/<uuid>/` artifact, not in the generation
+                // directory. Point the dump at wherever it actually is; the builder resolves
+                // the cipher from that artifact's own manifest.
+                let carried_graph = desc.carried_graph.clone();
+                let vamana_rel = match &carried_graph {
+                    Some(r) => format!("{graph}/vecidx/{}/{stem}.vamana", r.uuid.0),
+                    None => format!("{graph}/{base_uuid}/vector/{stem}.vamana"),
+                };
                 Some(DumpVectorCarry {
-                    base_vamana: format!("{graph}/{base_uuid}/vector/{stem}.vamana"),
+                    base_vamana: vamana_rel,
                     base_pq: format!("{graph}/{base_uuid}/vector/{stem}.pq"),
+                    base_gen: Some(base_uuid),
+                    base_vamana_artifact: carried_graph.as_ref().map(|r| r.uuid),
                     carry_map_file,
                     base_records: layout_to_dump_id.len() as u64,
                     r,

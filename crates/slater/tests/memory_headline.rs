@@ -248,6 +248,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
         property_keys: vec!["embedding".into()],
         range_indexes: vec![],
         vector_indexes: vec![VectorIndexDesc {
+            carried_graph: None,
             label: "Doc".into(),
             property: "embedding".into(),
             dim: DIM as u32,

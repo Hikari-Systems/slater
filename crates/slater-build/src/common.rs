@@ -254,6 +254,11 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
     // *composition*. A keyed reader refuses a set that carries no MAC, so this seal is
     // what makes an encrypted build openable at all.
     let mut set = graph_format::setmanifest::SetManifest::singleton(inp.generation, now_unix());
+    // HIK-145: bind the carried vector-graph artifacts this generation references into the
+    // composition, *before* sealing. Each artifact carries its own MAC, but a MAC on a part
+    // does not authenticate which parts are served together (HIK-144) — and this list is
+    // also what the GC sweep reads to know an artifact is still live.
+    set.bind_vector_artifacts(&manifest);
     if let Some(key) = inp.encryption_key {
         set.seal_mac(key)?;
     }
@@ -279,6 +284,11 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
     // reader never sees a pointer to a partially-uploaded generation (the same
     // copy-completeness barrier the local rename-current-last provides).
     if let Some(store) = &inp.store {
+        // Artifacts first: `upload_generation` writes the remote `current` pointer **last**
+        // as its publish barrier, so anything a published generation references must already
+        // be there when that pointer lands.
+        upload_vector_artifacts(store.as_ref(), inp.graph, inp.graph_dir, &set)
+            .context("upload carried vector-graph artifacts to object store")?;
         upload_generation(
             store.as_ref(),
             inp.graph,
@@ -297,6 +307,38 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         node_count: inp.node_count,
         edge_count: inp.edge_count,
     })
+}
+
+/// Upload every carried vector-graph artifact the published set references (HIK-145).
+///
+/// Runs **before** `upload_generation`, whose last act is the remote `current` pointer: a
+/// published generation must never name an artifact whose objects are not yet uploaded. An
+/// artifact already present is re-uploaded rather than probed — an artifact is immutable
+/// under its uuid, so a rewrite is a no-op in content.
+fn upload_vector_artifacts(
+    store: &dyn ObjectStore,
+    graph: &str,
+    graph_dir: &Path,
+    set: &graph_format::setmanifest::SetManifest,
+) -> Result<()> {
+    use graph_format::vecmanifest::VectorIndexManifest;
+    for r in &set.vector_artifacts {
+        let dir = graph_dir.join("vecidx").join(r.uuid.0.to_string());
+        let json = fs::read(dir.join("VECIDX.json"))
+            .with_context(|| format!("read {}/VECIDX.json", dir.display()))?;
+        let m: VectorIndexManifest = serde_json::from_slice(&json)
+            .with_context(|| format!("parse {}/VECIDX.json", dir.display()))?;
+        let bytes = fs::read(dir.join(&m.file))
+            .with_context(|| format!("read {} for upload", dir.join(&m.file).display()))?;
+        store
+            .put(&m.file_key(graph), &bytes, None)
+            .with_context(|| format!("upload carried vector graph {}", m.file))?;
+        // The manifest last, so a reader never sees one naming bytes that are not there yet.
+        store
+            .put(&VectorIndexManifest::key(graph, r.uuid), &json, None)
+            .with_context(|| format!("upload VECIDX.json of artifact {}", r.uuid))?;
+    }
+    Ok(())
 }
 
 /// Upload a finished, locally-published generation to an object store: every

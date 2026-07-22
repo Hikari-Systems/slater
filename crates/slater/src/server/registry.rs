@@ -697,6 +697,11 @@ impl Graphs {
                 graph_format::setmanifest::SegmentRef::from_manifest(&manifest),
             ))
             .collect();
+        // HIK-145: the base's carried vector-graph artifacts must travel with every set that
+        // names that base, or the next GC sweep would see them unreferenced and reclaim a
+        // live graph. Restated from the base manifest rather than copied from the old set, so
+        // it cannot drift from what the generation actually references.
+        set.bind_vector_artifacts(core.manifest());
         // Seal the new composition last, after the segment list is final (HIK-144) — a
         // keyed reader refuses an unsealed set.
         if let Some(key) = self.master_key_bytes() {
@@ -889,6 +894,9 @@ impl Graphs {
             ));
         }
         set.segments = refs;
+        // HIK-145: as in the flush path — the base is unchanged, so its carried vector-graph
+        // artifacts must be restated in the new composition.
+        set.bind_vector_artifacts(core.manifest());
         // Seal the recomposed set last, after the merged segment has taken the run's
         // ordinal slot (HIK-144) — a keyed reader refuses an unsealed set.
         if let Some(key) = self.master_key_bytes() {
@@ -1039,30 +1047,37 @@ impl Graphs {
         // names a bare generation uuid (a singleton — e.g. just after a retarget) has no set
         // file, so nothing under `sets/` or `segments/` is live and every entry is an orphan.
         let current = GenId(Generation::current_uuid_in(self.store.as_ref(), name)?);
-        let (live_set, live_segments): (Option<GenId>, std::collections::HashSet<GenId>) =
-            if graph_format::setmanifest::SetManifest::exists_via(
+        let (live_set, live_segments, live_vector_artifacts): (
+            Option<GenId>,
+            std::collections::HashSet<GenId>,
+            std::collections::HashSet<GenId>,
+        ) = if graph_format::setmanifest::SetManifest::exists_via(
+            self.store.as_ref(),
+            name,
+            current,
+        ) {
+            let set = graph_format::setmanifest::SetManifest::read_via(
                 self.store.as_ref(),
                 name,
                 current,
-            ) {
-                let set = graph_format::setmanifest::SetManifest::read_via(
-                    self.store.as_ref(),
-                    name,
-                    current,
-                )
-                .with_context(|| format!("read current set for GC of '{name}'"))?;
-                // Authenticate before acting on it: this document decides which segments
-                // are *live*, and everything else is deleted. Acting on an unauthenticated
-                // set here would let a data-dir attacker have the server itself delete the
-                // live stack — the same class of mistake as opening one (HIK-144).
-                graph_format::crypto::authenticate(&set, self.master_key_bytes()).with_context(
-                    || format!("authenticate the current set before GC of '{name}'"),
-                )?;
-                let segs = set.segments.iter().map(|s| s.uuid).collect();
-                (Some(current), segs)
-            } else {
-                (None, std::collections::HashSet::new())
-            };
+            )
+            .with_context(|| format!("read current set for GC of '{name}'"))?;
+            // Authenticate before acting on it: this document decides which segments
+            // are *live*, and everything else is deleted. Acting on an unauthenticated
+            // set here would let a data-dir attacker have the server itself delete the
+            // live stack — the same class of mistake as opening one (HIK-144).
+            graph_format::crypto::authenticate(&set, self.master_key_bytes())
+                .with_context(|| format!("authenticate the current set before GC of '{name}'"))?;
+            let segs = set.segments.iter().map(|s| s.uuid).collect();
+            let arts = set.vector_artifacts.iter().map(|a| a.uuid).collect();
+            (Some(current), segs, arts)
+        } else {
+            (
+                None,
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
+        };
 
         let graph_dir = data_dir.join(name);
         // Grace markers live here — always local (server-side bookkeeping), never in the segment
@@ -1174,12 +1189,48 @@ impl Graphs {
             report.deleted_sets.push(GenId(uuid));
         }
 
-        if !report.deleted_segments.is_empty() || !report.deleted_sets.is_empty() {
+        // Orphaned carried vector-graph artifacts (HIK-145). `vecidx/<uuid>/` the current set
+        // does not reference — a consolidation that promoted a graph and then turned out to
+        // rewrite it leaves one behind, and every superseded artifact becomes one on the next
+        // consolidation. The live set is read from the same **authenticated** document the
+        // segment sweep uses, so this referent does not reopen HIK-144's hole: an attacker who
+        // could rewrite the set pointer cannot make the server delete a live 370 GB graph.
+        let vecidx_dir = graph_dir.join("vecidx");
+        for child in self.store.list(&join_key(name, "vecidx"))? {
+            let Ok(uuid) = uuid::Uuid::parse_str(&child) else {
+                continue; // skip anything not a bare uuid dir
+            };
+            if live_vector_artifacts.contains(&GenId(uuid)) {
+                continue;
+            }
+            let marker = gc_dir.join(format!("vec-{uuid}"));
+            if !eligible(&marker)? {
+                report.marked += 1;
+                continue;
+            }
+            if remote {
+                let prefix = join_key(name, &format!("vecidx/{child}"));
+                for f in self.store.list(&prefix)? {
+                    self.store.delete(&join_key(&prefix, &f)).with_context(|| {
+                        format!("gc remote vector artifact object {prefix}/{f}")
+                    })?;
+                }
+            }
+            remove_local_dir(&vecidx_dir.join(&child))?;
+            let _ = remove_local_file(&marker);
+            report.deleted_vector_artifacts.push(GenId(uuid));
+        }
+
+        if !report.deleted_segments.is_empty()
+            || !report.deleted_sets.is_empty()
+            || !report.deleted_vector_artifacts.is_empty()
+        {
             info!(
                 graph = %name,
                 segments = report.deleted_segments.len(),
                 sets = report.deleted_sets.len(),
-                "reclaimed orphaned segment/set artifacts"
+                vector_artifacts = report.deleted_vector_artifacts.len(),
+                "reclaimed orphaned segment/set/vector artifacts"
             );
         }
         Ok(report)

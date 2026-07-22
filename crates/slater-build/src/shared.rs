@@ -322,6 +322,7 @@ pub(crate) fn write_vector_indexes(
     block_sizes: &mut BTreeMap<String, u32>,
     perm: &Permutation,
     data_dir: &Path,
+    graph: &str,
 ) -> Result<(Vec<VectorIndexDesc>, Vec<String>)> {
     fs::create_dir_all(tmp_dir.join("vector"))
         .with_context(|| format!("create {}", tmp_dir.join("vector").display()))?;
@@ -349,6 +350,7 @@ pub(crate) fn write_vector_indexes(
                 cipher.clone(),
                 perm,
                 data_dir,
+                graph,
             )?;
             for (name, block) in &files {
                 vector_files.push(name.clone());
@@ -387,6 +389,7 @@ pub(crate) fn write_vector_indexes(
                 count,
                 first_record,
                 mode: AnnMode::BruteForce,
+                carried_graph: None,
             });
         }
     }
@@ -562,6 +565,7 @@ fn build_vamana_index(
             max_norm: max_norm as f32,
             nav,
         },
+        carried_graph: None,
     };
     Ok((
         desc,
@@ -600,7 +604,14 @@ fn carry_vamana_index(
     cipher: Option<Arc<BlockCipher>>,
     perm: &Permutation,
     data_dir: &Path,
+    graph: &str,
 ) -> Result<(VectorIndexDesc, Vec<(String, u32)>)> {
+    // HIK-145: the base pair is a *different* artifact from the output, sealed under a
+    // different salt. Resolve the two base-side ciphers from the documents that actually
+    // record how those bytes were sealed — never from this build's fresh generation key,
+    // which is what made encrypted carry-by-reference fail its Poly1305 tag from the day the
+    // carry was written.
+    let src = CarrySource::resolve(carry, data_dir, graph, pi, master_key_bytes(opts))?;
     // The `layout → dump-id` table, composed through this build's permutation into final ids.
     let layout_to_dump_id = read_carry_map(&carry.carry_map_path, carry.base_records)
         .with_context(|| {
@@ -647,6 +658,8 @@ fn carry_vamana_index(
         // HIK-140: the pair's store-relative stem — the same one the served generation
         // opens them under (`generation.rs`'s `vector/{label}.{property}`).
         stem: format!("vector/{}.{}", pi.label, pi.property),
+        base_vamana_cipher: src.vamana_cipher.clone(),
+        base_pq_cipher: src.pq_cipher.clone(),
     };
     let stats = streaming_merge(
         &base_vamana,
@@ -694,14 +707,274 @@ fn carry_vamana_index(
             // `nav: inner_product`, so a Dot base stays IP-native across every consolidation.
             nav: carry.nav,
         },
+        carried_graph: None,
     };
-    Ok((
-        desc,
-        vec![
-            (vam_rel, opts.vector_block_size as u32),
-            (pq_rel, opts.block_size as u32),
-        ],
-    ))
+
+    // ── Where the graph file ends up ────────────────────────────────────────────────
+    // The `.pq` is always fresh bytes sealed under *this* generation's key, so it stays an
+    // ordinary inventory file. The `.vamana` splits:
+    //
+    // * `vamana_carried` — the pure-permutation fast path hard-linked the base, so the file
+    //   at `vam_out` is the base inode, still sealed under the base's salt. It cannot live
+    //   in this generation's directory (its salt is not this generation's) or its inventory
+    //   (its lifetime is not this generation's). Publish it as its own salt-bearing
+    //   artifact and reference it.
+    // * otherwise — `streaming_merge` rewrote it under `params.cipher`, so it is an ordinary
+    //   file of this generation exactly as before.
+    let mut files = vec![(pq_rel, opts.block_size as u32)];
+    let mut desc = desc;
+    if stats.vamana_carried {
+        let artifact = publish_carried_graph(
+            &vam_out,
+            data_dir,
+            graph,
+            &src,
+            stats.out_records,
+            opts.vector_block_size as u32,
+            master_key_bytes(opts),
+        )
+        .with_context(|| {
+            format!(
+                "publish the carried vector graph for {}.{} as its own artifact",
+                pi.label, pi.property
+            )
+        })?;
+        desc.carried_graph = Some(artifact);
+        // Out of the staging directory: it is neither in `files[]` nor under this
+        // generation's `content_hash`, and unlinking the staged hard link leaves the
+        // artifact's link (and therefore the inode) intact.
+        fs::remove_file(&vam_out)
+            .with_context(|| format!("unstage carried {}", vam_out.display()))?;
+    } else {
+        files.push((vam_rel, opts.vector_block_size as u32));
+    }
+    Ok((desc, files))
+}
+
+/// How the **base** pair of a carry is sealed — resolved from the documents that record it,
+/// never from the output generation's key (HIK-145).
+///
+/// The two halves are resolved independently on purpose. The `.pq` id column is rewritten by
+/// every merge, so it always sits in the base *generation* and is sealed under that
+/// generation's salt. The `.vamana` may have been carried through many generations without
+/// ever being rewritten, in which case it lives in a `vecidx/<uuid>/` artifact under a much
+/// older salt — and under a HIK-140 subkey label that its current path no longer states.
+struct CarrySource {
+    /// The base `.vamana`'s per-file cipher (`None` ⇒ plaintext).
+    vamana_cipher: Option<Arc<graph_format::crypto::FileCipher>>,
+    /// The base `.pq`'s per-file cipher (`None` ⇒ plaintext).
+    pq_cipher: Option<Arc<graph_format::crypto::FileCipher>>,
+    /// The encryption header describing how the `.vamana` **bytes** are sealed — copied
+    /// verbatim into the artifact manifest when the file is carried, because those bytes are
+    /// not rewritten and keep the salt they have.
+    vamana_encryption: Option<graph_format::manifest::EncryptionHeader>,
+    /// The HIK-140 subkey label the `.vamana` blocks were sealed under. Travels into the
+    /// artifact manifest so a later open derives the identical subkey wherever the file sits.
+    vamana_aad_name: String,
+}
+
+impl CarrySource {
+    fn resolve(
+        carry: &crate::model::VectorCarry,
+        data_dir: &Path,
+        graph: &str,
+        pi: &PendingIndex,
+        master_key: Option<&[u8]>,
+    ) -> Result<Self> {
+        let store = graph_format::store::fs::FsObjectStore::new(data_dir.to_path_buf());
+        // The base generation's MANIFEST: authenticated before a single field of it is
+        // trusted (HIK-144's one policy), then used for the `.pq` cipher.
+        let base_gen_header = match carry.base_gen {
+            Some(g) => {
+                let m = graph_format::manifest::Manifest::read_via(
+                    &store,
+                    &graph_format::store::join_key(graph, &g.to_string()),
+                )
+                .with_context(|| format!("read the base generation {g} MANIFEST for the carry"))?;
+                graph_format::crypto::authenticate(&m, master_key).with_context(|| {
+                    format!("authenticate the base generation {g} MANIFEST for the carry")
+                })?;
+                m.encryption.clone()
+            }
+            None => None,
+        };
+        let pq_stem = format!("vector/{}.{}", pi.label, pi.property);
+        let pq_aad = format!("{pq_stem}.pq");
+        let pq_cipher = derive_carry_cipher(
+            base_gen_header.as_ref(),
+            master_key,
+            &pq_aad,
+            "the base generation",
+        )?;
+
+        // The `.vamana`: its own artifact manifest when it has already been carried, else
+        // the same base generation.
+        let (vamana_encryption, vamana_aad_name) = match carry.base_vamana_artifact {
+            Some(a) => {
+                let m = graph_format::vecmanifest::VectorIndexManifest::read_via(&store, graph, a)
+                    .with_context(|| format!("read carried vector artifact {a}"))?;
+                graph_format::crypto::authenticate(&m, master_key)
+                    .with_context(|| format!("authenticate carried vector artifact {a}"))?;
+                (m.encryption.clone(), m.aad_name.clone())
+            }
+            None => (base_gen_header.clone(), format!("{pq_stem}.vamana")),
+        };
+        // A carry cannot *change* how the bytes are sealed — it does not rewrite them. So the
+        // base's encryption state and the build's must already agree, or the published image
+        // would not be what the operator asked for:
+        //
+        // * keyed build over a **plaintext** base ⇒ the served "encrypted" generation would
+        //   carry an unencrypted ~370 GB vector graph, silently. Before this ticket that
+        //   combination failed by accident (the reader tried to decrypt plaintext blocks);
+        //   making the carry work must not turn an accidental refusal into a silent
+        //   downgrade. Refuse, and say the index has to be rebuilt rather than carried.
+        // * unkeyed build over an **encrypted** base ⇒ `derive_carry_cipher` below refuses on
+        //   the missing key, which is the same statement from the other side.
+        if master_key.is_some() && vamana_encryption.is_none() {
+            bail!(
+                "vector index {}.{} would be carried by reference out of a plaintext base into \
+                 an encrypted build. A carry never rewrites the graph's bytes, so they would \
+                 stay unencrypted inside an image the operator asked to encrypt. Rebuild the \
+                 index instead of carrying it (build from a full dump, not a consolidation \
+                 dump).",
+                pi.label,
+                pi.property
+            );
+        }
+        if master_key.is_some() && carry.base_gen.is_none() {
+            bail!(
+                "the consolidation dump for vector index {}.{} names no base generation, so \
+                 this keyed build cannot learn which salt the base pair was sealed under. \
+                 Regenerate the dump with a matching server build.",
+                pi.label,
+                pi.property
+            );
+        }
+        let vamana_cipher = derive_carry_cipher(
+            vamana_encryption.as_ref(),
+            master_key,
+            &vamana_aad_name,
+            "the carried vector graph",
+        )?;
+
+        Ok(CarrySource {
+            vamana_cipher,
+            pq_cipher,
+            vamana_encryption,
+            vamana_aad_name,
+        })
+    }
+}
+
+/// Derive one base-side per-file cipher from the header that describes it, with the same
+/// gates every other opener applies: known aead/kdf, the HIK-140 AAD scheme, and a refusal
+/// when the bytes are encrypted but no key was supplied.
+fn derive_carry_cipher(
+    header: Option<&graph_format::manifest::EncryptionHeader>,
+    master_key: Option<&[u8]>,
+    aad_name: &str,
+    what: &str,
+) -> Result<Option<Arc<graph_format::crypto::FileCipher>>> {
+    let Some(h) = header else {
+        return Ok(None);
+    };
+    if h.aead != graph_format::crypto::AEAD_NAME {
+        bail!(
+            "{what} uses AEAD {:?}, which this build does not implement",
+            h.aead
+        );
+    }
+    if h.kdf != graph_format::crypto::KDF_NAME {
+        bail!(
+            "{what} uses KDF {:?}, which this build does not implement",
+            h.kdf
+        );
+    }
+    graph_format::crypto::check_aad_scheme(&h.aad_scheme).with_context(|| what.to_string())?;
+    let key = master_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{what} is encrypted at rest but this build was given no key — rerun with              --encrypt and the same --key-file/--key-env the base was built with"
+        )
+    })?;
+    let salt = graph_format::crypto::hex_decode(&h.salt_hex)
+        .with_context(|| format!("decode the encryption salt of {what}"))?;
+    let block = BlockCipher::from_master(key, &salt);
+    Ok(Some(Arc::new(block.for_file(aad_name))))
+}
+
+/// Publish a hard-linked carried `.vamana` as its own salt-bearing artifact under
+/// `<data_dir>/<graph>/vecidx/<uuid>/`, and return the reference a generation (and the set
+/// manifest) holds it by.
+///
+/// The file is **hard-linked**, never copied or re-sealed: the whole point of the carry is
+/// that its ~370 GB of bytes are not rewritten, and re-sealing them under the new
+/// generation's key would perform exactly the rebuild the carry exists to avoid. The salt
+/// they already carry travels with them, in the manifest written beside them.
+fn publish_carried_graph(
+    staged: &Path,
+    data_dir: &Path,
+    graph: &str,
+    src: &CarrySource,
+    records: u64,
+    block_size: u32,
+    master_key: Option<&[u8]>,
+) -> Result<graph_format::vecmanifest::VectorArtifactRef> {
+    use graph_format::vecmanifest::{VectorIndexManifest, VECIDX_MAGIC, VECIDX_VERSION};
+
+    let uuid = graph_format::ids::Generation(uuid::Uuid::new_v4());
+    // The file keeps the *base name* of the staged file. Its HIK-140 subkey label does not
+    // follow it — that is recorded explicitly in the manifest.
+    let file = staged
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("carried .vamana has no file name")?
+        .to_string();
+    let dir = data_dir.join(graph).join("vecidx").join(uuid.0.to_string());
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dst = dir.join(&file);
+    let _ = fs::remove_file(&dst);
+    fs::hard_link(staged, &dst).or_else(|_| {
+        fs::copy(staged, &dst).map(|_| ()).with_context(|| {
+            format!(
+                "carry {} → {} (hard-link failed)",
+                staged.display(),
+                dst.display()
+            )
+        })
+    })?;
+
+    let bytes = fs::metadata(&dst)
+        .with_context(|| format!("stat {}", dst.display()))?
+        .len();
+    let content_hash = graph_format::integrity::hash_file(&dst)?;
+    let mut m = VectorIndexManifest {
+        magic: VECIDX_MAGIC.to_string(),
+        version: VECIDX_VERSION,
+        artifact_uuid: uuid,
+        graph: graph.to_string(),
+        created_unix: crate::common::now_unix(),
+        file,
+        aad_name: src.vamana_aad_name.clone(),
+        bytes,
+        block_size,
+        records,
+        encryption: src.vamana_encryption.clone(),
+        content_hash,
+        mac: None,
+    };
+    if let Some(key) = master_key {
+        m.seal_mac(key)?;
+    }
+    let json = dir.join("VECIDX.json");
+    let tmp = dir.join(".VECIDX.json.tmp");
+    fs::write(&tmp, m.to_bytes()?).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &json).with_context(|| format!("publish {}", json.display()))?;
+    Ok(m.reference())
+}
+
+/// The build's at-rest master key as bytes, if any.
+fn master_key_bytes(opts: &BuildOptions) -> Option<&[u8]> {
+    opts.encryption_key.as_deref().map(Vec::as_slice)
 }
 
 /// Read a carried index's raw-`u64`-LE `layout → dump-id` sidecar (`HOLE` for a dead ordinal).
@@ -889,6 +1162,7 @@ mod vector_gather_tests {
             &mut block_sizes,
             &Permutation::Identity,
             dir,
+            "g",
         )
         .unwrap();
         std::fs::read(dir.join("vectors.f32.blk")).unwrap()
@@ -978,6 +1252,19 @@ mod carry_tests {
     /// byte copy on cross-device) — strictly at least as strong as the BLAKE3 the ticket names.
     fn same_bytes(a: &Path, b: &Path) -> bool {
         std::fs::read(a).unwrap() == std::fs::read(b).unwrap()
+    }
+
+    /// Where the emitted `.vamana` actually is: inside the generation when the merge rewrote
+    /// it, or inside its own `vecidx/<uuid>/` artifact when it was carried (HIK-145).
+    fn emitted_vamana(data_dir: &Path, out_dir: &Path, desc: &VectorIndexDesc) -> PathBuf {
+        match &desc.carried_graph {
+            Some(r) => data_dir
+                .join("g")
+                .join("vecidx")
+                .join(r.uuid.0.to_string())
+                .join("Doc.emb.vamana"),
+            None => out_dir.join("vector/Doc.emb.vamana"),
+        }
     }
 
     fn cosine(q: &[f32], v: &[f32]) -> f64 {
@@ -1100,6 +1387,8 @@ mod carry_tests {
         crate::model::VectorCarry {
             base_vamana: format!("{base_rel}/vector/Doc.emb.vamana"),
             base_pq: format!("{base_rel}/vector/Doc.emb.pq"),
+            base_gen: None,
+            base_vamana_artifact: None,
             carry_map_path: dump_dir.join(&map_file),
             base_records: layout_to_dump_id.len() as u64,
             r,
@@ -1156,6 +1445,7 @@ mod carry_tests {
             &mut block_sizes,
             perm,
             data_dir,
+            "g",
         )
         .unwrap();
         descs.into_iter().next().unwrap()
@@ -1211,8 +1501,13 @@ mod carry_tests {
         let out_dir = data_dir.join("out");
         let out_desc = run_carry(&data_dir, &out_dir, carry, &[], &perm);
 
-        let out_vamana = out_dir.join("vector/Doc.emb.vamana");
+        let out_vamana = emitted_vamana(&data_dir, &out_dir, &out_desc);
         let out_pq_path = out_dir.join("vector/Doc.emb.pq");
+        assert!(
+            out_desc.carried_graph.is_some(),
+            "a pure-permutation carry must publish the graph as a referenced artifact, not \
+             as a file of the new generation"
+        );
         assert!(
             same_bytes(&out_vamana, &base_vamana),
             "a pure-permutation carry must leave the .vamana byte-identical (the whole thesis)"
@@ -1273,10 +1568,13 @@ mod carry_tests {
         std::fs::create_dir_all(&dump_dir).unwrap();
         let carry = carry_for(&data_dir, &dump_dir, &base_rel, &desc, &layout_ids);
         let out_dir = data_dir.join("out");
-        run_carry(&data_dir, &out_dir, carry, &[], &Permutation::Identity);
+        let out_desc = run_carry(&data_dir, &out_dir, carry, &[], &Permutation::Identity);
 
         assert!(
-            same_bytes(&out_dir.join("vector/Doc.emb.vamana"), &base_vamana),
+            same_bytes(
+                &emitted_vamana(&data_dir, &out_dir, &out_desc),
+                &base_vamana
+            ),
             "identity carry is byte-identical too"
         );
         let out_pq = PqReader::open_with_cipher(out_dir.join("vector/Doc.emb.pq"), None)
@@ -1345,6 +1643,11 @@ mod carry_tests {
         let out_vamana = out_dir.join("vector/Doc.emb.vamana");
         let out_pq = out_dir.join("vector/Doc.emb.pq");
 
+        assert!(
+            out_desc.carried_graph.is_none(),
+            "a rewritten graph is fresh bytes under this generation's key, so it stays an \
+             ordinary file of the generation — not a referenced artifact"
+        );
         assert!(
             !same_bytes(&out_vamana, &base_vamana),
             "a delete+Δ merge must rewrite the .vamana, not carry it"

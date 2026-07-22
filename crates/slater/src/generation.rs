@@ -609,11 +609,31 @@ impl Generation {
             };
             let stem = format!("vector/{}.{}", vi.label, vi.property);
             let (vam_rel, pq_rel) = (format!("{stem}.vamana"), format!("{stem}.pq"));
-            let reader = VamanaReader::open_src(
-                store.open(&join_key(&base, &vam_rel))?,
-                file_cipher(&cipher, &vam_rel),
-            )
-            .with_context(|| format!("open Vamana store {stem}.vamana"))?;
+            // HIK-145: the graph half may be a **carried artifact** — hard-linked through a
+            // consolidation and therefore still sealed under the key it was written with,
+            // not this generation's. Its own manifest carries that salt (and the HIK-140
+            // subkey label, which its current path no longer states), so open it from there
+            // rather than from this generation's cipher.
+            let (vam_src, vam_cipher) = match &vi.carried_graph {
+                Some(r) => open_carried_graph(
+                    store,
+                    graph,
+                    r,
+                    &set,
+                    vi,
+                    &stem,
+                    CarriedGraphOpen {
+                        master_key,
+                        verify_integrity,
+                    },
+                )?,
+                None => (
+                    store.open(&join_key(&base, &vam_rel))?,
+                    file_cipher(&cipher, &vam_rel),
+                ),
+            };
+            let reader = VamanaReader::open_src(vam_src, vam_cipher)
+                .with_context(|| format!("open Vamana store {stem}.vamana"))?;
             let pq = PqReader::open_src(
                 store.open(&join_key(&base, &pq_rel))?,
                 file_cipher(&cipher, &pq_rel),
@@ -1191,6 +1211,143 @@ fn derive_cipher(
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
 }
 
+/// A block source plus the per-file cipher its blocks were sealed under.
+type SealedSource = (
+    Arc<dyn graph_format::store::RandomReadAt>,
+    Option<Arc<graph_format::crypto::FileCipher>>,
+);
+
+/// The opener's policy inputs for a carried artifact — grouped so the signature stays
+/// readable and the two booleans-shaped arguments cannot be transposed.
+#[derive(Clone, Copy)]
+struct CarriedGraphOpen<'a> {
+    master_key: Option<&'a [u8]>,
+    verify_integrity: bool,
+}
+
+/// Open a carried vector-graph artifact (HIK-145) and return its source plus the per-file
+/// cipher its blocks were sealed under.
+///
+/// Every check a generation gets, in the same order and through the same shared policy:
+///
+/// * the artifact manifest is bound to the location and graph it was read from (a validly
+///   sealed manifest copied to another uuid or another graph is refused, exactly as
+///   `SetManifest::read_via` refuses a moved set pointer);
+/// * it is authenticated under the master key — required-when-keyed, one implementation
+///   ([`crypto::authenticate`], HIK-144), so a MAC-stripped artifact cannot be served;
+/// * the **composition** is checked: the set manifest — itself MAC-sealed — must name this
+///   artifact with this content hash. A MAC on the artifact authenticates the part; only the
+///   set authenticates which parts are served together;
+/// * the record count must agree with the generation's descriptor, so a stale artifact
+///   cannot be paired with a newer `.pq` id column;
+/// * the cipher is derived from the artifact's **own** salt, with the same AEAD/KDF/AAD-scheme
+///   gates and missing-key refusal as [`derive_cipher`].
+fn open_carried_graph(
+    store: &dyn ObjectStore,
+    graph: &str,
+    r: &graph_format::vecmanifest::VectorArtifactRef,
+    set: &graph_format::setmanifest::SetManifest,
+    vi: &graph_format::manifest::VectorIndexDesc,
+    stem: &str,
+    open: CarriedGraphOpen<'_>,
+) -> Result<SealedSource> {
+    let CarriedGraphOpen {
+        master_key,
+        verify_integrity,
+    } = open;
+    use graph_format::vecmanifest::VectorIndexManifest;
+
+    let m = VectorIndexManifest::read_via(store, graph, r.uuid)
+        .with_context(|| format!("read the carried vector-graph artifact for {stem}"))?;
+    graph_format::crypto::authenticate(&m, master_key)
+        .with_context(|| format!("authenticate carried vector-graph artifact {}", r.uuid))?;
+    if m.content_hash != r.content_hash {
+        bail!(
+            "carried vector-graph artifact {} holds content hash {} but generation index              {stem} names {} — refusing a substituted artifact",
+            r.uuid,
+            m.content_hash,
+            r.content_hash
+        );
+    }
+    // The composition (HIK-144): the set pointer is the only document that authenticates
+    // *which* parts are served together, so a generation may not reference an artifact the
+    // set does not name — nor a different revision of one it does.
+    if !set.vector_artifacts.iter().any(|a| a == r) {
+        bail!(
+            "generation index {stem} references carried vector-graph artifact {} (content              {}), which the set manifest {} does not name — refusing an unauthenticated              composition",
+            r.uuid,
+            r.content_hash,
+            set.set_uuid
+        );
+    }
+    if m.records != vi.count {
+        bail!(
+            "carried vector-graph artifact {} holds {} records but generation index {stem}              declares {} — refusing a stale graph paired with a newer id column",
+            r.uuid,
+            m.records,
+            vi.count
+        );
+    }
+    let cipher = match &m.encryption {
+        None => None,
+        Some(h) => {
+            if h.aead != crypto::AEAD_NAME {
+                bail!(
+                    "carried vector-graph artifact {} uses AEAD {:?}, which this build does                      not implement",
+                    r.uuid,
+                    h.aead
+                );
+            }
+            if h.kdf != crypto::KDF_NAME {
+                bail!(
+                    "carried vector-graph artifact {} uses KDF {:?}, which this build does                      not implement",
+                    r.uuid,
+                    h.kdf
+                );
+            }
+            let key = master_key.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "carried vector-graph artifact {} is encrypted at rest but no key was                      supplied (set config.encryption.keyEnv or keyFile)",
+                    r.uuid
+                )
+            })?;
+            crypto::check_aad_scheme(&h.aad_scheme)
+                .with_context(|| format!("carried vector-graph artifact {}", r.uuid))?;
+            let salt = crypto::hex_decode(&h.salt_hex).with_context(|| {
+                format!("decode encryption salt of carried artifact {}", r.uuid)
+            })?;
+            // The subkey label is the one recorded in the manifest, never the file's current
+            // path: promoting the file out of the generation directory changed its name, and
+            // HIK-140 binds each block to the name it was **sealed** under.
+            Some(Arc::new(
+                BlockCipher::from_master(key, &salt).for_file(&m.aad_name),
+            ))
+        }
+    };
+    // The same copy-completeness guard the file had while it lived in the generation
+    // inventory. Moving it into an artifact must not quietly *drop* integrity coverage, so
+    // the artifact's own manifest (MAC-covered) states the hash and the backend picks the
+    // cheapest sound check — a local re-hash, an S3 metadata HEAD.
+    let file_key = m.file_key(graph);
+    if verify_integrity {
+        store
+            .verify_file(
+                &file_key,
+                &graph_format::store::FileIntegrity {
+                    size: m.bytes,
+                    blake3: &m.content_hash,
+                    sha256: None,
+                    crc32c: None,
+                },
+            )
+            .with_context(|| format!("verify carried vector-graph artifact {}", r.uuid))?;
+    }
+    let src = store
+        .open(&file_key)
+        .with_context(|| format!("open carried vector graph {file_key}"))?;
+    Ok((src, cipher))
+}
+
 /// Verify every file in the manifest inventory through the store, then confirm
 /// the overall content hash is self-consistent. Each file's check is delegated
 /// to [`ObjectStore::verify_file`], so the backend picks the cheapest sound
@@ -1513,6 +1670,7 @@ mod tests {
                 property: "name".into(),
             }],
             vector_indexes: vec![VectorIndexDesc {
+                carried_graph: None,
                 label: "Person".into(),
                 property: "embedding".into(),
                 dim: 3,
@@ -1986,6 +2144,7 @@ mod tests {
             .load_resident()
             .unwrap();
         let desc = VectorIndexDesc {
+            carried_graph: None,
             label: "Doc".into(),
             property: "embedding".into(),
             dim: dim as u32,
@@ -2148,6 +2307,7 @@ mod tests {
         let reader = VamanaReader::open_with_cipher(dir.join("x.vamana"), None).unwrap();
 
         let mk_desc = |nav| VectorIndexDesc {
+            carried_graph: None,
             label: "Doc".into(),
             property: "embedding".into(),
             dim: dim as u32,

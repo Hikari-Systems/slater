@@ -194,6 +194,9 @@ pub struct SegmentGcReport {
     pub deleted_segments: Vec<GenId>,
     /// Set manifest files deleted this sweep.
     pub deleted_sets: Vec<GenId>,
+    /// Carried vector-graph artifact directories (`vecidx/<uuid>/`) deleted this sweep —
+    /// artifacts no live set references (HIK-145).
+    pub deleted_vector_artifacts: Vec<GenId>,
     /// Orphans newly observed this sweep — marked, awaiting the grace before deletion.
     pub marked: usize,
 }

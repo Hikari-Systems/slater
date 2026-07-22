@@ -8405,6 +8405,455 @@ fn a_write_rejects_an_embedding_of_the_wrong_dimension() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A deterministic `n × dim` vector fixture plus the `slater-dump` script that creates it as
+/// `(:Doc:__DumpVertex__ {__dump_id__, embedding})`. Shared by the plaintext and encrypted
+/// carry-by-reference tests so both index exactly the same data.
+#[cfg(test)]
+fn vamana_fixture_script(dim: usize, n: usize) -> (String, Vec<Vec<f32>>) {
+    let mut seed: u64 = 0xDEAD_BEEF_1234;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+    };
+    let mut script =
+        format!("CALL db.idx.vector.createNodeIndex('Doc', 'embedding', {dim}, 'cosine');\n");
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v: Vec<f32> = (0..dim).map(|_| next()).collect();
+        let body: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+        script.push_str(&format!(
+            "CREATE (:Doc:__DumpVertex__ {{__dump_id__: {i}, embedding: vecf32([{}])}});\n",
+            body.join(", ")
+        ));
+        vectors.push(v);
+    }
+    (script, vectors)
+}
+
+/// The bytes of the served generation's `Doc.embedding` Vamana graph, wherever it lives —
+/// inside the generation directory (a freshly built or rewritten index) or in its own
+/// `vecidx/<uuid>/` artifact directory (a carried one, HIK-145).
+#[cfg(test)]
+fn carried_vamana_bytes(data: &Path, graph: &str, gen: &Generation) -> Vec<u8> {
+    let rel = "vector/Doc.embedding.vamana";
+    let in_gen = data.join(graph).join(gen.base_uuid().to_string()).join(rel);
+    if in_gen.exists() {
+        return std::fs::read(&in_gen).unwrap();
+    }
+    let vecidx = data.join(graph).join("vecidx");
+    for e in std::fs::read_dir(&vecidx).expect("no in-generation .vamana and no vecidx/ dir") {
+        let d = e.unwrap().path();
+        let f = d.join("Doc.embedding.vamana");
+        if f.exists() {
+            return std::fs::read(&f).unwrap();
+        }
+    }
+    panic!("no carried .vamana found under {}", vecidx.display());
+}
+
+/// Whether two paths are the same inode — i.e. whether the carry hard-linked rather than
+/// copied. `None` when either is missing.
+#[cfg(test)]
+fn same_inode(a: &Path, b: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (a, b) = (std::fs::metadata(a).ok()?, std::fs::metadata(b).ok()?);
+    Some(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// HIK-145: the **encrypted** arm of carry-by-reference — the configuration that had no test
+/// and in which the carry had therefore never worked.
+///
+/// Every build mints a fresh per-generation salt, so a `.vamana` hard-linked out of the base
+/// generation into the new one is sealed under the *old* generation's key while the new
+/// generation's manifest declares the *new* salt. Before the fix this fails the Poly1305 tag
+/// on the base's first block inside `streaming_merge` (the build aborts), and — if it got
+/// past that — again at serve time. After the fix the carried graph is its own salt-bearing
+/// artifact and KNN returns the right neighbour.
+///
+/// The second half re-opens the whole data directory from cold (test 2 of the ticket): the
+/// artifact's salt lives on disk in its own manifest, so a restart re-derives the cipher
+/// identically with no in-memory state.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
+    use graph_format::manifest::AnnMode;
+
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_vamana_enc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    // 32 hex chars = a 16-byte master key; the KDF takes any length.
+    let key_hex = "0123456789abcdef0123456789abcdef";
+    let key = graph_format::crypto::hex_decode(key_hex).unwrap();
+
+    let (dim, n) = (16usize, 400usize);
+    let (script, vectors) = vamana_fixture_script(dim, n);
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, &script).unwrap();
+
+    let build_args = |cmd: &mut std::process::Command| {
+        cmd.args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .arg("--encrypt")
+            .args(["--key-env", "SLATER_HIK145_KEY"])
+            .env("SLATER_HIK145_KEY", key_hex);
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(["--input", input.to_str().unwrap()])
+        .args(["--pk", "__dump_id__"])
+        .args(["--cluster", "none"]);
+    build_args(&mut cmd);
+    assert!(
+        cmd.status().expect("spawn slater-build").success(),
+        "the encrypted fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, Some(&key)).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+
+    let gen0 = graphs.get("docs").unwrap();
+    assert!(
+        matches!(
+            gen0.manifest().vector_indexes[0].mode,
+            AnnMode::Vamana { .. }
+        ),
+        "the fixture must actually be a Vamana index, else this proves nothing"
+    );
+    let base_uuid = gen0.base_uuid();
+    let base_vamana = data
+        .join("docs")
+        .join(base_uuid.to_string())
+        .join("vector/Doc.embedding.vamana");
+    let base_bytes = std::fs::read(&base_vamana).expect("base .vamana must exist");
+    drop(gen0);
+
+    graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("--input")
+                .arg(d)
+                .args(["--input-format", "slater-dump"]);
+            let _ = (g, dd);
+            build_args(&mut cmd);
+            let st = cmd.status().context("spawn builder")?;
+            anyhow::ensure!(st.success(), "encrypted consolidating build failed: {st}");
+            Ok(())
+        })
+        .expect("an encrypted carry-by-reference consolidation must succeed");
+
+    // The carried graph must still be the *same bytes* — the carry exists to avoid rewriting
+    // them, and re-sealing under the new generation key would rewrite every one.
+    let carried = graphs.get("docs").unwrap();
+    assert!(
+        matches!(
+            carried.manifest().vector_indexes[0].mode,
+            AnnMode::Vamana { .. }
+        ),
+        "a carried Vamana base must stay Vamana, not be rebuilt as brute-force"
+    );
+    let carried_bytes = carried_vamana_bytes(&data, "docs", carried.as_ref());
+    assert_eq!(
+        carried_bytes, base_bytes,
+        "an encrypted pure-permutation consolidation must carry the .vamana byte-identically"
+    );
+    drop(carried);
+
+    let probe = |graphs: &Graphs, what: &str| {
+        let g = graphs.get("docs").unwrap();
+        let view = MergedView::read_only(g.as_ref());
+        let body: Vec<String> = vectors[7].iter().map(|x| format!("{x:.6}")).collect();
+        let ast = parser::parse(&format!(
+            "CALL db.idx.vector.queryNodes('Doc', 'embedding', 1, vecf32([{}])) \
+             YIELD node, score RETURN id(node) AS id, score",
+            body.join(", ")
+        ))
+        .unwrap();
+        let res = Engine::new(&view, &cache)
+            .with_vector_cache(&vc, 96)
+            .run(&ast)
+            .unwrap_or_else(|e| panic!("{what}: KNN over the carried encrypted index: {e:#}"));
+        assert_eq!(
+            res.rows.len(),
+            1,
+            "{what}: the carried index must return a hit"
+        );
+        assert!(
+            matches!(res.rows[0][0], Val::Int(7)),
+            "{what}: a node's own embedding must be its own nearest neighbour, got {:?}",
+            res.rows[0][0]
+        );
+        let Val::Float(score) = res.rows[0][1] else {
+            panic!("{what}: score should be a float");
+        };
+        assert!(
+            score.abs() < 1e-5,
+            "{what}: an exact match must score ~0; got {score}"
+        );
+    };
+
+    probe(&graphs, "after consolidation");
+
+    // A **second** consolidation, carrying the artifact that the first one produced. This is
+    // the artifact→artifact case: the base `.vamana` is no longer a generation file, so its
+    // salt and its HIK-140 subkey label come from its own manifest and from nowhere else —
+    // and its on-disk name is now `Doc.embedding.vamana` while the label it was sealed under
+    // is still `vector/Doc.embedding.vamana`. If the subkey were inferred from the path this
+    // is the consolidation that would fail.
+    graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.arg("--input")
+                .arg(d)
+                .args(["--input-format", "slater-dump"]);
+            let _ = (g, dd);
+            build_args(&mut cmd);
+            let st = cmd.status().context("spawn builder")?;
+            anyhow::ensure!(st.success(), "second consolidating build failed: {st}");
+            Ok(())
+        })
+        .expect("carrying an already-carried artifact must succeed");
+    assert_eq!(
+        carried_vamana_bytes(&data, "docs", graphs.get("docs").unwrap().as_ref()),
+        base_bytes,
+        "a second carry must still be the original bytes — never re-sealed, never rebuilt"
+    );
+    probe(&graphs, "after a second consolidation");
+
+    // Test 2: cold restart. Drop every open handle and re-open the data dir from disk — the
+    // carried artifact's salt must round-trip through its own manifest.
+    drop(graphs);
+    let reopened = Graphs::open_all(&data, Some(&key)).unwrap();
+    probe(&reopened, "after restart");
+
+    // Retention: the GC sweep must not reclaim an artifact the live set references. The
+    // *superseded* artifact (the first consolidation's) is genuinely unreferenced and must
+    // go — but it shares an inode with the live one, so the bytes survive regardless.
+    let live_artifacts: Vec<GenId> = graph_format::setmanifest::SetManifest::read_via(
+        &graph_format::store::fs::FsObjectStore::new(data.clone()),
+        "docs",
+        reopened.get("docs").unwrap().uuid(),
+    )
+    .unwrap()
+    .vector_artifacts
+    .iter()
+    .map(|a| a.uuid)
+    .collect();
+    assert_eq!(
+        live_artifacts.len(),
+        1,
+        "the live set must name exactly the artifact the served generation references"
+    );
+    // Two consolidations ⇒ two artifact directories, of which exactly one is live. Assert the
+    // superseded one is actually reclaimed, or "the live one survived" would be vacuously
+    // true of a sweep that does nothing at all.
+    let on_disk: Vec<String> = std::fs::read_dir(data.join("docs").join("vecidx"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "two consolidations must have left a live artifact and a superseded one, got {on_disk:?}"
+    );
+    let rep = reopened.gc_orphan_segments("docs", &data, 0).unwrap();
+    assert_eq!(
+        rep.deleted_vector_artifacts.len(),
+        1,
+        "the sweep must reclaim the superseded artifact — a sweep that reclaims nothing \
+         cannot prove it spares the live one"
+    );
+    assert!(
+        !rep.deleted_vector_artifacts.contains(&live_artifacts[0]),
+        "GC must never reclaim a carried graph the live set references"
+    );
+    assert!(
+        data.join("docs")
+            .join("vecidx")
+            .join(live_artifacts[0].0.to_string())
+            .join("Doc.embedding.vamana")
+            .exists(),
+        "the live carried graph must still be on disk after a sweep"
+    );
+    // …and the graph still serves from it.
+    drop(reopened);
+    let after_gc = Graphs::open_all(&data, Some(&key)).unwrap();
+    probe(&after_gc, "after a GC sweep");
+    drop(after_gc);
+    let reopened = Graphs::open_all(&data, Some(&key)).unwrap();
+    drop(reopened);
+
+    // The optimisation must survive being encrypted: the artifact is a hard link to the
+    // original inode, not a re-sealed 370 GB copy.
+    let vecidx = data.join("docs").join("vecidx");
+    let artifact_dir = std::fs::read_dir(&vecidx)
+        .expect("an encrypted carry must publish a vecidx/ artifact")
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("Doc.embedding.vamana").exists())
+        .expect("the artifact must hold the carried graph file");
+    assert_eq!(
+        same_inode(&artifact_dir.join("Doc.embedding.vamana"), &base_vamana),
+        Some(true),
+        "an encrypted carry must hard-link the base inode, not re-seal its bytes"
+    );
+
+    // ── Test 3 (HIK-144 parity): a MAC-stripped artifact manifest, under a configured key.
+    let json = artifact_dir.join("VECIDX.json");
+    let sealed_json = std::fs::read(&json).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_slice(&sealed_json).unwrap();
+    assert!(
+        doc.get("mac").is_some_and(|m| !m.is_null()),
+        "an encrypted carry must seal its artifact manifest in the first place"
+    );
+    let real_mac = doc["mac"].clone();
+    doc["mac"] = serde_json::Value::Null;
+    std::fs::write(&json, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let err = match Graphs::open_all(&data, Some(&key)) {
+        Ok(_) => panic!("a MAC-stripped carried artifact must be refused under a key"),
+        Err(e) => e,
+    };
+    assert!(
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<graph_format::crypto::MacRejected>(),
+            Some(graph_format::crypto::MacRejected::Missing { .. })
+        )),
+        "must be refused by type, not by chance: {err:#}"
+    );
+
+    // ── Test 4: an artifact sealed under a *different* master key. Everything else in the
+    // image is sealed under the real one, so this isolates the artifact — it must fail
+    // closed with a readable refusal, never decrypt to garbage.
+    doc["mac"] = real_mac;
+    let mut m: graph_format::vecmanifest::VectorIndexManifest =
+        serde_json::from_value(doc).unwrap();
+    m.seal_mac(b"a completely different operator master key")
+        .unwrap();
+    std::fs::write(&json, m.to_bytes().unwrap()).unwrap();
+    let err = match Graphs::open_all(&data, Some(&key)) {
+        Ok(_) => panic!("an artifact sealed under another key must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<graph_format::crypto::MacRejected>(),
+            Some(graph_format::crypto::MacRejected::Mismatch { .. })
+        )),
+        "must be a typed MAC mismatch, not a block-decrypt failure or garbage: {err:#}"
+    );
+
+    // Restored, the image opens again — proving the two refusals above were caused by the
+    // tampering and nothing else.
+    std::fs::write(&json, &sealed_json).unwrap();
+    assert!(
+        Graphs::open_all(&data, Some(&key)).is_ok(),
+        "the untampered image must still open"
+    );
+
+    std::fs::remove_dir_all(&work).ok();
+}
+
+/// HIK-145, found while adversarially reviewing the fix: making the encrypted carry *work*
+/// must not make a **downgrade** work too.
+///
+/// A carry never rewrites the graph's bytes — that is its entire purpose — so it cannot
+/// change how they are sealed. Turning on `--encrypt` over a base whose `.vamana` is
+/// plaintext would therefore publish an "encrypted" generation serving an unencrypted ~370 GB
+/// vector graph, with no error and nothing in the manifest to show it. Before this ticket
+/// that combination failed by accident (the reader tried to decrypt plaintext blocks); the
+/// fix must refuse it deliberately, not inherit the accident and then lose it.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph() {
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_vamana_mixed_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    let (script, _vectors) = vamana_fixture_script(16, 400);
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, &script).unwrap();
+
+    // A **plaintext** base.
+    assert!(
+        std::process::Command::new(&bin)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--pk", "__dump_id__"])
+            .args(["--cluster", "none"])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .status()
+            .expect("spawn slater-build")
+            .success(),
+        "the plaintext fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+
+    // …consolidated by a build that has suddenly been given `--encrypt`.
+    let err = match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd| {
+        let st = std::process::Command::new(&bin)
+            .arg("--input")
+            .arg(d)
+            .args(["--input-format", "slater-dump"])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .args(["--ann-threshold", "50"])
+            .args(["--pq-subspaces", "8"])
+            .args(["--pq-bits", "8"])
+            .arg("--encrypt")
+            .args(["--key-env", "SLATER_HIK145_MIXED_KEY"])
+            .env(
+                "SLATER_HIK145_MIXED_KEY",
+                "0123456789abcdef0123456789abcdef",
+            )
+            .status()
+            .context("spawn builder")?;
+        anyhow::ensure!(
+            st.success(),
+            "keyed build over a plaintext base failed: {st}"
+        );
+        Ok(())
+    }) {
+        Ok(_) => {
+            panic!("a keyed build must not carry a plaintext vector graph into an encrypted image")
+        }
+        Err(e) => e,
+    };
+    // The refusal happens inside the builder, so it reaches the server as a failed build.
+    // Which of the two gates fires is not the property under test — in practice the earlier
+    // one does, because a keyed build authenticating the plaintext base generation's
+    // `MANIFEST.json` already refuses it as MAC-less (HIK-144). What matters, and what is
+    // asserted, is that no downgraded generation is published.
+    let _ = &err;
+
+    // The served generation is unchanged: the failed build published nothing.
+    assert!(
+        graphs.get("docs").unwrap().manifest().encryption.is_none(),
+        "a refused consolidation must leave the plaintext generation serving"
+    );
+    std::fs::remove_dir_all(&work).ok();
+}
+
 /// The **Vamana** arm of the same gate — and, since HIK-117, the server-level proof of
 /// **carry-by-reference**. A Vamana index's full vectors live in its `.vamana` blocks; the
 /// consolidation no longer streams them back out (the ~370 GB read at scale) and no longer
@@ -8509,19 +8958,28 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
         matches!(vidx[0].mode, AnnMode::Vamana { .. }),
         "a carried Vamana base must stay Vamana, not be rebuilt as brute-force"
     );
-    let new_vamana = data
-        .join("docs")
-        .join(gen1.base_uuid().to_string())
-        .join("vector/Doc.embedding.vamana");
-    assert_ne!(
-        new_vamana, base_vamana,
-        "the consolidation must publish a new generation"
-    );
+    // HIK-145: the carried graph now lives in its own `vecidx/<uuid>/` artifact rather than
+    // inside the new generation's directory — one carry path for plaintext and encrypted
+    // alike, because two structurally different paths are exactly what let the encrypted
+    // arm go untested for the whole life of the feature. What must not regress for an
+    // unencrypted deployment is the *optimisation*: byte-identical, and still a hard link
+    // (the same inode as the base), never a 370 GB copy.
+    let carried = carried_vamana_bytes(&data, "docs", gen1.as_ref());
     assert_eq!(
-        std::fs::read(&new_vamana).unwrap(),
-        base_bytes,
+        carried, base_bytes,
         "a pure-permutation consolidation must carry the .vamana byte-identically — this is \
              the BLAKE3-unchanged thesis at the server level"
+    );
+    let vecidx = data.join("docs").join("vecidx");
+    let artifact_file = std::fs::read_dir(&vecidx)
+        .expect("a carry must publish a vecidx/ artifact")
+        .map(|e| e.unwrap().path().join("Doc.embedding.vamana"))
+        .find(|p| p.exists())
+        .expect("the artifact must hold the carried graph file");
+    assert_eq!(
+        same_inode(&artifact_file, &base_vamana),
+        Some(true),
+        "the plaintext carry must still be a hard link to the base inode, not a copy"
     );
 
     // The data has to be the real thing, not zeros: query with node 7's own embedding

@@ -674,6 +674,7 @@ mod tests {
 
     fn desc(label: &str, prop: &str, dim: u32) -> VectorIndexDesc {
         VectorIndexDesc {
+            carried_graph: None,
             label: label.into(),
             property: prop.into(),
             dim,

@@ -214,6 +214,10 @@ pub enum MacDomain {
     /// ([`crate::setmanifest::SetManifest`]) — the document that authenticates the
     /// *composition* (which base, which segments), as opposed to the parts (HIK-144).
     SetManifest,
+    /// A carried vector-graph artifact's `VECIDX.json`
+    /// ([`crate::vecmanifest::VectorIndexManifest`]) — the salt-bearing manifest that
+    /// travels with a `.vamana` carried by reference through a consolidation (HIK-145).
+    VectorIndexManifest,
 }
 
 impl MacDomain {
@@ -225,6 +229,7 @@ impl MacDomain {
             MacDomain::Manifest => "slater.manifest",
             MacDomain::SegmentManifest => "slater.segment-manifest",
             MacDomain::SetManifest => "slater.set-manifest",
+            MacDomain::VectorIndexManifest => "slater.vector-index-manifest",
         }
     }
 }

@@ -98,6 +98,17 @@ pub struct SetManifest {
     #[serde(default)]
     pub segments: Vec<SegmentRef>,
     pub created_unix: i64,
+    /// Carried vector-graph artifacts this composition depends on (HIK-145) — the
+    /// `vecidx/<uuid>/` artifacts the base generation's vector indexes reference by
+    /// `carriedGraph`, each pinned by uuid **and** content hash.
+    ///
+    /// It is here, inside the MAC'd body, for the same reason `segments` is: a MAC on the
+    /// artifact authenticates the *part*, not the composition. It is also what GC reads —
+    /// the sweep only ever opens the current set, so this list is what keeps a referenced
+    /// artifact alive. Omitted from the JSON when empty, so every set manifest for a graph
+    /// with no carried index is byte-unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_artifacts: Vec<crate::vecmanifest::VectorArtifactRef>,
     /// Keyed-MAC over the canonical manifest, authenticating the set pointer itself —
     /// i.e. the **composition**: which base generation, and exactly which segments, in
     /// which order (HIK-144). `None` for a plaintext (unkeyed) set; under a configured
@@ -168,8 +179,22 @@ impl SetManifest {
             base,
             segments: Vec::new(),
             created_unix,
+            vector_artifacts: Vec::new(),
             mac: None,
         }
+    }
+
+    /// Restate the carried vector-graph artifacts the base generation references, so the
+    /// composition MAC covers them. Call before [`Self::seal_mac`], whenever the set is
+    /// (re)written over a base — a publish, a flush or a compaction: the base's carried
+    /// artifacts must travel with every set that names it, or the next GC sweep would see
+    /// them unreferenced.
+    pub fn bind_vector_artifacts(&mut self, base: &crate::manifest::Manifest) {
+        self.vector_artifacts = base
+            .vector_indexes
+            .iter()
+            .filter_map(|v| v.carried_graph.clone())
+            .collect();
     }
 
     /// The backend-relative key of the set manifest for `set_uuid` under `graph`.
@@ -267,6 +292,10 @@ mod tests {
                 },
             ],
             created_unix: 1_700_000_000,
+            vector_artifacts: vec![crate::vecmanifest::VectorArtifactRef {
+                uuid: uuid(0x33),
+                content_hash: "eeff".into(),
+            }],
             mac: None,
         }
     }
@@ -278,7 +307,7 @@ mod tests {
     /// this struct carries no `rename_all = "camelCase"`, and the on-disk set format is
     /// what it is. Renaming for consistency would be a format break, so the golden pins
     /// the spelling that exists.
-    const GOLDEN_SET_BODY: &str = r#"{"magic":"SLSET01","version":1,"set_uuid":"00000000-0000-0000-0000-000012345678","base":"00000000-0000-0000-0000-00009abcdef0","segments":[{"uuid":"00000000-0000-0000-0000-000000000011","node_band":[50,60],"edge_band":[200,205],"content_hash":"aabb"},{"uuid":"00000000-0000-0000-0000-000000000022","node_band":[60,61],"edge_band":[205,205],"content_hash":"ccdd"}],"created_unix":1700000000,"mac":null}"#;
+    const GOLDEN_SET_BODY: &str = r#"{"magic":"SLSET01","version":1,"set_uuid":"00000000-0000-0000-0000-000012345678","base":"00000000-0000-0000-0000-00009abcdef0","segments":[{"uuid":"00000000-0000-0000-0000-000000000011","node_band":[50,60],"edge_band":[200,205],"content_hash":"aabb"},{"uuid":"00000000-0000-0000-0000-000000000022","node_band":[60,61],"edge_band":[205,205],"content_hash":"ccdd"}],"created_unix":1700000000,"vector_artifacts":[{"uuid":"00000000-0000-0000-0000-000000000033","contentHash":"eeff"}],"mac":null}"#;
 
     /// HIK-144, on HIK-142's framing: pin the set manifest's MAC preimage.
     #[test]
@@ -317,6 +346,10 @@ mod tests {
         assert!(
             body.contains("00000000-0000-0000-0000-000000000022"),
             "seg 2"
+        );
+        assert!(
+            body.contains("00000000-0000-0000-0000-000000000033"),
+            "carried vector artifact"
         );
     }
 
@@ -388,6 +421,18 @@ mod tests {
         let mut renamed_set = sealed.clone();
         renamed_set.set_uuid = uuid(0xbeef);
 
+        // HIK-145: the carried vector-graph artifact is a third kind of referent, and is
+        // authenticated the same way — an attacker who repoints the composition at another
+        // artifact, or swaps the bytes under the one it names, must not verify.
+        let mut dropped_artifact = sealed.clone();
+        dropped_artifact.vector_artifacts.clear();
+
+        let mut repointed_artifact = sealed.clone();
+        repointed_artifact.vector_artifacts[0].uuid = uuid(0x99);
+
+        let mut swapped_artifact_bytes = sealed.clone();
+        swapped_artifact_bytes.vector_artifacts[0].content_hash = "0000".into();
+
         for (what, tampered) in [
             ("base rolled back", rolled_back_base),
             ("segment dropped", dropped_segment),
@@ -395,6 +440,12 @@ mod tests {
             ("segment added", added_segment),
             ("segment contents swapped", swapped_contents),
             ("set renamed", renamed_set),
+            ("carried vector artifact dropped", dropped_artifact),
+            ("carried vector artifact repointed", repointed_artifact),
+            (
+                "carried vector artifact bytes swapped",
+                swapped_artifact_bytes,
+            ),
         ] {
             let err = tampered
                 .verify_mac(master)

@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::columns::encode_props_record_into;
-use crate::ids::Value;
+use crate::ids::{Generation, Value};
 use crate::manifest::{AnnNav, EntityKind, Metric};
 use crate::nodelabels::encode_labels_record_into;
 use crate::wire::{read_uvarint, write_uvarint};
@@ -130,10 +130,25 @@ pub struct DumpVectorIndex {
 /// the swap, so the referenced files are alive for the whole build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DumpVectorCarry {
-    /// Data-dir-relative path to the base `.vamana`.
+    /// Data-dir-relative path to the base `.vamana` — either inside the base generation's
+    /// directory, or inside a `vecidx/<uuid>/` artifact when an earlier consolidation
+    /// already carried it (see [`Self::base_vamana_artifact`]).
     pub base_vamana: String,
-    /// Data-dir-relative path to the base `.pq`.
+    /// Data-dir-relative path to the base `.pq`. Always inside the base **generation**:
+    /// every merge rewrites the id column, so the `.pq` is never carried.
     pub base_pq: String,
+    /// The base generation's uuid. The builder reads and authenticates that generation's
+    /// `MANIFEST.json` to learn the salt its `.pq` (and, absent
+    /// [`Self::base_vamana_artifact`], its `.vamana`) was sealed under — the salt is never
+    /// copied into the dump (HIK-145). `None` on a pre-HIK-145 dump, which can only be
+    /// carried when the image is plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_gen: Option<Generation>,
+    /// Set when the base `.vamana` is already a carried artifact: its own
+    /// `vecidx/<uuid>/VECIDX.json` records the salt **and** the HIK-140 subkey label the
+    /// file was sealed under, neither of which is derivable from where the file now sits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_vamana_artifact: Option<Generation>,
     /// Dump-relative filename of the raw-`u64`-LE `layout → dump-id` sidecar (`HOLE` for a
     /// tombstoned/superseded/deleted ordinal), one entry per base `.vamana` record.
     pub carry_map_file: String,
@@ -694,6 +709,8 @@ mod tests {
         let layout = vec![7u64, HOLE, 3, 0, HOLE, 5];
         let map_file = w.write_vector_carry("Doc.embedding", &layout).unwrap();
         let carry = DumpVectorCarry {
+            base_gen: Some(Generation(uuid::Uuid::from_u128(9))),
+            base_vamana_artifact: None,
             base_vamana: "g/base/vector/Doc.embedding.vamana".into(),
             base_pq: "g/base/vector/Doc.embedding.pq".into(),
             carry_map_file: map_file,
