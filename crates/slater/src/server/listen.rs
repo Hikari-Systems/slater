@@ -206,7 +206,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
     let verify_integrity = cfg.data_backend.verify_integrity_resolved();
     let mut graphs = Graphs::open_all_with_store(
         store,
-        master_key.as_deref(),
+        master_key.as_deref().map(Vec::as_slice),
         verify_integrity,
         Some(cfg.cache.range_index_cache_bytes),
         cfg.cache.degree_column,

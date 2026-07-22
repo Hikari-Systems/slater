@@ -1531,6 +1531,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wide",
+ "zeroize",
  "zstd",
 ]
 
@@ -3260,6 +3261,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wide",
+ "zeroize",
 ]
 
 [[package]]
@@ -3282,6 +3284,7 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

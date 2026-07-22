@@ -58,6 +58,11 @@ crc32c = "0.6"
 # Crypto (graph-format encryption / slater ACL).
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
+# Best-effort wiping of key material on drop (`Zeroizing<T>`). `zeroize` uses
+# `unsafe` internally (volatile writes + a compiler fence) — that is fine:
+# `#![forbid(unsafe_code)]` is per-crate, exactly as it already is for `blake3`
+# and `chacha20poly1305` (which itself already depends on `zeroize`).
+zeroize = { version = "1", features = ["derive"] }
 
 # Parser + CLI (slater-build, slater).
 pest = "2"

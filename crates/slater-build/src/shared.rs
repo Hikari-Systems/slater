@@ -91,7 +91,7 @@ pub struct BuildOptions {
     pub vector_index_json: Option<PathBuf>,
     /// At-rest encryption master key (raw bytes). `None` ⇒ plaintext image, the
     /// default, so M2–M5 fixtures and the golden test keep working unchanged.
-    pub encryption_key: Option<Vec<u8>>,
+    pub encryption_key: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// BLAKE3 digest (hex) of the live `acl.json` to stamp into the manifest
     /// (`--acl`). `None` ⇒ no ACL stamp.
     pub acl_blake3: Option<String>,

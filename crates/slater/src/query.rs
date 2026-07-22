@@ -172,7 +172,7 @@ fn run(cfg: &AppConfig) -> Result<()> {
     let gen = Generation::open_with_store_opts(
         store.as_ref(),
         &graph,
-        master_key.as_deref(),
+        master_key.as_deref().map(Vec::as_slice),
         cfg.data_backend.verify_integrity_resolved(),
     )
     .with_context(|| format!("open generation for graph {graph:?}"))?;

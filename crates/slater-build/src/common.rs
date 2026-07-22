@@ -27,7 +27,7 @@ use graph_format::store::{join_key, ObjectStore};
 /// Derive the per-generation block cipher and the MANIFEST encryption header (which
 /// records the KDF salt, never the key) when encryption is requested.
 pub fn derive_cipher(
-    encryption_key: &Option<Vec<u8>>,
+    encryption_key: &Option<zeroize::Zeroizing<Vec<u8>>>,
 ) -> (Option<Arc<BlockCipher>>, Option<EncryptionHeader>) {
     match encryption_key {
         Some(key) => {
@@ -113,7 +113,7 @@ pub struct PublishInputs<'a> {
     /// inventory regardless.
     pub hub_degrees: Option<HubDegreeDesc>,
     pub encryption_header: Option<EncryptionHeader>,
-    pub encryption_key: &'a Option<Vec<u8>>,
+    pub encryption_key: &'a Option<zeroize::Zeroizing<Vec<u8>>>,
     pub acl_blake3: Option<String>,
     /// Extra inventory files beyond the fixed stores (the Vamana/PQ vector files).
     pub extra_files: Vec<String>,

@@ -7,6 +7,15 @@
 use super::*;
 
 impl Graphs {
+    /// The retained at-rest master key as a byte slice.
+    ///
+    /// `master_key` is an `Option<Zeroizing<Vec<u8>>>`, so plain `as_deref()` stops
+    /// at `&Vec<u8>` (`Zeroizing`'s `Deref` target) rather than reaching `&[u8]` —
+    /// this collapses both hops in one place.
+    fn master_key_bytes(&self) -> Option<&[u8]> {
+        self.master_key.as_deref().map(Vec::as_slice)
+    }
+
     /// Discover and open every graph under `data_dir` on the local filesystem,
     /// deriving each generation's block cipher from `master_key` (required iff a
     /// generation is encrypted). Convenience over [`open_all_with_store`] for the
@@ -67,7 +76,7 @@ impl Graphs {
         let swap_locks = graphs.keys().map(|n| (n.clone(), Mutex::new(()))).collect();
         Ok(Self {
             store,
-            master_key: master_key.map(<[u8]>::to_vec),
+            master_key: master_key.map(|k| zeroize::Zeroizing::new(k.to_vec())),
             verify_integrity,
             graphs,
             acl_path: None,
@@ -312,7 +321,7 @@ impl Graphs {
             Generation::open_with_store_opts_cached(
                 self.store.as_ref(),
                 name,
-                self.master_key.as_deref(),
+                self.master_key_bytes(),
                 self.verify_integrity,
                 self.range_index_cache_bytes,
                 self.degree_residency,
@@ -632,7 +641,7 @@ impl Graphs {
         let (cipher, encryption_header): (
             Option<std::sync::Arc<graph_format::crypto::BlockCipher>>,
             Option<graph_format::manifest::EncryptionHeader>,
-        ) = match self.master_key.as_deref() {
+        ) = match self.master_key_bytes() {
             Some(key) => {
                 let salt = graph_format::crypto::random_salt();
                 let header = graph_format::manifest::EncryptionHeader {
@@ -656,7 +665,7 @@ impl Graphs {
                 prior_node_total,
                 prior_edge_total,
                 cipher,
-                master_key: self.master_key.as_deref(),
+                master_key: self.master_key_bytes(),
                 encryption_header,
                 created_unix,
             };
@@ -812,7 +821,7 @@ impl Graphs {
         let (cipher, encryption_header): (
             Option<std::sync::Arc<graph_format::crypto::BlockCipher>>,
             Option<graph_format::manifest::EncryptionHeader>,
-        ) = match self.master_key.as_deref() {
+        ) = match self.master_key_bytes() {
             Some(key) => {
                 let salt = graph_format::crypto::random_salt();
                 let header = graph_format::manifest::EncryptionHeader {
@@ -834,7 +843,7 @@ impl Graphs {
                 base_uuid: core.base_uuid(),
                 base: core.as_ref(),
                 cipher,
-                master_key: self.master_key.as_deref(),
+                master_key: self.master_key_bytes(),
                 encryption_header,
                 created_unix,
             };

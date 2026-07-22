@@ -26,6 +26,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 argon2.workspace = true
+# Wipe the at-rest master key (and the hex text it was read from) on drop.
+zeroize.workspace = true
 rayon.workspace = true
 wide.workspace = true
 clap.workspace = true
