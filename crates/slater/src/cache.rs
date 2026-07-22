@@ -408,15 +408,50 @@ impl<V> ResultCache<V> {
         None
     }
 
+    /// What the pool itself spends to hold one entry, on top of the caller's
+    /// `value_bytes`. Every term is derived from a data structure this module
+    /// actually uses — none of it is a round number picked to look safe:
+    ///
+    /// * `2 * key.query.capacity()` — the key is stored **twice**: once in `map`
+    ///   and once in the CLOCK `ring`. Each copy owns its own `String` buffer, and
+    ///   an inlined-`vecf32` query key can be tens of kilobytes.
+    /// * `2 * size_of::<ResultKey>()` — likewise the key's own struct, in both the
+    ///   map slot and the ring slot.
+    /// * `size_of::<ResultEntry<V>>()` — the map's value slot: the `Arc`, the
+    ///   charged byte count and the two CLOCK words.
+    /// * `size_of::<Arc<V>>()` worth of control block — an `Arc`'s allocation
+    ///   carries two `usize` reference counts ahead of the payload (the payload
+    ///   itself is what `value_bytes` estimates).
+    /// * `bucket / 7` — `HashMap` (hashbrown) grows at 7/8 occupancy, so each live
+    ///   entry amortises ≈ 1/7 of an empty bucket beyond its own, where a bucket is
+    ///   the key/value pair plus its 1-byte control tag.
+    /// * `size_of::<ResultKey>()` again — the ring `Vec` doubles on growth, so a
+    ///   live entry amortises up to one spare slot beyond the one it occupies.
+    ///
+    /// Allocator size-class rounding is *not* modelled — it cannot be observed from
+    /// here — which is why the README says resident memory tracks the budgets to
+    /// within bounded per-entry and allocator overhead rather than equalling them.
+    fn entry_overhead_bytes(key: &ResultKey) -> usize {
+        let ring_slot = std::mem::size_of::<ResultKey>();
+        let bucket = std::mem::size_of::<ResultKey>() + std::mem::size_of::<ResultEntry<V>>() + 1;
+        2 * key.query.capacity()
+            + 2 * std::mem::size_of::<ResultKey>()
+            + std::mem::size_of::<ResultEntry<V>>()
+            + 2 * std::mem::size_of::<usize>()
+            + bucket / 7
+            + ring_slot
+    }
+
     /// Cache a result under `key`. `value_bytes` is the caller's estimate of the
-    /// value's resident footprint; the key's query string length is added on top so
-    /// a large inlined-`vecf32` query is charged for the memory its key occupies and
-    /// the pool stays bounded. A no-op when the pool is disabled.
+    /// value's resident footprint; [`Self::entry_overhead_bytes`] adds what the pool
+    /// itself spends to hold the entry — including the key, which is stored twice —
+    /// so a large inlined-`vecf32` query is charged for the memory its key occupies
+    /// and the pool stays bounded. A no-op when the pool is disabled.
     pub fn insert(&self, key: ResultKey, value: Arc<V>, value_bytes: usize) {
         if !self.enabled {
             return;
         }
-        let bytes = value_bytes + key.query.len();
+        let bytes = value_bytes + Self::entry_overhead_bytes(&key);
         let now_ms = self.now_ms();
         let evicted = self
             .inner
@@ -1039,10 +1074,20 @@ mod tests {
 
     #[test]
     fn result_cache_evicts_least_recently_used() {
-        // Budget holds two 100-byte values but not three (keys are short).
-        let cache: ResultCache<Vec<u8>> = ResultCache::new(230);
         let g = gen(7);
         let k = |q: &str| ResultKey::new(g, q);
+
+        // Size the budget to hold exactly two entries but not three. The per-entry
+        // charge is the value plus the pool's own bookkeeping (the key lives in both
+        // the map and the CLOCK ring), so measure one entry rather than hard-coding
+        // a number that drifts with `ResultEntry`'s layout.
+        let one = {
+            let probe: ResultCache<Vec<u8>> = ResultCache::new(1 << 20);
+            probe.insert(k("a"), Arc::new(vec![0u8; 100]), 100);
+            probe.bytes()
+        };
+        let budget = 2 * one;
+        let cache: ResultCache<Vec<u8>> = ResultCache::new(budget);
 
         cache.insert(k("a"), Arc::new(vec![0u8; 100]), 100);
         cache.insert(k("b"), Arc::new(vec![0u8; 100]), 100);
@@ -1057,7 +1102,7 @@ mod tests {
         assert!(cache.get(&k("b")).is_none(), "b should have been evicted");
         assert!(cache.get(&k("a")).is_some());
         assert!(cache.get(&k("c")).is_some());
-        assert!(cache.bytes() <= 230);
+        assert!(cache.bytes() <= budget);
     }
 
     #[test]
@@ -1075,6 +1120,32 @@ mod tests {
         // The old entry is still physically present but unreachable by the new key.
         assert!(cache.get(&old).is_some());
         assert_ne!(old, new);
+    }
+
+    /// A cached entry costs more than its value: the key's query string is stored
+    /// in *both* the map and the CLOCK ring, and the map slot, `ResultEntry` and
+    /// `Arc` control block are real resident bytes too. Charging only the value (or
+    /// only one copy of the key) lets an inlined-`vecf32` workload — where the key
+    /// dwarfs the result — blow past the budget (HIK-141).
+    ///
+    /// The bound is derived from what the pool demonstrably stores, not from a
+    /// second copy of the accounting code: two `String` buffers of `QLEN` bytes,
+    /// plus the two `ResultKey` structs holding them.
+    #[test]
+    fn result_cache_charges_the_key_in_both_the_map_and_the_ring() {
+        const QLEN: usize = 8192; // an inlined-vecf32 query key is this big
+        let cache: ResultCache<String> = ResultCache::new(1 << 20);
+        let key = ResultKey::new(gen(11), "q".repeat(QLEN));
+
+        cache.insert(key, Arc::new(String::new()), 0);
+
+        let floor = 2 * QLEN + 2 * std::mem::size_of::<ResultKey>();
+        assert!(
+            cache.bytes() >= floor,
+            "charged {} bytes for a zero-byte value under an {QLEN}-byte key; the \
+             key alone occupies at least {floor} bytes (map copy + ring copy)",
+            cache.bytes(),
+        );
     }
 
     #[test]
