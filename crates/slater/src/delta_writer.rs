@@ -71,8 +71,8 @@ use graph_format::blockcache::BlockCache as GfBlockCache;
 use graph_format::ids::{Generation as GenId, Value};
 use slater_delta::l0_offheap::{merge_run, write_segment};
 use slater_delta::{
-    replay_dir, DeltaSnapshot, L0Reader, L0Segment, LevelRead, Memtable, OpResolution, Seq, WalOp,
-    WalRecord, WalSink,
+    replay_dir, DeltaCipher, DeltaSnapshot, L0Reader, L0Segment, LevelRead, Memtable, OpResolution,
+    Seq, WalOp, WalRecord, WalSink,
 };
 
 use crate::rwindex::TouchedJournal;
@@ -235,6 +235,14 @@ struct WriterInner {
     /// The server's shared block cache off-heap L0 segments page through. `None` on the
     /// resident path and for non-server openers.
     block_cache: Option<Arc<GfBlockCache>>,
+    /// This graph's at-rest cipher for the delta's **own** artifacts — every WAL segment and
+    /// every L0 segment (HIK-146). Derived once at open from the runtime master key; `None`
+    /// is a plaintext deployment, which writes exactly the bytes it always did.
+    ///
+    /// It is deliberately held here, beside the sink and the L0 stack, rather than passed in
+    /// per call: every write path in this file goes through `WriterInner`, so there is no
+    /// seam at which a future caller could open a segment without it.
+    cipher: Option<DeltaCipher>,
 }
 
 /// The per-graph writable-layer writer. Cheap to clone-share behind an `Arc`.
@@ -314,12 +322,14 @@ impl DeltaWriter {
     /// (`None` for a key absent from the core, i.e. a delta-born node) — then opens
     /// a *fresh* segment after the highest existing one so no committed segment is
     /// ever truncated. `core_uuid` is the generation the dense ids resolve against.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         dir: impl AsRef<Path>,
         graph: &str,
         core_uuid: GenId,
         core_node_count: u64,
         core_edge_count: u64,
+        master_key: Option<&[u8]>,
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<Self> {
         Self::open_with_cache(
@@ -330,6 +340,7 @@ impl DeltaWriter {
             core_edge_count,
             false,
             None,
+            master_key,
             resolve,
         )
     }
@@ -348,9 +359,14 @@ impl DeltaWriter {
         core_edge_count: u64,
         off_heap: bool,
         cache: Option<Arc<GfBlockCache>>,
+        master_key: Option<&[u8]>,
         resolve: impl Fn(&WalOp) -> OpResolution,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        // The delta's own key, derived from the runtime master key under its own KDF context
+        // and bound to this graph (HIK-146). `None` ⇒ plaintext deployment.
+        let cipher: Option<DeltaCipher> = master_key
+            .map(|k| Arc::new(graph_format::crypto::delta_cipher(k, graph)) as DeltaCipher);
 
         // Reload the sealed L0 segments first (Phase 4c). They stack past the core: the
         // active memtable resumes past every level's synthetic id space, so a WAL-tail
@@ -362,7 +378,7 @@ impl DeltaWriter {
         let mut node_base = core_node_count;
         let mut edge_base = core_edge_count;
         for (_, path) in l0_segment_paths_sorted(&l0_dir)? {
-            let level = open_l0_level(&path, cache.as_ref())
+            let level = open_l0_level(&path, cache.as_ref(), cipher.as_ref())
                 .with_context(|| format!("reload L0 segment {path:?}"))?;
             let lv = level.as_level();
             node_base = node_base.max(lv.synthetic_base() + lv.born_count());
@@ -376,14 +392,15 @@ impl DeltaWriter {
         // the core is resolved against the L0 levels first (Phase 4c-B) so a re-`MERGE` of
         // an already-flushed born node reuses its synthetic id rather than duplicating it.
         let mut mem = Memtable::with_bases(node_base, edge_base);
-        let replay = replay_dir(&dir).with_context(|| format!("replay WAL dir {dir:?}"))?;
+        let replay =
+            replay_dir(&dir, cipher.as_ref()).with_context(|| format!("replay WAL dir {dir:?}"))?;
         for rec in &replay.records {
             let res = resolve_with_l0(&rec.op, resolve(&rec.op), &l0);
             mem.apply(&rec.op, res);
         }
 
         let next_segment = next_segment_number(&dir)?;
-        let sink = WalSink::create(&dir, next_segment)
+        let sink = WalSink::create(&dir, next_segment, cipher.as_ref())
             .with_context(|| format!("open WAL segment {next_segment} under {dir:?}"))?;
 
         let mem = Arc::new(mem);
@@ -399,6 +416,7 @@ impl DeltaWriter {
                 seq: replay.last_seq,
                 off_heap,
                 block_cache: cache,
+                cipher,
             }),
             published: RwLock::new(Published {
                 delta: published,
@@ -658,9 +676,10 @@ impl DeltaWriter {
         let consumed = wal_segment_paths(&inner.dir)?;
         let consumed_l0: Vec<PathBuf> = inner.l0.iter().map(|s| s.path().to_path_buf()).collect();
         let next = next_segment_number(&inner.dir)?;
-        let fresh = WalSink::create(&inner.dir, next).with_context(|| {
-            format!("open post-freeze WAL segment {next} under {:?}", inner.dir)
-        })?;
+        let fresh =
+            WalSink::create(&inner.dir, next, inner.cipher.as_ref()).with_context(|| {
+                format!("open post-freeze WAL segment {next} under {:?}", inner.dir)
+            })?;
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at freeze")?;
         // The memtable is shared, never mutated in place (the write path replaces it
@@ -719,15 +738,17 @@ impl DeltaWriter {
                 new_segment_scope(),
                 OFFHEAP_L0_BLOCK_BYTES,
                 OFFHEAP_L0_ZSTD_LEVEL,
+                inner.cipher.as_ref(),
             )
             .with_context(|| format!("write off-heap L0 segment {path:?}"))?;
-            open_l0_level(&path, Some(&cache))
+            open_l0_level(&path, Some(&cache), inner.cipher.as_ref())
                 .with_context(|| format!("reopen off-heap L0 segment {path:?}"))?
         } else {
-            L0Segment::write(&inner.mem, &path)
+            L0Segment::write(&inner.mem, &path, inner.cipher.as_ref())
                 .with_context(|| format!("write L0 segment {path:?}"))?;
             L0Level::Resident(
-                L0Segment::open(&path).with_context(|| format!("reopen L0 segment {path:?}"))?,
+                L0Segment::open(&path, inner.cipher.as_ref())
+                    .with_context(|| format!("reopen L0 segment {path:?}"))?,
             )
         };
 
@@ -740,7 +761,7 @@ impl DeltaWriter {
         //    current segment and open a fresh one before deleting the consumed segments.
         let consumed = wal_segment_paths(&inner.dir)?;
         let next = next_segment_number(&inner.dir)?;
-        let fresh = WalSink::create(&inner.dir, next)
+        let fresh = WalSink::create(&inner.dir, next, inner.cipher.as_ref())
             .with_context(|| format!("open post-flush WAL segment {next} under {:?}", inner.dir))?;
         let old = std::mem::replace(&mut inner.sink, fresh);
         old.seal().context("seal WAL segment at flush")?;
@@ -862,9 +883,10 @@ impl DeltaWriter {
                 new_segment_scope(),
                 OFFHEAP_L0_BLOCK_BYTES,
                 OFFHEAP_L0_ZSTD_LEVEL,
+                inner.cipher.as_ref(),
             )
             .with_context(|| format!("merge off-heap L0 run into {oldest_path:?}"))?;
-            open_l0_level(&oldest_path, Some(&cache))
+            open_l0_level(&oldest_path, Some(&cache), inner.cipher.as_ref())
                 .with_context(|| format!("reopen merged off-heap L0 segment {oldest_path:?}"))?
         } else {
             let Some(run) = inner.l0[start..end]
@@ -875,10 +897,10 @@ impl DeltaWriter {
                 return Ok(false); // unreachable by construction — never merge cross-format
             };
             let merged = Memtable::merge_levels(&run);
-            L0Segment::write(&merged, &oldest_path)
+            L0Segment::write(&merged, &oldest_path, inner.cipher.as_ref())
                 .with_context(|| format!("write compacted L0 segment {oldest_path:?}"))?;
             L0Level::Resident(
-                L0Segment::open(&oldest_path)
+                L0Segment::open(&oldest_path, inner.cipher.as_ref())
                     .with_context(|| format!("reopen compacted L0 segment {oldest_path:?}"))?,
             )
         };
@@ -965,7 +987,7 @@ impl DeltaWriter {
         // the pure new core (the same posture as a retire that returns `Err`), and the retire
         // is retryable — `remove_if_present` tolerates the already-deleted paths.
         let mut mem = Memtable::with_bases(new_core_node_count, new_core_edge_count);
-        let replay = replay_dir(&inner.dir)
+        let replay = replay_dir(&inner.dir, inner.cipher.as_ref())
             .with_context(|| format!("replay post-freeze WAL dir {:?}", inner.dir))?;
         for rec in &replay.records {
             mem.apply(&rec.op, resolve(&rec.op));
@@ -1160,14 +1182,18 @@ fn published_snapshot(mem: &Arc<Memtable>, l0: &[L0Level]) -> DeltaSnapshot {
 /// Open a sealed L0 segment at `path` in whichever format it was written: a **directory**
 /// is off-heap (its payloads page through the shared `cache`), a **file** is resident.
 /// Finding an off-heap segment with no `cache` is a clear configuration error.
-fn open_l0_level(path: &Path, cache: Option<&Arc<GfBlockCache>>) -> Result<L0Level> {
+fn open_l0_level(
+    path: &Path,
+    cache: Option<&Arc<GfBlockCache>>,
+    cipher: Option<&DeltaCipher>,
+) -> Result<L0Level> {
     if path.is_dir() {
         let cache = cache
             .cloned()
             .context("off-heap L0 segment on disk but no block cache configured")?;
         // The cache scope is read from the segment's meta (persisted, fresh per write), so
         // a compaction that reuses a directory can't collide with stale cached blocks.
-        let reader = Arc::new(L0Reader::open(path, cache)?);
+        let reader = Arc::new(L0Reader::open(path, cache, cipher)?);
         let bytes = dir_size(path);
         Ok(L0Level::OffHeap {
             reader,
@@ -1175,7 +1201,7 @@ fn open_l0_level(path: &Path, cache: Option<&Arc<GfBlockCache>>) -> Result<L0Lev
             bytes,
         })
     } else {
-        Ok(L0Level::Resident(L0Segment::open(path)?))
+        Ok(L0Level::Resident(L0Segment::open(path, cipher)?))
     }
 }
 
@@ -1404,6 +1430,7 @@ mod tests {
             0,
             off_heap,
             Some(cache),
+            None,
             resolve_ticker,
         )
         .unwrap()
@@ -1447,12 +1474,23 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn marker_is_not_greppable_out_of_the_wal_under_a_key() {
-        let dir = tmp("hik146_marker");
-        let _ = std::fs::remove_dir_all(&dir);
-        let w =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+    /// Open a writer on an encrypted deployment, off-heap or not.
+    fn open_keyed(dir: &Path, key: Option<&[u8]>, off_heap: bool) -> Result<DeltaWriter> {
+        DeltaWriter::open_with_cache(
+            dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            off_heap,
+            Some(gf_cache()),
+            key,
+            resolve_ticker,
+        )
+    }
+
+    /// The write that carries the marker into the delta.
+    fn marker_write(w: &DeltaWriter) {
         w.write(
             upsert(
                 "Company",
@@ -1463,8 +1501,176 @@ mod tests {
             node(10),
         )
         .unwrap();
-        let leaks = files_containing(&dir, MARKER);
-        assert!(leaks.is_empty(), "plaintext user data on disk: {leaks:?}");
+    }
+
+    /// The marker as the delta reads it back for core node 10.
+    fn marker_read(w: &DeltaWriter) -> Option<Value> {
+        w.delta_snapshot()
+            .node_patch(10)
+            .and_then(|d| d.patches.get("secret").cloned())
+    }
+
+    /// `unwrap_err` needs `Debug` on the `Ok` type, and [`DeltaWriter`] has none — this is
+    /// the equivalent that does not force a `Debug` impl into the production type.
+    fn open_err(r: Result<DeltaWriter>) -> anyhow::Error {
+        match r {
+            Ok(_) => panic!("expected the open to be refused"),
+            Err(e) => e,
+        }
+    }
+
+    /// HIK-146, the reproduction from the ticket: on an encrypted deployment a marker
+    /// written through the add path must not be greppable out of **anything** the delta
+    /// layer puts on disk — the live WAL, a flushed L0 segment, or (off-heap) any of the
+    /// segment directory's five files — and it must still read back after a reopen.
+    ///
+    /// Before the fix this failed on the very first assertion: the WAL held the marker in
+    /// the clear, because there was no way to hand the delta layer a key at all.
+    #[test]
+    fn marker_is_never_greppable_off_disk_under_a_key() {
+        for off_heap in [false, true] {
+            let dir = tmp(&format!("hik146_marker_{off_heap}"));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let w = open_keyed(&dir, Some(KEY), off_heap).unwrap();
+            marker_write(&w);
+            let leaks = files_containing(&dir, MARKER);
+            assert!(leaks.is_empty(), "plaintext in the WAL: {leaks:?}");
+
+            // …and after the memtable spills to an L0 segment (the other artifact).
+            assert!(w.flush_to_l0().unwrap());
+            let leaks = files_containing(&dir, MARKER);
+            assert!(leaks.is_empty(), "plaintext in an L0 segment: {leaks:?}");
+            // The flush really did write a segment (a vacuous grep proves nothing).
+            assert!(dir.join("l0").is_dir());
+            drop(w);
+
+            // Decrypt-and-replay: the write is still there.
+            let w = open_keyed(&dir, Some(KEY), off_heap).unwrap();
+            assert_eq!(marker_read(&w), Some(Value::Str(MARKER.into())));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A sealed delta fails closed for the wrong key and for no key at all — and the
+    /// refusals are **types**, not messages (CONTRIBUTING.md).
+    #[test]
+    fn a_sealed_delta_refuses_the_wrong_key_and_no_key() {
+        let dir = tmp("hik146_wrongkey");
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let w = open_keyed(&dir, Some(KEY), false).unwrap();
+            marker_write(&w);
+        }
+        // No key: the WAL is sealed, so the strip check fires before any decrypt.
+        let e = open_err(open_keyed(&dir, None, false));
+        assert_eq!(
+            e.downcast_ref::<slater_delta::DeltaSealRejected>(),
+            Some(&slater_delta::DeltaSealRejected::KeyRequired {
+                subject: "WAL segment"
+            })
+        );
+        // Wrong key: the framing is right, the tag is not.
+        let e = open_err(open_keyed(&dir, Some(b"a different master key"), false));
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The strip downgrade: a **plaintext** WAL segment dropped into an encrypted graph's
+    /// directory is refused rather than replayed unauthenticated. Without this direction of
+    /// the check, anyone who could write to the WAL dir could inject writes into an
+    /// encrypted graph without holding the key.
+    #[test]
+    fn a_plaintext_segment_under_a_key_is_refused() {
+        let plain = tmp("hik146_strip_src");
+        let keyed = tmp("hik146_strip_dst");
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&keyed);
+        {
+            let w = open_keyed(&plain, None, false).unwrap();
+            marker_write(&w);
+        }
+        {
+            let w = open_keyed(&keyed, Some(KEY), false).unwrap();
+            marker_write(&w);
+        }
+        // Substitute the plaintext segment for the sealed one, same segment number.
+        std::fs::copy(plain.join("0000000000.wal"), keyed.join("0000000000.wal")).unwrap();
+        let e = open_err(open_keyed(&keyed, Some(KEY), false));
+        assert_eq!(
+            e.downcast_ref::<slater_delta::DeltaSealRejected>(),
+            Some(&slater_delta::DeltaSealRejected::Unsealed {
+                subject: "WAL segment"
+            })
+        );
+        let _ = std::fs::remove_dir_all(&plain);
+        let _ = std::fs::remove_dir_all(&keyed);
+    }
+
+    /// A sealed WAL segment lifted into **another graph's** directory does not replay: the
+    /// delta key is bound to the graph name, so one master key does not make every graph's
+    /// delta interchangeable.
+    #[test]
+    fn a_sealed_segment_does_not_replay_into_another_graph() {
+        let a = tmp("hik146_graph_a");
+        let b = tmp("hik146_graph_b");
+        for d in [&a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let open = |dir: &Path, graph: &str| {
+            DeltaWriter::open(
+                dir,
+                graph,
+                GenId(uuid::Uuid::nil()),
+                100,
+                0,
+                Some(KEY),
+                resolve_ticker,
+            )
+        };
+        {
+            let w = open(&a, "a").unwrap();
+            marker_write(&w);
+        }
+        {
+            let w = open(&b, "b").unwrap();
+            marker_write(&w);
+        }
+        std::fs::copy(a.join("0000000000.wal"), b.join("0000000000.wal")).unwrap();
+        let e = open_err(open(&b, "b"));
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        for d in [&a, &b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A compaction of sealed resident L0 segments produces a sealed segment that still
+    /// reads — the merged file reuses the run's oldest slot, so it is re-sealed under that
+    /// slot's name with a fresh nonce.
+    #[test]
+    fn sealed_l0_segments_compact_and_still_read() {
+        let dir = tmp("hik146_compact");
+        let _ = std::fs::remove_dir_all(&dir);
+        let w = open_keyed(&dir, Some(KEY), false).unwrap();
+        marker_write(&w);
+        assert!(w.flush_to_l0().unwrap());
+        w.write(
+            upsert("Company", "ticker", Value::Str("B".into()), &[]),
+            node(20),
+        )
+        .unwrap();
+        assert!(w.flush_to_l0().unwrap());
+        assert!(w.compact_l0().unwrap(), "two same-tier levels merge");
+        assert!(files_containing(&dir, MARKER).is_empty());
+        drop(w);
+        let w = open_keyed(&dir, Some(KEY), false).unwrap();
+        assert_eq!(marker_read(&w), Some(Value::Str(MARKER.into())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1822,8 +2028,16 @@ mod tests {
     fn write_publishes_snapshot_and_bumps_epoch() {
         let dir = tmp("publish");
         let _ = std::fs::remove_dir_all(&dir);
-        let w =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(
+            &dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            None,
+            resolve_ticker,
+        )
+        .unwrap();
         assert_eq!(w.snapshot().node_delta_count(), 0);
         let e0 = w.epoch();
 
@@ -1850,8 +2064,16 @@ mod tests {
         let dir = tmp("reopen");
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let w = DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker)
-                .unwrap();
+            let w = DeltaWriter::open(
+                &dir,
+                "g",
+                GenId(uuid::Uuid::nil()),
+                100,
+                0,
+                None,
+                resolve_ticker,
+            )
+            .unwrap();
             w.write(
                 upsert(
                     "Company",
@@ -1874,8 +2096,16 @@ mod tests {
             .unwrap();
         }
         // A fresh writer over the same dir must rebuild the same memtable from the WAL.
-        let w2 =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(
+            &dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            None,
+            resolve_ticker,
+        )
+        .unwrap();
         let snap = w2.snapshot();
         assert_eq!(snap.node_delta_count(), 2);
         assert_eq!(
@@ -1897,8 +2127,16 @@ mod tests {
             node(10),
         )
         .unwrap();
-        let w3 =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        let w3 = DeltaWriter::open(
+            &dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            None,
+            resolve_ticker,
+        )
+        .unwrap();
         assert_eq!(
             w3.snapshot().node_patch(10).unwrap().patches.get("price"),
             Some(&Value::Int(99)),
@@ -1912,7 +2150,7 @@ mod tests {
         let dir = tmp("batch");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(77));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // An empty batch is a no-op that returns the current seq without publishing.
         let e0 = w.epoch();
@@ -1979,7 +2217,7 @@ mod tests {
 
         // The single group commit (one commit marker for seq 3) replays the whole batch.
         drop(w);
-        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(
             read(&w2),
             want,
@@ -1994,7 +2232,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let old_core = GenId(uuid::Uuid::from_u128(1));
         let new_core = GenId(uuid::Uuid::from_u128(2));
-        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, None, resolve_ticker).unwrap();
         w.write(
             upsert(
                 "Company",
@@ -2053,7 +2291,8 @@ mod tests {
 
         // A reopen after retire replays nothing (the only remaining segment is the
         // fresh empty one), so the writer comes up clean against the new core.
-        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, resolve_ticker).unwrap();
+        let reopened =
+            DeltaWriter::open(&dir, "g", new_core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(reopened.snapshot().node_delta_count(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2066,7 +2305,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let old_core = GenId(uuid::Uuid::from_u128(10));
         let new_core = GenId(uuid::Uuid::from_u128(11));
-        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, None, resolve_ticker).unwrap();
 
         // Pre-freeze write on core node A (dense 10).
         w.write(
@@ -2132,7 +2371,7 @@ mod tests {
 
         // Durable: a reopen against the new core replays the surviving segment and
         // recovers B at the same new dense id.
-        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, resolve_new).unwrap();
+        let reopened = DeltaWriter::open(&dir, "g", new_core, 100, 0, None, resolve_new).unwrap();
         assert_eq!(
             reopened
                 .snapshot()
@@ -2155,7 +2394,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let old_core = GenId(uuid::Uuid::from_u128(20));
         let new_core = GenId(uuid::Uuid::from_u128(21));
-        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, None, resolve_ticker).unwrap();
 
         // Pre-freeze: MERGE-create born node C (absent from the old core → synthetic id 100).
         w.write(
@@ -2234,7 +2473,7 @@ mod tests {
         let dir = tmp("freeze_crash");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(3));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         w.write(
             upsert(
                 "Company",
@@ -2248,7 +2487,7 @@ mod tests {
         let _frozen = w.freeze().unwrap(); // freeze, then "crash" (drop, no retire)
         drop(w);
 
-        let reopened = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let reopened = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(
             reopened
                 .snapshot()
@@ -2267,7 +2506,7 @@ mod tests {
         let dir = tmp("flush_reload");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(30));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // Empty flush is a no-op.
         assert!(!w.flush_to_l0().unwrap(), "nothing to flush");
@@ -2311,7 +2550,7 @@ mod tests {
         );
 
         // A reopen reloads the L0 segment before replaying the (now-empty) WAL tail.
-        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(w2.l0_len(), 1, "reopen reloads the L0 segment");
         assert_eq!(
             w2.delta_snapshot()
@@ -2332,7 +2571,7 @@ mod tests {
         let dir = tmp("flush_born_reuse");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(31));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // MERGE-create born node C (absent from the core → synthetic id 100).
         w.write(
@@ -2375,7 +2614,7 @@ mod tests {
 
         // A reopen reproduces the resolution: the WAL-tail re-MERGE re-resolves against
         // the reloaded L0 level, so the born id stays 100 (no duplicate on replay).
-        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         let snap2 = w2.delta_snapshot();
         assert_eq!(
             snap2.born_count(),
@@ -2395,7 +2634,7 @@ mod tests {
         let dir = tmp("compact");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(40));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // Nothing to compact yet.
         assert!(!w.compact_l0().unwrap());
@@ -2468,7 +2707,7 @@ mod tests {
         assert_eq!(reads(&w), before, "reads unchanged by compaction");
 
         // Reopen reloads the single compacted segment.
-        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(w2.l0_len(), 1);
         assert_eq!(reads(&w2), before, "compacted reads survive a reopen");
         std::fs::remove_dir_all(&dir).ok();
@@ -2551,7 +2790,7 @@ mod tests {
         let dir = tmp("compact_partial");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(41));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // Level 0 (oldest): one born node — synthetic id 100.
         w.write(
@@ -2638,7 +2877,7 @@ mod tests {
 
         // Durable + correctly ordered across a reopen (the merged segment reused the
         // run's oldest file number, so number order still matches born-id base order).
-        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w2 = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
         assert_eq!(
             reads(&w2),
             before,
@@ -2652,7 +2891,7 @@ mod tests {
         let dir = tmp("guard");
         let _ = std::fs::remove_dir_all(&dir);
         let core = GenId(uuid::Uuid::from_u128(41));
-        let w = DeltaWriter::open(&dir, "g", core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", core, 100, 0, None, resolve_ticker).unwrap();
 
         // Build two L0 segments so both flush and compact would have work to do.
         for v in ["A", "B"] {
@@ -2723,7 +2962,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let old_core = GenId(uuid::Uuid::from_u128(30));
         let new_core = GenId(uuid::Uuid::from_u128(31));
-        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(&dir, "g", old_core, 100, 0, None, resolve_ticker).unwrap();
 
         // A (dense 10) is written and flushed, so its patch lives **only** in the sealed L0
         // level — a reader that loses the L0 stack loses this write.
@@ -2842,8 +3081,16 @@ mod tests {
     fn a_batch_is_applied_whole_and_shares_the_published_memtable() {
         let dir = tmp("batch_cow");
         let _ = std::fs::remove_dir_all(&dir);
-        let w =
-            DeltaWriter::open(&dir, "g", GenId(uuid::Uuid::nil()), 100, 0, resolve_ticker).unwrap();
+        let w = DeltaWriter::open(
+            &dir,
+            "g",
+            GenId(uuid::Uuid::nil()),
+            100,
+            0,
+            None,
+            resolve_ticker,
+        )
+        .unwrap();
         w.write_batch(&[
             (
                 upsert(

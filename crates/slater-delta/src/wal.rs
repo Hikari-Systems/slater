@@ -1246,6 +1246,171 @@ mod tests {
         }
     }
 
+    /// A keyed sink for the HIK-146 tests.
+    fn key() -> DeltaCipher {
+        Arc::new(graph_format::crypto::delta_cipher(b"a master key", "g"))
+    }
+
+    /// HIK-146: a sealed segment round-trips, holds no plaintext, and keeps the crash-tail
+    /// contract — an un-fsynced tail is still dropped, not decrypted into the memtable.
+    #[test]
+    fn sealed_segment_round_trips_and_drops_its_uncommitted_tail() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_sealed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let committed = upsert(
+            1,
+            "L",
+            "MARKER-PLAINTEXT",
+            Value::Str("MARKER-VALUE".into()),
+            &[],
+        );
+        let uncommitted = upsert(2, "L", "k", Value::Int(2), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&committed), Seq(1))
+                .unwrap();
+            // Appended, never committed: no commit marker follows it. Dropping the sink
+            // flushes the buffered frame to disk, which is the crash shape — a record on
+            // disk that no commit fsync ever covered.
+            sink.append(&uncommitted).unwrap();
+        }
+        let bytes = fs::read(segment_path(&dir, 0)).unwrap();
+        assert_eq!(&bytes[..8], WAL_MAGIC_SEALED);
+        for needle in [b"MARKER-PLAINTEXT".as_slice(), b"MARKER-VALUE".as_slice()] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "plaintext user data in a sealed segment"
+            );
+        }
+        let replay = replay_dir(&dir, Some(&k)).unwrap();
+        assert_eq!(replay.records, vec![committed]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a **rollback rewinds the frame ordinal with the bytes.** The ordinal is a
+    /// frame's AEAD associated data, so a batch that rolls back and is followed by a
+    /// successful one must re-seal at the ordinal replay will present the frame at. Rewind
+    /// only the offset and the survivor seals at ordinal 2 while replay opens it at 0 —
+    /// replay then fails closed and the acked write is unreadable.
+    #[test]
+    fn a_rolled_back_sealed_batch_rewinds_the_frame_ordinal() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_sealroll_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let good0 = upsert(1, "L", "k", Value::Int(1), &[]);
+        let doomed = vec![
+            upsert(2, "L", "k", Value::Int(2), &[]),
+            upsert(3, "L", "k", Value::Int(3), &[]),
+        ];
+        let survivor = upsert(5, "L", "k", Value::Int(5), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&good0), Seq(1))
+                .unwrap();
+            FAIL_WRITE_AFTER.with(|c| c.set(Some(1)));
+            sink.append_batch(&doomed, Seq(3))
+                .expect_err("the injected fault must fail the batch mid-way");
+            sink.append_batch(std::slice::from_ref(&survivor), Seq(5))
+                .unwrap();
+        }
+        let replay = replay_dir(&dir, Some(&k)).unwrap();
+        assert_eq!(replay.records, vec![good0, survivor]);
+        assert_eq!(replay.last_seq, Seq(5));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a sealed frame cannot be **reordered or duplicated** inside its segment —
+    /// its ordinal is authenticated, so a copied frame fails closed rather than replaying
+    /// the write twice.
+    #[test]
+    fn a_sealed_frame_cannot_be_duplicated_within_its_segment() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_dup_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(&[upsert(1, "L", "k", Value::Int(1), &[])], Seq(1))
+                .unwrap();
+        }
+        // Duplicate the whole segment body after the magic: frame 0 reappears at ordinal 2.
+        let path = segment_path(&dir, 0);
+        let bytes = fs::read(&path).unwrap();
+        let mut doubled = bytes.clone();
+        doubled.extend_from_slice(&bytes[WAL_MAGIC.len()..]);
+        fs::write(&path, &doubled).unwrap();
+        let e = replay_dir(&dir, Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: the key policy is symmetric and typed at the WAL, exactly as at the L0
+    /// blob — a sealed segment with no key, and a plaintext segment under a key, are both
+    /// refused, and neither is reported as corruption.
+    #[test]
+    fn the_wal_key_policy_is_symmetric_and_typed() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_policy_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        let rec = upsert(1, "L", "k", Value::Int(1), &[]);
+        {
+            let mut sink = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            sink.append_batch(std::slice::from_ref(&rec), Seq(1))
+                .unwrap();
+            let mut plain = WalSink::create(&dir, 1, None).unwrap();
+            plain
+                .append_batch(std::slice::from_ref(&rec), Seq(1))
+                .unwrap();
+        }
+        let e = replay_segment(&segment_path(&dir, 0), None).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<DeltaSealRejected>(),
+            Some(&DeltaSealRejected::KeyRequired {
+                subject: WAL_SUBJECT
+            })
+        );
+        let e = replay_segment(&segment_path(&dir, 1), Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<DeltaSealRejected>(),
+            Some(&DeltaSealRejected::Unsealed {
+                subject: WAL_SUBJECT
+            })
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// HIK-146: a sealed frame is bound to its **segment**, so swapping two segments'
+    /// contents (the numbers decide replay order) fails closed instead of silently
+    /// reordering acked writes.
+    #[test]
+    fn a_sealed_frame_cannot_move_between_segments() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_xseg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let k = key();
+        {
+            let mut s0 = WalSink::create(&dir, 0, Some(&k)).unwrap();
+            s0.append_batch(&[upsert(1, "L", "k", Value::Int(1), &[])], Seq(1))
+                .unwrap();
+            let mut s1 = WalSink::create(&dir, 1, Some(&k)).unwrap();
+            s1.append_batch(&[upsert(2, "L", "k", Value::Int(2), &[])], Seq(2))
+                .unwrap();
+        }
+        assert!(replay_dir(&dir, Some(&k)).is_ok());
+        let b0 = fs::read(segment_path(&dir, 0)).unwrap();
+        let b1 = fs::read(segment_path(&dir, 1)).unwrap();
+        fs::write(segment_path(&dir, 0), &b1).unwrap();
+        fs::write(segment_path(&dir, 1), &b0).unwrap();
+        let e = replay_dir(&dir, Some(&k)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<graph_format::crypto::AeadRejected>(),
+            Some(&graph_format::crypto::AeadRejected::TagMismatch)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn delete_op_round_trips_through_a_segment() {
         let dir = std::env::temp_dir().join(format!("slater_wal_del_{}", std::process::id()));

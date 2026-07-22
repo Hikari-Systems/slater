@@ -99,6 +99,7 @@ fn build_fixture(n: usize) -> Fixture {
         gen.uuid(),
         gen.node_count(),
         gen.edge_count(),
+        None,
         // Fresh WAL → replay is empty; born-node resolution besides.
         |_: &WalOp| OpResolution::Node(None),
     )

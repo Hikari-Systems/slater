@@ -520,6 +520,7 @@ fn write_then_read_your_writes_and_survives_reopen() {
         gen.uuid(),
         gen.node_count(),
         gen.edge_count(),
+        None,
         |op| resolve_op(&gen, op),
     )
     .unwrap();
@@ -642,6 +643,7 @@ fn delete_then_read_suppresses_node_and_survives_reopen() {
         gen.uuid(),
         gen.node_count(),
         gen.edge_count(),
+        None,
         |op| resolve_op(&gen, op),
     )
     .unwrap();
@@ -752,6 +754,7 @@ fn merge_creates_delta_born_node_and_survives_reopen() {
         gen.uuid(),
         gen.node_count(),
         gen.edge_count(),
+        None,
         |op| resolve_op(&gen, op),
     )
     .unwrap();
@@ -850,6 +853,7 @@ fn delete_removes_a_delta_born_node_by_key() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             |op| resolve_op(&gen, op),
         )
         .unwrap(),
@@ -963,6 +967,7 @@ fn write_unwind_batches_node_writes_under_one_commit() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             |op| resolve_op(&gen, op),
         )
         .unwrap(),
@@ -1158,6 +1163,7 @@ fn moved_indexed_value_relocates_a_patched_core_node() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             |op| resolve_op(&gen, op),
         )
         .unwrap(),
@@ -1896,6 +1902,7 @@ fn edge_writes_survive_a_reopen() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             |op| resolve_op(&gen, op),
         )
         .unwrap(),
@@ -2045,6 +2052,7 @@ fn edge_properties_end_to_end() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             |op| resolve_op(&gen, op),
         )
         .unwrap(),
@@ -7681,6 +7689,7 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
         gen0.uuid(),
         gen0.node_count(),
         gen0.edge_count(),
+        None,
         |op| resolve_op(&gen0, op),
     )
     .unwrap();

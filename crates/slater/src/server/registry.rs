@@ -109,6 +109,11 @@ impl Graphs {
                 data_dir.join(p)
             }
         };
+        // The delta layer seals its own WAL and L0 segments under this key (HIK-146) —
+        // without it, every write sits in plaintext on disk until the next consolidation.
+        // Copied out of `self` up front: the loop below takes `&mut self` to install the
+        // writers, so a borrow of `self.master_key` cannot be held across it.
+        let master_key = self.master_key.clone();
         for (name, slot) in &self.graphs {
             let gen = slot.read().unwrap().clone();
             let dir = base.join(name);
@@ -120,6 +125,7 @@ impl Graphs {
                 gen.edge_count(),
                 cfg.off_heap_l0,
                 block_cache.clone(),
+                master_key.as_deref().map(Vec::as_slice),
                 |op| resolve_op(&gen, op),
             )
             .with_context(|| format!("open writable layer for graph '{name}'"))?;

@@ -7053,6 +7053,7 @@ fn rw_index_rebuilds_from_wal_replay() {
             gen.uuid(),
             gen.node_count(),
             gen.edge_count(),
+            None,
             basic_resolve,
         )
         .unwrap()
@@ -7172,6 +7173,7 @@ fn rw_index_ladder_survives_a_seal() {
         gen.uuid(),
         gen.node_count(),
         gen.edge_count(),
+        None,
         basic_resolve,
     )
     .unwrap();
