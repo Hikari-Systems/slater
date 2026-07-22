@@ -44,8 +44,19 @@ use graph_format::plane::{KeyColumn, PlaneCodecOpts};
 use graph_format::wire::{capacity_for, read_uvarint, read_value, write_uvarint, write_value};
 
 use crate::memtable::{DeltaEdge, DeltaSnapshot, EdgeDelta, LevelRead, Memtable, NodeDelta};
+use crate::seal::{bind, frame_blob, l0_name, unframe_blob, DeltaCipher};
 
 const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
+/// Magic prefix identifying a **sealed** off-heap `meta.bin` (HIK-146). The four block
+/// sections seal themselves — `BlockFileWriter` carries its own encrypted magic — but the
+/// meta is a plain blob and needs its own framing.
+const META_MAGIC_SEALED: &[u8; 8] = b"SLL0OFFE";
+/// How a refusal names an off-heap segment's meta to an operator.
+const META_SUBJECT: &str = "off-heap L0 segment meta";
+
+/// The four block-section file names, in a single place so the writer, the reader and the
+/// per-file subkey derivation can never disagree about them.
+const SECTION_FILES: [&str; 4] = ["node.blk", "adj_out.blk", "adj_in.blk", "edge.blk"];
 /// v2 adds the resident `tombstoned` dense-id column, so a merged live `count(*)` can
 /// enumerate this segment's suppressed rows without paging `node.blk`.
 // v5: the four presence key columns (node/adj_out/adj_in/edge) moved from dense uvarint arrays
@@ -294,6 +305,9 @@ fn decode_edge(mut r: &[u8]) -> Result<EdgeDelta> {
 pub struct OffheapSegmentWriter {
     tmp: PathBuf,
     dir: PathBuf,
+    /// The cipher for this segment's `meta.bin`, `None` on a plaintext deployment. Bound
+    /// to the segment's **final** directory name, not the staging `.tmp` one.
+    meta_cipher: Option<Arc<graph_format::crypto::FileCipher>>,
     /// A unique id for this written segment, persisted in the meta and used as the shared
     /// cache **scope** — fresh on every (re)write, so a compaction that reuses a segment
     /// directory can never collide with the pre-merge segment's stale cached blocks.
@@ -345,27 +359,34 @@ impl OffheapSegmentWriter {
         scope: u128,
         target_block_bytes: usize,
         zstd_level: i32,
+        cipher: Option<&DeltaCipher>,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let tmp = dir.with_extension("tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).with_context(|| format!("create L0 tmp dir {tmp:?}"))?;
+        // Every subkey is derived from the segment's **final** directory name: the sections
+        // are written into `<dir>.tmp/` and renamed into `<dir>/`, and the reader derives
+        // from what it opens.
         let mk = |name: &str| -> Result<BlockFileWriter> {
             let p = tmp.join(name);
-            BlockFileWriter::create(&p, target_block_bytes, zstd_level)
+            let fc = bind(cipher, &l0_name(&dir, Some(name))?);
+            BlockFileWriter::create_with_cipher(&p, target_block_bytes, zstd_level, fc)
                 .with_context(|| format!("create block file {p:?}"))
         };
+        let meta_cipher = bind(cipher, &l0_name(&dir, Some("meta.bin"))?);
         Ok(Self {
-            node: mk("node.blk")?,
+            node: mk(SECTION_FILES[0])?,
             node_keys: Vec::new(),
-            adj_out: mk("adj_out.blk")?,
+            adj_out: mk(SECTION_FILES[1])?,
             adj_out_keys: Vec::new(),
-            adj_in: mk("adj_in.blk")?,
+            adj_in: mk(SECTION_FILES[2])?,
             adj_in_keys: Vec::new(),
-            edge: mk("edge.blk")?,
+            edge: mk(SECTION_FILES[3])?,
             edge_keys: Vec::new(),
             tmp,
             dir,
+            meta_cipher,
             scope,
             synthetic_base: 0,
             edge_synthetic_base: 0,
@@ -493,7 +514,7 @@ impl OffheapSegmentWriter {
     }
 
     pub fn finish(self) -> Result<()> {
-        let meta = self.meta_bytes();
+        let meta = self.meta_bytes()?;
         self.node.finish().context("finish node.blk")?;
         self.adj_out.finish().context("finish adj_out.blk")?;
         self.adj_in.finish().context("finish adj_in.blk")?;
@@ -510,7 +531,7 @@ impl OffheapSegmentWriter {
         Ok(())
     }
 
-    fn meta_bytes(&self) -> Vec<u8> {
+    fn meta_bytes(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         write_uvarint(&mut body, OFFHEAP_VERSION);
         body.extend_from_slice(&self.scope.to_le_bytes());
@@ -588,12 +609,12 @@ impl OffheapSegmentWriter {
             w_str(&mut body, reltype);
         }
 
-        let crc = crc32c::crc32c(&body);
-        let mut out = Vec::with_capacity(body.len() + 12);
-        out.extend_from_slice(META_MAGIC);
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&body);
-        out
+        frame_blob(
+            META_MAGIC,
+            META_MAGIC_SEALED,
+            self.meta_cipher.as_deref(),
+            &body,
+        )
     }
 }
 
@@ -606,8 +627,9 @@ pub fn write_segment(
     scope: u128,
     target_block_bytes: usize,
     zstd_level: i32,
+    cipher: Option<&DeltaCipher>,
 ) -> Result<()> {
-    let mut w = OffheapSegmentWriter::create(dir, scope, target_block_bytes, zstd_level)?;
+    let mut w = OffheapSegmentWriter::create(dir, scope, target_block_bytes, zstd_level, cipher)?;
     for (dense, label, key, value, delta) in &data.nodes {
         w.push_node(*dense, label, key, value, delta)?;
     }
@@ -742,19 +764,23 @@ impl L0Reader {
     /// write), so it is unique per live segment and stable across a reopen — even when a
     /// compaction reuses a segment directory. A retired segment's scope is simply never
     /// queried again, so its blocks age out of the LRU.
-    pub fn open(dir: impl AsRef<Path>, cache: Arc<BlockCache>) -> Result<Self> {
+    pub fn open(
+        dir: impl AsRef<Path>,
+        cache: Arc<BlockCache>,
+        cipher: Option<&DeltaCipher>,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let meta = std::fs::read(dir.join("meta.bin"))
+        let raw = std::fs::read(dir.join("meta.bin"))
             .with_context(|| format!("read L0 meta {dir:?}/meta.bin"))?;
-        if meta.len() < 12 || &meta[..8] != META_MAGIC {
-            bail!("L0 segment {dir:?} has bad meta magic");
-        }
-        let crc = u32::from_le_bytes([meta[8], meta[9], meta[10], meta[11]]);
-        let body = &meta[12..];
-        if crc32c::crc32c(body) != crc {
-            bail!("L0 segment {dir:?} meta failed checksum");
-        }
-        let mut r = body;
+        let meta = unframe_blob(
+            META_MAGIC,
+            META_MAGIC_SEALED,
+            bind(cipher, &l0_name(&dir, Some("meta.bin"))?).as_deref(),
+            &raw,
+            META_SUBJECT,
+        )
+        .with_context(|| format!("open L0 meta {dir:?}/meta.bin"))?;
+        let mut r = &*meta;
         let version = read_uvarint(&mut r)?;
         if version != OFFHEAP_VERSION {
             bail!("unsupported off-heap L0 version {version} (expected {OFFHEAP_VERSION})");
@@ -862,11 +888,18 @@ impl L0Reader {
             bail!("L0 segment {dir:?} meta has {} trailing bytes", r.len());
         }
 
+        let open_section = |name: &str| -> Result<BlockFileReader> {
+            BlockFileReader::open_with_cipher(
+                dir.join(name),
+                bind(cipher, &l0_name(&dir, Some(name))?),
+            )
+            .with_context(|| format!("open L0 section {dir:?}/{name}"))
+        };
         Ok(Self {
-            node_rdr: BlockFileReader::open(dir.join("node.blk"))?,
-            adj_out_rdr: BlockFileReader::open(dir.join("adj_out.blk"))?,
-            adj_in_rdr: BlockFileReader::open(dir.join("adj_in.blk"))?,
-            edge_rdr: BlockFileReader::open(dir.join("edge.blk"))?,
+            node_rdr: open_section(SECTION_FILES[0])?,
+            adj_out_rdr: open_section(SECTION_FILES[1])?,
+            adj_in_rdr: open_section(SECTION_FILES[2])?,
+            edge_rdr: open_section(SECTION_FILES[3])?,
             dir,
             scope,
             cache,
@@ -1169,6 +1202,7 @@ pub fn merge_run(
     scope: u128,
     target_block_bytes: usize,
     zstd_level: i32,
+    cipher: Option<&DeltaCipher>,
 ) -> Result<()> {
     assert!(!run.is_empty(), "merge_run needs at least one segment");
     let oldest = run.last().unwrap();
@@ -1186,7 +1220,8 @@ pub fn merge_run(
         .collect();
     let snap = DeltaSnapshot::with_levels(empty, levels);
 
-    let mut w = OffheapSegmentWriter::create(out_dir, scope, target_block_bytes, zstd_level)?;
+    let mut w =
+        OffheapSegmentWriter::create(out_dir, scope, target_block_bytes, zstd_level, cipher)?;
 
     // Node section: sorted union of dense ids, folded newest-wins (a tombstoned entry is
     // kept — it must keep suppressing the core row).
@@ -1445,9 +1480,9 @@ mod tests {
     fn roundtrip(m: &Memtable, tag: &str) -> (PathBuf, L0Reader) {
         let dir = tmp(tag);
         let _ = std::fs::remove_dir_all(&dir);
-        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3).unwrap();
+        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3, None).unwrap();
         let cache = Arc::new(BlockCache::new(1 << 20));
-        let reader = L0Reader::open(&dir, cache).unwrap();
+        let reader = L0Reader::open(&dir, cache, None).unwrap();
         (dir, reader)
     }
 
@@ -1591,13 +1626,13 @@ mod tests {
         let m = populate();
         let dir = tmp("corrupt");
         let _ = std::fs::remove_dir_all(&dir);
-        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3).unwrap();
+        write_segment(&m.to_segment_data(), &dir, 0x1234, 256, 3, None).unwrap();
         let mut meta = std::fs::read(dir.join("meta.bin")).unwrap();
         let last = meta.len() - 1;
         meta[last] ^= 0xff;
         std::fs::write(dir.join("meta.bin"), &meta).unwrap();
         let cache = Arc::new(BlockCache::new(1 << 20));
-        assert!(L0Reader::open(&dir, cache).is_err());
+        assert!(L0Reader::open(&dir, cache, None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1660,10 +1695,26 @@ mod tests {
         upsert(&mut newer, "Yan", &[("age", Value::Int(20))], None); // born 101
 
         // Write each off-heap (tiny blocks → multi-block sections), open as readers.
-        write_segment(&older.to_segment_data(), base.join("old.l0"), 1, 64, 3).unwrap();
-        write_segment(&newer.to_segment_data(), base.join("new.l0"), 2, 64, 3).unwrap();
-        let r_old = Arc::new(L0Reader::open(base.join("old.l0"), cache.clone()).unwrap());
-        let r_new = Arc::new(L0Reader::open(base.join("new.l0"), cache.clone()).unwrap());
+        write_segment(
+            &older.to_segment_data(),
+            base.join("old.l0"),
+            1,
+            64,
+            3,
+            None,
+        )
+        .unwrap();
+        write_segment(
+            &newer.to_segment_data(),
+            base.join("new.l0"),
+            2,
+            64,
+            3,
+            None,
+        )
+        .unwrap();
+        let r_old = Arc::new(L0Reader::open(base.join("old.l0"), cache.clone(), None).unwrap());
+        let r_new = Arc::new(L0Reader::open(base.join("new.l0"), cache.clone(), None).unwrap());
         let run = vec![r_new.clone(), r_old.clone()]; // newest-first
 
         let mk_snap = |levels: Vec<Arc<dyn LevelRead>>, oldest: &Arc<L0Reader>| {
@@ -1682,8 +1733,8 @@ mod tests {
 
         // Merge, reopen, wrap in a snapshot the same way.
         let merged_dir = base.join("merged.l0");
-        merge_run(&run, &merged_dir, 99, 64, 3).unwrap();
-        let merged = Arc::new(L0Reader::open(&merged_dir, cache.clone()).unwrap());
+        merge_run(&run, &merged_dir, 99, 64, 3, None).unwrap();
+        let merged = Arc::new(L0Reader::open(&merged_dir, cache.clone(), None).unwrap());
         let folded = mk_snap(vec![merged.clone() as Arc<dyn LevelRead>], &merged);
 
         assert_eq!(reference.synthetic_base(), folded.synthetic_base());

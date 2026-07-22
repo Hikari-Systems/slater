@@ -17,6 +17,8 @@ slater-scalar.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 crc32c.workspace = true
+# Typed at-rest-seal refusals (HIK-146): callers branch on the error *type*, never its text.
+thiserror.workspace = true
 # Only for the WAL rollback guard's `Drop`, which cannot propagate an error: a failed
 # rollback truncate must not be silent (HIK-130).
 tracing.workspace = true
