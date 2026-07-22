@@ -12589,4 +12589,20 @@ fn result_byte_estimate_covers_string_and_container_capacity() {
         "estimate {est} under-counts the result's allocated footprint; it must be \
          at least {floor} bytes (summed String/Vec capacities + owning struct sizes)"
     );
+
+    // The `0` heap arms (Node/Rel/Point/temporals) rest entirely on the enum slot
+    // covering their inline payload. `Val::Rel` is the widest of them — four fields,
+    // one u64 each less the u32 reltype — so if the slot ever shrinks below what a
+    // Rel actually occupies, those arms silently under-charge. Pin the floor here
+    // rather than in a comment. See the CONTRACT note on `val_heap_bytes`.
+    assert!(
+        VAL >= 3 * size_of::<u64>() + size_of::<u32>(),
+        "size_of::<Val>() = {VAL} no longer covers Val::Rel's inline payload; the \
+         zero-heap arms in val_heap_bytes must be revisited"
+    );
+    assert_eq!(
+        val_bytes(&Val::Node(7)),
+        VAL,
+        "a scalar variant must charge exactly its inline slot"
+    );
 }

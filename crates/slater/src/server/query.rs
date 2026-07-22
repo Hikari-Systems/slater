@@ -312,6 +312,15 @@ pub(crate) fn val_bytes(v: &Val) -> usize {
 ///
 /// `Node`/`Rel`/`Point` and the temporals own nothing on the heap — they are
 /// plain scalars — so the enum slot already covers them.
+///
+/// CONTRACT: every `0` arm above asserts the variant stores its payload **inline**.
+/// The exhaustive match forces a decision when a variant is *added*, but not when an
+/// existing one gains an indirection — boxing `Path`, or making `Str` an `Arc<str>`,
+/// would leave its arm silently under-charging and re-arm exactly the bug this
+/// function exists to fix. Changing a variant's representation means revisiting its
+/// arm. `result_byte_estimate_covers_string_and_container_capacity` pins
+/// `size_of::<Val>()` as a floor so a shrinking enum slot cannot quietly erode the
+/// charge either.
 fn val_heap_bytes(v: &Val) -> usize {
     const SLOT: usize = std::mem::size_of::<Val>();
     match v {

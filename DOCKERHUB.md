@@ -288,9 +288,9 @@ So these are equivalent ways to set the block-cache budget:
 | `aclPath` | `aclPath` | `/config/acl.json` | Path to the ACL file. |
 | `server.bind` | `server__bind` | `0.0.0.0` | Bind address. |
 | `server.port` | `server__port` | `7687` | Bolt port. |
-| `cache.blockCacheBytes` | `cache__blockCacheBytes` | `268435456` (256 MiB) | Decompressed graph-block LRU. |
-| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | `134217728` (128 MiB) | Resident PQ codes + Vamana block LRU. |
-| `cache.resultCacheBytes` | `cache__resultCacheBytes` | `33554432` (32 MiB) | Query-result LRU. |
+| `cache.blockCacheBytes` | `cache__blockCacheBytes` | `67108864` (64 MiB) | Decompressed graph-block LRU. |
+| `cache.vectorCacheBytes` | `cache__vectorCacheBytes` | `67108864` (64 MiB) | Resident PQ codes + Vamana block LRU. A *cap*, not a reservation — empty without vector indexes. |
+| `cache.resultCacheBytes` | `cache__resultCacheBytes` | `16777216` (16 MiB) | Query-result LRU. |
 | `cache.cacheTtlMs` | `cache__cacheTtlMs` | `1800000` (30 min) | **Idle TTL**: a cached entry untouched for this long is reclaimed by a background sweep, freeing memory below the budgets. A **negative** value (or `0`) disables the sweep. |
 | `query.maxRows` | `query__maxRows` | `100000` | Max rows per result. |
 | `query.timeoutMs` | `query__timeoutMs` | `30000` | Per-query timeout (`0` = none). |
@@ -526,7 +526,7 @@ services:
       - slater-data:/data:ro
       - ./acl.json:/config/acl.json:ro
     environment:
-      # cache budgets default to 256/128/32 MiB — override any cache__* here as needed
+      # cache budgets default to 64/64/16 MiB (~144 MiB envelope) — override any cache__* here as needed
       cache__cacheTtlMs: "1800000"
       reloadStrategy: "exit"
     healthcheck:
