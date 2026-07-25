@@ -129,8 +129,22 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
 
+      # PINNED, not floating. The nightly published 2026-07-24 (rustc 89c61a754)
+      # introduced a codegen ICE that aborts any *release* build of tokio —
+      # `rustc_codegen_ssa/src/mir/operand.rs:291: not immediate: OperandRef(Uninit
+      # @ UnsafeCell<MaybeUninit<runtime::task::Notified<..>>>)`. It is not
+      # sanitizer- or fuzz-specific: a plain `cargo build --release` reproduces it,
+      # and it broke every leg of fuzz-nightly.yml on 2026-07-24 and -07-25 against
+      # an unchanged tree. Because every publishing job below is `needs: [.., fuzz]`,
+      # a floating nightly means an upstream compiler regression can block a release.
+      # nightly-2026-07-23 (rustc 6f72b5dd5) is the newest build verified good under
+      # the exact RUSTFLAGS cargo-fuzz sets. Re-float once upstream lands a fix:
+      # `rustup toolchain install nightly && cargo +nightly build --release` in a
+      # crate depending on tokio is enough to check.
       - name: Install the nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
 
       # One shared build cache across all matrix legs (and shared with
       # fuzz-nightly.yml). Every target links the SAME instrumented dependency graph —
