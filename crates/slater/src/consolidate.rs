@@ -56,12 +56,15 @@ use crate::read_view::ReadView;
 /// must wrap the [`ReadView`] being dumped (a `MergedView` to capture the delta, or
 /// a bare `Generation` for a plain export).
 ///
-/// **Refuses a graph that carries vector indexes.** The `MERGE` dialect has no
-/// spelling for an embedding — `merge_build` rejects a vector literal outright — so a
-/// text dump of a vector-carrying graph is lossy *by construction*: every embedding
-/// would render as the literal `null` and the rebuilt graph would have none. That used
-/// to happen silently. It is a hard error now; consolidation itself takes the binary
-/// path ([`serialise_binary_dump`]), which does carry vectors.
+/// **Refuses a graph that carries vector indexes.** The `MERGE` *dialect* can now spell
+/// an embedding (`SET n.embedding = vecf32([…])`, which `merge_build` routes to the
+/// vector store), but this serialiser cannot produce one: embeddings are not in
+/// `node_props` — they live in the vector store, which nothing here reads — and
+/// [`emit_index_ddl`] emits only range indexes. So a text dump of a vector-carrying
+/// graph would still be lossy: every embedding would render as the literal `null` and
+/// the rebuilt graph would have none. That used to happen silently. It is a hard error
+/// now; consolidation itself takes the binary path ([`serialise_binary_dump`]), which
+/// does carry vectors.
 pub fn serialise_merge_dump<V: ReadView>(
     engine: &Engine<'_, V>,
     view: &V,
@@ -74,9 +77,9 @@ pub fn serialise_merge_dump<V: ReadView>(
             .map(|d| format!("(:{} {{{}}})", d.label, d.property))
             .collect();
         bail!(
-            "cannot write a MERGE dump for a graph with vector indexes ({}): the MERGE \
-             dialect cannot carry embeddings, so the dump would silently drop them. Use the \
-             binary consolidation dump (`serialise_binary_dump`), which carries vectors.",
+            "cannot write a MERGE dump for a graph with vector indexes ({}): this serialiser \
+             does not read the vector store, so the dump would silently drop every embedding. \
+             Use the binary consolidation dump (`serialise_binary_dump`), which carries vectors.",
             names.join(", ")
         );
     }
@@ -731,8 +734,10 @@ fn literal(v: &Value) -> String {
             let inner: Vec<String> = items.iter().map(literal).collect();
             format!("[{}]", inner.join(", "))
         }
-        // A `vecf32(...)` prop cannot ride a MERGE dump (see the vectors non-goal);
-        // node_props already routes embeddings out, so this is a belt-and-braces guard.
+        // Unreachable in practice: `serialise_merge_dump` refuses a vector-carrying
+        // graph up front, and node_props routes embeddings out anyway. (The dialect
+        // does have a spelling — `vecf32([…])` — but emitting one would be wrong here
+        // until this serialiser reads the vector store and emits the index DDL.)
         Value::Vector(_) => "null".to_string(),
     }
 }
@@ -927,10 +932,12 @@ mod tests {
 
     #[test]
     fn merge_dump_refuses_a_graph_with_vector_indexes() {
-        // The `MERGE` dialect has no spelling for an embedding (`merge_build` rejects a
-        // vector literal), so a text dump of a vector-carrying graph would silently render
-        // every embedding as `null` and rebuild the graph without them. Refuse instead.
-        // The binary consolidation dump is the path that actually carries vectors.
+        // The `MERGE` dialect *can* spell an embedding (`SET n.embedding = vecf32([…])`,
+        // which the builder routes to the vector store), but this serialiser cannot
+        // produce one: embeddings are not in `node_props`, and it emits no vector-index
+        // DDL. A text dump of a vector-carrying graph would therefore still render every
+        // embedding as `null` and rebuild the graph without them. Refuse instead — the
+        // binary consolidation dump is the path that actually carries vectors.
         let (root, graph, _) = testgen::write_basic("consolidate_refuse_vectors");
         let gen = Generation::open(&root, &graph).unwrap();
         let cache = BlockCache::new(1 << 20);

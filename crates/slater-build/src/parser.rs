@@ -347,6 +347,7 @@ fn is_expr_rule(r: Rule) -> bool {
             | Rule::case_expr
             | Rule::func_call
             | Rule::value
+            | Rule::vecf32
             | Rule::prop_ref
     )
 }
@@ -384,6 +385,9 @@ fn parse_set_expr(pair: Pair<Rule>) -> Result<SetExpr> {
             Ok(SetExpr::Func { name, args })
         }
         Rule::value => Ok(SetExpr::Lit(parse_value(pair)?)),
+        // A vector literal, hoisted above `func_call` in the grammar so it is not
+        // mistaken for a call to a function named `vecf32`.
+        Rule::vecf32 => Ok(SetExpr::Lit(parse_vecf32(pair)?)),
         Rule::prop_ref => {
             // prop_ref = var "." key ; keep the key, drop the variable.
             let key = pair
@@ -760,21 +764,7 @@ fn parse_value(pair: Pair<Rule>) -> Result<Value> {
         .next()
         .ok_or_else(|| anyhow!("empty value"))?;
     match inner.as_rule() {
-        Rule::vecf32 => {
-            let mut xs = Vec::new();
-            for nl in inner.into_inner() {
-                if nl.as_rule() == Rule::num_list {
-                    for n in nl.into_inner() {
-                        xs.push(
-                            n.as_str()
-                                .parse::<f32>()
-                                .context("parse vecf32 component")?,
-                        );
-                    }
-                }
-            }
-            Ok(Value::Vector(xs))
-        }
+        Rule::vecf32 => parse_vecf32(inner),
         Rule::list => {
             let mut items = Vec::new();
             for v in inner.into_inner() {
@@ -797,6 +787,25 @@ fn parse_value(pair: Pair<Rule>) -> Result<Value> {
         }
         other => bail!("unexpected value rule {other:?}"),
     }
+}
+
+/// Parse a `vecf32` pair (`vecf32([1.0, 2.0])`) into a [`Value::Vector`]. Reached
+/// both from a property map (via [`parse_value`]) and from a SET right-hand side
+/// (where `vecf32` is a `primary` in its own right).
+fn parse_vecf32(pair: Pair<Rule>) -> Result<Value> {
+    let mut xs = Vec::new();
+    for nl in pair.into_inner() {
+        if nl.as_rule() == Rule::num_list {
+            for n in nl.into_inner() {
+                xs.push(
+                    n.as_str()
+                        .parse::<f32>()
+                        .context("parse vecf32 component")?,
+                );
+            }
+        }
+    }
+    Ok(Value::Vector(xs))
 }
 
 /// Decode a quoted `string` pair (single- or double-quoted) into its text,
@@ -1267,6 +1276,87 @@ mod tests {
             "MERGE (a:X {id: 'a'})-[r:T]->(b:Y {id: 'b'}) SET r.w = toUpper('a')"
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_vecf32_set_rhs_as_a_literal() {
+        // The vector literal is a *value*, not a call to a function named `vecf32`
+        // — the same `Value::Vector` a CREATE property map would carry.
+        let Statement::NodeOverwrite(m) = parse_statement(
+            "MERGE (n:Chunk {chunkId: 'c1'}) SET n.title = 'T', n.embedding = vecf32([0.1, -0.2, 3.0e-1])",
+        )
+        .unwrap() else {
+            panic!("expected node overwrite");
+        };
+        assert_eq!(
+            m.set_props,
+            vec![
+                ("title".to_string(), SetExpr::Lit(Value::Str("T".into()))),
+                (
+                    "embedding".to_string(),
+                    SetExpr::Lit(Value::Vector(vec![0.1, -0.2, 0.3]))
+                ),
+            ]
+        );
+
+        // Case-insensitive spelling, and an empty vector.
+        let Statement::NodeOverwrite(m) =
+            parse_statement("MERGE (n:X {id: 'a'}) SET n.e = VECF32([])").unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        assert_eq!(
+            m.set_props,
+            vec![("e".to_string(), SetExpr::Lit(Value::Vector(vec![])))]
+        );
+
+        // A vector literal is still a literal inside a larger expression, so it can
+        // reach the fold through CASE.
+        let Statement::NodeOverwrite(m) = parse_statement(
+            "MERGE (n:X {id: 'a'}) SET n.e = CASE WHEN n.k = 1 THEN vecf32([1.0]) ELSE vecf32([2.0]) END",
+        )
+        .unwrap() else {
+            panic!("expected node overwrite");
+        };
+        assert_eq!(
+            m.set_props,
+            vec![(
+                "e".to_string(),
+                SetExpr::Case {
+                    subject: None,
+                    whens: vec![(
+                        SetExpr::Cmp {
+                            op: slater_scalar::CmpOp::Eq,
+                            l: Box::new(SetExpr::Prop("k".to_string())),
+                            r: Box::new(SetExpr::Lit(Value::Int(1))),
+                        },
+                        SetExpr::Lit(Value::Vector(vec![1.0])),
+                    )],
+                    els: Some(Box::new(SetExpr::Lit(Value::Vector(vec![2.0])))),
+                }
+            )]
+        );
+
+        // Malformed: a non-literal argument is not a vector literal, and no scalar
+        // function named `vecf32` exists — so it parses as a call and the build-time
+        // validator rejects it with the literal-form hint.
+        let Statement::NodeOverwrite(m) =
+            parse_statement("MERGE (n:X {id: 'a'}) SET n.e = vecf32(n.raw)").unwrap()
+        else {
+            panic!("expected node overwrite");
+        };
+        let err = crate::set_eval::validate_set_expr(&m.set_props[0].1).unwrap_err();
+        assert!(
+            err.to_string().contains("literal vector"),
+            "unexpected error: {err}"
+        );
+
+        // An edge SET takes literals, so a vector parses there — it is rejected later,
+        // by the merge builder, since only nodes have a vector store.
+        assert!(parse_statement(
+            "MERGE (a:X {id: 'a'})-[r:T]->(b:Y {id: 'b'}) SET r.e = vecf32([1.0])"
+        )
+        .is_ok());
     }
 
     #[test]

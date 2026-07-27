@@ -356,3 +356,124 @@ fn merge_build_is_deterministic() {
     assert_eq!(a, b, "two merge builds produced different store files");
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// A merge dump that attaches embeddings through SET — the shape an embedding pass
+// emits over a business-key dump, where every property (including the vector) rides
+// a SET rather than a CREATE property map. `Doc.embedding` is a declared vector
+// index, so it must land in the vector store; `Doc.sig` is not declared and must
+// stay an ordinary property; and `Note.embedding` shares the property name but not
+// the indexed label, so it stays a property too.
+const VEC_SET_DUMP: &str = r#"CREATE INDEX FOR (n:Doc) ON (n.docId);
+CALL db.idx.vector.createNodeIndex('Doc', 'embedding', 3, 'cosine');
+MERGE (n:Doc {docId: 'd1'}) SET n.title = 'First', n.embedding = vecf32([1.0, 0.0, 0.0]);
+MERGE (n:Doc {docId: 'd2'}) SET n.title = 'Second', n.embedding = vecf32([0.0, 0.5, 0.5]);
+MERGE (n:Doc {docId: 'd2'}) SET n.embedding = vecf32([0.0, 1.0, 0.0]);
+MERGE (n:Doc {docId: 'd3'}) SET n.title = 'Third', n.sig = vecf32([7.0, 8.0]);
+MERGE (n:Note {noteId: 'n1'}) SET n.embedding = vecf32([5.0, 5.0, 5.0]);
+"#;
+
+#[test]
+fn set_vecf32_routes_to_the_vector_store_in_a_merge_dump() {
+    use graph_format::manifest::{AnnMode, Metric};
+    use graph_format::vectors::VectorStoreReader;
+
+    let work = unique_dir("vecset");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, VEC_SET_DUMP).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "vecset",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+        ])
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("vecset");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+    let m = Manifest::read_from_dir(&gen_dir).unwrap();
+    m.verify_content_hash().unwrap();
+    assert_eq!(m.node_count, 4, "d1, d2 (collapsed), d3, n1");
+
+    // One brute-force cosine index holding d1 and d2 — and only those: `Doc.sig` is
+    // not a declared index, and `Note.embedding` is the right property on the wrong
+    // label.
+    assert_eq!(m.vector_indexes.len(), 1);
+    let vi = &m.vector_indexes[0];
+    assert_eq!(
+        (vi.label.as_str(), vi.property.as_str()),
+        ("Doc", "embedding")
+    );
+    assert_eq!(vi.dim, 3);
+    assert_eq!(vi.metric, Metric::Cosine);
+    assert_eq!(vi.mode, AnnMode::BruteForce);
+    assert_eq!(vi.count, 2, "only the indexed (label, property) is routed");
+
+    // Recover each node's id by its business key, and read back what it stored.
+    let np = PropsReader::open(gen_dir.join("node_props.blk")).unwrap();
+    let mut id_of: HashMap<String, u64> = HashMap::new();
+    for id in 0..m.node_count {
+        let props = np.props(id).unwrap();
+        for key in ["docId", "noteId"] {
+            if let Some(Value::Str(s)) = prop(&props, &m.property_keys, key) {
+                id_of.insert(s.clone(), id);
+            }
+        }
+    }
+    assert_eq!(id_of.len(), 4);
+
+    // A routed embedding is OUT of the column store on the nodes that carry one …
+    for doc in ["d1", "d2"] {
+        let props = np.props(id_of[doc]).unwrap();
+        assert!(
+            prop(&props, &m.property_keys, "embedding").is_none(),
+            "{doc} kept an inline copy of a routed embedding"
+        );
+    }
+    // … while an undeclared vector property is stored inline, unchanged.
+    assert_eq!(
+        prop(&np.props(id_of["d3"]).unwrap(), &m.property_keys, "sig"),
+        Some(&Value::Vector(vec![7.0, 8.0])),
+        "an unindexed vector property stays in the column store"
+    );
+    assert_eq!(
+        prop(
+            &np.props(id_of["n1"]).unwrap(),
+            &m.property_keys,
+            "embedding"
+        ),
+        Some(&Value::Vector(vec![5.0, 5.0, 5.0])),
+        "the index is (label, property) — an unindexed label keeps its vector inline"
+    );
+
+    // The vector store holds one record per routed node, and d2's second MERGE won:
+    // last-writer-wins applies to a vector exactly as it does to a scalar.
+    let vs = VectorStoreReader::open(gen_dir.join("vectors.f32.blk")).unwrap();
+    let group = vs.group(vi.first_record, vi.count).unwrap();
+    let mut got: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
+    for rec in &group {
+        got.insert(rec.node_id, rec.vector.clone());
+    }
+    assert_eq!(
+        got,
+        BTreeMap::from([
+            (id_of["d1"], vec![1.0, 0.0, 0.0]),
+            (id_of["d2"], vec![0.0, 1.0, 0.0]),
+        ])
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

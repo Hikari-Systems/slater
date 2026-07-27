@@ -99,7 +99,13 @@ mul_expr   = { primary ~ (mul_op ~ primary)* }
 // before `prop_ref` so a numeric literal like `2.5` is not mis-parsed as `var.key`
 // (both `var` and `key` admit leading digits); `func_call` (needs a trailing `(`)
 // before the bare `prop_ref`.
-primary = { case_expr | paren | func_call | value | prop_ref }
+//
+// `vecf32` is lifted out of `value` and placed *before* `func_call`: it is spelled
+// like a call, so `func_call` would otherwise swallow `vecf32([…])` and the fold
+// would reject it as a non-scalar function. Hoisting it keeps a vector literal a
+// literal wherever it appears — `SET n.embedding = vecf32([…])` means exactly what
+// `{embedding: vecf32([…])}` means in a CREATE prop map.
+primary = { case_expr | paren | vecf32 | func_call | value | prop_ref }
 paren   = { "(" ~ set_expr ~ ")" }
 
 cmp_op = @{ "<>" | "<=" | ">=" | "=" | "<" | ">" }

@@ -49,8 +49,15 @@ business-key property.
    MERGE (a:Person {id: '9e…'})-[r:SOURCED_FROM]->(b:Source {sourceId: '0001…'});
    ```
 
-Value literals: single-quoted strings, ints/floats/bools/null, and lists (`['ORPHAN']`).
-Vector (`vecf32`) values are not supported in merge dumps.
+Value literals: single-quoted strings, ints/floats/bools/null, lists (`['ORPHAN']`),
+and vectors (`vecf32([0.1, -0.2, …])`).
+
+A vector may appear only as a **node** `SET` value — never as a business key (an
+identity is sorted and compared) and never in an edge `SET` (only nodes have a vector
+store). When the node's label and the property name match a declared vector index
+(`CALL db.idx.vector.createNodeIndex(…)` in the same dump, or `--vector-index-json`),
+the vector is routed to the vector store; otherwise it is stored as an ordinary
+property. Last-writer-wins applies to a vector as it does to a scalar.
 
 ## Semantics
 

@@ -266,12 +266,14 @@ properties; (5) edges — `MATCH (a…),(b…) MERGE (a)-[:TYPE {props}]->(b);` 
 endpoints' business keys (so the edge query returns endpoint labels + key props);
 (6) a Cypher-literal escaper for string/number/bool/null/list values.
 
-**Known limitation — vectors in the `MERGE` dump.** `vecf32` properties cannot be
-carried in a `MERGE` dump: the build path rejects vector values outright
-(`merge_build::reject_vector`). `serialise_merge_dump` therefore **refuses** a graph
-that declares vector indexes rather than emitting each embedding as a `null` literal,
-which is what it used to do — silently rebuilding the graph without its vectors. A text
-dump of a vector-carrying graph must use the `--pk`/`CREATE`-style offline path.
+**Known limitation — vectors in the `MERGE` dump.** The *builder* now accepts them:
+`MERGE (n:L {k: v}) SET n.embedding = vecf32([…])` routes to the vector store when
+`(label, property)` matches a declared index. The *serialiser* has not caught up —
+`serialise_merge_dump` neither reads the vector store nor emits vector-index DDL, so it
+still **refuses** a graph that declares vector indexes rather than emitting each
+embedding as a `null` literal, which is what it used to do — silently rebuilding the
+graph without its vectors. A text dump of a vector-carrying graph must use the
+`--pk`/`CREATE`-style offline path until the serialiser is extended.
 
 This is a limitation of the *text* dialect only. **Consolidation carries vectors.** It
 takes the binary path (`serialise_binary_dump`), whose dump has a `vectors.blk` stream

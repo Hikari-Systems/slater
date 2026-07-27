@@ -276,13 +276,16 @@ pub(crate) enum SetExprI {
 }
 
 /// Intern a parsed [`SetExpr`]'s property references against the local key interner.
-/// Validates that any function is build-evaluable and rejects vector literals.
+/// Validates that any function is build-evaluable.
+///
+/// A `Value::Vector` literal is allowed here (unlike in a business key or an edge
+/// SET): [`dedup_nodes`] routes it to the vector store when the node's label and the
+/// property name match a declared vector index, and stores it as an ordinary
+/// property otherwise — the same treatment a `vecf32([…])` in a CREATE property map
+/// gets in pass 1.
 fn intern_set_expr(e: &SetExpr, keys: &mut crate::shared::Interner) -> Result<SetExprI> {
     Ok(match e {
-        SetExpr::Lit(v) => {
-            reject_vector(v, "node MERGE SET")?;
-            SetExprI::Lit(v.clone())
-        }
+        SetExpr::Lit(v) => SetExprI::Lit(v.clone()),
         SetExpr::Prop(name) => SetExprI::Prop(keys.intern(name)),
         SetExpr::Func { name, args } => SetExprI::Func {
             name: name.clone(),
@@ -707,13 +710,21 @@ fn or3(a: &Value, b: &Value) -> Value {
 
 /// Fold a statement's `SET` assignments into the accumulating node props, evaluating
 /// each right-hand side against the state so far (last-writer-wins per key).
-fn fold_node_props(into: &mut Vec<(u32, Value)>, add: &[(u32, SetExprI)]) -> Result<()> {
+///
+/// Takes the assignments **by value** so a bare literal is moved rather than cloned:
+/// [`eval_set_expr`] can only hand back a clone of a `Lit`, and a `vecf32([…])`
+/// embedding is `4 × dim` bytes (4 KB at dim 1024) — one gratuitous memcpy per node
+/// that carries one. Every other form still evaluates against `into`.
+fn fold_node_props(into: &mut Vec<(u32, Value)>, add: Vec<(u32, SetExprI)>) -> Result<()> {
     for (k, e) in add {
-        let v = eval_set_expr(e, into)?;
-        if let Some(slot) = into.iter_mut().find(|(ek, _)| ek == k) {
+        let v = match e {
+            SetExprI::Lit(v) => v,
+            e => eval_set_expr(&e, into)?,
+        };
+        if let Some(slot) = into.iter_mut().find(|(ek, _)| *ek == k) {
             slot.1 = v;
         } else {
-            into.push((*k, v));
+            into.push((k, v));
         }
     }
     Ok(())
@@ -952,8 +963,9 @@ impl MergeShardWriters {
     }
 }
 
-/// Reject a value that cannot be a business key or a stored scalar prop (vectors are
-/// routed to the vector store, which merge dumps don't drive).
+/// Reject a value in a position that cannot carry a vector: a business key (it is
+/// sorted and compared as an identity) or an edge SET (only nodes have a vector
+/// store). A node's SET *can* carry one — see [`intern_set_expr`].
 fn reject_vector(v: &Value, ctx: &str) -> Result<()> {
     if matches!(v, Value::Vector(_)) {
         bail!("{ctx}: vector values are not supported in merge dumps");
@@ -1074,6 +1086,80 @@ fn union_node_labels(label: u32, extra: &std::collections::BTreeSet<u32>) -> Vec
     all_labels
 }
 
+/// The declared vector indexes, resolved to the global symbol ids a folded node
+/// carries: `(label id, property-key id) → property name`. A `Value::Vector` a node
+/// SET produced is routed to the vector store iff one of the node's labels pairs
+/// with its key here — the merge path's equivalent of pass 1's `vec_index_set`. A
+/// vector on any other property stays an ordinary stored property.
+///
+/// Empty (the overwhelmingly common case: a dump with no vector index) makes the
+/// split below a single length check per node.
+#[derive(Default)]
+pub(crate) struct VectorRoutes {
+    by_id: std::collections::HashMap<(u32, u32), String>,
+}
+
+impl VectorRoutes {
+    /// Resolve `(label, property)` name pairs against the global interners. A pair
+    /// naming a label or key no dump statement ever mentioned cannot match a node,
+    /// so it is simply dropped.
+    pub(crate) fn new(
+        stmts: &[crate::model::VectorIndexStmt],
+        labels: &crate::shared::Interner,
+        keys: &crate::shared::Interner,
+    ) -> Self {
+        let mut by_id = std::collections::HashMap::new();
+        for v in stmts {
+            if let (Some(l), Some(k)) = (labels.get(&v.label), keys.get(&v.property)) {
+                by_id.insert((l, k), v.property.clone());
+            }
+        }
+        Self { by_id }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    /// The vector-store property name for `key` on a node carrying `labels`.
+    fn route(&self, labels: &[u32], key: u32) -> Option<&str> {
+        labels
+            .iter()
+            .find_map(|l| self.by_id.get(&(*l, key)))
+            .map(String::as_str)
+    }
+}
+
+/// Move each vector property that a declared index claims out of `props` and into
+/// the [`NodeRec::vec_props`] tail the emit scan gathers from. Non-routed vectors
+/// are left in `props` and stored inline, matching the CREATE path.
+fn split_routed_vectors(
+    props: &mut Vec<(u32, Value)>,
+    labels: &[u32],
+    routes: &VectorRoutes,
+) -> Vec<(String, Vec<f32>)> {
+    let mut out = Vec::new();
+    if routes.is_empty() || !props.iter().any(|(_, v)| matches!(v, Value::Vector(_))) {
+        return out;
+    }
+    let mut i = 0;
+    while i < props.len() {
+        let name = match &props[i] {
+            (k, Value::Vector(_)) => routes.route(labels, *k).map(str::to_string),
+            _ => None,
+        };
+        match name {
+            Some(name) => {
+                let (_, v) = props.remove(i);
+                let Value::Vector(xs) = v else { unreachable!() };
+                out.push((name, xs));
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dedup_nodes(
     node_merge_bkt: &Path,
@@ -1083,6 +1169,7 @@ pub(crate) fn dedup_nodes(
     scratch_dir: &Path,
     mem: &Arc<MemoryBudget>,
     zstd_level: i32,
+    vec_routes: &VectorRoutes,
     diag: &crate::diag::BuildDiag,
 ) -> Result<u64> {
     // Two sub-steps with very different shapes; label them so `--diagnostics` can
@@ -1151,11 +1238,14 @@ pub(crate) fn dedup_nodes(
         if let Some((label, key, value)) = cur.take() {
             let all_labels = union_node_labels(label, extra);
             extra.clear();
+            // Split *before* encoding: a routed vector belongs to the vector store,
+            // not to this node's property record.
+            let vec_props = split_routed_vectors(props, &all_labels, vec_routes);
             nodes_w.append_node(&NodeRec {
                 dump_id: None,
                 labels_blob: crate::buckets::labels_blob(&all_labels),
                 props_blob: crate::buckets::props_blob(props),
-                vec_props: Vec::new(),
+                vec_props,
             })?;
             scratch.clear();
             let part = part_of_value(&value);
@@ -1191,7 +1281,7 @@ pub(crate) fn dedup_nodes(
             props = vec![(nm.key, nm.value.clone())];
         }
         extra.extend(nm.extra_labels.iter().copied());
-        fold_node_props(&mut props, &nm.set_props)?;
+        fold_node_props(&mut props, nm.set_props)?;
     }
     flush(
         &mut cur,
@@ -1866,7 +1956,7 @@ mod set_expr_tests {
         // First append hits the THEN branch (prop absent → coalesce empty); later
         // appends hit the ELSE concat against the accumulated value.
         for (lit, expected) in [("A", "A"), ("B", "A; B"), ("C", "A; B; C")] {
-            fold_node_props(&mut props, &[(k, append_idiom(k, lit))]).unwrap();
+            fold_node_props(&mut props, vec![(k, append_idiom(k, lit))]).unwrap();
             assert_eq!(get(&props, k), Some(Value::Str(expected.to_string())));
         }
     }
