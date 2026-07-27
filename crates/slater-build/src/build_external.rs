@@ -970,6 +970,12 @@ fn build_inner(
 
         // ---- pass 1: shard-parallel parse into node + unresolved-edge buckets -------
         let pass1_g = diag.phase("pass1");
+        // The header's vector-index declarations, kept past pass 1 so the routing set
+        // can be checked against what the shards actually found (see the bail below).
+        // `None` when this run resumed past pass 1 — a run that failed that check never
+        // reached the `Phase::Pass1` checkpoint, so a resume always re-enters pass 1 and
+        // re-checks.
+        let mut header_vec_indexes: Option<std::collections::HashSet<(String, String)>> = None;
         if resume_phase < Phase::Pass1 {
             // Vector-index routing set: which `(label, property)` vecf32 values go to the
             // vector store. The parallel workers see shards out of order, so they need
@@ -1001,6 +1007,7 @@ fn build_inner(
                     }
                 }
             }
+            header_vec_indexes = Some(vec_index_set.clone());
             // Mark the scratch resumable *before* the long parallel pass: a mid-pass-1
             // crash then leaves this `Phase::Start` state + the finalized shard sidecars,
             // and `--resume` re-enters pass 1, skipping shards whose sidecar exists.
@@ -1081,6 +1088,35 @@ fn build_inner(
             vector_stmts = vs;
         }
 
+        // A vector index the shards found but the header pre-scan did not is a
+        // *declaration pass 1 could not act on*: routing was decided per node, in
+        // parallel, against the header set, so every `vecf32` for this index was written
+        // into the node's property record instead of the vector store. The manifest would
+        // still advertise the index — built from this union — and it would come out with
+        // `count: 0` and no diagnostic at all. Refuse instead: the two collectors must
+        // agree, or the build is silently lossy.
+        //
+        // Merge dumps are exempt: `VectorRoutes` resolves routing after this union, so a
+        // declaration anywhere in the file is honoured.
+        if !merge_mode {
+            if let Some(header) = &header_vec_indexes {
+                for v in &vector_stmts {
+                    if !header.contains(&(v.label.clone(), v.property.clone())) {
+                        bail!(
+                            "vector index (:{} {{{}}}) is declared after node data, so no \
+                             embedding could be routed into it (pass 1 is parallel: it takes \
+                             the routing set from the dump header, which ends at the first \
+                             node statement). Move every `CALL \
+                             db.idx.vector.createNodeIndex(...)` above the first node, or \
+                             declare the indexes with --vector-index-json.",
+                            v.label,
+                            v.property
+                        );
+                    }
+                }
+            }
+        }
+
         // ---- pass 1.9: resolve overlay overwrites (MERGE|MATCH … SET …) -----------
         // Re-derived every run (incl. resume) from the persisted shard sidecars + node
         // buckets — deterministic, so no separate checkpoint is needed. Extends the
@@ -1131,6 +1167,11 @@ fn build_inner(
             let dedup_g = diag.phase("dedup");
             if resume_phase < Phase::Deduped {
                 // `dedup_nodes` labels its own sub-steps (scan+sort, then the drain).
+                // The routing set is built here, after the shard symbol tables have
+                // merged, so a `SET n.embedding = vecf32([…])` on an indexed
+                // (label, property) lands in the vector store rather than in the
+                // node's property record.
+                let vec_routes = merge_build::VectorRoutes::new(&vector_stmts, &labels, &keys);
                 node_count = merge_build::dedup_nodes(
                     &node_merge_bkt,
                     &remaps,
@@ -1139,6 +1180,7 @@ fn build_inner(
                     scratch_dir,
                     &mem,
                     SCRATCH_ZSTD,
+                    &vec_routes,
                     diag,
                 )?;
                 checkpoint(

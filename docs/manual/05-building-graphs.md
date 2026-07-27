@@ -59,17 +59,18 @@ assignments together. A node's identity label may be followed by extra labels
 (`MERGE (n:Person:Employee {email: …})`). The dump must be self-contained: an edge
 can only reference nodes the dump also defines.
 
-> **Vectors are not allowed in a MERGE dump.** A `SET n.embedding = vecf32([...])`
-> inside a business-key MERGE dump is rejected. Vectors enter a graph through the
-> CREATE / `--pk` build form (below) or through the writable layer at serve time
-> ([10 Vector search](10-vector-search.md)).
+> **Embeddings ride a `SET`.** `MERGE (n:Product {sku: 'CMP-1'}) SET n.embedding =
+> vecf32([...])` attaches a vector to a node, provided the dump also declares the
+> matching vector index ([10 Vector search](10-vector-search.md)). A vector cannot be
+> a business key, and edges cannot carry one.
 
 ### Single-global-key (`--pk <field>`)
 
 When every node already has one global, integer identifier, `--pk <field>` uses
 that field as the node identity across the whole dump. Nodes are `CREATE`d and
-edges reference endpoints by the id field. This form **does** carry `vecf32`
-values, so it is how you build a graph with embeddings offline:
+edges reference endpoints by the id field. Here a `vecf32` value rides the node's
+property map rather than a `SET` — and the index must be declared **above the first
+node** ([10 Vector search](10-vector-search.md)):
 
 ```cypher
 CREATE INDEX FOR (n:Product) ON (n.sku);

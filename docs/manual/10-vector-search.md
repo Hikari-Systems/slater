@@ -54,6 +54,14 @@ CALL db.idx.vector.createNodeIndex('Product', 'embedding', 4, 'cosine');
 createNodeVectorIndex('Product', 4, 'cosine', 'embedding');
 ```
 
+> **Declare it in the dump header, above the first node.** In a CREATE / `--pk` dump,
+> pass 1 runs in parallel over byte ranges of the file, so the routing set is taken
+> from the header — which ends at the first node statement. A declaration below the
+> node data cannot be honoured, and the build now **fails** rather than producing an
+> empty index. If your generator can't emit the DDL first, pass the declarations out
+> of band with `--vector-index-json`. (Business-key `MERGE` dumps resolve routing
+> later and accept the declaration anywhere.)
+
 ```json
 // Or a JSON sidecar passed as --vector-index-json vectors.json
 [{"label": "Product", "property": "embedding", "dim": 4, "metric": "cosine"}]
@@ -62,11 +70,13 @@ createNodeVectorIndex('Product', 4, 'cosine', 'embedding');
 The dimension is fixed at build time; a later write with a different-length vector
 is rejected (see below). Vector indexes are node-only.
 
-> **Correctness note.** Business-key `MERGE` dumps **cannot carry vector values** —
-> `SET p.embedding = vecf32([…])` in a MERGE dump is rejected. Vectors enter a
-> graph one of two ways: through the **CREATE / `--pk`** build form (as in the
-> sample [`products-vec.cypher`](examples/products-vec.cypher)), or through the
-> **writable layer** at serve time (below). See
+> **Where the vector goes.** A vector is only routed into the index when the
+> `(label, property)` pair matches a declaration. In a business-key `MERGE` dump it
+> rides a `SET` — `MERGE (p:Product {sku: 'CMP-1'}) SET p.embedding = vecf32([…])`;
+> in a **CREATE / `--pk`** dump it rides the property map (as in the sample
+> [`products-vec.cypher`](examples/products-vec.cypher)); at serve time it goes
+> through the **writable layer** (below). A `vecf32` on an *undeclared* property is
+> not an error — it is stored as an ordinary property and no KNN can see it. See
 > [05 Building graphs](05-building-graphs.md).
 
 ## Querying: `db.idx.vector.queryNodes`

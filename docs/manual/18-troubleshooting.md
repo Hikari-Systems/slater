@@ -28,7 +28,11 @@ These come from the writable layer. Background: [11 Writing data](11-writing-dat
 | generation refused for a missing `aclBlake3` stamp | `requireAclStamp` is on and the generation is unstamped. | Build with `slater-build --acl acl.json`, or set `requireAclStamp=false` for unstamped/dev graphs. |
 | `… must be rebuilt` (format version) | The generation's `FORMAT_VERSION` is not the one this server understands. | Rebuild the graph with a matching `slater-build`. Slater has no backwards compatibility. |
 | `parse error: … expected stmt` (during build) | A dump statement isn't a recognised shape — often a `//` comment or an unsupported form. | Remove comments; check the statement against [05 Building graphs](05-building-graphs.md). |
-| `vector values are not supported in merge dumps` | A business-key `MERGE` dump carries a `vecf32(...)` value. | Load vectors via the CREATE/`--pk` build form or the writable layer. See [10 Vector search](10-vector-search.md). |
+| `node MERGE business key: vector values are not supported` | A `vecf32(...)` is used as a node's identity, or in an edge `SET`. | A vector may only be a node `SET` value: `MERGE (n:L {k: 'v'}) SET n.embedding = vecf32([…])`. See [10 Vector search](10-vector-search.md). |
+| `vecf32 in build-time SET takes a literal vector` | The argument to `vecf32(…)` is an expression, not a list of numbers. | Write the literal form, `vecf32([0.1, 0.2, …])`; the builder does not compute embeddings. |
+| `vector index <p> declared dim N but a node has M` | An embedding's length disagrees with the declared index. | Fix the dump or the declaration — the dimension is fixed at build time. |
+| `vector index (:L {p}) is declared after node data` | In a CREATE/`--pk` dump the `CALL db.idx.vector.createNodeIndex(...)` sits below the first node, where pass 1's parallel routing can't see it. | Move every vector-index declaration into the dump header, or pass `--vector-index-json`. See [10 Vector search](10-vector-search.md). |
+| `warning: vector index L.p matched no node` (build still succeeds) | The declaration is fine but nothing matched it — usually a label/property typo, or embeddings missing from the dump. | Check the spelling against the dump; the index is real but every KNN over it returns nothing. |
 
 ## Resource and value errors
 

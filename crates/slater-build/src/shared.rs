@@ -360,6 +360,19 @@ pub(crate) fn write_vector_indexes(
             continue;
         }
         let count = pi.count;
+        // A declared index that gathered nothing is legal (an empty graph), but it is far
+        // more often a typo in the label or property name, or embeddings that never
+        // reached the dump: the build succeeds and every KNN over it returns nothing. Say
+        // so on stderr — the manifest descriptor alone looks perfectly healthy. (The
+        // *other* way to get here, a declaration that pass 1 could not see, is a hard
+        // error in `build_external`.)
+        if count == 0 {
+            eprintln!(
+                "warning: vector index {}.{} matched no node — it will answer every KNN \
+                 with nothing. Check the label and property spelling against the dump.",
+                pi.label, pi.property
+            );
+        }
         if count >= opts.ann_threshold && vamana_eligible(pi, opts) {
             // Disk-native Vamana/PQ path. The in-memory graph build needs the whole
             // group resident, so materialise it here (in scan order) — but only for

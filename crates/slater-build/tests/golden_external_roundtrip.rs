@@ -450,3 +450,77 @@ fn external_encrypted_build_then_reopen_with_key() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// The same vectors as VEC_DUMP, but the index is declared *after* the node data —
+// where pass 1's header pre-scan can no longer see it. Routing is decided per node,
+// in parallel, so this cannot be honoured; before it was caught, the build succeeded
+// and produced an index descriptor with `count: 0` while every embedding sat in
+// `node_props.blk`.
+const LATE_VEC_DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 0, title: 'First chunk', embedding: vecf32([1.0, 0.0, 0.0])});
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 1, title: 'Second chunk', embedding: vecf32([0.0, 1.0, 0.0])});
+CALL db.idx.vector.createNodeIndex('Chunk', 'embedding', 3, 'cosine');
+MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;
+DROP INDEX ON :__DumpVertex__(__dump_id__);
+"#;
+
+#[test]
+fn a_vector_index_declared_after_node_data_fails_the_build() {
+    let work = unique_dir("latevec");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, LATE_VEC_DUMP).unwrap();
+
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_slater-build"))
+            .args(["--pk", "__dump_id__"])
+            .args([
+                "--input",
+                input.to_str().unwrap(),
+                "--graph",
+                "docs",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--cluster",
+                "none",
+            ])
+            .args(extra)
+            .output()
+            .expect("run slater-build")
+    };
+
+    let out = run(&[]);
+    assert!(
+        !out.status.success(),
+        "a late vector-index declaration must not build silently"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("declared after node data"),
+        "unexpected failure: {err}"
+    );
+    // No generation was published, so nothing can read the half-built graph.
+    assert!(!data_dir.join("docs").join("current").exists());
+
+    // The sidecar is the documented escape hatch: the routing set no longer depends on
+    // where in the dump the declaration sits, so the same input now builds and routes.
+    let sidecar = work.join("vectors.json");
+    std::fs::write(
+        &sidecar,
+        r#"[{"label": "Chunk", "property": "embedding", "dim": 3, "metric": "cosine"}]"#,
+    )
+    .unwrap();
+    let out = run(&["--vector-index-json", sidecar.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "sidecar build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let graph_dir = data_dir.join("docs");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let m = Manifest::read_from_dir(graph_dir.join(gen.trim())).unwrap();
+    assert_eq!(m.vector_indexes.len(), 1);
+    assert_eq!(m.vector_indexes[0].count, 2, "both embeddings routed");
+
+    let _ = std::fs::remove_dir_all(&work);
+}
