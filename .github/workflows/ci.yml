@@ -123,6 +123,68 @@ jobs:
       - name: Test suite
         run: cargo test --workspace --locked
 
+  # ── Consolidation end-to-end: the `#[ignore]`d tests that spawn the real
+  #    `slater-build` binary. They are ignored because `cargo test -p slater` does
+  #    not build the builder — not because they are slow or flaky — so nothing ran
+  #    them anywhere, and the `--ignored` suite is not blanket-runnable (the
+  #    `SLATER_SMOKE_DATADIR` tests hard-fail without a prebuilt generation).
+  #
+  #    This matters most for the *encrypted* arm. HIK-145 was invisible for its
+  #    whole life because every carry test passed `cipher: None`; the tests that
+  #    finally cover `Some(..)` end to end are two of the ones listed here, and
+  #    leaving them unrun would have left the same "two configurations with no test
+  #    in common" gap that caused the bug. Named explicitly rather than filtered by
+  #    prefix so adding one is a deliberate act, and a rename fails loudly here
+  #    instead of silently dropping coverage.
+  consolidation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the builder the tests spawn
+        run: cargo build -p slater-build --locked
+
+      - name: Consolidation suite (real slater-build)
+        env:
+          SLATER_BUILD_BIN: target/debug/slater-build
+        run: |
+          set -euo pipefail
+          # Full module paths: `--exact` matches the whole path, so a bare function
+          # name silently matches nothing and the job passes having run zero tests.
+          for t in \
+            server::tests::consolidate_via_real_builder \
+            server::tests::consolidate_carries_vector_indexes_and_embeddings \
+            server::tests::consolidate_carries_a_delta_written_vector_over_the_base \
+            server::tests::a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding \
+            server::tests::a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation \
+            server::tests::a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding \
+            server::tests::consolidate_carries_an_encrypted_vamana_index_by_reference \
+            server::tests::a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph \
+            server::tests::consolidate_carries_a_vamana_index_out_of_its_vamana_blocks \
+            server::tests::write_path_auto_consolidates_at_core_fraction \
+            server::tests::bolt_consolidate_trigger_folds_delta_via_real_builder \
+          ; do
+            echo "── $t"
+            out="$(cargo test -p slater --locked --lib -- \
+                     --ignored --exact "$t" --test-threads 1 2>&1)"
+            echo "$out" | tail -20
+            # A rename must fail here rather than quietly dropping coverage: assert
+            # the run actually executed one test, not zero.
+            echo "$out" | grep -qE 'test result: ok\. 1 passed' \
+              || { echo "::error::$t did not run (renamed or removed?)"; exit 1; }
+          done
+
   # ── Store backends: compile + run the feature-gated s3/gcs code that the
   #    default build never touches (HIK-138). Whole modules under
   #    `graph-format/src/store/{s3,gcs}.rs` and every `tests/{s3_minio,gcs_*}.rs`

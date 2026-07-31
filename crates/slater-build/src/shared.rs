@@ -1222,6 +1222,20 @@ mod vector_gather_tests {
 /// `layout_to_dump_id ∘ perm.final_of` composition makes every KNN point at the wrong node with
 /// a plausible score and no error. The tests attack that composition directly, with a
 /// **non-monotone** permutation, and pin the BLAKE3-carried fast path.
+///
+/// **Every test here is plaintext** — `cipher: None`, `base_gen: None`,
+/// `base_vamana_artifact: None` — and that is deliberate but load-bearing to know about.
+/// It is also exactly why HIK-145 stayed invisible for its whole life: `carry_vamana_index`
+/// opened the *previous* generation's vector files with the *new* generation's cipher, so
+/// carry-by-reference had never once worked under encryption, and no test in this module
+/// could see it. Two configurations with no test in common.
+///
+/// The encrypted arm is covered end to end instead, where the base manifests actually exist
+/// on disk to resolve a salt from: `server::tests::consolidate_carries_an_encrypted_vamana_
+/// index_by_reference` and `::a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph`.
+/// Those are `#[ignore]`d (they spawn the real `slater-build`), so CI runs them in a dedicated
+/// `consolidation` job — see `.github/workflows/ci.yml`. If you add a case here, ask whether
+/// its encrypted counterpart exists there.
 #[cfg(test)]
 mod carry_tests {
     use super::*;
