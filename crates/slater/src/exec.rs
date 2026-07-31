@@ -341,16 +341,51 @@ fn anchor_correlated(start: &NodePat, where_: Option<&Expr>, cols: &[String]) ->
 }
 
 /// Recurse the top-level `AND`s of a `WHERE`, looking for a comparison between
-/// `var.prop` and a bound column `Expr::Var(c)` (c ∈ `cols`) — the shape that
-/// resolves to a per-row index seek.
+/// `var.prop` — or `id(var)` — and a bound column `Expr::Var(c)` (c ∈ `cols`): the
+/// shapes whose plan depends on the row.
+///
+/// The `id(var)` half was missing, and its absence made the whole bound-variable id
+/// seek inert. `id(n) = x` was classified *uncorrelated*, so the plan was hoisted out
+/// of the row loop and built with an empty `bound` map — leaving the id walkers, which
+/// do consult `bound`, nothing to find. `WITH 5 AS x MATCH (n) WHERE id(n) = x` walked
+/// the entire id space (HIK-148).
+///
+/// Classification is on **shape**, not on whether the value resolves: the decision is
+/// made once for the whole input table, and different rows carry different values, so
+/// "does it resolve" has no single answer here. That matches what the property half
+/// already does. The cost of a false positive is real but bounded — a correlated anchor
+/// re-plans per row and forfeits the shared-candidate replay (`matchclause`) — and it is
+/// the right trade for an id seek, which is O(1) and exact per row. It would *not* be
+/// the right trade if a non-resolving id expression fell back to a per-row full scan, so
+/// a multi-row input comparing `id()` against non-integers is the one shape this makes
+/// slower. Comparing a node id to a string is a type error in Cypher regardless, and the
+/// answer stays correct either way because `node_ok` re-filters every candidate.
 fn where_anchor_uses_col(expr: &Expr, var: &str, cols: &[String]) -> bool {
     let is_anchor_prop = |e: &Expr| matches!(e, Expr::Property(base, _) if matches!(&**base, Expr::Var(v) if v == var));
+    // The planner's own matcher, not a second opinion about what `id(var)` is.
+    let is_anchor_id = |e: &Expr| crate::plan::is_id_of(e, var);
     let is_col = |e: &Expr| matches!(e, Expr::Var(c) if cols.iter().any(|x| x == c));
     match expr {
         Expr::And(parts) => parts.iter().any(|p| where_anchor_uses_col(p, var, cols)),
-        Expr::Compare(_, l, r) => {
-            (is_anchor_prop(l) && is_col(r)) || (is_col(l) && is_anchor_prop(r))
+        Expr::Compare(op, l, r) => {
+            // A property comparison is row-dependent under **any** operator: a range
+            // index serves `<`/`>=` as readily as `=`.
+            let prop = (is_anchor_prop(l) && is_col(r)) || (is_col(l) && is_anchor_prop(r));
+            // An id comparison only under `=`. `collect_id_eq` exploits nothing else, so
+            // classifying `id(n) < x` as correlated would forfeit the shared-candidate
+            // replay and buy nothing back.
+            let id = matches!(op, CmpOp::Eq)
+                && ((is_anchor_id(l) && is_col(r)) || (is_col(l) && is_anchor_id(r)));
+            prop || id
         }
+        // `id(var) IN xs` — the membership counterpart, matching what `collect_id_eq`
+        // can actually seek on: the list as one bound column (`IN xs`, the same shape as
+        // the already-supported `IN $ids`), or an inline list with a bound element
+        // (`IN [a, 3]`, which `const_int` resolves per element).
+        Expr::In(l, r) if is_anchor_id(l) => match &**r {
+            Expr::List(items) => items.iter().any(is_col),
+            e => is_col(e),
+        },
         _ => false,
     }
 }
