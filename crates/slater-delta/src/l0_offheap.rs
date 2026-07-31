@@ -910,6 +910,31 @@ impl L0Reader {
                 }
                 .into());
             }
+            // Verify every block's Poly1305 tag now, while we are still on a fallible
+            // path. `BlockFileReader` checks a tag only when a block is actually paged
+            // in, which on this reader is lazily, from whatever thread is serving a
+            // query — and the `LevelRead` accessors below cannot return an error, so a
+            // tampered or bit-rotted block reaches them as a panic. Draw the boundary
+            // where the generation draws it: at open, as a typed refusal.
+            //
+            // Only for a sealed segment. A plaintext one has no tag to check (its
+            // integrity story is the core's, not ours), so this costs nothing in the
+            // default configuration — and `off_heap_l0` is itself off by default. The
+            // read is bounded by the spill segment, not the graph, and each block is
+            // dropped as soon as it is checked.
+            if cipher.is_some() {
+                for b in 0..rdr.num_blocks() {
+                    rdr.read_block(graph_format::ids::BlockId(b as u32))
+                        .with_context(|| {
+                            format!(
+                                "verify sealed L0 section {dir:?}/{name}: block {b} of {} failed \
+                                 its authentication tag — the segment is corrupt or was tampered \
+                                 with",
+                                rdr.num_blocks()
+                            )
+                        })?;
+                }
+            }
             Ok(rdr)
         };
         Ok(Self {
@@ -983,6 +1008,15 @@ impl L0Reader {
 
     /// Fetch record `idx` of `reader` (section `sub`) through the shared cache, returning
     /// its decoded body bytes.
+    ///
+    /// The `LevelRead` accessors that call this cannot propagate an error — their return
+    /// types are `Option`/`Vec`, fixed by the trait — so they `.expect()`. That is only
+    /// defensible because [`L0Reader::open`] has already read and authenticated every
+    /// block of a **sealed** segment, and validated the magic and framing of a plaintext
+    /// one: by the time a read happens, the remaining failure modes are transient I/O and
+    /// storage that changed underneath a live process. Anything that makes a block read
+    /// fallible *after* open — dropping the open-time verification, or admitting a
+    /// section this reader did not check — re-arms those panics.
     fn record_bytes(&self, reader: &BlockFileReader, sub: u32, idx: usize) -> Result<Vec<u8>> {
         let rec = self.cache.record(reader, self.scope, sub, idx as u64)?;
         Ok(rec.as_slice().to_vec())
@@ -1832,6 +1866,50 @@ mod tests {
             Some(&crate::seal::DeltaSealRejected::Unsealed {
                 subject: SECTION_SUBJECT
             })
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A tampered block *inside* a sealed section is refused at open, not on the read.
+    ///
+    /// `BlockFileReader` checks a block's Poly1305 tag only when that block is paged in,
+    /// which on this reader is lazy — long after open, on whatever thread is serving a
+    /// query. The `LevelRead` accessors cannot return an error (`node_patch_owned` →
+    /// `Option`, `out_edges` → `Vec`), so they `.expect()`, and a tampered block arrived
+    /// as a panic. The unwind is contained by the server's `spawn_blocking` boundary, so
+    /// it cost one query rather than the process — but "inscrutable panic" is not the
+    /// contract, and pre-HIK-146 the same flipped byte might instead have survived
+    /// decompression as a garbage-but-decodable record.
+    ///
+    /// So the segment now verifies every sealed block while it is still on the fallible
+    /// open path. This test flips a bit that cannot be caught by the magic/meta checks
+    /// (the directory and footer are at the tail) and asserts open refuses it.
+    #[test]
+    fn a_tampered_block_in_a_sealed_offheap_segment_is_refused_at_open() {
+        let base = std::env::temp_dir().join(format!("slater_l0off_tamper_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let k: DeltaCipher = Arc::new(graph_format::crypto::delta_cipher(b"a master key", "g"));
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let seg = base.join("000001.l0");
+        write_segment(&populate().to_segment_data(), &seg, 1, 4096, 3, Some(&k)).unwrap();
+        // Untampered, it opens and reads.
+        {
+            let r = L0Reader::open(&seg, cache.clone(), Some(&k)).unwrap();
+            assert!(<L0Reader as LevelRead>::node_patch_owned(&r, 5).is_some());
+        }
+
+        // Flip one bit of the first block's ciphertext, just past the 8-byte file magic.
+        let node_blk = seg.join("node.blk");
+        let mut bytes = std::fs::read(&node_blk).unwrap();
+        bytes[8] ^= 0x01;
+        std::fs::write(&node_blk, &bytes).unwrap();
+
+        let e = L0Reader::open(&seg, cache, Some(&k)).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("verify sealed L0 section") && msg.contains("authentication tag"),
+            "a tampered sealed block must be refused at open, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
