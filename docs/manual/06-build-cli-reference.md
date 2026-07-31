@@ -61,9 +61,10 @@ by these flags (it takes no config file).
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--encrypt` | off | Encrypt every data block at rest (XChaCha20-Poly1305); requires exactly one of `--key-file` / `--key-env`. |
+| `--encrypt` | off | Encrypt every data block at rest (XChaCha20-Poly1305); requires exactly one of `--key-file` / `--key-env` / `--key-stdin`. |
 | `--key-file <PATH>` | *(none)* | File holding the at-rest master key as hex. |
 | `--key-env <VAR>` | *(none)* | Environment variable holding the at-rest master key as hex. |
+| `--key-stdin` | off | Read the at-rest master key as hex from **stdin**, to EOF. For a parent process handing the key to a builder it spawns — the server uses this for `CALL slater.consolidate()`. Keeps the key out of `argv`, out of the environment, and off disk. |
 | `--acl <PATH>` | *(none)* | Path to `acl.json`; its BLAKE3 digest is stamped into the manifest (`aclBlake3`). See [15 Security](15-security.md). |
 
 ## Memory, scratch, and clustering

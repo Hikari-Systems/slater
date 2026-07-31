@@ -309,18 +309,88 @@ fn fsync_dir(dir: &Path) -> Result<()> {
 /// keeps the old core serving. The dump carries dense ids and global symbol ids, so
 /// the builder ingests it directly (`--input-format slater-dump`), skipping parse,
 /// node dedup, and endpoint resolution.
-pub fn run_builder(builder_bin: &str, dump: &Path, graph: &str, data_dir: &Path) -> Result<()> {
-    let status = std::process::Command::new(builder_bin)
-        .arg("--input")
+/// When `master_key` is `Some` the rebuilt generation must be **encrypted**, or a
+/// consolidation of an encrypted graph publishes the whole graph in the clear and then
+/// fails at the swap (HIK-144 refuses an unauthenticated image under a key). That is
+/// precisely what happened before HIK-157: this function passed no key and no `--encrypt`,
+/// and every test that consolidated an encrypted graph supplied its *own* builder closure,
+/// so nothing ever exercised the invocation production actually makes.
+///
+/// The key travels over the child's **stdin**, not `--key-env` or `--key-file`:
+///
+/// * `--key-env` would hold it in the child's environment block for the whole run — a full
+///   rebuild, hours on a large graph — readable from `/proc/<pid>/environ` and unwipeable
+///   (THREAT_MODEL.md limitation 7). Using it here would make the server's own consolidation
+///   create that exposure, rather than an operator opting into it.
+/// * `--key-file` would put it on disk, where a crash leaves it behind, and the existing
+///   tripwire refuses any key path inside the data directory.
+/// * `argv` is world-readable through `/proc/<pid>/cmdline`.
+///
+/// **Deadlock note:** stdout/stderr are *inherited*, so the child writes to the terminal and
+/// has no pipe to block on while we write to its stdin. If they ever become `Stdio::piped()`
+/// this must drain them concurrently or a chatty build will hang. The stdin handle is
+/// dropped — closing the pipe, signalling EOF — before `wait()`.
+pub fn run_builder(
+    builder_bin: &str,
+    dump: &Path,
+    graph: &str,
+    data_dir: &Path,
+    master_key: Option<&[u8]>,
+) -> Result<()> {
+    let mut cmd = std::process::Command::new(builder_bin);
+    cmd.arg("--input")
         .arg(dump)
         .arg("--input-format")
         .arg("slater-dump")
         .arg("--graph")
         .arg(graph)
         .arg("--data-dir")
-        .arg(data_dir)
-        .status()
+        .arg(data_dir);
+    if master_key.is_some() {
+        cmd.arg("--encrypt")
+            .arg("--key-stdin")
+            .stdin(std::process::Stdio::piped());
+    }
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("spawn builder '{builder_bin}'"))?;
+
+    if let Some(key) = master_key {
+        use std::io::Write;
+        // Hex, because that is the shape every other key source hands `resolve_master_key`.
+        let hex = zeroize::Zeroizing::new(graph_format::crypto::hex_encode(key));
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("builder '{builder_bin}' stdin was not piped"))?;
+        // A short write would hand the builder a *truncated* key, surfacing later as an
+        // opaque AEAD mismatch instead of here as a clear error. `write_all` + `flush`.
+        let wrote = stdin.write_all(hex.as_bytes()).and_then(|()| stdin.flush());
+        drop(stdin); // EOF — the builder reads to EOF and cannot proceed until this.
+        if let Err(e) = wrote {
+            // A broken pipe here almost always means the child **already exited** — most
+            // likely rejecting its arguments, e.g. a `builderBin` too old to know
+            // `--key-stdin`. Its own stderr is the useful message; ours would bury it under
+            // "failed to write to stdin". So reap it first and prefer its exit status,
+            // falling back to the write error only if it somehow succeeded.
+            match child.wait() {
+                Ok(st) if !st.success() => bail!(
+                    "builder '{builder_bin}' exited with {st} without reading the at-rest \
+                     master key from stdin while consolidating '{graph}' — check that \
+                     `delta.builderBin` supports --key-stdin"
+                ),
+                _ => {
+                    return Err(e).with_context(|| {
+                        format!("hand the at-rest master key to builder '{builder_bin}' over stdin")
+                    })
+                }
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for builder '{builder_bin}'"))?;
     if !status.success() {
         bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'");
     }

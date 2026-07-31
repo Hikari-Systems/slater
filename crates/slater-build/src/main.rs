@@ -196,7 +196,8 @@ struct Cli {
     pq_bits: u32,
 
     /// Encrypt every data block at rest (XChaCha20-Poly1305). Requires exactly
-    /// one of `--key-file` / `--key-env`. Absent, the image is written plaintext.
+    /// one of `--key-file` / `--key-env` / `--key-stdin`. Absent, the image is
+    /// written plaintext.
     #[arg(long)]
     encrypt: bool,
 
@@ -208,6 +209,18 @@ struct Cli {
     /// `--encrypt`).
     #[arg(long)]
     key_env: Option<String>,
+
+    /// Read the at-rest master key as hex from **stdin**, to EOF (read when
+    /// `--encrypt`).
+    ///
+    /// For a parent process handing the key to a child it spawns — which is what
+    /// the server does when it runs a consolidation. Unlike `--key-env` the key
+    /// never enters this process's environment block (readable from
+    /// `/proc/<pid>/environ` for the process's whole life, and unwipeable — see
+    /// THREAT_MODEL.md limitation 7), and unlike `--key-file` it never touches
+    /// disk. It is never in `argv` either, which rules out `/proc/<pid>/cmdline`.
+    #[arg(long)]
+    key_stdin: bool,
 
     /// Optional path to the live `acl.json`. When given, its BLAKE3 digest is
     /// stamped into the MANIFEST (`aclBlake3`); the server then refuses to serve
@@ -428,20 +441,49 @@ fn parse_size(s: &str) -> std::result::Result<u64, String> {
 /// `graph-format/src/crypto.rs` for what that does *not* cover (notably: a key
 /// arriving via `--key-env` stays in the process environment regardless).
 fn resolve_master_key(cli: &Cli) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let sources = usize::from(cli.key_file.is_some())
+        + usize::from(cli.key_env.is_some())
+        + usize::from(cli.key_stdin);
     if !cli.encrypt {
-        if cli.key_file.is_some() || cli.key_env.is_some() {
-            anyhow::bail!("--key-file/--key-env given without --encrypt");
+        if sources > 0 {
+            anyhow::bail!("--key-file/--key-env/--key-stdin given without --encrypt");
         }
         return Ok(None);
     }
-    let hex = Zeroizing::new(match (&cli.key_file, &cli.key_env) {
-        (Some(_), Some(_)) => anyhow::bail!("give only one of --key-file / --key-env"),
-        (Some(path), None) => std::fs::read_to_string(path)
+    if sources > 1 {
+        anyhow::bail!("give only one of --key-file / --key-env / --key-stdin");
+    }
+    // `--input -` streams the dump from stdin, and `--key-stdin` reads the key from stdin
+    // to EOF. Together the key read swallows the whole dump and then fails hex-decoding it,
+    // which is a baffling way to learn the two are incompatible. Refuse plainly instead.
+    // (The server never hits this — it always spawns the builder against a dump *path*.)
+    if cli.key_stdin && cli.input == "-" {
+        anyhow::bail!(
+            "--key-stdin cannot be combined with `--input -`: both read stdin, so the key \
+             read would consume the dump. Pass the dump as a path, or supply the key with \
+             --key-file/--key-env"
+        );
+    }
+    let hex = Zeroizing::new(match (&cli.key_file, &cli.key_env, cli.key_stdin) {
+        (Some(path), None, false) => std::fs::read_to_string(path)
             .with_context(|| format!("read key file {}", path.display()))?,
-        (None, Some(var)) => {
+        (None, Some(var), false) => {
             std::env::var(var).with_context(|| format!("read key env var {var}"))?
         }
-        (None, None) => anyhow::bail!("--encrypt requires --key-file or --key-env"),
+        // Read to EOF. The writer is a parent that hands over the key and closes the
+        // pipe, so EOF is the terminator — there is no length prefix and no newline
+        // contract. `with_capacity` pre-sizes for a 64-hex-char (32-byte) key so the
+        // common case never reallocates and strands a copy of the key in freed heap
+        // (`crypto.rs`'s LIMIT note, residual (b)); a longer key costs one realloc.
+        (None, None, true) => {
+            use std::io::Read;
+            let mut s = String::with_capacity(80);
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .context("read the at-rest master key from stdin (--key-stdin)")?;
+            s
+        }
+        _ => anyhow::bail!("--encrypt requires --key-file, --key-env or --key-stdin"),
     });
     let key =
         Zeroizing::new(graph_format::crypto::hex_decode(&hex).context("decode master key hex")?);

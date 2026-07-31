@@ -438,7 +438,7 @@ impl Graphs {
         cache: &BlockCache,
         vector_cache: &VectorIndexCache,
         data_dir: &Path,
-        build: impl Fn(&Path, &str, &Path) -> Result<()>,
+        build: impl Fn(&Path, &str, &Path, Option<&[u8]>) -> Result<()>,
     ) -> Result<GenId> {
         let writer = self
             .writer(name)
@@ -495,7 +495,36 @@ impl Graphs {
 
         // Rebuild. A builder failure leaves the delta live (no retire) and the old
         // core serving; propagate the error after removing the scratch dump.
-        if let Err(e) = build(&dump_path, name, data_dir) {
+        // The key goes *through* the closure rather than being reached for inside
+        // `run_builder`, because the closure is a test seam and a seam whose signature
+        // omits the key is exactly how HIK-157 hid: every encrypted-consolidation test
+        // supplied its own closure with `--encrypt --key-env`, so none of them exercised
+        // the keyless invocation production actually made. Widening the signature makes a
+        // test that ignores the key a deliberate act rather than an accident.
+        //
+        // A served graph cannot be plaintext-under-a-key — HIK-144 refuses an
+        // unauthenticated image at open when a key is configured — so "a key is configured"
+        // and "the served core is encrypted" are the same condition here. Asserted rather
+        // than assumed, because building the wrong way round is a silent plaintext publish.
+        let master_key = self.master_key_bytes();
+        if master_key.is_some() != core.manifest().encryption.is_some() {
+            bail!(
+                "cannot consolidate '{name}': the server {} a master key but the served \
+                 generation is {} — refusing to rebuild, since the result would be sealed \
+                 the wrong way",
+                if master_key.is_some() {
+                    "has"
+                } else {
+                    "has no"
+                },
+                if core.manifest().encryption.is_some() {
+                    "encrypted"
+                } else {
+                    "plaintext"
+                },
+            );
+        }
+        if let Err(e) = build(&dump_path, name, data_dir, master_key) {
             let _ = std::fs::remove_dir_all(&dump_path);
             return Err(e).with_context(|| format!("rebuild consolidated generation for '{name}'"));
         }

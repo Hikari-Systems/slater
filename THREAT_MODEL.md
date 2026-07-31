@@ -124,6 +124,25 @@ rebuild, on a deployment configured for at-rest encryption. It is removed afterw
 means plumbing a key through the dump format and the builder that reads it, and is tracked
 separately.
 
+**The consolidation's *output* is now encrypted (HIK-157).** Until this was fixed, the
+server spawned `slater-build` for a consolidation with **no key and no `--encrypt`**, so a
+keyed deployment published the whole rebuilt graph as a permanent **plaintext** generation —
+and then refused to serve it, because a MAC-less image under a key is rejected at open. The
+old core kept serving, so no query was ever answered wrongly; the cost was a clear-text copy
+of everything left on disk, and consolidation that could not succeed at all on an encrypted
+graph.
+
+The master key now reaches the builder over the child's **stdin** (`--key-stdin`), chosen
+over the alternatives on exposure grounds: `--key-env` would hold it in the child's
+environment block for the whole rebuild — hours on a large graph — readable from
+`/proc/<pid>/environ` and unwipeable per limitation 7 below; `--key-file` would put it on
+disk, where a crash leaves it behind; and `argv` is world-readable through
+`/proc/<pid>/cmdline`. So the key the server forwards is exposed *less* than one an operator
+supplies to the server itself via `encryption.keyEnv`.
+
+`consolidate_graph` additionally refuses up front if the server's key state and the served
+generation's encryption state disagree, rather than discovering it after a full rebuild.
+
 ## Existing protections
 
 - **At-rest encryption (optional, per block).** With `--encrypt`, each compressed block is

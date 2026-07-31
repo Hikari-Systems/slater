@@ -274,9 +274,13 @@ pub(crate) async fn execute_consolidate(
     let graph = graph.to_string();
     let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
     let new_uuid = tokio::task::spawn_blocking(move || {
-        graphs.consolidate_graph(&graph, &cache, &vector_cache, &data_dir, |dump, g, dd| {
-            run_builder(&builder_bin, dump, g, dd)
-        })
+        graphs.consolidate_graph(
+            &graph,
+            &cache,
+            &vector_cache,
+            &data_dir,
+            |dump, g, dd, key| run_builder(&builder_bin, dump, g, dd, key),
+        )
     })
     .await
     .map_err(|e| Failure::new(CODE_EXECUTION, format!("consolidation task failed: {e}")))?
