@@ -1012,6 +1012,34 @@ pub fn replay_dir(dir: &Path, cipher: Option<&DeltaCipher>) -> Result<Replay> {
     }
     segments.sort_by_key(|(n, _)| *n);
 
+    // Segment numbering is dense and monotonic: `next_segment_number` allocates n+1 after
+    // n and a segment is only unlinked by `retire`, which drains from the oldest end. So a
+    // *gap* in the run is a segment that was deleted from the middle, and replaying across
+    // it would silently drop every write it held and then keep going as if the stream were
+    // whole. Per-frame ordinals cannot see this — they are per segment, each restarting at
+    // zero — and nothing else authenticates the composition of a WAL directory the way the
+    // set manifest authenticates a generation's parts.
+    //
+    // This does NOT make the WAL tamper-evident on its own (see THREAT_MODEL.md): deleting
+    // the *newest* segments, or truncating a segment's tail, is still indistinguishable
+    // from a crash at that point, because that is exactly what a crash looks like. It
+    // closes the one case that is unambiguously not a crash.
+    if let (Some((first, _)), Some((last, _))) = (segments.first(), segments.last()) {
+        let expected = last - first + 1;
+        if segments.len() as u64 != expected {
+            let present: Vec<u64> = segments.iter().map(|(n, _)| *n).collect();
+            bail!(
+                "WAL dir {dir:?} is missing {} segment(s): numbering runs {first}..={last} but \
+                 only {} are present ({present:?}). A segment removed from the middle of the run \
+                 would replay as a silently shorter history; refusing rather than serving it. If \
+                 this is deliberate, remove the whole WAL directory (losing every unconsolidated \
+                 write) rather than part of it.",
+                expected - segments.len() as u64,
+                segments.len(),
+            );
+        }
+    }
+
     let mut out = Replay::default();
     for (_, path) in segments {
         let bytes = fs::read(&path).with_context(|| format!("read WAL segment {path:?}"))?;
@@ -1668,6 +1696,75 @@ mod tests {
         assert_eq!(replay.records, vec![a, b]);
         assert_eq!(replay.last_seq, Seq(2));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A segment deleted from the *middle* of the run is refused, not replayed across.
+    ///
+    /// Per-frame ordinals restart at zero in every segment, so they cannot see this, and
+    /// nothing authenticates the composition of a WAL directory the way the set manifest
+    /// authenticates a generation's parts. Without the continuity check the replay simply
+    /// skipped the hole and returned a shorter history that looked complete.
+    ///
+    /// Deliberately *not* asserted as tamper-evidence in general: removing the newest
+    /// segments, or truncating one, is what a crash looks like and stays indistinguishable
+    /// from one (see THREAT_MODEL.md).
+    #[test]
+    fn a_segment_missing_from_the_middle_of_the_run_is_refused() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_gap_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let recs: Vec<_> = (0..3)
+            .map(|i| upsert(i + 1, "L", "k", Value::Int(i as i64 + 1), &[]))
+            .collect();
+        for (i, r) in recs.iter().enumerate() {
+            let mut s = WalSink::create(&dir, i as u64, None).unwrap();
+            s.append(r).unwrap();
+            s.commit(Seq(i as u64 + 1)).unwrap();
+            s.seal().unwrap();
+        }
+        // All three present: replays whole.
+        assert_eq!(replay_dir(&dir, None).unwrap().records.len(), 3);
+
+        // Remove the middle one.
+        let victim = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some("0000000001"))
+            .expect("segment 1 exists");
+        fs::remove_file(&victim).unwrap();
+
+        let err = match replay_dir(&dir, None) {
+            Ok(r) => panic!(
+                "replayed across a hole in the segment run and returned {} record(s) as if \
+                 the history were whole",
+                r.records.len()
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("missing") && err.contains("segment"),
+            "the refusal must name what is wrong: {err}"
+        );
+
+        // Truncating the run at the newest end stays a clean, silent crash tail — that is
+        // exactly what a crash produces, so it must not become an error.
+        let dir2 = std::env::temp_dir().join(format!("slater_wal_tail_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir2);
+        for (i, r) in recs.iter().enumerate() {
+            let mut s = WalSink::create(&dir2, i as u64, None).unwrap();
+            s.append(r).unwrap();
+            s.commit(Seq(i as u64 + 1)).unwrap();
+            s.seal().unwrap();
+        }
+        let newest = fs::read_dir(&dir2)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some("0000000002"))
+            .expect("segment 2 exists");
+        fs::remove_file(&newest).unwrap();
+        assert_eq!(replay_dir(&dir2, None).unwrap().records.len(), 2);
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir2).ok();
     }
 
     /// Regression (HIK-71): `create` and `seal` must fsync the segment's *parent
