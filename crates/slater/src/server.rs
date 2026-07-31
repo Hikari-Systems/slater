@@ -368,12 +368,23 @@ pub fn run_builder(
         let wrote = stdin.write_all(hex.as_bytes()).and_then(|()| stdin.flush());
         drop(stdin); // EOF — the builder reads to EOF and cannot proceed until this.
         if let Err(e) = wrote {
-            // Never leave the child running against a key it did not receive.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e).with_context(|| {
-                format!("hand the at-rest master key to builder '{builder_bin}' over stdin")
-            });
+            // A broken pipe here almost always means the child **already exited** — most
+            // likely rejecting its arguments, e.g. a `builderBin` too old to know
+            // `--key-stdin`. Its own stderr is the useful message; ours would bury it under
+            // "failed to write to stdin". So reap it first and prefer its exit status,
+            // falling back to the write error only if it somehow succeeded.
+            match child.wait() {
+                Ok(st) if !st.success() => bail!(
+                    "builder '{builder_bin}' exited with {st} without reading the at-rest \
+                     master key from stdin while consolidating '{graph}' — check that \
+                     `delta.builderBin` supports --key-stdin"
+                ),
+                _ => {
+                    return Err(e).with_context(|| {
+                        format!("hand the at-rest master key to builder '{builder_bin}' over stdin")
+                    })
+                }
+            }
         }
     }
 
