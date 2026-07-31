@@ -357,7 +357,7 @@ fn external_encrypted_build_then_reopen_with_key() {
     // every store and assert the data survived encrypt→build→decrypt unchanged.
     // `--cluster none` ⇒ dense id == dump id, so positional lookups are valid.
     let key = crypto::hex_decode(key_hex).unwrap();
-    let salt = crypto::hex_decode(&header.salt_hex).unwrap();
+    let salt = crypto::hex_decode_salt(&header.salt_hex, "the fixture generation").unwrap();
     let cipher = Some(Arc::new(BlockCipher::from_master(&key, &salt)));
     // HIK-140: the generation must declare the AAD scheme this build seals under, and
     // every store below is opened under a subkey bound to its store-relative name — this

@@ -906,11 +906,11 @@ fn derive_carry_cipher(
     graph_format::crypto::check_aad_scheme(&h.aad_scheme).with_context(|| what.to_string())?;
     let key = master_key.ok_or_else(|| {
         anyhow::anyhow!(
-            "{what} is encrypted at rest but this build was given no key — rerun with              --encrypt and the same --key-file/--key-env the base was built with"
+            "{what} is encrypted at rest but this build was given no key — rerun with \
+             --encrypt and the same --key-file/--key-env the base was built with"
         )
     })?;
-    let salt = graph_format::crypto::hex_decode(&h.salt_hex)
-        .with_context(|| format!("decode the encryption salt of {what}"))?;
+    let salt = graph_format::crypto::hex_decode_salt(&h.salt_hex, what)?;
     let block = BlockCipher::from_master(key, &salt);
     Ok(Some(Arc::new(block.for_file(aad_name))))
 }

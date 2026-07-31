@@ -1686,7 +1686,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    fn gen_cipher(master: &[u8], salt: &[u8]) -> Arc<BlockCipher> {
+    fn gen_cipher(master: &[u8], salt: &[u8; crate::crypto::SALT_LEN]) -> Arc<BlockCipher> {
         Arc::new(BlockCipher::from_master(master, salt))
     }
     /// A file cipher for `name`, for the tests that hold a generation cipher directly.

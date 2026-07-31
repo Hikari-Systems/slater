@@ -248,12 +248,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
             return None;
         }
         let where_ = where_?;
+        // Same scalar view the anchor planner gets (`choose_node_scan`), so the
+        // re-root decision and the scan it enables cannot disagree about what is
+        // id-anchored: `UNWIND $ids AS i MATCH (m)-[r]->(n) WHERE id(n) = i` must
+        // both re-root onto `n` and then seek it.
+        let bound = bound_scalars(binding);
         let start_anchored = pattern
             .start
             .var
             .as_deref()
-            .is_some_and(|v| is_id_anchored(where_, v, &self.plan_params));
-        if start_anchored || !is_id_anchored(where_, end_var, &self.plan_params) {
+            .is_some_and(|v| is_id_anchored(where_, v, &self.plan_params, &bound));
+        if start_anchored || !is_id_anchored(where_, end_var, &self.plan_params, &bound) {
             return None;
         }
         Some(reverse_pattern(pattern))

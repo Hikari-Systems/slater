@@ -610,8 +610,7 @@ fn derive_segment_cipher(
     // refused, exactly like a generation (`generation.rs`'s `derive_cipher`).
     crypto::check_aad_scheme(&header.aad_scheme)
         .with_context(|| format!("segment {uuid} of {graph}"))?;
-    let salt = crypto::hex_decode(&header.salt_hex)
-        .with_context(|| format!("decode encryption salt for segment {uuid}"))?;
+    let salt = crypto::hex_decode_salt(&header.salt_hex, &format!("segment {uuid}"))?;
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
 }
 

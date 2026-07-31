@@ -103,7 +103,7 @@ pub fn choose_node_scan(
     // narrowing away a row a disjunction would have kept — which `id_seek_ids`
     // prevents by descending `AND` only (never `OR`).
     if let Some(w) = where_ {
-        if let Some(ids) = id_seek_ids(w, var, gen.node_count(), params) {
+        if let Some(ids) = id_seek_ids(w, var, gen.node_count(), params, bound) {
             return NodeScan::IdSeek { ids };
         }
     }
@@ -206,10 +206,11 @@ fn id_seek_ids(
     var: &str,
     node_count: u64,
     params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
 ) -> Option<Vec<u64>> {
     let mut ids: Vec<u64> = Vec::new();
     let mut found = false;
-    collect_id_eq(expr, var, params, &mut ids, &mut found);
+    collect_id_eq(expr, var, params, bound, &mut ids, &mut found);
     if !found {
         return None;
     }
@@ -224,10 +225,15 @@ fn id_seek_ids(
 /// id-seekable end node (so `MATCH (m)-[r]->(n) WHERE id(n) = X` seeks `n` and
 /// walks the edge backwards instead of scanning every `m`). Cheaper than
 /// [`id_seek_ids`] — no bounds resolution, just "is there an id constraint".
-pub(crate) fn is_id_anchored(where_: &Expr, var: &str, params: &HashMap<String, Value>) -> bool {
+pub(crate) fn is_id_anchored(
+    where_: &Expr,
+    var: &str,
+    params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
+) -> bool {
     let mut ids = Vec::new();
     let mut found = false;
-    collect_id_eq(where_, var, params, &mut ids, &mut found);
+    collect_id_eq(where_, var, params, bound, &mut ids, &mut found);
     found
 }
 
@@ -239,18 +245,19 @@ fn collect_id_eq(
     expr: &Expr,
     var: &str,
     params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
     ids: &mut Vec<u64>,
     found: &mut bool,
 ) {
     match expr {
         Expr::And(parts) => {
             for p in parts {
-                collect_id_eq(p, var, params, ids, found);
+                collect_id_eq(p, var, params, bound, ids, found);
             }
         }
         // `id(var) = <int>` / `<int> = id(var)`.
         Expr::Compare(CmpOp::Eq, l, r) => {
-            if let Some(i) = id_eq_operand(l, r, var, params) {
+            if let Some(i) = id_eq_operand(l, r, var, params, bound) {
                 *found = true;
                 if i >= 0 {
                     ids.push(i as u64);
@@ -261,7 +268,7 @@ fn collect_id_eq(
         // integer (otherwise the full id-set is unknown → fall back to a scan).
         Expr::In(lhs, rhs) if is_id_of(lhs, var) => {
             let consts: Option<Vec<i64>> = match &**rhs {
-                Expr::List(items) => items.iter().map(|e| const_int(e, params)).collect(),
+                Expr::List(items) => items.iter().map(|e| const_int(e, params, bound)).collect(),
                 // `id(var) IN $ids` — the whole list arrives as one bound param.
                 // Every element must be an integer, or the id-set is unknown.
                 Expr::Param(name) => match params.get(name) {
@@ -287,12 +294,18 @@ fn collect_id_eq(
 
 /// For an `=` comparison, return the integer if exactly one side is `id(var)` and
 /// the other a constant integer.
-fn id_eq_operand(l: &Expr, r: &Expr, var: &str, params: &HashMap<String, Value>) -> Option<i64> {
+fn id_eq_operand(
+    l: &Expr,
+    r: &Expr,
+    var: &str,
+    params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
+) -> Option<i64> {
     if is_id_of(l, var) {
-        return const_int(r, params);
+        return const_int(r, params, bound);
     }
     if is_id_of(r, var) {
-        return const_int(l, params);
+        return const_int(l, params, bound);
     }
     None
 }
@@ -301,7 +314,11 @@ fn id_eq_operand(l: &Expr, r: &Expr, var: &str, params: &HashMap<String, Value>)
 /// `$param`, or a (possibly nested) numeric negation of either. Needed because
 /// `-1` parses as `Neg(Literal(Int(1)))`,
 /// not a negative literal. Overflow (`-i64::MIN`) yields `None` (no seek).
-fn const_int(e: &Expr, params: &HashMap<String, Value>) -> Option<i64> {
+fn const_int(
+    e: &Expr,
+    params: &HashMap<String, Value>,
+    bound: &HashMap<String, Value>,
+) -> Option<i64> {
     match e {
         Expr::Literal(Value::Int(i)) => Some(*i),
         // `$p` bound to an integer by the RUN message. Drivers parameterise id
@@ -312,7 +329,16 @@ fn const_int(e: &Expr, params: &HashMap<String, Value>) -> Option<i64> {
             Some(Value::Int(i)) => Some(*i),
             _ => None,
         },
-        Expr::Neg(inner) => const_int(inner, params).and_then(i64::checked_neg),
+        // A variable already bound for this row — `UNWIND $ids AS i MATCH (n)
+        // WHERE id(n) = i`, which is how a driver spells a batched id lookup and
+        // the natural rewrite of the parameterised form above. Without this arm
+        // it full-scanned once per row while the single-`$param` spelling seeked.
+        // Same discipline: a non-integer binding is `None`, never a coercion.
+        Expr::Var(name) => match bound.get(name) {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        },
+        Expr::Neg(inner) => const_int(inner, params, bound).and_then(i64::checked_neg),
         _ => None,
     }
 }
@@ -859,7 +885,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
-        is_id_anchored(where_.unwrap(), var, &params)
+        is_id_anchored(where_.unwrap(), var, &params, &HashMap::new())
     }
 
     #[test]
@@ -881,6 +907,53 @@ mod tests {
             &[("p", Value::Int(2))],
         );
         assert_eq!(flipped, NodeScan::IdSeek { ids: vec![2] });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A **row-bound** integer seeks too, not just a `$param`.
+    ///
+    /// `UNWIND $ids AS i MATCH (n) WHERE id(n) = i` is how a driver spells a batched id
+    /// lookup, and the natural rewrite of the single-`$p` form above. `id(n) = i` is
+    /// `Expr::Var`, not `Expr::Param`, so the id walker — which was threaded `params`
+    /// but not `bound` — saw no constraint and fell back to a **full scan per row**,
+    /// while the property path (`resolve`) had consulted both maps all along.
+    #[test]
+    fn bound_variable_id_equality_picks_id_seek() {
+        let (root, graph, _) = crate::testgen::write_basic("plan_id_eq_bound");
+        let gen = Generation::open(&root, &graph).unwrap();
+
+        let scan = plan_for_bound(
+            &gen,
+            "MATCH (n) WHERE id(n) = i RETURN n",
+            &[("i", Value::Int(1))],
+        );
+        assert_eq!(scan, NodeScan::IdSeek { ids: vec![1] });
+
+        // Flipped operands, and a list membership, on the same footing as `$p`.
+        assert_eq!(
+            plan_for_bound(
+                &gen,
+                "MATCH (n) WHERE i = id(n) RETURN n",
+                &[("i", Value::Int(2))]
+            ),
+            NodeScan::IdSeek { ids: vec![2] }
+        );
+
+        // Unbound, or bound to a non-integer, must fall back to a scan rather than
+        // coerce — the same discipline the `$param` arm keeps.
+        assert_ne!(
+            plan_for_bound(&gen, "MATCH (n) WHERE id(n) = i RETURN n", &[]),
+            NodeScan::IdSeek { ids: vec![] },
+        );
+        assert_ne!(
+            plan_for_bound(
+                &gen,
+                "MATCH (n) WHERE id(n) = i RETURN n",
+                &[("i", Value::Str("1".into()))]
+            ),
+            NodeScan::IdSeek { ids: vec![1] },
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

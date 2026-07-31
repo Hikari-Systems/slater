@@ -1214,8 +1214,7 @@ fn derive_cipher(
     // wrong key or a corrupt block.
     crypto::check_aad_scheme(&header.aad_scheme)
         .with_context(|| format!("generation {uuid} of graph {graph}"))?;
-    let salt = crypto::hex_decode(&header.salt_hex)
-        .with_context(|| format!("decode encryption salt for generation {uuid}"))?;
+    let salt = crypto::hex_decode_salt(&header.salt_hex, &format!("generation {uuid}"))?;
     Ok(Some(Arc::new(BlockCipher::from_master(key, &salt))))
 }
 
@@ -1321,9 +1320,8 @@ fn open_carried_graph(
             })?;
             crypto::check_aad_scheme(&h.aad_scheme)
                 .with_context(|| format!("carried vector-graph artifact {}", r.uuid))?;
-            let salt = crypto::hex_decode(&h.salt_hex).with_context(|| {
-                format!("decode encryption salt of carried artifact {}", r.uuid)
-            })?;
+            let salt =
+                crypto::hex_decode_salt(&h.salt_hex, &format!("carried artifact {}", r.uuid))?;
             // The subkey label is the one recorded in the manifest, never the file's current
             // path: promoting the file out of the generation directory changed its name, and
             // HIK-140 binds each block to the name it was **sealed** under.

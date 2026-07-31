@@ -210,7 +210,16 @@ impl VectorIndexManifest {
     /// to another artifact's key (or another graph's): its MAC would still verify — the MAC
     /// covers `artifact_uuid`, not where the bytes are stored — and a generation reference
     /// naming that uuid would then resolve to a graph the operator never published there.
-    /// The same trap `SetManifest::read_via` closes (HIK-144).
+    ///
+    /// The uuid half is the trap `SetManifest::read_via` closes (HIK-144). The **graph**
+    /// half has no counterpart there: `SetManifest` carries no `graph` field at all, and
+    /// neither does `SegmentManifest`, so those two documents are byte-portable between
+    /// graphs on one server. It does not appear to be exploitable — moving a set requires
+    /// moving its base generation directory, and `Generation::open` refuses on
+    /// `manifest.graph != graph`, so the binding exists transitively through the generation
+    /// manifest — but it is transitive, not direct, and this comment used to imply
+    /// otherwise. An artifact has no such backstop (its manifest is the only document naming
+    /// it), which is why the check is direct here.
     pub fn read_via(store: &dyn ObjectStore, graph: &str, uuid: Generation) -> Result<Self> {
         let key = Self::key(graph, uuid);
         let bytes = store

@@ -48,7 +48,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -107,7 +107,18 @@ pub fn random_salt() -> [u8; SALT_LEN] {
 ///
 /// The subkey is returned in a [`Zeroizing`] so it is wiped when the caller drops
 /// it; deref gives `&[u8; KEY_LEN]` so call sites are otherwise unchanged.
-pub fn derive_key(master_key: &[u8], salt: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
+///
+/// **`salt` must be exactly [`SALT_LEN`] bytes**, and the type says so. The hash
+/// absorbs `master_key ‖ salt` with no length prefix — unlike its siblings
+/// [`derive_delta_key`], which prefixes, and [`derive_file_key`], whose leading
+/// input is a fixed-width 32-byte key — so with a variable-length salt the pair
+/// would be ambiguous: `("ab", "c")` and `("a", "bc")` absorb identical bytes and
+/// yield identical keys. Pinning the salt's width makes the split unambiguous
+/// (the master key is everything before the last [`SALT_LEN`] bytes) without
+/// changing a single derived key, so no image needs rebuilding for it. A
+/// length-prefix would have been the other fix and would have invalidated every
+/// encrypted image on disk.
+pub fn derive_key(master_key: &[u8], salt: &[u8; SALT_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
     let mut h = blake3::Hasher::new_derive_key(KDF_CONTEXT);
     h.update(master_key);
     h.update(salt);
@@ -398,8 +409,31 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Decode a manifest's `saltHex` into a fixed-width [`SALT_LEN`] salt.
+///
+/// The width is not cosmetic: [`derive_key`] absorbs `master_key ‖ salt` with no
+/// length prefix, so a variable-width salt would make the pair ambiguous — see
+/// its doc comment. Every sealed document's salt must therefore come through
+/// here rather than through bare [`hex_decode`], which cannot enforce it.
+///
+/// `what` names the document in the error, since a wrong-width salt reaches this
+/// from an on-disk manifest an operator has to go and look at.
+pub fn hex_decode_salt(s: &str, what: &str) -> Result<[u8; SALT_LEN]> {
+    let bytes = hex_decode(s).with_context(|| format!("decode the encryption salt of {what}"))?;
+    <[u8; SALT_LEN]>::try_from(bytes.as_slice()).map_err(|_| {
+        anyhow!(
+            "{what} declares a {}-byte encryption salt, but this build derives keys from a \
+             {SALT_LEN}-byte salt; the image is malformed or was written by another tool",
+            bytes.len()
+        )
+    })
+}
+
 /// Decode a lower/upper-case hex string into bytes. A clear error (not a panic)
 /// on an odd length or a non-hex digit — keys and salts arrive from operators.
+///
+/// For a manifest salt use [`hex_decode_salt`], which also pins the width
+/// [`derive_key`] depends on.
 pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
     if !s.len().is_multiple_of(2) {
@@ -462,7 +496,7 @@ impl BlockCipher {
 
     /// Derive the per-generation key from a runtime master key + salt and build
     /// the cipher.
-    pub fn from_master(master_key: &[u8], salt: &[u8]) -> Self {
+    pub fn from_master(master_key: &[u8], salt: &[u8; SALT_LEN]) -> Self {
         Self::from_key(&derive_key(master_key, salt))
     }
 
@@ -728,6 +762,36 @@ mod tests {
         assert_ne!(k1, derive_key(b"other-master-key", &salt_a));
     }
 
+    /// `derive_key` absorbs `master_key ‖ salt` with no length prefix, so the split is
+    /// only unambiguous while the salt has a fixed width — `("ab", "c")` and
+    /// `("a", "bc")` would otherwise derive the same key, which is the ambiguity
+    /// `derive_delta_key` length-prefixes to avoid.
+    ///
+    /// The type now carries that (`&[u8; SALT_LEN]`), so the collision is
+    /// unconstructible in Rust and this pins the remaining gap: the salt arriving as
+    /// *hex text* from an on-disk manifest, which nothing checked the width of.
+    #[test]
+    fn a_salt_of_the_wrong_width_is_refused_at_decode() {
+        let good = hex_encode(&[7u8; SALT_LEN]);
+        assert_eq!(
+            hex_decode_salt(&good, "the fixture").unwrap(),
+            [7u8; SALT_LEN]
+        );
+
+        for bad in [
+            hex_encode(&[7u8; SALT_LEN - 1]),
+            hex_encode(&[7u8; SALT_LEN + 1]),
+            String::new(),
+        ] {
+            let err = hex_decode_salt(&bad, "the fixture").expect_err("wrong width must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("encryption salt") && msg.contains("the fixture"),
+                "the refusal must name the document and what is wrong: {msg}"
+            );
+        }
+    }
+
     /// HIK-142: the preimage framing is a versioned domain tag, a NUL, the body length,
     /// then the body — and the tag's version tracks `FORMAT_VERSION` rather than a
     /// hand-maintained scheme string.
@@ -770,10 +834,10 @@ mod tests {
         );
         // Domain separation: the MAC key must not equal a block key derived from
         // the same master (the block KDF also folds in a salt, but even an
-        // empty-salt block key must differ thanks to the distinct context).
+        // all-zero-salt block key must differ thanks to the distinct context).
         assert_ne!(
             k1,
-            derive_key(master, b""),
+            derive_key(master, &[0u8; SALT_LEN]),
             "MAC key is domain-separated from the block key"
         );
     }
