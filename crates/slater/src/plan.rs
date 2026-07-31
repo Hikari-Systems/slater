@@ -269,9 +269,13 @@ fn collect_id_eq(
         Expr::In(lhs, rhs) if is_id_of(lhs, var) => {
             let consts: Option<Vec<i64>> = match &**rhs {
                 Expr::List(items) => items.iter().map(|e| const_int(e, params, bound)).collect(),
-                // `id(var) IN $ids` — the whole list arrives as one bound param.
-                // Every element must be an integer, or the id-set is unknown.
-                Expr::Param(name) => match params.get(name) {
+                // `id(var) IN $ids` — the whole list arrives as one bound param — or
+                // `id(var) IN xs` with `xs` a column bound for this row. Both are one
+                // `Value::List`, and `resolve` is the single place that knows where a
+                // plan-time value may come from, so ask it rather than matching the two
+                // sources apart. Every element must be an integer, or the id-set is
+                // unknown and the seek would be unsound.
+                e @ (Expr::Param(_) | Expr::Var(_)) => match resolve_ref(e, params, bound) {
                     Some(Value::List(items)) => items
                         .iter()
                         .map(|v| match v {
@@ -310,42 +314,41 @@ fn id_eq_operand(
     None
 }
 
-/// Evaluate a constant integer expression: an int literal, an integer-bound
-/// `$param`, or a (possibly nested) numeric negation of either. Needed because
-/// `-1` parses as `Neg(Literal(Int(1)))`,
-/// not a negative literal. Overflow (`-i64::MIN`) yields `None` (no seek).
+/// Evaluate a plan-time constant **integer**: a literal, an integer-valued `$param`,
+/// an integer-valued bound column, or a (possibly nested) numeric negation of any of
+/// those. The negation arm is needed because `-1` parses as `Neg(Literal(Int(1)))`,
+/// not as a negative literal; overflow (`-i64::MIN`) yields `None`, i.e. no seek.
+///
+/// **Delegates to [`resolve`] for everything except `Neg`, deliberately.** "Which
+/// expressions have a value at plan time?" has exactly one right answer, and this
+/// function used to hold a second, independent copy of it — which is how the same bug
+/// shipped twice: `resolve` learned about `$param` and bound columns while `const_int`
+/// learned only about literals (HIK-147), then only about `$param` (HIK-148). Anything
+/// that teaches `resolve` a new source now teaches this too. What stays local is the
+/// part that is genuinely specific: `Neg`, and the integer-only filter — a `Float`,
+/// `Str` or `Node` is not a node id, and is refused rather than coerced.
 fn const_int(
     e: &Expr,
     params: &HashMap<String, Value>,
     bound: &HashMap<String, Value>,
 ) -> Option<i64> {
     match e {
-        Expr::Literal(Value::Int(i)) => Some(*i),
-        // `$p` bound to an integer by the RUN message. Drivers parameterise id
-        // lookups, so this arm is the common one in production (HIK-147); an
-        // absent or non-integer binding yields `None` → fallback scan, never a
-        // coercion (a `Float`/`Str` is not a node id) and never a panic.
-        Expr::Param(name) => match params.get(name) {
-            Some(Value::Int(i)) => Some(*i),
-            _ => None,
-        },
-        // A variable already bound for this row — `UNWIND $ids AS i MATCH (n)
-        // WHERE id(n) = i`, which is how a driver spells a batched id lookup and
-        // the natural rewrite of the parameterised form above. Without this arm
-        // it full-scanned once per row while the single-`$param` spelling seeked.
-        // Same discipline: a non-integer binding is `None`, never a coercion.
-        Expr::Var(name) => match bound.get(name) {
-            Some(Value::Int(i)) => Some(*i),
-            _ => None,
-        },
         Expr::Neg(inner) => const_int(inner, params, bound).and_then(i64::checked_neg),
-        _ => None,
+        _ => match resolve_ref(e, params, bound) {
+            Some(Value::Int(i)) => Some(*i),
+            _ => None,
+        },
     }
 }
 
 /// Is `e` exactly `id(var)` — the built-in `id` function (case-insensitive, not
 /// `DISTINCT`) applied to the single variable `var`?
-fn is_id_of(e: &Expr, var: &str) -> bool {
+///
+/// `pub(crate)` because `exec::anchor_correlated` has to ask the same question when it
+/// decides whether an anchor's plan depends on the row. A second matcher there would be
+/// a second answer to "is this `id(var)`?", and this module already has one bug from
+/// exactly that shape — see `const_int`'s note about `resolve`.
+pub(crate) fn is_id_of(e: &Expr, var: &str) -> bool {
     matches!(
         e,
         Expr::Function { name, distinct: false, args: FuncArgs::Args(a) }
@@ -519,10 +522,25 @@ fn resolve(
     params: &HashMap<String, Value>,
     bound: &HashMap<String, Value>,
 ) -> Option<Value> {
+    resolve_ref(e, params, bound).cloned()
+}
+
+/// [`resolve`] without the clone — the single definition of "where can a plan-time
+/// value come from", which `resolve` wraps.
+///
+/// Borrowing matters on the id path: `id(n) IN $ids` resolves the *whole list* as one
+/// value, and a correlated anchor re-plans per row, so cloning there would copy every
+/// id once per input row purely to look at it. Callers that need ownership take
+/// [`resolve`]; callers that only inspect take this.
+fn resolve_ref<'a>(
+    e: &'a Expr,
+    params: &'a HashMap<String, Value>,
+    bound: &'a HashMap<String, Value>,
+) -> Option<&'a Value> {
     match e {
-        Expr::Literal(v) => Some(v.clone()),
-        Expr::Param(name) => params.get(name).cloned(),
-        Expr::Var(name) => bound.get(name).cloned(),
+        Expr::Literal(v) => Some(v),
+        Expr::Param(name) => params.get(name),
+        Expr::Var(name) => bound.get(name),
         _ => None,
     }
 }

@@ -7987,6 +7987,150 @@ fn parameterised_id_lookup_does_seek_sized_work_not_scan_sized() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The same guarantee for a **row-bound** id — `UNWIND … AS x MATCH (n) WHERE id(n) = x`
+/// — measured through the executor, not the planner.
+///
+/// This has to run on the streamed-MATCH path or it proves nothing. `choose_node_scan`
+/// receives the row's scalars only when the anchor is classified *correlated*
+/// (`matchclause`'s hoist decision); an uncorrelated anchor is planned once, outside the
+/// row loop, with an **empty** bound map. So threading `bound` into the id walkers is
+/// inert on its own — the walkers are handed nothing to find — while plan-level tests
+/// that call `plan_for_bound` with a hand-built map go green regardless. That is exactly
+/// the shape this test exists to refuse.
+///
+/// Also pins the correctness half, which matters more than the speed half: with the
+/// anchor correlated, a plan built from row 1 must never be replayed for row 2. Two rows
+/// naming different leaves must return their own leaf, not the first row's twice.
+#[test]
+fn a_row_bound_id_lookup_does_seek_sized_work_and_stays_per_row() {
+    const N: u64 = 2_000;
+    let (root, graph) = testgen::write_hub("exec_bound_id_seek", N);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    // One row: seek-sized work, not scan-sized. The un-seeked plan scans every node and
+    // expands all 2n LINK edges, so a budget two orders of magnitude below that trips.
+    let global = GlobalIntermediateBudget::new(0);
+    let engine = Engine::new(&gen, &cache)
+        .with_max_intermediate(N / 100)
+        .with_global_budget(&global);
+    let res = engine
+        .run(
+            &parser::parse(
+                "UNWIND [7] AS x MATCH (m)-[:LINK]->(n) WHERE id(n) = x RETURN m.name AS nm",
+            )
+            .unwrap(),
+        )
+        .expect("a row-bound id lookup must not scan the whole star");
+    let names: Vec<String> = res.rows.iter().map(|r| r[0].to_display()).collect();
+    assert_eq!(names, vec!["hub"], "only the hub links to leaf 7");
+    assert!(
+        global.peak() < N / 100,
+        "seek-sized work expected, peak charge was {} against {N} leaves",
+        global.peak()
+    );
+
+    // Multi-row: the regression guard for the hoist invariant. Each row must be answered
+    // from its own binding.
+    let engine = Engine::new(&gen, &cache);
+    let multi = engine
+        .run(
+            &parser::parse("UNWIND [7, 11, 3] AS x MATCH (n) WHERE id(n) = x RETURN id(n) AS got")
+                .unwrap(),
+        )
+        .expect("multi-row bound id lookup");
+    let got: Vec<String> = multi.rows.iter().map(|r| r[0].to_display()).collect();
+    assert_eq!(
+        got,
+        vec!["7", "11", "3"],
+        "each row must seek its own id — a hoisted plan replays row 1's for every row"
+    );
+
+    // ── The plain anchor: no traversal, so no re-root to rescue it ──────────────
+    //
+    // The intermediate budget does not instrument this shape (measured: peak 0 whether
+    // it seeks or scans), so assert on `anchor_ids_scanned()` — the ids the anchor scan
+    // actually walked. An `IdSeek` walks a handful; an `AllNodes` scan walks the id
+    // space. This is the assertion that stays red under half A.1 alone.
+    let scanned = |q: &str| -> (Vec<String>, u64) {
+        let eng = Engine::new(&gen, &cache);
+        let r = eng.run(&parser::parse(q).unwrap()).expect("query");
+        (
+            r.rows.iter().map(|row| row[0].to_display()).collect(),
+            eng.anchor_ids_scanned(),
+        )
+    };
+
+    let (got, walked) = scanned("WITH 5 AS x MATCH (n) WHERE id(n) = x RETURN id(n) AS got");
+    assert_eq!(got, vec!["5"]);
+    assert!(
+        walked <= 8,
+        "a WITH-bound id anchor must seek, not scan — walked {walked} ids of {N}"
+    );
+
+    // `id(n) IN <bound list>`, mirroring the `$ids` arm.
+    let (got, walked) =
+        scanned("WITH [4, 9] AS xs MATCH (n) WHERE id(n) IN xs RETURN id(n) AS got ORDER BY got");
+    assert_eq!(got, vec!["4", "9"]);
+    assert!(
+        walked <= 8,
+        "a bound-list id membership must seek — walked {walked} ids of {N}"
+    );
+
+    // Reversed operands.
+    let (got, walked) = scanned("WITH 6 AS x MATCH (n) WHERE x = id(n) RETURN id(n) AS got");
+    assert_eq!(got, vec!["6"]);
+    assert!(
+        walked <= 8,
+        "reversed operands must seek too — walked {walked}"
+    );
+
+    // ── The fallbacks must stay fallbacks ───────────────────────────────────────
+    //
+    // Classifying an anchor *correlated* costs the shared-candidate replay for
+    // multi-row inputs. That is the right trade for an O(1) seek and the wrong one for
+    // a per-row full scan, so an id expression that cannot resolve must not be treated
+    // as seekable — it must scan, and it must answer correctly.
+    let (got, _) = scanned("WITH 'five' AS x MATCH (n) WHERE id(n) = x RETURN id(n) AS got");
+    assert!(
+        got.is_empty(),
+        "a non-integer binding is not a node id: no rows, no coercion, no panic"
+    );
+    // Out of range and negative are provably empty — an empty seek, never an error.
+    for q in [
+        "WITH 999999 AS x MATCH (n) WHERE id(n) = x RETURN id(n) AS got",
+        "WITH -1 AS x MATCH (n) WHERE id(n) = x RETURN id(n) AS got",
+    ] {
+        let (got, walked) = scanned(q);
+        assert!(got.is_empty(), "{q} must return nothing");
+        assert!(walked <= 8, "{q} is provably empty — it must not scan");
+    }
+
+    // An inline list mixing a bound column with a literal. `const_int` resolves each
+    // element, so this seeks — which means the correlation check has to recognise it
+    // too, or it is planned with an empty `bound` and silently scans.
+    let (got, walked) =
+        scanned("WITH 2 AS a MATCH (n) WHERE id(n) IN [a, 3] RETURN id(n) AS got ORDER BY got");
+    assert_eq!(got, vec!["2", "3"]);
+    assert!(
+        walked <= 8,
+        "a list mixing a bound column and a literal must seek — walked {walked}"
+    );
+
+    // `id(n) < x` is NOT seekable — `collect_id_eq` handles equality only. It must
+    // answer correctly by scanning; the point is that it must not be *misclassified*
+    // as a per-row plan, which would forfeit the shared-candidate replay for nothing.
+    let (got, _) =
+        scanned("WITH 3 AS x MATCH (n) WHERE id(n) < x RETURN id(n) AS got ORDER BY got");
+    assert_eq!(
+        got,
+        vec!["0", "1", "2"],
+        "an unseekable id comparison still answers"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The **Vamana arm** of the HIK-122 rescue read. The consolidation tests exercise this
 /// through the real builder, but a fixture small enough to run there is always below
 /// `ann_threshold` and so always brute-force — this is the only place the other arm is
