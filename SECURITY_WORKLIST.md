@@ -1,6 +1,8 @@
 # Slater security worklist
 
-Items from the security review of 2026-06-12. The headline ACL-stamp-on-reload fix and the
+Items from the security review of 2026-06-12, plus everything raised since — most recently the
+external at-rest review of 2026-07-22 and the adversarial review of its remediation
+(2026-07-31). The headline ACL-stamp-on-reload fix and the
 Tier-1 DoS caps were implemented in that pass (see `THREAT_MODEL.md`); the rest were triaged
 as lower priority and recorded here. Several have since been completed — each item lists where
 it lives, why it matters, the fix, and its current status. Each line also carries a GitHub
@@ -168,9 +170,122 @@ authenticated principals over Bolt).
   (not merely an absent key) is rejected by serde rather than defaulting to `Augmented`. Complements
   the existing on-disk-decode refusals — finite centroids and in-range PQ code bytes (HIK-133/134).
 
+## Closed — the at-rest batch (2026-07-31, HIK-139..146 + HIK-153)
+
+An external reviewer's findings on the at-rest story, plus what the remediation's own
+adversarial review turned up. All on `v0.24.2`. `THREAT_MODEL.md` carries the narrative;
+this is the ledger.
+
+- [x] **✅ FIXED — key material survived its own drop (HIK-139).** The master key, the hex text
+  it was read from and the derived subkeys are now in `Zeroizing`. The subtlety the fix's own
+  self-review caught: wiping the KDF *output* is not enough — `blake3::Hasher::new_derive_key`
+  keeps the master key verbatim in its 64-byte block buffer, `finalize_xof`'s reader can
+  regenerate the subkey, a keyed hasher holds the MAC key in its key words, and `blake3::Hasher`
+  has no `Drop`. Fixed by enabling blake3's `zeroize` feature and wiping the hashers explicitly.
+  Three residual gaps are structural, not oversights, and are written up as limitation 7 in
+  `THREAT_MODEL.md` (`keyEnv` cannot be wiped at all; a buffer that grows by reallocation leaves
+  copies in freed heap; nothing reaches an optimizer spill).
+
+- [x] **✅ FIXED — a block's ciphertext was not bound to where it lived (HIK-140).** Blocks are
+  now sealed under a per-file subkey with the block ordinal *and* the plaintext directory row
+  (`raw_len`/`rec_count`) as associated data, recorded as `aadScheme: "file-block-v1"` and
+  **required**. A valid ciphertext lifted to another offset, another file of the same
+  generation, or the ISAM top slot no longer decrypts, and a forged directory row cannot
+  re-index a file's records. Encrypted images built before this must be rebuilt.
+
+- [x] **✅ FIXED — the MAC preimage had no domain framing (HIK-142).** A versioned tag derived
+  from `FORMAT_VERSION`, a NUL, the body length, then the body; `MacDomain` is a closed enum,
+  and all four document kinds have pinned golden preimages. Decision recorded: keep `serde_json`
+  as the preimage body — a hand-rolled canonical encoder fails in the worse direction, letting a
+  newly added field fall silently *outside* the MAC.
+
+- [x] **✅ FIXED — "MAC-strip is structurally closed" held on exactly one path (HIK-144).** The
+  refusal was written out only in the server's registry, so `slater query`, consolidation and the
+  bench harnesses opened images the server refused. It now lives in one place
+  (`crypto::authenticate` over `MacSealed`), invoked inside the open itself, so every opener
+  enforces it identically. Also closes **recomposition**: MACs on the parts did not authenticate
+  the *composition* of the parts, so an attacker could repoint the set at another base or
+  drop/add/reorder segments out of pieces that each verified perfectly. `sets/<uuid>.json` is now
+  sealed, and three bindings tie the named parts back to it.
+
+- [x] **✅ FIXED — carrying a Vamana index by reference had never worked under encryption
+  (HIK-145).** `carry_vamana_index` opened the *previous* generation's vector files with the
+  *new* generation's cipher while every build minted a fresh salt. Invisible for its whole life
+  because every test on the carry path passed `cipher: None` — two configurations with no test in
+  common. The carried index is now its own salt-bearing artifact, mirroring the segment pattern,
+  so the hard link survives and no bytes are rewritten. **Owner rule, final form: one salt per
+  *artifact*, in that artifact's own manifest.** CI now runs the encrypted arm (see below).
+
+- [x] **✅ FIXED — the writable layer's own artifacts were plaintext (HIK-146).** Every WAL
+  segment and L0 spill segment is AEAD-sealed under a per-graph delta key; frames seal on the
+  appending thread before the batch fsync, each binding its ordinal within its segment; L0 blocks
+  are authenticated at open rather than lazily on the read, where the accessors can only panic.
+  The policy is symmetric — a sealed artifact with no key and a plaintext artifact under a key are
+  both refused, the latter being the downgrade that would let anyone with write access to the WAL
+  directory inject writes into an encrypted graph.
+
+- [x] **✅ FIXED — a substituted *plaintext* container bypassed the AEAD entirely (HIK-153).**
+  `BlockFileReader::open_src` and `IsamReader::open_src` decided encrypted-ness from the file's
+  own magic and discarded the cipher they were handed if the magic said plaintext. Overwrite a
+  sealed `.blk`/`.isam` with an unsealed one and no tag was ever checked. The manifest MAC does
+  not catch it — it authenticates the per-file hashes, it does not *compare* them, and the
+  comparison is exactly what `dataBackend.verifyIntegrity: false` turns off, which is the
+  documented posture for a network backend. Both readers now refuse the mismatch in both
+  directions (`AeadRejected::Unsealed`). Found by adversarial review of the HIK-140/144 work,
+  not by the original reviewer.
+
+- [x] **✅ FIXED — replay walked across a hole in the WAL segment run.** Segment numbering is
+  dense and monotonic, so a gap is a deleted segment; replay returned a silently shorter history
+  that looked whole. Now refused. Deliberately **not** claimed as general tamper-evidence — see
+  the two open items below.
+
+- [x] **✅ FIXED — the KDF salt had no pinned width.** `derive_key` absorbs `master ‖ salt` with
+  no length prefix, so a variable-width salt made the pair ambiguous, and nothing validated that a
+  manifest's `saltHex` decoded to `SALT_LEN`. Pinned by type plus a checking decoder; derives
+  identical keys, so no image needs rebuilding for it.
+
+- [x] **✅ FIXED — the only encrypted-carry coverage never ran.** The two tests that exercise a
+  carry under a key are `#[ignore]`d (they spawn the real `slater-build`) and CI ran no
+  `--ignored` job, so the exact test-coverage shape that hid HIK-145 was still in place after
+  fixing it. A dedicated `consolidation` CI job now runs all eleven real-builder tests.
+
+## Still open from that batch
+
+- [ ] **⬜ OPEN — the WAL is not tamper-evident in general** (*medium*, requires data-dir write
+  access). Per-frame ordinal binding catches duplication, reordering, a cross-segment or
+  cross-graph move, and a frame-aligned deletion from the middle. It does **not** catch tail
+  truncation, deletion of a whole newest segment, or a byte splice that breaks frame
+  alignment — in all three the CRC gate fires first and replay treats the remainder as a torn
+  tail, i.e. silent data loss rather than a refusal. These are genuinely indistinguishable from a
+  crash at that point; closing them needs a committed-length or frame-count the replay can check
+  against, which the delta has nowhere to record. Same family as item 4 below.
+
+- [ ] **⬜ OPEN — the delta has no anti-rollback** (*medium*, same attacker). The delta key is a
+  function of the master key and graph name alone, so it is stable for the deployment's life,
+  and segment naming is deterministic and restartable (WAL numbering restarts at zero on an
+  emptied directory; L0 compaction reuses the oldest slot's name). Any segment ever validly
+  written for a graph therefore opens cleanly forever, so an attacker who kept a copy can restore
+  it. The core has the same gap (item 4); a shared fix — a monotonic, MAC-covered counter that
+  refuses to move backwards — would close both.
+
+- [ ] **⬜ OPEN — the consolidation dump is plaintext** (*high* on a keyed deployment; filed as
+  HIK-149). A consolidation writes the merged (core ⊕ delta) view to
+  `<data dir>/<graph>/.consolidate.dump` for `slater-build` to ingest, and
+  `graph_format::consolidate_dump` has no cipher support at all — so the **whole graph** sits in
+  the clear for the length of a full rebuild on a deployment configured for at-rest encryption.
+  Removed afterwards, including on the failure paths, but the window is real. Sealing it means
+  plumbing the key through the dump format and the builder that reads it.
+
+- [ ] **⬜ OPEN — `SetManifest` and `SegmentManifest` are not graph-bound** (*low*). Neither
+  carries a `graph` field, and the MAC key is per-master-key rather than per-graph, so those
+  documents are byte-portable between graphs on one server. Not exploitable as far as could be
+  determined — moving a set requires moving its base generation directory, and `Generation::open`
+  refuses on `manifest.graph != graph` — but the binding is transitive rather than direct.
+  `VectorIndexManifest` does carry `graph` and checks it.
+
 ## Status at a glance
 
-**5 done · 1 in progress · 3 open** (as of 2026-06-12)
+**16 done · 1 in progress · 7 open** (as of 2026-07-31)
 
 | # | Item | Tier | Status |
 |---|---|---|---|
@@ -183,6 +298,18 @@ authenticated principals over Bolt).
 | 7 | `requireManifestMac` / `requireAclStamp` defaults | Deployment | ✅ Done (2026-06-12) |
 | 8 | No connection-count / per-IP limits | Deployment | ⬜ Open |
 | 9 | Config / key-location trust boundary | Deployment | ✅ Done (2026-06-12) |
+| 10 | Key material wiped on drop (HIK-139) | At-rest | ✅ Done (2026-07-31) |
+| 11 | Block AEAD bound to file + ordinal + directory row (HIK-140) | At-rest | ✅ Done (2026-07-31) |
+| 12 | MAC preimage domain framing (HIK-142) | At-rest | ✅ Done (2026-07-31) |
+| 13 | MAC required on every open path; set pointer sealed (HIK-144) | At-rest | ✅ Done (2026-07-31) |
+| 14 | Encrypted carry-by-reference (HIK-145) | At-rest | ✅ Done (2026-07-31) |
+| 15 | WAL + L0 sealed at rest (HIK-146) | At-rest | ✅ Done (2026-07-31) |
+| 16 | Plaintext container substitution (HIK-153) | At-rest | ✅ Done (2026-07-31) |
+| 17 | WAL segment-run continuity | At-rest | ✅ Done (2026-07-31) |
+| 18 | WAL truncation / whole-segment deletion undetectable | At-rest | ⬜ Open |
+| 19 | Delta anti-rollback | At-rest | ⬜ Open |
+| 20 | Consolidation dump is plaintext (HIK-149) | At-rest | ⬜ Open |
+| 21 | `SetManifest`/`SegmentManifest` not graph-bound | At-rest | ⬜ Open |
 
 ## Tier 2 — bounded DoS, worth hardening
 
