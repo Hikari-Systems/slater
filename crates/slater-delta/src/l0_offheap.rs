@@ -52,9 +52,13 @@ const META_MAGIC: &[u8; 8] = b"SLL0OFF1";
 /// meta is a plain blob and needs its own framing.
 const META_MAGIC_SEALED: &[u8; 8] = b"SLL0OFFE";
 /// How a refusal names an off-heap segment's meta to an operator.
+///
+/// The four block sections have no counterpart here: `BlockFileReader::open_src` owns
+/// the sealed/plaintext mismatch for every container that has one, and names them
+/// itself, so a section refusal is a `crypto::AeadRejected` rather than a
+/// `DeltaSealRejected`. Only the meta — a plain blob this module frames by hand — needs
+/// its own subject.
 const META_SUBJECT: &str = "off-heap L0 segment meta";
-/// How a refusal names one of an off-heap segment's four block sections.
-const SECTION_SUBJECT: &str = "off-heap L0 segment section";
 
 /// The four block-section file names, in a single place so the writer, the reader and the
 /// per-file subkey derivation can never disagree about them.
@@ -896,20 +900,13 @@ impl L0Reader {
                 bind(cipher, &l0_name(&dir, Some(name))?),
             )
             .with_context(|| format!("open L0 section {dir:?}/{name}"))?;
-            // `BlockFileReader` refuses a sealed file with no key on its own, but it
-            // *ignores* a key handed to a plaintext file — correct for a generation, whose
-            // manifest MAC enumerates its files, and wrong here: this segment has no
-            // manifest, so a plaintext `node.blk` dropped into a sealed segment directory
-            // would otherwise be read straight into the memtable. The meta is framed and
-            // catches its own substitution; the sections must catch theirs (HIK-146).
-            // (The other direction — a sealed section with no key — `open_with_cipher`
-            // already refuses, so only this one is left to close.)
-            if cipher.is_some() && !rdr.is_encrypted() {
-                return Err(crate::seal::DeltaSealRejected::Unsealed {
-                    subject: SECTION_SUBJECT,
-                }
-                .into());
-            }
+            // A plaintext section substituted into a sealed segment is refused by
+            // `open_with_cipher` above, in *both* directions — this used to be restated
+            // here because `BlockFileReader` silently ignored a key handed to a plaintext
+            // file, which was wrong for a manifest-less segment like this one and, as it
+            // turned out, wrong for a generation too. The policy now lives at the reader,
+            // so there is one implementation rather than a rule each container restates.
+            //
             // Verify every block's Poly1305 tag now, while we are still on a fallible
             // path. `BlockFileReader` checks a tag only when a block is actually paged
             // in, which on this reader is lazily, from whatever thread is serving a
@@ -1841,10 +1838,14 @@ mod tests {
     }
 
     /// HIK-146: a **plaintext block section** substituted into a sealed off-heap segment
-    /// is refused. The meta is framed and catches its own substitution, but the four
-    /// sections are `BlockFileReader`s, which ignore a key handed to a plaintext file —
-    /// right for a generation (its manifest MAC enumerates the files), wrong for a
-    /// segment that has no manifest at all.
+    /// is refused. The meta is framed and catches its own substitution; the four sections
+    /// are `BlockFileReader`s, which used to ignore a key handed to a plaintext file.
+    ///
+    /// That refusal now lives in `BlockFileReader::open_src` itself rather than being
+    /// restated here — the same silent downgrade turned out to be reachable in a
+    /// *generation* too, under `verifyIntegrity: false` — so this asserts the typed error
+    /// the reader raises. It stays because the segment is the container with no manifest
+    /// at all, i.e. the case with no second line of defence.
     #[test]
     fn a_plaintext_section_in_a_sealed_offheap_segment_is_refused() {
         let base = std::env::temp_dir().join(format!("slater_l0off_strip_{}", std::process::id()));
@@ -1861,11 +1862,11 @@ mod tests {
 
         std::fs::copy(plain.join("node.blk"), sealed.join("node.blk")).unwrap();
         let e = L0Reader::open(&sealed, cache, Some(&k)).unwrap_err();
-        assert_eq!(
-            e.downcast_ref::<crate::seal::DeltaSealRejected>(),
-            Some(&crate::seal::DeltaSealRejected::Unsealed {
-                subject: SECTION_SUBJECT
-            })
+        assert!(
+            e.chain().any(|c| c
+                .downcast_ref::<graph_format::crypto::AeadRejected>()
+                .is_some_and(|a| matches!(a, graph_format::crypto::AeadRejected::Unsealed { .. }))),
+            "must be refused by type, not by message: {e:#}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -615,6 +615,23 @@ pub enum AeadRejected {
          for a different file or block ordinal"
     )]
     TagMismatch,
+    /// A container opened **with** a key turned out to be plaintext.
+    ///
+    /// A reader decides encrypted-ness from the file's own magic, so without this it
+    /// would simply discard the key it was handed and read the file in the clear. Under
+    /// a configured key that is never legitimate: a keyed build seals every file it
+    /// writes, so an unsealed one in an encrypted image is a substitution. It is the
+    /// downgrade that would otherwise let anyone with write access to the data
+    /// directory replace a sealed block file with bytes of their own and have the AEAD
+    /// never engage — invisible to the manifest MAC, which authenticates the per-file
+    /// hashes but does not compare them, and to `verifyIntegrity: false`, which is what
+    /// turns that comparison off.
+    #[error(
+        "{subject} is not sealed, but a master key is configured — a keyed build seals \
+         every file, so an unsealed one is a substituted or downgraded image, not a \
+         legitimate plaintext file"
+    )]
+    Unsealed { subject: &'static str },
 }
 
 /// An encrypted image whose `aadScheme` this build does not implement. A **type**, so

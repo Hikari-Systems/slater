@@ -853,15 +853,22 @@ impl BlockFileReader {
         src.read_exact_at(&mut magic, 0)?;
         let (codec, encrypted) =
             magic_kind(&magic).ok_or_else(|| anyhow!("bad block file magic"))?;
-        // Bind the cipher to what the file actually is: an encrypted file with no
-        // key is refused; a plaintext file ignores any key it was handed.
-        let cipher = if encrypted {
-            match cipher {
-                Some(c) => Some(c),
-                None => bail!("block file is encrypted but no key was supplied"),
+        // Bind the cipher to what the file actually is, in **both** directions: an
+        // encrypted file with no key is refused, and a plaintext file handed a key is
+        // refused too. The second half used to be "ignore the key", which quietly made
+        // a substituted plaintext block file readable inside an encrypted image — the
+        // AEAD never engaged because the reader had already dropped the cipher. See
+        // `AeadRejected::Unsealed`.
+        let cipher = match (encrypted, cipher) {
+            (true, Some(c)) => Some(c),
+            (true, None) => bail!("block file is encrypted but no key was supplied"),
+            (false, Some(_)) => {
+                return Err(crate::crypto::AeadRejected::Unsealed {
+                    subject: "block file",
+                }
+                .into())
             }
-        } else {
-            None
+            (false, None) => None,
         };
 
         let mut footer = [0u8; FOOTER_LEN as usize];
@@ -931,12 +938,13 @@ impl BlockFileReader {
 
     /// Whether the file this reader opened is AEAD-sealed.
     ///
-    /// [`open_src`](Self::open_src) refuses an encrypted file with no key, but a
-    /// **plaintext** file simply ignores any key it was handed — which is right for a
-    /// generation, where the manifest MAC enumerates the files and catches a substituted
-    /// one. A container with no manifest (the off-heap L0 segment, HIK-146) has no such
-    /// backstop, so it asks this and refuses a plaintext section under a configured key
-    /// itself.
+    /// [`open_src`](Self::open_src) now refuses both mismatches itself — an encrypted
+    /// file with no key, and a plaintext file with one — so this is no longer the only
+    /// thing standing between a keyed reader and an unsealed file. It used to be: a
+    /// plaintext file silently ignored any key it was handed, justified by "the manifest
+    /// MAC enumerates the files and catches a substituted one". It does not — the MAC
+    /// authenticates the per-file *hashes*, and only `verify_against_store` compares
+    /// them, which `dataBackend.verifyIntegrity: false` turns off.
     pub fn is_encrypted(&self) -> bool {
         self.cipher.is_some()
     }
@@ -1984,18 +1992,47 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_file_opens_with_a_key_present() {
-        // A key supplied for a plaintext file is simply ignored — encryption is
-        // optional, so a plaintext generation keeps opening even under a key.
+    fn a_plaintext_file_handed_a_key_is_refused() {
+        use crate::crypto::AeadRejected;
+        // This used to assert the opposite — "a key supplied for a plaintext file is
+        // simply ignored, because encryption is optional, so a plaintext generation
+        // keeps opening even under a key". The premise was wrong: the cipher a reader
+        // receives comes from `derive_cipher`, which returns `None` whenever
+        // `Manifest.encryption` is `None`. A plaintext generation on a keyed server
+        // therefore hands every reader `None` and opens exactly as before. There is no
+        // legitimate path that reaches a plaintext file *with* a cipher in hand.
+        //
+        // What the old behaviour did buy was an attack: overwrite a sealed block file
+        // inside an encrypted image with an unsealed one and the reader discarded the
+        // key, so the AEAD never ran. The manifest MAC does not catch it (it
+        // authenticates the per-file hashes, it does not compare them) and
+        // `verifyIntegrity: false` — the documented posture for a network backend — is
+        // what turns the comparison that *would* catch it off.
         let path = tmp("plain_with_key");
         let mut w = BlockFileWriter::create(&path, 4096, 3).unwrap();
         w.append_record(b"plain record").unwrap();
         w.finish().unwrap();
-        let cipher = gen_cipher(b"unused", &[9u8; 32]);
-        let r =
-            BlockFileReader::open_with_cipher(&path, Some(file_cipher(&cipher, "plain_with_key")))
-                .unwrap();
+
+        // No key: opens and reads, unchanged.
+        let r = BlockFileReader::open(&path).unwrap();
         assert_eq!(&r.read_record_global(0).unwrap(), b"plain record");
+
+        // With a key: refused, by type.
+        let cipher = gen_cipher(b"unused", &[9u8; 32]);
+        let err = match BlockFileReader::open_with_cipher(
+            &path,
+            Some(file_cipher(&cipher, "plain_with_key")),
+        ) {
+            Ok(_) => panic!("a plaintext block file must not be readable under a key"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::Unsealed {
+                subject: "block file"
+            }),
+            "must be refused by type, not by message: {err:#}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

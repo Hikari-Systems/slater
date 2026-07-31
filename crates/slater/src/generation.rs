@@ -297,6 +297,14 @@ impl Generation {
     /// keeps it on; a remote backend may disable it (re-hashing every object over
     /// the network at open is expensive) and rely on the manifest MAC + per-block
     /// AEAD instead — see `THREAT_MODEL.md`.
+    ///
+    /// That fallback is only sound because a reader refuses a **plaintext** container
+    /// when it holds a key (`crypto::AeadRejected::Unsealed`). Without it, disabling
+    /// this left a real hole: the manifest MAC authenticates the per-file hashes but
+    /// does not *compare* them — that comparison is what `verify_integrity` gates — so
+    /// an unsealed file substituted for a sealed one was read in the clear with no AEAD
+    /// engaged at all. Keeping it on is still better: it turns "refused on first touch
+    /// of the tampered block" into "refused at open".
     pub fn open_with_store_opts(
         store: &dyn ObjectStore,
         graph: &str,
@@ -2552,6 +2560,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A **plaintext** block file substituted into an encrypted generation must be
+    /// refused — including with `dataBackend.verifyIntegrity: false`, the documented
+    /// posture for a network backend.
+    ///
+    /// `BlockFileReader::open_src` (and `IsamReader::open_src`) decided encrypted-ness
+    /// from the file's own magic and *dropped the cipher it was handed* when the magic
+    /// said plaintext. Nothing cross-checked "the manifest declares encryption ⇒ every
+    /// file must be sealed", so the only thing standing between an attacker with write
+    /// access and an attacker-chosen graph was the per-file BLAKE3 comparison in
+    /// `verify_against_store` — which is exactly what `verifyIntegrity: false` turns
+    /// off. Every MAC still verified (they authenticate the hashes, they do not compare
+    /// them) and no AEAD ever engaged, because the reader had discarded the key.
+    ///
+    /// HIK-146 already closed this one level down for the off-heap L0 segment, whose
+    /// justification for *not* closing it here — "the manifest MAC enumerates the files
+    /// and catches a substituted one" — only holds while the comparison actually runs.
+    #[test]
+    fn a_plaintext_block_file_in_an_encrypted_generation_is_refused() {
+        let key = b"at-rest-master-key";
+        let (root, graph, uuid) = write_fixture_keyed("enc_plainsub", Some(key));
+        let (plain_root, plain_graph, plain_uuid) = write_fixture_keyed("enc_plainsub_src", None);
+
+        let store = graph_format::store::fs::FsObjectStore::new(&root);
+        // Sanity: untampered, it opens on both integrity settings.
+        assert!(Generation::open_with_store_opts(&store, &graph, Some(key), true).is_ok());
+        assert!(Generation::open_with_store_opts(&store, &graph, Some(key), false).is_ok());
+
+        // Swap in the plaintext build's `node_props.blk`. Its bytes are a perfectly
+        // well-formed block file — just an unsealed one.
+        let sealed = root.join(&graph).join(uuid.to_string());
+        let plain = plain_root
+            .join(&plain_graph)
+            .join(plain_uuid.to_string())
+            .join("node_props.blk");
+        std::fs::copy(&plain, sealed.join("node_props.blk")).unwrap();
+
+        // With verification on, the file hash catches it (that guard still works) …
+        assert!(
+            Generation::open_with_store_opts(&store, &graph, Some(key), true).is_err(),
+            "the file-hash comparison must still catch a substituted file"
+        );
+        // … and with it off, the reader itself must refuse rather than serve the
+        // attacker's plaintext.
+        let err = match Generation::open_with_store_opts(&store, &graph, Some(key), false) {
+            Ok(_) => panic!(
+                "an encrypted generation served a substituted PLAINTEXT block file \
+                 with verifyIntegrity off"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not sealed") || msg.contains("plaintext"),
+            "and the refusal must say why: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain_root);
     }
 
     #[test]

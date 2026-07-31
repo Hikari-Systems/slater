@@ -640,13 +640,20 @@ impl IsamReader {
             m if m == ISAM_MAGIC_ENC => true,
             _ => bail!("bad isam magic"),
         };
-        let cipher = if encrypted {
-            match cipher {
-                Some(c) => Some(c),
-                None => bail!("isam index is encrypted but no key was supplied"),
+        // Symmetric, like `BlockFileReader::open_src`: an encrypted index with no key is
+        // refused, and so is a plaintext index handed a key. The latter used to be
+        // silently ignored, which made a substituted plaintext `.isam` readable inside an
+        // encrypted image with the AEAD never engaging (`AeadRejected::Unsealed`).
+        let cipher = match (encrypted, cipher) {
+            (true, Some(c)) => Some(c),
+            (true, None) => bail!("isam index is encrypted but no key was supplied"),
+            (false, Some(_)) => {
+                return Err(crate::crypto::AeadRejected::Unsealed {
+                    subject: "isam index",
+                }
+                .into())
             }
-        } else {
-            None
+            (false, None) => None,
         };
         let footer_len = if encrypted {
             FOOTER_LEN_ENC
