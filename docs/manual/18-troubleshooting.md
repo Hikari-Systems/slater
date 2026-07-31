@@ -34,6 +34,20 @@ These come from the writable layer. Background: [11 Writing data](11-writing-dat
 | `vector index (:L {p}) is declared after node data` | In a CREATE/`--pk` dump the `CALL db.idx.vector.createNodeIndex(...)` sits below the first node, where pass 1's parallel routing can't see it. | Move every vector-index declaration into the dump header, or pass `--vector-index-json`. See [10 Vector search](10-vector-search.md). |
 | `warning: vector index L.p matched no node` (build still succeeds) | The declaration is fine but nothing matched it — usually a label/property typo, or embeddings missing from the dump. | Check the spelling against the dump; the index is real but every KNN over it returns nothing. |
 
+## At-rest encryption errors
+
+These only occur on a deployment with a master key configured. Note that `FORMAT_VERSION`
+did **not** change for these, so the `… must be rebuilt` row above will not match — an
+encrypted image built before per-file AEAD binding fails on its `aadScheme` instead.
+
+| Message | Meaning | Fix |
+|---|---|---|
+| `encrypted image declares aadScheme …, but this build seals blocks under "file-block-v1"` | The image predates per-file/per-ordinal AEAD binding. Its blocks are sealed under a scheme this server cannot verify, so opening it safely is impossible. | Rebuild the graph with a matching `slater-build` and republish. Plaintext images are unaffected. |
+| `… manifest carries no MAC` / `MAC did not verify` | With a key configured, the generation manifest, every sealed segment's `SEGMENT.json` and the `sets/<uuid>.json` pointer must each carry a valid keyed MAC. A missing one is a strip downgrade; a mismatched one is a forged or altered document. | Rebuild and republish under the key. There is deliberately no flag to accept a MAC-less document under a key. |
+| `block file is not sealed, but a master key is configured` (or `isam index …`) | A plaintext block file or range index was found inside an image whose manifest declares encryption — a keyed build seals every file it writes, so this is a substitution, not a mixed image. | Republish the generation. If it appeared on a shared mount or bucket, treat it as tampering rather than corruption. |
+| `… is plaintext but a master key is configured` (WAL or L0 segment) | The writable layer's on-disk artifacts are unsealed. On a running deployment that is the strip downgrade; on an **upgrade**, it is simply a delta written before at-rest sealing existed. | Consolidate (or otherwise drain the delta) on the previous version *before* upgrading. Failing that, delete the graph's WAL and L0 directories — which discards every write not yet folded into the core. |
+| `WAL dir … is missing N segment(s)` | A segment was removed from the middle of the run; replaying across the hole would return a silently shorter history. | Restore the segment, or remove the whole WAL directory (losing every unconsolidated write). Removing part of it is never safe. |
+
 ## Resource and value errors
 
 | Message | Meaning | Fix |

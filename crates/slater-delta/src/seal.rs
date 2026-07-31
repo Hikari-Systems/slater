@@ -63,9 +63,18 @@ pub enum DeltaSealRejected {
     )]
     KeyRequired { subject: &'static str },
     /// The artifact is plaintext under a configured master key — the strip downgrade.
+    ///
+    /// It is also what an **upgrade** looks like: a keyed deployment that was already
+    /// running the writable layer has plaintext WAL and L0 artifacts on disk, because
+    /// nothing sealed them before HIK-146. The two are indistinguishable from here, so
+    /// the message has to name the remedy rather than read purely as a tamper alarm.
     #[error(
         "{subject} is plaintext but a master key is configured — refusing to replay \
-         unauthenticated delta data into an encrypted graph"
+         unauthenticated delta data into an encrypted graph. If this is an upgrade of a \
+         keyed deployment that was already writable, its delta predates at-rest sealing: \
+         consolidate (or otherwise drain the delta) on the previous version first, then \
+         upgrade. Deleting the WAL and L0 directories also clears it, at the cost of every \
+         write not yet folded into the core"
     )]
     Unsealed { subject: &'static str },
 }

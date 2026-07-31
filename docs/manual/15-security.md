@@ -89,6 +89,30 @@ rewritten one, because whoever rewrites the blocks can rewrite the manifest too.
 The configuration-by-configuration comparison is in
 [`THREAT_MODEL.md`](../../THREAT_MODEL.md#what-integrity-means-in-each-configuration).
 
+The writable layer's own artifacts are sealed too: with `delta.enabled` on a keyed
+deployment, every WAL segment and every L0 spill segment is encrypted under a
+per-graph key derived from the master key and the graph name. A consequence worth
+knowing before you rely on it: **renaming a graph orphans its live delta**, because
+the graph name is part of the key. Consolidate before renaming.
+
+### Upgrading a keyed deployment
+
+Slater keeps no backwards compatibility, and two at-rest changes need action rather
+than just a new binary:
+
+* **Rebuild every encrypted image.** Blocks are now sealed under a per-file subkey
+  bound to the block's ordinal, and the manifest records the scheme as
+  `aadScheme: "file-block-v1"`. An image sealed before that does not open — it is
+  refused by `aadScheme`, *not* by format version, so the generic "must be rebuilt"
+  error will not be what you see. Plaintext images are unaffected.
+* **Drain the delta before you upgrade.** A keyed deployment that was already
+  writable has plaintext WAL and L0 segments on disk, and a keyed server now refuses
+  to replay unauthenticated delta data. Run `CALL slater.consolidate()` on the old
+  version first so the writes land in the core. If you upgrade without doing that,
+  the server refuses to start the writable layer, and the only way forward is to
+  delete the graph's WAL and L0 directories — discarding every write not yet folded
+  into the core.
+
 ## Resource limits (denial-of-service protection)
 
 The `server.*` limits are **on by default but generous**, sized to keep a server

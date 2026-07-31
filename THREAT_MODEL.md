@@ -57,6 +57,17 @@ Three caveats that change the answers above:
   of the same generation, or the ISAM top slot no longer decrypts — with `verifyIntegrity`
   off, and on every read rather than only at open. Leaving `verifyIntegrity` on is still
   advisable: it turns "wrong on first touch" into "refused at open".
+
+  For that to mean anything the AEAD has to actually *engage*, and until HIK-153 there was
+  one way to stop it: a reader decided encrypted-ness from the file's own magic and silently
+  discarded the key it was handed if the magic said plaintext. An attacker with write access
+  could therefore overwrite a sealed block file (or `.isam`) with an unsealed one of their
+  own construction, and no tag was ever checked. The manifest MAC does not catch that — it
+  authenticates the per-file hashes, it does not *compare* them, and the comparison is
+  precisely what `verifyIntegrity: false` turns off. Readers now refuse the mismatch in both
+  directions: a sealed file with no key, and a plaintext file under a key. A keyed build
+  seals every file it writes, so an unsealed one inside an encrypted image is a substitution,
+  never a legitimate mixed image.
 - **The open-time checks are open-time.** They establish what the image was when the server
   opened it. A file mutated *underneath* a running server is not re-hashed; in an encrypted
   image the per-block AEAD still catches it on the next read of that block, in a plaintext
@@ -69,13 +80,6 @@ Three caveats that change the answers above:
   refusals are not policy in that sense: since HIK-144 they are enforced inside the open
   itself, so `slater query` and every other opener refuse exactly what the server refuses.
 
-Two places where the writable layer (`delta.enabled`, off by default) is weaker than the
-core: a sealed segment's `SEGMENT.json` MAC is verified when present, but a keyed server does
-**not** yet refuse a MAC-*less* segment manifest the way it refuses a MAC-less generation
-manifest; and the set pointer `sets/<uuid>.json` carries a reserved `mac` field that is not
-yet sealed or verified. The segment *blocks* are encrypted and AEAD-sealed as usual. Treat
-the authenticated row above as covering the core generation.
-
 **The delta's own artifacts are sealed too (HIK-146).** With the writable layer enabled on a
 keyed deployment, every WAL segment and every L0 spill segment is AEAD-sealed under a
 per-graph delta key = `BLAKE3::derive_key("slater delta key v1", LE64(len) ‖ master key ‖
@@ -83,12 +87,33 @@ graph name)`. There is no salt: the delta owns no manifest to record one in, so 
 context supplies the domain separation and the graph name the identity (a WAL segment moved
 between graphs fails closed). WAL frames are sealed one at a time, on the appending thread
 before the batch fsync — group commit and the sub-millisecond durability floor are unchanged
-— and each frame binds its **ordinal within its segment**, so frames cannot be reordered,
-duplicated or dropped from the middle. An L0 segment seals whole under a subkey bound to its
-own file name. Sealed and plaintext artifacts carry distinct magics, and the policy is
-symmetric: a sealed artifact with no key **and** a plaintext artifact under a configured key
-are both refused, the latter being the strip downgrade that would otherwise let anyone with
-write access to the WAL directory inject writes into an encrypted graph without the key.
+— and each frame binds its **ordinal within its segment**. An L0 spill segment seals whole
+under a subkey bound to its own file name, and every one of its blocks is authenticated at
+open rather than lazily on the read. Sealed and plaintext artifacts carry distinct magics,
+and the policy is symmetric: a sealed artifact with no key **and** a plaintext artifact under
+a configured key are both refused, the latter being the strip downgrade that would otherwise
+let anyone with write access to the WAL directory inject writes into an encrypted graph
+without the key.
+
+Be precise about what the ordinal binding buys, because it is narrower than "the WAL is
+tamper-evident". **Caught**, as a hard AEAD failure: a duplicated frame, a reordered frame, a
+frame lifted into another segment or another graph, and a frame deleted from the middle when
+what follows stays frame-aligned (everything after it shifts an ordinal and fails its tag).
+**Not caught**, and indistinguishable from an ordinary crash tail: truncating a segment's
+**tail**, deleting a **whole segment** file, and a byte splice that breaks frame alignment —
+in all three the CRC gate fires first and replay treats the remainder as a torn tail, which
+is silent data loss rather than a refusal. Replay does now check that the segment sequence
+has no **gap**, so deleting a segment from the middle of a run is refused; deleting the
+newest segments still reads as "the process died there".
+
+Nor is there any **anti-rollback** in the delta. The key is a function of the master key and
+the graph name alone, so it is stable for the life of the deployment, and segment naming is
+deterministic and restartable — WAL numbering restarts at zero whenever the directory is
+emptied, and L0 compaction deliberately reuses the oldest slot's file name. Any WAL or L0
+segment ever validly written for that graph will therefore always open cleanly, so an
+attacker who kept a copy can restore it. That is the same freshness gap as limitation 6 for
+the core, and it is a real cost of the no-salt decision above, not only the loss of
+cross-generation key separation.
 
 **Known gap: the consolidation dump is plaintext.** A consolidation writes the merged
 (core ⊕ delta) view to a scratch binary dump directory (`<data dir>/<graph>/.consolidate.dump`)
