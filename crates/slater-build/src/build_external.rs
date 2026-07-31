@@ -976,6 +976,18 @@ fn build_inner(
         // reached the `Phase::Pass1` checkpoint, so a resume always re-enters pass 1 and
         // re-checks.
         let mut header_vec_indexes: Option<std::collections::HashSet<(String, String)>> = None;
+        // The `--vector-index-json` sidecar, read once. It is a *declaration*, exactly
+        // like a `CALL db.idx.vector.createNodeIndex(...)` in the dump, so it has to reach
+        // BOTH consumers: pass 1's routing set (which decides where a `vecf32` is written)
+        // and `vector_stmts` (which is the sole source of the index descriptors that then
+        // collect those vectors). Feeding only the first is silent, total data loss — the
+        // embeddings are routed out of the property record and then nothing gathers them,
+        // and the build exits 0 with no vector indexes at all. That is precisely the trap
+        // the late-declaration bail below tells operators to escape *with* this flag.
+        let sidecar_vec_stmts: Vec<VectorIndexStmt> = match &opts.vector_index_json {
+            Some(path) => crate::shared::load_vector_sidecar(path)?,
+            None => Vec::new(),
+        };
         if resume_phase < Phase::Pass1 {
             // Vector-index routing set: which `(label, property)` vecf32 values go to the
             // vector store. The parallel workers see shards out of order, so they need
@@ -984,10 +996,8 @@ fn build_inner(
             // sidecar gives the complete set.
             let mut vec_index_set: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
-            if let Some(path) = &opts.vector_index_json {
-                for v in crate::shared::load_vector_sidecar(path)? {
-                    vec_index_set.insert((v.label.clone(), v.property.clone()));
-                }
+            for v in &sidecar_vec_stmts {
+                vec_index_set.insert((v.label.clone(), v.property.clone()));
             }
             {
                 let mut sr = StatementReader::new(open_input(input_path, 0)?);
@@ -1082,6 +1092,19 @@ fn build_inner(
                     {
                         vs.push(v.clone());
                     }
+                }
+            }
+            // Sidecar declarations join the union on the same footing, deduped by
+            // `(label, property)` like the rest. A `CALL` in the dump wins a collision:
+            // it is the more specific statement, it can carry a `VectorCarry` that the
+            // sidecar's JSON shape cannot spell, and a dim disagreement is caught
+            // downstream by `gather_node_vectors` against the actual vector lengths.
+            for v in &sidecar_vec_stmts {
+                if !vs
+                    .iter()
+                    .any(|e| e.label == v.label && e.property == v.property)
+                {
+                    vs.push(v.clone());
                 }
             }
             range_stmts = rs;

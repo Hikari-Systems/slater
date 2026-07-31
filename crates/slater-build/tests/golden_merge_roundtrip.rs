@@ -477,3 +477,72 @@ fn set_vecf32_routes_to_the_vector_store_in_a_merge_dump() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// The same merge dump with its `CALL db.idx.vector.createNodeIndex(...)` removed and
+/// the index declared only by `--vector-index-json`.
+///
+/// `docs/MERGE-DUMP-FORMAT.md` promises the sidecar is interchangeable with an in-dump
+/// declaration; merge-mode routing reads `vector_stmts`, so the sidecar has to be in
+/// that union for the promise to hold. It used to feed only the CREATE path's header
+/// routing set, which merge mode never consults — so the sidecar was a complete no-op
+/// here and every embedding stayed inline as an ordinary property.
+#[test]
+fn a_sidecar_declared_index_routes_in_a_merge_dump() {
+    use graph_format::manifest::Metric;
+
+    let work = unique_dir("vecsetsidecar");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    let body: String = VEC_SET_DUMP
+        .lines()
+        .filter(|l| !l.starts_with("CALL db.idx.vector."))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        !body.contains("createNodeIndex"),
+        "the dump must carry no in-file declaration"
+    );
+    std::fs::write(&input, &body).unwrap();
+
+    let sidecar = work.join("vectors.json");
+    std::fs::write(
+        &sidecar,
+        r#"[{"label": "Doc", "property": "embedding", "dim": 3, "metric": "cosine"}]"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "vecsetsidecar",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+            "--vector-index-json",
+            sidecar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("vecsetsidecar");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let m = Manifest::read_from_dir(graph_dir.join(gen.trim())).unwrap();
+    assert_eq!(m.vector_indexes.len(), 1, "the sidecar declared one index");
+    let vi = &m.vector_indexes[0];
+    assert_eq!(
+        (vi.label.as_str(), vi.property.as_str()),
+        ("Doc", "embedding")
+    );
+    assert_eq!(vi.metric, Metric::Cosine);
+    assert_eq!(vi.count, 2, "d1 and d2 routed via the sidecar declaration");
+
+    let _ = std::fs::remove_dir_all(&work);
+}

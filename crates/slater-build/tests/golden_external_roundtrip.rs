@@ -524,3 +524,77 @@ fn a_vector_index_declared_after_node_data_fails_the_build() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// The same nodes again, with **no** `CALL db.idx.vector.createNodeIndex` anywhere —
+// the sidecar is the sole declaration. This is what the late-declaration bail tells
+// an operator to do ("or declare the indexes with --vector-index-json") and what the
+// manual recommends when a generator cannot emit the DDL first.
+const SIDECAR_ONLY_DUMP: &str = r#"CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 0, title: 'First chunk', embedding: vecf32([1.0, 0.0, 0.0])});
+CREATE (:Chunk:__DumpVertex__ {__dump_id__: 1, title: 'Second chunk', embedding: vecf32([0.0, 1.0, 0.0])});
+MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;
+DROP INDEX ON :__DumpVertex__(__dump_id__);
+"#;
+
+/// A sidecar-only declaration must build a real, populated index.
+///
+/// The sidecar used to feed pass 1's *routing* set alone, so every `vecf32` was moved
+/// out of the node's property record — and then nothing collected it, because the
+/// index descriptors were built from the dump's parsed `CALL` statements only. The
+/// build exited 0 with `vector_indexes: null` and the embeddings in neither store:
+/// silent, total loss, on the very path the late-declaration bail recommends.
+///
+/// Assert the **count**, never "the build succeeded" — a zero-count index is exactly
+/// the failure this whole check exists to catch.
+#[test]
+fn a_sidecar_only_vector_index_is_built_and_populated() {
+    let work = unique_dir("sidecaronly");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, SIDECAR_ONLY_DUMP).unwrap();
+
+    let sidecar = work.join("vectors.json");
+    std::fs::write(
+        &sidecar,
+        r#"[{"label": "Chunk", "property": "embedding", "dim": 3, "metric": "cosine"}]"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "docs",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+            "--vector-index-json",
+            sidecar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run slater-build");
+    assert!(
+        out.status.success(),
+        "sidecar-only build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("docs");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let m = Manifest::read_from_dir(graph_dir.join(gen.trim())).unwrap();
+    assert_eq!(
+        m.vector_indexes.len(),
+        1,
+        "the sidecar declared one index; the manifest advertises {}",
+        m.vector_indexes.len()
+    );
+    assert_eq!(
+        m.vector_indexes[0].count, 2,
+        "both embeddings must be routed into the sidecar-declared index"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
