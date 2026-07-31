@@ -53,8 +53,18 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
 
+      # PINNED, not floating — kept in lockstep with release.yml's fuzz gate, which
+      # carries the full rationale. Short version: the nightly published 2026-07-24
+      # (rustc 89c61a754) ICEs on any release build of tokio
+      # (`rustc_codegen_ssa/src/mir/operand.rs:291: not immediate`), which failed all
+      # seven legs here on 2026-07-24 and -07-25 against an unchanged tree. A
+      # scheduled job on a static branch is exactly where a floating toolchain turns
+      # an upstream regression into a nightly red build with no local change to blame.
+      # nightly-2026-07-23 (rustc 6f72b5dd5) is the last verified-good build.
       - name: Install the nightly Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
 
       # One shared build cache across all matrix legs (and shared with release.yml's
       # fuzz gate). Every target links the SAME instrumented dependency graph — only
