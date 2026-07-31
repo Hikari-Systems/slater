@@ -2178,7 +2178,7 @@ fn consolidate_folds_delta_into_fresh_generation() {
     let vc = VectorIndexCache::new(1 << 20);
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
-    let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         assert_eq!(
             dump_age(dump, "Alice"),
             Some(99),
@@ -2443,7 +2443,7 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
     let writer = graphs.writer("people").unwrap();
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
-    let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         let nodes = dump_nodes(dump);
         assert_eq!(
             dump_age(dump, "Alice"),
@@ -2727,7 +2727,7 @@ fn gc_after_retarget_reclaims_the_prior_set() {
 
     // Retarget to a singleton via an injected builder that publishes a fresh generation.
     let new_uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0072);
-    let build = |_dump: &Path, g: &str, dd: &Path| -> Result<()> {
+    let build = |_dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         assert_eq!(g, "people");
         testgen::write_indexed_people_at(dd, new_uuid, [30, 25, 40]);
         Ok(())
@@ -7605,7 +7605,7 @@ fn consolidation_folds_a_flushed_l0_level() {
     let new_uuid = uuid::Uuid::from_u128(0x4c0b_0000_0000_0000_0000_0000_0000_0001);
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
-    let build = |dump: &Path, g: &str, dd: &Path| -> Result<()> {
+    let build = |dump: &Path, g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         let nodes = dump_nodes(dump);
         assert!(
             nodes.contains_key("Dave"),
@@ -7661,8 +7661,9 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
 
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
-    let build =
-        |_d: &Path, _g: &str, _dd: &Path| -> Result<()> { bail!("simulated builder crash") };
+    let build = |_d: &Path, _g: &str, _dd: &Path, _k: Option<&[u8]>| -> Result<()> {
+        bail!("simulated builder crash")
+    };
     let err = graphs
         .consolidate_graph("people", &cache, &vc, &root, build)
         .unwrap_err();
@@ -7757,7 +7758,7 @@ fn consolidation_retires_the_delta_when_the_guard_wins_the_swap() {
     let vc = VectorIndexCache::new(1 << 20);
 
     let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0001);
-    let build = |_d: &Path, _g: &str, dd: &Path| -> Result<()> {
+    let build = |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
         // The guard's poll lands here — after the builder published `current`, before
         // the consolidation swaps the served slot onto it — and wins the swap.
@@ -7826,7 +7827,7 @@ fn guard_sweep_defers_to_an_in_flight_consolidation() {
 
     let new_uuid = uuid::Uuid::from_u128(0x_8900_0000_0000_0000_0000_0000_0000_0002);
     let gen0_for_build = gen0.clone();
-    let build = |_d: &Path, _g: &str, dd: &Path| -> Result<()> {
+    let build = |_d: &Path, _g: &str, dd: &Path, _key: Option<&[u8]>| -> Result<()> {
         testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
         // `current` has moved, and the consolidation has not yet swapped. A guard poll
         // landing here must defer on both strategies.
@@ -7913,7 +7914,7 @@ fn consolidate_via_real_builder() {
     let writer_mid = writer.clone();
     let gen_mid = gen0.clone();
     let new = graphs
-        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd| {
+        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, _key| {
             let bob = match parser::parse_statement("MATCH (n:Person {name:'Bob'}) SET n.age = 77")
                 .unwrap()
             {
@@ -7921,7 +7922,7 @@ fn consolidate_via_real_builder() {
                 _ => unreachable!(),
             };
             execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
-            run_builder(&bin, d, g, dd)
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -8011,8 +8012,8 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
     execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
 
@@ -8065,8 +8066,8 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
     drop(gen0);
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
 
@@ -8192,8 +8193,8 @@ fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
 
     // 3. A background consolidation, run while d00 is out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
     assert_eq!(
@@ -8280,8 +8281,8 @@ fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation()
     vwrite(&graphs, &graph, "MATCH (n:Key {name:'d00'}) REMOVE n:Doc");
 
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
 
@@ -8337,8 +8338,8 @@ fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
 
     // A consolidation while out of scope.
     graphs
-        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
 
@@ -8539,7 +8540,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     drop(gen0);
 
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
             let mut cmd = std::process::Command::new(&bin);
             cmd.arg("--input")
                 .arg(d)
@@ -8611,7 +8612,7 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     // is still `vector/Doc.embedding.vamana`. If the subkey were inferred from the path this
     // is the consolidation that would fail.
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
             let mut cmd = std::process::Command::new(&bin);
             cmd.arg("--input")
                 .arg(d)
@@ -8762,6 +8763,109 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     std::fs::remove_dir_all(&work).ok();
 }
 
+/// Consolidating an encrypted graph through the **production** builder invocation must
+/// publish an **encrypted** generation.
+///
+/// Every other encrypted-consolidation test here passes its own `build` closure carrying
+/// `--encrypt --key-env`, i.e. it exercises a `slater-build` invocation production never
+/// makes. `run_builder` — the closure production actually supplies — passed no key and no
+/// `--encrypt` at all, so a real consolidation published the whole graph as a **plaintext**
+/// generation and then failed at the swap on HIK-144's require-a-MAC policy. The graph kept
+/// serving its old core, so nothing was wrong-answered; the damage was a permanent
+/// clear-text copy of everything, plus consolidation that could never succeed on a keyed
+/// deployment (HIK-157).
+///
+/// This test therefore calls `run_builder` directly. That is the point of it — the
+/// `build`-closure seam is precisely what let every existing test miss this.
+///
+/// Note on the assertions: `encryption` and `mac` serialise as explicit `null` when absent,
+/// so `serde_json`'s `get()` returns `Some(Null)` for a plaintext manifest. Asserting the
+/// field is merely *present* passes against the bug. Assert non-null.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_generation() {
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_prodenc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    let key_hex = "0123456789abcdef0123456789abcdef";
+    let key = graph_format::crypto::hex_decode(key_hex).unwrap();
+
+    let script = "CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);\n\
+        CREATE (:Doc:__DumpVertex__ {__dump_id__: 0, title: 'alpha'});\n\
+        CREATE (:Doc:__DumpVertex__ {__dump_id__: 1, title: 'beta'});\n\
+        MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;\n\
+        DROP INDEX ON :__DumpVertex__(__dump_id__);\n";
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, script).unwrap();
+
+    assert!(
+        std::process::Command::new(&bin)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--pk", "__dump_id__"])
+            .args(["--cluster", "none"])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .arg("--encrypt")
+            .args(["--key-env", "SLATER_PRODENC_KEY"])
+            .env("SLATER_PRODENC_KEY", key_hex)
+            .status()
+            .expect("spawn slater-build")
+            .success(),
+        "the encrypted fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, Some(&key)).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+    let base = graphs.get("docs").unwrap().uuid();
+
+    // THE PRODUCTION PATH — `run_builder`, not a bespoke closure.
+    let new_uuid = graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
+            crate::server::run_builder(&bin, d, g, dd, k)
+        })
+        .expect("a consolidation of an encrypted graph must succeed");
+    assert_ne!(
+        new_uuid, base,
+        "a fresh generation must have been published"
+    );
+
+    let mani: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            data.join("docs")
+                .join(new_uuid.0.to_string())
+                .join("MANIFEST.json"),
+        )
+        .expect("read the consolidated manifest"),
+    )
+    .unwrap();
+    assert!(
+        mani.get("encryption").is_some_and(|v| !v.is_null()),
+        "the consolidated generation must be encrypted, got encryption={:?}",
+        mani.get("encryption")
+    );
+    assert!(
+        mani.get("mac").is_some_and(|v| !v.is_null()),
+        "the consolidated generation must be MAC-sealed, got mac={:?}",
+        mani.get("mac")
+    );
+
+    // And it must actually be servable under the key — the swap succeeding already implies
+    // it, but assert a read so this cannot pass on a manifest inspection alone.
+    let served = graphs.get("docs").unwrap();
+    assert_eq!(served.uuid(), new_uuid);
+    assert_eq!(served.node_count(), 2);
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
 /// HIK-145, found while adversarially reviewing the fix: making the encrypted carry *work*
 /// must not make a **downgrade** work too.
 ///
@@ -8810,7 +8914,7 @@ fn a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph() {
     let vc = VectorIndexCache::new(1 << 22);
 
     // …consolidated by a build that has suddenly been given `--encrypt`.
-    let err = match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd| {
+    let err = match graphs.consolidate_graph("docs", &cache, &vc, &data, |d, _g, _dd, _key| {
         let st = std::process::Command::new(&bin)
             .arg("--input")
             .arg(d)
@@ -8935,8 +9039,8 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
     let base_bytes = std::fs::read(&base_vamana).expect("base .vamana must exist");
 
     graphs
-        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd| {
-            run_builder(&bin, d, g, dd)
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
+            run_builder(&bin, d, g, dd, _key)
         })
         .unwrap();
 

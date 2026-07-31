@@ -598,3 +598,109 @@ fn a_sidecar_only_vector_index_is_built_and_populated() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// `--key-stdin`: the key source the server uses when it spawns this binary for a
+/// consolidation (HIK-157). Covers the flag's guard rails, which are what stop a
+/// misconfigured invocation from silently publishing a plaintext image.
+///
+/// The happy path is covered end-to-end by
+/// `slater::server::tests::a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_generation`;
+/// this pins the refusals, which that test cannot reach.
+#[test]
+fn key_stdin_guard_rails() {
+    use std::process::Stdio;
+
+    let work = unique_dir("keystdin");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, DUMP).unwrap();
+    let data = work.join("data");
+
+    let base = |extra: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_slater-build"));
+        c.args(["--pk", "__dump_id__"])
+            .args([
+                "--input",
+                input.to_str().unwrap(),
+                "--graph",
+                "social",
+                "--data-dir",
+                data.to_str().unwrap(),
+                "--cluster",
+                "none",
+            ])
+            .args(extra);
+        c
+    };
+    let stderr_of = |mut c: Command| {
+        let out = c.output().expect("run slater-build");
+        assert!(!out.status.success(), "expected a refusal");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    // Without --encrypt it is a misconfiguration, not a silent plaintext build.
+    let e = stderr_of(base(&["--key-stdin"]));
+    assert!(e.contains("without --encrypt"), "unexpected: {e}");
+
+    // Two sources is ambiguous — refuse rather than pick one.
+    let e = stderr_of(base(&["--encrypt", "--key-stdin", "--key-env", "SOME_VAR"]));
+    assert!(e.contains("only one of"), "unexpected: {e}");
+
+    // --encrypt with no source at all must still name every source.
+    let e = stderr_of(base(&["--encrypt"]));
+    assert!(
+        e.contains("--key-stdin"),
+        "the error must offer the new source: {e}"
+    );
+
+    // An *empty* pipe under --encrypt is the dangerous case: it must fail closed, never
+    // fall back to writing the image in the clear.
+    let mut child = base(&["--encrypt", "--key-stdin"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn slater-build");
+    drop(child.stdin.take().unwrap()); // immediate EOF, nothing written
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        !out.status.success(),
+        "an empty key pipe under --encrypt must not produce an image"
+    );
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("empty"), "unexpected: {e}");
+    assert!(
+        !data.join("social").join("current").exists(),
+        "nothing may be published when the key never arrived"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// `--key-stdin` and `--input -` both consume stdin, so together the key read swallows
+/// the dump. Found in adversarial review of HIK-157: without this guard the failure is a
+/// hex-decode error on the *dump contents*, which tells the operator nothing.
+#[test]
+fn key_stdin_refuses_a_dump_on_stdin() {
+    let work = unique_dir("keystdin_conflict");
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args(["--pk", "__dump_id__"])
+        .args([
+            "--input",
+            "-",
+            "--graph",
+            "social",
+            "--data-dir",
+            work.join("data").to_str().unwrap(),
+            "--cluster",
+            "none",
+        ])
+        .args(["--encrypt", "--key-stdin"])
+        .output()
+        .expect("run slater-build");
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains("both read stdin"),
+        "the refusal must explain the conflict: {e}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
