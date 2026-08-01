@@ -1023,7 +1023,18 @@ thread_local! {
 /// surviving incident edge — the input to a delete's removal fragments and netted marginals.
 /// A born endpoint id (≥ the base node count) has no base CSR record; its edges come wholly
 /// from the segment fragments.
-fn effective_adj(core: &Generation, node: u64, outgoing: bool) -> Result<Vec<(u64, u64, String)>> {
+///
+/// `pub(crate)` because the **read** side needs exactly this too (HIK-152):
+/// `MergedView::edges_lost_to_node_tombstones` has to know which edges a delta node-tombstone
+/// kills, and it was asking the base CSR alone — so an edge a flush had already moved into a
+/// segment was added by the stack's marginals and never subtracted. Same question, same
+/// answer; sharing the one implementation is the point, since a second copy of it is what
+/// diverged in the first place.
+pub(crate) fn effective_adj(
+    core: &Generation,
+    node: u64,
+    outgoing: bool,
+) -> Result<Vec<(u64, u64, String)>> {
     #[cfg(test)]
     EFFECTIVE_ADJ_CALLS.with(|c| c.set(c.get() + 1));
     let base_nodes = core.topology().node_count();

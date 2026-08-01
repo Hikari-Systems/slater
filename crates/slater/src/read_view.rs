@@ -27,7 +27,7 @@
 
 use anyhow::Result;
 use graph_format::columns::PropsReader;
-use graph_format::ids::{Generation as GenId, NodeId, Value};
+use graph_format::ids::{Generation as GenId, Value};
 use graph_format::isam::IsamReader;
 use graph_format::manifest::Manifest;
 use graph_format::nodelabels::NodeLabelsReader;
@@ -392,27 +392,49 @@ impl<'g> MergedView<'g> {
     ///
     /// Cost is O(Σ degree of the tombstoned nodes) — nothing at all when the delta has no
     /// deletes, and always proportional to the delta's blast radius rather than the graph.
+    ///
+    /// # The core side is the **effective** adjacency, not the base CSR (HIK-152)
+    /// This used to read `self.core.topology()`, which is the base reader alone, and to gate
+    /// on `self.core.node_count()`, which is the base manifest's count. Both are wrong the
+    /// moment a segment exists:
+    ///
+    /// * an edge a flush had already moved into a segment was added to the live count by
+    ///   `stack().edge_count_delta()` and then never subtracted here — `lost.core` could not
+    ///   see it (absent from the base) and `lost.born` could not either (no longer in the
+    ///   delta), so `live_edge_count` over-counted every such edge;
+    /// * a **segment-born node** sits above the base count, so the whole branch was skipped
+    ///   for it and its incident segment edges were missed the same way.
+    ///
+    /// `marginals_exact` does not cover this: the flush *is* exact for the tombstones that
+    /// existed when it ran (it resolves them against this same effective adjacency); the gap
+    /// is a tombstone that arrives afterwards. So both now go through
+    /// [`flush_segment::effective_adj`] — the flush's own resolver — over the whole stacked
+    /// id space.
     fn edges_lost_to_node_tombstones(&self) -> Result<LostEdges> {
         let mut lost = LostEdges::default();
         let suppressed = self.delta.effective_tombstoned_ids();
         if suppressed.is_empty() {
             return Ok(lost);
         }
-        let core_count = self.core.node_count();
+        // The whole stacked id space (base + every segment's born band), not the base count:
+        // a segment-born node has core-stack adjacency too.
+        let core_count = self.core.stack().extents().nodes.total();
         let dead: HashSet<u64> = suppressed.iter().copied().collect();
 
         for &dense in suppressed {
-            // Core adjacency exists only for core nodes.
+            // Core-stack adjacency exists only for core-stack ids (a delta-born id has none).
             if dense < core_count {
-                for a in self.core.topology().outgoing(NodeId(dense))? {
-                    let name = self.core.reltype_name(a.reltype).unwrap_or("").to_string();
+                for (_eid, _other, name) in
+                    crate::flush_segment::effective_adj(self.core, dense, true)?
+                {
                     *lost.core.entry(name).or_default() += 1;
                 }
-                for a in self.core.topology().incoming(NodeId(dense))? {
-                    if dead.contains(&(a.neighbour.index() as u64)) {
+                for (_eid, other, name) in
+                    crate::flush_segment::effective_adj(self.core, dense, false)?
+                {
+                    if dead.contains(&other) {
                         continue; // claimed by that source's outgoing pass
                     }
-                    let name = self.core.reltype_name(a.reltype).unwrap_or("").to_string();
                     *lost.core.entry(name).or_default() += 1;
                 }
             }
