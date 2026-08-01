@@ -2287,7 +2287,7 @@ fn consolidation_dump_folds_the_segment_stack() {
     // A base-node patch, a base-node delete, a born node, and a born edge from the born
     // node to a surviving base node — every stack override kind in one flush.
     write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
-    write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+    write(&graphs, "MATCH (n:Person {name:'Carol'}) DETACH DELETE n");
     write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
     write(
         &graphs,
@@ -2424,7 +2424,7 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
     };
     // Flush a patch + delete + born into a segment, so the core we consolidate is stacked.
     write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 99");
-    write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+    write(&graphs, "MATCH (n:Person {name:'Carol'}) DETACH DELETE n");
     write(&graphs, "MERGE (n:Person {name:'Dave'}) SET n.age = 50");
     graphs
         .flush_graph_to_segment("people", &vc, &root)
@@ -4760,7 +4760,7 @@ fn resolve_reborns_a_key_deleted_into_a_segment() {
 
     // Delete a base node with no incident edges (Carol — the only base edge is Alice→Bob),
     // then flush the tombstone into a segment.
-    write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+    write(&graphs, "MATCH (n:Person {name:'Carol'}) DETACH DELETE n");
     graphs
         .flush_graph_to_segment("people", &vc, &root)
         .unwrap()
@@ -5111,7 +5111,7 @@ fn flush_to_segment_folds_an_off_heap_l0_stack() {
     // Active memtable (newest): re-patch Alice (55 wins over 99), born Eve, delete Carol.
     write(&graphs, "MATCH (n:Person {name:'Alice'}) SET n.age = 55");
     write(&graphs, "MERGE (n:Person {name:'Eve'}) SET n.age = 60");
-    write(&graphs, "MATCH (n:Person {name:'Carol'}) DELETE n");
+    write(&graphs, "MATCH (n:Person {name:'Carol'}) DETACH DELETE n");
     assert_eq!(
         graphs.writer("people").unwrap().l0_len(),
         1,
@@ -13471,6 +13471,355 @@ fn the_count_walk_is_reachable_and_exact_over_a_stacked_set() {
         count_visits < walk_visits,
         "the final hop must be answered from maintained degrees over a stacked set too \
          ({count_visits} visits counting vs {walk_visits} materialising)"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-152: `live_edge_count` must not over-count when a node tombstone arrives **after** a
+/// flush has moved that node's edges into a core segment.
+///
+/// `edges_lost_to_node_tombstones` read the *base* CSR only, so a segment-born edge killed
+/// by a later `DELETE n` was added by `stack().edge_count_delta()` and never subtracted —
+/// `lost.core` could not see it (not in the base) and `lost.born` could not either (no
+/// longer in the delta).
+///
+/// Both halves are compared on the same view: `count(*)` (the metadata path, Stage E →
+/// `live_edge_count`) against the materialising walk's row count. Neither is a hand-computed
+/// constant; the claim is that two code paths disagree.
+#[test]
+fn a_node_delete_after_a_flush_must_not_over_count_edges() {
+    let (root, _g) = testgen::write_indexed_people("hik152_after_flush");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+
+    let write = |graphs: &Graphs, qy: &str| {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        match parser::parse_statement(qy).unwrap() {
+            parser::ast::Statement::Write(w) => {
+                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            parser::ast::Statement::WriteEdge(w) => {
+                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            _ => panic!("expected a write: {qy}"),
+        }
+    };
+    // `count(*)` over edges (metadata path) vs the materialising walk, on one view.
+    let check = |graphs: &Graphs, what: &str| -> usize {
+        let gen = graphs.get("people").unwrap();
+        let snap = graphs
+            .writer("people")
+            .map(|w| w.delta_snapshot())
+            .unwrap_or_else(DeltaSnapshot::empty);
+        let view = MergedView::new(gen.as_ref(), snap);
+        let counted = {
+            let ast = parser::parse("MATCH ()-[r]->() RETURN count(*)").unwrap();
+            match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+                Val::Int(n) => n as usize,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+        let walked = {
+            let ast = parser::parse("MATCH (a)-[r]->(b) RETURN r").unwrap();
+            Engine::new(&view, &cache).run(&ast).unwrap().rows.len()
+        };
+        assert_eq!(
+            counted, walked,
+            "{what}: the live edge count and the materialising walk must agree"
+        );
+        // The per-reltype grouping shares `edges_lost_to_node_tombstones`, so it has to be
+        // checked too — otherwise the fix is verified on one of its two consumers.
+        let grouped: usize = {
+            let ast = parser::parse("MATCH ()-[r]->() RETURN type(r), count(*)").unwrap();
+            Engine::new(&view, &cache)
+                .run(&ast)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|r| match r[1] {
+                    Val::Int(n) => n as usize,
+                    ref v => panic!("group count not int: {v:?}"),
+                })
+                .sum()
+        };
+        assert_eq!(
+            grouped, walked,
+            "{what}: the per-reltype live counts must sum to the materialising walk"
+        );
+        counted
+    };
+
+    // A born edge, flushed into a segment.
+    write(
+        &graphs,
+        "MERGE (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'})",
+    );
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("a born edge flushes a non-empty delta");
+    assert_eq!(
+        graphs.get("people").unwrap().stack().segments().len(),
+        1,
+        "the fixture must actually have a segment — segmentFlushBytes defaults to 0, so a \
+         silently-singleton set is the easy way for this test to pass for the wrong reason"
+    );
+    let before = check(&graphs, "flushed, no delete");
+
+    // …then delete the endpoint node. The segment-born edge dies with it.
+    write(&graphs, "MATCH (n:Person {name:'Carol'}) DETACH DELETE n");
+    let after = check(&graphs, "node deleted after the flush");
+    assert!(
+        after < before,
+        "deleting Carol must remove edges ({after} vs {before})"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-152, second instance — found while fixing the first and **not** in the ticket.
+///
+/// The same function gated its core-adjacency branch on `Generation::node_count()`, which is
+/// the *base* manifest's count. A node born in a segment sits above it, so deleting one
+/// skipped the branch entirely: its incident edges are in the segment, not the delta, so
+/// neither term saw them.
+///
+/// The distinguishing fixture is a node that **only exists in a segment** — created and
+/// flushed — then detached and deleted.
+#[test]
+fn deleting_a_segment_born_node_must_not_over_count_edges() {
+    let (root, _g) = testgen::write_indexed_people("hik152_segborn_node");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+
+    let write = |graphs: &Graphs, qy: &str| {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        match parser::parse_statement(qy).unwrap() {
+            parser::ast::Statement::Write(w) => {
+                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            parser::ast::Statement::WriteEdge(w) => {
+                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            _ => panic!("expected a write: {qy}"),
+        }
+    };
+    let check = |graphs: &Graphs, what: &str| -> usize {
+        let gen = graphs.get("people").unwrap();
+        let snap = graphs
+            .writer("people")
+            .map(|w| w.delta_snapshot())
+            .unwrap_or_else(DeltaSnapshot::empty);
+        let view = MergedView::new(gen.as_ref(), snap);
+        let counted = {
+            let ast = parser::parse("MATCH ()-[r]->() RETURN count(*)").unwrap();
+            match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+                Val::Int(n) => n as usize,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+        let walked = {
+            let ast = parser::parse("MATCH (a)-[r]->(b) RETURN r").unwrap();
+            Engine::new(&view, &cache).run(&ast).unwrap().rows.len()
+        };
+        assert_eq!(counted, walked, "{what}: live count vs materialising walk");
+        counted
+    };
+
+    // Dave exists nowhere in the base — he is born in the delta with an edge, then flushed,
+    // so his dense id sits in the segment's born band, above the base node count.
+    write(
+        &graphs,
+        "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Dave'})",
+    );
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("a born node + edge flushes a non-empty delta");
+    assert_eq!(
+        graphs.get("people").unwrap().stack().segments().len(),
+        1,
+        "the fixture must actually have a segment"
+    );
+    let base_nodes = graphs.get("people").unwrap().node_count();
+    let stacked_nodes = graphs
+        .get("people")
+        .unwrap()
+        .stack()
+        .extents()
+        .nodes
+        .total();
+    assert!(
+        stacked_nodes > base_nodes,
+        "Dave must be a segment-born id ({stacked_nodes} vs base {base_nodes}) — otherwise \
+         this test is not exercising the id-gate instance at all"
+    );
+    let before = check(&graphs, "segment-born node, alive");
+
+    write(&graphs, "MATCH (n:Person {name:'Dave'}) DETACH DELETE n");
+    let after = check(&graphs, "segment-born node deleted");
+    assert!(
+        after < before,
+        "deleting Dave must remove his edge ({after} vs {before})"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-152 control: the **singleton** case must be unchanged. The fix routes the core side
+/// through the flush's effective-adjacency resolver, so it has to still produce exactly the
+/// base CSR's answer when there is no segment — otherwise "subtract more" would be a
+/// regression everywhere rather than a fix in one configuration.
+#[test]
+fn a_node_delete_on_a_singleton_core_still_counts_edges_exactly() {
+    let (root, _g) = testgen::write_indexed_people("hik152_singleton_control");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    assert!(
+        graphs.get("people").unwrap().stack().is_singleton(),
+        "this control is only meaningful without a segment"
+    );
+
+    {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let parser::ast::Statement::Write(w) =
+            parser::parse_statement("MATCH (n:Person {name:'Bob'}) DETACH DELETE n").unwrap()
+        else {
+            panic!("expected a node write");
+        };
+        execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+    }
+
+    let gen = graphs.get("people").unwrap();
+    let snap = graphs.writer("people").unwrap().delta_snapshot();
+    let view = MergedView::new(gen.as_ref(), snap);
+    let counted = {
+        let ast = parser::parse("MATCH ()-[r]->() RETURN count(*)").unwrap();
+        match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+            Val::Int(n) => n as usize,
+            ref v => panic!("count not int: {v:?}"),
+        }
+    };
+    let walked = {
+        let ast = parser::parse("MATCH (a)-[r]->(b) RETURN r").unwrap();
+        Engine::new(&view, &cache).run(&ast).unwrap().rows.len()
+    };
+    assert_eq!(
+        counted, walked,
+        "a singleton core's live edge count must still match the walk"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-152, third instance — found in self-review, and the error in the **opposite**
+/// direction, which is why it is worth its own test.
+///
+/// The old code read the base CSR, which still lists an edge that a flush has since
+/// *removed*. So a core edge deleted into a segment and then implicated in a node tombstone
+/// was subtracted **twice**: once by `stack().edge_count_delta()` when it flushed, and again
+/// by `lost.core` when the node died. Under-counting rather than over-counting, from the
+/// same single-axis read.
+///
+/// Routing through `effective_adj` fixes it for free — it honours each segment's `removed`
+/// entries — but "for free" is exactly the kind of claim that needs a test rather than an
+/// argument.
+#[test]
+fn a_node_delete_must_not_double_subtract_an_edge_a_flush_already_removed() {
+    let (root, _g) = testgen::write_indexed_people("hik152_removed_twice");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+
+    let write = |graphs: &Graphs, qy: &str| {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        match parser::parse_statement(qy).unwrap() {
+            parser::ast::Statement::Write(w) => {
+                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            parser::ast::Statement::WriteEdge(w) => {
+                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            _ => panic!("expected a write: {qy}"),
+        }
+    };
+
+    // A born edge that survives, flushed…
+    write(
+        &graphs,
+        "MERGE (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'})",
+    );
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("born edge flushes");
+    // …then delete the *core* edge Alice→Bob and flush that too, so a segment carries a
+    // `removed` entry for an edge the base CSR still lists.
+    write(
+        &graphs,
+        "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+    );
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("edge delete flushes");
+    assert_eq!(
+        graphs.get("people").unwrap().stack().segments().len(),
+        2,
+        "the fixture needs a born segment and a removed segment"
+    );
+
+    // Now tombstone Alice — the endpoint of the already-removed edge.
+    write(&graphs, "MATCH (n:Person {name:'Alice'}) DETACH DELETE n");
+
+    let gen = graphs.get("people").unwrap();
+    let snap = graphs.writer("people").unwrap().delta_snapshot();
+    let view = MergedView::new(gen.as_ref(), snap);
+    let counted = {
+        let ast = parser::parse("MATCH ()-[r]->() RETURN count(*)").unwrap();
+        match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+            Val::Int(n) => n as usize,
+            ref v => panic!("count not int: {v:?}"),
+        }
+    };
+    let walked = {
+        let ast = parser::parse("MATCH (a)-[r]->(b) RETURN r").unwrap();
+        Engine::new(&view, &cache).run(&ast).unwrap().rows.len()
+    };
+    assert_eq!(
+        walked, 1,
+        "only Bob→Carol should survive — otherwise this fixture is not the one described"
+    );
+    assert_eq!(
+        counted, walked,
+        "an edge a flush already removed must not be subtracted again by a node tombstone"
     );
 
     std::fs::remove_dir_all(&root).ok();
