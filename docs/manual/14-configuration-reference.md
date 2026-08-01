@@ -144,20 +144,24 @@ the layering); it takes no CLI flags.
 | `delta.deltaCorePercent` | `0` (off) | Auto-consolidate when the delta reaches this % of core. |
 | `delta.deltaHardBytes` | `0` (off) | Resident-delta throttle. |
 | `delta.consolidateWindow` | (empty) | Cron-style off-peak consolidation window. |
-| `delta.builderBin` | `slater-build` | Builder binary for consolidation. A bare name resolves on `PATH`, then falls back to a copy sitting beside the `slater` binary; an absolute path is used as given. |
+| `delta.builderBin` | (empty) | **Empty = the server re-execs itself** as `slater --consolidate-worker`: same binary, same version, nothing to locate. Set it to pin an external `slater-build` instead — a bare name resolves on `PATH` then beside the server binary, an absolute path is used as given. Required on `slater:latest-lite`, which has no worker compiled in. |
 | `delta.builderMaxMemory` | `0` (derive) | `--max-memory` for the builder, in bytes. `0` derives ~35% of the server's cgroup memory limit (floor 64 MiB, never above the limit itself), or omits the flag when uncapped. |
 | `delta.builderThreads` | `0` (derive) | `--threads` for the builder. `0` derives from the server's cgroup CPU quota, or omits the flag when uncapped. |
 | `delta.consolidateTimeoutSecs` | `0` (none) | Wall-clock bound on one rebuild. On expiry the child is killed and the consolidation fails non-destructively. |
 | `delta.offHeapL0` | `false` | Keep L0 off-heap. |
 | `delta.segmentGcGraceSecs` | `0` (off) | Grace period before GCing superseded segments. |
 
-> **Consolidation gotcha:** `CALL slater.consolidate()` spawns `delta.builderBin`.
-> A bare name is looked up on `PATH` first and then beside the running `slater`
-> binary, so the official image works with the default — `/app` is not on the
-> distroless `PATH`, but `/app/slater-build` is the server's own sibling. Set an
-> absolute path (`/app/slater-build`) if you want the lookup pinned, and note that
-> `slater:latest-lite` ships **no** builder at all, so it cannot consolidate. See
-> [18 Troubleshooting](18-troubleshooting.md).
+> **Consolidation runs in a child process, and by default that child is `slater`
+> itself.** `CALL slater.consolidate()` re-execs the running binary as
+> `slater --consolidate-worker`, so the shipped image needs no configuration: there is
+> nothing to find on `PATH` and no way for the builder to be a different version than
+> the server. `slater:latest-lite` is built without the worker and reports that
+> clearly — point `delta.builderBin` at a `slater-build` binary, or use the full
+> `slater:latest` image. See [18 Troubleshooting](18-troubleshooting.md).
+>
+> The child process itself is not optional: a rebuild's peak resident memory is several
+> times the server's entire cache budget, so it is deliberately kept out of the server's
+> address space where an out-of-memory kill would take every connection with it.
 
 > **Sizing the builder:** a rebuild is O(core) and its peak RSS runs well above its
 > own `--max-memory` cap, so a builder left at its 4 GiB default inside a smaller

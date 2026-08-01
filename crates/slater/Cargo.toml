@@ -14,6 +14,10 @@ path = "src/main.rs"
 graph-format.workspace = true
 slater-scalar.workspace = true
 slater-delta.workspace = true
+# Optional: pulled in only by the `consolidate` feature, which compiles the in-binary
+# consolidation worker. Left out (as in `slater:latest-lite`) the server still serves and
+# writes; only `CALL slater.consolidate()` is unavailable, and says so.
+slater-build = { workspace = true, optional = true }
 hs-utils.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -43,7 +47,12 @@ chrono = { workspace = true, features = ["clock"] }
 tikv-jemallocator.workspace = true
 
 [features]
-default = []
+default = ["consolidate"]
+# Compile the consolidation worker into the server binary, so `run_builder` can re-exec
+# `current_exe()` instead of hunting for a separate `slater-build` on disk. On by default;
+# `slater:latest-lite` builds without it and reports consolidation unavailable as a typed
+# error rather than the runtime ENOENT it used to give.
+consolidate = ["dep:slater-build"]
 # Enable the S3 / object-store data backend (forwards to graph-format).
 s3 = ["graph-format/s3"]
 # Enable the GCS data backend (forwards to graph-format).

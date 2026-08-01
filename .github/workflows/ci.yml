@@ -155,6 +155,20 @@ jobs:
       - name: Build the builder the tests spawn
         run: cargo build -p slater-build --locked
 
+      - name: Worker/slater-build generation parity
+        env:
+          SLATER_BUILD_BIN: target/debug/slater-build
+        run: |
+          set -euo pipefail
+          # The self-exec worker is a second entry point into the build pipeline; this
+          # asserts it publishes byte-identical generations. Integration test, because the
+          # worker re-execs `current_exe()` — inside a unit test that is the test harness.
+          out="$(cargo test -p slater --locked --features testkit \
+                   --test consolidate_worker_parity -- --ignored 2>&1)"
+          echo "$out" | tail -20
+          echo "$out" | grep -qE 'test result: ok\. 1 passed' \
+            || { echo "::error::worker parity test did not run"; exit 1; }
+
       - name: Consolidation suite (real slater-build)
         env:
           SLATER_BUILD_BIN: target/debug/slater-build

@@ -6,19 +6,11 @@
 //! `slater` server serves read-only. Runs offline (build/CI or an admin box),
 //! never in the serving hot path, so it may use whatever memory it likes.
 
-mod buckets;
-mod build_external;
-mod cluster;
-mod common;
-mod diag;
-mod direct_ingest;
-mod merge_build;
-mod model;
-mod overlay;
-mod parser;
-mod resolve;
-mod set_eval;
-mod shared;
+// The pipeline itself lives in the library half of this crate (`lib.rs`), so the server
+// can link it and re-exec itself as a consolidation worker rather than hunting for a
+// second binary on disk. This file is the CLI: argument parsing, the `resolve_*` plumbing
+// that turns flags into `BuildOptions`, and the allocator (which must stay binary-side —
+// two `#[global_allocator]`s in one binary will not link).
 
 // On Linux, jemalloc is the global allocator, as it is for the server.
 //
@@ -57,34 +49,16 @@ use clap::Parser;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use crate::build_external::build_external;
-use crate::cluster::ClusterMode;
-use crate::diag::BuildDiag;
-use crate::shared::{BuildOptions, InputFormat};
+use slater_build::build_external;
+use slater_build::cluster::ClusterMode;
+use slater_build::compression::CompressionProfile;
+use slater_build::diag::BuildDiag;
+use slater_build::shared::{BuildOptions, InputFormat};
 
 // Candidate zstd levels per backend-aware profile. zstd decode speed is ~level
 // independent, so a higher build level shrinks on-disk/on-wire bytes (and thus read
 // time) without slowing the hot read path. These are starting points; the
 // `bench-codec` harness measures the per-backend knee and these get pinned to it.
-const LOCAL_ZSTD_LEVEL: i32 = 9; // balanced: NVMe reads are cheap, keep build CPU sane
-const REMOTE_ZSTD_LEVEL: i32 = 19; // object store: every saved byte is network/RTT
-const MAX_ZSTD_LEVEL: i32 = 22; // squeeze hardest, build cost no object
-
-/// Backend-aware compression profile. Selects the zstd level for published files
-/// when `--zstd-level` is not given explicitly.
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
-enum CompressionProfile {
-    /// `remote` when a remote publish target (`--publish-s3-bucket` /
-    /// `--publish-gcs-bucket`) is configured, else `local`.
-    Auto,
-    /// Balanced for local/NVMe reads (decompress CPU is a larger share there).
-    Local,
-    /// Max ratio for remote/object-store reads (bytes-on-the-wire dominate).
-    Remote,
-    /// Highest ratio regardless of build cost.
-    Max,
-}
-
 /// Build an immutable Slater graph generation from a primitive-Cypher dump.
 #[derive(Debug, Parser)]
 #[command(name = "slater-build", version, about)]
@@ -406,7 +380,7 @@ fn make_diag(cli: &Cli, data_dir: &std::path::Path) -> Result<BuildDiag> {
             "threads": resolve_threads(cli),
         });
         eprintln!("slater-build: diagnostics → {}", log_path.display());
-        Some(crate::diag::JsonlConfig {
+        Some(slater_build::diag::JsonlConfig {
             path: log_path,
             interval: Duration::from_millis(cli.diagnostics_interval_ms.max(1)),
             header,
@@ -498,39 +472,21 @@ fn resolve_master_key(cli: &Cli) -> Result<Option<Zeroizing<Vec<u8>>>> {
 /// chosen profile maps to a level, with `auto` deferring to whether a remote publish
 /// target is configured (`publishing_remote`).
 fn resolve_compression(cli: &Cli, publishing_remote: bool) -> (i32, String) {
-    if let Some(level) = cli.zstd_level {
-        return (level, "manual".into());
-    }
-    let profile = match cli.compression_profile {
-        CompressionProfile::Auto if publishing_remote => CompressionProfile::Remote,
-        CompressionProfile::Auto => CompressionProfile::Local,
-        p => p,
-    };
-    match profile {
-        CompressionProfile::Local => (LOCAL_ZSTD_LEVEL, "local".into()),
-        CompressionProfile::Remote => (REMOTE_ZSTD_LEVEL, "remote".into()),
-        CompressionProfile::Max => (MAX_ZSTD_LEVEL, "max".into()),
-        // `auto` is resolved to local/remote above.
-        CompressionProfile::Auto => unreachable!("auto resolved to local/remote"),
-    }
+    slater_build::compression::resolve_compression(
+        cli.zstd_level,
+        cli.compression_profile,
+        publishing_remote,
+    )
 }
 
-/// Resolve the degree-column `zstd-dense` selection margin. An explicit
-/// `--degree-zstd-margin` always wins; otherwise it tracks the compression profile — a local
-/// (fs/NVMe) target is latency-biased (0.5: prefer decompress-free EF), a remote/max
-/// (object-store) target is wire-biased (1.0: let zstd win when it is any smaller).
+/// Resolve the degree-column `zstd-dense` selection margin — see
+/// [`slater_build::compression::resolve_degree_zstd_margin`].
 fn resolve_degree_zstd_margin(cli: &Cli, publishing_remote: bool) -> f64 {
-    if let Some(m) = cli.degree_zstd_margin {
-        return m;
-    }
-    let profile_name = match cli.compression_profile {
-        CompressionProfile::Auto if publishing_remote => "remote",
-        CompressionProfile::Auto => "local",
-        CompressionProfile::Local => "local",
-        CompressionProfile::Remote => "remote",
-        CompressionProfile::Max => "max",
-    };
-    graph_format::degree_ef::margin_for_profile(profile_name)
+    slater_build::compression::resolve_degree_zstd_margin(
+        cli.degree_zstd_margin,
+        cli.compression_profile,
+        publishing_remote,
+    )
 }
 
 /// Build the optional remote publish target from the `--publish-s3-*` /

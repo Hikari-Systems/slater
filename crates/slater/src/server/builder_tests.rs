@@ -35,6 +35,12 @@ fn exe_dir() -> std::path::PathBuf {
 
 /// Put an executable stub at `<exe_dir>/<name>` by copying a real binary, so the spawn
 /// is a genuine `execve` and not a shell-dependent shim (the runtime image has no shell).
+///
+/// It has to be *that* directory — the fallback under test is defined as "beside
+/// `current_exe()`", and relocating it would need a seam in `spawn_builder`, which is the
+/// shape that hid HIK-157. For a test binary that directory is cargo's `deps/`, which
+/// cargo also writes to, so the name is uuid-suffixed and removed on drop. Do not run this
+/// module concurrently with a rebuild of the same target dir.
 struct Stub(std::path::PathBuf);
 
 impl Stub {
@@ -101,6 +107,45 @@ fn a_missing_builder_reports_both_attempts() {
     assert!(msg.contains(&name), "{msg}");
     assert!(msg.contains("also tried"), "{msg}");
     assert!(msg.contains("delta.builderBin"), "{msg}");
+}
+
+// ── which child to run ───────────────────────────────────────────────────────────
+
+/// An explicit `delta.builderBin` always selects the external binary — the escape hatch
+/// for pinning a specific builder version stays working in both build shapes.
+#[test]
+fn a_configured_builder_bin_selects_the_external_binary() {
+    assert!(matches!(
+        super::builder_target("slater-build").unwrap(),
+        super::BuilderTarget::External(ref b) if b == "slater-build"
+    ));
+}
+
+/// The default (empty) resolves to re-exec'ing the server itself. This is what makes the
+/// shipped image work with no configuration at all: nothing to find on `PATH`, nothing
+/// absent from the image, and no version skew possible.
+#[cfg(feature = "consolidate")]
+#[test]
+fn the_default_selects_the_servers_own_worker() {
+    let target = super::builder_target("").expect("current_exe() should resolve");
+    let super::BuilderTarget::SelfWorker(exe) = target else {
+        panic!("empty builderBin must select the self-exec worker");
+    };
+    assert_eq!(exe, std::env::current_exe().unwrap());
+}
+
+/// Built without the worker (`slater:latest-lite`), the default must fail with a *typed,
+/// actionable* error naming the config key and the full image — not the bare
+/// `No such file or directory` that the missing `slater-build` binary used to produce.
+#[cfg(not(feature = "consolidate"))]
+#[test]
+fn a_build_without_the_worker_says_so_instead_of_enoent() {
+    let msg = format!(
+        "{:#}",
+        super::builder_target("").expect_err("no worker compiled in")
+    );
+    assert!(msg.contains("delta.builderBin"), "{msg}");
+    assert!(msg.contains("consolidate"), "{msg}");
 }
 
 // ── resource limits ──────────────────────────────────────────────────────────────
