@@ -2449,6 +2449,48 @@ pub enum ExecLimit {
     ShortestPathCap(u64),
 }
 
+/// A maintained-degree read was asked for under conditions where it cannot be exact
+/// (HIK-150).
+///
+/// `directed_edge_count` composes a degree from marginals — core degree plus each segment's
+/// born−removed fragment plus the live delta's born−suppressed — and that composition is
+/// exact only while the delta holds no tombstone. It is the *arming* sites
+/// (`degree_terminal_dir`) that are supposed to guarantee it, and this type exists because
+/// relying on them alone is what produced this bug: the node-tombstone half was checked and
+/// the edge-tombstone half was not, so the fast path silently returned wrong degrees on any
+/// graph with a live `DELETE r`.
+///
+/// So the precondition is enforced where it is *needed* rather than where it is remembered.
+/// In production this is unreachable — the caller declined first — and it is deliberately an
+/// error rather than a silent fallback: a wrong count is worse than a failed query, and a
+/// future change that re-arms the fast path without re-reading this should fail loudly.
+///
+/// A **type**, not a message: callers branch on `downcast_ref::<DegreeNotExact>()`, never on
+/// the text (CONTRIBUTING.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DegreeNotExact {
+    /// A live node delete. Edges to a deleted node are filtered at read time rather than
+    /// materialised per source, so no maintained per-node degree reflects them until the
+    /// delete flushes into the core.
+    #[error(
+        "maintained degree is not exact while a node delete is live in the delta — the \
+         caller must decline this fast path (degree_terminal_dir)"
+    )]
+    NodeTombstone,
+    /// A live edge delete. A core-edge tombstone carries **no edge id** — it is matched
+    /// against the core adjacency by identity, so one tombstone suppresses *every* parallel
+    /// edge of that reltype to that neighbour, and a tombstone that matches nothing
+    /// suppresses none. Neither multiplicity is knowable without reading the core adjacency,
+    /// which is the read this fast path exists to avoid.
+    #[error(
+        "maintained degree is not exact while an edge delete is live in the delta — a \
+         core-edge tombstone is identity-matched, so its multiplicity is unknown without \
+         reading the core adjacency; the caller must decline this fast path \
+         (degree_terminal_dir)"
+    )]
+    EdgeTombstone,
+}
+
 // ── Server-wide intermediate budget ─────────────────────────────────────────
 
 /// Process-wide ceiling on the **sum** of all in-flight queries' intermediate
@@ -2591,6 +2633,15 @@ pub struct Engine<'g, V: ReadView> {
     /// pattern's final hop is a plain, unfiltered, count-only edge over a homogeneous
     /// graph with no pending node-deletes (see [`Self::degree_terminal_dir`]).
     degree_terminal: Cell<bool>,
+    /// Memoised answer to "can a maintained degree be exact against this delta?" — `None`
+    /// until first asked, then the refusal (or `Some(None)` for "yes, it can").
+    ///
+    /// Memoised because the predicates behind it are **not** O(1): `has_tombstones` builds a
+    /// bounded id list per level, and `has_edge_tombstones` scans a level's edge map. Those
+    /// costs are fine once per query and not fine once per *frontier node*, which is how
+    /// often `directed_edge_count` runs. The delta snapshot is immutable for an engine's
+    /// lifetime, so one answer is correct for all of it.
+    degrees_exact: std::cell::OnceCell<Option<DegreeNotExact>>,
     /// Server-wide intermediate budget shared across every concurrent query
     /// (`query.maxIntermediateGlobal`); `None` ⇒ no global guard. Charged in
     /// lock-step with `budget_used`; `global_charged` is this query's running
@@ -2654,6 +2705,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             scanned_ids: Cell::new(0),
             count_acc: Cell::new(None),
             degree_terminal: Cell::new(false),
+            degrees_exact: std::cell::OnceCell::new(),
             global_budget: None,
             global_charged: Cell::new(0),
             max_shortest_path_explore: 0,
