@@ -157,7 +157,13 @@ jobs:
 
       - name: Consolidation suite (real slater-build)
         env:
-          SLATER_BUILD_BIN: target/debug/slater-build
+          # ABSOLUTE. `cargo test` runs a test binary with its CWD set to the *package*
+          # root (`crates/slater/`), not the workspace root — so a relative
+          # `target/debug/slater-build` resolves to `crates/slater/target/…`, which never
+          # exists, and every test in this loop fails to spawn the builder. This job was
+          # authored on a release branch and first executed on `main`, where that is
+          # exactly what happened.
+          SLATER_BUILD_BIN: ${{ github.workspace }}/target/debug/slater-build
         run: |
           set -euo pipefail
           # Full module paths: `--exact` matches the whole path, so a bare function
@@ -179,13 +185,18 @@ jobs:
             server::tests::bolt_consolidate_trigger_folds_delta_via_real_builder \
           ; do
             echo "── $t"
+            # `|| true` is load-bearing: under `set -e` a failing command inside a
+            # `out="$(…)"` assignment aborts the script *before* the diagnostic below
+            # ever runs, so a genuine test failure surfaced as a bare "exit code 101"
+            # with none of cargo's output. Capture, always print, then judge.
             out="$(cargo test -p slater --locked --lib -- \
-                     --ignored --exact "$t" --test-threads 1 2>&1)"
-            echo "$out" | tail -20
-            # A rename must fail here rather than quietly dropping coverage: assert
-            # the run actually executed one test, not zero.
+                     --ignored --exact "$t" --test-threads 1 2>&1)" || true
+            echo "$out" | tail -30
+            # One assertion covers both failure modes: a test that failed, and a test
+            # that matched nothing (a rename silently dropping coverage) — neither
+            # prints `1 passed`.
             echo "$out" | grep -qE 'test result: ok\. 1 passed' \
-              || { echo "::error::$t did not run (renamed or removed?)"; exit 1; }
+              || { echo "::error::$t failed or did not run (renamed or removed?)"; exit 1; }
           done
 
   # ── Store backends: compile + run the feature-gated s3/gcs code that the
