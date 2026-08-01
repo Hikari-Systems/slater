@@ -164,6 +164,7 @@ jobs:
           # name silently matches nothing and the job passes having run zero tests.
           for t in \
             server::tests::consolidate_via_real_builder \
+            server::tests::a_production_consolidation_honours_non_default_builder_limits \
             server::tests::consolidate_carries_vector_indexes_and_embeddings \
             server::tests::consolidate_carries_a_delta_written_vector_over_the_base \
             server::tests::a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding \

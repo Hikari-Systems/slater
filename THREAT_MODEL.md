@@ -117,7 +117,7 @@ cross-generation key separation.
 
 **The consolidation scratch dump is sealed too (HIK-149).** A consolidation writes the
 merged (core ⊕ delta) view to a scratch binary dump directory
-(`<data dir>/<graph>/.consolidate.dump`) for `slater-build` to ingest. That directory holds
+(`<data dir>/<graph>/.consolidate.dump.<uuid>`) for `slater-build` to ingest. That directory holds
 the **whole graph** — base, segments, delta and vectors — and it lives for the length of a
 full rebuild, which on a large graph is hours. Until this was fixed it was written in the
 clear on a deployment configured for at-rest encryption; the exposure was larger than the
@@ -145,6 +145,14 @@ path, so a dump kept from an earlier consolidation of that graph will always ope
 An attacker with write access to the data directory could therefore substitute one and have
 the rebuild publish a stale generation. Closing it needs a per-consolidation freshness token
 crossing the process boundary into `slater-build`; it is not closed today.
+
+What *is* closed is the **residue**: the scratch directory now carries a per-attempt uuid
+rather than a fixed name, and the writable layer sweeps any leftover at boot
+(`sweep_consolidation_scratch`). Previously a server killed mid-rebuild — OOM, `SIGKILL`,
+host failure — left a complete copy of the graph behind that nothing would ever reclaim, and
+the next consolidation silently wrote over it. Boot is the only safe moment for the sweep
+(no consolidation of that process can have started yet), so it is deliberately not wired to
+anything on the serving path.
 
 **The consolidation's *output* is now encrypted (HIK-157).** Until this was fixed, the
 server spawned `slater-build` for a consolidation with **no key and no `--encrypt`**, so a

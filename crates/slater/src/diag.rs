@@ -457,7 +457,7 @@ fn read_cgroup_u64(path: &str) -> Option<u64> {
 
 /// cgroup memory limit in bytes: cgroup v2 `memory.max`, falling back to v1
 /// `memory.limit_in_bytes`. `None` when unlimited or unreadable.
-fn cgroup_mem_limit() -> Option<u64> {
+pub(crate) fn cgroup_mem_limit() -> Option<u64> {
     read_cgroup_u64("/sys/fs/cgroup/memory.max")
         .or_else(|| read_cgroup_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
         // v1 "unlimited" is a huge sentinel (~u64::MAX rounded to a page); treat
@@ -475,7 +475,7 @@ fn cgroup_mem_current() -> Option<u64> {
 /// cgroup CPU quota expressed in cores: v2 `cpu.max` (`"<quota> <period>"`, or
 /// `"max"` for unlimited), falling back to v1 `cpu.cfs_quota_us` /
 /// `cpu.cfs_period_us`. `None` when unlimited or unreadable.
-fn cgroup_cpu_quota_cores() -> Option<f64> {
+pub(crate) fn cgroup_cpu_quota_cores() -> Option<f64> {
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
         let mut it = s.split_whitespace();
         let quota = it.next()?;

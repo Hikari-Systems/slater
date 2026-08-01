@@ -440,6 +440,9 @@ fn delta_cfg(wal_dir: &Path) -> DeltaConfig {
         delta_hard_bytes: 0,
         consolidate_window: String::new(),
         builder_bin: "slater-build".to_string(),
+        builder_max_memory: 0,
+        builder_threads: 0,
+        consolidate_timeout_secs: 0,
         off_heap_l0: false,
         segment_gc_grace_secs: 0,
     }
@@ -2087,6 +2090,25 @@ fn result_key_binds_delta_epoch() {
     assert_eq!(k0, ResultKey::new(g, "q"), "epoch 0 == the read-only key");
 }
 
+/// Assert no consolidation scratch dump survives under `<root>/<graph>/`.
+///
+/// Matches on [`CONSOLIDATE_SCRATCH_PREFIX`] rather than a fixed name: the dump directory
+/// is uniquified per attempt, so the old `join(".consolidate.dump").exists()` assertion
+/// would now pass without the cleanup running at all.
+fn assert_no_consolidate_scratch(root: &Path, graph: &str) {
+    let leftovers: Vec<_> = std::fs::read_dir(root.join(graph))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(crate::server::registry::CONSOLIDATE_SCRATCH_PREFIX))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "consolidation scratch not cleaned up: {leftovers:?}"
+    );
+}
+
 /// Count the `*.wal` segment files under a WAL directory.
 fn wal_count(dir: &Path) -> usize {
     std::fs::read_dir(dir)
@@ -2239,7 +2261,7 @@ fn consolidate_folds_delta_into_fresh_generation() {
         gen1.uuid(),
         "writer re-bound to new core"
     );
-    assert!(!root.join("people").join(".consolidate.dump").exists());
+    assert_no_consolidate_scratch(&root, "people");
     assert_eq!(
         wal_count(&wal_dir),
         1,
@@ -2503,7 +2525,7 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
         matches!(read_age("Bob"), Val::Int(77)),
         "post-freeze write carried forward"
     );
-    assert!(!root.join("people").join(".consolidate.dump").exists());
+    assert_no_consolidate_scratch(&root, "people");
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -7633,7 +7655,7 @@ fn consolidation_folds_a_flushed_l0_level() {
     let writer = graphs.writer("people").unwrap();
     assert_eq!(writer.l0_len(), 0, "L0 stack cleared by retire");
     assert_eq!(l0_count(&wal_dir), 0, "L0 file deleted by retire");
-    assert!(!root.join("people").join(".consolidate.dump").exists());
+    assert_no_consolidate_scratch(&root, "people");
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -7684,7 +7706,7 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
         writer.snapshot().node_patch(0).unwrap().patches.get("age"),
         Some(&Value::Int(99))
     );
-    assert!(!root.join("people").join(".consolidate.dump").exists());
+    assert_no_consolidate_scratch(&root, "people");
 
     // Durability: a fresh writer over the WAL replays the write.
     let reopened = DeltaWriter::open(
@@ -7883,6 +7905,69 @@ fn guard_sweep_defers_to_an_in_flight_consolidation() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The same end-to-end consolidation, but with **non-default [`BuilderLimits`]** — the
+/// invocation a server running inside a memory- or CPU-capped container actually makes.
+///
+/// Every other real-builder test passes `BuilderLimits::default()`, i.e. no
+/// `--max-memory`, no `--threads`, no timeout. That leaves the flagged invocation
+/// completely uncovered, and "two configurations with no test in common" is exactly how
+/// HIK-145 and HIK-157 stayed invisible. What this pins down is that the real binary
+/// *accepts* what the server sends: `--max-memory` as a **bare byte count** (its
+/// `parse_size` treats a suffix-less number as bytes) and `--threads` as an integer. Get
+/// either wrong and consolidation fails on every capped deployment while every existing
+/// test still passes.
+///
+/// Ignored by default and run in CI for the same reason as its sibling below.
+#[test]
+#[ignore = "spawns the real slater-build binary; see the doc comment"]
+fn a_production_consolidation_honours_non_default_builder_limits() {
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let (root, _graph) = testgen::write_indexed_people("consolidate_limits");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let gen0 = graphs.get("people").unwrap();
+    let writer = graphs.writer("people").unwrap();
+    let stmt =
+        match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 42").unwrap() {
+            parser::ast::Statement::Write(w) => w,
+            _ => unreachable!(),
+        };
+    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+
+    // A budget at the derived floor, an explicit thread count, and a timeout generous
+    // enough that a healthy build never trips it but a wedged one does not hang CI.
+    let limits = BuilderLimits {
+        max_memory_bytes: MIN_BUILDER_MEMORY,
+        threads: 2,
+        timeout_secs: 600,
+    };
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+    let new = graphs
+        .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, key| {
+            run_builder(&bin, d, g, dd, key, limits)
+        })
+        .expect("the real builder must accept the flags the server sends");
+    assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
+
+    let gen1 = graphs.get("people").unwrap();
+    let view = MergedView::new(
+        gen1.as_ref(),
+        DeltaSnapshot::from_memtable(writer.snapshot()),
+    );
+    let ast = parser::parse("MATCH (n:Person {name:'Alice'}) RETURN n.age").unwrap();
+    let age = Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0].clone();
+    assert!(
+        matches!(age, Val::Int(42)),
+        "the flag-limited build folded the delta into the core, got {age:?}"
+    );
+    assert_no_consolidate_scratch(&root, "people");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// True end-to-end consolidation through the real `slater-build` binary. Ignored
 /// by default — `cargo test -p slater` does not build the builder. Run it with
 /// the binary located via `SLATER_BUILD_BIN` (or on `PATH`):
@@ -7925,7 +8010,7 @@ fn consolidate_via_real_builder() {
                 _ => unreachable!(),
             };
             execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -8016,7 +8101,7 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
 
@@ -8070,7 +8155,7 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
 
@@ -8197,7 +8282,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
     // 3. A background consolidation, run while d00 is out of scope.
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
     assert_eq!(
@@ -8285,7 +8370,7 @@ fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation()
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
 
@@ -8342,7 +8427,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
     // A consolidation while out of scope.
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
 
@@ -8909,7 +8994,7 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     let new_uuid = graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
             assert_dump_is_sealed(d);
-            crate::server::run_builder(&bin, d, g, dd, k)
+            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default())
         })
         .expect("a consolidation of an encrypted graph must succeed");
     assert_ne!(
@@ -9120,7 +9205,7 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
 
     graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key)
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
         })
         .unwrap();
 
@@ -9993,6 +10078,7 @@ fn build_writable_ctx_caps(
         max_pre_auth_connections: 4_096,
         data_dir: root.clone(),
         builder_bin: builder_bin.to_string(),
+        builder_limits: BuilderLimits::default(),
         memtable_bytes,
         l0_compaction_trigger,
         segment_flush_bytes,
@@ -10226,6 +10312,7 @@ fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<
         max_pre_auth_connections: limits.max_pre_auth_connections,
         data_dir: root.clone(),
         builder_bin: "slater-build".to_string(),
+        builder_limits: BuilderLimits::default(),
         memtable_bytes: 64 << 20,
         l0_compaction_trigger: 4,
         segment_flush_bytes: 0,
@@ -10322,6 +10409,7 @@ fn build_multi_ctx(tag: &str) -> Arc<ConnCtx> {
         max_pre_auth_connections: 4_096,
         data_dir: root.clone(),
         builder_bin: "slater-build".to_string(),
+        builder_limits: BuilderLimits::default(),
         memtable_bytes: 64 << 20,
         l0_compaction_trigger: 4,
         segment_flush_bytes: 0,

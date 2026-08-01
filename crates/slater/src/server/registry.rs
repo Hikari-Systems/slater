@@ -6,6 +6,53 @@
 
 use super::*;
 
+/// Directory-name prefix for a consolidation's scratch dump, under
+/// `<data_dir>/<graph>/`. The leading dot keeps it out of the way of the uuid-named
+/// generation directories; the suffix is a fresh uuid per attempt.
+pub(crate) const CONSOLIDATE_SCRATCH_PREFIX: &str = ".consolidate.dump.";
+
+/// Reclaim consolidation scratch dumps left behind by a previous process.
+///
+/// A dump is the whole merged graph — base, segments, delta and vectors — and on a keyed
+/// deployment it is sealed but still a complete copy (`THREAT_MODEL.md`). The in-process
+/// paths remove it on success and on every error, but a server killed mid-rebuild (OOM,
+/// `SIGKILL`, host failure) cannot, so the bytes used to sit in the data directory
+/// indefinitely with nothing that would ever notice them.
+///
+/// **Boot-only.** This deletes any directory matching the prefix without checking whether
+/// something is using it, which is sound exactly once: before any consolidation of this
+/// process can have started. Do not call it from a running server.
+///
+/// Best-effort throughout — a failure to reclaim scratch must never stop a graph coming
+/// online, so every error is logged and swallowed.
+pub(crate) fn sweep_consolidation_scratch(data_dir: &Path, graph: &str) {
+    let Ok(entries) = std::fs::read_dir(data_dir.join(graph)) else {
+        return; // no graph dir yet (fresh deployment) — nothing to reclaim
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(CONSOLIDATE_SCRATCH_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => warn!(
+                graph = %graph,
+                path = %path.display(),
+                "reclaimed a consolidation scratch dump left by a previous process — a \
+                 consolidation was interrupted before it could clean up"
+            ),
+            Err(e) => warn!(
+                graph = %graph,
+                path = %path.display(),
+                error = %e,
+                "could not reclaim a leftover consolidation scratch dump"
+            ),
+        }
+    }
+}
+
 impl Graphs {
     /// The retained at-rest master key as a byte slice.
     ///
@@ -134,6 +181,9 @@ impl Graphs {
                 info!(graph = %name, node_deltas = n, "writable layer replayed WAL");
             }
             self.writers.insert(name.clone(), Arc::new(writer));
+            // Boot is the one moment we know no consolidation is in flight, so it is the
+            // only safe moment to reclaim scratch dumps a previous process died holding.
+            sweep_consolidation_scratch(data_dir, name);
         }
         Ok(())
     }
@@ -509,7 +559,17 @@ impl Graphs {
         // beside the graph. The builder ingests it directly (no re-parse / re-resolve).
         // Sealed under the same key on an encrypted deployment: this is the entire merged
         // graph, and it sits here for the length of the rebuild (HIK-149).
-        let dump_path = data_dir.join(name).join(".consolidate.dump");
+        //
+        // The name carries a uuid rather than being the fixed `.consolidate.dump` it once
+        // was. A fixed name is only cleaned on the in-process exit paths below, so a server
+        // killed mid-rebuild left an (encrypted, but complete) copy of the whole graph in
+        // the data directory that nothing would ever reclaim — and the next consolidation
+        // would silently write over it. Uniquifying makes the residue attributable and lets
+        // `sweep_consolidation_scratch` reclaim it at boot.
+        let dump_path = data_dir.join(name).join(format!(
+            "{CONSOLIDATE_SCRATCH_PREFIX}{}",
+            uuid::Uuid::new_v4()
+        ));
         let dump_res: Result<()> = {
             let view = MergedView::new(
                 core.as_ref(),

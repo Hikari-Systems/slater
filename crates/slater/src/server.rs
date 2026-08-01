@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -302,10 +302,293 @@ fn fsync_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("fsync {}", dir.display()))
 }
 
+/// How many lines of the builder's own output to keep for the failure message. The
+/// child's diagnostics used to go to the server's inherited stderr and never reach the
+/// error, so a failed consolidation reported only `exited with <status>` — the worst
+/// debuggability in the codebase on its longest and rarest operation.
+const BUILDER_LOG_TAIL_LINES: usize = 40;
+
+/// Fraction of the server's cgroup memory limit to hand the builder as `--max-memory`
+/// when `delta.builderMaxMemory` is left at 0. Deliberately well under half: the budget
+/// bounds what the build *reserves*, and measured peak RSS runs **1.07–2.08× the cap**
+/// (`docs/BUILD-PERF-PLAN.md`), so the cap must leave room for its own overshoot *and*
+/// for the server still serving beside it.
+const BUILDER_MEMORY_FRACTION: f64 = 0.35;
+
+/// Floor for a derived `--max-memory`: 8× `graph_format::membudget::MIN_SORT_BYTES`
+/// (8 MiB), the smallest reservation an `ExtSorter` can form runs with at all. Below
+/// roughly this the run count explodes and the k-way merge's per-run resident block
+/// dominates whatever the buffer saved, so a derived budget never goes under it.
+///
+/// Deliberately **not** larger. A floor above the fraction would *raise* the budget on
+/// exactly the small containers the derivation exists to protect — on a 1 GiB limit a
+/// 512 MiB floor would hand the builder half the container while the server is still
+/// serving out of the other half. The floor is a sanity bound, not a target.
+const MIN_BUILDER_MEMORY: u64 = 64 << 20;
+
+/// Poll interval while waiting on the builder. The rebuild is O(core) — tens of minutes
+/// on a large graph — so the poll is free; it exists so the wait is *interruptible* by a
+/// timeout or by shutdown, which a bare blocking `wait()` is not.
+const BUILDER_POLL: Duration = Duration::from_millis(250);
+
+/// Resource and lifetime limits the server imposes on a consolidation child.
+///
+/// These are deliberately **not** part of the `build` seam's signature
+/// ([`Graphs::consolidate_graph`]): they describe how *this* server chooses to run the
+/// subprocess, not what consolidation means, so they are captured by the production
+/// closure and a test seam is unaffected by them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuilderLimits {
+    /// `--max-memory` in bytes; 0 ⇒ omit the flag (builder keeps its 4 GiB default).
+    pub max_memory_bytes: u64,
+    /// `--threads`; 0 ⇒ omit the flag (builder keeps its `cores - 2` default).
+    pub threads: usize,
+    /// Wall-clock bound on the rebuild in seconds; 0 ⇒ wait indefinitely.
+    pub timeout_secs: u64,
+}
+
+impl BuilderLimits {
+    /// Resolve the limits for a consolidation: explicit config wins, otherwise derive
+    /// from the container the **server** is running in.
+    ///
+    /// The derivation is the point. `slater-build`'s own defaults (4 GiB, `cores - 2`)
+    /// are sized for the offline box its module doc assumes — *"Runs offline (build/CI or
+    /// an admin box) … so it may use whatever memory it likes"*. A server-triggered
+    /// consolidation is not that: it runs inside the server's cgroup, where 4 GiB may be
+    /// twice the whole limit and `cores - 2` counts the *host's* cores, not the quota.
+    pub fn resolve(cfg: &DeltaConfig) -> Self {
+        let max_memory_bytes = if cfg.builder_max_memory > 0 {
+            cfg.builder_max_memory
+        } else {
+            // No cgroup limit ⇒ leave the flag off rather than invent a number: an
+            // uncapped host is exactly the case the builder's own default is right for.
+            crate::diag::cgroup_mem_limit()
+                .map(|lim| {
+                    // Clamped to `lim` last, so the floor can never ask for more memory
+                    // than the container has — on a limit under ~183 MiB the fraction is
+                    // below the floor, and handing the builder a budget it cannot possibly
+                    // hold would turn a clear budget abort into an OOM kill.
+                    (((lim as f64) * BUILDER_MEMORY_FRACTION) as u64)
+                        .max(MIN_BUILDER_MEMORY)
+                        .min(lim)
+                })
+                .unwrap_or(0)
+        };
+        let threads = if cfg.builder_threads > 0 {
+            cfg.builder_threads
+        } else {
+            crate::diag::cgroup_cpu_quota_cores()
+                .map(|c| (c.floor() as usize).max(1))
+                .unwrap_or(0)
+        };
+        Self {
+            max_memory_bytes,
+            threads,
+            timeout_secs: cfg.consolidate_timeout_secs,
+        }
+    }
+}
+
+/// Live consolidation children, so [`kill_live_builders`] can stop them at shutdown.
+///
+/// Without this an orderly shutdown leaves an hours-long rebuild running detached, still
+/// burning a core-count of CPU and hundreds of GB of IO, and still able to publish into
+/// `current` — where a *restarted* server's generation guard would then adopt it. The
+/// handle sits behind its own mutex because `Child::kill` needs `&mut`, and the wait loop
+/// only takes that lock for the length of one `try_wait` poll.
+///
+/// **Scope, precisely:** this covers the shutdown path the server actually runs code on —
+/// `reloadStrategy=exit` leaving the accept loop. It does **not** cover `SIGTERM`/`SIGKILL`,
+/// because the server installs no signal handler at all, so the process dies without running
+/// any Rust cleanup and the child is orphaned regardless. Closing that needs a signal handler
+/// and a decision about graceful connection draining — a separate change, not a side effect
+/// of supervising the builder. The boot-time `sweep_consolidation_scratch` is what limits the
+/// damage in the meantime.
+static LIVE_BUILDERS: Mutex<Vec<Arc<Mutex<std::process::Child>>>> = Mutex::new(Vec::new());
+
+/// Kill every in-flight consolidation child. Called on the shutdown path; safe to call
+/// when there are none. A child killed here makes its consolidation fail
+/// non-destructively (old core keeps serving, delta stays live), the same as any other
+/// builder failure.
+pub fn kill_live_builders() {
+    let live: Vec<_> = {
+        let mut g = LIVE_BUILDERS.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *g)
+    };
+    for child in live {
+        let mut c = child.lock().unwrap_or_else(PoisonError::into_inner);
+        // `Err` here is the benign "already exited" case — std tracks the reap, so this
+        // cannot signal a recycled pid.
+        if c.kill().is_ok() {
+            warn!("killed an in-flight consolidation builder on shutdown");
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Register `child` so shutdown can reach it, returning the shared handle the wait loop
+/// polls. Pruning happens in [`unregister_builder`] on every exit path.
+fn register_builder(child: std::process::Child) -> Arc<Mutex<std::process::Child>> {
+    let handle = Arc::new(Mutex::new(child));
+    LIVE_BUILDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(handle.clone());
+    handle
+}
+
+/// Drop `handle` from the shutdown registry. Matched by pointer identity, so two
+/// concurrent consolidations (of different graphs) never unregister each other.
+fn unregister_builder(handle: &Arc<Mutex<std::process::Child>>) {
+    LIVE_BUILDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|c| !Arc::ptr_eq(c, handle));
+}
+
+/// Drain one of the child's pipes: log every line through the server's own `tracing`
+/// pipeline (so builder progress lands wherever the operator already reads logs) and keep
+/// a bounded tail for the failure message.
+///
+/// This **must** run concurrently with the key write to the child's stdin. Piping stdout
+/// and stderr means the child now has pipes it can block on; a build chatty enough to fill
+/// one before it reads stdin would deadlock against a parent waiting to finish writing the
+/// key. That is the hazard the previous inherited-stdio comment warned about, and the drain
+/// threads are started *before* the key write for exactly this reason.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    graph: String,
+    is_stderr: bool,
+) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        for line in std::io::BufReader::new(pipe).lines() {
+            let Ok(line) = line else { break };
+            if is_stderr {
+                warn!(graph = %graph, "slater-build: {line}");
+            } else {
+                info!(graph = %graph, "slater-build: {line}");
+            }
+            if tail.len() == BUILDER_LOG_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        tail.into()
+    })
+}
+
+/// Spawn `builder_bin` with `args`, falling back to a binary sitting beside the running
+/// server when a **bare** name is not on `PATH`.
+///
+/// The fallback exists because the shipped image gets this wrong by default: `Dockerfile`
+/// puts both binaries in `/app`, `/app` is not on the distroless default `PATH`, and
+/// `delta.builderBin` defaults to the bare name `slater-build` — so `CALL
+/// slater.consolidate()` in the official image fails `No such file or directory` with the
+/// correct binary sitting next to the server that just tried to spawn it. Only a bare name
+/// is retried: an operator who gave an explicit path meant that path, and silently running
+/// a *different* binary than the one named would be worse than the error.
+fn spawn_builder(
+    builder_bin: &str,
+    configure: impl Fn(&mut std::process::Command),
+) -> Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(builder_bin);
+    configure(&mut cmd);
+    let first = match cmd.spawn() {
+        Ok(child) => return Ok(child),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => e,
+        Err(e) => return Err(e).with_context(|| format!("spawn builder '{builder_bin}'")),
+    };
+
+    let bare = !builder_bin.contains(std::path::MAIN_SEPARATOR);
+    let sibling = bare
+        .then(std::env::current_exe)
+        .and_then(|exe| exe.ok())
+        .and_then(|exe| exe.parent().map(|d| d.join(builder_bin)));
+    let Some(sibling) = sibling else {
+        return Err(first).with_context(|| format!("spawn builder '{builder_bin}'"));
+    };
+
+    let mut cmd = std::process::Command::new(&sibling);
+    configure(&mut cmd);
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(
+                builder = %sibling.display(),
+                "builder '{builder_bin}' is not on PATH; using the copy beside the server binary"
+            );
+            Ok(child)
+        }
+        // Report the *original* failure: "not on PATH" is the actionable message, and the
+        // fallback was our idea, not the operator's.
+        Err(_) => Err(first).with_context(|| {
+            format!(
+                "spawn builder '{builder_bin}' (also tried {}) — set `delta.builderBin` to an \
+                 absolute path",
+                sibling.display()
+            )
+        }),
+    }
+}
+
+/// Every builder exit path runs this: drop the child from the shutdown registry (so it can
+/// neither grow nor hold a reaped child), join the drain threads, and render their tail as
+/// a suffix for the error message. Takes `drains` by `&mut` and empties it, so it is safe
+/// to call from whichever path actually executes — and a second call is a no-op.
+fn finish(
+    handle: &Arc<Mutex<std::process::Child>>,
+    drains: &mut Vec<std::thread::JoinHandle<Vec<String>>>,
+) -> String {
+    unregister_builder(handle);
+    let mut tail: Vec<String> = Vec::new();
+    for d in drains.drain(..) {
+        tail.extend(d.join().unwrap_or_default());
+    }
+    if tail.is_empty() {
+        return String::new();
+    }
+    // The drains are joined in (stdout, stderr) order and each is already capped, so the
+    // suffix is bounded at 2 × BUILDER_LOG_TAIL_LINES.
+    format!(
+        "\n--- builder output (last {BUILDER_LOG_TAIL_LINES} lines per stream) ---\n{}",
+        tail.join("\n")
+    )
+}
+
+/// Wait for `handle`, killing it if `timeout_secs` elapses first. Returns the exit status,
+/// or an error naming the timeout. Polling rather than blocking in `wait()` is what makes
+/// the wait interruptible at all.
+fn wait_with_timeout(
+    handle: &Arc<Mutex<std::process::Child>>,
+    timeout_secs: u64,
+    graph: &str,
+) -> Result<std::process::ExitStatus> {
+    let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+    loop {
+        {
+            let mut child = handle.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(status) = child.try_wait().context("poll builder")? {
+                return Ok(status);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "builder for '{graph}' exceeded the {timeout_secs}s \
+                     `delta.consolidateTimeoutSecs` budget and was killed"
+                );
+            }
+        }
+        std::thread::sleep(BUILDER_POLL);
+    }
+}
+
 /// Spawn the configured `slater-build` binary to rebuild `graph` from the binary
 /// consolidation `dump` directory into `data_dir`, publishing a fresh generation —
 /// the production `build` seam for [`Graphs::consolidate_graph`]. A bare
-/// `builder_bin` resolves on `PATH`. A non-zero exit is an error, so the caller
+/// `builder_bin` resolves on `PATH`, falling back to a copy beside the server binary
+/// (see [`spawn_builder`]). A non-zero exit is an error, so the caller
 /// keeps the old core serving. The dump carries dense ids and global symbol ids, so
 /// the builder ingests it directly (`--input-format slater-dump`), skipping parse,
 /// node dedup, and endpoint resolution.
@@ -326,43 +609,74 @@ fn fsync_dir(dir: &Path) -> Result<()> {
 ///   tripwire refuses any key path inside the data directory.
 /// * `argv` is world-readable through `/proc/<pid>/cmdline`.
 ///
-/// **Deadlock note:** stdout/stderr are *inherited*, so the child writes to the terminal and
-/// has no pipe to block on while we write to its stdin. If they ever become `Stdio::piped()`
-/// this must drain them concurrently or a chatty build will hang. The stdin handle is
-/// dropped — closing the pipe, signalling EOF — before `wait()`.
+/// **Deadlock note:** stdout/stderr are piped and drained by [`drain_pipe`] on their own
+/// threads, started **before** the key is written to stdin. The child therefore always has
+/// a reader on both pipes and can never block on output while we block writing the key.
+/// The stdin handle is dropped — closing the pipe, signalling EOF — before the wait.
 pub fn run_builder(
     builder_bin: &str,
     dump: &Path,
     graph: &str,
     data_dir: &Path,
     master_key: Option<&[u8]>,
+    limits: BuilderLimits,
 ) -> Result<()> {
-    let mut cmd = std::process::Command::new(builder_bin);
-    cmd.arg("--input")
-        .arg(dump)
-        .arg("--input-format")
-        .arg("slater-dump")
-        .arg("--graph")
-        .arg(graph)
-        .arg("--data-dir")
-        .arg(data_dir);
-    if master_key.is_some() {
-        cmd.arg("--encrypt")
-            .arg("--key-stdin")
-            .stdin(std::process::Stdio::piped());
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn builder '{builder_bin}'"))?;
+    let child = spawn_builder(builder_bin, |cmd| {
+        cmd.arg("--input")
+            .arg(dump)
+            .arg("--input-format")
+            .arg("slater-dump")
+            .arg("--graph")
+            .arg(graph)
+            .arg("--data-dir")
+            .arg(data_dir)
+            // Piped so the builder's diagnostics reach the server's log pipeline and its
+            // failure message, instead of the inherited terminal where nothing read them.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if limits.max_memory_bytes > 0 {
+            cmd.arg("--max-memory")
+                .arg(limits.max_memory_bytes.to_string());
+        }
+        if limits.threads > 0 {
+            cmd.arg("--threads").arg(limits.threads.to_string());
+        }
+        if master_key.is_some() {
+            cmd.arg("--encrypt")
+                .arg("--key-stdin")
+                .stdin(std::process::Stdio::piped());
+        }
+    })?;
+    let handle = register_builder(child);
+
+    // Start draining before anything else can block. Taking the pipes needs the lock, but
+    // only for the `take()` itself.
+    let mut drains: Vec<std::thread::JoinHandle<Vec<String>>> = {
+        let mut c = handle.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = c
+            .stdout
+            .take()
+            .map(|p| drain_pipe(p, graph.to_string(), false));
+        let err = c
+            .stderr
+            .take()
+            .map(|p| drain_pipe(p, graph.to_string(), true));
+        [out, err].into_iter().flatten().collect()
+    };
 
     if let Some(key) = master_key {
         use std::io::Write;
         // Hex, because that is the shape every other key source hands `resolve_master_key`.
         let hex = zeroize::Zeroizing::new(graph_format::crypto::hex_encode(key));
-        let mut stdin = child
+        let stdin = handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .stdin
-            .take()
-            .ok_or_else(|| anyhow!("builder '{builder_bin}' stdin was not piped"))?;
+            .take();
+        let Some(mut stdin) = stdin else {
+            let out = finish(&handle, &mut drains);
+            bail!("builder '{builder_bin}' stdin was not piped{out}");
+        };
         // A short write would hand the builder a *truncated* key, surfacing later as an
         // opaque AEAD mismatch instead of here as a clear error. `write_all` + `flush`.
         let wrote = stdin.write_all(hex.as_bytes()).and_then(|()| stdin.flush());
@@ -373,26 +687,30 @@ pub fn run_builder(
             // `--key-stdin`. Its own stderr is the useful message; ours would bury it under
             // "failed to write to stdin". So reap it first and prefer its exit status,
             // falling back to the write error only if it somehow succeeded.
-            match child.wait() {
+            let status = handle.lock().unwrap_or_else(PoisonError::into_inner).wait();
+            let out = finish(&handle, &mut drains);
+            match status {
                 Ok(st) if !st.success() => bail!(
                     "builder '{builder_bin}' exited with {st} without reading the at-rest \
                      master key from stdin while consolidating '{graph}' — check that \
-                     `delta.builderBin` supports --key-stdin"
+                     `delta.builderBin` supports --key-stdin{out}"
                 ),
                 _ => {
                     return Err(e).with_context(|| {
-                        format!("hand the at-rest master key to builder '{builder_bin}' over stdin")
+                        format!(
+                            "hand the at-rest master key to builder '{builder_bin}' over stdin{out}"
+                        )
                     })
                 }
             }
         }
     }
 
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for builder '{builder_bin}'"))?;
+    let status = wait_with_timeout(&handle, limits.timeout_secs, graph);
+    let out = finish(&handle, &mut drains);
+    let status = status.with_context(|| format!("wait for builder '{builder_bin}'{out}"))?;
     if !status.success() {
-        bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'");
+        bail!("builder '{builder_bin}' exited with {status} while consolidating '{graph}'{out}");
     }
     Ok(())
 }
@@ -751,8 +1069,13 @@ pub(crate) struct ConnCtx {
     /// dump. Passed to [`Graphs::consolidate_graph`].
     data_dir: PathBuf,
     /// The `slater-build` binary spawned to rebuild a consolidated generation
-    /// (`config.delta.builder_bin`). A bare name resolves on `PATH`.
+    /// (`config.delta.builder_bin`). A bare name resolves on `PATH`, falling back to a
+    /// copy beside the server binary.
     builder_bin: String,
+    /// Resource + lifetime limits for that child, resolved once at startup by
+    /// [`BuilderLimits::resolve`] (explicit config, else derived from the server's own
+    /// cgroup limits).
+    builder_limits: BuilderLimits,
     /// Active-memtable byte budget: a write that pushes it past this flushes the
     /// memtable to an L0 segment (`config.delta.memtable_bytes`, Phase 4d-ii).
     memtable_bytes: usize,
@@ -1234,3 +1557,6 @@ impl ReadOverlay {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod builder_tests;

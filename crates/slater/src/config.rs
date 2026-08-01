@@ -1053,6 +1053,35 @@ pub struct DeltaConfig {
     /// absolute path pins a specific binary. Defaults to `slater-build`.
     #[serde(default = "default_builder_bin")]
     pub builder_bin: String,
+    /// Working-memory budget handed to the consolidation builder as `--max-memory`,
+    /// in bytes. **0 (the default) derives it** from the server's own cgroup memory
+    /// limit — `BUILDER_MEMORY_FRACTION` of it, floored at `MIN_BUILDER_MEMORY` and never
+    /// above the limit itself — and
+    /// falls back to leaving the flag off (the builder keeps its own 4 GiB default)
+    /// when the process is not memory-capped.
+    ///
+    /// This matters because the budget is not advisory: peak RSS runs 1.07–2.08× the
+    /// cap (`docs/BUILD-PERF-PLAN.md`), so a builder self-sizing to 4 GiB inside a
+    /// 2 GiB container OOMs deterministically. Sizing it from the container the server
+    /// actually runs in is the difference between a rebuild that completes and one that
+    /// is killed every time.
+    #[serde(default, deserialize_with = "de::u64")]
+    pub builder_max_memory: u64,
+    /// Worker threads handed to the consolidation builder as `--threads`. **0 (the
+    /// default) derives it** from the server's own cgroup CPU quota, and otherwise
+    /// leaves the flag off (the builder keeps its own `cores - 2` default, which reads
+    /// the *host's* core count and so over-subscribes a quota-capped container).
+    #[serde(default, deserialize_with = "de::usize")]
+    pub builder_threads: usize,
+    /// Wall-clock bound, in seconds, on a single consolidation rebuild. On expiry the
+    /// child is killed and the consolidation fails **non-destructively** (old core keeps
+    /// serving, delta stays live), exactly as a non-zero exit does. **0 (the default)
+    /// means no timeout** — the historical behaviour, and the right one for a large core
+    /// where a rebuild legitimately runs for hours. Set it where a wedged builder holding
+    /// the single-flight claim (and so blocking every cheaper flush/compaction rung)
+    /// is worse than a failed consolidation.
+    #[serde(default, deserialize_with = "de::u64")]
+    pub consolidate_timeout_secs: u64,
     /// Read sealed L0 delta segments **off-heap** (Phase C): a flushed level spills to a
     /// directory of block files whose per-entity payloads page through the server's shared
     /// `BlockCache` on demand, rather than being reloaded whole into RAM — so the resident
@@ -1088,6 +1117,9 @@ impl Default for DeltaConfig {
             delta_hard_bytes: 0,
             consolidate_window: String::new(),
             builder_bin: default_builder_bin(),
+            builder_max_memory: 0,
+            builder_threads: 0,
+            consolidate_timeout_secs: 0,
             off_heap_l0: false,
             segment_gc_grace_secs: 0,
         }

@@ -269,7 +269,7 @@ this is the ledger.
   refuses to move backwards — would close both.
 
 - [x] **✅ FIXED — the consolidation dump was plaintext (HIK-149).** A consolidation writes the
-  merged (core ⊕ delta) view to `<data dir>/<graph>/.consolidate.dump` for `slater-build` to
+  merged (core ⊕ delta) view to `<data dir>/<graph>/.consolidate.dump.<uuid>` for `slater-build` to
   ingest, and `graph_format::consolidate_dump` had no cipher support at all — so the **whole
   graph** sat in the clear for the length of a full rebuild on a deployment configured for
   at-rest encryption. Every file of the dump is now sealed under the same salt-free,

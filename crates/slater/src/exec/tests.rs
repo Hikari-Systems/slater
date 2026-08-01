@@ -1171,6 +1171,9 @@ fn segment_degree_delta_feeds_the_hub_probe() {
         delta_hard_bytes: 0,
         consolidate_window: String::new(),
         builder_bin: "slater-build".to_string(),
+        builder_max_memory: 0,
+        builder_threads: 0,
+        consolidate_timeout_secs: 0,
         off_heap_l0: false,
         segment_gc_grace_secs: 0,
     };

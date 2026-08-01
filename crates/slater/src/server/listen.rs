@@ -321,6 +321,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_pre_auth_connections: cfg.server.max_pre_auth_connections,
         data_dir: PathBuf::from(cfg.data_dir()),
         builder_bin: cfg.delta.builder_bin.clone(),
+        builder_limits: BuilderLimits::resolve(&cfg.delta),
         memtable_bytes: cfg.delta.memtable_bytes,
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
         segment_flush_bytes: cfg.delta.segment_flush_bytes,
@@ -539,6 +540,12 @@ pub(crate) async fn accept_loop(
             }
             reason = &mut shutdown_rx => {
                 let graph = reason.unwrap_or_else(|_| "unknown".to_string());
+                // Stop any in-flight consolidation before we exit. Left running it keeps
+                // burning a core-count of CPU and hundreds of GB of IO for an operator who
+                // has already stopped the server, and can still flip `current` afterwards —
+                // where the *restarted* server's generation guard would adopt it. Killing it
+                // is non-destructive: the old core keeps serving, the delta stays live.
+                kill_live_builders();
                 bail!(
                     "generation for graph '{graph}' changed on disk; exiting non-zero so the \
                      orchestrator restarts against it (reloadStrategy=exit)"

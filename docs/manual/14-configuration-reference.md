@@ -144,15 +144,26 @@ the layering); it takes no CLI flags.
 | `delta.deltaCorePercent` | `0` (off) | Auto-consolidate when the delta reaches this % of core. |
 | `delta.deltaHardBytes` | `0` (off) | Resident-delta throttle. |
 | `delta.consolidateWindow` | (empty) | Cron-style off-peak consolidation window. |
-| `delta.builderBin` | `slater-build` | Builder binary for consolidation — must resolve on `PATH` or be an absolute path. |
+| `delta.builderBin` | `slater-build` | Builder binary for consolidation. A bare name resolves on `PATH`, then falls back to a copy sitting beside the `slater` binary; an absolute path is used as given. |
+| `delta.builderMaxMemory` | `0` (derive) | `--max-memory` for the builder, in bytes. `0` derives ~35% of the server's cgroup memory limit (floor 64 MiB, never above the limit itself), or omits the flag when uncapped. |
+| `delta.builderThreads` | `0` (derive) | `--threads` for the builder. `0` derives from the server's cgroup CPU quota, or omits the flag when uncapped. |
+| `delta.consolidateTimeoutSecs` | `0` (none) | Wall-clock bound on one rebuild. On expiry the child is killed and the consolidation fails non-destructively. |
 | `delta.offHeapL0` | `false` | Keep L0 off-heap. |
 | `delta.segmentGcGraceSecs` | `0` (off) | Grace period before GCing superseded segments. |
 
 > **Consolidation gotcha:** `CALL slater.consolidate()` spawns `delta.builderBin`.
-> If it is left as the bare name `slater-build` and that is not on `PATH`,
-> consolidation fails with `spawn builder 'slater-build': No such file or
-> directory`. Set it to an absolute path in most deployments. See
+> A bare name is looked up on `PATH` first and then beside the running `slater`
+> binary, so the official image works with the default — `/app` is not on the
+> distroless `PATH`, but `/app/slater-build` is the server's own sibling. Set an
+> absolute path (`/app/slater-build`) if you want the lookup pinned, and note that
+> `slater:latest-lite` ships **no** builder at all, so it cannot consolidate. See
 > [18 Troubleshooting](18-troubleshooting.md).
+
+> **Sizing the builder:** a rebuild is O(core) and its peak RSS runs well above its
+> own `--max-memory` cap, so a builder left at its 4 GiB default inside a smaller
+> container is killed every time. Leaving `delta.builderMaxMemory` and
+> `delta.builderThreads` at `0` sizes the child from the server's own cgroup limits,
+> which is the right answer for almost every containerised deployment.
 
 ## Next
 

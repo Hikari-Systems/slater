@@ -271,6 +271,10 @@ pub(crate) async fn execute_consolidate(
     let vector_cache = ctx.vector_cache.clone();
     let data_dir = ctx.data_dir.clone();
     let builder_bin = ctx.builder_bin.clone();
+    // Resource + lifetime limits ride on the production closure, not on the `build` seam:
+    // they are how *this* server chooses to run the subprocess, not part of what
+    // consolidation means. See `BuilderLimits`.
+    let builder_limits = ctx.builder_limits;
     let graph = graph.to_string();
     let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
     let new_uuid = tokio::task::spawn_blocking(move || {
@@ -279,7 +283,7 @@ pub(crate) async fn execute_consolidate(
             &cache,
             &vector_cache,
             &data_dir,
-            |dump, g, dd, key| run_builder(&builder_bin, dump, g, dd, key),
+            |dump, g, dd, key| run_builder(&builder_bin, dump, g, dd, key, builder_limits),
         )
     })
     .await

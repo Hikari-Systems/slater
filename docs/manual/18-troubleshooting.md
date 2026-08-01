@@ -23,7 +23,9 @@ These come from the writable layer. Background: [11 Writing data](11-writing-dat
 
 | Message | Meaning | Fix |
 |---|---|---|
-| `consolidation failed: … spawn builder 'slater-build': No such file or directory` | `CALL slater.consolidate()` spawned `delta.builderBin`, which isn't on `PATH`. | Set `delta__builderBin` to an absolute path to the `slater-build` binary. |
+| `consolidation failed: … spawn builder 'slater-build' (also tried …)` | Neither `PATH` nor the directory holding the `slater` binary has the builder. On `slater:latest-lite` it is not shipped at all. | Set `delta__builderBin` to an absolute path, or use the full `slater:latest` image. |
+| `consolidation failed: … exceeded the Ns delta.consolidateTimeoutSecs budget` | The rebuild outran its wall-clock bound and was killed. Nothing was lost — the old core kept serving and the delta is still live. | Raise `delta__consolidateTimeoutSecs`, or `0` to disable. An O(core) rebuild takes ~45 min on a 91M-node graph. |
+| Consolidation is killed with no message, repeatedly | The builder OOMed: its default 4 GiB budget (and a peak RSS above it) does not fit the container. | Leave `delta__builderMaxMemory` at `0` so it is derived from the cgroup limit, or set it explicitly. |
 | `load ACL … No such file or directory` | The server can't read `aclPath`. | Create the ACL file, or point `aclPath` at it (shipped default `/config/acl.json`). |
 | generation refused for a missing `aclBlake3` stamp | `requireAclStamp` is on and the generation is unstamped. | Build with `slater-build --acl acl.json`, or set `requireAclStamp=false` for unstamped/dev graphs. |
 | `… must be rebuilt` (format version) | The generation's `FORMAT_VERSION` is not the one this server understands. | Rebuild the graph with a matching `slater-build`. Slater has no backwards compatibility. |
