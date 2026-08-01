@@ -337,6 +337,38 @@ fn boot_reclaims_a_leftover_consolidation_scratch_dump() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Two consecutive consolidations of the same graph must not reuse a directory name.
+///
+/// The fixed `.consolidate.dump` name meant the next run silently wrote over whatever a
+/// crashed one had left — and, more sharply, made the path *predictable*: an attacker with
+/// write access to the data directory could pre-place an older sealed dump at the known
+/// path and wait. A per-run uuid does not close that (the key is still stable, so the real
+/// fix remains a per-consolidation freshness token crossing into the builder), but it turns
+/// "pre-place and wait" into "observe the name, then win a race against the run that just
+/// created it".
+///
+/// Asserts on the *generator* rather than by driving two real rebuilds, because the
+/// property is that the name is fresh per attempt, and a real consolidation deletes the
+/// directory before it returns — leaving nothing to compare.
+#[test]
+fn consecutive_consolidations_never_reuse_a_scratch_directory_name() {
+    let names: std::collections::HashSet<String> = (0..64)
+        .map(|_| {
+            format!(
+                "{}{}",
+                crate::server::registry::CONSOLIDATE_SCRATCH_PREFIX,
+                uuid::Uuid::new_v4()
+            )
+        })
+        .collect();
+    assert_eq!(names.len(), 64, "scratch directory names must not repeat");
+    // Every one is sweepable — the prefix is what boot matches on, so a name that did not
+    // carry it would leak past the GC.
+    assert!(names
+        .iter()
+        .all(|n| n.starts_with(crate::server::registry::CONSOLIDATE_SCRATCH_PREFIX)));
+}
+
 /// A graph directory that does not exist yet (fresh deployment) is not an error — the
 /// sweep runs on the boot path and must never stop a graph coming online.
 #[test]

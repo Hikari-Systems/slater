@@ -146,7 +146,16 @@ An attacker with write access to the data directory could therefore substitute o
 the rebuild publish a stale generation. Closing it needs a per-consolidation freshness token
 crossing the process boundary into `slater-build`; it is not closed today.
 
-What *is* closed is the **residue**: the scratch directory now carries a per-attempt uuid
+The per-attempt uuid the directory now carries **narrows** this, and it is worth being
+precise about how much. With the old fixed `.consolidate.dump` path, an attacker needed only
+to pre-place an older sealed dump for that graph and wait for the next consolidation to pick
+it up. With an unpredictable name they must instead observe the directory a run has just
+created and win a race against that run. That is a genuine reduction and nothing more — the
+key is still a function of the master key and the graph name alone, so a substituted dump
+still *opens*. The close remains a per-consolidation freshness token crossing the process
+boundary, exactly as stated above.
+
+What *is* closed is the **residue**: the scratch directory carries that per-attempt uuid
 rather than a fixed name, and the writable layer sweeps any leftover at boot
 (`sweep_consolidation_scratch`). Previously a server killed mid-rebuild — OOM, `SIGKILL`,
 host failure — left a complete copy of the graph behind that nothing would ever reclaim, and
