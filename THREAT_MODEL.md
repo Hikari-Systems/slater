@@ -115,14 +115,36 @@ attacker who kept a copy can restore it. That is the same freshness gap as limit
 the core, and it is a real cost of the no-salt decision above, not only the loss of
 cross-generation key separation.
 
-**Known gap: the consolidation dump is plaintext.** A consolidation writes the merged
-(core ⊕ delta) view to a scratch binary dump directory (`<data dir>/<graph>/.consolidate.dump`)
-for `slater-build` to ingest, and `graph_format::consolidate_dump` has no cipher support at
-all. That directory therefore holds the **whole graph** in the clear for the duration of the
-rebuild, on a deployment configured for at-rest encryption. It is removed afterwards
-(including on the failure paths), but the window is the length of a full rebuild. Sealing it
-means plumbing a key through the dump format and the builder that reads it, and is tracked
-separately.
+**The consolidation scratch dump is sealed too (HIK-149).** A consolidation writes the
+merged (core ⊕ delta) view to a scratch binary dump directory
+(`<data dir>/<graph>/.consolidate.dump`) for `slater-build` to ingest. That directory holds
+the **whole graph** — base, segments, delta and vectors — and it lives for the length of a
+full rebuild, which on a large graph is hours. Until this was fixed it was written in the
+clear on a deployment configured for at-rest encryption; the exposure was larger than the
+WAL's, and narrower only in time.
+
+It is now sealed under the **same delta key** as the WAL and the L0 segments — the dump owns
+no manifest, so per the one-salt-per-artifact rule it takes the salt-free, graph-bound
+construction rather than inventing a salt (see above). Its per-file subkeys live in a
+`dump/` namespace so they cannot collide with the `wal/` and `l0/` names the same key also
+covers. Every file is sealed: `nodes.blk` / `edges.blk` / `vectors.blk` block-by-block
+through the ordinary block-file AEAD, and `meta.json` plus any vector-carry sidecar as
+whole one-shot blobs. `meta.json` is *encrypted*, not merely authenticated, because it
+carries the graph's entire symbol space — every label, relationship type and property key.
+
+The key policy is symmetric and typed at both ends, as it is for the delta: a sealed dump
+with no key is refused, a **plaintext** dump under a configured key is refused, and so is a
+sealed dump under the wrong key or one belonging to another graph. The second is the
+substitution that matters here — a dump has no manifest enumerating its files, so nothing
+else would notice a sealed `meta.json` swapped for a plaintext one. An unkeyed deployment
+pays nothing: its dump is byte-for-byte the plaintext shape it always was.
+
+The same **anti-rollback** gap as the WAL applies, for the same reason: the key is a
+function of the master key and the graph name alone and the dump always sits at the same
+path, so a dump kept from an earlier consolidation of that graph will always open cleanly.
+An attacker with write access to the data directory could therefore substitute one and have
+the rebuild publish a stale generation. Closing it needs a per-consolidation freshness token
+crossing the process boundary into `slater-build`; it is not closed today.
 
 **The consolidation's *output* is now encrypted (HIK-157).** Until this was fixed, the
 server spawned `slater-build` for a consolidation with **no key and no `--encrypt`**, so a

@@ -2103,7 +2103,7 @@ fn dump_nodes(
     dump: &Path,
 ) -> std::collections::HashMap<String, Vec<(String, graph_format::ids::Value)>> {
     use graph_format::consolidate_dump::DumpReader;
-    let r = DumpReader::open(dump).unwrap();
+    let r = DumpReader::open(dump, None).unwrap();
     let keys = r.meta().property_keys.clone();
     let mut out = std::collections::HashMap::new();
     r.for_each_node(|_, _lb, pb| {
@@ -2308,11 +2308,12 @@ fn consolidation_dump_folds_the_segment_stack() {
     let dir = root.join(".retarget71.dump");
     let _ = std::fs::remove_dir_all(&dir);
     let view = MergedView::new(gen.as_ref(), DeltaSnapshot::empty());
-    crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dir).unwrap();
+    crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dir, None)
+        .unwrap();
 
     // Read it back: id → name / age, and the edges as (src-name, dst-name, reltype).
     use graph_format::consolidate_dump::DumpReader;
-    let r = DumpReader::open(&dir).unwrap();
+    let r = DumpReader::open(&dir, None).unwrap();
     let keys = r.meta().property_keys.clone();
     let reltypes = r.meta().reltypes.clone();
     let mut id_name: HashMap<u64, String> = HashMap::new();
@@ -3452,9 +3453,10 @@ fn the_consolidation_dump_carries_one_vector_per_node_newest_wins() {
     let view = MergedView::new(gen.as_ref(), snap);
     let dump = root.join("_dump");
     std::fs::create_dir_all(&dump).unwrap();
-    crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dump).unwrap();
+    crate::consolidate::serialise_binary_dump(&Engine::new(&view, &cache), &view, &dump, None)
+        .unwrap();
 
-    let reader = graph_format::consolidate_dump::DumpReader::open(&dump).unwrap();
+    let reader = graph_format::consolidate_dump::DumpReader::open(&dump, None).unwrap();
     let mut dumped: Vec<(u64, Vec<f32>)> = Vec::new();
     reader
         .for_each_vector(|node_id, _key_id, v| {
@@ -3763,8 +3765,9 @@ fn dump_vectors(
     let snap = DeltaSnapshot::from_memtable(graphs.writer(graph).unwrap().snapshot());
     let view = MergedView::new(gen.as_ref(), snap);
     std::fs::create_dir_all(dump).unwrap();
-    crate::consolidate::serialise_binary_dump(&Engine::new(&view, cache), &view, dump).unwrap();
-    let reader = graph_format::consolidate_dump::DumpReader::open(dump).unwrap();
+    crate::consolidate::serialise_binary_dump(&Engine::new(&view, cache), &view, dump, None)
+        .unwrap();
+    let reader = graph_format::consolidate_dump::DumpReader::open(dump, None).unwrap();
     let mut out: Vec<(u64, Vec<f32>)> = Vec::new();
     reader
         .for_each_vector(|node_id, _key_id, v| {
@@ -8541,6 +8544,10 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
 
     graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
+            // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
+            // sidecar as well as the four base files — the one dump shape the marker test
+            // below cannot reach.
+            assert_dump_is_sealed(d);
             let mut cmd = std::process::Command::new(&bin);
             cmd.arg("--input")
                 .arg(d)
@@ -8613,6 +8620,10 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     // is the consolidation that would fail.
     graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
+            // HIK-149: this graph carries a Vamana index, so its dump has a vector-carry
+            // sidecar as well as the four base files — the one dump shape the marker test
+            // below cannot reach.
+            assert_dump_is_sealed(d);
             let mut cmd = std::process::Command::new(&bin);
             cmd.arg("--input")
                 .arg(d)
@@ -8763,6 +8774,67 @@ fn consolidate_carries_an_encrypted_vamana_index_by_reference() {
     std::fs::remove_dir_all(&work).ok();
 }
 
+/// HIK-149's markers. The value is node content; the key is a symbol-table entry. Chosen
+/// to be high-entropy and unique so a hit in the dump can only have come from the graph.
+const MARKER_KEY: &str = "hik149canarykey";
+const MARKER_VALUE: &str = "HIK149-CANARY-VALUE-7f3a91c2e5b8";
+
+/// HIK-149: every file of a consolidation dump written for an **encrypted** graph must be
+/// sealed. Asserted two ways, because either alone can pass against the bug:
+///
+/// * **No marker bytes anywhere in the directory.** Direct, but a false green is possible —
+///   the `.blk` bodies are zstd-compressed, so a plaintext value might not appear verbatim.
+/// * **Structurally sealed.** Every `.blk` reports the encrypted magic (a `BlockFileReader`
+///   opened with no key is *refused*), and `meta.json` does not parse as JSON. This half
+///   cannot be fooled by compression: it asks what the file *is*, not what it happens to
+///   contain.
+fn assert_dump_is_sealed(dump: &Path) {
+    let mut leaked: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for entry in std::fs::read_dir(dump).expect("read the scratch dump dir") {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        checked += 1;
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let bytes = std::fs::read(&path).expect("read a dump file");
+        for needle in [MARKER_KEY, MARKER_VALUE] {
+            if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                leaked.push(format!("{name} contains {needle:?} in the clear"));
+            }
+        }
+        // What the file *is*, independent of what compression did to its contents.
+        if name.ends_with(".blk") {
+            if graph_format::blockfile::BlockFileReader::open(&path).is_ok() {
+                leaked.push(format!("{name} opens with no key — it is not sealed"));
+            }
+        } else if name == "meta.json" {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_ok() {
+                leaked.push("meta.json is readable JSON — it is not sealed".to_string());
+            }
+        } else if name.starts_with("carry.") {
+            // A vector-carry sidecar. Reading it with no key must be *refused*, not read
+            // as a plain id table: `expected` is deliberately the length the raw file
+            // would have, so an unsealed sidecar sails through the length check and only a
+            // real seal stops it.
+            let raw_ids = (bytes.len() / 8) as u64;
+            if graph_format::consolidate_dump::read_vector_carry_at(&path, raw_ids, None).is_ok() {
+                leaked.push(format!("{name} reads with no key — it is not sealed"));
+            }
+        }
+    }
+    assert!(
+        checked >= 4,
+        "expected meta.json + three .blk files, saw {checked}"
+    );
+    assert!(
+        leaked.is_empty(),
+        "the consolidation dump of an encrypted graph is not sealed:\n  {}",
+        leaked.join("\n  ")
+    );
+}
+
 /// Consolidating an encrypted graph through the **production** builder invocation must
 /// publish an **encrypted** generation.
 ///
@@ -8794,13 +8866,18 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     let key_hex = "0123456789abcdef0123456789abcdef";
     let key = graph_format::crypto::hex_decode(key_hex).unwrap();
 
-    let script = "CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);\n\
-        CREATE (:Doc:__DumpVertex__ {__dump_id__: 0, title: 'alpha'});\n\
-        CREATE (:Doc:__DumpVertex__ {__dump_id__: 1, title: 'beta'});\n\
-        MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;\n\
-        DROP INDEX ON :__DumpVertex__(__dump_id__);\n";
+    // Two markers, because they leak through different files and one alone would be a
+    // weaker test: the *value* is node content (`nodes.blk`), the *property key* is a
+    // symbol-table entry (`meta.json`). HIK-149 leaked both.
+    let script = format!(
+        "CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);\n\
+         CREATE (:Doc:__DumpVertex__ {{__dump_id__: 0, {MARKER_KEY}: '{MARKER_VALUE}'}});\n\
+         CREATE (:Doc:__DumpVertex__ {{__dump_id__: 1, {MARKER_KEY}: 'beta'}});\n\
+         MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;\n\
+         DROP INDEX ON :__DumpVertex__(__dump_id__);\n"
+    );
     let input = work.join("dump.cypher");
-    std::fs::write(&input, script).unwrap();
+    std::fs::write(&input, &script).unwrap();
 
     assert!(
         std::process::Command::new(&bin)
@@ -8826,9 +8903,12 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     let vc = VectorIndexCache::new(1 << 22);
     let base = graphs.get("docs").unwrap().uuid();
 
-    // THE PRODUCTION PATH — `run_builder`, not a bespoke closure.
+    // THE PRODUCTION PATH — `run_builder`, not a bespoke closure. The closure is handed the
+    // scratch dump directory, which is the one moment it exists on disk, so HIK-149's
+    // assertion goes here: on an encrypted graph the dump must be sealed too.
     let new_uuid = graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
+            assert_dump_is_sealed(d);
             crate::server::run_builder(&bin, d, g, dd, k)
         })
         .expect("a consolidation of an encrypted graph must succeed");

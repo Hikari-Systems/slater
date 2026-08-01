@@ -626,13 +626,19 @@ fn carry_vamana_index(
     // carry was written.
     let src = CarrySource::resolve(carry, data_dir, graph, pi, master_key_bytes(opts))?;
     // The `layout → dump-id` table, composed through this build's permutation into final ids.
-    let layout_to_dump_id = read_carry_map(&carry.carry_map_path, carry.base_records)
-        .with_context(|| {
-            format!(
-                "read carry map for vector index {}.{}",
-                pi.label, pi.property
-            )
-        })?;
+    // Read through the dump's own decoder (HIK-149) — the sidecar is sealed on a keyed
+    // deployment, and this is the reader production actually reaches.
+    let layout_to_dump_id = graph_format::consolidate_dump::read_vector_carry_at(
+        &carry.carry_map_path,
+        carry.base_records,
+        dump_cipher(opts, graph).as_ref(),
+    )
+    .with_context(|| {
+        format!(
+            "read carry map for vector index {}.{}",
+            pi.label, pi.property
+        )
+    })?;
     let base_final_ids = compose_final_ids(&layout_to_dump_id, |id| perm.final_of(id));
 
     // The Δ inserts: the sorter holds *only* the delta for a carried index, already in scan
@@ -990,31 +996,19 @@ fn master_key_bytes(opts: &BuildOptions) -> Option<&[u8]> {
     opts.encryption_key.as_deref().map(Vec::as_slice)
 }
 
-/// Read a carried index's raw-`u64`-LE `layout → dump-id` sidecar (`HOLE` for a dead ordinal).
-/// `expected` is the base record count; a mismatch is a corrupt dump and is refused, since the
-/// table indexes the base `.vamana` by position.
-fn read_carry_map(path: &Path, expected: u64) -> Result<Vec<u64>> {
-    let bytes =
-        fs::read(path).with_context(|| format!("read carry map sidecar {}", path.display()))?;
-    if bytes.len() % 8 != 0 {
-        bail!(
-            "carry map {} has {} bytes, not a whole number of u64s",
-            path.display(),
-            bytes.len()
-        );
-    }
-    let n = (bytes.len() / 8) as u64;
-    if n != expected {
-        bail!(
-            "carry map {} holds {n} ids but the dump declares {expected} base records — they \
-             index the base .vamana by position",
-            path.display()
-        );
-    }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-        .collect())
+/// The **consolidation dump's** at-rest key for this build, or `None` when unkeyed
+/// (HIK-149).
+///
+/// Deliberately *not* the per-generation cipher this build is writing with: that one is
+/// derived from the fresh salt of the manifest being created, which the server could not
+/// have known when it wrote the dump. The dump owns no manifest, so it takes the salt-free,
+/// graph-bound delta-key construction — re-derived here from `--graph`, exactly as the
+/// server derived it from the graph it dumped.
+///
+/// One derivation site for the whole binary: the dump ingest and the vector-carry read must
+/// agree, and two `delta_cipher` calls free to drift apart is how this class of bug starts.
+pub(crate) fn dump_cipher(opts: &BuildOptions, graph: &str) -> Option<Arc<BlockCipher>> {
+    master_key_bytes(opts).map(|k| Arc::new(graph_format::crypto::delta_cipher(k, graph)))
 }
 
 pub(crate) fn parse_metric(s: &str) -> Result<Metric> {
@@ -1409,7 +1403,7 @@ mod carry_tests {
             _ => unreachable!("fixture builds Vamana"),
         };
         let _ = data_dir;
-        let mut dw = DumpWriter::create(dump_dir).unwrap();
+        let mut dw = DumpWriter::create(dump_dir, None).unwrap();
         let map_file = dw.write_vector_carry("Doc.emb", layout_to_dump_id).unwrap();
         crate::model::VectorCarry {
             base_vamana: format!("{base_rel}/vector/Doc.emb.vamana"),
