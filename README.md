@@ -12,12 +12,12 @@
 
 **Shortcuts**
 
-|  |  |  |  |
-|:--|:--|:--|:--|
-| [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) | 
+|  |  |  |  |  |
+|:--|:--|:--|:--|:--|
+| [Why Slater exists](#why-slater-exists) | [Reads and writes](#reads-and-writes) | [What you get](#what-you-get) | [Features](#features) | [Running with Docker](#running-with-docker) |
 | [How it works](#how-it-works) | [The writable layer](#the-writable-layer) | [Storage backends](#storage-backends-filesystem--s3--gcs) | [Mounts](#mounts) | [Configuration](#environment--configuration) |
-| [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) |
-| [Performance](#performance) | [License](#license) | [📖 Full manual](docs/manual/README.md) |
+| [ACL](#acl) | [Health check](#health-check) | [Worked example](#worked-example) | [Development](#development) | [Performance](#performance) |
+| [License](#license) | [📖 Full manual](docs/manual/README.md) |  |  |  |
 
 ## Why Slater exists
 
@@ -25,15 +25,15 @@ A **graph database** stores data as *things* (nodes) and the *relationships betw
 
 **The most common complaint about graph databases is that they don't scale past what you can hold in RAM.** Many of them (eg neo4j, Memgraph, FalkorDB, etc) keep the whole graph resident: a 40&nbsp;GB graph wants 40&nbsp;GB of memory — *per instance*. Want a replica per region, per tenant, or per pod? Multiply the bill. And past a certain size they simply won't load: eg the 90 million node / 1.5B-edge Wikidata graph needs ~64–128&nbsp;GiB resident, so the in-memory engines can't open it at all.
 
-Slater is the rebuttal. It serves that same 90M-node graph from **a few hundred MB of RAM**, because it pages the graph from an on-disk image on demand instead of holding it resident — so the graph size and the memory bill are decoupled.
-
-Slater takes the opposite approach. You compile the graph once, offline, into a content-addressed on-disk image with `slater-build`; then any number of Slater servers serve it over **Bolt** (so your existing neo4j drivers just work) while holding only a fixed cache budget in memory. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve** — you fan out cheap, stateless read replicas and let the store, not the heap, hold the graph.
+Slater is the rebuttal. Rather than loading the graph into memory, it **compiles it once, offline**: `slater-build` turns your data into a content-addressed, immutable on-disk image, and any number of Slater servers then serve that image over **Bolt** (so your existing neo4j drivers just work), paging blocks in on demand and holding only a fixed cache budget resident. That is how the same 90M-node graph serves from **a few hundred MB of RAM** — graph size and memory bill are decoupled. **A 4&nbsp;GB graph and a 400&nbsp;GB graph cost the same RAM to serve**, so you fan out cheap, stateless read replicas and let the store, not the heap, hold the graph.
 
 That makes it a natural fit for knowledge graphs behind RAG, recommendation and identity graphs, dependency graphs — anything large and connected you want to query cheaply and often. Disk-native vector search lives right next to the graph, so the same engine is the retrieval layer for embeddings too.
 
+Compiled once does not mean frozen, though. That image is a **base**, not a final state: an opt-in write layer sits above it, so a live graph can be corrected and extended without rebuilding anything.
+
 ### Reads and writes
 
-Slater is a **read-write** graph database. You don't rebuild the whole image to correct one property, add a node, or retract an edge — you write the change directly, over Bolt, and it lands durably. The trick is that writes never tax the read path.
+The core is immutable; the graph is not. Turn the writable layer on (`delta.enabled`) and you write over Bolt — correct one property, add a node, retract an edge — and the change lands durably, with no rebuild of the image. What keeps it cheap on the read side is *where* the writes live.
 
 Writes accumulate in a **log-structured-merge (LSM) layer over the immutable core**: a write-ahead log and an in-memory table, spilling to immutable delta segments, folded back into a fresh core by a periodic **consolidation**. What that buys you:
 
@@ -42,7 +42,7 @@ Writes accumulate in a **log-structured-merge (LSM) layer over the immutable cor
 - **Acknowledged means durable.** A single writer drains the queue and returns `SUCCESS` only after the `fsync` that covers the write. Group your writes and they're cheap — a write-`UNWIND` commits one `fsync` per batch rather than per row.
 - **Business-key writes, in either dialect.** `MERGE` / `MATCH … SET` / `DELETE` (and `CREATE` / `REMOVE`, detach delete, relationship writes) keyed on a node's identity property — or the equivalent ISO GQL data-modifying statements (`INSERT` / `SET` / `REMOVE` / `DELETE`), which lower onto the same path. Correct, insert, upsert and retract, over nodes and edges, addressed the way your data already is.
 
-The writable layer is opt-in (`delta.enabled`); with it off, Slater serves the pure immutable core and refuses writes. See [The writable layer](#the-writable-layer) for the full model.
+With the layer off — the default — Slater serves the pure immutable core and refuses writes. See [The writable layer](#the-writable-layer) for the full model.
 
 > **On the name.** Slater is named after the CIA agent in *Archer* (a great show)
 > who insists on going by a single name — "Just… Slater" — and one of my favourite
