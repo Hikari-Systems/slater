@@ -636,6 +636,40 @@ impl FileCipher {
     }
 }
 
+/// Seal one standalone payload that is **not** part of a block file — a whole small
+/// artifact written in one shot (a WAL frame, a consolidation dump's `meta.json`, a
+/// vector-carry sidecar). The nonce is *stored* ahead of the ciphertext, because there is
+/// no block directory to hold it:
+///
+/// ```text
+/// nonce(24) ‖ ciphertext(payload ‖ 16-byte tag)
+/// ```
+///
+/// `ordinal` is authenticated, not stored — the payload's position within whatever
+/// sequence the caller owns ([`BlockAad::position_only`]), or `0` for an artifact that is a
+/// single blob. File identity is already in the [`FileCipher`]'s subkey, so a payload
+/// cannot be moved to another artifact, or to another position within one, and still open.
+pub fn seal_blob(cipher: &FileCipher, ordinal: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    let nonce = BlockCipher::random_nonce();
+    let ct = cipher.seal(BlockAad::position_only(ordinal), &nonce, payload)?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// The inverse of [`seal_blob`]: open a stored payload claimed to sit at `ordinal`. Fails
+/// with a typed [`AeadRejected::TagMismatch`] for a wrong key, a tampered payload, or one
+/// lifted from another ordinal or another artifact.
+pub fn open_blob(cipher: &FileCipher, ordinal: u64, stored: &[u8]) -> Result<Vec<u8>> {
+    if stored.len() < NONCE_LEN {
+        bail!("sealed payload is shorter than its {NONCE_LEN}-byte nonce");
+    }
+    let (nonce, ct) = stored.split_at(NONCE_LEN);
+    let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
+    cipher.open(BlockAad::position_only(ordinal), &nonce, ct)
+}
+
 /// An AEAD open that did not verify. A **type**, not a message: the read paths that
 /// distinguish "this block is not the block that was sealed here" from "this block
 /// decoded but its contents are malformed" branch on `downcast_ref::<AeadRejected>()`,
@@ -666,6 +700,18 @@ pub enum AeadRejected {
          legitimate plaintext file"
     )]
     Unsealed { subject: &'static str },
+    /// A sealed artifact opened with **no** key configured — the mirror of
+    /// [`Unsealed`](Self::Unsealed).
+    ///
+    /// For a block file this is caught at open by the magic; for a one-shot artifact
+    /// ([`seal_blob`]) the caller checks its own magic and raises this. Typed for the same
+    /// reason: an operator who has lost the key needs to be told that, not handed a parse
+    /// error from whatever the ciphertext failed to decode as.
+    #[error(
+        "{subject} is sealed at rest but no master key is configured — supply the key it \
+         was written under"
+    )]
+    KeyRequired { subject: &'static str },
 }
 
 /// An encrypted image whose `aadScheme` this build does not implement. A **type**, so

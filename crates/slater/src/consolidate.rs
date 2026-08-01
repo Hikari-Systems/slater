@@ -40,11 +40,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use graph_format::consolidate_dump::{
     DumpRangeIndex, DumpVectorCarry, DumpVectorIndex, DumpWriter,
 };
+use graph_format::crypto::delta_cipher;
 use graph_format::ids::Value;
 use graph_format::manifest::{AnnMode, EntityKind};
 use graph_format::pq::HOLE;
@@ -188,10 +190,24 @@ fn intern_props(
 /// allocation, and no re-encode. Only delta-born or delta-patched entities take the
 /// decode + overlay + re-intern path. This turns the dump side from ~hundreds of
 /// millions of `rel_record` allocations into a near-sequential block copy.
+///
+/// # At rest (HIK-149)
+/// `master_key` seals the dump. It is not optional in the signature and it must agree with
+/// the served core: this scratch directory is the whole merged graph — base ⊕ segments ⊕
+/// delta, vectors included — and it lives for the length of a rebuild, which on a large
+/// graph is hours. Before this parameter existed it was written in the clear on every
+/// consolidation of an encrypted graph.
+///
+/// The key is [`graph_format::crypto::delta_cipher`] over the **graph name**, taken from
+/// the view's own core generation rather than passed in beside the key, so it cannot
+/// disagree with the graph being dumped. `slater-build` re-derives the same key from its
+/// `--graph` argument; if the two ever named different graphs the ingest would fail closed
+/// at the first block rather than read anything.
 pub fn serialise_binary_dump<V: ReadView>(
     engine: &Engine<'_, V>,
     view: &V,
     dir: &Path,
+    master_key: Option<&[u8]>,
 ) -> Result<()> {
     // Seed the symbol tables from the base generation so base records byte-copy without
     // an id remap; delta-born names append past the seeded range.
@@ -222,7 +238,12 @@ pub fn serialise_binary_dump<V: ReadView>(
     let core_nodes = view.core_generation().node_count();
     let core_edges = view.core_generation().edge_count();
     let n = view.node_count();
-    let mut w = DumpWriter::create(dir)?;
+    // The dump's at-rest key: salt-free, graph-bound, its own KDF context — the same
+    // construction the WAL and the L0 spill segments use (HIK-146), because the dump is a
+    // third artifact of that class. It owns no manifest to record a salt in, so it invents
+    // none (the one-salt-per-artifact rule, HIK-145).
+    let dump_cipher = master_key.map(|k| Arc::new(delta_cipher(k, view.core_generation().graph())));
+    let mut w = DumpWriter::create(dir, dump_cipher)?;
 
     // The dense ids elided from the rebuild: every id the *delta* tombstones plus every id a
     // *segment* tombstones (a base row deleted into a segment, or a segment-born-then-deleted
@@ -831,7 +852,7 @@ mod tests {
         Vec<(Vec<String>, Vec<(String, Value)>)>,
         Vec<(u64, u64, String, Vec<(String, Value)>)>,
     ) {
-        let r = DumpReader::open(dir).unwrap();
+        let r = DumpReader::open(dir, None).unwrap();
         let m = r.meta();
         let (labels, reltypes, keys) = (
             m.labels.clone(),
@@ -1361,7 +1382,7 @@ mod tests {
         let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
         let dir = dump_dir("fold");
         let _ = std::fs::remove_dir_all(&dir);
-        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir, None).unwrap();
 
         let (nodes, edges) = read_dump(&dir);
         // Core Alice(0), Bob(1), Carol(2) + born Dave(3), all in id order.
@@ -1411,7 +1432,7 @@ mod tests {
         let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
         let dir = dump_dir("tombstone");
         let _ = std::fs::remove_dir_all(&dir);
-        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
+        serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir, None).unwrap();
 
         let (nodes, edges) = read_dump(&dir);
         // Alice gone; Bob and Carol remain, at compacted ids 0 and 1.
@@ -1451,7 +1472,7 @@ mod tests {
             );
             let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
             let _ = std::fs::remove_dir_all(dir);
-            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, dir).unwrap();
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, dir, None).unwrap();
         };
         let a = dump_dir("det_a");
         let b = dump_dir("det_b");
@@ -1505,8 +1526,8 @@ mod tests {
             let merged = MergedView::read_only(&gen);
             let dir = dump_dir("carry_pure");
             let _ = std::fs::remove_dir_all(&dir);
-            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
-            let r = DumpReader::open(&dir).unwrap();
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir, None).unwrap();
+            let r = DumpReader::open(&dir, None).unwrap();
             assert_eq!(
                 r.vector_count(),
                 0,
@@ -1539,8 +1560,8 @@ mod tests {
             let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
             let dir = dump_dir("carry_delete");
             let _ = std::fs::remove_dir_all(&dir);
-            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir).unwrap();
-            let r = DumpReader::open(&dir).unwrap();
+            serialise_binary_dump(&Engine::new(&merged, &cache), &merged, &dir, None).unwrap();
+            let r = DumpReader::open(&dir, None).unwrap();
             assert_eq!(
                 r.vector_count(),
                 0,

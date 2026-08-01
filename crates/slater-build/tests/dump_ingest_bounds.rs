@@ -35,7 +35,7 @@ fn hostile_dump(tag: &str, src: u64, dst: u64, reltype: u32) -> PathBuf {
     std::fs::create_dir_all(&work).unwrap();
 
     let dump = work.join("dump");
-    let mut w = DumpWriter::create(&dump).unwrap();
+    let mut w = DumpWriter::create(&dump, None).unwrap();
     for i in 0..NODES {
         w.append_node(&[0], &[(0, Value::Int(i as i64))]).unwrap();
     }

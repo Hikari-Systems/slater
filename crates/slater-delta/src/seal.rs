@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use graph_format::crypto::{BlockAad, BlockCipher, FileCipher, NONCE_LEN};
+use graph_format::crypto::{BlockCipher, FileCipher};
 
 /// The writable layer's per-graph cipher. Built once at
 /// [`DeltaWriter`](https://docs.rs/slater) open from the runtime master key
@@ -104,25 +104,20 @@ pub(crate) fn bind(cipher: Option<&DeltaCipher>, name: &str) -> Option<Arc<FileC
 /// Seal one WAL frame payload at `ordinal` within its segment: `nonce(24) ‖ ciphertext`.
 /// The nonce is stored (XChaCha20's 24 bytes are wide enough that fresh random nonces
 /// never realistically collide) and the ordinal is authenticated, not stored.
+///
+/// The framing itself lives in `graph-format` ([`graph_format::crypto::seal_blob`]): the
+/// consolidation dump's `meta.json` and its vector-carry sidecar are the same shape — a
+/// whole small artifact sealed in one shot — and `graph-format` cannot depend on this crate
+/// (HIK-149). One implementation, so the two can never drift apart.
 pub(crate) fn seal_frame(cipher: &FileCipher, ordinal: u64, payload: &[u8]) -> Result<Vec<u8>> {
-    let nonce = BlockCipher::random_nonce();
-    let ct = cipher.seal(BlockAad::position_only(ordinal), &nonce, payload)?;
-    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ct);
-    Ok(out)
+    graph_format::crypto::seal_blob(cipher, ordinal, payload)
 }
 
 /// Open a stored WAL frame claimed to sit at `ordinal`. Fails — typed
 /// ([`graph_format::crypto::AeadRejected`]) — for a wrong key, a tampered frame, or a
 /// frame lifted from another ordinal or another segment.
 pub(crate) fn open_frame(cipher: &FileCipher, ordinal: u64, stored: &[u8]) -> Result<Vec<u8>> {
-    if stored.len() < NONCE_LEN {
-        bail!("sealed WAL frame is shorter than its nonce");
-    }
-    let (nonce, ct) = stored.split_at(NONCE_LEN);
-    let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("split at NONCE_LEN");
-    cipher.open(BlockAad::position_only(ordinal), &nonce, ct)
+    graph_format::crypto::open_blob(cipher, ordinal, stored)
 }
 
 /// Frame one whole immutable blob (a resident L0 segment, an off-heap `meta.bin`):

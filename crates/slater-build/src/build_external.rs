@@ -921,6 +921,8 @@ fn build_inner(
                 &edge_bkt,
                 BUCKET_BLOCK,
                 SCRATCH_ZSTD,
+                // The dump's own key (HIK-149), not this build's generation cipher.
+                crate::shared::dump_cipher(opts, graph),
                 diag,
             )?;
             node_count = ing.node_count;

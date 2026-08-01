@@ -46,13 +46,16 @@
 //! delta additions. A fixed `(core, delta)` therefore dumps byte-identically — the
 //! property the consolidation golden gate rests on.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::blockfile::{BlockFileReader, BlockFileWriter};
 use crate::columns::encode_props_record_into;
+use crate::crypto::{open_blob, seal_blob, AeadRejected, BlockCipher, FileCipher};
 use crate::ids::{Generation, Value};
 use crate::manifest::{AnnNav, EntityKind, Metric};
 use crate::nodelabels::encode_labels_record_into;
@@ -83,6 +86,82 @@ const META_FILE: &str = "meta.json";
 const NODES_FILE: &str = "nodes.blk";
 const EDGES_FILE: &str = "edges.blk";
 const VECTORS_FILE: &str = "vectors.blk";
+
+/// Magic on a **sealed** `meta.json` / vector-carry sidecar (HIK-149).
+///
+/// # Why only the sealed arm carries a magic
+///
+/// The plaintext arm of both files is byte-for-byte what an unkeyed deployment wrote
+/// before this existed — raw JSON, raw `u64`s — so an unkeyed consolidation pays nothing
+/// and its dump stays byte-identical. That is possible because the two arms are trivially
+/// distinguishable without a plaintext header: `serde_json::to_vec_pretty` always begins
+/// `{`, and a carry sidecar's first `u64` is a node id or [`crate::pq::HOLE`], neither of
+/// which can spell this magic.
+///
+/// (The `.blk` files need none of this — [`BlockFileWriter`] already writes a different
+/// magic for a sealed file and [`BlockFileReader::open_src`] already refuses both
+/// mismatches, HIK-146.)
+const SEALED_BLOB_MAGIC: &[u8; 8] = b"SLDSEAL1";
+
+/// The per-file subkey name a dump artifact is sealed under, in the delta key's namespace.
+///
+/// The `dump/` prefix is not decoration. The dump shares one key with the WAL and the L0
+/// segments (all three are manifest-less artifacts of the same graph, so all three derive
+/// from [`crate::crypto::derive_delta_key`]), and `slater-delta` seals its own files under
+/// `wal/…` and `l0/…`. Without a prefix here, a dump `nodes.blk` and an off-heap L0
+/// segment's `node.blk` could land on the same subkey, and a block of one would open as a
+/// block of the other.
+fn subkey_name(file: &str) -> String {
+    format!("dump/{file}")
+}
+
+/// Bind an optional dump cipher to one file of the dump.
+fn bind(cipher: Option<&Arc<BlockCipher>>, file: &str) -> Option<Arc<FileCipher>> {
+    cipher.map(|c| Arc::new(c.for_file(&subkey_name(file))))
+}
+
+/// Seal one whole dump artifact written in a single shot (`meta.json`, a carry sidecar):
+/// `MAGIC(8) ‖ nonce(24) ‖ ciphertext`, or `body` verbatim with no key.
+///
+/// Returns a [`Cow`] so the unkeyed arm **borrows**. That is not tidiness: a carry sidecar
+/// is 8 bytes per base `.vamana` record — ~733 MB at 91.6 M nodes — and copying it here
+/// would hold two of them live at once, on the plaintext deployments that gain nothing from
+/// this function at all.
+fn seal_whole<'a>(cipher: Option<&Arc<FileCipher>>, body: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    let Some(c) = cipher else {
+        return Ok(Cow::Borrowed(body));
+    };
+    let sealed = seal_blob(c, 0, body)?;
+    let mut out = Vec::with_capacity(SEALED_BLOB_MAGIC.len() + sealed.len());
+    out.extend_from_slice(SEALED_BLOB_MAGIC);
+    out.extend_from_slice(&sealed);
+    Ok(Cow::Owned(out))
+}
+
+/// The inverse of [`seal_whole`], with the **symmetric** key policy: a sealed artifact with
+/// no key is refused, and — the direction that matters — a *plaintext* artifact under a
+/// configured key is refused too.
+///
+/// The second half is the substitution HIK-146 found one level down in `BlockFileReader`.
+/// A dump has no manifest enumerating its files, so nothing else would notice a sealed
+/// `meta.json` swapped for a plaintext one naming a graph of the attacker's choosing.
+/// Both refusals are typed ([`AeadRejected`]), never message text.
+///
+/// [`Cow`] for the same reason as [`seal_whole`]: the unkeyed arm must not copy a
+/// several-hundred-megabyte sidecar just to hand it back.
+fn open_whole<'a>(
+    cipher: Option<&Arc<FileCipher>>,
+    bytes: &'a [u8],
+    subject: &'static str,
+) -> Result<Cow<'a, [u8]>> {
+    let sealed = bytes.starts_with(SEALED_BLOB_MAGIC);
+    match (sealed, cipher) {
+        (true, None) => Err(AeadRejected::KeyRequired { subject }.into()),
+        (false, Some(_)) => Err(AeadRejected::Unsealed { subject }.into()),
+        (false, None) => Ok(Cow::Borrowed(bytes)),
+        (true, Some(c)) => open_blob(c, 0, &bytes[SEALED_BLOB_MAGIC.len()..]).map(Cow::Owned),
+    }
+}
 
 /// A range index to recreate on the rebuilt generation. Mirrors the text dump's
 /// `CREATE INDEX FOR (n:Label) ON (n.prop)` DDL — only the entity, label/type and
@@ -209,11 +288,67 @@ fn read_blob<'a>(r: &mut &'a [u8]) -> Result<&'a [u8]> {
     Ok(blob)
 }
 
+/// Read a carried Vamana index's `layout → dump-id` sidecar back as a `Vec<u64>` (`HOLE`
+/// for a tombstoned/superseded/deleted ordinal), decrypting it under `cipher` if the dump
+/// was sealed. `expected` is the base record count from [`DumpVectorCarry::base_records`]; a
+/// length mismatch is a corrupt dump and is refused rather than silently truncated — the
+/// table indexes the base `.vamana` by position, so a wrong length would misalign every id.
+///
+/// # Why this is a free function
+///
+/// `slater-build` resolves the sidecar to an absolute path early (`VectorCarry::carry_map_path`)
+/// and reads it far from any [`DumpReader`], so it had grown **its own copy** of this decode
+/// in `shared.rs`. That copy is what HIK-149 first broke: sealing the sidecar made the
+/// `DumpReader` method decrypt and left the production reader measuring ciphertext, which
+/// surfaced as "holds 406 ids but the dump declares 400 base records". One implementation,
+/// reachable from a path alone, so the sealed and unsealed readers cannot disagree again.
+pub fn read_vector_carry_at(
+    path: &Path,
+    expected: u64,
+    cipher: Option<&Arc<BlockCipher>>,
+) -> Result<Vec<u64>> {
+    let file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("vector carry sidecar {} has no file name", path.display()))?;
+    let stored = std::fs::read(path)
+        .with_context(|| format!("read vector carry sidecar {}", path.display()))?;
+    let bytes = open_whole(
+        bind(cipher, file).as_ref(),
+        &stored,
+        "consolidation dump vector-carry sidecar",
+    )
+    .with_context(|| format!("open vector carry sidecar {}", path.display()))?;
+    if bytes.len() % 8 != 0 {
+        bail!(
+            "vector carry sidecar {} has {} bytes, not a whole number of u64s",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let n = bytes.len() / 8;
+    if n as u64 != expected {
+        bail!(
+            "vector carry sidecar {} holds {n} ids but the carry declares {expected} base \
+             records — they index the base .vamana by position",
+            path.display()
+        );
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
 /// Streaming writer for a consolidation dump directory. Append nodes in ascending
 /// compacted-id order, then edges in emit order, then [`finish`](DumpWriter::finish)
 /// with the symbol tables and index DDL.
 pub struct DumpWriter {
     dir: PathBuf,
+    /// The dump's cipher, or `None` for an unkeyed deployment. Held (rather than only the
+    /// per-file ciphers derived up front) because the vector-carry sidecars are named after
+    /// index stems that are not known until they are written.
+    cipher: Option<Arc<BlockCipher>>,
     nodes: BlockFileWriter,
     edges: BlockFileWriter,
     vectors: BlockFileWriter,
@@ -228,17 +363,33 @@ pub struct DumpWriter {
 }
 
 impl DumpWriter {
-    /// Create the dump directory and its two block files. `dir` is created (and its
+    /// Create the dump directory and its three block files. `dir` is created (and its
     /// parents) if absent; existing `nodes.blk`/`edges.blk` are overwritten.
-    pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
+    ///
+    /// `cipher` is the dump's at-rest key ([`crate::crypto::delta_cipher`] over the graph
+    /// name), or `None` for an unkeyed deployment — and it is a **required argument, not a
+    /// defaulted one** (HIK-149). There is deliberately no plaintext-by-default
+    /// constructor beside this: the whole finding was that writing the entire merged graph
+    /// in the clear was what happened when nobody at the call site mentioned encryption, and
+    /// a `create(dir)` overload would restore exactly that.
+    pub fn create(dir: impl AsRef<Path>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create dump dir {}", dir.display()))?;
-        let nodes = BlockFileWriter::create(dir.join(NODES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
-        let edges = BlockFileWriter::create(dir.join(EDGES_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
-        let vectors = BlockFileWriter::create(dir.join(VECTORS_FILE), DUMP_BLOCK, DUMP_ZSTD)?;
+        let mk = |file: &str| {
+            BlockFileWriter::create_with_cipher(
+                dir.join(file),
+                DUMP_BLOCK,
+                DUMP_ZSTD,
+                bind(cipher.as_ref(), file),
+            )
+        };
+        let nodes = mk(NODES_FILE)?;
+        let edges = mk(EDGES_FILE)?;
+        let vectors = mk(VECTORS_FILE)?;
         Ok(Self {
             dir,
+            cipher,
             nodes,
             edges,
             vectors,
@@ -375,7 +526,12 @@ impl DumpWriter {
             buf.extend_from_slice(&id.to_le_bytes());
         }
         let path = self.dir.join(&file);
-        std::fs::write(&path, &buf)
+        // Sealed like `meta.json` (HIK-149). It is only an id table, but it states which
+        // base records died and how the survivors renumber — the shape of the deletions
+        // since the last build. Nothing else in the dump is readable on a keyed
+        // deployment, and this must not be the exception that is.
+        let framed = seal_whole(bind(self.cipher.as_ref(), &file).as_ref(), &buf)?;
+        std::fs::write(&path, &framed)
             .with_context(|| format!("write vector carry sidecar {}", path.display()))?;
         Ok(file)
     }
@@ -417,8 +573,12 @@ impl DumpWriter {
             vector_indexes,
         };
         let json = serde_json::to_vec_pretty(&meta).context("serialise dump meta")?;
+        // Sealed too, not merely authenticated (HIK-149). `meta.json` carries the graph's
+        // entire symbol space — every label, every relationship type, every property key.
+        // That is graph content, so leaving it legible would leave the finding half open.
+        let framed = seal_whole(bind(self.cipher.as_ref(), META_FILE).as_ref(), &json)?;
         let meta_path = self.dir.join(META_FILE);
-        std::fs::write(&meta_path, &json)
+        std::fs::write(&meta_path, &framed)
             .with_context(|| format!("write dump meta {}", meta_path.display()))?;
         Ok(())
     }
@@ -428,6 +588,9 @@ impl DumpWriter {
 /// and streams the node / edge block files on demand.
 pub struct DumpReader {
     dir: PathBuf,
+    /// The dump's cipher, or `None` for an unkeyed deployment. Kept for the vector-carry
+    /// sidecars, which are opened lazily by name.
+    cipher: Option<Arc<BlockCipher>>,
     meta: DumpMeta,
     nodes: BlockFileReader,
     edges: BlockFileReader,
@@ -435,13 +598,27 @@ pub struct DumpReader {
 }
 
 impl DumpReader {
-    /// Open a dump directory: parse and validate `meta.json`, open the two block
-    /// files. Errors if the magic/version is not understood or a file is missing.
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+    /// Open a dump directory: parse and validate `meta.json`, open the three block files.
+    /// Errors if the magic/version is not understood or a file is missing.
+    ///
+    /// `cipher` must be the same key the writer used ([`DumpWriter::create`]) — for a
+    /// consolidation, [`crate::crypto::delta_cipher`] over the graph name, which is why the
+    /// server hands the builder the master key and the builder is told the graph by
+    /// `--graph`. Every mismatch fails closed: a sealed dump with no key, a plaintext dump
+    /// under a key, and a sealed dump under the wrong key are all refused, the first two
+    /// with a typed [`AeadRejected`]. `meta.json` is read first, so on a whole-dump
+    /// mismatch that is where the verdict comes from.
+    pub fn open(dir: impl AsRef<Path>, cipher: Option<Arc<BlockCipher>>) -> Result<Self> {
         let dir = dir.as_ref();
         let meta_path = dir.join(META_FILE);
-        let json = std::fs::read(&meta_path)
+        let stored = std::fs::read(&meta_path)
             .with_context(|| format!("read dump meta {}", meta_path.display()))?;
+        let json = open_whole(
+            bind(cipher.as_ref(), META_FILE).as_ref(),
+            &stored,
+            "consolidation dump meta.json",
+        )
+        .with_context(|| format!("open dump meta {}", meta_path.display()))?;
         let meta: DumpMeta = serde_json::from_slice(&json)
             .with_context(|| format!("parse dump meta {}", meta_path.display()))?;
         if meta.magic != DUMP_MAGIC {
@@ -456,8 +633,14 @@ impl DumpReader {
                 meta.version
             );
         }
-        let nodes = BlockFileReader::open(dir.join(NODES_FILE))?;
-        let edges = BlockFileReader::open(dir.join(EDGES_FILE))?;
+        let nodes = BlockFileReader::open_with_cipher(
+            dir.join(NODES_FILE),
+            bind(cipher.as_ref(), NODES_FILE),
+        )?;
+        let edges = BlockFileReader::open_with_cipher(
+            dir.join(EDGES_FILE),
+            bind(cipher.as_ref(), EDGES_FILE),
+        )?;
         if nodes.total_records() != meta.node_count {
             bail!(
                 "dump nodes.blk has {} records but meta declares {}",
@@ -472,9 +655,13 @@ impl DumpReader {
                 meta.edge_count
             );
         }
-        let vectors = BlockFileReader::open(dir.join(VECTORS_FILE))?;
+        let vectors = BlockFileReader::open_with_cipher(
+            dir.join(VECTORS_FILE),
+            bind(cipher.as_ref(), VECTORS_FILE),
+        )?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            cipher,
             meta,
             nodes,
             edges,
@@ -486,34 +673,10 @@ impl DumpReader {
         &self.meta
     }
 
-    /// Read a carried Vamana index's `layout → dump-id` sidecar back as a `Vec<u64>`
-    /// (`HOLE` for a tombstoned/superseded/deleted ordinal). `expected` is the base record
-    /// count from [`DumpVectorCarry::base_records`]; a length mismatch is a corrupt dump and
-    /// is refused rather than silently truncated — the table indexes the base `.vamana` by
-    /// position, so a wrong length would misalign every id.
+    /// Read a carried Vamana index's `layout → dump-id` sidecar back as a `Vec<u64>`.
+    /// Thin wrapper over [`read_vector_carry_at`], which is what `slater-build` calls.
     pub fn read_vector_carry(&self, file: &str, expected: u64) -> Result<Vec<u64>> {
-        let path = self.dir.join(file);
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("read vector carry sidecar {}", path.display()))?;
-        if bytes.len() % 8 != 0 {
-            bail!(
-                "vector carry sidecar {} has {} bytes, not a whole number of u64s",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let n = bytes.len() / 8;
-        if n as u64 != expected {
-            bail!(
-                "vector carry sidecar {} holds {n} ids but the carry declares {expected} base \
-                 records — they index the base .vamana by position",
-                path.display()
-            );
-        }
-        Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect())
+        read_vector_carry_at(&self.dir.join(file), expected, self.cipher.as_ref())
     }
 
     /// Stream every node record in id order, handing the callback the raw
@@ -584,10 +747,235 @@ impl DumpReader {
 mod tests {
     use super::*;
     use crate::columns::decode_props;
+    use crate::crypto::delta_cipher;
     use crate::nodelabels::decode_labels;
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("slater_dump_{}_{}", std::process::id(), name))
+    }
+
+    /// HIK-149 fixtures: the dump's cipher for one graph, and a marker that is graph
+    /// content in every file a dump has — a label and a property key land in `meta.json`,
+    /// a property value in `nodes.blk`.
+    const MASTER: &[u8] = b"a runtime master key";
+    const MARKER: &str = "HIK149-DUMP-MARKER-4d2f";
+
+    fn dump_cipher(graph: &str) -> Arc<BlockCipher> {
+        Arc::new(delta_cipher(MASTER, graph))
+    }
+
+    /// `DumpReader::open`'s error, or a panic. (`DumpReader` is not `Debug`, so
+    /// `unwrap_err` is unavailable — the same shape `rejects_foreign_magic` uses.)
+    fn open_err(dir: &Path, cipher: Option<Arc<BlockCipher>>) -> anyhow::Error {
+        match DumpReader::open(dir, cipher) {
+            Ok(_) => panic!("expected the dump open to be refused"),
+            Err(e) => e,
+        }
+    }
+
+    /// Write a small dump carrying `MARKER` as a label, a property key and a property
+    /// value, plus a vector-carry sidecar. Returns the sidecar's filename.
+    fn write_marked_dump(dir: &Path, cipher: Option<Arc<BlockCipher>>) -> String {
+        let _ = std::fs::remove_dir_all(dir);
+        let mut w = DumpWriter::create(dir, cipher).unwrap();
+        w.append_node(&[0], &[(0, Value::Str(MARKER.into()))])
+            .unwrap();
+        w.append_edge(0, 0, 0, &[]).unwrap();
+        w.append_vector(0, 0, &[1.0, 2.0]).unwrap();
+        let carry = w
+            .write_vector_carry("Doc.embedding", &[7, HOLE_ID, 3])
+            .unwrap();
+        w.finish(
+            vec![MARKER.into()],
+            vec!["KNOWS".into()],
+            vec![MARKER.into()],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        carry
+    }
+
+    const HOLE_ID: u64 = crate::pq::HOLE;
+
+    /// Every regular file in the dump directory that contains `MARKER` verbatim.
+    fn files_leaking_marker(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if !p.is_file() {
+                continue;
+            }
+            let b = std::fs::read(&p).unwrap();
+            if b.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()) {
+                out.push(p.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// HIK-149 — the finding itself. A dump written with a key must put **nothing** in the
+    /// clear, and must read back identically under that key.
+    ///
+    /// The unkeyed arm is asserted in the same test rather than a separate one, because the
+    /// point is the contrast: the same call with `None` leaks the marker from both the
+    /// symbol table (`meta.json`) and the node record (`nodes.blk`). That is what
+    /// consolidation of an encrypted graph did on every run.
+    #[test]
+    fn a_sealed_dump_puts_nothing_in_the_clear_and_round_trips() {
+        let plain_dir = tmp("seal_plain");
+        write_marked_dump(&plain_dir, None);
+        assert_eq!(
+            files_leaking_marker(&plain_dir),
+            vec!["meta.json".to_string(), "nodes.blk".to_string()],
+            "the unkeyed dump is the pre-HIK-149 shape: graph content in the clear"
+        );
+
+        let dir = tmp("seal_sealed");
+        let carry = write_marked_dump(&dir, Some(dump_cipher("docs")));
+        assert!(
+            files_leaking_marker(&dir).is_empty(),
+            "a sealed dump leaked: {:?}",
+            files_leaking_marker(&dir)
+        );
+
+        // …and it is still a dump: same key, same contents.
+        let r = DumpReader::open(&dir, Some(dump_cipher("docs"))).unwrap();
+        assert_eq!(r.meta().labels, vec![MARKER]);
+        assert_eq!(r.meta().property_keys, vec![MARKER]);
+        let mut props = Vec::new();
+        r.for_each_node(|_, _, pb| {
+            props.extend(decode_props(pb).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(props, vec![(0, Value::Str(MARKER.into()))]);
+        let mut vecs = Vec::new();
+        r.for_each_vector(|id, k, v| {
+            vecs.push((id, k, v));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(vecs, vec![(0, 0, vec![1.0, 2.0])]);
+        assert_eq!(r.read_vector_carry(&carry, 3).unwrap(), vec![7, HOLE_ID, 3]);
+
+        let _ = std::fs::remove_dir_all(&plain_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The key policy is **symmetric** and typed, in all three directions.
+    ///
+    /// The middle one is the substitution HIK-146 found a level down and this ticket's
+    /// description warned would be here too: a dump has no manifest enumerating its files,
+    /// so without this a plaintext `meta.json` dropped in place of the sealed one would be
+    /// read straight into a rebuild of an encrypted graph.
+    #[test]
+    fn the_dump_key_policy_is_symmetric_and_typed() {
+        let sealed = tmp("policy_sealed");
+        write_marked_dump(&sealed, Some(dump_cipher("docs")));
+        let plain = tmp("policy_plain");
+        write_marked_dump(&plain, None);
+
+        // Sealed, no key.
+        let e = open_err(&sealed, None);
+        assert_eq!(
+            e.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::KeyRequired {
+                subject: "consolidation dump meta.json"
+            }),
+            "got: {e:#}"
+        );
+        // Plaintext, under a key — the downgrade.
+        let e = open_err(&plain, Some(dump_cipher("docs")));
+        assert_eq!(
+            e.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::Unsealed {
+                subject: "consolidation dump meta.json"
+            }),
+            "got: {e:#}"
+        );
+        // Sealed, wrong key.
+        let e = open_err(
+            &sealed,
+            Some(Arc::new(delta_cipher(b"another key", "docs"))),
+        );
+        assert_eq!(
+            e.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "got: {e:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&sealed);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    /// A dump is bound to the **graph** it was dumped from, not merely to the master key.
+    ///
+    /// Same reasoning as the WAL's (HIK-146): one master key covers every graph on the
+    /// deployment, so without the graph in the KDF preimage, graph `a`'s dump dropped into
+    /// graph `b`'s consolidation would decrypt and rebuild `b` from `a`'s data. The server
+    /// derives from the graph it dumped and `slater-build` from its `--graph`, so a
+    /// mismatch can only be a substitution.
+    #[test]
+    fn a_sealed_dump_is_bound_to_its_graph() {
+        let dir = tmp("seal_graphbound");
+        write_marked_dump(&dir, Some(dump_cipher("docs")));
+        let e = open_err(&dir, Some(dump_cipher("other")));
+        assert_eq!(
+            e.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::TagMismatch),
+            "got: {e:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-file half of the same substitution: `meta.json` stays sealed, but one
+    /// `.blk` is swapped for a plaintext block file of the attacker's choosing.
+    ///
+    /// `meta.json` is what delivers the verdict for a whole-dump mismatch, so a test that
+    /// only replaced everything would never reach the block files. This one gets past the
+    /// meta check and has to be refused by `BlockFileReader` itself.
+    #[test]
+    fn a_plaintext_blk_substituted_into_a_sealed_dump_is_refused() {
+        let dir = tmp("seal_substitute");
+        write_marked_dump(&dir, Some(dump_cipher("docs")));
+        // A plaintext nodes.blk with one forged record, in place of the sealed one.
+        let mut w = BlockFileWriter::create(dir.join(NODES_FILE), DUMP_BLOCK, DUMP_ZSTD).unwrap();
+        w.append_record(b"forged").unwrap();
+        w.finish().unwrap();
+
+        let e = open_err(&dir, Some(dump_cipher("docs")));
+        assert_eq!(
+            e.downcast_ref::<AeadRejected>(),
+            Some(&AeadRejected::Unsealed {
+                subject: "block file"
+            }),
+            "a plaintext block file inside a sealed dump must be refused, got: {e:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unkeyed deployment pays **nothing**: no magic, no nonce, no tag. `meta.json` is
+    /// the same raw JSON it always was and the `.blk` files are the same plaintext
+    /// containers, so a plaintext consolidation is byte-for-byte what it was before
+    /// HIK-149 — which is why the sealed arm alone carries a magic.
+    #[test]
+    fn an_unkeyed_dump_is_unframed_plaintext() {
+        let dir = tmp("seal_unkeyed");
+        let carry = write_marked_dump(&dir, None);
+        let meta = std::fs::read(dir.join(META_FILE)).unwrap();
+        assert_eq!(meta[0], b'{', "meta.json must still be raw JSON");
+        assert!(serde_json::from_slice::<DumpMeta>(&meta).is_ok());
+        let ids = std::fs::read(dir.join(&carry)).unwrap();
+        assert_eq!(ids.len(), 3 * 8, "the carry sidecar must still be raw u64s");
+        for f in [NODES_FILE, EDGES_FILE, VECTORS_FILE] {
+            assert!(
+                !BlockFileReader::open(dir.join(f)).unwrap().is_encrypted(),
+                "{f} must be a plaintext container"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -613,7 +1001,7 @@ mod tests {
             (0, 2, 0, vec![]), // a parallel edge — must survive verbatim
         ];
 
-        let mut w = DumpWriter::create(&dir).unwrap();
+        let mut w = DumpWriter::create(&dir, None).unwrap();
         for (ls, ps) in &nodes {
             w.append_node(ls, ps).unwrap();
         }
@@ -635,7 +1023,7 @@ mod tests {
         )
         .unwrap();
 
-        let r = DumpReader::open(&dir).unwrap();
+        let r = DumpReader::open(&dir, None).unwrap();
         assert_eq!(r.meta().node_count, 3);
         assert_eq!(r.meta().edge_count, 3);
         assert_eq!(r.meta().labels, vec!["Person", "VIP", "Company"]);
@@ -680,7 +1068,7 @@ mod tests {
     fn rejects_foreign_magic() {
         let dir = tmp("foreign");
         let _ = std::fs::remove_dir_all(&dir);
-        let w = DumpWriter::create(&dir).unwrap();
+        let w = DumpWriter::create(&dir, None).unwrap();
         w.finish(vec![], vec![], vec![], vec![], vec![]).unwrap();
         // Corrupt the magic.
         let meta_path = dir.join(META_FILE);
@@ -688,7 +1076,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
         meta.magic = "NOTADUMP".into();
         std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-        let err = match DumpReader::open(&dir) {
+        let err = match DumpReader::open(&dir, None) {
             Ok(_) => panic!("expected a foreign-magic refusal"),
             Err(e) => e,
         };
@@ -704,7 +1092,7 @@ mod tests {
         use crate::pq::HOLE;
         let dir = tmp("carry");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut w = DumpWriter::create(&dir).unwrap();
+        let mut w = DumpWriter::create(&dir, None).unwrap();
         w.append_node(&[0], &[(0, Value::Str("x".into()))]).unwrap();
         let layout = vec![7u64, HOLE, 3, 0, HOLE, 5];
         let map_file = w.write_vector_carry("Doc.embedding", &layout).unwrap();
@@ -738,7 +1126,7 @@ mod tests {
         )
         .unwrap();
 
-        let r = DumpReader::open(&dir).unwrap();
+        let r = DumpReader::open(&dir, None).unwrap();
         let got = &r.meta().vector_indexes[0];
         assert_eq!(got.carry.as_ref(), Some(&carry));
         let back = r
@@ -758,7 +1146,7 @@ mod tests {
     #[test]
     fn dump_is_byte_deterministic() {
         let mk = |dir: &Path| {
-            let mut w = DumpWriter::create(dir).unwrap();
+            let mut w = DumpWriter::create(dir, None).unwrap();
             w.append_node(&[0], &[(0, Value::Str("Alice".into()))])
                 .unwrap();
             w.append_node(&[0], &[(0, Value::Str("Bob".into()))])

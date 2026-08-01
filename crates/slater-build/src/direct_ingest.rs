@@ -16,10 +16,12 @@
 //! order.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
 use graph_format::consolidate_dump::DumpReader;
+use graph_format::crypto::BlockCipher;
 use graph_format::manifest::{EntityKind, Metric};
 
 use crate::buckets::{Blob, BucketWriter, EdgeRec, NodeRec};
@@ -90,15 +92,21 @@ fn metric_token(m: Metric) -> &'static str {
 /// Ingest the dump at `dump_dir`, writing `node_bkt` / `edge_bkt` as single-segment
 /// buckets in the shape clustering + emit expect. `block_bytes` / `zstd_level` match
 /// the build's other transient buckets.
+///
+/// `cipher` is the dump's at-rest key (HIK-149) — [`graph_format::crypto::delta_cipher`]
+/// over the graph name, the same construction the server sealed it with. `None` for an
+/// unkeyed build. It is checked symmetrically: a sealed dump without it, and a plaintext
+/// dump with it, are both refused rather than read.
 pub fn ingest_dump(
     dump_dir: &Path,
     node_bkt: &Path,
     edge_bkt: &Path,
     block_bytes: usize,
     zstd_level: i32,
+    cipher: Option<Arc<BlockCipher>>,
     diag: &BuildDiag,
 ) -> Result<IngestResult> {
-    let r = DumpReader::open(dump_dir)
+    let r = DumpReader::open(dump_dir, cipher)
         .with_context(|| format!("open consolidation dump {}", dump_dir.display()))?;
     let (node_count, edge_count) = (r.meta().node_count, r.meta().edge_count);
 
@@ -313,7 +321,7 @@ mod tests {
     fn ingest_with_edge(tag: &str, src: u64, dst: u64, reltype: u32) -> Result<IngestResult> {
         let work = scratch(tag);
         let dump = work.join("dump");
-        let mut w = DumpWriter::create(&dump).unwrap();
+        let mut w = DumpWriter::create(&dump, None).unwrap();
         for i in 0..NODES {
             w.append_node(&[0], &[(0, Value::Int(i as i64))]).unwrap();
         }
@@ -334,6 +342,7 @@ mod tests {
             &work.join("edge_bkt"),
             64 * 1024,
             1,
+            None,
             &BuildDiag::disabled(),
         )
     }

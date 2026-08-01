@@ -268,13 +268,19 @@ this is the ledger.
   it. The core has the same gap (item 4); a shared fix — a monotonic, MAC-covered counter that
   refuses to move backwards — would close both.
 
-- [ ] **⬜ OPEN — the consolidation dump is plaintext** (*high* on a keyed deployment; filed as
-  HIK-149). A consolidation writes the merged (core ⊕ delta) view to
-  `<data dir>/<graph>/.consolidate.dump` for `slater-build` to ingest, and
-  `graph_format::consolidate_dump` has no cipher support at all — so the **whole graph** sits in
-  the clear for the length of a full rebuild on a deployment configured for at-rest encryption.
-  Removed afterwards, including on the failure paths, but the window is real. Sealing it means
-  plumbing the key through the dump format and the builder that reads it.
+- [x] **✅ FIXED — the consolidation dump was plaintext (HIK-149).** A consolidation writes the
+  merged (core ⊕ delta) view to `<data dir>/<graph>/.consolidate.dump` for `slater-build` to
+  ingest, and `graph_format::consolidate_dump` had no cipher support at all — so the **whole
+  graph** sat in the clear for the length of a full rebuild on a deployment configured for
+  at-rest encryption. Every file of the dump is now sealed under the same salt-free,
+  graph-bound delta key as the WAL and L0 (item 15), in its own `dump/` subkey namespace: the
+  three `.blk` files block-by-block, and `meta.json` plus any vector-carry sidecar as one-shot
+  blobs. `meta.json` is encrypted rather than merely MAC'd — it carries the graph's whole
+  symbol space. The policy is symmetric and typed at both ends (sealed-without-key,
+  plaintext-under-key, wrong key, and wrong graph are all refusals), and an unkeyed
+  deployment's dump is byte-for-byte unchanged. The **rollback** gap of item 4 / item 15
+  applies to the dump as well and is *not* closed: the path and the key are both stable, so a
+  dump kept from an earlier consolidation of the same graph still opens.
 
 - [ ] **⬜ OPEN — `SetManifest` and `SegmentManifest` are not graph-bound** (*low*). Neither
   carries a `graph` field, and the MAC key is per-master-key rather than per-graph, so those
@@ -285,7 +291,7 @@ this is the ledger.
 
 ## Status at a glance
 
-**16 done · 1 in progress · 7 open** (as of 2026-07-31)
+**17 done · 1 in progress · 6 open** (as of 2026-08-01)
 
 | # | Item | Tier | Status |
 |---|---|---|---|
@@ -308,7 +314,7 @@ this is the ledger.
 | 17 | WAL segment-run continuity | At-rest | ✅ Done (2026-07-31) |
 | 18 | WAL truncation / whole-segment deletion undetectable | At-rest | ⬜ Open |
 | 19 | Delta anti-rollback | At-rest | ⬜ Open |
-| 20 | Consolidation dump is plaintext (HIK-149) | At-rest | ⬜ Open |
+| 20 | Consolidation dump is plaintext (HIK-149) | At-rest | ✅ Done (2026-08-01) |
 | 21 | `SetManifest`/`SegmentManifest` not graph-bound | At-rest | ⬜ Open |
 
 ## Tier 2 — bounded DoS, worth hardening

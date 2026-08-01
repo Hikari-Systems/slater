@@ -477,35 +477,15 @@ impl Graphs {
             .freeze()
             .with_context(|| format!("freeze writable delta for '{name}'"))?;
 
-        // Dump the merged (core ⊕ delta) view to a scratch *binary* dump directory
-        // beside the graph. The builder ingests it directly (no re-parse / re-resolve).
-        let dump_path = data_dir.join(name).join(".consolidate.dump");
-        let dump_res: Result<()> = {
-            let view = MergedView::new(
-                core.as_ref(),
-                DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
-            );
-            let engine = Engine::new(&view, cache);
-            crate::consolidate::serialise_binary_dump(&engine, &view, &dump_path)
-        };
-        if let Err(e) = dump_res {
-            let _ = std::fs::remove_dir_all(&dump_path);
-            return Err(e).with_context(|| format!("serialise consolidation dump for '{name}'"));
-        }
-
-        // Rebuild. A builder failure leaves the delta live (no retire) and the old
-        // core serving; propagate the error after removing the scratch dump.
-        // The key goes *through* the closure rather than being reached for inside
-        // `run_builder`, because the closure is a test seam and a seam whose signature
-        // omits the key is exactly how HIK-157 hid: every encrypted-consolidation test
-        // supplied its own closure with `--encrypt --key-env`, so none of them exercised
-        // the keyless invocation production actually made. Widening the signature makes a
-        // test that ignores the key a deliberate act rather than an accident.
+        // The at-rest key, resolved **before** anything is written (HIK-149 moved this up
+        // from just above the `build` call, where it could not seal the dump).
         //
         // A served graph cannot be plaintext-under-a-key — HIK-144 refuses an
         // unauthenticated image at open when a key is configured — so "a key is configured"
         // and "the served core is encrypted" are the same condition here. Asserted rather
-        // than assumed, because building the wrong way round is a silent plaintext publish.
+        // than assumed, because building the wrong way round is a silent plaintext publish;
+        // and asserted before the dump, so a mismatched deployment never gets as far as
+        // writing the whole graph to scratch.
         let master_key = self.master_key_bytes();
         if master_key.is_some() != core.manifest().encryption.is_some() {
             bail!(
@@ -524,6 +504,33 @@ impl Graphs {
                 },
             );
         }
+
+        // Dump the merged (core ⊕ delta) view to a scratch *binary* dump directory
+        // beside the graph. The builder ingests it directly (no re-parse / re-resolve).
+        // Sealed under the same key on an encrypted deployment: this is the entire merged
+        // graph, and it sits here for the length of the rebuild (HIK-149).
+        let dump_path = data_dir.join(name).join(".consolidate.dump");
+        let dump_res: Result<()> = {
+            let view = MergedView::new(
+                core.as_ref(),
+                DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
+            );
+            let engine = Engine::new(&view, cache);
+            crate::consolidate::serialise_binary_dump(&engine, &view, &dump_path, master_key)
+        };
+        if let Err(e) = dump_res {
+            let _ = std::fs::remove_dir_all(&dump_path);
+            return Err(e).with_context(|| format!("serialise consolidation dump for '{name}'"));
+        }
+
+        // Rebuild. A builder failure leaves the delta live (no retire) and the old
+        // core serving; propagate the error after removing the scratch dump.
+        // The key goes *through* the closure rather than being reached for inside
+        // `run_builder`, because the closure is a test seam and a seam whose signature
+        // omits the key is exactly how HIK-157 hid: every encrypted-consolidation test
+        // supplied its own closure with `--encrypt --key-env`, so none of them exercised
+        // the keyless invocation production actually made. Widening the signature makes a
+        // test that ignores the key a deliberate act rather than an accident.
         if let Err(e) = build(&dump_path, name, data_dir, master_key) {
             let _ = std::fs::remove_dir_all(&dump_path);
             return Err(e).with_context(|| format!("rebuild consolidated generation for '{name}'"));
