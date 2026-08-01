@@ -406,7 +406,7 @@ pub fn serialise_binary_dump<V: ReadView>(
     // `append_vector` requires (and the builder merge-joins against).
     let mut vector_indexes: Vec<DumpVectorIndex> = Vec::new();
     let mut vectors: Vec<(u64, u32, Vec<f32>)> = Vec::new(); // (new_id, key_id, vector)
-    for (desc, levels) in manifest.vector_indexes.iter().zip(levels) {
+    for (ord, (desc, levels)) in manifest.vector_indexes.iter().zip(levels).enumerate() {
         let key_id = keys.intern(&desc.property);
         // The sealed base index, then the levels above it (delta patches and segment rows)
         // folded newest-wins: a node re-embedded since the build must carry its *new*
@@ -488,8 +488,12 @@ pub fn serialise_binary_dump<V: ReadView>(
                     };
                     layout_to_dump_id.push(mapped);
                 }
+                // `ord` — the index's position in `manifest.vector_indexes` — is what keys
+                // the sidecar. The `label.property` stem is decoration: sanitising it is not
+                // injective, so two indexes can collide on one filename and the second
+                // silently truncates the first (HIK-158).
                 let stem = format!("{}.{}", desc.label, desc.property);
-                let carry_map_file = w.write_vector_carry(&stem, &layout_to_dump_id)?;
+                let carry_map_file = w.write_vector_carry(ord, &stem, &layout_to_dump_id)?;
                 // Data-dir-relative references to the base files (the builder joins with its
                 // own `--data-dir`), matching the generation store's `graph/base_uuid` layout.
                 let base = view.core_generation();
@@ -1533,6 +1537,20 @@ mod tests {
                 0,
                 "no vector may be streamed for a carried index"
             );
+            // HIK-158: the sidecar filename is keyed on the index's **ordinal**, not on its
+            // sanitised `label.property` stem (which is not injective — two indexes can
+            // sanitise alike and the second silently truncates the first). Assert the
+            // production call site threads each index's own position, generically over all
+            // of them, so this keeps holding if a fixture ever carries more than one.
+            for (i, vi) in r.meta().vector_indexes.iter().enumerate() {
+                if let Some(c) = &vi.carry {
+                    assert!(
+                        c.carry_map_file.starts_with(&format!("carry.{i}.")),
+                        "index {i}'s sidecar must be keyed on its ordinal, got {}",
+                        c.carry_map_file
+                    );
+                }
+            }
             let vi = &r.meta().vector_indexes[0];
             let carry = vi.carry.as_ref().expect("a Vamana index must carry");
             assert_eq!(

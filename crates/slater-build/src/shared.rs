@@ -1404,7 +1404,9 @@ mod carry_tests {
         };
         let _ = data_dir;
         let mut dw = DumpWriter::create(dump_dir, None).unwrap();
-        let map_file = dw.write_vector_carry("Doc.emb", layout_to_dump_id).unwrap();
+        let map_file = dw
+            .write_vector_carry(0, "Doc.emb", layout_to_dump_id)
+            .unwrap();
         crate::model::VectorCarry {
             base_vamana: format!("{base_rel}/vector/Doc.emb.vamana"),
             base_pq: format!("{base_rel}/vector/Doc.emb.pq"),

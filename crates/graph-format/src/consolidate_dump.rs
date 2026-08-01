@@ -513,14 +513,36 @@ impl DumpWriter {
     ///
     /// Raw little-endian `u64`, one per base `.vamana` record, `HOLE` ([`crate::pq::HOLE`])
     /// for a tombstoned/superseded/deleted ordinal. Not put in `meta.json`: at scale this is
-    /// hundreds of MB, which JSON would both bloat and read back slowly. `stem` is the index's
-    /// `label.property`; the filename is sanitised so an odd label cannot escape the dir.
-    pub fn write_vector_carry(&mut self, stem: &str, layout_to_dump_id: &[u64]) -> Result<String> {
+    /// hundreds of MB, which JSON would both bloat and read back slowly.
+    ///
+    /// `ord` is the index's position in the dump's `vector_indexes`, and it is what makes
+    /// the filename **injective** (HIK-158). `stem` (`label.property`) is decoration, kept
+    /// only so a human reading the scratch directory can tell the sidecars apart — it is
+    /// still sanitised, because that is what stops an odd label escaping the directory, but
+    /// sanitising is *not* injective and must never be the only thing separating two files:
+    ///
+    /// * `(:Doc {` b.a `})` → stem `Doc.b.a` → `carry_Doc_b_a`
+    /// * ``(:`Doc.b` {a})`` → stem `Doc.b.a` → `carry_Doc_b_a`
+    ///
+    /// Labels and property keys are arbitrary strings over Bolt, so that collision is
+    /// reachable rather than theoretical. `std::fs::write` truncates, so before this the
+    /// second index silently overwrote the first's table — and nothing downstream caught it:
+    /// a shared name means a shared per-file subkey, so the AEAD passes, and
+    /// `read_vector_carry_at`'s length check only fires when the two indexes happen to have
+    /// *different* base record counts. With equal counts the first index would carry the
+    /// second's `layout → dump-id` table, mapping every base ordinal to the wrong node and
+    /// returning wrong neighbours with no error and exit 0.
+    pub fn write_vector_carry(
+        &mut self,
+        ord: usize,
+        stem: &str,
+        layout_to_dump_id: &[u64],
+    ) -> Result<String> {
         let safe: String = stem
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let file = format!("carry.{safe}.ids");
+        let file = format!("carry.{ord}.{safe}.ids");
         let mut buf: Vec<u8> = Vec::with_capacity(layout_to_dump_id.len() * 8);
         for &id in layout_to_dump_id {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -783,7 +805,7 @@ mod tests {
         w.append_edge(0, 0, 0, &[]).unwrap();
         w.append_vector(0, 0, &[1.0, 2.0]).unwrap();
         let carry = w
-            .write_vector_carry("Doc.embedding", &[7, HOLE_ID, 3])
+            .write_vector_carry(0, "Doc.embedding", &[7, HOLE_ID, 3])
             .unwrap();
         w.finish(
             vec![MARKER.into()],
@@ -1084,6 +1106,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **HIK-158.** Two vector indexes whose `label.property` stems sanitise to the same
+    /// string must not collide on one sidecar filename.
+    ///
+    /// The stems here are the ticket's own example, and they are reachable: labels and
+    /// property keys are arbitrary strings over Bolt.
+    ///
+    /// * `(:Doc {` b.a `})` → stem `Doc.b.a`
+    /// * ``(:`Doc.b` {a})`` → stem `Doc.b.a`
+    ///
+    /// The tables are given **equal lengths on purpose**. `read_vector_carry_at` checks the
+    /// declared `base_records` against the file, so with unequal lengths that check masks
+    /// the collision and a naive test passes against the unfixed code. Equal lengths remove
+    /// the mask and leave only the filename standing between the two indexes — which is the
+    /// bug: `std::fs::write` truncates, so the second write replaced the first's table, and
+    /// the first index would then read the second's `layout → dump-id` mapping. A shared
+    /// name also means a shared per-file subkey, so the AEAD passes too.
+    #[test]
+    fn two_indexes_whose_stems_sanitise_alike_get_distinct_carry_sidecars() {
+        let dir = tmp("carry_collide");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = DumpWriter::create(&dir, None).unwrap();
+
+        // Same sanitised stem, different indexes, same table length.
+        let a = vec![10u64, 11, 12, 13];
+        let b = vec![20u64, 21, 22, 23];
+        let file_a = w.write_vector_carry(0, "Doc.b.a", &a).unwrap();
+        let file_b = w.write_vector_carry(1, "Doc.b.a", &b).unwrap();
+
+        assert_ne!(
+            file_a, file_b,
+            "distinct indexes must not share a sidecar filename"
+        );
+        // Read back through the same free function production uses, so this cannot pass on
+        // a reader that disagrees with the writer.
+        let read = |f: &str, n: usize| read_vector_carry_at(&dir.join(f), n as u64, None).unwrap();
+        assert_eq!(
+            read(&file_a, a.len()),
+            a,
+            "index 0 must read back its OWN layout table, not index 1's"
+        );
+        assert_eq!(read(&file_b, b.len()), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same collision, end to end through a **sealed** dump: a shared filename would
+    /// also mean a shared per-file subkey, so the AEAD cannot be what catches this.
+    #[test]
+    fn colliding_stems_stay_distinct_when_the_dump_is_sealed() {
+        let cipher = Arc::new(BlockCipher::from_master(
+            b"master-key-bytes",
+            &[3u8; crate::crypto::SALT_LEN],
+        ));
+        let dir = tmp("carry_collide_sealed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = DumpWriter::create(&dir, Some(cipher.clone())).unwrap();
+        let a = vec![1u64, 2, 3, 4];
+        let b = vec![5u64, 6, 7, 8];
+        let file_a = w.write_vector_carry(0, "Doc.b.a", &a).unwrap();
+        let file_b = w.write_vector_carry(1, "Doc.b.a", &b).unwrap();
+        assert_ne!(file_a, file_b);
+        let read = |f: &str| read_vector_carry_at(&dir.join(f), 4, Some(&cipher)).unwrap();
+        assert_eq!(read(&file_a), a);
+        assert_eq!(read(&file_b), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A carried Vamana index round-trips through the dump: the `DumpVectorCarry` scalars
     /// survive `meta.json`, and the `layout → dump-id` sidecar reads back exactly — holes
     /// included, and only for the length the carry declares.
@@ -1095,7 +1183,7 @@ mod tests {
         let mut w = DumpWriter::create(&dir, None).unwrap();
         w.append_node(&[0], &[(0, Value::Str("x".into()))]).unwrap();
         let layout = vec![7u64, HOLE, 3, 0, HOLE, 5];
-        let map_file = w.write_vector_carry("Doc.embedding", &layout).unwrap();
+        let map_file = w.write_vector_carry(0, "Doc.embedding", &layout).unwrap();
         let carry = DumpVectorCarry {
             base_gen: Some(Generation(uuid::Uuid::from_u128(9))),
             base_vamana_artifact: None,
