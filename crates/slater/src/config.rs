@@ -1048,20 +1048,9 @@ pub struct DeltaConfig {
     /// 01:00–05:59 daily. Parsed by [`crate::cron_window::CronWindow`].
     #[serde(default)]
     pub consolidate_window: String,
-    /// External `slater-build` binary to invoke for a consolidation rebuild.
-    ///
-    /// **Empty (the default) means the server re-execs itself** as
-    /// `slater --consolidate-worker`: same binary, same version, nothing to locate. That is
-    /// the recommended path, and the only one that works in the shipped image without
-    /// configuration.
-    ///
-    /// Set it to pin an external builder instead — a bare name is resolved on `PATH` and
-    /// then beside the server binary; an absolute path is used as given. Required on a
-    /// build without the `consolidate` feature (`slater:latest-lite`), which has no worker
-    /// compiled in and says so rather than failing obscurely.
-    ///
-    /// Either way the rebuild runs in a **child process**, which is not a configuration
-    /// choice: its peak RSS is multiples of the server's whole budget.
+    /// Path to the `slater-build` binary invoked to rebuild a fresh generation
+    /// during consolidation (Phase 1d). A bare name is resolved on `PATH`; an
+    /// absolute path pins a specific binary. Defaults to `slater-build`.
     #[serde(default = "default_builder_bin")]
     pub builder_bin: String,
     /// Working-memory budget handed to the consolidation builder as `--max-memory`,
@@ -1150,11 +1139,7 @@ fn default_wal_dir() -> String {
 }
 
 fn default_builder_bin() -> String {
-    // Empty ⇒ re-exec the server itself as `slater --consolidate-worker`. The old default
-    // was the bare name `slater-build`, which had to be found on `PATH` — and is not on it
-    // in the shipped image, is absent entirely from `slater:latest-lite`, and could be a
-    // different version than the server that spawned it.
-    String::new()
+    "slater-build".to_string()
 }
 
 fn default_memtable_bytes() -> usize {

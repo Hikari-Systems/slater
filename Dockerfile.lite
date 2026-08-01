@@ -83,7 +83,7 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
     && echo '' > crates/slater/tests/object_store_readamp.rs \
-    && cargo build --release --locked -p slater --no-default-features \
+    && cargo build --release --locked -p slater \
     && rm -rf crates/*/src \
        target/release/slater \
        target/release/deps/slater-* \
@@ -91,14 +91,9 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
        target/release/deps/graph_format-* target/release/deps/libgraph_format-*
 
 # ── Real build ────────────────────────────────────────────────────────────────
-# Only the server binary, filesystem backend only, and **without the default
-# `consolidate` feature** — that feature links `slater-build`'s pipeline into the server
-# so it can re-exec itself as a consolidation worker, which is exactly the weight this
-# image exists to shed. Without it `CALL slater.consolidate()` returns a typed
-# "no consolidation worker in this build" error naming `delta.builderBin` and the full
-# image, rather than the bare `No such file or directory` the missing binary used to give.
+# Only the server binary, filesystem backend only (no `--features`).
 COPY crates ./crates
-RUN cargo build --release --locked -p slater --no-default-features --bin slater
+RUN cargo build --release --locked -p slater --bin slater
 
 # Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
 # libgcc/libstdc++ + ca-certificates and nothing else (no shell/apt/coreutils), so

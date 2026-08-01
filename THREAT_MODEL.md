@@ -173,6 +173,42 @@ supplies to the server itself via `encryption.keyEnv`.
 `consolidate_graph` additionally refuses up front if the server's key state and the served
 generation's encryption state disagree, rather than discovering it after a full rebuild.
 
+**The server does not contain the code that publishes a generation.** `slater` terminates
+untrusted Bolt connections; `slater-build` is the only thing that can compile and publish a
+generation, and it is a **separate binary** that the server reaches by `execve`, never by a
+function call. This is a deliberate capability boundary, not an accident of history:
+
+- Publishing a generation requires executing a *different file*, so it is subject to
+  controls a same-process call has none of — ownership and mode on the builder, `execve`
+  auditing, AppArmor/SELinux, and simply whether the file is in the image at all.
+- "What in this system can write a generation?" resolves to one small artifact with a
+  CLI-shaped invocation surface, rather than several thousand symbols living inside the
+  process that parses network input. That bounds both the reachable surface after a
+  server-side compromise and the code a reviewer must audit for an unauthorised write path.
+- A read replica can be made *incapable* of building by not shipping the binary
+  (`slater:latest-lite` does exactly this) — a deployment-time capability removal, stronger
+  and more inspectable than a compile-time flag.
+
+Note this is an **integrity/attack-surface** control, not confidentiality: the child runs
+as the same uid with the same data-directory access and is handed the same master key, and
+there is no sandbox around it (no seccomp, no landlock, no privilege drop, no rlimit — see
+limitation 8). It is also *not* why consolidation runs out of process; that is bounded
+memory (a rebuild's peak RSS is multiples of the server's whole budget, so an OOM must cost
+a child rather than every connection). The two reasons are independent and both hold.
+
+The boundary is enforced by `crates/slater/tests/no_build_pipeline_in_server.rs`, which
+fails if `slater` gains a dependency on `slater-build` directly or through any
+workspace-internal crate. It exists because the property was briefly lost: a change linked
+the pipeline into the server so it could re-exec itself as a consolidation worker, putting
+~4 100 build symbols into a binary that had none, behind a single `argv[1]` comparison. The
+operational problem that motivated it — the shipped image not finding `/app/slater-build`,
+since `/app` is not on the distroless `PATH` — is instead solved by `spawn_builder`'s
+`current_exe()`-sibling fallback, which links nothing.
+
+What the boundary *costs* is set out above under the consolidation scratch dump: because
+the builder cannot see the server's memory, the whole merged graph is materialised to disk
+for it to read. That cost is real and is what the anti-rollback gap above hangs off.
+
 ## Existing protections
 
 - **At-rest encryption (optional, per block).** With `--encrypt`, each compressed block is

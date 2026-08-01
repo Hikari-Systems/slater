@@ -20,11 +20,6 @@ pub mod bolt;
 pub mod cache;
 pub mod config;
 pub mod consolidate;
-// The in-binary consolidation worker (`slater --consolidate-worker`). Feature-gated so a
-// build without `consolidate` — `slater:latest-lite` — neither links `slater-build` nor
-// grows by it, and reports consolidation unavailable instead.
-#[cfg(feature = "consolidate")]
-pub mod consolidate_worker;
 pub mod cron_window;
 pub mod degree_column;
 pub mod delta_writer;

@@ -12,8 +12,6 @@
 //! and hand off to [`slater::server::serve`].
 
 use anyhow::Context;
-#[cfg(feature = "consolidate")]
-use slater::consolidate_worker;
 use slater::{acl, config, dump, health, help, query, server};
 use tracing::info;
 
@@ -48,14 +46,6 @@ fn main() -> anyhow::Result<()> {
     // is a blocking Bolt client, so like the probes above it runs before the async
     // runtime is built; it needs only the default port from config.
     dump::dump_subcommand(default_port);
-
-    // `--consolidate-worker` is the server re-exec'ing *itself* to run a consolidation
-    // rebuild as a child process. It is not an operator-facing subcommand: the only
-    // producer is `server::run_builder`. It runs before config load because every input it
-    // needs is on its own argv or stdin — it must not inherit the parent's config, since
-    // the parent already resolved what to build and with which limits.
-    #[cfg(feature = "consolidate")]
-    consolidate_worker::consolidate_worker_subcommand();
 
     let cfg = config::load()?;
 

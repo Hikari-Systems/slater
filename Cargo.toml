@@ -26,9 +26,6 @@ hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.17
 graph-format = { path = "crates/graph-format" }
 slater-scalar = { path = "crates/slater-scalar" }
 slater-delta = { path = "crates/slater-delta" }
-# The offline writer's pipeline, linked by `slater` under the `consolidate` feature so the
-# server can re-exec itself as a consolidation worker (see slater-build/src/lib.rs).
-slater-build = { path = "crates/slater-build", default-features = false }
 
 # Core.
 anyhow = "1"

@@ -3256,7 +3256,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "slater-build",
  "slater-delta",
  "slater-scalar",
  "thiserror",

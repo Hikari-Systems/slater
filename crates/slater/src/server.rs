@@ -479,52 +479,6 @@ fn drain_pipe<R: std::io::Read + Send + 'static>(
     })
 }
 
-/// What the consolidation child should actually be.
-///
-/// The **default is the server itself** — `slater --consolidate-worker`, the same binary
-/// re-exec'd. That keeps the process boundary (which the build's ~5.66 GB peak RSS makes
-/// non-negotiable) while removing everything the *second binary* cost: nothing to locate
-/// on `PATH`, nothing missing from `slater:latest-lite`, and version skew impossible by
-/// construction rather than caught by a bespoke error message.
-///
-/// A non-empty `delta.builderBin` overrides it with an external `slater-build`, kept as a
-/// deliberate escape hatch — pinning a different builder version, or a build that wants
-/// flags the worker does not expose.
-#[derive(Debug)]
-enum BuilderTarget {
-    /// Re-exec `current_exe()` with `consolidate_worker::WORKER_FLAG`. Gated on the
-    /// feature that compiles the worker in: without it the variant does not exist, so a
-    /// `--no-default-features` build cannot even name a path it has no code for.
-    #[cfg(feature = "consolidate")]
-    SelfWorker(PathBuf),
-    /// Spawn the named binary, resolved by [`spawn_builder`].
-    External(String),
-}
-
-/// Decide which of the two the configured `builder_bin` selects.
-fn builder_target(builder_bin: &str) -> Result<BuilderTarget> {
-    if !builder_bin.is_empty() {
-        return Ok(BuilderTarget::External(builder_bin.to_string()));
-    }
-    #[cfg(feature = "consolidate")]
-    {
-        let exe = std::env::current_exe().context(
-            "locate the running server binary to re-exec as a consolidation worker — set \
-             `delta.builderBin` to an external `slater-build` if this host cannot report it",
-        )?;
-        Ok(BuilderTarget::SelfWorker(exe))
-    }
-    #[cfg(not(feature = "consolidate"))]
-    {
-        bail!(
-            "this build has no consolidation worker (built without the `consolidate` \
-             feature — e.g. the `slater:latest-lite` image), so `CALL slater.consolidate()` \
-             needs an external builder: set `delta.builderBin` to a `slater-build` binary, \
-             or run the full `slater:latest` image"
-        )
-    }
-}
-
 /// Spawn `builder_bin` with `args`, falling back to a binary sitting beside the running
 /// server when a **bare** name is not on `PATH`.
 ///
@@ -630,20 +584,14 @@ fn wait_with_timeout(
     }
 }
 
-/// Rebuild `graph` from the binary consolidation `dump` directory into `data_dir` in a
-/// **child process**, publishing a fresh generation — the production `build` seam for
-/// [`Graphs::consolidate_graph`].
-///
-/// By default the child is *this binary* re-exec'd as `slater --consolidate-worker`; an
-/// explicit `delta.builderBin` selects an external `slater-build` instead, resolved on
-/// `PATH` and then beside the server binary (see [`BuilderTarget`], [`spawn_builder`]).
-/// Either way it is a separate process, which is the load-bearing part: the build peaks at
-/// ~5.66 GB RSS on the 91.6M-node core, above its own `--max-memory` cap and unbounded by
-/// anything, so an OOM there must cost a child exit rather than every Bolt connection.
-///
-/// A non-zero exit is an error, so the caller keeps the old core serving. The dump carries
-/// dense ids and global symbol ids, so the builder ingests it directly
-/// (`--input-format slater-dump`), skipping parse, node dedup, and endpoint resolution.
+/// Spawn the configured `slater-build` binary to rebuild `graph` from the binary
+/// consolidation `dump` directory into `data_dir`, publishing a fresh generation —
+/// the production `build` seam for [`Graphs::consolidate_graph`]. A bare
+/// `builder_bin` resolves on `PATH`, falling back to a copy beside the server binary
+/// (see [`spawn_builder`]). A non-zero exit is an error, so the caller
+/// keeps the old core serving. The dump carries dense ids and global symbol ids, so
+/// the builder ingests it directly (`--input-format slater-dump`), skipping parse,
+/// node dedup, and endpoint resolution.
 /// When `master_key` is `Some` the rebuilt generation must be **encrypted**, or a
 /// consolidation of an encrypted graph publishes the whole graph in the clear and then
 /// fails at the swap (HIK-144 refuses an unauthenticated image under a key). That is
@@ -673,14 +621,7 @@ pub fn run_builder(
     master_key: Option<&[u8]>,
     limits: BuilderLimits,
 ) -> Result<()> {
-    let target = builder_target(builder_bin)?;
-    // Identical argv either way — the worker deliberately accepts the same flags, so the
-    // two remain interchangeable and `delta.builderBin` stays a working escape hatch.
-    let configure = |cmd: &mut std::process::Command| {
-        #[cfg(feature = "consolidate")]
-        if let BuilderTarget::SelfWorker(_) = target {
-            cmd.arg(crate::consolidate_worker::WORKER_FLAG);
-        }
+    let child = spawn_builder(builder_bin, |cmd| {
         cmd.arg("--input")
             .arg(dump)
             .arg("--input-format")
@@ -705,18 +646,7 @@ pub fn run_builder(
                 .arg("--key-stdin")
                 .stdin(std::process::Stdio::piped());
         }
-    };
-    let child = match &target {
-        // No discovery needed: it is the file we are already running.
-        #[cfg(feature = "consolidate")]
-        BuilderTarget::SelfWorker(exe) => {
-            let mut cmd = std::process::Command::new(exe);
-            configure(&mut cmd);
-            cmd.spawn()
-                .with_context(|| format!("re-exec {} as a consolidation worker", exe.display()))?
-        }
-        BuilderTarget::External(bin) => spawn_builder(bin, configure)?,
-    };
+    })?;
     let handle = register_builder(child);
 
     // Start draining before anything else can block. Taking the pipes needs the lock, but
