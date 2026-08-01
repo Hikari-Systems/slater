@@ -13373,3 +13373,105 @@ fn an_edge_delete_gives_the_degree_fast_path_back_after_a_flush() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// HIK-151: Stage B is now reachable over a **stacked** set (base + upper segment) as well
+/// as a live delta — the other half of the gate it had inherited from Stage 7.
+///
+/// Stage 7 needs a singleton set because it reads the base range index and histograms
+/// directly. Stage B does not: it walks the ordinary segment-aware seams, and
+/// `directed_edge_count` adds each segment's fence-gated born−removed fragment to the core
+/// degree. This asserts both halves on the same view — the count agrees with the
+/// materialising walk, and the final hop really is answered from maintained degrees rather
+/// than by walking (so the optimisation is genuinely reachable, not merely correct).
+#[test]
+fn the_count_walk_is_reachable_and_exact_over_a_stacked_set() {
+    let (root, _g) = testgen::write_indexed_people("stageb_stacked");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+
+    let write = |graphs: &Graphs, qy: &str| {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        match parser::parse_statement(qy).unwrap() {
+            parser::ast::Statement::Write(w) => {
+                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            parser::ast::Statement::WriteEdge(w) => {
+                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+            }
+            _ => panic!("expected a write: {qy}"),
+        }
+    };
+
+    // A born edge AND a delete of the one core edge, flushed together into an upper
+    // segment: the segment therefore carries **both** terms `directed_edge_count` folds —
+    // a born fragment and a removed one — which is the composition the old gate excluded
+    // outright, since it refused any stacked set.
+    write(
+        &graphs,
+        "MERGE (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'})",
+    );
+    write(
+        &graphs,
+        "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+    );
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("a born edge and a delete flush a non-empty delta");
+    assert_eq!(
+        graphs.get("people").unwrap().stack().segments().len(),
+        1,
+        "the set must be stacked for this test to mean anything"
+    );
+
+    // …and a further born edge live in the delta on top of the segment.
+    write(
+        &graphs,
+        "MERGE (a:Person {name:'Carol'})-[r:KNOWS]->(b:Person {name:'Alice'})",
+    );
+
+    let gen = graphs.get("people").unwrap();
+    let snap = graphs.writer("people").unwrap().delta_snapshot();
+    let view = MergedView::new(gen.as_ref(), snap);
+    assert!(!view.core_stack().is_singleton() && !view.delta().is_empty());
+
+    let visits = || crate::exec::ADJ_VISIT_COUNT.with(|c| c.get());
+    let reset = || crate::exec::ADJ_VISIT_COUNT.with(|c| c.set(0));
+
+    reset();
+    let counted = {
+        let ast = parser::parse("MATCH (x)-[]->()-[]->(z) RETURN count(*)").unwrap();
+        match Engine::new(&view, &cache).run(&ast).unwrap().rows[0][0] {
+            Val::Int(n) => n as usize,
+            ref v => panic!("count not int: {v:?}"),
+        }
+    };
+    let count_visits = visits();
+
+    reset();
+    let materialised = {
+        let ast = parser::parse("MATCH (x)-[]->()-[]->(z) RETURN z").unwrap();
+        Engine::new(&view, &cache).run(&ast).unwrap().rows.len()
+    };
+    let walk_visits = visits();
+
+    assert_eq!(
+        counted, materialised,
+        "over a stacked set + live delta, the count walk must agree with the materialising walk"
+    );
+    assert!(counted > 0, "the fixture must produce rows to compare");
+    assert!(
+        count_visits < walk_visits,
+        "the final hop must be answered from maintained degrees over a stacked set too \
+         ({count_visits} visits counting vs {walk_visits} materialising)"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
