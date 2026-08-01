@@ -13295,3 +13295,81 @@ fn result_byte_estimate_covers_string_and_container_capacity() {
         "a scalar variant must charge exactly its inline slot"
     );
 }
+
+/// HIK-150: the maintained-degree fast path is given up only while the edge delete is
+/// **live**, not permanently. A flush resolves the identity tombstone against the effective
+/// adjacency into one `removed` entry per real core edge id, which the segment fold already
+/// counts exactly — so after the flush the path arms again and its answer is exact.
+///
+/// This is what makes "decline" a bounded cost rather than "any graph that has ever deleted
+/// an edge loses the fast path forever", and it is the assertion that would catch a future
+/// change to the flush's tombstone resolution silently making the segment fold wrong instead.
+#[test]
+fn an_edge_delete_gives_the_degree_fast_path_back_after_a_flush() {
+    let (root, _g) = testgen::write_indexed_people("degree_selfheal");
+    let wal = root.join("_wal");
+    let cache = BlockCache::new(1 << 20);
+    let vc = VectorIndexCache::new(1 << 20);
+
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+
+    // Alice(0) -[:KNOWS]-> Bob(1) is the only core edge.
+    let deg_now = |graphs: &Graphs| -> Result<u64, anyhow::Error> {
+        let g = graphs.get("people").unwrap();
+        let snap = graphs
+            .writer("people")
+            .map(|w| w.delta_snapshot())
+            .unwrap_or_else(DeltaSnapshot::empty);
+        let view = MergedView::new(g.as_ref(), snap);
+        let eng = Engine::new(&view, &cache);
+        eng.directed_edge_count(0, true)
+    };
+    assert_eq!(deg_now(&graphs).unwrap(), 1, "the core edge is counted");
+
+    {
+        let gen = graphs.get("people").unwrap();
+        let writer = graphs.writer("people").unwrap();
+        let parser::ast::Statement::WriteEdge(w) = parser::parse_statement(
+            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+        )
+        .unwrap() else {
+            panic!("expected an edge write");
+        };
+        execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+    }
+
+    // Live: refused, typed — the fold cannot know the tombstone's multiplicity.
+    let err = deg_now(&graphs).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<crate::exec::DegreeNotExact>(),
+        Some(&crate::exec::DegreeNotExact::EdgeTombstone),
+        "a live edge delete must refuse the maintained degree, got: {err:#}"
+    );
+
+    graphs
+        .flush_graph_to_segment("people", &vc, &root)
+        .unwrap()
+        .expect("an edge delete flushes a non-empty delta");
+
+    // Flushed: the delta is empty, the segment carries a resolved per-edge-id removal, and
+    // the maintained degree is exact again — agreeing with the adjacency overlay.
+    let gen = graphs.get("people").unwrap();
+    let snap = graphs
+        .writer("people")
+        .map(|w| w.delta_snapshot())
+        .unwrap_or_else(DeltaSnapshot::empty);
+    let view = MergedView::new(gen.as_ref(), snap);
+    let eng = Engine::new(&view, &cache);
+    let overlaid = eng.outgoing_adj(0).unwrap().len() as u64;
+    assert_eq!(overlaid, 0, "the edge is gone from the stacked view");
+    assert_eq!(
+        eng.directed_edge_count(0, true).unwrap(),
+        overlaid,
+        "after a flush the maintained degree is exact again"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

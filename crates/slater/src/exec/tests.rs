@@ -11169,3 +11169,183 @@ fn param_id_reroot_preserves_direction_and_multi_hop_results() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// HIK-150 (a): on a multigraph, **one** `DELETE r` suppresses **every** parallel core edge
+/// of that reltype to that neighbour — the delta keys an edge by `(src, reltype, dst)` and
+/// the read overlay honours that identity semantics (`exec.rs`'s `suppress` set), which
+/// `flush_segment.rs` documents as deliberate.
+///
+/// A maintained degree that decrements once per tombstone therefore disagrees with what the
+/// adjacency overlay actually emits, by (parallel multiplicity − 1).
+///
+/// Asserted against `outgoing_adj().len()` — the overlay's *own* answer — rather than a
+/// hand-computed number, because the claim is precisely that the two disagree. A hard-coded
+/// expectation would only be testing my arithmetic.
+#[test]
+fn a_parallel_edge_delete_makes_the_maintained_degree_disagree_with_the_overlay() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    let (root, graph) = testgen::write_multigraph("degree_parallel");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    // Sanity on the fixture itself: a has 4 outgoing edges, 3 of them parallel to b.
+    let clean = MergedView::read_only(&gen);
+    assert_eq!(
+        Engine::new(&clean, &cache).outgoing_adj(0).unwrap().len(),
+        4
+    );
+
+    // One `DELETE r` on the (a)-[:R]->(b) identity.
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.delete_edge(
+        "N",
+        "name",
+        Value::Str("a".into()),
+        "R",
+        "N",
+        "name",
+        Value::Str("b".into()),
+        Some(0),
+        Some(1),
+    );
+    let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    let eng = Engine::new(&view, &cache);
+
+    // The overlay drops all three parallel edges, leaving only a→c.
+    let overlaid = eng.outgoing_adj(0).unwrap().len() as u64;
+    assert_eq!(overlaid, 1, "identity semantics drop every parallel edge");
+
+    // The maintained degree must not claim otherwise. Before HIK-150 it answered 3
+    // (4 − 1), and nothing declined the fast path over it.
+    match eng.directed_edge_count(0, true) {
+        Ok(deg) => assert_eq!(
+            deg, overlaid,
+            "maintained out-degree disagrees with the adjacency overlay"
+        ),
+        Err(e) => assert!(
+            e.downcast_ref::<crate::exec::DegreeNotExact>().is_some(),
+            "a refusal must be the typed precondition error, got: {e:#}"
+        ),
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-150 (b): `delete_edge` inserts a tombstone unconditionally — it never checks that a
+/// core edge with that identity exists. Decrementing per tombstone therefore under-counts a
+/// node whose delete matched nothing.
+///
+/// `b` has exactly one real outgoing edge (b→c); deleting the edge (b)-[:R]->(a), which the
+/// core does not contain, must not change its degree.
+#[test]
+fn deleting_an_edge_that_does_not_exist_must_not_lower_the_degree() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    let (root, graph) = testgen::write_multigraph("degree_absent");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.delete_edge(
+        "N",
+        "name",
+        Value::Str("b".into()),
+        "R",
+        "N",
+        "name",
+        Value::Str("a".into()), // no such core edge
+        Some(1),
+        Some(0),
+    );
+    let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    let eng = Engine::new(&view, &cache);
+
+    let overlaid = eng.outgoing_adj(1).unwrap().len() as u64;
+    assert_eq!(
+        overlaid, 1,
+        "b→c is untouched by a delete that matched nothing"
+    );
+
+    // Before HIK-150 this answered 0 (1 − 1).
+    match eng.directed_edge_count(1, true) {
+        Ok(deg) => assert_eq!(
+            deg, overlaid,
+            "a delete that matched no core edge must not decrement the degree"
+        ),
+        Err(e) => assert!(
+            e.downcast_ref::<crate::exec::DegreeNotExact>().is_some(),
+            "a refusal must be the typed precondition error, got: {e:#}"
+        ),
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-150: with a live edge delete, `degree_terminal_dir` must **decline** — and the query
+/// must still answer correctly by walking.
+///
+/// This is the guard that keeps the two halves of the fix honest together. Refusing inside
+/// `directed_edge_count` alone would turn a wrong answer into a failed query; declining here
+/// is what keeps the query working at all.
+#[test]
+fn a_live_edge_delete_declines_the_degree_terminal_fast_path() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    fn pattern_of(q: &str) -> crate::parser::ast::Pattern {
+        let ast = parser::parse(q).unwrap();
+        let crate::parser::ast::Clause::Match(m) = &ast.head.reading[0] else {
+            panic!("not a match: {q}");
+        };
+        m.patterns[0].clone()
+    }
+
+    let (root, graph) = testgen::write_multigraph("degterm_edge_tomb");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let q = "MATCH (n:N)-[]->(m) RETURN count(m)";
+
+    // Baseline: no delete ⇒ the fast path arms, and it is right (5 core edges).
+    let clean = MergedView::read_only(&gen);
+    assert!(
+        Engine::new(&clean, &cache)
+            .degree_terminal_dir(&pattern_of(q))
+            .is_some(),
+        "the fast path must still arm on a delta with no deletes"
+    );
+    let ast = parser::parse(q).unwrap();
+    assert!(matches!(
+        Engine::new(&clean, &cache).run(&ast).unwrap().rows[0][0],
+        Val::Int(5)
+    ));
+
+    // One `DELETE r` ⇒ decline, and the walked answer is the overlay's (3 parallel edges
+    // suppressed by the single identity tombstone, leaving a→c and b→c).
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.delete_edge(
+        "N",
+        "name",
+        Value::Str("a".into()),
+        "R",
+        "N",
+        "name",
+        Value::Str("b".into()),
+        Some(0),
+        Some(1),
+    );
+    let view = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    let eng = Engine::new(&view, &cache);
+    assert!(
+        eng.degree_terminal_dir(&pattern_of(q)).is_none(),
+        "a live edge delete must decline the maintained-degree fast path"
+    );
+    assert!(
+        matches!(eng.run(&ast).unwrap().rows[0][0], Val::Int(2)),
+        "the walked count must be the overlay's own answer"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

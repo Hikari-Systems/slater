@@ -2665,6 +2665,28 @@ impl DeltaSnapshot {
             .any(|l| !l.tombstoned_ids().is_empty())
     }
 
+    /// Whether **any** edge is suppressed anywhere in the delta (a live edge-delete is
+    /// pending) — the edge-side companion to [`Self::has_tombstones`], and the same kind of
+    /// per-query gate.
+    ///
+    /// A core-edge tombstone carries **no edge id**: it is matched against the core
+    /// adjacency by identity `(reltype, neighbour)`. So one tombstone suppresses *every*
+    /// parallel core edge of that reltype to that neighbour, and a tombstone whose identity
+    /// matches nothing suppresses none — neither multiplicity is knowable without reading
+    /// the core adjacency, which is precisely the read a maintained-degree fast path exists
+    /// to avoid. Callers must therefore decline rather than net it out (HIK-150).
+    ///
+    /// This clears once the delete is **flushed or consolidated**, not on an L0 spill: a
+    /// flush resolves each identity tombstone against the effective adjacency into one
+    /// `removed` entry per real core edge id (`flush_segment.rs`), which the segment fold
+    /// then counts exactly, whereas an L0 level keeps the delta's own identity-keyed shape.
+    pub fn has_edge_tombstones(&self) -> bool {
+        if self.l0.is_empty() {
+            return self.mem.has_edge_tombstones();
+        }
+        self.levels_newest_first().any(|l| l.has_edge_tombstones())
+    }
+
     /// Count of delta-born-or-patched node identities, for scan-range planning. Summed
     /// across levels — an over-estimate when a core node is patched in several levels,
     /// which is fine for a planning bound.
@@ -2762,7 +2784,7 @@ impl DeltaSnapshot {
             .levels_newest_first()
             .filter(|l| l.born_edge_count() > 0)
             .count();
-        levels_with_born_edges <= 1 && !self.levels_newest_first().any(|l| l.has_edge_tombstones())
+        levels_with_born_edges <= 1 && !self.has_edge_tombstones()
     }
 
     /// The node dense ids the delta **effectively** suppresses: every level's tombstones,

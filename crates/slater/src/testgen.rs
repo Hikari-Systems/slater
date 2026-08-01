@@ -2460,3 +2460,138 @@ fn write_vamana_inner(
 
     (root, graph, raw, medoid_node_id)
 }
+
+/// A **multigraph**: three nodes `a`/`b`/`c` (label `N`, `name` property, one reltype `R`)
+/// with **three parallel** `a-[:R]->b` edges beside a single `a-[:R]->c` and a single
+/// `b-[:R]->c`. Out-degrees: `a` = 4, `b` = 1, `c` = 0.
+///
+/// Exists for HIK-150. No other fixture carries parallel edges, and the writable delta
+/// **cannot** create them — it keys an edge by `(src, reltype, dst)`, so a second `MERGE` of
+/// the same triple is the same identity. Parallel edges therefore only ever arrive from a
+/// build (`--pk`, the mode the Monarch import uses precisely to keep its ~21% of them), which
+/// is why they have to be written straight into a core generation here.
+///
+/// The point of the shape: the delta's `DELETE r` on `(a)-[:R]->(b)` is *one* identity
+/// tombstone that suppresses *three* core edges, so any count that decrements by one per
+/// tombstone disagrees with the adjacency overlay — while `a-[:R]->c` and `b-[:R]->c` stay
+/// live, so the disagreement cannot be mistaken for "everything vanished".
+pub fn write_multigraph(tag: &str) -> (PathBuf, String) {
+    let uuid = uuid::Uuid::from_u128(0x5_1a7e_0000_0000_0000_0000_0000_0015);
+    let graph = "multi".to_string();
+    let root = std::env::temp_dir().join(format!("slater_multifix_{}_{tag}", std::process::id()));
+    let dir = root.join(&graph).join(uuid.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut np = PropsWriter::create(dir.join("node_props.blk"), BLOCK, LEVEL).unwrap();
+    for name in ["a", "b", "c"] {
+        np.append(&[(0, Value::Str(name.into()))]).unwrap();
+    }
+    np.finish().unwrap();
+
+    let mut nl = NodeLabelsWriter::create(dir.join("node_labels.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..3 {
+        nl.append(&[0]).unwrap();
+    }
+    nl.finish().unwrap();
+
+    let mut ep = PropsWriter::create(dir.join("edge_props.blk"), BLOCK, LEVEL).unwrap();
+    for _ in 0..5 {
+        ep.append(&[]).unwrap();
+    }
+    ep.finish().unwrap();
+
+    // Three parallel a→b, then a→c, then b→c.
+    let mk = |src: u64, dst: u64, edge: u64| Edge {
+        src: NodeId(src),
+        dst: NodeId(dst),
+        reltype: 0,
+        edge: EdgeId(edge),
+    };
+    let edges = vec![
+        mk(0, 1, 0),
+        mk(0, 1, 1),
+        mk(0, 1, 2),
+        mk(0, 2, 3),
+        mk(1, 2, 4),
+    ];
+    write_csr(dir.join("topology.csr.blk"), 3, &edges, BLOCK, LEVEL).unwrap();
+
+    VectorStoreWriter::create(dir.join("vectors.f32.blk"), BLOCK, LEVEL)
+        .unwrap()
+        .finish()
+        .unwrap();
+
+    let mut block_sizes = BTreeMap::new();
+    let mut files = Vec::new();
+    let add = |name: &str, files: &mut Vec<FileEntry>, bs: &mut BTreeMap<String, u32>| {
+        let path = dir.join(name);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        files.push(FileEntry {
+            name: name.to_string(),
+            bytes,
+            blake3: hash_file(&path).unwrap(),
+            sha256: None,
+            crc32c: None,
+        });
+        bs.insert(name.to_string(), BLOCK as u32);
+    };
+    for name in [
+        "node_props.blk",
+        "node_labels.blk",
+        "edge_props.blk",
+        "topology.csr.blk",
+        "vectors.f32.blk",
+    ] {
+        add(name, &mut files, &mut block_sizes);
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let inv: Vec<(String, String)> = files
+        .iter()
+        .map(|f| (f.name.clone(), f.blake3.clone()))
+        .collect();
+    let content_hash = graph_format::integrity::content_hash(&inv);
+
+    let manifest = Manifest {
+        magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
+        format_version: FORMAT_VERSION,
+        build_uuid: GenId(uuid),
+        graph: graph.clone(),
+        created_unix: 1_700_000_000,
+        content_hash,
+        block_sizes,
+        codec: "zstd".into(),
+        zstd_level: LEVEL,
+        compression_profile: String::new(),
+        encryption: None,
+        node_count: 3,
+        edge_count: 5,
+        labels: vec!["N".into()],
+        reltypes: vec!["R".into()],
+        property_keys: vec!["name".into()],
+        range_indexes: vec![],
+        vector_indexes: vec![],
+        reltype_source_counts: vec![],
+        reltype_target_counts: vec![],
+        reltype_edge_counts: vec![],
+        reltype_self_loop_counts: vec![],
+        label_node_counts: vec![],
+        first_label_counts: vec![],
+        src_label_reltype_counts: vec![],
+        reltype_tgt_label_counts: vec![],
+        schema_triple_counts: vec![],
+        property_histograms: vec![],
+        hub_degrees: None,
+        acl_blake3: None,
+        mac: None,
+        files,
+    };
+    manifest.write_to_dir(&dir).unwrap();
+
+    std::fs::write(
+        root.join(&graph).join("current"),
+        format!("{}\n", uuid.hyphenated()),
+    )
+    .unwrap();
+
+    (root, graph)
+}

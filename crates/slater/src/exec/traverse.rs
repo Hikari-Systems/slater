@@ -395,10 +395,44 @@ impl<'g, V: ReadView> Engine<'g, V> {
         }
     }
 
+    /// Why a maintained degree cannot be exact against this engine's delta, or `None` when
+    /// it can. Memoised for the engine's lifetime (`degrees_exact`): the snapshot is
+    /// immutable, and the two predicates cost more than O(1) — a per-frontier-node
+    /// re-evaluation would put an id-list build and an edge-map scan inside the very loop
+    /// this fast path exists to keep cheap.
+    fn degrees_not_exact(&self) -> Option<DegreeNotExact> {
+        *self.degrees_exact.get_or_init(|| {
+            let delta = self.gen.delta();
+            if delta.has_tombstones() {
+                Some(DegreeNotExact::NodeTombstone)
+            } else if delta.has_edge_tombstones() {
+                Some(DegreeNotExact::EdgeTombstone)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Exact effective out-degree (`outgoing`) or in-degree of `node`, composed across the
     /// write path. See [`Self::effective_incident_count`] for the exactness preconditions.
+    ///
+    /// # The preconditions are enforced here, not merely documented (HIK-150)
+    /// The composition below is a fold of *marginals*, so it is exact only while the delta
+    /// holds no tombstone of either kind. `degree_terminal_dir` is supposed to guarantee
+    /// that before arming the fast path — and the reason this check exists anyway is that it
+    /// checked the node half and not the edge half, so a live `DELETE r` silently produced
+    /// wrong degrees: off by (parallel multiplicity − 1) for a delete that matched several
+    /// core edges, and one low for a delete that matched none.
+    ///
+    /// Refusing is deliberate. A wrong count is worse than a failed query — it is the
+    /// project's own Urgent bar — so if a future change re-arms this path without reading
+    /// [`DegreeNotExact`], it fails loudly rather than answering.
     pub(crate) fn directed_edge_count(&self, node: u64, outgoing: bool) -> Result<u64> {
         let gen = self.gen;
+        if let Some(why) = self.degrees_not_exact() {
+            return Err(why.into());
+        }
+        let delta = gen.delta();
         let cg = gen.core_generation();
         let mut deg: i64 = 0;
         // Core: exact out/in degree. Consult the **pinned** hub sidecar first (O(1), few MB,
@@ -470,9 +504,11 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
             }
         }
-        // Live delta: born edge (+1), suppressed core edge (−1). Node-tombstones are ruled
-        // out upfront (`degree_terminal_dir`), so no edge-to-deleted-node correction is owed.
-        let delta = gen.delta();
+        // Live delta: born edges only. Both tombstone kinds were refused at the top, so
+        // there is no suppression term to get wrong here — no edge-to-deleted-node
+        // correction, and no identity-matched core-edge tombstone whose multiplicity this
+        // fold cannot know. `e.tombstoned` is consequently unreachable; it is asserted
+        // rather than assumed, because that arm silently decrementing by one was the bug.
         if !delta.is_empty() {
             let edges = if outgoing {
                 delta.out_edges(node)
@@ -480,9 +516,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 delta.in_edges(node)
             };
             for e in edges {
-                if e.tombstoned {
-                    deg -= 1;
-                } else if e.edge_id.is_some() {
+                debug_assert!(
+                    !e.tombstoned,
+                    "has_edge_tombstones() refused above, so no tombstoned delta edge can \
+                     reach this fold"
+                );
+                if e.edge_id.is_some() {
                     deg += 1;
                 }
             }
@@ -541,7 +580,21 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 return None;
             }
         }
-        if self.gen.delta().has_tombstones() {
+        // No live delete of either kind, or the maintained degrees this path sums are not
+        // exact (HIK-150). A **node** delete is filtered at read time rather than
+        // materialised per source; an **edge** delete is an identity-matched core-edge
+        // tombstone carrying no edge id, so it suppresses every parallel edge of that
+        // reltype to that neighbour — or none, if it matched nothing — and neither count is
+        // knowable without reading the core adjacency this path exists to avoid.
+        //
+        // Only the node half was checked here, which is what made a live `DELETE r` return
+        // silently wrong degrees. Both halves clear at the next flush or consolidation,
+        // which resolves each identity tombstone into one `removed` entry per real core edge
+        // id; the segment fold then counts them exactly and this path arms again.
+        //
+        // Asked through the same memo `directed_edge_count` refuses on, so the decision to
+        // arm and the decision to answer can never be made on different grounds.
+        if self.degrees_not_exact().is_some() {
             return None;
         }
         Some(last_rel.dir)
