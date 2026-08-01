@@ -599,15 +599,23 @@ fn wait_with_timeout(
 /// and every test that consolidated an encrypted graph supplied its *own* builder closure,
 /// so nothing ever exercised the invocation production actually makes.
 ///
-/// The key travels over the child's **stdin**, not `--key-env` or `--key-file`:
+/// **How the key reaches the child mirrors where the server got it**, rather than always
+/// taking the same route:
 ///
-/// * `--key-env` would hold it in the child's environment block for the whole run — a full
-///   rebuild, hours on a large graph — readable from `/proc/<pid>/environ` and unwipeable
-///   (THREAT_MODEL.md limitation 7). Using it here would make the server's own consolidation
-///   create that exposure, rather than an operator opting into it.
-/// * `--key-file` would put it on disk, where a crash leaves it behind, and the existing
-///   tripwire refuses any key path inside the data directory.
-/// * `argv` is world-readable through `/proc/<pid>/cmdline`.
+/// * `encryption.keyEnv` ⇒ `--key-env <VAR>`. This is not the loosening it looks like.
+///   `std::process::Command` inherits the parent's environment and this function never
+///   clears it, so under `keyEnv` the key is **already** in the child's environment block
+///   for the whole rebuild — naming the variable adds no exposure, it just stops the code
+///   pretending otherwise. (An earlier version of this comment claimed `--key-stdin`
+///   avoided that exposure. It did not: the inherited variable was there either way, and
+///   the same principal who could read the child's `environ` could already read the
+///   server's, which holds the key for its entire life — THREAT_MODEL.md limitation 7.)
+/// * `encryption.keyFile` ⇒ `--key-stdin`, hex, written and closed for EOF. Here the
+///   server's own environment holds no key, so the child's must not either. `--key-file`
+///   would put it on disk where a crash leaves it behind (and the existing tripwire refuses
+///   any key path inside the data directory).
+/// * Never `argv`, under either source — that is world-readable through
+///   `/proc/<pid>/cmdline`.
 ///
 /// **Deadlock note:** stdout/stderr are piped and drained by [`drain_pipe`] on their own
 /// threads, started **before** the key is written to stdin. The child therefore always has
@@ -620,7 +628,14 @@ pub fn run_builder(
     data_dir: &Path,
     master_key: Option<&[u8]>,
     limits: BuilderLimits,
+    key_env: Option<&str>,
 ) -> Result<()> {
+    // Only meaningful together: `key_env` names where `master_key` came from.
+    debug_assert!(key_env.is_none() || master_key.is_some());
+    // `keyEnv` ⇒ forward the variable name (the child already inherits it); `keyFile` ⇒
+    // pipe it over stdin, keeping the child's environment as clean as the server's.
+    let via_env = master_key.is_some().then_some(key_env).flatten();
+    let via_stdin = master_key.is_some() && via_env.is_none();
     let child = spawn_builder(builder_bin, |cmd| {
         cmd.arg("--input")
             .arg(dump)
@@ -641,7 +656,9 @@ pub fn run_builder(
         if limits.threads > 0 {
             cmd.arg("--threads").arg(limits.threads.to_string());
         }
-        if master_key.is_some() {
+        if let Some(var) = via_env {
+            cmd.arg("--encrypt").arg("--key-env").arg(var);
+        } else if via_stdin {
             cmd.arg("--encrypt")
                 .arg("--key-stdin")
                 .stdin(std::process::Stdio::piped());
@@ -664,7 +681,7 @@ pub fn run_builder(
         [out, err].into_iter().flatten().collect()
     };
 
-    if let Some(key) = master_key {
+    if let (true, Some(key)) = (via_stdin, master_key) {
         use std::io::Write;
         // Hex, because that is the shape every other key source hands `resolve_master_key`.
         let hex = zeroize::Zeroizing::new(graph_format::crypto::hex_encode(key));
@@ -1076,6 +1093,11 @@ pub(crate) struct ConnCtx {
     /// [`BuilderLimits::resolve`] (explicit config, else derived from the server's own
     /// cgroup limits).
     builder_limits: BuilderLimits,
+    /// The env var holding the at-rest master key, when `encryption.keyEnv` is the
+    /// server's own key source ([`EncryptionConfig::key_env_var`]). `Some` ⇒ the builder
+    /// is given `--key-env <VAR>` (which it already inherits) instead of a piped stdin;
+    /// `None` (the `keyFile` source, or no key at all) ⇒ `--key-stdin`.
+    builder_key_env: Option<String>,
     /// Active-memtable byte budget: a write that pushes it past this flushes the
     /// memtable to an L0 segment (`config.delta.memtable_bytes`, Phase 4d-ii).
     memtable_bytes: usize,

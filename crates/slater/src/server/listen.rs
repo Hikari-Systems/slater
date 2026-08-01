@@ -322,6 +322,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         data_dir: PathBuf::from(cfg.data_dir()),
         builder_bin: cfg.delta.builder_bin.clone(),
         builder_limits: BuilderLimits::resolve(&cfg.delta),
+        builder_key_env: cfg.encryption.key_env_var().map(str::to_string),
         memtable_bytes: cfg.delta.memtable_bytes,
         l0_compaction_trigger: cfg.delta.l0_compaction_trigger,
         segment_flush_bytes: cfg.delta.segment_flush_bytes,

@@ -613,6 +613,23 @@ impl EncryptionConfig {
     /// wiped when dropped (HIK-139) — see the `LIMIT:` note at the top of
     /// `graph-format/src/crypto.rs` for what that does *not* cover (notably: a key
     /// arriving via `keyEnv` stays in the process environment regardless).
+    /// The env var the master key came from, when `keyEnv` is the *effective* source —
+    /// i.e. `keyFile` is empty, so [`load_key`](Self::load_key) reads the environment.
+    ///
+    /// Used to hand the consolidation builder `--key-env <VAR>` instead of piping the key
+    /// over its stdin. That is not a loosening: `std::process::Command` inherits the
+    /// parent's environment, so a key configured this way is **already** in the child's
+    /// environment block for the whole rebuild, whether we name it or not. Forwarding the
+    /// name simply stops the server pretending otherwise, and drops a piped stdin (and its
+    /// drain-ordering hazard) that was buying nothing in this configuration.
+    ///
+    /// Returns `None` for the `keyFile` source, where the server's own environment holds
+    /// no key and the child's must not either — that path keeps `--key-stdin`, so the
+    /// child's exposure mirrors the server's rather than inventing a worse one.
+    pub fn key_env_var(&self) -> Option<&str> {
+        (self.key_file.is_empty() && !self.key_env.is_empty()).then_some(self.key_env.as_str())
+    }
+
     pub fn load_key(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let hex = Zeroizing::new(if !self.key_file.is_empty() {
             std::fs::read_to_string(&self.key_file)

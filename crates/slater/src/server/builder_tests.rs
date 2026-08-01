@@ -103,6 +103,40 @@ fn a_missing_builder_reports_both_attempts() {
     assert!(msg.contains("delta.builderBin"), "{msg}");
 }
 
+// ── how the master key reaches the child ─────────────────────────────────────────
+
+/// `keyEnv` is the effective source only when `keyFile` is empty — `load_key` gives the
+/// file precedence, so forwarding the variable while the server was actually reading a
+/// file would hand the builder a *different* key (or none), and the failure would surface
+/// as an opaque AEAD mismatch a full rebuild later.
+#[test]
+fn the_key_env_var_is_forwarded_only_when_it_is_the_effective_source() {
+    use crate::config::EncryptionConfig;
+    let env_only = EncryptionConfig {
+        key_env: "SLATER_KEY".into(),
+        key_file: String::new(),
+    };
+    assert_eq!(env_only.key_env_var(), Some("SLATER_KEY"));
+
+    // keyFile wins in `load_key`, so it must win here too.
+    let both = EncryptionConfig {
+        key_env: "SLATER_KEY".into(),
+        key_file: "/etc/slater.key".into(),
+    };
+    assert_eq!(
+        both.key_env_var(),
+        None,
+        "keyFile takes precedence in load_key, so the env var is NOT the source"
+    );
+
+    assert_eq!(EncryptionConfig::default().key_env_var(), None);
+    let file_only = EncryptionConfig {
+        key_env: String::new(),
+        key_file: "/etc/slater.key".into(),
+    };
+    assert_eq!(file_only.key_env_var(), None);
+}
+
 // ── resource limits ──────────────────────────────────────────────────────────────
 
 /// Explicit config always wins over the derivation, so an operator can pin the budget

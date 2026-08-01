@@ -172,6 +172,7 @@ jobs:
             server::tests::a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding \
             server::tests::consolidate_carries_an_encrypted_vamana_index_by_reference \
             server::tests::a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_generation \
+            server::tests::a_key_env_consolidation_forwards_the_variable_and_publishes_an_encrypted_generation \
             server::tests::a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph \
             server::tests::consolidate_carries_a_vamana_index_out_of_its_vamana_blocks \
             server::tests::write_path_auto_consolidates_at_core_fraction \

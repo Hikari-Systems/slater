@@ -162,13 +162,24 @@ old core kept serving, so no query was ever answered wrongly; the cost was a cle
 of everything left on disk, and consolidation that could not succeed at all on an encrypted
 graph.
 
-The master key now reaches the builder over the child's **stdin** (`--key-stdin`), chosen
-over the alternatives on exposure grounds: `--key-env` would hold it in the child's
-environment block for the whole rebuild — hours on a large graph — readable from
-`/proc/<pid>/environ` and unwipeable per limitation 7 below; `--key-file` would put it on
-disk, where a crash leaves it behind; and `argv` is world-readable through
-`/proc/<pid>/cmdline`. So the key the server forwards is exposed *less* than one an operator
-supplies to the server itself via `encryption.keyEnv`.
+**How the key reaches the builder mirrors where the server got it.** Under
+`encryption.keyFile` it goes over the child's **stdin** (`--key-stdin`, hex, closed for
+EOF): the server's own environment holds no key, so the child's must not either.
+`--key-file` would put it on disk where a crash leaves it behind, and `argv` is
+world-readable through `/proc/<pid>/cmdline` under any source.
+
+Under `encryption.keyEnv` the builder is given `--key-env <VAR>` instead. This is **not** a
+loosening, and an earlier version of this document claimed otherwise. `std::process::Command`
+inherits the parent's environment and `run_builder` never clears it, so under `keyEnv` the
+key sits in the child's environment block for the whole rebuild *whether or not the variable
+is named* — verified empirically, not assumed. Naming it removes a piped stdin (and its
+drain-ordering hazard) that was buying nothing in that configuration. The marginal exposure
+is nil for a further reason: any principal who can read the builder's `environ` can already
+read the **server's**, which holds the same key for the process's entire life (limitation 7)
+— a strictly longer window.
+
+An operator who wants the key out of every environment block should use `keyFile`, which is
+the source that keeps both the server's and the builder's clean.
 
 `consolidate_graph` additionally refuses up front if the server's key state and the served
 generation's encryption state disagree, rather than discovering it after a full rebuild.

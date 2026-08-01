@@ -275,6 +275,7 @@ pub(crate) async fn execute_consolidate(
     // they are how *this* server chooses to run the subprocess, not part of what
     // consolidation means. See `BuilderLimits`.
     let builder_limits = ctx.builder_limits;
+    let builder_key_env = ctx.builder_key_env.clone();
     let graph = graph.to_string();
     let gc_graph = graph.clone(); // retained for the post-consolidation GC sweep below
     let new_uuid = tokio::task::spawn_blocking(move || {
@@ -283,7 +284,17 @@ pub(crate) async fn execute_consolidate(
             &cache,
             &vector_cache,
             &data_dir,
-            |dump, g, dd, key| run_builder(&builder_bin, dump, g, dd, key, builder_limits),
+            |dump, g, dd, key| {
+                run_builder(
+                    &builder_bin,
+                    dump,
+                    g,
+                    dd,
+                    key,
+                    builder_limits,
+                    builder_key_env.as_deref(),
+                )
+            },
         )
     })
     .await

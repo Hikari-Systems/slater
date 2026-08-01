@@ -7948,7 +7948,7 @@ fn a_production_consolidation_honours_non_default_builder_limits() {
     let vc = VectorIndexCache::new(1 << 20);
     let new = graphs
         .consolidate_graph("people", &cache, &vc, &root, |d, g, dd, key| {
-            run_builder(&bin, d, g, dd, key, limits)
+            run_builder(&bin, d, g, dd, key, limits, None)
         })
         .expect("the real builder must accept the flags the server sends");
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -8010,7 +8010,7 @@ fn consolidate_via_real_builder() {
                 _ => unreachable!(),
             };
             execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
     assert_ne!(new.0, gen0.uuid().0, "rebuilt a new generation");
@@ -8101,7 +8101,7 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
 
@@ -8155,7 +8155,7 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
 
@@ -8282,7 +8282,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding() {
     // 3. A background consolidation, run while d00 is out of scope.
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
     assert_eq!(
@@ -8370,7 +8370,7 @@ fn a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation()
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
 
@@ -8427,7 +8427,7 @@ fn a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding() {
     // A consolidation while out of scope.
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
 
@@ -8994,7 +8994,7 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     let new_uuid = graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
             assert_dump_is_sealed(d);
-            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default())
+            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), None)
         })
         .expect("a consolidation of an encrypted graph must succeed");
     assert_ne!(
@@ -9028,6 +9028,111 @@ fn a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_gener
     assert_eq!(served.uuid(), new_uuid);
     assert_eq!(served.node_count(), 2);
 
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The **`keyEnv` route** end to end: when the server's own key came from an environment
+/// variable, the builder is handed `--key-env <VAR>` instead of a piped stdin, and must
+/// publish a correctly encrypted, MAC-sealed, servable generation.
+///
+/// This is not a loosening. `std::process::Command` inherits the parent's environment and
+/// `run_builder` never clears it, so under `keyEnv` the key is already in the child's
+/// environment block for the whole rebuild whether or not we name the variable — measured,
+/// not assumed. What the routing removes is a piped stdin (and its drain-ordering hazard)
+/// that was buying nothing in this configuration. The `keyFile` route still uses stdin and
+/// is covered by `a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_generation`
+/// above, so both key sources have a test — the "two configurations with no test in common"
+/// gap that produced HIK-145 and HIK-157 stays closed.
+///
+/// Sets a process-wide env var, so it must run single-threaded; the CI job passes
+/// `--test-threads 1`.
+#[test]
+#[ignore = "spawns the real slater-build binary; see consolidate_via_real_builder"]
+fn a_key_env_consolidation_forwards_the_variable_and_publishes_an_encrypted_generation() {
+    let bin = std::env::var("SLATER_BUILD_BIN").unwrap_or_else(|_| "slater-build".to_string());
+    let work = std::env::temp_dir().join(format!("slater_keyenv_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let data = work.join("data");
+    let wal = work.join("_wal");
+
+    const VAR: &str = "SLATER_KEYENV_ROUTE_KEY";
+    let key_hex = "0123456789abcdef0123456789abcdef";
+    let key = graph_format::crypto::hex_decode(key_hex).unwrap();
+    // The server's own source. The child inherits it — that is the whole point.
+    std::env::set_var(VAR, key_hex);
+
+    let script = format!(
+        "CREATE INDEX FOR (n:__DumpVertex__) ON (n.__dump_id__);\n\
+         CREATE (:Doc:__DumpVertex__ {{__dump_id__: 0, {MARKER_KEY}: '{MARKER_VALUE}'}});\n\
+         CREATE (:Doc:__DumpVertex__ {{__dump_id__: 1, {MARKER_KEY}: 'beta'}});\n\
+         MATCH (n:__DumpVertex__) REMOVE n:__DumpVertex__, n.__dump_id__;\n\
+         DROP INDEX ON :__DumpVertex__(__dump_id__);\n"
+    );
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, &script).unwrap();
+    assert!(
+        std::process::Command::new(&bin)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--pk", "__dump_id__"])
+            .args(["--cluster", "none"])
+            .args(["--graph", "docs"])
+            .args(["--data-dir", data.to_str().unwrap()])
+            .arg("--encrypt")
+            .args(["--key-env", VAR])
+            .status()
+            .expect("spawn slater-build")
+            .success(),
+        "the encrypted fixture build must succeed"
+    );
+
+    let mut graphs = Graphs::open_all(&data, Some(&key)).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &data, None)
+        .unwrap();
+    let cache = BlockCache::new(1 << 22);
+    let vc = VectorIndexCache::new(1 << 22);
+    let base = graphs.get("docs").unwrap().uuid();
+
+    // `Some(VAR)` is the production wiring for a `keyEnv` deployment: no stdin is piped,
+    // and the builder resolves the key from the environment it inherited.
+    let new_uuid = graphs
+        .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, k| {
+            assert_dump_is_sealed(d);
+            crate::server::run_builder(&bin, d, g, dd, k, BuilderLimits::default(), Some(VAR))
+        })
+        .expect("a keyEnv-routed consolidation must succeed");
+    assert_ne!(
+        new_uuid, base,
+        "a fresh generation must have been published"
+    );
+
+    let mani: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            data.join("docs")
+                .join(new_uuid.0.to_string())
+                .join("MANIFEST.json"),
+        )
+        .expect("read the consolidated manifest"),
+    )
+    .unwrap();
+    assert!(
+        mani.get("encryption").is_some_and(|v| !v.is_null()),
+        "the keyEnv-routed generation must be encrypted, got encryption={:?}",
+        mani.get("encryption")
+    );
+    assert!(
+        mani.get("mac").is_some_and(|v| !v.is_null()),
+        "the keyEnv-routed generation must be MAC-sealed, got mac={:?}",
+        mani.get("mac")
+    );
+
+    // Servable under the key, so this cannot pass on manifest inspection alone.
+    let served = graphs.get("docs").unwrap();
+    assert_eq!(served.uuid(), new_uuid);
+    assert_eq!(served.node_count(), 2);
+
+    std::env::remove_var(VAR);
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -9205,7 +9310,7 @@ fn consolidate_carries_a_vamana_index_out_of_its_vamana_blocks() {
 
     graphs
         .consolidate_graph("docs", &cache, &vc, &data, |d, g, dd, _key| {
-            run_builder(&bin, d, g, dd, _key, BuilderLimits::default())
+            run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
 
@@ -10079,6 +10184,7 @@ fn build_writable_ctx_caps(
         data_dir: root.clone(),
         builder_bin: builder_bin.to_string(),
         builder_limits: BuilderLimits::default(),
+        builder_key_env: None,
         memtable_bytes,
         l0_compaction_trigger,
         segment_flush_bytes,
@@ -10313,6 +10419,7 @@ fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<
         data_dir: root.clone(),
         builder_bin: "slater-build".to_string(),
         builder_limits: BuilderLimits::default(),
+        builder_key_env: None,
         memtable_bytes: 64 << 20,
         l0_compaction_trigger: 4,
         segment_flush_bytes: 0,
@@ -10410,6 +10517,7 @@ fn build_multi_ctx(tag: &str) -> Arc<ConnCtx> {
         data_dir: root.clone(),
         builder_bin: "slater-build".to_string(),
         builder_limits: BuilderLimits::default(),
+        builder_key_env: None,
         memtable_bytes: 64 << 20,
         l0_compaction_trigger: 4,
         segment_flush_bytes: 0,
