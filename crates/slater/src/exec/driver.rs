@@ -96,22 +96,38 @@ impl<'g, V: ReadView> Engine<'g, V> {
         if let Some(res) = self.try_label_meta_fast_path(sq)? {
             return Ok(res);
         }
-        // The grouped-index fast path walks the base range index / histograms directly, which
-        // are not segment-aware, so it is only sound over a singleton set; a stacked set falls
-        // through to full execution (segment-aware via the scan / adjacency seams).
+        // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop) and
+        // `RETURN count(DISTINCT n.p)` are answered from the range index over (L, p) — one
+        // sequential index walk, no per-node property decode.
+        //
+        // This one genuinely needs a pure core: it walks the **base** range index and
+        // histograms directly, and neither is segment- or delta-aware, so a stacked set or a
+        // live delta falls through to full execution (which is segment-aware via the scan /
+        // adjacency seams).
         if self.gen.delta().is_empty() && self.gen.core_stack().is_singleton() {
-            // Stage 7: `MATCH (n:L) RETURN n.p, count(*)` (group-by an indexed prop)
-            // and `RETURN count(DISTINCT n.p)` are answered from the range index over
-            // (L, p) — one sequential index walk, no per-node property decode.
             if let Some(res) = self.try_grouped_index_fast_path(sq)? {
                 return Ok(res);
             }
-            // Stage B: `MATCH (…)-[…]->(…) [WHERE …] RETURN count(*)|count(v)` — a
-            // multi-hop count walks but counts during expansion instead of
-            // materialising the row set (the fanout RSS peak).
-            if let Some(res) = self.try_count_walk_fast_path(sq)? {
-                return Ok(res);
-            }
+        }
+        // Stage B: `MATCH (…)-[…]->(…) [WHERE …] RETURN count(*)|count(v)` — a multi-hop
+        // count walks but counts during expansion instead of materialising the row set (the
+        // fanout RSS peak), and its final hop is answered from maintained degrees.
+        //
+        // **Outside** Stage 7's gate (HIK-151). Stage B sat inside it and inherited a
+        // precondition written for a different stage: it reads nothing that is not
+        // segment-aware — it drives the ordinary matcher through the same scan and adjacency
+        // seams as full execution, and `directed_edge_count` composes the core degree with
+        // each segment's fence-gated fragment and the delta's own born term. So one `MERGE`
+        // was turning the 91.6M 3-hop hub count back from 0.8 s into the full walk, on every
+        // written-to deployment, permanently.
+        //
+        // What keeps it exact is `degree_terminal_dir`'s own decline conditions, not this
+        // gate — and those are only trustworthy since HIK-150, which added the edge-tombstone
+        // half and made `directed_edge_count` refuse rather than answer if it is ever armed
+        // wrongly. Lifting this gate before that would have bought speed with silent wrong
+        // counts.
+        if let Some(res) = self.try_count_walk_fast_path(sq)? {
+            return Ok(res);
         }
         self.run_single_seeded(sq, Table::singleton())
     }

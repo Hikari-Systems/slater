@@ -11349,3 +11349,170 @@ fn a_live_edge_delete_declines_the_degree_terminal_fast_path() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// HIK-151: a live delta must not disable the degree-sum count walk (Stage B).
+///
+/// Stage B sat inside a gate written for Stage 7 — `delta().is_empty() &&
+/// core_stack().is_singleton()` — whose justification (the grouped-index path walks the base
+/// range index and histograms, which are not segment-aware) is about Stage 7 alone. Stage B
+/// walks through the ordinary segment- and delta-aware seams and needs none of it, so one
+/// `MERGE` turned the 91.6M 3-hop hub count back from 0.8 s into a full walk.
+///
+/// Observed through `ADJ_VISIT_COUNT` rather than a timer: with Stage B armed, the final hop
+/// is answered from maintained degrees and its edges are never handed to
+/// `for_each_adj_overlaid` at all. The delta here is a **property patch**, so the graph's
+/// topology — and therefore the correct answer and the correct visit count — is identical
+/// with and without it. Any difference is the gate, not the data.
+#[test]
+fn a_live_delta_must_not_disable_the_degree_sum_count_walk() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    let (root, graph) = testgen::write_diamond("stageb_live_delta");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let q = "MATCH (x)-[]->()-[]->(z) RETURN count(*)";
+    let visits = || ADJ_VISIT_COUNT.with(|c| c.get());
+    let reset = || ADJ_VISIT_COUNT.with(|c| c.set(0));
+
+    let run = |view: &MergedView| -> (i64, u64) {
+        reset();
+        let ast = parser::parse(q).unwrap();
+        let r = Engine::new(view, &cache).run(&ast).unwrap();
+        let Val::Int(n) = r.rows[0][0] else {
+            panic!("count not int")
+        };
+        (n, visits())
+    };
+
+    // Cold graph: the fast path arms, so the final hop costs no adjacency visits.
+    let cold = MergedView::read_only(&gen);
+    let (n_cold, v_cold) = run(&cold);
+
+    // One property patch — no topology change whatsoever, but the delta is now non-empty.
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.upsert_node(
+        "N",
+        "name",
+        Value::Str("s".into()),
+        Some(0),
+        [("touched".to_string(), Value::Int(1))],
+    );
+    let live = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    let (n_live, v_live) = run(&live);
+
+    assert_eq!(
+        n_live, n_cold,
+        "a property patch cannot change an edge count"
+    );
+    assert_eq!(
+        v_live, v_cold,
+        "one MERGE must not disable the degree-sum count fast path: the live delta walked \
+         {v_live} adjacency edges where the cold graph walked {v_cold}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// HIK-151: with Stage B now reachable on a live graph, its answer must equal the
+/// materialising walk's answer in every delta shape it does not decline.
+///
+/// Both sides are computed on the **same** view — `count(*)` (Stage B) against
+/// `RETURN z` row count (full materialisation) — so neither is a hand-computed constant and
+/// a shared misunderstanding of the fixture cannot make both wrong in the same direction.
+///
+/// The four shapes: cold; a delta-born edge; a delta-born edge plus a **node tombstone**
+/// (which `degree_terminal_dir` declines, so Stage B still counts but walks the last hop);
+/// and an **edge tombstone** (declined for the reason HIK-150 established).
+#[test]
+fn the_count_walk_agrees_with_the_materialising_walk_on_a_live_delta() {
+    use crate::read_view::MergedView;
+    use slater_delta::{DeltaSnapshot, Memtable};
+    use std::sync::Arc;
+
+    let (root, graph) = testgen::write_diamond("stageb_agreement");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let check = |view: &MergedView, what: &str| {
+        let counted = {
+            let ast = parser::parse("MATCH (x)-[]->()-[]->(z) RETURN count(*)").unwrap();
+            match Engine::new(view, &cache).run(&ast).unwrap().rows[0][0] {
+                Val::Int(n) => n as usize,
+                ref v => panic!("count not int: {v:?}"),
+            }
+        };
+        let materialised = {
+            let ast = parser::parse("MATCH (x)-[]->()-[]->(z) RETURN z").unwrap();
+            Engine::new(view, &cache).run(&ast).unwrap().rows.len()
+        };
+        assert_eq!(
+            counted, materialised,
+            "{what}: the count walk and the materialising walk must agree"
+        );
+        counted
+    };
+
+    // (a) cold.
+    let cold = MergedView::read_only(&gen);
+    let n_cold = check(&cold, "cold");
+    assert!(n_cold > 0, "the fixture must produce rows to compare");
+
+    // (b) a delta-born edge — the born term of the maintained degree.
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.upsert_edge(
+        "N",
+        "name",
+        Value::Str("t".into()), // node 4
+        "R",
+        "N",
+        "name",
+        Value::Str("s".into()), // node 0
+        Some(4),
+        Some(0),
+        [],
+    );
+    let born = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    let n_born = check(&born, "delta-born edge");
+    assert!(
+        n_born > n_cold,
+        "a born edge closing the diamond must add rows ({n_born} vs {n_cold})"
+    );
+
+    // (c) a born edge plus a node tombstone — `degree_terminal_dir` declines, so the final
+    //     hop is walked; the count must still agree.
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.upsert_edge(
+        "N",
+        "name",
+        Value::Str("t".into()),
+        "R",
+        "N",
+        "name",
+        Value::Str("s".into()),
+        Some(4),
+        Some(0),
+        [],
+    );
+    mem.delete_node("N", "name", Value::Str("b".into()), Some(2));
+    let tombstoned = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    check(&tombstoned, "born edge + node tombstone");
+
+    // (d) an edge tombstone — declined for HIK-150's reason; the count must still agree.
+    let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+    mem.delete_edge(
+        "N",
+        "name",
+        Value::Str("s".into()),
+        "R",
+        "N",
+        "name",
+        Value::Str("a".into()),
+        Some(0),
+        Some(1),
+    );
+    let edge_tomb = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+    check(&edge_tomb, "edge tombstone");
+
+    std::fs::remove_dir_all(&root).ok();
+}
