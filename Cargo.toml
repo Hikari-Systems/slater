@@ -1,6 +1,7 @@
-# Slater — a low-memory, read-only, Bolt-speaking graph engine.
+# Slater — a low-memory, Bolt-speaking graph engine over an immutable core with
+# an opt-in single-writer delta.
 #
-# Internal cargo workspace of three crates. `hs-utils` is pulled in by the
+# Internal cargo workspace of five crates. `hs-utils` is pulled in by the
 # member crates via git+tag (house convention — never a path dependency), even
 # though Slater is itself a workspace.
 [workspace]
