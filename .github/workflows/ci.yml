@@ -126,16 +126,36 @@ jobs:
   # ── Consolidation end-to-end: the `#[ignore]`d tests that spawn the real
   #    `slater-build` binary. They are ignored because `cargo test -p slater` does
   #    not build the builder — not because they are slow or flaky — so nothing ran
-  #    them anywhere, and the `--ignored` suite is not blanket-runnable (the
-  #    `SLATER_SMOKE_DATADIR` tests hard-fail without a prebuilt generation).
+  #    them anywhere.
   #
   #    This matters most for the *encrypted* arm. HIK-145 was invisible for its
   #    whole life because every carry test passed `cipher: None`; the tests that
-  #    finally cover `Some(..)` end to end are two of the ones listed here, and
+  #    finally cover `Some(..)` end to end are two of the ones in this module, and
   #    leaving them unrun would have left the same "two configurations with no test
-  #    in common" gap that caused the bug. Named explicitly rather than filtered by
-  #    prefix so adding one is a deliberate act, and a rename fails loudly here
-  #    instead of silently dropping coverage.
+  #    in common" gap that caused the bug.
+  #
+  #    Why a `server::tests::` filter rather than a bare `--ignored` (HIK-220): the
+  #    lib target's ignored set is 16, not 14. The two extras are
+  #    `cache::tests::{result,vector}_cache_concurrent_*`, ignored as *flaky* — they
+  #    assert wall-clock throughput at 1 vs 4 threads, which is meaningless on a
+  #    loaded runner (a sibling once passed at 2.4x and failed below 1.2x in the
+  #    same run; see the comment at their definition). A blanket `--ignored` would
+  #    pull those in and go intermittently red on a timing assertion — worse than
+  #    not running them, because it trains people to re-run the job.
+  #
+  #    Filtering by module rather than by a hand-written list of 14 names means a
+  #    renamed builder test still runs, and a newly added one is picked up without
+  #    anyone remembering to edit this file. This replaces the previous "named
+  #    explicitly so adding one is a deliberate act" rule: a deliberate act is one
+  #    someone can forget, and HIK-145 is the precedent for what an unrun test costs.
+  #    The module filter is deliberately the *allowlist* form — `--skip
+  #    cache::tests::` is equivalent today but is a denylist, so a future flaky perf
+  #    test in any other module would silently join this job.
+  #
+  #    The `SLATER_SMOKE_DATADIR` benchmark in this same source file is NOT in this
+  #    ignored set: it is `#[cfg(feature = "perf-mem")]` and this job passes no
+  #    `--features`, so it is never compiled. It was previously believed to be the
+  #    reason a blanket `--ignored` was impossible here. It was not.
   consolidation:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -160,44 +180,26 @@ jobs:
           # ABSOLUTE. `cargo test` runs a test binary with its CWD set to the *package*
           # root (`crates/slater/`), not the workspace root — so a relative
           # `target/debug/slater-build` resolves to `crates/slater/target/…`, which never
-          # exists, and every test in this loop fails to spawn the builder. This job was
+          # exists, and every test in the suite fails to spawn the builder. This job was
           # authored on a release branch and first executed on `main`, where that is
           # exactly what happened.
           SLATER_BUILD_BIN: ${{ github.workspace }}/target/debug/slater-build
         run: |
           set -euo pipefail
-          # Full module paths: `--exact` matches the whole path, so a bare function
-          # name silently matches nothing and the job passes having run zero tests.
-          for t in \
-            server::tests::consolidate_via_real_builder \
-            server::tests::a_production_consolidation_honours_non_default_builder_limits \
-            server::tests::consolidate_carries_vector_indexes_and_embeddings \
-            server::tests::consolidate_carries_a_delta_written_vector_over_the_base \
-            server::tests::a_consolidation_while_out_of_scope_keeps_a_relabelled_nodes_embedding \
-            server::tests::a_value_removal_that_also_leaves_scope_stays_deleted_across_a_consolidation \
-            server::tests::a_consolidation_while_out_of_scope_keeps_a_base_indexed_embedding \
-            server::tests::consolidate_carries_an_encrypted_vamana_index_by_reference \
-            server::tests::a_production_consolidation_of_an_encrypted_graph_publishes_an_encrypted_generation \
-            server::tests::a_key_env_consolidation_forwards_the_variable_and_publishes_an_encrypted_generation \
-            server::tests::a_keyed_consolidation_refuses_to_carry_a_plaintext_vector_graph \
-            server::tests::consolidate_carries_a_vamana_index_out_of_its_vamana_blocks \
-            server::tests::write_path_auto_consolidates_at_core_fraction \
-            server::tests::bolt_consolidate_trigger_folds_delta_via_real_builder \
-          ; do
-            echo "── $t"
-            # `|| true` is load-bearing: under `set -e` a failing command inside a
-            # `out="$(…)"` assignment aborts the script *before* the diagnostic below
-            # ever runs, so a genuine test failure surfaced as a bare "exit code 101"
-            # with none of cargo's output. Capture, always print, then judge.
-            out="$(cargo test -p slater --locked --lib -- \
-                     --ignored --exact "$t" --test-threads 1 2>&1)" || true
-            echo "$out" | tail -30
-            # One assertion covers both failure modes: a test that failed, and a test
-            # that matched nothing (a rename silently dropping coverage) — neither
-            # prints `1 passed`.
-            echo "$out" | grep -qE 'test result: ok\. 1 passed' \
-              || { echo "::error::$t failed or did not run (renamed or removed?)"; exit 1; }
-          done
+          # `|| true` is load-bearing: under `set -e` a failing command inside an
+          # `out="$(…)"` assignment aborts the script *before* the diagnostic below
+          # ever runs, so a genuine test failure surfaced as a bare "exit code 101"
+          # with none of cargo's output. Capture, always print, then judge.
+          out="$(cargo test -p slater --locked --lib -- \
+                   --ignored server::tests:: --test-threads 1 2>&1)" || true
+          echo "$out"
+          # One assertion covers both failure modes: a run that failed (the result
+          # line is not `ok.`), and a filter that matched nothing (`0 passed`, the
+          # job otherwise passing having run no tests at all). Deliberately does not
+          # assert an exact count — hard-coding 14 here would reintroduce the drift
+          # that listing every test by name caused in the first place.
+          echo "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            || { echo "::error::the server::tests:: --ignored suite failed, or matched no tests"; exit 1; }
 
   # ── Store backends: compile + run the feature-gated s3/gcs code that the
   #    default build never touches (HIK-138). Whole modules under

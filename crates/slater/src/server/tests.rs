@@ -23,8 +23,16 @@ use tokio::net::TcpStream;
 #[test]
 #[ignore = "needs a prebuilt generation; see SLATER_SMOKE_DATADIR"]
 fn bench_resolve_business_key_over_the_segment() {
-    let data_dir = std::env::var("SLATER_SMOKE_DATADIR")
-        .expect("set SLATER_SMOKE_DATADIR to a slater data directory");
+    // Self-skip rather than panic when the fixture is absent, matching the idiom the
+    // other environment-sensitive tests use (see `cache::tests`, which returns early
+    // when the box has too few cores). A benchmark that needs a prebuilt generation
+    // has nothing to do without one — that is not a failure. This also keeps
+    // `--features perf-mem -- --ignored` blanket-runnable; it is NOT why the
+    // consolidation CI job filters by module (see the note there).
+    let Ok(data_dir) = std::env::var("SLATER_SMOKE_DATADIR") else {
+        eprintln!("skipping: set SLATER_SMOKE_DATADIR to a slater data directory");
+        return;
+    };
     let graph = std::env::var("SLATER_SMOKE_GRAPH").unwrap_or_else(|_| "wiki1m".to_string());
     let p30: i64 = std::env::var("SLATER_SMOKE_P30")
         .ok()
