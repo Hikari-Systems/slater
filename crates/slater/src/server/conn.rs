@@ -50,26 +50,43 @@ impl ConnCtx {
             .and_then(PsValue::as_str)
             .filter(|s| !s.is_empty())
         {
-            if self.graphs.get(db).is_none() {
-                let mut served: Vec<String> = self
+            // "Not served" and "served, but you hold no grant" answer with the *same*
+            // failure — same code, message and GQLSTATUS. Answering them differently
+            // made the pair a graph-name oracle: any authenticated principal, even one
+            // granted nothing, could probe a name and learn from the status code
+            // whether this deployment hosts it. Nothing else leaks the names (every
+            // listing surface, and the `available:` list below, is `can_read`-filtered),
+            // so this dichotomy was the whole of the exposure. `USE <graph>` already
+            // collapsed the two cases; this is `select_graph` catching up, not a new
+            // principle. (HIK-221)
+            //
+            // The distinction an operator needs is preserved in the log below —
+            // deliberately server-side only, never on the wire.
+            let is_served = self.graphs.get(db).is_some();
+            if !is_served || !acl.can_read(user, db) {
+                if is_served {
+                    // Security-relevant: a principal named a real graph it may not read.
+                    warn!(
+                        %user, graph = %db,
+                        "denied: no read grant (answered as not-served, to avoid a name oracle)"
+                    );
+                } else {
+                    // Benign and common — usually a mistyped database name.
+                    debug!(%user, graph = %db, "not served: no such graph");
+                }
+                let mut available: Vec<String> = self
                     .graphs
                     .names()
                     .into_iter()
                     .filter(|g| acl.can_read(user, g))
                     .collect();
-                served.sort();
+                available.sort();
                 return Err(Failure::new(
                     CODE_NOT_FOUND,
                     format!(
                         "graph '{db}' is not served (available: {})",
-                        served.join(", ")
+                        available.join(", ")
                     ),
-                ));
-            }
-            if !acl.can_read(user, db) {
-                return Err(Failure::new(
-                    CODE_FORBIDDEN,
-                    format!("user '{user}' has no read grant on graph '{db}'"),
                 ));
             }
             return Ok(db.to_string());

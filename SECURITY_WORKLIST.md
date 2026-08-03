@@ -99,6 +99,34 @@ authenticated principals over Bolt).
   itself is not reproducible against the emulator through slater's API — hence the unit tests pin
   that specific arm.)
 
+## Closed — graph names were enumerable through the failure code (2026-08-03, HIK-221)
+
+- [x] **✅ FIXED — `select_graph` answered "not served" and "no read grant" differently.**
+  Any authenticated principal may name an arbitrary graph in `BEGIN {db:…}` / `RUN {db:…}`
+  (also `SHOW STORAGE INFO` and the scoped introspection statements); only "is authenticated"
+  is checked first, so a principal holding **no grant at all** reached both branches. A
+  non-existent name returned `CODE_NOT_FOUND`, an existing-but-ungranted one `CODE_FORBIDDEN`
+  — so the response was an oracle for "does this deployment host a graph called X?".
+
+  Four channels carried the distinction, not the three first identified: the legacy `code`,
+  the `message`, the derived `gql_status` (`Failure::gqlstatus` maps FORBIDDEN into class
+  `42000` and NOT_FOUND into `50000`), and `status_description`, which embeds the message
+  again. A client reading *any* one of them could tell the cases apart.
+
+  Exposure was names only, post-authentication — no data, no grant escalation — and the
+  names were not otherwise reachable: `readable_databases`, `Acl::readable_graphs` and the
+  `available:` list inside the error are all `can_read`-filtered. This dichotomy was the
+  whole of it.
+
+  *Fixed (HIK-221):* both cases now return the identical `CODE_NOT_FOUND` failure, which is
+  what `USE <graph>` had always done — an internal inconsistency, not a missing principle.
+  The operator-facing distinction moves server-side: `warn!` when a real graph is denied (a
+  possible probe), `debug!` when the name is simply not served (usually a typo). The
+  db-less arm keeps `CODE_FORBIDDEN` deliberately — it names no graph, so there is nothing
+  to enumerate, and HIK-123's regression tests depend on that signal. Test:
+  `an_unreadable_graph_is_indistinguishable_from_a_missing_one`, which compares the whole
+  failure metadata map (so a fifth channel added later cannot reopen the hole silently).
+
 ## Closed — session state outlived the identity it belonged to (2026-07-16, HIK-123)
 
 - [x] **✅ FIXED — `LOGOFF` left the prior user's rows and transaction graph on the connection.**

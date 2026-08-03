@@ -321,6 +321,13 @@ per-connection state machine that ties `generation`+`cache`+`bolt`+`acl`+`parser
   enforces the per-graph `read` grant before parsing — codes:
   `Security.Unauthorized`/`Security.Forbidden`/`Database.DatabaseNotFound`/
   `Statement.SyntaxError`/`Statement.AccessMode` (read-only)/`Statement.ExecutionFailed`.
+  An **explicitly named** graph the user may not read answers
+  `Database.DatabaseNotFound`, identically to a graph that is not served at all —
+  otherwise the code pair enumerates graph names to any authenticated principal
+  (HIK-221); the real reason is logged server-side instead. `Security.Forbidden`
+  remains the answer wherever no attacker-chosen name is at stake: a db-less `RUN`
+  by a user with no readable graph, a grant revoked mid-transaction, and write
+  authorisation.
 - **`server` agent string `Neo4j/5.4.0 (Slater <ver>)`.** Kept with the `Neo4j/`
   prefix so the official drivers' agent-sniffing treats us as a modern Bolt server,
   while still naming Slater honestly. TLS is optional (`rustls` acceptor when a

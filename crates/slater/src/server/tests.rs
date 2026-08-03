@@ -11701,6 +11701,87 @@ async fn logoff_does_not_leave_the_prior_users_transaction_graph_for_the_next_us
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// **Graph names must not be enumerable through the failure.** Any authenticated
+/// user — including one holding no grant anywhere — may name an arbitrary graph in
+/// `BEGIN {db: …}`. If an *existing* graph they cannot read fails differently from a
+/// name the server does not host, the pair is an oracle: probe a name, read the
+/// failure, learn whether this deployment serves it.
+///
+/// The oracle had three channels, so this asserts all three: the legacy `code`
+/// (`…Security.Forbidden` vs `…Database.DatabaseNotFound`), the `message` text, and
+/// the derived `gql_status` (`42000` vs `50000` — `Failure::gqlstatus` maps FORBIDDEN
+/// into the syntax-or-access class, so a client reading only GQLSTATUS could still
+/// tell the two apart).
+///
+/// The probed name is normalised out of the message before comparison, because the
+/// message legitimately echoes back whatever the caller asked for — that is the
+/// caller's own input and reveals nothing.
+#[tokio::test]
+async fn an_unreadable_graph_is_indistinguishable_from_a_missing_one() {
+    let (root, ctx) = two_user_ctx("server_hik221_enumeration");
+    let addr = spawn_server(ctx).await;
+    let mut c = Client::connect(addr).await;
+
+    c.send(Client::hello()).await;
+    assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+    // `intruder` authenticates but is granted nothing; `people` exists and is
+    // readable only by `reporting`.
+    c.send(Client::logon("intruder", "pw2")).await;
+    assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+    // Everything the client can observe about a failure, with the probed name
+    // replaced so the two responses are comparable.
+    let observable = |fields: &[PsValue], probed: &str| -> Vec<(String, String)> {
+        let PsValue::Map(m) = &fields[0] else {
+            panic!("a FAILURE must carry a metadata map");
+        };
+        m.iter()
+            .map(|(k, v)| {
+                let raw = v.as_str().unwrap_or_default();
+                (k.clone(), raw.replace(probed, "<probed>"))
+            })
+            .collect()
+    };
+
+    // (a) A graph that exists, which this user may not read.
+    c.send(Client::begin_db("people")).await;
+    let (tag, fields) = c.recv().await;
+    assert_eq!(tag, message::tag::FAILURE, "an ungranted BEGIN must fail");
+    let unreadable = observable(&fields, "people");
+    c.send(Client::reset()).await;
+    assert_eq!(c.recv().await.0, message::tag::SUCCESS);
+
+    // (b) A name the server does not host at all.
+    c.send(Client::begin_db("no_such_graph")).await;
+    let (tag, fields) = c.recv().await;
+    assert_eq!(
+        tag,
+        message::tag::FAILURE,
+        "an unknown-graph BEGIN must fail"
+    );
+    let missing = observable(&fields, "no_such_graph");
+
+    assert_eq!(
+        unreadable, missing,
+        "an existing-but-unreadable graph must be indistinguishable from a missing \
+         one; any difference here is a graph-name oracle"
+    );
+
+    // The failure must not become a *new* oracle: the `available:` list is
+    // `can_read`-filtered, so a user with no grants must be told about no graphs.
+    let msg = missing
+        .iter()
+        .find(|(k, _)| k == "message")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("people"),
+        "the failure leaked a graph name the user cannot read: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The `tx_graph` arm re-checks the ACL per RUN, not once at BEGIN — so a grant
 /// revoked by an ACL hot-reload stops being served *inside* an open transaction,
 /// with no identity change involved. Independent of the LOGOFF clear: this one
