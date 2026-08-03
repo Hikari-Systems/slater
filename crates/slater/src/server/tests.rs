@@ -12000,10 +12000,86 @@ async fn unknown_principal_still_pays_for_a_full_verify() {
 
     // Same work, so the same order of magnitude. A skipped verify would be orders of
     // magnitude faster, which is exactly what the enumeration attack looks for.
+    //
+    // Two-sided (HIK-222). The old assertion was `unknown * 2 >= known`, which bounded
+    // only the "unknown is suspiciously fast" direction and tolerated the known path
+    // being up to 2x slower — so a deployment whose stored hashes were minted at
+    // stronger-than-default parameters diverged silently. The unknown path must not be
+    // conspicuously *slower* either: that is the same oracle with the sign flipped.
     assert!(
         unknown_user * 2 >= known_user,
         "an unknown principal took {unknown_user:?} against {known_user:?} for a known \
              one — the timing equalisation is gone"
+    );
+    assert!(
+        known_user * 4 >= unknown_user,
+        "an unknown principal took {unknown_user:?} against {known_user:?} for a known \
+             one — the unknown path is conspicuously slower, which enumerates just as \
+             well as being faster"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **The equalisation must track hashes the operator minted elsewhere.** `acl.json`
+/// accepts any valid PHC string, and argon2 verification derives at the *stored*
+/// parameters — so a deployment whose hashes came from a third-party tool used to run
+/// its known-user path at one cost and its unknown-user path at `Argon2::default()`'s.
+/// That divergence is username enumeration by timing, and it was live for anyone not
+/// using `slater hash-password`. (HIK-222)
+///
+/// The mechanism is pinned deterministically by `acl::tests::the_equalisation_hash_*`;
+/// this is the end-to-end backstop that the wall-clock actually follows.
+#[tokio::test]
+async fn an_unknown_principal_tracks_non_default_stored_parameters() {
+    // Deliberately *cheaper* than the default (m=19456, t=2), so the fixture is quick:
+    // the divergence to detect is the same either way, and argon2 is unoptimised in a
+    // debug build. Pre-fix the unknown path burns the ~19 MiB default dummy against
+    // this user's 64 KiB hash — a large, easily-measured gap in the wrong direction.
+    let weak = {
+        let params = argon2::Params::new(64, 1, 1, None).unwrap();
+        let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let salt = argon2::password_hash::SaltString::generate(
+            &mut argon2::password_hash::rand_core::OsRng,
+        );
+        argon2::password_hash::PasswordHasher::hash_password(&a, b"pw", &salt)
+            .unwrap()
+            .to_string()
+    };
+    let (root, ctx) = build_ctx_limited(
+        "server_auth_timing_nondefault",
+        TestLimits {
+            acl_json: Some(serde_json::json!({
+                "users": { "weak": { "passwordArgon2id": weak, "grants": {} } }
+            })),
+            ..Default::default()
+        },
+    );
+
+    // Warm any lazily-built state so a one-off mint is not counted.
+    assert!(!verify_off_reactor(&ctx, "nobody", "wrong", None)
+        .await
+        .unwrap());
+
+    let t0 = Instant::now();
+    assert!(!verify_off_reactor(&ctx, "weak", "wrong", None)
+        .await
+        .unwrap());
+    let known_user = t0.elapsed();
+
+    let t0 = Instant::now();
+    assert!(!verify_off_reactor(&ctx, "no-such-user", "wrong", None)
+        .await
+        .unwrap());
+    let unknown_user = t0.elapsed();
+
+    // Both derive at m=64,t=1 now, so they land within a small factor. The pre-fix gap
+    // is ~300x (19456*2 vs 64*1 block computations), so a loose bound still catches it
+    // decisively while leaving ample room for scheduler noise on a tiny workload.
+    assert!(
+        unknown_user * 10 >= known_user && known_user * 10 >= unknown_user,
+        "unknown {unknown_user:?} vs known {known_user:?}: the unknown-principal path \
+             is not deriving at the stored parameters, so a username can be found by \
+             timing on any deployment that minted its hashes elsewhere"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

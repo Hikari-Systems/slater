@@ -26,7 +26,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Argon2, Params};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -68,16 +68,70 @@ impl Acl {
 
     /// Verify `password` for `user`. Returns `true` only for a known user whose
     /// stored argon2id hash verifies. An unknown user still runs a verify against
-    /// a dummy hash so a missing account is not distinguishable by timing.
+    /// an equalisation hash so a missing account is not distinguishable by timing.
     pub fn verify(&self, user: &str, password: &str) -> bool {
         match self.users.get(user) {
             Some(u) => verify_hash(&u.password_argon2id, password),
             None => {
                 // Equalise timing against the absent-user path.
-                let _ = verify_hash(dummy_hash(), password);
+                let _ = verify_hash(self.equalisation_hash(), password);
                 false
             }
         }
+    }
+
+    /// The stored hash an *unknown* principal is verified against, so the two paths
+    /// cost the same and a username cannot be found by timing.
+    ///
+    /// This borrows the costliest hash the ACL actually holds rather than minting one
+    /// at [`Argon2::default`]'s parameters. Verification is **parameter-agnostic** —
+    /// `PasswordHash::new` reads `m`/`t`/`p` out of the stored PHC string and the
+    /// blanket `PasswordVerifier` impl re-derives with those — so a hash minted by any
+    /// third-party argon2 tool verifies at *its* cost, not the default's. A fixed
+    /// default-parameter dummy therefore diverged from the known-user path the moment
+    /// an operator minted with anything else, and username enumeration by timing came
+    /// back. (HIK-222)
+    ///
+    /// Borrowing is exact by construction: the unknown-user path runs the very same
+    /// derivation a real login runs. Minting at "observed" parameters could only
+    /// approximate that, and only for as long as the two code paths agreed.
+    ///
+    /// Verifying an attacker-supplied password against a real user's hash is safe: the
+    /// result is discarded and the caller returns `false` unconditionally, so even a
+    /// correct guess authenticates nobody — there is no account being logged into. The
+    /// comparison is constant-time, so a hit and a miss cost the same.
+    ///
+    /// **Cost metric** is `m_cost × t_cost`: the number of block computations. `p`
+    /// partitions the same memory into lanes rather than multiplying the work, so it
+    /// does not belong in the product; it breaks ties only to keep the choice stable.
+    ///
+    /// **Limit worth knowing.** With *heterogeneous* stored parameters no single dummy
+    /// can equalise everything — different users already cost different amounts, so
+    /// timing leaks *which* user independently of whether the name exists. Taking the
+    /// maximum means an unknown name looks like the most expensive known user: an
+    /// attacker who sees "fast" learns only "some cheap known user", and "slow" stays
+    /// ambiguous between unknown and the expensive one. Equalising *downward* would be
+    /// worse — it would make the known path the slow one and reopen the oracle with the
+    /// sign flipped. With uniform parameters (one minting tool, the normal case) the
+    /// equalisation is exact.
+    fn equalisation_hash(&self) -> &str {
+        self.users
+            .values()
+            .filter_map(|u| {
+                let parsed = PasswordHash::new(&u.password_argon2id).ok()?;
+                let params = Params::try_from(&parsed).ok()?;
+                let work = u64::from(params.m_cost()) * u64::from(params.t_cost());
+                Some((work, params.p_cost(), u.password_argon2id.as_str()))
+            })
+            // `max_by_key` over the whole tuple, so the hash string itself is the final
+            // tie-break: the choice must not depend on `HashMap` iteration order, or it
+            // would drift between runs and between ACL reloads.
+            .max_by_key(|&(work, p, hash)| (work, p, hash))
+            .map(|(_, _, hash)| hash)
+            // No users at all — nothing to borrow, so fall back to the minted default.
+            // Vacuous in this case: with zero accounts *every* login is an unknown-user
+            // login, so there is nothing for it to be distinguished from.
+            .unwrap_or_else(|| dummy_hash().as_str())
     }
 
     /// Does `user` hold a `read` grant on `graph`?
@@ -134,9 +188,14 @@ fn verify_hash(stored: &str, password: &str) -> bool {
     }
 }
 
-/// A throwaway hash used to keep the unknown-user verify path constant-time. Built
-/// once on first use.
-fn dummy_hash() -> &'static str {
+/// Last-resort equalisation hash for an ACL that holds **no users at all**, so
+/// [`Acl::equalisation_hash`] has nothing to borrow. Built once on first use.
+///
+/// Not the params-of-record for anything: an ACL with users always equalises against
+/// one of its own hashes. The literal fallback below is reached only if minting
+/// itself fails (`OsRng` unavailable), and being a well-formed PHC string it still
+/// burns a full verify rather than returning early.
+fn dummy_hash() -> &'static String {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
         hash_password("\0slater-absent-user\0")
@@ -399,6 +458,140 @@ mod tests {
             "users": { user: { "passwordArgon2id": hash, "grants": grants_json } }
         });
         Acl::from_json_str(&json.to_string()).unwrap()
+    }
+
+    /// Mint a hash at explicit, non-default argon2id parameters — the shape an
+    /// operator produces with any third-party tool, which `acl.json` accepts happily.
+    fn hash_password_with(password: &str, m_cost: u32, t_cost: u32, p_cost: u32) -> String {
+        let params = Params::new(m_cost, t_cost, p_cost, None).unwrap();
+        let a = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let salt = SaltString::generate(&mut OsRng);
+        a.hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    fn params_of(phc: &str) -> (u32, u32, u32) {
+        let parsed = PasswordHash::new(phc).unwrap();
+        let p = Params::try_from(&parsed).unwrap();
+        (p.m_cost(), p.t_cost(), p.p_cost())
+    }
+
+    /// **The unknown-principal path must cost what a real login costs.** argon2
+    /// verification reads `m`/`t`/`p` from the *stored* PHC string, so a dummy minted
+    /// at `Argon2::default()` diverges the moment an operator mints with anything else
+    /// — and username enumeration by timing returns. The equalisation hash must
+    /// therefore be one the ACL actually holds. (HIK-222)
+    ///
+    /// Structural rather than timed, so it cannot go flaky: it asserts the *parameters*
+    /// the unknown path will derive at, which is the property the timing depends on.
+    #[test]
+    fn the_equalisation_hash_tracks_the_stored_parameters() {
+        // Deliberately *cheaper* than the default (m=19456, t=2): same divergence to
+        // detect, but the test does less work than one at default cost. argon2 is
+        // unoptimised in a debug build, so an expensive fixture would tax every run.
+        let weak = hash_password_with("pw", 8, 1, 1);
+        let json = serde_json::json!({
+            "users": { "only": { "passwordArgon2id": weak, "grants": {} } }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+
+        assert_eq!(
+            params_of(acl.equalisation_hash()),
+            (8, 1, 1),
+            "the unknown-user path must derive at the stored parameters, not at \
+             Argon2::default()'s — otherwise its cost diverges from a real login's"
+        );
+    }
+
+    /// With mixed parameters, equalise *upward*: an unknown name must look like the
+    /// most expensive known user. Equalising downward would make the known path the
+    /// slow one and reopen the same oracle with the sign flipped.
+    #[test]
+    fn the_equalisation_hash_takes_the_costliest_stored_parameters() {
+        let cheap = hash_password_with("pw", 8, 1, 1);
+        let dear = hash_password_with("pw", 16, 3, 1); // 6x the block computations
+        let json = serde_json::json!({
+            "users": {
+                "cheap": { "passwordArgon2id": cheap, "grants": {} },
+                "dear":  { "passwordArgon2id": dear,  "grants": {} }
+            }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+
+        assert_eq!(
+            params_of(acl.equalisation_hash()),
+            (16, 3, 1),
+            "the costliest stored parameters must win"
+        );
+
+        // Stable across reloads: the choice must not ride on HashMap iteration order.
+        for _ in 0..8 {
+            let again = Acl::from_json_str(&json.to_string()).unwrap();
+            assert_eq!(again.equalisation_hash(), acl.equalisation_hash());
+        }
+    }
+
+    /// An ACL with no users has nothing to borrow and falls back to the minted dummy.
+    /// Vacuous for enumeration — with zero accounts every login is an unknown one —
+    /// but it must still be a well-formed hash that burns a real verify.
+    #[test]
+    fn an_empty_acl_still_burns_a_verify_for_an_unknown_principal() {
+        let acl = Acl::from_json_str(r#"{"users":{}}"#).unwrap();
+        let phc = acl.equalisation_hash();
+        assert!(phc.starts_with("$argon2id$"), "got {phc}");
+        assert!(PasswordHash::new(phc).is_ok(), "must be parseable: {phc}");
+        assert!(!acl.verify("nobody", "wrong"));
+    }
+
+    /// ADVERSARIAL: a malformed stored hash must not become the equalisation hash,
+    /// and must not make the ACL fall back to the default-params dummy either.
+    #[test]
+    fn adversarial_malformed_hash_is_skipped_not_selected() {
+        let good = hash_password_with("pw", 16, 2, 1);
+        let json = serde_json::json!({
+            "users": {
+                "broken": { "passwordArgon2id": "not-a-phc-string", "grants": {} },
+                "good":   { "passwordArgon2id": good, "grants": {} }
+            }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+        assert_eq!(params_of(acl.equalisation_hash()), (16, 2, 1));
+        assert!(!acl.verify("nobody", "x"));
+    }
+
+    /// ADVERSARIAL: an ACL where *every* stored hash is malformed has nothing valid to
+    /// borrow. It must still burn a real verify rather than returning early.
+    #[test]
+    fn adversarial_all_malformed_still_burns_a_verify() {
+        let json = serde_json::json!({
+            "users": { "a": { "passwordArgon2id": "garbage", "grants": {} } }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+        let phc = acl.equalisation_hash();
+        assert!(
+            PasswordHash::new(phc).is_ok(),
+            "must fall back to a usable hash: {phc}"
+        );
+        assert!(!acl.verify("nobody", "x"));
+    }
+
+    /// ADVERSARIAL: the unknown-user arm must return false even when the supplied
+    /// password is the *correct* one for the borrowed hash's owner.
+    #[test]
+    fn adversarial_correct_password_for_the_borrowed_hash_authenticates_nobody() {
+        let json = serde_json::json!({
+            "users": { "real": { "passwordArgon2id": hash_password("s3cret").unwrap(), "grants": {} } }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+        assert!(
+            acl.verify("real", "s3cret"),
+            "precondition: the real login works"
+        );
+        assert!(
+            !acl.verify("ghost", "s3cret"),
+            "a correct password against the borrowed hash must still authenticate nobody"
+        );
     }
 
     #[test]

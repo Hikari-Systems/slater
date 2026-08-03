@@ -195,7 +195,14 @@ hash-password` subcommand, wired in `main` before the runtime starts, mirroring 
 healthcheck pattern) mints them with a random salt and the argon2 crate's default
 params. `verify` runs a dummy verify on the unknown-user path so a missing account is
 not distinguishable by response timing, and a malformed stored hash logs and rejects
-rather than erroring. Grants are per-graph and only `"read"` is meaningful today;
+rather than erroring. That equalisation verifies against **the costliest hash the ACL
+actually holds**, not one minted at the default params (HIK-222): argon2 derives at
+the parameters in the *stored* PHC string, so a fixed default-params dummy diverged
+from the known-user path on any deployment whose hashes came from a third-party tool
+— in either direction, and by two orders of magnitude in the case measured. Borrowing
+a stored hash is exact by construction and costs nothing to build. The default-params
+mint above is therefore what `hash-password` *produces*, not what the equalisation
+*depends on*. Grants are per-graph and only `"read"` is meaningful today;
 `can_read(user, graph)` gates both the `db` select and every query. `AclHandle` wraps
 `RwLock<Arc<Acl>>`: handlers take a cheap `snapshot()` per request while the
 background poller swaps the active ACL underneath them. `reload()` re-reads and, on a

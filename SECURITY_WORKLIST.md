@@ -99,6 +99,44 @@ authenticated principals over Bolt).
   itself is not reproducible against the emulator through slater's API — hence the unit tests pin
   that specific arm.)
 
+## Closed — the timing equalisation used the wrong argon2 parameters (2026-08-03, HIK-222)
+
+- [x] **✅ FIXED — the unknown-user dummy hash was minted at `Argon2::default()`, not at the
+  stored parameters.** `Acl::verify` burns a full argon2id verify for an unknown principal so a
+  username cannot be found by timing. But argon2 verification is **parameter-agnostic**:
+  `PasswordHash::new` reads `m`/`t`/`p` out of the stored PHC string and the blanket
+  `PasswordVerifier` impl re-derives with *those*. The dummy was minted at the crate defaults
+  (m=19456, t=2, p=1), so the moment a deployment's hashes came from anywhere other than
+  `slater hash-password` — and `acl.json` accepts any valid PHC string — the two paths derived
+  at different costs and the equalisation was gone.
+
+  **Live for any non-default deployment, and worse than "stronger hashes diverge".** The gap
+  opens in *both* directions, and the cheaper direction is the more common one (operators lower
+  the memory cost for speed). Measured against the unfixed code with a 64 KiB / t=1 stored hash:
+  **unknown principal 841 ms, known principal 8.9 ms — a 95× gap**, trivially readable over a
+  network. The old guard (`unknown * 2 >= known`) bounded only the "unknown is suspiciously
+  fast" direction and could not see this at all.
+
+  *Fixed (HIK-222):* the unknown-user path now verifies against **the costliest hash the ACL
+  actually holds**, rather than a minted one. Exact by construction — it runs the very same
+  derivation a real login runs — and free to build, where minting at observed parameters would
+  cost an argon2 hash per ACL construction. Safe: the result is discarded and `verify` returns
+  `false` unconditionally, so even a correct guess authenticates nobody. With heterogeneous
+  stored parameters no single dummy can equalise everything (timing already leaks *which* user);
+  taking the maximum means an unknown name looks like the most expensive known user, which is
+  the best a single dummy can do and strictly better than equalising downward. An ACL with no
+  users at all keeps the minted fallback, where the question is vacuous.
+
+  Tests: `acl::tests::the_equalisation_hash_tracks_the_stored_parameters` and
+  `…_takes_the_costliest_stored_parameters` (structural and deterministic — they pin the derived
+  parameters rather than a wall clock), `an_unknown_principal_tracks_non_default_stored_parameters`
+  (end-to-end backstop), and `unknown_principal_still_pays_for_a_full_verify` now bounded
+  **two-sided** — conspicuously slower enumerates as well as conspicuously faster.
+
+  *Not done here:* making the argon2 parameters configurable. The 19 MiB figure is load-bearing
+  in the `maxConcurrentAuth` DoS budget (`config.rs`, `handle.rs`, `HARDENING.md`,
+  `THREAT_MODEL.md`), so that sizing rule has to become a function of it first.
+
 ## Closed — graph names were enumerable through the failure code (2026-08-03, HIK-221)
 
 - [x] **✅ FIXED — `select_graph` answered "not served" and "no read grant" differently.**
