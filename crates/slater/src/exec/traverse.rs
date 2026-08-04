@@ -35,6 +35,15 @@ pub(crate) struct VarLenWalk<'a> {
     pub(crate) mode: WalkMode,
     /// Scope for per-hop predicate evaluation.
     pub(crate) binding: &'a HashMap<String, Val>,
+    /// The pattern the walk's *end* node must satisfy.
+    ///
+    /// Applied at emission rather than by the caller draining `out` afterwards
+    /// (HIK-218). `node_ok` depends only on the endpoint, never on the path taken to
+    /// reach it, so testing it early is semantically identical — and it means a
+    /// rejected path never has its hop vector cloned or stored. On a fan-out graph
+    /// that is the difference between materialising every path and materialising only
+    /// the surviving ones.
+    pub(crate) next: &'a NodePat,
 }
 
 pub(crate) struct VarLenScratch<'a> {
@@ -1109,6 +1118,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         bounds: (min, max),
                         mode,
                         binding,
+                        next,
                     },
                     &mut VarLenScratch {
                         path: &mut path,
@@ -1121,9 +1131,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     if cap.is_some_and(|c| out.len() >= c) {
                         break;
                     }
-                    if !self.node_ok(endnode, next, &Scope::Map(binding), &[])? {
-                        continue;
-                    }
+                    // `node_ok` is applied inside the walk now (HIK-218), so a path
+                    // that reaches here has already passed it.
                     if let Some(v) = &next.var {
                         if let Some(existing) = binding.get(v) {
                             if existing.loose_eq(&Val::Node(endnode)) != Some(true) {
@@ -1181,10 +1190,17 @@ impl<'g, V: ReadView> Engine<'g, V> {
     ) -> Result<()> {
         let (min, max) = w.bounds;
         if sc.path.len() as u32 >= min {
-            // Each emission clones the hop vector, so charge by sc.path length: on a
+            // Each emission clones the hop vector, so charge by path length: on a
             // dense graph the depth cap alone still permits an enormous result set.
+            //
+            // Charge BEFORE the end-node filter, deliberately. The budget measures work
+            // the walk performed, and it performed this hop whether or not the endpoint
+            // survives — so the charge sequence is byte-for-byte what it was before the
+            // filter moved in here (HIK-218).
             self.charge(sc.path.len() as u64 + 1)?;
-            sc.out.push((sc.path.clone(), node));
+            if self.node_ok(node, w.next, &Scope::Map(w.binding), &[])? {
+                sc.out.push((sc.path.clone(), node));
+            }
         }
         if sc.path.len() as u32 >= max {
             return Ok(());
@@ -1195,8 +1211,8 @@ impl<'g, V: ReadView> Engine<'g, V> {
         for hop in self.expand_one_hop(node, w.rel, w.binding)? {
             let edge = hop.edge;
             let nb = hop.neighbour;
-            // SIMPLE alone permits the one repeat that closes the walk at its w.start;
-            // it is emitted but never extended (extending would repeat the w.start as
+            // SIMPLE alone permits the one repeat that closes the walk at its start;
+            // it is emitted but never extended (extending would repeat the start as
             // an interior node).
             let mut close_only = false;
             match w.mode {
@@ -1224,14 +1240,16 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 sc.used.insert(edge);
             }
             // `insert` returns false (so `inserted` stays false) when the node is
-            // already present — e.g. the SIMPLE close-the-cycle hop back to `w.start`,
+            // already present — e.g. the SIMPLE close-the-cycle hop back to the start,
             // which the caller pre-seeded — so we never wrongly remove it on unwind.
             let inserted = track_nodes && sc.visited.insert(nb);
             sc.path.push(hop);
             if close_only {
                 if sc.path.len() as u32 >= min {
                     self.charge(sc.path.len() as u64 + 1)?;
-                    sc.out.push((sc.path.clone(), nb));
+                    if self.node_ok(nb, w.next, &Scope::Map(w.binding), &[])? {
+                        sc.out.push((sc.path.clone(), nb));
+                    }
                 }
             } else {
                 self.varlen(nb, w, sc)?;
