@@ -213,3 +213,8 @@ required-features = ["testkit"]
 name = "ipnsw_ladder_e2e"
 harness = false
 required-features = ["testkit"]
+
+[[bench]]
+name = "query_runtime"
+harness = false
+required-features = ["testkit"]

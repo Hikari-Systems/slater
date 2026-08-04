@@ -315,6 +315,36 @@ pub struct Reader {
     cache: BlockCache,
 }
 
+/// A mandatory per-query memory ceiling for [`Reader::with_engine`].
+///
+/// Exists so the ceiling cannot be omitted by accident. `Engine`'s own setters take `0`
+/// to mean *unlimited*, which is the right default for the server (config always supplies
+/// a real value) and exactly the wrong one for a harness — so this type refuses `0` and
+/// makes the caller name a number.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBudget {
+    /// Ceiling on *retained* intermediate elements (`query.maxIntermediate`).
+    pub max_intermediate: u64,
+    /// Ceiling on *transient* walk elements (`query.maxScan`).
+    pub max_scan: u64,
+}
+
+impl QueryBudget {
+    /// Build a ceiling. Panics on `0`, which `Engine` would read as "unlimited" — the
+    /// failure mode this type exists to prevent.
+    pub fn new(max_intermediate: u64, max_scan: u64) -> Self {
+        assert!(
+            max_intermediate > 0 && max_scan > 0,
+            "a query budget of 0 means UNLIMITED to Engine; name a real ceiling \
+             (got max_intermediate={max_intermediate}, max_scan={max_scan})"
+        );
+        Self {
+            max_intermediate,
+            max_scan,
+        }
+    }
+}
+
 impl Reader {
     /// Cold-open `root/graph` with a base block cache of `cache_bytes` (size it past the
     /// working set so a single read never evicts — then a miss count is exactly the distinct
@@ -357,6 +387,41 @@ impl Reader {
     /// Cumulative segment-stack block misses so far.
     pub fn segment_misses(&self) -> u64 {
         self.gen.stack().cache_metrics().misses
+    }
+
+    /// Run `f` against an [`Engine`] over this reader's generation, with `fanout` as the
+    /// per-query worker pool and `budget` as its **mandatory** memory ceiling.
+    ///
+    /// [`run`](Self::run) hardcodes engine construction and so always gets
+    /// `fanout_pool: None` — and `chain_parallelizable` (`exec::traverse`) *requires* a
+    /// pool, so the whole `Frame` / `par_walk` / `flatten` code path is unreachable from
+    /// every existing bench and from any test that goes through `Reader`. A benchmark
+    /// that wants to measure that path has to be able to supply one.
+    ///
+    /// # The budget is a required argument, deliberately
+    ///
+    /// [`Engine::new`] defaults `max_intermediate` and `max_scan` to `0`, and **`0` means
+    /// unlimited**, not zero. The server never runs that way — it sets both from
+    /// `query.maxIntermediate` / `query.maxScan` — so a harness that builds an `Engine`
+    /// directly is the only place the guard can go missing. On a graph with hubs an
+    /// unbudgeted expansion materialises until the machine dies rather than returning a
+    /// budget error, which has happened. Taking the ceiling as a positional parameter
+    /// rather than an optional `with_…` setter makes forgetting it a compile error.
+    ///
+    /// Closure-based rather than returning the `Engine`: the `MergedView` it borrows is a
+    /// temporary owned inside this call, so it cannot outlive the frame.
+    pub fn with_engine<R>(
+        &self,
+        budget: QueryBudget,
+        fanout: Option<Arc<rayon::ThreadPool>>,
+        f: impl FnOnce(&Engine<'_, MergedView<'_>>) -> R,
+    ) -> R {
+        let view = MergedView::new(&self.gen, slater_delta::DeltaSnapshot::empty());
+        let engine = Engine::new(&view, &self.cache)
+            .with_max_intermediate(budget.max_intermediate)
+            .with_max_scan(budget.max_scan)
+            .with_fanout_pool(fanout);
+        f(&engine)
     }
 }
 
