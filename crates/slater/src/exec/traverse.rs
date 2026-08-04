@@ -55,6 +55,22 @@ pub(crate) struct VarLenScratch<'a> {
     pub(crate) visited: &'a mut HashSet<u64>,
     /// Completed `(hops, endpoint)` pairs.
     pub(crate) out: &'a mut Vec<(Vec<Hop>, u64)>,
+    /// Endpoints already emitted, when the caller has proved that two paths to the same
+    /// endpoint yield identical output rows (HIK-218 step 2). `None` disables the dedup.
+    ///
+    /// Soundness is the caller's obligation, not this struct's — see the gate in
+    /// `expand_chain`'s variable-length arm.
+    pub(crate) seen_endpoints: Option<&'a mut HashSet<u64>>,
+}
+
+impl VarLenScratch<'_> {
+    /// Record `endpoint` and report whether it is new. Always `true` when dedup is off.
+    fn first_sight_of(&mut self, endpoint: u64) -> bool {
+        match self.seen_endpoints.as_mut() {
+            Some(seen) => seen.insert(endpoint),
+            None => true,
+        }
+    }
 }
 
 impl<'g, V: ReadView> Engine<'g, V> {
@@ -1110,6 +1126,31 @@ impl<'g, V: ReadView> Engine<'g, V> {
                     visited.insert(cur);
                 }
                 let mut path = Vec::new();
+                // Endpoint dedup (HIK-218 step 2). Sound only when two paths to the same
+                // endpoint are indistinguishable in the output, which needs ALL of:
+                //
+                //  * the final projection is `DISTINCT` and this is the last reading
+                //    clause (`self.distinct_endpoint`) — otherwise path multiplicity is
+                //    observable, and Cypher counts one row per PATH, not per endpoint;
+                //  * no `path_var` — a bound path is literally the route;
+                //  * no `rel.var` — the bound relationship list differs per route;
+                //  * **this variable-length hop is the LAST in the chain.** This one is
+                //    not in the original brief and is the load-bearing condition: the
+                //    caller does `walk.extend(hops)` before recursing, and `walk` seeds
+                //    the `used` edge set of any LATER variable-length segment (see the
+                //    seeding a few lines above). Two routes to one endpoint leave
+                //    different `used` sets, so dropping one would change which edges a
+                //    subsequent segment may still traverse — wrong results, silently.
+                //
+                // Intermediate nodes are anonymous in a variable-length pattern, so with
+                // these conditions the only thing a route contributes to the output is
+                // its endpoint, and duplicates are rows the projection is about to
+                // collapse anyway.
+                let dedup_endpoints = self.distinct_endpoint.get()
+                    && pattern.path_var.is_none()
+                    && rel.var.is_none()
+                    && i + 1 == pattern.rels.len();
+                let mut seen: HashSet<u64> = HashSet::new();
                 self.varlen(
                     cur,
                     &VarLenWalk {
@@ -1125,6 +1166,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
                         used: &mut used,
                         visited: &mut visited,
                         out: &mut paths,
+                        seen_endpoints: dedup_endpoints.then_some(&mut seen),
                     },
                 )?;
                 for (hops, endnode) in paths {
@@ -1198,7 +1240,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             // survives — so the charge sequence is byte-for-byte what it was before the
             // filter moved in here (HIK-218).
             self.charge(sc.path.len() as u64 + 1)?;
-            if self.node_ok(node, w.next, &Scope::Map(w.binding), &[])? {
+            if self.node_ok(node, w.next, &Scope::Map(w.binding), &[])? && sc.first_sight_of(node) {
                 sc.out.push((sc.path.clone(), node));
             }
         }
@@ -1247,7 +1289,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
             if close_only {
                 if sc.path.len() as u32 >= min {
                     self.charge(sc.path.len() as u64 + 1)?;
-                    if self.node_ok(nb, w.next, &Scope::Map(w.binding), &[])? {
+                    if self.node_ok(nb, w.next, &Scope::Map(w.binding), &[])?
+                        && sc.first_sight_of(nb)
+                    {
                         sc.out.push((sc.path.clone(), nb));
                     }
                 }

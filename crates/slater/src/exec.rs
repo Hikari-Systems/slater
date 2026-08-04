@@ -2633,6 +2633,11 @@ pub struct Engine<'g, V: ReadView> {
     /// pattern's final hop is a plain, unfiltered, count-only edge over a homogeneous
     /// graph with no pending node-deletes (see [`Self::degree_terminal_dir`]).
     degree_terminal: Cell<bool>,
+    /// Armed when the final projection is `DISTINCT` over the *last* reading clause, so a
+    /// variable-length walk may drop a path whose endpoint it has already emitted
+    /// (HIK-218 step 2). Set by `run_single_seeded`; the structural preconditions that
+    /// make it *sound* are checked separately, at the walk itself.
+    distinct_endpoint: Cell<bool>,
     /// Memoised answer to "can a maintained degree be exact against this delta?" — `None`
     /// until first asked, then the refusal (or `Some(None)` for "yes, it can").
     ///
@@ -2705,6 +2710,7 @@ impl<'g, V: ReadView> Engine<'g, V> {
             scanned_ids: Cell::new(0),
             count_acc: Cell::new(None),
             degree_terminal: Cell::new(false),
+            distinct_endpoint: Cell::new(false),
             degrees_exact: std::cell::OnceCell::new(),
             global_budget: None,
             global_charged: Cell::new(0),

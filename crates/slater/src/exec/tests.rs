@@ -3390,6 +3390,87 @@ fn optional_match_yields_nulls() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ── HIK-218 step 2 — endpoint dedup must never change a result ───────────
+// A variable-length walk may drop a path whose endpoint it already emitted, but
+// only when two routes to that endpoint are indistinguishable in the output.
+// These pin the cases the gate must REFUSE; each would otherwise lose rows.
+
+/// The case the optimisation exists for: `DISTINCT` over the end node, no path
+/// variable, no bound relationship, var-length last in the chain.
+#[test]
+fn distinct_endpoint_dedup_matches_the_undeduped_result() {
+    let (root, res) = run(
+        "exec_h218_distinct_ok",
+        "MATCH (n:Person)-[:KNOWS*1..2]->(m:Person) RETURN DISTINCT m.name AS who ORDER BY who",
+    );
+    assert_eq!(col0(&res), vec!["Bob", "Carol"], "{:?}", col0(&res));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **Without** `DISTINCT`, Cypher emits one row per PATH. Deduping endpoints here
+/// would silently drop rows, so the gate must refuse.
+#[test]
+fn a_non_distinct_varlen_still_emits_one_row_per_path() {
+    let (root, res) = run(
+        "exec_h218_non_distinct",
+        "MATCH (n:Person)-[:KNOWS*1..2]->(m:Person) RETURN m.name AS who ORDER BY who",
+    );
+    // Alice->Bob, Alice->Carol, Bob->Carol (1-hop) + Alice->Bob->Carol (2-hop) = 4 paths.
+    assert_eq!(
+        res.rows.len(),
+        4,
+        "path multiplicity was lost: {:?}",
+        col0(&res)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bound path variable makes the route itself observable, so two routes to one
+/// endpoint are different rows even under `DISTINCT`.
+#[test]
+fn a_bound_path_var_refuses_endpoint_dedup() {
+    let (root, res) = run(
+        "exec_h218_path_var",
+        "MATCH p = (n:Person)-[:KNOWS*1..2]->(m:Person) RETURN DISTINCT p",
+    );
+    assert_eq!(
+        res.rows.len(),
+        4,
+        "distinct paths were collapsed by endpoint"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bound relationship list likewise differs per route.
+#[test]
+fn a_bound_rel_var_refuses_endpoint_dedup() {
+    let (root, res) = run(
+        "exec_h218_rel_var",
+        "MATCH (n:Person)-[r:KNOWS*1..2]->(m:Person) RETURN DISTINCT r",
+    );
+    assert_eq!(
+        res.rows.len(),
+        4,
+        "distinct relationship lists were collapsed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An aggregate counts PATHS, so the gate must refuse even under `DISTINCT`.
+#[test]
+fn an_aggregate_refuses_endpoint_dedup() {
+    let (root, res) = run(
+        "exec_h218_aggregate",
+        "MATCH (n:Person)-[:KNOWS*1..2]->(m:Person) RETURN DISTINCT count(*) AS c",
+    );
+    assert_eq!(
+        res.rows[0][0].to_display(),
+        "4",
+        "path count was deduped away"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ── HIK-217 — seed pruning must not change any result ────────────────────
 // `apply_match` seeds the matcher's binding with only the incoming columns the
 // clause can actually read, rather than the whole relation. These pin the ways

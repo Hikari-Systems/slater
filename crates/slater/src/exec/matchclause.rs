@@ -16,10 +16,28 @@ impl<'g, V: ReadView> Engine<'g, V> {
         // the final 1:1 projection — earlier clauses may be filtered or expanded
         // downstream, so capping them could under-produce.
         let cap = self.projection_row_cap(&sq.ret.body, sq.ret.distinct)?;
+        // A `RETURN DISTINCT` lets the LAST reading clause's variable-length walk drop a
+        // path whose endpoint it has already emitted (HIK-218 step 2). Restricted to the
+        // last clause for the same reason `cap` is: an earlier clause's row multiplicity
+        // can still be observed downstream (an aggregate, a further expansion), whereas
+        // the final projection is about to collapse these rows anyway.
+        //
+        // Aggregates disqualify it — `RETURN DISTINCT count(*)` counts paths, and paths
+        // are exactly what this drops. This flag alone is NOT sufficient for soundness;
+        // the structural preconditions are checked at the walk (see `expand_chain`).
+        let distinct_endpoint = sq.ret.distinct
+            && !sq
+                .ret
+                .body
+                .items
+                .iter()
+                .any(|it| contains_aggregate(&it.expr));
         let last = sq.reading.len();
         let mut table = seed;
         for (i, clause) in sq.reading.iter().enumerate() {
             let clause_cap = if i + 1 == last { cap } else { None };
+            self.distinct_endpoint
+                .set(distinct_endpoint && i + 1 == last);
             match clause {
                 Clause::Match(m) => table = self.apply_match(table, m, clause_cap)?,
                 Clause::With(w) => {
