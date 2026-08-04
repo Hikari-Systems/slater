@@ -79,6 +79,7 @@ RUN mkdir -p crates/graph-format/src crates/graph-format/benches \
     && echo 'fn main() {}' > crates/slater/benches/ipnsw_pq_checkpoint.rs \
     && echo 'fn main() {}' > crates/slater/benches/ipnsw_base_e2e.rs \
     && echo 'fn main() {}' > crates/slater/benches/ipnsw_ladder_e2e.rs \
+    && echo 'fn main() {}' > crates/slater/benches/query_runtime.rs \
     && echo '' > crates/slater/tests/dump_roundtrip.rs \
     && echo '' > crates/slater/tests/writable_bolt_roundtrip.rs \
     && echo '' > crates/slater/tests/wd91m_write_smoke.rs \
