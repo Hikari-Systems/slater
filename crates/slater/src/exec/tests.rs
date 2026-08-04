@@ -3407,6 +3407,47 @@ fn distinct_endpoint_dedup_matches_the_undeduped_result() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// **Proof the dedup actually fires.** The result set cannot show it — the projection
+/// would collapse these rows regardless — so this counts the paths dropped.
+///
+/// The diamond is `s -> {a,b,c} -> t`, so `*1..2` reaches `t` by three distinct routes.
+/// Two of them are redundant under `DISTINCT` over the end node.
+#[test]
+fn the_endpoint_dedup_fires_on_converging_routes() {
+    use crate::exec::traverse::VARLEN_DEDUP_SKIPS;
+    let (root, graph) = testgen::write_diamond("exec_h218_diamond");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    let run_q = |q: &str| -> (usize, u64) {
+        VARLEN_DEDUP_SKIPS.with(|c| c.set(0));
+        let engine = Engine::new(&gen, &cache);
+        let ast = parser::parse(q).unwrap();
+        let n = engine.run(&ast).unwrap().rows.len();
+        (n, VARLEN_DEDUP_SKIPS.with(|c| c.get()))
+    };
+
+    // DISTINCT over the end node: the gate opens and the redundant routes to `t` drop.
+    let (rows, skips) =
+        run_q("MATCH (s:N {name: 's'})-[:R*1..2]->(m:N) RETURN DISTINCT m.name AS n ORDER BY n");
+    assert_eq!(rows, 4, "expected s's reachable set {{a,b,c,t}}");
+    assert!(
+        skips > 0,
+        "the dedup never fired — the optimisation is inert"
+    );
+
+    // Same walk without DISTINCT: the gate must stay shut, so nothing is dropped.
+    let (rows_all, skips_all) =
+        run_q("MATCH (s:N {name: 's'})-[:R*1..2]->(m:N) RETURN m.name AS n ORDER BY n");
+    assert!(
+        rows_all > rows,
+        "non-DISTINCT must keep the duplicate paths"
+    );
+    assert_eq!(skips_all, 0, "the dedup fired without DISTINCT");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// **Without** `DISTINCT`, Cypher emits one row per PATH. Deduping endpoints here
 /// would silently drop rows, so the gate must refuse.
 #[test]

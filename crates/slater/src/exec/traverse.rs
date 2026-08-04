@@ -63,11 +63,28 @@ pub(crate) struct VarLenScratch<'a> {
     pub(crate) seen_endpoints: Option<&'a mut HashSet<u64>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Paths dropped because their endpoint had already been emitted (HIK-218 step 2).
+    /// Test-only: the optimisation is invisible in the result set by construction — the
+    /// projection would have collapsed these rows anyway — so without a counter there is
+    /// no way to show it fires at all, and an optimisation nobody can observe firing is
+    /// indistinguishable from one that does not work.
+    pub(crate) static VARLEN_DEDUP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl VarLenScratch<'_> {
     /// Record `endpoint` and report whether it is new. Always `true` when dedup is off.
     fn first_sight_of(&mut self, endpoint: u64) -> bool {
         match self.seen_endpoints.as_mut() {
-            Some(seen) => seen.insert(endpoint),
+            Some(seen) => {
+                let fresh = seen.insert(endpoint);
+                #[cfg(test)]
+                if !fresh {
+                    VARLEN_DEDUP_SKIPS.with(|c| c.set(c.get() + 1));
+                }
+                fresh
+            }
             None => true,
         }
     }
