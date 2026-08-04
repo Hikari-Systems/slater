@@ -4492,6 +4492,228 @@ fn collect_pattern_vars(p: &Pattern, existing: &[String], out: &mut Vec<String>)
     }
 }
 
+/// Every name a `MATCH` clause could possibly read, over-approximated (HIK-217).
+///
+/// `apply_match` used to seed the matcher's binding with **every** column of the
+/// incoming relation. `expand_chain`'s leaf then cloned that whole map — keys and
+/// values — once per emitted row, and `apply_match` immediately rebuilt the seed half
+/// positionally from the input row and read only the *new* variables out of the clone.
+/// Every unreferenced carried column was therefore copied per output row and dropped
+/// on arrival. Measured (HIK-216) at ~27 ms per carried column on a 200k-row query —
+/// about what it costs to read a live property from storage.
+///
+/// Seeding only the referenced names removes that. Correctness rests on this being an
+/// **over**-approximation:
+///
+/// * Scoping is deliberately ignored. A name bound *inside* a list/pattern
+///   comprehension shadows an outer one, but conflating them can only ever retain a
+///   column that was not needed — never drop one that was.
+/// * The seed half of the output is rebuilt from the input `row`, not from the
+///   binding, so pruning cannot change what a row contains.
+/// * The match is **exhaustive on purpose — never add a `_` arm.** A missed variant
+///   would silently drop a referenced binding and yield `null` where a value belongs,
+///   which is the worst failure class available here. Exhaustiveness makes the
+///   compiler the guard: a new `Expr` variant fails the build until it is classified.
+fn collect_expr_vars(e: &Expr, out: &mut Vec<String>) {
+    fn push(name: &str, out: &mut Vec<String>) {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    fn opt(e: &Option<Box<Expr>>, out: &mut Vec<String>) {
+        if let Some(x) = e {
+            collect_expr_vars(x, out);
+        }
+    }
+    match e {
+        Expr::Literal(_) | Expr::Param(_) => {}
+        Expr::Var(v) => push(v, out),
+        Expr::Property(b, _) | Expr::HasLabels(b, _) | Expr::Neg(b) | Expr::Not(b) => {
+            collect_expr_vars(b, out)
+        }
+        Expr::IsNull(b, _) => collect_expr_vars(b, out),
+        Expr::Index(a, b)
+        | Expr::Arith(_, a, b)
+        | Expr::Compare(_, a, b)
+        | Expr::StringOp(_, a, b)
+        | Expr::In(a, b) => {
+            collect_expr_vars(a, out);
+            collect_expr_vars(b, out);
+        }
+        Expr::Slice { base, from, to } => {
+            collect_expr_vars(base, out);
+            opt(from, out);
+            opt(to, out);
+        }
+        Expr::And(xs) | Expr::Or(xs) | Expr::Xor(xs) | Expr::List(xs) => {
+            for x in xs {
+                collect_expr_vars(x, out);
+            }
+        }
+        Expr::Map(kvs) => {
+            for (_, x) in kvs {
+                collect_expr_vars(x, out);
+            }
+        }
+        // `MapProjection`'s `var` IS an ordinary outer reference (`n {.name, .age}`),
+        // not a binder — it must be retained.
+        Expr::MapProjection { var, items } => {
+            push(var, out);
+            for it in items {
+                match it {
+                    MapProjItem::Property(_) => {}
+                    MapProjItem::Literal(_, x) => collect_expr_vars(x, out),
+                    MapProjItem::AllProps => {}
+                }
+            }
+        }
+        Expr::Case {
+            subject,
+            whens,
+            els,
+        } => {
+            opt(subject, out);
+            opt(els, out);
+            for (w, t) in whens {
+                collect_expr_vars(w, out);
+                collect_expr_vars(t, out);
+            }
+        }
+        Expr::Function { args, .. } => match args {
+            FuncArgs::Star => {}
+            FuncArgs::Args(a) => {
+                for x in a {
+                    collect_expr_vars(x, out);
+                }
+            }
+        },
+        // The comprehension binders below shadow rather than reference, so adding them
+        // can only retain a column that was not needed. Kept for over-approximation.
+        Expr::ListPredicate {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            push(var, out);
+            collect_expr_vars(list, out);
+            opt(predicate, out);
+        }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            push(var, out);
+            collect_expr_vars(list, out);
+            opt(predicate, out);
+            opt(projection, out);
+        }
+        Expr::Reduce {
+            acc_var,
+            acc_init,
+            var,
+            list,
+            body,
+        } => {
+            push(acc_var, out);
+            push(var, out);
+            collect_expr_vars(acc_init, out);
+            collect_expr_vars(list, out);
+            collect_expr_vars(body, out);
+        }
+        Expr::PatternComprehension {
+            pattern,
+            predicate,
+            projection,
+        } => {
+            collect_pattern_referenced_vars(pattern, out);
+            opt(predicate, out);
+            collect_expr_vars(projection, out);
+        }
+        Expr::PatternPredicate(p) | Expr::ShortestPath(p) => {
+            collect_pattern_referenced_vars(p, out)
+        }
+        Expr::Exists {
+            patterns,
+            predicate,
+        } => {
+            for p in patterns {
+                collect_pattern_referenced_vars(p, out);
+            }
+            opt(predicate, out);
+        }
+    }
+}
+
+/// Every name a pattern could read: its own variables plus any variable appearing in
+/// an inline property predicate. Over-approximates, per [`collect_expr_vars`].
+fn collect_pattern_referenced_vars(p: &Pattern, out: &mut Vec<String>) {
+    let push_opt = |v: &Option<String>, out: &mut Vec<String>| {
+        if let Some(n) = v {
+            if !out.contains(n) {
+                out.push(n.clone());
+            }
+        }
+    };
+    push_opt(&p.path_var, out);
+    let node = |n: &NodePat, out: &mut Vec<String>| {
+        push_opt(&n.var, out);
+        for (_, e) in &n.props {
+            collect_expr_vars(e, out);
+        }
+    };
+    node(&p.start, out);
+    for (rel, n) in &p.rels {
+        push_opt(&rel.var, out);
+        for (_, e) in &rel.props {
+            collect_expr_vars(e, out);
+        }
+        node(n, out);
+    }
+    // Quantified path groups (`((…)){m,n}`) carry their own element sequence. The
+    // executor desugars these before matching, but the analysis runs on the original
+    // clause, so their inner patterns must be walked here too.
+    if let Some(segs) = &p.segments {
+        for seg in segs {
+            match seg {
+                Segment::Hop(rel, n) => {
+                    if let Some(v) = &rel.var {
+                        if !out.iter().any(|x| x == v) {
+                            out.push(v.clone());
+                        }
+                    }
+                    for (_, e) in &rel.props {
+                        collect_expr_vars(e, out);
+                    }
+                    if let Some(v) = &n.var {
+                        if !out.iter().any(|x| x == v) {
+                            out.push(v.clone());
+                        }
+                    }
+                    for (_, e) in &n.props {
+                        collect_expr_vars(e, out);
+                    }
+                }
+                Segment::Quantified { inner, exit, .. } => {
+                    for (rel, n) in inner {
+                        for (_, e) in &rel.props {
+                            collect_expr_vars(e, out);
+                        }
+                        for (_, e) in &n.props {
+                            collect_expr_vars(e, out);
+                        }
+                    }
+                    for (_, e) in &exit.props {
+                        collect_expr_vars(e, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A best-effort column name for an unaliased projection item (Cypher uses the
 /// source text; we reconstruct a close approximation).
 fn expr_name(e: &Expr) -> String {

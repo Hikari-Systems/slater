@@ -3390,6 +3390,110 @@ fn optional_match_yields_nulls() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ── HIK-217 — seed pruning must not change any result ────────────────────
+// `apply_match` seeds the matcher's binding with only the incoming columns the
+// clause can actually read, rather than the whole relation. These pin the ways
+// that could silently drop a value; every one of them would surface as `null`
+// where a value belongs, which no pre-existing test would catch.
+
+/// The load-bearing case: a carried column the MATCH does **not** reference is
+/// pruned from the binding, yet must still reach the output. It does, because the
+/// output prefix is rebuilt positionally from the input row and never from the
+/// binding — which is precisely why pruning is safe.
+#[test]
+fn a_pruned_seed_column_is_still_returned() {
+    let (root, res) = run(
+        "exec_h217_pruned_returned",
+        "MATCH (n:Person) WITH n, n.city AS city, n.age AS age \
+         MATCH (n)-[:KNOWS]->(m:Person) \
+         RETURN n.name AS who, city, age, m.name AS friend ORDER BY who, friend",
+    );
+    // Exactly the three Person->Person KNOWS edges. Asserting the count is what
+    // makes this sensitive to *over*-pruning: dropping `n` would leave the second
+    // MATCH to rebind it as a fresh variable and emit a cartesian product instead.
+    assert_eq!(
+        res.rows.len(),
+        3,
+        "seed pruning changed the match cardinality"
+    );
+    for r in &res.rows {
+        assert!(
+            matches!(r[1], Val::Str(_)),
+            "a pruned column came back as {:?}",
+            r[1]
+        );
+        assert!(
+            matches!(r[2], Val::Int(_)),
+            "a pruned column came back as {:?}",
+            r[2]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A column referenced only by the clause's `WHERE` must be retained; pruning it
+/// would make the predicate see `null` and silently drop every row.
+#[test]
+fn a_seed_column_referenced_only_in_where_is_retained() {
+    let (root, res) = run(
+        "exec_h217_where_ref",
+        "MATCH (n:Person) WITH n, n.city AS home \
+         MATCH (n)-[:KNOWS]->(m:Person) WHERE home = 'London' \
+         RETURN n.name AS who ORDER BY who",
+    );
+    assert!(
+        !res.rows.is_empty(),
+        "WHERE saw null for a pruned column and dropped every row"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A column referenced only inside an inline property predicate must be retained —
+/// `node_ok`/`rel_ok` evaluate those against the binding mid-walk, so the analysis
+/// has to walk pattern props, not merely pattern variable names.
+#[test]
+fn a_seed_column_referenced_only_in_an_inline_prop_is_retained() {
+    let (root, res) = run(
+        "exec_h217_inline_prop",
+        // The pattern must carry a relationship: a node-only pattern is taken by
+        // `try_stream_match`, which bypasses `apply_match`'s seed entirely and would
+        // make this test vacuous.
+        "MATCH (n:Person) WITH n, n.name AS wanted \
+         MATCH (a:Person)-[:KNOWS]->(b:Person {name: wanted}) \
+         RETURN b.name AS got ORDER BY got",
+    );
+    assert!(
+        !res.rows.is_empty(),
+        "an inline property predicate saw null for a pruned column"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A column referenced only inside a nested pattern expression must be retained:
+/// `PatternPredicate` / `PatternComprehension` / `EXISTS` seed their inner match
+/// from the surrounding binding, so the analysis must recurse into them.
+#[test]
+fn a_seed_column_referenced_only_in_a_nested_pattern_is_retained() {
+    let (root, res) = run(
+        "exec_h217_nested_pattern",
+        // Two things are load-bearing in this query. The outer pattern carries a
+        // relationship, so `try_stream_match` does not take it. And the nested
+        // pattern references the carried column as a *property value*, not as a node
+        // variable: an unbound node variable would simply become a fresh binding and
+        // match MORE, whereas an unbound property value is null and matches nothing —
+        // so the test can actually tell the two apart.
+        "MATCH (n:Person) WITH n, n.name AS nm \
+         MATCH (x:Person)-[:KNOWS]->(y:Person) \
+         WHERE (y)-[:KNOWS]->(:Person {name: nm}) \
+         RETURN y.name AS friend ORDER BY friend",
+    );
+    assert!(
+        !res.rows.is_empty(),
+        "a nested pattern saw null for a pruned column and matched nothing"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ── Stage 6 — traversal-frame characterization ───────────────────────────
 // These lock the exact result set of the multi-hop / variable-length walk so
 // the mutate-in-place binding frame (replacing the per-hop `binding.clone()`)

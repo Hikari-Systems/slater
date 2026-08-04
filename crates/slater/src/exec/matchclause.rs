@@ -94,6 +94,22 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let mut out_cols = table.cols.clone();
         out_cols.extend(new_vars.iter().cloned());
 
+        // Which incoming columns this clause can actually read. See the seed
+        // construction below for why carrying the rest is pure waste (HIK-217).
+        let mut referenced: Vec<String> = Vec::new();
+        for p in &m.patterns {
+            collect_pattern_referenced_vars(p, &mut referenced);
+        }
+        if let Some(w) = m.where_.as_ref() {
+            collect_expr_vars(w, &mut referenced);
+        }
+        let seed_cols: Vec<(usize, &String)> = table
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| referenced.iter().any(|r| r == *c))
+            .collect();
+
         let mut out_rows = Vec::new();
         for row in &table.rows {
             // Stage 6: stop once a pushed `LIMIT` is satisfied — the cumulative cap
@@ -103,9 +119,23 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 break;
             }
             self.check_deadline()?;
-            let mut seed: HashMap<String, Val> = HashMap::with_capacity(table.cols.len());
-            for (c, v) in table.cols.iter().zip(row) {
-                seed.insert(c.clone(), v.clone());
+            // Seed with only the columns this clause can actually read (HIK-217).
+            //
+            // This binding is cloned again by `expand_chain`'s leaf once per *emitted*
+            // row — keys and values — and the seed half of that clone is then discarded:
+            // the output prefix is rebuilt positionally from `row` below, and only
+            // `new_vars` is read back out of the match. So every carried-but-unreferenced
+            // column was copied per output row and dropped on arrival. HIK-216 measured
+            // ~27 ms per carried column on a 200k-row query, comparable to reading a live
+            // property from storage.
+            //
+            // `seed_cols` comes from an over-approximating analysis (it ignores shadowing
+            // and walks every nested pattern), so a column is omitted only when it
+            // provably cannot be read. When everything is referenced this is byte-for-byte
+            // the old behaviour.
+            let mut seed: HashMap<String, Val> = HashMap::with_capacity(seed_cols.len());
+            for (i, c) in &seed_cols {
+                seed.insert((*c).clone(), row[*i].clone());
             }
             let mut matches: Vec<HashMap<String, Val>> = Vec::new();
             let remaining = cap.map(|c| c.saturating_sub(out_rows.len()));
