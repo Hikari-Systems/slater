@@ -69,15 +69,37 @@ impl Acl {
     /// Verify `password` for `user`. Returns `true` only for a known user whose
     /// stored argon2id hash verifies. An unknown user still runs a verify against
     /// an equalisation hash so a missing account is not distinguishable by timing.
+    /// All three arms — known-and-well-formed, known-but-malformed, unknown — must cost
+    /// the same, so every equalisation decision lives here rather than in [`verify_hash`],
+    /// which stays a pure "does this password match this PHC string" predicate.
     pub fn verify(&self, user: &str, password: &str) -> bool {
         match self.users.get(user) {
-            Some(u) => verify_hash(&u.password_argon2id, password),
+            // A stored hash that will not parse answers `None`, having done no derive at
+            // all. Left there it costs microseconds against the milliseconds every other
+            // arm costs, which enumerates the accounts whose hash is broken — the oracle
+            // HIK-222 closed for unknown users, one arm over. Burn the same equalisation
+            // verify before rejecting. (HIK-238)
+            Some(u) => verify_hash(&u.password_argon2id, password).unwrap_or_else(|| {
+                self.burn_equalisation_verify(password);
+                false
+            }),
             None => {
-                // Equalise timing against the absent-user path.
-                let _ = verify_hash(self.equalisation_hash(), password);
+                self.burn_equalisation_verify(password);
                 false
             }
         }
+    }
+
+    /// Run a full argon2id derive against [`Self::equalisation_hash`] and throw the answer
+    /// away, so a path that has no real verify to perform still costs what one costs.
+    ///
+    /// The inner call cannot recurse into the malformed arm: `equalisation_hash` filters
+    /// unparseable entries out, and its no-users fallback is a well-formed PHC string by
+    /// construction. An ACL whose stored hashes are *all* malformed therefore burns at
+    /// that fallback's cost — right answer, since in that state there is no well-formed
+    /// arm for it to be distinguished from.
+    fn burn_equalisation_verify(&self, password: &str) {
+        let _ = verify_hash(self.equalisation_hash(), password);
     }
 
     /// The stored hash an *unknown* principal is verified against, so the two paths
@@ -174,16 +196,23 @@ impl Acl {
     }
 }
 
-/// Verify a password against a stored PHC argon2 hash, returning `false` (and
-/// logging) on a malformed stored hash rather than erroring.
-fn verify_hash(stored: &str, password: &str) -> bool {
+/// Verify a password against a stored PHC argon2 hash.
+///
+/// `None` means the *stored* hash would not parse, which is not the same answer as
+/// "wrong password": no derive happened, so the call cost nothing. Callers that care
+/// about timing must not collapse it into `false` — see [`Acl::verify`], which burns an
+/// equalisation verify on that path. Logging stays here, at the site that saw the parse
+/// fail, so a deployment in this state keeps shouting on every attempt.
+fn verify_hash(stored: &str, password: &str) -> Option<bool> {
     match PasswordHash::new(stored) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
+        Ok(parsed) => Some(
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok(),
+        ),
         Err(e) => {
             warn!(error = %e, "ACL contains a malformed password hash; rejecting");
-            false
+            None
         }
     }
 }
@@ -594,12 +623,92 @@ mod tests {
         );
     }
 
+    /// **A known user with a malformed stored hash must not answer faster than a real
+    /// one.** HIK-222 equalised the *unknown*-principal arm against a borrowed stored
+    /// hash, but the third arm was left short: a stored hash that fails to parse returned
+    /// `false` on the parse error alone, with no derive at all. That is microseconds
+    /// against milliseconds, and it is an oracle for "this username exists but its hash
+    /// is broken" — the same bug class, one arm over. (HIK-238)
+    ///
+    /// Timed rather than structural, because what is being asserted *is* the cost. Two
+    /// things keep it off the flaky list: each arm is the **minimum** of several samples
+    /// (scheduler noise only ever adds time, so the minimum is the closest estimate of
+    /// what the path really costs), and the band is an order of magnitude while the
+    /// defect is three.
+    #[test]
+    fn a_malformed_stored_hash_still_burns_an_equalisation_verify() {
+        // Cheap, non-default parameters: enough work to be measurable against a parse
+        // failure, little enough not to tax every `cargo test`. argon2 is unoptimised in
+        // a debug build, so a default-cost fixture would cost ~100x this.
+        let good = hash_password_with("pw", 32, 1, 1);
+        let json = serde_json::json!({
+            "users": {
+                "good":   { "passwordArgon2id": good, "grants": {} },
+                "broken": { "passwordArgon2id": "not-a-phc-string", "grants": {} }
+            }
+        });
+        let acl = Acl::from_json_str(&json.to_string()).unwrap();
+
+        // The arm under test is "known user, malformed hash". If serde ever dropped the
+        // entry, `broken` would silently become an *unknown* user — the arm HIK-222
+        // already equalised — and this test would pass while proving nothing. Pinned
+        // structurally rather than left resting on the red run having caught it once.
+        assert!(
+            acl.users.contains_key("broken"),
+            "fixture: `broken` must be a KNOWN user, or this measures the unknown arm"
+        );
+
+        // Warm first: the first derive pays a cold allocation, and an unknown principal
+        // may mint the lazy fallback dummy. Neither belongs in the measurement.
+        assert!(!acl.verify("good", "wrong"));
+        assert!(!acl.verify("nobody", "wrong"));
+
+        let best = |user: &str| {
+            (0..5)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    assert!(!acl.verify(user, "wrong"), "{user} must not authenticate");
+                    t0.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let known = best("good");
+        let unknown = best("nobody");
+        let malformed = best("broken");
+
+        // Asserted FIRST and separately: this is HIK-222's property, which this fixture
+        // relies on but does not test. If it fails, the fixture is wrong (a hash that did
+        // not mint, an entry serde dropped) rather than this ticket's arm being open —
+        // and this test deliberately constructs a malformed hash, so the two failure
+        // modes are easy to confuse.
+        assert!(
+            unknown * 10 >= known && known * 10 >= unknown,
+            "precondition (HIK-222): unknown {unknown:?} vs known {known:?} — the \
+             fixture is not exercising an equalised unknown-user path, so nothing below \
+             this line means what it says"
+        );
+
+        assert!(
+            malformed * 10 >= known,
+            "a known user with a malformed stored hash answered in {malformed:?} against \
+             {known:?} for a well-formed one — the malformed arm skips the derive \
+             entirely, so an attacker can enumerate accounts whose stored hash is broken"
+        );
+    }
+
     #[test]
     fn hash_is_argon2id_and_verifies() {
         let hash = hash_password("correct horse battery staple").unwrap();
         assert!(hash.starts_with("$argon2id$"), "got {hash}");
-        assert!(verify_hash(&hash, "correct horse battery staple"));
-        assert!(!verify_hash(&hash, "wrong password"));
+        assert_eq!(
+            verify_hash(&hash, "correct horse battery staple"),
+            Some(true)
+        );
+        assert_eq!(verify_hash(&hash, "wrong password"), Some(false));
+        // A malformed *stored* hash is a third answer, not a `false`: no derive ran, so
+        // the caller must decide what that costs. (HIK-238)
+        assert_eq!(verify_hash("not-a-phc-string", "anything"), None);
     }
 
     #[test]

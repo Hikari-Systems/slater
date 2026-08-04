@@ -99,6 +99,39 @@ authenticated principals over Bolt).
   itself is not reproducible against the emulator through slater's API — hence the unit tests pin
   that specific arm.)
 
+## Closed — a malformed stored hash was rejected without burning a verify (2026-08-04, HIK-238)
+
+- [x] **✅ FIXED — the third arm of `Acl::verify` skipped the derive entirely.** HIK-222 (below)
+  equalised the *unknown*-principal arm against a borrowed stored hash. It left a third arm short:
+  `verify_hash` collapsed a stored hash that would not parse into a plain `false`, returned on the
+  parse error with no argon2 derive at all. So a **known** user whose `acl.json` entry is truncated
+  or hand-edited answered in microseconds while every other principal — known-and-well-formed, or
+  unknown — cost milliseconds. That is an oracle for "this username exists but its stored hash is
+  broken": the same bug class, one arm over.
+
+  **Exposure is genuinely thin, which is why this is low and not a re-run of HIK-222.** The affected
+  account cannot authenticate at all, so what leaks is the existence of a *broken* account rather
+  than a usable one; it takes an operator error to exist in the first place; and it logs a `warn!`
+  on every attempt, so a deployment in this state is already shouting. Measured against the unfixed
+  code with a 32 KiB / t=1 stored hash: **malformed 218 ns, well-formed 699 µs — a ~3200× gap.**
+  Filed and closed so it is a decision rather than an oversight.
+
+  *Fixed (HIK-238):* `verify_hash` now returns `Option<bool>`, where `None` states "the stored hash
+  would not parse, so nothing was derived" — a distinct answer from "wrong password", and one a
+  caller that cares about timing cannot collapse by accident. `Acl::verify` owns all three arms and
+  burns the same equalisation verify on the malformed path that it already burned for an unknown
+  principal. The alternative — threading the equalisation hash into `verify_hash` as a parameter —
+  was rejected: it puts timing policy inside a one-line predicate, and it makes the self-referential
+  call (`verify_hash(equalisation, …)`) a recursion hazard. In the shape taken, recursion is
+  structurally impossible: `equalisation_hash` filters unparseable entries out and its no-users
+  fallback is a well-formed PHC string, so the inner burn always derives.
+
+  Tests: `acl::tests::a_malformed_stored_hash_still_burns_an_equalisation_verify` times all three
+  arms off one ACL holding a well-formed and a deliberately malformed entry. Each arm is the
+  **minimum** of five samples (noise only adds, so the minimum is the closest estimate of the real
+  cost), and the HIK-222 unknown-vs-known property is asserted *first and separately* — a test that
+  builds a malformed hash on purpose must be able to tell a broken fixture from an open arm.
+
 ## Closed — the timing equalisation used the wrong argon2 parameters (2026-08-03, HIK-222)
 
 - [x] **✅ FIXED — the unknown-user dummy hash was minted at `Argon2::default()`, not at the
