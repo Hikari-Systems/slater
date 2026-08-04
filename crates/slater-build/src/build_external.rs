@@ -1923,34 +1923,32 @@ fn build_inner(
         edge_count,
     );
     diag.set_active_workers(threads as u64);
+    // Band-invariant for *both* emit phases — the forward loop below and the reverse loop
+    // that follows it pass exactly these values, so it is built once. (HIK-239)
+    let emit_ctx = BandEmitCtx {
+        scratch_dir,
+        pool: &worker_pool,
+        want: worker_want,
+        saturated: bands_saturate_pool,
+        block_size: opts.block_size,
+        zstd_level: opts.zstd_level,
+        csr_cipher: csr_fc.clone(),
+        diag,
+    };
     {
         let next = AtomicU64::new(0);
         let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let (
-            base_r,
-            fwd_band_paths_r,
-            edge_range_r,
-            posts_r,
-            range_r,
-            rev_spill_r,
-            worker_pool_r,
-            csr_fc_r,
-            eprops_fc_r,
-            next_r,
-            err_r,
-        ) = (
-            &base,
-            &fwd_band_paths,
-            &edge_range,
-            &posting_sinks,
-            &range_mx,
-            &rev_spill,
-            &worker_pool,
-            &csr_fc,
-            &eprops_fc,
-            &next,
-            &err,
-        );
+        let fwd_ctx = ForwardEmitCtx {
+            band,
+            edge_range: &edge_range,
+            posts: &posting_sinks,
+            range_sorters: &range_mx,
+            rev_spill: &rev_spill,
+            batch_threshold,
+            eprops_cipher: eprops_fc.clone(),
+        };
+        let (base_r, fwd_band_paths_r, fwd_ctx_r, emit_ctx_r, next_r, err_r) =
+            (&base, &fwd_band_paths, &fwd_ctx, &emit_ctx, &next, &err);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(move || loop {
@@ -1964,27 +1962,16 @@ fn build_inner(
                     let lo = (b as u64) * band;
                     let hi = (((b as u64) + 1) * band).min(node_count);
                     let res = emit_forward_band(
-                        lo,
-                        hi,
-                        band,
-                        base_r[b],
-                        &fwd_band_paths_r[b],
-                        &band_path(scratch_dir, pid, "csr_fwd", b),
-                        &band_path(scratch_dir, pid, "eprops", b),
-                        edge_range_r,
-                        posts_r,
-                        range_r,
-                        rev_spill_r,
-                        batch_threshold,
-                        scratch_dir,
-                        worker_pool_r,
-                        worker_want,
-                        bands_saturate_pool,
-                        opts.block_size,
-                        opts.zstd_level,
-                        csr_fc_r.clone(),
-                        eprops_fc_r.clone(),
-                        diag,
+                        ForwardBand {
+                            lo,
+                            hi,
+                            base: base_r[b],
+                            edges_in: &fwd_band_paths_r[b],
+                            csr_out: &band_path(scratch_dir, pid, "csr_fwd", b),
+                            eprops_out: &band_path(scratch_dir, pid, "eprops", b),
+                        },
+                        fwd_ctx_r,
+                        emit_ctx_r,
                     );
                     if let Err(e) = res {
                         let mut g = err_r.lock().unwrap();
@@ -2012,8 +1999,8 @@ fn build_inner(
     {
         let next = AtomicU64::new(0);
         let err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        let (rev_route_paths_r, worker_pool_r, csr_fc_r, next_r, err_r) =
-            (&rev_route_paths, &worker_pool, &csr_fc, &next, &err);
+        let (rev_route_paths_r, emit_ctx_r, next_r, err_r) =
+            (&rev_route_paths, &emit_ctx, &next, &err);
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(move || loop {
@@ -2027,18 +2014,13 @@ fn build_inner(
                     let lo = (b as u64) * band;
                     let hi = (((b as u64) + 1) * band).min(node_count);
                     let res = emit_reverse_band(
-                        lo,
-                        hi,
-                        &rev_route_paths_r[b],
-                        &band_path(scratch_dir, pid, "csr_rev", b),
-                        scratch_dir,
-                        worker_pool_r,
-                        worker_want,
-                        bands_saturate_pool,
-                        opts.block_size,
-                        opts.zstd_level,
-                        csr_fc_r.clone(),
-                        diag,
+                        ReverseBand {
+                            lo,
+                            hi,
+                            routes_in: &rev_route_paths_r[b],
+                            csr_out: &band_path(scratch_dir, pid, "csr_rev", b),
+                        },
+                        emit_ctx_r,
                     );
                     if let Err(e) = res {
                         let mut g = err_r.lock().unwrap();
@@ -2779,36 +2761,83 @@ const RANGE_SORT_FLOOR: usize = 1 << 20;
 /// letting each sorter form runs and make progress.
 const VECTOR_SORT_FLOOR: usize = 1 << 20;
 
+/// What a band emit worker needs that does **not** vary from band to band. Built once
+/// and shared by *both* phases: the forward and reverse loops pass the same values for
+/// every field here, so there is one context rather than two that must be kept in step.
+///
+/// The split from [`ForwardBand`] / [`ReverseBand`] is the point, not the parameter
+/// count — it is what says, at a glance, which values a worker may treat as fixed for
+/// the whole phase and which describe the one band it was handed. (HIK-239)
+struct BandEmitCtx<'a> {
+    /// Where band sorters spill.
+    scratch_dir: &'a Path,
+    /// Per-band sorter reservations come out of this shared worker pool.
+    pool: &'a Arc<MemoryBudget>,
+    /// Bytes one band's sorter asks the pool for.
+    want: usize,
+    /// Are there at least as many bands as workers? If so each band sorter spills
+    /// inline rather than leaning on the shared spill pool — see [`emit_forward_band`].
+    saturated: bool,
+    block_size: usize,
+    zstd_level: i32,
+    /// HIK-140: the band files are spliced into `topology.csr.blk` / `edge_props.blk`
+    /// by `concat_block_files`, so they are sealed under the **output** file's cipher —
+    /// the concat then only has to re-seal them at their corrected global ordinals.
+    csr_cipher: Option<Arc<FileCipher>>,
+    diag: &'a crate::diag::BuildDiag,
+}
+
+/// The forward phase's band-invariant half: the global sinks every band feeds, and the
+/// reverse-routing spill it fans records out to.
+struct ForwardEmitCtx<'a> {
+    /// Band width in nodes — an edge's reverse record routes to band `final_dst / band`.
+    band: u64,
+    edge_range: &'a [EdgeRangeSpec],
+    posts: &'a PostingSinks,
+    range_sorters: &'a Mutex<Vec<ExtSorter<RangeEntry>>>,
+    rev_spill: &'a BandSpill,
+    batch_threshold: usize,
+    /// See [`BandEmitCtx::csr_cipher`] — the same reasoning, for `edge_props.blk`.
+    eprops_cipher: Option<Arc<FileCipher>>,
+}
+
+/// The one forward band a worker was handed.
+///
+/// Naming these fields is the whole ticket: `edges_in`, `csr_out` and `eprops_out` were
+/// three adjacent positional `&Path`s, two of them written at the call site as the *same
+/// expression* differing only by a string literal. Transposing them compiled cleanly and
+/// wrote each band's `edge_props` records into its CSR file. (HIK-239)
+struct ForwardBand<'a> {
+    lo: u64,
+    hi: u64,
+    /// First `final_edge_id` this band assigns.
+    base: u64,
+    /// This band's unsorted edge records, spilled by the scan phase.
+    edges_in: &'a Path,
+    /// Where this band's forward CSR half is written.
+    csr_out: &'a Path,
+    /// Where this band's `edge_props` slice is written.
+    eprops_out: &'a Path,
+}
+
+/// The one reverse band a worker was handed.
+struct ReverseBand<'a> {
+    lo: u64,
+    hi: u64,
+    /// This band's reverse records, routed here by the forward phase.
+    routes_in: &'a Path,
+    /// Where this band's reverse CSR half is written.
+    csr_out: &'a Path,
+}
+
 /// Emit one forward node band `[lo, hi)`: sort the band's edges, assign
 /// `final_edge_id = base + i`, write the band's forward CSR half and `edge_props`
 /// slice, feed the global postings/edge-range sinks, and route each edge's reverse
 /// record (by `final_dst` band) into `rev_spill` for the reverse phase.
-#[allow(clippy::too_many_arguments)]
 fn emit_forward_band(
-    lo: u64,
-    hi: u64,
-    band: u64,
-    base: u64,
-    band_file: &Path,
-    csr_out: &Path,
-    eprops_out: &Path,
-    edge_range: &[EdgeRangeSpec],
-    posts: &PostingSinks,
-    range_sorters: &Mutex<Vec<ExtSorter<RangeEntry>>>,
-    rev_spill: &BandSpill,
-    batch_threshold: usize,
-    scratch_dir: &Path,
-    pool: &Arc<MemoryBudget>,
-    want: usize,
-    saturated: bool,
-    block_size: usize,
-    zstd_level: i32,
-    // HIK-140: the band files are spliced into `topology.csr.blk` / `edge_props.blk` by
-    // `concat_block_files`, so they are sealed under the **output** files' ciphers — the
-    // concat then only has to re-seal them at their corrected global ordinals.
-    csr_cipher: Option<Arc<FileCipher>>,
-    eprops_cipher: Option<Arc<FileCipher>>,
-    diag: &crate::diag::BuildDiag,
+    b: ForwardBand<'_>,
+    fwd: &ForwardEmitCtx<'_>,
+    ctx: &BandEmitCtx<'_>,
 ) -> Result<()> {
     // Load + sort this band's edges by (final_src, final_dst, prov_edge_id). Blocks
     // here if every slice of the pool is already out on another band.
@@ -2822,13 +2851,14 @@ fn emit_forward_band(
     // seals on its own pool. On a small graph with fewer bands than workers, inline
     // spilling would instead leave most cores idle — hence `saturated`.
     let mut sorter = ExtSorter::<EdgeFwd>::new_for_pool(
-        scratch_dir,
-        pool.reserve("forward band sorter", want, MIN_SORT_BYTES)?,
+        ctx.scratch_dir,
+        ctx.pool
+            .reserve("forward band sorter", ctx.want, MIN_SORT_BYTES)?,
         SCRATCH_ZSTD,
-        saturated,
+        ctx.saturated,
     )?;
     {
-        let r = BlockFileReader::open(band_file)?;
+        let r = BlockFileReader::open(b.edges_in)?;
         r.for_each_record(|_, rec| {
             let mut s = rec;
             sorter.push(EdgeFwd::decode(&mut s)?)
@@ -2836,13 +2866,23 @@ fn emit_forward_band(
     }
 
     let mut csr = CsrHalfWriter::create_with_cipher(
-        csr_out, lo, hi, true, block_size, zstd_level, csr_cipher,
+        b.csr_out,
+        b.lo,
+        b.hi,
+        true,
+        ctx.block_size,
+        ctx.zstd_level,
+        ctx.csr_cipher.clone(),
     )?;
-    let mut eprops =
-        BlockFileWriter::create_with_cipher(eprops_out, block_size, zstd_level, eprops_cipher)?;
-    let mut rev_batch = BandBatcher::new(rev_spill, batch_threshold);
+    let mut eprops = BlockFileWriter::create_with_cipher(
+        b.eprops_out,
+        ctx.block_size,
+        ctx.zstd_level,
+        fwd.eprops_cipher.clone(),
+    )?;
+    let mut rev_batch = BandBatcher::new(fwd.rev_spill, fwd.batch_threshold);
     // Only the sorter sink batches; the plane sink writes a bit per edge in place.
-    let batch_cap = match posts {
+    let batch_cap = match fwd.posts {
         PostingSinks::Sorters { .. } => FWD_SINK_BATCH,
         PostingSinks::Planes { .. } => 0,
     };
@@ -2852,7 +2892,7 @@ fn emit_forward_band(
 
     let flush_posts =
         |src_batch: &mut Vec<RelEndpoint>, tgt_batch: &mut Vec<RelEndpoint>| -> Result<()> {
-            let PostingSinks::Sorters { src, tgt } = posts else {
+            let PostingSinks::Sorters { src, tgt } = fwd.posts else {
                 return Ok(());
             };
             {
@@ -2871,7 +2911,7 @@ fn emit_forward_band(
     let mut i = 0u64;
     for r in sorter.sorted()? {
         let ef = r?;
-        let final_edge_id = base + i;
+        let final_edge_id = b.base + i;
         i += 1;
         csr.push(
             ef.final_src,
@@ -2882,7 +2922,7 @@ fn emit_forward_band(
             },
         )?;
         eprops.append_record(&ef.props_blob)?;
-        match posts {
+        match fwd.posts {
             // `final_src` is inside this band, so the source plane's words are ours
             // alone; `final_dst` can land in any band, hence the atomic in `set`.
             PostingSinks::Planes { src, tgt, .. } => {
@@ -2900,7 +2940,7 @@ fn emit_forward_band(
                 });
             }
         }
-        for spec in edge_range {
+        for spec in fwd.edge_range {
             if let (Some(rid), Some(kid)) = (spec.reltype_id, spec.key_id) {
                 if ef.reltype == rid {
                     if let Some(v) = extract_value(&ef.props_blob, kid)? {
@@ -2916,7 +2956,7 @@ fn emit_forward_band(
             }
         }
         rev_batch.push(
-            (ef.final_dst / band) as usize,
+            (ef.final_dst / fwd.band) as usize,
             &EdgeRev {
                 final_dst: ef.final_dst,
                 final_edge_id,
@@ -2931,50 +2971,43 @@ fn emit_forward_band(
     flush_posts(&mut src_batch, &mut tgt_batch)?;
     rev_batch.flush_all()?;
     if !range_batch.is_empty() {
-        let mut g = range_sorters.lock().unwrap();
+        let mut g = fwd.range_sorters.lock().unwrap();
         for (idx, re) in range_batch {
             g[idx].push(re)?;
         }
     }
     csr.finish()?;
     eprops.finish()?;
-    diag.progress_add(i);
+    ctx.diag.progress_add(i);
     Ok(())
 }
 
 /// Emit one reverse node band `[lo, hi)`: sort the band's routed reverse records by
 /// (final_dst, final_edge_id) and write the reverse CSR half for those nodes.
-#[allow(clippy::too_many_arguments)]
-fn emit_reverse_band(
-    lo: u64,
-    hi: u64,
-    route_file: &Path,
-    csr_out: &Path,
-    scratch_dir: &Path,
-    pool: &Arc<MemoryBudget>,
-    want: usize,
-    saturated: bool,
-    block_size: usize,
-    zstd_level: i32,
-    csr_cipher: Option<Arc<FileCipher>>,
-    diag: &crate::diag::BuildDiag,
-) -> Result<()> {
+fn emit_reverse_band(b: ReverseBand<'_>, ctx: &BandEmitCtx<'_>) -> Result<()> {
     // Inline vs pooled spill for the same reason as the forward band above.
     let mut sorter = ExtSorter::<EdgeRev>::new_for_pool(
-        scratch_dir,
-        pool.reserve("reverse band sorter", want, MIN_SORT_BYTES)?,
+        ctx.scratch_dir,
+        ctx.pool
+            .reserve("reverse band sorter", ctx.want, MIN_SORT_BYTES)?,
         SCRATCH_ZSTD,
-        saturated,
+        ctx.saturated,
     )?;
     {
-        let r = BlockFileReader::open(route_file)?;
+        let r = BlockFileReader::open(b.routes_in)?;
         r.for_each_record(|_, rec| {
             let mut s = rec;
             sorter.push(EdgeRev::decode(&mut s)?)
         })?;
     }
     let mut csr = CsrHalfWriter::create_with_cipher(
-        csr_out, lo, hi, false, block_size, zstd_level, csr_cipher,
+        b.csr_out,
+        b.lo,
+        b.hi,
+        false,
+        ctx.block_size,
+        ctx.zstd_level,
+        ctx.csr_cipher.clone(),
     )?;
     let mut i = 0u64;
     for r in sorter.sorted()? {
@@ -2990,7 +3023,7 @@ fn emit_reverse_band(
         i += 1;
     }
     csr.finish()?;
-    diag.progress_add(i);
+    ctx.diag.progress_add(i);
     Ok(())
 }
 
