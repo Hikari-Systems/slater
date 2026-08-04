@@ -7,6 +7,47 @@
 
 use super::*;
 
+/// The mutable scratch a variable-length walk threads through its recursion.
+///
+/// Bundled into a named-field struct rather than passed as four positional `&mut`
+/// arguments (HIK-219). `used` and `visited` are **both** `&mut HashSet<u64>` and sat
+/// adjacent in the old parameter list, so transposing them compiled cleanly and
+/// silently swapped edge-uniqueness (TRAIL) for node-uniqueness (ACYCLIC/SIMPLE) —
+/// a wrong-results bug with no type error and no test to catch it, in a recursive
+/// function that forwarded all four on every hop. Named fields make the swap
+/// unrepresentable.
+///
+/// Borrows rather than owns: the caller seeds `used` from the fixed prefix's edges and
+/// reads `out` afterwards, so the buffers must outlive the walk.
+/// The parts of a variable-length walk that do not change as it recurses.
+///
+/// Splitting these from the per-level position (`node`) and the mutable scratch makes
+/// the recursion self-documenting: everything here is fixed for the whole walk, and
+/// `varlen`'s only varying argument is where it currently stands.
+pub(crate) struct VarLenWalk<'a> {
+    /// The node the walk started from — SIMPLE allows one hop back to it to close.
+    pub(crate) start: u64,
+    /// The relationship pattern every hop must match.
+    pub(crate) rel: &'a RelPat,
+    /// Inclusive `(min, max)` hop bounds.
+    pub(crate) bounds: (u32, u32),
+    /// Which uniqueness rule applies (WALK / TRAIL / ACYCLIC / SIMPLE).
+    pub(crate) mode: WalkMode,
+    /// Scope for per-hop predicate evaluation.
+    pub(crate) binding: &'a HashMap<String, Val>,
+}
+
+pub(crate) struct VarLenScratch<'a> {
+    /// Hops on the current root-to-node path; pushed on descent, popped on unwind.
+    pub(crate) path: &'a mut Vec<Hop>,
+    /// Edge ids already walked — relationship-uniqueness for TRAIL.
+    pub(crate) used: &'a mut HashSet<u64>,
+    /// Node ids already visited — node-uniqueness for ACYCLIC / SIMPLE.
+    pub(crate) visited: &'a mut HashSet<u64>,
+    /// Completed `(hops, endpoint)` pairs.
+    pub(crate) out: &'a mut Vec<(Vec<Hop>, u64)>,
+}
+
 impl<'g, V: ReadView> Engine<'g, V> {
     /// Match `patterns[idx..]` against `binding`, applying the clause `WHERE` once
     /// every pattern is bound, collecting completed bindings.
@@ -1062,15 +1103,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 let mut path = Vec::new();
                 self.varlen(
                     cur,
-                    cur,
-                    rel,
-                    (min, max),
-                    mode,
-                    &mut path,
-                    &mut used,
-                    &mut visited,
-                    &mut paths,
-                    binding,
+                    &VarLenWalk {
+                        start: cur,
+                        rel,
+                        bounds: (min, max),
+                        mode,
+                        binding,
+                    },
+                    &mut VarLenScratch {
+                        path: &mut path,
+                        used: &mut used,
+                        visited: &mut visited,
+                        out: &mut paths,
+                    },
                 )?;
                 for (hops, endnode) in paths {
                     if cap.is_some_and(|c| out.len() >= c) {
@@ -1128,55 +1173,47 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// `visited` set and leave `used` untouched; `Trail` uses only `used`. This keeps
     /// each mode's per-hop work minimal and the `Trail`/default path byte-for-byte as
     /// before.
-    #[allow(clippy::too_many_arguments)] // recursive DFS: scratch buffers + scope
     pub(crate) fn varlen(
         &self,
-        start: u64,
         node: u64,
-        rel: &RelPat,
-        bounds: (u32, u32),
-        mode: WalkMode,
-        path: &mut Vec<Hop>,
-        used: &mut HashSet<u64>,
-        visited: &mut HashSet<u64>,
-        out: &mut Vec<(Vec<Hop>, u64)>,
-        binding: &HashMap<String, Val>,
+        w: &VarLenWalk<'_>,
+        sc: &mut VarLenScratch<'_>,
     ) -> Result<()> {
-        let (min, max) = bounds;
-        if path.len() as u32 >= min {
-            // Each emission clones the hop vector, so charge by path length: on a
+        let (min, max) = w.bounds;
+        if sc.path.len() as u32 >= min {
+            // Each emission clones the hop vector, so charge by sc.path length: on a
             // dense graph the depth cap alone still permits an enormous result set.
-            self.charge(path.len() as u64 + 1)?;
-            out.push((path.clone(), node));
+            self.charge(sc.path.len() as u64 + 1)?;
+            sc.out.push((sc.path.clone(), node));
         }
-        if path.len() as u32 >= max {
+        if sc.path.len() as u32 >= max {
             return Ok(());
         }
         self.check_deadline()?;
-        let track_edges = matches!(mode, WalkMode::Trail);
-        let track_nodes = matches!(mode, WalkMode::Acyclic | WalkMode::Simple);
-        for hop in self.expand_one_hop(node, rel, binding)? {
+        let track_edges = matches!(w.mode, WalkMode::Trail);
+        let track_nodes = matches!(w.mode, WalkMode::Acyclic | WalkMode::Simple);
+        for hop in self.expand_one_hop(node, w.rel, w.binding)? {
             let edge = hop.edge;
             let nb = hop.neighbour;
-            // SIMPLE alone permits the one repeat that closes the walk at its start;
-            // it is emitted but never extended (extending would repeat the start as
+            // SIMPLE alone permits the one repeat that closes the walk at its w.start;
+            // it is emitted but never extended (extending would repeat the w.start as
             // an interior node).
             let mut close_only = false;
-            match mode {
+            match w.mode {
                 WalkMode::Walk => {}
                 WalkMode::Trail => {
-                    if used.contains(&edge) {
+                    if sc.used.contains(&edge) {
                         continue;
                     }
                 }
                 WalkMode::Acyclic => {
-                    if visited.contains(&nb) {
+                    if sc.visited.contains(&nb) {
                         continue;
                     }
                 }
                 WalkMode::Simple => {
-                    if visited.contains(&nb) {
-                        if nb != start {
+                    if sc.visited.contains(&nb) {
+                        if nb != w.start {
                             continue;
                         }
                         close_only = true;
@@ -1184,29 +1221,27 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 }
             }
             if track_edges {
-                used.insert(edge);
+                sc.used.insert(edge);
             }
             // `insert` returns false (so `inserted` stays false) when the node is
-            // already present — e.g. the SIMPLE close-the-cycle hop back to `start`,
+            // already present — e.g. the SIMPLE close-the-cycle hop back to `w.start`,
             // which the caller pre-seeded — so we never wrongly remove it on unwind.
-            let inserted = track_nodes && visited.insert(nb);
-            path.push(hop);
+            let inserted = track_nodes && sc.visited.insert(nb);
+            sc.path.push(hop);
             if close_only {
-                if path.len() as u32 >= min {
-                    self.charge(path.len() as u64 + 1)?;
-                    out.push((path.clone(), nb));
+                if sc.path.len() as u32 >= min {
+                    self.charge(sc.path.len() as u64 + 1)?;
+                    sc.out.push((sc.path.clone(), nb));
                 }
             } else {
-                self.varlen(
-                    start, nb, rel, bounds, mode, path, used, visited, out, binding,
-                )?;
+                self.varlen(nb, w, sc)?;
             }
-            path.pop();
+            sc.path.pop();
             if track_edges {
-                used.remove(&edge);
+                sc.used.remove(&edge);
             }
             if inserted {
-                visited.remove(&nb);
+                sc.visited.remove(&nb);
             }
         }
         Ok(())
