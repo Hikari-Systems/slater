@@ -25,7 +25,14 @@ __pycache__/
 # being avoided here) so they aren't wiped on rebuilds.
 /client-gaps/
 
-perf/datasets
+# perf/datasets holds ~10 GB of generated corpora (wikidata_csr.duckdb, the
+# derived .cypher dumps, data/). Ignore the payload but TRACK the generators —
+# they are small, they are the only reproducible record of how each fixture was
+# derived, and a fixture nobody can rebuild is a fixture nobody can trust.
+perf/datasets/*
+!perf/datasets/*.sql
+!perf/datasets/*.sh
+!perf/datasets/README.md
 
 # Out-of-tree build dirs used to work around a stale root-owned lock in /target.
 /target-dc
