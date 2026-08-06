@@ -36,7 +36,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -193,6 +193,65 @@ fn touch(referenced: &AtomicBool, last_used_ms: &AtomicU64, now_ms: u64) {
     }
 }
 
+/// Shared-read guard on a cache pool, recovering the guard if a previous holder
+/// panicked. Sound only while every guarded section stays unwind-free — see
+/// [`ResultCache`]'s poisoning notes.
+#[inline]
+fn read_pool<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Exclusive guard on a cache pool. Same soundness condition as [`read_pool`].
+#[inline]
+fn write_pool<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a CLOCK sweep should do with the key under the hand.
+enum Sweep {
+    /// In the ring but not in the map — a broken `ring.len() == map.len()`. Drop the
+    /// ring entry and keep sweeping.
+    Stale,
+    /// Second-chance bit was set (now cleared): skip it this revolution.
+    Reprieve,
+    /// Bit was clear: evict.
+    Evict,
+}
+
+/// Subtract an entry's footprint from a pool's byte counter.
+///
+/// # Why this is not plain `-=`
+///
+/// Each counter is by construction the sum over its map of a per-entry byte count, kept
+/// exact by pairing: every insert adds and every removal subtracts the *same* quantity,
+/// because `Entry::bytes` is stored at insert time and `ResidentPq`/`ResidentMatrix`
+/// `resident_bytes()` are pure functions of `Vec` lengths behind an `Arc` (no interior
+/// mutability, so the value at removal equals the value at insertion). Underflow
+/// therefore means that invariant is already broken somewhere else.
+///
+/// Both of the things plain `-=` would do about that are worse than this:
+///
+/// * In **debug** it panics — *inside a write guard*, poisoning the pool's lock and
+///   turning one broken entry into a permanent serving outage for the whole process.
+/// * In **release** `usize` subtraction wraps, so the counter becomes ~2^64 and
+///   `evict_to_budget`'s `while bytes > budget` loop then evicts everything, forever,
+///   on every subsequent call. A silent, permanent cache collapse is harder to diagnose
+///   than either a panic or a wrong number.
+///
+/// Saturating to zero keeps the pool serving and errs toward *under*-reporting
+/// residency, which the budget treats as "room to spare" rather than "evict the world".
+/// The `debug_assert!` keeps the invariant loud where loudness is free — a violation
+/// fails the test suite rather than shipping.
+#[inline]
+fn sub_bytes(counter: usize, entry: usize) -> usize {
+    debug_assert!(
+        counter >= entry,
+        "cache byte accounting underflow: counter {counter} < entry {entry} — the \
+         per-pool 'counter == sum of entry footprints' invariant is broken"
+    );
+    counter.saturating_sub(entry)
+}
+
 // ── Result cache (the third pool) ─────────────────────────────────────────────
 
 /// Key for a cached query result: the generation UUID plus a normalised query
@@ -271,17 +330,40 @@ impl<V> ResultInner<V> {
                 self.hand += 1;
                 continue;
             }
-            if self.map[&key].referenced.swap(false, Ordering::Relaxed) {
-                self.hand += 1;
-                continue;
+            match self.sweep_verdict(&key) {
+                // `ring.len() == map.len()` is an invariant, and it used to be
+                // *enforced* by indexing (`self.map[&key]`) — a panic inside the write
+                // guard, which is the one thing a section whose poison recovery depends
+                // on being unwind-free must not contain. Heal instead: a ring entry with
+                // no result is nothing but a stale key, so drop it and carry on.
+                Sweep::Stale => {
+                    self.ring.remove(self.hand);
+                    continue;
+                }
+                Sweep::Reprieve => {
+                    self.hand += 1;
+                    continue;
+                }
+                Sweep::Evict => {}
             }
             self.ring.remove(self.hand);
             if let Some(e) = self.map.remove(&key) {
-                self.bytes -= e.bytes;
+                self.bytes = sub_bytes(self.bytes, e.bytes);
             }
             evicted += 1;
         }
         evicted
+    }
+
+    /// What the CLOCK hand should do with `key`, decided under a shared borrow so the
+    /// caller can then mutate. Clearing the second-chance bit is the observable side
+    /// effect, exactly as before.
+    fn sweep_verdict(&self, key: &ResultKey) -> Sweep {
+        match self.map.get(key) {
+            None => Sweep::Stale,
+            Some(e) if e.referenced.swap(false, Ordering::Relaxed) => Sweep::Reprieve,
+            Some(_) => Sweep::Evict,
+        }
     }
 
     /// Evict results idle for at least `ttl_ms`; see the block pool's `evict_expired`.
@@ -293,7 +375,7 @@ impl<V> ResultInner<V> {
             let idle = now_ms.saturating_sub(e.last_used_ms.load(Ordering::Relaxed));
             let keep = idle <= ttl_ms;
             if !keep {
-                *bytes -= e.bytes;
+                *bytes = sub_bytes(*bytes, e.bytes);
             }
             keep
         });
@@ -312,7 +394,7 @@ impl<V> ResultInner<V> {
         if let Some(e) = self.map.get_mut(&key) {
             // Overwrite in place — the key is already in the ring. A recompute of the
             // same result: reset the second-chance bit (a fresh insert earns none).
-            self.bytes -= e.bytes;
+            self.bytes = sub_bytes(self.bytes, e.bytes);
             e.value = value;
             e.bytes = bytes;
             *e.referenced.get_mut() = false;
@@ -343,6 +425,28 @@ impl<V> ResultInner<V> {
 /// budget. Generic over the stored value so it carries no dependency on the
 /// executor's result type and is unit-testable in isolation; `slater::server`
 /// instantiates it over `exec::QueryResult`.
+///
+/// # Lock poisoning cannot stop the pool serving
+///
+/// Both this pool and [`VectorIndexCache`] sit on the query path, so a poisoned lock
+/// taken with `.unwrap()` would turn a single panic into a permanent serving outage for
+/// the life of the process. The same two invariants `delta_writer` and `acl` rely on
+/// apply here, and both are load-bearing:
+///
+/// 1. **Nothing under a guard can unwind.** The two things that could were fixed rather
+///    than tolerated: the CLOCK sweep indexed its map (`self.map[&key]`), which panics
+///    when a stale ring entry outlives its result — it now heals via [`Sweep::Stale`] —
+///    and the byte counters used plain `-=`, which panics on underflow in debug and
+///    wraps to ~2^64 in release; they now go through [`sub_bytes`]. What remains under
+///    the guard is map/ring mutation and arithmetic that cannot fail.
+/// 2. **Acquisition never panics.** Because (1) makes the poison flag carry no
+///    information, every accessor takes its guard through [`read_pool`] / [`write_pool`],
+///    which recover via `PoisonError::into_inner`.
+///
+/// A cache is also the most forgiving place to recover a guard: entries are immutable
+/// values behind an `Arc`, keyed by generation UUID, so the worst a torn update can
+/// leave is a byte counter that over- or under-states residency — which costs
+/// eviction accuracy, never correctness of what is served.
 pub struct ResultCache<V> {
     inner: RwLock<ResultInner<V>>,
     /// Origin for the `last_used_ms` stamps.
@@ -394,7 +498,7 @@ impl<V> ResultCache<V> {
             return None;
         }
         let now_ms = self.now_ms();
-        if let Some(entry) = self.inner.read().unwrap().map.get(key) {
+        if let Some(entry) = read_pool(&self.inner).map.get(key) {
             touch(&entry.referenced, &entry.last_used_ms, now_ms);
             let value = entry.value.clone();
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -449,11 +553,7 @@ impl<V> ResultCache<V> {
         }
         let bytes = value_bytes + Self::entry_overhead_bytes(&key);
         let now_ms = self.now_ms();
-        let evicted = self
-            .inner
-            .write()
-            .unwrap()
-            .insert(key, value, bytes, now_ms);
+        let evicted = write_pool(&self.inner).insert(key, value, bytes, now_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -464,7 +564,7 @@ impl<V> ResultCache<V> {
     pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
         let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
         let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
-        let evicted = self.inner.write().unwrap().evict_expired(now_ms, ttl_ms);
+        let evicted = write_pool(&self.inner).evict_expired(now_ms, ttl_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -480,7 +580,7 @@ impl<V> ResultCache<V> {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().map.len()
+        read_pool(&self.inner).map.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -488,7 +588,7 @@ impl<V> ResultCache<V> {
     }
 
     pub fn bytes(&self) -> usize {
-        self.inner.read().unwrap().bytes
+        read_pool(&self.inner).bytes
     }
 }
 
@@ -559,7 +659,7 @@ impl VecInner {
             let idle = now_ms.saturating_sub(e.last_used_ms.load(Ordering::Relaxed));
             let keep = idle <= ttl_ms;
             if !keep {
-                *block_bytes -= e.bytes;
+                *block_bytes = sub_bytes(*block_bytes, e.bytes);
             }
             keep
         });
@@ -593,17 +693,35 @@ impl VecInner {
                 self.hand += 1;
                 continue;
             }
-            if self.blocks[&key].referenced.swap(false, Ordering::Relaxed) {
-                self.hand += 1;
-                continue;
+            match self.sweep_verdict(&key) {
+                // See `ResultInner::evict_to_budget`: a stale ring entry is healed, not
+                // panicked on. This was `self.blocks[&key]`, a `HashMap` index.
+                Sweep::Stale => {
+                    self.ring.remove(self.hand);
+                    continue;
+                }
+                Sweep::Reprieve => {
+                    self.hand += 1;
+                    continue;
+                }
+                Sweep::Evict => {}
             }
             self.ring.remove(self.hand);
             if let Some(e) = self.blocks.remove(&key) {
-                self.block_bytes -= e.bytes;
+                self.block_bytes = sub_bytes(self.block_bytes, e.bytes);
             }
             evicted += 1;
         }
         evicted
+    }
+
+    /// See [`ResultInner::sweep_verdict`].
+    fn sweep_verdict(&self, key: &VectorBlockKey) -> Sweep {
+        match self.blocks.get(key) {
+            None => Sweep::Stale,
+            Some(e) if e.referenced.swap(false, Ordering::Relaxed) => Sweep::Reprieve,
+            Some(_) => Sweep::Evict,
+        }
     }
 
     fn insert(
@@ -680,10 +798,10 @@ impl VectorIndexCache {
     /// replaces the entry). Charges the codes' footprint to the budget and evicts
     /// blocks if needed so the pool stays bounded.
     pub fn pin(&self, gen: GenId, ord: u32, pq: Arc<ResidentPq>) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_pool(&self.inner);
         let key = (gen.0.as_u128(), ord);
         if let Some(old) = inner.pinned.remove(&key) {
-            inner.pinned_bytes -= old.resident_bytes();
+            inner.pinned_bytes = sub_bytes(inner.pinned_bytes, old.resident_bytes());
         }
         inner.pinned_bytes += pq.resident_bytes();
         inner.pinned.insert(key, pq);
@@ -696,17 +814,15 @@ impl VectorIndexCache {
 
     /// Drop a pinned index (e.g. on generation swap), freeing its PQ footprint.
     pub fn unpin(&self, gen: GenId, ord: u32) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_pool(&self.inner);
         if let Some(old) = inner.pinned.remove(&(gen.0.as_u128(), ord)) {
-            inner.pinned_bytes -= old.resident_bytes();
+            inner.pinned_bytes = sub_bytes(inner.pinned_bytes, old.resident_bytes());
         }
     }
 
     /// The pinned resident PQ codes for an index, if any.
     pub fn resident_pq(&self, gen: GenId, ord: u32) -> Option<Arc<ResidentPq>> {
-        self.inner
-            .read()
-            .unwrap()
+        read_pool(&self.inner)
             .pinned
             .get(&(gen.0.as_u128(), ord))
             .cloned()
@@ -728,7 +844,7 @@ impl VectorIndexCache {
     ) -> Result<Option<Arc<ResidentMatrix>>> {
         let key = (gen.0.as_u128(), ord);
         {
-            let inner = self.inner.read().unwrap();
+            let inner = read_pool(&self.inner);
             if let Some(m) = inner.matrices.get(&key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(m.clone()));
@@ -742,7 +858,7 @@ impl VectorIndexCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let matrix = Arc::new(build()?);
         let bytes = matrix.resident_bytes();
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_pool(&self.inner);
         if let Some(m) = inner.matrices.get(&key) {
             return Ok(Some(m.clone())); // lost a race; use the installed one
         }
@@ -765,7 +881,7 @@ impl VectorIndexCache {
     /// promptly rather than waiting on the last in-flight query's `Arc`).
     pub fn unpin_generation(&self, gen: GenId) {
         let g = gen.0.as_u128();
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = write_pool(&self.inner);
         let pinned: Vec<_> = inner
             .pinned
             .keys()
@@ -774,7 +890,7 @@ impl VectorIndexCache {
             .collect();
         for key in pinned {
             if let Some(old) = inner.pinned.remove(&key) {
-                inner.pinned_bytes -= old.resident_bytes();
+                inner.pinned_bytes = sub_bytes(inner.pinned_bytes, old.resident_bytes());
             }
         }
         let mats: Vec<_> = inner
@@ -785,7 +901,7 @@ impl VectorIndexCache {
             .collect();
         for key in mats {
             if let Some(old) = inner.matrices.remove(&key) {
-                inner.matrix_bytes -= old.resident_bytes();
+                inner.matrix_bytes = sub_bytes(inner.matrix_bytes, old.resident_bytes());
             }
         }
     }
@@ -797,7 +913,7 @@ impl VectorIndexCache {
         load: impl FnOnce() -> Result<Vec<u8>>,
     ) -> Result<Arc<Vec<u8>>> {
         let now_ms = self.now_ms();
-        if let Some(entry) = self.inner.read().unwrap().blocks.get(&key) {
+        if let Some(entry) = read_pool(&self.inner).blocks.get(&key) {
             touch(&entry.referenced, &entry.last_used_ms, now_ms);
             let value = entry.value.clone();
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -805,11 +921,7 @@ impl VectorIndexCache {
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         let value = Arc::new(load()?);
-        let (canonical, evicted) = self
-            .inner
-            .write()
-            .unwrap()
-            .insert(key, value, self.now_ms());
+        let (canonical, evicted) = write_pool(&self.inner).insert(key, value, self.now_ms());
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -840,7 +952,7 @@ impl VectorIndexCache {
     pub fn evict_expired(&self, now: Instant, ttl: Duration) -> u64 {
         let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
         let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
-        let evicted = self.inner.write().unwrap().evict_expired(now_ms, ttl_ms);
+        let evicted = write_pool(&self.inner).evict_expired(now_ms, ttl_ms);
         if evicted > 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -857,13 +969,13 @@ impl VectorIndexCache {
 
     /// Current resident byte usage: pinned PQ codes + resident matrices + cached blocks.
     pub fn bytes(&self) -> usize {
-        let inner = self.inner.read().unwrap();
+        let inner = read_pool(&self.inner);
         inner.pinned_bytes + inner.matrix_bytes + inner.block_bytes
     }
 
     /// Number of cached blocks (excludes pinned PQ entries).
     pub fn block_count(&self) -> usize {
-        self.inner.read().unwrap().blocks.len()
+        read_pool(&self.inner).blocks.len()
     }
 }
 
@@ -871,6 +983,87 @@ impl VectorIndexCache {
 mod tests {
     use super::*;
     use graph_format::blockfile::BlockFileWriter;
+
+    /// Panic while holding a pool's write guard, then check the pool still serves.
+    ///
+    /// Both pools sit on the query path — `ResultCache` on every cached read,
+    /// `VectorIndexCache` on every kNN — so a poisoned lock taken with `.unwrap()`
+    /// turns one panic into a permanent, total serving outage for the life of the
+    /// process. Same argument as `delta_writer` and `acl`: the sections are written
+    /// so that nothing under the guard can unwind, which makes the poison flag carry
+    /// no information, which makes recovering the guard sound.
+    #[test]
+    fn a_poisoned_result_cache_lock_does_not_stop_serving() {
+        let cache: ResultCache<u32> = ResultCache::new(1 << 20);
+        let key = ResultKey::new(gen(1), "RETURN 1");
+        cache.insert(key.clone(), Arc::new(7), 8);
+        assert_eq!(cache.get(&key).as_deref(), Some(&7));
+
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = cache.inner.write().unwrap();
+            panic!("deliberate fault inside a result-cache critical section");
+        }));
+        assert!(poisoner.is_err(), "the injected panic must have unwound");
+        assert!(
+            cache.inner.is_poisoned(),
+            "the lock must actually be poisoned, or this test proves nothing"
+        );
+
+        assert_eq!(
+            cache.get(&key).as_deref(),
+            Some(&7),
+            "a poisoned result cache must keep serving"
+        );
+        cache.insert(ResultKey::new(gen(1), "RETURN 2"), Arc::new(9), 8);
+        assert_eq!(cache.len(), 2, "and must keep accepting inserts");
+        assert!(cache.bytes() > 0);
+    }
+
+    #[test]
+    fn a_poisoned_vector_cache_lock_does_not_stop_serving() {
+        let cache = VectorIndexCache::new(1 << 20);
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = cache.inner.write().unwrap();
+            panic!("deliberate fault inside a vector-cache critical section");
+        }));
+        assert!(poisoner.is_err(), "the injected panic must have unwound");
+        assert!(cache.inner.is_poisoned(), "the lock must be poisoned");
+
+        // Every accessor that the kNN path touches must still answer.
+        assert!(cache.resident_pq(gen(1), 0).is_none());
+        cache.unpin(gen(1), 0);
+        cache.unpin_generation(gen(1));
+        assert_eq!(cache.block_count(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    /// A ring entry whose map entry has gone must not panic the CLOCK sweep.
+    ///
+    /// `ring.len() == blocks.len()` is an invariant maintained by pairing, but it was
+    /// enforced by `self.blocks[&key]` — a `HashMap` index, i.e. a panic *inside the
+    /// write guard*, which is exactly what must not happen in a section whose
+    /// poison-recovery depends on being unwind-free. Desynchronise it deliberately and
+    /// check the sweep heals instead of dying.
+    #[test]
+    fn a_stale_ring_entry_is_swept_not_panicked_on() {
+        let cache = VectorIndexCache::new(64);
+        {
+            let mut inner = cache.inner.write().unwrap();
+            // A ring key with no matching block: the state the index would panic on.
+            inner.ring.push(VectorBlockKey::new(gen(9), 0, 999));
+            inner.ring.push(VectorBlockKey::new(gen(9), 0, 998));
+            inner.block_bytes = 1024; // over budget, so the sweep must run
+            inner.evict_to_budget(None);
+            assert!(
+                inner.ring.len() <= 1,
+                "the sweep must drop stale ring entries rather than spin or panic"
+            );
+        }
+        assert!(
+            !cache.inner.is_poisoned(),
+            "the sweep must not have panicked"
+        );
+    }
 
     fn gen(n: u128) -> GenId {
         GenId(uuid::Uuid::from_u128(n))

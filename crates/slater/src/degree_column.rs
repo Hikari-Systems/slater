@@ -111,8 +111,35 @@ pub struct DegreeColumn {
     /// Running sum of resident chunks' `DegreeChunk::resident_bytes()` across both halves. Every
     /// mutation happens while holding the owning half's `slots` write lock, so it stays
     /// consistent with the slots (the atomic only lets the hot read path and `resident_bytes()`
-    /// observe it without a lock).
+    /// observe it without a lock). Debited through [`debit_resident`], never a bare
+    /// `fetch_sub` — see there for why.
     resident_bytes: AtomicUsize,
+}
+
+/// Debit `bytes` from a resident-byte counter, saturating at zero.
+///
+/// The counter is the sum over both halves' resident slots of `resident_bytes()`, kept
+/// exact by pairing: a fault adds and an eviction subtracts the same quantity, because
+/// `DegreeChunk::resident_bytes()` is a pure function of an immutable chunk behind an
+/// `Arc`, and every mutation is made under the owning half's `slots` write lock. So
+/// underflow means that invariant is already broken elsewhere.
+///
+/// A bare `fetch_sub` would be silent about it and actively harmful: atomics wrap rather
+/// than panic in *both* profiles, so the counter would become ~2^64, every
+/// `resident_bytes() <= budget_bytes` check would fail forever, and the pressure evictor
+/// would evict every chunk on every fault — the degree column silently degrades to
+/// "always cold", which reads as a mysterious performance collapse rather than a bug.
+/// Saturating at zero errs the other way (the budget sees room to spare), and the
+/// `debug_assert!` makes a violation fail the test suite where that is free.
+fn debit_resident(counter: &AtomicUsize, bytes: usize) {
+    let prev = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        Some(c.saturating_sub(bytes))
+    });
+    debug_assert!(
+        prev.is_ok_and(|p| p >= bytes),
+        "degree-column resident-byte underflow: counter {prev:?} < chunk {bytes} — the \
+         'counter == sum of resident chunk footprints' invariant is broken"
+    );
 }
 
 impl DegreeColumn {
@@ -274,8 +301,7 @@ impl DegreeColumn {
                 let last = half.last_used[c].load(Ordering::Relaxed);
                 if now_nanos.saturating_sub(last) > ttl_nanos {
                     if let Some(chunk) = slot.take() {
-                        self.resident_bytes
-                            .fetch_sub(chunk.resident_bytes(), Ordering::Relaxed);
+                        debit_resident(&self.resident_bytes, chunk.resident_bytes());
                     }
                     freed += 1;
                 }
@@ -357,8 +383,7 @@ impl DegreeColumn {
     fn evict_chunk(&self, half: &Half, c: usize) {
         let mut slots = half.slots.write().unwrap();
         if let Some(chunk) = slots[c].take() {
-            self.resident_bytes
-                .fetch_sub(chunk.resident_bytes(), Ordering::Relaxed);
+            debit_resident(&self.resident_bytes, chunk.resident_bytes());
         }
     }
 
