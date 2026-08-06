@@ -8,6 +8,13 @@ name: ci
 on:
   push:
   pull_request:
+  # Manual re-trigger. Push and pull_request are webhook-driven, and GitHub throttles
+  # those webhooks during an Actions incident to aid recovery — on 2026-08-06 four
+  # consecutive pushes to `main` landed with no run created at all, leaving commits
+  # with zero CI and no way to ask for it. `workflow_dispatch` goes through the API
+  # instead, so it can be fired by hand (`gh workflow run ci --ref main`) to cover a
+  # commit whose push event was dropped, without an empty commit to force one.
+  workflow_dispatch:
 
 # A newer push to the same ref supersedes an in-flight run — don't waste runners
 # finishing checks on a commit that's already been replaced.
