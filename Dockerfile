@@ -43,11 +43,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the heavy dependency graph (tokio, rustls/aws-lc-rs, zstd, argon2, …) is cached
 # in its own layer. Editing `crates/*/src` afterwards only recompiles our code.
 #
-# INVARIANT: the stub list below must name a file for EVERY [[bench]], [[test]]
-# and [[bin]] declared in the crates' Cargo.toml — cargo parses the manifest at
-# this layer and fails ("can't find <target>") if a declared target has no source.
-# Adding a bench/test/bin means adding its stub here. This layer only runs on a
-# TAG release, so a gap stays invisible on branch CI until release day.
+# INVARIANT: the stub list below must name a file for EVERY [[bench]], [[test]],
+# [[bin]] and [[example]] declared in the crates' Cargo.toml — cargo parses the
+# manifest at this layer and fails ("can't find <target>") if a declared target has
+# no source. It resolves an explicit `path = …` too, so a target that moves outside
+# the `mkdir -p` set below needs that directory added as well. The list here and
+# Dockerfile.lite's must stay identical; both images build the whole workspace's
+# manifests, so `-p slater` does not narrow what has to be stubbed.
+#
+# This layer only runs on a TAG release, so a gap used to stay invisible on branch
+# CI until release day. It no longer does: ci.yml's fmt job runs
+# `.github/scripts/check_dockerfile_stubs.py`, which fails the build on the commit
+# that introduces the drift — in either direction, and for either Dockerfile. Run
+# that script locally before tagging, alongside `docker build --target builder`.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/config.toml .cargo/config.toml
 COPY crates/graph-format/Cargo.toml crates/graph-format/Cargo.toml

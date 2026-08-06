@@ -38,6 +38,17 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # The Dockerfiles' dependency-cache stub lists must name a source for every
+      # declared [[bench]]/[[test]]/[[bin]]/[[example]], and the two lists must agree.
+      # Nothing else on a branch checks that: `docker build` runs only from release.yml
+      # on a vX.Y.Z tag, so drift stays invisible until release day — after `test` and
+      # `fuzz` have burned an hour — and no image is published for that tag. Same
+      # reasoning as release.yml's "version tag matches README + Cargo.toml" grep, and
+      # the same rule as this file's builder-test filter below: a deliberate act is one
+      # someone can forget. Lives in the fmt job because it needs no toolchain or build.
+      - name: Dockerfile dep-cache stub lists cover every declared target
+        run: python3 .github/scripts/check_dockerfile_stubs.py
+
   # ── Clippy: mirror the local pre-commit hook (.githooks/pre-commit) ────────
   clippy:
     runs-on: ubuntu-latest
