@@ -151,10 +151,11 @@ const HUB_SHAPES: &[Shape] = &[Shape {
 
 /// Hard ceiling on retained intermediate elements, and on transient walk elements.
 ///
-/// **Not optional.** `Engine::new` defaults both to `0`, which means *unlimited* — the
-/// server never runs that way (it sets them from `query.maxIntermediate` /
-/// `query.maxScan`), so a bench that omits them is both unrealistic and dangerous: on a
-/// graph with hubs an unbudgeted expansion will materialise until the box dies rather
+/// **Not optional.** `0` means *unlimited* for both; `Engine::new` no longer defaults to
+/// that sentinel (it starts from `DEFAULT_MAX_INTERMEDIATE` / `DEFAULT_MAX_SCAN`), but a
+/// bench must still state its own ceiling: these shapes are deliberately larger than the
+/// server default, so inheriting it would measure the budget error instead of the query.
+/// On a graph with hubs an unbudgeted expansion will materialise until the box dies rather
 /// than returning a budget error. Sized here at ~10x the largest legitimate shape
 /// (200k rows), so every intended measurement fits and a runaway one fails fast.
 const MAX_INTERMEDIATE: u64 = 8_000_000;

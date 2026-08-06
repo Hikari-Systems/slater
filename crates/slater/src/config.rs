@@ -896,8 +896,10 @@ fn default_timeout_ms() -> u64 {
 // ~48 bytes per element (size_of::<Val>()), so 1M elements bounds a single
 // query's intermediate materialisation at roughly 48 MB worst case — sized for
 // deployments with 100–200 MB memory limits and a few concurrent queries.
+// The value lives in `exec` so an `Engine` built without config (a tool, a bench,
+// an internal helper) defaults to exactly what the server would have given it.
 fn default_max_intermediate() -> u64 {
-    1_000_000
+    crate::exec::DEFAULT_MAX_INTERMEDIATE
 }
 // Transient walk-work budget for count-pushdown traversals (`query.maxScan`). These
 // retain ~O(1) memory, so this charges no retained bytes and is memory-safe to set high —
@@ -908,7 +910,7 @@ fn default_max_intermediate() -> u64 {
 // of trip. 500M is chosen generously on that basis (a finite backstop still catches a
 // geometric blow-up sooner than the timeout would).
 fn default_max_scan() -> u64 {
-    500_000_000
+    crate::exec::DEFAULT_MAX_SCAN
 }
 // Server-wide companion to `max_intermediate`. At ~48 bytes per element the 8M
 // default bounds the aggregate live intermediate memory of *all* concurrent

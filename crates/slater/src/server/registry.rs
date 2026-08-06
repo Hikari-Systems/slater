@@ -575,7 +575,28 @@ impl Graphs {
                 core.as_ref(),
                 DeltaSnapshot::with_levels(frozen.snapshot.clone(), frozen.l0.clone()),
             );
-            let engine = Engine::new(&view, cache);
+            // Belt-and-braces, and deliberately *not* load-bearing today — the honest
+            // version of a comment that used to claim otherwise.
+            //
+            // The budgets are charged only from `Engine::run`: every `charge` /
+            // `charge_scan` / `charge_walk` call site lives under exec/{matchclause,
+            // driver, project, eval, traverse, proc}.rs. `serialise_binary_dump` never
+            // calls `run` — it drives the reader methods directly (`node_record`,
+            // `outgoing_adj`, `raw_node_props`, `vector_group`, …) — so deleting these
+            // two lines would change nothing at any graph size.
+            //
+            // The distinction matters more than the two lines do, because it is the
+            // criterion for auditing every other `Engine::new` that does not set a
+            // budget. The question is **"does this engine call `run`?"**, NOT "does it
+            // walk a lot of the graph" — an engine used only as a reader/renderer (the
+            // Bolt encode path, `node_has_relationships`, `find_outgoing_edge`) is
+            // unaffected by the budget however much it touches, while a small-looking
+            // call site that does `run` a query inherits `DEFAULT_MAX_INTERMEDIATE` and
+            // can start failing. Kept here so that if this dump ever grows a `run` — a
+            // query-driven export, say — it is already correct.
+            let engine = Engine::new(&view, cache)
+                .with_max_intermediate(0)
+                .with_max_scan(0);
             crate::consolidate::serialise_binary_dump(&engine, &view, &dump_path, master_key)
         };
         if let Err(e) = dump_res {

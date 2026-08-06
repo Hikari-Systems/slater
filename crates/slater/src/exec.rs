@@ -939,6 +939,29 @@ fn read_vector(gen: &dyn ReadView, cache: &BlockCache, global: u64) -> Result<Ve
 /// small). Above it, both the candidate reads and the distance/top-k scan parallelize.
 const KNN_PAR_MIN: usize = 256;
 
+/// Default per-query intermediate-element budget for an [`Engine`] built by
+/// [`Engine::new`], and the value `config.query.maxIntermediate` defaults to (that
+/// function delegates here, so the two can never drift).
+///
+/// **This is a default, not a fallback.** `max_intermediate` uses `0` as the
+/// "unlimited" sentinel, so leaving the field at its zero value would give an
+/// *unbounded* query — the opposite of a safe default, and a footgun that pointed at
+/// every caller who did not know to say `.with_max_intermediate()`. The serving paths
+/// always set it from config; everything else (tools, benches, consolidation helpers,
+/// any new call site) now inherits a real budget and has to ask for unlimited by name.
+///
+/// At ~48 bytes per element (`size_of::<Val>()`) 1M elements bounds one query's
+/// intermediate materialisation at roughly 48 MB.
+pub const DEFAULT_MAX_INTERMEDIATE: u64 = 1_000_000;
+
+/// Default transient walk-work budget for an [`Engine`] built by [`Engine::new`], and
+/// the value `config.query.maxScan` defaults to. Same reasoning as
+/// [`DEFAULT_MAX_INTERMEDIATE`]: `0` means unlimited, so it cannot be the default.
+///
+/// This budget retains no memory — it only backstops runaway *work* — so it is set
+/// generously; the query timeout is the primary governor.
+pub const DEFAULT_MAX_SCAN: u64 = 500_000_000;
+
 /// Thread-safe read+decode of node `id`'s resident label-id set through the (Sync)
 /// block cache. The free-fn body behind [`Engine::node_label_ids`] so the parallel
 /// anchor filter ([`node_ok_par`], Task 10) can read labels off-thread.
@@ -2699,9 +2722,9 @@ impl<'g, V: ReadView> Engine<'g, V> {
             deadline: None,
             beam_width: 64,
             temp_beam_width: 0,
-            max_intermediate: 0,
+            max_intermediate: DEFAULT_MAX_INTERMEDIATE,
             budget_used: Cell::new(0),
-            max_scan: 0,
+            max_scan: DEFAULT_MAX_SCAN,
             scan_used: Cell::new(0),
             scanned_ids: Cell::new(0),
             count_acc: Cell::new(None),

@@ -44,6 +44,16 @@ use crate::testgen::fixture_summaries;
 const BLOCK: usize = 4096;
 const LEVEL: i32 = 3;
 
+/// Per-query budgets for the harness's own engines ([`Reader::run`]).
+///
+/// A bench states its ceiling rather than inheriting the server's
+/// [`DEFAULT_MAX_INTERMEDIATE`](crate::exec::DEFAULT_MAX_INTERMEDIATE): bench shapes are
+/// chosen to be large, so inheriting a production default risks measuring the budget
+/// error instead of the query. These are set an order of magnitude above anything the
+/// read-amplification benches materialise, so they only ever catch a genuine runaway.
+const BENCH_MAX_INTERMEDIATE: u64 = 8_000_000;
+const BENCH_MAX_SCAN: u64 = 32_000_000;
+
 /// Nodes each flushed segment patches — a small, contiguous, disjoint band per segment near
 /// the top of the id space. Kept small so a segment stays cheap (O(delta)) and its name-fence
 /// stays narrow: an untouched lookup below the band falls outside every segment's fence.
@@ -359,11 +369,24 @@ impl Reader {
 
     /// Execute `query` as a read over the core stack (empty write-delta) and return the row
     /// count (a cheap observable for `black_box`). Panics on a parse/exec error.
+    ///
+    /// The budget is stated explicitly for the same reason [`Reader::with_engine`] takes
+    /// one as a required argument: a bench must not inherit the server's ceiling. This
+    /// call site used to rely on `Engine::new` leaving the budget unlimited, which stopped
+    /// being true when the default became [`DEFAULT_MAX_INTERMEDIATE`] — silently capping
+    /// the read-amplification benches at 1M elements and turning a fixture above that into
+    /// an `.unwrap()` panic that reads as a harness crash rather than a budget decision.
+    /// [`BENCH_MAX_INTERMEDIATE`] is deliberately far above any shape these benches
+    /// measure, so it backstops a runaway without ever being the thing being measured.
     pub fn run(&self, query: &str) -> usize {
         let ast = parser::parse(query).unwrap();
         let view = MergedView::new(&self.gen, slater_delta::DeltaSnapshot::empty());
         // Bind the owned result so the `Engine`/`view` borrows drop before the return.
-        let result = Engine::new(&view, &self.cache).run(&ast).unwrap();
+        let result = Engine::new(&view, &self.cache)
+            .with_max_intermediate(BENCH_MAX_INTERMEDIATE)
+            .with_max_scan(BENCH_MAX_SCAN)
+            .run(&ast)
+            .unwrap();
         result.rows.len()
     }
 
@@ -400,13 +423,16 @@ impl Reader {
     ///
     /// # The budget is a required argument, deliberately
     ///
-    /// [`Engine::new`] defaults `max_intermediate` and `max_scan` to `0`, and **`0` means
-    /// unlimited**, not zero. The server never runs that way — it sets both from
-    /// `query.maxIntermediate` / `query.maxScan` — so a harness that builds an `Engine`
-    /// directly is the only place the guard can go missing. On a graph with hubs an
-    /// unbudgeted expansion materialises until the machine dies rather than returning a
-    /// budget error, which has happened. Taking the ceiling as a positional parameter
-    /// rather than an optional `with_…` setter makes forgetting it a compile error.
+    /// `0` means **unlimited**, not zero, for both `max_intermediate` and `max_scan`.
+    /// [`Engine::new`] no longer *defaults* to that sentinel — it now starts from
+    /// [`DEFAULT_MAX_INTERMEDIATE`](crate::exec::DEFAULT_MAX_INTERMEDIATE) /
+    /// [`DEFAULT_MAX_SCAN`](crate::exec::DEFAULT_MAX_SCAN) — but a bench still has to
+    /// state its own ceiling rather than inherit the server's: bench shapes are chosen to
+    /// be large, and silently running one against a 1M default would measure the budget
+    /// error rather than the query. On a graph with hubs an unbudgeted expansion
+    /// materialises until the machine dies rather than returning a budget error, which has
+    /// happened. Taking the ceiling as a positional parameter rather than an optional
+    /// `with_…` setter makes forgetting it a compile error.
     ///
     /// Closure-based rather than returning the `Engine`: the `MergedView` it borrows is a
     /// temporary owned inside this call, so it cannot outlive the frame.

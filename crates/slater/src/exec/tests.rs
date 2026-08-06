@@ -4619,12 +4619,22 @@ fn run_budgeted(root_tag: &str, budget: u64, q: &str) -> Result<QueryResult> {
 /// Run `q` with the per-query budget OFF and a server-wide budget set. Asserts
 /// the universal invariant — every query refunds its whole global charge, so
 /// the live counter returns to zero — and returns `(result, peak_charge)`.
+///
+/// The `.with_max_intermediate(0)` is what makes the "per-query budget OFF" in that
+/// sentence true, and it is not optional: `Engine::new` defaults to
+/// [`DEFAULT_MAX_INTERMEDIATE`](crate::exec::DEFAULT_MAX_INTERMEDIATE), so without it
+/// every caller here silently runs under a live 1M per-query ceiling. Each of these
+/// tests names a *global*-budget behaviour, so a per-query trip would fail them with the
+/// wrong error — `is_global_budget_err` would return false and the failure would read as
+/// a server-wide-budget regression that does not exist.
 fn run_global(root_tag: &str, global: u64, q: &str) -> (Result<QueryResult>, u64) {
     let (root, graph, _) = testgen::write_basic(root_tag);
     let gen = Generation::open(&root, &graph).unwrap();
     let cache = BlockCache::new(1 << 20);
     let budget = GlobalIntermediateBudget::new(global);
-    let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+    let engine = Engine::new(&gen, &cache)
+        .with_max_intermediate(0)
+        .with_global_budget(&budget);
     let ast = parser::parse(q).unwrap();
     let res = engine.run(&ast);
     let peak = budget.peak();
@@ -4823,6 +4833,61 @@ fn global_budget_trips_with_per_query_off() {
 }
 
 #[test]
+fn a_default_engine_is_budgeted_not_unlimited() {
+    // `Engine::new` used to leave `max_intermediate` at 0 — and 0 means *unlimited*, not
+    // "no budget". So every caller that forgot `.with_max_intermediate()` got an unbounded
+    // query, and the failure mode was the machine's OOM killer rather than a `FAILURE` on
+    // the wire. The serving paths all set it; the footgun was aimed at everything else
+    // (tools, benches, and any new call site), and it went off at least once.
+    //
+    // The default is now `DEFAULT_MAX_INTERMEDIATE`, so an unconfigured engine trips on a
+    // query that materialises more than that.
+    //
+    // The vehicle has to be a *nested* UNWIND, not one big `range()`: `range()` carries its
+    // own hardcoded `MAX_RANGE_LEN` of 1M (eval.rs) and refuses to build a longer list at
+    // all, so a single `range(0, 1500000)` fails inside the function and never reaches the
+    // budget — it proves nothing about this fix. 1101 × 1101 = 1_212_201 charged elements
+    // clears the 1M default while each individual `range()` stays legal. Verified red
+    // before the fix: the unbudgeted engine returned `count(*) = 1212201` instead of failing.
+    let (root, graph, _) = testgen::write_basic("exec_default_budget");
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let ast =
+        parser::parse("UNWIND range(0, 1100) AS a UNWIND range(0, 1100) AS b RETURN count(*)")
+            .unwrap();
+
+    let err = Engine::new(&gen, &cache)
+        .run(&ast)
+        .expect_err("an engine with no explicit budget must still be bounded");
+    assert!(
+        format!("{err:#}").contains("intermediate result budget"),
+        "expected the per-query budget error, got: {err:#}"
+    );
+
+    // The escape hatch is still there, but it now has to be asked for by name. Prove it
+    // on a *small* query rather than by running the 1.2M-row one unbudgeted: 10_201
+    // elements is far above a budget of 10 and far below anything worth allocating, so
+    // the pair below isolates the sentinel without this test — which runs in the default
+    // `cargo test` suite, in parallel, on the mandatory pre-tag job — ever holding ~150 MB
+    // of `Val`s with its guard deliberately switched off. Running an engine unbudgeted is
+    // exactly what this commit exists to prevent; the test for it should not be the one
+    // place that does it at scale.
+    let small =
+        parser::parse("UNWIND range(0, 100) AS a UNWIND range(0, 100) AS b RETURN count(*)")
+            .unwrap();
+    Engine::new(&gen, &cache)
+        .with_max_intermediate(10)
+        .run(&small)
+        .expect_err("a budget of 10 must reject 10_201 elements");
+    Engine::new(&gen, &cache)
+        .with_max_intermediate(0)
+        .run(&small)
+        .expect("an explicit 0 still disables the budget");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn global_budget_refunds_after_successful_run() {
     let (root, graph, _) = testgen::write_basic("exec_global_refund");
     let gen = Generation::open(&root, &graph).unwrap();
@@ -4848,12 +4913,20 @@ fn global_budget_rises_during_run_and_falls_after() {
     // Generous ceiling so the query never trips the guard; it still charges
     // ~900k elements and holds them for the whole run, so the reader can see it
     // climb. (range() itself caps at 1M elements, so stay under that here.)
+    //
+    // The per-query budget is disabled explicitly below. This test is about the
+    // *global* gauge, and the total charge (the range list, the UNWIND expansion and
+    // the aggregate each draw) lands just over `DEFAULT_MAX_INTERMEDIATE` — so once
+    // `Engine::new` stopped defaulting to unlimited, the per-query guard tripped first
+    // and the run never reached the thing being measured.
     let budget = GlobalIntermediateBudget::new(100_000_000);
     let done = AtomicBool::new(false);
     let mut max_live = 0u64;
     std::thread::scope(|s| {
         s.spawn(|| {
-            let engine = Engine::new(&gen, &cache).with_global_budget(&budget);
+            let engine = Engine::new(&gen, &cache)
+                .with_max_intermediate(0)
+                .with_global_budget(&budget);
             let ast = parser::parse("UNWIND range(0, 900000) AS x RETURN count(x)").unwrap();
             engine.run(&ast).expect("within the budget");
             done.store(true, Ordering::Release);
@@ -5048,6 +5121,11 @@ fn global_budget_allows_small_query() {
 fn global_budget_zero_completes_large() {
     // Per-query off and global 0 → no cap; a large materialisation completes
     // and the (disabled) counter never accumulates.
+    //
+    // "Per-query off" is `run_global`'s doing, and it is load-bearing: with that
+    // `.with_max_intermediate(0)` removed, a shape above `DEFAULT_MAX_INTERMEDIATE`
+    // fails here with `query.maxIntermediate` instead — the wrong budget entirely.
+    // Verified by mutation rather than assumed.
     let (res, peak) = run_global(
         "exec_g_zero",
         0,
