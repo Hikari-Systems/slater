@@ -13,10 +13,6 @@
 //! The file is **hot-reloaded**: [`AclHandle::poll`] re-reads it when it changes,
 //! and a malformed file is rejected loudly while the last-good ACL keeps serving
 //! (a fat-fingered edit must never lock every user out).
-//
-// The server loop that calls poll()/verify()/can_read()/can_write() lands with the
-// Bolt connection state machine; allow dead_code for the standalone ACL until then.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

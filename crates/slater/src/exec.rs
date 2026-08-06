@@ -24,10 +24,6 @@
 //! optional wall-clock deadline, and intermediate collections (comprehensions,
 //! `UNWIND`, concatenation, aggregate buffers, varlen paths) by an optional
 //! query-wide element budget (`query.maxIntermediate`).
-//
-// The tokio Bolt listener that drives this (decoding RUN/PULL and PackStream-
-// encoding the rows) is the next M4 increment; allow dead_code until it lands.
-#![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

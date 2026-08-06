@@ -11,13 +11,8 @@
 //!   `SUCCESS`/`RECORD`/`FAILURE`/`IGNORED` responses.
 //!
 //! The per-connection state machine and `tokio` listener that drive these — and
-//! the TLS acceptor — are wired once the ACL (M4.4) and executor (M4.5) they call
-//! into exist; the wire layer here is complete and verified against the neo4j
-//! JavaScript and Python drivers' framing.
-//
-// The listener/state-machine consumers land in later M4 sub-steps; allow
-// dead_code for the standalone wire layer until then.
-#![allow(dead_code)]
+//! the TLS acceptor — live in [`server`](crate::server); the wire layer here is
+//! verified against the neo4j JavaScript and Python drivers' framing.
 
 pub mod chunk;
 pub mod client;

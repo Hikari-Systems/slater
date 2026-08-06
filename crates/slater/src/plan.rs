@@ -19,9 +19,6 @@
 //! literal would. A param that is absent or whose runtime type cannot key an index
 //! simply does not contribute a predicate — the anchor falls back to a scan and the
 //! executor filters it, exactly as before (this is what keeps it sound).
-//
-// Consumed by the executor (`exec`); the standalone planner is unit-tested here.
-#![allow(dead_code)]
 
 use crate::generation::RelEndpointSide;
 use crate::parser::ast::{CmpOp, Direction, Expr, FuncArgs, NodePat, Pattern};

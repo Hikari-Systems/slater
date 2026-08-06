@@ -10,11 +10,6 @@
 //! storage), opens every reader, and builds the
 //! inverted label/relationship-type postings the executor needs for selective
 //! scans (D11 — `slater-build` only emits the *forward* per-node label store).
-//
-// Many accessors below are consumed only from later M4 sub-steps (cache, parser,
-// executor). Allow dead_code for now so the build stays warning-clean; the allow
-// is removed once those callers land.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

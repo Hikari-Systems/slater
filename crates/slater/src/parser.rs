@@ -4,13 +4,11 @@
 //! The grammar (`cypher.pest`) is the online query language — separate from
 //! `slater-build`'s dump dialect. This module drives it and lowers the parse tree
 //! into the [`ast`] types the planner/executor consume. Write and procedure
-//! clauses parse structurally but are rejected here with a clear "Slater is
-//! read-only" error, so a client gets a meaningful `FAILURE` rather than an opaque
-//! syntax error.
-//
-// The planner/executor that consume this AST land in the next M4.5 increment;
-// allow dead_code for the AST + parser until then.
-#![allow(dead_code)]
+//! clauses parse structurally but are rejected by [`parse`] with a clear "Slater
+//! is read-only" error, so a client gets a meaningful `FAILURE` rather than an
+//! opaque syntax error. When the writable layer is enabled the server calls
+//! [`parse_statement`] instead, which tries the narrow write grammar first and
+//! falls through to [`parse`] for everything else.
 
 use anyhow::{bail, Result};
 use pest::iterators::Pair;

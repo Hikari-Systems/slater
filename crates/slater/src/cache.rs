@@ -33,10 +33,6 @@
 //! the read-lock hit path already lets concurrent hits proceed in parallel; sharding
 //! (which further spreads the miss-path *write* lock over cachelines) is a later step,
 //! taken only if a bench shows the miss rate warrants it.
-//
-// Consumed by the executor from M4.5; allow dead_code for the standalone cache
-// until those call sites land.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

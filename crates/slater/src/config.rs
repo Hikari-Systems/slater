@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Slater server configuration.
 //!
-// Many fields below are consumed only from milestone 4 (server/cache/query
-// wiring). Allow dead_code for the scaffold so the build stays warning-clean;
-// the allow is removed once the server loop reads them.
-#![allow(dead_code)]
-//!
 //! Loaded through `hs_utils::config::load_layered_value()` — the house-standard
 //! layered loader: base `config.json` (or `/app/config.json`) + `/sandbox`
 //! overlay + `[SECRET]:` resolution + `KEY__sub` env overrides. All scalar leaves

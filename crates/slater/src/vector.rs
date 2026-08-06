@@ -21,7 +21,6 @@
 // companion scalar `similarity(a, b)` returns the complementary cosine
 // *similarity* in `[-1, 1]` (so `score == 1 - similarity(query, node)`). Ties on
 // score are broken by ascending node id so a query is deterministic.
-#![allow(dead_code)]
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

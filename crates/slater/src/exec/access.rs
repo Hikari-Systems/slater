@@ -72,21 +72,10 @@ impl<'g, V: ReadView> Engine<'g, V> {
         read_adj_overlaid(self.gen, self.cache, id, false)
     }
 
-    /// Read a vector index group `[first_record, first_record + count)` from
-    /// `vectors.f32.blk` **through the block cache** (D18) — the brute-force KNN
-    /// candidate set. Each record decodes to its dense node id + full-precision
-    /// vector; the group is contiguous (D10), so this touches only that index's
-    /// blocks and they stay warm for repeat queries. When a fanout pool is
-    /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
-    /// (cache lookup + zstd decode) gather in parallel, preserving record order.
     /// What each level above the base holds for `desc`, resolved per level — see the free fn
     /// [`vector_levels`].
     pub(crate) fn vector_levels(&self, desc: &VectorIndexDesc) -> Result<VectorLevels> {
         vector_levels(self.gen, self.cache, desc)
-    }
-
-    pub(crate) fn segment_level(&self, desc: &VectorIndexDesc) -> Result<VectorLevel> {
-        segment_level(self.gen, self.cache, desc)
     }
 
     /// The full-precision embeddings the **sealed base index** holds for `wanted`, keyed by node
@@ -187,6 +176,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
         })
     }
 
+    /// Read a vector index group `[first_record, first_record + count)` from
+    /// `vectors.f32.blk` **through the block cache** (D18) — the brute-force KNN
+    /// candidate set. Each record decodes to its dense node id + full-precision
+    /// vector; the group is contiguous (D10), so this touches only that index's
+    /// blocks and they stay warm for repeat queries. When a fanout pool is
+    /// configured and the group is at least [`KNN_PAR_MIN`], the per-record reads
+    /// (cache lookup + zstd decode) gather in parallel, preserving record order.
     pub(crate) fn vector_group(&self, first_record: u64, count: u64) -> Result<Vec<VectorEntry>> {
         let ids: Vec<u64> = (first_record..first_record + count).collect();
         let (gen, cache) = (self.gen, self.cache);
