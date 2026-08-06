@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -240,9 +240,48 @@ pub fn hash_password(password: &str) -> Result<String> {
 /// A hot-reloadable handle around an [`Acl`]. Cheap to clone-snapshot
 /// (`Arc<Acl>`), so request handlers take a snapshot per LOGON/query and the
 /// background poller swaps the active ACL underneath them.
+///
+/// # Lock poisoning cannot lock the estate out
+///
+/// [`AclHandle::snapshot`] runs on **every LOGON**, so a poisoned `state` lock taken
+/// with `.unwrap()` would turn one panic — anywhere, once — into a permanent, total
+/// authentication outage lasting until someone restarts the process. The same two
+/// invariants `delta_writer` relies on (see its module docs) remove that failure mode
+/// here, and both are load-bearing:
+///
+/// 1. **Every mutating critical section is panic-atomic.** All fallible work — reading
+///    and parsing the file, hashing it, calling the caller-supplied `accept` closure,
+///    *allocating the new `Arc`*, and *logging* — happens on locals, outside the guard.
+///    What runs under the write lock is a run of moves into [`State`], which cannot
+///    unwind. A panic therefore always leaves `State` exactly as it was. Keep new code
+///    in that shape: nothing that can panic may run between the first and last write to
+///    `State`. In particular do not log inside the guard — `info!` formatting is
+///    arbitrary subscriber code, and that is precisely what used to run under the write
+///    lock here. (Allocation would abort rather than unwind, so hoisting the `Arc::new`
+///    is belt-and-braces — but it keeps the sentence above literally true, which is what
+///    makes the invariant checkable by reading.)
+/// 2. **Acquisition never panics.** Because (1) makes the poison flag carry no
+///    information, the accessors take their guards through [`read_state`] /
+///    [`write_state`], which recover from `PoisonError` and let the flag stand.
+///
+/// The panic itself still unwinds loudly to whoever caused it; what it must not do is
+/// take the estate's ability to authenticate with it.
 pub struct AclHandle {
     path: PathBuf,
     state: RwLock<State>,
+}
+
+/// Shared-read guard on the ACL state, recovering the guard if a previous holder
+/// panicked. Sound only while every mutating section stays panic-atomic — see
+/// [`AclHandle`]'s poisoning notes.
+fn read_state(l: &RwLock<State>) -> RwLockReadGuard<'_, State> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Exclusive guard on the ACL state, recovering the guard if a previous holder
+/// panicked. Same soundness condition as [`read_state`].
+fn write_state(l: &RwLock<State>) -> RwLockWriteGuard<'_, State> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct State {
@@ -283,14 +322,14 @@ impl AclHandle {
         })
     }
 
-    /// A cheap snapshot of the currently-active ACL.
+    /// A cheap snapshot of the currently-active ACL. On the LOGON path.
     pub fn snapshot(&self) -> Arc<Acl> {
-        self.state.read().unwrap().acl.clone()
+        read_state(&self.state).acl.clone()
     }
 
     /// The BLAKE3 digest of the `acl.json` bytes the active ACL was parsed from.
     pub fn digest(&self) -> String {
-        self.state.read().unwrap().digest.clone()
+        read_state(&self.state).digest.clone()
     }
 
     /// Re-read the file and swap in the new ACL unconditionally. On a parse/IO
@@ -306,18 +345,26 @@ impl AclHandle {
         let mtime = file_mtime(&self.path);
         match load_with_digest(&self.path) {
             Ok((acl, digest)) => {
-                let mut s = self.state.write().unwrap();
-                s.acl = Arc::new(acl);
-                s.mtime = mtime;
-                s.digest = digest;
-                info!(path = %self.path.display(), users = s.acl.users.len(), "reloaded ACL");
+                // Install: moves only, nothing that can unwind under the guard. The log
+                // is deliberately outside it — see AclHandle's poisoning notes.
+                // Prepare on locals: the `Arc` allocation happens before the guard, so
+                // what runs under the lock really is nothing but moves.
+                let users = acl.users.len();
+                let acl = Arc::new(acl);
+                {
+                    let mut s = write_state(&self.state);
+                    s.acl = acl;
+                    s.mtime = mtime;
+                    s.digest = digest;
+                }
+                info!(path = %self.path.display(), users, "reloaded ACL");
                 true
             }
             Err(e) => {
                 // Keep last-good; advance the recorded mtime so we do not re-log
                 // the same broken file every poll until it changes again.
                 warn!(path = %self.path.display(), error = %e, "ACL reload failed; keeping last-good ACL");
-                self.state.write().unwrap().mtime = mtime;
+                write_state(&self.state).mtime = mtime;
                 false
             }
         }
@@ -329,7 +376,7 @@ impl AclHandle {
     pub fn poll(&self) -> bool {
         let current = file_mtime(&self.path);
         let changed = {
-            let s = self.state.read().unwrap();
+            let s = read_state(&self.state);
             current != s.mtime
         };
         if changed {
@@ -352,11 +399,18 @@ impl AclHandle {
         let mtime = file_mtime(&self.path);
         match load_with_digest(&self.path) {
             Ok((acl, digest)) if accept(&digest) => {
-                let mut s = self.state.write().unwrap();
-                s.acl = Arc::new(acl);
-                s.mtime = mtime;
-                s.digest = digest;
-                info!(path = %self.path.display(), users = s.acl.users.len(), "reloaded ACL");
+                // As in `reload`: install under the guard, log outside it.
+                // Prepare on locals: the `Arc` allocation happens before the guard, so
+                // what runs under the lock really is nothing but moves.
+                let users = acl.users.len();
+                let acl = Arc::new(acl);
+                {
+                    let mut s = write_state(&self.state);
+                    s.acl = acl;
+                    s.mtime = mtime;
+                    s.digest = digest;
+                }
+                info!(path = %self.path.display(), users, "reloaded ACL");
                 true
             }
             Ok((_, digest)) => {
@@ -370,12 +424,12 @@ impl AclHandle {
                      hot-reload and keeping the last-good ACL (rebuild the generation against the \
                      new acl.json to change access control)"
                 );
-                self.state.write().unwrap().mtime = mtime;
+                write_state(&self.state).mtime = mtime;
                 false
             }
             Err(e) => {
                 warn!(path = %self.path.display(), error = %e, "ACL reload failed; keeping last-good ACL");
-                self.state.write().unwrap().mtime = mtime;
+                write_state(&self.state).mtime = mtime;
                 false
             }
         }
@@ -387,7 +441,7 @@ impl AclHandle {
     pub fn poll_checked(&self, accept: impl Fn(&str) -> bool) -> bool {
         let current = file_mtime(&self.path);
         let changed = {
-            let s = self.state.read().unwrap();
+            let s = read_state(&self.state);
             current != s.mtime
         };
         if changed {
@@ -823,6 +877,55 @@ mod tests {
             !snap.verify("alice", "a"),
             "old user gone after a successful reload"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_poisoned_state_lock_does_not_lock_every_user_out() {
+        // The ACL lock is taken on the auth path — `snapshot()` runs on every LOGON. With
+        // `.unwrap()` acquisition, one panic anywhere inside a critical section poisons the
+        // `RwLock` for the life of the process, and every subsequent LOGON panics with it:
+        // a single transient fault becomes a permanent, total authentication outage that
+        // survives until someone restarts the server. That is a far worse failure than the
+        // one query (or one reload) that panicked.
+        //
+        // `delta_writer` already settled the argument for the write path (see its module
+        // docs): make every critical section panic-*atomic*, and then recovering the guard
+        // is sound because the poison flag carries no information. The ACL sections qualify
+        // — each is a run of moves into `State` — so acquisition must not panic either.
+        let dir = std::env::temp_dir().join(format!("slater_acl_poison_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acl.json");
+        let acl = serde_json::json!({
+            "users": { "alice": { "passwordArgon2id": hash_password("a").unwrap(), "grants": { "g": ["read"] } } }
+        });
+        std::fs::write(&path, acl.to_string()).unwrap();
+        let handle = AclHandle::load(&path).unwrap();
+        assert!(handle.snapshot().verify("alice", "a"));
+
+        // Poison it: panic while holding the write guard. `catch_unwind` keeps the panic
+        // from failing the test itself — it is the *deliberate* fault being injected.
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = handle.state.write().unwrap();
+            panic!("deliberate fault inside an ACL critical section");
+        }));
+        assert!(poisoner.is_err(), "the injected panic must have unwound");
+        assert!(
+            handle.state.is_poisoned(),
+            "the lock must actually be poisoned, or this test proves nothing"
+        );
+
+        // The whole point: alice can still log in.
+        assert!(
+            handle.snapshot().verify("alice", "a"),
+            "a poisoned lock must not lock every user out"
+        );
+        assert!(
+            !handle.digest().is_empty(),
+            "digest() survives poisoning too"
+        );
+        assert!(!handle.poll(), "poll() survives poisoning too");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
