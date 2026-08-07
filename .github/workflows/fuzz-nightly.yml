@@ -40,7 +40,15 @@ jobs:
   # does), so they fuzz in parallel and each persists its own corpus.
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 40 was ~1 minute of headroom and `parse_statement` finally crossed it on
+    # 2026-08-07 (run 31152379917, cancelled mid cache-save at 40m22s; the night
+    # before finished at 38m41s). That leg currently spends its whole
+    # `-max_total_time=900` replaying the seed corpus — `#680 INITED` and
+    # `#680 DONE` at the same exec count, 1051s for 680 runs — then another ~17min
+    # in `cmin`. 60 stops the flake; it does not fix the underlying throughput,
+    # which is tracked separately: some corpus inputs cost ~1.5s each to replay,
+    # against microseconds for the same shapes parsed directly.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -139,4 +147,19 @@ jobs:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
           if-no-files-found: ignore
+          retention-days: 14
+
+      # The corpus otherwise lives only in the Actions cache, which has no download
+      # API — so a run's behaviour cannot be reproduced locally, and on 2026-08-07 a
+      # local replay of a *different* corpus (431 files, instant) was mistaken for
+      # evidence about CI's (679 files, 1051s). Publishing it as an artifact makes
+      # every night's exact input set fetchable with `gh run download`, which is the
+      # only way to bisect a slow or memory-hungry input. Small (~60 KB compressed).
+      - name: Upload fuzz corpus
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: warn
           retention-days: 14
