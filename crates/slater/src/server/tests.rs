@@ -2,6 +2,10 @@
 //! Unit tests for the parent module (extracted verbatim from the inline
 //! `mod tests`; a pure relocation, no test logic changed).
 
+/// The Bolt version write tests encode results for — 5.4 is what the server
+/// prefers, and the only one where element-id fields are emitted.
+const TEST_BOLT_VERSION: (u8, u8) = (5, 4);
+
 use super::*;
 use crate::acl::hash_password;
 use crate::testgen;
@@ -491,7 +495,14 @@ fn write_then_read_your_writes_and_survives_reopen() {
         parser::ast::Statement::Write(w) => w,
         _ => panic!("expected a write"),
     };
-    let out = execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    let out = execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     assert_eq!(
         out,
         (Vec::new(), Vec::new()),
@@ -568,27 +579,172 @@ fn write_errors_are_clean() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    let e = execute_write(&writer, gen.as_ref(), &absent, &HashMap::new()).unwrap_err();
+    let e = execute_write(
+        &writer,
+        gen.as_ref(),
+        &absent,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap_err();
     assert!(
         e.message.contains("node to update") && e.message.contains("MERGE"),
         "got: {}",
         e.message
     );
 
-    // RETURN after SET is not yet supported.
-    let with_ret =
-        match parser::parse_statement("MATCH (n:Person {name:'Alice'}) SET n.age = 1 RETURN n")
-            .unwrap()
-        {
-            parser::ast::Statement::Write(w) => w,
-            _ => unreachable!(),
-        };
-    let e = execute_write(&writer, gen.as_ref(), &with_ret, &HashMap::new()).unwrap_err();
-    assert!(
-        e.message.contains("RETURN after a write"),
-        "got: {}",
-        e.message
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `RETURN` after a write projects the node the write just touched, reading through the
+/// post-commit overlay — so it reports the value it wrote, not the pre-write one.
+#[test]
+fn a_write_returns_the_node_it_wrote() {
+    let (root, _g, _) = testgen::write_basic("write_return");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let gen = graphs.get("people").unwrap();
+    let writer = graphs.writer("people").unwrap();
+
+    let write_stmt = |q: &str| match parser::parse_statement(q).unwrap() {
+        parser::ast::Statement::Write(w) => w,
+        other => panic!("expected a node write, got {other:?}"),
+    };
+
+    // A projected property must be the *new* value; `age` was absent before this write.
+    let w = write_stmt("MATCH (n:Person {name:'Alice'}) SET n.age = 41 RETURN n.age AS age");
+    let (cols, rows) = execute_write(
+        &writer,
+        gen.as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+    assert_eq!(cols, vec!["age".to_string()]);
+    assert_eq!(rows, vec![vec![PsValue::Int(41)]]);
+
+    // Graphiti's shape: the uuid of the merged node, aliased.
+    let w = write_stmt("MATCH (n:Person {name:'Alice'}) SET n.age = 42 RETURN n.name AS uuid");
+    let (cols, rows) = execute_write(
+        &writer,
+        gen.as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+    assert_eq!(cols, vec!["uuid".to_string()]);
+    assert_eq!(rows, vec![vec![PsValue::str("Alice")]]);
+
+    // A whole node encodes as a Bolt Node struct carrying the overlaid properties.
+    let w = write_stmt("MATCH (n:Person {name:'Alice'}) SET n.age = 43 RETURN n");
+    let (_, rows) = execute_write(
+        &writer,
+        gen.as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+    match &rows[0][0] {
+        PsValue::Struct { tag, fields } => {
+            assert_eq!(*tag, TAG_NODE);
+            let PsValue::Map(props) = &fields[2] else {
+                panic!("expected a property map, got {:?}", fields[2])
+            };
+            assert!(
+                props
+                    .iter()
+                    .any(|(k, v)| k == "age" && *v == PsValue::Int(43)),
+                "the projection must read through the write: {props:?}",
+            );
+        }
+        other => panic!("expected a Node struct, got {other:?}"),
+    }
+
+    // A MERGE that *creates* has no dense id until the commit allocates one — the
+    // projection has to resolve it afterwards, which is the case most likely to regress.
+    let w = write_stmt("MERGE (n:Person {name:'Zoe'}) SET n.age = 7 RETURN n.age AS age");
+    let (_, rows) = execute_write(
+        &writer,
+        gen.as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+    assert_eq!(rows, vec![vec![PsValue::Int(7)]]);
+
+    // A write with no RETURN still reports nothing.
+    let w = write_stmt("MATCH (n:Person {name:'Alice'}) SET n.age = 44");
+    let (cols, rows) = execute_write(
+        &writer,
+        gen.as_ref(),
+        &w,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
+    assert!(cols.is_empty() && rows.is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A batched write projects **one row per input row, in input order** — the property a
+/// bulk loader relies on to line results up against what it sent.
+#[test]
+fn a_batched_write_returns_one_row_per_input_row() {
+    let (root, _g, _) = testgen::write_basic("write_return_batch");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let gen = graphs.get("people").unwrap();
+    let writer = graphs.writer("people").unwrap();
+
+    let w = match parser::parse_statement(
+        "UNWIND $rows AS r MERGE (n:Person {name: r.name}) SET n.age = r.age \
+         RETURN n.name AS name, n.age AS age",
+    )
+    .unwrap()
+    {
+        parser::ast::Statement::Write(w) => w,
+        other => panic!("expected a node write, got {other:?}"),
+    };
+    // A mix of an existing node (Alice) and two the batch creates, so the projection has
+    // to resolve both a core dense id and freshly allocated born ids.
+    let rows = Val::List(vec![
+        Val::Map(vec![
+            ("name".into(), Val::Str("Alice".into())),
+            ("age".into(), Val::Int(31)),
+        ]),
+        Val::Map(vec![
+            ("name".into(), Val::Str("Yves".into())),
+            ("age".into(), Val::Int(32)),
+        ]),
+        Val::Map(vec![
+            ("name".into(), Val::Str("Zoe".into())),
+            ("age".into(), Val::Int(33)),
+        ]),
+    ]);
+    let params = HashMap::from([("rows".to_string(), rows)]);
+    let (cols, out) = execute_write(&writer, gen.as_ref(), &w, &params, TEST_BOLT_VERSION).unwrap();
+
+    assert_eq!(cols, vec!["name".to_string(), "age".to_string()]);
+    assert_eq!(
+        out,
+        vec![
+            vec![PsValue::str("Alice"), PsValue::Int(31)],
+            vec![PsValue::str("Yves"), PsValue::Int(32)],
+            vec![PsValue::str("Zoe"), PsValue::Int(33)],
+        ],
     );
+
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -638,7 +794,14 @@ fn delete_then_read_suppresses_node_and_survives_reopen() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write"),
         };
-    execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     // Read-your-deletes: the anchor scan no longer yields Alice, the count drops,
     // and her tombstone is stored under dense id 0.
@@ -722,7 +885,14 @@ fn merge_creates_delta_born_node_and_survives_reopen() {
             _ => panic!("expected a write"),
         };
     assert!(stmt.upsert, "MERGE lowers to an upsert anchor");
-    execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     // Read-your-writes: Dave appears in the label scan with both his business-key
     // (name) and his SET property (age), and the count grew by exactly one.
@@ -739,7 +909,14 @@ fn merge_creates_delta_born_node_and_survives_reopen() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write"),
         };
-    execute_write(&writer, gen.as_ref(), &patch, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &patch,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     let patched = people(&writer);
     assert_eq!(
         patched.len(),
@@ -820,7 +997,7 @@ fn delete_removes_a_delta_born_node_by_key() {
             parser::ast::Statement::Write(s) => s,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(w, gen.as_ref(), &stmt, &HashMap::new())
+        execute_write(w, gen.as_ref(), &stmt, &HashMap::new(), TEST_BOLT_VERSION)
     };
 
     let base_n = names(&writer).len();
@@ -929,7 +1106,7 @@ fn write_unwind_batches_node_writes_under_one_commit() {
             parser::ast::Statement::Write(s) => s,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(w, gen.as_ref(), &stmt, params).unwrap();
+        execute_write(w, gen.as_ref(), &stmt, params, TEST_BOLT_VERSION).unwrap();
     };
 
     let base_n = names(&writer).len();
@@ -1053,7 +1230,14 @@ fn range_index_seek_overlays_born_and_tombstoned() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     write("MERGE (n:Person {name:'Dave'}) SET n.age = 50");
     // DETACH: Bob has an incident :KNOWS edge, so a plain DELETE would be rejected.
@@ -1141,7 +1325,14 @@ fn moved_indexed_value_relocates_a_patched_core_node() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write"),
         };
-    execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     // Equality seek: found at the NEW value (moved in), missed at the OLD one (moved
     // out). The "moved in" is the load-bearing case — the relocated node is absent
@@ -1345,7 +1536,14 @@ fn edge_overlay_suppresses_edge_to_tombstoned_node() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write"),
         };
-    execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     assert!(
         hop().is_empty(),
@@ -1371,9 +1569,14 @@ fn plain_delete_rejects_node_with_relationships_detach_allows() {
 
     let run = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::Write(w) => execute_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected a node write for {q:?}, got {other:?}"),
         }
     };
@@ -1438,9 +1641,14 @@ fn remove_and_replace_read_back_through_the_overlay() {
 
     let run = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::Write(w) => execute_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected a node write for {q:?}, got {other:?}"),
         }
     };
@@ -1523,7 +1731,14 @@ fn multi_item_and_merge_map_set_fold_in_source_order() {
     let run = |q: &str| {
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             other => panic!("expected a node write for {q:?}, got {other:?}"),
         };
@@ -1599,9 +1814,14 @@ fn label_mutation_matches_scans_counts_and_validates() {
 
     let run = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::Write(w) => execute_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected a node write for {q:?}, got {other:?}"),
         }
     };
@@ -1717,12 +1937,22 @@ fn create_and_merge_conditional_sets_end_to_end() {
 
     let run = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
-            parser::ast::Statement::Create(c) => {
-                execute_create(&writer, gen.as_ref(), &c, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::Write(w) => execute_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
+            parser::ast::Statement::Create(c) => execute_create(
+                &writer,
+                gen.as_ref(),
+                &c,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected a write/create for {q:?}, got {other:?}"),
         }
     };
@@ -1806,9 +2036,14 @@ fn edge_write_grammar_end_to_end() {
 
     let run_write = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::WriteEdge(w) => execute_edge_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected an edge write for {q:?}, got {other:?}"),
         }
     };
@@ -1897,7 +2132,14 @@ fn edge_writes_survive_a_reopen() {
         // Create Bob-KNOWS->Carol and delete the core Alice-KNOWS->Bob.
         let mk = |q: &str| match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected an edge write"),
         };
@@ -1965,9 +2207,14 @@ fn edge_properties_end_to_end() {
 
     let run_write = |q: &str| -> std::result::Result<(), Failure> {
         match parser::parse_statement(q).unwrap() {
-            parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).map(|_| ())
-            }
+            parser::ast::Statement::WriteEdge(w) => execute_edge_write(
+                &writer,
+                gen.as_ref(),
+                &w,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .map(|_| ()),
             other => panic!("expected an edge write for {q:?}, got {other:?}"),
         }
     };
@@ -2191,7 +2438,14 @@ fn consolidate_folds_delta_into_fresh_generation() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     assert!(
         !writer.snapshot().is_empty(),
         "delta live before consolidation"
@@ -2226,7 +2480,14 @@ fn consolidate_folds_delta_into_fresh_generation() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-        execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
+        execute_write(
+            &writer_mid,
+            gen_mid.as_ref(),
+            &bob,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
         testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
         Ok(())
     };
@@ -2306,10 +2567,24 @@ fn consolidation_dump_folds_the_segment_stack() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -2444,10 +2719,24 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -2497,7 +2786,14 @@ fn consolidate_over_a_stacked_set_collapses_to_a_singleton() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-        execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
+        execute_write(
+            &writer_mid,
+            gen_mid.as_ref(),
+            &bob,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
         testgen::write_indexed_people_at(dd, new_uuid, [99, 25, 40]);
         Ok(())
     };
@@ -2587,7 +2883,14 @@ fn gc_reclaims_stale_sets_and_compacted_segments() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -2676,7 +2979,14 @@ fn gc_respects_the_grace_before_reclaiming() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -2742,7 +3052,14 @@ fn gc_after_retarget_reclaims_the_prior_set() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -2825,7 +3142,14 @@ fn a_segment_merge_folds_vector_embeds_and_removals() {
         let writer = graphs.writer(&graph).unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -3131,7 +3455,14 @@ fn a_flush_carries_a_written_vector_and_a_removed_one_stays_removed() {
         let writer = graphs.writer(&graph).unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -3256,7 +3587,7 @@ fn vwrite_params(graphs: &Graphs, graph: &str, q: &str, params: &HashMap<String,
     let writer = graphs.writer(graph).unwrap();
     match parser::parse_statement(q).unwrap() {
         parser::ast::Statement::Write(w) => {
-            execute_write(&writer, gen.as_ref(), &w, params)
+            execute_write(&writer, gen.as_ref(), &w, params, TEST_BOLT_VERSION)
                 .unwrap_or_else(|e| panic!("write failed ({q}): {e:?}"));
         }
         _ => panic!("expected a write: {q}"),
@@ -4339,10 +4670,24 @@ fn flush_to_segment_folds_births_into_a_core_segment() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -4453,10 +4798,24 @@ fn resolve_through_the_stack_reuses_a_flushed_key_no_duplicate() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -4619,7 +4978,14 @@ fn batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -4629,7 +4995,7 @@ fn batch_resolve_through_the_stack_reuses_flushed_keys_no_duplicate() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, params).unwrap();
+                execute_write(&writer, gen.as_ref(), &w, params, TEST_BOLT_VERSION).unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -4774,7 +5140,14 @@ fn resolve_reborns_a_key_deleted_into_a_segment() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a node write: {q}"),
         }
@@ -4865,10 +5238,24 @@ fn flush_to_segment_encrypts_the_segment_under_a_master_key() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -4963,10 +5350,24 @@ fn flush_to_segment_folds_a_stacked_l0() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -5115,10 +5516,24 @@ fn flush_to_segment_folds_an_off_heap_l0_stack() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -5313,7 +5728,14 @@ fn flush_to_segment_uploads_to_an_object_store() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a node write: {q}"),
         }
@@ -5421,7 +5843,14 @@ fn gc_reclaims_orphans_from_an_object_store() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a node write: {q}"),
         }
@@ -5556,10 +5985,24 @@ fn flush_to_segment_materialises_core_node_patches() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -5744,7 +6187,14 @@ fn flush_to_segment_supersedes_a_lower_segment_value() {
         let parser::ast::Statement::Write(w) = parser::parse_statement(qy).unwrap() else {
             panic!("expected a write: {qy}");
         };
-        execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &w,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     let q = |graphs: &Graphs, qy: &str| -> QueryResult {
         let gen = graphs.get("people").unwrap();
@@ -5833,10 +6283,24 @@ fn flush_to_segment_materialises_a_node_delete() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -5967,10 +6431,24 @@ fn flush_to_segment_materialises_an_edge_delete() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -6088,10 +6566,24 @@ fn effective_adj_memoised_per_hub_on_multi_edge_delete() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -6196,10 +6688,24 @@ fn flush_to_segment_materialises_a_core_edge_patch() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -6329,10 +6835,24 @@ fn flush_to_segment_materialises_a_patch_then_delete_of_a_core_edge() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -6463,10 +6983,24 @@ fn compact_segments_folds_a_run_into_one() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {q}"),
         }
@@ -6652,7 +7186,14 @@ fn auto_compaction_admits_only_when_over_budget() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(q).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a node write: {q}"),
         }
@@ -6796,10 +7337,24 @@ fn compact_folds_a_base_delete_across_the_run() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -6946,10 +7501,24 @@ fn compact_a_partial_run_preserves_precedence() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -7105,7 +7674,14 @@ fn compact_folds_a_zero_width_band() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -7224,10 +7800,24 @@ fn compact_encrypts_the_merged_segment() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -7353,7 +7943,14 @@ fn compact_uploads_to_an_object_store() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a node write: {qy}"),
         }
@@ -7496,7 +8093,14 @@ fn flush_to_l0_overlay_reads_and_born_reuse_survive_reopen() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a node write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
 
     let mut graphs = Graphs::open_all(&root, None).unwrap();
@@ -7626,7 +8230,14 @@ fn consolidation_folds_a_flushed_l0_level() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-        execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen0.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     }
     assert!(writer.flush_to_l0().unwrap());
     assert_eq!(writer.l0_len(), 1);
@@ -7690,7 +8301,14 @@ fn failed_consolidation_preserves_the_write_and_old_core() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
@@ -7758,7 +8376,14 @@ fn consolidation_race_fixture(tag: &str) -> (PathBuf, Graphs, Arc<Generation>, A
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     assert!(!writer.snapshot().is_empty(), "the delta carries the write");
     (root, graphs, gen0, writer)
 }
@@ -7943,7 +8568,14 @@ fn a_production_consolidation_honours_non_default_builder_limits() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     // A budget at the derived floor, an explicit thread count, and a timeout generous
     // enough that a healthy build never trips it but a wedged one does not hang CI.
@@ -8001,7 +8633,14 @@ fn consolidate_via_real_builder() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     let cache = BlockCache::new(1 << 20);
     let vc = VectorIndexCache::new(1 << 20);
@@ -8017,7 +8656,14 @@ fn consolidate_via_real_builder() {
                 parser::ast::Statement::Write(w) => w,
                 _ => unreachable!(),
             };
-            execute_write(&writer_mid, gen_mid.as_ref(), &bob, &HashMap::new()).unwrap();
+            execute_write(
+                &writer_mid,
+                gen_mid.as_ref(),
+                &bob,
+                &HashMap::new(),
+                TEST_BOLT_VERSION,
+            )
+            .unwrap();
             run_builder(&bin, d, g, dd, _key, BuilderLimits::default(), None)
         })
         .unwrap();
@@ -8105,7 +8751,14 @@ fn consolidate_carries_vector_indexes_and_embeddings() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     graphs
         .consolidate_graph(&graph, &cache, &vc, &root, |d, g, dd, _key| {
@@ -8158,7 +8811,14 @@ fn consolidate_carries_a_delta_written_vector_over_the_base() {
         parser::ast::Statement::Write(w) => w,
         _ => unreachable!(),
     };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     drop(gen0);
 
     graphs
@@ -8480,8 +9140,14 @@ fn a_write_rejects_an_embedding_of_the_wrong_dimension() {
         parser::ast::Statement::Write(w) => w,
         _ => unreachable!(),
     };
-    let e = execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
-        .expect_err("a 2-dim value on a 3-dim index must be refused");
+    let e = execute_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .expect_err("a 2-dim value on a 3-dim index must be refused");
     let msg = format!("{e:?}");
     assert!(
         msg.contains("3-dimensional") && msg.contains("2 dimensions"),
@@ -8497,8 +9163,14 @@ fn a_write_rejects_an_embedding_of_the_wrong_dimension() {
         parser::ast::Statement::Write(w) => w,
         _ => unreachable!(),
     };
-    execute_write(&writer, gen.as_ref(), &ok, &HashMap::new())
-        .expect("an unindexed vector property carries no dimension contract");
+    execute_write(
+        &writer,
+        gen.as_ref(),
+        &ok,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .expect("an unindexed vector property carries no dimension contract");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -9495,7 +10167,13 @@ async fn merged_count_star_nets_born_and_suppressed_rows() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
     };
     let write = |q: &str| try_write(q).unwrap();
     let count = |q: &str| -> i64 {
@@ -9560,7 +10238,14 @@ async fn merged_metadata_and_edge_counts_track_the_delta() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     let rows = |q: &str| -> Vec<Vec<Val>> {
         let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
@@ -9662,7 +10347,14 @@ async fn edge_tombstone_makes_the_edge_fast_path_decline_not_lie() {
         parser::ast::Statement::WriteEdge(w) => w,
         other => panic!("expected an edge delete, got {other:?}"),
     };
-    execute_edge_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_edge_write(
+        &writer,
+        gen.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 
     let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
     assert!(
@@ -9695,7 +10387,13 @@ async fn match_set_updates_a_delta_born_node() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new())
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
     };
     let age_of = |name: &str| -> Option<i64> {
         let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
@@ -9745,7 +10443,14 @@ async fn merged_count_star_folds_across_l0_levels() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     let count = || -> i64 {
         let view = MergedView::new(gen.as_ref(), writer.delta_snapshot());
@@ -9794,7 +10499,14 @@ async fn write_path_auto_flushes_and_compacts() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a node write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
 
     write("MERGE (n:Person {name:'Dave'}) SET n.age = 1");
@@ -9857,7 +10569,14 @@ async fn write_path_auto_flushes_and_compacts_segments() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a node write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     let segment_count = || ctx.graphs.get("people").unwrap().stack().segments().len();
 
@@ -9956,7 +10675,14 @@ async fn write_path_auto_gc_marks_orphans_after_compaction() {
             parser::ast::Statement::Write(w) => w,
             _ => panic!("expected a node write: {q}"),
         };
-        execute_write(&writer, gen.as_ref(), &stmt, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &stmt,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     };
     // Count the GC grace markers the sweep stamps under `<graph>/.gc/` (a `seg-<uuid>` per
     // orphaned segment observed within the grace).
@@ -10078,7 +10804,14 @@ async fn write_path_auto_consolidates_at_core_fraction() {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
     assert!(consolidation_due(4, writer.delta_entity_count() as u64, 25));
 
     // The write-path hook spawns the background consolidation.
@@ -10215,7 +10948,14 @@ fn write_alice_age_99(ctx: &Arc<ConnCtx>) {
             parser::ast::Statement::Write(w) => w,
             _ => unreachable!(),
         };
-    execute_write(&writer, gen0.as_ref(), &stmt, &HashMap::new()).unwrap();
+    execute_write(
+        &writer,
+        gen0.as_ref(),
+        &stmt,
+        &HashMap::new(),
+        TEST_BOLT_VERSION,
+    )
+    .unwrap();
 }
 
 /// The `CALL slater.consolidate()` trigger reaches consolidation and surfaces a
@@ -12257,12 +12997,12 @@ async fn writes_do_not_block_the_reactor() {
     // Calibrate: what one write of this shape costs. Warm first — the first write mints
     // the WAL segment and faults in the ISAM blocks the resolve sweeps.
     let (job, params) = batch_write_job("warm", ROWS);
-    execute_write_off_reactor(&ctx, &writer, &gen, job, params)
+    execute_write_off_reactor(&ctx, &writer, &gen, job, params, TEST_BOLT_VERSION)
         .await
         .unwrap();
     let (job, params) = batch_write_job("calibrate", ROWS);
     let t0 = Instant::now();
-    execute_write_off_reactor(&ctx, &writer, &gen, job, params)
+    execute_write_off_reactor(&ctx, &writer, &gen, job, params, TEST_BOLT_VERSION)
         .await
         .unwrap();
     let one_write = t0.elapsed();
@@ -12284,7 +13024,7 @@ async fn writes_do_not_block_the_reactor() {
             let writer = writer.clone();
             let gen = gen.clone();
             tokio::spawn(async move {
-                execute_write_off_reactor(&ctx, &writer, &gen, job, params).await
+                execute_write_off_reactor(&ctx, &writer, &gen, job, params, TEST_BOLT_VERSION).await
             })
         })
         .collect();
@@ -12338,7 +13078,7 @@ async fn concurrent_writes_are_capped() {
             let writer = writer.clone();
             let gen = gen.clone();
             tokio::spawn(async move {
-                execute_write_off_reactor(&ctx, &writer, &gen, job, params).await
+                execute_write_off_reactor(&ctx, &writer, &gen, job, params, TEST_BOLT_VERSION).await
             })
         })
         .collect();
@@ -12385,9 +13125,9 @@ async fn an_abandoned_write_holds_its_permit_and_still_commits() {
         let ctx = ctx.clone();
         let writer = writer.clone();
         let gen = gen.clone();
-        tokio::spawn(
-            async move { execute_write_off_reactor(&ctx, &writer, &gen, job, params).await },
-        )
+        tokio::spawn(async move {
+            execute_write_off_reactor(&ctx, &writer, &gen, job, params, TEST_BOLT_VERSION).await
+        })
     };
     // One poll: the permit is taken and the write is handed to the blocking pool.
     tokio::task::yield_now().await;
@@ -13699,7 +14439,14 @@ fn an_edge_delete_gives_the_degree_fast_path_back_after_a_flush() {
         .unwrap() else {
             panic!("expected an edge write");
         };
-        execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+        execute_edge_write(
+            &writer,
+            gen.as_ref(),
+            &w,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     }
 
     // Live: refused, typed — the fold cannot know the tombstone's multiplicity.
@@ -13761,10 +14508,24 @@ fn the_count_walk_is_reachable_and_exact_over_a_stacked_set() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -13865,10 +14626,24 @@ fn a_node_delete_after_a_flush_must_not_over_count_edges() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -13972,10 +14747,24 @@ fn deleting_a_segment_born_node_must_not_over_count_edges() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }
@@ -14069,7 +14858,14 @@ fn a_node_delete_on_a_singleton_core_still_counts_edges_exactly() {
         else {
             panic!("expected a node write");
         };
-        execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+        execute_write(
+            &writer,
+            gen.as_ref(),
+            &w,
+            &HashMap::new(),
+            TEST_BOLT_VERSION,
+        )
+        .unwrap();
     }
 
     let gen = graphs.get("people").unwrap();
@@ -14123,10 +14919,24 @@ fn a_node_delete_must_not_double_subtract_an_edge_a_flush_already_removed() {
         let writer = graphs.writer("people").unwrap();
         match parser::parse_statement(qy).unwrap() {
             parser::ast::Statement::Write(w) => {
-                execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             parser::ast::Statement::WriteEdge(w) => {
-                execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                execute_edge_write(
+                    &writer,
+                    gen.as_ref(),
+                    &w,
+                    &HashMap::new(),
+                    TEST_BOLT_VERSION,
+                )
+                .unwrap();
             }
             _ => panic!("expected a write: {qy}"),
         }

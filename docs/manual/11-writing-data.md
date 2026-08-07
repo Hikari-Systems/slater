@@ -30,7 +30,7 @@ Two more gates apply even when the layer is on:
   does **not** imply write. Without it you get `write access to graph '…' is not
   granted`.
 - **Statement shape:** only the clauses below are accepted. Anything else — an
-  unsupported write form, or a trailing `RETURN` — is rejected with:
+  unsupported write form — is rejected with:
   `unsupported write: the writable layer accepts business-key MERGE / SET /
   REMOVE / [DETACH] DELETE, CREATE / INSERT (GQL), and relationship writes only`.
 
@@ -108,6 +108,29 @@ What a statement cannot do is combine *kinds* of updating clause — a `SET` bes
 combination is rejected by name rather than partly honoured; issue the clauses as
 separate statements.
 
+### Reading back what you wrote
+
+A node write may end in `RETURN`, projecting the node it just wrote:
+
+```cypher
+MERGE (n:Entity {uuid: $uuid}) SET n.name = $name RETURN n.uuid AS uuid;
+```
+
+The projection runs over the post-commit view, so it reports the values the write
+produced — including for a `MERGE` that created the node, which had no identity until the
+commit allocated one. Anything a read can project works here: aliases, `properties(n)`,
+`labels(n)`, `id(n)`.
+
+A batched write returns **one row per input row, in input order**, so results line up
+against the list that was sent:
+
+```cypher
+UNWIND $rows AS r MERGE (n:Entity {uuid: r.uuid}) SET n.name = r.name RETURN n.uuid AS uuid;
+```
+
+Relationship writes do not yet project a `RETURN`; read them back with a separate
+`MATCH … RETURN`.
+
 ## Removing data
 
 ```cypher
@@ -170,7 +193,7 @@ These are enforced with clear errors — they keep the served schema stable:
 | Write a relationship type not in the graph | rejected — the type must already exist |
 | `MERGE`/`CREATE` on a non-range-indexed key | rejected — add a range index at build time |
 | `DELETE` a node that still has relationships | rejected — use `DETACH DELETE` |
-| `RETURN` after a write | rejected — run a separate `MATCH … RETURN` |
+| `RETURN` after a relationship write | rejected — run a separate `MATCH … RETURN` |
 
 New labels and relationship types come only from a rebuild; the writable layer
 works within the schema the base generation already defines.

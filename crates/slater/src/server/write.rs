@@ -596,6 +596,47 @@ pub(crate) fn replace_map_patches(
     Ok(patches)
 }
 
+/// Project a write's `RETURN` over the **post-write** view.
+///
+/// A write already knows the node it touched, so there is nothing to match: bind the
+/// anchor and hand the one-row relation to the ordinary [`Engine::project`]. That reuses
+/// the whole expression evaluator — `n.uuid AS uuid`, `labels(n)`, `properties(n)`,
+/// `id(n)`, and aggregates or `ORDER BY` over the batch's rows all behave as they do in a
+/// read, with no second projector to keep in step.
+///
+/// The view is built from the writer's snapshot *after* the commit, so the projection
+/// sees the write it is reporting — including a delta-born node that has no core row.
+/// Callers must therefore invoke this after `write_batch` and before any delta
+/// maintenance, or a segment flush can move under it.
+pub(crate) fn project_write_return(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    ret: &parser::ast::ReturnClause,
+    cols: Vec<String>,
+    rows: Vec<Vec<Val>>,
+    params: &HashMap<String, Val>,
+    version: (u8, u8),
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    let delta = DeltaSnapshot::from_memtable(writer.snapshot());
+    let view = MergedView::new(gen, delta);
+    let cache = BlockCache::new(1 << 16);
+    let engine = crate::exec::Engine::new(&view, &cache).with_params(params.clone());
+    let table = crate::exec::Table::from_bindings(cols, rows);
+    let projected = engine
+        .project(table, &ret.body, ret.distinct, None)
+        .map_err(|e| Failure::from_query_error(&e))?;
+    let (columns, out_rows) = projected.into_parts();
+    let mut encoded = Vec::with_capacity(out_rows.len());
+    for row in &out_rows {
+        let mut r = Vec::with_capacity(row.len());
+        for v in row {
+            r.push(encode_val(&engine, version, v).map_err(|e| Failure::from_query_error(&e))?);
+        }
+        encoded.push(r);
+    }
+    Ok((columns, encoded))
+}
+
 /// Turn a map that arrived whole — `SET n = $props`, `SET n = row` — into property
 /// patches. Unlike [`replace_map_patches`], the keys come from the *value* rather than
 /// from the statement, so anything that is not a map, or that carries a value the store
@@ -695,11 +736,12 @@ impl WriteJob {
         writer: &Arc<DeltaWriter>,
         gen: &Generation,
         params: &HashMap<String, Val>,
+        version: (u8, u8),
     ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
         match self {
-            WriteJob::Node(stmt) => execute_write(writer, gen, &stmt, params),
-            WriteJob::Create(stmt) => execute_create(writer, gen, &stmt, params),
-            WriteJob::Edge(stmt) => execute_edge_write(writer, gen, &stmt, params),
+            WriteJob::Node(stmt) => execute_write(writer, gen, &stmt, params, version),
+            WriteJob::Create(stmt) => execute_create(writer, gen, &stmt, params, version),
+            WriteJob::Edge(stmt) => execute_edge_write(writer, gen, &stmt, params, version),
         }
     }
 }
@@ -747,6 +789,7 @@ pub(crate) async fn execute_write_off_reactor(
     gen: &Arc<Generation>,
     job: WriteJob,
     params: HashMap<String, Val>,
+    version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     let permit = ctx
         .write_limit
@@ -760,7 +803,7 @@ pub(crate) async fn execute_write_off_reactor(
     tokio::task::spawn_blocking(move || {
         // Held until the write is done, not until the caller stops waiting for it.
         let _permit = permit;
-        job.run(&writer, gen.as_ref(), &params)
+        job.run(&writer, gen.as_ref(), &params, version)
     })
     .await
     .map_err(|e| {
@@ -774,26 +817,19 @@ pub(crate) async fn execute_write_off_reactor(
 /// parameters, resolve the anchor's business key to a current-core dense id, and hand
 /// the ops to the writer (WAL append + fsync commit + memtable apply + publish) as one
 /// group commit. A statement lowers to several ops only when it mixes a replace-all with
-/// further SET items; they commit atomically. Returns an empty result — read-back is a
-/// separate `MATCH … RETURN` over the overlaid view.
+/// further SET items; they commit atomically. Returns the `RETURN` projection when the
+/// statement carries one, and an empty result otherwise.
 pub(crate) fn execute_write(
     writer: &Arc<DeltaWriter>,
     gen: &Generation,
     stmt: &parser::ast::WriteStmt,
     params: &HashMap<String, Val>,
+    version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     use parser::ast::WriteOp;
-    if stmt.ret.is_some() {
-        return Err(Failure::new(
-            CODE_REQUEST,
-            "RETURN after a write is not yet supported; issue a separate MATCH … RETURN to read \
-             back the written values"
-                .into(),
-        ));
-    }
     // A leading `UNWIND <list> AS r` is a batched (group-committed) write.
     if stmt.unwind.is_some() {
-        return execute_write_batch(writer, gen, stmt, params);
+        return execute_write_batch(writer, gen, stmt, params, version);
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
     let ops = build_node_wal_ops(
@@ -846,7 +882,32 @@ pub(crate) fn execute_write(
     writer
         .write_batch(&batch)
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
-    Ok((Vec::new(), Vec::new()))
+    let Some(ret) = &stmt.ret else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    // Resolve the anchor *after* the commit: a MERGE that created the node had no dense
+    // id before it (the delta allocates one on apply), so `resolved` was `None`.
+    let id = match resolved {
+        Some(id) => id,
+        None => writer
+            .born_synthetic_in_delta(&stmt.label, &stmt.key, &key_value)
+            .ok_or_else(|| {
+                Failure::new(
+                    CODE_EXECUTION,
+                    "the write committed but its node could not be resolved to project RETURN"
+                        .into(),
+                )
+            })?,
+    };
+    project_write_return(
+        writer,
+        gen,
+        ret,
+        vec![stmt.var.clone()],
+        vec![vec![Val::Node(id)]],
+        params,
+        version,
+    )
 }
 
 /// Whether a MERGE on `(label, key, value)` **creates** a new node (vs matching an
@@ -895,13 +956,8 @@ pub(crate) fn execute_create(
     gen: &Generation,
     stmt: &parser::ast::CreateStmt,
     params: &HashMap<String, Val>,
+    version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
-    if stmt.ret.is_some() {
-        return Err(Failure::new(
-            CODE_REQUEST,
-            "RETURN after a write is not yet supported; issue a separate MATCH … RETURN".into(),
-        ));
-    }
     // Evaluate every inline property, then pick the business key: the label's
     // range-indexed property (lowest core label id breaks a tie among indexes).
     let mut props: Vec<(String, Value)> = Vec::with_capacity(stmt.props.len());
@@ -944,10 +1000,37 @@ pub(crate) fn execute_create(
     };
     // Born-create (upsert semantics): resolve as a set-like op with create-on-absent.
     let resolved = resolve_node_op(writer, gen, &op, true, true)?;
+    let key_value = match &op {
+        WalOp::UpsertNode { value, .. } => value.clone(),
+        _ => unreachable!("CREATE builds an UpsertNode"),
+    };
     writer
         .write(op, OpResolution::Node(resolved))
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable CREATE failed: {e:#}")))?;
-    Ok((Vec::new(), Vec::new()))
+    let Some(ret) = &stmt.ret else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let id = match resolved {
+        Some(id) => id,
+        None => writer
+            .born_synthetic_in_delta(&stmt.label, &key, &key_value)
+            .ok_or_else(|| {
+                Failure::new(
+                    CODE_EXECUTION,
+                    "the CREATE committed but its node could not be resolved to project RETURN"
+                        .into(),
+                )
+            })?,
+    };
+    project_write_return(
+        writer,
+        gen,
+        ret,
+        vec![stmt.var.clone()],
+        vec![vec![Val::Node(id)]],
+        params,
+        version,
+    )
 }
 
 /// Does this statement mutate the graph, and so require a `write` grant?
@@ -1188,6 +1271,7 @@ pub(crate) fn execute_write_batch(
     gen: &Generation,
     stmt: &parser::ast::WriteStmt,
     params: &HashMap<String, Val>,
+    version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     use parser::ast::{Expr, WriteOp};
     let (source, var) = stmt
@@ -1271,6 +1355,8 @@ pub(crate) fn execute_write_batch(
     let batch_engine = crate::exec::Engine::new(&batch_view, &batch_cache);
 
     let mut ops: Vec<(WalOp, OpResolution)> = Vec::with_capacity(rows.len());
+    // The anchor of each row, kept in input order so a `RETURN` can project them.
+    let mut anchors: Vec<Option<u64>> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let key_value = &key_values[i];
         let resolution = row_res[i];
@@ -1325,11 +1411,41 @@ pub(crate) fn execute_write_batch(
         for op in row_ops {
             ops.push((op, OpResolution::Node(resolved)));
         }
+        anchors.push(resolved);
     }
     writer
         .write_batch(&ops)
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable batch write failed: {e:#}")))?;
-    Ok((Vec::new(), Vec::new()))
+    let Some(ret) = &stmt.ret else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    // One projected row per input row, in input order. A row whose MERGE created the
+    // node had no dense id until the commit allocated one, so resolve those now.
+    let mut out_rows = Vec::with_capacity(anchors.len());
+    for (resolved, key_value) in anchors.into_iter().zip(&key_values) {
+        let id = match resolved {
+            Some(id) => id,
+            None => writer
+                .born_synthetic_in_delta(&stmt.label, &stmt.key, key_value)
+                .ok_or_else(|| {
+                    Failure::new(
+                        CODE_EXECUTION,
+                        "the batch committed but a node could not be resolved to project RETURN"
+                            .into(),
+                    )
+                })?,
+        };
+        out_rows.push(vec![Val::Node(id)]);
+    }
+    project_write_return(
+        writer,
+        gen,
+        ret,
+        vec![stmt.var.clone()],
+        out_rows,
+        params,
+        version,
+    )
 }
 
 /// Resolve an edge-write endpoint's business key to a current-core dense id.
@@ -1399,6 +1515,7 @@ pub(crate) fn execute_edge_write(
     gen: &Generation,
     stmt: &parser::ast::EdgeWriteStmt,
     params: &HashMap<String, Val>,
+    _version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     use parser::ast::EdgeWriteOp;
     // The reltype must pre-exist: the read overlay resolves a born edge's type through

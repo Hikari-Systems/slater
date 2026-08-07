@@ -2448,6 +2448,26 @@ impl Table {
             rows: vec![Vec::new()],
         }
     }
+
+    /// A relation built directly from bound values rather than by scanning.
+    ///
+    /// The write path uses this for `RETURN` after a write: the anchor is already
+    /// resolved to a dense id, so there is nothing to match — binding it and handing the
+    /// table to [`Engine::project`] reuses the whole expression evaluator instead of
+    /// growing a second, thinner projector on the write side.
+    pub(crate) fn from_bindings(cols: Vec<String>, rows: Vec<Vec<Val>>) -> Table {
+        debug_assert!(
+            rows.iter().all(|r| r.len() == cols.len()),
+            "every row must be as wide as the column list",
+        );
+        Table { cols, rows }
+    }
+
+    /// Consume the table into its `(columns, rows)`, for a caller that encodes them
+    /// itself rather than handing the table on to another operator.
+    pub(crate) fn into_parts(self) -> (Vec<String>, Vec<Vec<Val>>) {
+        (self.cols, self.rows)
+    }
 }
 
 /// Typed executor limit violations (deadline, per-query / server-wide intermediate

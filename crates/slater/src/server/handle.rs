@@ -536,6 +536,7 @@ pub(crate) async fn handle_request(
                                 &gen,
                                 WriteJob::Node(Box::new(stmt)),
                                 param_vals,
+                                sess.version,
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
@@ -548,6 +549,7 @@ pub(crate) async fn handle_request(
                                 &gen,
                                 WriteJob::Create(stmt),
                                 param_vals,
+                                sess.version,
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
@@ -560,6 +562,7 @@ pub(crate) async fn handle_request(
                                 &gen,
                                 WriteJob::Edge(stmt),
                                 param_vals,
+                                sess.version,
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;

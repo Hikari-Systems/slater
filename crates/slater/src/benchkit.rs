@@ -15,6 +15,10 @@
 
 #![cfg(any(test, feature = "testkit"))]
 
+/// The Bolt version write tests encode results for — 5.4 is what the server
+/// prefers, and the only one where element-id fields are emitted.
+const TEST_BOLT_VERSION: (u8, u8) = (5, 4);
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -272,7 +276,14 @@ pub fn build_stacked(tag: &str, n: u64, segments: usize) -> (PathBuf, String) {
                 );
                 match parser::parse_statement(&q).unwrap() {
                     parser::ast::Statement::Write(w) => {
-                        execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                        execute_write(
+                            &writer,
+                            gen.as_ref(),
+                            &w,
+                            &HashMap::new(),
+                            TEST_BOLT_VERSION,
+                        )
+                        .unwrap();
                     }
                     other => panic!("expected a write statement, got {other:?}"),
                 }
@@ -660,7 +671,14 @@ mod tests {
             let q = "MERGE (p:Person {name:'zznew'}) SET p.age = 7";
             match parser::parse_statement(q).unwrap() {
                 parser::ast::Statement::Write(w) => {
-                    execute_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                    execute_write(
+                        &writer,
+                        gen.as_ref(),
+                        &w,
+                        &HashMap::new(),
+                        TEST_BOLT_VERSION,
+                    )
+                    .unwrap();
                 }
                 _ => unreachable!(),
             }

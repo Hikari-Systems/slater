@@ -1189,7 +1189,7 @@ fn segment_degree_delta_feeds_the_hub_probe() {
             );
             match parser::parse_statement(&q).unwrap() {
                 parser::ast::Statement::WriteEdge(w) => {
-                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new()).unwrap();
+                    execute_edge_write(&writer, gen.as_ref(), &w, &HashMap::new(), (5, 4)).unwrap();
                 }
                 other => panic!("expected an edge write, got {other:?}"),
             }
