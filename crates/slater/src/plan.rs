@@ -126,12 +126,27 @@ pub fn choose_node_scan(
 /// produce a null-padded row there). The executor re-checks the reltype on the
 /// first hop and re-checks the anchor's labels in `node_ok`, so the posting only
 /// ever narrows the candidate set — never changes results.
+///
+/// **The postings describe the base generation only.** They list the endpoints of
+/// *core* edges, so a node that is a source solely by virtue of a delta-born or
+/// segment-born edge is absent from them and would never become a candidate — the
+/// write would be invisible to `MATCH (a:L)-[:T]->(b)` while remaining visible to
+/// every other spelling of the same question. Narrowing is only sound when the
+/// writable layer cannot contribute an edge of one of these types, so this bails
+/// whenever it can. The fallback is the label/full scan, which is slower but sees
+/// everything, and it lasts only until the next consolidation folds the delta into a
+/// fresh core — which rebuilds the postings.
 pub(crate) fn maybe_rel_type_scan(
     gen: &dyn ReadView,
     base: &NodeScan,
     pattern: &Pattern,
 ) -> Option<NodeScan> {
     if !gen.has_reltype_postings() {
+        return None;
+    }
+    // A flushed T2 segment can carry born edges of any type, and nothing cheap
+    // enumerates which — so any segment at all disqualifies the postings.
+    if !gen.core_stack().is_singleton() {
         return None;
     }
     // Only replace a non-selective base; an id-seek / range lookup already wins.
@@ -160,6 +175,17 @@ pub(crate) fn maybe_rel_type_scan(
     let names = rel.type_expr.as_ref()?.positive_atoms()?;
     let reltype_ids: Vec<u32> = names.iter().filter_map(|n| gen.reltype_id(n)).collect();
     if reltype_ids.is_empty() {
+        return None;
+    }
+    // A delta-born edge of one of these types may hang off a source the postings never
+    // listed. Checked per requested type rather than "is the delta empty at all", so an
+    // unrelated write does not cost every typed expansion its plan.
+    let delta = gen.delta();
+    if !delta.is_empty()
+        && names
+            .iter()
+            .any(|n| delta.born_edge_count_with_reltype(n) > 0)
+    {
         return None;
     }
     // Candidate-count estimate for the cost gate. Summing per-type counts (and, for
@@ -1160,6 +1186,89 @@ mod tests {
                 side: RelEndpointSide::Source,
                 guaranteed_label: Some(0),
             }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Plan as [`rel_plan_for`] but over an arbitrary view, so a `MergedView` carrying
+    /// a write delta can be planned exactly as the executor would plan it.
+    fn rel_plan_for_view(view: &dyn ReadView, query: &str) -> NodeScan {
+        let q = parser::parse(query).unwrap();
+        let parser::ast::Clause::Match(m) = &q.head.reading[0] else {
+            panic!("expected a leading MATCH");
+        };
+        let pattern = &m.patterns[0];
+        let base = choose_node_scan(
+            view,
+            &pattern.start,
+            m.where_.as_ref(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        maybe_rel_type_scan(view, &base, pattern).unwrap_or(base)
+    }
+
+    #[test]
+    fn a_delta_born_edge_disqualifies_the_reltype_postings() {
+        // The postings list the endpoints of *core* edges only. Node 4 is isolated in
+        // the core, so it is in no `T` posting; a delta-born `(4)-[:T]->(5)` would
+        // therefore never be a candidate, and `MATCH (a:N)-[:T]->(b)` would silently
+        // miss a write that every other spelling of the question returns. Planning must
+        // fall back to the label scan while such an edge exists.
+        use crate::read_view::MergedView;
+        use slater_delta::{DeltaSnapshot, Memtable};
+        use std::sync::Arc;
+
+        let (root, graph) = crate::testgen::write_rel_sparse("plan_rel_delta_born");
+        let gen = Generation::open(&root, &graph).unwrap();
+        let q = "MATCH (a:N)-[:T]->(b) RETURN b";
+
+        // With no delta the optimisation stands.
+        assert!(matches!(
+            rel_plan_for(&gen, q),
+            NodeScan::RelTypeScan { .. }
+        ));
+
+        // A born `T` edge disqualifies it...
+        let mut mem = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        mem.upsert_edge(
+            "N",
+            "id",
+            Value::Int(4),
+            "T",
+            "N",
+            "id",
+            Value::Int(5),
+            Some(4),
+            Some(5),
+            std::iter::empty(),
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(mem)));
+        assert_eq!(
+            rel_plan_for_view(&merged, q),
+            NodeScan::LabelScan { label_id: 0 },
+            "a born T edge must send the plan back to the label scan"
+        );
+
+        // ...but a born edge of an *unrelated* type does not: the check is per
+        // requested reltype, so one write does not deoptimise every typed expansion.
+        let mut other = Memtable::with_bases(gen.node_count(), gen.edge_count());
+        other.upsert_edge(
+            "N",
+            "id",
+            Value::Int(4),
+            "U",
+            "N",
+            "id",
+            Value::Int(5),
+            Some(4),
+            Some(5),
+            std::iter::empty(),
+        );
+        let merged = MergedView::new(&gen, DeltaSnapshot::from_memtable(Arc::new(other)));
+        assert!(
+            matches!(rel_plan_for_view(&merged, q), NodeScan::RelTypeScan { .. }),
+            "a born U edge must not cost the T expansion its plan"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
