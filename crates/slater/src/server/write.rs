@@ -398,6 +398,10 @@ pub(crate) fn fold_set_items(
     value: &Value,
     ensure_nonempty: bool,
     eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
+    // A whole-map source resolves to a `Val::Map`, which is not a storable scalar, so it
+    // cannot go through `eval`. The caller supplies the matching resolver: parameters for
+    // a plain write, parameters-or-row for a batched one.
+    eval_map: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Val, Failure>,
 ) -> std::result::Result<Vec<WalOp>, Failure> {
     use parser::ast::SetItem;
     let upsert = |patches: Vec<(String, Value)>| WalOp::UpsertNode {
@@ -423,6 +427,23 @@ pub(crate) fn fold_set_items(
             }
             SetItem::ReplaceMap(map) => {
                 let patches = replace_map_patches(map, &eval)?;
+                pending.clear();
+                ops.push(WalOp::ReplaceNode {
+                    label: label.to_string(),
+                    key: key.to_string(),
+                    value: value.clone(),
+                    patches,
+                });
+            }
+            // The whole-map forms differ from the literal ones only in where the map
+            // comes from: its keys are unknown until now, so they are read here.
+            SetItem::MergeParam(expr) => {
+                let v = eval_map(expr, "a merge-map value")?;
+                pending.extend(map_val_to_patches(v, "a merge-map value")?);
+            }
+            SetItem::ReplaceParam(expr) => {
+                let v = eval_map(expr, "a replace-map value")?;
+                let patches = map_val_to_patches(v, "a replace-map value")?;
                 pending.clear();
                 ops.push(WalOp::ReplaceNode {
                     label: label.to_string(),
@@ -458,6 +479,7 @@ pub(crate) fn build_node_wal_ops(
     stmt: &parser::ast::WriteStmt,
     key_value: &Value,
     eval: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Value, Failure>,
+    eval_map: impl Fn(&parser::ast::Expr, &str) -> std::result::Result<Val, Failure>,
 ) -> std::result::Result<Vec<WalOp>, Failure> {
     use parser::ast::{RemoveItem, WriteOp};
     let label = stmt.label.clone();
@@ -466,7 +488,7 @@ pub(crate) fn build_node_wal_ops(
     match &stmt.op {
         // The main SET fold emits at least one op (a no-op upsert when empty) so a MERGE
         // create-if-absent's its node and the write acks.
-        WriteOp::Set(items) => fold_set_items(items, &label, &key, &value, true, eval),
+        WriteOp::Set(items) => fold_set_items(items, &label, &key, &value, true, eval, eval_map),
         WriteOp::Remove(items) => {
             let mut props = Vec::new();
             let mut removed_labels = Vec::new();
@@ -570,6 +592,40 @@ pub(crate) fn replace_map_patches(
     let mut patches = Vec::with_capacity(map.len());
     for (k, expr) in map {
         patches.push((k.clone(), eval(expr, "a replace-map value")?));
+    }
+    Ok(patches)
+}
+
+/// Turn a map that arrived whole — `SET n = $props`, `SET n = row` — into property
+/// patches. Unlike [`replace_map_patches`], the keys come from the *value* rather than
+/// from the statement, so anything that is not a map, or that carries a value the store
+/// cannot hold, is named here rather than at lowering.
+///
+/// The anchor business key needs no special handling, for the same reason it needs none
+/// in the literal form: it is never stored as a patch, and `overlay_node_props` re-seeds
+/// it from the delta identity on every read of a born-or-replaced node.
+pub(crate) fn map_val_to_patches(
+    v: Val,
+    what: &str,
+) -> std::result::Result<Vec<(String, Value)>, Failure> {
+    let Val::Map(entries) = v else {
+        return Err(Failure::new(
+            CODE_REQUEST,
+            format!(
+                "{what} must be a map, but it is {}",
+                crate::exec::type_name(&v)
+            ),
+        ));
+    };
+    let mut patches = Vec::with_capacity(entries.len());
+    for (k, val) in entries {
+        let value = crate::exec::val_to_value(&val).ok_or_else(|| {
+            Failure::new(
+                CODE_REQUEST,
+                format!("{what} carries '{k}', which is not a storable scalar value"),
+            )
+        })?;
+        patches.push((k, value));
     }
     Ok(patches)
 }
@@ -740,7 +796,12 @@ pub(crate) fn execute_write(
         return execute_write_batch(writer, gen, stmt, params);
     }
     let key_value = write_value(&stmt.key_value, params, "the anchor business-key value")?;
-    let ops = build_node_wal_ops(stmt, &key_value, |e, what| write_value(e, params, what))?;
+    let ops = build_node_wal_ops(
+        stmt,
+        &key_value,
+        |e, what| write_value(e, params, what),
+        |e, what| param_path_val(e, params, what),
+    )?;
     // Every op in a statement shares the anchor key, so one resolution serves them all.
     // A non-DELETE op is "set-like" (addresses an existing node, or MERGE-creates one).
     let mut ops = ops;
@@ -760,6 +821,7 @@ pub(crate) fn execute_write(
             &key_value,
             false,
             |e, what| write_value(e, params, what),
+            |e, what| param_path_val(e, params, what),
         )?);
     }
     // After the conditional fold, so an `ON CREATE SET` embedding is checked too.
@@ -1028,10 +1090,8 @@ pub(crate) fn resolve_node_op_from(
     })
 }
 
-/// Evaluate a write-UNWIND per-row value expression: a literal, a parameter, the row
-/// variable `var` itself, or `var.field` (a field of the current row map). Anything else
-/// is rejected — a batched write's values are the bulk-import subset, not arbitrary
-/// expressions. Returns the storable [`Value`].
+/// Evaluate a write-UNWIND per-row value expression to a storable [`Value`]. See
+/// [`eval_row_val`] for the admitted shapes.
 pub(crate) fn eval_row_value(
     e: &parser::ast::Expr,
     var: &str,
@@ -1039,15 +1099,39 @@ pub(crate) fn eval_row_value(
     params: &HashMap<String, Val>,
     what: &str,
 ) -> std::result::Result<Value, Failure> {
-    use parser::ast::Expr;
     // `SET n.embedding = vecf32(r.emb)` — the batched spelling. The argument is itself a
     // row reference, so evaluate it through this same restricted grammar and coerce.
     if let Some(arg) = parser::as_vecf32_arg(e) {
         let v = eval_row_value(arg, var, row, params, what)?;
         return coerce_vecf32(v, what);
     }
+    let val = eval_row_val(e, var, row, params, what)?;
+    crate::exec::val_to_value(&val).ok_or_else(|| {
+        Failure::new(
+            CODE_REQUEST,
+            format!("{what} is not a storable scalar value"),
+        )
+    })
+}
+
+/// Evaluate a write-UNWIND per-row expression to a runtime [`Val`]: a literal, a
+/// parameter (or a field path into one), the row variable `var` itself, or `var.field`.
+/// Anything else is rejected — a batched write's values are the bulk-import subset, not
+/// arbitrary expressions.
+///
+/// Stops at `Val` rather than `Value` because a whole-map assignment (`SET n = row`)
+/// needs the map, which is not a storable scalar. [`eval_row_value`] narrows to `Value`
+/// for the per-property case.
+pub(crate) fn eval_row_val(
+    e: &parser::ast::Expr,
+    var: &str,
+    row: &Val,
+    params: &HashMap<String, Val>,
+    what: &str,
+) -> std::result::Result<Val, Failure> {
+    use parser::ast::Expr;
     let val: Val = match e {
-        Expr::Literal(v) => return Ok(v.clone()),
+        Expr::Literal(v) => Val::from_value(v.clone()),
         Expr::Param(name) => params.get(name).cloned().ok_or_else(|| {
             Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
         })?,
@@ -1088,12 +1172,7 @@ pub(crate) fn eval_row_value(
             ))
         }
     };
-    crate::exec::val_to_value(&val).ok_or_else(|| {
-        Failure::new(
-            CODE_REQUEST,
-            format!("{what} is not a storable scalar value"),
-        )
-    })
+    Ok(val)
 }
 
 /// Execute a **batched** node write (`UNWIND <list> AS r MATCH|MERGE (n:L {k: …}) …`):
@@ -1195,9 +1274,12 @@ pub(crate) fn execute_write_batch(
     for (i, row) in rows.iter().enumerate() {
         let key_value = &key_values[i];
         let resolution = row_res[i];
-        let mut row_ops = build_node_wal_ops(stmt, key_value, |e, what| {
-            eval_row_value(e, var, row, params, what)
-        })?;
+        let mut row_ops = build_node_wal_ops(
+            stmt,
+            key_value,
+            |e, what| eval_row_value(e, var, row, params, what),
+            |e, what| eval_row_val(e, var, row, params, what),
+        )?;
         // MERGE ON CREATE / ON MATCH, per row (create-vs-match against the pre-batch state).
         if stmt.upsert && (!stmt.on_create.is_empty() || !stmt.on_match.is_empty()) {
             let created =
@@ -1214,6 +1296,7 @@ pub(crate) fn execute_write_batch(
                 key_value,
                 false,
                 |e, what| eval_row_value(e, var, row, params, what),
+                |e, what| eval_row_val(e, var, row, params, what),
             )?);
         }
         validate_vector_dims(&row_ops, gen)?;
@@ -1445,6 +1528,46 @@ mod param_path_tests {
     fn a_parameter_path_resolves_to_the_field_value() {
         let got = param_path_val(&field(param("data"), "uuid"), &params(), "the key").unwrap();
         assert!(matches!(&got, Val::Str(s) if s == "u1"), "got {got:?}");
+    }
+
+    #[test]
+    fn a_map_parameter_becomes_one_patch_per_key() {
+        // Flat: a property is a scalar, so a nested map is correctly not storable — see
+        // `an_unstorable_entry_is_named_by_its_key`.
+        let flat = HashMap::from([(
+            "data".to_string(),
+            Val::Map(vec![
+                ("uuid".into(), Val::Str("u1".into())),
+                ("name".into(), Val::Str("Ada".into())),
+            ]),
+        )]);
+        let v = param_path_val(&param("data"), &flat, "a replace-map value").unwrap();
+        let patches = map_val_to_patches(v, "a replace-map value").unwrap();
+        let keys: Vec<&str> = patches.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["uuid", "name"]);
+    }
+
+    /// The keys arrive with the value, so a non-map source can only be caught here.
+    #[test]
+    fn a_non_map_source_names_the_type_it_found() {
+        let err = msg(map_val_to_patches(Val::Int(1), "a replace-map value").unwrap_err());
+        assert!(err.contains("must be a map"), "got: {err}");
+        assert!(err.contains("Integer"), "must name the type. Got: {err}");
+    }
+
+    /// A value the store cannot hold is named with its key rather than reported as a
+    /// bare "not storable" — with the keys coming from the client, which one matters.
+    #[test]
+    fn an_unstorable_entry_is_named_by_its_key() {
+        let v = Val::Map(vec![
+            ("ok".into(), Val::Int(1)),
+            ("bad".into(), Val::Map(vec![])),
+        ]);
+        let err = msg(map_val_to_patches(v, "a replace-map value").unwrap_err());
+        assert!(
+            err.contains("'bad'"),
+            "must name the offending key. Got: {err}"
+        );
     }
 
     #[test]

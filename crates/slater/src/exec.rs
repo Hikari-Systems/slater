@@ -2107,7 +2107,9 @@ fn bidir_node_path(
 }
 
 impl Val {
-    fn from_value(v: Value) -> Val {
+    /// Lift a stored [`Value`] into a runtime `Val`. `pub(crate)` so the write path can
+    /// evaluate a literal without narrowing to `Value` first.
+    pub(crate) fn from_value(v: Value) -> Val {
         match v {
             Value::Null => Val::Null,
             Value::Bool(b) => Val::Bool(b),

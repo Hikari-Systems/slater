@@ -194,6 +194,14 @@ pub mod ast {
         ReplaceMap(Vec<(String, Expr)>),
         /// `SET var += {map}` — merge the map into the node's existing properties.
         MergeMap(Vec<(String, Expr)>),
+        /// `SET var = $param` — as [`SetItem::ReplaceMap`], but the map arrives whole as a
+        /// parameter (or a field path into one), so its *keys* are known only once the
+        /// parameter is bound. Kept as its own variant rather than folded into
+        /// `ReplaceMap`: the two carry genuinely different information at lowering, and
+        /// collapsing them would mean inventing a key set the parser cannot know.
+        ReplaceParam(Expr),
+        /// `SET var += $param` — the merging counterpart of [`SetItem::ReplaceParam`].
+        MergeParam(Expr),
         /// `SET var:Label[:Label…]` — add labels to the node.
         AddLabels(Vec<String>),
     }
@@ -965,7 +973,10 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                     let (svar, si) = lower_set_item(item)?;
                     match si {
                         SetItem::Prop { prop, value } => sets.push((svar, prop, value)),
-                        SetItem::ReplaceMap(_) | SetItem::MergeMap(_) => bail!(
+                        SetItem::ReplaceMap(_)
+                        | SetItem::MergeMap(_)
+                        | SetItem::ReplaceParam(_)
+                        | SetItem::MergeParam(_) => bail!(
                             "a relationship write supports only `SET r.prop = value`, not whole-map assignment"
                         ),
                         SetItem::AddLabels(_) => {
@@ -1104,6 +1115,29 @@ fn lower_node_labels(pair: Pair<Rule>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Where the map on the right of `SET var = …` / `SET var += …` comes from.
+enum MapSource {
+    /// A literal `{k: v, …}` — keys known at lowering.
+    Literal(Vec<(String, Expr)>),
+    /// An expression supplying the map whole — keys known only at execution.
+    Param(Expr),
+}
+
+/// Lower a `set_map_source`: a map literal, or an expression supplying the map whole.
+///
+/// The expression is deliberately *not* validated here, for the same reason `set_prop`'s
+/// value is not: what counts as an admissible source depends on the statement. A plain
+/// write needs a constant, which `ensure_set_item_constant` checks; a batched write may
+/// also name the UNWIND row, which is checked per row at execution. Rejecting here would
+/// have to duplicate both rules, and would wrongly refuse `SET n = row` in a batch.
+fn lower_set_map_source(pair: Pair<Rule>) -> Result<MapSource> {
+    let inner = only_child(pair)?;
+    match inner.as_rule() {
+        Rule::prop_map => Ok(MapSource::Literal(lower_prop_map(inner)?)),
+        _ => Ok(MapSource::Param(lower_expr(inner)?)),
+    }
+}
+
 /// Lower one `set_item` to its `(target_var, SetItem)`. The target variable is
 /// returned separately so the caller can check it against the anchor.
 fn lower_set_item(pair: Pair<Rule>) -> Result<(String, SetItem)> {
@@ -1121,14 +1155,26 @@ fn lower_set_item(pair: Pair<Rule>) -> Result<(String, SetItem)> {
         Rule::set_merge_map => {
             let mut it = kids(inner);
             let var = ident_text(it.next().expect("set_merge_map has a target variable"))?;
-            let map = lower_prop_map(it.next().expect("set_merge_map has a map literal"))?;
-            Ok((var, SetItem::MergeMap(map)))
+            let src = it.next().expect("set_merge_map has a map source");
+            Ok((
+                var,
+                match lower_set_map_source(src)? {
+                    MapSource::Literal(map) => SetItem::MergeMap(map),
+                    MapSource::Param(e) => SetItem::MergeParam(e),
+                },
+            ))
         }
         Rule::set_replace_map => {
             let mut it = kids(inner);
             let var = ident_text(it.next().expect("set_replace_map has a target variable"))?;
-            let map = lower_prop_map(it.next().expect("set_replace_map has a map literal"))?;
-            Ok((var, SetItem::ReplaceMap(map)))
+            let src = it.next().expect("set_replace_map has a map source");
+            Ok((
+                var,
+                match lower_set_map_source(src)? {
+                    MapSource::Literal(map) => SetItem::ReplaceMap(map),
+                    MapSource::Param(e) => SetItem::ReplaceParam(e),
+                },
+            ))
         }
         Rule::set_labels => {
             let mut it = kids(inner);
@@ -1556,6 +1602,11 @@ fn ensure_set_item_constant(item: &SetItem, var: &str) -> Result<()> {
             }
             Ok(())
         }
+        // The keys are unknown here, so there is nothing to name per-property; the whole
+        // map is one constant, checked as one.
+        SetItem::ReplaceParam(e) | SetItem::MergeParam(e) => {
+            ensure_constant(e, &format!("the map assigned to {var}"))
+        }
         SetItem::AddLabels(_) => Ok(()),
     }
 }
@@ -1651,6 +1702,8 @@ fn fold_set_item_vectors(item: &mut SetItem) {
                 fold_vecf32(v);
             }
         }
+        // A parameter holds no literal to fold — its values arrive already evaluated.
+        SetItem::ReplaceParam(_) | SetItem::MergeParam(_) => {}
         SetItem::AddLabels(_) => {}
     }
 }
@@ -4457,6 +4510,70 @@ mod tests {
             panic!("expected a SET write, got {:?}", w.op)
         };
         assert_eq!(items.len(), 2);
+    }
+
+    /// A client holding a whole entity as one map assigns it directly, rather than
+    /// spelling out a literal whose values are all `$`-references. The keys are unknown
+    /// here, so this lowers to `ReplaceParam`, not `ReplaceMap`.
+    #[test]
+    fn a_whole_map_can_be_assigned_from_a_parameter() {
+        let w = write("MERGE (n:Entity {uuid: $data.uuid}) SET n = $data");
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::ReplaceParam(Expr::Param("data".into()))]),
+        );
+
+        let w = write("MERGE (n:Entity {uuid: $data.uuid}) SET n += $data.props");
+        assert_eq!(
+            w.op,
+            WriteOp::Set(vec![SetItem::MergeParam(Expr::Property(
+                Box::new(Expr::Param("data".into())),
+                "props".into()
+            ))]),
+        );
+    }
+
+    /// The whole statement Graphiti emits to save an entity, which is what this and the
+    /// two preceding commits exist to accept.
+    #[test]
+    fn the_graphiti_entity_save_shape_parses() {
+        let w = write(
+            "MERGE (n:Entity {uuid: $entity_data.uuid}) \
+             SET n:Person \
+             SET n = $entity_data \
+             SET n.name_embedding = vecf32($entity_data.name_embedding)",
+        );
+        assert!(w.upsert);
+        assert_eq!(w.label, "Entity");
+        assert_eq!(w.key, "uuid");
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET write, got {:?}", w.op)
+        };
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0], SetItem::AddLabels(vec!["Person".to_string()]));
+        assert!(matches!(items[1], SetItem::ReplaceParam(_)));
+        assert!(matches!(items[2], SetItem::Prop { .. }));
+    }
+
+    /// A map source still has to be constant on a plain write — a graph read is not.
+    #[test]
+    fn a_map_assigned_from_a_graph_read_is_rejected() {
+        let e = write_err("MERGE (n:Entity {uuid: 'u'}) SET n = n.props");
+        assert!(
+            e.contains("must be a literal, a parameter, or a field of one") || e == "read-only",
+            "got: {e}"
+        );
+    }
+
+    /// Relationships take property writes only; the whole-map forms stay rejected there,
+    /// parameter spelling included.
+    #[test]
+    fn whole_map_assignment_is_still_rejected_on_a_relationship() {
+        let e = write_err("MERGE (a:P {n: 'a'})-[r:R]->(b:P {n: 'b'}) SET r = $props");
+        assert!(
+            e.contains("whole-map assignment") || e == "read-only",
+            "got: {e}"
+        );
     }
 
     /// Nested paths resolve the same way — there is no depth special-case.

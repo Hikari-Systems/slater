@@ -60,6 +60,8 @@ assignments depending on whether the node was created or matched.
 | `SET n.prop = value` | Set one property |
 | `SET n += {k: v, …}` | Merge a map into existing properties |
 | `SET n = {k: v, …}` | Replace **all** properties with the map |
+| `SET n = $props` | Replace all properties with a map supplied whole |
+| `SET n += $props` | Merge a map supplied whole |
 | `SET n:Label` | Add a (pre-existing) label |
 | `SET n.embedding = vecf32([…])` | Write an indexed vector ([10 Vector search](10-vector-search.md)) |
 
@@ -75,7 +77,21 @@ It resolves entirely from the bound parameters, so it is as constant as `$data` 
 property access on a *graph* variable (`n.other`) is a read, and stays rejected. A field
 the map does not carry reads as `null`, exactly as a parameter bound to `null` would.
 
-Re-setting the business-key property relocates the node in its index.
+The map on the right of `SET n = …` / `SET n += …` may itself be supplied whole, as a
+parameter rather than a literal — the usual shape when a client holds an entity as one
+map:
+
+```cypher
+MERGE (n:Entity {uuid: $data.uuid}) SET n = $data;
+```
+
+Its keys are then known only once the parameter is bound, so a source that is not a map,
+or a value the store cannot hold, is reported at execution and names the offending key.
+In a batched write the source may also be the `UNWIND` row (`SET n = row`).
+
+Re-setting the business-key property relocates the node in its index. A replace that
+*omits* the key is fine: the key is never stored as an ordinary property, and reads
+re-seed it from the node's identity.
 
 Items may be comma-separated in one `SET`, or split across consecutive `SET` clauses —
 the two spellings are the same write, folded in source order with the last write winning:

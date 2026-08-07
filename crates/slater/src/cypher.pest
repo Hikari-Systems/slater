@@ -166,11 +166,19 @@ update_clause = { set_clause | remove_clause | delete_clause }
 // `var += {map}` (merge properties), `var = {map}` (replace all properties), and
 // `var:Label[:Label…]` (add labels). `set_prop` is tried first (only it carries a
 // `.prop`); `set_merge_map` before `set_replace_map` so `+=` is not mis-read as `=`.
+//
+// The map side is `set_map_source`: a literal `{…}`, or a parameter (`$props`, or a field
+// path into one). openCypher allows any map-valued expression there, and a client holding
+// a whole entity as one map assigns it directly rather than spelling out a literal whose
+// values are all `$`-references. The parameter form's *keys* are only known once the
+// parameter is bound, so key validation moves from parse time to execution — see
+// `fold_set_items`, which is also where the business key is kept alive across a replace.
 set_clause = { kw_set ~ set_item ~ ("," ~ set_item)* }
 set_item = { set_prop | set_merge_map | set_replace_map | set_labels }
 set_prop = { var ~ property_access ~ "=" ~ expr }
-set_merge_map = { var ~ "+=" ~ prop_map }
-set_replace_map = { var ~ "=" ~ prop_map }
+set_merge_map = { var ~ "+=" ~ set_map_source }
+set_replace_map = { var ~ "=" ~ set_map_source }
+set_map_source = { prop_map | postfix_expr }
 set_labels = { var ~ node_labels }
 
 // `REMOVE var.prop` (drop a property) or `REMOVE var:Label[:Label…]` (drop labels).
