@@ -208,6 +208,33 @@ pub fn failure_gqlstatus(
     }
 }
 
+/// One entry for a SUCCESS's `notifications` list — the Bolt channel for telling a client
+/// something about a statement that is not an error.
+///
+/// The key predates Bolt 4.0, so it needs no version gate across the 5.4 / 4.4 / 4.1 range
+/// Slater negotiates, and a driver that does not read it ignores an unknown metadata key.
+/// (The GQLSTATUS-shaped `statuses` key is Bolt 5.6+ and therefore unreachable here.)
+///
+/// `severity` is `WARNING` or `INFORMATION`; `category` is a Neo4j notification category,
+/// of which `GENERIC` is the catch-all the drivers accept without mapping.
+pub fn notification(
+    code: &str,
+    title: &str,
+    description: &str,
+    severity: &str,
+) -> (String, PsValue) {
+    (
+        "notifications".into(),
+        PsValue::List(vec![PsValue::Map(vec![
+            ("code".into(), PsValue::str(code)),
+            ("title".into(), PsValue::str(title)),
+            ("description".into(), PsValue::str(description)),
+            ("severity".into(), PsValue::str(severity)),
+            ("category".into(), PsValue::str("GENERIC")),
+        ])]),
+    )
+}
+
 /// `IGNORED` — sent for messages received while the connection is in FAILED state.
 pub fn ignored() -> PsValue {
     PsValue::Struct {

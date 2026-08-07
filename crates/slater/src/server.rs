@@ -1366,6 +1366,16 @@ pub(crate) struct Session {
     /// the wait for an argon2 permit is bounded by the same deadline that bounds the
     /// pre-auth reads: a queued verify must not outlive the login window.
     login_deadline: Option<TokioInstant>,
+    /// Inside an explicit transaction (between `BEGIN` and `COMMIT`/`ROLLBACK`).
+    ///
+    /// Distinct from `tx_graph`, which is `None` for a `BEGIN` that carries no `db`
+    /// metadata — the common case, since the official drivers put the database in the
+    /// parameters rather than the BEGIN. So `tx_graph` cannot answer "am I in a
+    /// transaction", and using it for that would miss most transactions entirely.
+    in_tx: bool,
+    /// Write statements executed since `BEGIN`. Non-zero at `ROLLBACK` means durable
+    /// writes were **not** undone, which is what the client is warned about.
+    tx_writes: u32,
 }
 
 impl Session {
@@ -1389,6 +1399,11 @@ impl Session {
     fn clear_user_state(&mut self) {
         self.pending = None;
         self.tx_graph = None;
+        // Connection-scoped rather than user-scoped, but cleared here all the same: a
+        // `LOGOFF` mid-transaction that left `in_tx` set would attribute the next
+        // principal's writes to a transaction they never opened.
+        self.in_tx = false;
+        self.tx_writes = 0;
     }
 }
 

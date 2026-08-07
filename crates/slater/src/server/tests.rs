@@ -11328,6 +11328,8 @@ async fn begin_validates_the_graph_and_remembers_it_for_the_transaction() {
         version: (5, 4),
         auth_failures: 0,
         login_deadline: None,
+        in_tx: false,
+        tx_writes: 0,
     };
     // BEGIN naming an unserved graph fails at BEGIN, before any RUN.
     let bad = message::Request::Begin(PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]));
@@ -12288,6 +12290,8 @@ fn pre_auth_session() -> Session {
         version: (5, 4),
         auth_failures: 0,
         login_deadline: None,
+        in_tx: false,
+        tx_writes: 0,
     }
 }
 

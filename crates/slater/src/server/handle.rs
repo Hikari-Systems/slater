@@ -7,6 +7,47 @@
 
 use super::*;
 
+/// The metadata for a `COMMIT`/`ROLLBACK` reply.
+///
+/// Empty for a read transaction, which is the overwhelmingly common case — the wire stays
+/// byte-identical there. When the transaction did write, the reply says what actually
+/// happened, because the Bolt verbs promise something Slater does not do: each write
+/// committed at its own `RUN`, so `COMMIT` was a formality and `ROLLBACK` undid nothing.
+///
+/// The `notifications` key predates Bolt 4.0, so it needs no version gate across 5.4 /
+/// 4.4 / 4.1. Note the drivers discard COMMIT and ROLLBACK metadata, so this reaches
+/// graph browsers rather than applications; the server-side `warn!` beside the call is
+/// what an operator will actually see, and the RUN-time notification is what an
+/// application can see.
+fn tx_notification(writes: u32, rolling_back: bool) -> Vec<(String, PsValue)> {
+    if writes == 0 {
+        return Vec::new();
+    }
+    if rolling_back {
+        vec![message::notification(
+            "Slater.ClientNotification.Transaction.RollbackHasNoEffect",
+            "Rollback has no effect",
+            &format!(
+                "Slater commits each write statement at its own RUN (one group-commit fsync \
+                 per statement). {writes} write statement(s) in this transaction are already \
+                 durable and have not been undone. Slater has no multi-statement write \
+                 transaction.",
+            ),
+            "WARNING",
+        )]
+    } else {
+        vec![message::notification(
+            "Slater.ClientNotification.Transaction.CommitIsANoOp",
+            "Commit is a no-op",
+            &format!(
+                "Slater commits each write statement at its own RUN, so {writes} write \
+                 statement(s) in this transaction were already durable before this COMMIT.",
+            ),
+            "INFORMATION",
+        )]
+    }
+}
+
 /// Run one Bolt connection from handshake to close.
 ///
 /// `pre_auth` carries the antechamber slot and the login deadline, both already armed at
@@ -65,6 +106,8 @@ where
         version: (reply[3], reply[2]),
         auth_failures: 0,
         login_deadline,
+        in_tx: false,
+        tx_writes: 0,
     };
 
     loop {
@@ -367,8 +410,16 @@ pub(crate) async fn handle_request(
             Ok(vec![message::success(vec![])])
         }
 
-        // Slater only ever runs a read transaction; BEGIN/COMMIT/ROLLBACK carry no
-        // execution state. BEGIN *may* name the target graph in its `db` metadata —
+        // BEGIN/COMMIT/ROLLBACK carry no execution state: a write inside a transaction
+        // executes and commits at its own RUN, so `COMMIT` has nothing left to do and
+        // `ROLLBACK` has nothing to undo. That is what makes the drivers' managed
+        // transactions work at all — `session.execute_write()` and `execute_query()` both
+        // wrap their work in BEGIN/COMMIT, and both are supported.
+        //
+        // It also means a `ROLLBACK` after a write is a lie by omission, so `tx_writes`
+        // counts them and the reply says so. See `tx_notification`.
+        //
+        // BEGIN *may* name the target graph in its `db` metadata —
         // when it does, resolve and validate it now so an unknown/ambiguous graph
         // fails at BEGIN rather than at the first RUN. When it does not (some clients,
         // e.g. Memgraph Lab, put `db` on the RUN inside the transaction instead),
@@ -386,11 +437,31 @@ pub(crate) async fn handle_request(
                 Some(_) => Some(ctx.select_graph(&meta, user, None)?),
                 None => None,
             };
+            sess.in_tx = true;
+            sess.tx_writes = 0;
             Ok(vec![message::success(vec![])])
         }
-        Request::Commit | Request::Rollback => {
+        req @ (Request::Commit | Request::Rollback) => {
+            let rolling_back = matches!(req, Request::Rollback);
+            let writes = sess.tx_writes;
             sess.tx_graph = None;
-            Ok(vec![message::success(vec![])])
+            sess.in_tx = false;
+            sess.tx_writes = 0;
+            if writes > 0 && rolling_back {
+                // The only channel guaranteed to be seen: the drivers discard COMMIT and
+                // ROLLBACK metadata entirely (`Transaction.rollback()` returns nothing),
+                // so the notification below reaches browser tools but not applications.
+                // A rollback that silently did nothing is worth a server-side record.
+                warn!(
+                    user = %sess.user.as_deref().unwrap_or("?"),
+                    writes,
+                    "ROLLBACK had no effect: write statements were already committed",
+                );
+            }
+            Ok(vec![message::success(tx_notification(
+                writes,
+                rolling_back,
+            ))])
         }
 
         Request::Run {
@@ -506,6 +577,9 @@ pub(crate) async fn handle_request(
             // on, a query may be a write. Parse synchronously so a syntax /
             // read-only error is classified cleanly.
             let writer = ctx.graphs.writer(&graph);
+            // Whether this RUN executed a durable write, for the in-transaction warning
+            // below. Only the write arms set it.
+            let mut this_run_wrote = false;
             let (columns, rows) = match &writer {
                 Some(w) => {
                     let stmt = parser::parse_statement(&query).map_err(|e| {
@@ -540,6 +614,7 @@ pub(crate) async fn handle_request(
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
+                            this_run_wrote = true;
                             out
                         }
                         parser::ast::Statement::Create(stmt) => {
@@ -553,6 +628,7 @@ pub(crate) async fn handle_request(
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
+                            this_run_wrote = true;
                             out
                         }
                         parser::ast::Statement::WriteEdge(stmt) => {
@@ -566,6 +642,7 @@ pub(crate) async fn handle_request(
                             )
                             .await?;
                             maybe_maintain_delta(ctx, &graph, w).await;
+                            this_run_wrote = true;
                             out
                         }
                         parser::ast::Statement::Consolidate => {
@@ -611,10 +688,26 @@ pub(crate) async fn handle_request(
                 }
             };
             sess.pending = Some(Pending { rows, sent: 0 });
-            Ok(vec![message::success(vec![(
+            let mut meta = vec![(
                 "fields".into(),
                 PsValue::List(columns.into_iter().map(PsValue::String).collect()),
-            )])])
+            )];
+            // Warn at the point of no return, not afterwards. This is also the only
+            // channel an application sees: the drivers surface a RUN's notifications
+            // through the result summary, but discard COMMIT and ROLLBACK metadata
+            // entirely, so a notification attached only to those is invisible where it
+            // matters most.
+            if this_run_wrote && sess.in_tx {
+                sess.tx_writes = sess.tx_writes.saturating_add(1);
+                meta.push(message::notification(
+                    "Slater.ClientNotification.Transaction.WriteCommittedImmediately",
+                    "Write committed immediately",
+                    "This write is already durable. Slater commits each write statement at \
+                     its own RUN, so the enclosing transaction cannot roll it back.",
+                    "WARNING",
+                ));
+            }
+            Ok(vec![message::success(meta)])
         }
 
         Request::Pull(meta) => {
@@ -692,5 +785,57 @@ pub(crate) async fn handle_request(
 
         // Handled before dispatch.
         Request::Reset | Request::Goodbye => Ok(vec![message::success(vec![])]),
+    }
+}
+
+#[cfg(test)]
+mod tx_notification_tests {
+    use super::*;
+
+    fn only_notification(meta: &[(String, PsValue)]) -> Vec<(String, PsValue)> {
+        let Some((_, PsValue::List(items))) = meta.iter().find(|(k, _)| k == "notifications")
+        else {
+            panic!("expected a notifications entry, got {meta:?}");
+        };
+        assert_eq!(items.len(), 1, "one notification per reply");
+        match &items[0] {
+            PsValue::Map(m) => m.clone(),
+            other => panic!("expected a notification map, got {other:?}"),
+        }
+    }
+    fn field(n: &[(String, PsValue)], key: &str) -> String {
+        match n.iter().find(|(k, _)| k == key) {
+            Some((_, PsValue::String(s))) => s.clone(),
+            other => panic!("expected a string {key}, got {other:?}"),
+        }
+    }
+
+    /// The common case by far. A read transaction must leave the wire byte-identical, so
+    /// no client sees a new key where it saw none before.
+    #[test]
+    fn a_read_transaction_adds_nothing_to_the_reply() {
+        assert!(tx_notification(0, false).is_empty());
+        assert!(tx_notification(0, true).is_empty());
+    }
+
+    /// ROLLBACK is the dangerous verb: it reports success while the writes are already on
+    /// disk. The reply has to say so, and say how many.
+    #[test]
+    fn rollback_after_writes_warns_that_nothing_was_undone() {
+        let n = only_notification(&tx_notification(3, true));
+        assert_eq!(field(&n, "severity"), "WARNING");
+        assert!(field(&n, "code").contains("RollbackHasNoEffect"));
+        let d = field(&n, "description");
+        assert!(d.contains('3'), "must say how many writes: {d}");
+        assert!(d.contains("not been undone"), "{d}");
+    }
+
+    /// COMMIT is honest but redundant, so it is informational rather than a warning —
+    /// warning on every commit would be noise at any real write volume.
+    #[test]
+    fn commit_after_writes_is_informational_not_a_warning() {
+        let n = only_notification(&tx_notification(2, false));
+        assert_eq!(field(&n, "severity"), "INFORMATION");
+        assert!(field(&n, "code").contains("CommitIsANoOp"));
     }
 }
