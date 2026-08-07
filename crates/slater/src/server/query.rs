@@ -578,6 +578,370 @@ pub(crate) fn ps_to_val(v: &PsValue) -> Result<Val> {
                 .map(|(k, x)| Ok((k.clone(), ps_to_val(x)?)))
                 .collect::<Result<_>>()?,
         ),
-        PsValue::Struct { .. } => bail!("a structure cannot be used as a query parameter"),
+        // The temporal structs decode to strings — see `ps_temporal_to_val`. Every
+        // other structure (Node, Relationship, Path, Point) is a *result* shape that
+        // no client has any business sending back as an input.
+        PsValue::Struct { tag, fields } => match ps_temporal_to_val(*tag, fields)? {
+            Some(val) => val,
+            None => bail!(
+                "a {} structure cannot be used as a query parameter",
+                struct_tag_name(*tag)
+            ),
+        },
     })
+}
+
+/// Decode a Bolt temporal structure into a [`Val`]. Returns `Ok(None)` if the tag is
+/// not a temporal, so the caller can report it as an unusable parameter shape.
+///
+/// **Why these become `Val::Str` and not `Val::Date`/`Val::DateTime`.** Those variants
+/// exist, but they are constructor/compute-only: [`crate::exec::val_to_value`] returns
+/// `None` for all four because *the on-disk format cannot store a temporal*. Decoding a
+/// parameter into one would parse cleanly and then die on the write with "not a storable
+/// scalar value" — the failure simply moves one layer later. Giving temporals a storable
+/// representation means a new `Value` wire tag in `graph_format::wire`, which reinterprets
+/// existing bytes and is a format-version project in its own right, not something to
+/// smuggle in on the parameter path.
+///
+/// An ISO-8601 string is a genuinely good target rather than a consolation prize:
+/// - it is storable, and range-indexable, as an ordinary `Value::Str`;
+/// - `<`, `>` and `ORDER BY` over UTC ISO-8601 are lexicographic, so they order correctly;
+/// - it carries sub-second precision, which `Val::DateTime` (whole seconds — see
+///   [`crate::temporal`]) does not.
+///
+/// **Fractional seconds are always exactly 9 digits, and that is load-bearing.** Omitting
+/// a zero fraction would break the ordering property outright: `'…:00Z' < '…:00.5Z'` is
+/// *false*, because `'.'` (0x2E) sorts below `'Z'` (0x5A). Fixed width keeps the compare
+/// total. Clients that hold less precision truncate on the way back in — Python's
+/// `datetime.fromisoformat` accepts all 9 and keeps its native 6.
+///
+/// Zoned forms are normalised to UTC and suffixed `Z`, so two instants are comparable
+/// regardless of the offset the client happened to send.
+fn ps_temporal_to_val(tag: u8, fields: &[PsValue]) -> Result<Option<Val>> {
+    /// A Bolt temporal field, which is always an integer.
+    fn int_at(fields: &[PsValue], i: usize, what: &str) -> Result<i64> {
+        match fields.get(i) {
+            Some(PsValue::Int(n)) => Ok(*n),
+            _ => bail!("malformed Bolt {what} structure: field {i} is not an integer"),
+        }
+    }
+    /// `seconds` since the epoch + `nanos` → `YYYY-MM-DDTHH:MM:SS.fffffffff`, with the
+    /// caller's suffix. Nanos are normalised into the second so a client that sends
+    /// `nanoseconds >= 1e9` (or negative) cannot produce a malformed string.
+    fn iso_datetime(seconds: i64, nanos: i64, suffix: &str) -> Result<String> {
+        let secs = seconds
+            .checked_add(nanos.div_euclid(1_000_000_000))
+            .ok_or_else(|| anyhow::anyhow!("Bolt datetime is out of range"))?;
+        let nanos = nanos.rem_euclid(1_000_000_000) as u32;
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+            .ok_or_else(|| anyhow::anyhow!("Bolt datetime is out of range"))?;
+        Ok(format!("{}{suffix}", dt.format("%Y-%m-%dT%H:%M:%S%.9f")))
+    }
+
+    let val = match tag {
+        // Date: [days since epoch].
+        TAG_DATE => {
+            let days = int_at(fields, 0, "Date")?;
+            let d = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                days.checked_mul(86_400)
+                    .ok_or_else(|| anyhow::anyhow!("Bolt Date is out of range"))?,
+                0,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Bolt Date is out of range"))?;
+            Val::Str(d.format("%Y-%m-%d").to_string())
+        }
+        // LocalTime: [nanoOfDay]. No zone, so no suffix.
+        TAG_LOCAL_TIME => Val::Str(iso_time(int_at(fields, 0, "LocalTime")?)?),
+        // Time: [nanoOfDay, tzOffsetSeconds] — rotated to UTC within the day.
+        TAG_TIME => {
+            let nanos = int_at(fields, 0, "Time")?;
+            let offset = int_at(fields, 1, "Time")?;
+            let utc = nanos
+                .checked_sub(
+                    offset
+                        .checked_mul(1_000_000_000)
+                        .ok_or_else(|| anyhow::anyhow!("Bolt Time offset is out of range"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("Bolt Time is out of range"))?;
+            Val::Str(format!(
+                "{}Z",
+                iso_time(utc.rem_euclid(86_400_000_000_000))?
+            ))
+        }
+        // LocalDateTime: [seconds, nanoseconds]. Zone-free, so no `Z`.
+        TAG_LOCAL_DATETIME => Val::Str(iso_datetime(
+            int_at(fields, 0, "LocalDateTime")?,
+            int_at(fields, 1, "LocalDateTime")?,
+            "",
+        )?),
+        // DateTime (Bolt >= 5): [seconds (UTC), nanoseconds, tzOffsetSeconds]. This is
+        // what an official driver sends for a timezone-aware datetime, which is what
+        // every `datetime.now(timezone.utc)` produces — i.e. the common case.
+        TAG_DATETIME => Val::Str(iso_datetime(
+            int_at(fields, 0, "DateTime")?,
+            int_at(fields, 1, "DateTime")?,
+            "Z",
+        )?),
+        // DateTime (legacy, Bolt < 5): same shape, but `seconds` is *local* — subtract
+        // the offset to reach UTC. Reachable on the 4.4 / 4.1 fallbacks.
+        TAG_LEGACY_DATETIME => {
+            let local = int_at(fields, 0, "DateTime")?;
+            let offset = int_at(fields, 2, "DateTime")?;
+            Val::Str(iso_datetime(
+                local
+                    .checked_sub(offset)
+                    .ok_or_else(|| anyhow::anyhow!("Bolt DateTime is out of range"))?,
+                int_at(fields, 1, "DateTime")?,
+                "Z",
+            )?)
+        }
+        // DateTimeZoneId (Bolt >= 5): [seconds (UTC), nanoseconds, tzId]. The zone id is
+        // presentational once the instant is UTC, so it is dropped rather than resolved.
+        TAG_DATETIME_ZONE_ID => Val::Str(iso_datetime(
+            int_at(fields, 0, "DateTimeZoneId")?,
+            int_at(fields, 1, "DateTimeZoneId")?,
+            "Z",
+        )?),
+        // DateTimeZoneId (legacy): `seconds` is local, and recovering UTC needs the IANA
+        // rules for `tzId` at that instant. Slater carries no tz database, and guessing
+        // would silently shift an instant by up to a day. Refuse, and name the fix.
+        TAG_LEGACY_DATETIME_ZONE_ID => bail!(
+            "a zoned DateTime naming an IANA time zone cannot be used as a query parameter \
+             on Bolt 4.x (Slater carries no time-zone database); send a UTC-offset datetime, \
+             or connect over Bolt 5.x where the wire value is already UTC"
+        ),
+        // Duration: [months, days, seconds, nanoseconds] → ISO-8601. Months and days stay
+        // unfolded because neither has a fixed length in seconds.
+        TAG_DURATION => {
+            let (months, days, seconds, nanos) = (
+                int_at(fields, 0, "Duration")?,
+                int_at(fields, 1, "Duration")?,
+                int_at(fields, 2, "Duration")?,
+                int_at(fields, 3, "Duration")?,
+            );
+            let secs = seconds
+                .checked_add(nanos.div_euclid(1_000_000_000))
+                .ok_or_else(|| anyhow::anyhow!("Bolt Duration is out of range"))?;
+            Val::Str(format!(
+                "P{}M{}DT{}.{:09}S",
+                months,
+                days,
+                secs,
+                nanos.rem_euclid(1_000_000_000)
+            ))
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(val))
+}
+
+/// `nanoOfDay` → `HH:MM:SS.fffffffff`. Nine fractional digits, for the ordering reason
+/// given on [`ps_temporal_to_val`].
+fn iso_time(nano_of_day: i64) -> Result<String> {
+    if !(0..86_400_000_000_000).contains(&nano_of_day) {
+        bail!("Bolt time-of-day {nano_of_day} is outside a single day");
+    }
+    let (secs, nanos) = (nano_of_day / 1_000_000_000, nano_of_day % 1_000_000_000);
+    Ok(format!(
+        "{:02}:{:02}:{:02}.{:09}",
+        secs / 3_600,
+        (secs / 60) % 60,
+        secs % 60,
+        nanos
+    ))
+}
+
+/// A human name for a structure tag, for the "cannot be used as a query parameter"
+/// message — an operator seeing `0x4E` has to go looking, `Node` they do not.
+fn struct_tag_name(tag: u8) -> String {
+    match tag {
+        TAG_NODE => "Node".into(),
+        TAG_RELATIONSHIP => "Relationship".into(),
+        TAG_UNBOUND_REL => "UnboundRelationship".into(),
+        TAG_PATH => "Path".into(),
+        TAG_POINT2D => "Point2D".into(),
+        _ => format!("0x{tag:02X}"),
+    }
+}
+
+#[cfg(test)]
+mod temporal_param_tests {
+    use super::*;
+
+    fn decode(tag: u8, fields: Vec<PsValue>) -> Result<Val> {
+        ps_to_val(&PsValue::Struct { tag, fields })
+    }
+    fn decoded_str(tag: u8, fields: Vec<PsValue>) -> String {
+        match decode(tag, fields) {
+            Ok(Val::Str(s)) => s,
+            other => panic!("expected a string, got {other:?}"),
+        }
+    }
+
+    /// The shape an official driver sends for a timezone-aware `datetime` — which is
+    /// what `datetime.now(timezone.utc)` produces, i.e. every temporal Graphiti writes.
+    /// Before this decode existed, `ps_to_val` refused it and *every* write failed at
+    /// the parameter decoder, before any Cypher was parsed.
+    #[test]
+    fn a_bolt_5_datetime_decodes_to_a_utc_iso_string() {
+        assert_eq!(
+            decoded_str(
+                TAG_DATETIME,
+                vec![PsValue::Int(1), PsValue::Int(500_000_000), PsValue::Int(0)],
+            ),
+            "1970-01-01T00:00:01.500000000Z"
+        );
+    }
+
+    /// Bolt 4.x carries *local* seconds plus the offset; UTC is `seconds - offset`.
+    /// Reachable on the 4.4 / 4.1 fallbacks, so it must agree with the 5.x form.
+    #[test]
+    fn a_legacy_datetime_is_shifted_by_its_offset_to_match_the_bolt_5_form() {
+        let legacy = decoded_str(
+            TAG_LEGACY_DATETIME,
+            vec![
+                PsValue::Int(3_601), // 01:00:01 local
+                PsValue::Int(0),
+                PsValue::Int(3_600), // +01:00
+            ],
+        );
+        let modern = decoded_str(
+            TAG_DATETIME,
+            vec![PsValue::Int(1), PsValue::Int(0), PsValue::Int(3_600)],
+        );
+        assert_eq!(legacy, "1970-01-01T00:00:01.000000000Z");
+        assert_eq!(
+            legacy, modern,
+            "the two wire spellings must agree on the instant"
+        );
+    }
+
+    /// The ordering property the whole string representation exists to preserve. A
+    /// fraction-less spelling would invert this: `'.'` (0x2E) sorts below `'Z'` (0x5A),
+    /// so `'…:00Z' < '…:00.5Z'` is *false*. Graphiti's `ORDER BY e.valid_at DESC` and
+    /// `WHERE e.valid_at <= $reference_time` both depend on it holding.
+    #[test]
+    fn fixed_width_fractions_keep_the_lexicographic_order_correct() {
+        let zero = decoded_str(
+            TAG_DATETIME,
+            vec![PsValue::Int(0), PsValue::Int(0), PsValue::Int(0)],
+        );
+        let half = decoded_str(
+            TAG_DATETIME,
+            vec![PsValue::Int(0), PsValue::Int(500_000_000), PsValue::Int(0)],
+        );
+        let next = decoded_str(
+            TAG_DATETIME,
+            vec![PsValue::Int(1), PsValue::Int(0), PsValue::Int(0)],
+        );
+        assert!(zero < half && half < next, "{zero} < {half} < {next}");
+        for s in [&zero, &half, &next] {
+            assert_eq!(s.len(), "1970-01-01T00:00:00.000000000Z".len());
+        }
+    }
+
+    /// Out-of-range nanoseconds fold into the second rather than producing a string
+    /// like `…:00.1500000000Z` that no ISO-8601 parser would accept.
+    #[test]
+    fn nanoseconds_beyond_a_second_normalise_into_the_seconds_field() {
+        assert_eq!(
+            decoded_str(
+                TAG_DATETIME,
+                vec![
+                    PsValue::Int(0),
+                    PsValue::Int(1_500_000_000),
+                    PsValue::Int(0)
+                ],
+            ),
+            "1970-01-01T00:00:01.500000000Z"
+        );
+    }
+
+    #[test]
+    fn date_local_time_and_local_date_time_decode() {
+        assert_eq!(decoded_str(TAG_DATE, vec![PsValue::Int(1)]), "1970-01-02");
+        assert_eq!(
+            decoded_str(TAG_LOCAL_TIME, vec![PsValue::Int(3_601_000_000_000)]),
+            "01:00:01.000000000"
+        );
+        // Zone-free, so no `Z` — a LocalDateTime names no instant.
+        assert_eq!(
+            decoded_str(TAG_LOCAL_DATETIME, vec![PsValue::Int(5), PsValue::Int(0)]),
+            "1970-01-01T00:00:05.000000000"
+        );
+    }
+
+    /// A zoned Time rotates within the day, wrapping rather than escaping `[0, 24h)`.
+    #[test]
+    fn a_zoned_time_normalises_to_utc_and_wraps_within_the_day() {
+        // 00:30:00+01:00 is 23:30:00Z on the previous day; only the time survives.
+        assert_eq!(
+            decoded_str(
+                TAG_TIME,
+                vec![PsValue::Int(1_800_000_000_000), PsValue::Int(3_600)],
+            ),
+            "23:30:00.000000000Z"
+        );
+    }
+
+    #[test]
+    fn duration_keeps_months_and_days_unfolded() {
+        // Neither a month nor a day has a fixed length in seconds, so folding them
+        // would change the value.
+        assert_eq!(
+            decoded_str(
+                TAG_DURATION,
+                vec![
+                    PsValue::Int(2),
+                    PsValue::Int(3),
+                    PsValue::Int(3_604),
+                    PsValue::Int(0),
+                ],
+            ),
+            "P2M3DT3604.000000000S"
+        );
+    }
+
+    /// Refused rather than guessed at: recovering UTC needs the IANA rules for the zone
+    /// at that instant, and being wrong shifts the instant by up to a day.
+    #[test]
+    fn a_legacy_zone_id_datetime_is_refused_with_an_actionable_message() {
+        let err = decode(
+            TAG_LEGACY_DATETIME_ZONE_ID,
+            vec![
+                PsValue::Int(0),
+                PsValue::Int(0),
+                PsValue::str("Europe/London"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("time-zone database"), "got: {err}");
+        assert!(err.contains("Bolt 5.x"), "must name the fix. Got: {err}");
+    }
+
+    /// Result-only shapes stay refused — but by name, not as a bare "a structure".
+    #[test]
+    fn a_node_parameter_is_still_refused_and_names_the_shape() {
+        let err = decode(TAG_NODE, vec![PsValue::Int(1)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Node"), "got: {err}");
+    }
+
+    /// A malformed structure is a clean error, never a panic — these bytes are
+    /// attacker-controlled.
+    #[test]
+    fn a_malformed_temporal_structure_errors_rather_than_panicking() {
+        for fields in [
+            vec![],
+            vec![PsValue::str("not an int")],
+            vec![PsValue::Int(0)], // DateTime needs three fields
+        ] {
+            assert!(decode(TAG_DATETIME, fields).is_err());
+        }
+        // A day-of-time outside [0, 24h) is rejected rather than silently wrapped.
+        assert!(decode(TAG_LOCAL_TIME, vec![PsValue::Int(-1)]).is_err());
+        assert!(decode(TAG_LOCAL_TIME, vec![PsValue::Int(86_400_000_000_000)]).is_err());
+    }
 }

@@ -107,6 +107,27 @@ const TAG_DATE: u8 = 0x44;
 const TAG_LOCAL_TIME: u8 = 0x74;
 const TAG_LOCAL_DATETIME: u8 = 0x64;
 const TAG_DURATION: u8 = 0x45;
+/// The *zoned* temporal structs. Slater never **encodes** these — its temporals are
+/// timezone-free, so a result always uses the `Local*` tags above. But a client may
+/// **send** them as parameters, and the official drivers do: a Python
+/// timezone-aware `datetime` (which is what any `datetime.now(timezone.utc)`
+/// produces) packs as `DateTime`, not `LocalDateTime`. So these are decode-only.
+///
+/// Bolt 5.0 replaced the two legacy datetime structs with UTC-based ones under the
+/// same shape but new tags, because the legacy pair carried *local* epoch seconds
+/// and were ambiguous across a DST boundary. Both spellings are accepted: 5.4 is
+/// preferred but Slater still negotiates 4.4 and 4.1.
+/// - `Time` (`0x54`): `[nanoOfDay::Int, tzOffsetSeconds::Int]`.
+/// - `DateTime` (`0x49`, Bolt ≥ 5): `[seconds::Int (UTC), nanoseconds::Int, tzOffsetSeconds::Int]`.
+/// - `DateTime` (`0x46`, legacy): as above, but `seconds` is *local*.
+/// - `DateTimeZoneId` (`0x69`, Bolt ≥ 5): `[seconds::Int (UTC), nanoseconds::Int, tzId::String]`.
+/// - `DateTimeZoneId` (`0x66`, legacy): as above, but `seconds` is *local* — see
+///   [`query::ps_to_val`] for why that one is refused rather than guessed at.
+const TAG_TIME: u8 = 0x54;
+const TAG_DATETIME: u8 = 0x49;
+const TAG_LEGACY_DATETIME: u8 = 0x46;
+const TAG_DATETIME_ZONE_ID: u8 = 0x69;
+const TAG_LEGACY_DATETIME_ZONE_ID: u8 = 0x66;
 
 /// The `server` agent string returned in the `HELLO` reply. Kept with a `Neo4j/`
 /// prefix so the official drivers' feature-gating (which sniffs this string) treats

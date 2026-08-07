@@ -118,6 +118,44 @@ RETURN p.name,
        CASE WHEN p.active THEN 'active' ELSE 'inactive' END AS status
 ```
 
+### Temporal parameters
+
+A driver may send a native date/time value as a parameter — a Python `datetime`, a Java
+`ZonedDateTime`, a JavaScript `neo4j.types.DateTime`. Bolt packs these as structures, and
+Slater decodes them to **ISO-8601 strings**:
+
+| Sent | Received as |
+| --- | --- |
+| `Date` | `2024-03-01` |
+| `LocalTime` | `13:45:02.000000000` |
+| `Time` (zoned) | `12:45:02.000000000Z` |
+| `LocalDateTime` | `2024-03-01T13:45:02.000000000` |
+| `DateTime` (zoned) | `2024-03-01T12:45:02.000000000Z` |
+| `Duration` | `P2M3DT3604.000000000S` |
+
+Strings, not the `date()`/`localdatetime()` values [temporal functions](#temporal) return,
+because the on-disk format cannot store a temporal — a temporal-typed parameter could be
+compared but never written. A UTC ISO-8601 string is storable, is range-indexable as an
+ordinary string, and orders correctly under `<`, `>` and `ORDER BY`, because for this
+format lexicographic order *is* chronological order.
+
+Two consequences of that ordering guarantee:
+
+- Zoned values are normalised to UTC and suffixed `Z`, so two instants compare correctly
+  whatever offsets they were sent with.
+- Fractional seconds are always exactly nine digits, even when zero. A shorter spelling
+  would break the ordering: `.` sorts below `Z`, so `'…:00Z' < '…:00.5Z'` is false.
+
+Sub-second precision survives here that the `datetime()` constructors — whole seconds —
+would drop. Clients holding less precision truncate on the way back: Python's
+`datetime.fromisoformat` reads all nine digits and keeps its native six.
+
+One shape is refused. On Bolt 4.x a zoned datetime naming an IANA zone (`Europe/London`)
+carries *local* seconds, and recovering the instant needs that zone's rules for that
+moment. Slater ships no time-zone database, and guessing could shift the value by up to a
+day, so it errors instead. Send a UTC-offset datetime, or connect over Bolt 5.x, where the
+wire value is already UTC.
+
 ## Next
 
 - The clauses that host these expressions: [07 Querying](07-querying.md).
