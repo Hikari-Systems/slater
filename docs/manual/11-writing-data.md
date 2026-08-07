@@ -63,8 +63,19 @@ assignments depending on whether the node was created or matched.
 | `SET n:Label` | Add a (pre-existing) label |
 | `SET n.embedding = vecf32([…])` | Write an indexed vector ([10 Vector search](10-vector-search.md)) |
 
-Values must be constants (a literal or a `$parameter`). Re-setting the business-key
-property relocates the node in its index.
+Values must be constants — a literal, a `$parameter`, or a field of one (`$p.field`,
+`$p.a.b`). The path form is for the common shape where a client sends one map per entity
+and addresses into it rather than flattening every field into its own parameter:
+
+```cypher
+MERGE (n:Entity {uuid: $data.uuid}) SET n.name = $data.name;
+```
+
+It resolves entirely from the bound parameters, so it is as constant as `$data` itself. A
+property access on a *graph* variable (`n.other`) is a read, and stays rejected. A field
+the map does not carry reads as `null`, exactly as a parameter bound to `null` would.
+
+Re-setting the business-key property relocates the node in its index.
 
 Items may be comma-separated in one `SET`, or split across consecutive `SET` clauses —
 the two spellings are the same write, folded in source order with the last write winning:

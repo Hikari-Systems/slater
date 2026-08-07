@@ -4267,7 +4267,9 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn type_name(v: &Val) -> &'static str {
+/// The Cypher type name of a value, as it appears in error messages. `pub(crate)` so the
+/// write path names types the same way the expression evaluator does.
+pub(crate) fn type_name(v: &Val) -> &'static str {
     match v {
         Val::Null => "Null",
         Val::Bool(_) => "Boolean",

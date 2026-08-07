@@ -304,8 +304,49 @@ pub(crate) fn validate_vector_dims(
     Ok(())
 }
 
-/// Evaluate a Phase 1c write's constant expression (a literal or a parameter) to a
-/// storable [`Value`] against the query's parameters.
+/// Resolve a parameter, or a field path rooted at one (`$p`, `$p.field`, `$p.a.b`),
+/// against the query's bound parameters. This is the runtime half of
+/// [`parser::is_param_path`], and the two must move together — the lowering guarantees
+/// nothing else reaches here.
+///
+/// A field absent from the map reads as `Val::Null`, matching both Cypher's property
+/// semantics and how [`eval_row_value`] treats a missing row field. `Null` is storable
+/// (`val_to_value` maps it to `Value::Null`), so `$p.missing` writes a null property —
+/// which is exactly what a `$p` bound to null already did. The path form introduces no
+/// new behaviour here; it inherits the parameter case's.
+pub(crate) fn param_path_val(
+    e: &parser::ast::Expr,
+    params: &HashMap<String, Val>,
+    what: &str,
+) -> std::result::Result<Val, Failure> {
+    use parser::ast::Expr;
+    match e {
+        Expr::Param(name) => params.get(name).cloned().ok_or_else(|| {
+            Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
+        }),
+        Expr::Property(base, field) => match param_path_val(base, params, what)? {
+            Val::Map(m) => Ok(m
+                .into_iter()
+                .find(|(k, _)| k == field)
+                .map(|(_, v)| v)
+                .unwrap_or(Val::Null)),
+            // Null propagates rather than erroring, as it does everywhere else in Cypher.
+            Val::Null => Ok(Val::Null),
+            other => Err(Failure::new(
+                CODE_REQUEST,
+                format!(
+                    "{what} reads the field '{field}' of a parameter that is not a map \
+                     (it is {})",
+                    crate::exec::type_name(&other)
+                ),
+            )),
+        },
+        _ => unreachable!("lower_write_statement rejects non-constant {what}"),
+    }
+}
+
+/// Evaluate a Phase 1c write's constant expression (a literal, a parameter, or a field
+/// path into one) to a storable [`Value`] against the query's parameters.
 pub(crate) fn write_value(
     e: &parser::ast::Expr,
     params: &HashMap<String, Val>,
@@ -316,13 +357,8 @@ pub(crate) fn write_value(
     // once the parameter is bound, so unlike the all-literal form it cannot be folded at
     // lowering. Anything else non-constant was rejected there.
     if let Some(arg) = parser::as_vecf32_arg(e) {
-        let val = match arg {
-            Expr::Param(name) => params.get(name).ok_or_else(|| {
-                Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
-            })?,
-            _ => unreachable!("lower_write_statement folds or rejects vecf32 over {what}"),
-        };
-        let v = crate::exec::val_to_value(val).ok_or_else(|| {
+        let val = param_path_val(arg, params, what)?;
+        let v = crate::exec::val_to_value(&val).ok_or_else(|| {
             Failure::new(
                 CODE_REQUEST,
                 format!("{what} is not a storable scalar value"),
@@ -330,14 +366,11 @@ pub(crate) fn write_value(
         })?;
         return coerce_vecf32(v, what);
     }
-    let val = match e {
-        Expr::Literal(v) => return Ok(v.clone()),
-        Expr::Param(name) => params.get(name).ok_or_else(|| {
-            Failure::new(CODE_REQUEST, format!("parameter ${name} was not supplied"))
-        })?,
-        _ => unreachable!("lower_write_statement rejects non-constant {what}"),
-    };
-    crate::exec::val_to_value(val).ok_or_else(|| {
+    if let Expr::Literal(v) = e {
+        return Ok(v.clone());
+    }
+    let val = param_path_val(e, params, what)?;
+    crate::exec::val_to_value(&val).ok_or_else(|| {
         Failure::new(
             CODE_REQUEST,
             format!("{what} is not a storable scalar value"),
@@ -1035,11 +1068,15 @@ pub(crate) fn eval_row_value(
                     ))
                 }
             },
+            // A path into a parameter rather than into the row: constant across the whole
+            // batch, and admissible for the same reason a bare `$p` is.
+            _ if parser::is_param_path(e) => param_path_val(e, params, what)?,
             _ => {
                 return Err(Failure::new(
                     CODE_REQUEST,
                     format!(
-                        "{what} may reference only the UNWIND variable '{var}' (as {var}.field)"
+                        "{what} may reference only the UNWIND variable '{var}' (as {var}.field) \
+                         or a parameter"
                     ),
                 ))
             }
@@ -1372,4 +1409,94 @@ pub(crate) fn execute_edge_write(
         )
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
     Ok((Vec::new(), Vec::new()))
+}
+
+#[cfg(test)]
+mod param_path_tests {
+    use super::*;
+
+    /// `Failure` is a wire value, not an error type — no `Display`. Debug carries the
+    /// message, which is what these assertions are about.
+    fn msg(f: Failure) -> String {
+        format!("{f:?}")
+    }
+
+    fn param(name: &str) -> parser::ast::Expr {
+        parser::ast::Expr::Param(name.into())
+    }
+    fn field(base: parser::ast::Expr, name: &str) -> parser::ast::Expr {
+        parser::ast::Expr::Property(Box::new(base), name.into())
+    }
+    /// `{uuid: 'u1', nested: {deep: 7}}`
+    fn params() -> HashMap<String, Val> {
+        HashMap::from([(
+            "data".to_string(),
+            Val::Map(vec![
+                ("uuid".into(), Val::Str("u1".into())),
+                (
+                    "nested".into(),
+                    Val::Map(vec![("deep".into(), Val::Int(7))]),
+                ),
+            ]),
+        )])
+    }
+
+    #[test]
+    fn a_parameter_path_resolves_to_the_field_value() {
+        let got = param_path_val(&field(param("data"), "uuid"), &params(), "the key").unwrap();
+        assert!(matches!(&got, Val::Str(s) if s == "u1"), "got {got:?}");
+    }
+
+    #[test]
+    fn nested_paths_descend() {
+        let e = field(field(param("data"), "nested"), "deep");
+        let got = param_path_val(&e, &params(), "a value").unwrap();
+        assert!(matches!(got, Val::Int(7)), "got {got:?}");
+    }
+
+    /// An absent field is `Null`, as it is everywhere else in Cypher, and `Null` is
+    /// storable — so `$p.missing` writes a null property. That is not new behaviour to
+    /// argue about: it is exactly what a `$p` bound to null already did, and the path
+    /// form inherits it rather than inventing a special case.
+    #[test]
+    fn an_absent_field_writes_null_just_as_a_null_parameter_does() {
+        let absent = field(param("data"), "missing");
+        let got = param_path_val(&absent, &params(), "a value").unwrap();
+        assert!(matches!(got, Val::Null), "got {got:?}");
+
+        let mut with_null = params();
+        with_null.insert("nil".into(), Val::Null);
+        assert_eq!(
+            write_value(&absent, &with_null, "a value").unwrap(),
+            write_value(&param("nil"), &with_null, "a value").unwrap(),
+            "an absent field and a null parameter must write the same value",
+        );
+    }
+
+    /// Null propagates through a path rather than erroring.
+    #[test]
+    fn null_propagates_through_a_path() {
+        let p = HashMap::from([("data".to_string(), Val::Null)]);
+        let e = field(param("data"), "uuid");
+        let got = param_path_val(&e, &p, "a value").unwrap();
+        assert!(matches!(got, Val::Null), "got {got:?}");
+    }
+
+    #[test]
+    fn indexing_a_non_map_parameter_names_the_type_it_found() {
+        let p = HashMap::from([("data".to_string(), Val::Int(1))]);
+        let err = msg(param_path_val(&field(param("data"), "uuid"), &p, "the key").unwrap_err());
+        assert!(err.contains("not a map"), "got: {err}");
+        assert!(
+            err.contains("Integer"),
+            "must name the type found. Got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unsupplied_parameter_is_reported_by_name() {
+        let err =
+            msg(param_path_val(&field(param("absent"), "uuid"), &params(), "the key").unwrap_err());
+        assert!(err.contains("$absent"), "got: {err}");
+    }
 }

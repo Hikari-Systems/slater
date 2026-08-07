@@ -1561,18 +1561,37 @@ fn ensure_set_item_constant(item: &SetItem, var: &str) -> Result<()> {
 }
 
 /// A Phase 1c write's business-key value and every SET right-hand side must be a
-/// value known without reading the graph: a literal or a parameter. (Computed
-/// right-hand sides such as `n.x + 1` land in a later phase.)
+/// value known without reading the graph: a literal, a parameter, or a field path into
+/// a parameter. (Computed right-hand sides such as `n.x + 1` land in a later phase.)
+///
+/// The path form matters because clients pass one map per entity and address into it —
+/// `MERGE (n:Entity {uuid: $data.uuid}) SET n = $data` — rather than flattening every
+/// field into a separate top-level parameter. It is no less constant than `$data` itself:
+/// the whole path resolves from the bound parameters without touching the graph.
 ///
 /// `write_value`/`eval_row_value` on the server side match this admission set exactly
 /// — one of them `unreachable!()`s on anything else — so the two must move together.
 fn ensure_constant(e: &Expr, what: &str) -> Result<()> {
     match e {
-        Expr::Literal(_) | Expr::Param(_) => Ok(()),
+        Expr::Literal(_) => Ok(()),
+        e if is_param_path(e) => Ok(()),
         // `vecf32($p)` cannot fold at lowering (the parameter is bound per execution),
         // so it reaches the write path as a call and is coerced there.
-        e if as_vecf32_arg(e).is_some_and(|a| matches!(a, Expr::Param(_))) => Ok(()),
-        _ => bail!("{what} must be a literal or a parameter in a Phase 1c write"),
+        e if as_vecf32_arg(e).is_some_and(is_param_path) => Ok(()),
+        _ => bail!("{what} must be a literal, a parameter, or a field of one (e.g. $p.field)"),
+    }
+}
+
+/// A parameter, or a field path rooted at one: `$p`, `$p.field`, `$p.a.b`.
+///
+/// Resolves wholly from the bound parameters, so it is admissible anywhere a write wants
+/// a constant. Note this is a property access on a *parameter*, not on a graph variable —
+/// `n.prop` is a graph read and stays rejected.
+pub fn is_param_path(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_) => true,
+        Expr::Property(base, _) => is_param_path(base),
+        _ => false,
     }
 }
 
@@ -4127,7 +4146,7 @@ mod tests {
             "MERGE (a:Person {name: 'Ann'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET r.since = a.x",
         );
         assert!(
-            e.contains("must be a literal or a parameter") || e == "read-only",
+            e.contains("must be a literal, a parameter, or a field of one") || e == "read-only",
             "got: {e}"
         );
     }
@@ -4377,7 +4396,7 @@ mod tests {
     fn a_nonfinite_vecf32_literal_write_is_rejected_not_folded() {
         let e = write_err("MERGE (n:Doc {id: 1}) SET n.embedding = vecf32([1e400, 0.5, 0.5])");
         assert!(
-            e.contains("must be a literal or a parameter"),
+            e.contains("must be a literal, a parameter, or a field of one"),
             "a +inf literal write must be rejected, not folded into a stored vector; got: {e}"
         );
     }
@@ -4406,13 +4425,54 @@ mod tests {
         for q in [
             "MERGE (n:Doc {id: 1}) SET n.x = toUpper('a')",
             "MERGE (n:Doc {id: 1}) SET n.embedding = vecf32(n.other)",
+            // A property access on a *graph variable* is a read, and stays rejected —
+            // only a path rooted at a parameter is constant.
+            "MERGE (n:Doc {id: 1}) SET n.x = n.y",
+            "MERGE (n:Doc {id: $p.a + 1}) SET n.x = 1",
         ] {
             let e = write_err(q);
             assert!(
-                e.contains("must be a literal or a parameter") || e == "read-only",
+                e.contains("must be a literal, a parameter, or a field of one") || e == "read-only",
                 "for {q:?} got: {e}"
             );
         }
+    }
+
+    /// Clients pass one map per entity and address into it, rather than flattening every
+    /// field into its own top-level parameter. The path is as constant as the parameter
+    /// it is rooted at — it resolves without touching the graph.
+    #[test]
+    fn a_parameter_path_can_supply_the_business_key_and_set_values() {
+        let w = write(
+            "MERGE (n:Entity {uuid: $entity_data.uuid}) \
+             SET n.name = $entity_data.name \
+             SET n.name_embedding = vecf32($entity_data.name_embedding)",
+        );
+        assert_eq!(w.key, "uuid");
+        assert_eq!(
+            w.key_value,
+            Expr::Property(Box::new(Expr::Param("entity_data".into())), "uuid".into()),
+        );
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET write, got {:?}", w.op)
+        };
+        assert_eq!(items.len(), 2);
+    }
+
+    /// Nested paths resolve the same way — there is no depth special-case.
+    #[test]
+    fn a_nested_parameter_path_is_constant_too() {
+        let w = write("MERGE (n:Doc {id: $p.a.b}) SET n.x = 1");
+        assert_eq!(
+            w.key_value,
+            Expr::Property(
+                Box::new(Expr::Property(
+                    Box::new(Expr::Param("p".into())),
+                    "a".into()
+                )),
+                "b".into()
+            ),
+        );
     }
 
     #[test]
