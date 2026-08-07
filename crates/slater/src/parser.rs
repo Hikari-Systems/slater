@@ -955,9 +955,25 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
     let mut rel: Option<RelPat> = None;
     let mut delete: Option<(bool, String)> = None; // (detach, rel var)
     let mut sets: Vec<(String, String, Expr)> = Vec::new(); // (var, prop, value)
+                                                            // Endpoints bound by a leading `MATCH`, by variable name. Kept apart from the two
+                                                            // positional `node_pattern`s so a binding is never mistaken for an endpoint.
+    let mut bound: Vec<(String, NodePat)> = Vec::new();
     for c in kids(inner) {
         match c.as_rule() {
             Rule::kw_merge | Rule::kw_match => {}
+            Rule::edge_bind => {
+                let np = lower_node_pattern(only_child_of_rule(c, Rule::node_pattern)?)?;
+                let var = np.var.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a MATCH before a relationship write must name its node, e.g. \
+                         MATCH (a:Label {{key: value}})"
+                    )
+                })?;
+                if bound.iter().any(|(v, _)| v == &var) {
+                    bail!("'{var}' is bound twice before this relationship write");
+                }
+                bound.push((var, np));
+            }
             Rule::node_pattern => {
                 let np = lower_node_pattern(c)?;
                 if src.is_none() {
@@ -973,6 +989,10 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                     let (svar, si) = lower_set_item(item)?;
                     match si {
                         SetItem::Prop { prop, value } => sets.push((svar, prop, value)),
+                        // An edge's WAL op carries merge-semantics patches and has no
+                        // replace flag, so honouring `SET r = {…}` would silently *merge*
+                        // where the statement says replace. Rejecting is the honest answer
+                        // until the op can express the difference.
                         SetItem::ReplaceMap(_)
                         | SetItem::MergeMap(_)
                         | SetItem::ReplaceParam(_)
@@ -1005,9 +1025,20 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         }
     }
     let rel = rel.expect("edge_write always has a relationship");
-    let src = endpoint(src.expect("edge_write has a source node"), "the source")?;
+    let src = endpoint(
+        resolve_endpoint_pattern(
+            src.expect("edge_write has a source node"),
+            &bound,
+            "the source",
+        )?,
+        "the source",
+    )?;
     let dst = endpoint(
-        dst.expect("edge_write has a destination node"),
+        resolve_endpoint_pattern(
+            dst.expect("edge_write has a destination node"),
+            &bound,
+            "the destination",
+        )?,
         "the destination",
     )?;
 
@@ -1081,6 +1112,43 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
 /// Reduce a labelled node pattern to an [`EndpointPat`] (single label, exactly one
 /// inline business-key property whose value is a literal/parameter) — the endpoint of
 /// a relationship write. `what` names the endpoint in error messages.
+/// Resolve a relationship-write endpoint that may be written as a bare variable bound by
+/// a leading `MATCH`. An inline-keyed pattern passes straight through; a bare `(a)` is
+/// replaced by the pattern that bound `a`. The two spellings are the same write.
+fn resolve_endpoint_pattern(
+    node: NodePat,
+    bound: &[(String, NodePat)],
+    what: &str,
+) -> Result<NodePat> {
+    // Only a pattern carrying nothing but a name refers to a binding; anything with a
+    // label or an inline property is an endpoint in its own right.
+    let bare = node.label_expr.is_none() && node.props.is_empty();
+    if !bare {
+        return Ok(node);
+    }
+    let Some(var) = node.var.as_deref() else {
+        bail!("{what} node of a relationship write must carry a label and a business key");
+    };
+    bound
+        .iter()
+        .find(|(v, _)| v == var)
+        .map(|(_, np)| np.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{what} node '{var}' of this relationship write is not bound — either give it a \
+                 label and business key inline, or bind it first with MATCH ({var}:Label {{key: value}})"
+            )
+        })
+}
+
+/// The single child of `pair` with the given rule, for a wrapper rule that carries a
+/// keyword beside the child that matters.
+fn only_child_of_rule(pair: Pair<Rule>, rule: Rule) -> Result<Pair<Rule>> {
+    kids(pair)
+        .find(|c| c.as_rule() == rule)
+        .ok_or_else(|| anyhow::anyhow!("internal: expected a {rule:?} child"))
+}
+
 fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
     let label = node
         .label_expr
@@ -4674,6 +4742,58 @@ mod tests {
                 "for {q:?} got: {e}"
             );
         }
+    }
+
+    /// Binding endpoints with a leading `MATCH` and naming them in the `MERGE` is the
+    /// same write as spelling both inline — clients that generate Cypher tend to bind
+    /// first, and the two must lower identically.
+    #[test]
+    fn edge_endpoints_may_be_bound_by_a_leading_match() {
+        let inline = edge_write(
+            "MERGE (a:Person {email:'ada@x.com'})-[r:KNOWS]->(b:Person {email:'alan@x.com'}) \
+             SET r.since = 1936",
+        );
+        let bound = edge_write(
+            "MATCH (a:Person {email:'ada@x.com'}) \
+             MATCH (b:Person {email:'alan@x.com'}) \
+             MERGE (a)-[r:KNOWS]->(b) SET r.since = 1936",
+        );
+        assert_eq!(inline.src, bound.src);
+        assert_eq!(inline.dst, bound.dst);
+        assert_eq!(inline.reltype, bound.reltype);
+        assert_eq!(inline.sets, bound.sets);
+
+        // Mixing the spellings is fine — only one endpoint need be bound.
+        let mixed = edge_write(
+            "MATCH (a:Person {email:'ada@x.com'}) \
+             MERGE (a)-[r:KNOWS]->(b:Person {email:'alan@x.com'}) SET r.since = 1936",
+        );
+        assert_eq!(inline.src, mixed.src);
+        assert_eq!(inline.dst, mixed.dst);
+    }
+
+    /// A relationship write may carry several `SET` clauses, as a node write may.
+    #[test]
+    fn an_edge_write_accepts_repeated_set_clauses() {
+        let one = edge_write(
+            "MERGE (a:Person {email:'a@x'})-[r:KNOWS]->(b:Person {email:'b@x'}) \
+             SET r.since = 1936, r.note = 'x'",
+        );
+        let many = edge_write(
+            "MERGE (a:Person {email:'a@x'})-[r:KNOWS]->(b:Person {email:'b@x'}) \
+             SET r.since = 1936 SET r.note = 'x'",
+        );
+        assert_eq!(one.sets, many.sets);
+    }
+
+    /// An unbound bare endpoint says how to fix it rather than failing as a shape error.
+    #[test]
+    fn an_unbound_edge_endpoint_names_the_variable_and_the_fix() {
+        let e = write_err("MERGE (a)-[r:KNOWS]->(b:Person {email:'b@x'}) SET r.since = 1");
+        assert!(
+            (e.contains("'a'") && e.contains("MATCH")) || e == "read-only",
+            "got: {e}"
+        );
     }
 
     /// Nested paths resolve the same way — there is no depth special-case.

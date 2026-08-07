@@ -179,6 +179,20 @@ MATCH (a:Person {email:'ada@example.com'})-[r:KNOWS]->(b) DELETE r;
 `MERGE` on a relationship resolves both endpoints by their business keys, creating
 absent endpoints as needed. Re-merging an existing edge is an idempotent no-op.
 
+An endpoint may instead be bound by a leading `MATCH` and named in the `MERGE` — the same
+write, factored the way generated Cypher usually spells it:
+
+```cypher
+MATCH (a:Person {email:'ada@example.com'})
+MATCH (b:Person {email:'alan@example.com'})
+MERGE (a)-[r:KNOWS]->(b) SET r.since = 1936;
+```
+
+Relationship writes take property assignments only (`SET r.p = value`), across as many
+`SET` clauses as you like. Whole-map assignment (`SET r = {…}`) is **not** accepted: an
+edge's durable op carries merge-semantics patches with no replace flag, so honouring it
+would silently merge where the statement says replace.
+
 ## Batched writes with `UNWIND`
 
 For bulk loads, drive many rows through one statement. The source **must be a

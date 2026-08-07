@@ -220,9 +220,19 @@ delete_clause = { kw_detach? ~ kw_delete ~ var ~ ("," ~ var)* }
 // be a single directed `-[:R]->` with one type and no variable-length / properties
 // (validated at lowering, reusing the read grammar's `rel_pattern`). A rel variable
 // is required for DELETE (it names the edge) and optional for MERGE.
+// An endpoint may also be bound by a leading `MATCH` and then named by variable in the
+// MERGE — `MATCH (a:L {k:v}) MERGE (a)-[:R]->(b:M {j:w})`. That is the same write as the
+// all-inline spelling, just factored differently, and clients generating Cypher tend to
+// bind first. `edge_bind` is its own rule rather than another `node_pattern` so the
+// lowering can tell a binding apart from an endpoint by rule, not by position.
 edge_write = { edge_merge | edge_delete }
-edge_merge = { kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause? }
-edge_delete = { kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
+edge_merge = { edge_bind* ~ kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause* }
+edge_delete = { edge_bind* ~ kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
+// The lookahead is load-bearing. Without it PEG repetition is greedy and `edge_bind*`
+// swallows the `MATCH` that `edge_delete` itself needs, so
+// `MATCH (a)-[r:R]->(b) DELETE r` stops parsing. A binding is only a binding when another
+// `MATCH` or the `MERGE` follows it; a pattern followed by `-[` is the write's own anchor.
+edge_bind = { kw_match ~ node_pattern ~ &(kw_match | kw_merge) }
 
 // ── Consolidation trigger (Phase 5) ───────────────────────────────────────────
 // `CALL slater.consolidate()` folds the writable delta into a fresh generation and
