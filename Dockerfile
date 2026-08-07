@@ -113,6 +113,10 @@ COPY crates ./crates
 RUN cargo build --release --locked ${CARGO_FEATURES:+--features=$CARGO_FEATURES} \
         --bin slater --bin slater-build
 
+# Empty directories for the runtime stage to copy in as the writable mount points
+# (see the COPY --chown below) — a distroless stage has no shell to mkdir with.
+RUN mkdir -p /seed/data /seed/wal
+
 # Minimal glibc (non-musl) runtime: Debian 12 distroless ships glibc +
 # libgcc/libstdc++ (Rust needs libgcc_s for unwinding) + ca-certificates (for the
 # S3/GCS TLS chains), and nothing else — no shell, apt, or coreutils — so the same
@@ -133,6 +137,22 @@ COPY acl.json ./acl.json
 # (No glibc allocator tuning here: the server uses jemalloc as its global allocator
 # on Linux, whose background purge returns freed heap to the OS on its own — the
 # former `MALLOC_ARENA_MAX` / `MALLOC_TRIM_THRESHOLD_` env knobs are inert under it.)
+
+# The mount points a *writable* deployment needs, owned by the runtime uid.
+#
+# Docker seeds an empty named volume from whatever the image carries at that path,
+# ownership included — so shipping these two directories is what makes
+# `-v slater-data:/data -v slater-wal:/wal` land writable. Without them the volume is
+# created root-owned, the unprivileged process cannot write it, and the first thing
+# to fail is a bare `Permission denied` with nothing to point at. Distroless has no
+# shell and no `chown`, so there is no entrypoint script that could repair it at
+# start: it has to be in the image.
+#
+# They are created in the builder stage because a distroless stage cannot `RUN
+# mkdir`. A read-only deployment mounts its generations over /data and never notices
+# either directory was here.
+COPY --from=builder --chown=1000:1000 /seed/data /data
+COPY --from=builder --chown=1000:1000 /seed/wal /wal
 
 # Run unprivileged. Distroless has no `useradd`, but a numeric USER needs no
 # /etc/passwd entry — keep uid:gid 1000:1000 so existing writable mounts (e.g. the
