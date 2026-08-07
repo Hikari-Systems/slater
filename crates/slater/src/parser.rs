@@ -1196,6 +1196,12 @@ fn lower_update_clause(
                 }
             }
             debug_assert!(!targets.is_empty(), "delete_clause names a variable");
+            // Now that the grammar admits repeated updating clauses, a second DELETE
+            // would overwrite the first rather than add to it. One anchor can only be
+            // deleted once, so say so instead of silently keeping the last one.
+            if delete.is_some() {
+                bail!("a write carries at most one DELETE clause");
+            }
             *delete = Some((detach, targets));
         }
         other => bail!("internal: unexpected update_clause child {other:?}"),
@@ -1423,7 +1429,25 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
         ensure_constant(&key_value, "the anchor business-key value")?;
     }
 
-    // Exactly one update clause fired (the grammar alternates SET / REMOVE / DELETE).
+    // The grammar admits a *sequence* of updating clauses (openCypher's `UpdatingClause+`),
+    // so more than one kind can now arrive in one statement. A `WriteStmt` carries a single
+    // `WriteOp`, so only one kind is representable — and the arms below are an if/else
+    // chain, which would silently honour the first and drop the rest. Reject the mix here,
+    // naming both kinds, rather than losing a clause the client believed it had sent.
+    let kinds = [
+        (!set_items.is_empty(), "SET"),
+        (!remove_items.is_empty(), "REMOVE"),
+        (delete.is_some(), "DELETE"),
+    ];
+    let present: Vec<&str> = kinds.iter().filter(|(p, _)| *p).map(|(_, n)| *n).collect();
+    if present.len() > 1 {
+        bail!(
+            "a write applies one kind of updating clause, but this statement combines {} — \
+             issue them as separate statements",
+            present.join(" and ")
+        );
+    }
+
     let op = if let Some((detach, targets)) = delete {
         if upsert {
             bail!("MERGE cannot be combined with DELETE — use MATCH … DELETE to remove a node");
@@ -3544,6 +3568,62 @@ mod tests {
             ])
         );
         assert!(w.ret.is_none());
+    }
+
+    /// openCypher's `UpdatingClause+`: repeated `SET` keywords are the same statement as
+    /// one comma-separated `SET`, folded in source order. Clients write it this way when
+    /// the items are heterogeneous — labels, then a whole-map replace, then one property.
+    #[test]
+    fn repeated_set_clauses_fold_in_source_order() {
+        let one = write("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10, n.sector = 'Tech'");
+        let many =
+            write("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 10 SET n.sector = 'Tech'");
+        assert_eq!(one.op, many.op, "both spellings mean the same write");
+    }
+
+    /// The shape that motivated this: three consecutive `SET` keywords mixing a label add,
+    /// a property write and a vector write on one anchor.
+    #[test]
+    fn repeated_set_clauses_carry_labels_and_properties_together() {
+        let w = write(
+            "MERGE (n:Entity {uuid: 'u1'}) \
+             SET n:Person \
+             SET n.name = 'Ada' \
+             SET n.name_embedding = vecf32($e)",
+        );
+        assert!(w.upsert);
+        assert_eq!(w.key, "uuid");
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET write, got {:?}", w.op)
+        };
+        assert_eq!(items.len(), 3, "one item per SET clause: {items:?}");
+        assert_eq!(items[0], SetItem::AddLabels(vec!["Person".to_string()]));
+    }
+
+    /// A statement carrying more than one *kind* of updating clause is not representable —
+    /// `WriteStmt` holds a single `WriteOp`. Before the grammar admitted `UpdatingClause+`
+    /// this could not arise; now it can, and honouring one while dropping the other would
+    /// lose a clause the client believed it had sent.
+    #[test]
+    fn mixing_updating_clause_kinds_is_rejected_by_name() {
+        let e = write_err("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 1 REMOVE n.sector");
+        assert!(
+            e.contains("SET and REMOVE"),
+            "must name both kinds. Got: {e}"
+        );
+        let e = write_err("MATCH (n:Company {ticker: 'ABC'}) SET n.price = 1 DELETE n");
+        assert!(
+            e.contains("SET and DELETE"),
+            "must name both kinds. Got: {e}"
+        );
+    }
+
+    /// One anchor can only be deleted once; a second DELETE used to be unreachable and
+    /// would now silently overwrite the first.
+    #[test]
+    fn a_second_delete_clause_is_rejected() {
+        let e = write_err("MATCH (n:Company {ticker: 'ABC'}) DELETE n DELETE n");
+        assert!(e.contains("at most one DELETE"), "got: {e}");
     }
 
     #[test]

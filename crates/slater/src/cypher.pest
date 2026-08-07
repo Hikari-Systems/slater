@@ -142,10 +142,18 @@ create_stmt = { kw_create ~ node_pattern ~ return_clause? }
 // clear message, the same way the write grammar bounds its other shapes.
 insert_stmt = { kw_insert ~ node_pattern ~ (rel_pattern ~ node_pattern)? ~ return_clause? }
 
-// The action(s) applied to a MATCH/MERGE-anchored node: an unconditional updating clause,
+// The action(s) applied to a MATCH/MERGE-anchored node: unconditional updating clauses,
 // and/or (only for MERGE) `ON CREATE SET …` / `ON MATCH SET …` conditional blocks. At
 // least one merge action or an updating clause must be present.
-write_actions = { (merge_action+ ~ update_clause?) | update_clause }
+//
+// openCypher permits a *sequence* of updating clauses, and clients rely on it: writing
+// labels, then a whole-map replace, then one re-typed property is three consecutive `SET`
+// keywords, not one comma-separated `SET`. Both spellings mean the same thing — the items
+// fold in source order, last write wins — so the repetition is purely syntactic. Mixing
+// *kinds* (a `SET` beside a `DELETE`) is a different matter: the executor carries one
+// `WriteOp` per statement, so lowering rejects that combination by name rather than
+// silently honouring one and dropping the other.
+write_actions = { (merge_action+ ~ update_clause*) | update_clause+ }
 merge_action = { kw_on ~ (kw_create | kw_match) ~ set_clause }
 
 // One updating clause applied to the anchored node. openCypher's full `UpdatingClause`

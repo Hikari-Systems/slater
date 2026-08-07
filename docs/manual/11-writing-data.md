@@ -66,6 +66,21 @@ assignments depending on whether the node was created or matched.
 Values must be constants (a literal or a `$parameter`). Re-setting the business-key
 property relocates the node in its index.
 
+Items may be comma-separated in one `SET`, or split across consecutive `SET` clauses —
+the two spellings are the same write, folded in source order with the last write winning:
+
+```cypher
+MERGE (n:Entity {uuid: $uuid})
+SET n:Person
+SET n = $props
+SET n.embedding = vecf32($embedding);
+```
+
+What a statement cannot do is combine *kinds* of updating clause — a `SET` beside a
+`REMOVE` or a `DELETE`. A write carries one operation against one anchor, so that
+combination is rejected by name rather than partly honoured; issue the clauses as
+separate statements.
+
 ## Removing data
 
 ```cypher

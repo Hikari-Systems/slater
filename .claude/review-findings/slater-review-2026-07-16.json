@@ -1,0 +1,183 @@
+{
+  "review": "slater whole-codebase review",
+  "date": "2026-07-16",
+  "baseline": {
+    "branch": "main",
+    "head": "d5974c5",
+    "tree": "clean",
+    "loc": 132556,
+    "crates": ["slater (77643)", "graph-format (28111)", "slater-build (16809)", "slater-delta (8924)", "slater-scalar (1069)"]
+  },
+  "method": "9 read-only subagents fanned out in parallel, one per subsystem, each adversarially verifying every candidate end-to-end before reporting (try to break it; no nits; 'nothing found' is a valid outcome). Effort: medium.",
+  "prior_review": ".claude/review-findings/slater-review-2026-07-13.json (34 findings -> HIK-68..HIK-101, all since fixed)",
+  "totals": { "confirmed": 9, "plausible": 2 },
+  "themes": [
+    "Unvalidated on-disk widths/offsets: a forged or corrupt record panics (debug) or silently returns wrong values (release). 3 confirmed: pq.rs:711, plane.rs:503, degree_ef.rs:231.",
+    "Unbounded/unaccounted resources in the disk-cache tier: 2 confirmed, diskcache.rs:169 (unbounded disk across restarts) and diskcache.rs:68 (count-bounded queue = ~256MB unaccounted RSS).",
+    "Unchecked arithmetic on user-supplied values: temporal.rs:446 (saturating f64->i64 cast then unchecked *12).",
+    "Read path and consolidation fold disagreeing about what a label removal means: exec.rs:1275 -- permanent embedding loss."
+  ],
+  "findings": [
+    {
+      "id": 1,
+      "file": "crates/slater/src/exec.rs",
+      "line": 1275,
+      "category": "data-loss",
+      "verdict": "CONFIRMED",
+      "severity": "critical",
+      "summary": "segment_level turns an out-of-scope (label-removed) vector candidate into an unconditional removal, so a consolidation permanently destroys an embedding that HIK-118's KNN path guarantees a later SET n:Label will restore.",
+      "failure_scenario": "Base generation holds node X labelled :Doc with indexed vector V (D12 routes it out of the column store). Write 1: SET x.embedding = V1 -> flushed to segment S1 (sidecar ids=[X], S1's row carries embedding=V1). Write 2: REMOVE x:Doc -> flushed to segment S2 (sidecar label_removals=[X]; S2's row still carries embedding=V1, propagated by read_base_node_row in flush_segment.rs:184/203). X is now out of the index's scope. Per HIK-118 (exec.rs:5749-5753, 6239-6243) a later SET x:Doc would put X back in scope and re-score V1 from S1. Now a background consolidation runs while X is out of scope: segment_level (exec.rs:1265-1276) sees candidate X, vector_indexed(X) is false, and pushes X into segments.removed unconditionally -> VectorLevels::superseded() contains X -> consolidate.rs:381-391 maps X's base layout ordinal to HOLE, and into_effective_entries() (exec.rs:1078) emits no entry for X, so the rebuilt index has no record for X at all. Meanwhile the dump's property walk (consolidate.rs:258 -> Engine::node_record -> suppress_indexed_vectors_named, exec.rs:2826) does NOT strip embedding -- X's effective labels lack Doc -- so val_to_value maps Val::Vector -> Value::Vector and V1 is interned into the new generation's column store. After consolidation the user runs SET x:Doc. Result: (a) CALL db.idx.vector.queryNodes never returns X -- no entry exists on any level; (b) RETURN x.embedding returns Null, because suppress_indexed_vector (exec.rs:968-994) now sees Doc in the effective label set and suppresses the column value. The embedding is unreachable by any query. Without the consolidation the identical write sequence returns X from KNN with V1.",
+      "root_cause": "The two consumers of vector_levels -- which the doc at exec.rs:1070-1077 insists 'cannot disagree about which level wins' -- disagree exactly here: the KNN read path treats a label_removal as conditional, re-enterable suppression, while the consolidation fold treats it as an unconditional, irreversible delete.",
+      "area": "writable vector ladder (HIK-108..121)"
+    },
+    {
+      "id": 2,
+      "file": "crates/slater/src/server.rs",
+      "line": 3576,
+      "category": "security",
+      "verdict": "CONFIRMED",
+      "severity": "critical",
+      "summary": "LOGOFF clears only sess.user, leaving the prior user's buffered result rows (sess.pending) and open-transaction graph (sess.tx_graph) intact for the next authenticated user on the same connection -- a cross-user data leak via PULL and a read-ACL bypass via RUN inside the inherited transaction.",
+      "failure_scenario": "On a shared/pooled connection (or a client deliberately chaining credentials): (1) User A (read grant on g1) LOGON, RUN a query returning rows -> sess.pending = Some(rows), or BEGIN {db:'g1'} -> sess.tx_graph = 'g1'. (2) User A LOGOFF -> handler sets only sess.user = None; sess.pending and sess.tx_graph are NOT cleared (contrast RESET at lines 3379-3381 which clears both). (3) User B (NO read grant on g1) LOGON on the same connection. (4a) User B PULL -> Request::Pull (line 3813) drains sess.pending with no sess.user check -> User B sees User A's result rows from g1. (4b) User B RUN with no db field -> the graph resolves via the Some(g) arm of the tx_graph match (line 3678) which returns g.clone() WITHOUT calling select_graph/acl.can_read -> User B reads g1 despite having no read grant. The write arm is safe (authorize_statement re-checks can_write), but reads via tx_graph skip the ACL entirely.",
+      "fix_hint": "LOGOFF should clear pending + tx_graph exactly as RESET (server.rs:3379-3381) does.",
+      "area": "bolt session / authz"
+    },
+    {
+      "id": 3,
+      "file": "crates/graph-format/src/store/diskcache.rs",
+      "line": 169,
+      "category": "io",
+      "verdict": "CONFIRMED",
+      "severity": "high",
+      "summary": "The disk cache's byte budget is enforced only over entries the current process inserted; cache files left by a previous run are never indexed, never counted, and never evicted, so the cache directory grows without bound across restarts and can exceed diskCacheBytes until the volume fills.",
+      "failure_scenario": "Deploy per DOCKERHUB.md: dataBackend__s3__diskCacheBytes=10737418240 with /var/cache/slater on a 12 GiB volume. Run 1 warms the cache to the 10 GiB budget with names blake3(key||offset||len) where key embeds the generation/segment uuid. Publish a new generation (or flush a segment -- every flush mints a fresh segment uuid) and restart the container on the same volume. DiskCache::open() only does fs::create_dir_all; Lru::default() starts empty (total_bytes=0), so the 10 GiB of run-1 files are invisible. Their names are never revisited (the uuid in the key changed, so write_file never renames over them) and writer_loop only unlinks names returned by idx.pop_coldest()/Req::Delete -- both sourced exclusively from the in-memory index. Run 2 therefore writes up to another 10 GiB before its own trim loop fires: ENOSPC on the cache volume at ~12 GiB, which then also fails every write_file (silently, per the Err(_) arm) and can fail unrelated writers sharing the volume. Each subsequent restart+generation-change adds another budget's worth.",
+      "note": "The doc comment at line 169 asserts these files are 'aged out by the LRU as new writes land' -- they cannot be: the LRU has no record of them.",
+      "area": "storage backends / disk cache"
+    },
+    {
+      "id": 4,
+      "file": "crates/graph-format/src/store/diskcache.rs",
+      "line": 68,
+      "category": "io",
+      "verdict": "CONFIRMED",
+      "severity": "high",
+      "summary": "The write-behind channel is bounded by message COUNT (1024) rather than bytes, so up to 1024 heap-owned block payloads can be in flight -- an unaccounted allocation several times the whole blockCacheBytes budget, defeating the bounded-RSS guarantee the cache exists to protect.",
+      "failure_scenario": "Default build: --block-size 256 KiB (slater-build/src/main.rs:124), blockCacheBytes default 64 MiB (config.rs:838). Enable the S3 backend with diskCacheBytes>0 and run a cold scan. CachingRandomReadAt::read_ranges (line 481) issues a read-ahead batch whose range GETs go out concurrently on the backend runtime, then calls put_async once per range; put_async does bytes.to_vec() and try_send's it into a sync_channel of depth WRITE_QUEUE_DEPTH=1024. The single writer thread does one fs::File::create + write_all + sync_all + rename per entry (write_file, line 380) -- an fsync per block, on the order of 10^3 blocks/s -- while concurrent range GETs deliver far faster, so the queue reaches its 1024-message cap during any sustained cold scan. Peak resident = 1024 x sealed block size (up to ~256 KiB) ~= 256 MB of Vec payloads held in the channel, plus the writer's encoded copy. None of this is charged against blockCacheBytes, maxIntermediate, or any other cap, and README.md:465 accounts only 'the in-memory index' against the RSS ceiling. A container sized to the documented 100-200 MB envelope OOMs precisely when the disk cache is doing its job.",
+      "fix_hint": "Byte-budget the queue (drop once queued_bytes exceeds a cap) rather than count-budget it; the current cap is not a memory bound at all.",
+      "area": "storage backends / disk cache"
+    },
+    {
+      "id": 5,
+      "file": "crates/graph-format/src/plane.rs",
+      "line": 503,
+      "category": "correctness",
+      "verdict": "CONFIRMED",
+      "severity": "high",
+      "summary": "EfMono::deserialize reads the EF low-bits width `l` from body[4] without validating `l <= 63`, so a forged plane/EF record (or endpoint posting) passes the byte-length and ones-count checks and then value_at shifts by << self.l (>=64): debug builds panic, release builds mask the shift to l & 63 and return silently wrong values.",
+      "failure_scenario": "An attacker with data-dir write access crafts an EF plane record with l = 100, a body sized to match (m*100)/8 low bytes, and a highs bitmap with exactly m one-bits. decode_plane/EfMono::deserialize accepts it (byte-length check passes, ones == m passes). A query calls KeyColumn::find(x) or EndpointPostingIter::next -> EfMono::value_at(i) -> (((p - i) as u64) << 100) | read_low(.., 100, i). In debug this panics ('attempt to shift left with overflow'); in release << 100 wraps to << 36 and read_low masks to 36 bits, so the returned value is wrong -- a key-column membership probe misses present keys or returns wrong node ids, serving corrupt query results without any error.",
+      "note": "Sibling BitPacked::deserialize validates width against 1..=64 (plane.rs:317), and both EF decoders validate the high-bit count (ones == m) against attacker-controlled bytes -- but neither checks l <= 63. A legitimate encoder only ever writes l = low_bits(...) in 0..=63.",
+      "area": "plane codec (v7 series)"
+    },
+    {
+      "id": 6,
+      "file": "crates/graph-format/src/degree_ef.rs",
+      "line": 231,
+      "category": "correctness",
+      "verdict": "CONFIRMED",
+      "severity": "high",
+      "summary": "EfChunk::deserialize reads the EF low-bits width `l` from body[4] without validating `l <= 63`, so a forged degree-chunk record passes the byte-length and ones-count checks and then degree_at shifts by << self.l (>=64): debug builds panic, release builds mask to l & 63 and return silently wrong degrees.",
+      "failure_scenario": "An attacker with data-dir write access crafts an EF degree chunk with l = 100, body sized to (m*100)/8 low bytes, and highs with exactly m = n+1 one-bits. decode_chunk/EfChunk::deserialize accepts it. A query or the degree-sum count fast path calls EfChunk::degree_at(slot) -> (((p0 - slot) as u64) << 100) | self.low(slot) (and the p1 - (slot+1) term likewise). Debug panics on the shift; release masks to << 36, colliding high and low bits, so v1 - v0 yields a wrong degree -- the count fast path sums wrong degrees and returns an incorrect k-hop count with no error.",
+      "area": "degree column (Elias-Fano)"
+    },
+    {
+      "id": 7,
+      "file": "crates/slater/src/temporal.rs",
+      "line": 446,
+      "category": "panic",
+      "verdict": "CONFIRMED",
+      "severity": "high",
+      "summary": "A user-supplied duration year/month count saturates on the f64->i64 cast and then overflows an unchecked years_int * 12, panicking in debug and silently wrapping to a wrong duration in release.",
+      "failure_scenario": "Any authenticated client runs RETURN duration('P9999999999999999999Y') (or RETURN duration({years: 1e19})). exec.rs:9403 (string form) / exec.rs:10671 (map form) call temporal::duration_to_timet. Line 442 does years.trunc() as i64; Rust float->int `as` casts saturate, so 1e19 becomes i64::MAX (9223372036854775807) instead of erroring. Line 446 then evaluates years_int * 12 + months_int. Verified with a standalone binary: i64::MAX.checked_mul(12) == None and i64::MAX.wrapping_mul(12) == -12. Cargo.toml defines no [profile.dev] and no overflow-checks key anywhere, so dev/test default to overflow-checks ON (debug/test builds panic with 'attempt to multiply with overflow' inside query execution, and there is no catch_unwind on the query path) while [profile.release] defaults to OFF, where total_months wraps to -12 -> add_calendar_months(epoch, -12) -> the query returns a duration of MINUS ONE YEAR for a request for ten quintillion years, with no error. The same line is reached via add_durations (temporal.rs:592) for duration(...) + duration(...). Float literals reach it too: duration({years: 1e400}) parses to f64 INFINITY (parser.rs:3316 uses parse::<f64>, which never errors on overflow), and INFINITY.trunc() as i64 also saturates to i64::MAX.",
+      "fix_hint": "Reject non-finite / out-of-range components and use checked_mul/checked_add for the total_months fold.",
+      "area": "temporal / query front-end"
+    },
+    {
+      "id": 8,
+      "file": "crates/graph-format/src/pq.rs",
+      "line": 711,
+      "category": "panic",
+      "verdict": "CONFIRMED",
+      "severity": "medium",
+      "summary": "PqReader::load_resident slices record bytes from a decompressed block via manual indexing (offsets[slot]..offsets[slot+1]) without validating the offset table, so a corrupt/forged PQ block panics on slice-out-of-bounds instead of erroring -- unlike the for_each_record path, which validates via record_from_block.",
+      "failure_scenario": "A .pq file whose block offset table holds an offset value exceeding the block's data length (a forged block, a bit-flip in plaintext mode, or a writer bug that passes AEAD) reaches load_resident at generation open. parse_block (blockfile.rs:1048) only checks the header fits in raw.len(), not that offset values lie within data.len() or that start<=end. load_resident then executes &data[offsets[slot] as usize..offsets[slot+1] as usize] and panics (slice out of bounds / start > end). The same corrupt block through for_each_record (blockfile.rs:1037) would route through record_from_block, which validates start<=end<=data.len() and bails with a legible error -- so the hazard is an inconsistency, not a discipline the rest of the code lacks.",
+      "area": "FreshDiskANN / PQ"
+    },
+    {
+      "id": 9,
+      "file": "crates/slater-build/src/build_external.rs",
+      "line": 380,
+      "category": "correctness",
+      "verdict": "CONFIRMED",
+      "severity": "medium",
+      "summary": "The DumpVertex index filter uses && where De Morgan requires ||, so under --pk <field> every user range index on that property is silently dropped from the build.",
+      "failure_scenario": "The guard `if r.label_or_type != DUMP_VERTEX && r.property != pk_field { rstmts.push(r) }` is intended to drop only the internal (:__DumpVertex__)(pk_field) index; the correct predicate is !(label == DUMP_VERTEX && property == pk_field). Run slater-build --pk id on a dump containing CREATE INDEX FOR (n:Person) ON (n.id): label_or_type ('Person') != '__DumpVertex__' is true, but property ('id') != pk_field ('id') is false, so the conjunction is false and the statement is never pushed to rstmts. It therefore never reaches ShardMeta.range_stmts (line 411), never survives the cross-shard union (line 1058), and never reaches the index builder at line 1456 -- which is the sole source of range indexes; nothing auto-adds an index on the pk field. The build completes silently with no index on :Person(id), so MATCH (n:Person) WHERE n.id = ... degrades to a full label scan. This is precisely the mode --pk documents (main.rs:106: <FIELD> 'is stored as a queryable node property'), making an index on it the most likely index in such a dump. The default --pk __dump_id__ masks the bug: pk_field then equals DUMP_ID, so the first conjunct alone rejects the internal index and legitimate indexes on other properties pass -- which is why it has gone unnoticed.",
+      "related": "The identical De Morgan error exists at line 490 (merge path, with the fixed DUMP_ID constant); no realistic failing input could be constructed there since both __DumpVertex__ and __dump_id__ are reserved internal names, but it should be fixed in the same change.",
+      "area": "slater-build"
+    },
+    {
+      "id": 10,
+      "file": "crates/slater-delta/src/wal.rs",
+      "line": 689,
+      "category": "data-loss",
+      "verdict": "PLAUSIBLE",
+      "severity": "medium",
+      "summary": "write_commit_frame flushes the commit marker to the OS before fsync; on fsync failure the marker is already in the file, and Rollback::drop's truncate_to is best-effort (let _ =), so a crash before the next append_batch's self-heal can leave a durable commit frame that retro-commits the failed batch's orphan RECORD frames on replay.",
+      "failure_scenario": "append_batch writes N RECORD frames then calls write_commit_frame. write_frame + BufWriter flush succeed (commit frame reaches the OS file), but sync_data returns EIO. The ? returns Err; Rollback::drop calls truncate_to(committed_len), which runs set_len (truncating the OS file) but its own sync_data also fails (same failing disk) -- or the process crashes before it completes. truncate_to returns Err, which Drop ignores via `let _ =`. On restart, replay_dir reads the segment: the commit frame (with its committed_seq) is present and CRC-valid, so replay_bytes commits the N orphan RECORD frames. The failed batch -- which the client never saw acked -- is retro-committed. The Drop docstring at line 977 ('orphan frames carry no commit marker, so replay drops them even if this truncate fails') is violated: write_commit_frame writes the marker before the fsync it gates on.",
+      "note": "Requires a double I/O fault + crash. The reviewer cleared the rollback guard (HIK-105) on both Err and unwind paths, the append_batch self-heal, retire's deletion-before-replay ordering, flush_to_l0 durability ordering, and the lock ordering for deadlock-freedom.",
+      "area": "WAL durability"
+    },
+    {
+      "id": 11,
+      "file": "crates/slater-delta/src/l0_offheap.rs",
+      "line": 945,
+      "category": "panic",
+      "verdict": "PLAUSIBLE",
+      "severity": "medium",
+      "summary": "L0Reader's LevelRead accessors (node_entry, out_edges, in_edges, edge_delta_owned) use .expect() on both the BlockCache record fetch and the payload decode, so a corrupt or bit-rotted block file panics the whole process rather than failing the single read.",
+      "failure_scenario": "An off-heap L0 segment is opened (meta.bin passes its CRC check, so open succeeds). One of the four .blk payload files later suffers media bit-rot (or a partial write from a crash that the block file's own atomic-rename didn't fully cover). A query calls delta.node_patch_owned(dense_id) -> L0Reader::node_entry -> self.record_bytes(...).expect('l0 node record') or decode_node(...).expect('decode l0 node') panics, unwinding through the query and aborting the entire server process (not just the query), taking all other in-flight queries with it. The meta CRC is checked on open, but the per-block payloads have no integrity check on the read path, so corruption there is hit as a panic, not a bail.",
+      "area": "delta L0 off-heap"
+    }
+  ],
+  "clean_areas": [
+    {
+      "area": "segment lifecycle (generation/consolidate/flush/merge/segstack/read_view/rwindex/degree_column/cache/config/dump)",
+      "result": "0 findings",
+      "probed_and_cleared": [
+        "degree_column.rs:221-241 fault/evict race -- benign by design; faulting thread holds the Arc, re-fault is byte-identical and idempotent, resident_bytes stays consistent",
+        "read_view.rs:468-475 live_node_count double-count -- unreachable; a DELETE of an already-segment-tombstoned node resolves Absent and is rejected",
+        "merge_segment.rs fold_index/fold_adjacency/fold_vectors -- newest-wins with reclamation is correct; the 'live id has no merged node row' path is unreachable",
+        "degree_column.rs:300-352 CLOCK second-chance eviction -- budget invariant preserved",
+        "read_view.rs:395-432 edges_lost_to_node_tombstones -- each dead edge counted once; gated by edge_counts_are_exact()",
+        "consolidate.rs:380-391 vamana carry map -- combined_tombs complete before the vector pass",
+        "degree_ef.rs:457-465 partial last chunk bounds -- no out-of-range",
+        "rwindex.rs:521-555 TOCTOU -- epoch re-check under the read guard; all states fall back to brute force"
+      ]
+    },
+    {
+      "area": "bolt protocol",
+      "cleared": "chunk reassembler, packstream decoder (depth cap, value budget, capacity bounds), handshake (overflow-free covers), TLS/pre-auth deadline wiring, consolidation freeze/replay TOCTOU, write-path generation-swap race (freeze->retire WAL replay re-resolves post-freeze writes against the new core)"
+    },
+    {
+      "area": "authz / error-handling standards (both still holding, per project conventions)",
+      "cleared": "ACL stamp enforced on every hot-reload -- server.rs:1544 and server.rs:3535 both use reload_checked/poll_checked against acl_digest_acceptable (NOT regressed to unconditional reload); statement_mutates is an exhaustive match with no wildcard arm (Read(_) => false), so a new write variant is a compile error not a silent write-ACL bypass; errors branch on type via downcast_ref::<WriteClauseRejected>() at server.rs:2319/3711/3783 -- the only .contains() on error text is in out-of-scope generation.rs tests"
+    },
+    {
+      "area": "storage backend integrity/credentials",
+      "cleared": "No credential leak: neither S3Config nor GcsConfig is ever Debug-formatted; config.rs derives Debug but nothing logs the structs; build_store (server.rs:2528) moves secrets straight into the backend; startup logging emits only version/bind/port/data_dir/tls/writable. plan_verify on both backends (S3 sha256 / GCS crc32c) routes (Some, None) to a BLAKE3 body re-hash, never the length floor, and fails closed on composite/out-of-band checksums. get_range enforces the exact returned length on both backends; checked_content_length and the GCS negative-size guard cover the signed-length wrap. decode binds key+offset+len+CRC so a blake3 name collision or stale/torn cache file cannot return wrong bytes. SdkError::into_service_error does not panic on transport errors. Disk-cache stale-read-after-overwrite unreachable: block keys embed the generation/segment uuid and read_all (MANIFEST, current) bypasses the cache."
+    },
+    {
+      "area": "slater-build pipeline",
+      "cleared": "DumpResolver overflow (resolve.rs:90) is a dead end -- the i64 wrap is self-correcting and still yields the correct 'unknown __dump_id__' error. cluster.rs: LDG local_load underflow impossible; chunk vs part_prev neighbour read provably in-bounds; to_permutation is a bijection; empty stripes get real empty block files. Memory-fix regression check: the new_inline fixes still hold in cluster.rs:281 and resolve_edges (all four sorters); resident_hint correctly counts the Value string/list heap and the SetExprI tree. Merge-join integrity: part_of_value (FNV over write_value) is consistent with value_cmp_exact, so no endpoint can hash away from its node key; stage-2 pairing has an explicit alignment check. Parser precedence: cmp_op is longest-alternative-first, kw_* rules are atomic, OR<AND<NOT<cmp<add<mul matches Cypher. overlay.rs/direct_ingest.rs: created-node dedup and the vector merge-join orphan check are sound."
+    }
+  ]
+}
