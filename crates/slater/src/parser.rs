@@ -233,10 +233,22 @@ pub mod ast {
         pub reltype: String,
         pub dst: EndpointPat,
         pub op: EdgeWriteOp,
-        /// Relationship property assignments from an optional `SET r.p = …` on a
-        /// `MERGE` (each value a literal or parameter). Empty for a bare `MERGE` or a
-        /// `DELETE`. Only a **delta-born** edge carries editable properties for now.
-        pub sets: Vec<(String, Expr)>,
+        /// The inline relationship property that *is* the edge's identity:
+        /// `MERGE (a)-[r:R {uuid: $u}]->(b)`. `None` ⇒ one `R` between the pair is one
+        /// edge. With it, several `R` edges between the same pair stay distinct — which
+        /// is what a store keying its edges by an opaque id needs in order not to lose
+        /// facts. `MERGE` only; a `DELETE` may not spell one (see `lower_edge_write`).
+        pub key: Option<(String, Expr)>,
+        /// Relationship property assignments from an optional `SET` on a `MERGE`. Empty
+        /// for a bare `MERGE` or a `DELETE`. The whole-map forms are carried as-is:
+        /// a `SET r = {…}` *replaces* the edge's properties, the rest merge, and the
+        /// write path folds the sequence into one op.
+        pub sets: Vec<SetItem>,
+        /// The relationship variable, when the pattern names one — the binding a
+        /// `RETURN` projects.
+        pub rel_var: Option<String>,
+        /// An optional `RETURN` projecting the (post-write) relationship. `MERGE` only.
+        pub ret: Option<ReturnClause>,
     }
 
     /// The mutation an [`EdgeWriteStmt`] applies.
@@ -954,10 +966,11 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
     let mut dst: Option<NodePat> = None;
     let mut rel: Option<RelPat> = None;
     let mut delete: Option<(bool, String)> = None; // (detach, rel var)
-    let mut sets: Vec<(String, String, Expr)> = Vec::new(); // (var, prop, value)
-                                                            // Endpoints bound by a leading `MATCH`, by variable name. Kept apart from the two
-                                                            // positional `node_pattern`s so a binding is never mistaken for an endpoint.
+    let mut sets: Vec<(String, SetItem)> = Vec::new(); // (var, item)
+                                                       // Endpoints bound by a leading `MATCH`, by variable name. Kept apart from the two
+                                                       // positional `node_pattern`s so a binding is never mistaken for an endpoint.
     let mut bound: Vec<(String, NodePat)> = Vec::new();
+    let mut ret: Option<ReturnClause> = None;
     for c in kids(inner) {
         match c.as_rule() {
             Rule::kw_merge | Rule::kw_match => {}
@@ -987,24 +1000,13 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                 for item in kids(c) {
                     debug_assert_eq!(item.as_rule(), Rule::set_item);
                     let (svar, si) = lower_set_item(item)?;
-                    match si {
-                        SetItem::Prop { prop, value } => sets.push((svar, prop, value)),
-                        // An edge's WAL op carries merge-semantics patches and has no
-                        // replace flag, so honouring `SET r = {…}` would silently *merge*
-                        // where the statement says replace. Rejecting is the honest answer
-                        // until the op can express the difference.
-                        SetItem::ReplaceMap(_)
-                        | SetItem::MergeMap(_)
-                        | SetItem::ReplaceParam(_)
-                        | SetItem::MergeParam(_) => bail!(
-                            "a relationship write supports only `SET r.prop = value`, not whole-map assignment"
-                        ),
-                        SetItem::AddLabels(_) => {
-                            bail!("relationships have a type, not labels; use `SET r.prop = value`")
-                        }
+                    if let SetItem::AddLabels(_) = si {
+                        bail!("relationships have a type, not labels; use `SET r.prop = value`");
                     }
+                    sets.push((svar, si));
                 }
             }
+            Rule::return_clause => ret = Some(lower_return_clause(c)?),
             Rule::delete_clause => {
                 let mut detach = false;
                 let mut targets: Vec<String> = Vec::new();
@@ -1048,9 +1050,23 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
     if rel.var_length.is_some() {
         bail!("a write relationship cannot be variable-length");
     }
-    if !rel.props.is_empty() {
-        bail!("relationship properties are not yet supported in a write");
-    }
+    // An inline relationship property map is the edge's **identity**, not decoration:
+    // `MERGE (a)-[r:R {uuid: $u}]->(b)` means create-if-no-edge-with-this-uuid, so two
+    // `R` edges between the same pair with different uuids are two edges. Exactly one
+    // property can play that role, so more than one is refused rather than guessed at.
+    let key = match rel.props.len() {
+        0 => None,
+        1 => {
+            let (prop, mut value) = rel.props[0].clone();
+            fold_vecf32(&mut value);
+            ensure_constant(&value, &format!("the identifying value of {{{prop}: …}}"))?;
+            Some((prop, value))
+        }
+        n => bail!(
+            "a relationship write identifies its edge by at most one inline property, \
+             e.g. (a)-[r:R {{uuid: $u}}]->(b) — got {n}; assign the rest with SET"
+        ),
+    };
     let reltype = rel
         .type_expr
         .as_ref()
@@ -1070,17 +1086,13 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                 "to SET a relationship property, name the relationship: MERGE (a)-[r:R]->(b) SET r.p = …"
             )
         })?;
-        for (set_var, prop, mut value) in sets {
+        for (set_var, item) in sets {
             if set_var != rvar {
                 bail!(
                     "SET must target the relationship variable '{rvar}', not '{set_var}' (a relationship write mutates one edge)"
                 );
             }
-            // Vector indexes are node-only, so an edge's vector is an unindexed inline
-            // value — stored in the column store and read back verbatim, like the core's.
-            fold_vecf32(&mut value);
-            ensure_constant(&value, &format!("the value assigned to {rvar}.{prop}"))?;
-            out_sets.push((prop, value));
+            out_sets.push(check_edge_set_item(item, rvar)?);
         }
     }
 
@@ -1097,16 +1109,76 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         if target != rvar {
             bail!("DELETE must target the relationship variable '{rvar}', not '{target}'");
         }
+        // A keyed delete would have to suppress one of several parallel core edges, and
+        // the traversal overlay suppresses a core edge by `(type, neighbour)` — it has no
+        // way to spare its siblings. Refusing is the honest answer; silently deleting
+        // every `R` between the pair is exactly the loss the identity property prevents.
+        if key.is_some() {
+            bail!(
+                "deleting a relationship by an inline identifying property is not supported \
+                 yet; MATCH (a)-[r:R]->(b) DELETE r removes the edge between the pair"
+            );
+        }
         EdgeWriteOp::Delete
     };
 
+    // A `RETURN` projects the relationship the write just made, so the pattern has to
+    // have named it — there is nothing to project off `-[:R]->`.
+    if ret.is_some() && rel.var.is_none() {
+        bail!("to RETURN a relationship, name it: MERGE (a)-[r:R]->(b) SET r.p = … RETURN r.p");
+    }
     Ok(EdgeWriteStmt {
         src,
         reltype,
         dst,
         op,
+        key,
         sets: out_sets,
+        rel_var: rel.var.clone(),
+        ret,
     })
+}
+
+/// Validate one `SET` item on a relationship write and fold its constant values.
+///
+/// The shapes are the node write's, minus label assignment (a relationship has a type):
+/// `SET r.p = v`, `SET r = {…}` / `SET r += {…}`, and their whole-parameter spellings.
+/// Every right-hand side must be a literal or a parameter — a relationship write has no
+/// row context to evaluate anything else against.
+fn check_edge_set_item(item: SetItem, rvar: &str) -> Result<SetItem> {
+    // Vector indexes are node-only, so an edge's vector is an unindexed inline value —
+    // stored in the column store and read back verbatim, like the core's.
+    let mut fold_one = |value: &mut Expr, what: &str| -> Result<()> {
+        fold_vecf32(value);
+        ensure_constant(value, what)
+    };
+    Ok(match item {
+        SetItem::Prop { prop, mut value } => {
+            fold_one(&mut value, &format!("the value assigned to {rvar}.{prop}"))?;
+            SetItem::Prop { prop, value }
+        }
+        SetItem::ReplaceMap(map) => SetItem::ReplaceMap(fold_edge_map(map, rvar, &mut fold_one)?),
+        SetItem::MergeMap(map) => SetItem::MergeMap(fold_edge_map(map, rvar, &mut fold_one)?),
+        // A whole-parameter map's keys are unknown until the parameter is bound, so there
+        // is nothing to fold here; the write path validates the bound value.
+        SetItem::ReplaceParam(e) => SetItem::ReplaceParam(e),
+        SetItem::MergeParam(e) => SetItem::MergeParam(e),
+        SetItem::AddLabels(_) => unreachable!("label assignment is rejected before this point"),
+    })
+}
+
+/// Fold and constant-check every value of a literal `SET r = {…}` / `SET r += {…}` map.
+fn fold_edge_map(
+    map: Vec<(String, Expr)>,
+    rvar: &str,
+    fold_one: &mut impl FnMut(&mut Expr, &str) -> Result<()>,
+) -> Result<Vec<(String, Expr)>> {
+    map.into_iter()
+        .map(|(k, mut v)| {
+            fold_one(&mut v, &format!("the value assigned to {rvar}.{k}"))?;
+            Ok((k, v))
+        })
+        .collect()
 }
 
 /// Reduce a labelled node pattern to an [`EndpointPat`] (single label, exactly one
@@ -1450,12 +1522,20 @@ fn lower_insert_stmt(pair: Pair<Rule>) -> Result<ast::Statement> {
                     )
                 })?
                 .clone();
+            // The edge INSERT rides the same RETURN projection the MERGE spelling does,
+            // so `INSERT (a)-[r:R]->(b) RETURN r.p` is no longer silently dropped.
+            if ret.is_some() && rel.var.is_none() {
+                bail!("to RETURN a relationship, name it: INSERT (a)-[r:R]->(b) RETURN r.p");
+            }
             Ok(ast::Statement::WriteEdge(EdgeWriteStmt {
                 src,
                 reltype,
                 dst,
                 op: EdgeWriteOp::Create,
+                key: None,
                 sets: Vec::new(),
+                rel_var: rel.var.clone(),
+                ret,
             }))
         }
         // `INSERT (n:Label {…})` — create a node unconditionally, the create_stmt path.
@@ -4186,8 +4266,14 @@ mod tests {
         assert_eq!(
             w.sets,
             vec![
-                ("since".to_string(), Expr::Literal(Value::Int(2020))),
-                ("weight".to_string(), Expr::Param("w".into())),
+                SetItem::Prop {
+                    prop: "since".to_string(),
+                    value: Expr::Literal(Value::Int(2020)),
+                },
+                SetItem::Prop {
+                    prop: "weight".to_string(),
+                    value: Expr::Param("w".into()),
+                },
             ]
         );
         // A bare MERGE (and a DELETE) carries no SET.
@@ -4196,6 +4282,69 @@ mod tests {
                 .sets
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn merge_edge_lowers_an_inline_identifying_property() {
+        // Graphiti's MENTIONS write, verbatim: the inline map is the edge's identity.
+        let w = edge_write(
+            "MATCH (episode:Episodic {uuid: $episode_uuid}) \
+             MATCH (node:Entity {uuid: $entity_uuid}) \
+             MERGE (episode)-[e:MENTIONS {uuid: $uuid}]->(node) \
+             SET e.group_id = $group_id, e.created_at = $created_at",
+        );
+        assert_eq!(w.reltype, "MENTIONS");
+        assert_eq!(
+            w.key,
+            Some(("uuid".to_string(), Expr::Param("uuid".into())))
+        );
+        assert_eq!(w.sets.len(), 2);
+    }
+
+    #[test]
+    fn merge_edge_lowers_a_whole_map_set() {
+        // `SET e = $edge_data` replaces; `SET e += {…}` merges. Both were rejected before
+        // the edge op could tell the two apart.
+        let w = edge_write(
+            "MERGE (a:Person {name: 'Ann'})-[e:KNOWS]->(b:Person {name: 'Bob'}) SET e = $d",
+        );
+        assert_eq!(w.sets, vec![SetItem::ReplaceParam(Expr::Param("d".into()))]);
+        let w = edge_write(
+            "MERGE (a:Person {name: 'Ann'})-[e:KNOWS]->(b:Person {name: 'Bob'}) SET e += {since: 2020}",
+        );
+        assert_eq!(
+            w.sets,
+            vec![SetItem::MergeMap(vec![(
+                "since".to_string(),
+                Expr::Literal(Value::Int(2020))
+            )])]
+        );
+    }
+
+    #[test]
+    fn an_edge_write_refuses_what_it_cannot_identify() {
+        // More than one inline property: which one is the identity is a guess, so refuse.
+        let e = parse_statement(
+            "MERGE (a:Person {name: 'Ann'})-[r:KNOWS {uuid: 'x', since: 2020}]->(b:Person {name: 'Bob'})",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("at most one inline property"), "{e}");
+        // A keyed DELETE would have to spare the edge's siblings, and the traversal
+        // overlay cannot; refusing beats deleting every :KNOWS between the pair.
+        let e = parse_statement(
+            "MATCH (a:Person {name: 'Ann'})-[r:KNOWS {uuid: 'x'}]->(b:Person {name: 'Bob'}) DELETE r",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not supported"), "{e}");
+        // The identifying value must be a constant, like every other write value.
+        let e = parse_statement(
+            "MERGE (a:Person {name: 'Ann'})-[r:KNOWS {uuid: a.name}]->(b:Person {name: 'Bob'})",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("identifying value"), "{e}");
     }
 
     // ── GQL write spellings (INSERT / SET / DELETE lowering onto the write path) ──
@@ -4685,13 +4834,19 @@ mod tests {
         );
     }
 
-    /// Relationships take property writes only; the whole-map forms stay rejected there,
-    /// parameter spelling included.
+    /// Whole-map assignment on a relationship lowers like the node form — the edge op can
+    /// now say *replace* rather than silently merging. Only label assignment stays
+    /// rejected: a relationship has a type, not labels.
     #[test]
-    fn whole_map_assignment_is_still_rejected_on_a_relationship() {
-        let e = write_err("MERGE (a:P {n: 'a'})-[r:R]->(b:P {n: 'b'}) SET r = $props");
+    fn whole_map_assignment_lowers_on_a_relationship() {
+        let w = edge_write("MERGE (a:P {n: 'a'})-[r:R]->(b:P {n: 'b'}) SET r = $props");
+        assert_eq!(
+            w.sets,
+            vec![SetItem::ReplaceParam(Expr::Param("props".into()))]
+        );
+        let e = write_err("MERGE (a:P {n: 'a'})-[r:R]->(b:P {n: 'b'}) SET r:Label");
         assert!(
-            e.contains("whole-map assignment") || e == "read-only",
+            e.contains("type, not labels") || e == "read-only",
             "got: {e}"
         );
     }

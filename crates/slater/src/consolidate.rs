@@ -690,12 +690,29 @@ fn emit_edges_from<V: ReadView>(
         let (labels, k, v) = node_identity(view, src, &slabels, &sprops)?;
         (labels.into_iter().next().expect("identity label"), k, v)
     };
+    // `MERGE (a)-[:T]->(b)` locates an edge by `(src, dst, reltype)` — the builder
+    // ignores an inline relationship property map — so the dialect simply cannot spell
+    // two `T` edges between the same pair. Rather than emit two statements that fold back
+    // into one and silently drop a fact, refuse, the way a vector-carrying graph is
+    // refused above. Consolidation itself takes the binary path, which carries each edge
+    // by id and is unaffected.
+    let mut seen: HashSet<(u64, u32)> = HashSet::new();
     for adj in engine.outgoing_adj(src)? {
         let dst = adj.neighbour.0;
         // Belt-and-braces: `outgoing_adj` already drops an edge to a tombstoned node,
         // but a node tombstone must never leak an edge into the rebuild.
         if view.delta().is_tombstoned(dst) {
             continue;
+        }
+        if !seen.insert((dst, adj.reltype)) {
+            bail!(
+                "cannot write a MERGE dump for a graph with parallel relationships: nodes \
+                 {src} and {dst} carry more than one :{} edge, which the MERGE dialect \
+                 locates by (source, target, type) alone — the dump would fuse them and \
+                 lose a fact. Use the binary consolidation dump (`serialise_binary_dump`), \
+                 which carries each edge by id.",
+                view.reltype_name(adj.reltype).unwrap_or("?")
+            );
         }
         let (dlabels, dprops) = engine.node_record(dst)?;
         let (dl, dk, dv) = {

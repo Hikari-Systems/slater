@@ -187,6 +187,8 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Zoe".into()),
+                edge_key: None,
+                replace: false,
                 patches: Default::default(),
             },
             OpResolution::Edge {
@@ -205,6 +207,7 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Carol".into()),
+                edge_key: None,
             },
             OpResolution::Edge {
                 src: Some(5),

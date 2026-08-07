@@ -246,6 +246,16 @@ fn encode_adj(edges: &[DeltaEdge]) -> Vec<u8> {
             }
             None => buf.push(0),
         }
+        // The identifying edge property, when the identity carries one: it is what keeps
+        // two parallel facts about the same pair apart in the cross-level adjacency fold.
+        match &e.key {
+            Some((name, value)) => {
+                buf.push(1);
+                w_str(&mut buf, name);
+                write_value(&mut buf, value);
+            }
+            None => buf.push(0),
+        }
         buf.push(u8::from(e.tombstoned));
     }
     buf
@@ -271,6 +281,17 @@ fn decode_adj(mut r: &[u8]) -> Result<Vec<DeltaEdge>> {
             None
         };
         if r.is_empty() {
+            bail!("l0 offheap: short adj edge key tag");
+        }
+        let has_key = r[0] != 0;
+        r = &r[1..];
+        let key = if has_key {
+            let name = r_str(&mut r)?;
+            Some((name, read_value(&mut r)?))
+        } else {
+            None
+        };
+        if r.is_empty() {
             bail!("l0 offheap: short adj tombstone");
         }
         let tombstoned = r[0] != 0;
@@ -279,6 +300,7 @@ fn decode_adj(mut r: &[u8]) -> Result<Vec<DeltaEdge>> {
             other,
             reltype,
             edge_id,
+            key,
             tombstoned,
         });
     }
@@ -288,13 +310,19 @@ fn decode_adj(mut r: &[u8]) -> Result<Vec<DeltaEdge>> {
 fn encode_edge(delta: &EdgeDelta) -> Vec<u8> {
     let mut buf = Vec::new();
     w_patches(&mut buf, &delta.patches, delta.tombstoned);
+    buf.push(u8::from(delta.replaced));
     buf
 }
 
 fn decode_edge(mut r: &[u8]) -> Result<EdgeDelta> {
     let (patches, tombstoned) = r_patches(&mut r)?;
+    if r.is_empty() {
+        bail!("l0 offheap: short edge replace flag");
+    }
+    let replaced = r[0] != 0;
     Ok(EdgeDelta {
         patches,
+        replaced,
         tombstoned,
     })
 }
@@ -1308,6 +1336,7 @@ pub fn merge_run(
         };
         let merged = EdgeDelta {
             patches: snap.edge_patches(id),
+            replaced: snap.edge_replaced(id),
             tombstoned: newest.tombstoned,
         };
         w.push_edge(id, &merged)?;
@@ -1454,6 +1483,8 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Zoe".into()),
+                edge_key: None,
+                replace: false,
                 patches: [("since".to_string(), Value::Int(2020))]
                     .into_iter()
                     .collect(),
@@ -1476,6 +1507,8 @@ mod tests {
                 dst_label: "City".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Newbie".into()),
+                edge_key: None,
+                replace: false,
                 patches: Default::default(),
             },
             OpResolution::Edge {
@@ -1494,6 +1527,7 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Carol".into()),
+                edge_key: None,
             },
             OpResolution::Edge {
                 src: Some(5),
@@ -1511,6 +1545,8 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Dave".into()),
+                edge_key: None,
+                replace: false,
                 patches: [("weight".to_string(), Value::Int(7))]
                     .into_iter()
                     .collect(),
@@ -1713,6 +1749,8 @@ mod tests {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str("Zoe".into()),
+                edge_key: None,
+                replace: false,
                 patches: Default::default(),
             },
             OpResolution::Edge {

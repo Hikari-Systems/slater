@@ -522,6 +522,32 @@ impl DeltaWriter {
             .born_synthetic_for_identity(label, key, value)
     }
 
+    /// The identifying property of the live delta edge `src -[reltype]-> dst`, if the
+    /// delta holds one that carries an identity property.
+    ///
+    /// A **keyless** `MERGE (a)-[:R]->(b)` means "any `R` between the pair", so it has to
+    /// find an edge the delta is already holding under an identifying property and write
+    /// to *that* identity. Without this, `MERGE (a)-[r:R]->(b) SET r.uuid = 'x'` would
+    /// stand beside `MERGE (a)-[r:R {uuid: 'x'}]->(b)` as a second edge, while the
+    /// core-resident spelling of the same pair fuses them (an adjacency scan matches any
+    /// `R`). Adopting the found identity keeps both answers the same.
+    ///
+    /// The first live edge in adjacency order wins, matching how the core probe
+    /// (`find_outgoing_edge`) picks among parallel edges.
+    pub fn edge_identity_key_between(
+        &self,
+        src: u64,
+        reltype: &str,
+        dst: u64,
+    ) -> Option<(String, Value)> {
+        read_lock(&self.published)
+            .delta
+            .out_edges(src)
+            .into_iter()
+            .find(|e| !e.tombstoned && e.other == dst && e.reltype == reltype)
+            .and_then(|e| e.key)
+    }
+
     /// Publish `mem ⊕ l0` as one atomic [`Published`] pair — snapshot **and** epoch — so a
     /// lock-free reader never observes a half-applied flush (data in neither or both of the
     /// memtable and a new L0 level), nor an epoch that does not name the delta beside it.

@@ -398,7 +398,13 @@ pub fn write_flush_segment(data: &SegmentData, inp: &FlushInputs) -> Result<Segm
             let Some((src, dst, reltype)) = core_patched_edges.get(eid).cloned() else {
                 bail!("flush_to_segment: core-patched edge {eid} has no recorded endpoints");
             };
-            let mut props = read_base_edge_row(inp.core, *eid)?;
+            // `SET r = {…}` replaces rather than overlays, so the base row's properties
+            // go: the flushed row is the patch map alone.
+            let mut props = if edelta.replaced {
+                BTreeMap::new()
+            } else {
+                read_base_edge_row(inp.core, *eid)?
+            };
             for (k, v) in &edelta.patches {
                 props.insert(k.clone(), v.clone()); // a patch wins over the base value
             }

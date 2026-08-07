@@ -691,13 +691,53 @@ fn find_outgoing_edge_overlaid(
     reltype: u32,
     dst: u64,
 ) -> Result<Option<u64>> {
+    find_outgoing_edge_keyed_overlaid(gen, cache, src, reltype, dst, None)
+}
+
+/// [`find_outgoing_edge_overlaid`], narrowed to the edge carrying `key` — the identity
+/// probe behind `MERGE (a)-[r:R {uuid: $u}]->(b)`.
+///
+/// With a `key` the pair may carry several `reltype` edges, so the scan cannot stop at
+/// the first neighbour match: it reads each candidate's property and stops at the one
+/// that matches. Cost stays bounded by the source's out-degree *of that type* (the
+/// reltype set is pushed into the CSR decode), plus one property read per candidate.
+///
+/// The comparison is **type-exact**, via the same `write_value` byte image
+/// `EdgeIdentity` is keyed on — so a `MERGE` finds an edge iff the delta would consider
+/// it the same identity. A loose numeric equality here would let `{uuid: 1}` re-`MERGE`
+/// onto an edge stored with `{uuid: 1.0}` and quietly fuse two identities.
+fn find_outgoing_edge_keyed_overlaid(
+    gen: &dyn ReadView,
+    cache: &BlockCache,
+    src: u64,
+    reltype: u32,
+    dst: u64,
+    key: Option<(&str, &Value)>,
+) -> Result<Option<u64>> {
+    let want = key.map(|(prop, value)| {
+        let mut bytes = Vec::new();
+        graph_format::wire::write_value(&mut bytes, value);
+        (prop, bytes)
+    });
     let mut hit: Option<u64> = None;
     let rts = [reltype];
     let r = for_each_adj_overlaid(gen, cache, src, true, Some(&rts), 1, &mut |batch| {
-        if let Some(a) = batch
-            .iter()
-            .find(|a| a.reltype == reltype && a.neighbour.0 == dst)
-        {
+        for a in batch {
+            if a.reltype != reltype || a.neighbour.0 != dst {
+                continue;
+            }
+            if let Some((prop, want)) = &want {
+                // A property whose runtime shape no `Value` can hold (a map, a temporal)
+                // is not a business key and simply does not match.
+                let Some(got) = val_to_value(&edge_prop_par(gen, cache, a.edge.0, prop)?) else {
+                    continue;
+                };
+                let mut bytes = Vec::new();
+                graph_format::wire::write_value(&mut bytes, &got);
+                if &bytes != want {
+                    continue;
+                }
+            }
             hit = Some(a.edge.0);
             return Err(AdjScanStop.into());
         }
@@ -1670,6 +1710,11 @@ fn edge_prop_par(gen: &dyn ReadView, cache: &BlockCache, id: u64, key: &str) -> 
         // delta-born edge whose properties live only in the delta).
         if let Some(v) = gen.delta().edge_patch_value(id, key) {
             return Ok(Val::from_value(v));
+        }
+        // `SET r = {map}` replaces rather than overlays, so a key the map omitted is
+        // absent — the core/segment value below must not resurface.
+        if gen.delta().edge_replaced(id) {
+            return Ok(Val::Null);
         }
     }
     // Core stack: a segment full row for the edge wins over the base.

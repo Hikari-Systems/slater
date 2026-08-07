@@ -88,11 +88,19 @@ enum IndexState {
 }
 
 /// Per-edge delta, mirroring [`NodeDelta`] for relationship records (Phase 3):
-/// property patches (reserved — the write grammar creates topology only for now)
-/// plus a tombstone flag that suppresses the edge on traversal.
+/// property patches, a replace-all flag, and a tombstone flag that suppresses the
+/// edge on traversal.
+///
+/// Effective properties on read = `(replaced ? {} : core) + patches`. A born edge has
+/// no core row, so `replaced` is inert there; it matters for an in-place patch of a
+/// **core** edge, where `SET r = {…}` must drop the core's other properties rather
+/// than merge over them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EdgeDelta {
     pub patches: BTreeMap<String, Value>,
+    /// `SET r = {map}` — ignore the core edge's properties; the effective set is
+    /// `patches` alone (plus the identifying property, re-seeded from identity).
+    pub replaced: bool,
     pub tombstoned: bool,
 }
 
@@ -130,6 +138,11 @@ pub struct DeltaEdge {
     pub other: u64,
     pub reltype: String,
     pub edge_id: Option<u64>,
+    /// The identifying edge property, when this edge's identity carries one. Two edges
+    /// of the same type between the same pair differ *only* here, so the cross-level
+    /// fold ([`DeltaSnapshot::out_edges`]) must key on it — otherwise the newer of two
+    /// parallel facts would silently hide the older.
+    pub key: Option<(String, Value)>,
     pub tombstoned: bool,
 }
 
@@ -731,38 +744,47 @@ impl Memtable {
                     dst_label,
                     dst_key,
                     dst_value,
+                    edge_key,
+                    replace,
                     patches,
                 },
                 OpResolution::Edge { src, dst, edge_id },
-            ) => match edge_id {
-                // A resolved core edge id ⇒ patch an existing core edge in place.
-                Some(cid) => self.patch_core_edge(
-                    src_label,
-                    src_key,
-                    src_value.clone(),
-                    reltype,
-                    dst_label,
-                    dst_key,
-                    dst_value.clone(),
-                    src,
-                    dst,
-                    cid,
-                    patches.iter().cloned(),
-                ),
-                // No core edge ⇒ a delta-born edge (create-if-absent / re-MERGE).
-                None => self.upsert_edge(
-                    src_label,
-                    src_key,
-                    src_value.clone(),
-                    reltype,
-                    dst_label,
-                    dst_key,
-                    dst_value.clone(),
-                    src,
-                    dst,
-                    patches.iter().cloned(),
-                ),
-            },
+            ) => {
+                let ekey = edge_key.as_ref().map(|(n, v)| (n.as_str(), v.clone()));
+                match edge_id {
+                    // A resolved core edge id ⇒ patch an existing core edge in place.
+                    Some(cid) => self.patch_core_edge_keyed(
+                        src_label,
+                        src_key,
+                        src_value.clone(),
+                        reltype,
+                        dst_label,
+                        dst_key,
+                        dst_value.clone(),
+                        src,
+                        dst,
+                        ekey,
+                        cid,
+                        *replace,
+                        patches.iter().cloned(),
+                    ),
+                    // No core edge ⇒ a delta-born edge (create-if-absent / re-MERGE).
+                    None => self.upsert_edge_keyed(
+                        src_label,
+                        src_key,
+                        src_value.clone(),
+                        reltype,
+                        dst_label,
+                        dst_key,
+                        dst_value.clone(),
+                        src,
+                        dst,
+                        ekey,
+                        *replace,
+                        patches.iter().cloned(),
+                    ),
+                }
+            }
             (
                 WalOp::DeleteEdge {
                     src_label,
@@ -772,9 +794,10 @@ impl Memtable {
                     dst_label,
                     dst_key,
                     dst_value,
+                    edge_key,
                 },
                 OpResolution::Edge { src, dst, .. },
-            ) => self.delete_edge(
+            ) => self.delete_edge_keyed(
                 src_label,
                 src_key,
                 src_value.clone(),
@@ -784,6 +807,7 @@ impl Memtable {
                 dst_value.clone(),
                 src,
                 dst,
+                edge_key.as_ref().map(|(n, v)| (n.as_str(), v.clone())),
             ),
             (op, res) => {
                 unreachable!("WalOp/OpResolution kind mismatch: {op:?} vs {res:?}")
@@ -1053,6 +1077,37 @@ impl Memtable {
         dense
     }
 
+    /// Intern an edge's business identity `(src, reltype, dst[, key])` into this
+    /// memtable's symbol table — the one place the three edge write paths agree on what
+    /// an edge *is*, so a keyed and a keyless write can never disagree about identity.
+    #[allow(clippy::too_many_arguments)]
+    fn intern_edge_identity(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        edge_key: Option<(&str, Value)>,
+    ) -> EdgeIdentity {
+        EdgeIdentity::keyed(
+            NodeIdentity::new(
+                self.interner.intern(src_label),
+                self.interner.intern(src_key),
+                src_value,
+            ),
+            self.interner.intern(reltype),
+            NodeIdentity::new(
+                self.interner.intern(dst_label),
+                self.interner.intern(dst_key),
+                dst_value,
+            ),
+            edge_key.map(|(name, value)| (self.interner.intern(name), value)),
+        )
+    }
+
     /// Resolve an edge endpoint to a dense id **without creating** one (the delete
     /// path): the caller's ISAM `resolved` wins, else an existing born node's
     /// synthetic id, else `None` — an endpoint that exists nowhere means there is no
@@ -1082,6 +1137,9 @@ impl Memtable {
     /// edge id and indexed into the outgoing/incoming adjacency; re-`MERGE`-ing the
     /// same identity reuses it (idempotent, matching [`Self::upsert_node`]). Shared by
     /// live writes and WAL replay.
+    ///
+    /// This is the keyless form: one `reltype` between a node pair is one edge. To
+    /// distinguish several, see [`Self::upsert_edge_keyed`].
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_edge(
         &mut self,
@@ -1096,22 +1154,59 @@ impl Memtable {
         dst_resolved: Option<u64>,
         patches: impl IntoIterator<Item = (String, Value)>,
     ) {
+        self.upsert_edge_keyed(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            src_resolved,
+            dst_resolved,
+            None,
+            false,
+            patches,
+        )
+    }
+
+    /// [`Self::upsert_edge`], with the edge's identity optionally narrowed by an
+    /// identifying property (`MERGE (a)-[e:R {uuid: $u}]->(b)`) and the patches
+    /// optionally *replacing* rather than merging (`SET e = $map`).
+    ///
+    /// The identifying property is seeded into the delta's patches, so it reads back
+    /// off a born edge (which has no core row to carry it) and survives a `replace`
+    /// that omits it — the edge-side counterpart of the node reader re-seeding its
+    /// anchor business key from identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_edge_keyed(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        src_resolved: Option<u64>,
+        dst_resolved: Option<u64>,
+        edge_key: Option<(&str, Value)>,
+        replace: bool,
+        patches: impl IntoIterator<Item = (String, Value)>,
+    ) {
         let src_dense =
             self.endpoint_dense_or_create(src_label, src_key, src_value.clone(), src_resolved);
         let dst_dense =
             self.endpoint_dense_or_create(dst_label, dst_key, dst_value.clone(), dst_resolved);
-        let identity = EdgeIdentity::new(
-            NodeIdentity::new(
-                self.interner.intern(src_label),
-                self.interner.intern(src_key),
-                src_value,
-            ),
-            self.interner.intern(reltype),
-            NodeIdentity::new(
-                self.interner.intern(dst_label),
-                self.interner.intern(dst_key),
-                dst_value,
-            ),
+        let identity = self.intern_edge_identity(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            edge_key.clone(),
         );
         let eck = identity.canonical_key();
         if !self.edges.contains_key(&eck) {
@@ -1134,12 +1229,7 @@ impl Memtable {
         }
         let entry = self.edges.get_mut(&eck).expect("edge entry just ensured");
         entry.delta.tombstoned = false; // last-writer-wins resurrect
-        let mut added = 0usize;
-        for (name, val) in patches {
-            added += name.len() + value_size(&val);
-            entry.delta.patches.insert(name, val);
-        }
-        self.bytes += added;
+        self.bytes += apply_edge_patches(entry, edge_key, replace, patches);
     }
 
     /// Tombstone the relationship `(src) -[reltype]-> (dst)`: reads suppress it and
@@ -1162,6 +1252,37 @@ impl Memtable {
         src_resolved: Option<u64>,
         dst_resolved: Option<u64>,
     ) {
+        self.delete_edge_keyed(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            src_resolved,
+            dst_resolved,
+            None,
+        )
+    }
+
+    /// [`Self::delete_edge`], targeting the edge whose identity carries `edge_key`
+    /// (`MATCH (a)-[r:R {uuid: $u}]->(b) DELETE r`) — so a delete removes the one fact
+    /// it named, not every edge of that type between the pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_edge_keyed(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        src_resolved: Option<u64>,
+        dst_resolved: Option<u64>,
+        edge_key: Option<(&str, Value)>,
+    ) {
         let Some(src_dense) =
             self.born_endpoint_dense(src_label, src_key, src_value.clone(), src_resolved)
         else {
@@ -1172,18 +1293,15 @@ impl Memtable {
         else {
             return;
         };
-        let identity = EdgeIdentity::new(
-            NodeIdentity::new(
-                self.interner.intern(src_label),
-                self.interner.intern(src_key),
-                src_value,
-            ),
-            self.interner.intern(reltype),
-            NodeIdentity::new(
-                self.interner.intern(dst_label),
-                self.interner.intern(dst_key),
-                dst_value,
-            ),
+        let identity = self.intern_edge_identity(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            edge_key.clone(),
         );
         let eck = identity.canonical_key();
         if !self.edges.contains_key(&eck) {
@@ -1200,6 +1318,7 @@ impl Memtable {
                     core_edge: None,      // matched by adjacency, not by id
                     delta: EdgeDelta {
                         patches: BTreeMap::new(),
+                        replaced: false,
                         tombstoned: true,
                     },
                 },
@@ -1217,6 +1336,7 @@ impl Memtable {
                 let entry = self.edges.get_mut(&eck).expect("edge present");
                 entry.delta.tombstoned = true;
                 entry.delta.patches.clear();
+                entry.delta.replaced = false;
                 entry.core_edge.take()
             };
             if let Some(cid) = core_edge {
@@ -1258,24 +1378,58 @@ impl Memtable {
         core_edge_id: u64,
         patches: impl IntoIterator<Item = (String, Value)>,
     ) {
+        self.patch_core_edge_keyed(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            src_resolved,
+            dst_resolved,
+            None,
+            core_edge_id,
+            false,
+            patches,
+        )
+    }
+
+    /// [`Self::patch_core_edge`], with the edge's identity optionally narrowed by an
+    /// identifying property and the patches optionally *replacing* the core edge's
+    /// properties (`SET r = {map}`) rather than merging over them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn patch_core_edge_keyed(
+        &mut self,
+        src_label: &str,
+        src_key: &str,
+        src_value: Value,
+        reltype: &str,
+        dst_label: &str,
+        dst_key: &str,
+        dst_value: Value,
+        src_resolved: Option<u64>,
+        dst_resolved: Option<u64>,
+        edge_key: Option<(&str, Value)>,
+        core_edge_id: u64,
+        replace: bool,
+        patches: impl IntoIterator<Item = (String, Value)>,
+    ) {
         // Both endpoints are core (a core edge exists between them), so the resolved ids
         // are supplied; `endpoint_dense_or_create` returns them without allocating.
         let src_dense =
             self.endpoint_dense_or_create(src_label, src_key, src_value.clone(), src_resolved);
         let dst_dense =
             self.endpoint_dense_or_create(dst_label, dst_key, dst_value.clone(), dst_resolved);
-        let identity = EdgeIdentity::new(
-            NodeIdentity::new(
-                self.interner.intern(src_label),
-                self.interner.intern(src_key),
-                src_value,
-            ),
-            self.interner.intern(reltype),
-            NodeIdentity::new(
-                self.interner.intern(dst_label),
-                self.interner.intern(dst_key),
-                dst_value,
-            ),
+        let identity = self.intern_edge_identity(
+            src_label,
+            src_key,
+            src_value,
+            reltype,
+            dst_label,
+            dst_key,
+            dst_value,
+            edge_key.clone(),
         );
         let eck = identity.canonical_key();
         if !self.edges.contains_key(&eck) {
@@ -1298,12 +1452,7 @@ impl Memtable {
         let entry = self.edges.get_mut(&eck).expect("edge entry just ensured");
         entry.core_edge = Some(core_edge_id);
         entry.delta.tombstoned = false;
-        let mut added = 0usize;
-        for (name, val) in patches {
-            added += name.len() + value_size(&val);
-            entry.delta.patches.insert(name, val);
-        }
-        self.bytes += added;
+        self.bytes += apply_edge_patches(entry, edge_key, replace, patches);
     }
 
     /// The delta edges incident to `node` as a **source** (outgoing). The reader folds
@@ -1341,6 +1490,12 @@ impl Memtable {
                     .unwrap_or("")
                     .to_string(),
                 edge_id: e.synthetic_edge,
+                key: e.identity.key.as_ref().map(|(sym, value)| {
+                    (
+                        self.interner.name(*sym).unwrap_or("").to_string(),
+                        value.clone(),
+                    )
+                }),
                 tombstoned: e.delta.tombstoned,
             });
         }
@@ -1579,6 +1734,11 @@ impl Memtable {
                 let rt = seg.interner.name(entry.identity.reltype).unwrap_or("");
                 let dl = seg.interner.name(entry.identity.dst.label).unwrap_or("");
                 let dk = seg.interner.name(entry.identity.dst.key).unwrap_or("");
+                let edge_key = entry
+                    .identity
+                    .key
+                    .as_ref()
+                    .map(|(sym, value)| (seg.interner.name(*sym).unwrap_or(""), value));
                 let ek = edge_name_key(
                     sl,
                     sk,
@@ -1587,6 +1747,7 @@ impl Memtable {
                     dl,
                     dk,
                     &entry.identity.dst.value,
+                    edge_key,
                 );
                 let f = fedges.entry(ek).or_insert_with(|| FoldedEdge {
                     src_label: sl.to_string(),
@@ -1596,7 +1757,9 @@ impl Memtable {
                     dst_label: dl.to_string(),
                     dst_key: dk.to_string(),
                     dst_value: entry.identity.dst.value.clone(),
+                    edge_key: edge_key.map(|(n, v)| (n.to_string(), v.clone())),
                     patches: BTreeMap::new(),
+                    replaced: false,
                     tombstoned: false,
                     src_dense: entry.src_dense,
                     dst_dense: entry.dst_dense,
@@ -1611,7 +1774,12 @@ impl Memtable {
                 if f.core_edge_id.is_none() {
                     f.core_edge_id = entry.core_edge;
                 }
-                fold_delta_edge(&mut f.patches, &mut f.tombstoned, &entry.delta);
+                fold_delta_edge(
+                    &mut f.patches,
+                    &mut f.replaced,
+                    &mut f.tombstoned,
+                    &entry.delta,
+                );
             }
         }
 
@@ -1654,7 +1822,7 @@ impl Memtable {
                 base_edge + i as u64,
                 "born edge ids must tile [base, base+n) — run not contiguous?"
             );
-            m.upsert_edge(
+            m.upsert_edge_keyed(
                 &f.src_label,
                 &f.src_key,
                 f.src_value.clone(),
@@ -1664,10 +1832,12 @@ impl Memtable {
                 f.dst_value.clone(),
                 Some(f.src_dense),
                 Some(f.dst_dense),
+                f.edge_key_ref(),
+                f.replaced,
                 f.patches.clone(),
             );
             if f.tombstoned {
-                m.delete_edge(
+                m.delete_edge_keyed(
                     &f.src_label,
                     &f.src_key,
                     f.src_value.clone(),
@@ -1677,6 +1847,7 @@ impl Memtable {
                     f.dst_value.clone(),
                     Some(f.src_dense),
                     Some(f.dst_dense),
+                    f.edge_key_ref(),
                 );
             }
         }
@@ -1691,7 +1862,7 @@ impl Memtable {
         });
         for f in core_e {
             if f.tombstoned {
-                m.delete_edge(
+                m.delete_edge_keyed(
                     &f.src_label,
                     &f.src_key,
                     f.src_value.clone(),
@@ -1701,6 +1872,7 @@ impl Memtable {
                     f.dst_value.clone(),
                     Some(f.src_dense),
                     Some(f.dst_dense),
+                    f.edge_key_ref(),
                 );
             } else {
                 // A live `born_edge_id`-less entry is an in-place core-edge property
@@ -1708,7 +1880,7 @@ impl Memtable {
                 let cid = f
                     .core_edge_id
                     .expect("a non-tombstoned core-edge entry carries its core edge id");
-                m.patch_core_edge(
+                m.patch_core_edge_keyed(
                     &f.src_label,
                     &f.src_key,
                     f.src_value.clone(),
@@ -1718,7 +1890,9 @@ impl Memtable {
                     f.dst_value.clone(),
                     Some(f.src_dense),
                     Some(f.dst_dense),
+                    f.edge_key_ref(),
                     cid,
+                    f.replaced,
                     f.patches.clone(),
                 );
             }
@@ -1774,11 +1948,13 @@ impl Memtable {
             w_node_identity(&mut buf, &e.identity.src);
             write_uvarint(&mut buf, e.identity.reltype as u64);
             w_node_identity(&mut buf, &e.identity.dst);
+            w_edge_key(&mut buf, e.identity.key.as_ref());
             write_uvarint(&mut buf, e.src_dense);
             write_uvarint(&mut buf, e.dst_dense);
             w_opt_u64(&mut buf, e.synthetic_edge);
             w_opt_u64(&mut buf, e.core_edge);
             w_delta(&mut buf, &e.delta.patches, e.delta.tombstoned);
+            buf.push(e.delta.replaced as u8);
         }
 
         w_dense_index(&mut buf, &self.by_dense);
@@ -1835,21 +2011,29 @@ impl Memtable {
             let src = r_node_identity(r)?;
             let reltype = read_uvarint(r)? as SymbolId;
             let dst = r_node_identity(r)?;
+            let key = r_edge_key(r)?;
             let src_dense = read_uvarint(r)?;
             let dst_dense = read_uvarint(r)?;
             let synthetic_edge = r_opt_u64(r)?;
             let core_edge = r_opt_u64(r)?;
             let (patches, tombstoned) = r_delta(r)?;
+            let replaced = read_u8(r)? != 0;
             edges.insert(
                 ck,
                 EdgeEntry {
-                    identity: EdgeIdentity { src, reltype, dst },
+                    identity: EdgeIdentity {
+                        src,
+                        reltype,
+                        dst,
+                        key,
+                    },
                     src_dense,
                     dst_dense,
                     synthetic_edge,
                     core_edge,
                     delta: EdgeDelta {
                         patches,
+                        replaced,
                         tombstoned,
                     },
                 },
@@ -1919,12 +2103,24 @@ struct FoldedEdge {
     dst_label: String,
     dst_key: String,
     dst_value: Value,
+    /// The identifying edge property, if this identity carries one.
+    edge_key: Option<(String, Value)>,
     patches: BTreeMap<String, Value>,
+    replaced: bool,
     tombstoned: bool,
     src_dense: u64,
     dst_dense: u64,
     born_edge_id: Option<u64>,
     core_edge_id: Option<u64>,
+}
+
+impl FoldedEdge {
+    /// The identifying property in the borrowed shape the memtable's keyed writers take.
+    fn edge_key_ref(&self) -> Option<(&str, Value)> {
+        self.edge_key
+            .as_ref()
+            .map(|(name, value)| (name.as_str(), value.clone()))
+    }
 }
 
 /// Replay a folded node's net delta into the rebuilt memtable `m` at `resolved`
@@ -1979,16 +2175,60 @@ fn replay_folded_node(m: &mut Memtable, f: &FoldedNode, resolved: Option<u64>) {
 /// Fold one level's edge delta onto an accumulator newest-wins (the accumulator is the
 /// *older* state, `src` the newer): a newer tombstone clears the patches and tombstones;
 /// a newer upsert resurrects and its properties win per key.
-fn fold_delta_edge(patches: &mut BTreeMap<String, Value>, tombstoned: &mut bool, src: &EdgeDelta) {
+fn fold_delta_edge(
+    patches: &mut BTreeMap<String, Value>,
+    replaced: &mut bool,
+    tombstoned: &mut bool,
+    src: &EdgeDelta,
+) {
     if src.tombstoned {
         patches.clear();
+        *replaced = false;
         *tombstoned = true;
     } else {
         *tombstoned = false;
+        if src.replaced {
+            // A newer replace-all wipes the below-level property state; its patches are
+            // the base, and the core edge's own properties stay ignored.
+            patches.clear();
+            *replaced = true;
+        }
         for (k, v) in &src.patches {
             patches.insert(k.clone(), v.clone());
         }
     }
+}
+
+/// Fold one write's property assignments onto an edge entry, returning the byte growth
+/// to charge to the memtable's budget.
+///
+/// A `replace` (`SET r = {map}`) drops the entry's prior patches and marks the delta so
+/// the read ignores the **core** edge's properties too; otherwise the patches fold
+/// last-writer-wins. Either way the identifying property is re-seeded from the identity
+/// last: a born edge has no core row to carry it, and a replace that omits it must not
+/// erase the very thing the edge is named by. (The write path rejects a `SET` that would
+/// assign the identifying property a *different* value, so the re-seed only ever
+/// re-states what the statement already said.)
+fn apply_edge_patches(
+    entry: &mut EdgeEntry,
+    edge_key: Option<(&str, Value)>,
+    replace: bool,
+    patches: impl IntoIterator<Item = (String, Value)>,
+) -> usize {
+    let mut added = 0usize;
+    if replace {
+        entry.delta.patches.clear();
+        entry.delta.replaced = true;
+    }
+    for (name, val) in patches {
+        added += name.len() + value_size(&val);
+        entry.delta.patches.insert(name, val);
+    }
+    if let Some((name, value)) = edge_key {
+        added += name.len() + value_size(&value);
+        entry.delta.patches.insert(name.to_string(), value);
+    }
+    added
 }
 
 /// An **interner-independent** identity key for a node: length-prefixed label + key
@@ -2005,7 +2245,9 @@ fn node_name_key(label: &str, key: &str, value: &Value) -> Vec<u8> {
     b
 }
 
-/// An interner-independent identity key for an edge: `src ‖ reltype ‖ dst`.
+/// An interner-independent identity key for an edge: `src ‖ reltype ‖ dst`, plus the
+/// identifying edge property when the edge carries one (appended, mirroring
+/// [`EdgeIdentity::canonical_key`], so a keyless edge's key is unchanged).
 #[allow(clippy::too_many_arguments)]
 fn edge_name_key(
     src_label: &str,
@@ -2015,17 +2257,24 @@ fn edge_name_key(
     dst_label: &str,
     dst_key: &str,
     dst_value: &Value,
+    edge_key: Option<(&str, &Value)>,
 ) -> Vec<u8> {
     let mut b = node_name_key(src_label, src_key, src_value);
     write_uvarint(&mut b, reltype.len() as u64);
     b.extend_from_slice(reltype.as_bytes());
     b.extend_from_slice(&node_name_key(dst_label, dst_key, dst_value));
+    if let Some((name, value)) = edge_key {
+        write_uvarint(&mut b, name.len() as u64);
+        b.extend_from_slice(name.as_bytes());
+        write_value(&mut b, value);
+    }
     b
 }
 
 /// L0 segment body format version (see [`Memtable::serialise`]). v2 added per-property
-/// removals + the replace-all flag; v3 added the added/removed label-name sets.
-const L0_FORMAT_VERSION: u64 = 3;
+/// removals + the replace-all flag; v3 added the added/removed label-name sets; v4 added
+/// the edge's identifying property and the edge replace-all flag.
+const L0_FORMAT_VERSION: u64 = 4;
 
 fn w_str(buf: &mut Vec<u8>, s: &str) {
     write_uvarint(buf, s.len() as u64);
@@ -2142,6 +2391,27 @@ fn r_node_delta(r: &mut &[u8]) -> anyhow::Result<NodeDelta> {
         labels_removed,
         tombstoned,
     })
+}
+
+/// An edge's optional identifying property: a presence byte, then the interned key id
+/// and its type-exact value.
+fn w_edge_key(buf: &mut Vec<u8>, key: Option<&(SymbolId, Value)>) {
+    match key {
+        None => buf.push(0),
+        Some((sym, value)) => {
+            buf.push(1);
+            write_uvarint(buf, *sym as u64);
+            write_value(buf, value);
+        }
+    }
+}
+
+fn r_edge_key(r: &mut &[u8]) -> anyhow::Result<Option<(SymbolId, Value)>> {
+    if read_u8(r)? == 0 {
+        return Ok(None);
+    }
+    let sym = read_uvarint(r)? as SymbolId;
+    Ok(Some((sym, read_value(r)?)))
 }
 
 fn w_name_set(buf: &mut Vec<u8>, set: &BTreeSet<String>) {
@@ -3090,11 +3360,14 @@ impl DeltaSnapshot {
     }
 
     /// Fold the delta edges incident to `node` in one direction across levels, keyed by
-    /// edge identity `(reltype, neighbour)` (unique for a fixed node + direction), with
-    /// the **newest** level's entry winning. So a born edge flushed to an L0 level and
-    /// later deleted in a newer level surfaces once, tombstoned — the traversal overlay
-    /// then suppresses it, never double-counting or resurrecting it. Output order is
-    /// deterministic (newest level's edges first, in that level's own order).
+    /// edge identity `(reltype, neighbour, identifying property)` (unique for a fixed
+    /// node + direction), with the **newest** level's entry winning. So a born edge
+    /// flushed to an L0 level and later deleted in a newer level surfaces once,
+    /// tombstoned — the traversal overlay then suppresses it, never double-counting or
+    /// resurrecting it. The identifying property is part of the key precisely so two
+    /// parallel facts about the same pair (`{uuid: 'r-1'}` and `{uuid: 'r-2'}`) do not
+    /// deduplicate against each other. Output order is deterministic (newest level's
+    /// edges first, in that level's own order).
     fn merge_edges(&self, node: u64, outgoing: bool) -> Vec<DeltaEdge> {
         let read = |m: &dyn LevelRead| {
             if outgoing {
@@ -3106,11 +3379,18 @@ impl DeltaSnapshot {
         if self.l0.is_empty() {
             return read(self.mem.as_ref());
         }
-        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        let mut seen: HashSet<(String, u64, Vec<u8>)> = HashSet::new();
         let mut out = Vec::new();
         for level in self.levels_newest_first() {
             for e in read(level) {
-                if seen.insert((e.reltype.clone(), e.other)) {
+                // The value is folded into the key through its type-exact wire image,
+                // the same encoding identity itself uses (`Value` is not `Hash`).
+                let mut key_bytes = Vec::new();
+                if let Some((name, value)) = &e.key {
+                    key_bytes.extend_from_slice(name.as_bytes());
+                    write_value(&mut key_bytes, value);
+                }
+                if seen.insert((e.reltype.clone(), e.other, key_bytes)) {
                     out.push(e);
                 }
             }
@@ -3147,6 +3427,11 @@ impl DeltaSnapshot {
             if let Some(v) = d.patches.get(prop) {
                 return Some(v.clone());
             }
+            if d.replaced {
+                // A replace-all wipes every property it did not restate, so nothing older
+                // — delta patch or core value — survives for this one.
+                return None;
+            }
             // This level touches the edge but not this property — keep looking older.
         }
         None
@@ -3157,21 +3442,31 @@ impl DeltaSnapshot {
     /// Used to materialise a born edge's full property set (`RETURN r`), to overlay a
     /// patched core edge's full record, and to carry either through consolidation.
     pub fn edge_patches(&self, edge_id: u64) -> BTreeMap<String, Value> {
+        self.edge_delta(edge_id).0
+    }
+
+    /// Whether the delta *replaces* (rather than overlays) the core edge's stored
+    /// properties — `SET r = {map}`. The caller must drop the core edge-props record
+    /// when this is true; on a born edge there is none, so it is inert.
+    pub fn edge_replaced(&self, edge_id: u64) -> bool {
+        self.edge_delta(edge_id).1
+    }
+
+    /// The folded `(patches, replaced)` the delta presents for `edge_id`, oldest→newest
+    /// so a newer replace-all or delete wipes what is below it. The single fold both
+    /// [`Self::edge_patches`] and [`Self::edge_replaced`] read, so the two can never
+    /// disagree about which level won.
+    fn edge_delta(&self, edge_id: u64) -> (BTreeMap<String, Value>, bool) {
         let mut merged: BTreeMap<String, Value> = BTreeMap::new();
+        let mut replaced = false;
         for m in self.levels_oldest_first() {
             let Some(d) = m.edge_delta_owned(edge_id) else {
                 continue;
             };
-            if d.tombstoned {
-                // A newer delete clears everything patched below it.
-                merged.clear();
-            } else {
-                for (k, v) in &d.patches {
-                    merged.insert(k.clone(), v.clone());
-                }
-            }
+            let mut tombstoned = false;
+            fold_delta_edge(&mut merged, &mut replaced, &mut tombstoned, &d);
         }
-        merged
+        (merged, replaced)
     }
 }
 
@@ -3257,6 +3552,7 @@ pub fn flush_segment_data(
             id,
             EdgeDelta {
                 patches: snap.edge_patches(id),
+                replaced: snap.edge_replaced(id),
                 tombstoned: newest.tombstoned,
             },
         ));
@@ -4089,6 +4385,8 @@ mod tests {
             dst_label: "L".into(),
             dst_key: "k".into(),
             dst_value: Value::Int(2),
+            edge_key: None,
+            replace: false,
             patches: vec![],
         };
         let mut viae = Memtable::with_bases(0, 0);
@@ -4822,6 +5120,178 @@ mod tests {
         assert_eq!(s.edge_patch_value(3, "since"), Some(Value::Int(2020)));
         assert_eq!(s.edge_patch_value(3, "weight"), Some(Value::Int(9)));
         assert_eq!(s.edge_patches(3).len(), 2);
+    }
+
+    // ── Edge identity by an identifying property ───────────────────────────────────
+
+    /// `MERGE (Ann)-[r:RELATES_TO {uuid: <uuid>}]->(Bob) SET r.fact = <fact>` against a
+    /// core holding Ann(0) and Bob(1) and no such edge — the shape Graphiti writes.
+    fn merge_keyed_fact(m: &mut Memtable, uuid: &str, fact: &str) {
+        m.upsert_edge_keyed(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "RELATES_TO",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            Some(("uuid", Value::Str(uuid.into()))),
+            false,
+            [("fact".to_string(), Value::Str(fact.into()))],
+        );
+    }
+
+    #[test]
+    fn two_same_pair_edges_with_distinct_keys_both_survive() {
+        // The collapse this whole mechanism exists to prevent. Without the identifying
+        // property both writes fold onto one `(Ann, RELATES_TO, Bob)` identity and the
+        // first fact is silently overwritten.
+        let mut m = Memtable::with_bases(10, 5);
+        merge_keyed_fact(&mut m, "r-1", "Ann met Bob");
+        merge_keyed_fact(&mut m, "r-2", "Ann emailed Bob");
+        assert_eq!(m.born_edge_count(), 2, "two identities, two born edges");
+
+        let out = m.out_edges(0);
+        assert_eq!(out.len(), 2);
+        let facts: BTreeSet<String> = out
+            .iter()
+            .filter_map(|e| m.edge_delta_owned(e.edge_id?))
+            .filter_map(|d| match d.patches.get("fact") {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            facts,
+            ["Ann emailed Bob".to_string(), "Ann met Bob".to_string()]
+                .into_iter()
+                .collect()
+        );
+        // Re-MERGE-ing one of them is idempotent: the identity already exists.
+        merge_keyed_fact(&mut m, "r-1", "Ann met Bob");
+        assert_eq!(m.born_edge_count(), 2);
+    }
+
+    #[test]
+    fn the_identifying_property_reads_back_off_a_born_edge() {
+        // A born edge has no core row, so the identity property must be seeded into the
+        // delta — otherwise `r.uuid` reads Null on the very edge it names.
+        let mut m = Memtable::with_bases(10, 5);
+        merge_keyed_fact(&mut m, "r-1", "Ann met Bob");
+        let s = snap(m, vec![]);
+        assert_eq!(
+            s.edge_patch_value(5, "uuid"),
+            Some(Value::Str("r-1".into()))
+        );
+    }
+
+    #[test]
+    fn parallel_keyed_edges_survive_a_flush_and_a_later_write() {
+        // One fact flushed to an L0 level, a second written after: the cross-level
+        // adjacency fold keys on the identifying property, so the newer does not
+        // deduplicate the older away.
+        let mut older = Memtable::with_bases(10, 5);
+        merge_keyed_fact(&mut older, "r-1", "Ann met Bob");
+        let mut newer = Memtable::with_bases(10, 6);
+        merge_keyed_fact(&mut newer, "r-2", "Ann emailed Bob");
+
+        let s = snap(newer, vec![older]);
+        let out = s.out_edges(0);
+        assert_eq!(out.len(), 2, "both facts survive the fold: {out:?}");
+        let uuids: BTreeSet<String> = out
+            .iter()
+            .filter_map(|e| match &e.key {
+                Some((_, Value::Str(u))) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uuids,
+            ["r-1".to_string(), "r-2".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn parallel_keyed_edges_survive_serialise_and_merge_levels() {
+        // The identity travels through the L0 image and through the level fold — the two
+        // paths a born edge takes on its way to consolidation.
+        let mut older = Memtable::with_bases(10, 5);
+        merge_keyed_fact(&mut older, "r-1", "Ann met Bob");
+        let mut newer = Memtable::with_bases(10, 6);
+        merge_keyed_fact(&mut newer, "r-2", "Ann emailed Bob");
+
+        let older = Memtable::deserialise(&older.serialise()).unwrap();
+        let merged = Memtable::merge_levels(&[&newer, &older]);
+        assert_eq!(merged.born_edge_count(), 2);
+        assert_eq!(merged.out_edges(0).len(), 2);
+        // Both facts, each still attached to its own uuid.
+        for (eid, uuid, fact) in [(5u64, "r-1", "Ann met Bob"), (6, "r-2", "Ann emailed Bob")] {
+            let d = merged.edge_delta_owned(eid).expect("born edge {eid}");
+            assert_eq!(d.patches.get("uuid"), Some(&Value::Str(uuid.into())));
+            assert_eq!(d.patches.get("fact"), Some(&Value::Str(fact.into())));
+        }
+    }
+
+    #[test]
+    fn a_replace_drops_prior_patches_but_keeps_the_identity() {
+        // `SET r = {…}` is a replace, not a merge: what it omits is gone. The identifying
+        // property is the one exception — the edge would otherwise stop answering to the
+        // name it is stored under.
+        let mut m = Memtable::with_bases(10, 5);
+        merge_keyed_fact(&mut m, "r-1", "Ann met Bob");
+        m.upsert_edge_keyed(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "RELATES_TO",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            Some(("uuid", Value::Str("r-1".into()))),
+            true,
+            [("name".to_string(), Value::Str("MET".into()))],
+        );
+        let d = m.edge_delta_owned(5).expect("the born edge");
+        assert!(d.replaced);
+        assert_eq!(d.patches.get("fact"), None, "the replace dropped `fact`");
+        assert_eq!(d.patches.get("name"), Some(&Value::Str("MET".into())));
+        assert_eq!(d.patches.get("uuid"), Some(&Value::Str("r-1".into())));
+    }
+
+    #[test]
+    fn a_core_edge_replace_hides_the_core_properties() {
+        // On a core edge the replace flag is what a reader consults to drop the stored
+        // record; it must survive the L0 round-trip and the cross-level fold.
+        let mut m = Memtable::with_bases(10, 5);
+        m.patch_core_edge_keyed(
+            "Person",
+            "name",
+            Value::Str("Ann".into()),
+            "KNOWS",
+            "Person",
+            "name",
+            Value::Str("Bob".into()),
+            Some(0),
+            Some(1),
+            None,
+            3,
+            true,
+            [("since".to_string(), Value::Int(2020))],
+        );
+        for m in [
+            Memtable::deserialise(&m.serialise()).unwrap(),
+            Memtable::merge_levels(&[&m]),
+        ] {
+            let s = snap(m, vec![]);
+            assert!(s.edge_replaced(3));
+            assert_eq!(s.edge_patch_value(3, "since"), Some(Value::Int(2020)));
+            // A property the core carried and the replace omitted must not resurface.
+            assert_eq!(s.edge_patch_value(3, "note"), None);
+        }
     }
 
     #[test]

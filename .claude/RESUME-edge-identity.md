@@ -1,73 +1,91 @@
-# Next: edge identity by an indexed edge property
+# Done: edge identity by an identifying edge property
 
-Resume note. Everything else about the Graphiti compatibility work is committed on
-`feat/graphiti-write-compat` (8 commits, working tree clean, 1042 lib tests green,
-clippy + fmt clean). This is the one deliberately deferred item.
+Resume note. This was the deferred item on `feat/graphiti-write-compat`; it has landed.
+What follows is what shipped, what deliberately did not, and what is next.
 
-## The gap, reproduced
+## What shipped
 
-Graphiti emits (verbatim, `graphiti_core/models/edges/edge_db_queries.py:19-27`):
+`MERGE (a)-[e:R {uuid: $u}]->(b)` — the inline relationship property map is now the
+edge's **identity**, not decoration. `EdgeIdentity` (`crates/slater-delta/src/identity.rs`)
+carries an optional `(key: SymbolId, value: Value)` beside `(src, reltype, dst)`, appended
+to `canonical_key` only when present — so a keyless edge's byte image is exactly what it
+always was, and a keyed one can never collide with it.
 
-```cypher
-MATCH (episode:Episodic {uuid: $episode_uuid})
-MATCH (node:Entity {uuid: $entity_uuid})
-MERGE (episode)-[e:MENTIONS {uuid: $uuid}]->(node)
-SET e.group_id = $group_id, e.created_at = $created_at
-```
+Graphiti's several `RELATES_TO` edges between the same entity pair therefore stay distinct
+instead of collapsing into one and silently losing facts. Verified end to end, including
+across a `CALL slater.consolidate()`.
 
-Slater answers `relationship properties are not yet supported in a write`
-(`parser.rs`, in `lower_edge_write`: `if !rel.props.is_empty()`).
+Alongside it, four things the same op had to grow to support:
 
-Everything else in that statement already works — both MATCH-bound endpoints and the
-repeated `SET` clauses landed in `982112f`. The inline `{uuid: $uuid}` is the whole gap.
+- **`SET r = $map` on a relationship.** `WalOp::UpsertEdge` gained a `replace` flag and
+  `EdgeDelta` a `replaced` field, so the write can say *replace* where it used to be
+  refused for silently meaning *merge*. All the whole-map spellings (`SET r = {…}`,
+  `SET r += {…}`, and their `$param` forms) now lower; the write path folds the `SET`
+  sequence into the one `(patches, replace)` pair the edge op carries.
+- **`RETURN` after a relationship write.** `MERGE (a)-[e:R {…}]->(b) SET e = $d RETURN
+  e.uuid` — graphiti's `RELATES_TO` save needs it, and the node write already had it. The
+  edge is resolved over the *post-write* merged view (`find_merged_edge_id`), so a
+  delta-born edge projects its synthetic id and a patched core edge its own.
+- **A keyless MERGE adopts a keyed identity.** `MERGE (a)-[r:R]->(b)` means "any `R`
+  between the pair", so it matches an edge the delta already holds under an identifying
+  property rather than standing beside it. Without this the same statement pair answered
+  two ways: two edges before a consolidation, one after (the core probe is an adjacency
+  scan, which always matched any `R`). See `DeltaWriter::edge_identity_key_between`.
+- **The identifying property reads back.** It is seeded into the delta's patches, so
+  `r.uuid` answers off a born edge (which has no core row to carry it) and survives a
+  `SET r = $map` that omits it. A `SET` that would assign the identity property a
+  *different* value is refused — an edge that stops answering to the name it is stored
+  under is unfindable.
 
-**Why it matters, and why it is not cosmetic.** The map is the edge's *identity*:
-create-if-no-edge-with-this-uuid, not create-if-no-edge-between-these-nodes. Slater's
-`EdgeIdentity` is `(src, reltype, dst)`, so Graphiti's several `RELATES_TO` edges between
-the same entity pair collapse to one and **facts are silently lost**. Silent, not loud —
-which is what makes it worth doing properly rather than approximating.
+### Deliberately refused, not silently approximated
 
-## Sizing — smaller than the earlier estimate
+- **A keyed `DELETE`** (`MATCH (a)-[r:R {uuid:$u}]->(b) DELETE r`). The traversal overlay
+  suppresses a core edge by `(reltype, neighbour)`, so it cannot spare that edge's
+  siblings. Deleting every `R` between the pair is exactly the loss this work exists to
+  prevent, so the parser refuses with a message saying so. To lift it, the tombstone has
+  to name a resolved core edge id and the overlay needs a suppress-by-id set beside its
+  suppress-by-pair one.
+- **More than one inline property.** Which one is the identity would be a guess.
+- **A `MERGE` text dump of a graph with parallel edges.** `serialise_merge_dump` now
+  refuses, mirroring how it already refuses a vector-carrying graph. The builder's
+  `edge_overwrite` locates an edge by `(src, dst, reltype)` and *ignores* an inline
+  relationship property map, so the dialect genuinely cannot spell two `R` edges between
+  one pair — emitting them would fuse them on rebuild. Consolidation itself takes the
+  binary path, which carries each edge by id and is unaffected.
 
-- `EdgeIdentity` (`crates/slater-delta/src/identity.rs:41`) is `{src: NodeIdentity,
-  reltype: SymbolId, dst: NodeIdentity}`. **11 usages across 3 files**, all inside
-  `slater-delta` (`identity.rs`, `lib.rs`, `memtable.rs`). The blast radius is contained.
-- The shape to add is the one nodes already have: an optional `(key: SymbolId, value:
-  Value)` beside the triple, keyed off an **edge** range index. The machinery exists —
-  `RangeIndexDesc` already carries `entity: EntityKind::Edge`, and `consolidate.rs:578`
-  already re-emits `CREATE INDEX FOR ()-[r:T]->() ON (r.prop)`.
-- `canonical_key` (`identity.rs:77`) is the function that changes; it is a byte encoding
-  used as a map key, so any change to it changes every key in the memtable.
+### On the WAL, and why there is no magic bump
 
-**Correction to carry forward:** an earlier design pass claimed `wal.rs` has no record
-version and that one must be added. That is wrong at the file level — the WAL magic is
-`SLWAL001` (`wal.rs:94`), with `SLWALE01` for the sealed variant, and an unrecognised
-magic already fails closed with `bad or missing WAL magic` (`wal.rs:1067-1071`). So the
-versioning hook exists; the question is only whether to bump it and what to do with an
-in-flight WAL written by the older binary. Decide that deliberately — a bump means a
-replay of an existing WAL is refused, which needs an operator story.
+The earlier design pass was right that a version hook exists (`SLWAL001`, `wal.rs:94`) and
+wrong that one had to be added. Neither was needed: the extra fields ride **new op tags**
+(`OP_UPSERT_EDGE_V2` / `OP_DELETE_EDGE_V2`), emitted only when a record actually carries an
+identifying property or a replace. A write that was expressible before encodes to the same
+bytes as before (there is a test pinning this), so an existing WAL replays unchanged and no
+operator story is needed. An older binary meeting a v2 tag fails closed on the
+unknown-op-tag path, which is the right way round.
 
-## Also worth doing in the same change
+The L0 segment body went to `L0_FORMAT_VERSION = 4`, which needs no story at all — a
+segment lives only between a flush and the next consolidation, and a version mismatch is
+already a hard error on open.
 
-`SET r = $map` on a relationship is still rejected, and the reason is adjacent:
-`WalOp::UpsertEdge` (`crates/slater-delta/src/wal.rs:191`) carries merge-semantics
-`patches` with no replace flag, so honouring it would silently *merge* where the statement
-says replace. Graphiti emits `SET e = $edge_data`, so edges cannot be written without it.
-Both this and edge identity are changes to the same op, so they belong together.
+## Verification
 
-## What "done" looks like
+- **1560 lib tests green**, clippy + fmt clean.
+- Rust regression tests: two same-pair edges with distinct keys survive a write, a flush, a
+  `merge_levels` fold and an L0 round-trip (`memtable.rs`); the keyless canonical encoding
+  is unchanged (`identity.rs`); a keyed WAL op round-trips and a keyless one still encodes
+  under the v1 tag (`wal.rs`); the parser accepts graphiti's verbatim statements and
+  refuses what it cannot identify.
+- **End-to-end: 10 of 10 pass.** The harness is `hs-memory/scripts/verify.py` +
+  `hs-memory/schema/graphiti-schema.cypher`; it runs graphiti-core 0.29.3's real statements
+  against a live Slater over the neo4j Python driver 6.2.0. Both edge cases the note asked
+  for are in it, plus the two new ones (`RELATES_TO` verbatim, and that `SET e = $map`
+  really replaces).
 
-The end-to-end harness is at
-`/tmp/claude-1000/.../scratchpad/e2e/` (`verify.py` + `graphiti-schema.cypher`) — move it
-to `hs-memory/scripts/`. It runs graphiti-core 0.29.3's real statements against a live
-Slater with the neo4j Python driver 6.2.0. Currently **7 of 8 pass**; the failing case is
-`MENTIONS edge, graphiti verbatim (inline edge property key)`. That case going green is
-the acceptance test.
+To run it: `slater-build --input schema/graphiti-schema.cypher --graph graphiti --data-dir
+./data`, start `slater` beside a `config.json` on port 7699 with a `graphiti` ACL user, then
+`python scripts/verify.py`.
 
-Add a Rust test too: two same-pair `RELATES_TO` edges with distinct `uuid`s must both
-survive a consolidation round-trip. That is the regression the collapse would cause.
-
-## Empirical findings from this session that are not in git
+## Empirical findings that are still not in git
 
 1. **D12 is real and measured.** An *indexed* embedding reads back as `Null` from a column
    (`exec/access.rs:186` — routed out to the vector store). So graphiti's FalkorDB

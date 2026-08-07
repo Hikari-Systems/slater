@@ -1430,6 +1430,8 @@ fn edge_overlay_folds_born_and_deleted_edges() {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str(dname.into()),
+                edge_key: None,
+                replace: false,
                 patches: vec![],
             }
         } else {
@@ -1441,6 +1443,7 @@ fn edge_overlay_folds_born_and_deleted_edges() {
                 dst_label: "Person".into(),
                 dst_key: "name".into(),
                 dst_value: Value::Str(dname.into()),
+                edge_key: None,
             }
         };
         writer

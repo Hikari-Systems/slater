@@ -47,7 +47,12 @@ impl<'g, V: ReadView> Engine<'g, V> {
         let mut props = columns::decode_props(&rec)?;
         // A **core** edge patched in place: fold its delta patches over the core record
         // (replace an existing key, append a new one), mirroring the node patch overlay.
+        // Under `SET r = {map}` the core record is dropped first — the map is the whole
+        // property set, not an overlay on it.
         if !delta.is_empty() {
+            if delta.edge_replaced(id) {
+                props.clear();
+            }
             for (name, value) in delta.edge_patches(id) {
                 if let Some(kid) = self.gen.property_key_id(&name) {
                     match props.iter_mut().find(|(k, _)| *k == kid) {
@@ -286,9 +291,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 .into_iter()
                 .map(|(k, v)| (k, Val::from_value(v)))
                 .collect();
-            // A delta patch on a segment-carried edge wins last-writer-wins.
+            // A delta patch on a segment-carried edge wins last-writer-wins; a delta
+            // replace-all drops the segment row's properties first.
             let delta = self.gen.delta();
             if !delta.is_empty() {
+                if delta.edge_replaced(id) {
+                    out.clear();
+                }
                 for (name, value) in delta.edge_patches(id) {
                     overlay_named(&mut out, &name, Val::from_value(value));
                 }
@@ -378,6 +387,19 @@ impl<'g, V: ReadView> Engine<'g, V> {
     /// only (the `MERGE`-idempotency / core-edge-patch resolver's requirement).
     pub fn find_outgoing_edge(&self, src: u64, reltype: u32, dst: u64) -> Result<Option<u64>> {
         find_outgoing_edge_overlaid(self.gen, self.cache, src, reltype, dst)
+    }
+
+    /// [`Self::find_outgoing_edge`], narrowed to the edge carrying the identifying
+    /// property `key` — `MERGE (a)-[r:R {uuid: $u}]->(b)` asking "does *this* edge
+    /// exist?", not "is the pair connected?".
+    pub fn find_outgoing_edge_keyed(
+        &self,
+        src: u64,
+        reltype: u32,
+        dst: u64,
+        key: Option<(&str, &Value)>,
+    ) -> Result<Option<u64>> {
+        find_outgoing_edge_keyed_overlaid(self.gen, self.cache, src, reltype, dst, key)
     }
 
     /// Resolve a relationship's type name and named properties — the material a

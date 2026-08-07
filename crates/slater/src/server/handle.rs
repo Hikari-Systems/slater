@@ -622,7 +622,7 @@ pub(crate) async fn handle_request(
                                 ctx,
                                 w,
                                 &gen,
-                                WriteJob::Create(stmt),
+                                WriteJob::Create(Box::new(stmt)),
                                 param_vals,
                                 sess.version,
                             )
@@ -636,7 +636,7 @@ pub(crate) async fn handle_request(
                                 ctx,
                                 w,
                                 &gen,
-                                WriteJob::Edge(stmt),
+                                WriteJob::Edge(Box::new(stmt)),
                                 param_vals,
                                 sess.version,
                             )

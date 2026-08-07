@@ -47,7 +47,10 @@ pub(crate) fn resolve_op(gen: &Generation, op: &WalOp) -> OpResolution {
     // and this matches how endpoint resolution swallows a failed probe).
     let edge_id = match op {
         WalOp::UpsertEdge { .. } => match (src_id, dst_id, gen.reltype_id(reltype)) {
-            (Some(s), Some(d), Some(rt)) => find_core_edge_id(gen, s, rt, d).unwrap_or(None),
+            (Some(s), Some(d), Some(rt)) => {
+                let key = op.edge_identity_key().map(|(p, v)| (p.as_str(), v));
+                find_core_edge_id(gen, s, rt, d, key).unwrap_or(None)
+            }
             _ => None,
         },
         _ => None,
@@ -722,11 +725,12 @@ pub(crate) fn delete_has_relationships_error() -> Failure {
 /// which `execute_*` they dispatch to; carrying them in one owned enum lets a single
 /// helper move any of them onto a blocking thread.
 pub(crate) enum WriteJob {
-    /// Boxed: a `WriteStmt` is much the biggest of the three, and every `WriteJob` is
-    /// moved into a blocking task.
+    /// All three are boxed: each statement AST is hundreds of bytes, and every
+    /// `WriteJob` is moved into a blocking task — so the enum stays pointer-sized
+    /// however the three shapes grow relative to each other.
     Node(Box<parser::ast::WriteStmt>),
-    Create(parser::ast::CreateStmt),
-    Edge(parser::ast::EdgeWriteStmt),
+    Create(Box<parser::ast::CreateStmt>),
+    Edge(Box<parser::ast::EdgeWriteStmt>),
 }
 
 impl WriteJob {
@@ -1491,6 +1495,7 @@ pub(crate) fn find_core_edge_id(
     src: u64,
     reltype: u32,
     dst: u64,
+    key: Option<(&str, &Value)>,
 ) -> std::result::Result<Option<u64>, Failure> {
     let cache = BlockCache::new(1 << 16);
     let view = MergedView::read_only(gen);
@@ -1498,12 +1503,78 @@ pub(crate) fn find_core_edge_id(
     // Short-circuit at the first matching out-edge instead of materialising the source's whole
     // out-adjacency `Vec` to `find()` one edge — a hub source is never fully decoded. The
     // empty-delta (`read_only`) view keeps this core-only, so it returns the genuine core edge id.
-    engine.find_outgoing_edge(src, reltype, dst).map_err(|e| {
-        Failure::new(
-            CODE_EXECUTION,
-            format!("check for an existing relationship: {e:#}"),
-        )
-    })
+    // With a `key` the match is the edge carrying that identifying property, so several parallel
+    // edges between the pair are told apart rather than fused.
+    engine
+        .find_outgoing_edge_keyed(src, reltype, dst, key)
+        .map_err(|e| {
+            Failure::new(
+                CODE_EXECUTION,
+                format!("check for an existing relationship: {e:#}"),
+            )
+        })
+}
+
+/// Fold a relationship write's `SET` sequence into the one `(patches, replace)` pair
+/// [`WalOp::UpsertEdge`] carries.
+///
+/// The node write emits an op per clause because a node's ops differ in kind (replace,
+/// remove, labels); an edge has a single op, so the sequence collapses here instead. A
+/// `SET r = {…}` (literal or whole-parameter) discards everything assigned before it and
+/// sets `replace` — the core edge's own properties then go too — while later clauses
+/// merge on top, which is the order the statement reads in.
+fn edge_set_patches(
+    items: &[parser::ast::SetItem],
+    params: &HashMap<String, Val>,
+) -> std::result::Result<(Vec<(String, Value)>, bool), Failure> {
+    use parser::ast::SetItem;
+    let mut patches: Vec<(String, Value)> = Vec::with_capacity(items.len());
+    let mut replace = false;
+    for item in items {
+        match item {
+            SetItem::Prop { prop, value } => {
+                patches.push((
+                    prop.clone(),
+                    write_value(value, params, "a relationship SET value")?,
+                ));
+            }
+            SetItem::MergeMap(map) => {
+                for (k, expr) in map {
+                    patches.push((
+                        k.clone(),
+                        write_value(expr, params, "a relationship merge-map value")?,
+                    ));
+                }
+            }
+            SetItem::ReplaceMap(map) => {
+                let mut fresh = Vec::with_capacity(map.len());
+                for (k, expr) in map {
+                    fresh.push((
+                        k.clone(),
+                        write_value(expr, params, "a relationship replace-map value")?,
+                    ));
+                }
+                patches = fresh;
+                replace = true;
+            }
+            SetItem::MergeParam(expr) => {
+                let v = param_path_val(expr, params, "a relationship merge-map value")?;
+                patches.extend(map_val_to_patches(v, "a relationship merge-map value")?);
+            }
+            SetItem::ReplaceParam(expr) => {
+                let v = param_path_val(expr, params, "a relationship replace-map value")?;
+                patches = map_val_to_patches(v, "a relationship replace-map value")?;
+                replace = true;
+            }
+            SetItem::AddLabels(_) => {
+                return Err(Failure::new(
+                    CODE_EXECUTION,
+                    "relationships have a type, not labels".to_string(),
+                ))
+            }
+        }
+    }
+    Ok((patches, replace))
 }
 
 /// Execute one durable relationship write (Phase 3c): resolve both endpoints, build
@@ -1515,7 +1586,7 @@ pub(crate) fn execute_edge_write(
     gen: &Generation,
     stmt: &parser::ast::EdgeWriteStmt,
     params: &HashMap<String, Val>,
-    _version: (u8, u8),
+    version: (u8, u8),
 ) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
     use parser::ast::EdgeWriteOp;
     // The reltype must pre-exist: the read overlay resolves a born edge's type through
@@ -1536,14 +1607,35 @@ pub(crate) fn execute_edge_write(
         params,
         "the destination business-key value",
     )?;
-    // Evaluate the optional `SET r.p = …` property patches (empty for a bare MERGE or a
-    // DELETE). They are carried on the WAL op and stored on the delta-born edge.
-    let mut patches = Vec::with_capacity(stmt.sets.len());
-    for (prop, expr) in &stmt.sets {
-        patches.push((
+    // The inline `{prop: value}` that identifies the edge, if the statement spelled one.
+    let edge_key = match &stmt.key {
+        Some((prop, expr)) => Some((
             prop.clone(),
-            write_value(expr, params, "a relationship SET value")?,
-        ));
+            write_value(expr, params, "the identifying relationship value")?,
+        )),
+        None => None,
+    };
+    // Evaluate the optional `SET` (empty for a bare MERGE or a DELETE) into one
+    // `(patches, replace)` pair: a `SET r = {…}` restarts the patch list and marks the
+    // write as replacing, so the last replace in the statement wins and everything after
+    // it merges on top — the same order the statement reads in.
+    let (patches, replace) = edge_set_patches(&stmt.sets, params)?;
+    // The identity is the property, so a `SET` may restate it but not change it — that
+    // would leave the stored edge answering to a name nothing can find it by.
+    if let Some((key_prop, key_value)) = &edge_key {
+        if let Some((_, assigned)) = patches
+            .iter()
+            .find(|(p, v)| p == key_prop && v != key_value)
+        {
+            return Err(Failure::new(
+                CODE_EXECUTION,
+                format!(
+                    "SET {key_prop} = {assigned:?} contradicts the identifying property \
+                     {{{key_prop}: {key_value:?}}} of this relationship: the property a \
+                     relationship is identified by cannot be reassigned by the same write"
+                ),
+            ));
+        }
     }
     // Core-only resolution first (`None` = absent from the core): the duplicate check
     // below must run against genuine core dense ids, never a delta-born synthetic id.
@@ -1554,14 +1646,23 @@ pub(crate) fn execute_edge_write(
     // in the core. If it does, a bare re-MERGE is an idempotent no-op, and a
     // `SET r.p = …` is an **in-place property patch** of that core edge (resolved to its
     // core edge id, which routes the write to `patch_core_edge`). If either endpoint is
-    // delta-born there can be no matching core edge, so no check is needed.
+    // delta-born there can be no matching core edge, so no check is needed. With an
+    // identifying property the probe asks about *that* edge, so a second `{uuid: …}`
+    // between the same pair is a create, not a patch of the first.
     let mut core_edge_id = None;
     if stmt.op == EdgeWriteOp::Create {
         if let (Some(s), Some(d)) = (src_core, dst_core) {
-            core_edge_id = find_core_edge_id(gen, s, reltype_id, d)?;
-            if core_edge_id.is_some() && patches.is_empty() {
-                // Bare re-MERGE of an existing core edge: nothing to write.
-                return Ok((Vec::new(), Vec::new()));
+            let key = edge_key.as_ref().map(|(p, v)| (p.as_str(), v));
+            core_edge_id = find_core_edge_id(gen, s, reltype_id, d, key)?;
+            if let (Some(cid), true) = (core_edge_id, patches.is_empty() && !replace) {
+                // Bare re-MERGE of an existing core edge: nothing to write, but a RETURN
+                // still projects the edge the statement matched.
+                return match &stmt.ret {
+                    None => Ok((Vec::new(), Vec::new())),
+                    Some(ret) => project_edge_return(
+                        writer, gen, stmt, ret, cid, s, d, reltype_id, params, version,
+                    ),
+                };
             }
         }
     }
@@ -1575,6 +1676,42 @@ pub(crate) fn execute_edge_write(
     let dst = dst_core
         .or_else(|| writer.born_synthetic_for_identity(&stmt.dst.label, &stmt.dst.key, &dst_value));
 
+    // A **keyless** MERGE means "any edge of this type between the pair", so if the delta
+    // already holds one under an identifying property, this write is about *that* edge.
+    // Adopting its identity keeps the delta answering the way the core does: the core
+    // probe above is an adjacency scan, which already matches an edge whatever property
+    // identifies it. Without this, `MERGE (a)-[r:R]->(b) SET r.uuid = 'x'` would stand
+    // beside `MERGE (a)-[r:R {uuid: 'x'}]->(b)` as a second edge before a consolidation
+    // and fuse with it after — the same statement pair answering two different ways.
+    let edge_key = match (&edge_key, &stmt.op, core_edge_id) {
+        (None, EdgeWriteOp::Create, None) => {
+            // Resolved across the *whole* delta, unlike the WAL op's endpoints above
+            // (L0 levels only): an endpoint born into the active memtable by an earlier
+            // statement in the same session is exactly the case this is here for.
+            let ends = (
+                src.or_else(|| {
+                    writer.born_synthetic_in_delta(&stmt.src.label, &stmt.src.key, &src_value)
+                }),
+                dst.or_else(|| {
+                    writer.born_synthetic_in_delta(&stmt.dst.label, &stmt.dst.key, &dst_value)
+                }),
+            );
+            match ends {
+                (Some(s), Some(d)) => writer.edge_identity_key_between(s, &stmt.reltype, d),
+                _ => None,
+            }
+        }
+        _ => edge_key,
+    };
+
+    // The identity values are moved into the WAL op below; a `RETURN` needs them again
+    // afterwards, to resolve what the write produced.
+    let (src_value_for_ret, dst_value_for_ret, edge_key_for_ret) = if stmt.ret.is_some() {
+        (src_value.clone(), dst_value.clone(), edge_key.clone())
+    } else {
+        (Value::Null, Value::Null, None)
+    };
+
     let op = match stmt.op {
         EdgeWriteOp::Create => WalOp::UpsertEdge {
             src_label: stmt.src.label.clone(),
@@ -1584,6 +1721,8 @@ pub(crate) fn execute_edge_write(
             dst_label: stmt.dst.label.clone(),
             dst_key: stmt.dst.key.clone(),
             dst_value,
+            edge_key,
+            replace,
             patches,
         },
         EdgeWriteOp::Delete => WalOp::DeleteEdge {
@@ -1594,6 +1733,9 @@ pub(crate) fn execute_edge_write(
             dst_label: stmt.dst.label.clone(),
             dst_key: stmt.dst.key.clone(),
             dst_value,
+            // The parser refuses an inline identifying property on a DELETE, so there is
+            // never one to carry here.
+            edge_key: None,
         },
     };
     // `edge_id` is `Some` only for a core-edge patch (a Create whose edge exists in the
@@ -1608,7 +1750,110 @@ pub(crate) fn execute_edge_write(
             },
         )
         .map_err(|e| Failure::new(CODE_EXECUTION, format!("durable write failed: {e:#}")))?;
-    Ok((Vec::new(), Vec::new()))
+    let Some(ret) = &stmt.ret else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    // Resolve the endpoints and the edge *after* the commit: a MERGE that created a born
+    // endpoint or a born edge had no dense id before it (the delta allocates one on
+    // apply), so the pre-write `src`/`dst`/`core_edge_id` may all be `None`.
+    let (Some(src_id), Some(dst_id)) = (
+        src.or_else(|| {
+            writer.born_synthetic_in_delta(&stmt.src.label, &stmt.src.key, &src_value_for_ret)
+        }),
+        dst.or_else(|| {
+            writer.born_synthetic_in_delta(&stmt.dst.label, &stmt.dst.key, &dst_value_for_ret)
+        }),
+    ) else {
+        return Err(Failure::new(
+            CODE_EXECUTION,
+            "the write committed but its endpoints could not be resolved to project RETURN".into(),
+        ));
+    };
+    // Over the **post-write** view, so a delta-born edge resolves to its synthetic id and a
+    // patched core edge to its core one — the same probe the write used, minus the
+    // empty-delta restriction that kept that one core-only.
+    let edge_id = find_merged_edge_id(
+        writer,
+        gen,
+        src_id,
+        reltype_id,
+        dst_id,
+        edge_key_for_ret.as_ref().map(|(p, v)| (p.as_str(), v)),
+    )?
+    .ok_or_else(|| {
+        Failure::new(
+            CODE_EXECUTION,
+            "the write committed but its relationship could not be resolved to project RETURN"
+                .into(),
+        )
+    })?;
+    project_edge_return(
+        writer, gen, stmt, ret, edge_id, src_id, dst_id, reltype_id, params, version,
+    )
+}
+
+/// The dense edge id of `src -[reltype]-> dst` (optionally carrying `key`) over the
+/// **post-write** merged view — a born edge's synthetic id, or a core edge's own.
+/// [`find_core_edge_id`]'s delta-inclusive twin, used only to name the edge a `RETURN`
+/// projects.
+#[allow(clippy::too_many_arguments)]
+fn find_merged_edge_id(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    src: u64,
+    reltype: u32,
+    dst: u64,
+    key: Option<(&str, &Value)>,
+) -> std::result::Result<Option<u64>, Failure> {
+    let delta = DeltaSnapshot::from_memtable(writer.snapshot());
+    let view = MergedView::new(gen, delta);
+    let cache = BlockCache::new(1 << 16);
+    // Bound rather than returned directly: `view` and `cache` are locals the borrow must
+    // not outlive.
+    let found =
+        crate::exec::Engine::new(&view, &cache).find_outgoing_edge_keyed(src, reltype, dst, key);
+    found.map_err(|e| {
+        Failure::new(
+            CODE_EXECUTION,
+            format!("resolve the written relationship: {e:#}"),
+        )
+    })
+}
+
+/// Project a relationship write's `RETURN` over the single row the write produced —
+/// the edge bound to the pattern's relationship variable. The node write's
+/// [`project_write_return`] does the work; this only builds the binding.
+#[allow(clippy::too_many_arguments)]
+fn project_edge_return(
+    writer: &Arc<DeltaWriter>,
+    gen: &Generation,
+    stmt: &parser::ast::EdgeWriteStmt,
+    ret: &parser::ast::ReturnClause,
+    edge_id: u64,
+    src: u64,
+    dst: u64,
+    reltype: u32,
+    params: &HashMap<String, Val>,
+    version: (u8, u8),
+) -> std::result::Result<(Vec<String>, Vec<Vec<PsValue>>), Failure> {
+    let var = stmt
+        .rel_var
+        .clone()
+        .expect("lowering rejects a RETURN on an unnamed relationship");
+    project_write_return(
+        writer,
+        gen,
+        ret,
+        vec![var],
+        vec![vec![Val::Rel {
+            id: edge_id,
+            start: src,
+            end: dst,
+            reltype,
+        }]],
+        params,
+        version,
+    )
 }
 
 #[cfg(test)]

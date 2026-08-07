@@ -226,7 +226,7 @@ delete_clause = { kw_detach? ~ kw_delete ~ var ~ ("," ~ var)* }
 // bind first. `edge_bind` is its own rule rather than another `node_pattern` so the
 // lowering can tell a binding apart from an endpoint by rule, not by position.
 edge_write = { edge_merge | edge_delete }
-edge_merge = { edge_bind* ~ kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause* }
+edge_merge = { edge_bind* ~ kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause* ~ return_clause? }
 edge_delete = { edge_bind* ~ kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
 // The lookahead is load-bearing. Without it PEG repetition is greedy and `edge_bind*`
 // swallows the `MATCH` that `edge_delete` itself needs, so

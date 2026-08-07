@@ -112,6 +112,18 @@ const OP_DELETE_EDGE: u8 = 4;
 const OP_REMOVE_NODE_PROPS: u8 = 5;
 const OP_REPLACE_NODE: u8 = 6;
 const OP_SET_NODE_LABELS: u8 = 7;
+/// [`WalOp::UpsertEdge`] carrying an identifying edge property and/or replace-all
+/// semantics — the fields `OP_UPSERT_EDGE` has no room for.
+///
+/// Additive rather than a format bump: a record with neither field still writes under
+/// `OP_UPSERT_EDGE`, so every WAL an older binary produced replays unchanged and this
+/// one keeps producing byte-identical records for the writes it always supported. An
+/// *older* binary meeting a v2 tag fails closed on the unknown-op path, which is the
+/// right way round.
+const OP_UPSERT_EDGE_V2: u8 = 8;
+/// [`WalOp::DeleteEdge`] carrying an identifying edge property (see
+/// [`OP_UPSERT_EDGE_V2`]).
+const OP_DELETE_EDGE_V2: u8 = 9;
 
 /// A monotonic per-graph WAL sequence number.
 ///
@@ -184,10 +196,10 @@ pub enum WalOp {
         added: Vec<String>,
         removed: Vec<String>,
     },
-    /// Create (or, once edge properties land, patch) the relationship identified by
-    /// `(src business key) -[reltype]-> (dst business key)` (Phase 3). A `MERGE`
-    /// create; idempotent by edge identity. `patches` is reserved for edge-property
-    /// overlays (empty for now).
+    /// Create (or patch) the relationship identified by `(src business key) -[reltype]->
+    /// (dst business key)`, optionally narrowed by an identifying **edge property**
+    /// (Phase 3). A `MERGE` create; idempotent by edge identity. `patches` carries the
+    /// statement's `SET` assignments.
     UpsertEdge {
         src_label: String,
         src_key: String,
@@ -196,6 +208,13 @@ pub enum WalOp {
         dst_label: String,
         dst_key: String,
         dst_value: Value,
+        /// `MERGE (a)-[r:R {uuid: 'r-1'}]->(b)` — the property that *is* the edge's
+        /// identity, so several `R` edges between the same pair stay distinct.
+        edge_key: Option<(String, Value)>,
+        /// `SET r = {map}` — `patches` is the whole property set, not an overlay on the
+        /// core edge's. `false` for the merging `SET r.p = v` / `SET r += {map}`.
+        replace: bool,
+        /// `(property-name, value)` patches, applied in order (later wins).
         patches: Vec<(String, Value)>,
     },
     /// Tombstone the relationship `(src) -[reltype]-> (dst)`: the edge is suppressed
@@ -209,6 +228,8 @@ pub enum WalOp {
         dst_label: String,
         dst_key: String,
         dst_value: Value,
+        /// The identifying edge property, when the delete named one.
+        edge_key: Option<(String, Value)>,
     },
 }
 
@@ -254,6 +275,7 @@ impl WalOp {
                 dst_label,
                 dst_key,
                 dst_value,
+                ..
             } => Some((
                 (src_label, src_key, src_value),
                 reltype,
@@ -266,6 +288,43 @@ impl WalOp {
             | WalOp::SetNodeLabels { .. } => None,
         }
     }
+
+    /// The identifying edge property an *edge* op names — `None` for a node op or for
+    /// an edge identified by its endpoints and type alone. The write path needs it to
+    /// resolve *which* of several parallel core edges the op is about.
+    pub fn edge_identity_key(&self) -> Option<&(String, Value)> {
+        match self {
+            WalOp::UpsertEdge { edge_key, .. } | WalOp::DeleteEdge { edge_key, .. } => {
+                edge_key.as_ref()
+            }
+            WalOp::UpsertNode { .. }
+            | WalOp::DeleteNode { .. }
+            | WalOp::RemoveNodeProps { .. }
+            | WalOp::ReplaceNode { .. }
+            | WalOp::SetNodeLabels { .. } => None,
+        }
+    }
+}
+
+/// An edge op's optional identifying property: a presence byte, then the name and its
+/// type-exact value. Only ever written under a `_V2` op tag.
+fn write_edge_key(buf: &mut Vec<u8>, key: Option<&(String, Value)>) {
+    match key {
+        None => buf.push(0),
+        Some((name, value)) => {
+            buf.push(1);
+            write_str(buf, name);
+            write_value(buf, value);
+        }
+    }
+}
+
+fn read_edge_key(r: &mut &[u8]) -> Result<Option<(String, Value)>> {
+    if read_u8(r)? == 0 {
+        return Ok(None);
+    }
+    let name = read_str(r)?;
+    Ok(Some((name, read_value(r)?)))
 }
 
 /// One durable WAL entry: a sequence number and the operation it records.
@@ -361,9 +420,18 @@ impl WalRecord {
                 dst_label,
                 dst_key,
                 dst_value,
+                edge_key,
+                replace,
                 patches,
             } => {
-                buf.push(OP_UPSERT_EDGE);
+                // v1 unless the record needs a field v1 cannot spell, so a write that was
+                // expressible before this change still encodes to the same bytes.
+                let v2 = edge_key.is_some() || *replace;
+                buf.push(if v2 {
+                    OP_UPSERT_EDGE_V2
+                } else {
+                    OP_UPSERT_EDGE
+                });
                 write_str(buf, src_label);
                 write_str(buf, src_key);
                 write_value(buf, src_value);
@@ -371,6 +439,10 @@ impl WalRecord {
                 write_str(buf, dst_label);
                 write_str(buf, dst_key);
                 write_value(buf, dst_value);
+                if v2 {
+                    write_edge_key(buf, edge_key.as_ref());
+                    buf.push(u8::from(*replace));
+                }
                 write_uvarint(buf, patches.len() as u64);
                 for (prop, val) in patches {
                     write_str(buf, prop);
@@ -385,8 +457,14 @@ impl WalRecord {
                 dst_label,
                 dst_key,
                 dst_value,
+                edge_key,
             } => {
-                buf.push(OP_DELETE_EDGE);
+                let v2 = edge_key.is_some();
+                buf.push(if v2 {
+                    OP_DELETE_EDGE_V2
+                } else {
+                    OP_DELETE_EDGE
+                });
                 write_str(buf, src_label);
                 write_str(buf, src_key);
                 write_value(buf, src_value);
@@ -394,6 +472,9 @@ impl WalRecord {
                 write_str(buf, dst_label);
                 write_str(buf, dst_key);
                 write_value(buf, dst_value);
+                if v2 {
+                    write_edge_key(buf, edge_key.as_ref());
+                }
             }
         }
     }
@@ -498,7 +579,8 @@ impl WalRecord {
                     },
                 })
             }
-            OP_UPSERT_EDGE => {
+            OP_UPSERT_EDGE | OP_UPSERT_EDGE_V2 => {
+                let v2 = op_tag == OP_UPSERT_EDGE_V2;
                 let src_label = read_str(r)?;
                 let src_key = read_str(r)?;
                 let src_value = read_value(r)?;
@@ -506,6 +588,11 @@ impl WalRecord {
                 let dst_label = read_str(r)?;
                 let dst_key = read_str(r)?;
                 let dst_value = read_value(r)?;
+                let (edge_key, replace) = if v2 {
+                    (read_edge_key(r)?, read_u8(r)? != 0)
+                } else {
+                    (None, false)
+                };
                 let n = read_uvarint(r)? as usize;
                 let mut patches = Vec::with_capacity(n.min(r.len()));
                 for _ in 0..n {
@@ -523,11 +610,14 @@ impl WalRecord {
                         dst_label,
                         dst_key,
                         dst_value,
+                        edge_key,
+                        replace,
                         patches,
                     },
                 })
             }
-            OP_DELETE_EDGE => {
+            OP_DELETE_EDGE | OP_DELETE_EDGE_V2 => {
+                let v2 = op_tag == OP_DELETE_EDGE_V2;
                 let src_label = read_str(r)?;
                 let src_key = read_str(r)?;
                 let src_value = read_value(r)?;
@@ -535,6 +625,7 @@ impl WalRecord {
                 let dst_label = read_str(r)?;
                 let dst_key = read_str(r)?;
                 let dst_value = read_value(r)?;
+                let edge_key = if v2 { read_edge_key(r)? } else { None };
                 Ok(WalRecord {
                     seq,
                     op: WalOp::DeleteEdge {
@@ -545,6 +636,7 @@ impl WalRecord {
                         dst_label,
                         dst_key,
                         dst_value,
+                        edge_key,
                     },
                 })
             }
@@ -1521,6 +1613,8 @@ mod tests {
                 dst_label: "Drug".into(),
                 dst_key: "id".into(),
                 dst_value: Value::Int(7),
+                edge_key: None,
+                replace: false,
                 patches: vec![("since".into(), Value::Int(2020))],
             },
         };
@@ -1534,6 +1628,7 @@ mod tests {
                 dst_label: "Drug".into(),
                 dst_key: "id".into(),
                 dst_value: Value::Int(7),
+                edge_key: None,
             },
         };
         {
@@ -1551,6 +1646,85 @@ mod tests {
         assert_eq!(rel, "OWNS");
         assert_eq!(dst, ("Drug", "id", &Value::Int(7)));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_keyed_edge_op_round_trips_and_leaves_the_keyless_encoding_alone() {
+        let dir = std::env::temp_dir().join(format!("slater_wal_edgekey_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let keyed = |uuid: &str, replace: bool| WalOp::UpsertEdge {
+            src_label: "Episodic".into(),
+            src_key: "uuid".into(),
+            src_value: Value::Str("ep-1".into()),
+            reltype: "MENTIONS".into(),
+            dst_label: "Entity".into(),
+            dst_key: "uuid".into(),
+            dst_value: Value::Str("en-1".into()),
+            edge_key: Some(("uuid".into(), Value::Str(uuid.into()))),
+            replace,
+            patches: vec![("group_id".into(), Value::Str("g".into()))],
+        };
+        let recs = vec![
+            WalRecord {
+                seq: Seq(1),
+                op: keyed("me-1", false),
+            },
+            WalRecord {
+                seq: Seq(2),
+                op: keyed("me-2", true),
+            },
+        ];
+        {
+            let mut sink = WalSink::create(&dir, 0, None).unwrap();
+            for r in &recs {
+                sink.append(r).unwrap();
+            }
+            sink.commit(Seq(2)).unwrap();
+        }
+        assert_eq!(replay_dir(&dir, None).unwrap().records, recs);
+        assert_eq!(
+            recs[0].op.edge_identity_key(),
+            Some(&("uuid".to_string(), Value::Str("me-1".into())))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The extended fields ride distinct op tags, so a record that needs neither still
+    /// encodes exactly as the pre-identity writer produced it — which is what lets a WAL
+    /// written by an older binary replay unchanged, with no magic bump.
+    #[test]
+    fn a_keyless_edge_upsert_still_encodes_under_the_v1_op_tag() {
+        let mut got = Vec::new();
+        WalRecord {
+            seq: Seq(1),
+            op: WalOp::UpsertEdge {
+                src_label: "A".into(),
+                src_key: "k".into(),
+                src_value: Value::Int(1),
+                reltype: "R".into(),
+                dst_label: "B".into(),
+                dst_key: "k".into(),
+                dst_value: Value::Int(2),
+                edge_key: None,
+                replace: false,
+                patches: Vec::new(),
+            },
+        }
+        .encode_payload(&mut got);
+
+        let mut want = Vec::new();
+        want.push(KIND_RECORD);
+        write_uvarint(&mut want, 1);
+        want.push(OP_UPSERT_EDGE);
+        write_str(&mut want, "A");
+        write_str(&mut want, "k");
+        write_value(&mut want, &Value::Int(1));
+        write_str(&mut want, "R");
+        write_str(&mut want, "B");
+        write_str(&mut want, "k");
+        write_value(&mut want, &Value::Int(2));
+        write_uvarint(&mut want, 0);
+        assert_eq!(got, want);
     }
 
     #[test]
