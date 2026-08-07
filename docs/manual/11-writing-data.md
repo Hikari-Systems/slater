@@ -108,6 +108,21 @@ What a statement cannot do is combine *kinds* of updating clause — a `SET` bes
 combination is rejected by name rather than partly honoured; issue the clauses as
 separate statements.
 
+A `WITH` may appear between updating clauses, as a marker between phases of one write:
+
+```cypher
+UNWIND $rows AS row
+MERGE (n:Entity {uuid: row.uuid}) SET n = row
+WITH n, row
+SET n.embedding = vecf32(row.embedding);
+```
+
+It is accepted and ignored, because in the single-anchor write model it provably does
+nothing: there is no intermediate relation to reshape, so re-projecting what is already
+bound changes nothing. A `WITH` that *would* mean something — `DISTINCT`, a `WHERE`,
+`ORDER BY`/`SKIP`/`LIMIT`, or an alias introducing a new binding — is rejected by name
+rather than quietly dropped.
+
 ### Reading back what you wrote
 
 A node write may end in `RETURN`, projecting the node it just wrote:

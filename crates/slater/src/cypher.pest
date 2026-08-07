@@ -153,7 +153,19 @@ insert_stmt = { kw_insert ~ node_pattern ~ (rel_pattern ~ node_pattern)? ~ retur
 // *kinds* (a `SET` beside a `DELETE`) is a different matter: the executor carries one
 // `WriteOp` per statement, so lowering rejects that combination by name rather than
 // silently honouring one and dropping the other.
-write_actions = { (merge_action+ ~ update_clause*) | update_clause+ }
+// A `WITH` may sit between updating clauses. In the single-anchor write model it can only
+// re-project bindings that are already in scope, which is provably a no-op — so it is
+// accepted and ignored, not implemented. Clients emit it as a scope marker between phases
+// of a write (`SET n = row WITH n, row SET n.embedding = …`), where the intervening
+// projection changes nothing.
+//
+// This is the one place in the write grammar where "accept and ignore" is defensible, and
+// only because the clause demonstrably has no effect: `lower_write_statement` rejects a
+// `WITH` that introduces a binding, filters, reorders, limits or de-duplicates, since any
+// of those *would* mean something the write path is not doing. Do not read this rule as a
+// stub for a general mid-write `WITH`.
+write_actions = { (merge_action+ ~ write_step*) | write_step+ }
+write_step = { with_clause | update_clause }
 merge_action = { kw_on ~ (kw_create | kw_match) ~ set_clause }
 
 // One updating clause applied to the anchored node. openCypher's full `UpdatingClause`

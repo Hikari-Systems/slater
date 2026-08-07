@@ -1435,12 +1435,23 @@ fn lower_write_statement(pair: Pair<Rule>) -> Result<WriteStmt> {
                                 on_match_items.extend(items);
                             }
                         }
-                        Rule::update_clause => lower_update_clause(
-                            act,
-                            &mut set_items,
-                            &mut remove_items,
-                            &mut delete,
-                        )?,
+                        Rule::write_step => {
+                            let step = only_child(act)?;
+                            match step.as_rule() {
+                                Rule::with_clause => {
+                                    ensure_write_with_is_a_no_op(&lower_with_clause(step)?)?
+                                }
+                                Rule::update_clause => lower_update_clause(
+                                    step,
+                                    &mut set_items,
+                                    &mut remove_items,
+                                    &mut delete,
+                                )?,
+                                other => {
+                                    bail!("internal: unexpected write_step child {other:?}")
+                                }
+                            }
+                        }
                         other => bail!("internal: unexpected write_actions child {other:?}"),
                     }
                 }
@@ -1631,6 +1642,47 @@ fn ensure_constant(e: &Expr, what: &str) -> Result<()> {
         e if as_vecf32_arg(e).is_some_and(is_param_path) => Ok(()),
         _ => bail!("{what} must be a literal, a parameter, or a field of one (e.g. $p.field)"),
     }
+}
+
+/// A mid-write `WITH` is accepted only when it provably does nothing.
+///
+/// The write path binds one anchor (plus the `UNWIND` row) and mutates it; there is no
+/// intermediate relation for a `WITH` to reshape. A clause that only re-projects bindings
+/// already in scope therefore cannot change the write, and ignoring it is exact rather
+/// than approximate. Anything else *would* mean something — a filter would have to drop
+/// the write, an alias would introduce a binding nothing later can read, `ORDER BY` /
+/// `SKIP` / `LIMIT` / `DISTINCT` would have to reshape a relation the write does not have
+/// — so those are rejected by name rather than silently discarded.
+fn ensure_write_with_is_a_no_op(w: &WithClause) -> Result<()> {
+    let what = |s: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "a WITH inside a write may only re-project variables already in scope, so it has \
+             no effect; this one uses {s}"
+        )
+    };
+    if w.distinct {
+        return Err(what("DISTINCT"));
+    }
+    if w.where_.is_some() {
+        return Err(what("WHERE"));
+    }
+    if !w.body.order_by.is_empty() {
+        return Err(what("ORDER BY"));
+    }
+    if w.body.skip.is_some() {
+        return Err(what("SKIP"));
+    }
+    if w.body.limit.is_some() {
+        return Err(what("LIMIT"));
+    }
+    for item in &w.body.items {
+        // `WITH n` re-projects; `WITH n AS m` or `WITH n.x` would introduce a new binding,
+        // and nothing downstream in a write can read one.
+        if item.alias.is_some() || !matches!(item.expr, Expr::Var(_)) {
+            return Err(what("a computed or aliased projection"));
+        }
+    }
+    Ok(())
 }
 
 /// A parameter, or a field path rooted at one: `$p`, `$p.field`, `$p.a.b`.
@@ -4574,6 +4626,54 @@ mod tests {
             e.contains("whole-map assignment") || e == "read-only",
             "got: {e}"
         );
+    }
+
+    /// The bulk shape clients emit: a `WITH` marking the boundary between phases of one
+    /// write. It re-projects what is already bound, so it changes nothing.
+    #[test]
+    fn a_no_op_with_between_updating_clauses_is_accepted() {
+        let plain = write("MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 SET n.b = 2");
+        let withed = write("MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 WITH n SET n.b = 2");
+        assert_eq!(plain.op, withed.op, "the WITH must not change the write");
+
+        let w = write(
+            "UNWIND $rows AS row MERGE (n:Entity {uuid: row.uuid}) SET n = row \
+             WITH n, row SET n.name_embedding = vecf32(row.emb)",
+        );
+        let WriteOp::Set(items) = &w.op else {
+            panic!("expected a SET write, got {:?}", w.op)
+        };
+        assert_eq!(items.len(), 2, "the WITH contributes no item: {items:?}");
+    }
+
+    /// A `WITH` that would actually do something is refused rather than quietly dropped —
+    /// the write path has no relation for it to reshape.
+    #[test]
+    fn a_with_that_would_do_something_is_rejected_by_name() {
+        for (q, needle) in [
+            (
+                "MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 WITH DISTINCT n SET n.b = 2",
+                "DISTINCT",
+            ),
+            (
+                "MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 WITH n WHERE n.a > 0 SET n.b = 2",
+                "WHERE",
+            ),
+            (
+                "MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 WITH n LIMIT 1 SET n.b = 2",
+                "LIMIT",
+            ),
+            (
+                "MERGE (n:Entity {uuid: 'u'}) SET n.a = 1 WITH n AS m SET n.b = 2",
+                "aliased",
+            ),
+        ] {
+            let e = write_err(q);
+            assert!(
+                (e.contains("no effect") && e.contains(needle)) || e == "read-only",
+                "for {q:?} got: {e}"
+            );
+        }
     }
 
     /// Nested paths resolve the same way — there is no depth special-case.
