@@ -76,6 +76,32 @@ pub struct QueryTooDeep {
 /// means the over-count never rejects a query the exact guard would have allowed.
 const MAX_SOURCE_NESTING: usize = 64;
 
+/// Cap on how deeply `CALL { … }` subqueries may nest (HIK-267).
+///
+/// This is a *separate axis* from [`MAX_SOURCE_NESTING`] because it bounds a different
+/// cost. That limit exists to stop pest overflowing the stack, and depth is linear in
+/// stack use, so 64 is a fine number for it. Subquery nesting is not linear in anything:
+/// `single_query` offers three alternatives that each re-descend the same input
+/// (`forbidden_query | reading_clause* ~ return_clause | call_clause`) and
+/// `call_subquery` nests a `single_query`, so pest — a PEG with no packrat memoisation —
+/// retries all three at every level. An unclosed chain of `CALL {` costs **3^n**.
+///
+/// Measured on a release build before this guard: n=12 0.32 s, n=13 1.05 s, n=14 3.29 s,
+/// n=15 10.71 s. Seventy-five bytes bought ten seconds of CPU, on the reactor. At 64 the
+/// general nesting cap is not a bound at all here — 3^64 is astronomical — which is why
+/// this one is small rather than a tightening of that one.
+///
+/// **8** leaves the worst admitted case at 3^8 ≈ 6.5k units of backtracking (microseconds,
+/// against ~35 ms measured at n=10) while sitting far above any real query: openCypher
+/// subqueries are written one or two deep, and a hand-written query eight deep would be
+/// unreadable. Raising it is exponentially expensive — 16 would restore ~43M units — so
+/// treat this number as a cost ceiling, not a style preference.
+///
+/// This bounds the *shape* rather than fixing the ambiguity. Factoring the three
+/// `CALL`-prefixed alternatives so they cannot all re-descend is the real repair, and is
+/// grammar surgery on the read path; see HIK-267.
+const MAX_CALL_SUBQUERY_NESTING: usize = 8;
+
 /// Cap on the depth of the **parse tree** ([`check_parse_tree_depth`]), and so on the
 /// recursion depth of the `lower_*` walk over it — the surface that overflows *first*
 /// (a 2 MiB stack aborts at nesting depth ~192 in release, ~48 in debug: the lowering
@@ -800,8 +826,25 @@ fn check_source_nesting(input: &str) -> Result<()> {
     let mut max = 0usize;
     let mut prev_significant = ' '; // last non-space char, to spot `.case` property keys
 
+    // `CALL { … }` subquery nesting, tracked on its own axis (HIK-267 — see
+    // `MAX_CALL_SUBQUERY_NESTING` for why the general `depth` cap cannot hold it).
+    // `pending_call` carries "the last word was CALL" across the whitespace the grammar
+    // allows between the keyword and its brace; `braces` records, per open `{`, whether
+    // it opened a subquery, so the matching `}` knows what to un-count.
+    let mut call_depth = 0usize;
+    let mut max_call = 0usize;
+    let mut pending_call = false;
+    let mut braces: Vec<bool> = Vec::new();
+
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
+        // Only whitespace and the brace itself may sit between `CALL` and `{`; anything
+        // else ends the pairing. Cleared up-front so no arm can forget to, and re-armed
+        // by the word arm below.
+        let opens_subquery = pending_call;
+        if !c.is_whitespace() {
+            pending_call = false;
+        }
         match c {
             // Skip over anything whose contents are not grammar: a bracket inside a
             // string or a comment is just a character.
@@ -841,9 +884,25 @@ fn check_source_nesting(input: &str) -> Result<()> {
                     star = s == '*';
                 }
             }
-            '(' | '[' | '{' => depth += 1,
+            '(' | '[' => depth += 1,
+            '{' => {
+                depth += 1;
+                braces.push(opens_subquery);
+                if opens_subquery {
+                    call_depth += 1;
+                    max_call = max_call.max(call_depth);
+                }
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                // An unbalanced `}` pops nothing — the same "pest's to report" stance as
+                // the saturating depth below.
+                if braces.pop() == Some(true) {
+                    call_depth -= 1;
+                }
+            }
             // Saturating: an unbalanced closer is a syntax error, pest's to report.
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ')' | ']' => depth = depth.saturating_sub(1),
             // A word: consume it whole so `case` only matches the keyword and never a
             // prefix of `casement`, and so a digit run can't be mistaken for one.
             _ if c.is_alphanumeric() || c == '_' => {
@@ -860,6 +919,8 @@ fn check_source_nesting(input: &str) -> Result<()> {
                 if prev_significant != '.' && word.eq_ignore_ascii_case("case") {
                     cases += 1;
                 }
+                // Likewise `n.call` is a property key, not the keyword.
+                pending_call = prev_significant != '.' && word.eq_ignore_ascii_case("call");
             }
             _ => {}
         }
@@ -873,6 +934,16 @@ fn check_source_nesting(input: &str) -> Result<()> {
         return Err(QueryTooDeep {
             depth: max,
             limit: MAX_SOURCE_NESTING,
+            surface: "source",
+        }
+        .into());
+    }
+    // Checked second so the general depth cap keeps reporting first on a query that
+    // trips both — its limit is the one that describes the shape.
+    if max_call > MAX_CALL_SUBQUERY_NESTING {
+        return Err(QueryTooDeep {
+            depth: max_call,
+            limit: MAX_CALL_SUBQUERY_NESTING,
             surface: "source",
         }
         .into());
@@ -6431,6 +6502,52 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a typed QueryTooDeep, got: {err}"));
         assert_eq!(deep.surface, "source");
         assert_eq!(deep.limit, MAX_SOURCE_NESTING);
+    }
+
+    #[test]
+    fn nested_call_subqueries_cannot_blow_the_parse_up_exponentially() {
+        // HIK-267. `single_query` offers three alternatives that each re-descend the same
+        // input (`forbidden_query | reading_clause* ~ return_clause | call_clause`), and
+        // `call_subquery` nests a `single_query` inside `CALL { … }`. pest is a PEG with
+        // no packrat memoisation, so an unclosed chain of `CALL {` makes every level retry
+        // all three: cost is 3^n. Measured before this guard, on a release build:
+        //
+        //     n=12  0.32 s     n=13  1.05 s     n=14  3.29 s     n=15  10.71 s
+        //
+        // i.e. 75 bytes of `"CALL{"` bought ten seconds of CPU — and the parse runs on the
+        // tokio reactor, so it stalls every connection on that thread, not just the
+        // sender's. `MAX_SOURCE_NESTING` (64) is far too loose to hold this: 3^64 is
+        // astronomical. The chain is bounded on its own axis instead.
+        //
+        // The assertion is on *time*, deliberately. Asserting only that the query is
+        // rejected would pass just as well against the unguarded parser, which also
+        // rejects it — eventually. The bug was never the verdict, it was the cost of
+        // reaching it.
+        let chain = "CALL{".repeat(MAX_CALL_SUBQUERY_NESTING + 8);
+        let started = std::time::Instant::now();
+        let err = parse(&chain).expect_err("an unclosed CALL-subquery chain is not a query");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "parsing {} bytes took {elapsed:?} — the exponential backtracking is back",
+            chain.len()
+        );
+        let deep = err
+            .downcast_ref::<QueryTooDeep>()
+            .unwrap_or_else(|| panic!("expected a typed QueryTooDeep, got: {err}"));
+        assert_eq!(deep.surface, "source");
+        assert_eq!(deep.limit, MAX_CALL_SUBQUERY_NESTING);
+
+        // The guard must not cost the legitimate shapes anything: a *well-formed* subquery
+        // chain nested right at the limit still parses, and neither plain brace nesting
+        // nor a `CALL` that is not opening a subquery is affected.
+        let mut ok = "RETURN 1 AS x".to_string();
+        for _ in 0..MAX_CALL_SUBQUERY_NESTING {
+            ok = format!("CALL {{ {ok} }} RETURN x");
+        }
+        parse(&ok).unwrap_or_else(|e| panic!("a valid chain at the limit must parse: {e}"));
+        parse("MATCH (n) RETURN n {.name, .age}").expect("a map projection is not a subquery");
+        parse("CALL db.meta.stats() YIELD label RETURN label").expect("a plain CALL is fine");
     }
 
     #[test]
