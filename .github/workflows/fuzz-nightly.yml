@@ -109,6 +109,7 @@ jobs:
       # target for musl, which the minimal nightly toolchain has no std for.
       - name: Fuzz ${{ matrix.target }}
         run: |
+          set -o pipefail
           # See release.yml: `-malloc_limit_mb` catches a single oversized
           # allocation (the real bug); `-rss_limit_mb` must sit above libFuzzer's
           # own corpus/coverage footprint or it false-positives as an OOM. The
@@ -116,7 +117,32 @@ jobs:
           # 4 GiB total-RSS headroom over the 2 GiB single-allocation guard.
           cargo +nightly fuzz run "${{ matrix.target }}" \
             --target x86_64-unknown-linux-gnu -- \
-            -max_total_time=900 -malloc_limit_mb=2048 -rss_limit_mb=4096 -max_len=65536
+            -max_total_time=900 -malloc_limit_mb=2048 -rss_limit_mb=4096 -max_len=65536 \
+            2>&1 | tee /tmp/fuzz-${{ matrix.target }}.log
+
+          # Assert the run actually FUZZED, rather than spending its whole budget
+          # replaying the seed corpus. libFuzzer prints `#<n> INITED` when the corpus
+          # replay finishes and `#<m> DONE` when it stops; if m == n it never reached a
+          # single mutation. That is not hypothetical: for at least two nights
+          # `parse_statement` reported success with #680 INITED / #680 DONE — 680 execs,
+          # all replay — because one corpus input cost 1.5s to parse. The job stayed
+          # green and the target was doing nothing. It only surfaced when the leg
+          # eventually breached its timeout, by accident.
+          #
+          # A green fuzz job that fuzzed nothing is worse than a red one, so make it red.
+          log=/tmp/fuzz-${{ matrix.target }}.log
+          inited=$(grep -oE '#[0-9]+[[:space:]]+INITED' "$log" | tail -1 | tr -dc '0-9')
+          done_at=$(grep -oE '#[0-9]+[[:space:]]+DONE' "$log" | tail -1 | tr -dc '0-9')
+          echo "corpus replay finished at #${inited:-?}; run ended at #${done_at:-?}"
+          if [ -z "$inited" ] || [ -z "$done_at" ]; then
+            echo "::warning::could not read INITED/DONE from the fuzz log; skipping the progress assertion"
+          elif [ "$done_at" -le "$inited" ]; then
+            echo "::error::${{ matrix.target }} performed no mutations: INITED at #$inited, DONE at #$done_at."
+            echo "The whole -max_total_time went on replaying the seed corpus, so this run"
+            echo "tested nothing new. Usually means an input became pathologically slow to"
+            echo "process — check for 'Slowest unit' above. See HIK-267."
+            exit 1
+          fi
 
       # Minimise to a coverage-equivalent set so the cached corpus stays small and
       # the next run starts fast. continue-on-error: a cmin hiccup (e.g. replaying

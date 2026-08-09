@@ -23,7 +23,11 @@
 //!   resolution, adjacency materialisation and WAL append+fsync are just as blocking):
 //!   they go to the same pool via [`execute_write_off_reactor`], under the
 //!   `server.maxConcurrentWrites` cap that keeps a write flood — serialised behind one
-//!   writer lock per graph — from swallowing the pool that queries share.
+//!   writer lock per graph — from swallowing the pool that queries share. **Parsing**
+//!   goes the same way ([`parse_off_reactor`], `server.maxConcurrentParses`): it is a
+//!   recursive descent over untrusted text reached *before* authorization, so leaving it
+//!   inline meant one sender's query text was paid for by every connection sharing that
+//!   reactor worker. Nothing CPU-bound in a RUN is left on the reactor now.
 //! - **Buffered streaming.** `RUN` executes and buffers the (already `max_rows`-
 //!   bounded) result, replying `SUCCESS {fields}`; the following `PULL` drains the
 //!   buffer as `RECORD`s then a final `SUCCESS {has_more}`. Pull-time `n` is honoured.
@@ -1085,6 +1089,12 @@ pub(crate) struct ConnCtx {
     /// worker nor swamp the blocking pool that query execution runs on. See
     /// [`execute_write_off_reactor`].
     write_limit: Arc<Semaphore>,
+    /// Budget for query **parses** running at once (`server.maxConcurrentParses`). A RUN
+    /// takes a permit before it hands the parse to a blocking thread and holds it until
+    /// the parse finishes, so a query-text flood can neither wedge a reactor worker nor
+    /// swamp the blocking pool. Deliberately far looser than `write_limit`: every query
+    /// parses, so this cap is a backstop, not a scheduler. See [`parse_off_reactor`].
+    parse_limit: Arc<Semaphore>,
     /// Live per-source connection counts (key: /32 for IPv4, /64 for IPv6).
     per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     /// Per-source concurrent-connection cap; 0 = unlimited.

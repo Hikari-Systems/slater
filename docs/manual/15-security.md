@@ -126,6 +126,7 @@ ones:
 | Slow-loris / idle | `server.loginTimeoutMs` / `tlsHandshakeTimeoutMs` / `idleTimeoutMs` | 10000 / 5000 / 0 |
 | Auth abuse | `server.maxConcurrentAuth` / `maxAuthFailures` | 4 / 3 |
 | Write pressure | `server.maxConcurrentWrites` | 4 |
+| Query-text (parse) pressure | `server.maxConcurrentParses` | 32 |
 | Query memory | `query.maxIntermediate` / `maxIntermediateGlobal` | 1M / 8M |
 
 Query-memory bounding is covered in [16 Performance tuning](16-performance-tuning.md);

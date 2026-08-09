@@ -372,6 +372,72 @@ pub(crate) async fn verify_off_reactor(
     })
 }
 
+/// Parse one query **off the reactor**, under a concurrency cap (HIK-267).
+///
+/// Parsing is a pest recursive descent over attacker-supplied text, and it happens
+/// *before* `authorize_statement` — so any principal with read access to any served graph
+/// reaches it. Its cost is bounded per parse by `parser::MAX_PARSE_CALLS`, which is what
+/// turned this from a server-wide outage into one slow query; but bounded is not free,
+/// and inline on `handle_request` even a bounded parse is paid by every connection
+/// multiplexed on that reactor worker, not just the sender's. Execution moved to
+/// `spawn_blocking` long ago and auth followed it (HIK-90) — parsing was the last heavy
+/// work left inline. So, exactly as those two:
+///
+/// * the parse runs on a blocking thread, leaving the reactor free to keep driving other
+///   connections' IO;
+/// * `parse_limit` caps how many parses run **at once**, because `spawn_blocking` alone
+///   would relocate the denial of service rather than fix it: tokio's blocking pool is
+///   512 threads with an unbounded queue, and query *execution* runs on that same pool,
+///   so an uncapped parse flood would starve the thing the parse exists to feed. The cap
+///   is much looser than its write/auth siblings — every query parses — so it is a
+///   backstop, not a scheduler;
+/// * the permit is moved **into** the closure, so it is released when the parse actually
+///   finishes rather than when a hung-up client cancels the await (a cancelled
+///   `spawn_blocking` still runs to completion; releasing early would let the cap be
+///   overrun by clients that disconnect mid-RUN).
+///
+/// The query text **moves** into the closure and is handed back with the result rather
+/// than cloned: `server.maxMessageBytes` defaults to 64 MB and the caller still needs the
+/// text for the result-cache key, so cloning it would answer a CPU-amplification bug with
+/// a memory-amplification one.
+///
+/// The two `Result`s are different kinds of failure and stay separate. The outer one is
+/// *infrastructure* — the semaphore closed at shutdown, or the task died — while the
+/// inner one is the parse error itself, returned unclassified so each call site can keep
+/// applying its own reading of it (a `WriteClauseRejected` means "unsupported shape" on a
+/// writable graph and "this connection is read-only" on a graph without a writer).
+pub(crate) async fn parse_off_reactor<T, F>(
+    ctx: &Arc<ConnCtx>,
+    query: String,
+    parse: F,
+) -> std::result::Result<(String, Result<T>), Failure>
+where
+    F: FnOnce(&str) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = ctx
+        .parse_limit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Failure::new(CODE_EXECUTION, "server is shutting down".into()))?;
+
+    tokio::task::spawn_blocking(move || {
+        // Held until the parse is done, not until the caller stops waiting for it.
+        let _permit = permit;
+        let parsed = parse(&query);
+        (query, parsed)
+    })
+    .await
+    .map_err(|e| {
+        // A panicked/aborted parse is not a syntax verdict, and must not be reported as
+        // one: the query may be perfectly valid. `CODE_EXECUTION` (not `CODE_SYNTAX`) and
+        // wording that says the parse did not finish, rather than that it rejected.
+        warn!(error = %e, "parse task did not complete");
+        Failure::new(CODE_EXECUTION, "the query parse did not complete".into())
+    })
+}
+
 /// Handle one decoded request, returning the messages to send back (in order) or a
 /// `Failure` (which the caller writes and then enters the FAILED state).
 pub(crate) async fn handle_request(
@@ -574,15 +640,19 @@ pub(crate) async fn handle_request(
             })?;
             let param_vals = params_to_vals(&params)?;
             // The writable layer is per-graph and off unless configured; when it is
-            // on, a query may be a write. Parse synchronously so a syntax /
-            // read-only error is classified cleanly.
+            // on, a query may be a write. The parse itself runs off the reactor (see
+            // `parse_off_reactor`), but its *error* is still classified here, where the
+            // writable layer's state is known — that distinction is what the old
+            // "parse synchronously" note was really about.
             let writer = ctx.graphs.writer(&graph);
             // Whether this RUN executed a durable write, for the in-transaction warning
             // below. Only the write arms set it.
             let mut this_run_wrote = false;
             let (columns, rows) = match &writer {
                 Some(w) => {
-                    let stmt = parser::parse_statement(&query).map_err(|e| {
+                    let (query, parsed) =
+                        parse_off_reactor(ctx, query, parser::parse_statement).await?;
+                    let stmt = parsed.map_err(|e| {
                         // The writable layer IS enabled for this graph, so a write-clause
                         // rejection from the write parser means the *shape* is not one the
                         // writable grammar supports — not that the connection is read-only.
@@ -658,7 +728,8 @@ pub(crate) async fn handle_request(
                     }
                 }
                 None => {
-                    let ast = parser::parse(&query).map_err(|e| {
+                    let (query, parsed) = parse_off_reactor(ctx, query, parser::parse).await?;
+                    let ast = parsed.map_err(|e| {
                         // No writer for this graph ⇒ the writable layer is not enabled, so this
                         // connection cannot mutate at all. Reword the write-clause rejection into a
                         // connection-level message — distinct from an ACL write-grant denial

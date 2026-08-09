@@ -37,6 +37,7 @@ the layering); it takes no CLI flags.
 | `server.maxConcurrentAuth` | `4` | Concurrent argon2id verifications. |
 | `server.maxAuthFailures` | `3` | Auth failures per connection before drop. |
 | `server.maxConcurrentWrites` | `4` | Concurrent write statements. |
+| `server.maxConcurrentParses` | `32` | Concurrent query parses; parsing runs off the reactor, on the blocking pool. |
 
 ## `log.*` / `tls.*`
 

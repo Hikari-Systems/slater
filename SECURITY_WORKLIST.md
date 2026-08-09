@@ -457,7 +457,9 @@ this is the ledger.
   `unwrap()` / `expect()` on parsed structure in `crates/slater/src/parser.rs` (e.g. ~361,
   ~1057, ~1083) and `crates/slater/src/bolt/packstream.rs`. These run inside per-connection
   / `spawn_blocking` tasks, so a panic drops *that connection*, not the server — but it is
-  still a sharp edge.
+  still a sharp edge. (Since HIK-267 the Cypher parse is one of the `spawn_blocking` cases
+  literally: a panicking parse now surfaces as a join error the RUN reports as a failed
+  statement, so it costs the *statement* rather than the connection.)
   *In progress (2026-06-12):* a cargo-fuzz harness now exists (`fuzz/`) with three targets —
   the Cypher parser (`parser::parse`), the PackStream value decoder (`packstream::from_slice`),
   and the Bolt chunk-framing decoder (`chunk::decode_message`) — gated on tagged builds by the
@@ -561,6 +563,34 @@ this is the ledger.
   attempts. The timing-equalisation against username enumeration is unchanged. Tests:
   `concurrent_logons_do_not_block_the_reactor`, `concurrent_verifies_are_capped`,
   `unknown_principal_still_pays_for_a_full_verify`, `repeated_bad_logons_close_the_connection`.
+
+- [x] **✅ DONE — Cypher parsing was super-linear and ran on the reactor (query-text DoS).** A
+  ~250-byte query of repeated `CALL` + `{` runs cost **3.8 s** of CPU to parse, 267 bytes cost
+  12 s, 1 KB cost 21 s — 7% more input for 3.2× the work. The grammar's three `CALL`-prefixed
+  alternatives in `reading_clause*` re-descend across *siblings* as well as through nesting, so the
+  cost is exponential in the token run. The `HIK-76` depth guards do not catch it: these inputs are
+  long, not deep. Worse, the parse ran inline on a reactor worker in `handle_request`, so one
+  sender's 250 bytes stalled every connection multiplexed on that thread, and it is reached
+  **before** `authorize_statement` — any principal with read access to any served graph could fire
+  it, on a read-only deployment (`delta.enabled = false`) just as easily as a writable one.
+  *Fixed (HIK-267), in two parts.* **The work is bounded:** `pest::set_call_limit`
+  (`parser::MAX_PARSE_CALLS`, 1M — ~40× the heaviest parse in the suite) caps invocations of every
+  nesting non-terminal, which is exactly the quantity that goes exponential; exceeding it is
+  reported as the typed `QueryTooComplex`, classified on pest's error *variant*, not its message.
+  A first attempt bounded the *shape* instead (a `CALL {…}` nesting cap) and the next fuzz run
+  broke it within hours with `CALL{CALL}` repeated flat — bounding shapes does not converge.
+  Worst case across a 940-input corpus went 7.026 s → 0.0041 s, with nothing above 50 ms.
+  **And the work is off the reactor:** the parse now runs on a blocking thread via
+  `parse_off_reactor`, under `server.maxConcurrentParses` (default 32, held by the parse itself so
+  a client hanging up mid-RUN cannot leak the cap) — because `spawn_blocking` alone would merely
+  relocate the flood into the 512-thread pool that query execution shares. The cap is deliberately
+  looser than its auth/write siblings: every query parses. Tests:
+  `nested_call_subqueries_cannot_blow_the_parse_up_exponentially`,
+  `parses_do_not_block_the_reactor`, `concurrent_parses_are_capped`,
+  `an_abandoned_parse_holds_its_permit_until_it_finishes`.
+  *Related monitoring gap, also closed:* the `parse_statement` fuzz leg had been reporting success
+  for two nights while doing **zero** mutations — its whole budget went on replaying a corpus that
+  contained a 1.5 s input. A leg whose `INITED` and `DONE` exec counts match now fails.
 
 - [x] **✅ DONE — Config / key-location trust boundary.** The MAC's trust root is the master key, and the
   config only *names* where that key is read from (`encryption.keyFile`/`keyEnv`). An attacker
