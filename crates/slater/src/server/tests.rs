@@ -10587,15 +10587,7 @@ fn ambiguous_session_errors_instead_of_silently_serving_the_default() {
 #[tokio::test]
 async fn begin_validates_the_graph_and_remembers_it_for_the_transaction() {
     let ctx = build_multi_ctx("begin_validate");
-    let mut sess = Session {
-        user: Some("reporting".into()),
-        failed: false,
-        pending: None,
-        tx_graph: None,
-        version: (5, 4),
-        auth_failures: 0,
-        login_deadline: None,
-    };
+    let mut sess = authenticated_session("reporting");
     // BEGIN naming an unserved graph fails at BEGIN, before any RUN.
     let bad = message::Request::Begin(PsValue::Map(vec![("db".into(), PsValue::str("eu-ai-act"))]));
     let err = handle_request(&mut sess, &ctx, bad).await.unwrap_err();
@@ -14240,7 +14232,6 @@ fn authenticated_session(user: &str) -> Session {
 #[tokio::test]
 async fn parses_do_not_block_the_reactor() {
     const FLOOD: usize = 8;
-    let (root, ctx) = build_ctx("server_parse_off_reactor");
     let query = wide_projection_query(500);
 
     // Calibrate: what one parse of this query costs. Warm first, so the measurement is
@@ -14255,36 +14246,63 @@ async fn parses_do_not_block_the_reactor() {
          still big enough to measure against?"
     );
 
-    let flood: Vec<_> = (0..FLOOD)
-        .map(|_| {
-            let ctx = ctx.clone();
-            let query = query.clone();
-            tokio::spawn(async move {
-                let mut sess = authenticated_session("reporting");
-                let run = message::Request::Run {
-                    query,
-                    params: PsValue::Map(vec![]),
-                    extra: PsValue::Map(vec![]),
-                };
-                handle_request(&mut sess, &ctx, run).await
+    // Both arms, because they are two call sites and only one of them is on the default
+    // deployment path: a writable graph parses through `parse_statement`, a graph with no
+    // writer through `parse`. Re-inlining either would be a regression, so neither may be
+    // left to the other's coverage.
+    for writable in [false, true] {
+        let (root, ctx) = build_ctx_limited(
+            &format!("server_parse_off_reactor_{writable}"),
+            TestLimits {
+                writable,
+                ..Default::default()
+            },
+        );
+        let permits = ctx.parse_limit.available_permits();
+
+        let flood: Vec<_> = (0..FLOOD)
+            .map(|_| {
+                let ctx = ctx.clone();
+                let query = query.clone();
+                tokio::spawn(async move {
+                    let mut sess = authenticated_session("reporting");
+                    let run = message::Request::Run {
+                        query,
+                        params: PsValue::Map(vec![]),
+                        extra: PsValue::Map(vec![]),
+                    };
+                    handle_request(&mut sess, &ctx, run).await
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    let t0 = Instant::now();
-    tokio::task::yield_now().await;
-    let reactor_stall = t0.elapsed();
-    assert!(
-        reactor_stall < one_parse,
-        "the reactor was held for {reactor_stall:?} while {FLOOD} queries parsed (one parse \
-         = {one_parse:?}) — parsing is running on a reactor worker"
-    );
+        let t0 = Instant::now();
+        tokio::task::yield_now().await;
+        let reactor_stall = t0.elapsed();
+        assert!(
+            reactor_stall < one_parse,
+            "(writable={writable}) the reactor was held for {reactor_stall:?} while {FLOOD} \
+             queries parsed (one parse = {one_parse:?}) — parsing is running on a reactor worker"
+        );
+        // Timing alone cannot tell "the parse moved to a blocking thread" from "something
+        // yielded before the parse", which would leave the bug in place and the assertion
+        // above green. The permits pin the mechanism: every flooded query is holding one
+        // right now, so the parse it is doing is provably the off-reactor one.
+        assert_eq!(
+            ctx.parse_limit.available_permits(),
+            permits - FLOOD,
+            "(writable={writable}) every flooded query should be holding a parse permit \
+             while it parses"
+        );
 
-    // …and every query still parsed and ran: this is not a fast path that skipped the work.
-    for t in flood {
-        t.await.unwrap().expect("every flooded RUN should succeed");
+        // …and every query still parsed and ran: this is not a fast path that skipped the
+        // work, and the permits all came back.
+        for t in flood {
+            t.await.unwrap().expect("every flooded RUN should succeed");
+        }
+        assert_eq!(ctx.parse_limit.available_permits(), permits);
+        let _ = std::fs::remove_dir_all(&root);
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A ctx with an explicit `maxConcurrentParses` cap — the harness for the parse-gate
