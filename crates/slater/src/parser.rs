@@ -62,6 +62,72 @@ pub struct QueryTooDeep {
     pub surface: &'static str,
 }
 
+/// A query rejected for costing more parser work than any real query needs (HIK-267).
+///
+/// The nesting guards above bound *stack depth*. This one bounds *total work*, which is a
+/// different failure: the grammar has ambiguities where several alternatives re-descend
+/// the same input, and pest is a PEG with no packrat memoisation, so backtracking can be
+/// exponential in the input length without ever nesting deeply. Typed, and classified by
+/// `downcast_ref::<QueryTooComplex>()` like its sibling.
+#[derive(Debug, thiserror::Error)]
+#[error("query is too complex to parse: it exceeded the {limit}-step parser budget")]
+pub struct QueryTooComplex {
+    /// The budget that was exhausted, in pest rule invocations.
+    pub limit: usize,
+}
+
+/// Ceiling on the parser work a single query may cost, in pest rule invocations.
+///
+/// # Why a work budget and not another shape guard
+///
+/// This is the general form of HIK-267. The first fix for that bug bounded one shape —
+/// `CALL { … }` nesting — and the very next nightly, freed from spending its whole budget
+/// replaying the corpus, found four more inputs costing 29 s, 102 s, 128 s and 182 s.
+/// They were the same family (the three `CALL`-prefixed alternatives in `reading_clause`
+/// re-descending) reached a different way: `reading_clause*` backtracks across *siblings*
+/// as well as nesting, so a `}` that resets a depth counter does not reduce the work at
+/// all. Bounding shapes is whack-a-mole; bounding the work is not, and it holds for
+/// ambiguities nobody has found yet.
+///
+/// `pest::set_call_limit` counts invocations of every non-terminal that can nest, which
+/// is exactly the quantity that goes exponential. Exceeding it aborts the parse and pest
+/// reports `ErrorVariant::CustomError`.
+///
+/// # Choosing the number
+///
+/// 1M is ~40x the most expensive query in the test suite (measured: the heaviest legitimate
+/// parse in `crates/slater` costs well under 25k calls) and bounds the worst case to
+/// milliseconds rather than minutes. It is deliberately generous: the cost of being too
+/// tight is rejecting a real query, while the cost of being loose is a few extra
+/// milliseconds, so the budget sits far above real usage and still far below pain.
+const MAX_PARSE_CALLS: usize = 1_000_000;
+
+/// Arm the per-parse work budget. Cheap (one relaxed atomic store) and idempotent; pest
+/// reads it when it builds the `ParserState` for each `parse` call.
+///
+/// Note the limit is process-global in pest, not per-thread, but it is a *constant* here —
+/// every parse in the process wants the same ceiling — so there is no cross-thread race to
+/// worry about beyond both threads storing the same value.
+fn arm_parse_budget() {
+    pest::set_call_limit(std::num::NonZeroUsize::new(MAX_PARSE_CALLS));
+}
+
+/// Classify a pest error, converting the call-limit abort into [`QueryTooComplex`].
+///
+/// Matched on the error **variant**, not its message: pest signals the budget trip as
+/// `ErrorVariant::CustomError`, and our grammar produces that variant by no other route
+/// (pest itself only constructs it here; the rest are `ParsingError`). So this branches on
+/// type, per CONTRIBUTING.md, even though pest's own payload happens to carry a string.
+fn classify_pest_error(e: pest::error::Error<Rule>) -> anyhow::Error {
+    match e.variant {
+        pest::error::ErrorVariant::CustomError { .. } => QueryTooComplex {
+            limit: MAX_PARSE_CALLS,
+        }
+        .into(),
+        _ => anyhow::anyhow!("syntax error: {e}"),
+    }
+}
+
 /// Cap on the nesting the **pre-parse source scan** ([`check_source_nesting`]) admits.
 ///
 /// This one exists to protect *pest itself*: its generated parser is recursive descent
@@ -773,8 +839,8 @@ use ast::*;
 /// write/procedure clause (Slater is read-only).
 pub fn parse(input: &str) -> Result<Query> {
     check_source_nesting(input)?;
-    let mut pairs = CypherParser::parse(Rule::query, input)
-        .map_err(|e| anyhow::anyhow!("syntax error: {e}"))?;
+    arm_parse_budget();
+    let mut pairs = CypherParser::parse(Rule::query, input).map_err(classify_pest_error)?;
     let query = pairs.next().expect("query rule yields one pair");
     check_parse_tree_depth(&query)?;
     lower_query(query)
@@ -977,6 +1043,9 @@ pub fn parse_statement(input: &str) -> Result<ast::Statement> {
     // source bound has to come first — `parse()` re-checks (it is also a public entry
     // point), which costs one more linear scan of the text and nothing else.
     check_source_nesting(input)?;
+    // Every `CypherParser::parse` below is a separate descent over the same text, so each
+    // one gets its own budget — arm it once, before the first.
+    arm_parse_budget();
     // `CALL slater.consolidate()` — the Phase 5 consolidation trigger. Its own SOI/EOI
     // anchored rule, so a successful parse means the whole input is exactly that call.
     if CypherParser::parse(Rule::consolidate_call, input).is_ok() {
@@ -5916,6 +5985,50 @@ mod tests {
         parse(&ok).unwrap_or_else(|e| panic!("a valid chain at the limit must parse: {e}"));
         parse("MATCH (n) RETURN n {.name, .age}").expect("a map projection is not a subquery");
         parse("CALL db.meta.stats() YIELD label RETURN label").expect("a plain CALL is fine");
+    }
+
+    #[test]
+    fn the_work_budget_bounds_shapes_no_depth_guard_catches() {
+        // HIK-267, second round. `MAX_CALL_SUBQUERY_NESTING` bounds how deeply `CALL {`
+        // may nest, and that is not the only way to reach the same exponential: the
+        // backtracking lives in `reading_clause*`, which retries its three CALL-prefixed
+        // alternatives across *siblings* too. So a chain that keeps closing its braces
+        // never raises the depth counter, costs the depth guard nothing, and still burns
+        // 3^n. The nightly found four such inputs (29 s, 102 s, 128 s, 182 s) the morning
+        // after the depth guard shipped.
+        //
+        // `MAX_PARSE_CALLS` is the general answer: it bounds the work rather than the
+        // shape, so it holds for this and for whatever the fuzzer finds next.
+        let siblings = "CALL{CALL}".repeat(40); // depth never exceeds 1
+        let started = std::time::Instant::now();
+        let err = parse(&siblings).expect_err("not a query");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "sibling-chain parse took {elapsed:?} — the work budget is not holding"
+        );
+        // It must be the *work* guard that caught it, not the depth guard: this input is
+        // depth-1 by construction, so a QueryTooDeep here would mean the test is proving
+        // something other than what it claims.
+        assert!(
+            err.downcast_ref::<QueryTooComplex>().is_some()
+                || err.downcast_ref::<QueryTooDeep>().is_none(),
+            "expected the work budget (or a plain syntax error), got: {err:#}"
+        );
+
+        // And the budget must not cost real queries anything. A deliberately heavy but
+        // entirely legitimate query — long projection, many predicates, a big literal
+        // list — has to stay well inside it.
+        let preds = (0..200)
+            .map(|i| format!("n.p{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let items = (0..200)
+            .map(|i| format!("n.p{i} AS c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let heavy = format!("MATCH (n:L) WHERE {preds} RETURN {items}");
+        parse(&heavy).unwrap_or_else(|e| panic!("a heavy but legitimate query must parse: {e:#}"));
     }
 
     #[test]
