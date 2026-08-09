@@ -10183,6 +10183,7 @@ fn build_writable_ctx_caps(
         auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
         max_auth_failures: 3,
         write_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
+        parse_limit: Arc::new(Semaphore::new(semaphore_permits(32))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: 0,
         diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -10321,6 +10322,7 @@ struct TestLimits {
     max_concurrent_auth: usize,
     max_auth_failures: usize,
     max_concurrent_writes: usize,
+    max_concurrent_parses: usize,
     /// Turn the writable layer on for the fixture graph (WAL under `<root>/_wal`), so
     /// the ctx has a `DeltaWriter` and the RUN write arms are reachable.
     writable: bool,
@@ -10343,6 +10345,7 @@ impl Default for TestLimits {
             max_concurrent_auth: 4,       // as in prod
             max_auth_failures: 3,         // as in prod
             max_concurrent_writes: 4,     // as in prod
+            max_concurrent_parses: 32,    // as in prod
             writable: false,              // read-only unless a test asks for writes
             load_test_diagnostics: false, // diagnostics off by default, as in prod
             acl_json: None,               // the single-user fixture ACL
@@ -10417,6 +10420,9 @@ fn build_ctx_limited(tag: &str, limits: TestLimits) -> (std::path::PathBuf, Arc<
         max_auth_failures: limits.max_auth_failures,
         write_limit: Arc::new(Semaphore::new(semaphore_permits(
             limits.max_concurrent_writes,
+        ))),
+        parse_limit: Arc::new(Semaphore::new(semaphore_permits(
+            limits.max_concurrent_parses,
         ))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: limits.max_per_ip,
@@ -10516,6 +10522,7 @@ fn build_multi_ctx(tag: &str) -> Arc<ConnCtx> {
         auth_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
         max_auth_failures: 3,
         write_limit: Arc::new(Semaphore::new(semaphore_permits(4))),
+        parse_limit: Arc::new(Semaphore::new(semaphore_permits(32))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: 0,
         diag: Arc::new(crate::diag::Diagnostics::new(false)),
@@ -14184,4 +14191,187 @@ fn a_node_delete_must_not_double_subtract_an_edge_a_flush_already_removed() {
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// A large but entirely *legitimate* query, sized so one parse costs measurable wall
+/// time — a projection chain, not one of the ticket's pathological `CALL` runs. Those
+/// are the wrong instrument now: `MAX_PARSE_CALLS` bounds them to a few milliseconds,
+/// which is too tight to assert on without flake, and they would test the work budget
+/// (already fixed) rather than where the parse runs. An ordinary big query stalls the
+/// reactor for just as long, which is the point.
+fn wide_projection_query(clauses: usize) -> String {
+    let chain: Vec<String> = (0..clauses)
+        .map(|i| format!("WITH n, {i} AS k{i}"))
+        .collect();
+    format!("MATCH (n:Person) {} RETURN n", chain.join(" "))
+}
+
+/// A session already past LOGON, as every RUN in these tests needs.
+fn authenticated_session(user: &str) -> Session {
+    Session {
+        user: Some(user.into()),
+        failed: false,
+        pending: None,
+        tx_graph: None,
+        version: (5, 4),
+        auth_failures: 0,
+        login_deadline: None,
+    }
+}
+
+/// HIK-267 regression: parsing must not run on the reactor.
+///
+/// Same instrument as [`writes_do_not_block_the_reactor`] (HIK-87), because it is the
+/// same bug class and parsing is the last heavy work left inline in `handle_request`.
+/// `#[tokio::test]` is a **current-thread** runtime — the one place a blocked reactor is
+/// directly observable — and a single `yield_now()` gives every ready task exactly one
+/// poll. If the parses run inline (the bug), that one trip through the scheduler costs
+/// FLOOD × one parse, and every other connection multiplexed on that worker waits out
+/// all of it. Handed to a blocking thread, each poll parks at the join handle and the
+/// reactor comes straight back.
+///
+/// This drives the **read-only** arm (`parser::parse`, no writable layer) deliberately:
+/// `delta.enabled = false` is the default deployment and is hit exactly as hard, so a
+/// fix that only covered the write arm would fix nothing for most installs.
+///
+/// The bound is calibrated against a parse measured on this box and build profile, not a
+/// hard-coded millisecond, so it neither flakes on a slow machine nor passes vacuously
+/// on a fast one.
+#[tokio::test]
+async fn parses_do_not_block_the_reactor() {
+    const FLOOD: usize = 8;
+    let (root, ctx) = build_ctx("server_parse_off_reactor");
+    let query = wide_projection_query(500);
+
+    // Calibrate: what one parse of this query costs. Warm first, so the measurement is
+    // not paying for anything the process only initialises once.
+    parser::parse(&query).expect("the calibration query must be legitimate Cypher");
+    let t0 = Instant::now();
+    parser::parse(&query).unwrap();
+    let one_parse = t0.elapsed();
+    assert!(
+        one_parse >= Duration::from_millis(1),
+        "the calibration query should cost real parse time; measured {one_parse:?} — is it \
+         still big enough to measure against?"
+    );
+
+    let flood: Vec<_> = (0..FLOOD)
+        .map(|_| {
+            let ctx = ctx.clone();
+            let query = query.clone();
+            tokio::spawn(async move {
+                let mut sess = authenticated_session("reporting");
+                let run = message::Request::Run {
+                    query,
+                    params: PsValue::Map(vec![]),
+                    extra: PsValue::Map(vec![]),
+                };
+                handle_request(&mut sess, &ctx, run).await
+            })
+        })
+        .collect();
+
+    let t0 = Instant::now();
+    tokio::task::yield_now().await;
+    let reactor_stall = t0.elapsed();
+    assert!(
+        reactor_stall < one_parse,
+        "the reactor was held for {reactor_stall:?} while {FLOOD} queries parsed (one parse \
+         = {one_parse:?}) — parsing is running on a reactor worker"
+    );
+
+    // …and every query still parsed and ran: this is not a fast path that skipped the work.
+    for t in flood {
+        t.await.unwrap().expect("every flooded RUN should succeed");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A ctx with an explicit `maxConcurrentParses` cap — the harness for the parse-gate
+/// tests.
+fn build_gated_parse_ctx(tag: &str, max_concurrent_parses: usize) -> (PathBuf, Arc<ConnCtx>) {
+    build_ctx_limited(
+        tag,
+        TestLimits {
+            max_concurrent_parses,
+            ..Default::default()
+        },
+    )
+}
+
+/// The cap is what stops the fix from simply *moving* the denial of service into tokio's
+/// 512-thread blocking pool — the pool query execution runs on. An uncapped
+/// `spawn_blocking` per RUN would hand that pool an unbounded queue of CPU-bound parses,
+/// and reads would starve behind them.
+///
+/// While a flood is in flight no permit is left; once it drains every permit is back, and
+/// every query still parsed.
+#[tokio::test]
+async fn concurrent_parses_are_capped() {
+    const FLOOD: usize = 6;
+    const CAP: usize = 2;
+    let (root, ctx) = build_gated_parse_ctx("server_parses_capped", CAP);
+    assert_eq!(ctx.parse_limit.available_permits(), CAP);
+    let query = wide_projection_query(500);
+
+    let flood: Vec<_> = (0..FLOOD)
+        .map(|_| {
+            let ctx = ctx.clone();
+            let query = query.clone();
+            tokio::spawn(async move { parse_off_reactor(&ctx, query, parser::parse).await })
+        })
+        .collect();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        ctx.parse_limit.available_permits(),
+        0,
+        "every parse permit should be in use while a flood is queued"
+    );
+
+    for t in flood {
+        let (_query, parsed) = t.await.unwrap().expect("the parse task should complete");
+        parsed.expect("every capped parse should still succeed");
+    }
+    // The cap is fully released once the flood drains — the permit lives with the parse,
+    // not with the caller — and no query was lost to the gate.
+    assert_eq!(ctx.parse_limit.available_permits(), CAP);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `spawn_blocking` task cannot be cancelled: if the client hangs up mid-RUN, the await
+/// on the join handle is dropped but the parse runs to completion on its thread anyway.
+///
+/// So the permit is moved *into* the closure. Held in the async frame instead, it would be
+/// released the instant the caller was cancelled while the parse still burned CPU — and a
+/// flood of clients that disconnect immediately after RUN could overrun the cap at will,
+/// which is exactly the blocking-pool starvation the cap exists to prevent.
+#[tokio::test]
+async fn an_abandoned_parse_holds_its_permit_until_it_finishes() {
+    const CAP: usize = 2;
+    let (root, ctx) = build_gated_parse_ctx("server_parse_abandoned", CAP);
+    let query = wide_projection_query(500);
+
+    let task = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { parse_off_reactor(&ctx, query, parser::parse).await })
+    };
+    // One poll: the permit is taken and the parse is handed to the blocking pool.
+    tokio::task::yield_now().await;
+    assert_eq!(ctx.parse_limit.available_permits(), CAP - 1);
+
+    // The client hangs up: the caller is cancelled, the parse is not.
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        ctx.parse_limit.available_permits(),
+        CAP - 1,
+        "an abandoned parse must keep its permit while it is still running — releasing it \
+         at cancellation lets a hung-up client overrun the cap"
+    );
+
+    // It runs to completion, and only then is the permit released.
+    while ctx.parse_limit.available_permits() < CAP {
+        tokio::task::yield_now().await;
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -313,6 +313,9 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         write_limit: Arc::new(Semaphore::new(semaphore_permits(
             cfg.server.max_concurrent_writes,
         ))),
+        parse_limit: Arc::new(Semaphore::new(semaphore_permits(
+            cfg.server.max_concurrent_parses,
+        ))),
         per_ip: Arc::new(Mutex::new(HashMap::new())),
         max_per_ip: cfg.server.max_connections_per_ip,
         diag: Arc::new(crate::diag::Diagnostics::new(cfg.load_test_diagnostics)),
@@ -353,6 +356,7 @@ pub async fn serve_with_listener(cfg: AppConfig, listener: TcpListener) -> Resul
         max_concurrent_auth = cfg.server.max_concurrent_auth,
         max_auth_failures = cfg.server.max_auth_failures,
         max_concurrent_writes = cfg.server.max_concurrent_writes,
+        max_concurrent_parses = cfg.server.max_concurrent_parses,
         login_timeout_ms = cfg.server.login_timeout_ms,
         tls_handshake_timeout_ms = cfg.server.tls_handshake_timeout_ms,
         "slater Bolt listener ready"

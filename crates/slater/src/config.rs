@@ -320,6 +320,24 @@ pub struct ServerConfig {
         deserialize_with = "de::usize"
     )]
     pub max_concurrent_writes: usize,
+    /// Cap on query **parses** running at once. Parsing is the last CPU-bound step of a
+    /// RUN still measured in real time (a pest recursive descent, bounded per parse by
+    /// `parser::MAX_PARSE_CALLS`), and it happens *before* authorization — so it runs on
+    /// a blocking thread, never on a reactor worker, and this caps how much of the
+    /// blocking pool a parse flood may hold, leaving room for the query execution that
+    /// runs on the same pool.
+    ///
+    /// Larger than its `maxConcurrentAuth` / `maxConcurrentWrites` siblings on purpose,
+    /// and not by taste: those gate work that is rare and individually expensive, while
+    /// **every** query parses, in microseconds. A cap of 4 would make parsing the first
+    /// hard ceiling on read throughput — a self-inflicted regression far likelier to be
+    /// met than the flood it defends against. 0 = unlimited (do not: an uncapped parse
+    /// flood fills the blocking pool and execution starves behind it).
+    #[serde(
+        default = "default_max_concurrent_parses",
+        deserialize_with = "de::usize"
+    )]
+    pub max_concurrent_parses: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -845,6 +863,9 @@ fn default_max_auth_failures() -> usize {
 }
 fn default_max_concurrent_writes() -> usize {
     4 // enough to pipeline key resolution against the writer lock, far below the pool
+}
+fn default_max_concurrent_parses() -> usize {
+    32 // every query parses (in µs), so this must not throttle; still a slice of the pool
 }
 fn default_log_level() -> String {
     // `info` already surfaces the per-query `query executed` timing summary (the
@@ -1498,6 +1519,20 @@ mod tests {
             "unbounded by default would starve the blocking pool that reads share"
         );
         assert!(cfg.max_concurrent_writes < cfg.max_blocking_threads.max(512));
+        // Parsing is bounded by default for the same reason — it runs on that pool too
+        // (HIK-267) — but with a far looser cap, because *every* query parses and a tight
+        // one would throttle ordinary reads rather than defend them.
+        assert_eq!(cfg.max_concurrent_parses, 32);
+        assert!(
+            cfg.max_concurrent_parses > 0,
+            "unbounded by default would starve the blocking pool that reads share"
+        );
+        assert!(cfg.max_concurrent_parses < cfg.max_blocking_threads.max(512));
+        assert!(
+            cfg.max_concurrent_parses > cfg.max_concurrent_writes,
+            "a per-query cap must be looser than a per-write one, or parsing becomes the \
+             first ceiling on read throughput"
+        );
         // The TLS handshake is bounded by default and *more* tightly than the login
         // window it sits inside: a peer stalled mid-ClientHello holds a connection slot
         // while being invisible to every guard behind the handshake, so it must not be
@@ -1526,6 +1561,7 @@ mod tests {
             "maxConcurrentAuth": 2,
             "maxAuthFailures": 5,
             "maxConcurrentWrites": 3,
+            "maxConcurrentParses": 12,
         }))
         .unwrap();
         let from_str: ServerConfig = serde_json::from_value(serde_json::json!({
@@ -1540,6 +1576,7 @@ mod tests {
             "maxConcurrentAuth": "2",
             "maxAuthFailures": "5",
             "maxConcurrentWrites": "3",
+            "maxConcurrentParses": "12",
         }))
         .unwrap();
         for cfg in [&from_num, &from_str] {
@@ -1554,6 +1591,7 @@ mod tests {
             assert_eq!(cfg.max_concurrent_auth, 2);
             assert_eq!(cfg.max_auth_failures, 5);
             assert_eq!(cfg.max_concurrent_writes, 3);
+            assert_eq!(cfg.max_concurrent_parses, 12);
         }
     }
 }
