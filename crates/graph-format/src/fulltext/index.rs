@@ -140,49 +140,109 @@ pub struct Chunk {
 /// `cipher_for` is handed each file's store-relative name so the caller binds the
 /// generation cipher exactly as it does for every other file (HIK-140 requires the name
 /// to be byte-identical on the writing and reading sides — see [`FulltextReader::open`]).
-pub fn write_fulltext_index<D, P>(
+/// The store-relative names of an index's four files, in [`SUFFIXES`] order.
+pub fn file_names(rel_stem: &str) -> Vec<String> {
+    SUFFIXES.iter().map(|s| format!("{rel_stem}{s}")).collect()
+}
+
+/// Streaming writer for `.docs.blk`, whose record index **is** the docid.
+///
+/// Split out from [`write_fulltext_index`] because the builder can avoid ever holding a
+/// docid map: its node emit already runs in ascending final-id order, so pushing
+/// documents as it goes hands back exactly the dense, ascending docids the postings need.
+/// Materialising `entity id -> docid` instead would be a resident map over every indexed
+/// entity, which is the one structure a build of this shape has no reason to pay for.
+pub struct DocWriter {
+    w: BlockFileWriter,
+    count: u64,
+    total_len: u128,
+    rec: Vec<u8>,
+}
+
+impl DocWriter {
+    pub fn create(
+        dir: &Path,
+        rel_stem: &str,
+        block_bytes: usize,
+        zstd_level: i32,
+        cipher_for: &dyn Fn(&str) -> Option<Arc<FileCipher>>,
+    ) -> Result<Self> {
+        let names = file_names(rel_stem);
+        if let Some(parent) = dir.join(&names[0]).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        Ok(Self {
+            w: BlockFileWriter::create_with_cipher(
+                dir.join(&names[3]),
+                block_bytes,
+                zstd_level,
+                cipher_for(&names[3]),
+            )?,
+            count: 0,
+            total_len: 0,
+            rec: Vec::new(),
+        })
+    }
+
+    /// Append a document and return its docid. Callers **must** push in ascending entity
+    /// order: the postings they emit alongside are sorted on this docid, and an
+    /// out-of-order push would make those postings non-ascending, which
+    /// [`write_fulltext_postings`] then refuses.
+    pub fn push(&mut self, d: &DocEntry) -> Result<u64> {
+        self.rec.clear();
+        write_uvarint(&mut self.rec, d.entity);
+        write_uvarint(&mut self.rec, d.len as u64);
+        if let Some((s, e, t)) = d.endpoints {
+            write_uvarint(&mut self.rec, s);
+            write_uvarint(&mut self.rec, e);
+            write_uvarint(&mut self.rec, t as u64);
+        }
+        self.w.append_record(&self.rec)?;
+        let docid = self.count;
+        self.count += 1;
+        self.total_len += d.len as u128;
+        Ok(docid)
+    }
+
+    /// Documents written so far — the next docid [`push`](Self::push) would hand out.
+    pub fn doc_count(&self) -> u64 {
+        self.count
+    }
+
+    /// Close the file, returning `(doc_count, avg_doc_len)` for the manifest descriptor.
+    pub fn finish(self) -> Result<(u64, f32)> {
+        let count = self.count;
+        let total = self.total_len;
+        self.w.finish()?;
+        Ok((
+            count,
+            if count == 0 {
+                0.0
+            } else {
+                (total as f64 / count as f64) as f32
+            },
+        ))
+    }
+}
+
+/// Write the three term-side files (`.ftd`, `.ftm.blk`, `.post.blk`) from a posting
+/// stream ascending by `(term, field, doc)`. `.docs.blk` is [`DocWriter`]'s job.
+pub fn write_fulltext_postings<P>(
     dir: &Path,
     rel_stem: &str,
-    docs: D,
     postings: P,
     block_bytes: usize,
     zstd_level: i32,
     cipher_for: &dyn Fn(&str) -> Option<Arc<FileCipher>>,
-) -> Result<FulltextBuildStats>
+) -> Result<()>
 where
-    D: IntoIterator<Item = Result<DocEntry>>,
     P: IntoIterator<Item = Result<Posting>>,
 {
-    let names: Vec<String> = SUFFIXES.iter().map(|s| format!("{rel_stem}{s}")).collect();
+    let names = file_names(rel_stem);
     if let Some(parent) = dir.join(&names[0]).parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-
-    // ── .docs.blk — record index is the docid ──
-    let mut doc_w = BlockFileWriter::create_with_cipher(
-        dir.join(&names[3]),
-        block_bytes,
-        zstd_level,
-        cipher_for(&names[3]),
-    )?;
-    let mut doc_count = 0u64;
-    let mut total_len = 0u128;
-    let mut rec = Vec::new();
-    for d in docs {
-        let d = d?;
-        rec.clear();
-        write_uvarint(&mut rec, d.entity);
-        write_uvarint(&mut rec, d.len as u64);
-        if let Some((s, e, t)) = d.endpoints {
-            write_uvarint(&mut rec, s);
-            write_uvarint(&mut rec, e);
-            write_uvarint(&mut rec, t as u64);
-        }
-        doc_w.append_record(&rec)?;
-        doc_count += 1;
-        total_len += d.len as u128;
-    }
-    doc_w.finish()?;
 
     // ── .post.blk + .ftm.blk, driven by one pass over the sorted postings ──
     //
@@ -281,14 +341,36 @@ where
         cipher_for(&names[0]),
     )?;
 
+    Ok(())
+}
+
+/// Write a whole index in one call — [`DocWriter`] then [`write_fulltext_postings`].
+///
+/// Convenient when the documents are already in hand; the builder uses the two halves
+/// directly so it never materialises them.
+pub fn write_fulltext_index<D, P>(
+    dir: &Path,
+    rel_stem: &str,
+    docs: D,
+    postings: P,
+    block_bytes: usize,
+    zstd_level: i32,
+    cipher_for: &dyn Fn(&str) -> Option<Arc<FileCipher>>,
+) -> Result<FulltextBuildStats>
+where
+    D: IntoIterator<Item = Result<DocEntry>>,
+    P: IntoIterator<Item = Result<Posting>>,
+{
+    let mut dw = DocWriter::create(dir, rel_stem, block_bytes, zstd_level, cipher_for)?;
+    for d in docs {
+        dw.push(&d?)?;
+    }
+    let (doc_count, avg_doc_len) = dw.finish()?;
+    write_fulltext_postings(dir, rel_stem, postings, block_bytes, zstd_level, cipher_for)?;
     Ok(FulltextBuildStats {
         doc_count,
-        avg_doc_len: if doc_count == 0 {
-            0.0
-        } else {
-            (total_len as f64 / doc_count as f64) as f32
-        },
-        files: names,
+        avg_doc_len,
+        files: file_names(rel_stem),
     })
 }
 

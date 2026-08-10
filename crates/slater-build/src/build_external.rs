@@ -24,6 +24,10 @@ use graph_format::blockfile::{concat_block_files, BlockFileReader, BlockFileWrit
 use graph_format::columns::PropsWriter;
 use graph_format::crypto::{file_cipher, BlockCipher, FileCipher};
 use graph_format::extsort::{ExtSorter, SortRecord};
+use graph_format::fulltext::index::{
+    file_names as ft_file_names, write_fulltext_postings, DocEntry, DocWriter, Posting,
+};
+use graph_format::fulltext::Analyzer;
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
 use graph_format::manifest::{EntityKind, FulltextIndexDesc, RangeIndexDesc};
@@ -1623,6 +1627,47 @@ fn build_inner(
     // regardless of `--max-memory`. The sorters are reserved here, *before* the
     // node-store sorter below grabs `mem.available()`, and drained by
     // `write_vector_indexes` after the scan; they mirror the range-sorter discipline.
+    // Full-text plumbing, mirroring the vector sorters above: one budgeted `ExtSorter`
+    // per declared index, reserved before the node-store sorter takes what is left, and
+    // drained after the scan. A `summary` over tens of millions of nodes is the same
+    // shape of problem a dim-768 embedding is, and gets the same answer.
+    //
+    // `.docs.blk` needs no sorter at all. The node emit below already runs in ascending
+    // final-id order on both its paths, so documents are pushed as they are met and the
+    // docids come back dense and ascending — no `entity id -> docid` map is ever built.
+    let mut fulltext_files: Vec<String> = Vec::new();
+    let mut ft_specs: Vec<FulltextSpec> = Vec::new();
+    let mut ft_state: Vec<FulltextState> = Vec::new();
+    let ft_node: Vec<&FulltextIndexStmt> = fulltext_stmts
+        .iter()
+        .filter(|f| f.entity == Entity::Node)
+        .collect();
+    let ft_want = if ft_node.is_empty() {
+        0
+    } else {
+        (mem.total() / 8 / ft_node.len()).max(FULLTEXT_SORT_FLOOR)
+    };
+    for fi in &ft_node {
+        let stem = format!("fulltext/node_{}", fi.label_or_type);
+        ft_specs.push(FulltextSpec {
+            idx: ft_state.len(),
+            label_id: labels.get(&fi.label_or_type),
+            key_ids: fi.properties.iter().map(|p| keys.get(p)).collect(),
+            analyzer: Analyzer::new(&fi.stopwords),
+        });
+        ft_state.push(FulltextState {
+            docs: DocWriter::create(tmp_dir, &stem, opts.block_size, opts.zstd_level, &|name| {
+                file_cipher(&cipher, name)
+            })?,
+            stem,
+            sorter: ExtSorter::<FulltextEntry>::new(
+                scratch_dir,
+                mem.reserve_now("full-text sorter", ft_want, FULLTEXT_SORT_FLOOR)?,
+                opts.zstd_level,
+            )?,
+        });
+    }
+
     let mut vec_specs: Vec<(usize, Option<u32>, String, u32)> = Vec::new();
     let mut pending: Vec<PendingIndex> = Vec::new();
     let mut vector_sorters: Vec<ExtSorter<PendingVector>> = Vec::new();
@@ -1720,6 +1765,13 @@ fn build_inner(
             props_w.append_raw(&node.props_blob)?;
             emit_node_ranges(&node, prov, &mut range_sorters)?;
             gather_node_vectors(&node, prov, &vec_specs, &mut pending, &mut vector_sorters)?;
+            gather_node_fulltext(
+                &node.labels_blob,
+                &node.props_blob,
+                prov,
+                &ft_specs,
+                &mut ft_state,
+            )?;
             Ok(())
         })?;
         // MERGE-created overlay nodes follow at prov = base_node_count + i (= final id
@@ -1737,6 +1789,13 @@ fn build_inner(
                     &vec_specs,
                     &mut pending,
                     &mut vector_sorters,
+                )?;
+                gather_node_fulltext(
+                    &cnode.labels_blob,
+                    &cnode.props_blob,
+                    final_id,
+                    &ft_specs,
+                    &mut ft_state,
                 )?;
             }
         }
@@ -1794,6 +1853,17 @@ fn build_inner(
             let ne = r?;
             labels_w.append_blob(&ne.labels_blob)?;
             props_w.append_raw(&ne.props_blob)?;
+            // Full text is gathered *here*, not in the scan above: this is the only point
+            // on the clustered path where nodes are seen in ascending final-id order, and
+            // a docid is a rank in that order. Gathering during the scan would hand out
+            // docids in provisional order and the postings would not be ascending.
+            gather_node_fulltext(
+                &ne.labels_blob,
+                &ne.props_blob,
+                ne.final_id,
+                &ft_specs,
+                &mut ft_state,
+            )?;
             written += 1;
             diag.tick(written);
         }
@@ -2259,12 +2329,40 @@ fn build_inner(
     }
     drop(emit_range_g);
 
-    // --- full-text index declarations ---
+    // --- full-text indexes: drain the sorters and write the term-side files ---
     //
-    // Declaration only at this stage: the four `fulltext/` files are written by a later
-    // commit on this branch, so `doc_count`/`avg_doc_len` stay 0 and the index answers
-    // every query with nothing. That is the same state a declaration whose label matched
-    // no entity ends in, and it is a legal one — an empty index is well-defined.
+    // `.docs.blk` was written streaming during the node scan; what is left is the sorted
+    // posting pass that produces `.ftd` / `.ftm.blk` / `.post.blk`.
+    let emit_ft_g = diag.phase("emit.fulltext");
+    diag.set_op("write full-text indexes", "indexes", ft_state.len() as u64);
+    let mut ft_built: BTreeMap<String, (u64, f32)> = BTreeMap::new();
+    for st in ft_state {
+        diag.set_op_detail(&st.stem);
+        let (doc_count, avg_doc_len) = st.docs.finish()?;
+        write_fulltext_postings(
+            tmp_dir,
+            &st.stem,
+            st.sorter.sorted()?.map(|r| {
+                r.map(|e| Posting {
+                    term: e.term,
+                    field: e.field,
+                    doc: e.doc,
+                    tf: e.tf,
+                })
+            }),
+            opts.block_size,
+            opts.zstd_level,
+            &|name| file_cipher(&cipher, name),
+        )?;
+        for name in ft_file_names(&st.stem) {
+            block_sizes.insert(name.clone(), opts.block_size as u32);
+            fulltext_files.push(name);
+        }
+        ft_built.insert(st.stem.clone(), (doc_count, avg_doc_len));
+    }
+    drop(emit_ft_g);
+
+    // --- full-text index declarations ---
     let fulltext_indexes: Vec<FulltextIndexDesc> = fulltext_stmts
         .iter()
         .map(|fi| {
@@ -2286,11 +2384,27 @@ fn build_inner(
                     fi.label_or_type
                 );
             }
+            let name = match fi.entity {
+                Entity::Node => format!("node_{}", fi.label_or_type),
+                Entity::Edge => format!("edge_{}", fi.label_or_type),
+            };
+            // A relationship index has no files yet — the edge scan is band-parallel and
+            // does not visit edges in ascending final order, so assigning dense docids
+            // there needs its own pass. Until then it is declared, empty, and answers
+            // nothing, exactly like a declaration whose label matched no entity.
+            let (doc_count, avg_doc_len) = ft_built
+                .get(&format!("fulltext/{name}"))
+                .copied()
+                .unwrap_or((0, 0.0));
+            if known && doc_count == 0 && fi.entity == Entity::Node {
+                eprintln!(
+                    "warning: full-text index on {kind} '{}' matched no text — every query \
+                     over it will return nothing. Check the declared property names.",
+                    fi.label_or_type
+                );
+            }
             FulltextIndexDesc {
-                name: match fi.entity {
-                    Entity::Node => format!("node_{}", fi.label_or_type),
-                    Entity::Edge => format!("edge_{}", fi.label_or_type),
-                },
+                name,
                 entity: match fi.entity {
                     Entity::Node => EntityKind::Node,
                     Entity::Edge => EntityKind::Edge,
@@ -2299,8 +2413,8 @@ fn build_inner(
                 properties: fi.properties.clone(),
                 stopwords: fi.stopwords.clone(),
                 stemmer: None,
-                doc_count: 0,
-                avg_doc_len: 0.0,
+                doc_count,
+                avg_doc_len,
             }
         })
         .collect();
@@ -2402,7 +2516,7 @@ fn build_inner(
         encryption_header,
         encryption_key: &opts.encryption_key,
         acl_blake3: opts.acl_blake3.clone(),
-        extra_files: vector_files,
+        extra_files: vector_files.into_iter().chain(fulltext_files).collect(),
         store: opts.publish_store.clone(),
         force_object_checksums: opts.object_checksums,
     })
@@ -2846,6 +2960,139 @@ const FWD_SINK_BATCH: usize = 8192;
 /// they take a modest floor rather than [`MIN_SORT_BYTES`]: a graph declaring many
 /// indexes must not starve the band workers, which is where the bytes actually go.
 const RANGE_SORT_FLOOR: usize = 1 << 20;
+
+/// Smallest reservation a full-text sorter is given. Like the range and vector
+/// sorters it is long-lived — created before the node scan, drained after it — and
+/// there are at most a handful, so a modest floor keeps a tiny build from reserving
+/// a share it will never fill.
+const FULLTEXT_SORT_FLOOR: usize = 1 << 20;
+
+/// One `(term, field, doc)` posting on its way to the sorter that will order them.
+///
+/// Sorted by `(term, field, doc)` — exactly the order
+/// [`write_fulltext_postings`](graph_format::fulltext::index::write_fulltext_postings)
+/// requires, and it refuses the stream otherwise, so a mis-ordering here fails the build
+/// rather than producing an index that reads back and returns the wrong documents.
+struct FulltextEntry {
+    term: String,
+    field: u32,
+    doc: u64,
+    tf: u32,
+}
+
+impl SortRecord for FulltextEntry {
+    fn encode(&self, buf: &mut Vec<u8>) {
+        write_uvarint(buf, self.term.len() as u64);
+        buf.extend_from_slice(self.term.as_bytes());
+        write_uvarint(buf, self.field as u64);
+        write_uvarint(buf, self.doc);
+        write_uvarint(buf, self.tf as u64);
+    }
+    fn decode(r: &mut &[u8]) -> Result<Self> {
+        let n = read_uvarint(r)? as usize;
+        if r.len() < n {
+            bail!("full-text sort record has a truncated term");
+        }
+        let term = std::str::from_utf8(&r[..n])
+            .context("full-text sort record term is not UTF-8")?
+            .to_string();
+        *r = &r[n..];
+        Ok(FulltextEntry {
+            term,
+            field: read_uvarint(r)? as u32,
+            doc: read_uvarint(r)?,
+            tf: read_uvarint(r)? as u32,
+        })
+    }
+    fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        self.term
+            .cmp(&other.term)
+            .then(self.field.cmp(&other.field))
+            .then(self.doc.cmp(&other.doc))
+    }
+    fn size_hint(&self) -> usize {
+        self.term.len() + 4 * 10
+    }
+}
+
+/// What the node scan needs to gather one declared full-text index.
+struct FulltextSpec {
+    /// Position in the parallel `ft_state` vector.
+    idx: usize,
+    /// `None` when the declared label never entered the symbol table — the index is
+    /// declared, matches nothing, and was already warned about.
+    label_id: Option<u32>,
+    /// Property key ids in **declaration order**: position is the field id. `None` for a
+    /// declared property no node in the dump carries, which is legal (that field simply
+    /// contributes no terms) and needs no warning of its own.
+    key_ids: Vec<Option<u32>>,
+    analyzer: Analyzer,
+}
+
+/// The per-index writers and counters the scan feeds.
+struct FulltextState {
+    stem: String,
+    docs: DocWriter,
+    sorter: ExtSorter<FulltextEntry>,
+}
+
+/// Analyze one entity's declared properties and emit its document + postings.
+///
+/// Returns `Ok(())` having pushed nothing when the entity does not carry the index's
+/// label, or when it carries no text at all in any indexed field — an entity with nothing
+/// to match should not occupy a docid, or it would drag `avgDocLen` down and dilute the
+/// length normalisation of every real document.
+fn gather_node_fulltext(
+    labels_blob: &[u8],
+    props_blob: &[u8],
+    final_id: u64,
+    specs: &[FulltextSpec],
+    state: &mut [FulltextState],
+) -> Result<()> {
+    for spec in specs {
+        let Some(lid) = spec.label_id else { continue };
+        if !has_label(labels_blob, lid)? {
+            continue;
+        }
+        // Term frequencies per (field, term). A `BTreeMap` rather than a hash map so the
+        // postings leave here in a deterministic order — two builds of the same dump must
+        // produce byte-identical runs, which is what the golden gate rests on.
+        let mut counts: BTreeMap<(u32, String), u32> = BTreeMap::new();
+        let mut len = 0u32;
+        for (field, key) in spec.key_ids.iter().enumerate() {
+            let Some(kid) = key else { continue };
+            let Some(v) = extract_value(props_blob, *kid)? else {
+                continue;
+            };
+            // Only text is indexable. A number or a list in a declared field is not an
+            // error — graphiti writes `group_id` as a string but nothing stops another
+            // client declaring an int property — it simply has no terms.
+            let Value::Str(text) = v else { continue };
+            for term in spec.analyzer.terms(&text) {
+                *counts.entry((field as u32, term)).or_insert(0) += 1;
+                len += 1;
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        let st = &mut state[spec.idx];
+        let doc = st.docs.push(&DocEntry {
+            entity: final_id,
+            len,
+            endpoints: None,
+        })?;
+        for ((field, term), tf) in counts {
+            st.sorter.push(FulltextEntry {
+                term,
+                field,
+                doc,
+                tf,
+            })?;
+        }
+    }
+    Ok(())
+}
 
 /// Smallest reservation a vector-index sorter is given. Like the range sorters,
 /// vector sorters are long-lived (created before the scan, drained by

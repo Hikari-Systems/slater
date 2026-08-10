@@ -727,6 +727,9 @@ MERGE (a:Entity {uuid: 'a'})-[r:RELATES_TO]->(b:Entity {uuid: 'b'}) SET r.name =
 /// `graphiti_slater`'s startup schema assertion checks.
 #[test]
 fn external_build_declares_fulltext_indexes() {
+    use graph_format::fulltext::bm25::Bm25Params;
+    use graph_format::fulltext::index::FulltextReader;
+    use graph_format::fulltext::search::{search, FulltextQuery};
     use graph_format::manifest::EntityKind;
 
     let work = unique_dir("fulltext");
@@ -787,11 +790,160 @@ fn external_build_declares_fulltext_indexes() {
     // existing sealed MANIFEST in the estate stops verifying (see the manifest test
     // `a_pre_fulltext_manifest_parses_and_re_serialises_byte_identically`). Check the
     // real on-disk bytes, not just the parsed value.
-    let raw = std::fs::read_to_string(graph_dir.join(gen.trim()).join("MANIFEST.json")).unwrap();
+    let gen_dir = graph_dir.join(gen.trim());
+    let raw = std::fs::read_to_string(gen_dir.join("MANIFEST.json")).unwrap();
     assert!(
         raw.contains("fulltextIndexes"),
         "a declaring generation must record the key"
     );
 
+    // ── the node index is populated, and searchable ──
+    assert_eq!(node.doc_count, 2, "two Entity nodes carry text");
+    assert!(node.avg_doc_len > 0.0);
+    // The four files are in the inventory, so the content hash covers them.
+    for suffix in [".ftd", ".ftm.blk", ".post.blk", ".docs.blk"] {
+        let name = format!("fulltext/node_Entity{suffix}");
+        assert!(
+            m.files.iter().any(|f| f.name == name),
+            "{name} must be in the generation inventory"
+        );
+        assert!(gen_dir.join(&name).exists(), "{name} must exist on disk");
+    }
+
+    let no_cipher = |_: &str| None;
+    let r = FulltextReader::open(&gen_dir, "fulltext/node_Entity", false, &no_cipher).unwrap();
+    assert_eq!(r.doc_count(), 2);
+
+    let q = |term: &str| FulltextQuery {
+        filters: Vec::new(),
+        terms: vec![term.to_string()],
+    };
+    // "alice" is in Alice's `name`, and "engineer" in her `summary` — different fields of
+    // the same document, which is what the multi-property declaration is for.
+    for term in ["alice", "engineer"] {
+        let hits = search(&r, &q(term), node.avg_doc_len, Bm25Params::default(), 10).unwrap();
+        assert_eq!(hits.len(), 1, "one match for {term:?}: {hits:?}");
+        // A hit resolves back to the node's dense id, which is what the query layer binds.
+        let doc = r.doc(hits[0].doc).unwrap();
+        assert_eq!(
+            entity_name(&gen_dir, &m, doc.entity),
+            "Alice",
+            "the hit for {term:?} must resolve to Alice"
+        );
+    }
+    // The stopword list from the declaration was applied at index time.
+    assert!(
+        r.term_metas("the").unwrap().is_empty(),
+        "'the' was declared a stopword"
+    );
+    // `group_id` is an indexed field, which is what makes graphiti's @group_id filter work.
+    let filtered = search(
+        &r,
+        &FulltextQuery {
+            filters: vec![vec![(2, "g".to_string())]],
+            terms: vec!["alice".to_string()],
+        },
+        node.avg_doc_len,
+        Bm25Params::default(),
+        10,
+    )
+    .unwrap();
+    assert_eq!(
+        filtered.len(),
+        1,
+        "the group filter resolves against a field"
+    );
+
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// The clustered path visits nodes in *provisional* order and only sees them in ascending
+/// final-id order at its sorted drain — which is why the gather happens there. A docid is a
+/// rank in that order, so getting it wrong would hand out docids the postings are not
+/// sorted by. This builds the same dump both ways and asserts the searches agree.
+#[test]
+fn fulltext_is_identical_under_both_cluster_modes() {
+    use graph_format::fulltext::bm25::Bm25Params;
+    use graph_format::fulltext::index::FulltextReader;
+    use graph_format::fulltext::search::{search, FulltextQuery};
+
+    let names = |mode: &str| -> Vec<String> {
+        let work = unique_dir(&format!("ftclust-{mode}"));
+        let data_dir = work.join("data");
+        let input = work.join("dump.cypher");
+        std::fs::write(&input, FULLTEXT_DUMP).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+            .args([
+                "--input",
+                input.to_str().unwrap(),
+                "--graph",
+                "docs",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--cluster",
+                mode,
+            ])
+            .output()
+            .expect("run slater-build");
+        assert!(
+            out.status.success(),
+            "{mode} build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let graph_dir = data_dir.join("docs");
+        let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+        let gen_dir = graph_dir.join(gen.trim());
+        let m = Manifest::read_from_dir(&gen_dir).unwrap();
+        let desc = m
+            .fulltext_indexes
+            .iter()
+            .find(|f| f.label_or_type == "Entity")
+            .unwrap()
+            .clone();
+        let no_cipher = |_: &str| None;
+        let r = FulltextReader::open(&gen_dir, "fulltext/node_Entity", false, &no_cipher).unwrap();
+
+        // Resolve each hit to the node's `name`, so the comparison is over graph
+        // identities rather than over docids — which are *expected* to differ between
+        // the two clusterings, since the node ids themselves do.
+        let hits = search(
+            &r,
+            &FulltextQuery {
+                filters: Vec::new(),
+                terms: vec!["alice".into(), "baker".into()],
+            },
+            desc.avg_doc_len,
+            Bm25Params::default(),
+            10,
+        )
+        .unwrap();
+        assert_eq!(desc.doc_count, 2);
+        let out: Vec<String> = hits
+            .iter()
+            .map(|h| entity_name(&gen_dir, &m, r.doc(h.doc).unwrap().entity))
+            .collect();
+        let _ = std::fs::remove_dir_all(&work);
+        out
+    };
+
+    let none = names("none");
+    let ldg = names("ldg");
+    assert!(
+        !none.is_empty(),
+        "the fixture must actually match something"
+    );
+    assert_eq!(
+        none, ldg,
+        "clustering must not change which nodes a full-text search returns, or in what order"
+    );
+}
+
+/// The `name` property of a node, read back out of the generation's property store — so
+/// a full-text hit is checked against the actual node it names rather than an id.
+fn entity_name(gen_dir: &std::path::Path, m: &Manifest, id: u64) -> String {
+    let np = PropsReader::open(gen_dir.join("node_props.blk")).unwrap();
+    match prop(&np.props(id).unwrap(), &m.property_keys, "name") {
+        Some(Value::Str(s)) => s.clone(),
+        other => panic!("node {id} has no string name: {other:?}"),
+    }
 }
