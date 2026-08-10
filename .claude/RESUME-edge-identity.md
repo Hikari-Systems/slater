@@ -100,7 +100,34 @@ To run it: `slater-build --input schema/graphiti-schema.cypher --graph graphiti 
 3. **Temporal parameters round-trip as ISO-8601 strings**, and `properties(n)` returns
    `created_at` as a `str`, which is what graphiti's `parse_db_date` expects.
 
-## Then
+## Then — W8, and it is the only thing left
 
-`graphiti-slater` (driver + `SearchInterface`) and the `hs-memory` compose stack — tasks 8
-and 9 in the plan at `~/.claude/plans/using-slater-as-a-soft-twilight.md`.
+`graphiti-slater` and the `hs-memory` compose stack both landed after this note was
+written; the stack is up, healthy, and verified end to end **until the first edge write**.
+
+The one remaining gap is **UNWIND-batched relationship writes**:
+
+```cypher
+UNWIND $entity_edges AS edge
+MATCH (source:Entity {uuid: edge.source_node_uuid})
+MATCH (target:Entity {uuid: edge.target_node_uuid})
+MERGE (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target)
+SET r = edge
+SET r.fact_embedding = vecf32(edge.fact_embedding)
+WITH r, edge
+RETURN edge.uuid AS uuid
+```
+
+Refused as an unsupported write. The batched *node* save passes and every single-edge
+write passes — the edge grammar just never got the `UNWIND` prefix the node grammar has
+(`cypher.pest:122-129` vs `:228-230`). Graphiti uses the batched form for both
+`MENTIONS` and `RELATES_TO`, so nothing persists without it.
+
+Mirror the node path: `WriteStmt.unwind` (`parser.rs:263`), `lower_write_statement`
+(`parser.rs:1696`), and above all `execute_write_batch` (`write.rs:1273`), which resolves
+the `$param` list, evaluates each row through `eval_row_value` (`write.rs:1182`), and
+hands every op to `DeltaWriter::write_batch` (`delta_writer.rs:645`) for one group
+commit. `execute_edge_write` (`write.rs:1584`) does a single `write()` today.
+
+Full brief, acceptance criteria and how to run the stack: the **DO THIS FIRST** section
+at the top of `~/.claude/plans/using-slater-as-a-soft-twilight.md`.
