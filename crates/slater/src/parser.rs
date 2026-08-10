@@ -341,6 +341,13 @@ pub mod ast {
         pub rel_var: Option<String>,
         /// An optional `RETURN` projecting the (post-write) relationship. `MERGE` only.
         pub ret: Option<ReturnClause>,
+        /// A leading `UNWIND <list> AS <var>` (write-UNWIND): `Some((list_expr, var))`
+        /// makes this a **batched** edge write — one edge per list element under a single
+        /// group commit, with the endpoint business keys, the identifying property and the
+        /// SET values evaluated per row (they may reference `<var>`'s fields). `None` is a
+        /// plain single write, whose values must be constants. `MERGE` only — the grammar
+        /// gives `edge_delete` no `UNWIND` prefix.
+        pub unwind: Option<(Expr, String)>,
     }
 
     /// The mutation an [`EdgeWriteStmt`] applies.
@@ -1111,8 +1118,16 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                                                        // positional `node_pattern`s so a binding is never mistaken for an endpoint.
     let mut bound: Vec<(String, NodePat)> = Vec::new();
     let mut ret: Option<ReturnClause> = None;
+    let mut unwind: Option<(Expr, String)> = None; // write-UNWIND source + alias
     for c in kids(inner) {
         match c.as_rule() {
+            Rule::unwind_clause => {
+                let uw = lower_unwind_clause(c)?;
+                unwind = Some((uw.expr, uw.var));
+            }
+            // `WITH r, edge` before the RETURN. Accepted only when it provably does
+            // nothing — the same gate the node write path applies to a mid-write `WITH`.
+            Rule::with_clause => ensure_write_with_is_a_no_op(&lower_with_clause(c)?)?,
             Rule::kw_merge | Rule::kw_match => {}
             Rule::edge_bind => {
                 let np = lower_node_pattern(only_child_of_rule(c, Rule::node_pattern)?)?;
@@ -1167,6 +1182,9 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         }
     }
     let rel = rel.expect("edge_write always has a relationship");
+    // A plain edge write's values must be constants; a batched one's may reference the
+    // UNWIND alias's fields, which only have a value per row (validated at execution).
+    let is_unwind = unwind.is_some();
     let src = endpoint(
         resolve_endpoint_pattern(
             src.expect("edge_write has a source node"),
@@ -1174,6 +1192,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
             "the source",
         )?,
         "the source",
+        is_unwind,
     )?;
     let dst = endpoint(
         resolve_endpoint_pattern(
@@ -1182,6 +1201,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
             "the destination",
         )?,
         "the destination",
+        is_unwind,
     )?;
 
     if rel.dir != Direction::Outgoing {
@@ -1199,7 +1219,9 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         1 => {
             let (prop, mut value) = rel.props[0].clone();
             fold_vecf32(&mut value);
-            ensure_constant(&value, &format!("the identifying value of {{{prop}: …}}"))?;
+            if !is_unwind {
+                ensure_constant(&value, &format!("the identifying value of {{{prop}: …}}"))?;
+            }
             Some((prop, value))
         }
         n => bail!(
@@ -1232,7 +1254,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
                     "SET must target the relationship variable '{rvar}', not '{set_var}' (a relationship write mutates one edge)"
                 );
             }
-            out_sets.push(check_edge_set_item(item, rvar)?);
+            out_sets.push(check_edge_set_item(item, rvar, is_unwind)?);
         }
     }
 
@@ -1267,6 +1289,17 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
     if ret.is_some() && rel.var.is_none() {
         bail!("to RETURN a relationship, name it: MERGE (a)-[r:R]->(b) SET r.p = … RETURN r.p");
     }
+    // A batched write's `RETURN` has both the relationship and the row in scope (graphiti
+    // projects one of each), so the two cannot share a name — one would shadow the other
+    // and `RETURN r.uuid` would silently mean whichever won.
+    if let (Some((_, uw_var)), Some(rvar)) = (&unwind, rel.var.as_deref()) {
+        if uw_var == rvar {
+            bail!(
+                "'{rvar}' names both the UNWIND row and the relationship; give them different \
+                 names, e.g. UNWIND $rows AS row … MERGE (a)-[{rvar}:R]->(b)"
+            );
+        }
+    }
     Ok(EdgeWriteStmt {
         src,
         reltype,
@@ -1276,6 +1309,7 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
         sets: out_sets,
         rel_var: rel.var.clone(),
         ret,
+        unwind,
     })
 }
 
@@ -1283,13 +1317,18 @@ fn lower_edge_write(pair: Pair<Rule>) -> Result<EdgeWriteStmt> {
 ///
 /// The shapes are the node write's, minus label assignment (a relationship has a type):
 /// `SET r.p = v`, `SET r = {…}` / `SET r += {…}`, and their whole-parameter spellings.
-/// Every right-hand side must be a literal or a parameter — a relationship write has no
-/// row context to evaluate anything else against.
-fn check_edge_set_item(item: SetItem, rvar: &str) -> Result<SetItem> {
+/// Every right-hand side must be a literal or a parameter — a plain relationship write has
+/// no row context to evaluate anything else against. Under a write-`UNWIND` (`is_unwind`)
+/// it does: the values may also reference the row alias's fields, so the constant check is
+/// dropped and each row's values are evaluated (and rejected) at execution instead.
+fn check_edge_set_item(item: SetItem, rvar: &str, is_unwind: bool) -> Result<SetItem> {
     // Vector indexes are node-only, so an edge's vector is an unindexed inline value —
     // stored in the column store and read back verbatim, like the core's.
     let mut fold_one = |value: &mut Expr, what: &str| -> Result<()> {
         fold_vecf32(value);
+        if is_unwind {
+            return Ok(());
+        }
         ensure_constant(value, what)
     };
     Ok(match item {
@@ -1361,7 +1400,7 @@ fn only_child_of_rule(pair: Pair<Rule>, rule: Rule) -> Result<Pair<Rule>> {
         .ok_or_else(|| anyhow::anyhow!("internal: expected a {rule:?} child"))
 }
 
-fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
+fn endpoint(node: NodePat, what: &str, is_unwind: bool) -> Result<EndpointPat> {
     let label = node
         .label_expr
         .as_ref()
@@ -1376,7 +1415,11 @@ fn endpoint(node: NodePat, what: &str) -> Result<EndpointPat> {
         bail!("{what} node of a write must carry exactly one inline business-key property, e.g. (a:Label {{key: value}})");
     }
     let (key, key_value) = node.props.into_iter().next().unwrap();
-    ensure_constant(&key_value, &format!("{what} business-key value"))?;
+    // A batched write's endpoint key is per-row (`{uuid: edge.source_node_uuid}`), so it
+    // is checked when the row supplies a value rather than here.
+    if !is_unwind {
+        ensure_constant(&key_value, &format!("{what} business-key value"))?;
+    }
     Ok(EndpointPat {
         label,
         key,
@@ -1634,14 +1677,18 @@ fn lower_insert_stmt(pair: Pair<Rule>) -> Result<ast::Statement> {
         // edge identity, auto-creating absent endpoints), mirroring `edge_merge`.
         Some(rel) => {
             let mut it = nodes.into_iter();
+            // GQL `INSERT` has no `UNWIND` prefix, so its endpoint keys are always
+            // constants — hence `false`, never a batch.
             let src = endpoint(
                 it.next().expect("insert edge always has a source node"),
                 "the source",
+                false,
             )?;
             let dst = endpoint(
                 it.next()
                     .expect("insert edge always has a destination node"),
                 "the destination",
+                false,
             )?;
             if rel.dir != Direction::Outgoing {
                 bail!("an INSERT relationship must point left-to-right, e.g. INSERT (a)-[:R]->(b)");
@@ -1676,6 +1723,7 @@ fn lower_insert_stmt(pair: Pair<Rule>) -> Result<ast::Statement> {
                 sets: Vec::new(),
                 rel_var: rel.var.clone(),
                 ret,
+                unwind: None,
             }))
         }
         // `INSERT (n:Label {…})` — create a node unconditionally, the create_stmt path.
@@ -4485,6 +4533,109 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("identifying value"), "{e}");
+    }
+
+    /// Graphiti's two **batched** edge saves, verbatim (graphiti-core 0.29.3,
+    /// `edge_db_queries.py`, FALKORDB branch). Both were refused as unsupported writes
+    /// until the edge grammar grew the `UNWIND` prefix the node grammar already had —
+    /// and because graphiti uses the batched form for both `MENTIONS` and `RELATES_TO`,
+    /// nothing it extracted persisted without them (W8).
+    #[test]
+    fn a_batched_edge_write_lowers_graphitis_bulk_saves() {
+        // MENTIONS: per-row endpoints and identity, and a RETURN over the *relationship*.
+        let w = edge_write(
+            "UNWIND $episodic_edges AS edge \
+             MATCH (episode:Episodic {uuid: edge.source_node_uuid}) \
+             MATCH (node:Entity {uuid: edge.target_node_uuid}) \
+             MERGE (episode)-[e:MENTIONS {uuid: edge.uuid}]->(node) \
+             SET e.group_id = edge.group_id, e.created_at = edge.created_at \
+             RETURN e.uuid AS uuid",
+        );
+        assert_eq!(
+            w.unwind,
+            Some((Expr::Param("episodic_edges".into()), "edge".to_string()))
+        );
+        assert_eq!(w.reltype, "MENTIONS");
+        // The endpoint keys and the identity are row references — the very expressions a
+        // plain edge write refuses, admitted here because a row supplies each one.
+        assert_eq!(w.src.label, "Episodic");
+        assert_eq!(
+            w.src.key_value,
+            Expr::Property(
+                Box::new(Expr::Var("edge".into())),
+                "source_node_uuid".into()
+            )
+        );
+        assert_eq!(
+            w.key,
+            Some((
+                "uuid".to_string(),
+                Expr::Property(Box::new(Expr::Var("edge".into())), "uuid".into())
+            ))
+        );
+        assert_eq!(w.sets.len(), 2);
+        assert!(w.ret.is_some());
+
+        // RELATES_TO: `SET r = edge` (a whole *row* replace, not a parameter), a
+        // row-referencing `vecf32(…)` that cannot fold at lowering, the no-op
+        // `WITH r, edge`, and a RETURN over the **row** variable rather than the edge.
+        let w = edge_write(
+            "UNWIND $entity_edges AS edge \
+             MATCH (source:Entity {uuid: edge.source_node_uuid}) \
+             MATCH (target:Entity {uuid: edge.target_node_uuid}) \
+             MERGE (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target) \
+             SET r = edge \
+             SET r.fact_embedding = vecf32(edge.fact_embedding) \
+             WITH r, edge \
+             RETURN edge.uuid AS uuid",
+        );
+        assert_eq!(
+            w.unwind,
+            Some((Expr::Param("entity_edges".into()), "edge".to_string()))
+        );
+        assert_eq!(w.reltype, "RELATES_TO");
+        assert_eq!(w.rel_var.as_deref(), Some("r"));
+        assert_eq!(
+            w.sets.first(),
+            Some(&SetItem::ReplaceParam(Expr::Var("edge".into())))
+        );
+        assert!(
+            matches!(w.sets.get(1), Some(SetItem::Prop { prop, value })
+                if prop == "fact_embedding" && as_vecf32_arg(value).is_some()),
+            "the row-referencing vecf32 must survive lowering unfolded: {:?}",
+            w.sets.get(1)
+        );
+        assert!(w.ret.is_some());
+    }
+
+    /// The batch relaxes *what a value may be*, not what the write may do. Everything the
+    /// plain edge write refuses for structural reasons is still refused under `UNWIND`,
+    /// and a `WITH` that would actually mean something is still refused too.
+    #[test]
+    fn a_batched_edge_write_relaxes_only_the_values() {
+        // Two inline properties: still a guess at which is the identity.
+        let e = write_err(
+            "UNWIND $rows AS r MERGE (a:Person {name: r.a})-[e:KNOWS {uuid: r.u, since: r.s}]->\
+             (b:Person {name: r.b})",
+        );
+        assert!(e.contains("at most one inline property"), "{e}");
+        // A batched DELETE has no grammar arm: it falls through to the read parser and is
+        // rejected as read-only, exactly as a keyed DELETE is refused.
+        let e = write_err("UNWIND $rows AS r MATCH (a:Person {name: r.a})-[x:KNOWS]->(b:Person {name: r.b}) DELETE x");
+        assert!(e.contains("read-only"), "{e}");
+        // A `WITH` that filters is not a no-op, so it cannot be ignored.
+        let e = write_err(
+            "UNWIND $rows AS r MERGE (a:Person {name: r.a})-[e:KNOWS]->(b:Person {name: r.b}) \
+             SET e.since = r.s WITH e WHERE e.since > 2000 RETURN e.since",
+        );
+        assert!(e.contains("read-only") || e.contains("no effect"), "{e}");
+        // Without the UNWIND those same row references have nothing to resolve against.
+        let e =
+            write_err("MERGE (a:Person {name: r.a})-[e:KNOWS {uuid: r.u}]->(b:Person {name: r.b})");
+        assert!(
+            e.contains("business-key value") || e.contains("identifying value"),
+            "{e}"
+        );
     }
 
     // ── GQL write spellings (INSERT / SET / DELETE lowering onto the write path) ──

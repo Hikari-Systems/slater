@@ -225,8 +225,20 @@ delete_clause = { kw_detach? ~ kw_delete ~ var ~ ("," ~ var)* }
 // all-inline spelling, just factored differently, and clients generating Cypher tend to
 // bind first. `edge_bind` is its own rule rather than another `node_pattern` so the
 // lowering can tell a binding apart from an endpoint by rule, not by position.
+// A leading `UNWIND <list> AS r` makes the MERGE a **batched** edge write, exactly as it
+// does for a node write (see `write_statement`): the endpoint business keys, the inline
+// identifying property and the SET values may reference `r`'s fields, one edge per list
+// element, all under a single group commit. Unlike the node arm this is an optional
+// prefix rather than a separate alternative — the rest of the rule is identical either
+// way, so `lower_edge_write` handles both uniformly (the `unwind_clause` child, if any,
+// marks the batch). `edge_delete` deliberately has no such prefix: a batched delete would
+// have to suppress core edges row by row, which is the same gap that already refuses a
+// keyed `DELETE`, so it stays refused rather than half-supported.
+// A trailing `WITH r, edge` before the `RETURN` is accepted and ignored on the same terms
+// as the node path's mid-write `WITH` — it may only re-project bindings already in scope,
+// which in a single-anchor write provably does nothing (`ensure_write_with_is_a_no_op`).
 edge_write = { edge_merge | edge_delete }
-edge_merge = { edge_bind* ~ kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause* ~ return_clause? }
+edge_merge = { unwind_clause? ~ edge_bind* ~ kw_merge ~ node_pattern ~ rel_pattern ~ node_pattern ~ set_clause* ~ with_clause* ~ return_clause? }
 edge_delete = { edge_bind* ~ kw_match ~ node_pattern ~ rel_pattern ~ node_pattern ~ delete_clause }
 // The lookahead is load-bearing. Without it PEG repetition is greedy and `edge_bind*`
 // swallows the `MATCH` that `edge_delete` itself needs, so

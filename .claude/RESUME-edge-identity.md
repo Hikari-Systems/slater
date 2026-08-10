@@ -100,12 +100,27 @@ To run it: `slater-build --input schema/graphiti-schema.cypher --graph graphiti 
 3. **Temporal parameters round-trip as ISO-8601 strings**, and `properties(n)` returns
    `created_at` as a `str`, which is what graphiti's `parse_db_date` expects.
 
-## Then — W8, and it is the only thing left
+## Then — W8, **now done**
 
 `graphiti-slater` and the `hs-memory` compose stack both landed after this note was
-written; the stack is up, healthy, and verified end to end **until the first edge write**.
+written. W8 — UNWIND-batched relationship writes — has since landed too, and the stack
+now runs end to end: a real `add_memory` extracts on Bedrock, embeds on Voyage, persists
+through Slater, and reads back through MCP. 1054 lib tests green, `verify.py` 13/13 at
+dim 1024.
 
-The one remaining gap is **UNWIND-batched relationship writes**:
+The edge grammar gained the `unwind_clause?` prefix the node arm already had (plus
+`with_clause*` for graphiti's no-op `WITH r, edge`), `EdgeWriteStmt` gained `unwind`, and
+`execute_edge_write_batch` commits the whole list through one `DeltaWriter::write_batch`.
+The core-edge probe, the idempotent-re-MERGE decision and the keyless-identity adoption
+were extracted into `plan_edge_merge`, and `edge_set_patches` now takes the same
+evaluator-closure pair the node path does — so single and batched writes share one
+implementation. `edge_delete` deliberately got **no** `UNWIND` prefix, for the same reason
+a keyed `DELETE` is refused: the overlay suppresses by `(reltype, neighbour)` and cannot
+spare an edge's siblings.
+
+Full detail: `~/.claude/plans/using-slater-as-a-soft-twilight.md`.
+
+What it was, for the record:
 
 ```cypher
 UNWIND $entity_edges AS edge
@@ -118,16 +133,17 @@ WITH r, edge
 RETURN edge.uuid AS uuid
 ```
 
-Refused as an unsupported write. The batched *node* save passes and every single-edge
-write passes — the edge grammar just never got the `UNWIND` prefix the node grammar has
-(`cypher.pest:122-129` vs `:228-230`). Graphiti uses the batched form for both
-`MENTIONS` and `RELATES_TO`, so nothing persists without it.
+Refused as an unsupported write, and graphiti uses the batched form for both `MENTIONS`
+and `RELATES_TO` — so nothing it extracted persisted. Both statements are now in
+`hs-memory/scripts/verify.py` verbatim, and both pass.
 
-Mirror the node path: `WriteStmt.unwind` (`parser.rs:263`), `lower_write_statement`
-(`parser.rs:1696`), and above all `execute_write_batch` (`write.rs:1273`), which resolves
-the `$param` list, evaluates each row through `eval_row_value` (`write.rs:1182`), and
-hands every op to `DeltaWriter::write_batch` (`delta_writer.rs:645`) for one group
-commit. `execute_edge_write` (`write.rs:1584`) does a single `write()` today.
+## What is actually left
 
-Full brief, acceptance criteria and how to run the stack: the **DO THIS FIRST** section
-at the top of `~/.claude/plans/using-slater-as-a-soft-twilight.md`.
+Nothing on this track blocks the stack. What remains is work stream 2 — **fulltext**
+(`db.idx.fulltext.*`), ~5,600 LOC, untouched. Until it lands, graphiti's BM25 leg returns
+empty and hybrid search runs on the similarity list alone: worse recall on exact-name
+matches, everything else working. Also still open: communities / `HAS_MEMBER` (a
+label-less endpoint the relationship write does not accept), and a keyed `DELETE`, which
+needs a tombstone naming a resolved core edge id and a suppress-by-id set in the overlay.
+
+How to run the stack, and the full history: `~/.claude/plans/using-slater-as-a-soft-twilight.md`.

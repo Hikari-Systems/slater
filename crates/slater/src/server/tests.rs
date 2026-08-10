@@ -1179,6 +1179,159 @@ fn write_unwind_batches_node_writes_under_one_commit() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// W8 — batched **relationship** writes, the edge twin of the test above. Graphiti's bulk
+/// edge saves are all `UNWIND $edges AS edge … MERGE (a)-[r:R {uuid: edge.uuid}]->(b)`,
+/// and until the edge grammar grew the `UNWIND` prefix the node grammar already had, both
+/// `MENTIONS` and `RELATES_TO` were refused — so nothing graphiti extracted persisted.
+///
+/// Three properties, all of which the single-edge path already had and the batch must not
+/// lose: the whole batch is **one** group commit; rows carrying **distinct identity
+/// properties produce distinct edges** between the *same* pair rather than collapsing onto
+/// one (the parallel-facts property, now under `UNWIND`); and the writes are durable
+/// across a reopen. Plus the one thing only the batch has: a `RETURN` projecting one row
+/// per input row.
+#[test]
+fn write_unwind_batches_edge_writes_under_one_commit() {
+    let (root, _g) = testgen::write_indexed_people("unwind_edge_batch");
+    let wal = root.join("_wal");
+    let mut graphs = Graphs::open_all(&root, None).unwrap();
+    graphs
+        .enable_writable_layer(&delta_cfg(&wal), &root, None)
+        .unwrap();
+    let gen = graphs.get("people").unwrap();
+    let writer = graphs.writer("people").unwrap();
+    let cache = BlockCache::new(1 << 20);
+
+    // Every `fact` on a Bob-KNOWS->Carol edge, sorted — the parallel-edge probe.
+    let facts = |w: &Arc<DeltaWriter>| -> Vec<String> {
+        let view = MergedView::new(gen.as_ref(), w.delta_snapshot());
+        let res = Engine::new(&view, &cache)
+            .run(
+                &parser::parse(
+                    "MATCH (a:Person {name:'Bob'})-[r:KNOWS]->(b:Person {name:'Carol'}) \
+                     RETURN r.fact",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut out: Vec<String> = res
+            .rows
+            .iter()
+            .filter_map(|r| match &r[0] {
+                Val::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let run = |w: &Arc<DeltaWriter>, q: &str, params: &HashMap<String, Val>| {
+        let stmt = match parser::parse_statement(q).unwrap() {
+            parser::ast::Statement::WriteEdge(s) => s,
+            other => panic!("expected an edge write for {q:?}, got {other:?}"),
+        };
+        execute_edge_write(w, gen.as_ref(), &stmt, params, TEST_BOLT_VERSION).unwrap()
+    };
+
+    // Two facts about the *same* pair, distinguished only by `uuid` — exactly the shape
+    // graphiti's `RELATES_TO` bulk save emits, and exactly what a store keying edges by
+    // endpoint pair alone would fuse into one, losing a fact.
+    let row = |uuid: &str, fact: &str| {
+        Val::Map(vec![
+            ("uuid".into(), Val::Str(uuid.into())),
+            ("src".into(), Val::Str("Bob".into())),
+            ("dst".into(), Val::Str("Carol".into())),
+            ("fact".into(), Val::Str(fact.into())),
+        ])
+    };
+    let params = HashMap::from([(
+        "edges".to_string(),
+        Val::List(vec![
+            row("u1", "Bob taught Carol"),
+            row("u2", "Bob hired Carol"),
+        ]),
+    )]);
+
+    // `SET r = edge` is the whole-row replace graphiti uses, and the RETURN projects the
+    // **row** variable, not the relationship — the `RELATES_TO` spelling.
+    let e0 = writer.epoch();
+    let (cols, out) = run(
+        &writer,
+        "UNWIND $edges AS edge \
+         MATCH (a:Person {name: edge.src}) \
+         MATCH (b:Person {name: edge.dst}) \
+         MERGE (a)-[r:KNOWS {uuid: edge.uuid}]->(b) \
+         SET r = edge \
+         WITH r, edge \
+         RETURN edge.uuid AS uuid",
+        &params,
+    );
+    assert_eq!(
+        writer.epoch(),
+        e0 + 1,
+        "the whole edge batch is one epoch (group commit)"
+    );
+    assert_eq!(cols, vec!["uuid".to_string()]);
+    assert_eq!(
+        out,
+        vec![vec![PsValue::str("u1")], vec![PsValue::str("u2")]],
+        "one projected row per input row, in input order"
+    );
+    assert_eq!(
+        facts(&writer),
+        vec![
+            "Bob hired Carol".to_string(),
+            "Bob taught Carol".to_string()
+        ],
+        "two identity-distinct rows are two edges between the same pair, not one"
+    );
+
+    // Re-running the identical batch is idempotent by edge identity: each row's `uuid`
+    // still names its own edge, so nothing is duplicated.
+    run(
+        &writer,
+        "UNWIND $edges AS edge \
+         MATCH (a:Person {name: edge.src}) \
+         MATCH (b:Person {name: edge.dst}) \
+         MERGE (a)-[r:KNOWS {uuid: edge.uuid}]->(b) \
+         SET r = edge \
+         WITH r, edge \
+         RETURN edge.uuid AS uuid",
+        &params,
+    );
+    assert_eq!(
+        facts(&writer).len(),
+        2,
+        "re-merging the same batch adds no edges"
+    );
+
+    // Durable across a reopen (WAL replay reconstructs the batched edge ops). The epoch
+    // counts commits in *this* writer's life, so replay restarts it — what must survive is
+    // the graph, both parallel edges included.
+    drop(writer);
+    let reopened = Arc::new(
+        DeltaWriter::open(
+            wal.join("people"),
+            "people",
+            gen.uuid(),
+            gen.node_count(),
+            gen.edge_count(),
+            None,
+            |op| resolve_op(&gen, op),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        facts(&reopened),
+        vec![
+            "Bob hired Carol".to_string(),
+            "Bob taught Carol".to_string()
+        ],
+        "both parallel edges survive a WAL replay"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Phase 2d: a range-index seek overlays the delta — an equality seek finds a
 /// delta-born node and drops a tombstoned core node, and a range seek unions the
 /// born node into the core hits. The fixture carries a `(Person, name)` index, so
@@ -10091,6 +10244,11 @@ fn every_write_statement() -> Vec<&'static str> {
         "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'})",
         "MERGE (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) SET r.since = 2020",
         "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) DELETE r",
+        // ── batched (write-`UNWIND`) relationship writes ─────────────────────
+        //    MERGE only: `edge_delete` has no UNWIND prefix (see `cypher.pest`).
+        "UNWIND $rows AS e MERGE (a:Person {name: e.src})-[r:KNOWS]->(b:Person {name: e.dst})",
+        "UNWIND $rows AS e MATCH (a:Person {name: e.src}) MATCH (b:Person {name: e.dst}) \
+         MERGE (a)-[r:KNOWS {uuid: e.uuid}]->(b) SET r = e RETURN r.uuid AS uuid",
         // ── admin: rewrites the served generation ────────────────────────────
         "CALL slater.consolidate()",
     ]
