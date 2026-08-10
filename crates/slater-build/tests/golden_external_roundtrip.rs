@@ -704,3 +704,94 @@ fn key_stdin_refuses_a_dump_on_stdin() {
     );
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// A dump carrying graphiti's two full-text declarations verbatim (graphiti-core 0.29.3
+// `graph_queries.get_fulltext_indices(FALKORDB)`), over seed rows that put the label and
+// the relationship type in the symbol table.
+const FULLTEXT_DUMP: &str = r#"CREATE INDEX FOR (n:Entity) ON (n.uuid);
+CALL db.idx.fulltext.createNodeIndex(
+                                                {
+                                                    label: 'Entity',
+                                                    stopwords: ['a', 'is', 'the']
+                                                },
+                                                'name', 'summary', 'group_id'
+                                                );
+CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id);
+MERGE (n:Entity {uuid: 'a'}) SET n.name = 'Alice', n.summary = 'an engineer', n.group_id = 'g';
+MERGE (n:Entity {uuid: 'b'}) SET n.name = 'Bob', n.summary = 'a baker', n.group_id = 'g';
+MERGE (a:Entity {uuid: 'a'})-[r:RELATES_TO]->(b:Entity {uuid: 'b'}) SET r.name = 'KNOWS', r.fact = 'Alice knows Bob', r.group_id = 'g';
+"#;
+
+/// The declaration reaches the manifest with its property order and stopwords intact,
+/// for both entities — the surface `SHOW INDEXES` reports and therefore the surface
+/// `graphiti_slater`'s startup schema assertion checks.
+#[test]
+fn external_build_declares_fulltext_indexes() {
+    use graph_format::manifest::EntityKind;
+
+    let work = unique_dir("fulltext");
+    let data_dir = work.join("data");
+    let input = work.join("dump.cypher");
+    std::fs::write(&input, FULLTEXT_DUMP).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_slater-build"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--graph",
+            "docs",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--cluster",
+            "none",
+        ])
+        .output()
+        .expect("run slater-build (fulltext)");
+    assert!(
+        out.status.success(),
+        "fulltext build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let graph_dir = data_dir.join("docs");
+    let gen = std::fs::read_to_string(graph_dir.join("current")).unwrap();
+    let m = Manifest::read_from_dir(graph_dir.join(gen.trim())).unwrap();
+    m.verify_content_hash().unwrap();
+
+    assert_eq!(m.fulltext_indexes.len(), 2, "one per declaration");
+
+    let node = m
+        .fulltext_indexes
+        .iter()
+        .find(|f| f.entity == EntityKind::Node)
+        .expect("the Entity declaration");
+    assert_eq!(node.label_or_type, "Entity");
+    assert_eq!(
+        node.properties,
+        ["name", "summary", "group_id"],
+        "declaration order is the field id the postings are keyed by"
+    );
+    assert_eq!(node.stopwords, ["a", "is", "the"]);
+    assert_eq!(node.name, "node_Entity");
+
+    let edge = m
+        .fulltext_indexes
+        .iter()
+        .find(|f| f.entity == EntityKind::Edge)
+        .expect("the RELATES_TO declaration");
+    assert_eq!(edge.label_or_type, "RELATES_TO");
+    assert_eq!(edge.properties, ["name", "fact", "group_id"]);
+    assert_eq!(edge.name, "edge_RELATES_TO");
+
+    // A manifest that declares no full-text index must not gain the key, or every
+    // existing sealed MANIFEST in the estate stops verifying (see the manifest test
+    // `a_pre_fulltext_manifest_parses_and_re_serialises_byte_identically`). Check the
+    // real on-disk bytes, not just the parsed value.
+    let raw = std::fs::read_to_string(graph_dir.join(gen.trim()).join("MANIFEST.json")).unwrap();
+    assert!(
+        raw.contains("fulltextIndexes"),
+        "a declaring generation must record the key"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

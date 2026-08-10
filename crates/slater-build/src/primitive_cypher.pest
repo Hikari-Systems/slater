@@ -15,6 +15,8 @@
 //   4. edge range idx  CREATE INDEX FOR ()-[r:TYPE]->() ON (r.prop)
 //   5. vector idx call CALL db.idx.vector.createNodeIndex('Label','prop', dim, 'cosine')
 //   6. vector idx help createNodeVectorIndex('Label', dim, 'cosine', 'property')
+//   9. fulltext idx    CALL db.idx.fulltext.createNodeIndex({label: 'L', stopwords: […]}, 'p1', 'p2')
+//                      CREATE FULLTEXT INDEX FOR ()-[e:TYPE]-() ON (e.a, e.b)
 // plus the ignorable marker/cleanup lines (DROP INDEX …, MATCH … REMOVE …), which
 // parse but carry no data (the marker label/property are simply never persisted).
 //
@@ -29,9 +31,11 @@ WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 statement = { SOI ~ stmt ~ ";"? ~ EOI }
 
 stmt = {
-    create_index
+    create_fulltext_index
+  | create_index
   | vector_index_call
   | vector_index_helper
+  | fulltext_index_call
   | edge_overwrite
   | node_overwrite
   | edge_create
@@ -159,6 +163,49 @@ vector_index_helper = { ^"createNodeVectorIndex" ~ "(" ~ arg_list ~ ")" }
 
 arg_list = { value ~ ("," ~ value)* }
 yield_clause = _{ ^"yield" ~ ANY* }
+
+// --- full-text indexes ---------------------------------------------------------
+//
+// Two spellings, because two producers emit them and neither can emit the other's.
+//
+// The `CALL` map form is graphiti's node declaration verbatim (graphiti-core
+// `graph_queries.get_fulltext_indices`, FALKORDB branch) and is also what a
+// consolidation re-emits for *both* entities — it is the only form with somewhere to
+// put the stopword list, and a stopword list lost across a rebuild is silently wrong.
+// FalkorDB also accepts a bare label string in place of the option map, so both parse.
+//
+// `CREATE FULLTEXT INDEX` is graphiti's *relationship* declaration. Note its endpoints
+// are **undirected** (`()-[e:T]-()`), unlike the range-index `edge_index_target`, so
+// the arrow head is optional here. Multiple properties per index is the whole point:
+// their declaration order is the field id the postings are keyed by.
+fulltext_index_call = {
+    ^"call" ~ proc_create_fulltext ~ "(" ~ ft_target ~ ("," ~ value)* ~ ")" ~ yield_clause?
+}
+proc_create_fulltext = @{
+    "db.idx.fulltext.createNodeIndex" | "db.idx.fulltext.createRelationshipIndex"
+}
+ft_target = { prop_map | string }
+
+create_fulltext_index = {
+    ^"create" ~ ^"fulltext" ~ ^"index"
+  ~ ft_index_name?
+  ~ (^"if" ~ ^"not" ~ ^"exists")?
+  ~ ^"for" ~ (ft_edge_index_target | node_index_target)
+  ~ ^"on" ~ ^"each"? ~ ft_prop_list
+}
+// Both bracketings: graphiti's FalkorDB branch writes `ON (e.name, e.fact)`, its Neo4j
+// branch `ON EACH [n.name, n.summary]`.
+ft_prop_list = _{
+    ("[" ~ index_prop ~ ("," ~ index_prop)* ~ "]")
+  | ("(" ~ index_prop ~ ("," ~ index_prop)* ~ ")")
+}
+// Neo4j names its full-text indexes (`CREATE FULLTEXT INDEX edge_name_and_fact FOR …`).
+// Slater keys a full-text index by `(entity, label)` — the FalkorDB procedures take the
+// label, not an index name — so the name parses and is discarded.
+ft_index_name = @{ !(^"for" ~ !ident_cont) ~ (ASCII_ALPHANUMERIC | "_")+ }
+ft_edge_index_target = {
+    "(" ~ ")" ~ "-" ~ "[" ~ var? ~ ":" ~ reltype ~ "]" ~ ("->" | "-") ~ "(" ~ ")"
+}
 
 // --- ignorable marker / cleanup ------------------------------------------------
 

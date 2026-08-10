@@ -1648,6 +1648,7 @@ mod tests {
         let content_hash = graph_format::integrity::content_hash(&inv);
 
         let mut manifest = Manifest {
+            fulltext_indexes: Vec::new(),
             magic: "SLATER01".into(),
             format_version: FORMAT_VERSION,
             build_uuid: GenId(uuid),

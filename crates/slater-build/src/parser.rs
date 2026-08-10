@@ -16,8 +16,8 @@ use pest_derive::Parser;
 use graph_format::ids::Value;
 
 use crate::model::{
-    EdgeOverwriteStmt, EdgeStmt, Entity, NodeMatch, NodeOverwriteStmt, NodeStmt, RangeIndexStmt,
-    SetExpr, Statement, VectorIndexStmt,
+    EdgeOverwriteStmt, EdgeStmt, Entity, FulltextIndexStmt, NodeMatch, NodeOverwriteStmt, NodeStmt,
+    RangeIndexStmt, SetExpr, Statement, VectorIndexStmt,
 };
 
 #[derive(Parser)]
@@ -172,6 +172,8 @@ pub fn parse_statement_with_id_field(input: &str, id_field: &str) -> Result<Stat
         Rule::create_index => parse_create_index(form),
         Rule::vector_index_call => parse_vector_index(form, ArgOrder::Call),
         Rule::vector_index_helper => parse_vector_index(form, ArgOrder::Helper),
+        Rule::fulltext_index_call => parse_fulltext_index_call(form),
+        Rule::create_fulltext_index => parse_create_fulltext_index(form),
         Rule::ignored => Ok(Statement::Ignored),
         other => bail!("unexpected statement rule {other:?}"),
     }
@@ -659,6 +661,144 @@ fn parse_create_index(pair: Pair<Rule>) -> Result<Statement> {
     }))
 }
 
+/// `CALL db.idx.fulltext.create{Node,Relationship}Index(<target>, 'p1', 'p2', …)`.
+///
+/// `<target>` is either graphiti's option map (`{label: 'Entity', stopwords: […]}`) or —
+/// FalkorDB accepts both — a bare label string. The trailing arguments are the indexed
+/// properties, and their order is load-bearing: position is the field id.
+fn parse_fulltext_index_call(pair: Pair<Rule>) -> Result<Statement> {
+    let mut entity = Entity::Node;
+    let mut label_or_type = String::new();
+    let mut stopwords: Vec<String> = Vec::new();
+    let mut properties: Vec<String> = Vec::new();
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::proc_create_fulltext => {
+                entity = if child.as_str().ends_with("createRelationshipIndex") {
+                    Entity::Edge
+                } else {
+                    Entity::Node
+                };
+            }
+            Rule::ft_target => {
+                let inner = child
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| anyhow!("full-text index call has an empty target"))?;
+                match inner.as_rule() {
+                    Rule::string => label_or_type = as_str(&parse_value_from_string(inner)?)?,
+                    Rule::prop_map => {
+                        for (k, v) in parse_prop_map(inner)? {
+                            match k.as_str() {
+                                "label" => label_or_type = as_str(&v)?,
+                                "stopwords" => stopwords = as_str_list(&v, "stopwords")?,
+                                // Forward-compatible: FalkorDB's option map carries
+                                // analyzer knobs Slater does not implement. Ignoring an
+                                // unknown key is what lets a dump written for a richer
+                                // engine still build, and the cut ones (a stemmer) are
+                                // reserved in the descriptor rather than errors here.
+                                _ => {}
+                            }
+                        }
+                    }
+                    other => bail!("unexpected full-text target {other:?}"),
+                }
+            }
+            Rule::value => properties.push(as_str(&parse_value(child)?)?),
+            _ => {}
+        }
+    }
+    finish_fulltext(entity, label_or_type, properties, stopwords)
+}
+
+/// `CREATE FULLTEXT INDEX [name] [IF NOT EXISTS] FOR <target> ON [EACH] (p, …)`.
+/// Graphiti's relationship declaration; carries no stopword list.
+fn parse_create_fulltext_index(pair: Pair<Rule>) -> Result<Statement> {
+    let mut entity = Entity::Node;
+    let mut label_or_type = String::new();
+    let mut properties: Vec<String> = Vec::new();
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::node_index_target => {
+                entity = Entity::Node;
+                for c in child.into_inner() {
+                    if c.as_rule() == Rule::label {
+                        label_or_type = unquote_key(c.as_str());
+                    }
+                }
+            }
+            Rule::ft_edge_index_target => {
+                entity = Entity::Edge;
+                for c in child.into_inner() {
+                    if c.as_rule() == Rule::reltype {
+                        label_or_type = unquote_key(c.as_str());
+                    }
+                }
+            }
+            Rule::index_prop => {
+                for c in child.into_inner() {
+                    if c.as_rule() == Rule::key {
+                        properties.push(unquote_key(c.as_str()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    finish_fulltext(entity, label_or_type, properties, Vec::new())
+}
+
+/// The checks both spellings share. A declaration naming no label, or no property, would
+/// build an index that can never match anything — and would do it silently, since an
+/// empty index is otherwise a legal thing to have.
+fn finish_fulltext(
+    entity: Entity,
+    label_or_type: String,
+    properties: Vec<String>,
+    stopwords: Vec<String>,
+) -> Result<Statement> {
+    if label_or_type.is_empty() {
+        bail!("a full-text index declaration must name a label or relationship type");
+    }
+    if properties.is_empty() {
+        bail!(
+            "full-text index on '{label_or_type}' declares no properties — it could never \
+             match anything"
+        );
+    }
+    // Position is the field id, so a repeat would give one property two ids and split its
+    // postings between them. Cheap to refuse, near-impossible to debug from the results.
+    for (i, p) in properties.iter().enumerate() {
+        if properties[..i].contains(p) {
+            bail!("full-text index on '{label_or_type}' declares property '{p}' twice");
+        }
+    }
+    Ok(Statement::FulltextIndex(FulltextIndexStmt {
+        entity,
+        label_or_type,
+        properties,
+        stopwords,
+    }))
+}
+
+/// A `Rule::string` pair as a [`Value::Str`]. `parse_value` expects a `Rule::value`
+/// wrapper, which `ft_target`'s bare-label arm does not have.
+fn parse_value_from_string(pair: Pair<Rule>) -> Result<Value> {
+    Ok(Value::Str(parse_string(pair)))
+}
+
+/// A list-of-strings option-map value (`stopwords: ['a', 'the']`).
+fn as_str_list(v: &Value, which: &str) -> Result<Vec<String>> {
+    match v {
+        Value::List(items) => items.iter().map(as_str).collect(),
+        other => bail!(
+            "{which} must be a list of strings, got {}",
+            other.type_name()
+        ),
+    }
+}
+
 enum ArgOrder {
     /// `(label, prop, dim, metric)`
     Call,
@@ -1114,6 +1254,108 @@ mod tests {
         assert_eq!(e.entity, Entity::Edge);
         assert_eq!(e.label_or_type, "CITES");
         assert_eq!(e.property, "weight");
+    }
+
+    /// Graphiti's node declaration **verbatim**, whitespace and all, from
+    /// graphiti-core 0.29.3 `graph_queries.get_fulltext_indices(FALKORDB)`. The seed dump
+    /// is generated from that same function, so this is the shape the builder actually
+    /// meets — not a tidied paraphrase of it.
+    #[test]
+    fn parses_graphitis_verbatim_node_fulltext_declaration() {
+        let Statement::FulltextIndex(f) = parse_statement(
+            "CALL db.idx.fulltext.createNodeIndex(
+                                                {
+                                                    label: 'Entity',
+                                                    stopwords: ['a', 'is', 'the']
+                                                },
+                                                'name', 'summary', 'group_id'
+                                                )",
+        )
+        .unwrap() else {
+            panic!("expected a full-text index declaration");
+        };
+        assert_eq!(f.entity, Entity::Node);
+        assert_eq!(f.label_or_type, "Entity");
+        assert_eq!(f.properties, ["name", "summary", "group_id"]);
+        assert_eq!(f.stopwords, ["a", "is", "the"]);
+    }
+
+    /// Graphiti's *relationship* declaration verbatim. Note the **undirected**
+    /// `()-[e:T]-()` endpoints — the range-index edge form requires an arrow head, so
+    /// this needs its own target rule, and getting it wrong fails as a parse error on
+    /// every startup rather than as anything subtle.
+    #[test]
+    fn parses_graphitis_verbatim_relationship_fulltext_declaration() {
+        let Statement::FulltextIndex(f) = parse_statement(
+            "CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact, e.group_id)",
+        )
+        .unwrap() else {
+            panic!("expected a full-text index declaration");
+        };
+        assert_eq!(f.entity, Entity::Edge);
+        assert_eq!(f.label_or_type, "RELATES_TO");
+        assert_eq!(f.properties, ["name", "fact", "group_id"]);
+        assert!(
+            f.stopwords.is_empty(),
+            "the CREATE FULLTEXT spelling has nowhere to put stopwords"
+        );
+    }
+
+    /// The spellings a consolidation re-emits, and the ones other clients bring: the
+    /// relationship `CALL` form (which *can* carry stopwords, which is why consolidation
+    /// uses it), a bare label instead of the option map, and Neo4j's named
+    /// `ON EACH [...]` form.
+    #[test]
+    fn accepts_the_other_fulltext_spellings() {
+        let Statement::FulltextIndex(rel) = parse_statement(
+            "CALL db.idx.fulltext.createRelationshipIndex({label: 'RELATES_TO', \
+             stopwords: ['the']}, 'name', 'fact')",
+        )
+        .unwrap() else {
+            panic!("relationship call form");
+        };
+        assert_eq!(rel.entity, Entity::Edge);
+        assert_eq!(rel.label_or_type, "RELATES_TO");
+        assert_eq!(rel.stopwords, ["the"]);
+
+        let Statement::FulltextIndex(bare) =
+            parse_statement("CALL db.idx.fulltext.createNodeIndex('Doc', 'body')").unwrap()
+        else {
+            panic!("bare-label form");
+        };
+        assert_eq!(bare.label_or_type, "Doc");
+        assert_eq!(bare.properties, ["body"]);
+
+        let Statement::FulltextIndex(neo) = parse_statement(
+            "CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS \
+             FOR (n:Entity) ON EACH [n.name, n.summary]",
+        )
+        .unwrap() else {
+            panic!("neo4j named form");
+        };
+        assert_eq!(neo.entity, Entity::Node);
+        assert_eq!(neo.label_or_type, "Entity");
+        assert_eq!(neo.properties, ["name", "summary"]);
+    }
+
+    /// Two declarations that would build an index incapable of matching anything, and one
+    /// that would split a property's postings across two field ids. All three are far
+    /// cheaper to refuse than to debug from an empty result set.
+    #[test]
+    fn refuses_fulltext_declarations_that_could_never_match() {
+        for bad in [
+            // No properties.
+            "CALL db.idx.fulltext.createNodeIndex({label: 'Entity'})",
+            // No label.
+            "CALL db.idx.fulltext.createNodeIndex({stopwords: []}, 'name')",
+            // A property twice — position is the field id, so this gives one property two.
+            "CREATE FULLTEXT INDEX FOR (n:Entity) ON (n.name, n.name)",
+        ] {
+            assert!(
+                parse_statement(bad).is_err(),
+                "should have been refused: {bad}"
+            );
+        }
     }
 
     #[test]

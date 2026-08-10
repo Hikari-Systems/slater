@@ -267,6 +267,7 @@ fn write_basic_opt(tag: &str, with_histogram: bool) -> (PathBuf, String, uuid::U
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -463,6 +464,7 @@ pub fn write_vector_docs_keyed(
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -708,6 +710,7 @@ pub fn write_indexed_people_at_keyed(
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let mut manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -892,6 +895,7 @@ pub fn write_meta(tag: &str) -> (PathBuf, String, uuid::Uuid) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1132,6 +1136,7 @@ pub fn write_cycle(tag: &str) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1300,6 +1305,7 @@ fn write_rel_sparse_opt(tag: &str, with_postings: bool) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1436,6 +1442,7 @@ pub fn write_rel_chain(tag: &str, n: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1602,6 +1609,7 @@ pub fn write_diamond(tag: &str) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1728,6 +1736,7 @@ pub fn write_chain(tag: &str, len: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1840,6 +1849,7 @@ pub fn write_isolated(tag: &str, n: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -1965,6 +1975,7 @@ pub fn write_wide(tag: &str, n: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -2117,6 +2128,7 @@ pub fn write_hub(tag: &str, n: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -2398,6 +2410,7 @@ fn write_vamana_inner(
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),
@@ -2552,6 +2565,7 @@ pub fn write_multigraph(tag: &str) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),

@@ -47,6 +47,7 @@ fn hostile_dump(tag: &str, src: u64, dst: u64, reltype: u32) -> PathBuf {
         vec!["k".into()],
         vec![],
         vec![],
+        vec![],
     )
     .unwrap();
     work

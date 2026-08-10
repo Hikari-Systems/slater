@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use graph_format::consolidate_dump::{
-    DumpRangeIndex, DumpVectorCarry, DumpVectorIndex, DumpWriter,
+    DumpFulltextIndex, DumpRangeIndex, DumpVectorCarry, DumpVectorIndex, DumpWriter,
 };
 use graph_format::crypto::delta_cipher;
 use graph_format::ids::Value;
@@ -557,19 +557,42 @@ pub fn serialise_binary_dump<V: ReadView>(
         w.append_vector(*id, *key, v)?;
     }
 
+    // Full-text declarations travel like the range ones: only the declaration, since the
+    // postings are rebuilt from the merged view. Leaving them out would make every
+    // `CALL slater.consolidate()` silently drop the index.
+    let fulltext_indexes: Vec<DumpFulltextIndex> = view
+        .manifest()
+        .fulltext_indexes
+        .iter()
+        .map(|fi| DumpFulltextIndex {
+            entity: fi.entity,
+            label_or_type: fi.label_or_type.clone(),
+            properties: fi.properties.clone(),
+            stopwords: fi.stopwords.clone(),
+        })
+        .collect();
+
     w.finish(
         labels.into_names(),
         reltypes.into_names(),
         keys.into_names(),
         range_indexes,
         vector_indexes,
+        fulltext_indexes,
     )
     .context("finish binary consolidation dump")?;
     Ok(())
 }
 
 /// `CREATE INDEX …;` for every range index, so the rebuilt generation carries the
-/// same indexes forward (and business keys stay resolvable for later writes).
+/// same indexes forward (and business keys stay resolvable for later writes) — plus a
+/// `CALL db.idx.fulltext.create*Index(…)` for every full-text index, for the same reason.
+///
+/// The full-text declarations use the **`CALL` map spelling for both entities**, not
+/// graphiti's `CREATE FULLTEXT INDEX FOR ()-[e:T]-() ON (…)` relationship form. Both
+/// parse, but only the map form has somewhere to put the stopword list, and a stopword
+/// list lost across a consolidation is silently wrong: a term dropped at index time but
+/// kept at query time simply stops matching.
 fn emit_index_ddl<V: ReadView>(view: &V, out: &mut impl Write) -> Result<()> {
     for ri in &view.manifest().range_indexes {
         let (lt, prop) = (quote_ident(&ri.label_or_type), quote_ident(&ri.property));
@@ -578,7 +601,46 @@ fn emit_index_ddl<V: ReadView>(view: &V, out: &mut impl Write) -> Result<()> {
             EntityKind::Edge => writeln!(out, "CREATE INDEX FOR ()-[r:{lt}]->() ON (r.{prop});")?,
         }
     }
+    for fi in &view.manifest().fulltext_indexes {
+        let proc = match fi.entity {
+            EntityKind::Node => "createNodeIndex",
+            EntityKind::Edge => "createRelationshipIndex",
+        };
+        let stopwords = fi
+            .stopwords
+            .iter()
+            .map(|w| quote_string(w))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let props = fi
+            .properties
+            .iter()
+            .map(|p| quote_string(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            out,
+            "CALL db.idx.fulltext.{proc}({{label: {}, stopwords: [{stopwords}]}}, {props});",
+            quote_string(&fi.label_or_type),
+        )?;
+    }
     Ok(())
+}
+
+/// A dump **string literal** — single-quoted with `\` and `'` escaped. Distinct from
+/// [`quote_ident`], which backtick-quotes an identifier: a label reaches the full-text
+/// `CALL` form as a quoted *value* inside the option map, not as a pattern identifier.
+fn quote_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\\' || c == '\'' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// The recovered business identity of a node: its labels **ordered with the identity

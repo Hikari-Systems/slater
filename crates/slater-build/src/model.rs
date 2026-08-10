@@ -32,6 +32,9 @@ pub enum Statement {
     /// A vector index declaration (either the `CALL …createNodeIndex` form or the
     /// `createNodeVectorIndex(..)` helper form).
     VectorIndex(VectorIndexStmt),
+    /// A full-text index declaration (`CALL db.idx.fulltext.create{Node,Relationship}Index`
+    /// or `CREATE FULLTEXT INDEX FOR … ON …`).
+    FulltextIndex(FulltextIndexStmt),
     /// `MERGE (n:L {k:v}) SET …` / `MATCH (n:L {k:v}) SET …` — overwrite the
     /// properties of node(s) created earlier in the same build (overlay dialect).
     NodeOverwrite(NodeOverwriteStmt),
@@ -148,6 +151,21 @@ pub struct RangeIndexStmt {
     pub entity: Entity,
     pub label_or_type: String,
     pub property: String,
+}
+
+/// A declared full-text index. Unlike a range or vector index this covers several
+/// properties, and `properties` is a **sequence, not a set**: a property's position is
+/// the field id its postings are keyed by, which is what lets a field-scoped query term
+/// (graphiti's `@group_id:"g1"`) resolve to a posting list instead of a scan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FulltextIndexStmt {
+    pub entity: Entity,
+    pub label_or_type: String,
+    pub properties: Vec<String>,
+    /// Words dropped at index time — and, necessarily, at query time too. Empty for the
+    /// `CREATE FULLTEXT INDEX` spelling, which has nowhere to put them.
+    #[serde(default)]
+    pub stopwords: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

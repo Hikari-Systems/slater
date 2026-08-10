@@ -26,7 +26,7 @@ use graph_format::crypto::{file_cipher, BlockCipher, FileCipher};
 use graph_format::extsort::{ExtSorter, SortRecord};
 use graph_format::ids::{EdgeId, Generation, NodeId, Value};
 use graph_format::isam::write_isam_sorted;
-use graph_format::manifest::{EntityKind, RangeIndexDesc};
+use graph_format::manifest::{EntityKind, FulltextIndexDesc, RangeIndexDesc};
 use graph_format::membudget::{MemoryBudget, Reservation, MIN_SORT_BYTES};
 use graph_format::nodelabels::{NodeLabelsReader, NodeLabelsWriter};
 use graph_format::postings::{
@@ -41,7 +41,7 @@ use crate::buckets::{
 use crate::cluster::{self, ClusterParams, Permutation};
 use crate::common::{self, BuildOutcome, PublishInputs};
 use crate::merge_build;
-use crate::model::{Entity, RangeIndexStmt, Statement, VectorIndexStmt};
+use crate::model::{Entity, FulltextIndexStmt, RangeIndexStmt, Statement, VectorIndexStmt};
 use crate::parser::{parse_statement, parse_statement_with_id_field, StatementReader};
 use crate::resolve::{DumpResolver, NO_DUMP};
 use crate::shared::{
@@ -129,6 +129,8 @@ struct BuildState {
     property_keys: Vec<String>,
     range_stmts: Vec<RangeIndexStmt>,
     vector_stmts: Vec<VectorIndexStmt>,
+    #[serde(default)]
+    fulltext_stmts: Vec<FulltextIndexStmt>,
     /// Valid once `phase >= Clustered`: whether the permutation is the identity
     /// (so no `perm.bin` was written).
     cluster_identity: bool,
@@ -294,6 +296,7 @@ fn process_shard(
     let mut keys = Interner::default();
     let mut rstmts: Vec<RangeIndexStmt> = Vec::new();
     let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
+    let mut fstmts: Vec<FulltextIndexStmt> = Vec::new();
     let mut node_ovr: Vec<crate::model::NodeOverwriteStmt> = Vec::new();
     let mut edge_ovr: Vec<crate::model::EdgeOverwriteStmt> = Vec::new();
     // Inline seal: pass 1 already runs one of these per shard across every core, so the
@@ -397,6 +400,16 @@ fn process_shard(
                     vstmts.push(v);
                 }
             }
+            Statement::FulltextIndex(f) => {
+                // Keyed by `(entity, label)` — the FalkorDB procedures take the label,
+                // so a label carries at most one full-text index and a redeclaration is
+                // the same index, not a second one.
+                if !fstmts.iter().any(|e: &FulltextIndexStmt| {
+                    e.entity == f.entity && e.label_or_type == f.label_or_type
+                }) {
+                    fstmts.push(f);
+                }
+            }
             // Overlay overwrites: stash verbatim (in statement order) for the global
             // pass-1.9 — matching is by label+property against ALL nodes, so it can't
             // be resolved shard-locally.
@@ -418,6 +431,7 @@ fn process_shard(
         keys: keys.into_names(),
         range_stmts: rstmts,
         vector_stmts: vstmts,
+        fulltext_stmts: fstmts,
         node_overwrites: node_ovr,
         edge_overwrites: edge_ovr,
     };
@@ -459,6 +473,7 @@ fn process_shard_merge(
     let mut keys = Interner::default();
     let mut rstmts: Vec<RangeIndexStmt> = Vec::new();
     let mut vstmts: Vec<VectorIndexStmt> = Vec::new();
+    let mut fstmts: Vec<FulltextIndexStmt> = Vec::new();
     let mut mw = merge_build::MergeShardWriters::create(
         &buckets::seg_path(node_merge_bkt, chunk.shard),
         &buckets::seg_path(edge_merge_bkt, chunk.shard),
@@ -507,6 +522,16 @@ fn process_shard_merge(
                     vstmts.push(v);
                 }
             }
+            Statement::FulltextIndex(f) => {
+                // Keyed by `(entity, label)` — the FalkorDB procedures take the label,
+                // so a label carries at most one full-text index and a redeclaration is
+                // the same index, not a second one.
+                if !fstmts.iter().any(|e: &FulltextIndexStmt| {
+                    e.entity == f.entity && e.label_or_type == f.label_or_type
+                }) {
+                    fstmts.push(f);
+                }
+            }
             Statement::Node(_) | Statement::Edge(_) => bail!(
                 "merge dump does not accept __dump_id__ CREATE statements; emit business-key \
                  MERGE statements, or pass --pk <field> for a dump_id-style import: {}",
@@ -527,6 +552,7 @@ fn process_shard_merge(
         keys: keys.into_names(),
         range_stmts: rstmts,
         vector_stmts: vstmts,
+        fulltext_stmts: fstmts,
         node_overwrites: Vec::new(),
         edge_overwrites: Vec::new(),
     };
@@ -894,6 +920,7 @@ fn build_inner(
 
     let range_stmts: Vec<RangeIndexStmt>;
     let vector_stmts: Vec<VectorIndexStmt>;
+    let fulltext_stmts: Vec<FulltextIndexStmt>;
 
     // The post-resolve inputs the clustering + emit phases consume. Produced either by
     // the Cypher front-half (pass 1 → dedup → resolve, below) or, for a
@@ -935,9 +962,11 @@ fn build_inner(
             // This used to be `Vec::new()`, which is what silently rebuilt every
             // vector-carrying graph with no vectors and no vector indexes at all.
             vector_stmts = ing.vector_stmts;
+            fulltext_stmts = ing.fulltext_stmts;
             checkpoint(
                 scratch_dir,
                 &BuildState {
+                    fulltext_stmts: fulltext_stmts.clone(),
                     generation: generation.0.to_string(),
                     phase: Phase::Resolved,
                     node_count,
@@ -962,6 +991,7 @@ fn build_inner(
             keys = Interner::from_names(s.property_keys.clone());
             range_stmts = s.range_stmts.clone();
             vector_stmts = s.vector_stmts.clone();
+            fulltext_stmts = s.fulltext_stmts.clone();
         }
         remaps = Vec::new();
         overlay = None;
@@ -1026,6 +1056,7 @@ fn build_inner(
             checkpoint(
                 scratch_dir,
                 &BuildState {
+                    fulltext_stmts: Vec::new(),
                     generation: generation.0.to_string(),
                     phase: Phase::Start,
                     node_count: 0,
@@ -1081,6 +1112,7 @@ fn build_inner(
         {
             let mut rs: Vec<RangeIndexStmt> = Vec::new();
             let mut vs: Vec<VectorIndexStmt> = Vec::new();
+            let mut fs: Vec<FulltextIndexStmt> = Vec::new();
             for m in &metas {
                 for r in &m.range_stmts {
                     if !rs.contains(r) {
@@ -1093,6 +1125,14 @@ fn build_inner(
                         .any(|e| e.label == v.label && e.property == v.property)
                     {
                         vs.push(v.clone());
+                    }
+                }
+                for f in &m.fulltext_stmts {
+                    if !fs
+                        .iter()
+                        .any(|e| e.entity == f.entity && e.label_or_type == f.label_or_type)
+                    {
+                        fs.push(f.clone());
                     }
                 }
             }
@@ -1111,6 +1151,7 @@ fn build_inner(
             }
             range_stmts = rs;
             vector_stmts = vs;
+            fulltext_stmts = fs;
         }
 
         // A vector index the shards found but the header pre-scan did not is a
@@ -1168,6 +1209,7 @@ fn build_inner(
             checkpoint(
                 scratch_dir,
                 &BuildState {
+                    fulltext_stmts: fulltext_stmts.clone(),
                     generation: generation.0.to_string(),
                     phase: Phase::Pass1,
                     node_count,
@@ -1211,6 +1253,7 @@ fn build_inner(
                 checkpoint(
                     scratch_dir,
                     &BuildState {
+                        fulltext_stmts: fulltext_stmts.clone(),
                         generation: generation.0.to_string(),
                         phase: Phase::Deduped,
                         node_count,
@@ -1252,6 +1295,7 @@ fn build_inner(
             checkpoint(
                 scratch_dir,
                 &BuildState {
+                    fulltext_stmts: fulltext_stmts.clone(),
                     generation: generation.0.to_string(),
                     phase: Phase::Resolved,
                     node_count,
@@ -1413,6 +1457,7 @@ fn build_inner(
             checkpoint(
                 scratch_dir,
                 &BuildState {
+                    fulltext_stmts: fulltext_stmts.clone(),
                     generation: generation.0.to_string(),
                     phase: Phase::Resolved,
                     node_count,
@@ -1471,6 +1516,7 @@ fn build_inner(
         checkpoint(
             scratch_dir,
             &BuildState {
+                fulltext_stmts: fulltext_stmts.clone(),
                 generation: generation.0.to_string(),
                 phase: Phase::Clustered,
                 node_count,
@@ -2213,6 +2259,52 @@ fn build_inner(
     }
     drop(emit_range_g);
 
+    // --- full-text index declarations ---
+    //
+    // Declaration only at this stage: the four `fulltext/` files are written by a later
+    // commit on this branch, so `doc_count`/`avg_doc_len` stay 0 and the index answers
+    // every query with nothing. That is the same state a declaration whose label matched
+    // no entity ends in, and it is a legal one — an empty index is well-defined.
+    let fulltext_indexes: Vec<FulltextIndexDesc> = fulltext_stmts
+        .iter()
+        .map(|fi| {
+            // A declaration whose label was never interned matched no entity, which is
+            // almost always a typo rather than an empty graph. Say so — the manifest
+            // descriptor alone looks perfectly healthy, exactly as it does for a vector
+            // index that gathered nothing.
+            let (kind, known) = match fi.entity {
+                Entity::Node => ("label", labels.names().contains(&fi.label_or_type)),
+                Entity::Edge => (
+                    "relationship type",
+                    reltypes.names().contains(&fi.label_or_type),
+                ),
+            };
+            if !known {
+                eprintln!(
+                    "warning: full-text index on {kind} '{}' — no such {kind} in the dump, so it \
+                     will answer every query with nothing. Check the spelling.",
+                    fi.label_or_type
+                );
+            }
+            FulltextIndexDesc {
+                name: match fi.entity {
+                    Entity::Node => format!("node_{}", fi.label_or_type),
+                    Entity::Edge => format!("edge_{}", fi.label_or_type),
+                },
+                entity: match fi.entity {
+                    Entity::Node => EntityKind::Node,
+                    Entity::Edge => EntityKind::Edge,
+                },
+                label_or_type: fi.label_or_type.clone(),
+                properties: fi.properties.clone(),
+                stopwords: fi.stopwords.clone(),
+                stemmer: None,
+                doc_count: 0,
+                avg_doc_len: 0.0,
+            }
+        })
+        .collect();
+
     // prop_hist.blk — value→count histograms from the node range ISAMs just
     // written (run-length-count the finished ISAM). High-cardinality / disabled
     // indexes are skipped.
@@ -2295,6 +2387,7 @@ fn build_inner(
         property_keys: keys.into_names(),
         range_indexes,
         vector_indexes,
+        fulltext_indexes,
         reltype_source_counts,
         reltype_target_counts,
         reltype_edge_counts: summaries.reltype_edge_counts,

@@ -230,6 +230,7 @@ fn build_large_vamana(root: &Path, graph: &str) -> Vec<Vec<f32>> {
     let content_hash = content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),

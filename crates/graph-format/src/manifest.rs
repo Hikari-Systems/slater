@@ -290,6 +290,53 @@ pub struct EncryptionHeader {
     pub aad_scheme: String,
 }
 
+/// Descriptor for one declared full-text index over a `(label, properties…)`.
+///
+/// Unlike a range or vector index this covers **several** properties at once, and the
+/// order matters: a term's posting list is keyed by `(field, term)` where `field` is the
+/// property's *position* in [`Self::properties`]. That is what lets a field-scoped query
+/// term — graphiti's `(@group_id:"g1")` filter — resolve to a posting list rather than
+/// degrade into a scan-and-filter.
+///
+/// Lookup is by `(entity, label_or_type)`, not by name: FalkorDB's procedures take the
+/// label (`db.idx.fulltext.queryNodes('Entity', $q)`), so a label carries at most one
+/// full-text index. [`Self::name`] is only the file stem under `fulltext/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FulltextIndexDesc {
+    /// Index file stem under `fulltext/` (`<name>.ftd`, `.ftm.blk`, `.post.blk`,
+    /// `.docs.blk`). Formed as `node_<label>` / `edge_<reltype>`, mirroring
+    /// [`RangeIndexDesc::name`]'s `node_<label>_<property>` convention.
+    pub name: String,
+    pub entity: EntityKind,
+    /// Node label or relationship type the index covers.
+    pub label_or_type: String,
+    /// The indexed properties **in declaration order** — position is the field id (see
+    /// the type-level note). Reordering an existing index's properties therefore
+    /// invalidates its postings, so the builder writes them exactly as declared.
+    pub properties: Vec<String>,
+    /// Words dropped at *both* index and query time. Carried per index rather than
+    /// hardcoded because the declaration supplies them: graphiti embeds its own
+    /// `STOPWORDS` list in every `db.idx.fulltext.createNodeIndex` call, and a term
+    /// dropped at build time but not at query time simply never matches.
+    #[serde(default)]
+    pub stopwords: Vec<String>,
+    /// Reserved for a future stemmer, deliberately unimplemented (the cut list's first
+    /// item). Present from the outset so adding one is a value change, not a schema
+    /// change — i.e. never a format bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stemmer: Option<String>,
+    /// Indexed documents — BM25's `N`. Zero for a declaration whose label matched
+    /// nothing, which is legal (it answers every query with nothing).
+    #[serde(default)]
+    pub doc_count: u64,
+    /// Mean document length in terms — BM25's `avgdl`. Zero when [`Self::doc_count`]
+    /// is; the scorer treats a zero `avgdl` as "no length normalisation" rather than
+    /// dividing by it.
+    #[serde(default)]
+    pub avg_doc_len: f32,
+}
+
 /// One file in the generation inventory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -353,6 +400,26 @@ pub struct Manifest {
     pub range_indexes: Vec<RangeIndexDesc>,
     #[serde(default)]
     pub vector_indexes: Vec<VectorIndexDesc>,
+    /// Declared full-text indexes (`fulltext/<name>.{ftd,ftm.blk,post.blk,docs.blk}`).
+    ///
+    /// **Additive-optional, and it must stay that way.** `skip_serializing_if` is not a
+    /// tidiness choice here: [`Manifest::mac_body`] recomputes the MAC by re-serialising
+    /// this struct, so a generation built before full-text existed parses to an empty vec
+    /// and *must* re-serialise to the byte-identical preimage or its MAC stops verifying.
+    /// A bare `#[serde(default)]` would emit `"fulltextIndexes":[]` and invalidate every
+    /// sealed manifest in the estate. Same treatment [`AnnNav`] took for `nav` (HIK-137),
+    /// and for the same reason.
+    ///
+    /// The change therefore needs no format bump: it reinterprets no existing bytes, and
+    /// the four files are new names in `files[]`.
+    ///
+    /// **Ordering constraint for operators:** an *old* server handed a *new*
+    /// full-text-declaring generation drops the unknown key. Keyed, the MAC then differs
+    /// and it is refused; **unkeyed**, where integrity rests on the content hash over
+    /// `files[]`, it is served silently *without* full text. Roll servers before
+    /// publishing full-text-declaring generations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fulltext_indexes: Vec<FulltextIndexDesc>,
     /// Per-reltype distinct **source** node counts (index = reltype id, aligned
     /// with `reltypes`). Non-empty ⇒ the generation carries `reltype_src.post`;
     /// the planner uses these to cost a relationship-type scan against a label
@@ -712,6 +779,73 @@ mod tests {
         }
     }
 
+    /// The whole no-format-bump argument for full text, as an executable claim.
+    ///
+    /// `mac_body` recomputes the MAC by re-serialising the struct, so a manifest written
+    /// before full-text existed must parse to an empty vec and re-serialise to the *same
+    /// bytes* — otherwise every sealed manifest in the estate stops verifying. That is why
+    /// the field carries `skip_serializing_if`, and this is the test that would catch its
+    /// removal. (`mac_preimage_body_is_pinned_to_a_golden_shape` covers the same ground
+    /// from the other end: the golden body has no `fulltextIndexes` key.)
+    #[test]
+    fn a_pre_fulltext_manifest_parses_and_re_serialises_byte_identically() {
+        let json = format!(
+            r#"{{
+            "magic":"SLATER01","formatVersion":{ver},
+            "buildUuid":"00000000-0000-0000-0000-000000000001","graph":"docs",
+            "createdUnix":1700000000,"contentHash":"abc","blockSizes":{{}},
+            "codec":"zstd","zstdLevel":3,"compressionProfile":"",
+            "nodeCount":10,"edgeCount":0,
+            "labels":["Doc"],"reltypes":[],"propertyKeys":["name"],
+            "rangeIndexes":[],"vectorIndexes":[],
+            "reltypeSourceCounts":[],"reltypeTargetCounts":[],"reltypeEdgeCounts":[],
+            "reltypeSelfLoopCounts":[],"labelNodeCounts":[],"firstLabelCounts":[],
+            "srcLabelReltypeCounts":[],"reltypeTgtLabelCounts":[],
+            "schemaTripleCounts":[],"propertyHistograms":[],"files":[]
+        }}"#,
+            ver = crate::FORMAT_VERSION
+        );
+        let m = parse_manifest(&json)
+            .expect("a manifest predating full text (no fulltextIndexes key) must still parse");
+        assert!(m.fulltext_indexes.is_empty());
+
+        let round = serde_json::to_string(&m).unwrap();
+        assert!(
+            !round.contains("fulltextIndexes"),
+            "an empty fulltext_indexes must be omitted, or the re-serialised MAC preimage \
+             changes and every existing sealed manifest is refused: {round}"
+        );
+    }
+
+    /// A declared index *does* serialise, and round-trips with its field order intact —
+    /// position in `properties` is the field id the postings are keyed by, so a reorder
+    /// would silently repoint every field-scoped query at the wrong posting list.
+    #[test]
+    fn a_declared_fulltext_index_roundtrips_with_its_property_order() {
+        let desc = FulltextIndexDesc {
+            name: "node_Entity".into(),
+            entity: EntityKind::Node,
+            label_or_type: "Entity".into(),
+            properties: vec!["name".into(), "summary".into(), "group_id".into()],
+            stopwords: vec!["the".into(), "a".into()],
+            stemmer: None,
+            doc_count: 3,
+            avg_doc_len: 7.5,
+        };
+        let js = serde_json::to_string(&desc).unwrap();
+        assert!(
+            !js.contains("stemmer"),
+            "the reserved stemmer must stay absent until one exists: {js}"
+        );
+        let back: FulltextIndexDesc = serde_json::from_str(&js).unwrap();
+        assert_eq!(back, desc);
+        assert_eq!(
+            back.properties,
+            ["name", "summary", "group_id"],
+            "property order is the field id — it must survive a round trip verbatim"
+        );
+    }
+
     /// The discriminator round-trips, and — critically — an `Augmented` index **omits** the `nav`
     /// key on serialize (so existing cosine/L2/augmented-Dot manifests are byte-identical to
     /// before), while an `InnerProduct` index emits `"nav":"inner_product"`.
@@ -821,6 +955,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         Manifest {
+            fulltext_indexes: Vec::new(),
             magic: "SLATER01".into(),
             format_version: crate::FORMAT_VERSION,
             build_uuid: Generation(uuid::Uuid::nil()),
@@ -1004,6 +1139,7 @@ mod tests {
     /// framing assertion below derives from the live constant.)
     fn golden_manifest() -> Manifest {
         Manifest {
+            fulltext_indexes: Vec::new(),
             magic: "SLATER01".into(),
             format_version: 8,
             build_uuid: Generation(uuid::Uuid::from_u128(0x1234_5678)),

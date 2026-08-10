@@ -168,6 +168,7 @@ pub fn write_scale(tag: &str, n: u64) -> (PathBuf, String) {
     let content_hash = graph_format::integrity::content_hash(&inv);
 
     let manifest = Manifest {
+        fulltext_indexes: Vec::new(),
         magic: String::from_utf8(MAGIC.to_vec()).unwrap(),
         format_version: FORMAT_VERSION,
         build_uuid: GenId(uuid),

@@ -19,8 +19,8 @@ use graph_format::histogram::{
 use graph_format::ids::Generation;
 use graph_format::integrity::content_hash;
 use graph_format::manifest::{
-    EncryptionHeader, EntityKind, HubDegreeDesc, Manifest, PropertyHistogramDesc, RangeIndexDesc,
-    VectorIndexDesc,
+    EncryptionHeader, EntityKind, FulltextIndexDesc, HubDegreeDesc, Manifest,
+    PropertyHistogramDesc, RangeIndexDesc, VectorIndexDesc,
 };
 use graph_format::store::{join_key, ObjectStore};
 
@@ -91,6 +91,7 @@ pub struct PublishInputs<'a> {
     pub property_keys: Vec<String>,
     pub range_indexes: Vec<RangeIndexDesc>,
     pub vector_indexes: Vec<VectorIndexDesc>,
+    pub fulltext_indexes: Vec<FulltextIndexDesc>,
     /// Per-reltype distinct source/target node counts for the endpoint postings
     /// (`reltype_src.post` / `reltype_tgt.post`), index = reltype id.
     pub reltype_source_counts: Vec<u64>,
@@ -213,6 +214,7 @@ pub fn write_manifest_and_publish(inp: PublishInputs) -> Result<BuildOutcome> {
         property_keys: inp.property_keys,
         range_indexes: inp.range_indexes,
         vector_indexes: inp.vector_indexes,
+        fulltext_indexes: inp.fulltext_indexes,
         reltype_source_counts: inp.reltype_source_counts,
         reltype_target_counts: inp.reltype_target_counts,
         reltype_edge_counts: inp.reltype_edge_counts,

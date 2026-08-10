@@ -168,6 +168,51 @@ The metric keyword accepts synonyms: `cosine`; `euclidean` / `l2`; and `ip` /
 `--vamana-r`, `--vamana-alpha`, `--pq-subspaces`, `--pq-bits`; smaller ones stay
 exact brute-force. See [10 Vector search](10-vector-search.md).
 
+## Declaring full-text indexes
+
+Like a vector index, a full-text index is declared when the generation is built.
+Unlike range and vector indexes it covers **several properties at once**, and the
+order they are declared in matters — a property's position is the field its terms
+are indexed under, which is what lets a field-scoped query term resolve against a
+posting list instead of falling back to a scan.
+
+```cypher
+-- The option-map form. `stopwords` are dropped at index time and at query time.
+CALL db.idx.fulltext.createNodeIndex(
+  {label: 'Entity', stopwords: ['a', 'is', 'the']},
+  'name', 'summary', 'group_id');
+
+-- The relationship equivalent.
+CALL db.idx.fulltext.createRelationshipIndex(
+  {label: 'RELATES_TO', stopwords: []}, 'name', 'fact');
+
+-- A bare label, when the defaults will do.
+CALL db.idx.fulltext.createNodeIndex('Product', 'title', 'description');
+```
+
+The `CREATE FULLTEXT INDEX` spelling is accepted too, in both the FalkorDB and
+Neo4j bracketings, so a schema written for either engine builds unchanged. Note
+that its relationship pattern is **undirected**:
+
+```cypher
+CREATE FULLTEXT INDEX FOR ()-[e:RELATES_TO]-() ON (e.name, e.fact);
+CREATE FULLTEXT INDEX product_text IF NOT EXISTS
+  FOR (n:Product) ON EACH [n.title, n.description];
+```
+
+An index is keyed by its `(entity, label)` — the query procedures take a label,
+not an index name — so a label carries at most one full-text index, and any index
+name in the declaration is parsed and discarded. Redeclaring the same label is
+the same index, not a second one.
+
+A declaration whose label or relationship type appears nowhere in the dump builds
+an empty index and warns on stderr: legal (it answers every query with nothing),
+but nearly always a misspelling.
+
+> Declaring an index is not yet the same as being able to search it — the
+> `db.idx.fulltext.query*` procedures land later in this work. Declarations are
+> carried through `CALL slater.consolidate()`, so a graph built now keeps them.
+
 ## Resume and diagnostics
 
 - **`--resume`** — an interrupted build can be resumed. The builder checkpoints a

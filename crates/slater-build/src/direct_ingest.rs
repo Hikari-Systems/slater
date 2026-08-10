@@ -26,7 +26,7 @@ use graph_format::manifest::{EntityKind, Metric};
 
 use crate::buckets::{Blob, BucketWriter, EdgeRec, NodeRec};
 use crate::diag::BuildDiag;
-use crate::model::{Entity, RangeIndexStmt, VectorIndexStmt};
+use crate::model::{Entity, FulltextIndexStmt, RangeIndexStmt, VectorIndexStmt};
 
 /// A dump edge names something the dump itself does not contain.
 ///
@@ -76,6 +76,7 @@ pub struct IngestResult {
     pub keys: Vec<String>,
     pub range_stmts: Vec<RangeIndexStmt>,
     pub vector_stmts: Vec<VectorIndexStmt>,
+    pub fulltext_stmts: Vec<FulltextIndexStmt>,
 }
 
 /// The canonical token for a metric, as `shared::parse_metric` reads it back. Kept
@@ -278,6 +279,23 @@ pub fn ingest_dump(
         })
         .collect();
 
+    // The full-text declarations. Only the declaration travels — the postings are
+    // rebuilt from the dumped nodes/edges, exactly as the range ISAMs are.
+    let fulltext_stmts = r
+        .meta()
+        .fulltext_indexes
+        .iter()
+        .map(|fi| FulltextIndexStmt {
+            entity: match fi.entity {
+                EntityKind::Node => Entity::Node,
+                EntityKind::Edge => Entity::Edge,
+            },
+            label_or_type: fi.label_or_type.clone(),
+            properties: fi.properties.clone(),
+            stopwords: fi.stopwords.clone(),
+        })
+        .collect();
+
     Ok(IngestResult {
         node_count,
         edge_count,
@@ -286,6 +304,7 @@ pub fn ingest_dump(
         keys: r.meta().property_keys.clone(),
         range_stmts,
         vector_stmts,
+        fulltext_stmts,
     })
 }
 
@@ -331,6 +350,7 @@ mod tests {
             vec!["N".into()],
             (0..RELTYPES).map(|i| format!("R{i}")).collect(),
             vec!["k".into()],
+            vec![],
             vec![],
             vec![],
         )

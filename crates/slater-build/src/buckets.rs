@@ -374,6 +374,8 @@ pub struct ShardMeta {
     pub range_stmts: Vec<crate::model::RangeIndexStmt>,
     #[serde(default)]
     pub vector_stmts: Vec<crate::model::VectorIndexStmt>,
+    #[serde(default)]
+    pub fulltext_stmts: Vec<crate::model::FulltextIndexStmt>,
     /// Overlay overwrite statements (`MERGE|MATCH … SET …`) seen in this shard, in
     /// statement order. Tiny in practice (overlays are small patch sections), and
     /// applied globally in pass-1.9. Persisted so resume reproduces them.

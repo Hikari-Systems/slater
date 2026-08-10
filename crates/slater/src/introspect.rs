@@ -209,15 +209,20 @@ pub(crate) fn db_property_keys(m: &Manifest) -> Rows {
 /// Flattened view of every index in the manifest, dialect-independent.
 struct IdxView {
     name: String,
-    kind: &'static str,   // "RANGE" | "VECTOR"
+    kind: &'static str,   // "RANGE" | "VECTOR" | "FULLTEXT"
     entity: &'static str, // "NODE" | "RELATIONSHIP"
     label: String,
-    property: String,
+    /// A list, not a single name: a full-text index covers several properties at once
+    /// and reports them in **one** row, the way Neo4j does. Range and vector indexes are
+    /// single-property and contribute a one-element list, so their rows are unchanged.
+    properties: Vec<String>,
     provider: &'static str,
 }
 
 fn index_views(m: &Manifest) -> Vec<IdxView> {
-    let mut out = Vec::with_capacity(m.range_indexes.len() + m.vector_indexes.len());
+    let mut out = Vec::with_capacity(
+        m.range_indexes.len() + m.vector_indexes.len() + m.fulltext_indexes.len(),
+    );
     for r in &m.range_indexes {
         out.push(IdxView {
             name: r.name.clone(),
@@ -227,7 +232,7 @@ fn index_views(m: &Manifest) -> Vec<IdxView> {
                 EntityKind::Edge => "RELATIONSHIP",
             },
             label: r.label_or_type.clone(),
-            property: r.property.clone(),
+            properties: vec![r.property.clone()],
             provider: "range-1.0",
         });
     }
@@ -237,8 +242,21 @@ fn index_views(m: &Manifest) -> Vec<IdxView> {
             kind: "VECTOR",
             entity: "NODE",
             label: v.label.clone(),
-            property: v.property.clone(),
+            properties: vec![v.property.clone()],
             provider: "vector-2.0",
+        });
+    }
+    for f in &m.fulltext_indexes {
+        out.push(IdxView {
+            name: format!("fulltext_{}", f.name),
+            kind: "FULLTEXT",
+            entity: match f.entity {
+                EntityKind::Node => "NODE",
+                EntityKind::Edge => "RELATIONSHIP",
+            },
+            label: f.label_or_type.clone(),
+            properties: f.properties.clone(),
+            provider: "fulltext-1.0",
         });
     }
     out
@@ -272,7 +290,7 @@ pub(crate) fn show_indexes(m: &Manifest) -> Rows {
                 s(ix.kind),
                 s(ix.entity),
                 strlist([ix.label]),
-                strlist([ix.property]),
+                strlist(ix.properties),
                 s(ix.provider),
                 PsValue::Null,
                 PsValue::Null,
@@ -310,7 +328,7 @@ pub(crate) fn db_indexes(m: &Manifest) -> Rows {
                 s(ix.kind),
                 s(ix.entity),
                 strlist([ix.label]),
-                strlist([ix.property]),
+                strlist(ix.properties),
                 s(ix.provider),
             ]
         })
@@ -327,7 +345,9 @@ pub(crate) fn show_index_info(m: &Manifest) -> Rows {
             vec![
                 s("label+property"),
                 s(ix.label),
-                s(ix.property),
+                // One string column, so a multi-property full-text index joins. Memgraph
+                // has no full-text row shape to be faithful to here.
+                s(ix.properties.join(", ")),
                 PsValue::Null,
             ]
         })

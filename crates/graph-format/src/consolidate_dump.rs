@@ -173,6 +173,25 @@ pub struct DumpRangeIndex {
     pub property: String,
 }
 
+/// A full-text index to recreate on the rebuilt generation. Like [`DumpRangeIndex`],
+/// only the *declaration* travels — the postings are rebuilt from the merged view, so
+/// nothing index-shaped rides the dump.
+///
+/// It has to travel at all for the same reason the range indexes do: `CALL
+/// slater.consolidate()` rebuilds the generation from this dump, so a declaration left
+/// out here is a declaration **silently dropped** at the next consolidation. The graph
+/// would keep answering, minus its full-text index, with nothing in the log to say so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpFulltextIndex {
+    pub entity: EntityKind,
+    pub label_or_type: String,
+    /// Indexed properties in declaration order — position is the field id, so this
+    /// travels as a sequence and never as a set.
+    pub properties: Vec<String>,
+    #[serde(default)]
+    pub stopwords: Vec<String>,
+}
+
 /// A vector index to recreate on the rebuilt generation. The ANN parameters (`R`,
 /// `alpha`, PQ subspaces/bits, the ANN threshold) are *build* options, not per-index
 /// state, so a *fresh* rebuild re-derives them exactly as a fresh build would — only the
@@ -268,6 +287,11 @@ pub struct DumpMeta {
     /// Vector indexes to recreate. Empty for a graph that carries none.
     #[serde(default)]
     pub vector_indexes: Vec<DumpVectorIndex>,
+    /// Full-text indexes to recreate. **Additive-optional** — a dump written before full
+    /// text existed has no key and parses to empty, exactly as [`DumpVectorCarry::nav`]
+    /// does, so an in-flight dump from an older binary still reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fulltext_indexes: Vec<DumpFulltextIndex>,
 }
 
 /// Append `blob(rec) = uvarint(len) ‖ rec`, so a reader can split concatenated
@@ -577,6 +601,7 @@ impl DumpWriter {
         property_keys: Vec<String>,
         range_indexes: Vec<DumpRangeIndex>,
         vector_indexes: Vec<DumpVectorIndex>,
+        fulltext_indexes: Vec<DumpFulltextIndex>,
     ) -> Result<()> {
         let node_count = self.node_count;
         let edge_count = self.edge_count;
@@ -593,6 +618,7 @@ impl DumpWriter {
             property_keys,
             range_indexes,
             vector_indexes,
+            fulltext_indexes,
         };
         let json = serde_json::to_vec_pretty(&meta).context("serialise dump meta")?;
         // Sealed too, not merely authenticated (HIK-149). `meta.json` carries the graph's
@@ -811,6 +837,7 @@ mod tests {
             vec![MARKER.into()],
             vec!["KNOWS".into()],
             vec![MARKER.into()],
+            vec![],
             vec![],
             vec![],
         )
@@ -1042,6 +1069,7 @@ mod tests {
                 property: "name".into(),
             }],
             vec![],
+            vec![],
         )
         .unwrap();
 
@@ -1091,7 +1119,8 @@ mod tests {
         let dir = tmp("foreign");
         let _ = std::fs::remove_dir_all(&dir);
         let w = DumpWriter::create(&dir, None).unwrap();
-        w.finish(vec![], vec![], vec![], vec![], vec![]).unwrap();
+        w.finish(vec![], vec![], vec![], vec![], vec![], vec![])
+            .unwrap();
         // Corrupt the magic.
         let meta_path = dir.join(META_FILE);
         let mut meta: DumpMeta =
@@ -1211,6 +1240,7 @@ mod tests {
                 metric: Metric::Cosine,
                 carry: Some(carry.clone()),
             }],
+            vec![],
         )
         .unwrap();
 
@@ -1244,6 +1274,7 @@ mod tests {
                 vec!["Person".into()],
                 vec!["KNOWS".into()],
                 vec!["name".into(), "since".into()],
+                vec![],
                 vec![],
                 vec![],
             )
