@@ -55,6 +55,7 @@ pub mod crypto;
 pub mod degree_ef;
 pub mod extents;
 pub mod extsort;
+pub mod fulltext;
 pub mod histogram;
 pub mod hubdegree;
 pub mod ids;
