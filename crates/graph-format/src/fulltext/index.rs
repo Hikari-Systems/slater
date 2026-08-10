@@ -139,7 +139,7 @@ pub struct Chunk {
 ///
 /// `cipher_for` is handed each file's store-relative name so the caller binds the
 /// generation cipher exactly as it does for every other file (HIK-140 requires the name
-/// to be byte-identical on the writing and reading sides — see [`open`]).
+/// to be byte-identical on the writing and reading sides — see [`FulltextReader::open`]).
 pub fn write_fulltext_index<D, P>(
     dir: &Path,
     rel_stem: &str,

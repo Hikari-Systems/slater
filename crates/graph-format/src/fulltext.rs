@@ -37,7 +37,9 @@
 //! the field so adding one later is a value change, not a format change. Until then a
 //! search for `running` does not match `runs`, which is a recall limit, not a defect.
 
+pub mod bm25;
 pub mod index;
+pub mod search;
 
 /// The characters FalkorDB treats as token separators, verbatim from graphiti-core's
 /// `_SEPARATOR_MAP`. ASCII whitespace separates too and is handled by
