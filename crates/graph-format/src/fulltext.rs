@@ -37,6 +37,8 @@
 //! the field so adding one later is a value change, not a format change. Until then a
 //! search for `running` does not match `runs`, which is a recall limit, not a defect.
 
+pub mod index;
+
 /// The characters FalkorDB treats as token separators, verbatim from graphiti-core's
 /// `_SEPARATOR_MAP`. ASCII whitespace separates too and is handled by
 /// [`char::is_whitespace`], so it is not listed here.
@@ -58,17 +60,11 @@ pub fn is_separator(c: char) -> bool {
     c.is_whitespace() || SEPARATORS.binary_search(&c).is_ok()
 }
 
-/// Split `text` into lowercased terms, dropping `stopwords`.
+/// Splits text into the lowercased terms an index stores and a query looks up.
 ///
-/// `stopwords` is expected to be already lowercased and sorted — the descriptor stores
-/// what the declaration supplied, and [`Analyzer::new`] does that normalisation once so
-/// the per-token test is a binary search rather than a linear scan of a 33-element list
-/// per token of every property of every entity.
-///
-/// Yields `(term, position)` where `position` counts **surviving** tokens from 0.
-/// Positions are not used by the scorer today (there are no phrase queries — graphiti
-/// strips the quotes that would spell one before we ever see it), but they are what a
-/// later phrase or proximity feature would need, and computing them here costs nothing.
+/// The declared stopword list is normalised once at construction — lowercased, sorted,
+/// deduped — so the per-token test is a binary search rather than a linear scan of a
+/// 33-element list for every token of every property of every entity.
 pub struct Analyzer {
     stopwords: Vec<String>,
 }
