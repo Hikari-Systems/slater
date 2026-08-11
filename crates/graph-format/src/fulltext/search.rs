@@ -40,12 +40,35 @@ use anyhow::Result;
 use super::bm25::{self, Bm25Params};
 use super::index::FulltextReader;
 
+/// One alternative of a filter group: a field, and every term its value analyzed to.
+///
+/// The terms are **conjunctive** — a document matches only if that field contains all of
+/// them. That is how a multi-token value is handled: `@group_id:"550e8400-e29b-…"` is one
+/// value, but the analyzer splits it on `-` into several terms, and a filter has to
+/// require all of them rather than any.
+///
+/// It is an **over-approximation** of the exact phrase RediSearch would match, since term
+/// order and adjacency are not checked. Two different values with the same token multiset
+/// in a different order would both match. That is deliberate and safe here: it can only
+/// widen the candidate set, never narrow it, and every graphiti leg re-applies an exact
+/// `group_id IN $group_ids` predicate in Cypher on top of this — verified against all four
+/// of `node_`/`edge_`/`episode_`/`community_fulltext_search`. Do not treat it as an exact
+/// equality predicate on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterAlternative {
+    pub field: u32,
+    /// All required. **Empty means no constraint** — a value that analyzed to nothing (it
+    /// was entirely stopwords) cannot be checked, and excluding everything would be the
+    /// worse guess when the caller re-filters exactly anyway.
+    pub terms: Vec<String>,
+}
+
 /// A parsed full-text query.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FulltextQuery {
     /// Required, unscored. Outer vector is **AND** across groups, inner is **OR** of
-    /// `(field, term)` alternatives within a group — the shape `(@group_id:"a"|"b")` has.
-    pub filters: Vec<Vec<(u32, String)>>,
+    /// alternatives within a group — the shape `(@group_id:"a"|"b")` has.
+    pub filters: Vec<Vec<FilterAlternative>>,
     /// The scored disjunction. Empty means nothing scores, and the query matches nothing:
     /// graphiti already returns `''` (and skips the call) when every word was a stopword,
     /// so an empty term list arriving here is a caller that should have short-circuited.
@@ -129,18 +152,41 @@ pub fn search(
             break;
         }
         let mut keep: HashSet<u64> = HashSet::new();
-        for (field, term) in group {
-            for m in reader.term_metas(term)? {
-                if m.field != *field {
-                    continue;
-                }
-                for c in 0..m.chunk_count {
-                    for d in reader.chunk(&m, c)?.docs {
-                        if acc.contains_key(&d) {
-                            keep.insert(d);
+        for alt in group {
+            if alt.terms.is_empty() {
+                // No constraint (see `FilterAlternative::terms`): this alternative admits
+                // every candidate, so the whole group does.
+                keep.extend(acc.keys().copied());
+                break;
+            }
+            // Intersect the alternative's terms: every one must be present, in its field.
+            // `surviving` starts as "all candidates" and narrows, so the first term does
+            // the bulk of the cutting and later terms scan against a shrinking set.
+            let mut surviving: Option<HashSet<u64>> = None;
+            for term in &alt.terms {
+                let mut here: HashSet<u64> = HashSet::new();
+                for m in reader.term_metas(term)? {
+                    if m.field != alt.field {
+                        continue;
+                    }
+                    for c in 0..m.chunk_count {
+                        for d in reader.chunk(&m, c)?.docs {
+                            let live = acc.contains_key(&d)
+                                && surviving.as_ref().is_none_or(|s| s.contains(&d));
+                            if live {
+                                here.insert(d);
+                            }
                         }
                     }
                 }
+                let empty = here.is_empty();
+                surviving = Some(here);
+                if empty {
+                    break; // this alternative cannot match; stop reading its postings
+                }
+            }
+            if let Some(s) = surviving {
+                keep.extend(s);
             }
         }
         acc.retain(|d, _| keep.contains(d));
@@ -297,7 +343,10 @@ mod tests {
         let filtered = search(
             &r,
             &FulltextQuery {
-                filters: vec![vec![(2, "g1".to_string())]],
+                filters: vec![vec![FilterAlternative {
+                    field: 2,
+                    terms: vec!["g1".into()],
+                }]],
                 terms: vec!["alpha".to_string()],
             },
             avg,
@@ -338,7 +387,16 @@ mod tests {
         let or = search(
             &r,
             &FulltextQuery {
-                filters: vec![vec![(2, "g1".into()), (2, "g3".into())]],
+                filters: vec![vec![
+                    FilterAlternative {
+                        field: 2,
+                        terms: vec!["g1".into()],
+                    },
+                    FilterAlternative {
+                        field: 2,
+                        terms: vec!["g3".into()],
+                    },
+                ]],
                 terms: vec!["alpha".into()],
             },
             avg,
@@ -352,7 +410,16 @@ mod tests {
         let and = search(
             &r,
             &FulltextQuery {
-                filters: vec![vec![(2, "g1".into())], vec![(2, "g2".into())]],
+                filters: vec![
+                    vec![FilterAlternative {
+                        field: 2,
+                        terms: vec!["g1".into()],
+                    }],
+                    vec![FilterAlternative {
+                        field: 2,
+                        terms: vec!["g2".into()],
+                    }],
+                ],
                 terms: vec!["alpha".into()],
             },
             avg,

@@ -39,6 +39,7 @@
 
 pub mod bm25;
 pub mod index;
+pub mod query;
 pub mod search;
 
 /// The characters FalkorDB treats as token separators, verbatim from graphiti-core's
