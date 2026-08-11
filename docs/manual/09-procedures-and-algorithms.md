@@ -189,10 +189,26 @@ Three things to know:
   matching nothing. A field filter's value is matched by its terms, not as an exact
   phrase, so treat it as a narrowing filter rather than an equality predicate.
 
-One current limit: a document written through the writable layer since the
-generation was built is not searchable until `CALL slater.consolidate()` rebuilds
-the index. That is a recall gap, not a correctness one — every hit returned is real
-and correctly scored.
+**Writes are visible immediately.** The built index covers the core generation;
+everything written since — sealed segments and the write delta — is served by an
+overlay scan that analyzes the affected documents' current text at query time, and
+those documents are suppressed in the index arm so nothing is scored twice or from a
+stale copy. A node created, edited or deleted through the writable layer therefore
+searches correctly straight away, with no consolidation needed. This is cheap here
+only because text stays an ordinary property; an embedding, which is routed out of
+the property record, needs the much larger machinery in
+[10 Vector search](10-vector-search.md).
+
+Both arms score with one reconciled `idf`, taken from the built index's statistics,
+so a term's weight cannot change depending on which arm found a document. Those
+statistics go slightly stale between consolidations: a superseded document still
+counts toward the stored `df` and document count, and cannot be subtracted without
+its old text. The effect is a uniform downward bias on recently-edited terms,
+proportional to the overlay's share of the graph, and it disappears at `CALL
+slater.consolidate()`. Ranking is affected; which documents match is not.
+
+One limit: a **relationship** index is served from the core alone, so an edge whose
+`fact` changed since the build keeps its old text until a consolidation.
 
 ## Not supported
 

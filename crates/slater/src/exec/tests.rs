@@ -11993,3 +11993,164 @@ fn unsupported_fulltext_syntax_is_refused_at_execution() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── full text over the write delta ───────────────────────────────────────────
+//
+// The built index covers the core generation only; everything written since is served
+// by the overlay scan. These pin the three things that can go wrong: a fresh write
+// being invisible, an edited document being returned from its *stale* core text, and a
+// deleted one still matching.
+
+use crate::read_view::MergedView as FtMergedView;
+use slater_delta::{DeltaSnapshot as FtDeltaSnapshot, Memtable as FtMemtable};
+
+/// Open the full-text fixture, let `build` populate a memtable against it, and run `q`.
+///
+/// The memtable is seeded with the generation's counts: a bare `Memtable` numbers born
+/// ids from 0, which would collide with the core's dense ids.
+fn run_ft_delta(
+    root_tag: &str,
+    build: impl FnOnce(&mut FtMemtable),
+    q: &str,
+) -> (std::path::PathBuf, QueryResult) {
+    let (root, graph, _) = testgen::write_basic_with_fulltext(root_tag);
+    let gen = Generation::open(&root, &graph).unwrap();
+    let cache = BlockCache::new(1 << 20);
+    let mut mem = FtMemtable::with_bases(gen.node_count(), gen.edge_count());
+    build(&mut mem);
+    let view = FtMergedView::new(&gen, FtDeltaSnapshot::from_memtable(Arc::new(mem)));
+    let engine = Engine::new(&view, &cache);
+    let ast = parser::parse(q).unwrap();
+    let res = engine.run(&ast).unwrap();
+    (root, res)
+}
+
+const FT_LONDON: &str = "CALL db.idx.fulltext.queryNodes('Person', ' (London)') \
+     YIELD node RETURN node.name AS name ORDER BY name";
+
+/// A node written through the delta since the build is searchable immediately — the
+/// gap this arm exists to close. Without it a memory added and searched in the same
+/// session would simply not be found.
+#[test]
+fn a_delta_born_node_is_searchable_before_consolidation() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_born",
+        |mem| {
+            mem.upsert_node(
+                "Person",
+                "name",
+                Value::Str("Dave".into()),
+                None, // no core id: born in the delta
+                [("city".to_string(), Value::Str("London".into()))],
+            );
+        },
+        FT_LONDON,
+    );
+    assert_eq!(
+        col0(&res),
+        ["Alice", "Bob", "Dave"],
+        "the delta-born Londoner must be found alongside the core ones"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Editing a document must re-score it from its **current** text, not return the core
+/// index's stale copy. Carol moves Paris → London: she must now match, and the core
+/// arm must not also return her under her old text.
+#[test]
+fn an_edited_node_is_scored_from_its_current_text() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_edit",
+        |mem| {
+            mem.upsert_node(
+                "Person",
+                "name",
+                Value::Str("Carol".into()),
+                Some(2),
+                [("city".to_string(), Value::Str("London".into()))],
+            );
+        },
+        FT_LONDON,
+    );
+    assert_eq!(col0(&res), ["Alice", "Bob", "Carol"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// …and the other direction: a document edited *away* from a term must stop matching,
+/// which is the case a core arm without suppression gets wrong. Alice moves London →
+/// Paris, so only Bob is left.
+#[test]
+fn an_edit_that_removes_a_term_stops_matching() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_unedit",
+        |mem| {
+            mem.upsert_node(
+                "Person",
+                "name",
+                Value::Str("Alice".into()),
+                Some(0),
+                [("city".to_string(), Value::Str("Paris".into()))],
+            );
+        },
+        FT_LONDON,
+    );
+    assert_eq!(
+        col0(&res),
+        ["Bob"],
+        "Alice's stale core posting must be suppressed, not returned"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A deleted node must stop matching even though its core posting is still on disk —
+/// the index is immutable, so the only place a delete can take effect is the read.
+#[test]
+fn a_deleted_node_stops_matching() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_delete",
+        |mem| {
+            mem.delete_node("Person", "name", Value::Str("Bob".into()), Some(1));
+        },
+        FT_LONDON,
+    );
+    assert_eq!(col0(&res), ["Alice"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A field filter is evaluated against the overlay document's own fields, so a
+/// delta-born node is filtered on the same terms a core one is.
+#[test]
+fn a_field_filter_applies_to_overlay_documents() {
+    let (root, res) = run_ft_delta(
+        "exec_ft_overlay_filter",
+        |mem| {
+            mem.upsert_node(
+                "Person",
+                "name",
+                Value::Str("Dave".into()),
+                None,
+                [("city".to_string(), Value::Str("Paris".into()))],
+            );
+        },
+        "CALL db.idx.fulltext.queryNodes('Person', '(@city:\"Paris\") (Dave | Carol)') \
+             YIELD node RETURN node.name AS name ORDER BY name",
+    );
+    assert_eq!(
+        col0(&res),
+        ["Carol", "Dave"],
+        "both Parisians match; the filter resolves for core and overlay alike"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An empty delta must leave the core arm's answer exactly as it was — the overlay
+/// machinery costs nothing and changes nothing on a read-only estate.
+#[test]
+fn an_empty_delta_does_not_disturb_the_core_answer() {
+    let (root, plain) = run_ft("exec_ft_nodelta_a", FT_LONDON);
+    let (root2, empty) = run_ft_delta("exec_ft_nodelta_b", |_| {}, FT_LONDON);
+    assert_eq!(col0(&plain), col0(&empty));
+    assert_eq!(col0(&plain), ["Alice", "Bob"]);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}
