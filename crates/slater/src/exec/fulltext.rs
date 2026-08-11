@@ -40,7 +40,6 @@
 //! size — an `O(overlay/N)` uniform downward bias on recently-edited terms, which vanishes
 //! at `CALL slater.consolidate()`. Ranking is affected; correctness is not.
 
-use anyhow::Context as _;
 use graph_format::fulltext::bm25;
 use graph_format::fulltext::bm25::Bm25Params;
 use graph_format::fulltext::index::DocEntry;
@@ -284,8 +283,13 @@ impl<'g, V: ReadView> Engine<'g, V> {
                 Val::Null => String::new(),
                 other => bail!("{proc} query must be a string, got {}", other.to_display()),
             };
+            // Not `.context(…)`: a Bolt failure renders the error with anyhow's `Display`,
+            // which shows only the *outermost* message — so wrapping would replace "this
+            // syntax is not supported" with "in db.idx.fulltext.queryNodes(…)" and tell
+            // the client nothing. Flatten the chain into one message instead, reason
+            // first, location after.
             let q = parse_query(&query_str, &desc.properties, &analyzer)
-                .with_context(|| format!("in {proc}('{}', …)", fc.label))?;
+                .map_err(|e| anyhow::anyhow!("{e:#} (in {proc}('{}', …))", fc.label))?;
 
             // ── the core arm, minus everything a newer level has touched ──
             let mut scored: Vec<(u64, f64)> = Vec::new();
